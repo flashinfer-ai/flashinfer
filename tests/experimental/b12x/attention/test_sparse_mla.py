@@ -1,11 +1,14 @@
-"""attention.sparse_mla: decode over top-k-selected tokens vs the in-tree
-pure-torch reference (packed NSA MLA cache layout), through the public
-plan -> bind -> run lifecycle, including -1-padded selections.
+"""attention.sparse_mla: decode and extend over top-k-selected tokens vs the
+in-tree pure-torch reference (packed NSA MLA cache layout), through the public
+plan -> bind -> run lifecycle, including -1-padded selections. Also checks that
+run() returns only the output when return_lse=False and (output, lse) when
+return_lse=True, in both modes.
 """
 
 from __future__ import annotations
 
 import torch
+import pytest
 from b12x.preparation import PreparedCall, PreparationSession
 
 from b12x.attention import sparse_mla
@@ -44,7 +47,17 @@ def _make_case(*, rows: int, heads: int, cache_tokens: int, width: int):
     return q_all, kv_cache, selected, cache_seqlens, active
 
 
-def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, width):
+def _run_public(
+    q_all,
+    kv_cache,
+    selected,
+    cache_seqlens,
+    active,
+    *,
+    width,
+    mode: str = "decode",
+    return_lse: bool = False,
+):
     rows, heads, _ = q_all.shape
     sm_scale = HEAD_DIM**-0.5
     declaration = sparse_mla.plan(
@@ -55,6 +68,8 @@ def _run_public_decode(q_all, kv_cache, selected, cache_seqlens, active, *, widt
             max_width=width,
             softmax_scale=sm_scale,
             kv_dtype=torch.uint8,
+            mode=mode,
+            return_lse=return_lse,
         )
     )
     owned = {}
@@ -121,7 +136,7 @@ def _assert_matches(out: torch.Tensor, ref: torch.Tensor) -> None:
 def test_run_decode_matches_reference() -> None:
     require_b12x()
     q, kv, sel, lens, active = _make_case(rows=4, heads=16, cache_tokens=512, width=128)
-    out, ref = _run_public_decode(q, kv, sel, lens, active, width=128)
+    out, ref = _run_public(q, kv, sel, lens, active, width=128)
     _assert_matches(out, ref)
 
 
@@ -136,5 +151,41 @@ def test_run_decode_masks_padded_selection() -> None:
     # attend only to the front half.
     sel[:, width // 2 :] = -1
     active.fill_(width // 2)
-    out, ref = _run_public_decode(q, kv, sel, lens, active, width=width)
+    out, ref = _run_public(q, kv, sel, lens, active, width=width)
     _assert_matches(out, ref)
+
+
+@pytest.mark.parametrize("mode", ["decode", "extend"])
+def test_run_return_format_follows_return_lse(mode: str) -> None:
+    require_b12x()
+    q, kv, sel, lens, active = _make_case(
+        rows=4, heads=16, cache_tokens=1024, width=512
+    )
+
+    without_lse, _ = _run_public(
+        q, kv, sel, lens, active, width=512, mode=mode, return_lse=False
+    )
+    assert isinstance(without_lse, torch.Tensor)
+
+    with_lse, _ = _run_public(
+        q, kv, sel, lens, active, width=512, mode=mode, return_lse=True
+    )
+    assert isinstance(with_lse, tuple)
+    assert len(with_lse) == 2
+
+
+def test_run_extend_output_unchanged_by_return_lse() -> None:
+    require_b12x()
+    q, kv, sel, lens, active = _make_case(
+        rows=4, heads=16, cache_tokens=1024, width=512
+    )
+
+    output_only, ref = _run_public(
+        q, kv, sel, lens, active, width=512, mode="extend", return_lse=False
+    )
+    (output_with_lse, _), _ = _run_public(
+        q, kv, sel, lens, active, width=512, mode="extend", return_lse=True
+    )
+
+    torch.testing.assert_close(output_only, output_with_lse, rtol=0, atol=0)
+    _assert_matches(output_only, ref)
