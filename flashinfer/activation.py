@@ -103,9 +103,11 @@ def silu_and_mul(
     ----------
     input: torch.Tensor
         Input tensor, shape (..., 2 * hidden_size).
+        Must be contiguous.
 
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor in place.
+        Must be contiguous if specified.
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
@@ -147,9 +149,11 @@ def gelu_tanh_and_mul(
     ----------
     input: torch.Tensor
         Input tensor, shape (..., 2 * hidden_size).
+        Must be contiguous.
 
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor in place.
+        Must be contiguous if specified.
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch
@@ -187,9 +191,11 @@ def gelu_and_mul(
     ----------
     input: torch.Tensor
         Input tensor, shape (..., 2 * hidden_size).
+        Must be contiguous.
 
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor in place.
+        Must be contiguous if specified.
 
     enable_pdl: Optional[bool]
         Whether to enable `programmatic dependent launch

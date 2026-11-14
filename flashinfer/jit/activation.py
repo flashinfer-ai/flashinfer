@@ -36,6 +36,9 @@ using namespace flashinfer;
 {{ act_func_def }}
 
 void {{ func_name }}(TensorView out, TensorView input, bool enable_pdl) {
+  CHECK_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(out);
+
   int d = input.size(input.ndim() -1) / 2;
   int64_t num_tokens = input.numel() / input.size(input.ndim() -1);
   dim3 grid(num_tokens);
