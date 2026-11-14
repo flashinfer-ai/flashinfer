@@ -21,6 +21,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint8, Uint32
 
 from ....batch_invariant import canon, jit
+from .. import pdl
 from ....batch_invariant.quantization.cute_ext import CuteF32
 from ....batch_invariant.quantization.layout import sanitize_symbol_name
 from ....batch_invariant.quantization.nvfp4_kernel import (
@@ -110,6 +111,7 @@ class RowMappedNvFP4QuantKernel(NvFP4QuantKernel):
         bidx, _, _ = cute.arch.block_idx()
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
+            pdl.trigger_one_wave()
         W, Lr, rows, bpt, V = self.W, self.Lr, self.rows, self.bpt, self.V
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -196,8 +198,6 @@ class RowMappedNvFP4QuantKernel(NvFP4QuantKernel):
             if (t == 0) & (w == 0) & mapped:
                 for c in cutlass.range_constexpr(self.Kbp, SF_COL_TILE):
                     mS[self._sf_off(srow, Int32(c), pcols)] = Uint8(0)
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
 
 
 class ScatterQuantNvFP4Quantizer(NvFP4QuantKernel):
@@ -268,6 +268,7 @@ class ScatterQuantNvFP4Quantizer(NvFP4QuantKernel):
         bidx, _, _ = cute.arch.block_idx()
         if enable_pdl:
             cute.arch.griddepcontrol_wait()
+            pdl.trigger_one_wave()
         W, Lr, rows, bpt, V = self.W, self.Lr, self.rows, self.bpt, self.V
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
@@ -357,8 +358,6 @@ class ScatterQuantNvFP4Quantizer(NvFP4QuantKernel):
                 if (t == 0) & (w == 0) & live:
                     for c in cutlass.range_constexpr(self.Kbp, SF_COL_TILE):
                         mS[self._sf_off(dp, Int32(c), pcols)] = Uint8(0)
-        if enable_pdl:
-            cute.arch.griddepcontrol_launch_dependents()
 
 
 def get_compiled_rowmap_quant(

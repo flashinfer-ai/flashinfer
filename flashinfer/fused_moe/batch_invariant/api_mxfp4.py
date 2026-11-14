@@ -408,7 +408,12 @@ def fused_moe_mxfp4(
     outputs after the ids and weights)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
-    from .permute_nvfp4 import get_compiled_scatter_fp4, get_compiled_scatter_sf
+    from .permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+        scatter_lanes,
+        scatter_sf_lanes,
+    )
     from .schedule_mxfp4 import default_configs_mxfp4
 
     if path not in PATHS:
@@ -522,7 +527,15 @@ def fused_moe_mxfp4(
         x_perm4 = torch.empty(Tk_a, H // 2, dtype=torch.uint8, device=dev)
         x_perm_sf = torch.empty(mx_sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
         if Tk:
-            get_compiled_scatter_fp4(k, wpr, sf_src, False, True, MX_BLOCK)(
+            get_compiled_scatter_fp4(
+                k,
+                wpr,
+                sf_src,
+                False,
+                True,
+                MX_BLOCK,
+                **scatter_lanes(H // 2, pcols_h, wpr),
+            )(
                 x4,
                 x_sf,
                 unit,
@@ -556,7 +569,7 @@ def fused_moe_mxfp4(
         a_sf_pad = torch.empty(mx_sf_numel(Tk_sf, I), dtype=torch.uint8, device=dev)
         if Tk:
             quantize_rows_mx(a[:Tk], out=(a4[:Tk], a_sf))
-            get_compiled_scatter_sf(1, True)(
+            get_compiled_scatter_sf(1, True, spl=scatter_sf_lanes(pcols_i))(
                 a_sf, unit, pos_pad, a_sf_pad, unit, Tk, pcols_i
             )
         y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
@@ -602,7 +615,12 @@ def fused_moe_mxfp4(
         return out
     # the padded packing: every group's rows start at a 128-row atom; the padding rows are zero (computed, never stored)
     from .api import PLAN_MULTI_MIN_N
-    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
+    from .permute import (
+        get_compiled_plan,
+        get_compiled_plan_multi,
+        PLAN_BLOCK,
+        plan_threads,
+    )
 
     n = Tk
     dest = torch.empty(n, dtype=torch.int32, device=dev)
@@ -618,13 +636,17 @@ def fused_moe_mxfp4(
             flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(GROUP_ALIGN, False)(flat, counts, dest, src, dest, dest, n, E)
+        get_compiled_plan(GROUP_ALIGN, False, threads=plan_threads(n))(
+            flat, counts, dest, src, dest, dest, n, E
+        )
     dest = dest.view(T, k)
     x_perm4 = torch.zeros(Tk_pad, H // 2, dtype=torch.uint8, device=dev)
     x_perm_sf = torch.zeros(mx_sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     if Tk:
         flat_dest = dest.reshape(-1)
-        get_compiled_scatter_fp4(k, wpr, sf_src, False, True, MX_BLOCK)(
+        get_compiled_scatter_fp4(
+            k, wpr, sf_src, False, True, MX_BLOCK, **scatter_lanes(H // 2, pcols_h, wpr)
+        )(
             x4,
             x_sf,
             unit,

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Programmatic dependent launch: where a kernel lets its dependents start. Every kernel waits for its predecessor before
 its first dependent read (``griddepcontrol.wait``); the trigger (``griddepcontrol.launch_dependents``) decides when the next
-kernel's CTAs may become resident. No kernel of this backend triggers: the dependents launch at completion (``TRIGGER =
-"none"``), the placement that measured fastest for the MoE chain (an early trigger lets the dependents' CTAs occupy SM slots
+kernel's CTAs may become resident. The persistent bodies do not trigger: their dependents launch at completion (``TRIGGER =
+"none"``); the one-wave kernels take ``TRIGGER_SMALL`` (``none``: completion) right after their wait, the placement that measured fastest for the MoE chain (an early trigger lets the dependents' CTAs occupy SM slots
 during the main work; a trigger after the persistent body's last loads still overlaps its epilogue, which at decode is most
 of the kernel). The trigger sites below mark where the other placements would go (``late``: after the CTA's last tile's
 loads; ``early``: right after the wait). The placement is baked into every compiled object and the kernel names do not
@@ -15,8 +15,12 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 
-#: The trigger placement of every kernel of the backend: ``none`` (the dependents launch at completion).
+#: The trigger placement of the persistent bodies: ``none`` (the dependents launch at completion).
 TRIGGER = "none"
+#: The trigger placement of the one-wave kernels (gather, scatters, quantizers, combine; the plan-side kernels never
+#: trigger): ``none`` -- the early placement (right after their own wait) leaves the persistent bodies' CTAs resident
+#: while these kernels run and costs the largest prefill cells more than it saves anywhere.
+TRIGGER_SMALL = "none"
 #: The placements the swapped box form compiles under (asserted by its builder, ``blocks/swap.py``): the form reads
 #: the plan's group counts -- its predecessor's predecessor's output -- before its own wait, which holds while every
 #: dependent launches only after its predecessor's wait has returned (the trigger after the loads, or completion). The
@@ -40,6 +44,7 @@ def trigger_late():
 
 @cute.jit
 def trigger_one_wave():
-    """A one-wave kernel's trigger: only the early placement triggers at all (the dependents launch at completion otherwise)."""
-    if cutlass.const_expr(TRIGGER == "early"):
+    """A one-wave kernel's trigger, placed right after its wait: only the early placement triggers at all (the dependents launch
+    at completion otherwise)."""
+    if cutlass.const_expr(TRIGGER_SMALL == "early"):
         cute.arch.griddepcontrol_launch_dependents()

@@ -563,7 +563,12 @@ def permute_plan_dual(
     plus the positions with the groups padded to ``pad_align`` rows (``dest_pad[i]``) and the padded position of every dense
     row (``pos_pad[p]``): the dense packing's row map (A rows dense, scale factors and row scales at the padded positions)."""
     from .api import PLAN_MULTI_MIN_N
-    from .permute import PLAN_BLOCK, get_compiled_plan, get_compiled_plan_multi
+    from .permute import (
+        PLAN_BLOCK,
+        get_compiled_plan,
+        get_compiled_plan_multi,
+        plan_threads,
+    )
 
     T, k = experts.shape
     n = T * k
@@ -585,7 +590,7 @@ def permute_plan_dual(
             flat, counts, dest, src, dest_pad, pos_pad, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(1, True, pad_align)(
+        get_compiled_plan(1, True, pad_align, plan_threads(n))(
             flat, counts, dest, src, dest_pad, pos_pad, n, E
         )
     return counts, dest.view(T, k), src, dest_pad.view(T, k), pos_pad
@@ -784,7 +789,12 @@ def fused_moe_nvfp4(
     :func:`permute_plan_dual`'s, one launch saved)."""
     from .combine import get_compiled_combine, warps_per_token
     from .permute import warps_per_row
-    from .permute_nvfp4 import get_compiled_scatter_fp4, get_compiled_scatter_sf
+    from .permute_nvfp4 import (
+        get_compiled_scatter_fp4,
+        get_compiled_scatter_sf,
+        scatter_lanes,
+        scatter_sf_lanes,
+    )
     from .schedule_nvfp4 import default_configs_nvfp4
 
     if path not in PATHS:
@@ -923,8 +933,9 @@ def fused_moe_nvfp4(
                 (x_perm4, x_perm_sf, x_perm_pts),
             )
         elif Tk:
+            wpr = warps_per_row(Tk, H // 32, sm_count)
             get_compiled_scatter_fp4(
-                k, warps_per_row(Tk, H // 32, sm_count), sf_src, unit_pts
+                k, wpr, sf_src, unit_pts, **scatter_lanes(H // 2, pcols_h, wpr)
             )(
                 x4,
                 x_sf,
@@ -989,7 +1000,7 @@ def fused_moe_nvfp4(
             elif Tk:
                 a_sf = torch.empty(sf_numel(Tk, I), dtype=torch.uint8, device=dev)
                 _, _, a_pts = quantize_activations(a[:Tk], gsi, out=(a4[:Tk], a_sf))
-                get_compiled_scatter_sf(1)(
+                get_compiled_scatter_sf(1, spl=scatter_sf_lanes(pcols_i))(
                     a_sf, a_pts, pos_pad, a_sf_pad, a_pts_pad, Tk, pcols_i
                 )
         y = torch.empty(Tk_a, H, dtype=torch.bfloat16, device=dev)
@@ -1040,7 +1051,12 @@ def fused_moe_nvfp4(
             )
         return out
     # the padded packing: every group's rows start at a 128-row atom; the padding rows are zero (computed, never stored)
-    from .permute import get_compiled_plan, get_compiled_plan_multi, PLAN_BLOCK
+    from .permute import (
+        PLAN_BLOCK,
+        get_compiled_plan,
+        get_compiled_plan_multi,
+        plan_threads,
+    )
     from .api import PLAN_MULTI_MIN_N
 
     n = Tk
@@ -1057,15 +1073,18 @@ def fused_moe_nvfp4(
             flat, counts, dest, src, dest, dest, hist_blk, n, E, nb
         )
     else:
-        get_compiled_plan(GROUP_ALIGN, False)(flat, counts, dest, src, dest, dest, n, E)
+        get_compiled_plan(GROUP_ALIGN, False, threads=plan_threads(n))(
+            flat, counts, dest, src, dest, dest, n, E
+        )
     dest = dest.view(T, k)
     x_perm4 = torch.zeros(Tk_pad, H // 2, dtype=torch.uint8, device=dev)
     x_perm_sf = torch.zeros(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     x_perm_pts = torch.zeros(Tk_pad, dtype=torch.float32, device=dev)
     if Tk:
         flat_dest = dest.reshape(-1)
+        wpr = warps_per_row(Tk, H // 32, sm_count)
         get_compiled_scatter_fp4(
-            k, warps_per_row(Tk, H // 32, sm_count), sf_src, unit_pts
+            k, wpr, sf_src, unit_pts, **scatter_lanes(H // 2, pcols_h, wpr)
         )(
             x4,
             x_sf,

@@ -67,7 +67,7 @@ class HistogramKernel:
     def kernel(self, mExp: cute.Tensor, mCounts: cute.Tensor, n: Int32, E: Int32):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no trigger: the dependent is a one-wave grid whose waiting CTAs would crowd this one out
         smem = cutlass.utils.SmemAllocator()
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E,)), byte_alignment=16
@@ -87,7 +87,6 @@ class HistogramKernel:
             v = hist[tidx]
             if v > 0:
                 cute.arch.atomic_add(mCounts.iterator + tidx, v)
-        pdl.trigger_one_wave()
 
 
 class PositionKernel:
@@ -126,7 +125,7 @@ class PositionKernel:
         e, _, _ = cute.arch.block_idx()
         warp = tidx // LANES
         lane = cute.arch.lane_idx()
-        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no trigger: the dependent is a one-wave grid whose waiting CTAs would crowd this one out
         smem = cutlass.utils.SmemAllocator()
         s_off = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
@@ -174,7 +173,6 @@ class PositionKernel:
             # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
             for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
                 mSrc[p] = Int32(-1)
-        pdl.trigger_one_wave()
 
 
 class PlanKernel:
@@ -190,9 +188,17 @@ class PlanKernel:
     ``pad_align`` rows on top of the dense ``dest`` / ``src`` (the block-scaled classes' second packing; the bf16 class
     passes ``dual=False`` and any two int32 tensors for the padded outputs)."""
 
-    def __init__(self, align: int = 1, dual: bool = False, pad_align: int = 128):
+    def __init__(
+        self,
+        align: int = 1,
+        dual: bool = False,
+        pad_align: int = 128,
+        threads: int = THREADS,
+    ):
         assert align >= 1 and pad_align > 1 and not (dual and align > 1)
         self.align, self.dual, self.pad_align = align, dual, pad_align
+        assert threads % LANES == 0 and threads <= THREADS, threads
+        self.threads = threads
 
     @cute.jit
     def __call__(
@@ -208,7 +214,7 @@ class PlanKernel:
         stream,
     ):
         self.kernel(mExp, mCounts, mDest, mSrc, mDestPad, mPosPad, n, E).launch(
-            grid=[E, 1, 1], block=[THREADS, 1, 1], stream=stream, use_pdl=True
+            grid=[E, 1, 1], block=[self.threads, 1, 1], stream=stream, use_pdl=True
         )
 
     @cute.kernel
@@ -227,7 +233,7 @@ class PlanKernel:
         e, _, _ = cute.arch.block_idx()
         warp = tidx // LANES
         lane = cute.arch.lane_idx()
-        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no trigger: the dependent is a one-wave grid whose waiting CTAs would crowd this one out
         smem = cutlass.utils.SmemAllocator()
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E,)), byte_alignment=16
@@ -247,12 +253,12 @@ class PlanKernel:
                 Int32, cute.make_layout((MAX_E + 1,)), byte_alignment=16
             )
         warp_tot = smem.allocate_tensor(
-            Int32, cute.make_layout((THREADS // LANES,)), byte_alignment=16
+            Int32, cute.make_layout((self.threads // LANES,)), byte_alignment=16
         )
-        if tidx < MAX_E:
-            hist[tidx] = Int32(0)
+        for h in cutlass.range(tidx, MAX_E, self.threads):
+            hist[h] = Int32(0)
         cute.arch.barrier()
-        for i in cutlass.range(tidx, n, THREADS):
+        for i in cutlass.range(tidx, n, self.threads):
             ei = mExp[i]
             if (ei >= Int32(0)) & (ei < E):
                 cute.arch.atomic_add(hist.iterator + ei, Int32(1))
@@ -262,14 +268,15 @@ class PlanKernel:
                 if cutlass.const_expr(self.dual):
                     mDestPad[i] = Int32(-1)
         cute.arch.barrier()
-        if (e == 0) & (tidx < E):
-            mCounts[tidx] = hist[tidx]
+        if e == 0:
+            for ee in cutlass.range(tidx, E, self.threads):
+                mCounts[ee] = hist[ee]
         if warp == 0:
             build_group_tables(hist, E, 1, s_off, s_pre, self.align)
             if cutlass.const_expr(self.dual):
                 build_group_tables(hist, E, 1, s_off_pad, s_pre_pad, self.pad_align)
         # pass 1: this warp's slot range, its count of expert e (ballots over 32 slots at a time)
-        n_warps = Int32(THREADS // LANES)
+        n_warps = Int32(self.threads // LANES)
         per_warp = (n + n_warps - Int32(1)) // n_warps
         lo = warp * per_warp
         hi = cutlass.min(lo + per_warp, n)
@@ -286,7 +293,7 @@ class PlanKernel:
         cute.arch.barrier()  # the tables and the warp totals are complete
         if e == Int32(0):
             # the rows past the total: the dropped slots' share of the buffer holds -1, which the gather skips
-            for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], THREADS):
+            for p in cutlass.range(s_off[MAX_E] + tidx, mSrc.shape[0], self.threads):
                 mSrc[p] = Int32(-1)
                 if cutlass.const_expr(self.dual):
                     mPosPad[p] = Int32(-1)
@@ -294,7 +301,7 @@ class PlanKernel:
         base_pad = Int32(0)
         if cutlass.const_expr(self.dual):
             base_pad = s_off_pad[e]
-        for w in cutlass.range_constexpr(THREADS // LANES):
+        for w in cutlass.range_constexpr(self.threads // LANES):
             if Int32(w) < warp:
                 base = base + warp_tot[w]
                 base_pad = base_pad + warp_tot[w]
@@ -316,7 +323,6 @@ class PlanKernel:
                     mDestPad[i] = base_pad + prefix
                     mPosPad[base + prefix] = base_pad + prefix
             running = running + Int32(cute.arch.popc(Uint32(ballot)))
-        pdl.trigger_one_wave()
 
 
 PLAN_THREADS = 256  # plan_multi: threads per CTA (8 warps)
@@ -363,7 +369,7 @@ class PlanBlocksKernel:
         b, _, _ = cute.arch.block_idx()
         warp = tidx // LANES
         lane = cute.arch.lane_idx()
-        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no trigger: the dependent is a one-wave grid whose waiting CTAs would crowd this one out
         smem = cutlass.utils.SmemAllocator()
         wcnt = smem.allocate_tensor(
             Int32, cute.make_layout((PLAN_WARPS * MAX_E,)), byte_alignment=16
@@ -415,7 +421,6 @@ class PlanBlocksKernel:
                 if oks[c]:
                     d = rs[c] + wcnt[warp * MAX_E + es[c]]
                 mDest[i] = d
-        pdl.trigger_one_wave()
 
 
 class PlanFinishKernel:
@@ -466,7 +471,7 @@ class PlanFinishKernel:
         tidx, _, _ = cute.arch.thread_idx()
         b, _, _ = cute.arch.block_idx()
         warp = tidx // LANES
-        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()  # no trigger: the dependent is a one-wave grid whose waiting CTAs would crowd this one out
         smem = cutlass.utils.SmemAllocator()
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((MAX_E,)), byte_alignment=16
@@ -530,7 +535,6 @@ class PlanFinishKernel:
                 if cutlass.const_expr(self.dual):
                     if (e < Int32(0)) | (e >= E):
                         mDestPad[i] = Int32(-1)
-        pdl.trigger_one_wave()
 
 
 class PlanMultiKernel:
@@ -624,6 +628,7 @@ class GatherKernel:
         bidx, _, _ = cute.arch.block_idx()
         lane = cute.arch.lane_idx()
         cute.arch.griddepcontrol_wait()
+        pdl.trigger_one_wave()
         g = bidx * WARPS + tidx // LANES
         p_raw = g // Int32(wpr)
         part = g % Int32(wpr)
@@ -651,14 +656,27 @@ class GatherKernel:
             cute.copy(atom, cute.local_tile(row_x, (vec,), (jc,)), frag)
             if valid & (j < n_vec):
                 cute.copy(atom, frag, cute.local_tile(row_p, (vec,), (jc,)))
-        pdl.trigger_one_wave()
 
 
-def plan_kernel_name(kind: str, align: int, dual: bool, pad_align: int) -> str:
-    """``moe_plan_a<align>[_dual<pad_align>]`` / ``moe_plan_multi_...``."""
+def plan_kernel_name(
+    kind: str, align: int, dual: bool, pad_align: int, threads: int = THREADS
+) -> str:
+    """``moe_plan_a<align>[_dual<pad_align>][_t<threads>]`` / ``moe_plan_multi_...``."""
     return jit.sanitize_symbol_name(
-        f"moe_{kind}_a{align}" + (f"_dual{pad_align}" if dual else "")
+        f"moe_{kind}_a{align}"
+        + (f"_dual{pad_align}" if dual else "")
+        + (f"_t{threads}" if threads != THREADS else "")
     )
+
+
+#: Slots up to which the plan runs 128-thread CTAs (one per expert): below it the launch of E x 1024-thread CTAs is the cost.
+PLAN_SMALL_N = 512
+PLAN_SMALL_THREADS = 128
+
+
+def plan_threads(n: int) -> int:
+    """The plan CTA's thread count at ``n`` slots (a placement: the same tables and positions)."""
+    return PLAN_SMALL_THREADS if n <= PLAN_SMALL_N else THREADS
 
 
 @functools.cache
@@ -712,7 +730,9 @@ def get_compiled_positions(align: int = 1) -> Any:
 
 
 @functools.cache
-def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) -> Any:
+def get_compiled_plan(
+    align: int = 1, dual: bool = False, pad_align: int = 128, threads: int = THREADS
+) -> Any:
     """``kernel(experts [T k] i32, counts [E] i32 (written), dest [T k], src [Tk(_pad)], dest_pad [T k], pos_pad [T k], n, E)``;
     without ``dual`` pass any two int32 tensors for the last two."""
 
@@ -726,7 +746,7 @@ def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) 
         pp_fake = cute.runtime.make_fake_tensor(Int32, (sym_n,), (1,), assumed_align=4)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            PlanKernel(align, dual, pad_align),
+            PlanKernel(align, dual, pad_align, threads),
             e_fake,
             c_fake,
             d_fake,
@@ -740,7 +760,7 @@ def get_compiled_plan(align: int = 1, dual: bool = False, pad_align: int = 128) 
         )
 
     return jit.build_and_load(
-        MODULE, plan_kernel_name("plan", align, dual, pad_align), compile_fn
+        MODULE, plan_kernel_name("plan", align, dual, pad_align, threads), compile_fn
     )
 
 
