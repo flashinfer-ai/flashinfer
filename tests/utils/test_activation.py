@@ -150,9 +150,7 @@ def test_act_and_mul_rejects_noncontiguous(op, strided_arg):
             fn(x, out=out)
 
 
-@pytest.mark.parametrize(
-    "op", ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
-)
+@pytest.mark.parametrize("op", ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"])
 @pytest.mark.parametrize("strided_arg", ["input", "out"])
 def test_act_and_mul_ffi_rejects_noncontiguous(op, strided_arg):
     act = op.removesuffix("_and_mul")
