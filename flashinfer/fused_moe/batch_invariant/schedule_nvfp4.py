@@ -24,6 +24,7 @@ canonical (the same bits), so the dispatcher may depend on anything; the ranked 
 
 from __future__ import annotations
 
+import functools
 from typing import List, Optional, Tuple
 
 from ...gemm.batch_invariant.generator import (
@@ -58,7 +59,14 @@ def grouped_knobs_blockscaled(clusters=None) -> List[Knobs]:
     """The grouped block-scaled space: the dense records of the nvfp4 knob product at swizzle 1 (no in-cluster split, no
     operand swap, no B-reuse tile, no in-CTA chunk fold: the group scheduler has none of them), the same records for both
     instruction classes (the step is the class)."""
-    return [
+    return list(
+        _grouped_knobs_blockscaled(None if clusters is None else tuple(clusters))
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _grouped_knobs_blockscaled(clusters) -> Tuple[Knobs, ...]:
+    return tuple(
         k
         for k in knob_product(
             swizzles=(1,),
@@ -66,7 +74,7 @@ def grouped_knobs_blockscaled(clusters=None) -> List[Knobs]:
             in_fmt="nvfp4",
         )
         if k.cluster_k == 1 and not k.swap_ab and not k.b_reuse and not k.cta_chunks
-    ]
+    )
 
 
 def swapped_knobs_blockscaled() -> List[Knobs]:
@@ -221,6 +229,30 @@ def rank_grouped_nvfp4(
     n_active: Optional[int] = None,
     swap: Optional[bool] = None,
 ) -> List[Knobs]:
+    """The ranked records (:func:`_rank_grouped_nvfp4`), memoised on the arguments: the ranking runs on the host at every call
+    of the op and of the layer, and enumerating and costing the space is milliseconds of Python per GEMM."""
+    return list(
+        _rank_grouped_nvfp4(
+            rows, N, K, E, chain, in_fmt, sm_count, family, k, nominal, n_active, swap
+        )
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _rank_grouped_nvfp4(
+    rows: int,
+    N: int,
+    K: int,
+    E: int,
+    chain: GroupedEpilogueBlock,
+    in_fmt: str,
+    sm_count: Optional[int],
+    family: Optional[str],
+    k: int,
+    nominal: bool,
+    n_active: Optional[int],
+    swap: Optional[bool],
+) -> Tuple[Knobs, ...]:
     """The ranked records for one GEMM over both record spaces (the bf16 dispatcher's form, :func:`.schedule.rank_grouped`): the
     grouped records the grouped body accepts for the weight shape, the chain and the instruction class (at a decode-sized ``rows``
     the dense dispatcher's structural guard, `heuristic.decode_sane`, selects the candidates; a record whose M tile is taller than
@@ -325,7 +357,7 @@ def rank_grouped_nvfp4(
     )
     if pair is not None and pair not in seen and k > 1:
         out = out[: k - 1] + [pair] if len(out) >= k else out + [pair]
-    return out[:k]
+    return tuple(out[:k])
 
 
 def default_configs_nvfp4(
