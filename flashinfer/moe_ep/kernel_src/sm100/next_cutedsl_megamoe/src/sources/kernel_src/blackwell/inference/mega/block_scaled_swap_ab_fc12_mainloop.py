@@ -86,6 +86,8 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         self._validate_desc_inputs(problem_desc, impl_desc)
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
+        # Pin instruction N together with its matching two-CTA input split.
+        self.batch_invariant = bool(problem_desc.get("batch_invariant", False))
         # Derived, not declared: see BlockScaledSwapAbMegaMoeKernel.__init__ for the reasoning.
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
@@ -870,7 +872,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
                         load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile, mma_tiler_n=self.mma_tiler_mnk[1]
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile), mma_tiler_n=self.mma_tiler_mnk[1]
                         )
                         real_b = cute.domain_offset((load_shift, 0, 0), real_b)
 
@@ -948,7 +950,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                 if cutlass.const_expr(self.use_2cta_instrs):
                     if not self.is_leader_cta:
                         load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
-                            valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile, mma_tiler_n=self.mma_tiler_mnk[1]
+                            valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile), mma_tiler_n=self.mma_tiler_mnk[1]
                         )
                         real_b = cute.domain_offset((load_shift, 0, 0), real_b)
 
@@ -1109,7 +1111,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
                         sfa_tensor=tmem_sfa,
                         sfb_tensor=mma_tmem_sfb,
                         k_tile_idx=k_tile_idx,
-                        valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile,
+                        valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile),
                         mma_tiler_mnk=self.mma_tiler_mnk,
                     )
                     ab_pipeline.consumer_release(ab_pipeline_state)

@@ -54,6 +54,7 @@ def test_reference_row_sampling_under_model_default_dtype(
         experts_per_rank=1,
         quant_kind="nvfp4",
         combine_dtype="bf16",
+        batch_invariant=False,
         gate_up_clamp=None,
         apply_routing_weights_before_fc2=False,
         situ_beta=None,

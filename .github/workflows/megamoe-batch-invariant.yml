@@ -1,0 +1,60 @@
+name: MegaMoE batch-invariant qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_labels:
+        description: 'JSON labels for a provisioned Blackwell or Rubin NVLink runner'
+        required: true
+        type: string
+      python:
+        description: 'Python executable in the provisioned CUDA environment'
+        default: python3
+        required: true
+        type: string
+      arch:
+        description: 'Required architecture on every physical GPU'
+        type: choice
+        options: ['sm_100', 'sm_103', 'sm_107']
+        required: true
+      world_size:
+        description: 'Physical GPUs in one NVLink domain'
+        type: choice
+        options: ['2', '4', '8']
+        default: '4'
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 360
+    env:
+      QUALIFY_PYTHON: ${{ inputs.python }}
+      BI_ARCH: ${{ inputs.arch }}
+      EP_WORLD_SIZE: ${{ inputs.world_size }}
+    steps:
+      - name: Set the Lean installation directory
+        run: echo "ELAN_HOME=$RUNNER_TEMP/flashinfer-bi-elan" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install the pinned Lean toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --no-modify-path --default-toolchain "$(cat flashinfer/batch_invariant/lean/lean-toolchain)"
+          echo "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+      - name: Qualify host proofs, all BI formats and physical EP
+        run: >-
+          "$QUALIFY_PYTHON" tests/moe_ep/qualify_batch_invariant.py
+          --suite all --arch "$BI_ARCH" --world-size "$EP_WORLD_SIZE"
+          --output-dir "$RUNNER_TEMP/megamoe-bi-qualification"
+      - name: Preserve qualification logs and per-rank results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: megamoe-bi-${{ inputs.arch }}-ep${{ inputs.world_size }}
+          path: ${{ runner.temp }}/megamoe-bi-qualification
+          if-no-files-found: error

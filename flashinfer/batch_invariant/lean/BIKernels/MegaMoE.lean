@@ -31,6 +31,7 @@ mutual
   private def sexprImpl : Expr → String
     | .str s => s
     | .int i => toString i
+    | .op name [] => "(op:" ++ name ++ " )"
     | .op name args => "(op:" ++ name ++ sexprsImpl args ++ ")"
   termination_by e => sizeOf e
 
@@ -45,7 +46,7 @@ the same traversal and is checked against the kernel-decided Python pins. -/
 @[implemented_by sexprImpl]
 def sexpr : Expr → String :=
   Expr.rec (motive_1 := fun _ => String) (motive_2 := fun _ => String)
-    (fun name _ args => "(op:" ++ name ++ args ++ ")")
+    (fun name original args => "(op:" ++ name ++ (if original.isEmpty then " " else args) ++ ")")
     (fun value => value) (fun value => toString value) ""
     (fun _ _ arg rest => " " ++ arg ++ rest)
 

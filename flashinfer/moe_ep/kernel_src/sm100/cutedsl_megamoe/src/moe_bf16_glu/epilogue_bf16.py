@@ -13,6 +13,7 @@ from cutlass.cute.typing import Float32
 from moe_mxfp8_glu.epilogue_mxfp8 import GluMxfp8Epilogue
 from flashinfer.moe_ep.batch_invariant.device import PackedF32
 from flashinfer.moe_ep.batch_invariant.spec import fc1_activation_accumulator
+from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
 
 
 @cute.jit
@@ -190,13 +191,22 @@ class GluBf16Epilogue(GluMxfp8Epilogue):
             if cutlass.const_expr(prob is not None):
                 weight = (prob, prob)
             for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
-                result = fc1_activation_accumulator(
-                    PackedF32,
-                    (t_gate[i], t_gate[i + 1]),
-                    (t_up[i], t_up[i + 1]),
-                    weight=weight,
-                    clamp=self._batch_invariant_clamp,
-                )
+                if cutlass.const_expr(getattr(self, "batch_invariant_activation", None) is not None):
+                    result = activation_accumulator(
+                        PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        variant=self.batch_invariant_activation,
+                        weight=weight,
+                    )
+                else:
+                    result = fc1_activation_accumulator(
+                        PackedF32,
+                        (t_gate[i], t_gate[i + 1]),
+                        (t_up[i], t_up[i + 1]),
+                        weight=weight,
+                        clamp=self._batch_invariant_clamp,
+                    )
                 t_swiglu[i], t_swiglu[i + 1] = result
         else:
             swiglu_act(t_swiglu, t_up, t_gate, prob)

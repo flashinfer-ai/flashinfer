@@ -61,7 +61,14 @@ class BlackwellTuningProtocol:
         process_group: ProcessGroup | None = None,
         install_winner: bool = False,
         allow_nondeterministic: bool | None = None,
+        make_trial=None,
+        execution_contract: dict | None = None,
     ) -> None:
+        if (make_trial is None) != (execution_contract is None):
+            raise ValueError(
+                "complete-forward tuning requires both a trial and its execution contract"
+            )
+        self.make_trial, self.execution_contract = make_trial, execution_contract
         self.y, self.l1, self.l2 = y, l1, l2
         self.workspace = workspace
         self.cfg = workspace.config
@@ -96,10 +103,20 @@ class BlackwellTuningProtocol:
         return {**knob_cache._key(self.cfg), "live_tokens": live_tokens}
 
     def _contract(self):
-        return knob_cache._key(self.cfg)
+        base = knob_cache._key(self.cfg)
+        return (
+            {"kernel": base, "execution": self._gather(self.execution_contract)}
+            if self.make_trial is not None
+            else base
+        )
 
     def _compatible(self, record, contract, context, measurement):
         if not isinstance(record, dict):
+            return False
+        boundary = "complete_forward" if self.make_trial is not None else "kernel"
+        if record.get("timing_boundary", "kernel") != boundary:
+            return False
+        if self.make_trial is not None and record.get("protocol_contract") != contract:
             return False
         if record.get("protocol_contract") not in (None, contract):
             return False
@@ -231,6 +248,7 @@ class BlackwellTuningProtocol:
             context.skipped,
             policy_fields,
             measurement,
+            self.make_trial is not None,
         )
         if any(_json(p) != _json(proposal) for p in self._gather(proposal)):
             raise ValueError(
@@ -322,6 +340,7 @@ class BlackwellTuningProtocol:
                 calls_per_sample=self.calls_per_sample,
                 process_group=self.group,
                 measurement=measurement,
+                make_trial=self.make_trial,
             )
             record = knob_cache.make_record(
                 knobs, cfg, live_tokens=max(counts), p50_us=score
@@ -330,6 +349,8 @@ class BlackwellTuningProtocol:
             record["profiling_policy"] = {
                 k: v for k, v in measurement.items() if k != "warmup_iters"
             }
+            if self.make_trial is not None:
+                record["timing_boundary"] = "complete_forward"
         else:
             successful = 0
             knobs = knob_cache._decode(record, cfg)
