@@ -1632,6 +1632,13 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         if remove_cutlass:
             backends.remove("cutlass")
 
+    if "cute-dsl-prims" in backends and not (
+        q_dtype == torch.float8_e4m3fn and kv_dtype == q_dtype and v_dtype == q_dtype
+    ):
+        _drop_backend(
+            backends, "cute-dsl-prims", "requires FP8 E4M3 Q, K and V of the same dtype"
+        )
+
     if "prims-ts" in backends:
         if is_nvfp4_kv:
             _drop_backend(backends, "prims-ts", "does not support NVFP4 K/V")
@@ -2590,6 +2597,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 backends.remove("trtllm-fmha-v2")
             else:
                 fmha_v2_layout = "SEPARATE_Q_K_V"
+
+    if "cute-dsl-prims" in backends and not (
+        q_dtype == torch.float8_e4m3fn and kv_dtype == q_dtype
+    ):
+        _drop_backend(
+            backends, "cute-dsl-prims", "requires FP8 E4M3 Q and K/V of the same dtype"
+        )
 
     if "prims-ts" in backends:
         if q_dtype != kv_dtype:
