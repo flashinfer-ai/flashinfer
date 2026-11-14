@@ -1306,6 +1306,7 @@ def _tuning_group_agreement(phase, selection, status=0, error=None):
             "Distributed autotuning cannot synchronize during an active CUDA Graph capture"
         )
     import torch.distributed as dist
+    from torch.distributed.distributed_c10d import _get_object_coll_device
 
     def digest(value):
         encoded = json.dumps(
@@ -1323,8 +1324,7 @@ def _tuning_group_agreement(phase, selection, status=0, error=None):
         selection_digest = bytes(32)
         status = 2
         error = f"unrepresentable selection: {exc}"
-    backend = str(dist.get_backend(_tune_process_group)).lower()
-    device = "cuda" if backend == "nccl" else "cpu"
+    device = _get_object_coll_device(_tune_process_group)
     agreement = torch.tensor(
         [
             status,
@@ -1548,9 +1548,9 @@ def _sync_cupti_status(status: int) -> int:
         return status
 
     import torch.distributed as dist
+    from torch.distributed.distributed_c10d import _get_object_coll_device
 
-    backend = str(dist.get_backend(_tune_process_group)).lower()
-    device = "cuda" if backend == "nccl" else "cpu"
+    device = _get_object_coll_device(_tune_process_group)
     result = torch.tensor([status], dtype=torch.int32, device=device)
     dist.all_reduce(result, op=dist.ReduceOp.MAX, group=_tune_process_group)
     return int(result.item())
@@ -4395,11 +4395,9 @@ class AutoTuner:
         try:
             if _tune_process_group is not None:
                 import torch.distributed as dist
+                from torch.distributed.distributed_c10d import _get_object_coll_device
 
-                # NCCL requires a CUDA tensor; a gloo (CPU) subgroup — the
-                # recommended choice — uses a CPU tensor.
-                backend = str(dist.get_backend(_tune_process_group)).lower()
-                device = "cuda" if backend == "nccl" else "cpu"
+                device = _get_object_coll_device(_tune_process_group)
                 time_tensor = torch.tensor(
                     [avg_time], dtype=torch.float64, device=device
                 )
