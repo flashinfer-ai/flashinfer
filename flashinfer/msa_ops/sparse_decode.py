@@ -173,6 +173,13 @@ def _decode_num_chunks(
     return max(1, min(pow2, topk))
 
 
+# Backends for msa_sparse_decode_attention. "auto" (the default) behaves as
+# "native" (the stock per-architecture dispatch) except that allowlisted
+# calls route to the agent-generated "specialized" kernel; explicit backends
+# are never swapped.
+MSA_SPARSE_DECODE_BACKENDS = ("auto", "specialized", "native")
+
+
 @flashinfer_api(trace=msa_sparse_decode_attention_trace)
 def msa_sparse_decode_attention(
     q: torch.Tensor,
@@ -196,6 +203,7 @@ def msa_sparse_decode_attention(
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
     out: Optional[torch.Tensor] = None,
+    backend: str = "auto",
 ):
     """Sparse decode attention for SM100/SM103/SM107 and SM120/SM121 GPUs.
 
@@ -308,6 +316,18 @@ def msa_sparse_decode_attention(
         device query, so a host tensor gets the same answer -- deliberately, so
         that a caller cannot be handed the copy back without being told.
 
+    backend : str
+        One of ``("auto", "specialized", "native")``. ``"auto"`` (the
+        default) behaves exactly like ``"native"`` (the stock
+        per-architecture dispatch) except that calls matching the
+        ``"specialized"`` allowlist -- bf16 Q, paged fp8 E4M3 KV, 16:1 head
+        group, head_dim 128, page 128, topk 16, ``seqlen_q`` 1, causal,
+        default scale, on SM103 -- route to an agent-generated kernel
+        (:mod:`flashinfer.msa_sparse_decode_fp8kv_cuda`). That route also
+        honours ``out=``. An explicitly selected backend is never silently
+        swapped: ``"specialized"`` raises when it cannot serve the call.
+        Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``.
+
     Returns
     -------
     torch.Tensor or (torch.Tensor, torch.Tensor)
@@ -316,6 +336,34 @@ def msa_sparse_decode_attention(
         ``return_softmax_lse``. When ``out`` is given it IS the returned
         tensor.
     """
+    if backend not in MSA_SPARSE_DECODE_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {MSA_SPARSE_DECODE_BACKENDS}, "
+            f"got {backend!r}")
+    # "specialized" backend: an agent-generated kernel for the bf16-Q /
+    # fp8-E4M3 paged-KV single-token decode contract
+    # (flashinfer/msa_sparse_decode_fp8kv_cuda.py). backend="auto" (the
+    # default; otherwise identical to "native") routes to it only on its
+    # strict allowlist; explicitly selected backends are never swapped;
+    # kill switch: FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1.
+    if backend in ("auto", "specialized"):
+        from ..msa_sparse_decode_fp8kv_cuda import (
+            maybe_dispatch_specialized as _mds,
+        )
+
+        _specialized_out = _mds(
+            backend=backend, q=q, k=k, v=v, q2k_indices=q2k_indices,
+            page_table=page_table, seqused_k=seqused_k,
+            softmax_scale=softmax_scale, out=out,
+            extras=dict(
+                seqlen_q=seqlen_q, causal=causal,
+                return_softmax_lse=return_softmax_lse,
+                cu_seqlens_k=cu_seqlens_k, k_scale=k_scale, v_scale=v_scale,
+                k_global_scale=k_global_scale, v_global_scale=v_global_scale,
+                q_offset=q_offset, partial_dtype=partial_dtype,
+                force_fused=force_fused, workspace=workspace))
+        if _specialized_out is not None:
+            return _specialized_out
     if is_blackwell_msa_device(q.device):
         return blackwell_msa_sparse_decode_attention(
             q,
