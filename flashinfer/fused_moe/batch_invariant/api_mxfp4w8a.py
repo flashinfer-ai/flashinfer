@@ -599,8 +599,9 @@ def fused_moe_mxfp4w8a(
     pre-routed packed-word convention). ``return_intermediates``: the live buffers (``counts``, ``dest``, ``src``, ``xq``,
     ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``; the dense packing adds ``dest_pad`` / ``pos_pad``
     and the row counts ``Tk_a`` / ``Tk_sf``), the records used, the packing, the requantization spelling and the bodies."""
-    from .mx_permute import get_compiled_scatter_mx
+    from .api_mxfp4 import _placeholder
     from .permute import warps_per_row
+    from .permute_nvfp4 import get_compiled_scatter_fp4, scatter_lanes
     from .schedule_mxfp4w8a import GEMM2_CHAIN, default_configs_mx, packing_for
 
     H, I, E = w.hidden_size, w.intermediate_size, w.num_experts
@@ -679,7 +680,8 @@ def fused_moe_mxfp4w8a(
         raise ValueError(
             "fused_moe_mxfp4w8a: the plan's form (padded: 3 tensors, dual: 5) must match the packing"
         )
-    nb, pcols = H // BLOCK, padded_sf_cols(H)
+    pcols = padded_sf_cols(H)
+    unit = _placeholder(dev)  # the scatter's unread per-token-scale operands
     # the GEMMs' persistent grids: clipped to each launch's tile bound, or the device's capacity (a placement)
     g1 = None if grid_clip else persistent_clusters(dev, config1)
     g2 = None if grid_clip else persistent_clusters(dev, config2)
@@ -699,16 +701,22 @@ def fused_moe_mxfp4w8a(
         Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
         x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
         x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
-        get_compiled_scatter_mx(k, warps_per_row(Tk, H // 16, sm_count_of(dev)))(
+        # the shared block-scaled scatter at the e4m3 token width: the rows to the dense positions, the UE8M0 scale bytes
+        # re-tiled into the swizzled atoms at the padded positions (no per-token scale: placeholders unread)
+        wpr = warps_per_row(Tk, H // 16, sm_count_of(dev))
+        get_compiled_scatter_fp4(
+            k, wpr, "linear", False, True, BLOCK, elem_bits=8, **scatter_lanes(H, pcols, wpr)
+        )(
             xq.view(torch.uint8),
             xsf8.reshape(-1),
+            unit,
             dest.reshape(-1),
             dest_pad.reshape(-1),
             x_perm.view(torch.uint8),
             x_perm_sf,
+            unit,
             Tk,
             H,
-            nb,
             pcols,
         )
         aq, a_sf = grouped_gemm_mxfp4w8a(
@@ -770,16 +778,20 @@ def fused_moe_mxfp4w8a(
     x_perm_sf = torch.empty(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     # one launch over the live rows: the e4m3 rows and the UE8M0 scales to their padded positions (the scales re-tiled into
     # the swizzled atoms); the padding rows are never written (unspecified bytes the MMA reads into rows no tile stores)
-    get_compiled_scatter_mx(k, warps_per_row(T * k, H // 16, sm_count_of(dev)))(
+    wpr = warps_per_row(T * k, H // 16, sm_count_of(dev))
+    get_compiled_scatter_fp4(
+        k, wpr, "linear", False, True, BLOCK, elem_bits=8, **scatter_lanes(H, pcols, wpr)
+    )(
         xq.view(torch.uint8),
         xsf8.reshape(-1),
+        unit,
         dest.reshape(-1),
         dest.reshape(-1),
         x_perm.view(torch.uint8),
         x_perm_sf,
+        unit,
         T * k,
         H,
-        nb,
         pcols,
     )
     if requant == "fused":

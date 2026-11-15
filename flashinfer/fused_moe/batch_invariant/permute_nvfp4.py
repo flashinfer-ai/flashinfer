@@ -56,20 +56,24 @@ class ScatterFp4Kernel:
         block: int = 16,
         cpl: int = 1,
         spl: int = 1,
+        elem_bits: int = 4,
     ):
         """``sf_src``: the source scale factors' layout -- ``"128x4"`` (the quantizer's swizzled buffer) or ``"linear"`` (row-major
         ``[T, K / block]`` bytes, the layout of the per-tensor activation pack of the TRTLLM backends: the kernel assembles each
         4-byte group of the destination atom from the row's bytes, a zero past the row's last block); ``unit_pts``: the rows'
         per-token scales are one (the per-tensor pack: nothing to read, the destination gets ``1.0``); ``no_pts``: the class
         carries no per-token scale (the MX classes: nothing is read or stored); ``block``: the elements per scale of the
-        linear source layout; ``cpl`` / ``spl``: a lane's 16-byte chunks and 4-byte scale groups per row (static bounds from
-        the row width and ``wpr``, :func:`scatter_lanes`; the tail predicated), so a row's loads are all issued before its
-        stores. Placements of the same bytes."""
+        linear source layout, ``elem_bits`` the token element's width (the row's bytes per scale block follow both: the e2m1
+        and the e4m3 token rows of the block-scaled classes); ``cpl`` / ``spl``: a lane's 16-byte chunks and 4-byte scale
+        groups per row (static bounds from the row width and ``wpr``, :func:`scatter_lanes`; the tail predicated), so a row's
+        loads are all issued before its stores. Placements of the same bytes."""
         assert wpr >= 1 and wpr & (wpr - 1) == 0, wpr
         assert sf_src in ("128x4", "linear"), sf_src
         assert cpl >= 1 and spl >= 1, (cpl, spl)
+        assert elem_bits in (4, 8) and (block * elem_bits) % 8 == 0, (block, elem_bits)
         self.k, self.wpr, self.sf_src, self.unit_pts = k, wpr, sf_src, unit_pts
         self.no_pts, self.block, self.cpl, self.spl = no_pts, block, cpl, spl
+        self.elem_bits = elem_bits
 
     @cute.jit
     def __call__(
@@ -140,8 +144,8 @@ class ScatterFp4Kernel:
         )
         n_groups = pcols // Int32(SF_COL_TILE)
         nb = B // Int32(
-            self.block // 2
-        )  # scale blocks per row (K / block): the linear row's bytes
+            self.block * self.elem_bits // 8
+        )  # scale blocks per row (K / block): the linear row's bytes per block at the token element's width
         # this lane's chunks and scale groups of a row: slab c of its phase (static bounds, the tail predicated), and their
         # dynamic counts for the chunks past the bounds
         js = [(Int32(c) * wpr + part) * Int32(LANES) + lane for c in range(self.cpl)]
@@ -364,12 +368,14 @@ def get_compiled_scatter_fp4(
     block: int = 16,
     cpl: int = 1,
     spl: int = 1,
+    elem_bits: int = 4,
 ) -> Any:
     """``kernel(x4 [T, B] u8, sf [n_src] u8, pts [T] f32, dest [T k] i32, dest_sf [T k] i32, x_perm [rows, B] u8, sf_perm
     [n_dst] u8, pts_perm [rows_sf] f32, Tk, B, pcols)``, ``B % 16 == 0``; ``wpr`` warps per row (``warps_per_row``); ``sf_src``
     the source scale factors' layout (``"128x4"`` / ``"linear"``: ``sf`` then the row-major ``[T, K / block]`` bytes, any count);
     ``unit_pts``: the per-token scales are one (``pts`` unread, a 1-element placeholder); ``no_pts``: no per-token scale at all
-    (``pts`` / ``pts_perm`` unread, 1-element placeholders); ``block``: the elements per scale of the linear layout."""
+    (``pts`` / ``pts_perm`` unread, 1-element placeholders); ``block``: the elements per scale of the linear layout, ``elem_bits``
+    the token element's width (``B`` bytes per row either way)."""
 
     def compile_fn():
         sym_t, sym_n, sym_p, sym_b = (
@@ -418,7 +424,9 @@ def get_compiled_scatter_fp4(
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return cute.compile(
-            ScatterFp4Kernel(k, wpr, sf_src, unit_pts, no_pts, block, cpl, spl),
+            ScatterFp4Kernel(
+                k, wpr, sf_src, unit_pts, no_pts, block, cpl, spl, elem_bits
+            ),
             x_fake,
             sf_fake,
             pts_fake,
@@ -444,6 +452,7 @@ def get_compiled_scatter_fp4(
             + ("_unit" if unit_pts else "")
             + ("_nopts" if no_pts else "")
             + (f"_b{block}" if block != 16 else "")
+            + (f"_e{elem_bits}" if elem_bits != 4 else "")
         ),
         compile_fn,
     )
