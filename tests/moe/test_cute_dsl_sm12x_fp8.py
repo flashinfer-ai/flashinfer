@@ -253,13 +253,15 @@ def _assert_quantized_output(output, reference):
 
 @pytest.mark.parametrize("bm", (8, 32))
 @pytest.mark.parametrize("byte_offset", (1, 16))
-def test_fp8_fc1_gather_activation_alignment(bm, byte_offset, monkeypatch):
+def test_fp8_fc1_gather_activation_alignment(
+    bm, byte_offset, monkeypatch, cuda_matmul_flags
+):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc1_act_q1 as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     inputs = _make_gather_inputs(counts=(0, 2, 0), tokens=2, k=512, n=128)
     a_q, a_sf, b_q, b_sf, offsets = inputs["gather"]
     mapping = inputs["mapping"]
@@ -298,13 +300,13 @@ def test_fp8_fc1_gather_activation_alignment(bm, byte_offset, monkeypatch):
 
 @pytest.mark.parametrize("bm", (8, 32, 64))
 @pytest.mark.parametrize("limit", (None, 0.25))
-def test_fp8_fc1_token_gather_matches_reference(bm, limit, monkeypatch):
+def test_fp8_fc1_token_gather_matches_reference(bm, limit, cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc1_act_q1 as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     inputs = _make_gather_inputs(limit=limit)
     tactics = [t for t in entry.TACTICS if t[0] == bm]
     assert tactics
@@ -336,13 +338,13 @@ def test_fp8_fc1_token_gather_matches_reference(bm, limit, monkeypatch):
 
 
 @pytest.mark.parametrize("bm", (8, 32, 64))
-def test_fp8_fc1_gather_singleton_scale(bm, monkeypatch):
+def test_fp8_fc1_gather_singleton_scale(bm, cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc1_act_q1 as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     inputs = _make_gather_inputs(counts=(3,), k=128, tokens=1, n=128)
     assert inputs["gather"][1].shape == (1, 1)
     tile, epi = entry.split_tactic(next(t for t in entry.TACTICS if t[0] == bm))
@@ -355,13 +357,13 @@ def test_fp8_fc1_gather_singleton_scale(bm, monkeypatch):
 
 
 @pytest.mark.parametrize("bm", (8, 32, 64))
-def test_fp8_fc1_gather_multiple_sf_cycles_and_work_items(bm, monkeypatch):
+def test_fp8_fc1_gather_multiple_sf_cycles_and_work_items(bm, cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc1_act_q1 as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     inputs = _make_gather_inputs(counts=(bm * sms + 3, 0, 3), k=3584, limit=0.25)
     tactics = [t for t in entry.TACTICS if t[0] == bm]
@@ -380,13 +382,13 @@ def test_fp8_fc1_gather_multiple_sf_cycles_and_work_items(bm, monkeypatch):
         )
 
 
-def test_fp8_fc1_gather_cache_mode_and_graph_replay(monkeypatch):
+def test_fp8_fc1_gather_cache_mode_and_graph_replay(cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc1_act_q1 as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     inputs = _make_gather_inputs(counts=(0, 3, 7, 9))
     tile, epi = entry.split_tactic(next(t for t in entry.TACTICS if t[0] == 64))
     for args, mapping in (
@@ -478,13 +480,13 @@ def test_fp8_fc1_gather_rejects_invalid_inputs(bad):
 
 @pytest.mark.parametrize("bm", (32, 64, 128))
 @pytest.mark.parametrize("k", (128, 384, 512, 640))
-def test_fp8_fc2_copy_modes_ragged_rows(bm, k, monkeypatch):
+def test_fp8_fc2_copy_modes_ragged_rows(bm, k, cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc2_finalize as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     a, b, a_sf, b_sf, offsets, ref = make_inputs([0, bm - 3, bm + 1], 256, k)
     rows = a.shape[0]
     tokens = torch.arange(rows, dtype=torch.int32, device="cuda")
@@ -503,13 +505,13 @@ def test_fp8_fc2_copy_modes_ragged_rows(bm, k, monkeypatch):
 
 
 @pytest.mark.parametrize("k", (384, 512, 640))
-def test_fp8_fc2_strided_a(k, monkeypatch):
+def test_fp8_fc2_strided_a(k, cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc2_finalize as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     a, b, a_sf, b_sf, offsets, ref = make_inputs([0, 61, 65], 256, k)
     storage = torch.full((a.shape[0], k + 128), 3.0, device="cuda").to(a.dtype)
     pitched = storage[:, :k]
@@ -532,11 +534,11 @@ def test_fp8_fc2_strided_a(k, monkeypatch):
     assert torch.count_nonzero(out[a.shape[0] :]) == 0
 
 
-def test_fp8_fc2_singleton_weight_scale(monkeypatch):
+def test_fp8_fc2_singleton_weight_scale(cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe import cute_dsl_sm12x_fc2_finalize_fp8
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     a, b, a_sf, b_sf, offsets, ref = make_inputs([3], 128, 128)
     assert b_sf.shape == (1, 1, 1)
     tokens = torch.arange(3, dtype=torch.int32, device="cuda")
@@ -555,13 +557,13 @@ def test_fp8_fc2_singleton_weight_scale(monkeypatch):
     assert calc_diff(out.float(), ref.float()) < 5e-3
 
 
-def test_fp8_fc2_cache_mode_switches_match_reference(monkeypatch):
+def test_fp8_fc2_cache_mode_switches_match_reference(monkeypatch, cuda_matmul_flags):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_fp8_fc2_finalize as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     modes = []
     original_compile = entry.compiled_kernel
 

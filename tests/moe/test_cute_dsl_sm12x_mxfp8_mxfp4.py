@@ -608,13 +608,15 @@ def test_fc1_gather_activation_offset_exceeds_int32():
 
 @pytest.mark.parametrize("bm", (8, 32))
 @pytest.mark.parametrize("byte_offset", (1, 16))
-def test_fc1_q1_gather_activation_alignment(bm, byte_offset, monkeypatch):
+def test_fc1_q1_gather_activation_alignment(
+    bm, byte_offset, monkeypatch, cuda_matmul_flags
+):
     skip_if_not_sm120()
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
         moe_mxfp8_mxfp4_fc1_act_q1 as entry,
     )
 
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    cuda_matmul_flags(allow_tf32=False)
     a_q, a_sf, _, _, b_q, b_sf, offsets, mapping, ref = _gather_inputs(
         bm, 512, counts=[0, 2, 0], tokens=2
     )
