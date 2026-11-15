@@ -2205,6 +2205,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The right (inclusive) window size for the attention window.
             ``-1`` disables the right bound. Defaults to ``0``. Currently ``window_right != 0``
             only supported by the ``cute-dsl`` backend.
+        pdl_kv_preload : bool
+            Keyword-only, ``cute-dsl`` backend only, defaults to ``False``. Under
+            Programmatic Dependent Launch (``run(enable_pdl=True)``), start loading
+            K/V pages before waiting on the preceding kernel; only ``q`` and the
+            pages holding each request's newest ``q_len_per_req`` tokens wait for
+            it. Enable this only when the preceding kernel writes nothing else that
+            decode reads: all other KV cache entries and the planned page table
+            (``indptr``, ``indices``, sequence lengths) must be complete before the
+            decode kernel launches.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -2285,7 +2294,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Optional arguments after ``page_size`` are accepted positionally for
         backward compatibility, but that calling convention is deprecated and
         scheduled for removal in a future release. Pass them by keyword instead.
-        ``window_right`` is keyword-only.
+        ``window_right`` and ``pdl_kv_preload`` are keyword-only.
         """
         if not deprecated_positional_args:
             return self._plan_impl(
@@ -2346,8 +2355,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
         use_token_head_sf: bool = False,
+        pdl_kv_preload: bool = False,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
+        if pdl_kv_preload and self._backend != "cute-dsl":
+            raise NotImplementedError(
+                "pdl_kv_preload=True is only supported with backend='cute-dsl'"
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2842,6 +2856,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 window_right=(None if window_right < 0 else window_right),
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
+                pdl_kv_preload=pdl_kv_preload,
             )
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0

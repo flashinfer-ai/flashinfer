@@ -353,8 +353,6 @@ def apply_mask(
 
 
 # JIT-extendable masking configurations
-# Currently only supports GQA/MHA decode kernel
-# TODO: support skipping fully masked tiles for prefill integration
 class AttentionMask(ABC):
     """ABC interface for attention masking configurations."""
 
@@ -373,12 +371,27 @@ class AttentionMask(ABC):
 
     @cute.jit
     @abstractmethod
+    def get_tiles_kv(
+        self,
+        seqlen_qo,
+        seqlen_kv,
+        tile_kv,
+        tile_qo,
+        coord_qo,
+    ) -> tuple[Int32, Int32]:  # coord_kv, tiles_kv
+        """Returns KV tile offset and number of KV tiles to process across all splits"""
+        ...
+
+    @cute.jit
+    @abstractmethod
     def get_range_args(
         self,
         seqlen_q,
         seqlen_kv,
         tile_q,
         tile_kv,
+        coord_qo,
+        coord_kv,
         num_tiles_kv,
         num_iters_kv,
         kv_splits,
@@ -402,8 +415,12 @@ class AttentionMask(ABC):
             Query sequence per threadblock
         tile_kv
             Key/Value sequence per threadblock per outer mainloop iteration
+        coord_qo
+            Query tile coordinate
+        coord_kv
+            Global KV tile offset returned by get_tiles_kv; zero when no tiles are skipped
         num_tiles_kv
-            KV tiles across entire KV sequence for this Q tile
+            Number of KV tiles selected for this Q tile, starting at coord_kv
         num_iters_kv
             KV tiles for this KV split, number of outer mainloop iterations
         kv_splits
@@ -437,12 +454,28 @@ class NoMask(AttentionMask):
         return False
 
     @cute.jit
+    def get_tiles_kv(
+        self,
+        seqlen_qo,
+        seqlen_kv,
+        tile_kv,
+        tile_qo,
+        coord_qo,
+    ) -> tuple[Int32, Int32]:  # coord_kv, tiles_kv
+        tiles_kv = cute.ceil_div(seqlen_kv, tile_kv)
+        coord_kv = 0
+
+        return coord_kv, tiles_kv
+
+    @cute.jit
     def get_range_args(
         self,
         seqlen_q,
         seqlen_kv,
         tile_q,
         tile_kv,
+        coord_qo,
+        coord_kv,
         num_tiles_kv,
         num_iters_kv,
         kv_splits,
@@ -462,12 +495,28 @@ class DenseMask(AttentionMask):  # aka ResidualMask
         return idx_kv >= seqlen_kv
 
     @cute.jit
+    def get_tiles_kv(
+        self,
+        seqlen_qo,
+        seqlen_kv,
+        tile_kv,
+        tile_qo,
+        coord_qo,
+    ) -> tuple[Int32, Int32]:  # coord_kv, tiles_kv
+        tiles_kv = cute.ceil_div(seqlen_kv, tile_kv)
+        coord_kv = 0
+
+        return coord_kv, tiles_kv
+
+    @cute.jit
     def get_range_args(
         self,
         seqlen_q,
         seqlen_kv,
         tile_q,
         tile_kv,
+        coord_qo,
+        coord_kv,
         num_tiles_kv,
         num_iters_kv,
         kv_splits,
@@ -475,19 +524,24 @@ class DenseMask(AttentionMask):  # aka ResidualMask
         warpgroups_kv,
         warpgroup_kv_idx,
     ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
-        is_last_split = kv_split_idx == (num_tiles_kv - 1) % kv_splits
-        is_last_phase = warpgroup_kv_idx == (num_iters_kv - 1) % warpgroups_kv
-
+        # Producers execute at least two iterations even for a single KV tile.
+        # Only complete, in-bounds tiles may skip masking; residual and padded
+        # iterations must use their actual global KV coordinates.
+        unmasked_tiles = min(seqlen_kv // tile_kv, num_tiles_kv)
         unmasked_start = warpgroup_kv_idx
-        unmasked_end = num_iters_kv
+        unmasked_end = min(
+            num_iters_kv,
+            max(cute.ceil_div(unmasked_tiles - kv_split_idx, kv_splits), 0),
+        )
         unmasked_step = warpgroups_kv
-        masked_start = masked_end = masked_step = 0
-
-        if seqlen_kv % tile_kv != 0 and is_last_split and is_last_phase:
-            unmasked_end -= 1
-            masked_start = num_tiles_kv - 1
-            masked_end = num_tiles_kv
-            masked_step = 1
+        masked_iter = (
+            warpgroup_kv_idx
+            + cute.ceil_div(max(unmasked_end - warpgroup_kv_idx, 0), warpgroups_kv)
+            * warpgroups_kv
+        )
+        masked_start = kv_split_idx + masked_iter * kv_splits
+        masked_end = kv_split_idx + num_iters_kv * kv_splits
+        masked_step = warpgroups_kv * kv_splits
 
         return (
             (unmasked_start, unmasked_end, unmasked_step, False),
@@ -500,11 +554,9 @@ class CausalMask(AttentionMask):
     """Current tokens only attend to past tokens and itself."""
 
     def can_implement(self, seqlen_q, seqlen_kv, tile_q, tile_kv):
-        # Only causal mask up to two tiles
-        # Revisit this for prefill integration
-        if seqlen_q > tile_kv:
+        if seqlen_q > seqlen_kv:
             raise ValueError(
-                f"seqlen_q({seqlen_q}) with causal mask can be at most tile_kv({tile_kv})"
+                f"seqlen_q({seqlen_q}) with causal mask can be at most seqlen_kv({seqlen_kv})"
             )
 
     @cute.jit
@@ -513,12 +565,31 @@ class CausalMask(AttentionMask):
         return idx_kv > idx_current
 
     @cute.jit
+    def get_tiles_kv(
+        self,
+        seqlen_qo,
+        seqlen_kv,
+        tile_kv,
+        tile_qo,
+        coord_qo,
+    ) -> tuple[Int32, Int32]:  # coord_kv, tiles_kv
+        # Padded Q rows must not extend the selected interval past KV.
+        last_idx_q = min((coord_qo + 1) * tile_qo, seqlen_qo) - 1
+        unmasked_kv = max(seqlen_kv - seqlen_qo + last_idx_q + 1, 0)
+        tiles_kv = cute.ceil_div(unmasked_kv, tile_kv)
+        coord_kv = 0
+
+        return coord_kv, tiles_kv
+
+    @cute.jit
     def get_range_args(
         self,
         seqlen_q,
         seqlen_kv,
         tile_q,
         tile_kv,
+        coord_qo,
+        coord_kv,
         num_tiles_kv,
         num_iters_kv,
         kv_splits,
@@ -526,40 +597,32 @@ class CausalMask(AttentionMask):
         warpgroups_kv,
         warpgroup_kv_idx,
     ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
-        is_last_split = kv_split_idx == (num_tiles_kv - 1) % kv_splits
-        is_prev_split = kv_split_idx == (num_tiles_kv - 2) % kv_splits
-        is_last_phase = warpgroup_kv_idx == (num_iters_kv - 1) % warpgroups_kv
-        is_prev_phase = warpgroup_kv_idx == (num_iters_kv - 2) % warpgroups_kv
+        # A KV tile is fully visible to every row only if its last token
+        # is at or before the causal diagonal of the first Q row.
+        first_idx_q = coord_qo * tile_q
+        unmasked_tokens = seqlen_kv - seqlen_q + first_idx_q + 1
+        unmasked_tiles = min(unmasked_tokens // tile_kv, num_tiles_kv)
 
+        # Split-local iteration i processes global KV tile kv_split_idx +
+        # i * kv_splits. Partition that stream at the first masked tile.
         unmasked_start = warpgroup_kv_idx
-        unmasked_end = num_iters_kv
+        unmasked_end = min(
+            num_iters_kv,
+            max(cute.ceil_div(unmasked_tiles - kv_split_idx, kv_splits), 0),
+        )
         unmasked_step = warpgroups_kv
-        masked_start = masked_end = masked_step = 0
 
-        # 2 masked tiles
-        if 0 < seqlen_kv % tile_kv < seqlen_q:
-            # 1 split masks 2 tiles
-            if kv_splits == 1:
-                unmasked_end -= 2
-                masked_start = num_tiles_kv - 2 + (0 if is_prev_phase else 1)
-                masked_end = num_tiles_kv
-                masked_step = warpgroups_kv
-            # 2 splits mask 1 tile each
-            elif (is_last_split or is_prev_split) and is_last_phase:
-                unmasked_end -= 1
-                masked_start = (
-                    (num_tiles_kv - 1) if is_last_split else (num_tiles_kv - 2)
-                )
-                masked_end = num_tiles_kv
-                masked_step = 2
-        # 1 masked tile
-        elif seqlen_q > 1 or seqlen_kv % tile_kv != 0:
-            # 1 split masks 1 tile
-            if is_last_split and is_last_phase:
-                unmasked_end -= 1
-                masked_start = num_tiles_kv - 1
-                masked_end = num_tiles_kv
-                masked_step = 1
+        # Round up to this warpgroup's next iteration and convert back to
+        # global KV coordinates for is_oob_kv. Include any padded iterations
+        # in num_iters_kv so both phases consume the full producer stream.
+        masked_iter = (
+            warpgroup_kv_idx
+            + cute.ceil_div(max(unmasked_end - warpgroup_kv_idx, 0), warpgroups_kv)
+            * warpgroups_kv
+        )
+        masked_start = kv_split_idx + masked_iter * kv_splits
+        masked_end = kv_split_idx + num_iters_kv * kv_splits
+        masked_step = warpgroups_kv * kv_splits
 
         return (
             (unmasked_start, unmasked_end, unmasked_step, False),
@@ -596,12 +659,46 @@ class SlidingWindowMask(AttentionMask):
         return is_oob
 
     @cute.jit
+    def get_tiles_kv(
+        self,
+        seqlen_qo,
+        seqlen_kv,
+        tile_kv,
+        tile_qo,
+        coord_qo,
+    ) -> tuple[Int32, Int32]:  # coord_kv, tiles_kv
+        first_idx_q = coord_qo * tile_qo
+        last_idx_q = min(first_idx_q + tile_qo, seqlen_qo) - 1
+        diagonal_offset = seqlen_kv - seqlen_qo
+
+        # Select the union of the windows for all valid rows in this Q tile.
+        first_idx_kv = 0
+        end_idx_kv = seqlen_kv
+        if cutlass.const_expr(self.window_left is not None):
+            first_idx_kv = min(
+                max(diagonal_offset + first_idx_q - self.window_left, 0),
+                seqlen_kv,
+            )
+        if cutlass.const_expr(self.window_right is not None):
+            end_idx_kv = max(
+                min(diagonal_offset + last_idx_q + self.window_right + 1, seqlen_kv),
+                0,
+            )
+
+        # Keep the boundary tiles: individual rows still need element masking.
+        coord_kv = first_idx_kv // tile_kv
+        tiles_kv = max(cute.ceil_div(end_idx_kv, tile_kv) - coord_kv, 0)
+        return coord_kv, tiles_kv
+
+    @cute.jit
     def get_range_args(
         self,
         seqlen_q,
         seqlen_kv,
         tile_q,
         tile_kv,
+        coord_qo,
+        coord_kv,
         num_tiles_kv,
         num_iters_kv,
         kv_splits,
@@ -609,10 +706,10 @@ class SlidingWindowMask(AttentionMask):
         warpgroups_kv,
         warpgroup_kv_idx,
     ) -> tuple[tuple[Int32, Int32, Int32, bool], ...]:
-        # Assume KV seqlen roughly matches window size and that
-        # window is small enough to not need an unmasked phase.
-        # Can revisit this for perf for very large windows.
-        masked_start = kv_split_idx + warpgroup_kv_idx * kv_splits
-        masked_stop = num_tiles_kv
+        # Mask all selected tiles, including padded prefetch iterations.
+        # Split/warpgroup assignment is relative to the selected KV interval;
+        # emit global coordinates so is_oob_kv sees the original token indices.
+        masked_start = coord_kv + kv_split_idx + warpgroup_kv_idx * kv_splits
+        masked_stop = coord_kv + kv_split_idx + num_iters_kv * kv_splits
         masked_step = warpgroups_kv * kv_splits
         return ((masked_start, masked_stop, masked_step, True),)
