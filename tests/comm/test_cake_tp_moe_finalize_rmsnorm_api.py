@@ -613,10 +613,6 @@ def test_manifest_passes_the_flashinfer_checker():
     assert findings == []
 
 
-@pytest.mark.xfail(
-    reason="pyproject.toml package-data entry for the package is a shared-file edit outside this branch",
-    strict=False,
-)
 def test_package_data_lists_the_package():
     checker = _checker()
     table = checker.package_data(ROOT / "pyproject.toml")

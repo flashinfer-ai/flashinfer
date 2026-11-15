@@ -931,6 +931,15 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   __shared__ ScalePackedType scaleArrSmem[MaxTopK / TopKUnrollFactor];
   __shared__ IdxPackedType permutedIdxArrSmem[MaxTopK / TopKUnrollFactor];
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Wait on the primary kernel before reading anything another kernel wrote, including the
+  // routing outputs below. Under PDL this kernel can start before routing has finished: only
+  // this wait guarantees that their writes are visible.
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
   for (int kChunkIdx = threadIdx.x; kChunkIdx < params.topK / TopKUnrollFactor;
        kChunkIdx += blockDim.x) {
     int const expandedIdx = tokenIdx * params.topK + kChunkIdx * TopKUnrollFactor;
@@ -949,12 +958,6 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  // wait on primary kernel when using PDL
-  if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
-  }
-#endif
   __syncthreads();
 
   auto const* inElemPtr2 = reinterpret_cast<InputElem const*>(params.inPtr2);
@@ -1044,9 +1047,16 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
   }
 #endif
 
-  // The permutation and the expert weights come from routing, which completed before the GEMMs
-  // this kernel depends on could start, so they are read before waiting on the primary kernel
-  // (as in finalizeKernelVecLoad). Only the GEMM output is read after the wait.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // Wait on the primary kernel before reading anything another kernel wrote, including the
+  // permutation and expert weights from routing. Under PDL, the kernels before this one trigger
+  // early, so routing may still be running (or its writes not yet visible) when this kernel
+  // starts. Only this wait guarantees that their writes are visible.
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
   int permutedIdx[SMALL_BATCH_FINALIZE_MAX_LOADS];
   float scale[SMALL_BATCH_FINALIZE_MAX_LOADS];
 #pragma unroll
@@ -1062,13 +1072,6 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
                      : 1.f;
     }
   }
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
-  // wait on primary kernel when using PDL
-  if constexpr (KernelParams::UsePdl) {
-    cudaGridDependencySynchronize();
-  }
-#endif
 
   ComputeElem acc;
   acc.fill(0.f);

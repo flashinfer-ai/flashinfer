@@ -709,6 +709,7 @@ def test_outer_selects_full_plan_and_replays_without_measurement(split_capture_f
     )
     for prototype in layer._prototypes.values():
         prototype._kernel = Mock()
+        prototype._megakernel_config = SimpleNamespace(kernel_variant="inference")
     tensors = MoEEpTensors(
         torch.empty(2, 8), torch.zeros(2, 1, dtype=torch.int64), torch.ones(2, 1)
     )

@@ -580,7 +580,8 @@ e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL and NVLink backends
 ``group`` to support CUDA all-to-all (an NCCL process group), checked at
 construction before any resource is armed. Operands must be contiguous 4-D
 CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
-only) on the construction device, every dim positive, and ``nbytes`` at most
+plus the PCIe types listed below) on the construction device, every dim positive,
+and ``nbytes`` at most
 ``max_bytes``; the element count of any one operand must additionally stay
 within the int32 kernel index range. ``scatter_heads`` requires
 ``H % world_size == 0``

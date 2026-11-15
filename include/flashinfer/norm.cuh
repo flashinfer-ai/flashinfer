@@ -16,7 +16,9 @@
 #ifndef FLASHINFER_NORM_CUH_
 #define FLASHINFER_NORM_CUH_
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
@@ -920,7 +922,7 @@ __inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_varianc
 }
 
 template <typename T, typename Tw, typename QuantT, bool USE_SHMEM,
-          bool USE_DIFF_OF_SQUARES = false>
+          bool USE_DIFF_OF_SQUARES = false, typename IdxT = int64_t>
 __global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta, T* normed_output,
                                  float const eps, int tokens, int hidden_dim, int64_t input_stride,
                                  int64_t output_stride, float const* clamp_ptr,
@@ -958,8 +960,9 @@ __global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta
 
   int const n_elems = hidden_dim / num_elems_T;
   // Strides count scalar elements; T may pack two scalars per load/store.
-  int64_t const input_row_offset = int64_t(bidx) * (input_stride / num_elems_T);
-  int64_t const output_row_offset = int64_t(bidx) * (output_stride / num_elems_T);
+  // IdxT is int32_t when the host has checked that every element index fits.
+  IdxT const input_row_offset = IdxT(bidx) * IdxT(input_stride / num_elems_T);
+  IdxT const output_row_offset = IdxT(bidx) * IdxT(output_stride / num_elems_T);
   for (int i = tidx; i < n_elems; i += blockDim.x) {
     const T val = input[input_row_offset + i];
     if constexpr (USE_SHMEM) {
@@ -1018,7 +1021,7 @@ __global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta
   local_sum = 0.f;
 
   for (int i = tidx; i < n_elems; i += blockDim.x) {
-    int64_t const output_index = output_row_offset + i;
+    IdxT const output_index = output_row_offset + i;
     const float_packed_t val_f =
         cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : input[input_row_offset + i]);
     T val = cuda_cast<T>(compute_layernorm(val_f, s_mean, s_variance, gemma, beta, i));
@@ -1048,7 +1051,7 @@ __global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta
         has_fp8_min_scaling ? fminf(MAX_QUANT_VAL / abs_max_f, MIN_SCALING_FACTOR_RCP)
                             : (MAX_QUANT_VAL / abs_max_f);
     for (int i = tidx; i < n_elems; i += blockDim.x) {
-      int64_t const output_index = output_row_offset + i;
+      IdxT const output_index = output_row_offset + i;
       float_packed_t val_f =
           cuda_cast<float_packed_t>(USE_SHMEM ? shmem[i] : input[input_row_offset + i]);
       if constexpr (!USE_SHMEM) {
@@ -1074,7 +1077,7 @@ __global__ void generalLayerNorm(T const* input, Tw const* gemma, Tw const* beta
   }
 }
 
-template <bool USE_DIFF_OF_SQUARES, typename T, typename Tw, typename QuantT>
+template <bool USE_DIFF_OF_SQUARES, typename IdxT, typename T, typename Tw, typename QuantT>
 void dispatch_layernorm_type_square_method(
     T const* input, Tw const* gemma, Tw const* beta, T* normed_output, float const eps, int tokens,
     int hidden_dim, int64_t input_stride, int64_t output_stride, float const* clamp_ptr,
@@ -1085,7 +1088,7 @@ void dispatch_layernorm_type_square_method(
   bool use_shmem = true;
   if (shmem_size >= (48 << 10)) {
     cudaError_t ret =
-        cudaFuncSetAttribute(generalLayerNorm<T, Tw, QuantT, true, USE_DIFF_OF_SQUARES>,
+        cudaFuncSetAttribute(generalLayerNorm<T, Tw, QuantT, true, USE_DIFF_OF_SQUARES, IdxT>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_size);
     // Use shared memory when the capacity is enough
     use_shmem = (ret == cudaSuccess);
@@ -1096,12 +1099,13 @@ void dispatch_layernorm_type_square_method(
   }
 
   if (use_shmem) {
-    generalLayerNorm<T, Tw, QuantT, true, USE_DIFF_OF_SQUARES><<<grid, block, shmem_size, stream>>>(
-        input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
-        clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
-        normed_output_quant, has_fp8_min_scaling);
+    generalLayerNorm<T, Tw, QuantT, true, USE_DIFF_OF_SQUARES, IdxT>
+        <<<grid, block, shmem_size, stream>>>(
+            input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
+            clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
+            normed_output_quant, has_fp8_min_scaling);
   } else {
-    generalLayerNorm<T, Tw, QuantT, false, USE_DIFF_OF_SQUARES><<<grid, block, 0, stream>>>(
+    generalLayerNorm<T, Tw, QuantT, false, USE_DIFF_OF_SQUARES, IdxT><<<grid, block, 0, stream>>>(
         input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
         clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
         normed_output_quant, has_fp8_min_scaling);
@@ -1117,16 +1121,35 @@ void dispatch_layernorm_type(T const* input, Tw const* gemma, Tw const* beta, T*
                              QuantT* normed_output_quant, bool const has_fp8_min_scaling,
                              dim3 const grid, dim3 const block, size_t const shmem_size,
                              cudaStream_t stream, bool const use_diff_of_squares) {
+  // 64-bit row offsets cost a few percent on short rows, so keep 32-bit offsets
+  // whenever the largest element index fits. Strides may be 0 (broadcast rows).
+  bool const use_int64_offsets =
+      int64_t(tokens) * std::max(input_stride, output_stride) + hidden_dim >
+      std::numeric_limits<int32_t>::max();
   if (use_diff_of_squares) {
-    dispatch_layernorm_type_square_method<true>(
-        input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
-        clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
-        normed_output_quant, has_fp8_min_scaling, grid, block, shmem_size, stream);
+    if (use_int64_offsets) {
+      dispatch_layernorm_type_square_method<true, int64_t>(
+          input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
+          clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
+          normed_output_quant, has_fp8_min_scaling, grid, block, shmem_size, stream);
+    } else {
+      dispatch_layernorm_type_square_method<true, int32_t>(
+          input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
+          clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
+          normed_output_quant, has_fp8_min_scaling, grid, block, shmem_size, stream);
+    }
   } else {
-    dispatch_layernorm_type_square_method<false>(
-        input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
-        clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
-        normed_output_quant, has_fp8_min_scaling, grid, block, shmem_size, stream);
+    if (use_int64_offsets) {
+      dispatch_layernorm_type_square_method<false, int64_t>(
+          input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
+          clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
+          normed_output_quant, has_fp8_min_scaling, grid, block, shmem_size, stream);
+    } else {
+      dispatch_layernorm_type_square_method<false, int32_t>(
+          input, gemma, beta, normed_output, eps, tokens, hidden_dim, input_stride, output_stride,
+          clamp_ptr, scale_orig_quant_per_tensor, scale_orig_quant_per_token, sum_per_token,
+          normed_output_quant, has_fp8_min_scaling, grid, block, shmem_size, stream);
+    }
   }
 }
 

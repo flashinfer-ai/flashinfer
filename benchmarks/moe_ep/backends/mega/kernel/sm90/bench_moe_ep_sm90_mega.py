@@ -410,6 +410,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--no-compact-pull-buffer restores the 4-slot buffer",
     )
     p.add_argument(
+        "--dispatch-pull-batch",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=None,
+        help="dispatch-pull rows in flight per active dispatch warp (default: "
+        "the resolved tactic's, else 1); > 1 uses the 4-slot pull buffer and "
+        "needs epi_warps token-back with batch x active dispatch warps <= 4",
+    )
+    p.add_argument(
+        "--dispatch-pull-rotate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="rotate the dispatch warp -> pull row assignment every pass "
+        "(default: the resolved tactic's, else off); needs epi_warps token-back",
+    )
+    p.add_argument(
         "--generate-c",
         action="store_true",
         default=False,
@@ -532,6 +548,8 @@ _FP8_EXPLICIT_KNOBS = frozenset(
         "fc1_early_done_publish",
         "fold_producer_warps",
         "compact_pull_buffer",
+        "dispatch_pull_batch",
+        "dispatch_pull_rotate",
         "generate_c",
     }
 )
@@ -623,6 +641,7 @@ def _parse_knobs_json(value: str, backend: str) -> dict[str, object]:
         "fold_producer_warps",
         "tail_split_pairs",
         "compact_pull_buffer",
+        "dispatch_pull_rotate",
         "generate_c",
     ):
         if name in knobs and not isinstance(knobs[name], bool):
@@ -679,6 +698,9 @@ _MANUAL_TACTIC_OPTIONS = (
         "--swap-token-tile",
         "--compact-pull-buffer",
         "--no-compact-pull-buffer",
+        "--dispatch-pull-batch",
+        "--dispatch-pull-rotate",
+        "--no-dispatch-pull-rotate",
         "--generate-c",
     }
 )
@@ -717,6 +739,9 @@ def _resolve_sweep(
                 "--generate-c",
                 "--compact-pull-buffer",
                 "--no-compact-pull-buffer",
+                "--dispatch-pull-batch",
+                "--dispatch-pull-rotate",
+                "--no-dispatch-pull-rotate",
             }
         )
         if fp8_only:
@@ -1186,6 +1211,8 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         combine_format=combine_format,
         active_dispatch_warps=args.active_dispatch_warps,
         compact_pull_buffer=args.compact_pull_buffer,
+        dispatch_pull_batch=args.dispatch_pull_batch,
+        dispatch_pull_rotate=args.dispatch_pull_rotate,
         fc1_store_offload=args.fc1_store_offload,
         fc1_early_done_publish=args.fc1_early_done_publish,
         fold_producer_warps=args.fold_producer_warps,
@@ -1222,6 +1249,8 @@ def _runtime_tactic(args: argparse.Namespace, workspace) -> dict[str, object]:
         "token_back_mode": config.resolved_token_back_mode,
         "in_kernel_fc2_reduce": config.in_kernel_fc2_reduce,
         "compact_pull_buffer": config.compact_pull_buffer,
+        "dispatch_pull_batch": int(kernel.token_comm.pull_batch),
+        "dispatch_pull_rotate": bool(kernel.token_comm.pull_rotate),
         "generate_c": config.generate_c,
         "dedup_dispatch": bool(kernel.dedup_dispatch),
         "grouped_token_back": bool(kernel.grouped_token_back),

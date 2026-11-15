@@ -9,9 +9,45 @@ allocates from that heap and tracks allocation lifetime.
 from __future__ import annotations
 
 import os
-from typing import Optional, Tuple
+from typing import Any, Callable, Optional, Tuple, TypeVar, cast
 
 import torch
+
+_Prepared = TypeVar("_Prepared")
+
+
+def prepare_local(
+    prepare: Callable[[], _Prepared],
+    world_size: int,
+    process_group: Any = None,
+    *,
+    phase: str = "local preparation",
+) -> _Prepared:
+    """Agree on rank-local failures before any following symmetric operation.
+
+    Only call at a collective preparation boundary, never from a rank-local
+    compile-cache miss or a steady-state/captured launch. Failed local trials
+    must not release symmetric storage that the existing session still owns.
+    """
+    if world_size <= 1 or _no_dist():
+        return prepare()
+    import torch.distributed as dist
+
+    if not dist.is_initialized() or dist.get_world_size(process_group) != world_size:
+        raise RuntimeError("MegaMoE preparation requires the matching EP process group")
+    result, error = None, None
+    try:
+        result = prepare()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    errors = [None] * world_size
+    dist.all_gather_object(errors, error, group=process_group)
+    if any(errors):
+        # Do not retain successful peers' temporary local tensors in this
+        # exception's traceback. Existing symmetric owners are untouched.
+        result = None
+        raise RuntimeError(f"MegaMoE {phase} failed on EP ranks: {errors}")
+    return cast(_Prepared, result)
 
 
 def _no_dist() -> bool:

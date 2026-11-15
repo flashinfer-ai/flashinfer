@@ -1,7 +1,10 @@
+import hashlib
 import importlib.util
 import os
+import platform
 import subprocess
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -489,6 +492,175 @@ test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
     subprocess.run(["bash", "-c", script], check=True, env=_sccache_free_env())
 
     assert not lane_stats_dir.exists()
+
+
+@pytest.mark.cpu_only
+def test_sccache_setup_rapids_nvcc_impl(tmp_path):
+    """FLASHINFER_SCCACHE_NVCC_IMPL=rapids runs the fork under its own key prefix,
+    caches nvcc with it and leaves host C++ uncached."""
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "calls.log"
+    # The fork is installed as "sccache" in a directory of its own (it hangs
+    # under any other name); the tag in the log tells the two fakes apart.
+    rapids_bin = tmp_path / "rapids" / "sccache"
+    rapids_bin.parent.mkdir()
+    for command, executable in (
+        ("sccache", fake_bin / "sccache"),
+        ("sccache-rapids", rapids_bin),
+    ):
+        executable.write_text(
+            f'#!/bin/bash\necho "{command} $*" >> "{calls}"\n'
+            f'if [ "$1" = --version ]; then echo "sccache 0.18.0-rapids.8"; fi\n'
+        )
+        executable.chmod(0o755)
+
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+install_rapids_sccache() {{
+  echo "install $1" >> "{calls}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE=test
+  export FLASHINFER_SCCACHE_REVISION=v${{SCCACHE_RAPIDS_VERSION}}
+}}
+SCCACHE_RAPIDS_BIN="{rapids_bin}"
+export PATH="{fake_bin}:$PATH"
+export SCCACHE_BUCKET=test-bucket
+export FLASHINFER_SCCACHE_NVCC_IMPL=rapids
+setup_sccache test-prefix "{tmp_path}"
+test "${{SCCACHE_S3_KEY_PREFIX}}" = test-prefix-rapids
+test -z "${{FLASHINFER_CXX_LAUNCHER}}"
+test "${{FLASHINFER_NVCC_LAUNCHER}}" = "{rapids_bin}"
+test "${{FLASHINFER_SCCACHE_REVISION}}" = v${{SCCACHE_RAPIDS_VERSION}}
+collect_sccache_stats
+"""
+
+    subprocess.run(["bash", "-c", script], check=True, env=_sccache_free_env())
+
+    lines = calls.read_text().splitlines()
+    # Nothing preinstalls the fork, so setup installs it without probing.
+    assert lines[0] == f"install {platform.machine()}"
+    # Every control command goes to the fork's server, none to upstream's.
+    assert not any(line.startswith("sccache ") for line in lines)
+    assert "sccache-rapids --start-server" in lines
+    assert "sccache-rapids --stop-server" in lines
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+def test_install_rapids_sccache_passes_pinned_checksum(arch):
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+install_released_sccache() {{ printf '%s|' "$@"; }}
+install_rapids_sccache {arch}
+printf '%s|%s' "${{FLASHINFER_SCCACHE_INSTALL_SOURCE}}" "${{FLASHINFER_SCCACHE_REVISION}}"
+expected_sha="${{SCCACHE_RAPIDS_SHA256_{arch}}}"
+test ${{#expected_sha}} -eq 64
+printf '|%s' "${{expected_sha}}"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_sccache_free_env(),
+    )
+    fields = result.stdout.split("|")
+    assert fields[:4] == [
+        "0.18.0-rapids.8",
+        arch,
+        "rapidsai/sccache",
+        "/usr/local/libexec/sccache-rapids/sccache",
+    ]
+    # The pinned checksum is passed through, so no .sha256 is downloaded.
+    assert fields[4] == fields[-1]
+    assert fields[5:7] == ["github-release-rapidsai", "v0.18.0-rapids.8"]
+
+
+def _run_install_released_sccache(tmp_path, *, corrupt):
+    """Install a fake fork release through install_released_sccache, serving the
+    archive from a stubbed curl and pinning its real checksum."""
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    package = "sccache-v0.18.0-rapids.8-x86_64-unknown-linux-musl"
+    staging = tmp_path / "staging" / package
+    staging.mkdir(parents=True)
+    (staging / "sccache").write_text("#!/bin/bash\necho fake\n")
+    archive = tmp_path / f"{package}.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(staging, arcname=package)
+    sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if corrupt:
+        sha256 = "0" * 64
+    dest = tmp_path / "libexec" / "sccache"
+    tar_log = tmp_path / "tar.log"
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+curl() {{
+  case "$*" in
+    *.sha256*) echo "unexpected checksum download" >&2; return 1 ;;
+  esac
+  cp "{archive}" "${{@: -1}}"
+}}
+tar() {{ echo tar >> "{tar_log}"; command tar "$@"; }}
+# The guarded caller in run_with_test_sccache.sh runs setup with errexit off.
+if install_released_sccache 0.18.0-rapids.8 x86_64 rapidsai/sccache "{dest}" {sha256}; then
+  echo returned
+fi
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env=_sccache_free_env(),
+    )
+    return result, dest, tar_log
+
+
+@pytest.mark.cpu_only
+def test_install_released_sccache_installs_verified_archive(tmp_path):
+    result, dest, tar_log = _run_install_released_sccache(tmp_path, corrupt=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "returned" in result.stdout
+    assert dest.read_text() == "#!/bin/bash\necho fake\n"
+    assert os.access(dest, os.X_OK)
+    assert tar_log.exists()
+
+
+@pytest.mark.cpu_only
+def test_install_released_sccache_stops_on_checksum_mismatch(tmp_path):
+    result, dest, tar_log = _run_install_released_sccache(tmp_path, corrupt=True)
+    assert result.returncode != 0
+    assert "returned" not in result.stdout
+    assert "Checksum mismatch" in result.stdout
+    assert not tar_log.exists()
+    assert not dest.exists()
+
+
+@pytest.mark.cpu_only
+def test_sccache_setup_rejects_unknown_nvcc_impl(tmp_path):
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    script = f"""
+source "{common_script}"
+export SCCACHE_BUCKET=test-bucket FLASHINFER_SCCACHE_NVCC_IMPL=bogus
+setup_sccache test-prefix "{tmp_path}"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], env=_sccache_free_env(), capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "Unsupported FLASHINFER_SCCACHE_NVCC_IMPL=bogus" in result.stdout
 
 
 def _write_test_sccache_fakes(

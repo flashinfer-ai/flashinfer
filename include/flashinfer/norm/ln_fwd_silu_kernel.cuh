@@ -155,7 +155,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
   index_t idx = c;
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("griddepcontrol.wait;\n");
+  cudaGridDependencySynchronize();
 #endif
 
   // Load gamma and beta into shared memory or registers
@@ -463,7 +463,7 @@ __global__ __launch_bounds__(Ktraits::THREADS_PER_CTA, DESIRED_OCCUPANCY) void l
   }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  asm volatile("griddepcontrol.launch_dependents;\n");
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
   // amax can be after launch_dependents - only needed for delayed scaling (next iteration)

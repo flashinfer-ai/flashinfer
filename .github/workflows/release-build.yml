@@ -115,8 +115,7 @@ jobs:
 
   build-flashinfer-cubin:
     needs: setup
-    # Ubuntu 26.04 mounts /tmp as a quota-limited tmpfs. The isolated PEP 517
-    # environment for torch and its CUDA dependencies exceeds that quota.
+    # Pinned to 24.04: the 26.04 image mounts /tmp as a quota-limited tmpfs.
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
@@ -143,28 +142,41 @@ jobs:
             flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}-partial-
             flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-
 
+      # The cubin backend imports flashinfer.artifacts, whose import chain
+      # (jit.core, compilation_context, cpp_ext) needs torch only for its CPU
+      # side; no CUDA is used. An isolated PEP 517 environment would install the
+      # default CUDA torch wheel and its nvidia-* dependencies (several GB),
+      # which filled the ~8 GB free on the hosted runner's root disk. Install
+      # the CPU wheel into the job environment and build with --no-isolation.
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install build twine wheel
+          pip install build twine wheel tomli
+          # Everything in flashinfer-cubin's [build-system].requires except
+          # torch, so the list cannot drift from pyproject.toml.
+          python - <<'PY' > "${RUNNER_TEMP}/cubin-build-requires.txt"
+          import tomli
+          with open("flashinfer-cubin/pyproject.toml", "rb") as f:
+              requires = tomli.load(f)["build-system"]["requires"]
+          print("\n".join(r for r in requires if not r.startswith("torch")))
+          PY
+          pip install -r "${RUNNER_TEMP}/cubin-build-requires.txt"
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Build flashinfer-cubin wheel
         id: build-cubin-wheel
         env:
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ inputs.dev_suffix }}
           FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS: ${{ inputs.cubin_retry_window_seconds }}
-          # Keep PEP 517's large isolated build environment off /tmp, which is
-          # a quota-limited tmpfs on Ubuntu 26.04 GitHub-hosted runners.
-          TMPDIR: ${{ runner.temp }}/flashinfer-cubin-build
         run: |
-          mkdir -p "${TMPDIR}"
-          df -hT "${TMPDIR}" /tmp
-          findmnt /tmp || true
+          df -h /
           echo "Building flashinfer-cubin (dev suffix: '${FLASHINFER_DEV_RELEASE_SUFFIX}')..."
           echo "Git commit: $(git rev-parse HEAD)"
           cd flashinfer-cubin
           rm -rf dist build *.egg-info
-          python -m build --wheel
+          # The backend also lists provider-build requirements (CUTLASS DSL)
+          # that the cubin build never imports; skip the pre-check for them.
+          python -m build --no-isolation --skip-dependency-check --wheel
           ls -lh dist/
           mkdir -p ../dist
           cp dist/*.whl ../dist/
@@ -276,21 +288,22 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           repository: ${{ inputs.repository }}
-          submodules: true
+
+      # The shim is a metadata-only wheel: it needs no torch, CUDA toolkit or
+      # builder image, so it builds on the runner's own Python.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
 
       - name: Build shim wheel
         env:
           ARCH: ${{ matrix.cpu_architecture }}
-          CUDA_VERSION: ${{ matrix.cuda_version }}
-          DOCKER_IMAGE: ${{ matrix.cpu_architecture == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda_version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda_version) }}
-          FLASHINFER_CI_CACHE: ${{ github.workspace }}/ci-cache
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ inputs.dev_suffix }}
-          FLASHINFER_JIT_CACHE_BUILD_TARGET: shim
           FLASHINFER_JIT_CACHE_PROVIDER_ARCHS: ${{ matrix.provider_architectures }}
           FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda_label }}
-          PYTORCH_INDEX: ${{ matrix.pytorch_index }}
-        run: bash scripts/build_flashinfer_jit_cache_artifact.sh
-        timeout-minutes: 60
+        run: bash scripts/build_jit_cache_shim_wheel.sh
+        timeout-minutes: 15
 
       - name: Upload shim artifact
         uses: actions/upload-artifact@v4

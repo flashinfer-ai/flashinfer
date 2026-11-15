@@ -335,8 +335,10 @@ class QkvNormRopeExchangeOverlap:
 
     The Cake backend also applies per-architecture row-count gates to each call's host plan
     (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH``; SM100 / SM103: a call with ``batch * s_local <= 4096``
-    rows publishes one readiness word per destination, a call with ``>= 16384`` rows launches the producer once per
-    destination run; SM90: a call with ``<= 4096`` rows publishes one readiness word per destination and a call
+    rows publishes one readiness word per destination, and the per-destination producer launch threshold follows
+    ``cake_qkv_exchange_plan.SHAPE_GATE_K_TABLE`` by world size and hidden size (8192, 16384 or 32768 rows);
+    ``per_dest_k_table=0`` restores 16384 and an explicit ``per_dest_large_m`` overrides the table.
+    SM90: a call with ``<= 4096`` rows publishes one readiness word per destination and a call
     with ``>= 16384`` rows runs the persistent producer grid over every SM -- ``reserved_sms_large_m = 16384``, no
     reserved SMs --, the per-destination launch gate off; SM107: no per-architecture gate).  Three (architecture,
     world size) cells differ from these tables (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``): a group
