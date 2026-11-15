@@ -24,9 +24,13 @@ from cutlass.base_dsl.common import DSLUserCodeError
 from ....tllm_enums import ActivationType
 from ....utils import ceil_div
 from ._moe_utils.heuristic import select_fc1_act_tile
+from ._moe_utils.moe_copy import can_use_tma_gather4
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
-from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN, compute_padded_offset
+from ._moe_utils.sm12x_blockscaled_layout import (
+    SF_M_ALIGN,
+    compute_padded_offset,
+)
 from .kernel_moe_fp8_fc1_act_q1 import (
     GRAN_K,
     QUANT_EPIS,
@@ -144,8 +148,12 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
             and cls.is_constructible(tile, epi, activation)
         )
 
-    def build(self, grid_x: int) -> CuteDslSm120MoeFp8Fc1ActQ1:
-        return CuteDslSm120MoeFp8Fc1ActQ1(self.cfg, grid_x)
+    def build(
+        self, grid_x: int, *, use_tma_gather4=False
+    ) -> CuteDslSm120MoeFp8Fc1ActQ1:
+        return CuteDslSm120MoeFp8Fc1ActQ1(
+            self.cfg, grid_x, use_tma_gather4=use_tma_gather4
+        )
 
 
 def epi_tactics(tile):
@@ -193,7 +201,9 @@ def _op(
 _COMPILED: dict = {}
 
 
-def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
+def compiled_kernel(
+    sample_args, *, op, grid_x: int, sm_version: str, use_tma_gather4=False
+):
     gather = len(sample_args) == 9
     if gather != op.gather:
         raise ValueError("gather configuration does not match the kernel arguments")
@@ -205,11 +215,14 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         op.swiglu_limit,
         grid_x,
         sm_version,
+        use_tma_gather4,
         gather,
     )
     hit = _COMPILED.get(key)
     if hit is None:
-        hit = cute.compile(op.build(grid_x), *sample_args)
+        hit = cute.compile(
+            op.build(grid_x, use_tma_gather4=use_tma_gather4), *sample_args
+        )
         _COMPILED[key] = hit
     return hit
 
@@ -357,5 +370,14 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
         op.cfg.TILE,
         token_map=token_map,
     )
-    compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
+    use_tma_gather4 = epi is DEFAULT_EPI and can_use_tma_gather4(
+        tile, token_map, sm_version
+    )
+    compiled_kernel(
+        args,
+        op=op,
+        grid_x=grid_x,
+        sm_version=sm_version,
+        use_tma_gather4=use_tma_gather4,
+    )(*args)
     return q, sf

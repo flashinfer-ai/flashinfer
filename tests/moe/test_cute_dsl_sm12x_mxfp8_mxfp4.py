@@ -496,6 +496,58 @@ def _dequant_q1(q, sf, indptr):
     return out
 
 
+@pytest.mark.parametrize("tail", (1, 2, 3))
+def test_fc1_q1_gather_tail_pdl(tail, cuda_matmul_flags):
+    skip_if_not_sm120()
+    op = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_fc1_act_q1"
+    )
+    cuda_matmul_flags(allow_tf32=False)
+
+    def activation(linear, gate):
+        return (
+            4.0
+            * torch.tanh(gate / 4.0)
+            * torch.sigmoid(gate)
+            * 25.0
+            * torch.tanh(linear / 25.0)
+        )
+
+    aq, asf, _, _, bq, bsf, offsets, mapping, ref = _gather_inputs(
+        64, 512, counts=(0, 65, 2, 0, 64 + tail), activation=activation
+    )
+    if tail == 2:
+        mapping = torch.cat((torch.zeros_like(mapping[:1]), mapping))[1:]
+    out_q = torch.empty_like(ref, dtype=torch.float8_e4m3fn)
+    out_sf = torch.zeros(
+        op.out_sf_shape(ref.shape[0], ref.shape[1], bq.shape[0]),
+        dtype=torch.int32,
+        device=aq.device,
+    )
+    q, sf = op.cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
+        aq,
+        asf,
+        bq,
+        bsf,
+        offsets,
+        token_map=mapping,
+        tile=(64, 128, 128),
+        tune=False,
+        split_k=1,
+        enable_pdl=True,
+        activation=op.ActivationType.Situ,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        out_q=out_q,
+        out_sf=out_sf,
+    )
+    assert q.data_ptr() == out_q.data_ptr()
+    assert sf.data_ptr() == out_sf.data_ptr()
+    q_ref, sf_ref = mxfp8_act_quantize(ref)
+    ref_deq = q_ref.float() * sf_ref.repeat_interleave(128, dim=1)
+    assert calc_diff(_dequant_q1(q, sf, offsets), ref_deq) < 8e-3
+
+
 @pytest.mark.parametrize(
     "bm,epi_name,k",
     [

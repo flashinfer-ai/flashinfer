@@ -36,6 +36,7 @@ from ....tllm_enums import (
 from ....utils import ceil_div
 from ._moe_utils.heuristic import select_fc1_act_tile
 from ._moe_utils.moe_activation import make_gated_activation
+from ._moe_utils.moe_copy import can_use_tma_gather4
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from ._moe_utils.sm12x_blockscaled_layout import (
@@ -167,8 +168,12 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc1ActQ1Op:
             and cls.is_constructible(tile, epi, activation)
         )
 
-    def build(self, grid_x: int) -> CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
-        return CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1(self.cfg, grid_x)
+    def build(
+        self, grid_x: int, *, use_tma_gather4=False
+    ) -> CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
+        return CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1(
+            self.cfg, grid_x, use_tma_gather4=use_tma_gather4
+        )
 
 
 def epi_tactics(tile):
@@ -388,7 +393,9 @@ def _run_split_k(
     return q, sf
 
 
-def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
+def compiled_kernel(
+    sample_args, *, op, grid_x: int, sm_version: str, use_tma_gather4=False
+):
     # Scale recasts are specialized to the input tensor element types.
     scale_dtypes = tuple(arg.element_type for arg in sample_args[2:4])
     key = (
@@ -402,11 +409,14 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         grid_x,
         sm_version,
         scale_dtypes,
+        use_tma_gather4,
         len(sample_args) == 9,
     )
     hit = _COMPILED.get(key)
     if hit is None:
-        hit = cute.compile(op.build(grid_x), *sample_args)
+        hit = cute.compile(
+            op.build(grid_x, use_tma_gather4=use_tma_gather4), *sample_args
+        )
         _COMPILED[key] = hit
     return hit
 
@@ -651,7 +661,16 @@ def cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4(
         op.cfg.TILE,
         token_map=token_map,
     )
-    compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
+    use_tma_gather4 = epi is DEFAULT_EPI and can_use_tma_gather4(
+        tile, token_map, sm_version
+    )
+    compiled_kernel(
+        args,
+        op=op,
+        grid_x=grid_x,
+        sm_version=sm_version,
+        use_tma_gather4=use_tma_gather4,
+    )(*args)
     return q, sf
 
 
@@ -768,7 +787,16 @@ class _Fc1ActQ1Runner(TunableRunner):
             token_map=token_map,
         )
         sm_version = "sm_{}{}".format(props.major, props.minor)
-        compiled_kernel(args, op=op, grid_x=grid_x, sm_version=sm_version)(*args)
+        use_tma_gather4 = epi is DEFAULT_EPI and can_use_tma_gather4(
+            tile, token_map, sm_version
+        )
+        compiled_kernel(
+            args,
+            op=op,
+            grid_x=grid_x,
+            sm_version=sm_version,
+            use_tma_gather4=use_tma_gather4,
+        )(*args)
 
     def get_cache_key_extras(self, inputs):
         a_q, a_scale, b_q, b_scale, m_indptr, token_map = _unpack_inputs(inputs)

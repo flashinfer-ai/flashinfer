@@ -242,6 +242,34 @@ def _make_gather_inputs(counts=(0, 1, 31, 33), k=512, limit=None, *, tokens=19, 
     )
 
 
+@pytest.mark.parametrize("tail", (1, 2, 3))
+def test_fp8_fc1_gather_tail_pdl(tail, cuda_matmul_flags):
+    skip_if_not_sm120()
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import (
+        moe_fp8_fc1_act_q1 as entry,
+    )
+
+    cuda_matmul_flags(allow_tf32=False)
+    inputs = _make_gather_inputs(counts=(0, 65, 2, 0, 64 + tail), n=128, limit=0.25)
+    mapping = inputs["mapping"]
+    if tail == 2:
+        mapping = torch.cat((torch.zeros_like(mapping[:1]), mapping))[1:]
+    out_q = torch.empty_like(inputs["reference"][0])
+    out_sf = torch.zeros_like(inputs["reference"][1])
+    result = entry.cute_dsl_sm12x_fc1_act_q1_fp8(
+        *inputs["gather"],
+        token_map=mapping,
+        tile=(64, 128, 128),
+        enable_pdl=True,
+        swiglu_limit=0.25,
+        out_q=out_q,
+        out_sf=out_sf,
+    )
+    assert result[0].data_ptr() == out_q.data_ptr()
+    assert result[1].data_ptr() == out_sf.data_ptr()
+    _assert_quantized_output(result, inputs["reference"])
+
+
 def _assert_quantized_output(output, reference):
     q, sf = output
     ref_q, ref_sf = reference

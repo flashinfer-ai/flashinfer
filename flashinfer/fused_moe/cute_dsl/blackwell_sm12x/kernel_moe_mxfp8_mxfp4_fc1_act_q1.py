@@ -30,6 +30,12 @@ from ....tllm_enums import (
 )
 from ....utils import ceil_div
 from ._moe_utils import moe_activation, moe_epilogue, moe_scheduler
+from ._moe_utils.moe_copy import (
+    gmem_to_smem_gather4,
+    gmem_to_smem_tokens,
+    make_gather4_tma_atom,
+    partition_gather4,
+)
 from ._moe_utils.moe_epilogue import (
     EPI_CONFIGS,
     EpiMethod,
@@ -46,7 +52,6 @@ from ._moe_utils.sm12x_blockscaled_layout import (
     SF_M_ALIGN,
     UE8M0_PACK_NUM,
     Sm120SfConfigMxfp8Mxfp4,
-    gmem_to_smem_tokens,
 )
 
 GRANK_A, GRANK_B = 128, 32
@@ -181,12 +186,19 @@ def load_tokens(
     stages,
     phase,
     swap: cutlass.Constexpr,
+    tma_atom=None,
+    tma_tensor=None,
 ):
     extent = tile_mnk[1] if swap else tile_mnk[0]
     block = tile.n_block if cutlass.const_expr(swap) else tile.m_block
     begin = tile.m_offset + block * extent
     rows = max(cutlass.Int32(0), min(tile.m_boundary - begin, cutlass.Int32(extent)))
-    target = tiled_copy.get_slice(cute.arch.lane_idx()).partition_D(sA)
+    if cutlass.const_expr(tma_atom is not None):
+        tAsA, tAgA, tAgI = partition_gather4(
+            tma_atom, tma_tensor, gMap, sA, begin, tile_mnk[2]
+        )
+    else:
+        target = tiled_copy.get_slice(cute.arch.lane_idx()).partition_D(sA)
     assert kt_per_pack == 4
     for kt in cutlass.range(0, cycles * sf_stages * kt_per_pack, unroll=1):
         stage = kt & (stages - 1)
@@ -194,9 +206,23 @@ def load_tokens(
         sf_stage = pack & (sf_stages - 1)
         cute.arch.mbarrier_wait(empty + stage, phase)
         cute.arch.sync_warp()
-        gmem_to_smem_tokens(
-            atom_a, gA, gMap, target[None, None, 0, stage], begin, rows, kt
-        )
+        if cutlass.const_expr(tma_atom is not None):
+            gmem_to_smem_gather4(
+                tma_atom,
+                tAgA,
+                tAgI,
+                tAsA,
+                kt,
+                stage,
+                full + stage,
+                tile_mnk[2],
+                rows,
+                cute.size(gA, mode=[0]),
+            )
+        else:
+            gmem_to_smem_tokens(
+                atom_a, gA, gMap, target[None, None, 0, stage], begin, rows, kt
+            )
         if (kt & 3) == 0:
             gmem_to_smem_token_sf(
                 atom_sf, gSF, gMap, sSF[None, 0, sf_stage], begin, rows, pack
@@ -827,10 +853,11 @@ _DEFAULT_QCFG = QuantConst()
 
 
 class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
-    def __init__(self, cfg, grid_x, qcfg=_DEFAULT_QCFG):
+    def __init__(self, cfg, grid_x, qcfg=_DEFAULT_QCFG, *, use_tma_gather4=False):
         self.cfg = cfg
         self.grid_x = grid_x
         self.qcfg = qcfg
+        self.use_tma_gather4 = use_tma_gather4
         self.epi_q = EPI_CONFIGS[cfg.epi.METHOD](
             cutlass.Float8E4M3FN,
             cfg.mma_threads,
@@ -961,14 +988,17 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
             )
         gather_a, gather_copy, gather_sf = None, None, None
         if cutlass.const_expr(gather):
-            gather_a = cute.make_copy_atom(
-                cpasync.CopyG2SOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
-            )
-            gather_copy = cute.make_tiled_copy_tv(
-                gather_a,
-                cute.make_ordered_layout((4, 8), order=(1, 0)),
-                cute.make_layout((1, 16)),
-            )
+            if cutlass.const_expr(self.use_tma_gather4):
+                tma_atom_a, tma_tensor_a = make_gather4_tma_atom(gA, gMap, a_smem, bk)
+            else:
+                gather_a = cute.make_copy_atom(
+                    cpasync.CopyG2SOp(), cutlass.Float8E4M3FN, num_bits_per_copy=128
+                )
+                gather_copy = cute.make_tiled_copy_tv(
+                    gather_a,
+                    cute.make_ordered_layout((4, 8), order=(1, 0)),
+                    cute.make_layout((1, 16)),
+                )
             gather_sf = cute.make_copy_atom(
                 cpasync.CopyG2SOp(), cutlass.Int32, num_bits_per_copy=32
             )
@@ -1318,6 +1348,8 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
                             cfg.ab_stage,
                             a_phase,
                             False,
+                            tma_atom_a if self.use_tma_gather4 else None,
+                            tma_tensor_a if self.use_tma_gather4 else None,
                         )
                     else:
                         a_phase = load_a_sfa(
