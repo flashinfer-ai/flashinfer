@@ -22,7 +22,11 @@ launch build of each of the three (``attention_pdl``, ``quantize_qk_vamax_pdl``,
 ``quantize_v_pdl``: the kernel waits on the preceding grid before its first
 global read and launches with the per-call ``enable_pdl`` argument) and the
 one-launch quantizer (``quantize_qkv_c8w16``: one 8-CTA cluster per batch and
-head, also a PDL build).  Twenty programs serve
+head, also a PDL build).  Two more PDL builds serve small rows: the one-launch
+TMA-ring quantizer (``quantize_qkv_tma_x4``, ``quantize_qkv_tma_x8``: 4-CTA
+clusters, ``vsplit`` clusters per batch and KV head, each holding a slice of
+``128 / vsplit`` V channels, plus clusters that take only Q/K tiles up to the
+clusters the device holds at once).  Twenty programs serve
 SM120 (RTX PRO 6000 / RTX 5090): the ``mma.sync`` INT8-QK / FP8-PV kernel, one
 per dispatched specialization of the five metadata flags (``sm120_module_key``
 derives them from a call; the record's ``select_rule`` fixes them).  The SM120
@@ -786,6 +790,132 @@ MODULES: dict[str, dict[str, Any]] = {
             "v_scale": "v_scale",
         },
         "role": "quantize_qkv",
+        "select_rule": None,
+    },
+    "quantize_qkv_tma_x4": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "v"],
+            ["buffer", "q_out"],
+            ["buffer", "k_out"],
+            ["buffer", "v_out"],
+            ["buffer", "q_scale"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["parameter", "batch"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "k_scale_groups"],
+            ["parameter", "q_chunks"],
+            ["parameter", "k_chunks"],
+            ["parameter", "v_boxes"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "vsplit_clusters",
+            "vsplit": 4,
+        },
+        "kernel_symbol": "kernel_cake_sage_block_sparse_attention_f6fc272a4f67d46dd9cf",
+        "launch": {
+            "block": (800, 1, 1),
+            "cluster": (4, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 198912,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_sage_block_sparse_attention_f6fc272a4f67d46dd9cf",
+        "logical": {
+            "batch": "batch",
+            "k": "k",
+            "k_chunks": "k_chunks",
+            "k_out": "k_out",
+            "k_scale": "k_scale",
+            "k_scale_groups": "k_scale_groups",
+            "num_heads": "num_heads",
+            "num_kv_heads": "num_kv_heads",
+            "q": "q",
+            "q_chunks": "q_chunks",
+            "q_out": "q_out",
+            "q_scale": "q_scale",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "v": "v",
+            "v_boxes": "v_boxes",
+            "v_out": "v_out",
+            "v_scale": "v_scale",
+        },
+        "role": "quantize_qkv_tma",
+        "select_rule": None,
+    },
+    "quantize_qkv_tma_x8": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "v"],
+            ["buffer", "q_out"],
+            ["buffer", "k_out"],
+            ["buffer", "v_out"],
+            ["buffer", "q_scale"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_scale"],
+            ["parameter", "batch"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_kv_heads"],
+            ["parameter", "k_scale_groups"],
+            ["parameter", "q_chunks"],
+            ["parameter", "k_chunks"],
+            ["parameter", "v_boxes"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "vsplit_clusters",
+            "vsplit": 8,
+        },
+        "kernel_symbol": "kernel_cake_sage_block_sparse_attention_9c29009b4dc0cd7fd54b",
+        "launch": {
+            "block": (800, 1, 1),
+            "cluster": (4, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 165504,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_sage_block_sparse_attention_9c29009b4dc0cd7fd54b",
+        "logical": {
+            "batch": "batch",
+            "k": "k",
+            "k_chunks": "k_chunks",
+            "k_out": "k_out",
+            "k_scale": "k_scale",
+            "k_scale_groups": "k_scale_groups",
+            "num_heads": "num_heads",
+            "num_kv_heads": "num_kv_heads",
+            "q": "q",
+            "q_chunks": "q_chunks",
+            "q_out": "q_out",
+            "q_scale": "q_scale",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "v": "v",
+            "v_boxes": "v_boxes",
+            "v_out": "v_out",
+            "v_scale": "v_scale",
+        },
+        "role": "quantize_qkv_tma",
         "select_rule": None,
     },
     "attention_sm120_00000": {
@@ -2104,13 +2234,14 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 SM100_ARCHES = ("sm_100a", "sm_103a")
 SM120_ARCH = "sm_120a"
 # The roles of the records: the SM100-family attention and quantizers (a plain
-# and a PDL record each; the one-launch quantizer a PDL record), and the SM120
+# and a PDL record each; the one-launch quantizers PDL records), and the SM120
 # attention, one record per specialization.
 ROLES = (
     "attention",
     "quantize_qk_vamax",
     "quantize_v",
     "quantize_qkv",
+    "quantize_qkv_tma",
     "attention_sm120",
 )
 # The five metadata flags an SM120 record's ``select_rule`` fixes, in the order
@@ -2171,6 +2302,8 @@ LOGICAL_SCALARS = (
     "q_chunks",
     "k_chunks",
     "passes",
+    "batch",
+    "v_boxes",
 )
 
 
@@ -2272,6 +2405,98 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-int(numerator) // int(denominator))
 
 
+# An empty kernel for the cluster occupancy query (PTX: the driver JIT-compiles it
+# for the device).
+_OCCUPANCY_PROBE = b"""
+.version 7.8
+.target sm_90
+.address_size 64
+.visible .entry cake_sage_occupancy_probe()
+{
+    ret;
+}
+\0"""
+
+
+def _driver_result(result: Any) -> Any:
+    error, *values = result
+    if int(error) != 0:
+        raise RuntimeError(f"CUDA driver error {error}")
+    return values[0] if values else None
+
+
+@functools.cache
+def _max_active_clusters(
+    block: tuple[int, int, int],
+    cluster: tuple[int, int, int],
+    smem_bytes: int,
+    device_index: int,
+) -> int:
+    import torch
+
+    try:
+        from cuda.bindings import driver
+    except ImportError:
+        from cuda import cuda as driver  # type: ignore[no-redef]
+    with torch.cuda.device(device_index):
+        torch.cuda.init()
+        module = _driver_result(driver.cuModuleLoadData(_OCCUPANCY_PROBE))
+        function = _driver_result(
+            driver.cuModuleGetFunction(module, b"cake_sage_occupancy_probe")
+        )
+        _driver_result(
+            driver.cuFuncSetAttribute(
+                function,
+                driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                smem_bytes,
+            )
+        )
+        config = driver.CUlaunchConfig()
+        config.gridDimX, config.gridDimY, config.gridDimZ = cluster
+        config.blockDimX, config.blockDimY, config.blockDimZ = block
+        config.sharedMemBytes = smem_bytes
+        dims = driver.CUlaunchAttribute()
+        dims.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+        value = driver.CUlaunchAttributeValue()
+        value.clusterDim.x, value.clusterDim.y, value.clusterDim.z = cluster
+        dims.value = value
+        policy = driver.CUlaunchAttribute()
+        policy.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE
+        spread = driver.CUlaunchAttributeValue()
+        spread.clusterSchedulingPolicyPreference = (
+            driver.CUclusterSchedulingPolicy.CU_CLUSTER_SCHEDULING_POLICY_SPREAD
+        )
+        policy.value = spread
+        config.attrs = [dims, policy]
+        config.numAttrs = 2
+        clusters = _driver_result(driver.cuOccupancyMaxActiveClusters(function, config))
+        _driver_result(driver.cuModuleUnload(module))
+    return int(clusters)
+
+
+def resident_clusters(record: dict[str, Any], device_index: int) -> int:
+    """Clusters of a record's launch the device holds at once (0 when unknown).
+
+    ``cuOccupancyMaxActiveClusters`` of an empty kernel launched with the
+    record's block, cluster and dynamic shared memory: a kernel whose shared
+    memory holds one CTA per SM (the TMA-ring quantizer) co-resides as any other
+    kernel of that footprint.  Queried once per launch shape and device.  0 when
+    the driver query is unavailable (the caller then adds no cluster beyond those
+    the shape needs).
+    """
+
+    launch = record["launch"]
+    try:
+        return _max_active_clusters(
+            tuple(int(x) for x in launch["block"]),
+            tuple(int(x) for x in launch["cluster"]),
+            int(launch["dynamic_smem_bytes"]),
+            device_index,
+        )
+    except Exception:  # noqa: BLE001 - an unavailable driver query adds no cluster
+        return 0
+
+
 @functools.cache
 def sm_count(device_index: int) -> int:
     """Streaming multiprocessor count of one CUDA device (immutable per process)."""
@@ -2293,7 +2518,10 @@ def launch_grid(
     where ``heads`` is the kernel's ``grid_heads`` / ``num_heads`` and
     ``chunks`` its ``chunks_per_bh``.  ``batch_heads_clusters`` (the one-launch
     quantizer): one cluster of ``launch.cluster[0]`` CTAs per batch and
-    ``grid_heads``.  ``q_blocks_heads_batch`` (SM120): the 3-D grid
+    ``grid_heads``.  ``vsplit_clusters`` (the TMA-ring quantizer): clusters of
+    ``launch.cluster[0]`` CTAs, ``vsplit`` per batch and ``num_kv_heads``,
+    raised to the clusters the device holds at once (:func:`resident_clusters`;
+    the extra clusters take Q/K tiles only).  ``q_blocks_heads_batch`` (SM120): the 3-D grid
     ``(q_blocks, num_heads, batch)``.  Every input is a host scalar the caller
     already holds; nothing is read from a tensor.
     """
@@ -2315,6 +2543,12 @@ def launch_grid(
         )
     if kind == "batch_heads_clusters":
         clusters = int(values["batch"]) * int(values["grid_heads"])
+        return (max(1, clusters * int(record["launch"]["cluster"][0])), 1, 1)
+    if kind == "vsplit_clusters":
+        clusters = (
+            int(values["batch"]) * int(values["num_kv_heads"]) * int(rule["vsplit"])
+        )
+        clusters = max(clusters, resident_clusters(record, device_index))
         return (max(1, clusters * int(record["launch"]["cluster"][0])), 1, 1)
     if kind == "q_blocks_heads_batch":
         return (
@@ -2438,6 +2672,7 @@ __all__ = [
     "library_name",
     "load",
     "records_of_role",
+    "resident_clusters",
     "run_module",
     "select_sm120",
     "sm120_module_key",
