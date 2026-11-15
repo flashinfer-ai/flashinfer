@@ -35,13 +35,19 @@ layer = MoEEpLayer(
 
 - The configured layer is built exactly as without the option; `forward`,
   `stage_inputs` / `compute_staged`, `warmup` and other attributes behave as on it.
+  With `transport=None` on cake, the nosync kernel is built on cake's table at
+  `warmup()` or the first eager call, so the default workspace can still be
+  configured (`create_workspace`) after construction; call `warmup()` on every
+  rank before capturing.
 - Every rank must take the same kernel for a call, so the switch uses a
   rank-uniform bound: `compile_tokens_per_rank` of `stage_inputs` when given, the
   captured token count during CUDA graph capture, otherwise the largest token
   count of any rank (one all-reduce).
 - Where the kernel cannot run (compute capability other than 12.0, weights that
-  are not pre-quantized MXFP4, an unsupported geometry) the option warns once and
-  every call runs the configured backend.
+  are not pre-quantized MXFP4, cake with its in-kernel shared expert
+  (`shared_expert="fp8_in_kernel"`; the nosync kernel computes the routed experts
+  only), an unsupported geometry) the option warns once and every call runs the
+  configured backend.
 - `NosyncOptions` fields: `max_tokens_per_rank` (1–128, same on every rank),
   `transport` and `tokens_per_item` (below), and `top_k` / `swiglu_limit`, which
   default to the configured cake or cutedsl backend's and must be set for any
@@ -124,7 +130,8 @@ work.
 - `None` (the `NosyncOptions` default): with the cake backend configured, the
   per-pair table cake resolved (its `transport_table`, including `"auto"` /
   `"tuned"`), so both kernels reach each pair of ranks the same way: P2P where
-  cake uses LSA, GIN where it uses GIN; with any other backend `"p2p"`.
+  cake uses LSA, GIN where it uses GIN; with any other backend `"p2p"`. The table
+  is read from the layer's default workspace at `warmup()` or the first call.
 - `"p2p"` (the default of `Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`): PCIe
   peer stores between every pair (torch symmetric memory).
 - `"auto"`: the buffer is one NCCL symmetric window; pairs NCCL maps for
