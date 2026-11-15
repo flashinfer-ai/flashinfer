@@ -1,0 +1,10 @@
+{
+  "control": {
+    "tree": "/scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/campaign/caac1/control/flashinfer",
+    "sha256": "bdd21070413392d0d081cae381a30d0f723008717b04c64e46996f5c6c51f314"
+  },
+  "candidate": {
+    "tree": "/scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/campaign/caac1/candidate/flashinfer",
+    "sha256": "50cc30425d697b18506408c9e27ab6a456c407da7171d6b4848e69364fcbc45b"
+  }
+}

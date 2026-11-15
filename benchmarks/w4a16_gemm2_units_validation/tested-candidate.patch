@@ -1,0 +1,1226 @@
+diff --git a/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py b/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py
+index a35abb88e..70185b77c 100644
+--- a/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py
++++ b/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py
+@@ -77,6 +77,11 @@ _NVFP4_SCALE_GRANULARITY_M = 1
+ _NVFP4_SCALE_GRANULARITY_K = 16
+ _TMA_CACHE_HINT_EVICT_FIRST = 0x12F0000000000000
+ _TMA_CACHE_HINT_EVICT_LAST = 0x14F0000000000000
++# Most weight stages (M tiles x K stages) one work unit spans when it groups
++# M tiles. With two accumulator stages, the MMA can then run eight weight
++# stages ahead of the epilogue; larger units leave too few units to occupy
++# every SM when only a few routed-row tiles are active.
++_MAX_UNIT_WEIGHT_STAGES = 4
+ 
+ 
+ @cute.jit
+@@ -293,6 +298,10 @@ class Sm100W4A16GroupedGemmKernel:
+         self.use_2cta_instrs = use_2cta_instrs
+         self.cluster_shape_mn = cluster_shape_mn
+         self.mma_tiler = mma_tiler_mnk
++        # Static (M, K) of the expert weights; set when the kernel is traced.
++        self.problem_mk: Optional[tuple[int, int]] = None
++        # Consecutive CTA M tiles that share one routed-row tile per work unit.
++        self.m_tiles_per_unit = 1
+         if activation_type not in (
+             None,
+             ActivationType.Swiglu.value,
+@@ -428,6 +437,7 @@ class Sm100W4A16GroupedGemmKernel:
+             else default_epi_tile
+         )
+         self.epi_tile_n = cute.size(self.epi_tile[1])
++        self.m_tiles_per_unit = self._select_m_tiles_per_unit()
+ 
+         (
+             self.num_load2trans_stage,
+@@ -450,6 +460,7 @@ class Sm100W4A16GroupedGemmKernel:
+             self.smem_buffer_align_bytes,
+             self.use_fused_finalize,
+             self.use_clc_scheduler,
++            self.m_tiles_per_unit,
+         )
+ 
+         # TMEM allocation requires power-of-two column alignment.
+@@ -502,6 +513,49 @@ class Sm100W4A16GroupedGemmKernel:
+             self.num_load2trans_stage,
+         )
+ 
++    def _select_m_tiles_per_unit(self) -> int:
++        """Choose how many consecutive M tiles one work unit covers.
++
++        With few K stages per output tile, the per-tile activation load,
++        scheduler entry and accumulator handoff bound how far weight
++        streaming runs ahead of the epilogue. A unit of M tiles from the same
++        routed-row tile loads that activation tile once and hands all its
++        accumulators to the epilogue together. Each M tile keeps its own
++        accumulator, K order and epilogue arithmetic.
++
++        Use the largest divisor of the cluster's M tiles whose unit spans at
++        most _MAX_UNIT_WEIGHT_STAGES weight stages (M tiles x K stages) and
++        still fits two accumulator and two decoded-weight stages in TMEM.
++        """
++        if (
++            self.problem_mk is None
++            or self.gather_input
++            or self.activation_type is not None
++            or self.use_fused_finalize
++            or self.use_2cta_instrs
++            or not self.m_cluster_aligned
++            or self.transform_a_source != tcgen05.OperandSource.TMEM
++        ):
++            return 1
++        m, k = self.problem_mk
++        k_tiles = (k + self.mma_tiler[2] - 1) // self.mma_tiler[2]
++        # Units tile each cluster's M extent exactly.
++        cluster_m_tiles = m // (self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0])
++        # An M128 FP32 accumulator spans the routed-row tile's N columns, and a
++        # decoded BF16 weight stage spans K/2 columns.
++        acc_tmem_cols = self.cta_tile_shape_mnk[1]
++        a_tmem_cols = cute.round_up(self.cta_tile_shape_mnk[2] // 2, 4)
++        tmem_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
++        m_tiles_per_unit = 1
++        for tiles in range(2, _MAX_UNIT_WEIGHT_STAGES // k_tiles + 1):
++            # Two accumulator stages and at least two decoded-weight stages.
++            if (
++                cluster_m_tiles % tiles == 0
++                and 2 * tiles * acc_tmem_cols + 2 * a_tmem_cols <= tmem_cols
++            ):
++                m_tiles_per_unit = tiles
++        return m_tiles_per_unit
++
+     @cute.jit
+     def _issue_mma_tile(
+         self,
+@@ -718,8 +772,11 @@ class Sm100W4A16GroupedGemmKernel:
+         transform_tiler: cute.Layout,
+         consumed_k: cutlass.Constexpr[int],
+         transform_group_idx: cutlass.Int32,
++        m_tiles_per_unit: cutlass.Constexpr[int] = 1,
+     ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+         k_tile_cnt = cute.ceil_div(consumed_k, self.mma_tiler[2])
++        # A work unit's M tiles alternate within each K stage.
++        num_stages = k_tile_cnt * m_tiles_per_unit
+         group_k = self.mma_tiler[2] // self.num_transform_warpgroups
+         tail_k = consumed_k % self.mma_tiler[2]
+         transform_k_tiles = k_tile_cnt
+@@ -729,18 +786,21 @@ class Sm100W4A16GroupedGemmKernel:
+             )
+         a_load2trans_consumer_state.reset_count()
+         peek_load2trans_full_status = cutlass.Boolean(1)
+-        if a_load2trans_consumer_state.count < k_tile_cnt:
++        if a_load2trans_consumer_state.count < num_stages:
+             peek_load2trans_full_status = a_load2trans_pipeline.consumer_try_wait(
+                 a_load2trans_consumer_state
+             )
+         trans2mma_producer_state.reset_count()
+         peek_trans2mma_empty_status = cutlass.Boolean(1)
+-        if trans2mma_producer_state.count < k_tile_cnt:
++        if trans2mma_producer_state.count < num_stages:
+             peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(
+                 trans2mma_producer_state
+             )
+ 
+-        for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
++        for _stage in cutlass.range(0, num_stages, 1, unroll=1):
++            _k_tile = _stage
++            if cutlass.const_expr(m_tiles_per_unit > 1):
++                _k_tile = _stage // m_tiles_per_unit
+             self._trace_transform_push("transform_wait_raw_tma_ready", _k_tile)
+             a_load2trans_pipeline.consumer_wait(
+                 a_load2trans_consumer_state,
+@@ -785,7 +845,7 @@ class Sm100W4A16GroupedGemmKernel:
+                     )
+                     if cutlass.const_expr(idx == cute.size(tArA_load, mode=[1]) - 1):
+                         a_load2trans_consumer_state.advance()
+-                        if a_load2trans_consumer_state.count < k_tile_cnt:
++                        if a_load2trans_consumer_state.count < num_stages:
+                             peek_load2trans_full_status = (
+                                 a_load2trans_pipeline.consumer_try_wait(
+                                     a_load2trans_consumer_state
+@@ -808,8 +868,18 @@ class Sm100W4A16GroupedGemmKernel:
+                     )
+                     tArA_transform_store[(None, idx)].store(tensor_transformed)
+             else:
+-                # Only the final stage can have a wholly unused K group.
++                # Only the final K stage of each M tile can have a wholly unused
++                # K group.
+                 a_load2trans_consumer_state.advance()
++                if cutlass.const_expr(m_tiles_per_unit > 1):
++                    # The unit's next M tile also ends on this K stage: peek its
++                    # load so its wait does not reuse this stage's token.
++                    if a_load2trans_consumer_state.count < num_stages:
++                        peek_load2trans_full_status = (
++                            a_load2trans_pipeline.consumer_try_wait(
++                                a_load2trans_consumer_state
++                            )
++                        )
+             self._trace_transform_pop()
+ 
+             self._trace_transform_push("transform_store_commit_bf16", _k_tile)
+@@ -830,7 +900,7 @@ class Sm100W4A16GroupedGemmKernel:
+             )
+             self._trace_transform_pop()
+             trans2mma_producer_state.advance()
+-            if trans2mma_producer_state.count < k_tile_cnt:
++            if trans2mma_producer_state.count < num_stages:
+                 peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(
+                     trans2mma_producer_state
+                 )
+@@ -960,6 +1030,7 @@ class Sm100W4A16GroupedGemmKernel:
+         ):
+             raise ValueError("scale_major_mode must be K-major")
+ 
++        self.problem_mk = (a.shape[0], a.shape[1])
+         self._setup_attributes()
+ 
+         tiled_mma = sm100_utils.make_trivial_tiled_mma(
+@@ -1045,9 +1116,13 @@ class Sm100W4A16GroupedGemmKernel:
+ 
+         self.num_tma_load_bytes_a_scale = a_copy_size + a_scale_copy_size
+         self.num_tma_load_bytes_b = b_copy_size * cute.size(tiled_mma.thr_id.shape)
++        # The scheduler assigns work units: m_tiles_per_unit output M tiles.
+         self.tile_sched_params, grid = self._compute_grid(
+             c,
+-            self.cta_tile_shape_mnk_c,
++            (
++                self.cta_tile_shape_mnk_c[0] * self.m_tiles_per_unit,
++                *self.cta_tile_shape_mnk_c[1:],
++            ),
+             self.cluster_shape_mn,
+             max_active_clusters,
+             self.use_clc_scheduler,
+@@ -1493,8 +1568,10 @@ class Sm100W4A16GroupedGemmKernel:
+         tCrB = tiled_mma.make_fragment_B(sB_input)
+         # (MMA, MMA_M, MMA_N)
+         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
++        # Accumulator stage s holds M tile t of a work unit at index
++        # s * m_tiles_per_unit + t.
+         tCtAcc_fake = tiled_mma.make_fragment_C(
+-            cute.append(acc_shape, self.num_acc_stage)
++            cute.append(acc_shape, self.num_acc_stage * self.m_tiles_per_unit)
+         )
+ 
+         # Cluster wait before TMEM alloc and ensure pipelines are ready.
+@@ -1856,69 +1933,87 @@ class Sm100W4A16GroupedGemmKernel:
+                         if cutlass.const_expr(self.enable_iket):
+                             _iket.range_pop()
+                 while work_tile.is_valid_tile:
+-                    tAgA_slice = tAgA[
+-                        (
+-                            None,
+-                            work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+-                            None,
+-                            work_tile.group_idx,
++                    tAgA_slices = []
++                    tSgS_slices = []
++                    for unit_tile in cutlass.range_constexpr(self.m_tiles_per_unit):
++                        cta_coord_m = work_tile.cta_coord_m
++                        if cutlass.const_expr(self.m_tiles_per_unit > 1):
++                            cta_coord_m = (
++                                cta_coord_m * self.m_tiles_per_unit + unit_tile
++                            )
++                        tAgA_slices.append(
++                            tAgA[
++                                (
++                                    None,
++                                    cta_coord_m // cute.size(tiled_mma.thr_id.shape),
++                                    None,
++                                    work_tile.group_idx,
++                                )
++                            ]
+                         )
+-                    ]
+-                    tSgS_slice = tSgS[
+-                        (
+-                            None,
+-                            work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+-                            None,
+-                            work_tile.group_idx,
++                        tSgS_slice = tSgS[
++                            (
++                                None,
++                                cta_coord_m // cute.size(tiled_mma.thr_id.shape),
++                                None,
++                                work_tile.group_idx,
++                            )
++                        ]
++                        # Filter zeros in rest mode
++                        rest_filtered = cute.filter_zeros(tSgS_slice[(0, None)].layout)
++                        tSgS_slices.append(
++                            cute.make_tensor(
++                                tSgS_slice.iterator,
++                                cute.make_layout(
++                                    (tSgS_slice.layout[0].shape, rest_filtered.shape),
++                                    stride=(
++                                        tSgS_slice.layout[0].stride,
++                                        rest_filtered.stride,
++                                    ),
++                                ),
++                            )
+                         )
+-                    ]
+-                    # Filter zeros in rest mode
+-                    rest_filtered = cute.filter_zeros(tSgS_slice[(0, None)].layout)
+-                    tSgS_slice_filtered = cute.make_tensor(
+-                        tSgS_slice.iterator,
+-                        cute.make_layout(
+-                            (tSgS_slice.layout[0].shape, rest_filtered.shape),
+-                            stride=(tSgS_slice.layout[0].stride, rest_filtered.stride),
+-                        ),
+-                    )
+ 
+                     a_load2trans_producer_state.reset_count()
++                    # K-major order: a unit's M tiles share each activation stage.
+                     for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+-                        if cutlass.const_expr(self.enable_iket):
+-                            _iket.range_push("weight_tma_empty")
+-                        a_load2trans_pipeline.producer_acquire(
+-                            a_load2trans_producer_state,
+-                        )
+-                        if cutlass.const_expr(self.enable_iket):
+-                            _iket.range_pop()
+-                            _iket.range_push("weight_tma_issue")
+-                        cute.copy(
+-                            tma_atom_a,
+-                            tAgA_slice[(None, a_load2trans_producer_state.count)],
+-                            tAsA[(None, a_load2trans_producer_state.index)],
+-                            tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
+-                                a_load2trans_producer_state
+-                            ),
+-                            mcast_mask=a_full_mcast_mask,
+-                            cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_FIRST),
+-                        )
+-                        cute.copy(
+-                            tma_atom_s,
+-                            tSgS_slice_filtered[
+-                                (None, a_load2trans_producer_state.count)
+-                            ],
+-                            tSsS[(None, a_load2trans_producer_state.index)],
+-                            tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
++                        for unit_tile in cutlass.range_constexpr(self.m_tiles_per_unit):
++                            k_coord = a_load2trans_producer_state.count
++                            if cutlass.const_expr(self.m_tiles_per_unit > 1):
++                                k_coord = _k_tile
++                            if cutlass.const_expr(self.enable_iket):
++                                _iket.range_push("weight_tma_empty")
++                            a_load2trans_pipeline.producer_acquire(
++                                a_load2trans_producer_state,
++                            )
++                            if cutlass.const_expr(self.enable_iket):
++                                _iket.range_pop()
++                                _iket.range_push("weight_tma_issue")
++                            cute.copy(
++                                tma_atom_a,
++                                tAgA_slices[unit_tile][(None, k_coord)],
++                                tAsA[(None, a_load2trans_producer_state.index)],
++                                tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
++                                    a_load2trans_producer_state
++                                ),
++                                mcast_mask=a_full_mcast_mask,
++                                cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_FIRST),
++                            )
++                            cute.copy(
++                                tma_atom_s,
++                                tSgS_slices[unit_tile][(None, k_coord)],
++                                tSsS[(None, a_load2trans_producer_state.index)],
++                                tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
++                                    a_load2trans_producer_state
++                                ),
++                                mcast_mask=s_full_mcast_mask,
++                            )
++                            a_load2trans_pipeline.producer_commit(
+                                 a_load2trans_producer_state
+-                            ),
+-                            mcast_mask=s_full_mcast_mask,
+-                        )
+-                        a_load2trans_pipeline.producer_commit(
+-                            a_load2trans_producer_state
+-                        )
+-                        if cutlass.const_expr(self.enable_iket):
+-                            _iket.range_pop()
+-                        a_load2trans_producer_state.advance()
++                            )
++                            if cutlass.const_expr(self.enable_iket):
++                                _iket.range_pop()
++                            a_load2trans_producer_state.advance()
+ 
+                     tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                     work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+@@ -1968,8 +2063,15 @@ class Sm100W4A16GroupedGemmKernel:
+                     pipeline.PipelineUserType.Producer, self.num_acc_stage
+                 )
+                 while work_tile.is_valid_tile:
+-                    # (MMA, MMA_M, MMA_N)
+-                    tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
++                    # (MMA, MMA_M, MMA_N) for each M tile of the work unit
++                    unit_accumulators = []
++                    for unit_tile in cutlass.range_constexpr(self.m_tiles_per_unit):
++                        acc_idx = acc_producer_state.index
++                        if cutlass.const_expr(self.m_tiles_per_unit > 1):
++                            acc_idx = acc_idx * self.m_tiles_per_unit + unit_tile
++                        unit_accumulators.append(
++                            tCtAcc_base[(None, None, None, acc_idx)]
++                        )
+                     b_load2mma_consumer_state.reset_count()
+                     trans2mma_consumer_state.reset_count()
+                     if is_leader_cta:
+@@ -1998,55 +2100,65 @@ class Sm100W4A16GroupedGemmKernel:
+                             for _k_tile in cutlass.range(
+                                 first_stage, last_stage, 1, unroll=1
+                             ):
+-                                if cutlass.const_expr(self.enable_iket):
+-                                    _iket.range_push("mma_a_ready")
+-                                trans2mma_pipeline.consumer_wait(
+-                                    trans2mma_consumer_state
+-                                )
+-                                if cutlass.const_expr(self.enable_iket):
+-                                    _iket.range_pop()
+-                                    _iket.range_push("mma_b_ready")
+-                                b_load2mma_pipeline.consumer_wait(
+-                                    b_load2mma_consumer_state
+-                                )
+-                                if cutlass.const_expr(self.enable_iket):
+-                                    _iket.range_pop()
+-                                    _iket.range_push("mma_issue")
+-                                self._issue_mma_tile(
+-                                    tiled_mma,
+-                                    tCtAcc,
+-                                    tCrA[
+-                                        (
+-                                            None,
+-                                            None,
+-                                            None,
+-                                            trans2mma_consumer_state.index,
++                                # Every M tile of a unit consumes this activation stage.
++                                for unit_tile in cutlass.range_constexpr(
++                                    self.m_tiles_per_unit
++                                ):
++                                    if cutlass.const_expr(self.enable_iket):
++                                        _iket.range_push("mma_a_ready")
++                                    trans2mma_pipeline.consumer_wait(
++                                        trans2mma_consumer_state
++                                    )
++                                    if cutlass.const_expr(self.enable_iket):
++                                        _iket.range_pop()
++                                    if cutlass.const_expr(unit_tile == 0):
++                                        if cutlass.const_expr(self.enable_iket):
++                                            _iket.range_push("mma_b_ready")
++                                        b_load2mma_pipeline.consumer_wait(
++                                            b_load2mma_consumer_state
+                                         )
+-                                    ],
+-                                    tCrB[
+-                                        (
+-                                            None,
+-                                            None,
+-                                            None,
+-                                            b_load2mma_consumer_state.index,
++                                        if cutlass.const_expr(self.enable_iket):
++                                            _iket.range_pop()
++                                    if cutlass.const_expr(self.enable_iket):
++                                        _iket.range_push("mma_issue")
++                                    self._issue_mma_tile(
++                                        tiled_mma,
++                                        unit_accumulators[unit_tile],
++                                        tCrA[
++                                            (
++                                                None,
++                                                None,
++                                                None,
++                                                trans2mma_consumer_state.index,
++                                            )
++                                        ],
++                                        tCrB[
++                                            (
++                                                None,
++                                                None,
++                                                None,
++                                                b_load2mma_consumer_state.index,
++                                            )
++                                        ],
++                                        _k_tile,
++                                        valid_tokens,
++                                        stage_k,
++                                    )
++                                    if cutlass.const_expr(self.enable_iket):
++                                        _iket.range_pop()
++                                        _iket.range_push("mma_release")
++                                    trans2mma_pipeline.consumer_release(
++                                        trans2mma_consumer_state
++                                    )
++                                    if cutlass.const_expr(
++                                        unit_tile == self.m_tiles_per_unit - 1
++                                    ):
++                                        b_load2mma_pipeline.consumer_release(
++                                            b_load2mma_consumer_state
+                                         )
+-                                    ],
+-                                    _k_tile,
+-                                    valid_tokens,
+-                                    stage_k,
+-                                )
+-                                if cutlass.const_expr(self.enable_iket):
+-                                    _iket.range_pop()
+-                                    _iket.range_push("mma_release")
+-                                trans2mma_pipeline.consumer_release(
+-                                    trans2mma_consumer_state
+-                                )
+-                                b_load2mma_pipeline.consumer_release(
+-                                    b_load2mma_consumer_state
+-                                )
+-                                if cutlass.const_expr(self.enable_iket):
+-                                    _iket.range_pop()
+-                                trans2mma_consumer_state.advance()
++                                    if cutlass.const_expr(self.enable_iket):
++                                        _iket.range_pop()
++                                    trans2mma_consumer_state.advance()
+                                 b_load2mma_consumer_state.advance()
+                         # Async arrive accumulator buffer full
+                         acc_pipeline.producer_commit(acc_producer_state)
+@@ -2137,6 +2249,7 @@ class Sm100W4A16GroupedGemmKernel:
+                     transform_tiler,
+                     mA_mkl.shape[1],
+                     transform_group_idx,
++                    self.m_tiles_per_unit,
+                 )
+                 # Advance to next tile
+                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+@@ -2291,60 +2404,13 @@ class Sm100W4A16GroupedGemmKernel:
+                 alpha_val = alpha[work_tile.group_idx]
+                 if cutlass.const_expr(self.gated):
+                     bSG_gC = bSG_gC_partitioned[(None, work_tile.cta_coord_m, None, 0)]
+-                else:
+-                    bSG_gC = bSG_gC_partitioned[
+-                        (
+-                            None,
+-                            None,
+-                            None,
+-                            work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+-                            0,
+-                            0,
+-                        )
+-                    ]
+-                    tma_store_offset_coord = (
+-                        (work_tile.coord_n, 0)
+-                        if cutlass.const_expr(self.c_layout.is_n_major_c())
+-                        else (0, work_tile.coord_n)
+-                    )
+-                    bSG_gC = cute.make_tensor(
+-                        (
+-                            tma_store_offset_coord[0] + bSG_gC.iterator[0],
+-                            tma_store_offset_coord[1] + bSG_gC.iterator[1],
+-                        ),
+-                        bSG_gC.layout,
+-                    )
+-                tTR_gC = tTR_gC_partitioned[
+-                    (
+-                        None,
+-                        None,
+-                        None,
+-                        None,
+-                        None,
+-                        work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+-                        0,
+-                        0,
+-                    )
+-                ]
+-                tTR_gC = cute.make_tensor(
+-                    tTR_gC.iterator + (work_tile.coord_n * tensor_c.layout.stride[1]),
+-                    tTR_gC.layout,
+-                )
+-
+-                tTR_tAcc = tTR_tAcc_base[
+-                    (None, None, None, None, None, acc_consumer_state.index)
+-                ]
+-                # Wait for accumulator buffer full
+-                if cutlass.const_expr(self.enable_iket):
+-                    _iket.range_push("epi_acc_wait")
+-                acc_pipeline.consumer_wait(acc_consumer_state)
+-                if cutlass.const_expr(self.enable_iket):
+-                    _iket.range_pop()
+-                    _iket.range_push("epi_body")
+-                if cutlass.const_expr(not self.gated):
+-                    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+-
+-                if cutlass.const_expr(self.gated):
++                    # Wait for accumulator buffer full
++                    if cutlass.const_expr(self.enable_iket):
++                        _iket.range_push("epi_acc_wait")
++                    acc_pipeline.consumer_wait(acc_consumer_state)
++                    if cutlass.const_expr(self.enable_iket):
++                        _iket.range_pop()
++                        _iket.range_push("epi_body")
+                     gated_tTR_tAcc = gated_tTR_tAcc_base[
+                         (None, None, None, None, None, acc_consumer_state.index)
+                     ]
+@@ -2526,213 +2592,284 @@ class Sm100W4A16GroupedGemmKernel:
+                             c_pipeline.producer_acquire()
+                         self.epilog_sync_barrier.arrive_and_wait()
+ 
+-                tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+-                tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
+-                tma_distance_to_boundary = work_tile.distance_to_boundary
++                # Each M tile of a work unit stores its own accumulator.
++                for unit_tile in cutlass.range_constexpr(
++                    0 if self.gated else self.m_tiles_per_unit
++                ):
++                    cta_coord_m = work_tile.cta_coord_m
++                    acc_idx = acc_consumer_state.index
++                    if cutlass.const_expr(self.m_tiles_per_unit > 1):
++                        cta_coord_m = cta_coord_m * self.m_tiles_per_unit + unit_tile
++                        acc_idx = acc_idx * self.m_tiles_per_unit + unit_tile
++                    bSG_gC = bSG_gC_partitioned[
++                        (
++                            None,
++                            None,
++                            None,
++                            cta_coord_m // cute.size(tiled_mma.thr_id.shape),
++                            0,
++                            0,
++                        )
++                    ]
++                    tma_store_offset_coord = (
++                        (work_tile.coord_n, 0)
++                        if cutlass.const_expr(self.c_layout.is_n_major_c())
++                        else (0, work_tile.coord_n)
++                    )
++                    bSG_gC = cute.make_tensor(
++                        (
++                            tma_store_offset_coord[0] + bSG_gC.iterator[0],
++                            tma_store_offset_coord[1] + bSG_gC.iterator[1],
++                        ),
++                        bSG_gC.layout,
++                    )
++                    tTR_gC = tTR_gC_partitioned[
++                        (
++                            None,
++                            None,
++                            None,
++                            None,
++                            None,
++                            cta_coord_m // cute.size(tiled_mma.thr_id.shape),
++                            0,
++                            0,
++                        )
++                    ]
++                    tTR_gC = cute.make_tensor(
++                        tTR_gC.iterator
++                        + (work_tile.coord_n * tensor_c.layout.stride[1]),
++                        tTR_gC.layout,
++                    )
++
++                    tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_idx)]
++                    if cutlass.const_expr(unit_tile == 0):
++                        # Wait for accumulator buffer full
++                        if cutlass.const_expr(self.enable_iket):
++                            _iket.range_push("epi_acc_wait")
++                        acc_pipeline.consumer_wait(acc_consumer_state)
++                        if cutlass.const_expr(self.enable_iket):
++                            _iket.range_pop()
++                            _iket.range_push("epi_body")
++                    bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
++
++                    tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
++                    tTR_gC = cute.group_modes(tTR_gC, 3, cute.rank(tTR_gC))
++                    tma_distance_to_boundary = work_tile.distance_to_boundary
+ 
+-                # Store accumulator to global memory in subtiles
+-                subtile_cnt = (
+-                    0
+-                    if cutlass.const_expr(self.gated)
+-                    else cutlass.min(
++                    # Store accumulator to global memory in subtiles
++                    subtile_cnt = cutlass.min(
+                         cute.size(tTR_tAcc.shape, mode=[3]), active_subtile_cnt
+                     )
+-                )
+-                for subtile_idx in cutlass.range(subtile_cnt):
+-                    # Load accumulator from tensor memory buffer to register
+-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+-                    if subtile_idx == subtile_cnt - 1:
+-                        cute.arch.fence_view_async_tmem_load()
+-                        with cute.arch.elect_one():
+-                            acc_pipeline.consumer_release(acc_consumer_state)
+-                        acc_consumer_state.advance()
+-
+-                    if cutlass.const_expr(self.fuse_activation):
+-                        alpha_f32 = cutlass.Float32(alpha_val)
+-                        acc_up = tTR_rAcc.load()
+-                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+-                            value = cute.arch.mul_packed_f32x2(
+-                                (acc_up[i], acc_up[i + 1]),
+-                                (alpha_f32, alpha_f32),
+-                            )
+-                            relu = (
+-                                cute.arch.fmax(value[0], cutlass.Float32(0.0)),
+-                                cute.arch.fmax(value[1], cutlass.Float32(0.0)),
+-                            )
+-                            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+-                                relu, relu
+-                            )
+-                    elif cutlass.const_expr(not self.use_fused_finalize):
+-                        alpha_f32 = cutlass.Float32(alpha_val)
+-                        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+-                            tTR_rAcc[i], tTR_rAcc[i + 1] = cute.arch.mul_packed_f32x2(
+-                                (tTR_rAcc[i], tTR_rAcc[i + 1]),
+-                                (alpha_f32, alpha_f32),
+-                            )
+-                    if cutlass.const_expr(self.use_fused_finalize):
+-                        finalize_thr_slice = m_thr_offset[
+-                            (None, None, None, subtile_idx)
+-                        ]
+-                        top_k = token_final_scales.shape[1]
+-                        finalize_scale_route = epi_tidx
+-                        finalize_scale_route_in_tile = (
+-                            subtile_idx * self.epi_tile_n + finalize_scale_route
+-                        )
+-                        if finalize_scale_route < self.epi_tile_n:
+-                            finalize_scale_permuted_row = (
+-                                work_tile.coord_n + finalize_scale_route_in_tile
+-                            )
+-                            finalize_scale_expanded_idx = permuted_idx_to_expanded_idx[
+-                                finalize_scale_permuted_row
+-                            ]
+-                            finalize_scale_safe_idx = cutlass.max(
+-                                finalize_scale_expanded_idx, cutlass.Int32(0)
+-                            )
+-                            finalize_scale_token_idx = finalize_scale_safe_idx // top_k
+-                            finalize_scale_topk_idx = finalize_scale_safe_idx % top_k
+-                            finalize_scale_is_valid = cutlass.Int32(
+-                                finalize_scale_route_in_tile
+-                                < work_tile.distance_to_boundary
+-                            )
+-                            finalize_token_scale = token_final_scales[
+-                                (
+-                                    finalize_scale_token_idx * finalize_scale_is_valid,
+-                                    finalize_scale_topk_idx,
++                    for subtile_idx in cutlass.range(subtile_cnt):
++                        # Load accumulator from tensor memory buffer to register
++                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
++                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
++                        # The unit's last TMEM load frees its accumulator stage.
++                        if cutlass.const_expr(unit_tile == self.m_tiles_per_unit - 1):
++                            if subtile_idx == subtile_cnt - 1:
++                                cute.arch.fence_view_async_tmem_load()
++                                with cute.arch.elect_one():
++                                    acc_pipeline.consumer_release(acc_consumer_state)
++                                acc_consumer_state.advance()
++
++                        if cutlass.const_expr(self.fuse_activation):
++                            alpha_f32 = cutlass.Float32(alpha_val)
++                            acc_up = tTR_rAcc.load()
++                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
++                                value = cute.arch.mul_packed_f32x2(
++                                    (acc_up[i], acc_up[i + 1]),
++                                    (alpha_f32, alpha_f32),
++                                )
++                                relu = (
++                                    cute.arch.fmax(value[0], cutlass.Float32(0.0)),
++                                    cute.arch.fmax(value[1], cutlass.Float32(0.0)),
+                                 )
++                                tTR_rAcc[i], tTR_rAcc[i + 1] = (
++                                    cute.arch.mul_packed_f32x2(relu, relu)
++                                )
++                        elif cutlass.const_expr(not self.use_fused_finalize):
++                            alpha_f32 = cutlass.Float32(alpha_val)
++                            for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
++                                tTR_rAcc[i], tTR_rAcc[i + 1] = (
++                                    cute.arch.mul_packed_f32x2(
++                                        (tTR_rAcc[i], tTR_rAcc[i + 1]),
++                                        (alpha_f32, alpha_f32),
++                                    )
++                                )
++                        if cutlass.const_expr(self.use_fused_finalize):
++                            finalize_thr_slice = m_thr_offset[
++                                (None, None, None, subtile_idx)
+                             ]
+-                            sFinalizeScale[finalize_scale_route] = (
+-                                cutlass.Float32(alpha_val)
+-                                * cutlass.Float32(finalize_token_scale)
+-                                * cutlass.Float32(finalize_scale_is_valid)
++                            top_k = token_final_scales.shape[1]
++                            finalize_scale_route = epi_tidx
++                            finalize_scale_route_in_tile = (
++                                subtile_idx * self.epi_tile_n + finalize_scale_route
+                             )
+-
+-                        cute.arch.fence_proxy("async.shared", space="cta")
+-                        self.epilog_sync_barrier.arrive_and_wait()
+-                        for i in cutlass.range(cute.size(tTR_rC), unroll_full=True):
+-                            finalize_route = finalize_thr_slice[(i)][1]
+-                            finalize_value = sFinalizeScale[
+-                                finalize_route % self.epi_tile_n
+-                            ] * cutlass.Float32(tTR_rAcc[i])
+-                            sFinalize[
+-                                (
+-                                    finalize_route % self.epi_tile_n,
+-                                    finalize_thr_slice[(i)][0],
++                            if finalize_scale_route < self.epi_tile_n:
++                                finalize_scale_permuted_row = (
++                                    work_tile.coord_n + finalize_scale_route_in_tile
++                                )
++                                finalize_scale_expanded_idx = (
++                                    permuted_idx_to_expanded_idx[
++                                        finalize_scale_permuted_row
++                                    ]
++                                )
++                                finalize_scale_safe_idx = cutlass.max(
++                                    finalize_scale_expanded_idx, cutlass.Int32(0)
++                                )
++                                finalize_scale_token_idx = (
++                                    finalize_scale_safe_idx // top_k
++                                )
++                                finalize_scale_topk_idx = (
++                                    finalize_scale_safe_idx % top_k
++                                )
++                                finalize_scale_is_valid = cutlass.Int32(
++                                    finalize_scale_route_in_tile
++                                    < work_tile.distance_to_boundary
++                                )
++                                finalize_token_scale = token_final_scales[
++                                    (
++                                        finalize_scale_token_idx
++                                        * finalize_scale_is_valid,
++                                        finalize_scale_topk_idx,
++                                    )
++                                ]
++                                sFinalizeScale[finalize_scale_route] = (
++                                    cutlass.Float32(alpha_val)
++                                    * cutlass.Float32(finalize_token_scale)
++                                    * cutlass.Float32(finalize_scale_is_valid)
+                                 )
+-                            ] = self.c_dtype(finalize_value)
+ 
+-                        cute.arch.fence_proxy("async.shared", space="cta")
+-                        self.epilog_sync_barrier.arrive_and_wait()
++                            cute.arch.fence_proxy("async.shared", space="cta")
++                            self.epilog_sync_barrier.arrive_and_wait()
++                            for i in cutlass.range(cute.size(tTR_rC), unroll_full=True):
++                                finalize_route = finalize_thr_slice[(i)][1]
++                                finalize_value = sFinalizeScale[
++                                    finalize_route % self.epi_tile_n
++                                ] * cutlass.Float32(tTR_rAcc[i])
++                                sFinalize[
++                                    (
++                                        finalize_route % self.epi_tile_n,
++                                        finalize_thr_slice[(i)][0],
++                                    )
++                                ] = self.c_dtype(finalize_value)
+ 
+-                        reduce_route = epi_tidx
+-                        reduce_route_in_tile = (
+-                            subtile_idx * self.epi_tile_n + reduce_route
+-                        )
+-                        if (
+-                            reduce_route < self.epi_tile_n
+-                            and reduce_route_in_tile < work_tile.distance_to_boundary
+-                        ):
+-                            reduce_permuted_row = (
+-                                work_tile.coord_n + reduce_route_in_tile
+-                            )
+-                            reduce_expanded_idx = permuted_idx_to_expanded_idx[
+-                                reduce_permuted_row
+-                            ]
+-                            reduce_token_idx = reduce_expanded_idx // top_k
+-                            hidden_base = (
+-                                work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
++                            cute.arch.fence_proxy("async.shared", space="cta")
++                            self.epilog_sync_barrier.arrive_and_wait()
++
++                            reduce_route = epi_tidx
++                            reduce_route_in_tile = (
++                                subtile_idx * self.epi_tile_n + reduce_route
+                             )
+-                            valid_elements = cutlass.Int64(self.cta_tile_shape_mnk[0])
+-                            if cutlass.const_expr(not self.m_cluster_aligned):
+-                                valid_elements = (
+-                                    cutlass.Int64(final_output.shape[0]) - hidden_base
+-                                )
+                             if (
+-                                cutlass.const_expr(self.m_cluster_aligned)
+-                                or valid_elements > 0
++                                reduce_route < self.epi_tile_n
++                                and reduce_route_in_tile
++                                < work_tile.distance_to_boundary
+                             ):
+-                                scatter_out = cute.domain_offset(
+-                                    (hidden_base, reduce_token_idx, 0), final_output
++                                reduce_permuted_row = (
++                                    work_tile.coord_n + reduce_route_in_tile
+                                 )
+-                                copy_elements = cutlass.Int32(
++                                reduce_expanded_idx = permuted_idx_to_expanded_idx[
++                                    reduce_permuted_row
++                                ]
++                                reduce_token_idx = reduce_expanded_idx // top_k
++                                hidden_base = cta_coord_m * self.cta_tile_shape_mnk[0]
++                                valid_elements = cutlass.Int64(
+                                     self.cta_tile_shape_mnk[0]
+                                 )
+                                 if cutlass.const_expr(not self.m_cluster_aligned):
++                                    valid_elements = (
++                                        cutlass.Int64(final_output.shape[0])
++                                        - hidden_base
++                                    )
++                                if (
++                                    cutlass.const_expr(self.m_cluster_aligned)
++                                    or valid_elements > 0
++                                ):
++                                    scatter_out = cute.domain_offset(
++                                        (hidden_base, reduce_token_idx, 0), final_output
++                                    )
+                                     copy_elements = cutlass.Int32(
+-                                        cutlass.min(
+-                                            cutlass.Int64(self.cta_tile_shape_mnk[0]),
+-                                            valid_elements,
++                                        self.cta_tile_shape_mnk[0]
++                                    )
++                                    if cutlass.const_expr(not self.m_cluster_aligned):
++                                        copy_elements = cutlass.Int32(
++                                            cutlass.min(
++                                                cutlass.Int64(
++                                                    self.cta_tile_shape_mnk[0]
++                                                ),
++                                                valid_elements,
++                                            )
+                                         )
++                                    blk_reduce_bf16(
++                                        scatter_out,
++                                        sFinalize[(reduce_route, None)],
++                                        copy_elements * (self.c_dtype.width // 8),
+                                     )
+-                                blk_reduce_bf16(
+-                                    scatter_out,
+-                                    sFinalize[(reduce_route, None)],
+-                                    copy_elements * (self.c_dtype.width // 8),
+-                                )
+ 
+-                        cute.arch.cp_async_bulk_commit_group()
+-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+-                        self.epilog_sync_barrier.arrive_and_wait()
+-                    elif (
+-                        tma_distance_to_boundary >= (subtile_idx + 1) * self.epi_tile_n
+-                    ):
+-                        # Convert to C type
+-                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+-                        acc_vec = acc_vec.to(self.c_dtype)
+-                        tRS_rC.store(acc_vec)
+-                        num_prev_subtiles += 1
+-                        c_buffer = num_prev_subtiles % self.num_c_stage
+-                        # Store C to shared memory
+-                        cute.copy(
+-                            tiled_copy_r2s,
+-                            tRS_rC,
+-                            tRS_sC[(None, None, None, c_buffer)],
+-                        )
+-                        # Fence and barrier to make sure shared memory store is visible to TMA store
+-                        cute.arch.fence_proxy(
+-                            "async.shared",
+-                            space="cta",
+-                        )
+-                        self.epilog_sync_barrier.arrive_and_wait()
+-                        # TMA store C to global memory
+-                        if warp_idx == self.epilog_warp_id[0]:
++                            cute.arch.cp_async_bulk_commit_group()
++                            cute.arch.cp_async_bulk_wait_group(0, read=True)
++                            self.epilog_sync_barrier.arrive_and_wait()
++                        elif (
++                            tma_distance_to_boundary
++                            >= (subtile_idx + 1) * self.epi_tile_n
++                        ):
++                            # Convert to C type
++                            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
++                            acc_vec = acc_vec.to(self.c_dtype)
++                            tRS_rC.store(acc_vec)
++                            num_prev_subtiles += 1
++                            c_buffer = num_prev_subtiles % self.num_c_stage
++                            # Store C to shared memory
+                             cute.copy(
+-                                tma_atom_c,
+-                                bSG_sC[(None, c_buffer)],
+-                                bSG_gC[(None, subtile_idx)],
++                                tiled_copy_r2s,
++                                tRS_rC,
++                                tRS_sC[(None, None, None, c_buffer)],
+                             )
+-                            c_pipeline.producer_commit()
+-                            c_pipeline.producer_acquire()
+-                        self.epilog_sync_barrier.arrive_and_wait()
+-                    else:
+-                        # Convert to C type
+-                        acc_vec = tTR_rAcc.load()
+-                        acc_vec = acc_vec.to(self.c_dtype)
+-                        tTR_rC.store(acc_vec)
+-                        # Compute predicate for SIMT store
+-                        tCpC = cute.make_rmem_tensor(
+-                            cute.make_layout(tTR_rC.shape),
+-                            cutlass.Boolean,
+-                        )
+-                        m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
+-                        for i in cutlass.range(cute.size(tCpC), unroll_full=True):
+-                            tCpC[i] = (
+-                                m_thr_slice[(i)][1] < work_tile.distance_to_boundary
++                            # Fence and barrier to make sure shared memory store is visible to TMA store
++                            cute.arch.fence_proxy(
++                                "async.shared",
++                                space="cta",
+                             )
+-                            if cutlass.const_expr(not self.m_cluster_aligned):
++                            self.epilog_sync_barrier.arrive_and_wait()
++                            # TMA store C to global memory
++                            if warp_idx == self.epilog_warp_id[0]:
++                                cute.copy(
++                                    tma_atom_c,
++                                    bSG_sC[(None, c_buffer)],
++                                    bSG_gC[(None, subtile_idx)],
++                                )
++                                c_pipeline.producer_commit()
++                                c_pipeline.producer_acquire()
++                            self.epilog_sync_barrier.arrive_and_wait()
++                        else:
++                            # Convert to C type
++                            acc_vec = tTR_rAcc.load()
++                            acc_vec = acc_vec.to(self.c_dtype)
++                            tTR_rC.store(acc_vec)
++                            # Compute predicate for SIMT store
++                            tCpC = cute.make_rmem_tensor(
++                                cute.make_layout(tTR_rC.shape),
++                                cutlass.Boolean,
++                            )
++                            m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
++                            for i in cutlass.range(cute.size(tCpC), unroll_full=True):
+                                 tCpC[i] = (
+-                                    m_thr_slice[(i)][0]
+-                                    + work_tile.cta_coord_m
+-                                    * self.cta_tile_shape_mnk_c[0]
+-                                    < cute.size(tensor_c.shape[0])
+-                                ) and tCpC[i]
+-                        # Store C to global memory
+-                        cute.copy(
+-                            simt_atom,
+-                            cute.flatten(tTR_rC),
+-                            cute.flatten(tTR_gC[(None, None, None, subtile_idx)]),
+-                            pred=cute.flatten(tCpC),
+-                        )
++                                    m_thr_slice[(i)][1] < work_tile.distance_to_boundary
++                                )
++                                if cutlass.const_expr(not self.m_cluster_aligned):
++                                    tCpC[i] = (
++                                        m_thr_slice[(i)][0]
++                                        + cta_coord_m * self.cta_tile_shape_mnk_c[0]
++                                        < cute.size(tensor_c.shape[0])
++                                    ) and tCpC[i]
++                            # Store C to global memory
++                            cute.copy(
++                                simt_atom,
++                                cute.flatten(tTR_rC),
++                                cute.flatten(tTR_gC[(None, None, None, subtile_idx)]),
++                                pred=cute.flatten(tCpC),
++                            )
+                 if cutlass.const_expr(self.enable_iket):
+                     _iket.range_pop()
+                 # Advance to next tile
+@@ -2895,6 +3032,7 @@ class Sm100W4A16GroupedGemmKernel:
+         smem_buffer_align_bytes: int,
+         use_fused_finalize: bool,
+         use_clc_scheduler: bool,
++        m_tiles_per_unit: int = 1,
+     ) -> tuple[int, int, int, int, int, int, int]:
+         """Fit the load, transform, accumulator, and epilogue pipelines."""
+         # Compute tmem columns required for accumulator
+@@ -2967,6 +3105,19 @@ class Sm100W4A16GroupedGemmKernel:
+         num_tmem_acc_cols = cute.round_up(
+             accumulator_stage_count * num_tmem_acc_col_per_stage, 4
+         )
++        if m_tiles_per_unit > 1:
++            # Each stage packs one accumulator per M tile of a work unit.
++            num_tmem_acc_cols = cute.round_up(
++                utils.get_num_tmem_alloc_cols(
++                    tiled_mma.make_fragment_C(
++                        cute.append(
++                            acc_shape, accumulator_stage_count * m_tiles_per_unit
++                        )
++                    ),
++                    False,
++                ),
++                4,
++            )
+ 
+         transform2mma_stage_count_a_source_tmem_potential = (
+             (sm100_tmem_columns - num_tmem_acc_cols) // num_tmem_cols_a_per_stage
+diff --git a/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py b/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py
+index 6ff55162b..1265f3308 100644
+--- a/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py
++++ b/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py
+@@ -79,7 +79,9 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
+         smem_buffer_align_bytes,
+         use_fused_finalize,
+         use_clc_scheduler,
++        m_tiles_per_unit=1,
+     ):
++        assert m_tiles_per_unit == 1
+         assert mma_tiler_mnk in (
+             (128, 32, 256),
+             (128, 64, 256),
+diff --git a/tests/moe/test_cute_dsl_fused_moe.py b/tests/moe/test_cute_dsl_fused_moe.py
+index 7ad846781..f214418e8 100644
+--- a/tests/moe/test_cute_dsl_fused_moe.py
++++ b/tests/moe/test_cute_dsl_fused_moe.py
+@@ -2059,6 +2059,23 @@ class TestCuteDslMoeW4A16:
+             pytest.param(128, 32, ((128, 32, 64), (1, 1), True), id="1cta"),
+             pytest.param(256, 64, ((256, 64, 128), (2, 1), True), id="2cta"),
+             pytest.param(256, 128, ((128, 128, 256), (2, 1), True), id="cluster2"),
++            # One K stage per tile groups several M tiles into each work unit.
++            pytest.param(512, 16, ((128, 16, 256), (1, 1), True), id="1cta-units4"),
++            pytest.param(768, 32, ((128, 32, 256), (1, 1), True), id="1cta-units3"),
++            pytest.param(512, 64, ((128, 64, 256), (1, 1), True), id="1cta-units2"),
++            pytest.param(
++                1024, 16, ((128, 16, 256), (2, 1), True), id="cluster2-units4"
++            ),
++            # More units than SMs: CTAs reuse both accumulator stages across units.
++            pytest.param(
++                131072, 16, ((128, 16, 256), (1, 1), True), id="1cta-units4-multiwave"
++            ),
++            pytest.param(
++                131072,
++                16,
++                ((128, 16, 256), (2, 1), True),
++                id="cluster2-units4-multiwave",
++            ),
+         ],
+     )
+     def test_weight_scale_mapping(
+@@ -2135,57 +2152,114 @@ class TestCuteDslMoeW4A16:
+         assert_w4a16_bits(output, expected)
+ 
+     @pytest.mark.parametrize(
+-        "route_tile,gemm1_tactic,gemm2_tactic",
++        "route_tile,gemm1_tactic,gemm2_tactic,hidden_size,intermediate_size",
+         [
+             pytest.param(
+                 8,
+                 ((128, 8, 256), (2, 1), True),
+                 ((128, 8, 256), (2, 1), True),
++                256,
++                512,
+                 id="route8-1cta",
+             ),
+             pytest.param(
+                 16,
+                 ((128, 16, 256), (1, 1), True),
+                 ((128, 16, 256), (1, 1), True),
++                256,
++                512,
+                 id="route16-1cta",
+             ),
+             pytest.param(
+                 32,
+                 ((128, 32, 256), (2, 1), True),
+                 ((256, 32, 256), (2, 1), True),
++                256,
++                512,
+                 id="route32-mixed",
+             ),
+             pytest.param(
+                 64,
+                 ((256, 64, 256), (2, 1), True),
+                 ((128, 64, 256), (2, 1), True),
++                256,
++                512,
+                 id="route64-mixed",
+             ),
+             pytest.param(
+                 128,
+                 ((256, 128, 256), (2, 1), True),
+                 ((256, 128, 256), (2, 1), True),
++                256,
++                512,
+                 id="route128-2cta",
+             ),
+             pytest.param(
+                 192,
+                 ((256, 192, 256), (2, 1), True),
+                 ((256, 192, 256), (2, 1), True),
++                256,
++                512,
+                 id="route192",
+             ),
++            # Short GEMM2 K loops group several M tiles into each work unit.
++            pytest.param(
++                8,
++                ((128, 8, 256), (1, 1), True),
++                ((128, 8, 256), (1, 1), True),
++                1024,
++                256,
++                id="route8-1cta-units4",
++            ),
++            pytest.param(
++                16,
++                ((128, 16, 256), (2, 1), True),
++                ((128, 16, 256), (2, 1), True),
++                1024,
++                256,
++                id="route16-cluster2-units4",
++            ),
++            pytest.param(
++                16,
++                ((128, 16, 256), (1, 1), True),
++                ((128, 16, 256), (1, 1), True),
++                768,
++                384,
++                id="route16-1cta-ktail-units2",
++            ),
++            pytest.param(
++                32,
++                ((128, 32, 256), (1, 1), True),
++                ((128, 32, 256), (1, 1), True),
++                1536,
++                256,
++                id="route32-1cta-units4",
++            ),
++            pytest.param(
++                64,
++                ((128, 64, 256), (1, 1), True),
++                ((128, 64, 256), (1, 1), True),
++                512,
++                256,
++                id="route64-1cta-units2",
++            ),
+         ],
+     )
+     @pytest.mark.parametrize(
+         "half_tile_tail", [False, True], ids=["tail1", "tail-half-plus1"]
+     )
+     @pytest.mark.parametrize("top_k", [2, 3])
++    @pytest.mark.parametrize("enable_pdl", [False, True], ids=["pdl-off", "pdl-on"])
+     def test_route_tile_boundary_accuracy(
+         self,
+         route_tile: int,
+         gemm1_tactic: tuple,
+         gemm2_tactic: tuple,
++        hidden_size: int,
++        intermediate_size: int,
+         half_tile_tail: bool,
+         top_k: int,
++        enable_pdl: bool,
+     ):
+         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
+             launch_w4a16_moe,
+@@ -2193,7 +2267,6 @@ class TestCuteDslMoeW4A16:
+         from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
+ 
+         num_tokens = route_tile + (route_tile // 2 + 1 if half_tile_tail else 1)
+-        hidden_size, intermediate_size = 256, 512
+         num_experts = 8
+         tensors = create_moe_tensors(
+             num_tokens=num_tokens,
+@@ -2228,7 +2301,7 @@ class TestCuteDslMoeW4A16:
+                 (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
+             ),
+             use_fused_finalize=False,
+-            enable_pdl=False,
++            enable_pdl=enable_pdl,
+             activation_type=ActivationType.Swiglu,
+             tactic=tactic,
+         )

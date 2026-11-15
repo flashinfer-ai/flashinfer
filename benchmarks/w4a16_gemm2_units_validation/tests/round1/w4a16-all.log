@@ -1,0 +1,179 @@
+........................................................................ [ 28%]
+........................................................................ [ 57%]
+........................................................................ [ 86%]
+..................................                                       [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/anyio/pytest_plugin.py:14
+  /usr/local/lib/python3.12/dist-packages/anyio/pytest_plugin.py:14: PytestRemovedIn10Warning: _pytest.python.CallSpec2 has been renamed to CallSpec.
+  The CallSpec2 alias will be removed in pytest 10.
+  Update imports to use CallSpec instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#callspec2-renamed
+    from _pytest.python import CallSpec2
+
+tests/conftest.py:30
+tests/conftest.py:30
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/conftest.py:30: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+
+flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py:3616
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py:3616: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    c_layout: utils.LayoutEnum,
+
+flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:3014
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:3014: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    c_layout: utils.LayoutEnum,
+
+flashinfer/fused_moe/cute_dsl/hopper/utils.py:29
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/hopper/utils.py:29: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    a_layout: utils.LayoutEnum,
+
+flashinfer/fused_moe/cute_dsl/hopper/utils.py:31
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/hopper/utils.py:31: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    b_layout: utils.LayoutEnum,
+
+flashinfer/fused_moe/cute_dsl/hopper/utils.py:34
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/hopper/utils.py:34: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    c_layout: utils.LayoutEnum,
+
+flashinfer/fused_moe/cute_dsl/hopper/contiguous_grouped_gemm_finalize_fusion.py:968
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/hopper/contiguous_grouped_gemm_finalize_fusion.py:968: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    a_layout: utils.LayoutEnum,
+
+flashinfer/fused_moe/cute_dsl/hopper/contiguous_grouped_gemm_finalize_fusion.py:970
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/hopper/contiguous_grouped_gemm_finalize_fusion.py:970: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    b_layout: utils.LayoutEnum,
+
+flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py:427
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py:427: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    epi_layout: utils.LayoutEnum,
+
+flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py:2391
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/gemm/kernels/grouped_gemm_masked_blackwell.py:2391: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    c_layout: utils.LayoutEnum,
+
+flashinfer/gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py:103
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/gemm/kernels/cute_dsl/low_latency_blockscaled_gemm.py:103: DeprecationWarning: cutlass.utils.smem_allocator.get_smem_capacity_in_bytes is deprecated; use cutlass.memory.get_smem_capacity_in_bytes instead. It will be removed in a future release.
+    _SMEM_CAPACITY_BYTES = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
+
+flashinfer/gemm/kernels/grouped_gemm_masked_rubin.py:218
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/gemm/kernels/grouped_gemm_masked_rubin.py:218: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    c_layout: utils.LayoutEnum,
+
+flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py:95
+flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py:95
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py:95: DeprecationWarning: cutlass.utils.TensorMapUpdateMode is deprecated; use cutlass.tensor_utils.TensorMapUpdateMode instead. It will be removed in a future release.
+    from cutlass.utils import TensorMapManager, TensorMapUpdateMode
+
+flashinfer/gdn_kernels/delta_rule_dsl/collective_store_tma.py:6
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/gdn_kernels/delta_rule_dsl/collective_store_tma.py:6: DeprecationWarning: cutlass.utils.tensormap_manager.TensorMapUpdateMode is deprecated; use cutlass.tensor_utils.TensorMapUpdateMode instead. It will be removed in a future release.
+    from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
+
+flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py:55
+flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py:55
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/gdn_kernels/blackwell/gated_delta_net_cp_prefill.py:55: DeprecationWarning: cutlass.utils.TensorMapUpdateMode is deprecated; use cutlass.tensor_utils.TensorMapUpdateMode instead. It will be removed in a future release.
+    from cutlass.utils import TensorMapManager, TensorMapUpdateMode
+
+flashinfer/cute_dsl/availability.py:136
+flashinfer/cute_dsl/availability.py:136
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/cute_dsl/availability.py:136: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:1013: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:1014: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:1015: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    self.c_layout = utils.LayoutEnum.from_tensor(c)
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:1018: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
+
+tests/moe/test_cute_dsl_fused_moe.py: 676 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/_mlir_helpers/op.py:493: DeprecationWarning: make_trivial_tiled_mma with ab_dtype is deprecated, use the overload with separate a_dtype and b_dtype instead
+    res_or_list = opFunc(*args, **kwargs, loc=loc)
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:3025: DeprecationWarning: cutlass.utils.tmem_allocator.get_num_tmem_alloc_cols is deprecated; use cutlass.memory.get_num_tmem_alloc_cols instead. It will be removed in a future release.
+    num_tmem_acc_col_per_stage = utils.get_num_tmem_alloc_cols(tCtAcc_stage1, True)
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:3071: DeprecationWarning: cutlass.utils.smem_allocator.get_smem_capacity_in_bytes is deprecated; use cutlass.memory.get_smem_capacity_in_bytes instead. It will be removed in a future release.
+    smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+
+tests/moe/test_cute_dsl_fused_moe.py: 208 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:3227: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/static_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    tile_sched_params = utils.PersistentTileSchedulerParams(
+
+tests/moe/test_cute_dsl_fused_moe.py: 3744 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/_mlir_helpers/op.py:493: DeprecationWarning: FastDivmodDivisor is deprecated in favor of cute.FastDivmodDivisorV2 / cute.fast_divmod_create_divisor_v2. V2 additionally carries the scalar divisor across kernel boundaries (2 MLIR values per object instead of 1), so '.divisor' is readable inside kernels; arithmetic (divmod, //, %) is unchanged.
+    res_or_list = opFunc(*args, **kwargs, loc=loc)
+
+tests/moe/test_cute_dsl_fused_moe.py: 1664 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/utils/static_persistent_tile_scheduler.py:312: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/static_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    new_params = PersistentTileSchedulerParams(*(tuple(obj_list)), loc=self._loc)
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:1261: DeprecationWarning: cutlass.utils.smem_allocator.SmemAllocator is deprecated; use cutlass.memory.SmemAllocator instead. It will be removed in a future release.
+    smem = utils.SmemAllocator()
+
+tests/moe/test_cute_dsl_fused_moe.py: 338 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:1359: DeprecationWarning: cutlass.utils.tmem_allocator.TmemAllocator is deprecated; use cutlass.memory.TmemAllocator instead. It will be removed in a future release.
+    tmem = utils.TmemAllocator(
+
+tests/moe/test_cute_dsl_fused_moe.py: 4056 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/memory/tmem.py:420: DeprecationWarning: cutlass.utils.tmem_allocator.TmemAllocator is deprecated; use cutlass.memory.TmemAllocator instead. It will be removed in a future release.
+    return type(self)(
+
+tests/moe/test_cute_dsl_fused_moe.py: 208 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/utils/static_persistent_tile_scheduler.py:818: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/static_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    return StaticPersistentRuntimeTileScheduler(
+
+tests/moe/test_cute_dsl_fused_moe.py: 624 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/utils/static_persistent_tile_scheduler.py:763: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/static_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    return StaticPersistentRuntimeTileScheduler(
+
+tests/moe/test_cute_dsl_fused_moe.py: 24 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:3095: DeprecationWarning: cutlass.utils.tmem_allocator.get_num_tmem_alloc_cols is deprecated; use cutlass.memory.get_num_tmem_alloc_cols instead. It will be removed in a future release.
+    utils.get_num_tmem_alloc_cols(
+
+tests/moe/test_cute_dsl_fused_moe.py: 130 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16_kernel.py:3220: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/dynamic_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+
+tests/moe/test_cute_dsl_fused_moe.py: 260 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/utils/dynamic_persistent_tile_scheduler.py:232: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/dynamic_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    new_params = ClcDynamicPersistentTileSchedulerParams(
+
+tests/moe/test_cute_dsl_fused_moe.py: 130 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/utils/dynamic_persistent_tile_scheduler.py:421: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/dynamic_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    return ClcDynamicPersistentTileScheduler(
+
+tests/moe/test_cute_dsl_fused_moe.py: 1170 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/utils/dynamic_persistent_tile_scheduler.py:359: DeprecationWarning: Migrated to examples/CuTeDSL/helpers/dynamic_persistent_tile_scheduler.py (BSD-3). The wheel copy will be removed in a future release.
+    return ClcDynamicPersistentTileScheduler(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================= slowest 15 durations =============================
+49.75s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslFusedMoeFunctional::test_with_autotune[False-w4a16]
+42.33s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslFusedMoeFunctional::test_with_autotune[True-w4a16]
+31.00s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoEWrapper::test_wrapper_with_autotune[situ-w4a16]
+30.41s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoEWrapper::test_wrapper_with_autotune[geglu-tanh-w4a16]
+28.26s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoEWrapper::test_wrapper_with_autotune[swiglu-w4a16]
+26.55s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoEWrapper::test_wrapper_with_autotune[relu2-w4a16]
+8.31s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoeW4A16::test_weight_scale_update[False-False]
+3.54s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoeW4A16::test_unfused_batch_invariant[tactic0]
+3.16s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslFusedMoeFunctional::test_finalize_handles_cluster_padding_and_partial_tiles[w4a16-ordinary]
+3.04s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoeW4A16::test_unfused_batch_invariant[tactic1]
+2.46s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoeW4A16::test_weight_scale_update[True-False]
+2.38s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoeW4A16::test_route_tile_boundary_accuracy[pdl-on-2-tail1-route32-1cta-units4]
+2.17s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoeW4A16::test_route_tile_boundary_accuracy[pdl-off-2-tail1-route64-1cta-units2]
+2.15s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslFusedMoeFunctional::test_numerical_accuracy[3-256-128-1-w4a16-1024-2048]
+2.15s call     tests/moe/test_cute_dsl_fused_moe.py::TestCuteDslMoeW4A16::test_route_tile_boundary_accuracy[pdl-on-2-tail1-route64-1cta-units2]
+250 passed, 663 deselected, 15619 warnings in 368.56s (0:06:08)
+exit=0

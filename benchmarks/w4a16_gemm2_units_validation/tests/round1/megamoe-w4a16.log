@@ -1,0 +1,132 @@
+..............................FF                                         [100%]
+=================================== FAILURES ===================================
+_________ test_nvfp4_w4a16_fp32_scales_and_routing[runtime-epi_warps] __________
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1534: in test_nvfp4_w4a16_fp32_scales_and_routing
+    assert_w4a16_bits(actual, expected)
+tests/moe_ep/test_helpers/w4a16_reference.py:548: in assert_w4a16_bits
+    torch.testing.assert_close(
+E   AssertionError: Tensor-likes are not equal!
+E   
+E   Mismatched elements: 4 / 1024 (0.4%)
+E   Greatest absolute difference: 214 at index (1, 0)
+E   Greatest relative difference: 0.013917422853410244 at index (0, 0)
+____ test_nvfp4_w4a16_fp32_scales_and_routing[runtime-reuse_dispatch_warps] ____
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1534: in test_nvfp4_w4a16_fp32_scales_and_routing
+    assert_w4a16_bits(actual, expected)
+tests/moe_ep/test_helpers/w4a16_reference.py:548: in assert_w4a16_bits
+    torch.testing.assert_close(
+E   AssertionError: Tensor-likes are not equal!
+E   
+E   Mismatched elements: 4 / 1024 (0.4%)
+E   Greatest absolute difference: 214 at index (1, 0)
+E   Greatest relative difference: 0.013917422853410244 at index (0, 0)
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/anyio/pytest_plugin.py:14
+  /usr/local/lib/python3.12/dist-packages/anyio/pytest_plugin.py:14: PytestRemovedIn10Warning: _pytest.python.CallSpec2 has been renamed to CallSpec.
+  The CallSpec2 alias will be removed in pytest 10.
+  Update imports to use CallSpec instead.
+  See https://docs.pytest.org/en/stable/deprecations.html#callspec2-renamed
+    from _pytest.python import CallSpec2
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:42
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:42: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:150
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:150: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:200
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:200: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:252
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:252: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:315
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:315: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:514
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:514: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:867
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:867: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:974
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:974: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1035
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1035: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1055
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1055: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1416
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1416: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1543
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1543: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1645
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1645: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1687
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1687: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1935
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py:1935: PytestUnknownMarkWarning: Unknown pytest.mark.arch_blackwell - is this a typo?  You can register custom marks to avoid this warning - for details, see https://docs.pytest.org/en/stable/how-to/mark.html
+    @pytest.mark.arch_blackwell
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 144 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py:395: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    mixed.a_major_mode = mixed.b_major_mode = tcgen05.OperandMajorMode.K
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 144 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py:396: DeprecationWarning: cutlass.utils.LayoutEnum is deprecated; use cutlass.tensor_utils.LayoutEnum instead. It will be removed in a future release.
+    mixed.c_layout = utils.LayoutEnum.from_tensor(output_tensor)
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 336 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/_mlir_helpers/op.py:493: DeprecationWarning: make_trivial_tiled_mma with ab_dtype is deprecated, use the overload with separate a_dtype and b_dtype instead
+    res_or_list = opFunc(*args, **kwargs, loc=loc)
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 336 warnings
+  <string>:11: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 144 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py:96: DeprecationWarning: cutlass.utils.tmem_allocator.get_num_tmem_alloc_cols is deprecated; use cutlass.memory.get_num_tmem_alloc_cols instead. It will be removed in a future release.
+    cols_per_acc = utils.get_num_tmem_alloc_cols(acc_one, True)
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 48 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py:465: DeprecationWarning: cutlass.utils.smem_allocator.get_smem_capacity_in_bytes is deprecated; use cutlass.memory.get_smem_capacity_in_bytes instead. It will be removed in a future release.
+    capacity = utils.get_smem_capacity_in_bytes("sm_100")
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 48 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py:1192: DeprecationWarning: cutlass.utils.smem_allocator.SmemAllocator is deprecated; use cutlass.memory.SmemAllocator instead. It will be removed in a future release.
+    smem = utils.SmemAllocator()
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 48 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/flashinfer/flashinfer/moe_ep/cute_dsl/megamoe/bf16_nvfp4/megamoe_kernel.py:1240: DeprecationWarning: cutlass.utils.tmem_allocator.TmemAllocator is deprecated; use cutlass.memory.TmemAllocator instead. It will be removed in a future release.
+    tmem = utils.TmemAllocator(
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 576 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/memory/tmem.py:420: DeprecationWarning: cutlass.utils.tmem_allocator.TmemAllocator is deprecated; use cutlass.memory.TmemAllocator instead. It will be removed in a future release.
+    return type(self)(
+
+tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py: 192 warnings
+  /scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/venv/lib/python3.12/site-packages/nvidia_cutlass_dsl/dsl_packages/cutlass/_mlir_helpers/op.py:493: DeprecationWarning: FastDivmodDivisor is deprecated in favor of cute.FastDivmodDivisorV2 / cute.fast_divmod_create_divisor_v2. V2 additionally carries the scalar divisor across kernel boundaries (2 MLIR values per object instead of 1), so '.divisor' is readable inside kernels; arithmetic (divmod, //, %) is unchanged.
+    res_or_list = opFunc(*args, **kwargs, loc=loc)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 failed, 30 passed, 111 deselected, 2032 warnings in 146.93s (0:02:26)
+exit=1

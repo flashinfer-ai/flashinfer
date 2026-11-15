@@ -1,0 +1,4 @@
+PASSED tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py::test_nvfp4_w4a16_fp32_scales_and_routing[config-epi_warps]
+PASSED tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py::test_nvfp4_w4a16_fp32_scales_and_routing[config-reuse_dispatch_warps]
+FAILED tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py::test_nvfp4_w4a16_fp32_scales_and_routing[runtime-epi_warps]
+FAILED tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py::test_nvfp4_w4a16_fp32_scales_and_routing[runtime-reuse_dispatch_warps]

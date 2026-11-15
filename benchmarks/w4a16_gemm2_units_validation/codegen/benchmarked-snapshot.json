@@ -1,0 +1,209 @@
+{
+  "tree": "/scratch/ziangli/flashinfer-w4a16-tp-low-concurrency/campaign/caac1/candidate/flashinfer",
+  "kernels": [
+    {
+      "stem": "fc1-swiglu-tp8-c11-fc1",
+      "case": "fc1-swiglu-tp8-c11",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 15,
+        "tile_info": 1,
+        "acc_cols": 64,
+        "a_cols": 384
+      },
+      "ptx_sha256": "d431ed1e9cd9071948ae2b8fe193a3199d4302b091129bb4a8fa622d777e699b",
+      "sass_sha256": "50c77b3877e69fd71d7edc72f3c934c866fe922fdd800e9b83267938899959bf",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:96 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[2]:16 CONSTANT[0]:1648 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc1-swiglu-tp8-2cta-fc1",
+      "case": "fc1-swiglu-tp8-2cta",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 4,
+        "trans": 2,
+        "acc": 2,
+        "c": 4,
+        "tile_info": 1,
+        "acc_cols": 256,
+        "a_cols": 256
+      },
+      "ptx_sha256": "2faa941d93f705ed4d2e972810b6567ace40af9f4818961d47acddebc91bfc02",
+      "sass_sha256": "ba484e79d66ecabf6f144f4a6edb5588a423d7459415e1ca0e693f228e0f9873",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeMNK2_0: REG:96 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[2]:16 CONSTANT[0]:1648 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc1-relu2-n3u-c11-fc1",
+      "case": "fc1-relu2-n3u-c11",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 7,
+        "tile_info": 1,
+        "acc_cols": 64,
+        "a_cols": 384
+      },
+      "ptx_sha256": "f9c3d6487e965543a502409e8541e1d3b2a5a229bc69f2d826f4596cb2b00b15",
+      "sass_sha256": "e5ca16ff1dd5d5e339438b6dc4a9ef278ef4b75ea1acfad00d6a025fd72eb0a6",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:96 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[2]:16 CONSTANT[0]:1648 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-ep-k2048-c11-fc2",
+      "case": "fc2-ep-k2048-c11",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 7,
+        "tile_info": 3,
+        "acc_cols": 64,
+        "a_cols": 384
+      },
+      "ptx_sha256": "546edf83c1fb7724ad0b8cd6c6d8193fddcbaca296bdd30f3bbd06a2918b7eda",
+      "sass_sha256": "e961aa1c055bdaafbf6b4b8ba25b128f96d411e15bb35cbc5348ec3721493936",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-v41f-k576-c11-fc2",
+      "case": "fc2-v41f-k576-c11",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 7,
+        "tile_info": 3,
+        "acc_cols": 64,
+        "a_cols": 384
+      },
+      "ptx_sha256": "d2ce9779b5fe4b3a13d81a73bef74f97798333c6ad1fec06ebcac5fe4ad4757b",
+      "sass_sha256": "7f54e4979ba4d691747fb8768acfdfb7f72395a4471b09e9d1690921349fa44c",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-n3u-k640-c21-fc2",
+      "case": "fc2-n3u-k640-c21",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 7,
+        "tile_info": 3,
+        "acc_cols": 64,
+        "a_cols": 384
+      },
+      "ptx_sha256": "18a9f5f3c43f9fc84a2aa90ba246480c532cfdcc0c3dc4f3cb76d28396ad5abd",
+      "sass_sha256": "08a62dc90c837229b2437730867b3edcea9b4790bc65301e4a4d2a88814bc659",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-tp8-k256-2cta-fc2",
+      "case": "fc2-tp8-k256-2cta",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 9,
+        "trans": 3,
+        "acc": 2,
+        "c": 2,
+        "tile_info": 3,
+        "acc_cols": 64,
+        "a_cols": 384
+      },
+      "ptx_sha256": "24ec26fa5cf469e7e268974abcd7a8da33bc39d984cf5ad83659712583f2a810",
+      "sass_sha256": "d7f2edb559063ffe0d76698578558579a4f7169f1e7c0f7161411ef3d0e1f705",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____MMAAtom_ThrID21_ShapeMNK2_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-tp8-k256-route128-fc2",
+      "case": "fc2-tp8-k256-route128",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 2,
+        "trans": 2,
+        "acc": 2,
+        "c": 7,
+        "tile_info": 3,
+        "acc_cols": 256,
+        "a_cols": 256
+      },
+      "ptx_sha256": "de2d6ed9ddb003848c5e19b2e9b8ccfaa0bad5f4e4b88b800aa4c933568b6686",
+      "sass_sha256": "72f6d194ac45a59027b6b352cddaedb1732a5c68468ff5454a60f8315f94bcaa",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-relu2-finalize-k512-fc2",
+      "case": "fc2-relu2-finalize-k512",
+      "m_tiles_per_unit": 1,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 1,
+        "tile_info": 3,
+        "acc_cols": 64,
+        "a_cols": 384
+      },
+      "ptx_sha256": "09719e492fd2c543208fb19c47c14dcbe27f6bc43a33c81b3b2676cba93fef6a",
+      "sass_sha256": "b2177082772b237dfeaab0f178a049e3bb4fcb3f8504fdad04a378138855b701",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1712 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-tp8-k256-c11-grouped-fc2",
+      "case": "fc2-tp8-k256-c11-grouped",
+      "m_tiles_per_unit": 4,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 7,
+        "tile_info": 3,
+        "acc_cols": 128,
+        "a_cols": 384
+      },
+      "ptx_sha256": "9a1afa9a038d4a0366f7d4e186e6080712f0cb833b891439c55ca65876370731",
+      "sass_sha256": "d65828ade03850f0a650960f463780da0e61886298fc0b7c9e39b5bcf45057f1",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-k3-k384-c11-grouped-fc2",
+      "case": "fc2-k3-k384-c11-grouped",
+      "m_tiles_per_unit": 2,
+      "stages": {
+        "load": 9,
+        "trans": 3,
+        "acc": 2,
+        "c": 5,
+        "tile_info": 3,
+        "acc_cols": 32,
+        "a_cols": 384
+      },
+      "ptx_sha256": "3debaaee4b02b0fa05aeb7027b1ab90fe52f1322f9fdc9aa8e2ef65f0b50936b",
+      "sass_sha256": "d45179544395f169be7b1c324fab3da3f5120dadebe71113b69ccb91aae78927",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    },
+    {
+      "stem": "fc2-tp8-k256-c21-grouped-fc2",
+      "case": "fc2-tp8-k256-c21-grouped",
+      "m_tiles_per_unit": 4,
+      "stages": {
+        "load": 7,
+        "trans": 3,
+        "acc": 2,
+        "c": 7,
+        "tile_info": 3,
+        "acc_cols": 128,
+        "a_cols": 384
+      },
+      "ptx_sha256": "0d237695c35606ac937d966b167c21d72a5e3270b7d8c0275e742e42ddec5956",
+      "sass_sha256": "990436b585886d2348a6dc9184794e4003c82eb082e02b24ee73f4c5c58c10e5",
+      "resources": "Resource usage: Common: GLOBAL:0 Function kernel_cutlass_kernel_flashinferfused_moecute_dslblackwellmoe_w4a16_kernelSm100W4A16GroupedGemmKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK1_0: REG:128 STACK:0 SHARED:1024 LOCAL:0 CONSTANT[0]:1680 TEXTURE:0 SURFACE:0 SAMPLER:0"
+    }
+  ]
+}
