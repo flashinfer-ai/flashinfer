@@ -189,6 +189,14 @@ class TllmGenFmhaRunnerCache {
   };
 };
 
+// Per-thread config batch size for the following generation launches (0 = off); see
+// TllmGenFmhaRunnerParams::mConfigBatchSize.
+static thread_local int64_t fmha_config_batch_size = 0;
+
+void trtllm_fmha_set_config_batch(int64_t batch_size) {
+  fmha_config_batch_size = batch_size > 0 ? batch_size : 0;
+}
+
 void trtllm_paged_attention_launcher(
     void* out, void* out_scale_factor, void* query, void* key_cache, void* value_cache,
     void* workspace_buffer, void* multi_ctas_kv_counter_buffer, int64_t multi_ctas_kv_counter_size,
@@ -261,6 +269,7 @@ void trtllm_paged_attention_launcher(
   runner_params.mNumHeadsKv = num_kv_heads;
   runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
   runner_params.mBatchSize = batch_size;
+  runner_params.mConfigBatchSize = static_cast<int>(fmha_config_batch_size);
   runner_params.mMaxSeqLenKv = max_kv_len;
   runner_params.mMaxNumPagesPerSeqKv = max_num_blocks_per_seq;
   runner_params.mNumTokensPerPage = page_size;
@@ -1411,6 +1420,7 @@ namespace trtllm_cubin_loader {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fmha_set_config_batch, trtllm_fmha_set_config_batch);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(_mla_plan_head_divisor, mla_plan_head_divisor);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,

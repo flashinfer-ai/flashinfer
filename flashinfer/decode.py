@@ -645,6 +645,33 @@ def get_trtllm_gen_fmha_module():
     return op
 
 
+def trtllm_fmha_set_config_batch(batch_size: int) -> None:
+    r"""Set the config batch size of the following trtllm-gen generation launches.
+
+    With ``batch_size = n > 0``, a :func:`trtllm_batch_decode_with_kv_cache` launch
+    (``backend="trtllm-gen"``, one query token per request, not MLA) of more than
+    ``n`` requests selects its kernel, its KV split and its split-KV reduction as for
+    a batch of ``n`` requests, and runs that configuration over all of its requests
+    in one launch. For a batch of ``k * n`` requests, the output is bitwise identical
+    to launching each block of ``n`` consecutive requests separately, with one launch
+    instead of ``k``. Launch a partial last block separately to keep that identity.
+    ``0`` (the default) turns it off; launches of at most ``n`` requests, MLA and
+    multi-token launches ignore it.
+
+    The setting belongs to the calling host thread and applies to the launches that
+    thread makes until it is changed. When the selected kernel reduces split-KV
+    partial results in global memory, they are stored for every request of the
+    launch; if the workspace cannot hold them, the launch runs without the config
+    batch (correct output, but the configuration of the whole batch).
+
+    Parameters
+    ----------
+    batch_size : int
+        Requests per configured block; ``0`` turns the config batch off.
+    """
+    get_trtllm_gen_fmha_module().trtllm_fmha_set_config_batch(int(batch_size))
+
+
 # Granularity (in tokens) at which the cudnn decode backend rounds up
 # max_seq_len_kv / block-table width, so one built cuDNN graph serves many steps.
 # 2048 is also where cudnn-frontend 1.30's placement starts ranking its FROST decode

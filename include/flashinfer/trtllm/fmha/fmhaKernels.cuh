@@ -415,8 +415,10 @@ class TllmGenFmhaKernel {
     // length, using the effective attention window and the selected kernel's KV step. The split
     // cannot see device-side KV lengths, so a loose bound can still oversplit short requests.
     // If it cannot launch, select again from a fresh state with the one-wave rule (the stock path).
-    bool const allowMultiWaveKvSplit =
-        multiWaveKvSplitMode() != 0 && params.mMultiCtasKvScratchBytes > 0;
+    // A config-batch launch keeps the one-wave selection of mConfigBatchSize requests.
+    bool const allowMultiWaveKvSplit = multiWaveKvSplitMode() != 0 &&
+                                       params.mMultiCtasKvScratchBytes > 0 &&
+                                       !usesConfigBatch(params);
     if (!allowMultiWaveKvSplit || !tryRun(params, /*allowMultiWaveKvSplit=*/true)) {
       tryRun(params, /*allowMultiWaveKvSplit=*/false);
     }
@@ -435,9 +437,27 @@ class TllmGenFmhaKernel {
     return mode;
   }
 
+  // Whether a launch takes the config-batch mode (see RunnerParams::mConfigBatchSize).
+  bool usesConfigBatch(RunnerParams const& params) const {
+    return params.mConfigBatchSize > 0 && params.mConfigBatchSize < params.mBatchSize &&
+           isGenerationKernel(params.mKernelType) && params.mMaxSeqLenQ == 1 &&
+           !isMlaGenKernel(params);
+  }
+
   // One kernel selection and launch; all selection state is built here. Returns false before any
   // launch only if a multi-wave split cannot launch; with allowMultiWaveKvSplit false it launches.
-  bool tryRun(RunnerParams const& params, bool allowMultiWaveKvSplit) const {
+  bool tryRun(RunnerParams const& launchParams, bool allowMultiWaveKvSplit) const {
+    // Config-batch mode (see RunnerParams::mConfigBatchSize): select the kernel and compute the
+    // grid for a batch of mConfigBatchSize requests; only the grid Z (requests), the kernel
+    // arguments and the partial-result scratch use the real batch.
+    RunnerParams configParams;
+    bool const useConfigBatch = usesConfigBatch(launchParams) && !allowMultiWaveKvSplit;
+    if (useConfigBatch) {
+      configParams = launchParams;
+      configParams.mBatchSize = launchParams.mConfigBatchSize;
+      configParams.mSumOfSeqLensQ = launchParams.mConfigBatchSize;
+    }
+    RunnerParams const& params = useConfigBatch ? configParams : launchParams;
     SelectKernelParams selectKernelParams{params};
     CtaLaunchParams ctaLaunchParams{};
 
@@ -465,10 +485,24 @@ class TllmGenFmhaKernel {
     if (!fitsMultiCtasKvScratch(params, kernelMeta, ctaLaunchParams, totalNumCtas)) {
       return false;
     }
+    // The grid of mConfigBatchSize requests, over all requests (grid Z is the request index).
+    int const configNumCtasZ = ctaLaunchParams.mNumCtasZ;
+    if (useConfigBatch) {
+      FLASHINFER_CHECK(configNumCtasZ == params.mBatchSize && !isMlaGenKernel(params),
+                       "trtllm-gen config batch: unexpected grid Z %d for %d requests",
+                       configNumCtasZ, params.mBatchSize);
+      ctaLaunchParams.mNumCtasZ = launchParams.mBatchSize;
+      // Partial results in global memory are indexed by the real request index, so they are
+      // sized for the whole grid; without room for them, launch without the config batch.
+      if (!fitsConfigBatchPartials(launchParams, kernelMeta, selectKernelParams, ctaLaunchParams,
+                                   totalNumCtas)) {
+        return tryRun(withoutConfigBatch(launchParams), allowMultiWaveKvSplit);
+      }
+    }
 
     // Prepare the kernel parameters.
     auto kernelParams =
-        KernelParams::setKernelParams(params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ,
+        KernelParams::setKernelParams(launchParams, kernelMeta, ctaLaunchParams.mMaxNumCtasQ,
                                       ctaLaunchParams.mMaxNumCtasKv, totalNumCtas);
 
     // Override SageAttention parameters.
@@ -489,7 +523,7 @@ class TllmGenFmhaKernel {
     void* kernelParamsList[] = {&kernelParams};
     CUlaunchAttribute launch_attribute[4] = {};
     CUlaunchConfig launch_config{};
-    buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
+    buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, launchParams);
 
     // Debug info.
     IKL_LOG_DEBUG(
@@ -515,14 +549,18 @@ class TllmGenFmhaKernel {
     if (isCgaSmemReduction(selectKernelParams.mMultiCtasKvMode)) {
       int maxActiveClusters = 1;
       cuErrCheck(cuOccupancyMaxActiveClusters(&maxActiveClusters, func, &launch_config));
+      // Config-batch mode keeps the reduction of a launch of mConfigBatchSize requests.
       if (maxActiveClusters * ctaLaunchParams.mClusterDimX <
-          ctaLaunchParams.mNumCtasX * ctaLaunchParams.mNumCtasY * ctaLaunchParams.mNumCtasZ) {
+          ctaLaunchParams.mNumCtasX * ctaLaunchParams.mNumCtasY * configNumCtasZ) {
         selectKernelParams.mForceGmemReduction = true;
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::GmemReduction;
         selectKernel(params, selectKernelParams);
         std::tie(func, kernelMeta) = loadKernel(params, selectKernelParams);
         computeCtaAndClusterConfig(ctaLaunchParams, params, kernelMeta, selectKernelParams,
                                    allowMultiWaveKvSplit);
+        if (useConfigBatch) {
+          ctaLaunchParams.mNumCtasZ = launchParams.mBatchSize;
+        }
         if (allowMultiWaveKvSplit && selectKernelParams.mSelectNewKernel) {
           return false;
         }
@@ -532,12 +570,17 @@ class TllmGenFmhaKernel {
         if (!fitsMultiCtasKvScratch(params, kernelMeta, ctaLaunchParams, totalNumCtas)) {
           return false;
         }
+        if (useConfigBatch && !fitsConfigBatchPartials(launchParams, kernelMeta, selectKernelParams,
+                                                       ctaLaunchParams, totalNumCtas)) {
+          return tryRun(withoutConfigBatch(launchParams), allowMultiWaveKvSplit);
+        }
         // Rebuild kernelParams: setKernelParams uses kernelMeta (TMA descriptors, tile shapes)
         // which changed when switching from CgaSmemReduction to GmemReduction kernel.
         kernelParams =
-            KernelParams::setKernelParams(params, kernelMeta, ctaLaunchParams.mMaxNumCtasQ,
+            KernelParams::setKernelParams(launchParams, kernelMeta, ctaLaunchParams.mMaxNumCtasQ,
                                           ctaLaunchParams.mMaxNumCtasKv, totalNumCtas);
-        buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams, params);
+        buildLaunchConfig(launch_config, launch_attribute, kernelMeta, ctaLaunchParams,
+                          launchParams);
         setNonPortableClusterIfNeeded(func, ctaLaunchParams);
       }
     }
@@ -550,14 +593,15 @@ class TllmGenFmhaKernel {
     cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
     // Run the separate reduction kernel if needed.
-    tensorrt_llm::kernels::runFmhaReduction(kernelMeta, kernelParams, params.mMultiProcessorCount,
-                                            params.enable_pdl, params.stream);
+    tensorrt_llm::kernels::runFmhaReduction(kernelMeta, kernelParams,
+                                            launchParams.mMultiProcessorCount,
+                                            launchParams.enable_pdl, launchParams.stream);
 
-    if (params.lsePtr != nullptr) {
-      FLASHINFER_CUDA_CHECK(
-          flashinfer::ComputeLSEFromMD(params.softmaxStatsPtr, params.lsePtr, params.mSumOfSeqLensQ,
-                                       params.mNumHeadsQ, params.lseStrideTokens, params.lseScale,
-                                       params.lseStrideHeads, params.enable_pdl, params.stream));
+    if (launchParams.lsePtr != nullptr) {
+      FLASHINFER_CUDA_CHECK(flashinfer::ComputeLSEFromMD(
+          launchParams.softmaxStatsPtr, launchParams.lsePtr, launchParams.mSumOfSeqLensQ,
+          launchParams.mNumHeadsQ, launchParams.lseStrideTokens, launchParams.lseScale,
+          launchParams.lseStrideHeads, launchParams.enable_pdl, launchParams.stream));
     }
     return true;
   }
@@ -574,6 +618,33 @@ class TllmGenFmhaKernel {
     if (!ctaLaunchParams.mMultiWaveKvSplit) {
       return true;
     }
+    return fitsPartialsOfGrid(params, kernelMeta, ctaLaunchParams, totalNumCtas);
+  }
+
+  // Config-batch mode: a one-wave grid of mConfigBatchSize requests runs over all requests, so
+  // when the kernel reduces partial results through global memory they are sized for every CTA
+  // of the launched grid (totalNumCtas). False if the scratch cannot hold them.
+  bool fitsConfigBatchPartials(RunnerParams const& launchParams, KernelMeta const& kernelMeta,
+                               SelectKernelParams const& selectKernelParams,
+                               CtaLaunchParams const& ctaLaunchParams,
+                               int32_t& totalNumCtas) const {
+    if (!isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
+        !isGmemReductionWithSeparateKernel(selectKernelParams.mMultiCtasKvMode)) {
+      return true;
+    }
+    return fitsPartialsOfGrid(launchParams, kernelMeta, ctaLaunchParams, totalNumCtas);
+  }
+
+  static RunnerParams withoutConfigBatch(RunnerParams const& params) {
+    RunnerParams plain = params;
+    plain.mConfigBatchSize = 0;
+    return plain;
+  }
+
+  // Partial stats and partial O for every CTA of the grid; totalNumCtas = that CTA count.
+  bool fitsPartialsOfGrid(RunnerParams const& params, KernelMeta const& kernelMeta,
+                          CtaLaunchParams const& ctaLaunchParams, int32_t& totalNumCtas) const {
+    totalNumCtas = 0;
     // acc *= x; false on int64 overflow. Written without __builtin_mul_overflow, which
     // MSVC does not provide; the operands are non-negative counts.
     auto const mulTo = [](int64_t& acc, int64_t x) {
