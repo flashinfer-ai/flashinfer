@@ -598,7 +598,7 @@
                 int _vec_load_0eb401y[4];
 #endif // moe-select
                 {
-#if (MOE_SW_SF_LANE_WORD == 1 && MOE_SW_RETURN_INT8 == 0) // moe-select
+#if (MOE_SW_SF_LANE_WORD == 1 && (MOE_SW_RETURN_INT8 == 0 && MOE_SW_ACT_FP4 == 0)) // moe-select
                     const int4* _ivptr_aa124c = reinterpret_cast<const int4*>(cd_src_i32 + (cd_body_word + (unsigned long long)cd_q * 4) + 0);
                     int4 _ivld_f69e0dy_15;
                     _ivld_f69e0dy_15 = *_ivptr_aa124c;
@@ -614,7 +614,7 @@
                 int _vec_load_2e47dfx[1];
                 {
                     _vec_load_2e47dfx[0] = *reinterpret_cast<const int*>(cd_src_i32 + (cd_body_word + 17 + (unsigned long long)cd_q * 2) + 0);
-#elif MOE_SW_SF_LANE_WORD == 1 // moe-select
+#elif (MOE_SW_SF_LANE_WORD == 1 && MOE_SW_ACT_FP4 == 0) // moe-select
                     const int4* _ivptr_73b0a1 = reinterpret_cast<const int4*>(cd_src_i32 + (cd_q_base + (unsigned long long)MOE_X_303705a5a6 + (unsigned long long)cd_blk * 16 + (unsigned long long)cd_q * 4) + 0);
                     int4 _ivld_f69e0dy_15;
                     _ivld_f69e0dy_15 = *_ivptr_73b0a1;
