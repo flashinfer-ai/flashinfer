@@ -290,7 +290,16 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
   }
   long long bgi0 =
       (long long)n * a_stride_p0 + (long long)bt0 * a_stride_p1 + (long long)h * a_stride_p2;
+#if __CUDA_ARCH__ == 900
   ba0[0] = (float)a[bgi0];
+#else
+  unsigned int bwa0[1];
+  {
+    uint32_t _bf16_bits_4;
+    _bf16_bits_4 = *reinterpret_cast<const uint16_t*>(a + bgi0);
+    bwa0[0] = _bf16_bits_4;
+  }
+#endif
   ba0[1] = dt_bias[h];
   ba0[2] = A_log[h];
   if (read_state_slot_valid != 0) {
@@ -453,19 +462,20 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sum_k_pair_x = _fma_2;
     sum_k_pair_y = _fma_3;
     float sum_k = sum_k_pair_x + sum_k_pair_y;
+    float _warp_reduce_20 = sum_k;
 #else
     float2 k_pair0 = make_float2(bk0[0], bk0[1]);
     float2 k_pair1 = make_float2(bk0[2], bk0[3]);
     float2 sum_k_pair = fma_f32x2_rn_ftz(k_pair0, k_pair0, make_float2(0.0f, 0.0f));
     sum_k_pair = fma_f32x2_rn_ftz(k_pair1, k_pair1, sum_k_pair);
     float sum_k = sum_k_pair.x + sum_k_pair.y;
+    float _warp_reduce_21 = sum_k;
 #endif
-    float _warp_reduce_20 = sum_k;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
+#if __CUDA_ARCH__ == 900
       _warp_reduce_20 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_20, offset);
     float k_norm = rsqrtf(_warp_reduce_20 + 1e-06f);
-#if __CUDA_ARCH__ == 900
     float k_norm_pair_x = k_norm;
     float k_norm_pair_y = k_norm;
     float _mul_0;
@@ -485,6 +495,8 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sK[bm0 * 128 + k_col0 + 2] = k_pair1_x;
     sK[bm0 * 128 + k_col0 + 3] = k_pair1_y;
 #else
+      _warp_reduce_21 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_21, offset);
+    float k_norm = rsqrtf(_warp_reduce_21 + 1e-06f);
     float2 k_norm_pair = make_float2(k_norm, k_norm);
     k_pair0 = mul_f32x2(k_pair0, k_norm_pair);
     k_pair1 = mul_f32x2(k_pair1, k_norm_pair);
@@ -497,9 +509,15 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sV[bm0 * 64 + v_col] = bv0[0];
     sV[bm0 * 64 + v_col + 1] = bv0[1];
     if (lane_local == 0) {
+#if __CUDA_ARCH__ == 900
       float _exp_22 = __expf(-bb0[0]);
       float _rcp_21 = approx_rcp(1.0f + _exp_22);
       sBeta[bm0] = _rcp_21;
+#else
+      float _exp_23 = __expf(-bb0[0]);
+      float _rcp_22 = approx_rcp(1.0f + _exp_23);
+      sBeta[bm0] = _rcp_22;
+#endif
     }
 #if __CUDA_ARCH__ == 900
     float k_pair0_x_0 = bk1[0];
@@ -534,12 +552,12 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     float2 sum_k_pair_2 = fma_f32x2_rn_ftz(k_pair0_0, k_pair0_0, make_float2(0.0f, 0.0f));
     sum_k_pair_2 = fma_f32x2_rn_ftz(k_pair1_1, k_pair1_1, sum_k_pair_2);
     float sum_k_3 = sum_k_pair_2.x + sum_k_pair_2.y;
-    float _warp_reduce_23 = sum_k_3;
+    float _warp_reduce_24 = sum_k_3;
 #endif
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-      _warp_reduce_23 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_23, offset);
 #if __CUDA_ARCH__ == 900
+      _warp_reduce_23 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_23, offset);
     float k_norm_7 = rsqrtf(_warp_reduce_23 + 1e-06f);
     float k_norm_pair_x_8 = k_norm_7;
     float k_norm_pair_y_9 = k_norm_7;
@@ -563,7 +581,8 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sV[bm1 * 64 + v_col_10] = bv1[0];
     sV[bm1 * 64 + v_col_10 + 1] = bv1[1];
 #else
-    float k_norm_4 = rsqrtf(_warp_reduce_23 + 1e-06f);
+      _warp_reduce_24 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_24, offset);
+    float k_norm_4 = rsqrtf(_warp_reduce_24 + 1e-06f);
     float2 k_norm_pair_5 = make_float2(k_norm_4, k_norm_4);
     k_pair0_0 = mul_f32x2(k_pair0_0, k_norm_pair_5);
     k_pair1_1 = mul_f32x2(k_pair1_1, k_norm_pair_5);
@@ -576,9 +595,15 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sV[bm1 * 64 + v_col_6 + 1] = bv1[1];
 #endif
     if (lane_local == 0) {
+#if __CUDA_ARCH__ == 900
       float _exp_25 = __expf(-bb1[0]);
       float _rcp_24 = approx_rcp(1.0f + _exp_25);
       sBeta[bm1] = _rcp_24;
+#else
+      float _exp_26 = __expf(-bb1[0]);
+      float _rcp_25 = approx_rcp(1.0f + _exp_26);
+      sBeta[bm1] = _rcp_25;
+#endif
     }
 #if __CUDA_ARCH__ == 900
     float k_pair0_x_11 = bk2[0];
@@ -613,12 +638,12 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     float2 sum_k_pair_9 = fma_f32x2_rn_ftz(k_pair0_7, k_pair0_7, make_float2(0.0f, 0.0f));
     sum_k_pair_9 = fma_f32x2_rn_ftz(k_pair1_8, k_pair1_8, sum_k_pair_9);
     float sum_k_10 = sum_k_pair_9.x + sum_k_pair_9.y;
-    float _warp_reduce_26 = sum_k_10;
+    float _warp_reduce_27 = sum_k_10;
 #endif
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-      _warp_reduce_26 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_26, offset);
 #if __CUDA_ARCH__ == 900
+      _warp_reduce_26 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_26, offset);
     float k_norm_18 = rsqrtf(_warp_reduce_26 + 1e-06f);
     float k_norm_pair_x_19 = k_norm_18;
     float k_norm_pair_y_20 = k_norm_18;
@@ -642,7 +667,8 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sV[bm2 * 64 + v_col_21] = bv2[0];
     sV[bm2 * 64 + v_col_21 + 1] = bv2[1];
 #else
-    float k_norm_11 = rsqrtf(_warp_reduce_26 + 1e-06f);
+      _warp_reduce_27 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_27, offset);
+    float k_norm_11 = rsqrtf(_warp_reduce_27 + 1e-06f);
     float2 k_norm_pair_12 = make_float2(k_norm_11, k_norm_11);
     k_pair0_7 = mul_f32x2(k_pair0_7, k_norm_pair_12);
     k_pair1_8 = mul_f32x2(k_pair1_8, k_norm_pair_12);
@@ -655,9 +681,15 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sV[bm2 * 64 + v_col_13 + 1] = bv2[1];
 #endif
     if (lane_local == 0) {
+#if __CUDA_ARCH__ == 900
       float _exp_28 = __expf(-bb2[0]);
       float _rcp_27 = approx_rcp(1.0f + _exp_28);
       sBeta[bm2] = _rcp_27;
+#else
+      float _exp_29 = __expf(-bb2[0]);
+      float _rcp_28 = approx_rcp(1.0f + _exp_29);
+      sBeta[bm2] = _rcp_28;
+#endif
     }
 #if __CUDA_ARCH__ == 900
     float q_raw_pair0_x = bq0[0];
@@ -691,17 +723,18 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sum_q_pair_x = _fma_14;
     sum_q_pair_y = _fma_15;
     float sum_q = sum_q_pair_x + sum_q_pair_y;
+    float _warp_reduce_29 = sum_q;
 #else
     float2 sum_q_pair = fma_f32x2_rn_ftz(q_raw_pair0, q_raw_pair0, make_float2(0.0f, 0.0f));
     sum_q_pair = fma_f32x2_rn_ftz(q_raw_pair1, q_raw_pair1, sum_q_pair);
     float sum_q = sum_q_pair.x + sum_q_pair.y;
+    float _warp_reduce_30 = sum_q;
 #endif
-    float _warp_reduce_29 = sum_q;
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
+#if __CUDA_ARCH__ == 900
       _warp_reduce_29 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_29, offset);
     float _rsqrt_0 = rsqrtf(_warp_reduce_29 + 1e-06f);
-#if __CUDA_ARCH__ == 900
     float q_norm_pair_x = _rsqrt_0 * scale;
     float q_norm_pair_y = _rsqrt_0 * scale;
     float _mul_12;
@@ -721,6 +754,8 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sQ[bt0 * 128 + k_col0 + 2] = q_pair1_x;
     sQ[bt0 * 128 + k_col0 + 3] = q_pair1_y;
 #else
+      _warp_reduce_30 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_30, offset);
+    float _rsqrt_0 = rsqrtf(_warp_reduce_30 + 1e-06f);
     float2 q_norm_pair = make_float2(_rsqrt_0 * scale, _rsqrt_0 * scale);
     float2 q_pair0;
     asm("mul.rn.ftz.f32x2 %0, %1, %2;"
@@ -736,8 +771,42 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
     sQ[bt0 * 128 + k_col0 + 1] = q_pair0.y;
     sQ[bt0 * 128 + k_col0 + 2] = q_pair1.x;
     sQ[bt0 * 128 + k_col0 + 3] = q_pair1.y;
+    float da[2];
+#pragma unroll
+    for (int _pair = 0; _pair < 1; _pair++) {
+      asm volatile(
+          "{\n\t"
+          "shl.b32 %0, %2, 16;\n\t"
+          "and.b32 %1, %2, 0xffff0000;\n\t"
+          "}\n"
+          : "=f"((&da[_pair * 2])[0]), "=f"((&da[_pair * 2])[1])
+          : "r"(bwa0[_pair]));
+    }
+    ba0[0] = da[0];
+    float x = ba0[0] + ba0[1];
+    float softplus_x = x;
+    if (x <= 20.0f) {
+      float _exp_32 = __expf(x);
+      float _log2_31;
+      asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_31) : "f"(1.0f + _exp_32));
+      softplus_x = _log2_31 * 0.6931472f;
+    }
+    float a_log = ba0[2];
+    {
+      float _scope_arg_0 = a_log;
+      asm volatile(
+          "{\n.reg .f32 _cake_f0;\nmov.f32 _cake_f0, %0;\nmov.f32 _cake_f0, _cake_f0;\nmov.f32 %0, "
+          "_cake_f0;\n}"
+          : "+f"(_scope_arg_0)
+          :);
+      a_log = _scope_arg_0;
+    }
+    float _exp_33 = __expf(a_log);
+    float g_log = (-_exp_33) * softplus_x;
+    float alpha = __expf(g_log);
 #endif
     if (lane_local == 0) {
+#if __CUDA_ARCH__ == 900
       float x = ba0[0] + ba0[1];
       float softplus_x = x;
       if (x <= 20.0f) {
@@ -750,6 +819,9 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
       float g_log = (-_exp_32) * softplus_x;
       float _exp_33 = __expf(g_log);
       sAlpha[bt0] = _exp_33;
+#else
+      sAlpha[bt0] = alpha;
+#endif
       if (use_ssm_state_indices != 0) {
         sSsm[bt0] = ssm_state_indices[(long long)n * ssm_state_indices_stride_p0 +
                                       (long long)bt0 * ssm_state_indices_stride_p1];
@@ -4138,13 +4210,20 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
         if (u == 0) {
           long long out_index = (long long)n * out_stride_p0 + (long long)t * out_stride_p1 +
                                 (long long)h * out_stride_p2 + (long long)row0;
-          {
-            uint2 _pk2;
-            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-            _pk[0] = __floats2bfloat162_rn(o4[0 + 0], o4[0 + 1]);
-            _pk[1] = __floats2bfloat162_rn(o4[0 + 2], o4[0 + 3]);
-            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out))[out_index]) = _pk2;
+          unsigned int _packed_0[2];
+#pragma unroll
+          for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 =
+                __float22bfloat162_rn(make_float2(o4[_lp * 2 + 0], o4[_lp * 2 + 1 + 0]));
+            _packed_0[_lp] = *(uint32_t*)&_bf2;
           }
+#pragma unroll
+          for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 =
+                __float22bfloat162_rn(make_float2(o4[_lp * 2 + 2], o4[_lp * 2 + 1 + 2]));
+            _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+          }
+          reinterpret_cast<int2*>(out + (out_index))[0] = reinterpret_cast<int2*>(_packed_0)[0];
         }
         int ssm_slot = sSsm[t];
         int snap_valid =
@@ -8041,13 +8120,20 @@ __global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_gdp_27eb88
         if (u == 0) {
           long long out_index_1 = (long long)n * out_stride_p0 + (long long)t_1 * out_stride_p1 +
                                   (long long)h * out_stride_p2 + (long long)row0;
-          {
-            uint2 _pk2;
-            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-            _pk[0] = __floats2bfloat162_rn(o4[0 + 0], o4[0 + 1]);
-            _pk[1] = __floats2bfloat162_rn(o4[0 + 2], o4[0 + 3]);
-            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(out))[out_index_1]) = _pk2;
+          unsigned int _packed_1[2];
+#pragma unroll
+          for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 =
+                __float22bfloat162_rn(make_float2(o4[_lp * 2 + 0], o4[_lp * 2 + 1 + 0]));
+            _packed_1[_lp] = *(uint32_t*)&_bf2;
           }
+#pragma unroll
+          for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 =
+                __float22bfloat162_rn(make_float2(o4[_lp * 2 + 2], o4[_lp * 2 + 1 + 2]));
+            _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+          }
+          reinterpret_cast<int2*>(out + (out_index_1))[0] = reinterpret_cast<int2*>(_packed_1)[0];
         }
       }
     }

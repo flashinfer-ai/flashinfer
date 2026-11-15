@@ -61,7 +61,7 @@ from .fmha_resources import (
     TmemStatsDoneResource,
     TmemPPrefixReadyResource,
 )
-from .vc_resources import SmemMuResource
+from .vc_attention.vc_resources import SmemMuResource
 
 
 @dataclass(kw_only=True)
@@ -1464,7 +1464,13 @@ def create_mma_task(
         pb1: SmemPResource | None = None,
         smu: SmemMuResource | None = None,
     ) -> None:
-        """Interleave paired QK/PV while retaining each K slice for both Qs."""
+        """Interleave paired QK/PV while retaining each K slice for both Qs.
+
+        MXFP8 Q/K keeps each QK step's scales in the tail of the peer S tile.
+        S1 is acquired before the first query tile's step and S0 again before
+        the second's, which waits for softmax0's load of S0. The repeated
+        acquire of a stage not yet committed passes at once.
+        """
         # VC-Attention: the current tile's mean-operand descriptor, waited and
         # released in lockstep with V.
         mu_state: dict[str, Any] = {"desc": None}
@@ -1542,6 +1548,8 @@ def create_mma_task(
                         vd0.acquire()
                     sp0.acquire()
                     seed_scores(sp0)
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp1.acquire()
                 qk_mma_slice(
                     sp0, desc_q0_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1555,6 +1563,8 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd1.acquire()
                     sp1.acquire()
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp0.acquire()
                     seed_scores(sp1)
                 qk_mma_slice(
                     sp1, desc_q1_base, desc_k, FmhaStage.Head, head_dim_stage_idx
@@ -1627,6 +1637,8 @@ def create_mma_task(
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp0.acquire()
                     seed_scores(sp0)
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp1.acquire()
                     k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
                     sp0.commit()
                     # Wait for the mean operand here, off the QK issue path.
@@ -1642,6 +1654,8 @@ def create_mma_task(
                     )
                     to.commit()
                     sp1.acquire()
+                    if smem_q.cfg.use_mxfp8_qk:
+                        sp0.acquire()
                     seed_scores(sp1)
                     qk_mma_stages(
                         sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
@@ -2480,11 +2494,11 @@ def create_softmax_task(
     sage_scaling = tmem_sp.cfg.sage_score_scaling
     if use_sage and not p_in_smem:
         raise ValueError("Sage attention requires P in SMEM")
-    if sage_transport is SageKTransport.RING and sage_scaling is SageScoreScaling.BLOCK:
+    if sage_transport is SageKTransport.SMEM and sage_scaling is SageScoreScaling.BLOCK:
         # The P pass of block-scaled scores reuses the max pass's words, and
         # a ring stage is released after the max pass.
         raise ValueError("block-scaled Sage scores load their sfK words directly")
-    if sage_transport is SageKTransport.RING:
+    if sage_transport is SageKTransport.SMEM:
         if smem_sage_k is None:
             raise ValueError("this Sage K block size requires the sfK ring")
         src.append(smem_sage_k)
@@ -2513,6 +2527,7 @@ def create_softmax_task(
             "prev_sum": None,
             "row_sum": None,
             "sums": None,
+            "k_next": None,
             "kept": None,
         }
 
@@ -2606,7 +2621,8 @@ def create_softmax_task(
                 init = sp.vc_init_row_scale()
                 vc_row_scale, vc_state["prev_sum"] = init[0], init[1]
                 vc_state["sums"] = init[2]
-                vc_state["kept"] = init[-1]
+                vc_state["kept"] = init[3]
+                vc_state["k_next"] = init[4]
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
@@ -2625,7 +2641,7 @@ def create_softmax_task(
                 The global transport loads the words, so the wait hides their
                 latency; the ring transport waits for the load warp's stage and
                 returns its offset, read after the score wait."""
-                if sage_transport is SageKTransport.GLOBAL:
+                if sage_transport is SageKTransport.GMEM:
                     return sp.load_sage_k_words(
                         sage_k_first_atom=sage_k_first_atom, section=section
                     )
@@ -2637,7 +2653,7 @@ def create_softmax_task(
 
                 A ring stage's words are read after the score wait and the
                 stage is released after the max pass (``SmemSageKScalesResource``)."""
-                if sage_transport is SageKTransport.RING:
+                if sage_transport is SageKTransport.SMEM:
                     k_words = sp.read_staged_sage_k_words(sage_k_stage_words=k_words)
                 if sage_scaling is SageScoreScaling.BLOCK:
                     maxima = sp.sage_row_max(
@@ -2653,7 +2669,7 @@ def create_softmax_task(
                         sage_k_words=k_words,
                         section=section,
                     )
-                if sage_transport is SageKTransport.RING:
+                if sage_transport is SageKTransport.SMEM:
                     skr.release()
                 return maxima
 
@@ -2697,8 +2713,10 @@ def create_softmax_task(
                         section=FmhaStage.Loop,
                     )
                 elif vc_attention:
-                    old_row_max, row_max = sp.vc_compute_row_max(
-                        row_max=row_max, vc_row_scale=vc_row_scale
+                    old_row_max, row_max, vc_state["k_next"] = sp.vc_compute_row_max(
+                        row_max=row_max,
+                        vc_row_scale=vc_row_scale,
+                        vc_k_scale_next=vc_state["k_next"],
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
@@ -2987,7 +3005,9 @@ def create_softmax_task(
                 sp.wait()
                 if vc_attention:
                     old_row_max, row_max = sp.vc_fixed_dense_k_tail_masked_row_max(
-                        row_max=row_max, vc_row_scale=vc_row_scale
+                        row_max=row_max,
+                        vc_row_scale=vc_row_scale,
+                        vc_k_scale_next=vc_state["k_next"],
                     )
                 elif use_sage:
                     old_row_max, row_max = sage_row_max(
@@ -3085,7 +3105,7 @@ def create_softmax_task(
     ) -> None:
         softmax_schedule_body(sp, vec, seq, wq, None, pb, skr)
 
-    if p_in_smem and sage_transport is SageKTransport.RING:
+    if p_in_smem and sage_transport is SageKTransport.SMEM:
         captured_schedule = _schedule_with_work_queue(
             softmax_schedule_pb_skr,
             tmem_sp,

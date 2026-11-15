@@ -4,7 +4,7 @@ Design doc: ``docs/design_docs/autotuner_v2.md`` — read it before changing the
 store layout, the environment identity, or the attach semantics, and update it
 in the same PR if this file's behavior changes.
 
-This module owns *persistence only*: given an already-canonical lookup key
+This module owns managed persistence and its context controls. Given a canonical lookup key
 (the same ``str((custom_op, runner_class_name, profile, extras))`` string the
 :class:`~flashinfer.autotuner.AutoTuner` uses for its JSON config files), it
 stores one winner per key as one small JSON file under an
@@ -32,7 +32,7 @@ Design rules (kept deliberately minimal for the first version):
 
 The cache root defaults to ``FLASHINFER_CACHE_DIR/autotune`` and can be
 overridden with the ``FLASHINFER_AUTOTUNE_CACHE_DIR`` environment variable
-or ``autotune_v2(root=...)`` (always a directory, never a schema-bearing
+or ``autotune_v2(cache_root=...)`` (always a directory, never a schema-bearing
 filename: the location is placement only, so no choice of root can mix
 incompatible entries).
 """
@@ -61,6 +61,66 @@ _SCHEMA = "v2"
 # Sentinel for "this value has no round-trippable encoding" (distinct from a
 # legitimately-stored None).
 _UNENCODABLE = object()
+
+
+@dataclasses.dataclass
+class ReplayCoverage:
+    """Bounded diagnostics for Python cache lookups in a replay region.
+
+    Counts include every observed lookup; ``records`` retains only the first
+    ``max_records`` decisions. CUDA graph replay executes no Python lookups.
+    A hit describes the tuner's selection, not a backend's executed kernel.
+    Read the report after leaving the context; concurrent tuning is unsupported.
+    """
+
+    max_records: int = 64
+    hits: int = dataclasses.field(default=0, init=False)
+    misses: int = dataclasses.field(default=0, init=False)
+    skipped: int = dataclasses.field(default=0, init=False)
+    dropped_records: int = dataclasses.field(default=0, init=False)
+    records: list[dict[str, Any]] = dataclasses.field(default_factory=list, init=False)
+
+    def __post_init__(self):
+        if type(self.max_records) is not int or self.max_records < 0:
+            raise ValueError("max_records must be a nonnegative integer")
+
+    def _record(
+        self,
+        op,
+        shapes,
+        identity,
+        *,
+        status,
+        source,
+        runner,
+        tactic,
+        reasons=(),
+        requested_policy=None,
+        stored_policy=None,
+    ):
+        if status == "hit":
+            self.hits += 1
+        elif status == "skipped":
+            self.skipped += 1
+        else:
+            self.misses += 1
+        if len(self.records) >= self.max_records:
+            self.dropped_records += 1
+            return
+        self.records.append(
+            dict(
+                op=op,
+                input_shapes=shapes,
+                cache_identity=identity,
+                status=status,
+                source=source,
+                runner=runner,
+                selected_tactic=repr(tactic)[:256],
+                requested_policy=requested_policy,
+                stored_policy=stored_policy,
+                reasons=tuple(reasons),
+            )
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -512,6 +572,9 @@ def _resolve_managed_store(
                     f"env {tuner._managed_cache.env_hash})."
                 )
             tuner._managed_cache = store
+            from .autotuner.protocol import _advance_execution_generation
+
+            _advance_execution_generation()
             # Deliberately NOT clearing _managed_decoded: it is keyed by
             # (root, env_hash, file_key), so entries decoded under other
             # identities coexist safely and are never served cross-identity.
@@ -600,6 +663,7 @@ def autotune_v2_reload() -> None:
     when next selected. Reload inside a context scope raises ``RuntimeError``.
     """
     from .autotuner import AutoTuner
+    from .autotuner.protocol import _advance_execution_generation
 
     tuner = AutoTuner.get()
     if tuner._v2_local.active and tuner._v2_local.cache_scope == "context":
@@ -612,6 +676,7 @@ def autotune_v2_reload() -> None:
         tuner._protocol_record_partitions.clear()
         tuner._protocol_cache_generation += 1
         tuner._profiling_cache_policies.clear()
+        tuner._profiling_cache_selections.clear()
         tuner._managed_decoded.clear()
         # Drop the hydration markers so every store re-hydrates on its next
         # attach instead of silently degrading to lazy per-key disk reads.
@@ -626,6 +691,7 @@ def autotune_v2_reload() -> None:
             # store's final published state is wanted -- serving afterwards
             # is warm from memory rather than paying a disk read per key.
             _hydrate_from_store(tuner, store)
+        _advance_execution_generation()
     logger.info(
         "[Autotuner]: autotune_v2_reload(): in-memory winners dropped; "
         "lookups now serve the managed store's current state."
@@ -640,6 +706,8 @@ def autotune_v2(
     measurement_policy: Optional[MeasurementPolicy] = None,
     *,
     cache_scope: str = "process",
+    replay_report: Optional[ReplayCoverage] = None,
+    strict_replay: bool = False,
     tuning_buckets: Optional[Tuple[int, ...]] = None,
     round_up: Optional[bool] = None,
     skip_ops: Optional[Union[str, Set[str]]] = None,
@@ -706,6 +774,16 @@ def autotune_v2(
             runs no Python lookup. Nested v2 contexts and scoped reload are
             unsupported. Concurrent tuning/serving and distributed scoped
             stores require separate qualification.
+        replay_report: Optional bounded report for ``mode="replay"``. Records
+            hits, fallback misses and explicit ``skip_ops`` exclusions, with
+            selected runner/tactic and cache source. Backend-internal fallback
+            is not observable here. Profiling is forbidden while reporting.
+        strict_replay: Require a policy-compatible cached winner for every
+            non-skipped operation. Only supported for identified context scopes
+            in single-rank replay, before or during capture-time lookup. Run
+            all planned profiles through replay before capturing. A miss raises
+            without profiling or publishing replacement winners. Creates a report
+            if none was supplied; the context yields that report. Defaults to False.
         tuning_buckets: Forwarded to :func:`flashinfer.autotune`.
         round_up: Forwarded to :func:`flashinfer.autotune`.  Context-
             scoped: post-context lookups use each op's default bucket
@@ -731,7 +809,12 @@ def autotune_v2(
             pass
         model(inputs)  # reuses tuned winners, no context needed
     """
-    from .autotuner import AutoTuner, _collect_metadata, autotune
+    from .autotuner import (
+        AutoTuner,
+        _collect_metadata,
+        autotune,
+        get_autotune_process_group,
+    )
 
     if mode not in ("tune", "replay"):
         raise ValueError(
@@ -748,9 +831,36 @@ def autotune_v2(
         )
     if cache_scope not in ("process", "context"):
         raise ValueError("cache_scope must be 'process' or 'context'")
+    if not isinstance(strict_replay, bool):
+        raise TypeError("strict_replay must be a bool")
+    if replay_report is not None and not isinstance(replay_report, ReplayCoverage):
+        raise TypeError("replay_report must be ReplayCoverage or None")
+    if mode != "replay" and (strict_replay or replay_report is not None):
+        raise ValueError("replay diagnostics require mode='replay'")
+    if strict_replay:
+        import torch.distributed as dist
+
+        if cache_scope != "context" or not (
+            persistent_cache
+            or (measurement_policy and measurement_policy.manifest_fields())
+        ):
+            raise ValueError(
+                "strict_replay requires an identified context-scoped cache"
+            )
+        if get_autotune_process_group() is not None or (
+            dist.is_initialized() and dist.get_world_size() > 1
+        ):
+            raise RuntimeError(
+                "strict_replay requires single-rank execution; use replay_report "
+                "and coordinate distributed coverage validation before capture"
+            )
+        if replay_report is None:
+            replay_report = ReplayCoverage()
     enable_tuning = mode == "tune"
 
     tuner = AutoTuner.get()
+    if replay_report is not None and tuner.is_tuning_mode:
+        raise RuntimeError("replay diagnostics cannot run while tuning is enabled")
     # autotune_v2 does not nest: a v2-inside-v2 context would have ambiguous
     # store/policy targeting (which store does the outer's later work publish
     # to?).  Fail fast instead of silently last-wins.  Nesting a plain v1
@@ -793,10 +903,14 @@ def autotune_v2(
         local.store = store
         local.measure = measurement_policy
         local.cache_scope = cache_scope
+        local.replay_report = replay_report
+        local.strict_replay = strict_replay
         try:
-            yield
+            yield replay_report
         finally:
             local.active = False
             local.store = None
             local.measure = None
             local.cache_scope = "process"
+            local.replay_report = None
+            local.strict_replay = False

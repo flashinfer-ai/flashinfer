@@ -18,19 +18,21 @@ attention package: the Sage-FP8 block-sparse attention forward against an
 exact-P dequantized reference, the fused quantizer against the torch recipe,
 the one-launch and CUDA-Graph contract of the host path, and the package's
 ``build.json`` contract.  It imports the package only through
-``tests.test_helpers.cake_package`` and nothing else from flashinfer; the
+``tests.cake.test_helpers.cake_package`` and nothing else from flashinfer; the
 flashinfer public routes are covered by
 ``test_cake_sage_block_sparse_attention_sm100_api.py``.
 """
 
 import math
 import re
+import zlib
 from pathlib import Path
 
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 pkg = cake_package("cake_sage_block_sparse_attention")
 cake_build = cake_package("cake_sage_block_sparse_attention", "cake_build")
@@ -98,6 +100,28 @@ def _torch_sage_quantize(q, k, v):
     )
 
 
+# Relative slack of the kernel's P against the reference's: FP32 rounding of the scaled
+# scores and the approximate exp2 (``ex2.approx`` or its polynomial emulation) move a P
+# entry by well under this fraction, so an entry closer than this to an e4m3 rounding
+# boundary may round to the other neighbour in the kernel.
+_P_ROUNDING_SLACK = 1e-4
+# The kernel's softmax (``cake_sage_block_sparse_attention_9884891b129880048274_kernel.cu``):
+# the row max moves only when a pair's max exceeds it by more than log2(1.75), and the
+# exp2 argument carries a +8 bias, so P = 2^(s - m + 8) lies in (0, 448] (e4m3's range) and
+# is rounded on that grid.
+_MAX_STEP_LOG2 = 0.8073549220576041  # log2(1.75)
+_P_BIAS_LOG2 = 8.0
+_E4M3_MAX = 448.0
+_LOG2E = 1.4426950408889634
+_LN2 = 0.6931471805599453
+
+
+def _e4m3(p):
+    """P rounded to e4m3 as the kernel's ``cvt.rn.satfinite.e4m3x2.f32`` does (P is in (0, 448];
+    the conversion saturates at 448)."""
+    return p.clamp(max=_E4M3_MAX).to(torch.float8_e4m3fn).float()
+
+
 def _reference(
     q8,
     k8,
@@ -112,7 +136,19 @@ def _reference(
     block_sizes,
     scale,
 ):
-    """Exact-P dequantized FP32 reference over the selected tokens (per (b, h, q-block))."""
+    """Reference of the kernel's arithmetic over the selected tokens (per (b, h, q-block)).
+
+    FP32 log2 scores (E4M3 products, scaled after the sum); the online softmax of the kernel's
+    two consumer groups (group ``g`` takes every other pair of selected blocks starting at pair
+    ``g``; the 128 columns of a pair share one max update).  The row max follows the kernel's
+    rule: a pair takes it when the row had none, and later only when the pair's max exceeds
+    it by more than ``_MAX_STEP_LOG2``; ``P = 2^(s - m + 8)`` (``_P_BIAS_LOG2``) is rounded to
+    e4m3 before the PV product while the row sum keeps the exact FP32 ``P``; the two groups are
+    merged at the end and the LSE drops the bias.  Returns the output, the LSE and a per-element
+    budget for the entries the kernel may round to the other e4m3 neighbour
+    (``_P_ROUNDING_SLACK``): their one rounding step, weighted by |V| and normalized like the
+    output.
+    """
     q = q8.float().transpose(1, 2)
     k = k8.float().transpose(1, 2)
     v = v8.float().transpose(1, 2)
@@ -124,6 +160,7 @@ def _reference(
     if v_scale.ndim == 2:
         v_scale = v_scale.unsqueeze(0).expand(batch, kv_heads, dim)
     out = torch.zeros((batch, heads, sq, dim), dtype=torch.float32, device=q.device)
+    budget = torch.zeros_like(out)
     lse = torch.full(
         (batch, heads, sq), float("-inf"), dtype=torch.float32, device=q.device
     )
@@ -133,7 +170,7 @@ def _reference(
             for qb in range(q_blocks):
                 q0, q1 = qb * _BLOCK, min(sq, (qb + 1) * _BLOCK)
                 n = int(block_nums[b, h, qb]) if block_nums is not None else count
-                tokens = []
+                blocks = []  # the valid token range of every selected block, in selection order
                 for blk in index[b, h, qb, : max(n, 0)].tolist():
                     valid = max(0, min(_BLOCK, sk - blk * _BLOCK))
                     if block_sizes is not None:
@@ -151,25 +188,66 @@ def _reference(
                                 ),
                             ),
                         )
-                    if valid > 0:
-                        tokens.append(
-                            torch.arange(
-                                blk * _BLOCK, blk * _BLOCK + valid, device=q.device
-                            )
+                    blocks.append(
+                        torch.arange(
+                            blk * _BLOCK, blk * _BLOCK + valid, device=q.device
                         )
-                if not tokens:
+                    )
+                if not any(len(tok) for tok in blocks):
                     continue
-                tok = torch.cat(tokens)
-                kk = k[b, kh, tok] * k_tok_scale[b, kh, tok, None]
-                vv = v[b, kh, tok] * v_scale[b, kh][None, :]
-                qq = q[b, h, q0:q1] * q_scale[b, h, q0:q1, None]
-                s = (qq @ kk.T) * scale
-                m = s.amax(dim=-1, keepdim=True)
-                p = torch.exp(s - m)
-                d = p.sum(dim=-1, keepdim=True)
-                out[b, h, q0:q1] = (p / d) @ vv
-                lse[b, h, q0:q1] = (m + torch.log(d)).squeeze(-1)
-    return out.transpose(1, 2).contiguous(), lse
+                # The products take the E4M3 operands as they are (exact in FP32, TF32 and
+                # BF16 inputs) and apply the scales after the sum, as the kernel does; a
+                # product of dequantized FP32 operands would round them to TF32 wherever
+                # TF32 matmuls are on (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 in NGC-based
+                # images), which moves P by far more than _P_ROUNDING_SLACK.
+                qq = q[b, h, q0:q1]
+                q_log2 = q_scale[b, h, q0:q1, None] * (scale * _LOG2E)
+                rows = q1 - q0
+                merged = []  # (m, l, acc, bud) of the two consumer groups
+                for g in range(2):
+                    m = torch.full((rows,), float("-inf"), device=q.device)
+                    l_sum = torch.zeros((rows,), device=q.device)
+                    acc = torch.zeros((rows, dim), device=q.device)
+                    bud = torch.zeros((rows, dim), device=q.device)
+                    for pair in range(g, _ceil_div(len(blocks), 2), 2):
+                        tok = torch.cat(blocks[2 * pair : 2 * pair + 2])
+                        if not len(tok):
+                            continue
+                        kk = k[b, kh, tok]
+                        vv = v[b, kh, tok]
+                        s = (qq @ kk.T) * (q_log2 * k_tok_scale[b, kh, tok][None, :])
+                        tile_max = s.amax(dim=-1)
+                        fresh = torch.isinf(m)  # the row had no column yet
+                        bump = ~fresh & (tile_max - m > _MAX_STEP_LOG2)
+                        alpha = torch.where(bump, torch.exp2(m - tile_max), 1.0)
+                        m = torch.where(fresh | bump, tile_max, m)
+                        p = torch.exp2(s + _P_BIAS_LOG2 - m[:, None])  # in (0, 448]
+                        l_sum = l_sum * alpha + p.sum(dim=-1)
+                        acc = acc * alpha[:, None] + _e4m3(p) @ vv
+                        flip = (
+                            _e4m3(p * (1.0 + _P_ROUNDING_SLACK))
+                            - _e4m3(p * (1.0 - _P_ROUNDING_SLACK))
+                        ).abs()
+                        bud = bud * alpha[:, None] + flip @ vv.abs()
+                    merged.append((m, l_sum, acc, bud))
+                m_all = torch.maximum(merged[0][0], merged[1][0])
+                l_all = torch.zeros((rows,), device=q.device)
+                acc_all = torch.zeros((rows, dim), device=q.device)
+                bud_all = torch.zeros((rows, dim), device=q.device)
+                for m, l_sum, acc, bud in merged:
+                    w = torch.exp2(m - m_all)  # 0 for a group without a pair
+                    l_all = l_all + w * l_sum
+                    acc_all = acc_all + w[:, None] * acc
+                    bud_all = bud_all + w[:, None] * bud
+                vs = v_scale[b, kh][None, :]
+                out[b, h, q0:q1] = acc_all * vs / l_all[:, None]
+                budget[b, h, q0:q1] = bud_all * vs / l_all[:, None]
+                lse[b, h, q0:q1] = (m_all + torch.log2(l_all) - _P_BIAS_LOG2) * _LN2
+    return (
+        out.transpose(1, 2).contiguous(),
+        lse,
+        budget.transpose(1, 2).contiguous(),
+    )
 
 
 _CASES = [
@@ -203,7 +281,8 @@ def _make_case(case, device):
         use_lse,
         q_gain,
     ) = case
-    g = torch.Generator(device=device).manual_seed(abs(hash(name)) % (2**31))
+    # a seed that does not depend on the process's hash randomization: a failing draw reproduces
+    g = torch.Generator(device=device).manual_seed(zlib.crc32(name.encode()))
     q = torch.randn(
         (batch, sq, heads, _HEAD_DIM), device=device, generator=g
     ).bfloat16()
@@ -278,7 +357,7 @@ def test_cake_sage_sm100_matches_reference(case):
     c = _make_case(case, device)
     out, lse = _run(c)
     torch.cuda.synchronize()
-    ref, ref_lse = _reference(
+    ref, ref_lse, budget = _reference(
         c["q8"],
         c["k8"],
         c["v8"],
@@ -292,7 +371,21 @@ def test_cake_sage_sm100_matches_reference(case):
         scale=c["scale"],
     )
     assert out.dtype == torch.bfloat16 and out.shape == ref.shape
-    torch.testing.assert_close(out.float(), ref, atol=5e-2, rtol=5e-2)
+    # The reference rounds P to e4m3 on the kernel's grid and keeps its row max where the
+    # kernel keeps it, so what remains is the BF16 output rounding, FP32 ordering and the
+    # entries the kernel may round to the other e4m3 neighbour (``budget``).  The former
+    # exact-P reference with a 5e-2 tolerance missed the rounding of a dominant entry in a
+    # pair that leaves the row max where it was (P in (256, 448], a step of 32, up to 2^-4 of
+    # |V| after normalization), which a peaked draw of the inputs crossed.
+    error = (out.float() - ref).abs()
+    allowed = 1e-2 + 1e-2 * ref.abs() + budget
+    ratio = error / allowed
+    worst = int(ratio.argmax())
+    assert bool((ratio <= 1.0).all()), (
+        f"max error / allowance {ratio.flatten()[worst].item():.3f} at flat index {worst}: "
+        f"error {error.flatten()[worst].item():.4g}, reference {ref.flatten()[worst].item():.4g}, "
+        f"budget {budget.flatten()[worst].item():.4g}"
+    )
     if c["use_lse"]:
         finite = torch.isfinite(ref_lse)
         assert torch.equal(torch.isinf(lse), ~finite)
@@ -314,33 +407,16 @@ def test_cake_sage_sm100_v_scale_without_batch_axis():
     assert torch.equal(out_b, out_hd)
 
 
-def _cuda_kernel_names(fn) -> list[str]:
-    """CUDA kernel names of one call of ``fn`` (memcpy / memset activities excluded).  The profiler's
-    warm-up step runs one call whose records are discarded: CUDA activity collection starts
-    asynchronously once the profiler is entered."""
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-    ) as profile:
-        fn()
-        torch.cuda.synchronize()
-        profile.step()
-        fn()
-        torch.cuda.synchronize()
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-        and not event.name.startswith(("Memcpy", "Memset"))
-    ]
-
-
 @requires_sm100
 def test_cake_sage_sm100_launches_one_kernel_per_call():
     """The attention call is one kernel: the TMA descriptors travel by value in the
-    kernel parameters, so no upload kernel precedes the attention kernel.  The
-    quantizer is its two kernels behind the zero-fill of its V amax scratch
-    (``torch.zeros``, a torch fill kernel)."""
+    kernel parameters, so no upload kernel precedes the attention kernel.  It is the
+    PDL build (``attention_pdl``) by default on SM100/SM103 and the plain one with
+    ``enable_pdl=False``.  The two-launch quantizer is its two kernels behind the
+    zero-fill of its V amax scratch (``zero_``: a torch fill kernel, or a memset on
+    torch builds that zero that way); the one-launch quantizer is one kernel.  The
+    launch records come from ``tests.cake.test_helpers.cake_profiler``, which
+    retries a profiler session that lost its CUDA records."""
     device = torch.device("cuda")
     c = _make_case(
         ("one_launch_b2_h4", 2, 4, 2, 257, 1000, 6, True, True, 2, 40, True, 1.0),
@@ -348,9 +424,10 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
     )
     out = torch.empty_like(c["q8"], dtype=torch.bfloat16)
     lse = torch.empty(c["q_scale"].shape, dtype=torch.float32, device=device)
-    names = _cuda_kernel_names(lambda: _run(c, out=out, lse=lse))
-    symbol = loader.MODULES["attention"]["kernel_symbol"]
-    assert names == [symbol], names
+    names = cuda_kernel_names(lambda: _run(c, out=out, lse=lse))
+    assert names == [loader.MODULES["attention_pdl"]["kernel_symbol"]], names
+    names = cuda_kernel_names(lambda: _run(c, out=out, lse=lse, enable_pdl=False))
+    assert names == [loader.MODULES["attention"]["kernel_symbol"]], names
     g = torch.Generator(device=device).manual_seed(11)
     q, k, v = (
         torch.randn(s, device=device, generator=g).bfloat16()
@@ -360,13 +437,24 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
             (1, 500, 2, _HEAD_DIM),
         )
     )
-    names = _cuda_kernel_names(lambda: sage_fp8_quantize_sm100(q, k, v))
+    names = cuda_kernel_names(
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="one_launch"),
+        exclude=("Memcpy",),
+    )
+    assert names == [loader.MODULES["quantize_qkv_c8w16"]["kernel_symbol"]], names
+    names = cuda_kernel_names(
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="two_launch"),
+        exclude=("Memcpy",),
+    )
     kernels = [name for name in names if name.startswith("kernel_")]
     assert kernels == [
-        loader.MODULES["quantize_qk_vamax"]["kernel_symbol"],
-        loader.MODULES["quantize_v"]["kernel_symbol"],
+        loader.MODULES["quantize_qk_vamax_pdl"]["kernel_symbol"],
+        loader.MODULES["quantize_v_pdl"]["kernel_symbol"],
     ], names
-    assert len(names) == len(kernels) + 1 and "Fill" in names[0], names
+    fills = [name for name in names if not name.startswith("kernel_")]
+    assert fills == [names[0]] and (
+        "Fill" in names[0] or names[0].startswith("Memset")
+    ), names
 
 
 @requires_sm100
@@ -536,7 +624,11 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert set(record["arches"]) <= set(manifest["arch_flags"]), name
         plan = [tuple(pair) for pair in record["arg_plan"]]
         assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
-        for kind, key in plan[:-3]:
+        # A PDL record takes the per-call ``enable_pdl`` argument right before the grid.
+        pdl = record["launch"]["use_pdl"] == "runtime"
+        assert record["launch"]["use_pdl"] in (False, "runtime"), name
+        assert (plan[-4] == ("launch", "enable_pdl")) == pdl, name
+        for kind, key in plan[: -4 if pdl else -3]:
             assert kind in ("buffer", "parameter"), (name, kind, key)
             assert record["logical"][key] in (
                 loader.LOGICAL_TENSORS + loader.LOGICAL_SCALARS
@@ -587,6 +679,16 @@ def test_registry_records_reference_the_build_manifest() -> None:
         == 20
     )
     assert all(loader.MODULES[name]["arches"] == ["sm_120a"] for name in sm120)
-    assert [
-        loader.MODULES[name]["arches"] for name in loader.records_of_role("attention")
-    ] == [["sm_100a", "sm_103a"]]
+    # The default attention build (and its PDL build) ships on both architectures; the
+    # second build of each architecture (split QK on SM100, per tile on SM103) on its own.
+    assert {
+        name: loader.MODULES[name]["arches"]
+        for name in loader.records_of_role("attention")
+    } == {
+        "attention": ["sm_100a", "sm_103a"],
+        "attention_pdl": ["sm_100a", "sm_103a"],
+        "attention_qs": ["sm_100a"],
+        "attention_qs_pdl": ["sm_100a"],
+        "attention_per_tile": ["sm_103a"],
+        "attention_per_tile_pdl": ["sm_103a"],
+    }

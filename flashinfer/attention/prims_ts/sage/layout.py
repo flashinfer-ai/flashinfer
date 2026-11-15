@@ -108,7 +108,10 @@ class _SageQSection:
 
     A Q tile is what one softmax instance reads: ``rows_per_tile`` rows, its
     MMA M extent, row ``r`` of tile ``t`` at word ``word_offset + t *
-    rows_per_tile + r``, in the order the softmax lanes read them. With
+    rows_per_tile + r``, in the order the softmax lanes read them. That is
+    the decode kernel's ``tile_size_q``, whose two K/V instances read the
+    same rows, and half of the query-paired context kernel's 256-row CTA
+    tile (``tile_size_q``), whose two softmax instances each read one. With
     ``heads_interleaved`` (the decode kernel's grouped tile) a tile holds
     ``tokens_per_tile`` tokens of each of the ``heads_q_per_kv`` Q heads of
     its KV head, row ``r`` being token ``r // heads_q_per_kv`` of local head

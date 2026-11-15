@@ -51,15 +51,22 @@ unusable entries as work to rebuild).
 v2 is a standalone context manager, deliberately disjoint from `autotune()`:
 
 ```python
-with flashinfer.autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="cuda_graph")):
+graph_policy = MeasurementPolicy(execution_mode="cuda_graph")
+with flashinfer.autotune_v2(measurement_policy=graph_policy):
     model(dummy_inputs)      # warmup: tune misses, publish each winner atomically
 model(inputs)                # serving: reuses entries, no context needed
 
-# fresh process, same environment
-with flashinfer.autotune_v2(mode="replay"):
+# fresh process, same environment and measurement policy
+graph_policy = MeasurementPolicy(execution_mode="cuda_graph")
+with flashinfer.autotune_v2(mode="replay", measurement_policy=graph_policy):
     pass                     # hydrate only
 model(inputs)
 ```
+
+The measurement policy is part of the managed-cache identity. Reusing the same
+cache root without passing the original policy selects a different store; it
+does not hydrate the graph-tuned winners. Bare serving after the context exits
+uses the attached store under the default process scope.
 
 | `mode` | `persistent_cache` | meaning |
 |---|---|---|
@@ -110,6 +117,51 @@ hydrate when next selected. Overlapping read-only replay scopes are supported;
 concurrent tuning/serving and distributed scoped-store use require separate
 qualification. Scoped ownership does not make the process-global tuning mode
 thread-local.
+
+**Replay coverage.** An optional `ReplayCoverage` report observes Python cache
+lookups without profiling. Pass `replay_report=report` to `mode="replay"`; the
+context yields the same report. Counters cover all observed decisions, while
+`records` keeps only the first `max_records` (64 by default). Reusing a report
+accumulates counts. Each record includes the op, input shapes, cache identity,
+source, selected runner/tactic and known profiling-policy provenance. An unknown
+stored policy is `None`. Tactic representations are truncated to 256 characters.
+
+A cached default tactic `-1` is a hit. An absent or rejected winner is a miss;
+explicit `skip_ops` exclusions are counted separately. Ordinary observation
+preserves source precedence and compatibility behavior, including legacy-file
+hits and replay of entries whose profiling policy is unknown. A report describes
+tuner choices, not backend-internal fallback or the kernels actually executed.
+Delegated protocols report their own `TuningResult.cache_hit`; protocols remain
+responsible for honoring disabled tuning and validating their records.
+
+For single-rank preflight, `strict_replay=True` additionally requires a compatible
+cached winner for every non-skipped lookup, including known matching profiling
+policy for ordinary winners. It requires an identified `cache_scope="context"`
+and raises on a miss without profiling or publishing a replacement. It creates
+and yields a report when none is supplied:
+
+```python
+with autotune_v2(
+    mode="replay", cache_scope="context", measurement_policy=graph_policy,
+    strict_replay=True,
+) as coverage:
+    for inputs in planned_capture_inputs:
+        graph_region(inputs)  # preflight every intended capture profile
+```
+
+Run preflight before capture, then use the same identity and profiling controls
+for capture-time lookup. Strict lookup also works during capture, but a miss then
+aborts that capture; it cannot prove coverage for shapes never exercised. CUDA
+graph replay executes no Python and adds no records. Shortlist calls in replay
+return and report the single cached winner, as before. Diagnostics reject nested
+tuning, forced protocol tuning and direct library profiling. The default path
+allocates no report and retains fallback behavior.
+
+Strict replay rejects configured tuning groups or a distributed world larger
+than one: a unilateral exception during a model forward could strand peers in a
+collective. Distributed callers can collect non-strict reports, then coordinate
+coverage checks at a framework-owned boundary before capture. This API adds no
+serving collectives and does not provide concurrent tuning/serving support.
 
 ### 2.2 Store layout on disk
 
@@ -261,6 +313,10 @@ CUPTI also overrides an inherited per-op individual-timing flag.
 before preparing the input schedule used by `profile_tactic`. Delegated tuning
 contexts also preserve the attached store's graph-timing objective after warmup.
 
+Event timing initializes its delay-kernel module before candidate warmup. Lazy
+module loading between warmup and timing can bias the first candidate in a fresh
+process. Timing paths that do not use the delay kernel do not initialize it.
+
 Each newly tuned entry also records an optional `profiling_policy` payload: the effective
 CUDA-graph replay count (or `null` without graphs), L2 policy (`hot`, `cold`, or
 `cold-chain:<n>`, see `TuningConfig.cold_chain_launches`), and active individual-call
@@ -269,7 +325,8 @@ are not fully represented by the manifest.
 When `choose_one` can profile, it reuses a managed winner only when this provenance matches,
 including after preload, reload, and promotion to the root/environment-partitioned memory
 cache. A missing or different policy is a profiling miss, not deletion; replay, bare inference,
-and direct `search_cache` lookups still accept the winner, even inside a tuning context.
+and direct `search_cache` lookups still accept the winner, even inside a tuning context,
+unless strict replay explicitly requires matching provenance.
 Entries without provenance are retuned by `choose_one` even under the default policy, including
 after a same-version build upgrade that leaves the environment directory unchanged.
 Successful retuning retires the previous candidates before publishing the new winner, including
@@ -327,13 +384,35 @@ Persistence and orchestration stay separate responsibilities.
 
 - **Shared filesystem**: per-entry publication prevents torn entries. It does not provide a
   snapshot across ranks: concurrent publishers or an interrupted run can produce mixed hits.
-- **Profiling participation**: with `set_autotune_process_group`, each profile first reduces
-  its hit flag and a digest of the cached runner/tactic. Only an all-hit group with matching
-  selections skips profiling; any miss or disagreement makes all ranks discard that
-  profile's old runner entries and re-profile. Invalidation covers memory and persistence so
-  a different runner can win without an older entry taking precedence after reload. These
-  collectives run only during tuning, outside CUDA Graph capture. The framework must still
-  ensure matching op/profile/candidate order and skip lists across the group.
+- **Profiling participation**: `set_autotune_process_group` adds startup gates
+  for operation/runner order, skip decisions, profile count, effective measurement
+  policy and ordered candidates. A mismatch raises on all participating ranks
+  before they enter incompatible tactic loops. Rank-local shapes and cache roots
+  need not match; runners still own the validity of their distributed inputs and
+  kernel collectives. Every rank must enable tuning and enter the same calls.
+  A missing rank remains a process-group timeout, not a recoverable plan mismatch.
+- **Preparation failures**: input synthesis, candidate discovery and runner
+  preparation coordinate OOM fallback and propagate caught non-OOM Python errors
+  across the group. A fixed-size phase/selection exchange also detects mismatched
+  nested shortlist preparation. It does not recover sticky CUDA errors or
+  failures inside arbitrary runner collectives. Delegated protocols still own
+  their distributed coordination.
+- **Sticky CUDA errors**: a failed tactic is skipped only while the CUDA context
+  stays usable. After an illegal memory access or a device-side assert, tuning
+  stops with an error naming the op, runner, tactic and input shapes, instead of
+  failing later in an unrelated runner. A tuning-group member stops the same
+  way, since it cannot rejoin the per-tactic reduces on a dead context; its
+  peers then fail at their next collective or the process-group timeout.
+- **Cache agreement**: each profile reduces its hit flag and a digest of the
+  cached runner/tactic. Only an all-hit group with matching selections skips
+  profiling; any miss or disagreement makes all ranks discard that profile's
+  winner/shortlist and re-profile. Malformed persisted selections remain cache
+  misses. Warm tuning still performs startup gates; serving with tuning disabled
+  adds no collective. Distributed tuning must run outside CUDA Graph capture.
+- **Timer fallback**: CUPTI availability and initialization are checked across the tuning
+  group before candidate warmup or graph capture. If tracing fails on any rank, all ranks
+  fall back to CUDA events. Candidate exceptions still disqualify the tactic rather than
+  retrying it with another timer.
 - **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
   tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
@@ -406,7 +485,7 @@ users have migrated, which is exactly the cost the separate entry point was mean
 
 ### 4.3 Version policy
 
-Under the right-shifted scheme in `CLAUDE.md`, **removing** `autotune(cache=<path>)` /
+Under the right-shifted scheme in `AGENTS.md`, **removing** `autotune(cache=<path>)` /
 `save_configs` / `load_configs` is an incompatible API change and requires a **major** bump — as
 does eventually dropping the `autotune_v2` alias. So:
 

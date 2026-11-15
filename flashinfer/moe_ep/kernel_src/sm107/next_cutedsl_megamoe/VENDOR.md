@@ -51,7 +51,7 @@ export manifest/log and file hashes with the integration evidence.
 ## Scope of this drop
 
 The generic inference entry point is `RubinInferenceMegaMoE`
-(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
+(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
 backends expose SwiGLU and SiTU with BF16 output. BF16 combine supports separate
 and in-kernel reduction; `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`
 require separate reduction. They accept canonical prequantized weights; NVFP4
@@ -71,7 +71,7 @@ coverage. The shim rejects that combination before allocation or compilation,
 and `is_valid_sm107` excludes it from the geometry-specific tuning set. EP1
 phase-interleave and the inherited N128/N256 admission remain unchanged.
 Other N64 combinations remain rejected. Combine remains BF16.
-Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
+Tile K is 256 for NVFP4/MXFP4 activations and 128 for MXFP8 activations.
 SiTU requires both beta parameters, matching the exported kernel.
 
 `combine_dtype="nvfp4"` selects the existing quantized FC2 return path.
@@ -128,10 +128,10 @@ silently dropped by a fresh export. Paths below are relative to `src/sources/`.
 | `helpers/ptx_helpers.py` | Counted, unaligned CTA barrier helper for the actual participating warps. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py` | Use that barrier for the Generic MMA/accumulator TMEM allocation rendezvous. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | N64 SFB/TMEM parity, valid-row TMA-gather extent and transaction accounting, and two gather warps for CGA4. |
-| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16 reduction, advertise masked-slot handling, and configure small-prefix CTA0 reset ownership. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16, NVFP4, and MXFP8 reductions, advertise masked-slot handling, and configure small-prefix CTA0 reset ownership. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor, explicit router/all-role quiescence before reset, and small-prefix CTA0 reset ownership. |
 | `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, fence rewritten shared indices before async bulk publication, reuse the acquired extent in the sort body, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
-| `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
+| `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16, NVFP4, and MXFP8 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
 | `communication/nvlink_domain/token_comm.py` | Skip invalid-route histogram/scatter work, protect partial dump reads, fence generic shared-memory writes before async bulk size publication, and let CTA0 reset prefixes up to 16 KiB without a second grid join. |
 
 The Generic router shortcut is retained with an async-proxy publication fence
@@ -185,16 +185,104 @@ upstream `main` up to `413da003` have the same code):
   cost of at most one extra terminal FC1 claim per cluster. Re-apply this fix
   when the drop is re-exported until upstream carries it.
 
+The NVFP4 and MXFP8 reducers also accept route IDs and skip masked slots before
+loading payloads, scales or scores. The standard kernel advertises masked-slot
+handling for all separate reducers. These quantized-reduction changes are not
+part of the pinned upstream snapshot.
+
 FlashInfer-owned `shim/block_scaled.py` admits the geometries listed above and
-omits BF16 masked-slot preclear only when the kernel advertises masked reduction.
-Quantized combine and in-kernel reduction retain their existing clearing rules.
+omits combine-slot preclear when the kernel advertises masked reduction.
+In-kernel reduction retains its accumulation reset.
 This shim change is outside the exported payload. The local patch inventory
 above is separate from the historical upstream qualification evidence; run the
 registered strict single/multirank suites when updating or rebasing these patches.
 All remaining exported implementation files retain the pinned export, apart
 from the previously documented comment and the scheduler fix above.
 
+## NVFP4 batch-invariant integration patch
+
+Pending upstream, both kernel entry points pass an optional `batch_invariant`
+problem field to their mainloop, shared FC12 epilogue and BF16 reducer. The
+opt-in mainloops pin instruction N and the corresponding two-CTA input split;
+GenPhase also pins the Gather4 index split. The shared epilogue interprets
+FlashInfer's ordered NVFP4 activation, block16 requantization and FC2
+conversion chains. The reducer starts at positive zero, retains every top-k
+slot in order and masks both operands of invalid routes. These branches leave
+ordinary execution unchanged. They are additional FlashInfer-owned exceptions
+to the pinned export and must be retained on regeneration until upstreamed.
+The shim admits only the certified NVFP4 geometry and arithmetic modes.
+
+## MXFP4 batch-invariant integration patch
+
+Pure MXFP4 and mixed MXFP4-weight/MXFP8-E4M3-activation inference additionally
+support the opt-in batch-invariant problem field. Their shim dispatch uses
+a separate arithmetic policy and receipt; NVFP4 retains its existing identity.
+Both fix instruction N128 and use cluster `(2, 1)` for standard inference or
+`(4, 1)` for GenPhase. Mixed inference uses canonical tile `(256, 128, 128)`
+and native K64 MMA; pure MXFP4 uses `(256, 128, 256)` and native K128 MMA. The latter's
+actual Rubin opcode is `kind::mxf4nvf4.block_scale.block32`. Neither MX format
+has per-expert alpha or normalization operands.
+
+The additional shared-epilogue patch fixes block32 amax as ordered block16
+folds and a logical low-half-first merge on both participating warps. Explicit
+UE8M0 RP conversion and round-trip, the existing capped/masked approximate
+reciprocal recipe, and RN data scaling interpret the shared MXFP4
+specification. The existing fixed-N/Gather4 mapping, SwiGLU, BF16 conversion
+and ordered masked reduction are reused. Ordinary execution and NVFP4
+branches remain unchanged. These are additional FlashInfer-owned exceptions
+to retain when regenerating the pinned export until upstreamed.
+
+Standard inference can regroup the unchanged native instruction sequence
+into a larger K stage: K512 for NVFP4/pure MXFP4 and K256 for mixed MXFP4/MXFP8.
+Admission requires the H and post-activation I padding extents to match the
+canonical stage exactly. M256, N128 and the two-CTA instruction remain fixed;
+GenPhase keeps its Gather4 stage. This changes host admission and lowering
+partitions, not the native arithmetic atom or canonical receipt.
+
+## Activation variant integration patch
+
+The standard FC2 epilogue also forwards its BI flag to the shared canonical
+BF16-to-quantized combine encoder. The reducer uses one zero-seeded, ordered
+masked slot fold for quantized BI wires, preserving the ordinary quantizer
+and reducer branches. Reapply until upstream absorbs this patch.
+
+The FC12 epilogue accepts an opt-in BI ordered activation recipe from
+`ProblemDesc.batch_invariant_activation`. A missing recipe keeps the existing
+default helper; ordinary execution retains its original activation branch.
+Reapply until upstream absorbs this integration hook.
+
+## MXFP8 batch-invariant integration patch
+
+The E4M3/E5M2 W8A8 paths additionally use the opt-in batch-invariant problem
+field with a separate typed quantizer and arithmetic receipt. They retain
+native K64 MMA, fixed `(256, 128, 128)` tiles, cluster `(2, 1)` for standard
+inference or `(4, 1)` for GenPhase, and no per-expert alpha or normalization
+operands. The shared epilogue dispatches block32 requantization to the MXFP8
+specification with the data format's reciprocal limit. Its ordered block16
+amax folds, canonical half merge, explicit UE8M0 round-trip, capped/masked
+reciprocal and RN scaling retain the next-generation arithmetic chain.
+Existing fixed-N/Gather4 handling, SwiGLU, BF16 conversion and ordered masked
+finalization are reused. NVFP4, MXFP4 and ordinary branches keep their existing
+arithmetic. Retain this additional FlashInfer-owned exception until upstreamed.
+
+## Batch-invariant compiled identity patch
+
+Both standard and GenPhase kernel `name()` methods append the BI mode and,
+when present, a hash of the ordered activation signature's effective FP32
+coefficient bits. Ordinary names remain byte-for-byte unchanged. Reapply this
+host metadata patch together with the BI arithmetic hooks after regenerating
+the export until upstream absorbs it.
+
 ## Related trees
+
+The FlashInfer host shim prepares kernel metadata, routing indices, scalar
+buffers, local output and scratch before entering the symmetric heap. All EP
+ranks exchange local allocation failures through their process group first.
+Tuning winner installation likewise prepares replacement local storage before
+freeing any existing symmetric owner; trial staging and compilation agree on
+failure before collective execution. These checks run only at collective
+preparation boundaries, without adding host collectives to steady-state or
+captured launches. Retain this shim integration when refreshing the export.
 
 `sm100/cutedsl_megamoe` and the SM90 drop are separate snapshots. This Rubin
 drop comes from upstream's `next/` generation, with relative imports and the

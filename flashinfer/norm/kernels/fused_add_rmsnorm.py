@@ -41,6 +41,7 @@ from ..utils import (
     has_hw_fp8_cvt,
     get_ptr_as_int64,
     get_sm_version,
+    max_cluster_n,
     row_reduce_sum_multirow,
     predicate_k,
     _torch_dtype_to_str,
@@ -124,8 +125,12 @@ class FusedAddRMSNormKernel:
         elem_size = dtype.width // 8
         occupancy_target = max_smem_bytes // 2
 
+        max_cluster = max_cluster_n(sm_version)
+
         best_fit = 1
         for cluster_n in [1, 2, 4, 8, 16]:
+            if cluster_n > max_cluster:
+                break
             if H % cluster_n != 0:
                 continue
             smem_needed = FusedAddRMSNormKernel._estimate_smem_bytes(

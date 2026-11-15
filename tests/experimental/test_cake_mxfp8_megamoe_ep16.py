@@ -19,6 +19,7 @@ limitations under the License.
 import ast
 import inspect
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -32,8 +33,8 @@ import pytest
 import torch
 import torch.distributed as dist
 from flashinfer.experimental.cake_mxfp8_megamoe_ep16.backend import (
-    _MAX_LAUNCH_EPOCH,
     _interleave_gate_up_16,
+    _max_launch_epoch,
     _pack_scale_n128_k128,
     _quantize_mxfp8_block32,
     _validate_backend,
@@ -204,15 +205,23 @@ for kwargs in ({}, {"backend": "cuda"}):
     subprocess.run([sys.executable, "-c", code], check=True, env=env, timeout=120)
 
 
-def test_cute_peer_arguments_preserve_all_address_bits() -> None:
+def test_cute_peer_tables_preserve_all_address_bits() -> None:
     from flashinfer.experimental.cake_mxfp8_megamoe_ep16.cute_dsl import (
-        _peer_arguments,
+        _peer_table,
     )
 
     active = (1, 2**63 - 1, 2**63, 2**64 - 1, *range(5, 17))
     pointers = active + (0,) * 16
-    packed = _peer_arguments(SimpleNamespace(peer_pointers=pointers))
-    assert packed == (1, 2**63 - 1, -(2**63), -1, *range(5, 17), *((0,) * 16))
+    table = _peer_table(SimpleNamespace(peer_pointers=pointers))
+    assert table.dtype == torch.int64 and table.device.type == "cpu"
+    assert tuple(table.tolist()) == (
+        1,
+        2**63 - 1,
+        -(2**63),
+        -1,
+        *range(5, 17),
+        *((0,) * 16),
+    )
     assert pointers == active + (0,) * 16
 
 
@@ -232,16 +241,17 @@ def test_cute_peer_arguments_preserve_all_address_bits() -> None:
         (1,) * 16 + (False,) + (0,) * 15,
     ),
 )
-def test_cute_peer_arguments_reject_invalid_tables(pointers) -> None:
+def test_cute_peer_tables_reject_invalid_tables(pointers) -> None:
     from flashinfer.experimental.cake_mxfp8_megamoe_ep16.cute_dsl import (
-        _peer_arguments,
+        _peer_table,
     )
 
     with pytest.raises(ValueError):
-        _peer_arguments(SimpleNamespace(peer_pointers=pointers))
+        _peer_table(SimpleNamespace(peer_pointers=pointers))
 
 
-def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_cute_source_key_covers_kernel_and_adapter_dependencies(arch) -> None:
     from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
     from flashinfer.jit import cute_dsl_core
 
@@ -249,8 +259,9 @@ def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
     flashinfer_root = package.parent.parent
     generated = package / "csrc" / "cake_mxfp8_megamoe_ep16" / "cute"
     expected = {
-        generated / "cake_mxfp8_megamoe_ep16_fused.py",
-        generated / "cake_mxfp8_megamoe_ep16_topk_reduce.py",
+        generated / f"cake_mxfp8_megamoe_ep16_fused_{arch}.py",
+        generated / f"cake_mxfp8_megamoe_ep16_fused_return_all_cta_{arch}.py",
+        generated / f"cake_mxfp8_megamoe_ep16_topk_reduce_{arch}.py",
         package / "cute_dsl.py",
         package / "backend.py",
         package / "jit.py",
@@ -258,7 +269,7 @@ def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
         flashinfer_root / "moe_ep" / "cake_mxfp8_megamoe_ep16.py",
         Path(cute_dsl_core.__file__).resolve(),
     }
-    actual = tuple(Path(path) for path in cute_dsl._source_files())
+    actual = tuple(Path(path) for path in cute_dsl._source_files(arch))
     assert len(actual) == len(set(actual))
     assert set(actual) == expected
     assert all(path.is_file() for path in actual)
@@ -269,7 +280,7 @@ def test_cute_source_key_changes_for_each_dependency(tmp_path) -> None:
     from flashinfer.jit.cute_dsl_core import _hash_source_files
 
     flashinfer_root = Path(cute_dsl.__file__).resolve().parents[2]
-    sources = cute_dsl._source_files()
+    sources = cute_dsl._source_files("sm_103a")
     original_key = _hash_source_files(sources)
     copies = []
     for name in sources:
@@ -296,13 +307,17 @@ def test_cute_source_key_changes_for_each_dependency(tmp_path) -> None:
 def test_generated_source_closure() -> None:
     csrc_root, manifest = _read_manifest()
     sequence = manifest["sequences"][0]
-    assert sequence["archs"] == ["sm_100a", "sm_103a"]
+    assert sequence["archs"] == ["sm_100a", "sm_103a", "sm_107a"]
     units = sequence["translation_units"]
     assert len(units["devices"]) == 2 and len(units["headers"]) == 1
     assert sequence["setup_ffi_entry"] == "setup_tma"
     assert sequence["launches_per_call"] == 2
     assert sequence["setup_launches"] == 1
-    assert sequence["max_launch_epoch"] == _MAX_LAUNCH_EPOCH
+    # The CUDA closure's bound: the smallest over its per-capability fused grids.
+    assert sequence["max_launch_epoch"] == min(
+        _max_launch_epoch(_jit.fused_grid_ctas(capability))
+        for capability in _jit.SUPPORTED_CAPABILITIES
+    )
     variants = sequence["fused_variants"]
     tokens = sequence["token_specializations"]
     assert tokens == {"16": variants["0"], "32": variants["1"], "64": variants["0"]}
@@ -318,7 +333,9 @@ def test_generated_source_closure() -> None:
     (
         ("10.3a", ((10, 3),)),
         ("10.0a", ((10, 0),)),
+        ("10.7a", ((10, 7),)),
         ("10.0 10.3", ((10, 0), (10, 3))),
+        ("10.0a 10.3a 10.7a", ((10, 0), (10, 3), (10, 7))),
         ("9.0a 12.0f", ()),
     ),
 )
@@ -326,6 +343,7 @@ def test_loader_targets_follow_flashinfer_cuda_arch_list(
     monkeypatch, arch_list, expected
 ) -> None:
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", arch_list)
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
     assert _jit.supported_capabilities() == expected
     for capability in expected:
         assert _jit.require_supported_capability(capability) == capability
@@ -336,38 +354,91 @@ def test_loader_targets_follow_flashinfer_cuda_arch_list(
         _jit.require_supported_capability((9, 0))
 
 
+def test_sm107a_target_requires_cuda_13_4(monkeypatch) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+    monkeypatch.setattr(
+        _jit, "is_cuda_version_at_least", lambda version: version != "13.4"
+    )
+    assert _jit.supported_capabilities() == ((10, 0), (10, 3))
+    with pytest.raises(RuntimeError, match="requires CUDA 13.4 or newer"):
+        _jit.require_supported_capability((10, 7))
+    assert _jit.require_supported_capability((10, 3)) == (10, 3)
+
+
+def test_cute_dsl_backend_targets_every_supported_capability(monkeypatch) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
+    assert _jit.CUTE_DSL_CAPABILITIES == ((10, 0), (10, 3), (10, 7))
+    for capability in _jit.CUTE_DSL_CAPABILITIES:
+        assert _jit.require_cute_dsl_capability(capability) == capability
+    with pytest.raises(RuntimeError, match="requires compute capability"):
+        _jit.require_cute_dsl_capability((9, 0))
+
+
 @pytest.mark.parametrize(
-    "capability,arch", (((10, 0), "compute_100a"), ((10, 3), "compute_103a"))
+    "capability,arch,grid_ctas",
+    (
+        ((10, 0), "compute_100a", 144),
+        ((10, 3), "compute_103a", 144),
+        ((10, 7), "compute_107a", 208),
+    ),
 )
-def test_jit_spec_is_exact_per_capability(monkeypatch, capability, arch) -> None:
-    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
+def test_jit_spec_is_exact_per_capability(
+    monkeypatch, capability, arch, grid_ctas
+) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
     _jit.gen_cake_mxfp8_megamoe_ep16_module.cache_clear()
     spec = _jit.gen_cake_mxfp8_megamoe_ep16_module(capability)
     assert spec.name.endswith(_jit.device_arch(capability))
     assert any(arch in flag for flag in spec.extra_cuda_cflags)
     assert len(spec.sources) == 3
-
-
-def test_cute_compile_program_takes_variant_and_architecture() -> None:
-    for role, parameters in (
-        ("fused", ["return_all_cta", "arch"]),
-        ("topk_reduce", ["arch"]),
-    ):
-        tree = ast.parse(_jit.cute_dsl_source(role).read_text())
-        functions = {
-            node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
-        }
-        assert [a.arg for a in functions["compile_program"].args.args] == parameters
-    fused = ast.parse(_jit.cute_dsl_source("fused").read_text())
-    guards = [
-        node
-        for node in ast.walk(fused)
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Call)
-        and getattr(node.test.func, "attr", "") == "const_expr"
-        and getattr(node.test.args[0], "id", "") == "return_all_cta"
+    # The fused grid: the default 72 clusters, or the module's CAKE_MEGAMOE_GRID_CLUSTERS.
+    assert _jit.fused_grid_ctas(capability) == grid_ctas
+    grid_flags = [
+        flag
+        for flag in spec.extra_cuda_cflags
+        if flag.startswith("-DCAKE_MEGAMOE_GRID_CLUSTERS=")
     ]
-    assert guards and all(node.orelse for node in guards)
+    assert grid_flags == (
+        [] if grid_ctas == 144 else [f"-DCAKE_MEGAMOE_GRID_CLUSTERS={grid_ctas // 2}"]
+    )
+    assert _max_launch_epoch(grid_ctas) == {144: 14913079, 208: 10324439}[grid_ctas]
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+@pytest.mark.parametrize("role", ("fused", "fused_return_all_cta", "topk_reduce"))
+def test_cute_program_targets_one_architecture(role, arch) -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
+
+    tree = ast.parse(_jit.cute_dsl_source(role, arch).read_text())
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    compile_program = functions["compile_program"].args
+    assert compile_program.vararg.arg == "options"
+    assert [a.arg for a in compile_program.kwonlyargs] == ["ranks", "aligned"]
+    ranks = ast.literal_eval(compile_program.kw_defaults[0])
+    expected = (
+        cute_dsl._REDUCE_RANKS if role == "topk_reduce" else cute_dsl._FUSED_RANKS
+    )
+    assert len(ranks) == len(expected)
+    assert len([name for name in functions if name.startswith("check_launch_")]) == 1
+    kernels = [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
+    ]
+    symbol = f"kernel_cake_mxfp8_megamoe_ep16_{role}"
+    assert kernels == [symbol if arch == "sm_100a" else f"{symbol}_{arch}"]
+    targets = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [getattr(t, "id", "") for t in node.targets] == ["CAKE_TARGET_ARCH"]
+    ]
+    assert len(targets) == 1 and ast.literal_eval(targets[0]) == arch
 
 
 def test_jit_resolves_flashinfer_headers() -> None:
@@ -438,13 +509,67 @@ def test_host_calls_bridge_the_torch_stream() -> None:
         assert len(bridged_calls) == 1
 
 
-def test_launch_epoch_guard_prevents_grid_counter_overflow() -> None:
-    _validate_launch_epoch(0)
-    _validate_launch_epoch(_MAX_LAUNCH_EPOCH)
+@pytest.mark.parametrize("grid_ctas", (144, 208))
+def test_launch_epoch_guard_prevents_grid_counter_overflow(grid_ctas) -> None:
+    _validate_launch_epoch(0, grid_ctas)
+    _validate_launch_epoch(_max_launch_epoch(grid_ctas), grid_ctas)
+    assert (_max_launch_epoch(grid_ctas) + 2) * grid_ctas > 2**31 - 1
+    assert (_max_launch_epoch(grid_ctas) + 1) * grid_ctas <= 2**31 - 1
     with pytest.raises(RuntimeError, match="launch epoch is exhausted"):
-        _validate_launch_epoch(-1)
+        _validate_launch_epoch(-1, grid_ctas)
     with pytest.raises(RuntimeError, match="launch epoch is exhausted"):
-        _validate_launch_epoch(_MAX_LAUNCH_EPOCH + 1)
+        _validate_launch_epoch(_max_launch_epoch(grid_ctas) + 1, grid_ctas)
+
+
+@pytest.mark.parametrize(
+    "arch,clusters", (("sm_100a", 72), ("sm_103a", 72), ("sm_107a", 104))
+)
+def test_cute_dsl_grid_matches_each_program_schedule(arch, clusters) -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
+
+    assert set(cute_dsl.FUSED_GRID_CTAS) == {a for a, _ in _jit._ARCH_FLAGS.values()}
+    grid_ctas = cute_dsl.FUSED_GRID_CTAS[arch]
+    assert grid_ctas == 2 * clusters
+    assert _max_launch_epoch(grid_ctas) == {144: 14913079, 208: 10324439}[grid_ctas]
+    # Each fused program fixes its static schedule: the FC work items and the
+    # weight prefetch stride by the cluster count of the grid it is launched on.
+    for role in ("fused", "fused_return_all_cta"):
+        text = _jit.cute_dsl_source(role, arch).read_text()
+        strides = re.findall(r"\(\((?:prefetch_)?item(?:_\d+)? \* (\d+)\) \+ ", text)
+        assert len(strides) == 6 and set(strides) == {str(clusters)}
+    # The CuTe-DSL grid follows its programs, not the CUDA module's define.
+    source = Path(cute_dsl.__file__).read_text()
+    assert "fused_grid_ctas" not in source
+    assert "CAKE_MEGAMOE_GRID_CLUSTERS" not in source
+
+
+@pytest.mark.parametrize("backend", ("cuda", "cute_dsl"))
+@pytest.mark.parametrize("capability,grid_ctas", (((10, 3), 144), ((10, 7), 208)))
+def test_session_refuses_a_device_with_fewer_sms_than_the_fused_grid(
+    monkeypatch, backend, capability, grid_ctas
+) -> None:
+    def all_gather_object(output, selected, *, group):
+        output[:] = [selected] * 16
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=grid_ctas - 1),
+    )
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+
+    # Both backends need every CTA of the cooperative grid resident, one per SM.
+    with pytest.raises(RuntimeError, match=f"needs {grid_ctas} co-resident CTAs"):
+        _CakeMxfp8MegaMoeEp16Session(
+            None, None, process_group=object(), backend=backend
+        )
 
 
 def test_interleave_gate_up_16() -> None:
@@ -605,8 +730,8 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
         device_index = local_rank
     torch.cuda.set_device(device_index)
     device = torch.device("cuda", torch.cuda.current_device())
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        pytest.skip("requires SM100 or SM103")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("requires SM100, SM103 or SM107")
 
     initialized_here = not dist.is_initialized()
     if initialized_here:
@@ -653,7 +778,7 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
             else:
                 session = CakeMxfp8MegaMoeEp16(weights, topk_ids, backend=backend)
             workspace = session._workspace
-            assert workspace.flags.tensor.numel() == (66 if backend else 2)
+            assert workspace.flags.tensor.numel() == 2
             for symm in (
                 workspace.flags,
                 workspace.published_hidden,
@@ -670,6 +795,10 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
                     assert symm.peer_pointers is None
                     assert symm.peers.dtype == torch.int64
                     assert symm.peers.numel() == 16
+            # Both backends keep one row and route slot per source rank.
+            assert workspace.published_hidden.tensor.shape == (16, tokens, 3072)
+            assert workspace.published_topk_ids.tensor.shape == (16, tokens, 8)
+            assert workspace.published_topk_weights.tensor.shape == (16, tokens, 8)
 
             first_copy = None
             for repeat in range(32):

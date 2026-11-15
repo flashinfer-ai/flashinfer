@@ -120,34 +120,85 @@ For how we review, see [docs/code_review_guidance_human.md](docs/code_review_gui
 
 FlashInfer has two CI systems: a public CI running on GitHub Actions and an NVIDIA internal CI running on GitLab.
 
+> **Targeted tests are the default when you trigger CI.** Public: `@flashinfer-bot run tests/<dir-or-file> [tests/...]`;
+> internal: `/bot run tests/<dir-or-file> [tests/...]` — whitespace-separated paths under `tests/`,
+> naming the test files or directories your change touches. Bare `run` asks AI for a recommendation;
+> focused and inconclusive results only post advice for review. `run all` requests the
+> **full** suite, which is expensive and appropriate for a cross-cutting change or final check — tick the full-scope box in the PR template and say why.
+
 ## Public CI (GitHub Actions)
 
 Public CI runs AOT build tests (x64/arm64) and GPU unit tests across different hardware on AWS self-hosted runners.
 
+Every public CI run that runs tests, targeted or full, also runs all of `tests/cpu` in a "CPU Unittest" lane on a
+CPU runner, whatever paths you named; the GPU lanes never run it. Tests under `tests/cpu` must therefore run without a GPU.
+Two runs leave it out:
+a PR that changes only docs or other skipped paths runs no tests at all, and a manual `workflow_dispatch` with
+`skip_gpu` drops every unit-test lane, this one included.
+
 The commands below are the user-facing reference. The design behind them -- why there are two CI systems, how a run is narrowed to specific tests, and the constraints that follow -- is recorded in [`docs/design_docs/ci_bot_and_targeted_testing.md`](docs/design_docs/ci_bot_and_targeted_testing.md).
 
-Public CI does not start on its own for any PR. Commenting `@flashinfer-bot run` starts it, and works for anyone who can label the PR as well as for members of the `ci-users` team. Adding the `run-ci` label by hand does the same, for anyone whose permissions let them label a PR. This applies to everyone, including maintainers.
+Public CI does not start on its own for any PR. An explicit `@flashinfer-bot run <paths>` or `@flashinfer-bot run all` starts it, and works for anyone who can label the PR as well as for members of the `ci-users` team. Adding the `run-ci` label by hand does the same, for anyone whose permissions let them label a PR. This applies to everyone, including maintainers.
 
-Starting CI applies to the commit that is current at that moment. Pushing new commits, rebasing, or merging `main` into your branch does **not** start a new run, so ask for `@flashinfer-bot run` again once your PR is ready for a final check. Note that GitHub requires the checks to pass on the last commit before a PR can merge.
+Starting CI applies to the commit that is current at that moment. Pushing new commits, rebasing, or merging `main` into your branch does **not** start a new run, so ask for `@flashinfer-bot run tests/...` again (with the same targets) once your PR is ready for a final check. Note that GitHub requires the checks to pass on the last commit before a PR can merge.
 
 It is what applies the `run-ci` label that starts CI, not the label sitting on the PR, so the label stays behind after a run and adding it a second time does nothing. `@flashinfer-bot run` handles this for you by removing the label before re-adding it. If you would rather use the label directly, remove `run-ci` and add it again. Any other label leaves a running CI alone.
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `@flashinfer-bot run` | Can label the PR, or `ci-users` | Start CI on the PR's current commit |
+| `@flashinfer-bot run` | Can label the PR, or `ci-users` | AI recommends a scope; only a full-suite recommendation starts CI, while focused or uncertain decisions are posted for review |
+| `@flashinfer-bot run all` | Can label the PR, or `ci-users` | Start the full suite on the current commit without AI; replaces `run full` |
+| `@flashinfer-bot run tests/<dir-or-file> [tests/...]` | Can label the PR, or `ci-users` | Start CI on the explicitly named paths, without calling AI |
 | `@flashinfer-bot rerun` | Can label the PR, or `ci-users` | Cancel and rerun all workflows |
 | `@flashinfer-bot rerun failed` | Can label the PR, or `ci-users` | Rerun only failed/cancelled jobs |
 | `@flashinfer-bot stop` | Can label the PR, or `ci-users` | Cancel all in-progress workflows |
+
+Bare `run` asks NVIDIA Inference Hub to recommend a scope. It prefers changed
+or existing tests that exercise the changed behavior, using an isolated merge of
+the current target-branch tip and PR head, complete inspected test bodies, and
+current CI routing. Source hooks and external Git configuration are disabled;
+PR code is never imported, executed or collected during selection.
+
+Focused suggestions (up to ten paths), no-pytest-change decisions, and uncertain
+decisions produce a PR comment with the AI rationale and instructions to review
+and run explicit targets. They do not change scope statuses or labels or start CI.
+Only an explicit `full_suite` decision with a supporting explanation launches the
+full suite, without a test-path scope. Missing evidence or an inference failure
+never becomes an automatic full run. Missing configuration, conflicts, changed
+head/base, or invalid AI responses start no CI. `run all` and explicit targets
+bypass AI; the old `run full` spelling is rejected.
+
+Automatic full-suite runs publish selected base/head/tree metadata and an empty-scope
+fingerprint, using the existing `run-ci-focused` label for snapshot verification.
+Administrators must create both `run-ci` and `run-ci-focused` labels. Explicit
+paths and `run all` use `run-ci`. CI reconstructs the pinned base/head merge,
+verifies the tree, and initializes submodules only afterward. GitHub's merge ref
+need not be current. Missing or overwritten automatic metadata fails preparation.
+Author-declared `experimental-tests` behavior remains unchanged.
+
+Repository administrators enable automatic selection with an `INFERENCE_API_KEY`
+Actions secret entitled to the selected NVIDIA Inference Hub model. Optional
+Actions variables are `INFERENCE_BASE_URL` (default
+`https://inference-api.nvidia.com/v1`), `CI_BOT_TARGET_MODEL` (default
+`us/aws/anthropic/eccn-claude-opus-5`), and
+`CI_BOT_TARGET_TIMEOUT_SECONDS` (default `240`, maximum `420`). The public
+command job has a ten-minute limit; the internal daemon's timeout is independent.
+Explicit paths and `run all` need no AI key.
+The selector uses Git, Python's standard library and two bounded JSON model calls,
+matching the Inference Hub integration used by the cuDNN frontend triage job.
+Only the authorized command step receives the inference key. The endpoint must be
+reachable from the GitHub-hosted command runner; it is never given to PR code.
 
 > **Note:** Draft PRs work the same way. They never run CI on their own, but anyone who can use the commands above can start a run on one when you need it.
 
 ## NVIDIA Internal CI (GitLab)
 
-Internal CI runs an extended test matrix across NVIDIA GPU architectures. It is triggered by commenting `/bot run` on a GitHub PR. The bot mirrors the PR to an internal GitLab instance, runs the pipeline, and posts results back to the PR.
+Internal CI runs an extended test matrix across NVIDIA GPU architectures. Explicit `/bot run <paths>` and `/bot run all` requests mirror the PR to GitLab, run the pipeline, and post results back. Bare `/bot run` asks AI for a scope: focused or uncertain decisions only post advice, while a full-suite recommendation launches an unscoped run.
 
 | Command | Who can use | Description |
 |---------|-------------|-------------|
-| `/bot run` | Allowed users | Mirror PR to GitLab and run the full unit-test pipeline |
+| `/bot run` | Allowed users | AI recommends a scope; focused or uncertain results only post advice, while a full-suite recommendation launches CI on the pinned merged source |
+| `/bot run all` | Allowed users | Mirror PR to GitLab and run the full unit-test pipeline without AI selection |
 | `/bot run tests/<dir-or-file> [tests/...]` | Allowed users | Same pipeline, scoped to one or more paths under `tests/` (whitespace-separated). Invalid tokens are rejected and do not start a pipeline. Unit jobs collect those trees. Multi-GPU and multi-node jobs run only their hardcoded files that fall under the same paths, and skip (exit 0) before package setup when none overlap. |
 | `/bot status` | Allowed users | Check current pipeline status |
 | `/bot stop` | Allowed users | Cancel a running pipeline |

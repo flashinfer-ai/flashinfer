@@ -30,6 +30,12 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
+// tcgen05 SMEM descriptor start-address field: 14 bits on SM100 / SM103, 15 bits on SM107.
+#if __CUDA_ARCH__ >= 1070
+#define CAKE_SSD_SMEM_DESC_ADDR_MASK 0x7FFF
+#else
+#define CAKE_SSD_SMEM_DESC_ADDR_MASK 0x3FFF
+#endif
 #define TMEM_NCOLS 512
 #define TMEM_CB_TMEM_OFFSET 0
 #define TMEM_INTRA_TMEM_OFFSET 256
@@ -420,8 +426,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     mbarrier_wait(inter_empty_addr, _phase_inter_empty_0);
                     _phase_inter_empty_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_a_lo_2 = make_warp_uniform((((smem_c_addr) >> 4) & 0x3FFF) + (input_stage) * 2048);
-                    int _mma_b_lo_2 = make_warp_uniform((((smem_state_addr) >> 4) & 0x3FFF) + (state_stage) * 1024);
+                    int _mma_a_lo_2 = make_warp_uniform((((smem_c_addr) >> 4) & CAKE_SSD_SMEM_DESC_ADDR_MASK) + (input_stage) * 2048);
+                    int _mma_b_lo_2 = make_warp_uniform((((smem_state_addr) >> 4) & CAKE_SSD_SMEM_DESC_ADDR_MASK) + (state_stage) * 1024);
                     {
                         uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
                         uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
@@ -470,8 +476,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     mbarrier_wait(scaled_b_full_addr, _phase_scaled_b_full_0);
                     _phase_scaled_b_full_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_a_lo_3 = make_warp_uniform(((((smem_b_t_addr) >> 4) & 0x3FFF) | 0x4000000) + (input_stage) * 2048);
-                    int _mma_b_lo_3 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x4000000) + (input_stage) * 1024);
+                    int _mma_a_lo_3 = make_warp_uniform(((((smem_b_t_addr) >> 4) & CAKE_SSD_SMEM_DESC_ADDR_MASK) | 0x4000000) + (input_stage) * 2048);
+                    int _mma_b_lo_3 = make_warp_uniform(((((smem_x_addr) >> 4) & CAKE_SSD_SMEM_DESC_ADDR_MASK) | 0x4000000) + (input_stage) * 1024);
                     {
                         uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_3);
                         uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_3);
@@ -560,7 +566,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     mbarrier_wait(intra_empty_addr + (acc_stage) * 8, _phase_intra_empty);
                     mbarrier_wait(x_full_addr + (input_stage_1) * 8, _phase_x_full_1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_b_lo_1 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x3FFF) | 0x4000000) + (input_stage_1) * 1024);
+                    int _mma_b_lo_1 = make_warp_uniform(((((smem_x_addr) >> 4) & CAKE_SSD_SMEM_DESC_ADDR_MASK) | 0x4000000) + (input_stage_1) * 1024);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -733,8 +739,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     mbarrier_wait(bc_full_addr + (cb_input_stage) * 8, _phase_bc_full_1);
                     mbarrier_wait(cb_empty_addr + (cb_acc_stage) * 8, _phase_cb_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_a_lo_0 = make_warp_uniform((((smem_c_addr) >> 4) & 0x3FFF) + (cb_input_stage) * 2048);
-                    int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (cb_input_stage) * 2048);
+                    int _mma_a_lo_0 = make_warp_uniform((((smem_c_addr) >> 4) & CAKE_SSD_SMEM_DESC_ADDR_MASK) + (cb_input_stage) * 2048);
+                    int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & CAKE_SSD_SMEM_DESC_ADDR_MASK) + (cb_input_stage) * 2048);
                     {
                         uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
                         uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);

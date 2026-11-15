@@ -50,6 +50,8 @@ from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
+from . import _softplus
+from ._softplus import softplus_fp32
 
 
 def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 16):
@@ -198,6 +200,51 @@ def fma_pair_mul(a1, a2, b1, b2):
     return result1, result2
 
 
+def _pow2_align_fp32(*elem_strides):
+    """Largest power-of-two byte alignment (<= 16) that every fp32 element
+    stride of the slot offset keeps. ``Pointer.align`` rounds the address
+    up, so it must never over-promise; strides here are trace-time
+    constants (the 4D pool bakes its layout, the flat pool is compact)."""
+    align = 16
+    while align > 1 and any((int(s) * 4) % align for s in elem_strides):
+        align //= 2
+    return align
+
+
+@cute.jit
+def _slot_view_i64(
+    pool,
+    slot,
+    i_hv,
+    HV: cutlass.Constexpr,
+    V: cutlass.Constexpr,
+    K: cutlass.Constexpr,
+    pool_4d: cutlass.Constexpr,
+):
+    """(V, K) view of one (slot, head) row, based once in 64-bit.
+
+    The slot offset can exceed 2^31 elements on serving-size pools (the
+    element offset wraps Int32 from flat index 131,072 at V = K = 128), so
+    it is folded into the view base as Int64; every tile offset inside the
+    returned view stays 32-bit (at most V * K elements). The advanced
+    iterator re-asserts the alignment the offset terms preserve, so the
+    vectorized copies keep their width.
+    """
+    if cutlass.const_expr(pool_4d):
+        off = cutlass.Int64(slot) * pool.layout.stride[0] + i_hv * pool.layout.stride[1]
+        aln = _pow2_align_fp32(pool.layout.stride[0], pool.layout.stride[1])
+        sv = pool.layout.stride[2]
+        sk = pool.layout.stride[3]
+    else:
+        off = (cutlass.Int64(slot) * HV + i_hv) * pool.layout.stride[0]
+        aln = _pow2_align_fp32(pool.layout.stride[0])
+        sv = pool.layout.stride[1]
+        sk = pool.layout.stride[2]
+    return cute.make_tensor(
+        (pool.iterator + off).align(aln), cute.make_layout((V, K), stride=(sv, sk))
+    )
+
+
 @cute.jit
 def fma_pair(a1, a2, b1, b2, c1, c2):
     """FMA two pairs: (a1*b1+c1, a2*b2+c2). SM90-compatible."""
@@ -311,13 +358,7 @@ def _mtp_precompute_replayssm_step(
     r_a = cutlass.Float32(a[i_n, i_t, i_hv])
     r_b = cutlass.Float32(b[i_n, i_t, i_hv])
     x = r_a + r_dt_bias
-    beta_x = softplus_beta * x
-    # Avoid evaluating exp on the linear softplus branch.
-    softplus_x = x
-    if beta_x <= softplus_threshold:
-        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True), fastmath=True
-        )
+    softplus_x = softplus_fp32(x, softplus_beta, softplus_threshold)
     r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
     r_beta = cutlass.Float32(1.0) / (
         cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
@@ -470,7 +511,6 @@ def gdn_verify_kernel_mtp(
 
         # Pre-compute these before Phase 1 (needed for h-state prefetch)
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
-        flat_state_idx = cache_idx * HV + i_hv
         # Separate write index supports output_state_indices != initial_state_indices.
         # Negative write indices skip the writeback (preserves the read-side
         # "padding skip" semantics for the legacy fp32 path) — but the view we
@@ -478,30 +518,26 @@ def gdn_verify_kernel_mtp(
         # the negative case to the read slot. The outer `if write_cache_idx >= 0`
         # guard at each writeback site ensures we never actually store through
         # the clamped view when the caller asked us to skip the slot.
-        # CuTe DSL: pre-declare flat_write_idx so it lives outside the `if`.
         # Also keep the "is this slot skipped?" signal separately from the
         # clamped write_cache_idx that the 4D view construction uses.
         write_cache_idx_raw = h0_out_indices[i_n]
         write_cache_idx = write_cache_idx_raw
         if write_cache_idx_raw < 0:
             write_cache_idx = cache_idx
-        flat_write_idx = write_cache_idx * HV + i_hv
-        # 2D (V, K) views onto the read/write slots. The branch on
-        # `use_pool_indexing` is the only place that knows the actual
-        # h0_source layout:
-        #   - True : h0_source is 4D [pool, HV, V, K]; slice with
-        #            (cache_idx, i_hv) — works for non-contiguous strided
-        #            pools (e.g., vLLM's page-strided SSM pool).
-        #   - False: h0_source is 3D [pool*HV, V, K] (free reshape view of
-        #            a contiguous 4D pool); slice with flat_*_idx.
-        # All subsequent kernel sites use these views uniformly via
+        # 2D (V, K) views onto the read/write slots; _slot_view_i64 owns
+        # the 4D-vs-flat layout branch. All subsequent kernel sites use
+        # these views uniformly via
         # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
-        if cutlass.const_expr(use_pool_indexing):
-            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
-            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
-        else:
-            h_read_view = h0_source[(flat_state_idx, None, None)]
-            h_write_view = h0_source[(flat_write_idx, None, None)]
+        # The slot offset is folded into the view base as Int64 ONCE (the
+        # element offset wraps Int32 from flat index 131,072; slot ~10,923
+        # at HV=12, inside serving-size pools); tile offsets within the
+        # view stay 32-bit.
+        h_read_view = _slot_view_i64(
+            h0_source, cache_idx, i_hv, HV, V, K, use_pool_indexing
+        )
+        h_write_view = _slot_view_i64(
+            h0_source, write_cache_idx, i_hv, HV, V, K, use_pool_indexing
+        )
 
         # === WARP SPECIALIZATION: Phase 1 ===
         # ReplaySSM assigns timesteps across all four warps and folds the raw
@@ -601,21 +637,7 @@ def gdn_verify_kernel_mtp(
                 r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
                 x = r_a + r_dt_bias
-                beta_x = softplus_beta * x
-
-                exp_beta_x = cute.exp(beta_x, fastmath=True)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=True
-                )
-                use_softplus = (
-                    cutlass.Float32(1.0)
-                    if beta_x <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x = (
-                    use_softplus * softplus_val
-                    + (cutlass.Float32(1.0) - use_softplus) * x
-                )
+                softplus_x = softplus_fp32(x, softplus_beta, softplus_threshold)
 
                 r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
                 r_beta = cutlass.Float32(1.0) / (
@@ -868,116 +890,136 @@ def gdn_verify_kernel_mtp(
                         # Cache intermediate state if needed
                         if not cutlass.const_expr(cache_replayssm):
                             if cache_intermediate_states:
-                                flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
-                                it0 = cute.local_tile(
+                                # The cache-tile flat index has the same Int32 wrap as the
+                                # pool (his element offset exceeds 2^31 from flat index
+                                # 131,072, e.g. T=8, HV=32, B>=513): base the slot view in
+                                # Int64 once, keep tile offsets 32-bit.
+                                it_view = _slot_view_i64(
                                     intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v0, lane_in_group),
+                                    i_n * cache_steps + i_t,
+                                    i_hv,
+                                    HV,
+                                    V,
+                                    K,
+                                    False,
+                                )
+                                it0 = cute.local_tile(
+                                    it_view,
+                                    (1, vec_size),
+                                    (v0, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (0, None)), it0)
                                 it1 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v1, lane_in_group),
+                                    it_view,
+                                    (1, vec_size),
+                                    (v1, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (1, None)), it1)
                                 it2 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v2, lane_in_group),
+                                    it_view,
+                                    (1, vec_size),
+                                    (v2, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (2, None)), it2)
                                 it3 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v3, lane_in_group),
+                                    it_view,
+                                    (1, vec_size),
+                                    (v3, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (3, None)), it3)
                                 it4 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v4, lane_in_group),
+                                    it_view,
+                                    (1, vec_size),
+                                    (v4, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (4, None)), it4)
                                 it5 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v5, lane_in_group),
+                                    it_view,
+                                    (1, vec_size),
+                                    (v5, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (5, None)), it5)
                                 it6 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v6, lane_in_group),
+                                    it_view,
+                                    (1, vec_size),
+                                    (v6, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (6, None)), it6)
                                 it7 = cute.local_tile(
-                                    intermediate_states,
-                                    (1, 1, vec_size),
-                                    (flat_idx, v7, lane_in_group),
+                                    it_view,
+                                    (1, vec_size),
+                                    (v7, lane_in_group),
                                 )
                                 cute.autovec_copy(cute.slice_(r_h, (7, None)), it7)
 
                         # FLA-style per-token scatter: write h_{i_t+1} directly
                         # to pool[ssm_state_indices[i_n, i_t]] (a different slot
-                        # per iteration). h0_source is [pool_size * HV, V, K] so
-                        # the slot-flat index is pool_slot * HV + i_hv.
+                        # per iteration). 3D flat pools use slot-flat
+                        # index pool_slot * HV + i_hv; 4D strided pools are
+                        # addressed through a per-slot view.
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t0 = cute.local_tile(
+                            # Rank-aware (V, K) slot view, like the read-path
+                            # views above: a flat 3-coordinate local_tile cannot
+                            # address the 4D use_pool_indexing pool (strided
+                            # serving pools), and the slot offset must be Int64
+                            # (the element offset wraps Int32 from flat index
+                            # 131,072); the base is formed once per (i_n, i_t).
+                            h_fla_view = _slot_view_i64(
                                 h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v0, lane_in_group),
+                                pool_slot_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                use_pool_indexing,
+                            )
+                            fla_t0 = cute.local_tile(
+                                h_fla_view,
+                                (1, vec_size),
+                                (v0, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t0)
                             fla_t1 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v1, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v1, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t1)
                             fla_t2 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v2, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v2, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t2)
                             fla_t3 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v3, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v3, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t3)
                             fla_t4 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v4, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v4, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (4, None)), fla_t4)
                             fla_t5 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v5, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v5, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (5, None)), fla_t5)
                             fla_t6 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v6, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v6, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (6, None)), fla_t6)
                             fla_t7 = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v7, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v7, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (7, None)), fla_t7)
 
@@ -1462,65 +1504,84 @@ def gdn_verify_kernel_mtp(
                         # Cache intermediate state LAST in timestep (fire-and-forget stores
                         # overlap with next timestep's compute)
                         if cache_intermediate_states:
-                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
+                            # The cache-tile flat index has the same Int32 wrap as the
+                            # pool (his element offset exceeds 2^31 from flat index
+                            # 131,072, e.g. T=8, HV=32, B>=513): base the slot view in
+                            # Int64 once, keep tile offsets 32-bit.
+                            it_view = _slot_view_i64(
                                 intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
+                                i_n * cache_steps + i_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                False,
+                            )
+                            inter_tile_a = cute.local_tile(
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
                             inter_tile_c = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_c, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_c, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (2, None)), inter_tile_c)
                             inter_tile_d = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_d, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_d, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
                         # FLA-style per-token pool scatter (parallel to cache).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
+                            # Rank-aware (V, K) slot view, like the read-path
+                            # views above: a flat 3-coordinate local_tile cannot
+                            # address the 4D use_pool_indexing pool (strided
+                            # serving pools), and the slot offset must be Int64
+                            # (the element offset wraps Int32 from flat index
+                            # 131,072); the base is formed once per (i_n, i_t).
+                            h_fla_view = _slot_view_i64(
                                 h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
+                                pool_slot_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                use_pool_indexing,
+                            )
+                            fla_t_a = cute.local_tile(
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
                             fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
                             fla_t_c = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_c, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_c, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
                             fla_t_d = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_d, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_d, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
 
@@ -1637,41 +1698,60 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
+                            # The cache-tile flat index has the same Int32 wrap as the
+                            # pool (his element offset exceeds 2^31 from flat index
+                            # 131,072, e.g. T=8, HV=32, B>=513): base the slot view in
+                            # Int64 once, keep tile offsets 32-bit.
+                            it_view = _slot_view_i64(
                                 intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
+                                i_n * cache_steps + i_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                False,
+                            )
+                            inter_tile_a = cute.local_tile(
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
                         # FLA-style per-token pool scatter (parallel to cache).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
+                            # Rank-aware (V, K) slot view, like the read-path
+                            # views above: a flat 3-coordinate local_tile cannot
+                            # address the 4D use_pool_indexing pool (strided
+                            # serving pools), and the slot offset must be Int64
+                            # (the element offset wraps Int32 from flat index
+                            # 131,072); the base is formed once per (i_n, i_t).
+                            h_fla_view = _slot_view_i64(
                                 h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
+                                pool_slot_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                use_pool_indexing,
+                            )
+                            fla_t_a = cute.local_tile(
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
                             fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
 
@@ -2011,7 +2091,6 @@ def gdn_verify_kernel_mtp_inline(
 
         # Each group handles tile_v/num_groups V rows
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
-        flat_state_idx = cache_idx * HV + i_hv
         # Separate write index supports output_state_indices != initial_state_indices.
         # Negative write indices skip the writeback (preserves the read-side
         # "padding skip" semantics for the legacy fp32 path).
@@ -2024,23 +2103,20 @@ def gdn_verify_kernel_mtp_inline(
         write_cache_idx = write_cache_idx_raw
         if write_cache_idx_raw < 0:
             write_cache_idx = cache_idx
-        flat_write_idx = write_cache_idx * HV + i_hv
-        # 2D (V, K) views onto the read/write slots. The branch on
-        # `use_pool_indexing` is the only place that knows the actual
-        # h0_source layout:
-        #   - True : h0_source is 4D [pool, HV, V, K]; slice with
-        #            (cache_idx, i_hv) — works for non-contiguous strided
-        #            pools (e.g., vLLM's page-strided SSM pool).
-        #   - False: h0_source is 3D [pool*HV, V, K] (free reshape view of
-        #            a contiguous 4D pool); slice with flat_*_idx.
-        # All subsequent kernel sites use these views uniformly via
+        # 2D (V, K) views onto the read/write slots; _slot_view_i64 owns
+        # the 4D-vs-flat layout branch. All subsequent kernel sites use
+        # these views uniformly via
         # `cute.local_tile(h_*_view, (1, vec_size), (v, lane))`.
-        if cutlass.const_expr(use_pool_indexing):
-            h_read_view = h0_source[(cache_idx, i_hv, None, None)]
-            h_write_view = h0_source[(write_cache_idx, i_hv, None, None)]
-        else:
-            h_read_view = h0_source[(flat_state_idx, None, None)]
-            h_write_view = h0_source[(flat_write_idx, None, None)]
+        # The slot offset is folded into the view base as Int64 ONCE (the
+        # element offset wraps Int32 from flat index 131,072; slot ~10,923
+        # at HV=12, inside serving-size pools); tile offsets within the
+        # view stay 32-bit.
+        h_read_view = _slot_view_i64(
+            h0_source, cache_idx, i_hv, HV, V, K, use_pool_indexing
+        )
+        h_write_view = _slot_view_i64(
+            h0_source, write_cache_idx, i_hv, HV, V, K, use_pool_indexing
+        )
 
         # v10: Pre-compute g/β for ALL timesteps into register arrays (shared across V-rows)
         # This avoids redundant softplus/sigmoid computation in each V-row iteration.
@@ -2054,14 +2130,7 @@ def gdn_verify_kernel_mtp_inline(
             r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
             r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
             x_val = r_a_val + r_dt_bias
-            beta_x_val = softplus_beta * x_val
-            # A masked 0 * exp(large_x) would still produce NaN.
-            sp_x = x_val
-            if beta_x_val <= softplus_threshold:
-                sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + cute.exp(beta_x_val, fastmath=True),
-                    fastmath=True,
-                )
+            sp_x = softplus_fp32(x_val, softplus_beta, softplus_threshold)
             r_g_value = -cute.exp(r_A_log, fastmath=True) * sp_x
             r_g_arr[i_t] = cute.exp(r_g_value, fastmath=True)
             r_beta_value = cutlass.Float32(1.0) / (
@@ -2229,65 +2298,84 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
+                            # The cache-tile flat index has the same Int32 wrap as the
+                            # pool (his element offset exceeds 2^31 from flat index
+                            # 131,072, e.g. T=8, HV=32, B>=513): base the slot view in
+                            # Int64 once, keep tile offsets 32-bit.
+                            it_view = _slot_view_i64(
                                 intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
+                                i_n * cache_steps + i_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                False,
+                            )
+                            inter_tile_a = cute.local_tile(
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
                             inter_tile_c = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_c, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_c, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (2, None)), inter_tile_c)
                             inter_tile_d = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_d, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_d, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_tile_d)
 
                         # FLA-style per-token pool scatter (inline ilp_rows=4).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
+                            # Rank-aware (V, K) slot view, like the read-path
+                            # views above: a flat 3-coordinate local_tile cannot
+                            # address the 4D use_pool_indexing pool (strided
+                            # serving pools), and the slot offset must be Int64
+                            # (the element offset wraps Int32 from flat index
+                            # 131,072); the base is formed once per (i_n, i_t).
+                            h_fla_view = _slot_view_i64(
                                 h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
+                                pool_slot_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                use_pool_indexing,
+                            )
+                            fla_t_a = cute.local_tile(
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
                             fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
                             fla_t_c = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_c, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_c, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (2, None)), fla_t_c)
                             fla_t_d = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_d, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_d, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (3, None)), fla_t_d)
 
@@ -2563,41 +2651,60 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state
                         if cache_intermediate_states:
-                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
-                            inter_tile_a = cute.local_tile(
+                            # The cache-tile flat index has the same Int32 wrap as the
+                            # pool (his element offset exceeds 2^31 from flat index
+                            # 131,072, e.g. T=8, HV=32, B>=513): base the slot view in
+                            # Int64 once, keep tile offsets 32-bit.
+                            it_view = _slot_view_i64(
                                 intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_a, lane_in_group),
+                                i_n * cache_steps + i_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                False,
+                            )
+                            inter_tile_a = cute.local_tile(
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_tile_a)
                             inter_tile_b = cute.local_tile(
-                                intermediate_states,
-                                (1, 1, vec_size),
-                                (flat_idx, v_idx_b, lane_in_group),
+                                it_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_tile_b)
 
                         # FLA-style per-token pool scatter (inline ilp_rows=2).
                         if cutlass.const_expr(per_token_pool_scatter):
                             pool_slot_t = cutlass.Int32(ssm_state_indices[i_n, i_t])
-                            # Int64 widen: stride[0] = V*K = 16,384 FP32 elements
-                            # (65,536 bytes). Element multiply overflows Int32 at
-                            # fla_idx ≥ 32,768; for pool_size = B*(T+1) at B=128/
-                            # T=8 the max is 73,727 — well over. Matches the
-                            # `h0_source[(Int64(cache_idx), ...)]` widen idiom
-                            # used by reads (PR #3230). Zero reg cost: compiler
-                            # emits mad.wide.u32.
-                            fla_idx = cutlass.Int64(pool_slot_t) * HV + i_hv
-                            fla_t_a = cute.local_tile(
+                            # Rank-aware (V, K) slot view, like the read-path
+                            # views above: a flat 3-coordinate local_tile cannot
+                            # address the 4D use_pool_indexing pool (strided
+                            # serving pools), and the slot offset must be Int64
+                            # (the element offset wraps Int32 from flat index
+                            # 131,072); the base is formed once per (i_n, i_t).
+                            h_fla_view = _slot_view_i64(
                                 h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_a, lane_in_group),
+                                pool_slot_t,
+                                i_hv,
+                                HV,
+                                V,
+                                K,
+                                use_pool_indexing,
+                            )
+                            fla_t_a = cute.local_tile(
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_a, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (0, None)), fla_t_a)
                             fla_t_b = cute.local_tile(
-                                h0_source,
-                                (1, 1, vec_size),
-                                (fla_idx, v_idx_b, lane_in_group),
+                                h_fla_view,
+                                (1, vec_size),
+                                (v_idx_b, lane_in_group),
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), fla_t_b)
 
@@ -2914,6 +3021,7 @@ def run_mtp_decode(
     replayssm_rawk: Optional[torch.Tensor] = None,
     replayssm_g: Optional[torch.Tensor] = None,
     replayssm_beta: Optional[torch.Tensor] = None,
+    verify_parents: Optional[torch.Tensor] = None,
 ):
     """Execute the appropriate MTP kernel based on batch size.
 
@@ -2947,6 +3055,11 @@ def run_mtp_decode(
             that batch slot (matching the read-side padding skip semantics).
         cache_replayssm: Whether to persist only the fold-every-commit
             ReplaySSM inputs instead of full intermediate states.
+        verify_parents: Optional int32 [B, T] parent indices for tree-structured
+            drafts. Requires ``parent[i] < i`` for ``i >= 1``; the root entry
+            may be -1 or 0. Checked on device only when
+            ``FLASHINFER_VALIDATE_VERIFY_PARENTS=1``. Only the tcgen05
+            ReplaySSM verify honors it; any other path raises.
     """
     if B == 0:
         return
@@ -2966,6 +3079,63 @@ def run_mtp_decode(
     use_packed_fma = target.use_packed_fma
 
     per_token_pool_scatter = ssm_state_indices is not None
+
+    # SM120 frozen-state ReplaySSM fast path.  SM120 has no tcgen05, so the
+    # state/K, state/Q and Gram products use TF32 warp MMA (mma.sync).  It is
+    # selected where it beats the FMA path: always when B * HV <= 128 (few
+    # CTAs, where splitting V rows across CTAs helps most), and for larger
+    # batches only when T >= 7.  At T <= 6 the FMA path is as fast or faster
+    # (up to ~15% at T=4) once B * HV > 128.
+    use_replayssm_hmma = (
+        (target.major, target.minor) == (12, 0)
+        and cache_replayssm
+        and disable_state_update
+        and not cache_intermediate_states
+        and not per_token_pool_scatter
+        and not use_pool_indexing
+        and output_writeback is None
+        and h0_source.dtype == torch.float32
+        and initial_state_indices.dtype == torch.int32
+        and 4 <= T <= 8
+        and K == 128
+        and V == 128
+        and 1 <= B <= 256
+        and use_qk_l2norm
+        and (use_inline_kernel or T >= 7)
+    )
+    if use_replayssm_hmma:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+        from .gdn_decode_mtp_replayssm_hmma import (
+            run_gdn_verify_kernel_mtp_replayssm_hmma,
+        )
+
+        run_gdn_verify_kernel_mtp_replayssm_hmma(
+            h0_source,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices,
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            H,
+            HV,
+            scale,
+            # Split each head's V rows across CTAs so enough state loads are
+            # in flight: four ways when there are few heads, two otherwise.
+            v_split=4 if use_inline_kernel else 2,
+        )
+        return
 
     # SM100 frozen-state ReplaySSM fast path.  One CTA owns two adjacent
     # (V=128, K=128) heads, shares their Q/K and Gram work, streams both FP32
@@ -3018,12 +3188,23 @@ def run_mtp_decode(
             H,
             HV,
             scale,
+            verify_parents,
         )
         return
+    if verify_parents is not None:
+        raise ValueError(
+            "verify_parents is only supported by the tcgen05 ReplaySSM verify "
+            "(SM100/SM103, cache_replayssm with a contiguous fp32 pool, int32 "
+            "indices and BF16 output, 4 <= T <= 8, B <= 256, K = V = 128, even HV "
+            "and HV // H, use_qk_l2norm); this call does not qualify"
+        )
 
     # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
     if use_pool_indexing:
-        pool_strides_key = tuple(h0_source.stride())
+        # The 4D compile bakes the pool's static shape, so the cache
+        # key must include shape[0]: same-stride pools of different
+        # sizes must not share a kernel.
+        pool_strides_key = (h0_source.shape[0], *h0_source.stride())
     else:
         pool_strides_key = None
 
@@ -3166,11 +3347,10 @@ def run_mtp_decode(
             # assumes a compact 3D flat pool (wrong rank + compactness here), and
             # mark_layout_dynamic would make V/K dynamic (the kernel needs them as
             # compile-time constants, e.g. num_v_tiles). So pass the layout through
-            # statically: the exact strides are baked in and keyed via
-            # pool_strides_key. The pool-dim (mode 0) stride is independent of the
-            # pool size, so one compiled kernel is reused across batch sizes and
-            # indexes correctly by cache_idx * stride — pool_size is not needed in
-            # the cache key or as a compile-time shape.
+            # statically: shape[0] and the strides are both baked into the
+            # 4D compile and keyed via pool_strides_key, so a compiled
+            # kernel is reused across batch sizes but not across pool
+            # capacities.
             h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
         else:
             # 3D flat pool [pool*HV, V, K], compact.
@@ -3183,14 +3363,14 @@ def run_mtp_decode(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )
         )
-        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log)
         # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
-        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        a_tensor = from_dlpack(a).mark_layout_dynamic()
+        dt_bias_tensor = from_dlpack(dt_bias)
         q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
         k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
         v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
-        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b).mark_layout_dynamic()
         o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
         h0_indices_tensor = from_dlpack(
             initial_state_indices, assumed_align=16
@@ -3268,7 +3448,7 @@ def run_mtp_decode(
                     cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             )
         else:
             compiled = build_and_load_cute_dsl_kernel(
@@ -3320,7 +3500,7 @@ def run_mtp_decode(
                     cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             )
         cache["compiled"] = compiled
     else:

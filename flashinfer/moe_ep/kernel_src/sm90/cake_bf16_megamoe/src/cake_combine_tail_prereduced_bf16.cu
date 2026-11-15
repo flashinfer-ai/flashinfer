@@ -63,6 +63,37 @@ constexpr int kMaxTopK = 8;        // matches the pipe's top_k validation
 constexpr int kColsPerThread = 8;  // one 16-byte bf16 vector per thread and slot
 constexpr int kColsPerBlock = kThreads * kColsPerThread;
 
+// Programmatic dependent launch (PDL).  Every kernel of the round waits for the
+// preceding grid before it touches global memory and then, unless told
+// otherwise, lets the next PDL-launched grid be scheduled at once; without the
+// early trigger the next grid is scheduled when this grid's blocks exit.  Both
+// instructions are no-ops when the launch carries no PDL attribute.  use_pdl:
+// bit 0 = launch with the PDL attribute, bit 1 = no early trigger.
+__device__ __forceinline__ void pdl_wait_and_trigger(int trigger) {
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  if (trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+// Launch on the caller's stream, optionally with the PDL attribute (the kernel
+// may then start while the preceding kernel finishes; see pdl_wait_and_trigger).
+template <typename... Params, typename... Args>
+void launch_kernel(void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
+                   cudaStream_t stream, bool use_pdl, Args... args) {
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = smem;
+  config.stream = stream;
+  config.attrs = &attr;
+  config.numAttrs = use_pdl ? 1 : 0;
+  cudaError_t const status = cudaLaunchKernelEx(&config, kernel, args...);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sm90_cake_bf16: kernel launch failed: " << cudaGetErrorString(status);
+}
+
 PushLayout build_layout(int64_t peer_bases, int64_t ep_size, int64_t rank,
                         int64_t num_local_experts, int64_t pool_rows, int64_t meta_rows,
                         int64_t bytes_per_row, int64_t hidden, int64_t top_k, int64_t t_cap,
@@ -162,8 +193,9 @@ __global__ void __launch_bounds__(kThreads)
                                         TOut* __restrict__ out, int num_tokens,
                                         int32_t* __restrict__ lc, int32_t* __restrict__ done,
                                         int nreset_lc, int nkeys, int32_t* __restrict__ blocks_done,
-                                        int split_partials) {
+                                        int split_partials, int pdl_trigger) {
   __shared__ int s_last;
+  pdl_wait_and_trigger(pdl_trigger);
   uint32_t const tag = static_cast<uint32_t>(*round_ctr);
 
   // 1. wait: lane s acquires source s's cdone cell; the CTA barrier extends the
@@ -232,7 +264,7 @@ __global__ void __launch_bounds__(kThreads)
 void sm90_cake_combine_tail_prereduced_bf16(TensorView out, TensorView topk_ids, LAYOUT_PARAMS,
                                             TensorView round_ctr, TensorView lc, TensorView done,
                                             TensorView blocks_done, int64_t num_tokens,
-                                            int64_t split_partials) {
+                                            int64_t split_partials, int64_t use_pdl) {
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   int const nkeys = L.num_local_experts * L.ep_size;
@@ -267,13 +299,14 @@ void sm90_cake_combine_tail_prereduced_bf16(TensorView out, TensorView topk_ids,
   int const nt = static_cast<int>(num_tokens);
   int const split = split_partials != 0 ? 1 : 0;
   if (out.dtype() == dl_float32) {
-    combine_tail_prereduced_bf16_kernel<float>
-        <<<grid, kThreads, 0, stream>>>(L, rc, ids, static_cast<float*>(out.data_ptr()), nt, lcp,
-                                        donep, nreset_lc, nkeys, bd, split);
+    launch_kernel(combine_tail_prereduced_bf16_kernel<float>, grid, dim3(kThreads), 0, stream,
+                  (use_pdl & 1) != 0, L, rc, ids, static_cast<float*>(out.data_ptr()), nt, lcp,
+                  donep, nreset_lc, nkeys, bd, split, static_cast<int>((use_pdl & 2) == 0));
   } else if (out.dtype() == dl_bfloat16) {
-    combine_tail_prereduced_bf16_kernel<__nv_bfloat16>
-        <<<grid, kThreads, 0, stream>>>(L, rc, ids, static_cast<__nv_bfloat16*>(out.data_ptr()), nt,
-                                        lcp, donep, nreset_lc, nkeys, bd, split);
+    launch_kernel(combine_tail_prereduced_bf16_kernel<__nv_bfloat16>, grid, dim3(kThreads), 0,
+                  stream, (use_pdl & 1) != 0, L, rc, ids,
+                  static_cast<__nv_bfloat16*>(out.data_ptr()), nt, lcp, donep, nreset_lc, nkeys, bd,
+                  split, static_cast<int>((use_pdl & 2) == 0));
   } else {
     TVM_FFI_ICHECK(false) << "combine_tail: out must be float32 or bfloat16";
   }

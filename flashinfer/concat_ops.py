@@ -263,17 +263,19 @@ def concat_mla_k(
 
 
     This function efficiently concatenates:
-      - k_nope: per-head nope values
-      - k_rope: shared rope values (broadcast to all heads)
+
+    - k_nope: per-head nope values
+    - k_rope: shared rope values (broadcast to all heads)
 
     Supported dtypes: ``torch.bfloat16``, ``torch.float16``,
-      ``torch.float8_e4m3fn``, ``torch.float8_e5m2``.
+    ``torch.float8_e4m3fn``, ``torch.float8_e5m2``.
 
     Key optimizations:
-      - Warp-based processing with software pipelining
-      - Vectorized memory access (compile-time dispatch per dtype)
-      - L2 prefetching for next row while processing current
-      - Register reuse for rope values across all heads in a chunk
+
+    - Warp-based processing with software pipelining
+    - Vectorized memory access (compile-time dispatch per dtype)
+    - L2 prefetching for next row while processing current
+    - Register reuse for rope values across all heads in a chunk
 
     Parameters
     ----------
@@ -307,6 +309,7 @@ def concat_mla_k(
     Note
     ----
     This kernel is specifically optimized for:
+
     - ``num_heads = 128``
     - ``nope_dim = 128``
     - ``rope_dim = 64``

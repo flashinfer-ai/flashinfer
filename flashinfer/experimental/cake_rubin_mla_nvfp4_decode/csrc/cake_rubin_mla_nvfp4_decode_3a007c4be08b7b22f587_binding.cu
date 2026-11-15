@@ -70,6 +70,8 @@ void Run(TensorView a_partial_o, TensorView a_partial_lse, TensorView a_O, Tenso
   check_same_device(a_O, a_partial_o, "O", "partial_o");
   check_contiguous(a_lse, "lse");
   check_same_device(a_lse, a_partial_o, "lse", "partial_o");
+  TVM_FFI_CHECK((a_num_split >= 1LL), ValueError) << KERNEL_NAME << ": requires (num_split >= 1)";
+  TVM_FFI_CHECK((a_num_split <= 64LL), ValueError) << KERNEL_NAME << ": requires (num_split <= 64)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

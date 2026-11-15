@@ -38,7 +38,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass._mlir.dialects import math
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import Int32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import Int32, T, dsl_user_op
 
 from flashinfer.tllm_enums import (
     ActivationType,
@@ -66,6 +67,7 @@ from .utils import (
     situ_f32,
     tanh_f32,
 )
+
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM with gather
@@ -170,6 +172,47 @@ CUDA Graph Support:
 * Only rows within (aligned_groupm[0]+aligned_groupm[1]+...) contain valid data
 * Padding rows in C matrix will not be written by the kernel
 """
+
+
+# Pre-FC2 routing mirrors a standalone BF16-FC1 weighting and NVFP4 quantization
+# operation by operation (div.full.f32 as Triton lowers ``/``, tanh.approx.f32,
+# BF16 round trips), so the PTX of each rounding step is fixed here.
+def _f32_asm(asm, *values, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(v).ir_value(loc=loc, ip=ip) for v in values],
+            asm,
+            "=f" + ",f" * len(values),
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _div_full_f32(a, b, *, loc=None, ip=None):
+    """FP32 division as Triton lowers ``/`` (div.full.f32)."""
+    return _f32_asm("div.full.f32 $0, $1, $2;", a, b, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _tanh_approx_f32(a, *, loc=None, ip=None):
+    return _f32_asm("tanh.approx.f32 $0, $1;", a, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def _round_to_bf16(a, *, loc=None, ip=None):
+    """Round an FP32 value to BF16 (nearest even) and widen it back."""
+    return _f32_asm(
+        "{ .reg .b16 h; cvt.rn.bf16.f32 h, $1; cvt.f32.bf16 $0, h; }",
+        a,
+        loc=loc,
+        ip=ip,
+    )
 
 
 # TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.3.x is no longer supported.
@@ -429,6 +472,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta: Optional[float] = None,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        pre_fc2_routing: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -470,8 +514,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type enable_pdl: bool
         :param activation_type: FC1 activation type. Use ActivationType.Swiglu
             for gated SwiGLU/OAI/SiTU, ActivationType.GegluTanh for
-            tanh-approximate GeGLU, and ActivationType.Relu2 for non-gated
-            ReLU^2. Setting situ_beta selects SiTU.
+            tanh-approximate GeGLU, ActivationType.Relu2 for non-gated
+            ReLU^2, and ActivationType.ClampedRelu2 for non-gated clamped
+            ReLU^2 (its limit is a runtime tensor passed at launch). Setting
+            situ_beta selects SiTU.
         :type activation_type: int
         :param swiglu_alpha: Sigmoid multiplier for parameterized SwiGLU.
         :type swiglu_alpha: float
@@ -485,8 +531,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :param situ_linear_beta: Optional SiTU tanh clamp for the up branch.
         :type situ_linear_beta: Optional[float]
         :param gated: Whether GEMM1 output is split into up/gate halves. If
-            False, the epilogue computes non-gated ReLU^2.
+            False, the epilogue computes non-gated (clamped) ReLU^2.
         :type gated: bool
+        :param pre_fc2_routing: Weight each route in the epilogue and quantize
+            with one FC2 input scale per expert, rounding to BF16 after FC1,
+            the soft clamp, the square and the weighting. Requires non-gated
+            ClampedRelu2 and the routing_weights tensor.
+        :type pre_fc2_routing: bool
         """
 
         self.sf_vec_size = sf_vec_size
@@ -588,6 +639,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        # Compile-time switch only; the limit itself is read at runtime from
+        # the clamped_relu2_limit tensor, so its value is not specialized.
+        self.use_clamped_relu2 = activation_type == ActivationType.ClampedRelu2
+        # Weight each route after a BF16-rounded ClampedRelu2 and quantize with
+        # one global scale per expert, matching the pre-FC2 reference bit for bit.
+        self.pre_fc2_routing = pre_fc2_routing
+        if pre_fc2_routing and (gated or not self.use_clamped_relu2):
+            raise ValueError("pre_fc2_routing requires non-gated ClampedRelu2")
+        if pre_fc2_routing and use_a_per_token_scale:
+            raise ValueError("pre_fc2_routing does not support per-token A scales")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -810,6 +871,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        clamped_relu2_limit: Optional[cute.Tensor],
+        routing_weights: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -872,6 +935,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             shape (orig_m,). Indexed by the original token ID decoded from
             token_id_mapping_tensor. Only used when use_a_per_token_scale is true.
         :type a_per_token_scale: Optional[cute.Tensor]
+        :param clamped_relu2_limit: One-element float32 tensor holding the
+            ActivationType.ClampedRelu2 limit ``L``, read at runtime. Required
+            with ClampedRelu2 and must be None otherwise.
+        :type clamped_relu2_limit: Optional[cute.Tensor]
+        :param routing_weights: Optional per-route weight, float32, shape
+            (orig_m * topk,), indexed by token_id_mapping_tensor. Only used,
+            and then required, with pre_fc2_routing.
+        :type routing_weights: Optional[cute.Tensor]
         :param max_active_clusters: Maximum number of active clusters
         :type max_active_clusters: cutlass.Constexpr
         :param stream: CUDA stream for asynchronous execution
@@ -909,6 +980,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(b.shape, self.sf_vec_size)
         sfb = cute.make_tensor(sfb.iterator, sfb_layout)
+
+        if cutlass.const_expr(self.pre_fc2_routing != (routing_weights is not None)):
+            raise ValueError("routing_weights is required exactly with pre_fc2_routing")
+        if cutlass.const_expr(
+            self.use_clamped_relu2 != (clamped_relu2_limit is not None)
+        ):
+            raise ValueError(
+                "clamped_relu2_limit is required with ActivationType.ClampedRelu2 "
+                "and must be None otherwise"
+            )
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout
         self.generate_sfc = sfc_tensor is not None
@@ -1173,6 +1254,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            clamped_relu2_limit,
+            routing_weights,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1260,6 +1343,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        clamped_relu2_limit: Optional[cute.Tensor],
+        routing_weights: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2608,6 +2693,12 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 )
                 tCrSFC_pvscale = cute.make_rmem_tensor_like(tCrSFC, cutlass.Float32)
 
+            # ClampedRelu2 limit L: read once per CTA (like norm_const above);
+            # the reciprocal is computed once here, not per element.
+            if cutlass.const_expr(self.use_clamped_relu2):
+                clamp_limit = clamped_relu2_limit[0]
+                inv_clamp_limit = cutlass.Float32(1.0) / clamp_limit
+
             #
             # Persistent tile scheduling loop
             #
@@ -2643,7 +2734,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
             tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
             tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
-            if cutlass.const_expr(self.use_a_per_token_scale):
+            if cutlass.const_expr(self.use_a_per_token_scale or self.pre_fc2_routing):
                 tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
@@ -2673,6 +2764,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         expanded_idx = token_id_mapping_tensor[permuted_row]
                         token_idx = expanded_idx // self.topk
                         alpha_val = alpha_val * a_per_token_scale[token_idx]
+                if cutlass.const_expr(self.pre_fc2_routing):
+                    # One epilogue thread per tile row: fetch its route weight.
+                    tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
+                    permuted_row = tile_m_start + epi_tidx
+                    route_weight = cutlass.Float32(0.0)
+                    if permuted_row < tile_info[4]:
+                        route_weight = routing_weights[
+                            token_id_mapping_tensor[permuted_row]
+                        ]
+                    norm_const = norm_const_tensor[expert_idx]
+                    sf_from_amax = _div_full_f32(norm_const, cutlass.Float32(6.0))
 
                 #
                 # Slice to per mma tile index
@@ -2773,7 +2875,23 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     if cutlass.const_expr(not self.gated):
                         acc_vec = tTR_rAcc_up.load()
                         tCompute = cute.make_rmem_tensor(acc_vec.shape, self.acc_dtype)
-                        if cutlass.const_expr(self.vectorized_f32):
+                        # ClampedRelu2: relu(L * tanh(x / L)) ** 2 on the
+                        # alpha-scaled accumulator x, with L read at runtime.
+                        if cutlass.const_expr(self.pre_fc2_routing):
+                            # BF16 rounding after FC1, the soft clamp, the square
+                            # and the route weighting, as in the reference.
+                            for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
+                                v = _round_to_bf16(
+                                    acc_vec[i] * cutlass.Float32(alpha_val)
+                                )
+                                v = _round_to_bf16(
+                                    clamp_limit
+                                    * _tanh_approx_f32(_div_full_f32(v, clamp_limit))
+                                )
+                                v = cute.arch.fmax(v, cutlass.Float32(0.0))
+                                v = _round_to_bf16(v * v)
+                                tCompute[i] = _round_to_bf16(v * route_weight)
+                        elif cutlass.const_expr(self.vectorized_f32):
                             for i in cutlass.range_constexpr(
                                 0, cute.size(tTR_rAcc_up), 2
                             ):
@@ -2784,6 +2902,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         cutlass.Float32(alpha_val),
                                     ),
                                 )
+                                if cutlass.const_expr(self.use_clamped_relu2):
+                                    acc_alpha = (
+                                        clamp_limit
+                                        * tanh_f32(
+                                            acc_alpha[0] * inv_clamp_limit,
+                                            fastmath=True,
+                                        ),
+                                        clamp_limit
+                                        * tanh_f32(
+                                            acc_alpha[1] * inv_clamp_limit,
+                                            fastmath=True,
+                                        ),
+                                    )
                                 r0 = cute.arch.fmax(acc_alpha[0], cutlass.Float32(0.0))
                                 r1 = cute.arch.fmax(acc_alpha[1], cutlass.Float32(0.0))
                                 (
@@ -2793,6 +2924,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         else:
                             for i in cutlass.range_constexpr(cute.size(tTR_rAcc_up)):
                                 v = acc_vec[i] * cutlass.Float32(alpha_val)
+                                if cutlass.const_expr(self.use_clamped_relu2):
+                                    v = clamp_limit * tanh_f32(
+                                        v * inv_clamp_limit, fastmath=True
+                                    )
                                 v = cute.arch.fmax(v, cutlass.Float32(0.0))
                                 tCompute[i] = v * v
                     else:
@@ -3096,7 +3231,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                             abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype
                         )
 
-                        if cutlass.const_expr(self.vectorized_f32):
+                        if cutlass.const_expr(self.pre_fc2_routing):
+                            for vi in cutlass.range_constexpr(abs_acc_frg.shape[1]):
+                                tCrSFC_pvscale[vi] = (
+                                    abs_acc_frg[None, vi].reduce(
+                                        cute.ReductionOp.MAX,
+                                        cutlass.Float32(0.0),
+                                        0,
+                                    )
+                                    * sf_from_amax
+                                )
+                        elif cutlass.const_expr(self.vectorized_f32):
                             for vi in cutlass.range_constexpr(abs_acc_frg.shape[1]):
                                 tCrSFC_pvscale[vi] = abs_acc_frg[None, vi].reduce(
                                     cute.ReductionOp.MAX,
@@ -3162,7 +3307,17 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         # Compute quantized output values and convert to C type
                         #
                         fp32_max = cutlass.Float32(3.40282346638528859812e38)
-                        if cutlass.const_expr(self.is_mxfp8_output):
+                        if cutlass.const_expr(self.pre_fc2_routing):
+                            tCrSFC_qpvscale_up = tCrSFC.load().to(cutlass.Float32)
+                            for vi in cutlass.range_constexpr(cute.size(tCrSFC)):
+                                block_scale = tCrSFC_qpvscale_up[vi]
+                                acc_scale = cutlass.Float32(0.0)
+                                if block_scale > cutlass.Float32(0.0):
+                                    acc_scale = _div_full_f32(norm_const, block_scale)
+                                vec = tTR_rAcc_frg[None, vi]
+                                for ei in cutlass.range_constexpr(self.sf_vec_size):
+                                    vec[ei] = vec[ei] * acc_scale
+                        elif cutlass.const_expr(self.is_mxfp8_output):
                             for vi in cutlass.range_constexpr(0, cute.size(tCrSFC), 2):
                                 acc_scale0 = ue8m0_to_inv_scale_fast(
                                     tCrSFC[vi].to(cutlass.Uint32)
@@ -3268,7 +3423,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 tile_info[1] = sInfo[(1, tile_info_consumer_state.index)]
                 tile_info[2] = sInfo[(2, tile_info_consumer_state.index)]
                 tile_info[3] = sInfo[(3, tile_info_consumer_state.index)]
-                if cutlass.const_expr(self.use_a_per_token_scale):
+                if cutlass.const_expr(
+                    self.use_a_per_token_scale or self.pre_fc2_routing
+                ):
                     tile_info[4] = sInfo[(4, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
@@ -3778,6 +3935,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def is_valid_mma_tiler_and_cluster_shape(
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        gated: bool = True,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
@@ -3788,6 +3946,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
+        :param gated: Whether the fused activation is gated (SwiGLU family).
+            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
+        :type gated: bool
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -3799,8 +3960,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             is_valid = False
         # Skip invalid mma tile n
         # SwiGlu Fusion requires even epi_tile counts,
-        # based on epi_tile_n = 64, only mma_tiler_n = 128 and 256 are supported
-        if mma_tiler_mn[1] not in (128, 256):
+        # based on epi_tile_n = 64, only mma_tiler_n = 128 and 256 are supported.
+        # Non-gated activations have no gate/up pairing, so 192 (three epi tiles)
+        # also works.
+        if mma_tiler_mn[1] not in ((128, 256) if gated else (128, 192, 256)):
             is_valid = False
 
         # Skip illegal cluster shape
@@ -3916,6 +4079,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
+        gated: bool = True,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -3948,6 +4112,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
+        :param gated: Whether the fused activation is gated (SwiGLU family).
+            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
+        :type gated: bool
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -3966,7 +4133,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
-        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
+        if not cls.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mn, cluster_shape_mn, gated
+        ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not cls.is_valid_tensor_alignment(
@@ -4013,6 +4182,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
+        clamped_relu2_limit_ptr: Optional[cute.Pointer],
+        routing_weights_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -4083,9 +4254,25 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles = cute.make_tensor(
             num_non_exiting_tiles_ptr, layout=cute.make_layout((1,))
         )
+        # Pre-FC2 routing takes one FC2 input scale per local expert.
         global_sf = (
-            cute.make_tensor(global_sf_ptr, layout=cute.make_layout((1,)))
+            cute.make_tensor(
+                global_sf_ptr,
+                layout=cute.make_layout((l if self.pre_fc2_routing else 1,)),
+            )
             if cutlass.const_expr(global_sf_ptr is not None)
+            else None
+        )
+        routing_weights = (
+            cute.make_tensor(
+                routing_weights_ptr, layout=cute.make_layout((orig_m * self.topk,))
+            )
+            if cutlass.const_expr(routing_weights_ptr is not None)
+            else None
+        )
+        clamped_relu2_limit = (
+            cute.make_tensor(clamped_relu2_limit_ptr, layout=cute.make_layout((1,)))
+            if cutlass.const_expr(clamped_relu2_limit_ptr is not None)
             else None
         )
 
@@ -4103,6 +4290,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            clamped_relu2_limit,
+            routing_weights,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,

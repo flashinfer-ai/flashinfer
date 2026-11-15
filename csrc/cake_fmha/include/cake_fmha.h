@@ -100,6 +100,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
     int bmm1_is_log2,
     int num_splits,
     int blocks_per_split,
+    float bmm1_scalar,
+    float bmm2_scalar,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
@@ -125,6 +127,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_nvfp4(
     int bmm1_is_log2,
     int num_splits,
     int blocks_per_split,
+    float bmm1_scalar,
+    float bmm2_scalar,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
@@ -161,10 +165,12 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8_reduce(
     uint8_t* O,
     float* bmm2_scale_ptr,
     int num_split,
+    float bmm2_scalar,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool use_pdl
 );
 
 extern "C" cudaError_t cake_fmha_launch_context_bf16(

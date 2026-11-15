@@ -168,7 +168,9 @@ def test_prefill_ln_no_lse_or_fp8_does_not_probe(
     monkeypatch.setattr(prefill, "supports_native_cudnn_log2", unexpected)
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
     monkeypatch.setattr(
-        prefill, "_build_prefill_graph", lambda **kwargs: (object(), [])
+        prefill,
+        "_build_prefill_graph",
+        lambda **kwargs: (SimpleNamespace(get_workspace_size=lambda: 0), []),
     )
     q = torch.empty(4, 2, 64, dtype=dtype)
     lengths = torch.tensor([4], dtype=torch.int32)
@@ -305,10 +307,9 @@ def test_cudnn_log2_capture_replan_and_base_switch(monkeypatch, kind, dtype, nat
             return wrapper.run(q, keys, values, **kwargs)
         return wrapper.run(q, (k, v), **kwargs)
 
-    # Paged preparation needs mixed-form sequence lengths (cuDNN 9.25+).
-    # Older runtimes still exercise correctness, capture and replan below.
-    prepared_supported = kind != "paged" or prefill._cudnn_supports_direct_seqlens(
-        dtype, mixed=True
+    # The paged wrapper stages explicit Q and KV lengths, supported from 9.24.
+    prepared_supported = kind != "paged" or prefill._cudnn_supports_paged_token_offsets(
+        dtype, explicit_q=True, explicit_kv=True
     )
 
     def check_graph(wrapper, expected_native):

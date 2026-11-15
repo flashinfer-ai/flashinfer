@@ -38,6 +38,7 @@ from .shim import (
     MegaMoEBf16Mxfp8Inputs,
     MegaMoEBf16Mxfp8SymmBuffer,
     MegaMoEMxfp8Inputs,
+    MegaMoEMxfp8Config,
     MegaMoEMxfp8SymmBuffer,
     MegaMoEBf16Inputs,
     MegaMoEBf16SymmBuffer,
@@ -66,6 +67,7 @@ from .shim import (
     ensure_not_capturing,
     finalize_dist,
     forget_staged_tokens,
+    fused_bf16_stage,
     fused_quant_stage,
     fused_quant_stage_supported,
     get_symm_buffer_for_mega_moe,
@@ -149,6 +151,7 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
+    "MegaMoEMxfp8Config",
     "_CompiledMega",
     "_compute_peer_offsets",
     "_resolve_per_expert_epilogue",
@@ -193,6 +196,7 @@ __all__ = [
     "finalize_dist",
     "forget_staged_tokens",
     "fused_quant_stage",
+    "fused_bf16_stage",
     "fused_quant_stage_supported",
     "bf16_mxfp8_candidates",
     "get_symm_buffer_for_mega_moe",

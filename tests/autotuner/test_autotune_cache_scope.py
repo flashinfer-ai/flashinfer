@@ -17,7 +17,7 @@ import torch
 from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2, autotune_v2_reload
 from flashinfer.autotuner import AutoTuner, TuningConfig
 
-from .utils import DummyRunner
+from .utils import DummyRunner, make_scoped_tuner
 
 
 _OP = "test::scoped_cache"
@@ -28,24 +28,7 @@ _EAGER = MeasurementPolicy(execution_mode="eager", cold_l2=False)
 
 @pytest.fixture
 def scoped(tmp_path, monkeypatch):
-    monkeypatch.setenv("FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
-    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
-    monkeypatch.setattr(
-        "flashinfer.autotuner._collect_metadata", lambda: {"test": "scope"}
-    )
-    if not torch.cuda.is_available():
-        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    tuner = AutoTuner()
-    monkeypatch.setattr(AutoTuner, "_instance", tuner)
-    calls = []
-
-    def profile(runner, inputs, tactic, config, **kwargs):
-        calls.append((config.use_cuda_graph, tactic))
-        winner = 2 if config.use_cuda_graph else 1
-        return 1.0 if tactic == winner else 2.0 + abs(tactic)
-
-    monkeypatch.setattr(tuner, "_profile_single_kernel", profile)
-    return tuner, calls
+    return make_scoped_tuner(tmp_path, monkeypatch)
 
 
 def _choose(tuner, config=_CONFIG):
@@ -295,7 +278,8 @@ def test_scoped_cache_reused_in_fresh_process(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_scoped_gpu_tuning_restart_and_capture(tmp_path, monkeypatch):
+@pytest.mark.parametrize("strict_replay", [False, True])
+def test_scoped_gpu_tuning_restart_and_capture(tmp_path, monkeypatch, strict_replay):
     class AddRunner(DummyRunner):
         def forward(self, inputs, tactic=-1, **kwargs):
             x = inputs[0].clone() if tactic == 1 else inputs[0]
@@ -322,7 +306,12 @@ def test_scoped_gpu_tuning_restart_and_capture(tmp_path, monkeypatch):
         pytest.fail("warm graph scope attempted profiling")
 
     monkeypatch.setattr(tuner, "_profile_single_kernel", no_profile)
-    with autotune_v2(mode="replay", cache_scope="context", measurement_policy=_GRAPH):
+    with autotune_v2(
+        mode="replay",
+        cache_scope="context",
+        measurement_policy=_GRAPH,
+        strict_replay=strict_replay,
+    ):
         assert tuner.search_cache(
             _OP, [runner], ((64,),), replace(_CONFIG, use_cuda_graph=True), inputs
         )[0]
