@@ -381,6 +381,30 @@ def test_int32_metadata_is_passed_through_and_int64_is_cast_per_call() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overflow_value",
+    (
+        2**31,
+        2**31 + 500,
+        -(2**31) - 1,
+    ),
+    ids=("int32-max-plus-one", "int32-large-overflow", "int32-min-minus-one"),
+)
+def test_int64_metadata_overflow_raises_value_error(overflow_value: int) -> None:
+    values = torch.tensor([0, overflow_value], dtype=torch.int64)
+    with pytest.raises(ValueError, match="GDN metadata values exceed int32 range"):
+        gdn_prefill._cake_gdn_prefill_i32(values)
+
+
+@pytest.mark.cpu_only
+def test_int64_metadata_empty_tensor() -> None:
+    empty = torch.tensor([], dtype=torch.int64)
+    cast = gdn_prefill._cake_gdn_prefill_i32(empty)
+    assert cast.dtype == torch.int32
+    assert cast.numel() == 0
+
+
+@pytest.mark.cpu_only
 def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records() -> None:
     launch = gdn_prefill._cake_gdn_prefill_launch_metadata
     i32 = torch.tensor([0, 64, 128], dtype=torch.int32)
@@ -393,6 +417,11 @@ def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records() -> N
     cast = launch(i64, metadata_i64=False)
     assert cast.dtype == torch.int32
     assert torch.equal(cast, i32)
+    # Out-of-range int64 metadata is rejected on int32 routes, preserved on metadata_i64
+    overflow = torch.tensor([0, 2**31], dtype=torch.int64)
+    with pytest.raises(ValueError, match="GDN metadata values exceed int32 range"):
+        launch(overflow, metadata_i64=False)
+    assert launch(overflow, metadata_i64=True) is overflow
     # The route carries the contract and defaults to the int32-only ABI.
     assert cake_gdn.CakeGDNRoute._fields == (
         "route_id",

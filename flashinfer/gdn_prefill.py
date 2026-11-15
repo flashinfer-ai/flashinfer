@@ -270,7 +270,21 @@ def _cake_gdn_prefill_i32(values: torch.Tensor) -> torch.Tensor:
     their kernels read int32 or int64 metadata directly.
     """
 
-    return values if values.dtype == torch.int32 else values.to(torch.int32)
+    if values.dtype == torch.int32:
+        return values
+
+    if values.device.type == "cpu":
+        if values.numel() and (values.max() > 2**31 - 1 or values.min() < -(2**31)):
+            raise ValueError(
+                f"GDN metadata values exceed int32 range: [{values.min().item()}, {values.max().item()}]"
+            )
+    else:
+        torch._assert_async(
+            ((values >= -(2**31)) & (values <= 2**31 - 1)).all(),
+            "GDN metadata values exceed int32 range",
+        )
+
+    return values.to(torch.int32)
 
 
 def _cake_gdn_prefill_launch_metadata(

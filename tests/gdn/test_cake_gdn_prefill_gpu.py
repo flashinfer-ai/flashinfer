@@ -2636,12 +2636,45 @@ def test_public_cake_gdn_prefill_invalid_cuda_slots_fail_in_isolated_process(
     assert device_asserted, combined
 
 
-if (
-    __name__ == "__main__"
-    and len(sys.argv) == 3
-    and sys.argv[1] == "--cake-gdn-invalid-slot"
-):
-    _run_public_prefill_invalid_slot_child(sys.argv[2])
+def _run_cake_gdn_int64_overflow_child() -> None:
+    values = torch.tensor([0, 2**31], dtype=torch.int64, device="cuda")
+    prefill_mod._cake_gdn_prefill_i32(values)
+    torch.cuda.synchronize()
+
+
+def test_public_cake_gdn_prefill_int64_overflow_cuda_assert_in_isolated_process():
+    repo_root = str(Path(__file__).resolve().parents[2])
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    new_pythonpath = f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else repo_root
+    env = {
+        **os.environ,
+        "PYTHONPATH": new_pythonpath,
+    }
+    env.pop("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--cake-gdn-int64-overflow",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    combined = completed.stdout + completed.stderr
+    assert completed.returncode != 0, combined
+    assert any(
+        marker in combined
+        for marker in ("device-side assert", "_assert_async_cuda_kernel")
+    ), combined
+
+
+if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--cake-gdn-invalid-slot":
+        _run_public_prefill_invalid_slot_child(sys.argv[2])
+    elif len(sys.argv) == 2 and sys.argv[1] == "--cake-gdn-int64-overflow":
+        _run_cake_gdn_int64_overflow_child()
 
 
 @pytest.mark.parametrize(
