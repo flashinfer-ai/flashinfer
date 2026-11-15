@@ -261,6 +261,9 @@ MXFP8 input preflight
 
 Functions decorated with ``backend_requirement`` expose ``validate_call``
 for explicit call-level validation without executing the operation.
+Modes that bypass generic backend validation raise ``NotImplementedError``
+unless a complete call validator owns that mode; generic backend checks do
+not certify the mode's separate input contract.
 ``mxfp8_quantize.validate_call`` accepts the same arguments as the quantizer
 and raises on known input violations without preparing tensors, allocating
 outputs, detecting PDL, or loading a quantization module. Benchmarks and
@@ -285,17 +288,16 @@ but rejects non-strided layouts and an empty last dimension. ``auto`` keeps
 its existing route. Passing preflight does not certify build,
 storage-address alignment, launch or numerical correctness. Batch-invariant
 preflight reuses that mode's existing device and dependency checks.
-Native and CuTe calls require explicit ``SfLayout`` members and reject bare
-integers or unknown scale-factor layouts before backend mapping.
+Explicit preflight requires ``SfLayout`` members and rejects bare integers
+or unknown scale-factor layouts before backend mapping.
 Batch-invariant calls reject non-strided tensors with
 ``BatchInvariantUnsupportedError`` before preparing input.
 
 MXFP8 keeps full admission in this explicit preflight. Eager native calls
-retain layout, CPU-contiguity, positive CUDA-alignment, nonempty CUDA-K and
-architecture guards; the native binding checks the remaining CUDA tensor
-requirements. CuTe execution checks tensor requirements once in its
-preparation entry point. Invalid calls can therefore reach dependency or
-binding errors during execution that explicit preflight would reject sooner.
+retain the existing architecture guard and native binding checks; the
+CuTe execution path also retains its existing checks without importing the
+preflight validator. Invalid calls can therefore reach dependency or binding
+errors during execution that explicit preflight would reject sooner.
 
 Fused gated-activation MXFP8 quantization (Cake, deterministic)
 ----------------------------------------------------------------
