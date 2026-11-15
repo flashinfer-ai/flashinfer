@@ -52,7 +52,8 @@ def llama_rms_norm(x, w, eps=1e-6):
     x = x.float()
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = x * w.float()
+    if w is not None:
+        x = x * w.float()
     x = x.to(orig_dtype)
     return x
 
@@ -114,7 +115,9 @@ def fused_add_rms_norm(x, residual, weight, eps):
 
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = (x * weight.float()).to(orig_dtype)
+    if weight is not None:
+        x = x * weight.float()
+    x = x.to(orig_dtype)
     return x, residual
 
 
@@ -160,6 +163,72 @@ def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguou
         y = flashinfer.norm.rmsnorm(x, w, enable_pdl=enable_pdl)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+def _select_weightless_norm_backend(backend, monkeypatch):
+    if backend == "cuda":
+        monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    elif not hasattr(flashinfer.norm, "rmsnorm_cute"):
+        pytest.skip("nvidia-cutlass-dsl not available")
+    elif not flashinfer.norm._cute_dsl_supports_arch(
+        *torch.cuda.get_device_capability()
+    ):
+        pytest.skip("CuTe DSL cannot target this compute capability")
+    else:
+        monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [111, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_weightless_norm(
+    batch_size, hidden_size, dtype, enable_pdl, contiguous, backend, monkeypatch
+):
+    _select_weightless_norm_backend(backend, monkeypatch)
+    storage = torch.randn(batch_size, hidden_size * 2, dtype=dtype, device="cuda")
+    x = (
+        storage[:, :hidden_size]
+        if not contiguous
+        else storage[:, :hidden_size].contiguous()
+    )
+
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
+    y_ref = llama_rms_norm(x, None)
+    y = flashinfer.norm.rmsnorm(x, None, enable_pdl=enable_pdl)
+
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
+
+
+def test_weightless_norm_first_call_during_graph_capture(monkeypatch):
+    _select_weightless_norm_backend("cute-dsl", monkeypatch)
+    x = torch.randn(8, 2304, dtype=torch.float16, device="cuda")
+    key = (x.device.index, x.dtype, x.shape[-1])
+    assert key not in flashinfer.norm._weightless_cute_weights
+
+    # Warm the CUDA fallback without creating a CuTe zero weight.
+    monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: True)
+    flashinfer.norm.rmsnorm(x, None)
+    monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
+
+    earlier = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(earlier):
+        x.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=earlier.pool()):
+        captured = flashinfer.norm.rmsnorm(x, None)
+
+    assert key not in flashinfer.norm._weightless_cute_weights
+    eager = flashinfer.norm.rmsnorm(x, None)
+    graph.replay()
+    expected = llama_rms_norm(x, None)
+    torch.testing.assert_close(eager, expected, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(captured, expected, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("shape", [(5, 111), (5, 1024), (3, 5, 64), (3, 5, 256)])
@@ -851,6 +920,29 @@ def test_qknorm(
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_weightless_qknorm(
+    batch_size, head_dim, dtype, enable_pdl, contiguous, backend, monkeypatch
+):
+    _select_weightless_norm_backend(backend, monkeypatch)
+    storage = torch.randn(batch_size, 8, head_dim, dtype=dtype, device="cuda")
+    x = storage[:, :4, :] if not contiguous else storage[:, :4, :].contiguous()
+
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
+    y_ref = llama_rms_norm(x, None)
+    y = flashinfer.norm.rmsnorm(x, None, enable_pdl=enable_pdl)
+
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(y_ref, y, rtol=tol, atol=tol)
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
@@ -885,6 +977,52 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19])
+@pytest.mark.parametrize("hidden_size", [111, 1024])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_weightless_fused_add_rmsnorm(
+    batch_size, hidden_size, dtype, enable_pdl, contiguous, backend, monkeypatch
+):
+    _select_weightless_norm_backend(backend, monkeypatch)
+    eps = 1e-6
+    storage = torch.randn(batch_size, hidden_size * 2, dtype=dtype, device="cuda")
+    x = (
+        storage[:, :hidden_size]
+        if not contiguous
+        else storage[:, :hidden_size].contiguous()
+    )
+
+    if enable_pdl and not device_support_pdl(x.device):
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
+    residual_storage = torch.randn_like(storage)
+    residual = (
+        residual_storage[:, :hidden_size]
+        if not contiguous
+        else residual_storage[:, :hidden_size].contiguous()
+    )
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), None, eps
+    )
+
+    x_fused = storage.clone()[:, :hidden_size] if not contiguous else x.clone()
+    residual_fused = (
+        residual_storage.clone()[:, :hidden_size]
+        if not contiguous
+        else residual.clone()
+    )
+    flashinfer.fused_add_rmsnorm(
+        x_fused, residual_fused, None, eps, enable_pdl=enable_pdl
+    )
+
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(x_fused, x_native, rtol=tol, atol=tol)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=tol, atol=tol)
 
 
 @parametrize_product(
