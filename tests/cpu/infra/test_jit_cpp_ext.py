@@ -251,14 +251,16 @@ def test_generate_ninja_embeds_cubins_as_coff_objects_on_windows(monkeypatch, tm
     cubin_obj = (
         tmp_path / "jit" / "test_module" / "embedded_cubin_alphamoe_small_sm_103a.o"
     ).resolve()
+    # The generator escapes paths for ninja ("C:\" -> "C$:\"); expect them escaped.
+    escape = cpp_ext._ninja_windows_path
     assert "tvm_ffi.utils.embed_cubin" not in ninja
     assert "embed_cubin_coff.py" in ninja
     assert (
         '--machine arm64 --name $cubin_name --cubin "$in" --output-obj "$out"' in ninja
     )
-    assert f"build {cubin_obj}: embed_cubin {cubin.resolve()}" in ninja
+    assert f"build {escape(cubin_obj)}: embed_cubin {escape(cubin.resolve())}" in ninja
     assert "  cubin_name = alphamoe_small_sm_103a" in ninja
-    assert f": link {host_obj} {cubin_obj}" in ninja
+    assert f": link {escape(host_obj)} {escape(cubin_obj)}" in ninja
 
 
 @pytest.mark.cpu_only
