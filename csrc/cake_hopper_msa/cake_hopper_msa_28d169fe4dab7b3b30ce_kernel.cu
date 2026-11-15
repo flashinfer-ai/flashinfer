@@ -14,37 +14,27 @@
  * limitations under the License.
  */
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long uint64_t;
+#include "cake_hopper_msa_device.h"
+
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags set the knob values below (a knob without a -D flag is a compile error) and name
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel).
+//   CAKE_HQ     query heads per KV head of the route (hq1 / hq2 / hq4)
+//   CAKE_SQ     max query length of the route (sq1 .. sq4)
+//   CAKE_HQ_SQ  CAKE_HQ * CAKE_SQ, the query rows per batch element
+#ifndef CAKE_HQ
+#error "CAKE_HQ must come from the record's compile_flags"
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(64) CakeTensorMap64 {
-  uint64_t opaque[16];
-};
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
-#include <cuda.h>
+#ifndef CAKE_SQ
+#error "CAKE_SQ must come from the record's compile_flags"
 #endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-#define CAKE_INF CUDART_INF_F
+#ifndef CAKE_HQ_SQ
+#error "CAKE_HQ_SQ must come from the record's compile_flags"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL (the program's kernel symbol) must come from the record's compile_flags"
+#endif
 #define NUM_MAIN_STAGES 1
 #define SMEM_K_S_OFF 1024
 #define SMEM_K_S_STAGE_BYTES 16384
@@ -59,70 +49,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define THREADS 128
 #define LAUNCH_MIN_BLOCKS 4
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-  uint32_t pred = 0;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred %%px;\n\t"
-      "elect.sync _|%%px, %1;\n\t"
-      "@%%px mov.s32 %0, 1;\n\t"
-      "}\n"
-      : "+r"(pred)
-      : "r"(0xFFFFFFFF));
-  return pred;
-}
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
-}
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE;\n\t"
-      "bra.uni LAB_WAIT;\n\t"
-      "DONE:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(mbar_addr),
-      "r"(bytes)
-      : "memory");
-}
-
-__device__ __forceinline__ void tma_3d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.3d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
-  uint32_t result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(result) : "r"(val));
-  return result;
-}
-
 extern "C" {
 
-__global__
-__launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_28d169fe4dab7b3b30ce(
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void CAKE_PROGRAM_KERNEL(
     const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K,
     float* __restrict__ out, int* __restrict__ page_table, int* __restrict__ seqused_k,
     int* __restrict__ q_offset, int has_qoff, int pt_stride, int max_k_tiles, int total_q,
@@ -186,13 +115,13 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_28d169fe4d
   int sk = seqused_k[b];
   int page = page_table[b * pt_stride + t];
   int nb = (sk + 127) / 128;
-  int qoff = sk - 3;
+  int qoff = sk - CAKE_SQ;
   if (has_qoff != 0) {
     qoff = q_offset[b];
   }
-  int oidx = ((tid_1 - tid_1 / 4 * 4) * max_k_tiles + t) * total_q + b * 3 + tid_1 / 4;
+  int oidx = ((tid_1 - tid_1 / 4 * 4) * max_k_tiles + t) * total_q + b * CAKE_SQ + tid_1 / 4;
   if (t >= nb) {
-    if (tid_1 < 12) {
+    if (tid_1 < CAKE_HQ_SQ) {
       out[oidx] = -CUDART_INF_F;
     }
   }
@@ -242,7 +171,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_28d169fe4d
           tma_3d_gmem2smem(k_s_addr, (&K), 0, krow, 0, full_addr);
           tma_3d_gmem2smem(k_s_addr + 16384, (&K), 0, krow + 64, 0, full_addr);
         }
-        tma_3d_gmem2smem(q_s_addr, (&Q), 0, b * 12, 0, full_addr);
+        tma_3d_gmem2smem(q_s_addr, (&Q), 0, b * CAKE_HQ_SQ, 0, full_addr);
       }
     }
     int sk1 = sk - 1;
@@ -502,7 +431,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_28d169fe4d
       red[(8 + 2 * lane_0 + 1) * 4 + warp_1] = cm[3];
     }
     asm volatile("barrier.sync 1, 128;" ::: "memory");
-    if (tid_1 < 12) {
+    if (tid_1 < CAKE_HQ_SQ) {
       float rv[4];
       asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                    : "=r"(*reinterpret_cast<uint32_t*>(&rv[0])),

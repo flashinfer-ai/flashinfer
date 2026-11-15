@@ -5,7 +5,11 @@ The primary metric is the maximum of per-rank p50 latencies, matching the
 Blackwell autotuner's aggregation. JSONL also reports rank-zero p50,
 preserving every sample, timing/cache
 protocol, resolved knobs, shape, seed, environment, accuracy, and memory.
-A sampled Torch oracle gates every result.
+A sampled Torch oracle gates every result. --kernel-variant selects inference or
+GenPhase; --prequantized prepares activation bytes outside the forward span.
+--eager-completed-wall includes host dispatch and device completion. Without it,
+eager timing retains its GPU-stream boundary. --testlist reads explicit workload
+rows for the current EP degree and measures graph and completed eager forwards.
 
 Example (four GPUs in one NVLink domain, CUTE_DSL_ARCH=sm_107a exported):
     torchrun --standalone --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py \\
@@ -20,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import statistics
 import time
@@ -96,8 +101,7 @@ def _topk_idx_power_law(generator, world, tokens, topk, experts, exponent, devic
 
 def _make_routing(world, tokens, routing, alpha, device="cuda"):
     if routing == "gaussian":
-        # bench_common.make_problem at moe_ep_benchmark ba9f8acb: independent
-        # rank seeds, unsorted top-k, and the selected scores as routing weights.
+        # Independent rank seeds, unsorted top-k, and selected scores as weights.
         ids, weights = [], []
         for rank in range(world):
             generator = torch.Generator(device=device).manual_seed(SEED + 17 + rank)
@@ -142,7 +146,7 @@ def _local_transformed_weights(
         )
 
         extra = {}
-    elif quant_kind == "mxfp4_mxfp8":
+    elif quant_kind in ("mxfp4", "mxfp4_mxfp8"):
         from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl import (
             weights as weights_mod,
         )
@@ -257,18 +261,32 @@ def _timing_protocol(args):
     else:
         allocation = "during_capture" if args.execution == "graph" else "per_call"
     return dict(
-        timing_method="cuda_event",
+        timing_method="perf_counter_completed_wall"
+        if args.eager_completed_wall
+        else "cuda_event",
         timed_span={
             "kernel": "prestaged_kernel_reset_reduce",
             "compute": "prestaged_backend_compute_and_output_copy",
-            "forward": "bf16_public_forward",
+            "forward": "prequantized_public_forward"
+            if args.prequantized
+            else "bf16_public_forward",
         }[args.mode],
-        timing_scope="gpu_graph_replay" if args.execution == "graph" else "gpu_stream",
-        host_wall_time_measured=False,
+        timing_scope=(
+            "host_dispatch_and_completion"
+            if args.eager_completed_wall
+            else "gpu_graph_replay"
+            if args.execution == "graph"
+            else "gpu_stream"
+        ),
+        host_wall_time_measured=args.eager_completed_wall,
         input_staging_in_timed_span=args.mode == "forward",
         output_ownership="workspace_view" if args.mode == "kernel" else "owned",
         output_allocation=allocation,
-        synchronization="barrier_before_batch_no_inter_iteration_sync",
+        synchronization=(
+            "barrier_before_batch_device_sync_after_each_call"
+            if args.eager_completed_wall
+            else "barrier_before_batch_no_inter_iteration_sync"
+        ),
         cache_policy="consecutive_launches" if args.no_l2_flush else "l2_flushed",
         l2_flush_bytes=0 if args.no_l2_flush else L2_FLUSH_BYTES,
         l2_flush_method="none" if args.no_l2_flush else "per_iteration_fp32_randn",
@@ -287,11 +305,22 @@ def _summarize_samples(per_rank):
     }
 
 
-def _selected_knobs(pkg, policy, tokens, capacity, routing, quant_kind, world):
+def _selected_knobs(
+    pkg,
+    policy,
+    tokens,
+    capacity,
+    routing,
+    quant_kind,
+    world,
+    kernel_variant="inference",
+):
     if policy == "default":
         return None
     if policy == "heuristic":
-        return pkg.default_knobs(capacity, quant_kind=quant_kind)
+        return pkg.default_knobs(
+            capacity, quant_kind=quant_kind, kernel_variant=kernel_variant
+        )
     if policy == "cache":
         return "cache"
     if policy != "reported":
@@ -312,7 +341,7 @@ def _selected_knobs(pkg, policy, tokens, capacity, routing, quant_kind, world):
         mma_tiler_mnk=(
             row["tile"][0],
             row["tile"][1],
-            256 if quant_kind == "nvfp4" else 128,
+            256 if quant_kind in ("nvfp4", "mxfp4") else 128,
         ),
         cluster_shape_mn=(4, 1),
         fallback_cluster_shape_mn=(2, 1),
@@ -339,11 +368,19 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         MoEEpTensors,
         Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     selection = _selected_knobs(
-        pkg, args.knobs, tokens, capacity, routing, quant_kind, world
+        pkg,
+        args.knobs,
+        tokens,
+        capacity,
+        routing,
+        quant_kind,
+        world,
+        args.kernel_variant,
     )
     if args.variant is not None and isinstance(selection, dict):
         selection = dict(selection, reduce_topk_in_kernel=args.variant == "ikr")
@@ -351,12 +388,15 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         intermediate_size=INTERMEDIATE,
         top_k=TOP_K,
         knobs=selection,
+        kernel_variant=args.kernel_variant,
         in_kernel_fc2_reduce=args.variant == "ikr",
         gate_up_clamp=10.0 if args.input_profile == "blackwell" else None,
     )
     cfg = (
         Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
         if quant_kind == "nvfp4"
+        else Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
+        if quant_kind == "mxfp4"
         else Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(**common)
         if quant_kind == "mxfp4_mxfp8"
         else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind=quant_kind, **common)
@@ -370,7 +410,11 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
             token_hidden_size=HIDDEN,
         ),
         weights=None,
-        backend=MegaConfig(megakernel=cfg, transformed_weights=transformed),
+        backend=MegaConfig(
+            megakernel=cfg,
+            transformed_weights=transformed,
+            quantize_input=not args.prequantized,
+        ),
     )
     try:
         if args.input_profile == "blackwell":
@@ -387,7 +431,21 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
                 tokens, HIDDEN, device="cuda", dtype=torch.float32, generator=gen
             ).bfloat16()
         topk_idx, topk_weights = _make_routing(world, tokens, routing, args.alpha)
-        tensors = MoEEpTensors(x, topk_idx[rank], topk_weights[rank])
+        if args.prequantized:
+            if quant_kind == "nvfp4":
+                xq, sf = pkg.quantize_nvfp4_block16(x)
+            elif quant_kind == "mxfp4":
+                xq, sf = pkg.quantize_mxfp4_block32(x)
+            else:
+                dtype = (
+                    torch.float8_e5m2
+                    if quant_kind == "mxfp8_e5m2"
+                    else torch.float8_e4m3fn
+                )
+                xq, sf = pkg.quantize_mxfp8_block32(x, dtype)
+            tensors = MoEEpTensors(xq, topk_idx[rank], topk_weights[rank], scales=sf)
+        else:
+            tensors = MoEEpTensors(x, topk_idx[rank], topk_weights[rank])
         dist.barrier()
         layer.forward(tensors)
         resolved_variant = (
@@ -430,12 +488,19 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         dist.barrier()
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
         stops = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
+        wall_samples = []
         for i in range(args.iters):
             if not args.no_l2_flush:
                 # Retain the allocation through the launch, as Blackwell does.
                 flush_buffer = _l2_flush()
+                if args.eager_completed_wall:
+                    torch.cuda.synchronize()
             starts[i].record()
+            wall_start = time.perf_counter_ns() if args.eager_completed_wall else 0
             output = invoke()
+            if args.eager_completed_wall:
+                torch.cuda.synchronize()
+                wall_samples.append((time.perf_counter_ns() - wall_start) / 1000)
             stops[i].record()
         torch.cuda.synchronize()
         if not args.no_l2_flush:
@@ -443,6 +508,8 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         samples = [
             a.elapsed_time(b) * 1000.0 for a, b in zip(starts, stops, strict=False)
         ]
+        if args.eager_completed_wall:
+            samples = wall_samples
         observed = (
             layer._workspace.output_activation[:tokens]
             if args.mode == "kernel"
@@ -453,7 +520,9 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         error = pkg.output_error(observed, indices, expected)
         error_tensor = torch.tensor(error, device="cuda", dtype=torch.float64)
         dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)
-        if float(error_tensor) > (0.06 if quant_kind == "nvfp4" else 0.02):
+        if not math.isfinite(float(error_tensor)) or float(error_tensor) > (
+            0.06 if quant_kind in ("nvfp4", "mxfp4") else 0.02
+        ):
             raise RuntimeError(
                 f"benchmark output failed sampled Torch oracle: rel_l2={float(error_tensor)}"
             )
@@ -463,6 +532,9 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
         ).float()
         result = dict(
             schema_version=3,
+            case_id=args.case_id,
+            kernel_variant=workspace.config.kernel_variant,
+            prequantized=args.prequantized,
             rank=rank,
             routing=routing,
             alpha=args.alpha,
@@ -522,6 +594,7 @@ def _bench_one(rank, world, tokens, capacity, routing, transformed, args, quant_
 def _environment():
     import datetime
     import importlib.metadata
+    import flashinfer
     import subprocess
 
     def command(argv):
@@ -540,7 +613,9 @@ def _environment():
             versions[package] = None
     return dict(
         timestamp_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        git_revision=command(["git", "rev-parse", "HEAD"]),
+        git_revision=os.environ.get("MEGAMOE_SOURCE_SHA")
+        or command(["git", "rev-parse", "HEAD"]),
+        flashinfer_source_path=flashinfer.__file__,
         git_status=command(["git", "status", "--porcelain"]),
         torch=torch.__version__,
         torch_cuda=torch.version.cuda,
@@ -562,16 +637,108 @@ def _environment():
                 "NVSHMEM_REMOTE_TRANSPORT",
                 "NVSHMEM_DISABLE_P2P",
                 "FLASHINFER_MOE_EP_KNOB_CACHE",
+                "FLASHINFER_SM107_MEGA_CHECK_ROUTES",
+                "FLASHINFER_SM107_FUSED_ROUTE_CHECK",
                 "CUDA_VISIBLE_DEVICES",
             )
         },
     )
 
 
+def _testlist(args, world):
+    """Expand an explicit workload list without changing standalone defaults."""
+    if not args.testlist:
+        return [args]
+    with open(args.testlist) as stream:
+        rows = json.load(stream)
+    allowed = {
+        "case_id",
+        "world_size",
+        "hidden",
+        "intermediate",
+        "num_experts",
+        "topk",
+        "tokens",
+        "capacity",
+        "quant_kind",
+        "kernel_variant",
+        "prequantized",
+    }
+    cases, ids = [], set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != allowed:
+            raise ValueError(
+                "each testlist row must specify exactly " + ", ".join(sorted(allowed))
+            )
+        if not row["case_id"] or row["case_id"] in ids:
+            raise ValueError("testlist case IDs must be nonempty and unique")
+        ids.add(row["case_id"])
+        if row["world_size"] != world:
+            continue
+        values = dict(vars(args))
+        values.update({key: value for key, value in row.items() if key != "world_size"})
+        values["tokens"] = str(values["tokens"])
+        case = argparse.Namespace(**values)
+        if any(
+            type(getattr(case, name)) is not int
+            for name in ("hidden", "intermediate", "num_experts", "topk", "capacity")
+        ):
+            raise ValueError("testlist dimensions and capacity must be integers")
+        if (
+            min(
+                case.hidden,
+                case.intermediate,
+                case.num_experts,
+                case.topk,
+                int(case.tokens),
+            )
+            < 1
+        ):
+            raise ValueError("testlist dimensions must be positive")
+        if (
+            case.capacity < int(case.tokens)
+            or case.num_experts % world
+            or case.topk > case.num_experts
+        ):
+            raise ValueError("invalid capacity, expert partition or top-k")
+        if (
+            case.kernel_variant not in ("inference", "genphase")
+            or case.quant_kind
+            not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8")
+            or type(case.prequantized) is not bool
+        ):
+            raise ValueError("invalid kernel variant, format or input policy")
+        if case.mode != "forward" or case.knobs not in ("default", "heuristic"):
+            raise ValueError("testlists require forward timing and built-in knobs")
+        if case.kernel_variant == "genphase" and (
+            case.knobs != "heuristic" or case.capacity > 1024
+        ):
+            raise ValueError(
+                "GenPhase testlists require heuristic knobs and capacity <= 1024"
+            )
+        cases.append(case)
+    if not cases:
+        raise ValueError(f"no testlist cases for EP{world}")
+    return cases
+
+
 def main():
     global HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--testlist", help="JSON testlist; select rows matching WORLD_SIZE"
+    )
+    parser.add_argument("--case-id", default="standalone")
+    parser.add_argument(
+        "--kernel-variant", choices=["inference", "genphase"], default="inference"
+    )
+    parser.add_argument("--prequantized", action="store_true")
+    parser.add_argument(
+        "--eager-completed-wall",
+        action="store_true",
+        help="time eager host dispatch through device completion for each call",
+    )
     parser.add_argument("--tokens", default="8,64,512,1024,2048,4096,8192")
     parser.add_argument(
         "--capacity",
@@ -598,7 +765,15 @@ def main():
     parser.add_argument(
         "--quant-kind",
         default="nvfp4",
-        choices=["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8", "both", "all"],
+        choices=[
+            "nvfp4",
+            "mxfp8_e4m3",
+            "mxfp8_e5m2",
+            "mxfp4",
+            "mxfp4_mxfp8",
+            "both",
+            "all",
+        ],
     )
     parser.add_argument(
         "--mode", choices=["kernel", "compute", "forward"], default="kernel"
@@ -623,6 +798,12 @@ def main():
     )
     parser.add_argument("--output", default="bench_sm107_mega_results.jsonl")
     args = parser.parse_args()
+    if args.eager_completed_wall and args.execution != "eager":
+        parser.error("--eager-completed-wall requires --execution eager")
+    if args.kernel_variant == "genphase" and (
+        args.variant == "ikr" or args.knobs == "reported"
+    ):
+        parser.error("GenPhase does not use IKR or reported inference profiles")
     if args.knobs == "reported" and args.variant == "ikr":
         parser.error(
             "reported profiles use separate reduction; do not label an IKR override reported"
@@ -639,6 +820,14 @@ def main():
         parser.error("tokens, warmup, iters, and repetition must be positive")
     if args.capacity is not None and args.capacity < max(token_list):
         parser.error("--capacity must cover every live token count")
+    if (
+        not args.testlist
+        and args.kernel_variant == "genphase"
+        and (args.knobs == "default" or (args.capacity or max(token_list)) > 1024)
+    ):
+        parser.error(
+            "GenPhase requires heuristic, cache, or explicit knobs and capacity <= 1024"
+        )
     rank, world = (
         int(os.environ.get("RANK", "0")),
         int(os.environ.get("WORLD_SIZE", "1")),
@@ -649,6 +838,7 @@ def main():
         parser.error(
             "num-experts must divide across ranks and topk must be in [1, num-experts]"
         )
+    cases = _testlist(args, world)
     from flashinfer.moe_ep import (
         BootstrapConfig,
         bootstrap_moe_ep_runtime,
@@ -670,7 +860,7 @@ def main():
     )
     routings = ["balanced", "power_law"] if args.routing == "both" else [args.routing]
     kinds = (
-        ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
+        ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8"]
         if args.quant_kind == "all"
         else ["nvfp4", "mxfp8_e4m3"]
         if args.quant_kind == "both"
@@ -678,64 +868,84 @@ def main():
     )
     environment = _environment()
     try:
-        for kind in kinds:
-            torch.cuda.reset_peak_memory_stats()
-            start = time.perf_counter()
-            transformed = _local_transformed_weights(
-                rank, world, kind, args.input_profile
+        for case in cases:
+            HIDDEN, INTERMEDIATE, NUM_EXPERTS, TOP_K, SEED = (
+                case.hidden,
+                case.intermediate,
+                case.num_experts,
+                case.topk,
+                case.seed,
             )
-            torch.cuda.synchronize()
-            preparation = dict(
-                elapsed_seconds=time.perf_counter() - start,
-                torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
-                torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
-            )
-            for routing in routings:
-                for tokens in token_list:
-                    result, samples = _bench_one(
-                        rank,
-                        world,
-                        tokens,
-                        args.capacity or tokens,
-                        routing,
-                        transformed,
-                        args,
-                        kind,
-                    )
-                    local = dict(
-                        result=result,
-                        samples_us=samples,
-                        preprocessing=preparation,
-                        environment=environment,
-                    )
-                    gathered = [None] * world
-                    dist.all_gather_object(gathered, local)
-                    if rank == 0:
-                        summary = _summarize_samples(
-                            [r["samples_us"] for r in gathered]
+            # One weight bank per testlist row, reused by both timing boundaries.
+            for kind in [case.quant_kind] if case.testlist else kinds:
+                torch.cuda.reset_peak_memory_stats()
+                start = time.perf_counter()
+                transformed = _local_transformed_weights(
+                    rank, world, kind, case.input_profile
+                )
+                torch.cuda.synchronize()
+                preparation = dict(
+                    elapsed_seconds=time.perf_counter() - start,
+                    torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                    torch_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                )
+                for routing in routings:
+                    for tokens in [int(t) for t in case.tokens.split(",")]:
+                        executions = (
+                            [("graph", False), ("eager", True)]
+                            if case.testlist
+                            else [(case.execution, case.eager_completed_wall)]
                         )
-                        summary["model_tflops_per_rank"] = (
-                            tokens
-                            * TOP_K
-                            * 6
-                            * HIDDEN
-                            * INTERMEDIATE
-                            / summary["max_rank_p50_us"]
-                            / 1e6
-                        )
-                        record = dict(result, **summary, per_rank=gathered)
-                        with open(args.output, "a") as stream:
-                            stream.write(json.dumps(record) + "\n")
-                        print(
-                            f"{kind} EP{world} {routing} T={tokens}/{args.capacity or tokens} "
-                            f"{args.mode}/{args.execution}: max(rank p50)={summary['max_rank_p50_us']:.2f} us, "
-                            f"p50(rank 0)={summary['p50_rank0_us']:.2f} us, "
-                            f"rel_l2={result['relative_l2_max_rank']:.5f}",
-                            flush=True,
-                        )
-                    dist.barrier()
-            del transformed
-            torch.cuda.empty_cache()
+                        for case.execution, case.eager_completed_wall in executions:
+                            result, samples = _bench_one(
+                                rank,
+                                world,
+                                tokens,
+                                case.capacity or tokens,
+                                routing,
+                                transformed,
+                                case,
+                                kind,
+                            )
+                            local = dict(
+                                result=result,
+                                samples_us=samples,
+                                preprocessing=preparation,
+                                environment=environment,
+                            )
+                            gathered = [None] * world
+                            dist.all_gather_object(gathered, local)
+                            if rank == 0:
+                                summary = _summarize_samples(
+                                    [r["samples_us"] for r in gathered]
+                                )
+                                summary["rank_max_median_us"] = statistics.median(
+                                    max(values)
+                                    for values in zip(
+                                        *(r["samples_us"] for r in gathered),
+                                        strict=True,
+                                    )
+                                )
+                                summary["model_tflops_per_rank"] = (
+                                    tokens
+                                    * TOP_K
+                                    * 6
+                                    * HIDDEN
+                                    * INTERMEDIATE
+                                    / summary["max_rank_p50_us"]
+                                    / 1e6
+                                )
+                                record = dict(result, **summary, per_rank=gathered)
+                                with open(case.output, "a") as stream:
+                                    stream.write(json.dumps(record) + "\n")
+                                print(
+                                    f"{case.case_id} {kind} EP{world} T={tokens}: "
+                                    f"{case.execution} {summary['rank_max_median_us']:.2f} us",
+                                    flush=True,
+                                )
+                            dist.barrier()
+                del transformed
+                torch.cuda.empty_cache()
     except BaseException:
         runtime = None
         raise

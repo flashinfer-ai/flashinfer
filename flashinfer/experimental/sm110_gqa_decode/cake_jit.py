@@ -54,9 +54,9 @@ record's ``workspace`` leaf names the four buffers the host allocates
 zero at prepare and reset by the kernel, so a captured graph replays without a
 reset node).  No rule reads a tensor.
 
-The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
-``logical``) are rewritten by the exporter from the rendered binding; the
-other fields are the host plan and never change.
+The derived leaves of a record (``arg_plan``, ``logical``) are rewritten by
+the exporter from the rendered binding; the other fields are the host plan and
+never change.
 """
 
 from __future__ import annotations
@@ -100,8 +100,8 @@ LOGICAL_TENSORS = (
 )
 LOGICAL_SCALARS = ("softmax_scale_log2",)
 
-# Filled mechanically by the exporter (the derived leaves ``kernel_symbol``, ``launch``, ``arg_plan``,
-# ``logical``); the host plan (``stage``, ``variant``, ``select_rule``, ``grid_rule``, ``library``, ``arches``)
+# Filled mechanically by the exporter (the derived leaves ``arg_plan``, ``logical``); the host plan
+# (``stage``, ``variant``, ``select_rule``, ``grid_rule``, ``library``, ``arches``)
 # is written by hand.  Every value is a literal: FlashInfer's manifest checker and the exporter read this file
 # with ``ast.literal_eval``.  A record is named by its route.
 MODULES: dict[str, dict[str, Any]] = {
@@ -120,12 +120,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "batch_heads", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_01f1434b7424417bec5c",
-        "launch": {
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_01f1434b7424417bec5c",
         "logical": {
             "K": "K",
@@ -164,12 +158,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "batch_heads", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_daa3a415e53b721fe538",
-        "launch": {
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_daa3a415e53b721fe538",
         "logical": {
             "K": "K",
@@ -212,12 +200,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_d8f05d2bfbbde5459902",
-        "launch": {
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_d8f05d2bfbbde5459902",
         "logical": {
             "K": "K",
@@ -255,12 +237,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_e5128e91902434559902",
-        "launch": {
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_e5128e91902434559902",
         "logical": {
             "K": "K",
@@ -314,12 +290,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_f0ed92bc2f7a1e380d70",
-        "launch": {
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_f0ed92bc2f7a1e380d70",
         "logical": {
             "K": "K",
@@ -373,12 +343,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": "runtime"},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_b7f31235adbc7ac497d0",
-        "launch": {
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_b7f31235adbc7ac497d0",
         "logical": {
             "K": "K",
@@ -416,12 +380,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": "runtime"},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_3f0576c3791ebdd23b5a",
-        "launch": {
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_3f0576c3791ebdd23b5a",
         "logical": {
             "K": "K",

@@ -588,7 +588,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (load_clc_stage) * 8), "r"(0) : "memory");
                             load_clc_stage += 1;
                             if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
                             load_valid = _clc_valid_1;
@@ -700,7 +700,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (load_clc_stage) * 8), "r"(0) : "memory");
                             load_clc_stage += 1;
                             if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
                             load_valid = _clc_valid_2;
@@ -906,7 +906,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (mma_clc_stage) * 8), "r"(0) : "memory");
                             mma_clc_stage += 1;
                             if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
                             mma_valid = _clc_valid_3;
@@ -916,7 +916,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                     last_stage = mma_stage;
                     if (cta_rank == 0) {
                         elect_commit_cg2_local(klast_done_addr);
-                        unsigned int _parity_klast_done = completed % 2;
+                        int _parity_klast_done = (int)((unsigned int)(int)completed % 2);
                         mbarrier_wait(klast_done_addr, _parity_klast_done);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
@@ -1079,7 +1079,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             if (hs_1 >= 5) {
                                 hs_1 = hs_1 - 5;
                             }
-                            elect_commit_cg2_multicast(tma_empty_addr + (hs_1) * 8, (uint16_t)(3));
+                            elect_commit_cg2_multicast(tma_empty_addr + (((mma_stage + (4 + rank_chunk_4) >= 5) ? mma_stage + (4 + rank_chunk_4) - 5 : mma_stage + (4 + rank_chunk_4))) * 8, (uint16_t)(3));
                         }
                     }
                 } else {
@@ -1212,7 +1212,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                                 "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
-                                :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                                :: "r"(clc_empty_addr + (mma_clc_stage) * 8), "r"(0) : "memory");
                             mma_clc_stage += 1;
                             if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
                             mma_valid = _clc_valid_4;
@@ -1222,7 +1222,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                     last_stage = mma_stage;
                     if (cta_rank == 0) {
                         elect_commit_cg2_local(klast_done_addr);
-                        unsigned int _parity_klast_done_1 = completed % 2;
+                        int _parity_klast_done_1 = (int)((unsigned int)(int)completed % 2);
                         mbarrier_wait(klast_done_addr, _parity_klast_done_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
@@ -1385,14 +1385,14 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             if (hs_3 >= 5) {
                                 hs_3 = hs_3 - 5;
                             }
-                            elect_commit_cg2_multicast(tma_empty_addr + (hs_3) * 8, (uint16_t)(3));
+                            elect_commit_cg2_multicast(tma_empty_addr + (((mma_stage + (4 + rank_chunk_7) >= 5) ? mma_stage + (4 + rank_chunk_7) - 5 : mma_stage + (4 + rank_chunk_7))) * 8, (uint16_t)(3));
                         }
                     }
                 }
                 _phase_acc_empty ^= 1;
                 accf_stage += 1;
                 if (accf_stage == 2) { accf_stage = 0; }
-                completed = completed + 1;
+                completed += 1;
                 if (mma_valid == 0) {
                     break;
                 }
@@ -1454,7 +1454,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(clc_full_addr + sched_clc_stage * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(clc_full_addr + (sched_clc_stage) * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
                     }
                     if (elect_sync()) {
                         asm volatile(
@@ -1485,7 +1485,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(clc_empty_addr + sched_clc_stage * 8), "r"(0) : "memory");
+                        :: "r"(clc_empty_addr + (sched_clc_stage) * 8), "r"(0) : "memory");
                     sched_clc_stage += 1;
                     if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_2 ^= 1; }
                     if (_clc_valid_0 == 0) {
@@ -1558,7 +1558,7 @@ kernel_cake_nvfp4_svdquant_gemm_2ca0cf40f7bbfca9df92(const __grid_constant__ CUt
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(clc_empty_addr + epi_clc_stage * 8), "r"(0) : "memory");
+                    :: "r"(clc_empty_addr + (epi_clc_stage) * 8), "r"(0) : "memory");
                 epi_clc_stage += 1;
                 if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_3 ^= 1; }
                 int unit_i_2 = (int)unit_e;

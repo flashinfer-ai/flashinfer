@@ -14,37 +14,8 @@
  * limitations under the License.
  */
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(64) CakeTensorMap64 {
-  uint64_t opaque[16];
-};
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#include "cake_hopper_msa_device.h"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_Q_S_OFF 1024
 #define SMEM_Q_S_STAGE_BYTES 32768
@@ -55,80 +26,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_TOTAL 99328
 #define THREADS 544
 #define LAUNCH_MIN_BLOCKS 1
-
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-  uint32_t pred = 0;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred %%px;\n\t"
-      "elect.sync _|%%px, %1;\n\t"
-      "@%%px mov.s32 %0, 1;\n\t"
-      "}\n"
-      : "+r"(pred)
-      : "r"(0xFFFFFFFF));
-  return pred;
-}
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
-}
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE;\n\t"
-      "bra.uni LAB_WAIT;\n\t"
-      "DONE:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];" ::"r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(mbar_addr),
-      "r"(bytes)
-      : "memory");
-}
-
-__device__ __forceinline__ void tma_3d_gmem2smem(int dst, const void* tmap_ptr, int x, int y, int z,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.3d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4}], [%5];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ void tma_2d_gmem2smem(int dst, const void* tmap_ptr, int x, int y,
-                                                 int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global"
-      ".mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst),
-      "l"(tmap_ptr), "r"(x), "r"(y), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
-  uint32_t result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(result) : "r"(val));
-  return result;
-}
 
 extern "C" {
 

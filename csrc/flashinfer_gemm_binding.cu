@@ -20,11 +20,12 @@ void bmm_fp8(TensorView A, TensorView B, TensorView D, TensorView A_scale, Tenso
              TensorView workspace_buffer);
 
 int64_t bmm_fp8_get_algos(TensorView A, TensorView B, TensorView D, TensorView A_scale,
-                          TensorView B_scale, TensorView workspace_buffer, TensorView algo_buffer);
+                          TensorView B_scale, TensorView workspace_buffer, TensorView algo_buffer,
+                          int64_t algo_m);
 
-void bmm_fp8_run_with_algo(TensorView A, TensorView B, TensorView D, TensorView A_scale,
-                           TensorView B_scale, TensorView workspace_buffer, TensorView algo_buffer,
-                           int64_t algo_idx);
+int64_t bmm_fp8_run_with_descriptor(TensorView A, TensorView B, TensorView D, TensorView A_scale,
+                                    TensorView B_scale, TensorView workspace_buffer,
+                                    ffi::Optional<TensorView> algo_desc);
 
 void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, TensorView x_ptr,
                         TensorView w_ptr, TensorView y_ptr, TensorView x_ld, TensorView w_ld,
@@ -33,4 +34,4 @@ void CutlassSegmentGEMM(TensorView workspace_buffer, TensorView all_problems, Te
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cutlass_segment_gemm, CutlassSegmentGEMM);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8, bmm_fp8);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8_get_algos, bmm_fp8_get_algos);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8_run_with_algo, bmm_fp8_run_with_algo);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(bmm_fp8_run_with_descriptor, bmm_fp8_run_with_descriptor);

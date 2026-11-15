@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SM120 block-scaled GEMM builder for the warp-specialized kernel family: composable per-phase configs + top builder."""
+"""SM120 block-scaled GEMM phase configs and cooperative/warp-specialized builders."""
 
 import cutlass
 import cutlass.cute as cute
@@ -22,6 +22,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync
 
 from .moe_scheduler import MoeSchedStages, MoeWorkTile
+from .sm12x_blockscaled_layout import align, ceil_div
 
 _SM12X_ARCHS = ("sm_120a", "sm_120f", "sm_121a", "sm_121f")
 
@@ -34,6 +35,15 @@ def dsl_targets_sm12x() -> bool:
     except Exception:
         return True
     return target in _SM12X_ARCHS
+
+
+def get_moe_worklist_grid_size(total_rows, num_experts, n, tile):
+    bm, bn = tile[:2]
+    bound = min(num_experts, total_rows) + ceil_div(total_rows, bm)
+    grid_m = min(
+        bound, min(num_experts, total_rows) + max(1, ceil_div(total_rows, 8 * bm))
+    )
+    return max(1, grid_m) * ceil_div(n, bn)
 
 
 class MmaConfig:
@@ -71,8 +81,10 @@ class MmaConfig:
         return self.op.shape_mnk[2] if self.plain_fp8 else self.op.sf_vec_size
 
     def make_tiled_mma(self, tile):
-        if self.plain_fp8 or self.swap_ab:
+        if self.plain_fp8:
             perm = (tile[0], tile[1], self.sf_vec)
+        elif self.swap_ab:
+            perm = (tile[0], tile[1], self.op.shape_mnk[2])
         else:
             perm = sm120_utils.get_permutation_mnk(tile, self.sf_vec, self.use_mxf8f6f4)
         return cute.make_tiled_mma(
@@ -192,6 +204,89 @@ class LoadABConfig:
         return self._tma_atom(gB, smem_layout_b, self.tma_box_b, self.b_tma_internal)
 
 
+class Sm12xDecodeGemmConfig:
+    WARP_SIZE = 32
+    G2S_BITS = 64
+    SMEM_ALIGN_BYTES = 128
+
+    def __init__(
+        self, mma, load_ab, load_sf, epi, ab_stage, tile, epi_bar_id=3, enable_pdl=False
+    ):
+        self.mma, self.load_ab, self.load_sf, self.epi = mma, load_ab, load_sf, epi
+        self.TILE = tuple(tile)
+        self.ab_stage, self.enable_pdl = ab_stage, enable_pdl
+        self.mma_threads = self.threads = mma.num_math_warps * self.WARP_SIZE
+        self.epi_bar_id = epi_bar_id
+        assert ab_stage >= 2 and ab_stage & (ab_stage - 1) == 0
+        copy_elements = self.G2S_BITS // load_ab.a_dtype.width
+        assert self.TILE[2] % copy_elements == 0
+        lanes_k = ceil_div(self.TILE[2], copy_elements)
+        assert lanes_k <= self.WARP_SIZE and lanes_k & (lanes_k - 1) == 0
+        assert self.smem_bytes <= cutlass.utils.SmemAllocator.capacity_in_bytes()
+
+    @property
+    def min_blocks_per_sm(self):
+        return cutlass.utils.SmemAllocator.capacity_in_bytes() // self.smem_bytes
+
+    @property
+    def smem_bytes(self):
+        total = self.load_ab.smem_bytes() + self.load_sf.smem_bytes(
+            self.TILE, self.ab_stage
+        )
+        total += self.epi.smem_bytes(self.TILE) + self.epi.aux_smem_bytes(self.TILE)
+        return align(total, self.SMEM_ALIGN_BYTES)
+
+
+class Sm12xDecodeFc1GemmConfig(Sm12xDecodeGemmConfig):
+    def __init__(self, *args, activation, gated, fused_gated=False, k=None, **kwargs):
+        self.activation, self.gated = activation, gated
+        self.fused_gated, self.k = fused_gated, k
+        if fused_gated:
+            assert k is not None and k > 0
+        super().__init__(*args, **kwargs)
+        if fused_gated:
+            assert k % self.TILE[2] == 0
+
+    @property
+    def min_blocks_per_sm(self):
+        return 1 if self.fused_gated else super().min_blocks_per_sm
+
+    @property
+    def sf_staged(self):
+        return (
+            self.fused_gated
+            and self._fused_gated_smem_bytes(ceil_div(self.k, self.TILE[2]))
+            > cutlass.utils.SmemAllocator.capacity_in_bytes()
+        )
+
+    @property
+    def sf_stages(self):
+        return self.ab_stage if self.sf_staged else ceil_div(self.k, self.TILE[2])
+
+    @property
+    def smem_bytes(self):
+        if not self.fused_gated:
+            total = super().smem_bytes
+            if self.gated:
+                total += self.load_ab.smem_bytes_a()
+                total += self.load_sf.gate_smem_bytes(self.TILE, self.ab_stage, True)
+            return align(total, self.SMEM_ALIGN_BYTES)
+        return self._fused_gated_smem_bytes(self.sf_stages)
+
+    def _fused_gated_smem_bytes(self, sf_stages):
+        bm, bn, bk = self.TILE
+        word_bytes = self.load_sf.sf_dtype.width // 8
+        token_sf = bn * self.load_sf.sf_in_tile_k(bk) * sf_stages * word_bytes
+        weight_sf = bm * self.load_sf.sf_in_tile_k(bk) * self.ab_stage * word_bytes
+        total = self.load_ab.smem_bytes_b()
+        total = align(total, 1024) + self.load_ab.smem_bytes_a()
+        total = align(total, 16) + bn * cutlass.Int32.width // 8
+        total = align(total, 1024) + token_sf
+        total = align(total, 16) + weight_sf
+        total += max(0, bm * bn * cutlass.Float32.width // 8 - token_sf - weight_sf)
+        return total
+
+
 class SmemUnionTooSmall(AssertionError):
     pass
 
@@ -230,16 +325,12 @@ class Sm12xGemmConfig:
                 f"staging, so they reach the SF ring, which a different warp refills without waiting "
                 f"on epi_empty"
             )
-        assert not epi.DRAINS_SC_IN_WG or union_smem, (
-            f"{epi.METHOD} writes sC in place, and store_wg's entry barrier exists only to keep "
-            f"one warp's sC write from racing another's still-pending read of the sA it overlays"
-        )
         self.TILE = tuple(tile)
         self.ab_stage = ab_stage
         self.epi_bar_id = epi_bar_id
         num_math_warps = mma.num_math_warps
         self.num_math_warps = num_math_warps
-        self.mma_threads = num_math_warps * 32
+        self.mma_threads = mma.num_math_warps * 32
         assert epi.mma_threads == self.mma_threads, (
             f"EpiConfig was built for {epi.mma_threads} math threads but MmaConfig gives "
             f"{self.mma_threads}; the S2G thread layout is derived from that count"
@@ -325,6 +416,12 @@ class Sm12xGemmConfig:
 
     def is_prod_wg(self, warp_idx):
         return warp_idx >= self.num_math_warps
+
+
+class Sm12xUnaryGemmConfig(Sm12xGemmConfig):
+    def __init__(self, *args, activation, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.activation = activation
 
 
 class Sm12xGatedGemmConfig(Sm12xGemmConfig):

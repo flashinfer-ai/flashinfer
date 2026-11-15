@@ -1,0 +1,45 @@
+{
+  "fi_api": "flashinfer.fused_moe.core.cutlass_fused_moe",
+  "flashinfer_version": "0.6.18.post1",
+  "inputs": {
+    "fc1_expert_weights": "bfloat16",
+    "fc2_expert_weights": "bfloat16",
+    "input": "bfloat16",
+    "output": "bfloat16",
+    "token_final_scales": "float32",
+    "token_selected_experts": "int32"
+  },
+  "operation": "cutlass_fused_moe_e128_h2688_i1856_topk6",
+  "receipt_sha256": "723d5fec2b7309473911e7e41b8342ccac35318b5a22c44f27e93b69df3e31f3",
+  "scalars": {
+    "activation_type": 6,
+    "cluster_rank": 0,
+    "cluster_size": 1,
+    "enable_alltoall": false,
+    "enable_pdl": null,
+    "ep_rank": 0,
+    "ep_size": 1,
+    "fc1_expert_biases": null,
+    "fc2_expert_biases": null,
+    "input_sf": null,
+    "min_latency_mode": false,
+    "profile_ids": null,
+    "swiglu_alpha": null,
+    "swiglu_beta": null,
+    "swiglu_limit": null,
+    "swizzled_input_sf": true,
+    "tp_rank": 0,
+    "tp_size": 1,
+    "tune_max_num_tokens": 8192,
+    "use_deepseek_fp8_block_scale": false,
+    "use_fused_finalize": true,
+    "use_mxfp8_act_scaling": false,
+    "use_packed_weights": false,
+    "use_w4_group_scaling": false,
+    "use_wfp4afp8_humming": false,
+    "workspace_buffer": null
+  },
+  "target_hardware": [
+    "sm100"
+  ]
+}

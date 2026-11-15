@@ -30,6 +30,9 @@ from .weights import (
 )
 
 if TYPE_CHECKING:
+    from ..mxfp4_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
     from ......tensors import MoEEpTensors
     from ......kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
         Sm107BlockScaledSymmBuffer,
@@ -41,7 +44,8 @@ if TYPE_CHECKING:
 
 def _resolve_gate_up_clamp(
     config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
 ) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
@@ -59,10 +63,43 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def __init__(
         self,
         config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     ) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self._arithmetic_arch = "sm_107"
+
+    def ep_weight_pack(self, weights):
+        from ..automatic import ep_weight_pack
+
+        return ep_weight_pack(self, weights)
+
+    def ep_selected_config(self, workspace):
+        from ..automatic import ep_selected_config
+
+        return ep_selected_config(self, workspace)
+
+    def ep_prepare_fixed(self, workspace, weights):
+        workspace.prepare(*weights)
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        from ..automatic import ep_force_tune
+
+        ep_force_tune(self, workspace, tensors, weights, output)
+
+    def ep_tuning_contract(self, fleet_params):
+        from ..automatic import ep_tuning_contract
+
+        return ep_tuning_contract(self, fleet_params)
+
+    @classmethod
+    def create(cls, config):
+        if config.kernel_variant == "auto":
+            from ..variant_selection import RubinVariantBackend
+
+            return RubinVariantBackend(config, cls)
+        return cls(config)
 
     def coordinate_workspace_replacement(
         self, workspace: Sm107BlockScaledSymmBuffer
@@ -89,6 +126,12 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
         validate_mega_arch_sm107()
+        if getattr(self._kernel_config, "batch_invariant", False):
+            from ...sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            validate_block_scaled_batch_invariant(self._kernel_config, arch="sm_107")
         from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
 
         self._ensure_ep_bootstrap(bootstrap)
@@ -149,6 +192,10 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict:
         k = self._kernel_config
+        from ...sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_version,
+        )
+
         return dict(
             dtype=k.kind,
             world_size=self.ep_world_size,
@@ -164,7 +211,24 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             combine_dtype=k.combine_dtype,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            swiglu_alpha=getattr(k, "swiglu_alpha", None),
+            swiglu_beta=getattr(k, "swiglu_beta", None),
             gate_up_clamp=_resolve_gate_up_clamp(k),
+            batch_invariant=getattr(k, "batch_invariant", False),
+            batch_invariant_version=block_scaled_batch_invariant_version(k)
+            if getattr(k, "batch_invariant", False)
+            else None,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not getattr(self._kernel_config, "batch_invariant", False):
+            return None
+        from ...sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
+        )
+
+        return block_scaled_batch_invariant_fingerprint(
+            self._resolved_config(fleet_params), arch="sm_107"
         )
 
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
@@ -177,13 +241,41 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             Sm107BlockScaledSymmBuffer,
         )
 
-        return Sm107BlockScaledSymmBuffer(self._resolved_config(fleet_params))
+        return Sm107BlockScaledSymmBuffer(
+            self._resolved_config(fleet_params),
+            process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
+        )
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
         """Resolve fixed overrides or the automatic workspace's initial heuristic."""
         from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
+        if getattr(k, "batch_invariant", False):
+            from ...sm100.common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_default_knobs,
+                validate_block_scaled_batch_invariant,
+            )
+
+            selected = block_scaled_batch_invariant_default_knobs(
+                k,
+                "genphase" if k.kernel_variant == "genphase" else "standard",
+                arch="sm_107",
+            )
+            for name in selected:
+                configured = getattr(k, name, None)
+                if configured is not None:
+                    selected[name] = configured
+            if isinstance(k.knobs, dict):
+                selected.update(k.knobs)
+            elif k.knobs == "cache":
+                selected.update(self._workspace_knobs(fleet_params))
+            elif k.knobs not in (None, "auto"):
+                raise MoEEpConfigError(
+                    "knobs must be None, 'cache', 'auto', or a dictionary"
+                )
+            validate_block_scaled_batch_invariant(k, selected, arch="sm_107")
+            return selected
         if k.knobs is None:
             return {}
         if isinstance(k.knobs, dict):
@@ -239,12 +331,13 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
-        validate_routing_values(
-            t.topk_ids,
-            t.topk_weights,
-            workspace.config.num_total_experts,
-            workspace=workspace,
-        )
+        """Stage validated MXFP8 activations and routes, masking unused rows.
+
+        BF16 inputs may fuse validation with quantization; prequantized inputs
+        are validated before copying their payload and logical scale columns.
+        """
+        if self._kernel_config.knobs == "auto":
+            workspace._tuning_inputs = (t, quantize_input)
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
@@ -255,9 +348,23 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 kind=self._kernel_config.kind,
+                num_experts=workspace.config.num_total_experts,
+                workspace=workspace,
+                **(
+                    {"batch_invariant": True}
+                    if getattr(self._kernel_config, "batch_invariant", False)
+                    else {}
+                ),
             )
             workspace.note_staged_tokens(staged)
             return
+
+        validate_routing_values(
+            t.topk_ids,
+            t.topk_weights,
+            workspace.config.num_total_experts,
+            workspace=workspace,
+        )
 
         num_tokens = t.hidden_states.shape[0]
         capacity = workspace.x.shape[0]
@@ -270,8 +377,15 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
                 t.scales.view(torch.uint8)
             )
-            workspace.topk_idx[:num_tokens].copy_(t.topk_ids.to(torch.int32))
-            workspace.topk_weights[:num_tokens].copy_(t.topk_weights.to(torch.float32))
+            from ..routing_staging import stage_routes
+
+            stage_routes(
+                t.topk_ids,
+                t.topk_weights,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                workspace=workspace,
+            )
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)
@@ -320,6 +434,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         fp = fleet_params
         return (
             self.kernel_name(),
+            getattr(k, "batch_invariant", False),
+            self.batch_invariant_fingerprint(fleet_params),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

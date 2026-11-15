@@ -207,7 +207,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             )
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
-            # tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
+            if load_init_state:
+                # Finish initial-history reads before the in-place state update.
+                tl.debug_barrier()
             tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
         else:
@@ -253,6 +255,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
                     None, :
                 ]
+                # Shifted history can be read and written by different warps.
+                tl.debug_barrier()
                 tl.store(conv_states_ptrs_target, new_conv_state, mask)
             else:  # load_init_state == False
                 # update conv_state by shifting left, BUT
@@ -765,6 +769,8 @@ def _causal_conv1d_update_kernel(
         conv_state_base + (idx_tokens * stride_conv_state_tok)[:, None]
     )  # [BLOCK_M, BLOCK_N]
     mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+    # Finish old-history reads in all warps before overwriting the state pool.
+    tl.debug_barrier()
     tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator

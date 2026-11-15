@@ -366,9 +366,10 @@ __global__ void checkpointing_ssu_precompute_kernel(CheckpointingSsuParams param
   // via __ldg (read-only path), so its latency overlaps the ring_start load instead of fully
   // stalling must_checkpoint on a cold dependent global load.
   auto const* __restrict__ prev_ptr = reinterpret_cast<int32_t const*>(params.prev_num_accepted);
-  int const prev_k = __ldg(&prev_ptr[cache_slot]);
+  int const prev_k = __ldg(&prev_ptr[tracker_offset(cache_slot, params.prev_num_accepted_stride)]);
   auto const* __restrict__ ring_start_ptr = reinterpret_cast<int32_t const*>(params.ring_start);
-  int const ring_start = __ldg(&ring_start_ptr[cache_slot]);
+  int const ring_start =
+      __ldg(&ring_start_ptr[tracker_offset(cache_slot, params.ring_start_stride)]);
 
   int seq_len;
   int64_t outer;

@@ -91,6 +91,8 @@ from .pcie_ipc_topology import (
     resolve_pcie_ipc_profile as resolve_pcie_ipc_profile,
 )
 from .ulysses import UlyssesCommunicator as UlyssesCommunicator
+from .ulysses import UlyssesQKV as UlyssesQKV
+from .ulysses import UlyssesQKVWorkspace as UlyssesQKVWorkspace
 from .ulysses import UlyssesWorkspace as UlyssesWorkspace
 from .ulysses import dispose_ulysses_a2a as dispose_ulysses_a2a
 from .ulysses import init_ulysses_a2a as init_ulysses_a2a
@@ -101,6 +103,7 @@ from .ulysses_head_chunk import (
 from .ulysses_head_chunk import (
     pack_ulysses_qkv_head_chunk as pack_ulysses_qkv_head_chunk,
 )
+
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError
@@ -126,6 +129,16 @@ from .allreduce import (
     create_allreduce_fusion_workspace as create_allreduce_fusion_workspace,
 )
 from .allreduce import is_mnnvl_cutedsl_supported as is_mnnvl_cutedsl_supported
+
+# Experimental: MNNVL all-reduce fused with the mHC post-map and pre-norm partials. Thin entry
+# points; the backend is imported on first call.
+from .allreduce_mhc import allreduce_mhc_post_prenorm as allreduce_mhc_post_prenorm
+from .allreduce_mhc import (
+    allreduce_mhc_post_prenorm_prepare as allreduce_mhc_post_prenorm_prepare,
+)
+from .allreduce_mhc import (
+    allreduce_mhc_post_prenorm_supported as allreduce_mhc_post_prenorm_supported,
+)
 
 with contextlib.suppress(ImportError, AttributeError):
     from .tp_moe_finalize_rmsnorm import (

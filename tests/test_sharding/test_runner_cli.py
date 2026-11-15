@@ -471,6 +471,49 @@ def test_slow_collection_reports_a_live_heartbeat(
     assert f"test_path={suite}" in output
 
 
+@pytest.mark.parametrize("collection_error", [False, True])
+def test_collection_logs_survive_success_and_failure(
+    tmp_path: Path, collection_error: bool
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "conftest.py").write_text(
+        "import warnings\n"
+        "def pytest_collection_modifyitems(items):\n"
+        "    warnings.warn('prewarm diagnostic retained')\n"
+        + (
+            "    raise RuntimeError('collection diagnostic retained')\n"
+            if collection_error
+            else ""
+        ),
+        encoding="utf-8",
+    )
+    (suite / "test_sample.py").write_text("def test_passes(): pass\n", encoding="utf-8")
+
+    result = _run(tmp_path, "plan", suite)
+
+    assert (result.returncode != 0) == collection_error, result.stdout + result.stderr
+    logs = list((tmp_path / "junit").glob("collection-*/*.log"))
+    assert len(logs) == 1
+    original = logs[0].read_text(encoding="utf-8")
+    expected = (
+        "collection diagnostic retained"
+        if collection_error
+        else "prewarm diagnostic retained"
+    )
+    assert expected in original
+    assert not list(logs[0].parent.glob("*.json"))
+
+    repeated = _run(tmp_path, "plan", suite)
+    assert (repeated.returncode != 0) == collection_error
+    assert logs[0].read_text(encoding="utf-8") == original
+    # A failed collection retries into a new directory; a completed plan reuses
+    # its manifest without recollecting or overwriting the original diagnostics.
+    assert len(list((tmp_path / "junit").glob("collection-*/*.log"))) == (
+        2 if collection_error else 1
+    )
+
+
 def test_collection_isolates_sm90_pull_multirank_modules(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
@@ -1048,6 +1091,7 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
     assert "signal=SIGKILL" in combined
     assert "deadline_elapsed=" in combined
     assert "deadline=1s" in combined
+    assert len(list((tmp_path / "junit").glob("collection-*/*.log"))) == 1
 
 
 def test_plan_run_and_completed_reuse_publish_resumable_artifacts(

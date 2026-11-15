@@ -21,11 +21,23 @@ def _align128(n: int) -> int:
     return (n + 127) & ~127
 
 
+def _has_memop_region(world_size: int) -> bool:
+    return world_size in (4, 8) and torch.cuda.get_device_capability() == (12, 0)
+
+
 def _expected_binary_flag_bytes(world_size: int) -> int:
     # SM120 TP4/TP8 append one cache-line-separated flag per flat-ring step.
-    if world_size in (4, 8) and torch.cuda.get_device_capability() == (12, 0):
-        return 2 * (world_size - 1) * 128
-    return 0
+    return 2 * (world_size - 1) * 128 if _has_memop_region(world_size) else 0
+
+
+def _expected_piped_bytes(world_size: int, max_payload: int) -> int:
+    # Then the pipelined ring: a flag per step and piece, and a landing slot per
+    # step sized for twice the even share plus a pack of rounding.
+    if not _has_memop_region(world_size):
+        return 0
+    steps = 2 * (world_size - 1)
+    slot = _align128(2 * max_payload // world_size + 16)
+    return steps * 4 * 128 + steps * slot
 
 
 def _expected_total(
@@ -58,6 +70,7 @@ def _expected_total(
         + ce_counter_bytes
         + ce_scratch_bytes
         + _expected_binary_flag_bytes(world_size)
+        + _expected_piped_bytes(world_size, max_payload)
     )
 
 
@@ -96,13 +109,23 @@ def test_the_copy_engine_region_stays_proportional_to_the_payload(
     island = 7 * _align128(payload // 4) if world_size == 8 else 0
     ce_scratch = max(flat, island)
 
-    # The whole slab includes the SM part, CE regions, and optional binary flags.
+    # The whole slab includes the SM part, CE regions, and the optional SM120
+    # region: binary flags and the pipelined ring's own flags and slots.
     binary_flag_bytes = _expected_binary_flag_bytes(world_size)
+    piped_bytes = _expected_piped_bytes(world_size, payload)
     signal_bytes = _align128(4 * (128 + 8 * 128 * world_size + 128 + 4))
     sm_bytes = signal_bytes + 2 * _align128(2 * world_size * payload)
     assert module.workspace_size(world_size, max_numel, 2, 128) == (
-        sm_bytes + ce_flag_bytes + ce_counter_bytes + ce_scratch + binary_flag_bytes
+        sm_bytes
+        + ce_flag_bytes
+        + ce_counter_bytes
+        + ce_scratch
+        + binary_flag_bytes
+        + piped_bytes
     )
+    # The pipelined ring stages at most twice what the flat ring does.
+    if piped_bytes:
+        assert piped_bytes < 2 * flat + 64 * 1024 + 2 * (world_size - 1) * 256
 
     expected_ratio = 2 * (world_size - 1) / world_size
     ratio = ce_scratch / payload

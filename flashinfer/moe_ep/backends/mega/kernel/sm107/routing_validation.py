@@ -51,12 +51,8 @@ class _RoutingCheck:
             expert = cutlass.Int64(ids[row, col])
             score = cutlass.Float32(weights[row, col])
             valid = valid & (expert >= -1) & (expert < experts)
-            valid = (
-                valid
-                & (score == score)
-                & (score < float("inf"))
-                & (score > -float("inf"))
-            )
+            finite = (score == score) & (score < float("inf")) & (score > -float("inf"))
+            valid = valid & ((expert == -1) | finite)
             for other in cutlass.range_constexpr(self.topk):
                 if other < col:
                     duplicate = (expert >= 0) & (
@@ -154,5 +150,5 @@ def check_routing(
     )
     torch._assert_async(
         entry.result.all() if entry.result.numel() > 1 else entry.result,
-        "SM107 routes require unique expert IDs in [0, E), or -1, and finite scores",
+        "SM107 routes require unique expert IDs in [0, E), or -1, and finite scores for valid routes",
     )

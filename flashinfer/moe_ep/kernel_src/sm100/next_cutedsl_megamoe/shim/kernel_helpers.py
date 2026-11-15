@@ -303,7 +303,8 @@ def preprocess_block_scaled_weights(
     ):
         raise ValueError("canonical weight shapes must be [E, 2I, H] and [E, H, I].")
     intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
-    if hidden % (4 * sf_vec) or intermediate_size % intermediate_alignment:
+    hidden_alignment = 64 if quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2") else 4 * sf_vec
+    if hidden % hidden_alignment or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the block-scaled scale-vector alignment."
         )
@@ -391,7 +392,8 @@ def preprocess_prequantized_block_scaled_weights(
     if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
     intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
-    if hidden_size % (4 * sf_vec) or intermediate_size % intermediate_alignment:
+    hidden_alignment = 64 if quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2") else 4 * sf_vec
+    if hidden_size % hidden_alignment or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the block-scaled scale-vector alignment."
         )
@@ -534,6 +536,9 @@ def compute_megamoe_reference_block_scaled(
     fc1_alpha: Optional[torch.Tensor] = None,
     fc2_alpha: Optional[torch.Tensor] = None,
     fc1_norm_const: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    fc1_activation_per_token_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pure-torch single-rank oracle for the Blackwell block-scaled kernel.
 
@@ -548,8 +553,10 @@ def compute_megamoe_reference_block_scaled(
     ``(E, 2I, hidden/vec)``; ``fc2_weight_k_major (E, hidden, I[packed])`` with
     raw SF ``(E, hidden, I/vec)``.
     """
-    if (situ_beta is None) != (situ_linear_beta is None):
-        raise ValueError("SiTU requires both beta parameters.")
+    if situ_beta is None and situ_linear_beta is not None:
+        raise ValueError("situ_linear_beta requires situ_beta.")
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
     device = topk_idx.device
     tokens = x_data.shape[0] if num_tokens is None else num_tokens
     num_local_experts, fc1_out, _ = fc1_weight_k_major.shape
@@ -573,7 +580,14 @@ def compute_megamoe_reference_block_scaled(
             sf2 = from_blocked(sf2, hidden, intermediate // vec)
         w1 = _dequant_weight_k_major(quant_kind, fc1_weight_k_major[local_e], sf1)
         fc1 = x[src_t] @ w1.transpose(0, 1)  # (v, 2I): (pair, {gate,up}, 16)
-        if fc1_alpha is not None:
+        if fc1_activation_per_token_scale is not None:
+            dequant_scale = fc1_activation_per_token_scale[src_t, None]
+            if fc1_alpha is not None:
+                # The kernel folds these FP32 scales before multiplying the
+                # accumulator, avoiding overflow in acc * alpha alone.
+                dequant_scale = dequant_scale * fc1_alpha[local_e]
+            fc1 = fc1 * dequant_scale
+        elif fc1_alpha is not None:
             fc1 = fc1 * fc1_alpha[local_e]
         pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
         gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
@@ -582,10 +596,15 @@ def compute_megamoe_reference_block_scaled(
             up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
         if situ_beta is not None:
             gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            if situ_linear_beta is not None:
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
             act = (up * gate).reshape(-1, intermediate)
         else:
-            act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
+            alpha = 1.0 if swiglu_alpha is None else swiglu_alpha
+            beta = 0.0 if swiglu_beta is None else swiglu_beta
+            act = ((up + beta) * gate * torch.sigmoid(alpha * gate)).reshape(
+                -1, intermediate
+            )
         if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).

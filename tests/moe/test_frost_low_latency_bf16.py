@@ -123,7 +123,7 @@ def _inputs(
     dtype=torch.bfloat16,
     output_dtype=torch.bfloat16,
 ):
-    _require_gpu(allow_sm120=True, allow_sm90=True)
+    _require_gpu(allow_sm120=True, allow_sm90=True, allow_sm80=True)
     torch.manual_seed(5103 + tokens)
     e = max(5, topk) if experts is None else experts
     x = torch.randn(tokens, hidden, device="cuda").to(dtype)

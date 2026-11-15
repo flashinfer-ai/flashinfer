@@ -31,7 +31,7 @@ from flashinfer.gemm import (
 from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.cute_dsl import is_cute_dsl_available, is_rubin_cute_dsl_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm12x_supported
 
 # Peak host RSS 124-200 GiB in 9 of 35 flashinfer-ci nightly runs (2026-10),
 # from JIT-building the blockscale GEMM module when no earlier file in the job
@@ -170,6 +170,34 @@ def test_fp8_groupwise_gemm(
         backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("n", [192, 200])
+def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
+    # The SM12x kernel rejects n % 128 != 0; the error must reach the caller
+    # instead of returning with `out` unwritten.
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("SM12x only")
+    m, k = 128, 256
+    a = torch.randn((m, k), device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn((n, k), device="cuda").to(torch.float8_e4m3fn)
+    a_scale = torch.ones((k // 128, m), device="cuda")
+    b_scale = torch.ones((k // 128, math.ceil(n / 128)), device="cuda")
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="sm120"):
+        gemm_fp8_nt_groupwise(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            "MN",
+            out=out,
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+        )
+        torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(
@@ -1248,6 +1276,30 @@ def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
             out_dtype=torch.bfloat16,
             backend="cutile",
         )
+
+
+def test_deepgemm_runtime_cache_hit(monkeypatch, tmp_path):
+    # load_all() and load() must share RUNTIME_CACHE keys, so the cubin is
+    # fetched and its runtime built once. Fake cubin; no GPU needed.
+    import flashinfer.deep_gemm as dg
+
+    name, code = "fake_gemm", "// code"
+    cubin_name = f"kernel.{name}.{dg.hash_to_hex(f'{name}$${code}')}"
+    (tmp_path / "deepgemm").mkdir()
+    (tmp_path / "deepgemm" / f"{cubin_name}.cubin").write_bytes(b"")
+    fetches = []
+    monkeypatch.setattr(dg, "KERNEL_MAP", {cubin_name: ("fake_symbol", "0" * 64)})
+    monkeypatch.setattr(dg, "RUNTIME_CACHE", {})
+    monkeypatch.setattr(dg, "FLASHINFER_CUBIN_DIR", tmp_path)
+    monkeypatch.setattr(dg, "get_deepgemm_artifact_path", lambda: "deepgemm")
+    monkeypatch.setattr(dg, "get_artifact", lambda path, sha: fetches.append(path))
+
+    dg.load_all()
+    first = dg.load(name, code)
+    second = dg.load(name, code)
+
+    assert first is second is dg.RUNTIME_CACHE[cubin_name]
+    assert len(fetches) == 1
 
 
 if __name__ == "__main__":

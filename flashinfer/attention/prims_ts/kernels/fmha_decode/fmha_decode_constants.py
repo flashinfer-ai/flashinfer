@@ -56,12 +56,17 @@ KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 # letting an intermediate probability exceed 2**8; the softmax identity is
 # unchanged apart from normal finite-precision rounding. As in the
 # FlashInfer/TRT-LLM policy, this assumes normal model logits rather than
-# adversarial values outside the qualified probability bound. Streamed KV256
-# and block-sparse Keeps profiles apply it; see
-# ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
+# adversarial values outside the qualified probability bound. Keeps profiles
+# apply it; see ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
 # ``FmhaDecodeConfig.softmax_rescale_threshold_log2``, is its 16-bit default,
 # and is the block-sparse plans' default for every P dtype.
 SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
+
+# KV256 tiles run at most this many score pairs of a streamed K32 fragment as
+# FMA polynomials, below the share that KV128 tiles take on SM100: their
+# 16-bit fragment loops slow down with a larger share. See
+# ``FmhaDecodeConfig.fragment_ex2_emulated_pairs``.
+KV_TILE_256_MAX_EX2_EMULATED_PAIRS = 4
 
 # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
 # the resulting register hand-off has a fixed cost. Paired B200 measurements

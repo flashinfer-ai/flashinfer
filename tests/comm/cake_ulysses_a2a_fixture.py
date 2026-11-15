@@ -27,6 +27,9 @@ attention operation is timed.
 kernel: ``"cake"`` (the package route; the device must have a delivered route)
 or ``"portable"`` (FlashInfer's own kernel, forced by routing the communicator
 away from the package for the duration of its construction).
+``prepare(..., registered=True)`` takes the four outputs from the
+communicator's ``allocate_output``, so on the Cake route every collective
+writes the peers' registered outputs directly.
 """
 
 import contextlib
@@ -457,6 +460,8 @@ class PreparedCase:
     workspace: object
     # "cake" | "portable" for the NVLink backend, None for NCCL
     nvlink_kernel: object = None
+    # whether the outputs come from the communicator's allocate_output
+    registered: bool = False
 
     def run(self):
         """Three scatters and an independent gather, including copy-out."""
@@ -469,12 +474,14 @@ class PreparedCase:
         )
         return self.outputs
 
-    def check(self):
-        """Check both directions independently using all-gather references."""
+    def check(self, run=True):
+        """Check both directions independently using all-gather references
+        (``run=False`` checks the outputs of calls the caller already issued)."""
         group = self.communicator.group
         rank = self.communicator.rank
         world = self.communicator.world_size
-        self.run()
+        if run:
+            self.run()
         for index, (source, actual) in enumerate(
             zip(self.inputs, self.outputs, strict=False)
         ):
@@ -523,6 +530,19 @@ def cake_route_available(world_size, dtype_names=("float16", "bfloat16", "float3
     )
 
 
+def cake_direct_available(world_size, dtype_names=("float16", "bfloat16", "float32")):
+    """Whether the package also delivers the direct route (registered outputs) of every ``dtype``."""
+    device_index = torch.cuda.current_device()
+    for name in dtype_names:
+        dtype = getattr(torch, name)
+        arch = ulysses_mod._cake_nvlink_route(device_index, dtype, world_size)
+        if arch is None or not ulysses_mod._cake_nvlink_direct(
+            arch, device_index, dtype, world_size
+        ):
+            return False
+    return True
+
+
 @contextlib.contextmanager
 def _portable_nvlink_kernel():
     """Route communicators constructed inside away from the Cake package."""
@@ -542,12 +562,19 @@ def prepare(
     group=None,
     inputs=None,
     outputs=None,
+    registered=False,
 ):
-    """Allocate a case once; reuse its tensors and IPC state for every call."""
+    """Allocate a case once; reuse its tensors and IPC state for every call.
+
+    ``registered`` takes the outputs from ``allocate_output`` (``outputs`` must
+    then be ``None``).
+    """
     if nvlink_kernel not in NVLINK_KERNELS:
         raise ValueError(
             f"nvlink_kernel must be one of {NVLINK_KERNELS}, got {nvlink_kernel!r}"
         )
+    if registered and outputs is not None:
+        raise ValueError("a registered case allocates its own outputs")
     group = dist.group.WORLD if group is None else group
     world = dist.get_world_size(group=group)
     if world != shape["world_size"]:
@@ -565,7 +592,7 @@ def prepare(
             torch.randn(dimensions, dtype=dtype, device="cuda", generator=generator)
             for dimensions in (local_shape, local_shape, local_shape, global_shape)
         )
-    if outputs is None:
+    if outputs is None and not registered:
         outputs = tuple(
             torch.empty(dimensions, dtype=dtype, device="cuda")
             for dimensions in (global_shape, global_shape, global_shape, local_shape)
@@ -592,6 +619,15 @@ def prepare(
             f"requested the {nvlink_kernel} NVLink kernel, selected {selected} "
             "(the package delivers no route for this device and dtype)"
         )
+    if registered:
+        outputs = tuple(
+            communicator.allocate_output(source, op)
+            for source, op in zip(
+                inputs,
+                ("scatter_heads", "scatter_heads", "scatter_heads", "gather_heads"),
+                strict=True,
+            )
+        )
     workspace = communicator.create_workspace() if backend == "nccl" else None
     return PreparedCase(
         communicator,
@@ -599,4 +635,5 @@ def prepare(
         outputs,
         workspace,
         communicator.nvlink_kernel if backend == "nvlink" else None,
+        registered,
     )

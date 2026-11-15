@@ -13,12 +13,12 @@ run over NVLink (MNNVL) symmetric memory.
 
 .. autosummary::
     :toctree: ../generated
+    :template: autosummary/class_with_members.rst
 
     BootstrapConfig
     MoEEpCommunication
     MoEEpCommParams
     MoEEpDispatchResult
-    create_communication
     NVLinkOneSidedAlltoAll
     NVLinkOneSidedConfig
     CakeAlltoAll
@@ -26,20 +26,23 @@ run over NVLink (MNNVL) symmetric memory.
     NVLinkTwoSidedAlltoAll
     NVLinkTwoSidedConfig
 
-``NVLinkOneSidedAlltoAll`` and ``CakeAlltoAll`` preserve their workspace's CUDA
-virtual addresses across process checkpoint/restore.  After quiescing all work,
-call ``checkpoint_prepare`` to release the non-checkpointable physical MNNVL
-handles, and for ``NVLinkOneSidedAlltoAll`` its CFT logical endpoints.  Then
-call ``checkpoint_restore`` with a fresh communication backend before replaying
-a captured CUDA graph:
+.. autosummary::
+    :toctree: ../generated
 
-.. code-block:: python
+    create_communication
 
-    communication.checkpoint_prepare()
-    communication.checkpoint_restore(comm_backend)
+Complete EP selection
+---------------------
 
-Both methods are collective.  Every rank must call them in the same order, and
-``comm_backend`` must reproduce the original rank and world size.
-Repeated calls are no-ops after the workspace reaches the requested state.
-If an exception occurs after physical handle unmapping or remapping begins,
-do not retry or reuse the workspace; restart the affected rank.
+``MoEEpLayer(..., backend=AutoConfig(...))`` compares complete Mega and split
+forwards during a v2 warmup. See the `EP architecture notes
+<https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/moe_ep_architecture.md#complete-ep-selection>`_ for candidate
+configuration, cache matching and graph lifetime.
+
+.. autosummary::
+    :toctree: ../generated
+    :template: autosummary/class_with_members.rst
+
+    AutoConfig
+    MoEEpAutoLayer
+    MoEEpAutoWorkspace

@@ -60,6 +60,8 @@ class TllmGenFmhaRunner {
 
   TllmGenFmhaRunner() = default;
 
+  int smVersion() const { return mSM; }
+
   // Check if fmha is supported.
   bool isSupported(TllmGenFmhaRunnerParams const& runnerParams) {
     return mKernel->checkIfKernelExist(runnerParams).first;

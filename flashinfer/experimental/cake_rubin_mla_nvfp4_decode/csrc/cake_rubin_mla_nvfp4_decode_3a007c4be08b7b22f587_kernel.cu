@@ -123,11 +123,11 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
     int w_base = warp * 64;
     int d0 = part * 512 + lane_0 * 16;
     int last = num_split - 1;
-    int _min_0 = ((0) < (last) ? (0) : (last));
-    float _vec_load_0[16];
+    int _mn_0 = ((0) < (last) ? (0) : (last));
+    float po_0[16];
     {
       const uint4* _vptr_0 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_0) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_0) * 512 + d0);
       uint4 _vld_0[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -135,18 +135,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_0[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_0[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) << 16);
-          (&_vec_load_0[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_0[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_0[_pair]) & 0xffff0000u);
         }
       }
     }
-    int _min_1 = ((1) < (last) ? (1) : (last));
-    float _vec_load_1[16];
+    int _mn_1 = ((1) < (last) ? (1) : (last));
+    float po_1[16];
     {
       const uint4* _vptr_1 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_1) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_1) * 512 + d0);
       uint4 _vld_1[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -154,18 +154,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_1[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_1[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
-          (&_vec_load_1[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_1[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
         }
       }
     }
-    int _min_2 = ((2) < (last) ? (2) : (last));
-    float _vec_load_2[16];
+    int _mn_2 = ((2) < (last) ? (2) : (last));
+    float po_2[16];
     {
       const uint4* _vptr_2 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_2) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_2) * 512 + d0);
       uint4 _vld_2[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -173,18 +173,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_2[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_2[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
-          (&_vec_load_2[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_2[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
         }
       }
     }
-    int _min_3 = ((3) < (last) ? (3) : (last));
-    float _vec_load_3[16];
+    int _mn_3 = ((3) < (last) ? (3) : (last));
+    float po_3[16];
     {
       const uint4* _vptr_3 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_3) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_3) * 512 + d0);
       uint4 _vld_3[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -192,18 +192,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_3[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-          (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_3[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
         }
       }
     }
-    int _min_4 = ((4) < (last) ? (4) : (last));
-    float _vec_load_4[16];
+    int _mn_4 = ((4) < (last) ? (4) : (last));
+    float po_4[16];
     {
       const uint4* _vptr_4 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_4) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_4) * 512 + d0);
       uint4 _vld_4[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -211,18 +211,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_4[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_4[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
-          (&_vec_load_4[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_4[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
         }
       }
     }
-    int _min_5 = ((5) < (last) ? (5) : (last));
-    float _vec_load_5[16];
+    int _mn_5 = ((5) < (last) ? (5) : (last));
+    float po_5[16];
     {
       const uint4* _vptr_5 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_5) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_5) * 512 + d0);
       uint4 _vld_5[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -230,18 +230,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_5[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_5[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
-          (&_vec_load_5[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_5[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
         }
       }
     }
-    int _min_6 = ((6) < (last) ? (6) : (last));
-    float _vec_load_6[16];
+    int _mn_6 = ((6) < (last) ? (6) : (last));
+    float po_6[16];
     {
       const uint4* _vptr_6 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_6) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_6) * 512 + d0);
       uint4 _vld_6[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -249,18 +249,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_6[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_6[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) << 16);
-          (&_vec_load_6[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_6[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
         }
       }
     }
-    int _min_7 = ((7) < (last) ? (7) : (last));
-    float _vec_load_7[16];
+    int _mn_7 = ((7) < (last) ? (7) : (last));
+    float po_7[16];
     {
       const uint4* _vptr_7 =
-          reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_7) * 512 + d0);
+          reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_7) * 512 + d0);
       uint4 _vld_7[2];
 #pragma unroll
       for (int _blk = 0; _blk < 2; _blk++) {
@@ -268,9 +268,9 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
 #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
-          (&_vec_load_7[0 + _blk * 8 + _pair * 2])[0] =
+          (&po_7[0 + _blk * 8 + _pair * 2])[0] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) << 16);
-          (&_vec_load_7[0 + _blk * 8 + _pair * 2])[1] =
+          (&po_7[0 + _blk * 8 + _pair * 2])[1] =
               __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) & 0xffff0000u);
         }
       }
@@ -315,150 +315,150 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
     }
     float wts[8];
     wts[0] = smem_w[w_base];
-    acc[0] = acc[0] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_0[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[0] > 0.0f) ? wts[0] * po_0[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[0] > 0.0f) ? wts[0] * po_0[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[0] > 0.0f) ? wts[0] * po_0[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[0] > 0.0f) ? wts[0] * po_0[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[0] > 0.0f) ? wts[0] * po_0[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[0] > 0.0f) ? wts[0] * po_0[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[0] > 0.0f) ? wts[0] * po_0[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[0] > 0.0f) ? wts[0] * po_0[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[0] > 0.0f) ? wts[0] * po_0[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[0] > 0.0f) ? wts[0] * po_0[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[0] > 0.0f) ? wts[0] * po_0[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[0] > 0.0f) ? wts[0] * po_0[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[0] > 0.0f) ? wts[0] * po_0[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[0] > 0.0f) ? wts[0] * po_0[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[0] > 0.0f) ? wts[0] * po_0[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[0] > 0.0f) ? wts[0] * po_0[15] : 0.0f);
     wts[1] = smem_w[w_base + 1];
-    acc[0] = acc[0] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_1[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[1] > 0.0f) ? wts[1] * po_1[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[1] > 0.0f) ? wts[1] * po_1[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[1] > 0.0f) ? wts[1] * po_1[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[1] > 0.0f) ? wts[1] * po_1[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[1] > 0.0f) ? wts[1] * po_1[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[1] > 0.0f) ? wts[1] * po_1[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[1] > 0.0f) ? wts[1] * po_1[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[1] > 0.0f) ? wts[1] * po_1[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[1] > 0.0f) ? wts[1] * po_1[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[1] > 0.0f) ? wts[1] * po_1[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[1] > 0.0f) ? wts[1] * po_1[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[1] > 0.0f) ? wts[1] * po_1[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[1] > 0.0f) ? wts[1] * po_1[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[1] > 0.0f) ? wts[1] * po_1[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[1] > 0.0f) ? wts[1] * po_1[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[1] > 0.0f) ? wts[1] * po_1[15] : 0.0f);
     wts[2] = smem_w[w_base + 2];
-    acc[0] = acc[0] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_2[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[2] > 0.0f) ? wts[2] * po_2[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[2] > 0.0f) ? wts[2] * po_2[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[2] > 0.0f) ? wts[2] * po_2[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[2] > 0.0f) ? wts[2] * po_2[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[2] > 0.0f) ? wts[2] * po_2[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[2] > 0.0f) ? wts[2] * po_2[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[2] > 0.0f) ? wts[2] * po_2[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[2] > 0.0f) ? wts[2] * po_2[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[2] > 0.0f) ? wts[2] * po_2[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[2] > 0.0f) ? wts[2] * po_2[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[2] > 0.0f) ? wts[2] * po_2[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[2] > 0.0f) ? wts[2] * po_2[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[2] > 0.0f) ? wts[2] * po_2[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[2] > 0.0f) ? wts[2] * po_2[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[2] > 0.0f) ? wts[2] * po_2[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[2] > 0.0f) ? wts[2] * po_2[15] : 0.0f);
     wts[3] = smem_w[w_base + 3];
-    acc[0] = acc[0] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_3[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[3] > 0.0f) ? wts[3] * po_3[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[3] > 0.0f) ? wts[3] * po_3[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[3] > 0.0f) ? wts[3] * po_3[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[3] > 0.0f) ? wts[3] * po_3[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[3] > 0.0f) ? wts[3] * po_3[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[3] > 0.0f) ? wts[3] * po_3[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[3] > 0.0f) ? wts[3] * po_3[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[3] > 0.0f) ? wts[3] * po_3[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[3] > 0.0f) ? wts[3] * po_3[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[3] > 0.0f) ? wts[3] * po_3[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[3] > 0.0f) ? wts[3] * po_3[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[3] > 0.0f) ? wts[3] * po_3[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[3] > 0.0f) ? wts[3] * po_3[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[3] > 0.0f) ? wts[3] * po_3[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[3] > 0.0f) ? wts[3] * po_3[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[3] > 0.0f) ? wts[3] * po_3[15] : 0.0f);
     wts[4] = smem_w[w_base + 4];
-    acc[0] = acc[0] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_4[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[4] > 0.0f) ? wts[4] * po_4[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[4] > 0.0f) ? wts[4] * po_4[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[4] > 0.0f) ? wts[4] * po_4[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[4] > 0.0f) ? wts[4] * po_4[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[4] > 0.0f) ? wts[4] * po_4[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[4] > 0.0f) ? wts[4] * po_4[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[4] > 0.0f) ? wts[4] * po_4[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[4] > 0.0f) ? wts[4] * po_4[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[4] > 0.0f) ? wts[4] * po_4[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[4] > 0.0f) ? wts[4] * po_4[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[4] > 0.0f) ? wts[4] * po_4[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[4] > 0.0f) ? wts[4] * po_4[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[4] > 0.0f) ? wts[4] * po_4[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[4] > 0.0f) ? wts[4] * po_4[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[4] > 0.0f) ? wts[4] * po_4[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[4] > 0.0f) ? wts[4] * po_4[15] : 0.0f);
     wts[5] = smem_w[w_base + 5];
-    acc[0] = acc[0] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_5[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[5] > 0.0f) ? wts[5] * po_5[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[5] > 0.0f) ? wts[5] * po_5[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[5] > 0.0f) ? wts[5] * po_5[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[5] > 0.0f) ? wts[5] * po_5[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[5] > 0.0f) ? wts[5] * po_5[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[5] > 0.0f) ? wts[5] * po_5[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[5] > 0.0f) ? wts[5] * po_5[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[5] > 0.0f) ? wts[5] * po_5[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[5] > 0.0f) ? wts[5] * po_5[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[5] > 0.0f) ? wts[5] * po_5[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[5] > 0.0f) ? wts[5] * po_5[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[5] > 0.0f) ? wts[5] * po_5[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[5] > 0.0f) ? wts[5] * po_5[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[5] > 0.0f) ? wts[5] * po_5[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[5] > 0.0f) ? wts[5] * po_5[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[5] > 0.0f) ? wts[5] * po_5[15] : 0.0f);
     wts[6] = smem_w[w_base + 6];
-    acc[0] = acc[0] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_6[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[6] > 0.0f) ? wts[6] * po_6[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[6] > 0.0f) ? wts[6] * po_6[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[6] > 0.0f) ? wts[6] * po_6[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[6] > 0.0f) ? wts[6] * po_6[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[6] > 0.0f) ? wts[6] * po_6[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[6] > 0.0f) ? wts[6] * po_6[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[6] > 0.0f) ? wts[6] * po_6[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[6] > 0.0f) ? wts[6] * po_6[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[6] > 0.0f) ? wts[6] * po_6[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[6] > 0.0f) ? wts[6] * po_6[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[6] > 0.0f) ? wts[6] * po_6[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[6] > 0.0f) ? wts[6] * po_6[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[6] > 0.0f) ? wts[6] * po_6[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[6] > 0.0f) ? wts[6] * po_6[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[6] > 0.0f) ? wts[6] * po_6[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[6] > 0.0f) ? wts[6] * po_6[15] : 0.0f);
     wts[7] = smem_w[w_base + 7];
-    acc[0] = acc[0] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[0] : 0.0f);
-    acc[1] = acc[1] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[1] : 0.0f);
-    acc[2] = acc[2] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[2] : 0.0f);
-    acc[3] = acc[3] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[3] : 0.0f);
-    acc[4] = acc[4] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[4] : 0.0f);
-    acc[5] = acc[5] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[5] : 0.0f);
-    acc[6] = acc[6] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[6] : 0.0f);
-    acc[7] = acc[7] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[7] : 0.0f);
-    acc[8] = acc[8] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[8] : 0.0f);
-    acc[9] = acc[9] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[9] : 0.0f);
-    acc[10] = acc[10] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[10] : 0.0f);
-    acc[11] = acc[11] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[11] : 0.0f);
-    acc[12] = acc[12] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[12] : 0.0f);
-    acc[13] = acc[13] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[13] : 0.0f);
-    acc[14] = acc[14] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[14] : 0.0f);
-    acc[15] = acc[15] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_7[15] : 0.0f);
+    acc[0] = acc[0] + ((wts[7] > 0.0f) ? wts[7] * po_7[0] : 0.0f);
+    acc[1] = acc[1] + ((wts[7] > 0.0f) ? wts[7] * po_7[1] : 0.0f);
+    acc[2] = acc[2] + ((wts[7] > 0.0f) ? wts[7] * po_7[2] : 0.0f);
+    acc[3] = acc[3] + ((wts[7] > 0.0f) ? wts[7] * po_7[3] : 0.0f);
+    acc[4] = acc[4] + ((wts[7] > 0.0f) ? wts[7] * po_7[4] : 0.0f);
+    acc[5] = acc[5] + ((wts[7] > 0.0f) ? wts[7] * po_7[5] : 0.0f);
+    acc[6] = acc[6] + ((wts[7] > 0.0f) ? wts[7] * po_7[6] : 0.0f);
+    acc[7] = acc[7] + ((wts[7] > 0.0f) ? wts[7] * po_7[7] : 0.0f);
+    acc[8] = acc[8] + ((wts[7] > 0.0f) ? wts[7] * po_7[8] : 0.0f);
+    acc[9] = acc[9] + ((wts[7] > 0.0f) ? wts[7] * po_7[9] : 0.0f);
+    acc[10] = acc[10] + ((wts[7] > 0.0f) ? wts[7] * po_7[10] : 0.0f);
+    acc[11] = acc[11] + ((wts[7] > 0.0f) ? wts[7] * po_7[11] : 0.0f);
+    acc[12] = acc[12] + ((wts[7] > 0.0f) ? wts[7] * po_7[12] : 0.0f);
+    acc[13] = acc[13] + ((wts[7] > 0.0f) ? wts[7] * po_7[13] : 0.0f);
+    acc[14] = acc[14] + ((wts[7] > 0.0f) ? wts[7] * po_7[14] : 0.0f);
+    acc[15] = acc[15] + ((wts[7] > 0.0f) ? wts[7] * po_7[15] : 0.0f);
     int n_batches = (num_split + 8 - 1) / 8;
 #pragma unroll 1
     for (int bt = 1; bt < n_batches; bt++) {
       int k0 = bt * 8;
-      int _min_8 = ((k0) < (last) ? (k0) : (last));
-      float _vec_load_8[16];
+      int _mn_8 = ((k0) < (last) ? (k0) : (last));
+      float po_8[16];
       {
         const uint4* _vptr_11 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_8) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_8) * 512 + d0);
         uint4 _vld_11[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -466,18 +466,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_11 = reinterpret_cast<uint32_t*>(&_vld_11[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_8[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_8[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_11[_pair]) << 16);
-            (&_vec_load_8[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_8[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_11[_pair]) & 0xffff0000u);
           }
         }
       }
-      int _min_9 = ((k0 + 1) < (last) ? (k0 + 1) : (last));
-      float _vec_load_9[16];
+      int _mn_9 = ((k0 + 1) < (last) ? (k0 + 1) : (last));
+      float po_9[16];
       {
         const uint4* _vptr_12 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_9) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_9) * 512 + d0);
         uint4 _vld_12[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -485,18 +485,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_12 = reinterpret_cast<uint32_t*>(&_vld_12[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_9[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_9[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) << 16);
-            (&_vec_load_9[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_9[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_12[_pair]) & 0xffff0000u);
           }
         }
       }
-      int _min_10 = ((k0 + 2) < (last) ? (k0 + 2) : (last));
-      float _vec_load_10[16];
+      int _mn_10 = ((k0 + 2) < (last) ? (k0 + 2) : (last));
+      float po_10[16];
       {
         const uint4* _vptr_13 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_10) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_10) * 512 + d0);
         uint4 _vld_13[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -504,18 +504,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_13 = reinterpret_cast<uint32_t*>(&_vld_13[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_10[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_10[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) << 16);
-            (&_vec_load_10[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_10[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_13[_pair]) & 0xffff0000u);
           }
         }
       }
-      int _min_11 = ((k0 + 3) < (last) ? (k0 + 3) : (last));
-      float _vec_load_11[16];
+      int _mn_11 = ((k0 + 3) < (last) ? (k0 + 3) : (last));
+      float po_11[16];
       {
         const uint4* _vptr_14 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_11) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_11) * 512 + d0);
         uint4 _vld_14[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -523,18 +523,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_14 = reinterpret_cast<uint32_t*>(&_vld_14[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_11[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_11[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_14[_pair]) << 16);
-            (&_vec_load_11[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_11[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_14[_pair]) & 0xffff0000u);
           }
         }
       }
-      int _min_12 = ((k0 + 4) < (last) ? (k0 + 4) : (last));
-      float _vec_load_12[16];
+      int _mn_12 = ((k0 + 4) < (last) ? (k0 + 4) : (last));
+      float po_12[16];
       {
         const uint4* _vptr_15 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_12) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_12) * 512 + d0);
         uint4 _vld_15[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -542,18 +542,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_15 = reinterpret_cast<uint32_t*>(&_vld_15[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_12[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_12[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_15[_pair]) << 16);
-            (&_vec_load_12[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_12[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_15[_pair]) & 0xffff0000u);
           }
         }
       }
-      int _min_13 = ((k0 + 5) < (last) ? (k0 + 5) : (last));
-      float _vec_load_13[16];
+      int _mn_13 = ((k0 + 5) < (last) ? (k0 + 5) : (last));
+      float po_13[16];
       {
         const uint4* _vptr_16 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_13) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_13) * 512 + d0);
         uint4 _vld_16[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -561,18 +561,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_16 = reinterpret_cast<uint32_t*>(&_vld_16[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_13[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_13[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_16[_pair]) << 16);
-            (&_vec_load_13[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_13[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_16[_pair]) & 0xffff0000u);
           }
         }
       }
-      int _min_14 = ((k0 + 6) < (last) ? (k0 + 6) : (last));
-      float _vec_load_14[16];
+      int _mn_14 = ((k0 + 6) < (last) ? (k0 + 6) : (last));
+      float po_14[16];
       {
         const uint4* _vptr_17 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_14) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_14) * 512 + d0);
         uint4 _vld_17[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -580,18 +580,18 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_17 = reinterpret_cast<uint32_t*>(&_vld_17[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_14[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_14[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_17[_pair]) << 16);
-            (&_vec_load_14[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_14[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_17[_pair]) & 0xffff0000u);
           }
         }
       }
-      int _min_15 = ((k0 + 7) < (last) ? (k0 + 7) : (last));
-      float _vec_load_15[16];
+      int _mn_15 = ((k0 + 7) < (last) ? (k0 + 7) : (last));
+      float po_15[16];
       {
         const uint4* _vptr_18 =
-            reinterpret_cast<const uint4*>(partial_o + (stat_base + _min_15) * 512 + d0);
+            reinterpret_cast<const uint4*>(partial_o + (stat_base + _mn_15) * 512 + d0);
         uint4 _vld_18[2];
 #pragma unroll
         for (int _blk = 0; _blk < 2; _blk++) {
@@ -599,168 +599,205 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
           uint32_t* _vpairs_18 = reinterpret_cast<uint32_t*>(&_vld_18[_blk]);
 #pragma unroll
           for (int _pair = 0; _pair < 4; _pair++) {
-            (&_vec_load_15[0 + _blk * 8 + _pair * 2])[0] =
+            (&po_15[0 + _blk * 8 + _pair * 2])[0] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_18[_pair]) << 16);
-            (&_vec_load_15[0 + _blk * 8 + _pair * 2])[1] =
+            (&po_15[0 + _blk * 8 + _pair * 2])[1] =
                 __uint_as_float(static_cast<uint32_t>(_vpairs_18[_pair]) & 0xffff0000u);
           }
         }
       }
       wts[0] = smem_w[w_base + k0];
-      acc[0] = acc[0] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[0] > 0.0f) ? wts[0] * _vec_load_8[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[0] > 0.0f) ? wts[0] * po_8[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[0] > 0.0f) ? wts[0] * po_8[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[0] > 0.0f) ? wts[0] * po_8[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[0] > 0.0f) ? wts[0] * po_8[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[0] > 0.0f) ? wts[0] * po_8[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[0] > 0.0f) ? wts[0] * po_8[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[0] > 0.0f) ? wts[0] * po_8[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[0] > 0.0f) ? wts[0] * po_8[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[0] > 0.0f) ? wts[0] * po_8[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[0] > 0.0f) ? wts[0] * po_8[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[0] > 0.0f) ? wts[0] * po_8[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[0] > 0.0f) ? wts[0] * po_8[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[0] > 0.0f) ? wts[0] * po_8[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[0] > 0.0f) ? wts[0] * po_8[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[0] > 0.0f) ? wts[0] * po_8[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[0] > 0.0f) ? wts[0] * po_8[15] : 0.0f);
       wts[1] = smem_w[w_base + k0 + 1];
-      acc[0] = acc[0] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[1] > 0.0f) ? wts[1] * _vec_load_9[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[1] > 0.0f) ? wts[1] * po_9[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[1] > 0.0f) ? wts[1] * po_9[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[1] > 0.0f) ? wts[1] * po_9[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[1] > 0.0f) ? wts[1] * po_9[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[1] > 0.0f) ? wts[1] * po_9[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[1] > 0.0f) ? wts[1] * po_9[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[1] > 0.0f) ? wts[1] * po_9[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[1] > 0.0f) ? wts[1] * po_9[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[1] > 0.0f) ? wts[1] * po_9[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[1] > 0.0f) ? wts[1] * po_9[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[1] > 0.0f) ? wts[1] * po_9[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[1] > 0.0f) ? wts[1] * po_9[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[1] > 0.0f) ? wts[1] * po_9[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[1] > 0.0f) ? wts[1] * po_9[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[1] > 0.0f) ? wts[1] * po_9[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[1] > 0.0f) ? wts[1] * po_9[15] : 0.0f);
       wts[2] = smem_w[w_base + k0 + 2];
-      acc[0] = acc[0] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[2] > 0.0f) ? wts[2] * _vec_load_10[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[2] > 0.0f) ? wts[2] * po_10[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[2] > 0.0f) ? wts[2] * po_10[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[2] > 0.0f) ? wts[2] * po_10[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[2] > 0.0f) ? wts[2] * po_10[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[2] > 0.0f) ? wts[2] * po_10[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[2] > 0.0f) ? wts[2] * po_10[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[2] > 0.0f) ? wts[2] * po_10[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[2] > 0.0f) ? wts[2] * po_10[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[2] > 0.0f) ? wts[2] * po_10[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[2] > 0.0f) ? wts[2] * po_10[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[2] > 0.0f) ? wts[2] * po_10[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[2] > 0.0f) ? wts[2] * po_10[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[2] > 0.0f) ? wts[2] * po_10[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[2] > 0.0f) ? wts[2] * po_10[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[2] > 0.0f) ? wts[2] * po_10[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[2] > 0.0f) ? wts[2] * po_10[15] : 0.0f);
       wts[3] = smem_w[w_base + k0 + 3];
-      acc[0] = acc[0] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[3] > 0.0f) ? wts[3] * _vec_load_11[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[3] > 0.0f) ? wts[3] * po_11[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[3] > 0.0f) ? wts[3] * po_11[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[3] > 0.0f) ? wts[3] * po_11[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[3] > 0.0f) ? wts[3] * po_11[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[3] > 0.0f) ? wts[3] * po_11[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[3] > 0.0f) ? wts[3] * po_11[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[3] > 0.0f) ? wts[3] * po_11[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[3] > 0.0f) ? wts[3] * po_11[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[3] > 0.0f) ? wts[3] * po_11[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[3] > 0.0f) ? wts[3] * po_11[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[3] > 0.0f) ? wts[3] * po_11[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[3] > 0.0f) ? wts[3] * po_11[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[3] > 0.0f) ? wts[3] * po_11[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[3] > 0.0f) ? wts[3] * po_11[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[3] > 0.0f) ? wts[3] * po_11[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[3] > 0.0f) ? wts[3] * po_11[15] : 0.0f);
       wts[4] = smem_w[w_base + k0 + 4];
-      acc[0] = acc[0] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[4] > 0.0f) ? wts[4] * _vec_load_12[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[4] > 0.0f) ? wts[4] * po_12[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[4] > 0.0f) ? wts[4] * po_12[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[4] > 0.0f) ? wts[4] * po_12[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[4] > 0.0f) ? wts[4] * po_12[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[4] > 0.0f) ? wts[4] * po_12[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[4] > 0.0f) ? wts[4] * po_12[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[4] > 0.0f) ? wts[4] * po_12[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[4] > 0.0f) ? wts[4] * po_12[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[4] > 0.0f) ? wts[4] * po_12[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[4] > 0.0f) ? wts[4] * po_12[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[4] > 0.0f) ? wts[4] * po_12[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[4] > 0.0f) ? wts[4] * po_12[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[4] > 0.0f) ? wts[4] * po_12[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[4] > 0.0f) ? wts[4] * po_12[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[4] > 0.0f) ? wts[4] * po_12[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[4] > 0.0f) ? wts[4] * po_12[15] : 0.0f);
       wts[5] = smem_w[w_base + k0 + 5];
-      acc[0] = acc[0] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[5] > 0.0f) ? wts[5] * _vec_load_13[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[5] > 0.0f) ? wts[5] * po_13[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[5] > 0.0f) ? wts[5] * po_13[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[5] > 0.0f) ? wts[5] * po_13[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[5] > 0.0f) ? wts[5] * po_13[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[5] > 0.0f) ? wts[5] * po_13[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[5] > 0.0f) ? wts[5] * po_13[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[5] > 0.0f) ? wts[5] * po_13[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[5] > 0.0f) ? wts[5] * po_13[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[5] > 0.0f) ? wts[5] * po_13[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[5] > 0.0f) ? wts[5] * po_13[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[5] > 0.0f) ? wts[5] * po_13[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[5] > 0.0f) ? wts[5] * po_13[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[5] > 0.0f) ? wts[5] * po_13[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[5] > 0.0f) ? wts[5] * po_13[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[5] > 0.0f) ? wts[5] * po_13[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[5] > 0.0f) ? wts[5] * po_13[15] : 0.0f);
       wts[6] = smem_w[w_base + k0 + 6];
-      acc[0] = acc[0] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[6] > 0.0f) ? wts[6] * _vec_load_14[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[6] > 0.0f) ? wts[6] * po_14[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[6] > 0.0f) ? wts[6] * po_14[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[6] > 0.0f) ? wts[6] * po_14[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[6] > 0.0f) ? wts[6] * po_14[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[6] > 0.0f) ? wts[6] * po_14[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[6] > 0.0f) ? wts[6] * po_14[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[6] > 0.0f) ? wts[6] * po_14[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[6] > 0.0f) ? wts[6] * po_14[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[6] > 0.0f) ? wts[6] * po_14[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[6] > 0.0f) ? wts[6] * po_14[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[6] > 0.0f) ? wts[6] * po_14[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[6] > 0.0f) ? wts[6] * po_14[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[6] > 0.0f) ? wts[6] * po_14[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[6] > 0.0f) ? wts[6] * po_14[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[6] > 0.0f) ? wts[6] * po_14[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[6] > 0.0f) ? wts[6] * po_14[15] : 0.0f);
       wts[7] = smem_w[w_base + k0 + 7];
-      acc[0] = acc[0] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[0] : 0.0f);
-      acc[1] = acc[1] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[1] : 0.0f);
-      acc[2] = acc[2] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[2] : 0.0f);
-      acc[3] = acc[3] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[3] : 0.0f);
-      acc[4] = acc[4] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[4] : 0.0f);
-      acc[5] = acc[5] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[5] : 0.0f);
-      acc[6] = acc[6] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[6] : 0.0f);
-      acc[7] = acc[7] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[7] : 0.0f);
-      acc[8] = acc[8] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[8] : 0.0f);
-      acc[9] = acc[9] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[9] : 0.0f);
-      acc[10] = acc[10] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[10] : 0.0f);
-      acc[11] = acc[11] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[11] : 0.0f);
-      acc[12] = acc[12] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[12] : 0.0f);
-      acc[13] = acc[13] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[13] : 0.0f);
-      acc[14] = acc[14] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[14] : 0.0f);
-      acc[15] = acc[15] + ((wts[7] > 0.0f) ? wts[7] * _vec_load_15[15] : 0.0f);
+      acc[0] = acc[0] + ((wts[7] > 0.0f) ? wts[7] * po_15[0] : 0.0f);
+      acc[1] = acc[1] + ((wts[7] > 0.0f) ? wts[7] * po_15[1] : 0.0f);
+      acc[2] = acc[2] + ((wts[7] > 0.0f) ? wts[7] * po_15[2] : 0.0f);
+      acc[3] = acc[3] + ((wts[7] > 0.0f) ? wts[7] * po_15[3] : 0.0f);
+      acc[4] = acc[4] + ((wts[7] > 0.0f) ? wts[7] * po_15[4] : 0.0f);
+      acc[5] = acc[5] + ((wts[7] > 0.0f) ? wts[7] * po_15[5] : 0.0f);
+      acc[6] = acc[6] + ((wts[7] > 0.0f) ? wts[7] * po_15[6] : 0.0f);
+      acc[7] = acc[7] + ((wts[7] > 0.0f) ? wts[7] * po_15[7] : 0.0f);
+      acc[8] = acc[8] + ((wts[7] > 0.0f) ? wts[7] * po_15[8] : 0.0f);
+      acc[9] = acc[9] + ((wts[7] > 0.0f) ? wts[7] * po_15[9] : 0.0f);
+      acc[10] = acc[10] + ((wts[7] > 0.0f) ? wts[7] * po_15[10] : 0.0f);
+      acc[11] = acc[11] + ((wts[7] > 0.0f) ? wts[7] * po_15[11] : 0.0f);
+      acc[12] = acc[12] + ((wts[7] > 0.0f) ? wts[7] * po_15[12] : 0.0f);
+      acc[13] = acc[13] + ((wts[7] > 0.0f) ? wts[7] * po_15[13] : 0.0f);
+      acc[14] = acc[14] + ((wts[7] > 0.0f) ? wts[7] * po_15[14] : 0.0f);
+      acc[15] = acc[15] + ((wts[7] > 0.0f) ? wts[7] * po_15[15] : 0.0f);
     }
     for (int e_1 = 0; e_1 < 16; e_1++) {
       acc[e_1] = acc[e_1] * inv;
     }
-    {
-      __nv_bfloat162 _pk[8];
-      _pk[0] = __floats2bfloat162_rn(acc[0 + 0], acc[0 + 1]);
-      _pk[1] = __floats2bfloat162_rn(acc[0 + 2], acc[0 + 3]);
-      _pk[2] = __floats2bfloat162_rn(acc[0 + 4], acc[0 + 5]);
-      _pk[3] = __floats2bfloat162_rn(acc[0 + 6], acc[0 + 7]);
-      _pk[4] = __floats2bfloat162_rn(acc[0 + 8], acc[0 + 9]);
-      _pk[5] = __floats2bfloat162_rn(acc[0 + 10], acc[0 + 11]);
-      _pk[6] = __floats2bfloat162_rn(acc[0 + 12], acc[0 + 13]);
-      _pk[7] = __floats2bfloat162_rn(acc[0 + 14], acc[0 + 15]);
-      *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (row * 512 + d0)))[0]) =
-          *reinterpret_cast<uint4*>(&_pk[0]);
-      *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (row * 512 + d0)))[8]) =
-          *reinterpret_cast<uint4*>(&_pk[4]);
+    unsigned int _packed[8];
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 0], acc[_lp * 2 + 1 + 0]));
+      _packed[_lp] = *(uint32_t*)&_bf2;
     }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 2], acc[_lp * 2 + 1 + 2]));
+      _packed[_lp + 1] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 4], acc[_lp * 2 + 1 + 4]));
+      _packed[_lp + 2] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 6], acc[_lp * 2 + 1 + 6]));
+      _packed[_lp + 3] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 8], acc[_lp * 2 + 1 + 8]));
+      _packed[_lp + 4] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 10], acc[_lp * 2 + 1 + 10]));
+      _packed[_lp + 5] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 12], acc[_lp * 2 + 1 + 12]));
+      _packed[_lp + 6] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 14], acc[_lp * 2 + 1 + 14]));
+      _packed[_lp + 7] = *(uint32_t*)&_bf2;
+    }
+    reinterpret_cast<int4*>(O + (row * 512 + d0))[0] = reinterpret_cast<int4*>(_packed)[0];
+    reinterpret_cast<int4*>(O + (row * 512 + d0 + 8))[0] =
+        reinterpret_cast<int4*>(_packed + (4))[0];
     if (has_lse != 0) {
       if (part == 0) {
         if (lane_0 == 0) {

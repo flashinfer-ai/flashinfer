@@ -83,12 +83,12 @@ class SageAttentionParams:
 
     All tensors are FP32 with the block sizes of the plan's
     :class:`SageAttentionConfig`: ``q_scale`` is
-    ``[Hq, flat_scale_numel(B, Sq, q_block_size)]``, ``k_scale`` is
-    ``[Hkv, flat_scale_numel(B, Skv, k_block_size)]``, and ``v_scale`` and
+    ``[Hq, sage_flat_scale_numel(B, Sq, q_block_size)]``, ``k_scale`` is
+    ``[Hkv, sage_flat_scale_numel(B, Skv, k_block_size)]``, and ``v_scale`` and
     ``v_mean`` are ``[B, Hkv, D]``, one per-channel row per batch entry and
     KV head. ``k_summary_scale`` holds the scales of the
     K summaries of a proxy plan,
-    ``[Hkv, flat_scale_numel(B, num_kv_blocks, k_summary_block_size)]``.
+    ``[Hkv, sage_flat_scale_numel(B, num_kv_blocks, k_summary_block_size)]``.
     ``v_mean`` and ``k_summary_scale`` are present exactly when the plan uses
     them. Scales must be positive and finite; the kernel does not check them.
     """
@@ -100,7 +100,7 @@ class SageAttentionParams:
     v_mean: torch.Tensor | None = None
 
 
-def flat_scale_numel(batch_size: int, seq_len: int, block_size: int) -> int:
+def sage_flat_scale_numel(batch_size: int, seq_len: int, block_size: int) -> int:
     """Return the per-head slot count of the flat scale layout."""
     return ceil_div(batch_size * seq_len, block_size) + batch_size - 1
 
@@ -110,14 +110,14 @@ def is_power_of_two(value: int) -> bool:
     return value > 0 and value & (value - 1) == 0
 
 
-def log2_block_size(block_size: int) -> int:
+def sage_log2_block_size(block_size: int) -> int:
     """Return ``log2`` of a power-of-two scale block size."""
     if not is_power_of_two(block_size):
         raise ValueError(f"block size must be a power of two, got {block_size}")
     return block_size.bit_length() - 1
 
 
-def flat_scale_slot(batch_idx, token_idx, seq_len, log2_block: int):
+def sage_flat_scale_slot(batch_idx, token_idx, seq_len, log2_block: int):
     """Return the per-head slot of one token in the flat scale layout.
 
     Sequence ``b`` starts at ``b * S // blk + b``; the extra ``b`` keeps its
@@ -222,18 +222,20 @@ def sage_scale_shapes(
     shapes = {
         "q_scale": (
             num_qo_heads,
-            flat_scale_numel(batch_size, seq_len_q, config.q_block_size),
+            sage_flat_scale_numel(batch_size, seq_len_q, config.q_block_size),
         ),
         "k_scale": (
             num_kv_heads,
-            flat_scale_numel(batch_size, seq_len_kv, config.k_block_size),
+            sage_flat_scale_numel(batch_size, seq_len_kv, config.k_block_size),
         ),
         "v_scale": (batch_size, num_kv_heads, head_dim),
     }
     if summary_seq_len is not None:
         shapes["k_summary_scale"] = (
             num_kv_heads,
-            flat_scale_numel(batch_size, summary_seq_len, config.k_summary_block_size),
+            sage_flat_scale_numel(
+                batch_size, summary_seq_len, config.k_summary_block_size
+            ),
         )
     if config.v_mean:
         shapes["v_mean"] = (batch_size, num_kv_heads, head_dim)
