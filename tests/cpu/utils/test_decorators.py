@@ -246,8 +246,6 @@ def test_complete_call_validator_owns_cpu_routing(monkeypatch, validate_on_call)
 
     kernel = backend_requirement(
         {"native": metadata_only},
-        common_check=unexpected,
-        heuristic_func=unexpected,
         call_check=call_check,
         validate_on_call=validate_on_call,
     )(original)
@@ -375,5 +373,54 @@ def test_bypass_skips_backend_selection_and_checks():
     assert my_kernel(1, backend="b", own_mode=True, skip_check=True) == "own"
     assert calls == []
 
+    # Generic backend checks cannot certify a mode that owns its validation.
+    # Explicit preflight must neither execute it nor silently accept it.
+    for x in (0, 1):
+        with pytest.raises(NotImplementedError, match="mode owns input validation"):
+            my_kernel.validate_call(x, backend="b", own_mode=True)
+    assert calls == []
+
     assert my_kernel(1) == "a"
     assert calls == ["common", "check_a", "heuristic"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("option", ["common_check", "heuristic_func"])
+def test_complete_call_validator_rejects_ignored_options(option):
+    with pytest.raises(ValueError, match="call_check cannot be combined"):
+        backend_requirement(
+            {}, call_check=lambda **kwargs: None, **{option: lambda: True}
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("option", ["heuristic_func", "bypass"])
+def test_manual_validation_rejects_wrapper_only_options(option):
+    with pytest.raises(ValueError, match="validate_on_call=False cannot be combined"):
+        backend_requirement({}, validate_on_call=False, **{option: lambda: True})
+
+
+@pytest.mark.cpu_only
+def test_manual_validation_rejects_lost_experimental_backend_policy():
+    @experimental_backend
+    @supported_compute_capability([100])
+    def checker(x, backend="risky"):
+        return True
+
+    with pytest.raises(ValueError, match="experimental backends"):
+        backend_requirement({"risky": checker}, validate_on_call=False)(lambda x: x)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+def test_public_gemm_preflight_defers_bypassed_mode(monkeypatch, out_dtype):
+    from flashinfer import mm_bf16
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("bypassed mode must not use generic backend admission")
+
+    monkeypatch.setattr(utils, "get_compute_capability", unexpected)
+    a = torch.empty((1, 32), dtype=torch.bfloat16)
+    b = torch.empty((32, 32), dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="mode owns input validation"):
+        mm_bf16.validate_call(a, b, out_dtype=out_dtype, batch_invariant=True)
