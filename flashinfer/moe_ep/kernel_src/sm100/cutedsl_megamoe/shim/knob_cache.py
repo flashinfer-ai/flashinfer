@@ -46,6 +46,7 @@ import json
 import os
 import tempfile
 import warnings
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from flashinfer.moe_ep._compat import deprecated_aliases
@@ -60,6 +61,172 @@ _KEY_FIELDS = (
     "topk",
     "combine_dtype",
 )
+
+
+def _batch_invariant_version(
+    dtype: str, batch_invariant: bool, version: Optional[int]
+) -> Optional[int]:
+    if not batch_invariant:
+        return None
+    if dtype in ("bf16_nvfp4", "bf16_mxfp8_e4m3", "bf16_mxfp8_e5m2"):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+            A16_BATCH_INVARIANT_VERSION,
+        )
+
+        return A16_BATCH_INVARIANT_VERSION if version is None else version
+    if dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            MXFP8_BATCH_INVARIANT_VERSION,
+        )
+
+        return MXFP8_BATCH_INVARIANT_VERSION if version is None else version
+    if dtype not in ("bf16", "nvfp4"):
+        raise ValueError("unsupported batch_invariant knob-cache dtype")
+    if dtype == "nvfp4":
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            NVFP4_BATCH_INVARIANT_VERSION,
+        )
+
+        return NVFP4_BATCH_INVARIANT_VERSION if version is None else version
+    if version is None:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+            BF16_BATCH_INVARIANT_VERSION,
+        )
+
+        return BF16_BATCH_INVARIANT_VERSION
+    return version
+
+
+def _arithmetic_fingerprint(
+    *,
+    batch_invariant: bool,
+    dtype: str,
+    input_norm_const: float,
+    activation: str = "swiglu",
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    handoff_norm: bool = False,
+    output_mode: str = "finalized",
+    combine_dtype: str = "bf16",
+    hidden: int,
+    intermediate: int,
+    topk: int,
+    num_experts: int,
+    apply_routing_weights_before_fc2: bool,
+    gate_up_clamp: Optional[float],
+) -> Optional[str]:
+    if not batch_invariant:
+        return None
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+        batch_invariant_variant_kwargs,
+    )
+
+    if per_token_scale and dtype != "nvfp4":
+        raise ValueError("per-token FC1 scaling is only supported by NVFP4")
+    variants = batch_invariant_variant_kwargs(
+        SimpleNamespace(
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            enable_fc1_activation_per_token_scale=per_token_scale,
+        )
+    )
+    if dtype in ("bf16_nvfp4", "bf16_mxfp8_e4m3", "bf16_mxfp8_e5m2"):
+        from flashinfer.moe_ep.batch_invariant.a16_spec import (
+            spec_fingerprint as a16_fingerprint,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+            bf16_batch_invariant_arch,
+        )
+
+        kind = {
+            "bf16_nvfp4": "w4a16",
+            "bf16_mxfp8_e4m3": "w8a16_e4m3",
+            "bf16_mxfp8_e5m2": "w8a16_e5m2",
+        }[dtype]
+        return a16_fingerprint(
+            hidden,
+            intermediate,
+            topk,
+            num_experts,
+            kind=kind,
+            arch=bf16_batch_invariant_arch(),
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            gate_up_clamp=gate_up_clamp,
+            handoff_norm=handoff_norm,
+            output_mode=output_mode,
+            **variants,
+        )
+    if output_mode != "finalized":
+        variants["output_mode"] = output_mode
+    if combine_dtype != "bf16":
+        variants["combine_dtype"] = combine_dtype
+    if dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        from flashinfer.moe_ep.batch_invariant.mxfp8_spec import (
+            spec_fingerprint as mxfp8_spec_fingerprint,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_arch,
+        )
+
+        if isinstance(input_norm_const, bool) or input_norm_const != 1.0:
+            raise ValueError("batch_invariant MXFP8 requires input_norm_const=1.0")
+        return mxfp8_spec_fingerprint(
+            hidden=hidden,
+            intermediate=intermediate,
+            top_k=topk,
+            num_experts=num_experts,
+            arch=nvfp4_batch_invariant_arch(),
+            quant_kind=dtype,
+            implementation="legacy",
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            gate_up_clamp=gate_up_clamp,
+            **variants,
+        )
+    if dtype == "nvfp4":
+        from flashinfer.moe_ep.batch_invariant.nvfp4_spec import (
+            spec_fingerprint as nvfp4_spec_fingerprint,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_arch,
+        )
+
+        return nvfp4_spec_fingerprint(
+            hidden=hidden,
+            intermediate=intermediate // 2,
+            top_k=topk,
+            num_experts=num_experts,
+            arch=nvfp4_batch_invariant_arch(),
+            implementation="legacy",
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            gate_up_clamp=gate_up_clamp,
+            input_norm_const=input_norm_const,
+            has_fc1_alpha=True,
+            has_fc2_alpha=True,
+            has_fc1_norm_const=True,
+            **variants,
+        )
+    from flashinfer.moe_ep.batch_invariant.spec import spec_fingerprint
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        bf16_batch_invariant_arch,
+    )
+
+    return spec_fingerprint(
+        hidden,
+        intermediate,
+        topk,
+        num_experts,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        arch=bf16_batch_invariant_arch(),
+        **variants,
+    )
 
 
 def _cache_path() -> Optional[str]:
@@ -136,6 +303,79 @@ def _entry_needs_ikr(entry: Dict[str, Any]) -> bool:
     return bool(isinstance(knobs, dict) and knobs.get("in_kernel_fc2_reduce"))
 
 
+def _nvfp4_bi_plan_valid(knobs, combine_dtype="bf16"):
+    if (
+        combine_dtype != "bf16"
+        and knobs.get("token_back_mode", "epi_warps") != "reuse_dispatch_warps"
+    ):
+        return False
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+        nvfp4_batch_invariant_knobs_valid,
+    )
+
+    return nvfp4_batch_invariant_knobs_valid(
+        _knobs_from_json(knobs), implementation="legacy"
+    )
+
+
+def _a16_bi_plan_valid(knobs, dtype):
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+        validate_a16_batch_invariant,
+    )
+
+    try:
+        from .tuner import reject_explicit_knobs
+
+        reject_explicit_knobs(knobs)
+        validate_a16_batch_invariant(
+            SimpleNamespace(batch_invariant=True, kind=dtype), _knobs_from_json(knobs)
+        )
+    except (TypeError, ValueError, KeyError):
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class _Bf16CacheProblem:
+    hidden: int
+    intermediate: int
+    num_total_experts: int
+    batch_invariant: bool = True
+
+
+def _bf16_bi_plan_valid(knobs, hidden, intermediate, num_experts):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        validate_bf16_batch_invariant,
+    )
+
+    try:
+        validate_bf16_batch_invariant(
+            _Bf16CacheProblem(hidden, intermediate, num_experts),
+            _knobs_from_json(knobs),
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _mxfp8_bi_plan_valid(knobs, dtype):
+    from types import SimpleNamespace
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+        validate_mxfp8_batch_invariant,
+    )
+
+    try:
+        validate_mxfp8_batch_invariant(
+            SimpleNamespace(batch_invariant=True, kind=dtype),
+            _knobs_from_json(knobs),
+            implementation="legacy",
+        )
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 @deprecated_aliases(
     apply_topk_in_fc1="apply_routing_weights_before_fc2",
     defer_topk_reduce="use_custom_finalize",
@@ -153,12 +393,46 @@ def _matching_entries(
     enable_in_kernel_fc2_reduce: bool = False,
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
+    activation: str = "swiglu",
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    handoff_norm: bool = False,
     device: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss.
 
     ``enable_in_kernel_fc2_reduce`` indicates whether the user has opted in to in_kernel_fc2_reduce.
     """
+    policy_version = _batch_invariant_version(
+        dtype, batch_invariant, batch_invariant_version
+    )
+    arithmetic_fingerprint = _arithmetic_fingerprint(
+        dtype=dtype,
+        batch_invariant=batch_invariant,
+        hidden=hidden,
+        intermediate=intermediate,
+        topk=topk,
+        num_experts=num_experts,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        per_token_scale=per_token_scale,
+        handoff_norm=handoff_norm,
+        output_mode="deferred" if use_custom_finalize else "finalized",
+        combine_dtype=combine_dtype,
+    )
     path = _cache_path()
     if path is None:
         return []
@@ -179,8 +453,34 @@ def _matching_entries(
         and e.get("apply_routing_weights_before_fc2")
         == apply_routing_weights_before_fc2
         and e.get("use_custom_finalize", False) == use_custom_finalize
+        and e.get("batch_invariant", False) == batch_invariant
+        and (not batch_invariant or e.get("batch_invariant_version") == policy_version)
+        and (
+            not batch_invariant
+            or e.get("batch_invariant_fingerprint") == arithmetic_fingerprint
+        )
         and e.get("profile") in (None, "live_tokens")
         and isinstance(e.get("knobs"), dict)
+        and (
+            not batch_invariant
+            or dtype not in ("bf16_nvfp4", "bf16_mxfp8_e4m3", "bf16_mxfp8_e5m2")
+            or _a16_bi_plan_valid(e["knobs"], dtype)
+        )
+        and (
+            not batch_invariant
+            or dtype != "bf16"
+            or _bf16_bi_plan_valid(e["knobs"], hidden, intermediate, num_experts)
+        )
+        and (
+            not batch_invariant
+            or dtype != "nvfp4"
+            or _nvfp4_bi_plan_valid(e["knobs"], combine_dtype)
+        )
+        and (
+            not batch_invariant
+            or dtype not in ("mxfp8_e4m3", "mxfp8_e5m2")
+            or _mxfp8_bi_plan_valid(e["knobs"], dtype)
+        )
         and isinstance(e.get("max_tokens"), int)
         and (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
     ]
@@ -215,6 +515,17 @@ def lookup_knobs(
     enable_in_kernel_fc2_reduce: bool = False,
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
+    activation: str = "swiglu",
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    handoff_norm: bool = False,
     device: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
@@ -231,7 +542,18 @@ def lookup_knobs(
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         use_custom_finalize=use_custom_finalize,
+        batch_invariant=batch_invariant,
+        batch_invariant_version=batch_invariant_version,
+        gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
         device=device,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        per_token_scale=per_token_scale,
+        handoff_norm=handoff_norm,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
@@ -269,6 +591,17 @@ def record_knobs(
     combine_dtype: str = "bf16",
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
+    activation: str = "swiglu",
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    handoff_norm: bool = False,
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -277,7 +610,8 @@ def record_knobs(
 
     Deterministic and ikr-tuned winners for the same geometry are separate
     entries (see :func:`_entry_needs_ikr`); FC1 and post-FC2 routing-weight
-    placement and reduced/deferred output also have separate winners. A
+    placement and reduced/deferred output also have separate winners. BF16
+    batch-invariant entries additionally isolate the numerical policy version. A
     ``--allow-nondeterministic`` sweep does not evict the deterministic winner
     a reproducible session needs, or vice versa.
 
@@ -287,6 +621,53 @@ def record_knobs(
     the write failed (recording is best-effort — a read-only home directory
     must not break tuning).
     """
+    if (
+        batch_invariant
+        and dtype == "nvfp4"
+        and not _nvfp4_bi_plan_valid(knobs, combine_dtype)
+    ):
+        raise ValueError("cannot record an inadmissible batch-invariant NVFP4 plan")
+    if (
+        batch_invariant
+        and dtype == "bf16"
+        and not _bf16_bi_plan_valid(knobs, hidden, intermediate, num_experts)
+    ):
+        raise ValueError("cannot record an inadmissible batch-invariant BF16 plan")
+    if (
+        batch_invariant
+        and dtype in ("mxfp8_e4m3", "mxfp8_e5m2")
+        and not _mxfp8_bi_plan_valid(knobs, dtype)
+    ):
+        raise ValueError("cannot record an inadmissible batch-invariant MXFP8 plan")
+    if (
+        batch_invariant
+        and dtype in ("bf16_nvfp4", "bf16_mxfp8_e4m3", "bf16_mxfp8_e5m2")
+        and not _a16_bi_plan_valid(knobs, dtype)
+    ):
+        raise ValueError("cannot record an inadmissible batch-invariant A16 plan")
+    policy_version = _batch_invariant_version(
+        dtype, batch_invariant, batch_invariant_version
+    )
+    arithmetic_fingerprint = _arithmetic_fingerprint(
+        dtype=dtype,
+        batch_invariant=batch_invariant,
+        hidden=hidden,
+        intermediate=intermediate,
+        topk=topk,
+        num_experts=num_experts,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+        gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        per_token_scale=per_token_scale,
+        handoff_norm=handoff_norm,
+        output_mode="deferred" if use_custom_finalize else "finalized",
+        combine_dtype=combine_dtype,
+    )
     if live_tokens is None:
         live_tokens = max_tokens
     if type(live_tokens) is not int or not 0 <= live_tokens <= max_tokens:
@@ -312,6 +693,12 @@ def record_knobs(
         source=source,
         tuned_at=datetime.datetime.now().isoformat(timespec="seconds"),
     )
+    if dtype in ("bf16", "nvfp4") or batch_invariant:
+        entry.update(
+            batch_invariant=batch_invariant,
+            batch_invariant_version=policy_version,
+            batch_invariant_fingerprint=arithmetic_fingerprint,
+        )
     try:
         entries = _load_entries(path)
         entries = [
@@ -324,6 +711,15 @@ def record_knobs(
                 and e.get("apply_routing_weights_before_fc2")
                 == apply_routing_weights_before_fc2
                 and e.get("use_custom_finalize", False) == use_custom_finalize
+                and e.get("batch_invariant", False) == batch_invariant
+                and (
+                    not batch_invariant
+                    or e.get("batch_invariant_version") == policy_version
+                )
+                and (
+                    not batch_invariant
+                    or e.get("batch_invariant_fingerprint") == arithmetic_fingerprint
+                )
                 and e.get("profile") in (None, "live_tokens")
                 and _entry_needs_ikr(e) == _entry_needs_ikr(entry)
             )
@@ -373,6 +769,17 @@ def resolve_knobs(
     enable_in_kernel_fc2_reduce: bool = False,
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    batch_invariant_version: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    input_norm_const: float = 1.0,
+    activation: str = "swiglu",
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    per_token_scale: bool = False,
+    handoff_norm: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -401,9 +808,47 @@ def resolve_knobs(
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         use_custom_finalize=use_custom_finalize,
+        batch_invariant=batch_invariant,
+        batch_invariant_version=batch_invariant_version,
+        gate_up_clamp=gate_up_clamp,
+        input_norm_const=input_norm_const,
+        activation=activation,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        per_token_scale=per_token_scale,
+        handoff_norm=handoff_norm,
     )
     if cached is not None:
         return cached, "cache"
+    if batch_invariant and dtype == "nvfp4":
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_default_knobs,
+        )
+
+        fallback = nvfp4_batch_invariant_default_knobs("legacy")
+        if combine_dtype != "bf16":
+            fallback["token_back_mode"] = "reuse_dispatch_warps"
+        return fallback, "heuristic"
+    if batch_invariant and dtype in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.mxfp8_batch_invariant import (
+            mxfp8_batch_invariant_default_knobs,
+        )
+
+        return mxfp8_batch_invariant_default_knobs(
+            "legacy", quant_kind=dtype
+        ), "heuristic"
+    if batch_invariant and dtype in (
+        "bf16_nvfp4",
+        "bf16_mxfp8_e4m3",
+        "bf16_mxfp8_e5m2",
+    ):
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+            a16_batch_invariant_default_knobs,
+        )
+
+        return a16_batch_invariant_default_knobs(dtype), "heuristic"
     from .tuner import default_knobs
 
     # The cache keys on the precise element kind (``mxfp8_e4m3`` and
