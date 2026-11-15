@@ -640,6 +640,20 @@ def test_tma_quantizer_refuses_sequences_beyond_its_v_boxes():
 
 
 @requires_sm100
+def test_tma_quantizer_refuses_partitions_beyond_32_bits():
+    """The TMA kernel multiplies its CTA count by its Q/K tile count in 32-bit integers:
+    ``impl="tma"`` refuses a shape whose product reaches ``2**31``, and ``"auto"`` takes
+    another quantizer for it."""
+    route = ("quantize_qkv_tma_x4", 4, 37)
+    assert pkg._tma_partition_fits(1, 8, 8, 4096, 4096, route)
+    assert not pkg._tma_partition_fits(64, 128, 128, 64, 64, route)
+    assert not pkg._tma_partition_fits(1, 8, 8, 1 << 27, 4096, route)
+    q, k, v = _quantizer_inputs(64, 128, 128, 64, 64, torch.device("cuda"), 5)
+    with pytest.raises(ValueError, match="32-bit"):
+        sage_fp8_quantize_sm100(q, k, v, impl="tma")
+
+
+@requires_sm100
 def test_auto_quantizer_capture_without_an_eager_call_takes_two_launches():
     """The TMA route's occupancy query cannot run inside a CUDA-graph capture: a capture
     of a row no eager call has routed takes the two-launch quantizer (same bits), the

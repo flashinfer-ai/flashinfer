@@ -602,6 +602,27 @@ def _tma_route(
     return name, vsplit, _TMA_RESIDENT[(name, device_index)]
 
 
+def _tma_partition_fits(
+    batch: int,
+    heads: int,
+    kv_heads: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    tma: Tuple[str, int, int],
+) -> bool:
+    """Whether the TMA-ring quantizer's work partition stays in 32-bit integers.
+
+    The kernel splits the Q/K tiles over its CTAs with products of the CTA count and
+    the tile count in ``int``; a shape whose product reaches ``2**31`` takes another
+    quantizer.
+    """
+    _, vsplit, resident = tma
+    q_tiles = batch * heads * _ceil_div(seqlen_q, TOKENS_PER_CTA)
+    k_tiles = batch * kv_heads * _ceil_div(seqlen_k, TOKENS_PER_CTA)
+    ctas = _TMA_CLUSTER_CTAS * max(batch * kv_heads * vsplit, resident)
+    return ctas * (q_tiles + k_tiles) < 2**31
+
+
 def _one_launch_fits(batch: int, grid_heads: int, seqlen: int, sms: int) -> bool:
     """Whether the one-launch quantizer serves a shape faster than two launches.
 
@@ -656,6 +677,7 @@ def _quantize_calls(
     q8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
     k8 = torch.empty_like(k, dtype=torch.float8_e4m3fn)
     v8 = torch.empty_like(v, dtype=torch.float8_e4m3fn)
+    explicit_tma = impl == "tma"
     tma = None
     if impl == "auto":
         if _ONE_LAUNCH_RECORD in _loader.MODULES and _one_launch_fits(
@@ -691,6 +713,16 @@ def _quantize_calls(
                 f'impl="tma" quantizes 1 <= seqlen_k <= {_TMA_MAX_SEQLEN_K} and '
                 f"seqlen_q >= 1 tokens, got seqlen_q={seqlen_q}, seqlen_k={seqlen_k}"
             )
+    if tma is not None and not _tma_partition_fits(
+        batch, heads, kv_heads, seqlen_q, seqlen_k, tma
+    ):
+        if explicit_tma:
+            raise ValueError(
+                'impl="tma" splits its Q/K tiles over its CTAs in 32-bit integers; '
+                f"batch={batch}, num_heads={heads}, num_kv_heads={kv_heads}, "
+                f"seqlen_q={seqlen_q}, seqlen_k={seqlen_k} exceeds them"
+            )
+        tma, impl = None, "two_launch"
     if impl in ("one_launch", "tma"):
         # One buffer for the three scale tensors: one allocation on the host path.  Each
         # view starts on a 256-byte boundary, as a tensor of its own would: the kernels
