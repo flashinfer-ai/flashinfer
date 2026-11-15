@@ -34,8 +34,20 @@ __all__ = [
 ]
 
 try:
-    from .ssd_combined import SSDCombined, ssd_combined_fwd
+    from .ssd_combined import SSD_BACKENDS, SSDCombined, ssd_combined_fwd
 
-    __all__.extend(("SSDCombined", "ssd_combined_fwd"))
+    __all__.extend(("SSDCombined", "ssd_combined_fwd", "SSD_BACKENDS"))
+except ImportError:
+    pass
+
+try:
+    from .specialized.ssd_prefill_sm120 import (
+        specialized_ssd_prefill_stats,
+        warmup as specialized_ssd_prefill_warmup,
+    )
+
+    __all__.extend(
+        ("specialized_ssd_prefill_stats", "specialized_ssd_prefill_warmup")
+    )
 except ImportError:
     pass
