@@ -687,6 +687,7 @@ def test_auto_quantizer_capture_without_an_eager_call_takes_two_launches():
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+@requires_sm100
 def test_auto_quantizer_routes_captured_small_rows_to_the_tma_quantizer():
     """``impl="auto"``: eager small rows take the cluster quantizer; inside a CUDA-graph
     capture the rows whose TMA V clusters fit one wave take the TMA quantizer (one kernel
