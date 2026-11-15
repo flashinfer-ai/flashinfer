@@ -79,7 +79,9 @@ class _MegaMixedInput(Sm100W4A16GroupedGemmKernel):
         smem_buffer_align_bytes,
         use_fused_finalize,
         use_clc_scheduler,
+        m_tiles_per_unit=1,
     ):
+        assert m_tiles_per_unit == 1
         assert mma_tiler_mnk in (
             (128, 32, 256),
             (128, 64, 256),
