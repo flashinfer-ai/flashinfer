@@ -580,16 +580,15 @@ def _tma_route(
     """
     if not (1 <= seqlen_k <= _TMA_MAX_SEQLEN_K and seqlen_q >= 1):
         return None
+    # A cluster of 4 CTAs holds at most one CTA per SM: past that bound even the
+    # smallest split does not fit one wave, without asking the driver.
+    ctas = batch * kv_heads * _TMA_RECORDS[-1][1] * _TMA_CLUSTER_CTAS
+    if one_wave and ctas > _loader.sm_count(device_index):
+        return None
     shipped = [
         (name, vsplit) for name, vsplit in _TMA_RECORDS if name in _loader.MODULES
     ]
     if not shipped:
-        return None
-    # A cluster of 4 CTAs holds at most one CTA per SM: past that bound no split fits
-    # one wave, without asking the driver.
-    if one_wave and batch * kv_heads * shipped[-1][
-        1
-    ] * _TMA_CLUSTER_CTAS > _loader.sm_count(device_index):
         return None
     for name, vsplit in shipped:
         resident = _tma_resident(name, device_index)
@@ -667,10 +666,12 @@ def _quantize_calls(
         ):
             impl = "one_launch"
             # The same row inside a later CUDA-graph capture takes the TMA quantizer:
-            # query its occupancy now, outside the capture.
-            for name, _ in _TMA_RECORDS:
-                if name in _loader.MODULES:
-                    _tma_resident(name, device_index)
+            # query its occupancy now, outside the capture (once: the query fills
+            # ``_TMA_RESIDENT``).
+            if (_TMA_RECORDS[-1][0], device_index) not in _TMA_RESIDENT:
+                for name, _ in _TMA_RECORDS:
+                    if name in _loader.MODULES:
+                        _tma_resident(name, device_index)
         else:
             tma = _tma_route(
                 batch, kv_heads, seqlen_q, seqlen_k, device_index, one_wave=True
