@@ -60,6 +60,10 @@ from ...jit.core import logger
 from ...utils import get_compute_capability
 
 _DISABLE_ENV = "FLASHINFER_DISABLE_MLA_DECODE_FP8_PAGED_SM90"
+# shared specialized-kernel kill switch (#5667 convention), honored as an
+# alias of the route-scoped switch above; the census records which fired
+_DISABLE_ENV_SHARED = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+_FP8Q_BACKENDS = ("auto", "specialized", "stock")
 _NUM_HEADS = 8
 _HEAD_DIM_CKV = 512
 _HEAD_DIM_KPE = 64
@@ -71,6 +75,8 @@ _MAX_KV_LEN = 262144
 _COMPUTE_CAPABILITY = (9, 0)
 
 _counters: Dict[str, int] = {
+    "plans_selector_stock": 0,
+    "specialized_raises": 0,
     "plans_seen": 0,
     "plans_disabled": 0,
     "plans_ineligible": 0,
@@ -89,8 +95,21 @@ _init_devices: set = set()
 _announced = False
 
 
+def _disabled_by() -> Optional[str]:
+    """The kill-switch env var that fired, or None (route-scoped name and
+    the shared #5667 alias are both honored)."""
+    for env in (_DISABLE_ENV, _DISABLE_ENV_SHARED):
+        if os.environ.get(env, "") not in ("", "0"):
+            return env
+    return None
+
+
 def _disabled() -> bool:
-    return os.environ.get(_DISABLE_ENV, "") not in ("", "0")
+    return _disabled_by() is not None
+
+
+def _fp8q_selector(wrapper: Any) -> str:
+    return getattr(wrapper, "_fp8q_backend", "auto")
 
 
 def _mla_dec_fp8q_sm90_stats() -> Dict[str, Any]:
@@ -156,13 +175,29 @@ def _mla_dec_fp8q_sm90_prepare(
     counters = _counters
     wrapper._mla_dec_fp8q_sm90_state = None
     counters["plans_seen"] += 1
-    if _disabled():
+    selector = _fp8q_selector(wrapper)
+    if selector == "stock":
+        counters["plans_selector_stock"] += 1
+        logger.info_once(
+            "mla_decode_fp8_paged_sm90: fp8q_backend='stock'; the fast "
+            "path is never prepared, fp8-Q calls are served by exact "
+            "dequantisation into the stock MLA path")
+        return
+    fired = _disabled_by()
+    if fired is not None:
         counters["plans_disabled"] += 1
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "the kill switch %s=%s disables the fast path (an "
+                "explicitly selected backend is never silently swapped)"
+                % (fired, os.environ.get(fired, "")))
         logger.info_once(
             "mla_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
             "served by exact dequantisation into the stock MLA path",
-            _DISABLE_ENV,
-            os.environ.get(_DISABLE_ENV, ""),
+            fired,
+            os.environ.get(fired, ""),
         )
         return
     device = wrapper.device if hasattr(wrapper, "device") else None
@@ -245,6 +280,13 @@ def _mla_dec_fp8q_sm90_prepare(
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
     if reason is not None:
         counters["plans_ineligible"] += 1
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "this plan is outside the measured contract (%s); an "
+                "explicitly selected backend is never silently swapped — "
+                "use fp8q_backend='auto' for guarded fallback" % reason)
         logger.info_once(
             "mla_decode_fp8_paged_sm90: not dispatched for this plan (%s); "
             "fp8-Q calls are served by exact dequantisation into the stock "
@@ -434,8 +476,17 @@ def _mla_dec_fp8q_sm90_dispatch(
     state = getattr(wrapper, "_mla_dec_fp8q_sm90_state", None)
     counters = _counters
 
+    selector = _fp8q_selector(wrapper)
+
     def _fallback(reason: str):
         counters["runs_ineligible"] += 1
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "this call cannot be served by the fast path (%s); an "
+                "explicitly selected backend is never silently swapped"
+                % reason)
         logger.info_once(
             "mla_decode_fp8_paged_sm90: not dispatched for this call (%s); "
             "the dequant + stock MLA path serves it",
@@ -443,13 +494,20 @@ def _mla_dec_fp8q_sm90_dispatch(
         )
         return None, _dequant_query(query, q_scale)
 
-    if _disabled():
+    fired = _disabled_by()
+    if fired is not None:
         counters["runs_disabled"] += 1
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "the kill switch %s=%s disables the fast path"
+                % (fired, os.environ.get(fired, "")))
         logger.info_once(
             "mla_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
             "served by exact dequantisation into the stock MLA path",
-            _DISABLE_ENV,
-            os.environ.get(_DISABLE_ENV, ""),
+            fired,
+            os.environ.get(fired, ""),
         )
         return None, _dequant_query(query, q_scale)
     if state is None:

@@ -155,10 +155,11 @@ def _reference(batch, q_scale=1.0, kv_scale=1.0):
     return out
 
 
-def _plan_wrapper(batch, device):
+def _plan_wrapper(batch, device, fp8q_backend="auto"):
     ws = torch.zeros(160 * 1024 * 1024, dtype=torch.uint8, device=device)
     w = BatchMLAPagedAttentionWrapper(float_workspace_buffer=ws,
-                                      backend="auto")
+                                      backend="auto",
+                                      fp8q_backend=fp8q_backend)
     w.plan(
         qo_indptr=batch["qo_indptr"],
         kv_indptr=batch["kv_indptr"],
@@ -306,5 +307,77 @@ def test_ragged_short_kv_b5_workspace_bound_regression():
     w = _plan_wrapper(batch, device)
     out = _run(w, batch)
     assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
+    ref = _reference(batch)
+    assert _matched_ratio(out, ref) >= MATCHED
+
+
+SHARED_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+
+
+def test_fp8q_backend_selector_values():
+    import pytest as _pytest
+    ws = torch.zeros(16, dtype=torch.uint8)
+    with _pytest.raises(ValueError):
+        BatchMLAPagedAttentionWrapper(float_workspace_buffer=ws,
+                                      backend="auto", fp8q_backend="fa2")
+
+
+def test_fp8q_backend_stock_never_prepares():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    _reset_mla_dec_fp8q_sm90_stats()
+    w = _plan_wrapper(batch, device, fp8q_backend="stock")
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["plans_selector_stock"] == 1, stats
+    assert stats["plans_prepared"] == 0, stats
+    out = _run(w, batch)  # served by dequant + stock
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
+    ref = _reference(batch)
+    assert _matched_ratio(out, ref) >= MATCHED
+
+
+def test_fp8q_backend_specialized_serves_on_contract():
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    _reset_mla_dec_fp8q_sm90_stats()
+    w = _plan_wrapper(batch, device, fp8q_backend="specialized")
+    out = _run(w, batch)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 1, stats
+    ref = _reference(batch)
+    assert _matched_ratio(out, ref) >= MATCHED
+
+
+def test_fp8q_backend_specialized_raises_when_unservable(monkeypatch):
+    # an explicitly selected backend is never silently swapped: with the
+    # fast path disabled (either kill-switch env), plan must RAISE under
+    # fp8q_backend='specialized' instead of dequant-serving
+    import pytest as _pytest
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    _reset_mla_dec_fp8q_sm90_stats()
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    with _pytest.raises(RuntimeError):
+        _plan_wrapper(batch, device, fp8q_backend="specialized")
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["specialized_raises"] == 1, stats
+
+
+def test_shared_kill_switch_alias(monkeypatch):
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    _reset_mla_dec_fp8q_sm90_stats()
+    monkeypatch.setenv(SHARED_DISABLE_ENV, "1")
+    w = _plan_wrapper(batch, device)  # auto: alias disables, no raise
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["plans_disabled"] == 1, stats
+    out = _run(w, batch)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
     ref = _reference(batch)
     assert _matched_ratio(out, ref) >= MATCHED
