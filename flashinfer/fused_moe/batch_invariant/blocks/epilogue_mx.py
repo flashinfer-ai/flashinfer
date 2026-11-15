@@ -48,7 +48,7 @@ from typing import Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Float32, Int32, Int64, Uint8, Uint32
+from cutlass import Boolean, Float32, Int32, Int64, Uint8, Uint32
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils.blackwell_helpers import get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
@@ -100,6 +100,10 @@ BAR_EPI_XCH = 8  # named barrier ids BAR_EPI_XCH + warpgroup pair (the staged st
 # The accumulator a dead lane or dead token column computes its (never stored) chain on: a normal operand through the chain's
 # exact division and the block scale's reciprocal, where a dead row's zero or arbitrary accumulators take the slow sequences.
 DEAD_ACC = 1.0
+#: The chains whose per-column epilogue cost is the block-amax butterfly rather than the chain (no transcendental, no
+#: division): the swapped fused requantization keeps the straight-line form for them, where the columns' butterflies
+#: interleave; the other chains skip the dead token columns (the chain dominates).
+CHEAP_ACTS = ("relu2", "relu", "identity")
 
 
 def xch_layout(epi_warpgroups: int):
@@ -501,7 +505,8 @@ def swapped_epilogue_quant_loop(
     whose token columns are all live runs every column's chain straight-line (the chains interleave); a subtile with dead
     columns computes the chain and the block amax of the live columns only (a warp-uniform branch per column: every lane of
     the warp holds the same token column, and a column's reduction never mixes with another's, so the stored bits are the
-    same). ``mOut [Tk', N_out]`` uint8 codes, ``mSf`` the flat 128x4 bytes of the padded rows."""
+    same); the ReLU family (``CHEAP_ACTS``) runs every column straight-line whatever the live count (its per-column cost is
+    the butterfly, which interleaves). ``mOut [Tk', N_out]`` uint8 codes, ``mSf`` the flat 128x4 bytes of the padded rows."""
     pair = chain.pair
     twin = bf16_twin(chain)
     fp = CuteF32
@@ -613,7 +618,12 @@ def swapped_epilogue_quant_loop(
             leader = store_ok & (
                 (out_loc % Int32(BLOCK)) == Int32(0)
             )  # the block's first column stores its scale byte
-            full = (col0 + Int32(span)) <= rows_left  # every token column of the subtile is a live token
+            # the dead-column skip pays where the per-column cost is the chain itself; the ReLU family keeps every column
+            # straight-line (its butterflies interleave)
+            if cutlass.const_expr(chain.act in CHEAP_ACTS):
+                full = Boolean(True)
+            else:
+                full = (col0 + Int32(span)) <= rows_left  # every token column of the subtile is a live token
             if full:
                 # every token column's chain straight-line (the column chains interleave), its block amax across the lanes
                 # (the gate lanes' leaves ``+0``)
