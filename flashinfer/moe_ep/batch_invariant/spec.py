@@ -31,6 +31,7 @@ from functools import lru_cache
 from typing import Any, Sequence
 
 from ...batch_invariant.fp_interface.term import Term, TermAlgebra
+from . import numerical_variants as _numerical
 
 SPEC_VERSION = 1
 MMA_K = 16
@@ -366,11 +367,26 @@ def component_terms(
     blocked: bool = False,
     valid_routes: Sequence[bool] | None = None,
     fp: OrderedTermAlgebra | None = None,
+    **numerical_kwargs,
 ) -> dict[str, Term]:
     """Canonical components with references bound by ``COMPOSITION`` below."""
     _validate_spec(
         hidden, intermediate, top_k, num_experts, apply_routing_weights_before_fc2, arch
     )
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.component_terms(
+            "bf16",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+                blocked=blocked,
+                valid_routes=valid_routes,
+            ),
+            numerical_kwargs,
+            fp=fp,
+        )
     fp = fp or OrderedTermAlgebra()
     return {
         "fc1_gate": mma_fold(fp, hidden, "fc1.gate", blocked=blocked),
@@ -412,6 +428,7 @@ def plan_component_terms(
     plan_config: PlanConfig = DEFAULT_PLAN_CONFIG,
     valid_routes: Sequence[bool] | None = None,
     fp: OrderedTermAlgebra | None = None,
+    **numerical_kwargs,
 ) -> dict[str, Term]:
     """A physical plan's lowering; M/N change ownership, K regroups K16 steps.
 
@@ -434,6 +451,7 @@ def plan_component_terms(
         arch,
         valid_routes=valid_routes,
         fp=fp,
+        **numerical_kwargs,
     )
     stage_k = plan_config.mma_tiler_mnk[2]
     terms["fc1_gate"] = mma_plan_fold(fp, hidden, "fc1.gate", stage_k=stage_k)
@@ -466,8 +484,20 @@ def specification(
     apply_routing_weights_before_fc2: bool = True,
     gate_up_clamp: float | None = None,
     arch: str = "sm_100",
+    **numerical_kwargs,
 ) -> dict[str, Any]:
     """The compositional arithmetic receipt, excluding batch and placement."""
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.specification(
+            "bf16",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+            ),
+            numerical_kwargs,
+        )
     terms = component_terms(
         hidden,
         intermediate,
@@ -531,6 +561,7 @@ def spec_fingerprint(
     apply_routing_weights_before_fc2: bool = True,
     gate_up_clamp: float | None = None,
     arch: str = "sm_100",
+    **numerical_kwargs,
 ) -> str:
     """Hash the arithmetic specification, rather than a launch configuration.
 
@@ -544,6 +575,17 @@ def spec_fingerprint(
     _validate_spec(
         hidden, intermediate, top_k, num_experts, apply_routing_weights_before_fc2, arch
     )
+    if not _numerical.is_default(**numerical_kwargs):
+        return _numerical.spec_fingerprint(
+            "bf16",
+            (hidden, intermediate, top_k, num_experts),
+            dict(
+                arch=arch,
+                apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+                gate_up_clamp=gate_up_clamp,
+            ),
+            numerical_kwargs,
+        )
     return _cached_spec_fingerprint(
         hidden,
         intermediate,
