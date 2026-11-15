@@ -553,8 +553,14 @@ def test_mx_classes_run_on_the_unified_bodies():
         # fused requantization's own epilogue on one
         for sw2 in swapped_knobs_mx():
             s2 = SwappedGroupedGemm(sw2, plain.at(fmt), k_block=256)
-            assert s2.epi_wgs == max(1, min(4, sw2.tile_n // 8)) and s2.sf_warp == 4 * s2.epi_wgs
-            assert SwappedGroupedGemm(sw2, quant.at(fmt), k_block=256).epi_wgs == 1
+            assert (
+                s2.epi_wgs == max(1, min(4, sw2.tile_n // 8))
+                and s2.sf_warp == 4 * s2.epi_wgs
+            )
+            assert (
+                SwappedGroupedGemm(sw2, quant.at(fmt), k_block=256).epi_wgs
+                == s2.epi_wgs
+            )
         assert C.can_implement_grouped_blockscaled(dense, 256, 2048, 8, quant, fmt)
         assert C.can_implement_swapped_blockscaled(sw, 256, 2048, 8, quant, fmt)
         assert not C.can_implement_grouped_blockscaled(dense, 256, 2064, 8, quant, fmt)
@@ -575,9 +581,11 @@ def test_mx_classes_run_on_the_unified_bodies():
     assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith(
         "_kb256_e2"
     )
-    # the fused requantization's one-warpgroup epilogue: no warpgroup suffix
-    name = C.swapped_kernel_name(swapped_knobs_mx()[1], quant.at("mxfp8_k64"), k_block=256)
-    assert name.endswith("_kb256")
+    # the fused requantization's epilogue over the same warpgroups: the same suffix
+    name = C.swapped_kernel_name(
+        swapped_knobs_mx()[1], quant.at("mxfp8_k64"), k_block=256
+    )
+    assert name.endswith("_kb256_e2")
     assert C.MODULE == SCATTER_MODULE == "batch_invariant_moe"
     assert "batch_invariant_moe_mxfp8" not in jit.MODULE_ROOTS
     srcs = jit.relative_sources("batch_invariant_moe")

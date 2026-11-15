@@ -127,9 +127,9 @@ def epilogue_warps(token_tile: int):
 
 
 def epi_warpgroups_of(chain, token_tile: int) -> int:
-    """:func:`epi_warpgroups` for the shared transposed epilogue; a chain with its own swapped epilogue (the MX classes'
-    fused requantization, ``swapped_loop``) runs it on one warpgroup."""
-    return 1 if chain.swapped_loop() is not None else epi_warpgroups(token_tile)
+    """:func:`epi_warpgroups` for every chain's swapped epilogue: the shared transposed one and a chain's own (the MX
+    classes' fused requantization, ``swapped_loop``) both split the token tile's subtiles over the warpgroups."""
+    return epi_warpgroups(token_tile)
 
 
 WEIGHT_TILE = (
@@ -600,7 +600,9 @@ class SwappedGroupedGemm:
         # the gather form's slab is one swizzle atom of K wide (the gather4 box is the atom): it keeps the format's default stage
         body = "gather" if self.gather else "swapped"
         sfw_t = None
-        self.xch_layout = self.chain.smem_layout(1, token_tile=self.token_tile)
+        self.xch_layout = self.chain.smem_layout(
+            self.epi_wgs, token_tile=self.token_tile
+        )
         if cutlass.const_expr(ops.block_scaled):
             rows = ops.view_tokens(
                 rows
@@ -988,7 +990,7 @@ class SwappedGroupedGemm:
             # the layout is built here (a layout built at plan time belongs to the host region)
             sX = smem.allocate_tensor(
                 element_type=cutlass.Float32,
-                layout=self.chain.smem_layout(1, token_tile=tn),
+                layout=self.chain.smem_layout(self.epi_wgs, token_tile=tn),
                 byte_alignment=16,
             )
         gW_mkl = cute.local_tile(
@@ -1187,7 +1189,7 @@ class SwappedGroupedGemm:
                 quant_loop(
                     st,
                     self.chain,
-                    tidx,
+                    tidx % 128,
                     tile_sched,
                     tCtAcc_base,
                     thr_mma,
@@ -1195,12 +1197,18 @@ class SwappedGroupedGemm:
                     mOutSf,
                     Tk,
                     N,
-                    epi_tile,
+                    (wt, tn // self.epi_wgs)
+                    if cutlass.const_expr(self.epi_wgs > 1)
+                    else epi_tile,
                     acc_pipeline,
                     sX,
                     s_off,
                     s_off_pad,
                     wt,
+                    subtile=tidx // 128
+                    if cutlass.const_expr(self.epi_wgs > 1)
+                    else None,
+                    wg=tidx // 128 if cutlass.const_expr(self.epi_wgs > 1) else None,
                 )
             else:
                 swapped_epilogue_loop(
