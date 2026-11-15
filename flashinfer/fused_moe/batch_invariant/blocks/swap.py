@@ -242,15 +242,13 @@ class SwappedGroupedGemm:
             self.in_fmt,
         )
         gather = gather or knobs.gather_a
-        bs4 = self.operands.block_scaled and self.operands.elem_bits == 4
-        assert not gather or self.in_fmt == "bf16" or bs4, (
-            "the gather form is the bf16 classes' (the API's choice) and the 4-bit block-scaled classes' (the record's flag: "
-            "its token box and scale gather read packed 4-bit rows)",
+        assert not gather or self.in_fmt == "bf16" or self.operands.block_scaled, (
+            "the gather form is the bf16 classes' (the API's choice) and the block-scaled classes' (the record's flag)",
             knobs,
             self.in_fmt,
         )
-        assert not knobs.gather_a or bs4, (
-            "the gather record is the 4-bit block-scaled classes'",
+        assert not knobs.gather_a or self.operands.block_scaled, (
+            "the gather record is the block-scaled classes'",
             knobs,
         )
         assert sf_src in ("128x4", "linear"), sf_src
@@ -260,6 +258,11 @@ class SwappedGroupedGemm:
             self.operands.block_scaled and k_block % MMA_K_OF[self.in_fmt] == 0
         ), ("the k-block is the block-scaled bodies' whole instruction steps", k_block)
         self.k_block = k_block
+        assert not (gather and k_block), (
+            "the gather form's stage is one swizzle atom of K (the gather4 box is the atom): no k-block",
+            knobs,
+            k_block,
+        )
         # the warp roles: the epilogue warpgroup, (the block-scaled formats' scale-factor warp,) the MMA warp, the TMA warp
         bs = self.operands.block_scaled
         self.epi_wgs = epi_warpgroups(self.token_tile, chain)
@@ -423,6 +426,40 @@ class SwappedGroupedGemm:
         assert self.gather and self.operands.block_scaled and not self.chain.operands
         self._launch(
             x, w, out, counts, max_active_clusters, stream, src, k_div, sfa=sfx, sfw=sfw
+        )
+
+    @cute.jit
+    def block_scaled_quant_gathered(
+        self,
+        x: cute.Tensor,
+        sfx: cute.Tensor,
+        src: cute.Tensor,
+        k_div: Int32,
+        w: cute.Tensor,
+        sfw: cute.Tensor,
+        out: cute.Tensor,
+        out_sf: cute.Tensor,
+        counts: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The gather form of :meth:`block_scaled_quant` (the MXFP8 classes' fused requantization): ``x`` the unpermuted token
+        rows, ``sfx`` their scale bytes (the pack's row-major layout or the flat 128x4 buffer), ``src`` the plan's slot of every
+        dense row."""
+        assert self.gather and self.operands.block_scaled and not self.chain.operands
+        assert self.chain.quant, self.chain
+        self._launch(
+            x,
+            w,
+            out,
+            counts,
+            max_active_clusters,
+            stream,
+            src,
+            k_div,
+            sfa=sfx,
+            sfw=sfw,
+            out_sf=out_sf,
         )
 
     @cute.jit

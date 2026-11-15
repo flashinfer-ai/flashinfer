@@ -526,7 +526,24 @@ def compile_swapped_fn(
         )
         if _is_block_scaled(chain) and cfg.gather_a:
             sfx = f["sfa_lin"] if sf_src == "linear" else f["sfa"]
-            if isinstance(chain, Mxfp4Chain):
+            if isinstance(chain, (MxChain, Mxfp4Chain)):
+                # the MX chains' gather entries: the fused requantization (the MXFP8 classes) or the plain chain
+                if chain.quant:
+                    return cute.compile(
+                        body.block_scaled_quant_gathered,
+                        f["rows"],
+                        sfx,
+                        f["src"],
+                        Int32(1),
+                        f["b"],
+                        f["sfb"],
+                        f["out"],
+                        f["out_sf"],
+                        f["counts"],
+                        grid,
+                        stream_fake,
+                        options="--enable-tvm-ffi",
+                    )
                 return cute.compile(
                     body.block_scaled_plain_gathered,
                     f["rows"],

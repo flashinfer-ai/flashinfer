@@ -465,7 +465,7 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     """The MX chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts under the
     chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own
     wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the gather form
-    belongs to the bf16 and the 4-bit block-scaled classes; a k-block is whole instruction steps of the class."""
+    runs the one-atom stage; a k-block is whole instruction steps of the class."""
     from flashinfer.fused_moe.batch_invariant import pdl
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
@@ -482,8 +482,10 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
         assert SwappedGroupedGemm(cfg, ch, k_block=256).k_block == 256
         with pytest.raises(AssertionError):
             SwappedGroupedGemm(cfg, ch, k_block=48)
+        # the gather form (the token rows read through the plan's map) runs the one-atom stage: no k-block with it
+        assert SwappedGroupedGemm(cfg, ch, gather=True).gather
         with pytest.raises(AssertionError):
-            SwappedGroupedGemm(cfg, ch, gather=True)
+            SwappedGroupedGemm(cfg, ch, gather=True, k_block=256)
     monkeypatch.setattr(pdl, "TRIGGER", "early")
     with pytest.raises(AssertionError):
         SwappedGroupedGemm(cfg, GEMM2_CHAIN)
@@ -1905,6 +1907,110 @@ def test_swapped_path_equals_the_padded_path(T, k, H, I, E, act):
         F.fused_moe_mxfp8(
             (xq, xsf), ids, weights, W, config1=s1, config2=s2, path="padded"
         )
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "T, k, H, I, E, act, dropped",
+    [
+        (1, 2, 256, 128, 8, "swiglu", False),
+        (13, 8, 256, 128, 8, "swiglu", True),
+        (16, 8, 512, 256, 64, "swiglu", False),
+        (3, 6, 384, 256, 16, "relu2", True),
+    ],
+)
+def test_gather_form_gives_the_box_forms_bits(T, k, H, I, E, act, dropped):
+    """GEMM1's gather form (the swapped record reading the token rows and their scale bytes through the plan's map, no scatter
+    launch) gives the box form's bits at every swapped token tile: the op's output, the fused codes at the dense rows and the
+    scale bytes at the padded positions; a dropped slot (an id outside the expert range) is skipped by both forms; the default
+    form follows the structural rule (the gather form at the narrow swapped tile)."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GATHER_TOKEN_TILE_MAX,
+        default_configs_mx,
+        swapped_knobs_mx,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    a = activation_of(SwiGLU() if act == "swiglu" else ReLU2())
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=700 + T + E, gated=a.gated, adversarial=True
+    )
+    xq, xsf = _quant(x)
+    W = F.MoEWeightsMXFP8.prepare(w1, w2, gated=a.gated, act=a.act, params=a.params)
+    ids, weights = route(logits, k)
+    if dropped:
+        ids = ids.clone()
+        ids[0, 0] = E  # a dropped slot: no position, the term +0
+    sm_count, family = F._part(xq.device)
+    fmt = F.mx_class_of(xq.device)
+    _, s2 = default_configs_mx(T, k, H, I, E, W.chain1, fmt, sm_count, family, swap=True)
+    for s1 in swapped_knobs_mx():
+        box, im_b = F.fused_moe_mxfp8(
+            (xq, xsf), ids, weights, W, config1=s1, config2=s2, gather=False, return_intermediates=True
+        )
+        got, im_g = F.fused_moe_mxfp8(
+            (xq, xsf), ids, weights, W, config1=s1, config2=s2, gather=True, return_intermediates=True
+        )
+        assert not im_b["config1"].gather_a and im_g["config1"].gather_a
+        assert im_g["x_perm"] is None and im_b["x_perm"] is not None
+        assert torch.equal(bits(got), bits(box))
+        live = im_b["dest"].reshape(-1)
+        live = live[live >= 0].long()
+        assert torch.equal(
+            im_g["aq"].view(torch.uint8)[live], im_b["aq"].view(torch.uint8)[live]
+        )
+        pos = im_b["pos_pad"].reshape(-1)[: live.numel()].long()
+        assert torch.equal(
+            _unswizzle(im_g["a_sf"], im_g["Tk_sf"], I)[pos],
+            _unswizzle(im_b["a_sf"], im_b["Tk_sf"], I)[pos],
+        )
+        assert torch.equal(bits(im_g["y"][live].cpu()), bits(im_b["y"][live].cpu()))
+        auto, im_a = F.fused_moe_mxfp8(
+            (xq, xsf), ids, weights, W, config1=s1, config2=s2, return_intermediates=True
+        )
+        assert im_a["config1"].gather_a == (s1.mma_tiler_mn[1] <= GATHER_TOKEN_TILE_MAX)
+        assert torch.equal(bits(auto), bits(box))
+    # the gather form is GEMM1's swapped record on the dense packing with the fused requantization
+    p1, p2 = default_configs_mx(T, k, H, I, E, W.chain1, fmt, sm_count, family, swap=False)
+    with pytest.raises(ValueError, match="gather form"):
+        F.fused_moe_mxfp8((xq, xsf), ids, weights, W, config1=p1, config2=p2, gather=True)
+    with pytest.raises(ValueError, match="gather form"):
+        F.fused_moe_mxfp8(
+            (xq, xsf), ids, weights, W, config1=s1, config2=s2, gather=True, requant="standalone"
+        )
+
+
+def test_gather_form_rule_and_operand_contract():
+    """The gather form is a structural rule of the fused op (a swapped GEMM1 record at most `GATHER_TOKEN_TILE_MAX` tokens wide;
+    the scale rows whole 4-byte groups, i.e. a hidden size that is a multiple of 128) and a record attribute of the grouped
+    entry (``src`` and ``rows`` belong to it)."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GATHER_TOKEN_TILE_MAX,
+        gather_form_rule,
+        grouped_knobs_mx,
+        swapped_knobs_mx,
+    )
+
+    for c in swapped_knobs_mx():
+        assert gather_form_rule(c).gather_a == (c.mma_tiler_mn[1] <= GATHER_TOKEN_TILE_MAX)
+    for c in grouped_knobs_mx("mxfp8")[:3]:
+        assert not gather_form_rule(c).gather_a
+    assert F.gather_form_ok(2048) and F.gather_form_ok(128) and not F.gather_form_ok(96)
+    assert not F.gather_form_ok(64)
+    if not torch.cuda.is_available():
+        return
+    dev = torch.device("cuda")
+    a = torch.zeros(4, 256, dtype=torch.float8_e4m3fn, device=dev)
+    sf = torch.zeros(4 * 8, dtype=torch.uint8, device=dev)
+    w = torch.zeros(8, 256, 256, dtype=torch.float8_e4m3fn, device=dev)
+    w_sf = torch.zeros(8, F.sf_numel(256, 256), dtype=torch.uint8, device=dev)
+    counts = torch.zeros(8, dtype=torch.int32, device=dev)
+    box = swapped_knobs_mx()[0]
+    with pytest.raises(ValueError, match="gather record"):
+        F.grouped_gemm_mxfp8(a, sf, w, w_sf, counts, box, F.MoEWeightsMXFP8(w, w_sf, w, w_sf).chain1_quant, dense_a=True, src=torch.zeros(8, dtype=torch.int32, device=dev))
 
 
 @needs_device
