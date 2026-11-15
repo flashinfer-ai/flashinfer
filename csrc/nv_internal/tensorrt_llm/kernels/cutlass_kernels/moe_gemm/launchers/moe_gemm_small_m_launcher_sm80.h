@@ -53,6 +53,35 @@ constexpr int kStageBytes = kWBytes + kSBytes + kABytes;  // 12416
 constexpr int kScanBytes = 64;                            // the m-block scan's shared words
 constexpr int kSmemBytes = kStages * kStageBytes + kScanBytes;
 
+// flashinfer::e2m1x8_to_bf16x8 with its BF16 magnitude tables passed in: high and low bytes of
+// +{0.0, 0.5, 1.0, 1.5} (hi0, lo0) and of +{2.0, 3.0, 4.0, 6.0} (hi1, lo1). `prmt` reads both table
+// words from registers, so ptxas rebuilds immediate tables before each conversion in a loop; the
+// main loop builds them once, OR'ed with a zero the compiler cannot prove (derived from a kernel
+// argument), to keep the four words in registers instead.
+struct E2m1Bf16Lut {
+  uint32_t hi0, hi1, lo0, lo1;
+};
+
+__device__ __forceinline__ E2m1Bf16Lut e2m1_bf16_lut(uint32_t zero) {
+  return {0x3F3F3F00u | zero, 0x40404040u | zero, 0xC0800000u | zero, 0xC0804000u | zero};
+}
+
+__device__ __forceinline__ void e2m1x8_to_bf16x8(uint32_t packed, uint32_t* d,
+                                                 E2m1Bf16Lut const& t) {
+  uint32_t const mag = packed & 0x77777777u;
+  uint32_t const mag_a = mag, mag_b = mag >> 16;
+  uint32_t hi_a = __byte_perm(t.hi0, t.hi1, mag_a);
+  uint32_t hi_b = __byte_perm(t.hi0, t.hi1, mag_b);
+  uint32_t const lo_a = __byte_perm(t.lo0, t.lo1, mag_a);
+  uint32_t const lo_b = __byte_perm(t.lo0, t.lo1, mag_b);
+  hi_a |= flashinfer::e2m1_sign_bytes(packed, 0xD9C8u);
+  hi_b |= flashinfer::e2m1_sign_bytes(packed, 0xFBEAu);
+  d[0] = __byte_perm(lo_a, hi_a, 0x5140u);
+  d[1] = __byte_perm(lo_a, hi_a, 0x7362u);
+  d[2] = __byte_perm(lo_b, hi_b, 0x5140u);
+  d[3] = __byte_perm(lo_b, hi_b, 0x7362u);
+}
+
 __device__ __forceinline__ void mma_bf16(float* d, uint32_t const* a, uint32_t const* b) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
@@ -213,7 +242,7 @@ __global__ void __launch_bounds__(kThreads, 1)
   uint32_t const soff = kWBytes + (tl * 4 + h * 2) * 256 + (warp_n * 64 + g) * 2;
 
   // The E2M1 tables stay in registers over the main loop (N is never negative).
-  flashinfer::E2m1Bf16Lut const lut = flashinfer::e2m1_bf16_lut(N < 0);
+  E2m1Bf16Lut const lut = e2m1_bf16_lut(N < 0);
   float acc[4][4] = {};
 #pragma unroll
   for (int st = 0; st < kNumStages - 1; ++st) {
@@ -244,8 +273,8 @@ __global__ void __launch_bounds__(kThreads, 1)
 #pragma unroll
     for (int j = 0; j < 4; ++j) {  // columns 16j + g (register 2j) and 16j + 8 + g (2j + 1)
       uint32_t d0[4], d1[4], a[4];
-      flashinfer::e2m1x8_to_bf16x8(wr[2 * j], d0, lut);
-      flashinfer::e2m1x8_to_bf16x8(wr[2 * j + 1], d1, lut);
+      e2m1x8_to_bf16x8(wr[2 * j], d0, lut);
+      e2m1x8_to_bf16x8(wr[2 * j + 1], d1, lut);
 #pragma unroll
       for (int ks = 0; ks < 2; ++ks) {  // k16 steps: d[2ks] = k 2c + {0,1}, d[2ks + 1] = 2c + {8,9}
         a[0] = mul_bf16x2(d0[2 * ks], sc[ks][2 * j]);

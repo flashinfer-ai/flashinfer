@@ -1042,16 +1042,18 @@ __global__ void __launch_bounds__(1024)
   }
 }
 
-// out[t][h] = sum_j w[t][j] * y[t * top_k + j][h], fp32 in slot order. 8
-// columns per thread.
+// out[t][h] = sum_j w[t][j] * y[t * top_k + j][h], fp32 in slot order, over the slots with
+// an expert (prep leaves y unwritten for ids < 0). 8 columns per thread.
 __global__ void finalize(const __nv_bfloat16* __restrict__ y, const float* __restrict__ w,
-                         __nv_bfloat16* __restrict__ out, int tokens, int top_k, int H) {
+                         const int* __restrict__ ids, __nv_bfloat16* __restrict__ out, int tokens,
+                         int top_k, int H) {
   const int h8 = H / 8;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= tokens * h8) return;
   const int t = idx / h8, c = idx % h8;
   float a[8] = {};
   for (int j = 0; j < top_k; ++j) {
+    if (ids[t * top_k + j] < 0) continue;
     const float wj = w[t * top_k + j];
     const uint4 v =
         __ldg(reinterpret_cast<const uint4*>(y + (static_cast<long>(t) * top_k + j) * H + c * 8));
@@ -1325,10 +1327,12 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
 }
 
 // out[t][h] = sum_j topk_weights[t][j] * y[t * top_k + j][h], fp32 in slot
-// order.
-void w4a16_moe_sm80_finalize(TensorView y, TensorView topk_weights, TensorView out, int64_t top_k) {
+// order, over the slots whose topk_ids are not negative.
+void w4a16_moe_sm80_finalize(TensorView y, TensorView topk_weights, TensorView topk_ids,
+                             TensorView out, int64_t top_k) {
   CHECK_INPUT_AND_TYPE(y, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(topk_weights, dl_float32);
+  CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
   CHECK_INPUT_AND_TYPE(out, dl_bfloat16);
   CHECK_DIM(2, out);
   const int tokens = static_cast<int>(out.size(0)), H = static_cast<int>(out.size(1));
@@ -1339,6 +1343,7 @@ void w4a16_moe_sm80_finalize(TensorView y, TensorView topk_weights, TensorView o
   if (n == 0) return;
   finalize<<<(n + 255) / 256, 256, 0, st>>>(static_cast<const __nv_bfloat16*>(y.data_ptr()),
                                             static_cast<const float*>(topk_weights.data_ptr()),
+                                            static_cast<const int*>(topk_ids.data_ptr()),
                                             static_cast<__nv_bfloat16*>(out.data_ptr()), tokens,
                                             static_cast<int>(top_k), H);
 }

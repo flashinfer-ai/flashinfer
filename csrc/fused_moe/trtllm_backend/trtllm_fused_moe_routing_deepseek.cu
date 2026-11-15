@@ -583,7 +583,7 @@ void run(Data& data, void* stream) {
   // Step 2: Permutation pipeline (reads from mPtrTopKPacked written by step 1)
   if (data.mPtrPermutedIdxSize != nullptr) {
     // Below SM90 (no clusters, no grid sync) the histogram kernels take every batch.
-    int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
+    static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
     int numThreadsPerCluster = numThreadsHist * NumBlocksPerCluster;
     bool const useSingleCluster =
         smMajor >= 9 && data.mNumTokens <= 1024 && data.mNumTokens * topK <= numThreadsPerCluster;

@@ -638,8 +638,18 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     ReturnType const e2m1Vec6 = fp32_vec_to_e2m1(fp2Vals6);
     uint64_t const e2m1Bits4 = static_cast<uint64_t>(e2m1Vec4);
     uint64_t const e2m1Bits6 = static_cast<uint64_t>(e2m1Vec6);
-    float errors4[CVT_ELTS_PER_THREAD];
-    float errors6[CVT_ELTS_PER_THREAD];
+    float error4 = 0.0f;
+    float error6 = 0.0f;
+    // Below SM100 in software, each element's errors are kept and added up after the loop.
+    [[maybe_unused]] float errors4[CVT_ELTS_PER_THREAD];
+    [[maybe_unused]] float errors6[CVT_ELTS_PER_THREAD];
+    auto const addError = [](float& error, [[maybe_unused]] float& kept, float elementError) {
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+      kept = elementError;
+#else
+      error = __fadd_rn(error, elementError);
+#endif
+    };
 
 #pragma unroll
     for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
@@ -654,13 +664,13 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
         originalScaled.x = __fmul_rn(fp2Vals[i].x, SFScaleVal);
         originalScaled.y = __fmul_rn(fp2Vals[i].y, SFScaleVal);
         diff4 = __fsub_rn(candidate4.x, originalScaled.x);
-        errors4[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
+        addError(error4, errors4[2 * i], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
         diff6 = __fsub_rn(candidate6.x, originalScaled.x);
-        errors6[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
+        addError(error6, errors6[2 * i], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
         diff4 = __fsub_rn(candidate4.y, originalScaled.y);
-        errors4[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
+        addError(error4, errors4[2 * i + 1], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
         diff6 = __fsub_rn(candidate6.y, originalScaled.y);
-        errors6[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
+        addError(error6, errors6[2 * i + 1], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
       } else {
         float2 const e2m1Val4 = e2m1x2_byte_to_float2(byte4);
         float2 const e2m1Val6 = e2m1x2_byte_to_float2(byte6);
@@ -670,7 +680,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
                 ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), rowAmax), ERROR_DENOM)
                 : __fmul_rn(__fmul_rn(e2m1Val4.x, sfValue4), globalDecodeScale);
         diff4 = __fsub_rn(dequant4, fp2Vals[i].x);
-        errors4[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
+        addError(error4, errors4[2 * i], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
 
         float diff6;
         float dequant6 =
@@ -678,48 +688,47 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
                 ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), rowAmax), ERROR_DENOM)
                 : __fmul_rn(__fmul_rn(e2m1Val6.x, sfValue6), globalDecodeScale);
         diff6 = __fsub_rn(dequant6, fp2Vals[i].x);
-        errors6[2 * i] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
+        addError(error6, errors6[2 * i], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
 
         dequant4 = rowAmax > 0.0f
                        ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), rowAmax), ERROR_DENOM)
                        : __fmul_rn(__fmul_rn(e2m1Val4.y, sfValue4), globalDecodeScale);
         diff4 = __fsub_rn(dequant4, fp2Vals[i].y);
-        errors4[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4);
+        addError(error4, errors4[2 * i + 1], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff4));
 
         dequant6 = rowAmax > 0.0f
                        ? __fdiv_rn(__fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), rowAmax), ERROR_DENOM)
                        : __fmul_rn(__fmul_rn(e2m1Val6.y, sfValue6), globalDecodeScale);
         diff6 = __fsub_rn(dequant6, fp2Vals[i].y);
-        errors6[2 * i + 1] = compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6);
+        addError(error6, errors6[2 * i + 1], compute_4over6_error_rn<NVFP4_4OVER6_CONFIG>(diff6));
       }
     }
 
-    // Adds this thread's errors to error4 and error6 in element order.
-    auto const addErrors = [&](float& error4, float& error6) {
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+    // The block's errors add up in element order, as in a 16-element thread, so the 4/6 choice does
+    // not depend on the thread width: the pair's upper thread continues from the lower thread's
+    // sum, and both take its total.
+    auto const addErrors = [&] {
 #pragma unroll
       for (int i = 0; i < CVT_ELTS_PER_THREAD; i++) {
         error4 = __fadd_rn(error4, errors4[i]);
         error6 = __fadd_rn(error6, errors6[i]);
       }
     };
-    float error4 = 0.0f;
-    float error6 = 0.0f;
-    addErrors(error4, error6);
+    addErrors();
     if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
-#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
-      // The block's errors add up in element order, as in a 16-element thread, so the 4/6 choice
-      // does not depend on the thread width: the pair's upper thread continues from the lower
-      // thread's sum, and both take its total.
       error4 = __shfl_sync(uint32_t(-1), error4, 0, 2);
       error6 = __shfl_sync(uint32_t(-1), error6, 0, 2);
-      addErrors(error4, error6);
+      addErrors();
       error4 = __shfl_sync(uint32_t(-1), error4, 1, 2);
       error6 = __shfl_sync(uint32_t(-1), error6, 1, 2);
+    }
 #else
+    if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
       error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
       error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 1));
-#endif
     }
+#endif
     if constexpr (CVT_NUM_THREADS_PER_SF == 4) {
       error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
       error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));

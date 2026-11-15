@@ -364,6 +364,8 @@ def _assert_moe_quant_mode_reference(actual, expected, quant_mode, swap_ab=False
     elif quant_mode in ("w4a4", "w4a8", "mxfp8") and swap_ab:
         assert_cute_dsl_moe_bits(actual, expected)
     elif quant_mode in ("w4a4", "w4a16"):
+        # check_accuracy passes a few non-finite values; the kernels produce none.
+        assert torch.isfinite(actual).all(), "non-finite MoE output"
         passed, percent_within, atol = check_accuracy(actual, expected)
         assert passed, (
             f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"

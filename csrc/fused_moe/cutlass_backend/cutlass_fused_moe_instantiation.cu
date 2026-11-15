@@ -49,9 +49,9 @@ template class CutlassMoeFCRunner<Fp4Type, Fp4Type, half, half>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, half>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, half, half, half, false,
                                   Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
-// SM90 MXFP8 x MXFP4 takes FP8 activations and UE8M0 block scales, as on SM100.
-template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, half, __nv_fp8_e4m3, half, false,
-                                  Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>;
+// PHASE3_POST_MMA_PLACEHOLDER: future post-MMA MXFP4 x FP8/MXFP8 paths should
+// use FP16/BF16 external activation input plus online FP8/MXFP8 quantization,
+// not the transitional direct-FP8 input runner.
 template class CutlassMoeFCRunner<half, Fp4Type>;
 #ifdef ENABLE_BF16
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, __nv_bfloat16>;
@@ -59,10 +59,13 @@ template class CutlassMoeFCRunner<Fp4Type, Fp4Type, __nv_bfloat16, __nv_bfloat16
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16>;
 template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_bfloat16,
                                   __nv_bfloat16, false, Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0>;
-template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_fp8_e4m3,
-                                  __nv_bfloat16, false, Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>;
 template class CutlassMoeFCRunner<__nv_bfloat16, Fp4Type>;
 #if defined(FLASHINFER_FP4_SW_CVT)
+// SM90 MXFP8 x MXFP4 takes FP8 activations and UE8M0 block scales, as on SM100.
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, half, __nv_fp8_e4m3, half, false,
+                                  Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, Fp4Type, __nv_bfloat16, __nv_fp8_e4m3,
+                                  __nv_bfloat16, false, Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>;
 // Below SM100 MXFP8 x MXFP4 runs on the restored NVFP4 runner, in BF16 for either output.
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, half, __nv_fp8_e4m3, __nv_bfloat16>;
 template class CutlassMoeFCRunner<Fp4Type, Fp4Type, __nv_bfloat16, __nv_fp8_e4m3>;

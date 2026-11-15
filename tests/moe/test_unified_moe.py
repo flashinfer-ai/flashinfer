@@ -2810,6 +2810,11 @@ def _make_packs_and_config(
 # ---------------------------------------------------------------------------
 
 
+# Below SM100 the W4A16 outputs differ from the split reference by a few BF16
+# ulps; the counterfactual formulas differ by at least 0.2.
+_W4A16_ATOL, _W4A16_RTOL = 2e-2, 2e-2
+
+
 def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False):
     """bf16 ground-truth MoE output for the given pack + shape.
 
@@ -2958,12 +2963,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
         )
         assert_cute_dsl_moe_bits(actual, reference)
         return
-    # Below SM100 NVFP4 x BF16 runs on the records or CUTLASS SM80 kernels, which round
-    # differently from the split kernel the exact reference follows.
-    if (
-        quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
-        and get_compute_capability(torch.device("cuda"))[0] >= 10
-    ):
+    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
         from tests.moe_ep.test_helpers.w4a16_reference import (
             assert_w4a16_bits,
             split_w4a16_reference_from_tensors,
@@ -2997,7 +2997,18 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
             )
 
         reference = exact_reference(activation)
-        assert_w4a16_bits(actual, reference)
+        # Below SM100 the records and CUTLASS SM80 kernels sum in a different order
+        # from the split kernel this reference follows.
+        exact = get_compute_capability(torch.device("cuda"))[0] >= 10
+        if exact:
+            assert_w4a16_bits(actual, reference)
+        else:
+            assert torch.isfinite(actual).all(), (
+                f"{activation!r}: non-finite MoE output"
+            )
+            torch.testing.assert_close(
+                actual, reference, atol=_W4A16_ATOL, rtol=_W4A16_RTOL
+            )
         # The same packed inputs must distinguish the intended formula from
         # a counterfactual with matching gated/non-gated geometry.
         if activation.type in (ActivationType.Swiglu, ActivationType.GegluTanh):
@@ -3009,13 +3020,15 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
         else:
             raise ValueError(f"Unsupported test activation {activation!r}")
         assert torch.isfinite(control_reference).all()
-        assert not torch.equal(
-            actual.view(torch.int16), control_reference.view(torch.int16)
-        ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
-    elif quant.pair in (
-        (QuantFormat.NVFP4, QuantFormat.NVFP4),
-        (QuantFormat.NVFP4, QuantFormat.BF16),
-    ):
+        if exact:
+            assert not torch.equal(
+                actual.view(torch.int16), control_reference.view(torch.int16)
+            ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
+        else:
+            assert not torch.allclose(
+                actual, control_reference, atol=_W4A16_ATOL, rtol=_W4A16_RTOL
+            ), f"{activation!r}: the tolerance cannot distinguish the wrong formula"
+    elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         reference = _compute_ref(act_pack, tensors, shape, activation)
         passed, pct, atol = check_accuracy(actual, reference)
         assert passed, (

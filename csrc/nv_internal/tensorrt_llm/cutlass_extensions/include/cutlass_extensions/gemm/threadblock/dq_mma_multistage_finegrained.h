@@ -671,11 +671,15 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
       load_scales();
     }
 
-    // Commit and drain all pending and predicated cp.async pnz from the GEMM mainloop: the prologue
-    // zero-fills unconditionally, and the epilogue reuses this shared memory.
-    cutlass::arch::cp_async_fence();
-    cutlass::arch::cp_async_wait<0>();
-    __syncthreads();
+    // E2M1 weights drain too: the prologue zero-fills unconditionally, and the epilogue reuses this
+    // shared memory.
+    if (SharedMemoryClear == SharedMemoryClearOption::kZfill ||
+        platform::is_same<ElementB, float_e2m1_t>::value) {
+      // commit and drain all pending and predicated LDGSTS pnz from the GEMM mainloop
+      cutlass::arch::cp_async_fence();
+      cutlass::arch::cp_async_wait<0>();
+      __syncthreads();
+    }
   }
 };
 

@@ -106,9 +106,21 @@ def test_mxfp8_quantize_rejects_unsupported_real_cuda():
         mxfp8_quantize(input, backend="cuda")
 
 
-@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0)])
+@pytest.mark.parametrize(
+    ("capability", "module_backend"),
+    [
+        ((8, 0), "80"),
+        ((8, 9), "80"),
+        ((9, 0), "90"),
+        ((10, 0), "100"),
+        ((10, 3), "100"),
+        ((12, 0), "100"),
+    ],
+)
 @pytest.mark.parametrize("backend", ["auto", "cuda"])
-def test_mxfp8_quantize_keeps_supported_cuda_dispatch(monkeypatch, capability, backend):
+def test_mxfp8_quantize_keeps_supported_cuda_dispatch(
+    monkeypatch, capability, module_backend, backend
+):
     input = _fake_cuda_input()
     output = (object(), object())
     quantize = Mock(return_value=output)
@@ -119,7 +131,7 @@ def test_mxfp8_quantize_keeps_supported_cuda_dispatch(monkeypatch, capability, b
     monkeypatch.setattr(fp8_quantization, "get_mxfp8_quantization_sm100_module", loader)
 
     assert mxfp8_quantize(input, backend=backend, enable_pdl=False) == output
-    loader.assert_called_once_with()
+    loader.assert_called_once_with(module_backend)
     quantize.assert_called_once_with(
         input, fp8_quantization.SfLayout.layout_128x4, 32, False
     )
@@ -133,15 +145,13 @@ def test_mxfp8_quantize_keeps_cpu_host_dispatch(monkeypatch, backend):
         side_effect=AssertionError("CPU input queried CUDA capability")
     )
     quantize = Mock(return_value=output)
+    loader = Mock(return_value=SimpleNamespace(mxfp8_quantize_sm100=quantize))
     monkeypatch.setattr(fp8_quantization, "get_compute_capability", capability_query)
-    monkeypatch.setattr(
-        fp8_quantization,
-        "get_mxfp8_quantization_sm100_module",
-        lambda: SimpleNamespace(mxfp8_quantize_sm100=quantize),
-    )
+    monkeypatch.setattr(fp8_quantization, "get_mxfp8_quantization_sm100_module", loader)
 
     assert mxfp8_quantize(input, backend=backend, enable_pdl=False) == output
     capability_query.assert_not_called()
+    loader.assert_called_once_with("100")
     quantize.assert_called_once_with(
         input, fp8_quantization.SfLayout.layout_128x4, 32, False
     )

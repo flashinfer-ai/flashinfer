@@ -2298,16 +2298,19 @@ def _w4a16_records(
     scale: torch.Tensor,
     gated: bool,
     rows_from: Optional[torch.Tensor] = None,
-    chunk: int = 16,
 ) -> torch.Tensor:
     """Packed NVFP4 [E, N, K / 2] (low nibble = even K) and E4M3 block scales [E, N, K / 16], rows
-    taken from ``rows_from``, as records [E, record columns / 128 x K steps x record], ``chunk``
-    experts at a time. Codes are [half 2][warp 8][lane 32][4 words], 3 + 1 bits per code; scales
-    [warp 8][g 8][16 B] U5 bytes, byte 4 j2 + 2 hi + jl. Padding is zero codes."""
+    taken from ``rows_from``, as records [E, record columns / 128 x K steps x record], as many
+    experts at a time as fit in about 1 GiB of int32 work buffers. Codes are
+    [half 2][warp 8][lane 32][4 words], 3 + 1 bits per code; scales [warp 8][g 8][16 B] U5 bytes,
+    byte 4 j2 + 2 hi + jl. Padding is zero codes."""
     num_experts, n, half_k = w.shape
     k, dev = 2 * half_k, w.device
     cols, steps, half = _w4a16_records_geometry(n, k, gated)
     chunks, kf = cols // 128, 128 * steps
+    # An expert holds up to three int32 copies of its padded codes at once (cp, cp[:, perm] and
+    # the permuted x).
+    chunk = max(1, (1 << 30) // (3 * 4 * cols * kf))
     r = torch.arange(n, device=dev)
     # Record row of each weight row (gated up rows from cols / 2); record row of each record column
     # (gated: 8 gate rows, then the matching 8 up rows, per warp and chunk).

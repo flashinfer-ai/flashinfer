@@ -1943,14 +1943,15 @@ def _w4a16_moe_sm80(runner, inputs, tactic):
     blocked = torch.empty(max_blocks * row_tile, inter, dtype=bf16, device=dev)
     y = torch.empty(m, hidden, dtype=bf16, device=dev)
     module = _w4a16_sm80_module()
-    module.prep(experts.to(i32).contiguous(), meta, rowmap, workspace, num_experts, row_tile, max_blocks)  # fmt: skip
+    ids = experts.to(i32).contiguous()
+    module.prep(ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks)  # fmt: skip
     n1 = _w4a16_records_geometry(rows1, hidden, gated)[0]
     n2 = _w4a16_records_geometry(hidden, inter, False)[0]
     act = 1 if gated else 2
     x = x.contiguous()
     module.gemm(r1, alpha1.float().contiguous(), x, meta, rowmap, blocked, row_tile, act, top_k, n1, hidden, inter, max_blocks, gemm1)  # fmt: skip
     module.gemm(r2, alpha2.float().contiguous(), blocked, meta, rowmap, y, row_tile, 0, top_k, n2, inter, hidden, max_blocks, gemm2)  # fmt: skip
-    module.finalize(y, scales.float().contiguous(), out, top_k)
+    module.finalize(y, scales.float().contiguous(), ids, out, top_k)
     return out
 
 
@@ -1979,7 +1980,7 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
         return _w4a16_moe_sm80(runner, inputs, tactic)
     w4a8 = getattr(runner, "quant_mode", None) == "w4a8"
     situ = runner.situ_beta is not None
-    if not (w4a16 or w4a8 or runner.quant_mode == "w4a4") or tactic is not None:
+    if not (w4a16 or w4a8 or runner.quant_mode == "w4a4") or tactic not in (None, -1):
         raise NotImplementedError(
             "Below SM100 CuTe-DSL MoE runs W4A4, W4A8 and W4A16, without tactics."
         )

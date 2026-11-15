@@ -207,7 +207,9 @@ struct genericMoeGemmKernelLauncher {
           reinterpret_cast<CutlassGemmOutputType const*>(inputs.biases), inputs.bias_is_broadcast,
           reinterpret_cast<CutlassGemmOutputType*>(inputs.C), inputs.total_tokens_including_expert,
           inputs.n, inputs.k);
+#if defined(FLASHINFER_FP4_SW_CVT)
       args.row_scales = inputs.row_scales;
+#endif
 
       GemmGrouped gemm;
 

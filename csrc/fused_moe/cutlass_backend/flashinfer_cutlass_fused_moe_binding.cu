@@ -237,8 +237,17 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           __nv_fp8_e4m3, kernels::Fp4Type, false, false,
           kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaFp8Act>(mOutputDtype);
     }
+
+    if (sm == 90 && isWMxfp4AMxfp8Quant()) {
+      mInnerDimMultiplier = 2;
+      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act;
+      mKernelRunner = switch_output_type<
+          __nv_fp8_e4m3, kernels::Fp4Type, false, false,
+          kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
+    }
 #endif
 
+#if defined(FLASHINFER_FP4_SW_CVT)
     if (isSm90WMxfp4AMxfp8Quant()) {
       TVM_FFI_ICHECK_EQ(sm, 90) << "uint8 MXFP4 weights with MXFP8 activations need SM90";
       mInnerDimMultiplier = 2;
@@ -247,6 +256,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, false, false,
                              kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
     }
+#endif
 
     auto make_humming_runner = [&] {
       mInnerDimMultiplier = 2;
@@ -484,8 +494,11 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     auto const quant_params = getQuantParams(num_experts_on_rank, hidden_size, inter_size,
                                              quant_scales, base_activation_type, nvfp4_4over6_code);
-    // Below SM100 a 7th NVFP4 quant scale gives per-token activation scales, one per input row.
+    kernels::MoeMinLatencyParams min_latency_params{};
+
     float const* per_token_scale = nullptr;
+#if defined(FLASHINFER_FP4_SW_CVT)
+    // Below SM100 a 7th NVFP4 quant scale gives per-token activation scales, one per input row.
     if (isNvfp4Quant() && quant_scales.value().size() == 7) {
       auto const& token_scale = quant_scales.value()[6];
       CHECK_INPUT_AND_TYPE(token_scale, dl_float32);
@@ -494,7 +507,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "per-token scale must be (num_rows,)";
       per_token_scale = static_cast<float const*>(token_scale.data_ptr());
     }
-    kernels::MoeMinLatencyParams min_latency_params{};
 
     // Not the LoRA plugin (use_lora stays false): only TRT-LLM MoE's FC1 deltas and GEMM2 inputs.
     ::tensorrt_llm::kernels::LoraParams lora_params{};
@@ -530,8 +542,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (fc2_inputs.has_value()) {
       // NVFP4 codes (inter_size / 2 bytes a row), MXFP8 ones, or 16-bit activations.
       int64_t const row_bytes = isWMxfp4AMxfp8Quant() || isSm90WMxfp4AMxfp8Quant() ? inter_size
-                                : quant_scales.value().size() == 6                 ? inter_size / 2
-                                                                                   : inter_size * 2;
+                                : quant_scales.has_value() && quant_scales.value().size() == 6
+                                    ? inter_size / 2
+                                    : inter_size * 2;
       CHECK_INPUT(fc2_inputs.value());
       TVM_FFI_ICHECK(fc2_inputs.value().size(0) == expanded_rows &&
                      fc2_inputs.value().numel() * get_element_size(fc2_inputs.value()) ==
@@ -539,6 +552,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
           << "fc2_inputs must be " << expanded_rows << " rows of " << row_bytes << " bytes";
       lora_params.fc2_inputs = fc2_inputs.value().data_ptr();
     }
+#else
+    TVM_FFI_ICHECK(!permuted_rows.has_value() && !skip_finalize && !fc1_deltas.has_value() &&
+                   !fc2_inputs.has_value())
+        << "permuted_rows, skip_finalize, fc1_deltas and fc2_inputs are below SM100 only";
+    // TODO: support lora in the future
+    ::tensorrt_llm::kernels::LoraParams lora_params{};
+    // HACK Define default values for parameters we don't have good values for
+    int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
+#endif
     bool const use_lora = false;  // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     mKernelRunner->runMoe(
@@ -1271,13 +1293,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                    fc1_weight_block.size(1) * 64 == inter_size * fc1_n_mult &&
                    fc1_weight_block.size(2) * 128 == hidden_size &&
                    fc1_weight_block.size(3) == 16 && fc1_weight_block.size(4) == 4)
-        << "fc1 folded weight scale must be (num_experts_on_rank, inter_size"
+        << "fc1 Humming-style folded weight scale must be "
+           "(num_experts_on_rank, inter_size"
         << (fc1_n_mult == 2 ? " * 2" : "") << " / 64, hidden_size / 128, 16, 4)";
     TVM_FFI_ICHECK(fc2_weight_block.size(0) == num_experts_on_rank &&
                    fc2_weight_block.size(1) * 64 == hidden_size &&
                    fc2_weight_block.size(2) * 128 == inter_size && fc2_weight_block.size(3) == 16 &&
                    fc2_weight_block.size(4) == 4)
-        << "fc2 folded weight scale must be "
+        << "fc2 Humming-style folded weight scale must be "
            "(num_experts_on_rank, hidden_size / 64, inter_size / 128, 16, 4)";
   }
 
@@ -1504,11 +1527,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                      fc2_global.ndim() == 1 && fc2_global.size(0) == num_experts_on_rank)
           << "fc1 and fc2 global sizes must be (num_experts_on_rank,)";
 
-      return kernels::QuantParams::MXFP8MXFP4(
+      auto params = kernels::QuantParams::MXFP8MXFP4(
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc1_weight_block.data_ptr()),
           static_cast<float const*>(fc1_global.data_ptr()),
           static_cast<TmaWarpSpecializedGroupedGemmInput::ElementSF*>(fc2_weight_block.data_ptr()),
           static_cast<float const*>(fc2_global.data_ptr()));
+      // The SM90 grouped GEMM reads the weight block scales through fp8_mxfp4.
+      params.fp8_mxfp4.fc1.weight_block_scale = params.mxfp8_mxfp4.fc1.weight_block_scale;
+      params.fp8_mxfp4.fc2.weight_block_scale = params.mxfp8_mxfp4.fc2.weight_block_scale;
+      return params;
     } else if (isWMxfp4AMxfp8Quant() && !kRestoredMxfp4) {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
       TVM_FFI_ICHECK(quant_scales.has_value())
@@ -1807,9 +1834,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_int64 && mUseMxfp8ActScaling;
   }
 
+  // SM90 MXFP8 x MXFP4 on uint8 weights, built below SM100 only.
   bool isSm90WMxfp4AMxfp8Quant() const {
+#if defined(FLASHINFER_FP4_SW_CVT)
     return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_uint8 &&
            mUseMxfp8ActScaling && !mUsePackedWeights;
+#else
+    return false;
+#endif
   }
 };
 

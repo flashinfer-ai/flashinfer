@@ -1575,6 +1575,9 @@ def e2m1_and_ufp8sf_scale_to_float(
             ufp8_type,
             is_sf_swizzled_layout,
         )
+    if major < 10 and global_scale_tensor is None:
+        # As in the host fallback SM80 to SM89 took before: no global scale is 1.0.
+        global_scale_tensor = torch.ones(1, dtype=torch.float32)
     device_arch = f"{major * 10 + minor}"
     return get_fp4_quantization_module(
         device_arch

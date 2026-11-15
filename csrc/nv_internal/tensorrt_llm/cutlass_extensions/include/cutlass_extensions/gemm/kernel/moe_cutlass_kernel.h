@@ -166,8 +166,10 @@ struct MoeFCGemm {
     // Included so we can use Gemm Universal
     int batch_stride_D = 0;
 
+#if defined(FLASHINFER_FP4_SW_CVT)
     // E2M1 weights with per-token activations: FP32 scale per row of A, padded by a tile.
     float const* row_scales = nullptr;
+#endif
 
     //
     // Methods
@@ -251,7 +253,9 @@ struct MoeFCGemm {
     int const* gather_A_indices;
     int const* gather_B_indices;
     int const* scatter_D_indices;
+#if defined(FLASHINFER_FP4_SW_CVT)
     float const* row_scales = nullptr;
+#endif
 
     //
     // Methods
@@ -286,8 +290,11 @@ struct MoeFCGemm {
           C_is_broadcast(args.C_is_broadcast),
           gather_A_indices(args.gather_A_indices),
           gather_B_indices(args.gather_B_indices),
-          scatter_D_indices(args.scatter_D_indices),
-          row_scales(args.row_scales) {}
+          scatter_D_indices(args.scatter_D_indices) {
+#if defined(FLASHINFER_FP4_SW_CVT)
+      row_scales = args.row_scales;
+#endif
+    }
 
     CUTLASS_HOST_DEVICE
     void update(Arguments const& args, void* workspace = nullptr, int tile_count = 0) {
@@ -306,7 +313,9 @@ struct MoeFCGemm {
       gather_A_indices = args.gather_A_indices;
       gather_B_indices = args.gather_B_indices;
       scatter_D_indices = args.scatter_D_indices;
+#if defined(FLASHINFER_FP4_SW_CVT)
       row_scales = args.row_scales;
+#endif
     }
   };
 
@@ -615,6 +624,7 @@ struct MoeFCGemm {
         mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, accumulators);
       }
 
+#if defined(FLASHINFER_FP4_SW_CVT)
       if constexpr (kE2m1B) {
         if (params.row_scales) {
           // Each accumulator row times its FP32 scale, read in the accumulators' own fragment
@@ -635,6 +645,7 @@ struct MoeFCGemm {
           }
         }
       }
+#endif
 
       //
       // Epilogue

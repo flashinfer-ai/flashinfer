@@ -1558,9 +1558,7 @@ void run(Data const& data, void* stream) {
       << "Routing kernel expects #experts " << data.mNumExperts << " to be no more than "
       << MaxSupportedExperts << ".";
 
-  // From the static-block boundary the path depends on the device (clusters, grid sync: SM90+).
-  int const smMajor =
-      data.mNumTokens < BlockKernelMaxNumTokens ? 0 : tensorrt_llm::common::getSMVersion() / 10;
+  static int const smMajor = tensorrt_llm::common::getSMVersion() / 10;
   // Gate on the dispatched tier size, not the raw expert count.
   // Example: a model with 512 experts and topK=22 skips Tier<512,8> (topK too
   // large) and falls through to Tier<1024,32>.  queryDispatchedMaxExperts()

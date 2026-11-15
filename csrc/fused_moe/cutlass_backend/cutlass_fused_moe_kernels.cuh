@@ -410,6 +410,7 @@ void buildMinLatencyActiveExpertMaps(
                      smart_routing, cluster_rank, cluster_size, num_experts_smem);
 }
 
+#if defined(FLASHINFER_FP4_SW_CVT)
 constexpr static int SMALL_PROLOGUE_THREADS = 256;
 
 // One CTA sorts the expanded rows by expert when there is a thread per row: a row's permuted row
@@ -475,6 +476,30 @@ __global__ void smallBuildExpertMapsSortFirstTokenKernel(
     expert_first_token_offset[e] = first;
   }
 }
+
+void smallBuildExpertMapsSortFirstToken(
+    int const* token_selected_experts, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+    int64_t* expert_first_token_offset, int64_t const num_tokens,
+    int64_t const num_experts_per_node, int64_t const num_experts_per_token,
+    int const start_expert_id, bool enable_pdl, cudaStream_t stream) {
+  cudaLaunchConfig_t config;
+  config.gridDim = 1;
+  config.blockDim = SMALL_PROLOGUE_THREADS;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+  cudaLaunchKernelEx(&config, smallBuildExpertMapsSortFirstTokenKernel, token_selected_experts,
+                     permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+                     unpermuted_row_to_permuted_row, expert_first_token_offset,
+                     static_cast<int>(num_tokens), static_cast<int>(num_experts_per_token),
+                     static_cast<int>(num_experts_per_node), start_expert_id);
+}
+#endif
 
 template <int BLOCK_SIZE, int EXPERTS_PER_TOKEN, int LOG2_NUM_EXPERTS>
 __global__ void fusedBuildExpertMapsSortFirstTokenKernel(
@@ -745,20 +770,14 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
 #endif
 
   int expanded_token_id = -1;
-  bool repeated = false;
   if (token_id < num_tokens) {
-    // One load at a time, as with the early exit; unrolled loads are slower at many tokens.
-#pragma unroll 1
     for (int i = 0; i < num_experts_per_token; i++) {
       // TODO(enweiz): Fix uncoalesced access with shared memory.
       int const expert_id =
           token_selected_experts[token_id * num_experts_per_token + i] - start_expert_id;
       if (expert_id == target_expert_id) {
-        if (expanded_token_id < 0) {
-          expanded_token_id = i * num_tokens + token_id;
-        } else {
-          repeated = true;
-        }
+        expanded_token_id = i * num_tokens + token_id;
+        break;
       }
     }
   }
@@ -768,10 +787,8 @@ __global__ void blockExpertPrefixSumKernel(int const* token_selected_experts,
   BlockScan(temp_storage).ExclusiveSum(has_matched, index);
 
   if (has_matched) {
-    // A token picking the expert again keeps its first k, with the bits flipped so that
-    // mergeExpertPrefixSumKernel maps the later k too.
     blocked_row_to_unpermuted_row[target_expert_id * num_tokens + block_id * kNumTokensPerBlock +
-                                  index] = repeated ? ~expanded_token_id : expanded_token_id;
+                                  index] = expanded_token_id;
   }
   if (threadIdx.x == kNumTokensPerBlock - 1) {
     blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id] = index + has_matched;
@@ -945,12 +962,13 @@ void globalExpertPrefixSum(int const* blocked_expert_counts, int* blocked_expert
   }
 }
 
-__global__ void mergeExpertPrefixSumKernel(
-    int const* blocked_expert_counts, int const* blocked_expert_counts_cumsum,
-    int const* blocked_row_to_unpermuted_row, int const* token_selected_experts,
-    int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
-    int* unpermuted_row_to_permuted_row, int const num_tokens, int const num_experts_per_token,
-    int const start_expert_id) {
+__global__ void mergeExpertPrefixSumKernel(int const* blocked_expert_counts,
+                                           int const* blocked_expert_counts_cumsum,
+                                           int const* blocked_row_to_unpermuted_row,
+                                           int* permuted_token_selected_experts,
+                                           int* permuted_row_to_unpermuted_row,
+                                           int* unpermuted_row_to_permuted_row,
+                                           int const num_tokens) {
   int const target_expert_id = blockIdx.x;
   int const block_id = blockIdx.y;
   int const num_blocks_per_seq = gridDim.y;
@@ -963,22 +981,12 @@ __global__ void mergeExpertPrefixSumKernel(
   int const cnt = blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id];
   int const offset = blocked_expert_counts_cumsum[target_expert_id * num_blocks_per_seq + block_id];
   if (threadIdx.x < cnt) {
-    int const blocked_row = blocked_row_to_unpermuted_row[target_expert_id * num_tokens + token_id];
-    int const unpermuted_row = blocked_row < 0 ? ~blocked_row : blocked_row;
+    int const unpermuted_row =
+        blocked_row_to_unpermuted_row[target_expert_id * num_tokens + token_id];
     int const permuted_row = offset + threadIdx.x;
     permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
     permuted_token_selected_experts[permuted_row] = target_expert_id;
     unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
-    if (blocked_row < 0) {
-      // The token's later k of this expert take the same row; finalize adds their scales over it.
-      int const source_row = unpermuted_row % num_tokens;
-      for (int k = unpermuted_row / num_tokens + 1; k < num_experts_per_token; ++k) {
-        if (token_selected_experts[source_row * num_experts_per_token + k] - start_expert_id ==
-            target_expert_id) {
-          unpermuted_row_to_permuted_row[k * num_tokens + source_row] = permuted_row;
-        }
-      }
-    }
   }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -988,12 +996,10 @@ __global__ void mergeExpertPrefixSumKernel(
 
 void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_expert_counts_cumsum,
                           int const* blocked_row_to_unpermuted_row,
-                          int const* token_selected_experts, int* permuted_token_selected_experts,
-                          int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
-                          int64_t const num_tokens, int64_t const num_experts_per_node,
-                          int64_t const num_experts_per_token, int64_t const num_tokens_per_block,
-                          int64_t const num_blocks_per_seq, int const start_expert_id,
-                          bool enable_pdl, cudaStream_t stream) {
+                          int* permuted_token_selected_experts, int* permuted_row_to_unpermuted_row,
+                          int* unpermuted_row_to_permuted_row, int64_t const num_tokens,
+                          int64_t const num_experts_per_node, int64_t const num_tokens_per_block,
+                          int64_t const num_blocks_per_seq, bool enable_pdl, cudaStream_t stream) {
   dim3 const blocks(num_experts_per_node, num_blocks_per_seq);
   dim3 const threads(num_tokens_per_block);
 
@@ -1010,14 +1016,12 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
 
   cudaLaunchKernelEx(&config, mergeExpertPrefixSumKernel, blocked_expert_counts,
                      blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row,
-                     token_selected_experts, permuted_token_selected_experts,
-                     permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
-                     num_experts_per_token, start_expert_id);
+                     permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+                     unpermuted_row_to_permuted_row, num_tokens);
 }
 
 // threeStepBuildExpertMapsSortFirstToken uses three kernels to achieve the sort of
-// token_selected_experts (one, smallBuildExpertMapsSortFirstTokenKernel, for at most
-// SMALL_PROLOGUE_THREADS expanded rows)
+// token_selected_experts
 
 // 1. blockExpertPrefixSumKernel launches [num_experts_per_node, num_blocks_per_seq] CTAs; each CTA
 // has num_tokens_per_block threads. blocked_row_to_unpermuted_row points to a 2D buffer of size
@@ -1053,33 +1057,26 @@ void threeStepBuildExpertMapsSortFirstToken(
     int* blocked_expert_counts_cumsum, int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
     int64_t const num_experts_per_node, int64_t const num_experts_per_token,
     int const start_expert_id, bool enable_pdl, cudaStream_t stream) {
+#if defined(FLASHINFER_FP4_SW_CVT)
   if (num_tokens * num_experts_per_token <= SMALL_PROLOGUE_THREADS) {
-    cudaLaunchConfig_t config;
-    config.gridDim = 1;
-    config.blockDim = SMALL_PROLOGUE_THREADS;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config, smallBuildExpertMapsSortFirstTokenKernel, token_selected_experts,
-                       permuted_token_selected_experts, permuted_row_to_unpermuted_row,
-                       unpermuted_row_to_permuted_row, expert_first_token_offset,
-                       static_cast<int>(num_tokens), static_cast<int>(num_experts_per_token),
-                       static_cast<int>(num_experts_per_node), start_expert_id);
+    smallBuildExpertMapsSortFirstToken(
+        token_selected_experts, permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+        unpermuted_row_to_permuted_row, expert_first_token_offset, num_tokens, num_experts_per_node,
+        num_experts_per_token, start_expert_id, enable_pdl, stream);
     return;
   }
+#endif
   int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
   int64_t const num_blocks_per_seq =
       tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+  int64_t block_threads = num_tokens_per_block;
+#if defined(FLASHINFER_FP4_SW_CVT)
   // The global scan's size sets num_tokens_per_block; when the tokens fit in one block, the
   // per-expert blocks only need a power of two covering them.
-  int64_t block_threads = num_tokens_per_block;
   if (num_blocks_per_seq == 1) {
     while (block_threads > 32 && block_threads / 2 >= num_tokens) block_threads /= 2;
   }
+#endif
 
   blockExpertPrefixSum(token_selected_experts, blocked_expert_counts, blocked_row_to_unpermuted_row,
                        num_tokens, num_experts_per_node, num_experts_per_token, block_threads,
@@ -1091,11 +1088,10 @@ void threeStepBuildExpertMapsSortFirstToken(
                         num_blocks_per_seq, enable_pdl, stream);
   sync_check_cuda_error(stream);
 
-  mergeExpertPrefixSum(
-      blocked_expert_counts, blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row,
-      token_selected_experts, permuted_token_selected_experts, permuted_row_to_unpermuted_row,
-      unpermuted_row_to_permuted_row, num_tokens, num_experts_per_node, num_experts_per_token,
-      block_threads, num_blocks_per_seq, start_expert_id, enable_pdl, stream);
+  mergeExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
+                       blocked_row_to_unpermuted_row, permuted_token_selected_experts,
+                       permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
+                       num_experts_per_node, block_threads, num_blocks_per_seq, enable_pdl, stream);
 }
 
 // ============================== Infer GEMM sizes =================================
@@ -1195,6 +1191,15 @@ __host__ __device__ constexpr int64_t getOffsetActivationSF(
 __host__ __device__ constexpr int64_t padNvfp4K(int64_t k) {
   return TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
       k, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4);
+}
+
+// Below SM100 the token rows GEMM1 reads for BF16 W4A16 on the small-M kernel; none from SM100.
+inline int const* w4a16TokenRows(QuantParams const& quant_params) {
+#if defined(FLASHINFER_FP4_SW_CVT)
+  return quant_params.w4a16_token_rows;
+#else
+  return nullptr;
+#endif
 }
 
 // 2^x in FP32, -149 <= x <= 127.
@@ -1494,7 +1499,7 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
       w.e = block_sf(row, v / 4, vecs / 4);
       *reinterpret_cast<uint64_t*>(&w.q) = static_cast<uint64_t const*>(input)[row * vecs + v];
     } else if (v < vecs && sf) {
-      w.e = block_sf(row, v / 2, padded_vecs / 2);
+      w.e = block_sf(row, v / 2, swizzled_sf ? padded_vecs / 2 : vecs / 2);
       w.q.x = static_cast<uint32_t const*>(input)[row * vecs + v];
     } else if (v < vecs) {
       w.q = static_cast<uint4 const*>(input)[row * vecs + v];
@@ -2340,18 +2345,12 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
       quant_params.fp8_mxfp4.fc1.weight_block_scale
           ? reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                 quant_params.fp8_mxfp4.fc1.weight_block_scale)
-      : quant_params.mxfp8_mxfp4.fc1.weight_block_scale
-          ? reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
-                quant_params.mxfp8_mxfp4.fc1.weight_block_scale)
           : reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                 quant_params.groupwise.fc1.weight_scales);
   auto const* fc2_weight_scale =
       quant_params.fp8_mxfp4.fc2.weight_block_scale
           ? reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                 quant_params.fp8_mxfp4.fc2.weight_block_scale)
-      : quant_params.mxfp8_mxfp4.fc2.weight_block_scale
-          ? reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
-                quant_params.mxfp8_mxfp4.fc2.weight_block_scale)
           : reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::SFA const*>(
                 quant_params.groupwise.fc2.weight_scales);
 
@@ -2781,16 +2780,97 @@ enum class ScaleMode : int {
 };
 
 constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
-// finalizeMoeRoutingKernel's shared memory holds the first this many k (48 KB), in batches of
-// FINALIZE_K_LOADS k rows loaded at once.
-constexpr static int FINALIZE_CACHED_K = 4096;
-constexpr static int FINALIZE_K_LOADS = 4;
 
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
 // connection.
 template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
 __global__ void finalizeMoeRoutingKernel(
+    GemmOutputType const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
+    ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
+    int const* token_selected_experts, int64_t const padded_cols, int64_t const unpadded_cols,
+    int64_t const experts_per_token, int const num_experts_per_node, int const start_expert_id) {
+  assert(padded_cols % 4 == 0);
+  assert(unpadded_cols % 4 == 0);
+  assert(unpadded_cols <= padded_cols);
+  int64_t const original_row = blockIdx.x;
+  int64_t const num_rows = gridDim.x;
+  auto const offset = original_row * unpadded_cols;
+  OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
+
+  // Load 128-bits per thread, according to the smallest data type we read/write
+  constexpr int64_t FINALIZE_ELEM_PER_THREAD =
+      128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
+
+  int64_t const start_offset = threadIdx.x;
+  int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
+  int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
+  int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
+
+  using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
+  using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
+  using OutputElem = cutlass::Array<OutputType, FINALIZE_ELEM_PER_THREAD>;
+  using ComputeElem = cutlass::Array<float, FINALIZE_ELEM_PER_THREAD>;
+  auto const* bias_v = reinterpret_cast<BiasElem const*>(bias);
+  auto const* expanded_permuted_rows_v = reinterpret_cast<InputElem const*>(expanded_permuted_rows);
+  auto* reduced_row_ptr_v = reinterpret_cast<OutputElem*>(reduced_row_ptr);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+
+#pragma unroll
+  for (int elem_index = start_offset; elem_index < num_elems_in_orig_col; elem_index += stride) {
+    ComputeElem thread_output;
+    thread_output.fill(0);
+    for (int k_idx = 0; k_idx < experts_per_token; ++k_idx) {
+      int64_t const k_offset = original_row * experts_per_token + k_idx;
+      int64_t const expert_id = token_selected_experts[k_offset] - start_expert_id;
+      if (expert_id < 0 || expert_id >= num_experts_per_node) {
+        continue;
+      }
+
+      int64_t const expanded_original_row = original_row + k_idx * num_rows;
+      int64_t const expanded_permuted_row = unpermuted_row_to_permuted_row[expanded_original_row];
+
+      int64_t const expanded_rows = num_rows * experts_per_token;
+      if (expanded_permuted_row < 0 || expanded_permuted_row >= expanded_rows) {
+        continue;
+      }
+
+      float const row_scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
+
+      auto const* expanded_permuted_rows_row_ptr =
+          expanded_permuted_rows_v + expanded_permuted_row * num_elems_in_padded_col;
+
+      ComputeElem expert_result =
+          arrayConvert<InputElem, ComputeElem>(expanded_permuted_rows_row_ptr[elem_index]);
+      if (bias) {
+        auto const* bias_ptr = bias_v + expert_id * num_elems_in_padded_col;
+        expert_result = expert_result + arrayConvert<BiasElem, ComputeElem>(bias_ptr[elem_index]);
+      }
+
+      thread_output = thread_output + row_scale * expert_result;
+    }
+
+    OutputElem output_elem = arrayConvert<ComputeElem, OutputElem>(thread_output);
+    reduced_row_ptr_v[elem_index] = output_elem;
+  }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+#if defined(FLASHINFER_FP4_SW_CVT)
+// finalizeMoeRoutingKernel's shared memory holds the first this many k (48 KB), in batches of
+// FINALIZE_K_LOADS k rows loaded at once.
+constexpr static int FINALIZE_CACHED_K = 4096;
+constexpr static int FINALIZE_K_LOADS = 4;
+
+// finalizeMoeRoutingKernel below SM100: a row's columns split over gridDim.y CTAs when there are
+// few rows, and the k rows loaded FINALIZE_K_LOADS at a time.
+template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleMode SCALE_MODE>
+__global__ void finalizeMoeRoutingSplitKernel(
     GemmOutputType const* expanded_permuted_rows, OutputType* reduced_unpermuted_output,
     ScaleBiasType const* bias, float const* scales, int const* unpermuted_row_to_permuted_row,
     int const* token_selected_experts, int64_t const padded_cols, int64_t const unpadded_cols,
@@ -2915,6 +2995,7 @@ __global__ void finalizeMoeRoutingKernel(
   cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
+#endif
 
 // Final kernel to unpermute and scale
 // This kernel unpermutes the original data, does the k-way reduction and performs the final skip
@@ -3064,6 +3145,7 @@ void finalizeMoeRoutingKernelLauncher(
     // If all-gather reduce-scatter is used, finalizeMoeRouting must fill invalid output tokens with
     // zeros.
     int64_t const blocks = num_rows;
+#if defined(FLASHINFER_FP4_SW_CVT)
     // With fewer rows than SMs, each row's columns are split over more CTAs, halved down to 64
     // threads while every CTA still gets an SM of its own.
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -3082,10 +3164,19 @@ void finalizeMoeRoutingKernelLauncher(
         tensorrt_llm::common::roundUp(std::min<int64_t>(experts_per_token, FINALIZE_CACHED_K),
                                       int64_t{FINALIZE_K_LOADS}) *
         (2 * sizeof(int) + sizeof(float));
+    auto func = final_scales ? &finalizeMoeRoutingSplitKernel<OutputType, GemmOutputType,
+                                                              ScaleBiasType, ScaleMode::DEFAULT>
+                             : &finalizeMoeRoutingSplitKernel<OutputType, GemmOutputType,
+                                                              ScaleBiasType, ScaleMode::NO_SCALE>;
+#else
+    int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
+    config.gridDim = blocks;
+    config.blockDim = threads;
     auto func = final_scales ? &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType,
                                                          ScaleMode::DEFAULT>
                              : &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType,
                                                          ScaleMode::NO_SCALE>;
+#endif
     cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr,
                        final_scales, unpermuted_row_to_permuted_row, token_selected_experts,
                        padded_cols, unpadded_cols, experts_per_token, num_experts_per_node,
@@ -3471,9 +3562,14 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     assert(reinterpret_cast<std::uintptr_t>(output_vec) % sizeof(OutputElem) == 0);
     assert(reinterpret_cast<std::uintptr_t>(bias_ptr_vec) % sizeof(BiasElem) == 0);
 
+#if defined(FLASHINFER_FP4_SW_CVT)
     // The row's columns, split over gridDim.y CTAs when there are few rows.
     int64_t const start_offset = tid + blockIdx.y * blockDim.x;
     int64_t const stride = blockDim.x * gridDim.y;
+#else
+    int64_t const start_offset = tid;
+    int64_t const stride = blockDim.x;
+#endif
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
@@ -3667,12 +3763,16 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       tensorrt_llm::common::ceilDiv(int64_t{8} * MAX_ACTIVATION_THREADS_PER_BLOCK, threads));
   int64_t const blocks =
       std::min(smCount * blocks_per_sm, std::max(expanded_num_tokens, int64_t{1}));
+#if defined(FLASHINFER_FP4_SW_CVT)
   // With fewer rows than that, each row's columns are split over more CTAs, except for the
   // per-token FP8 quant, which reduces each row in one CTA.
   int64_t const splits = fp8_token_dequant_scale != nullptr
                              ? 1
                              : std::min(tensorrt_llm::common::ceilDiv(loads_per_row, threads),
                                         smCount * blocks_per_sm / blocks);
+#else
+  int64_t const splits = 1;
+#endif
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type, auto disableFP4QuantFastMathTag,
@@ -4066,6 +4166,13 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
       min_latency_mode
           ? num_moe_inputs
           : std::min(num_moe_inputs, static_cast<size_t>(num_rows * num_experts_per_node));
+#if defined(FLASHINFER_FP4_SW_CVT)
+  // Below SM100 threeStepBuildExpertMapsSortFirstToken's one-CTA sort keeps every expanded row,
+  // including an expert a token picks twice, which the three-step sort keeps once.
+  if (!min_latency_mode && num_moe_inputs <= SMALL_PROLOGUE_THREADS) {
+    act_sf_rows = num_moe_inputs;
+  }
+#endif
   size_t const sf_size =
       getScalingType() == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
           ? sizeof(TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF)
@@ -4625,7 +4732,7 @@ void CutlassMoeFCRunner<
     // Restored rows with row scales carry their expert's global scale in them; with the token rows
     // the small-M kernel takes the global scales themselves.
     alpha_scale_ptr_array =
-        use_restored_fp4 && (act_fp8_token_scale || quant_params.w4a16_token_rows)
+        use_restored_fp4 && (act_fp8_token_scale || w4a16TokenRows(quant_params))
             ? nullptr
             : computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
                                      use_restored_fp4 ? quant_params.fp4.fc1.global_scale
@@ -4654,8 +4761,8 @@ void CutlassMoeFCRunner<
         config};
     // Below SM100 act_fp8_token_scale is given with the token rows restored: the row scales.
     universal_input.row_scales = use_restored_fp4 ? act_fp8_token_scale : nullptr;
-    if (quant_params.w4a16_token_rows) {
-      universal_input.a_rows = quant_params.w4a16_token_rows;
+    if (int const* const token_rows = w4a16TokenRows(quant_params)) {
+      universal_input.a_rows = token_rows;
       universal_input.a_tokens = static_cast<int>(num_rows);
       universal_input.expert_scales = quant_params.fp4.fc1.global_scale;
     }
@@ -4839,7 +4946,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     }
   } else if (use_fp8 || use_restored_fp4) {
     alpha_scale_ptr_array =
-        use_restored_fp4 && (row_scales || quant_params.w4a16_token_rows)
+        use_restored_fp4 && (row_scales || w4a16TokenRows(quant_params))
             ? nullptr
             : computeFP8DequantScale(
                   alpha_scale_ptr_array, num_experts_per_node,
@@ -4881,7 +4988,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
       config};
   universal_input.row_scales = row_scales;
   universal_input.expert_scales =
-      quant_params.w4a16_token_rows ? quant_params.fp4.fc2.global_scale : nullptr;
+      w4a16TokenRows(quant_params) ? quant_params.fp4.fc2.global_scale : nullptr;
   gemm_runner.moeGemmBiasAct(universal_input, tma_ws_input);
   sync_check_cuda_error(stream);
 
@@ -4899,7 +5006,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     sync_check_cuda_error(stream);
   }
   if (skip_finalize) {  // GEMM2's rows, with the FC2 biases, in final_output
-    if (fc2_expert_biases) {
+    // Only rank 0 adds the biases under tensor parallelism, as finalize does.
+    if (fc2_expert_biases && parallelism_config.tp_rank == 0) {
       doActivation<UnfusedGemmOutputType, UnfusedGemmOutputType, ScaleBiasType>(
           reinterpret_cast<UnfusedGemmOutputType*>(final_output),
           static_cast<UnfusedGemmOutputType const*>(gemm_output), nullptr, fc2_expert_biases, true,
@@ -5412,12 +5520,15 @@ void CutlassMoeFCRunner<
     sync_check_cuda_error(stream);
   } else {
     bool fused_prologue_result = false;
+    bool try_fused_prologue = true;
+#if defined(FLASHINFER_FP4_SW_CVT)
     // Rows at most the experts sort faster in threeStepBuildExpertMapsSortFirstToken's one CTA,
     // whose scan grows with the rows, than in the fused radix rank, whose scan grows with the
     // experts.
-    if (!use_sm90_mixed_input_gemm &&
-        num_rows * experts_per_token >
-            std::min<int64_t>(SMALL_PROLOGUE_THREADS, num_experts_per_node)) {
+    try_fused_prologue = num_rows * experts_per_token >
+                         std::min<int64_t>(SMALL_PROLOGUE_THREADS, num_experts_per_node);
+#endif
+    if (!use_sm90_mixed_input_gemm && try_fused_prologue) {
       // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
       // W4AFP8
       fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
@@ -5616,7 +5727,7 @@ void CutlassMoeFCRunner<
           applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
                              num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
     }
-    if (quant_params.w4a16_token_rows) {
+    if (w4a16TokenRows(quant_params)) {
       gemm1_input = static_cast<T const*>(input_activations_void);
     }
     sync_check_cuda_error(stream);
@@ -6471,6 +6582,9 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
         static_cast<float const*>(quant_3),
         static_cast<TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF const*>(quant_5),
         static_cast<float const*>(quant_6));
+    // The SM90 grouped GEMM reads the weight block scales through fp8_mxfp4.
+    mQuantParams.fp8_mxfp4.fc1.weight_block_scale = mQuantParams.mxfp8_mxfp4.fc1.weight_block_scale;
+    mQuantParams.fp8_mxfp4.fc2.weight_block_scale = mQuantParams.mxfp8_mxfp4.fc2.weight_block_scale;
   } else if (isSm90Wfp4Afp8Family()) {
     TLLM_CHECK(quant_2 && quant_3 && quant_4 && quant_5 && quant_6);
     mQuantParams = QuantParams::FP8MXFP4(

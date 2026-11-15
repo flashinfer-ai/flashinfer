@@ -102,13 +102,18 @@ from .jit.cake_kda_packed_t1 import (
 )
 from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
-from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fp8_quantization import (
+    gen_mxfp8_quantization_sm80_module,
+    gen_mxfp8_quantization_sm90_module,
+    gen_mxfp8_quantization_sm100_module,
+)
 from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
     gen_alphamoe_nvfp4_sm100_module,
     gen_cutlass_fused_moe_sm80_module,
+    gen_cutlass_fused_moe_sm89_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -973,7 +978,11 @@ def gen_all_modules(
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_103a"))
         if has_sm80 and get_cuda_version() >= Version("12.8"):
             jit_specs.append(gen_fp4_quantization_sm80_module())
+            jit_specs.append(gen_mxfp8_quantization_sm80_module())
             jit_specs.append(gen_cutlass_fused_moe_sm80_module())
+        if has_sm89:
+            # SM89 devices load their own CUTLASS MoE module.
+            jit_specs.append(gen_cutlass_fused_moe_sm89_module())
         if has_sm80 or has_sm90:
             # One module emits the requested SM80/SM90 targets of the W4A16 MoE records.
             jit_specs.append(gen_w4a16_moe_sm80_module())
@@ -982,6 +991,7 @@ def gen_all_modules(
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
+            jit_specs.append(gen_mxfp8_quantization_sm90_module())
             jit_specs.append(gen_cutlass_fused_moe_sm90_module())
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to

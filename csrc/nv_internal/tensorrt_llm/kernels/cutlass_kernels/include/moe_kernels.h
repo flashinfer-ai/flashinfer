@@ -350,6 +350,7 @@ struct QuantParams {
         : fc1_scales_ptrs(fc1_scales_ptrs), fc2_scales_ptrs(fc2_scales_ptrs) {}
   } fp8_block_scaling;
 
+#if defined(FLASHINFER_FP4_SW_CVT)
   // Below SM100, MXFP8 x MXFP4: the MXFP8 input, and per GEMM1 row (permuted) whether an E8M0
   // scale of its token is 244 to 254 (the restored BF16 row out of range), GEMM1 recomputing those
   // rows from the codes.
@@ -365,6 +366,7 @@ struct QuantParams {
   // the token rows (GEMM row r takes token w4a16_token_rows[r] % the tokens) and both GEMMs scaling
   // by their experts' global scales.
   int const* w4a16_token_rows = nullptr;
+#endif
 
   static QuantParams Int(void const* fc1_weight_scales, void const* fc2_weight_scales) {
     QuantParams qp;

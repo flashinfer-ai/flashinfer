@@ -14,13 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .core import JitSpec, gen_jit_spec, current_compilation_context
+from typing import List
+
+from .core import JitSpec, gen_jit_spec, current_compilation_context, sm90a_nvcc_flags
 from . import env as jit_env
 
 
-def gen_mxfp8_quantization_sm100_module() -> JitSpec:
+def gen_mxfp8_quantization_module(nvcc_flags: List[str], device_arch: str) -> JitSpec:
     return gen_jit_spec(
-        "mxfp8_quantization_sm100",
+        f"mxfp8_quantization_sm{device_arch}",
         [
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/thop/fp8Quantize.cpp",
@@ -30,14 +32,11 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
         ],
-        extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
-            supported_major_versions=None, map_sm107_to_100f=True
-        )
+        extra_cuda_cflags=nvcc_flags
         + [
             "-DENABLE_BF16",
             "-DENABLE_FP8",
             "-DENABLE_FP4",
-            "-DFLASHINFER_FP4_SW_CVT",
         ],
         extra_cflags=[
             "-DENABLE_BF16",
@@ -48,4 +47,27 @@ def gen_mxfp8_quantization_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
         ],
+    )
+
+
+def gen_mxfp8_quantization_sm100_module() -> JitSpec:
+    return gen_mxfp8_quantization_module(
+        current_compilation_context.get_nvcc_flags_list(
+            supported_major_versions=None, map_sm107_to_100f=True
+        ),
+        "100",
+    )
+
+
+def gen_mxfp8_quantization_sm80_module() -> JitSpec:
+    return gen_mxfp8_quantization_module(
+        current_compilation_context.get_nvcc_flags_list(supported_major_versions=[8])
+        + ["-DFLASHINFER_FP4_SW_CVT", "-DFLASHINFER_FP4_QUANT_NO_TMA"],
+        "80",
+    )
+
+
+def gen_mxfp8_quantization_sm90_module() -> JitSpec:
+    return gen_mxfp8_quantization_module(
+        sm90a_nvcc_flags + ["-DFLASHINFER_FP4_SW_CVT"], "90"
     )

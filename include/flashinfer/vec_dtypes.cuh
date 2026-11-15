@@ -460,28 +460,17 @@ __device__ __forceinline__ void e2m1x8_to_f16x8(uint32_t packed, uint32_t* d) {
   d[3] = __byte_perm(hi_b, 0u, 0x3424u);
 }
 
-// The BF16 magnitude tables: high and low bytes of +{0.0, 0.5, 1.0, 1.5} (hi0, lo0) and of
-// +{2.0, 3.0, 4.0, 6.0} (hi1, lo1).
-struct E2m1Bf16Lut {
-  uint32_t hi0, hi1, lo0, lo1;
-};
-
-// The tables with every word OR'ed with `zero`, which must be 0. `prmt` reads both table words
-// from registers, so ptxas rebuilds immediate tables before each conversion in a loop; a kernel
-// converting in its main loop passes a zero the compiler cannot prove (derived from a kernel
-// argument) to keep the four words in registers instead.
-__device__ __forceinline__ E2m1Bf16Lut e2m1_bf16_lut(uint32_t zero = 0u) {
-  return {0x3F3F3F00u | zero, 0x40404040u | zero, 0xC0800000u | zero, 0xC0804000u | zero};
-}
-
-__device__ __forceinline__ void e2m1x8_to_bf16x8(uint32_t packed, uint32_t* d,
-                                                 E2m1Bf16Lut const& t = e2m1_bf16_lut()) {
+__device__ __forceinline__ void e2m1x8_to_bf16x8(uint32_t packed, uint32_t* d) {
+  constexpr uint32_t kHi0 = 0x3F3F3F00u;  // high bytes of +{0.0, 0.5, 1.0, 1.5}
+  constexpr uint32_t kHi1 = 0x40404040u;  // high bytes of +{2.0, 3.0, 4.0, 6.0}
+  constexpr uint32_t kLo0 = 0xC0800000u;  // low  bytes of +{0.0, 0.5, 1.0, 1.5}
+  constexpr uint32_t kLo1 = 0xC0804000u;  // low  bytes of +{2.0, 3.0, 4.0, 6.0}
   const uint32_t mag = packed & 0x77777777u;
   const uint32_t mag_a = mag, mag_b = mag >> 16;
-  uint32_t hi_a = __byte_perm(t.hi0, t.hi1, mag_a);
-  uint32_t hi_b = __byte_perm(t.hi0, t.hi1, mag_b);
-  const uint32_t lo_a = __byte_perm(t.lo0, t.lo1, mag_a);
-  const uint32_t lo_b = __byte_perm(t.lo0, t.lo1, mag_b);
+  uint32_t hi_a = __byte_perm(kHi0, kHi1, mag_a);
+  uint32_t hi_b = __byte_perm(kHi0, kHi1, mag_b);
+  const uint32_t lo_a = __byte_perm(kLo0, kLo1, mag_a);
+  const uint32_t lo_b = __byte_perm(kLo0, kLo1, mag_b);
   hi_a |= e2m1_sign_bytes(packed, 0xD9C8u);
   hi_b |= e2m1_sign_bytes(packed, 0xFBEAu);
   d[0] = __byte_perm(lo_a, hi_a, 0x5140u);
