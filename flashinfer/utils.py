@@ -1411,12 +1411,14 @@ def backend_requirement(
     call_check : callable, optional
         Complete call validator accepting the decorated function's arguments with
         defaults applied. It returns None or raises, and owns all routing and input
-        requirements, including CPU paths. When provided, it replaces the common,
-        backend, compute-capability and automatic-selection validation.
+        requirements, including CPU paths. It cannot be combined with
+        common_check or heuristic_func, whose validation it replaces.
     validate_on_call : bool, optional
         Defaults to True. If False, return the original callable with the query
         methods attached, without an execution wrapper or a new skip_check keyword.
         Call validate_call explicitly to check inputs before execution.
+        Cannot be combined with heuristic_func, bypass or experimental backends,
+        whose execution policies require the wrapper.
 
     Returns
     -------
@@ -1446,6 +1448,8 @@ def backend_requirement(
         Validate the same call arguments without executing the function. Returns
         None or raises. Wrapped APIs ignore skip_check here and still validate;
         manual mode follows the original signature, without an added keyword.
+        A bypassed mode without a complete call_check raises NotImplementedError:
+        its validation belongs to that mode, not the generic backend checks.
 
     Keyword Arguments Added to Decorated Function
     ---------------------------------------------
@@ -1503,6 +1507,17 @@ def backend_requirement(
       provide fine-grained control over backend and architecture support.
     """
 
+    if call_check is not None and (
+        common_check is not None or heuristic_func is not None
+    ):
+        raise ValueError(
+            "call_check cannot be combined with common_check or heuristic_func"
+        )
+    if not validate_on_call and (heuristic_func is not None or bypass is not None):
+        raise ValueError(
+            "validate_on_call=False cannot be combined with heuristic_func or bypass"
+        )
+
     def decorator(func):
         # Get the function signature once for reuse
         sig = inspect.signature(func)
@@ -1517,6 +1532,10 @@ def backend_requirement(
             for name, checker in backend_checks.items()
             if getattr(checker, "is_experimental", False)
         )
+        if not validate_on_call and experimental_backends:
+            raise ValueError(
+                "validate_on_call=False cannot be combined with experimental backends"
+            )
         for name, checker in backend_checks.items():
             module = getattr(checker, "__module__", "") or ""
             if (
@@ -1653,15 +1672,16 @@ def backend_requirement(
                 capability = major * 10 + minor
             return capability
 
-        @functools.wraps(func)
-        def validate_call(*args, **kwargs):
-            # Explicit validation cannot be disabled by the execution-only flag.
-            if validate_on_call:
-                kwargs.pop("skip_check", None)
+        def _validate(args, kwargs):
             kwargs_with_defaults = bind_with_defaults(args, kwargs)
             if call_check is not None:
                 call_check(**kwargs_with_defaults)
                 return
+            if bypass is not None and bypass(*args, **kwargs):
+                raise NotImplementedError(
+                    f"{func.__name__}.validate_call is not available for this bypassed "
+                    "mode; the mode owns input validation"
+                )
 
             backend = kwargs_with_defaults.get("backend")
             capability = _get_capability(*args, **kwargs)
@@ -1715,13 +1735,20 @@ def backend_requirement(
                     )
 
         @functools.wraps(func)
+        def validate_call(*args, **kwargs):
+            # Explicit validation cannot be disabled by the execution-only flag.
+            if validate_on_call:
+                kwargs.pop("skip_check", None)
+            return _validate(args, kwargs)
+
+        @functools.wraps(func)
         def wrapper(*args, **kwargs):
             skip_check = kwargs.pop("skip_check", False)
             if bypass is not None and bypass(*args, **kwargs):
                 # A mode the function validates and dispatches itself: no backend selection here.
                 return func(*args, **kwargs)
             if not skip_check:
-                validate_call(*args, **kwargs)
+                _validate(args, kwargs)
             elif call_check is None:
                 backend = kwargs.get("backend")
                 if backend == "auto" and heuristic_func is not None:
