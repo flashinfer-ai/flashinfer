@@ -345,10 +345,13 @@ class BatchInvariantMoeMxfp4w8aRunner(_Fp4PairRunner):
         return dict(align=GROUP_ALIGN)
 
     # ---- tactics ---------------------------------------------------------------------------------------------------
-    def _ranked(self, T: int, H: int) -> Tuple[list, list]:
+    def _ranked(
+        self, T: int, H: int, scatter_launch: bool = False
+    ) -> Tuple[list, list]:
         """The ranked records of both GEMMs over both record spaces at ``T`` tokens (`schedule_mxfp4w8a.ranked_mx`,
         memoised), trimmed to the packing the first picks run on: on the padded packing the swapped records cannot run, so
-        they leave the lists."""
+        they leave the lists. ``scatter_launch`` is the pair runner's gather-form switch: the MX chains read the token box
+        (no gather twin), so the lists are the same either way."""
         from .schedule import TOP_K
         from .schedule_mxfp4w8a import packing_for, ranked_mx
 
