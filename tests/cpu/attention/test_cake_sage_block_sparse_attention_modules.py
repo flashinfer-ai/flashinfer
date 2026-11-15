@@ -93,3 +93,29 @@ def test_flat_offset_guard_refuses_tensors_beyond_int32():
     _check_flat_indexable(
         "out", torch.empty((2, 3, 4, 128), device=meta, dtype=torch.bfloat16)
     )
+
+
+@pytest.mark.cpu_only
+def test_alignment_guard_refuses_views_off_the_boundary():
+    """The quantizers read BF16 Q/K/V with 32-byte vector loads and the attention needs
+    16-byte Q/K/V/out/v_scale; a contiguous view with a storage offset can break both."""
+    import torch
+
+    from flashinfer.cake_sage_block_sparse_attention_backend import (
+        ATTENTION_ALIGNMENT,
+        QUANTIZE_INPUT_ALIGNMENT,
+        _check_aligned,
+    )
+
+    assert (QUANTIZE_INPUT_ALIGNMENT, ATTENTION_ALIGNMENT) == (32, 16)
+    buf = torch.zeros(4096, dtype=torch.uint8)
+    base = (-buf.data_ptr()) % 64  # first 64-byte boundary in buf
+    aligned = buf[base : base + 1024].view(torch.bfloat16)
+    _check_aligned("q", aligned, 32)
+    _check_aligned("q", buf[base + 16 : base + 1040], 16)
+    with pytest.raises(ValueError, match="q must start on a 32-byte boundary"):
+        _check_aligned("q", buf[base + 16 : base + 1040], 32)
+    with pytest.raises(
+        ValueError, match=r"out must start on a 16-byte boundary.*\.clone\(\)"
+    ):
+        _check_aligned("out", buf[base + 2 : base + 1026].view(torch.bfloat16), 16)
