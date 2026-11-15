@@ -34,7 +34,9 @@
 //
 // Every spin wait times out and records an error code in the counter block instead of hanging the
 // GPU; the last CTA to exit resets the per-call counters and advances the epoch (CUDA-graph replay
-// safe).
+// safe). The epoch is a wrapping 32-bit call number compared modulo 2^32 (wait_ge), so a flag one
+// call old reads as behind after the wrap too; the GIN routing signal, a 64-bit count of calls,
+// is compared with a 64-bit call count (kCtrCalls).
 //
 // NIC transport (built with FLASHINFER_MEGAMOE_SM120_GIN=1, NCCL Device API): ranks in Gin::mask
 // are reached with NCCL GIN puts instead of P2P stores, for hosts where a pair's PCIe peer path is
@@ -102,9 +104,10 @@ __host__ __device__ constexpr size_t pool_row_bytes(int H) {
 // error codes (counter kCtrErr)
 constexpr int kErrDispatchWait = 1, kErrL1Wait = 2, kErrCombineWait = 3, kErrRouteWait = 4;
 
-// counters (local, reset by the last CTA to exit)
+// counters (local, reset by the last CTA to exit; the epoch and the call count persist)
 constexpr int kCtrDispatch = 0, kCtrQueue = 1, kCtrL2Done = 2, kCtrErr = 3, kCtrExit = 4,
-              kCtrEpoch = 5, kCtrL1 = 8;
+              kCtrEpoch = 5, kCtrCalls = 6, kCtrL1 = 8;
+static_assert(kCtrCalls % 2 == 0, "the u64 call count must be 8-byte aligned");
 // GIN transport state: per-tile FC2 completion counts, this call's expected GIN signal counts per
 // source (dispatch, combine) and the cumulative totals (u64, persistent across calls)
 constexpr int kMaxTiles = kMaxEl + kMaxWorld * 128 * kMaxTopk / 8;  // sum_el ceil(n_el / kTile)
@@ -196,10 +199,12 @@ __device__ __forceinline__ int ld_acquire_gpu(const int* p) {
 __device__ __forceinline__ void st_release_sys(int* p, int v) {
   asm volatile("st.release.sys.global.b32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
-// thread 0 spins until *p >= v (sys or gpu scope); returns false on timeout
+// thread 0 spins until *p >= v modulo 2^32 (the difference read as signed, so it holds across the
+// epoch's wrap; counts within a call are far below 2^31), sys or gpu scope; false on timeout
 __device__ __forceinline__ bool wait_ge(const int* p, int v, bool sys) {
   const uint64_t t0 = gtime();
-  while ((sys ? ld_acquire_sys(p) : ld_acquire_gpu(p)) < v)
+  while (static_cast<int>(static_cast<unsigned>(sys ? ld_acquire_sys(p) : ld_acquire_gpu(p)) -
+                          static_cast<unsigned>(v)) < 0)
     if (gtime() - t0 > kSpinNs) return false;
   return true;
 }
@@ -513,7 +518,8 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
       gtime()};  // +8 route-push 9 route-ok 10 map 11 pf 12 flag-sent 13 last FC1 end 14 first FC2
                  // start 15 comb-flag release  // 0 start 1 pushed 2 flags 3 work end 4 comb flags
                  // 5 end 6 L1-wait ns 7 items
-  if (threadIdx.x == 0) s_epoch = *reinterpret_cast<volatile int*>(a.ctr + kCtrEpoch) + 1;
+  if (threadIdx.x == 0)  // wraps modulo 2^32 (unsigned: no signed overflow)
+    s_epoch = static_cast<int>(*reinterpret_cast<volatile unsigned*>(a.ctr + kCtrEpoch) + 1u);
   // the error word reports this call only (a wait records one no earlier than kSpinNs from now)
   if (blockIdx.x == 0 && threadIdx.x == 0) a.ctr[kCtrErr] = 0;
   __syncthreads();
@@ -706,8 +712,10 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
     s_ok = 1;
     for (int w = 0; w < W; ++w) {
 #if MEGAMOE_SM120_GIN_DEVICE
-      if (is_gin(a, w)) {  // one routing put per call: the signal counts calls, like the epoch
-        if (!gin_wait(a, kSigRoute + w, (unsigned long long)epoch)) s_ok = 0;
+      if (is_gin(a, w)) {  // one routing put per call: the signal counts calls (64-bit)
+        const unsigned long long calls =
+            *reinterpret_cast<volatile unsigned long long*>(ctr + kCtrCalls);
+        if (!gin_wait(a, kSigRoute + w, calls + 1)) s_ok = 0;
         continue;
       }
 #endif
@@ -1127,6 +1135,7 @@ exit_kernel:
     if (done ==
         int(gridDim.x) - 1) {  // last CTA out: advance the epoch, reset the per-call counters
       ctr[kCtrEpoch] = epoch;
+      *reinterpret_cast<unsigned long long*>(ctr + kCtrCalls) += 1;
       ctr[kCtrDispatch] = 0;
       ctr[kCtrQueue] = 0;
       ctr[kCtrL2Done] = 0;

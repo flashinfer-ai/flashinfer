@@ -32,6 +32,7 @@ import torch
 # per-tile counts, GIN signal totals; error word at 3) and its slot in the layout below.
 COUNTER_INTS = 1592
 ERROR_INDEX = 3
+EPOCH_INDEX = 5
 _CTR_SLOT = 14
 # GIN contexts (queue-pair sets): CTAs spread their puts over them; on RTX 6000D EP8 four beat one
 # (1.8 vs 2.5 ms at 128 tokens per rank) and sixteen added signal-poll cost at small batches.
@@ -315,6 +316,18 @@ class NosyncWorkspace:
         hanging; each call clears it on entry. Synchronizes with the device."""
         ctr = self._view(_CTR_SLOT, (COUNTER_INTS,), torch.int32)
         return int(ctr[ERROR_INDEX].item())
+
+    def set_epoch(self, epoch: int) -> None:
+        """Make ``epoch`` (modulo 2^32) the last call's epoch: the counter and the flags the other
+        ranks wrote here. Tests use it to cross the epoch's wrap; every rank calls it between
+        calls (no kernel in flight), then the EP group synchronizes."""
+        value = (epoch + 2**31) % 2**32 - 2**31  # the int32 with these 32 bits
+        ctr = self._view(_CTR_SLOT, (COUNTER_INTS,), torch.int32)
+        ctr[EPOCH_INDEX] = value
+        # recv_flag, comb_flag, route_flag: one int per source rank
+        for slot in (7, 9, 11):
+            self._view(slot, (self.world_size,), torch.int32).fill_(value)
+        torch.cuda.synchronize(self.device)
 
     def destroy(self) -> None:
         """Release the buffer (collective with the NIC transport, which deregisters the NCCL window)."""

@@ -7,12 +7,13 @@ within ``NosyncOptions.max_tokens_per_rank`` on every rank runs the nosync kerne
 call runs the configured layer. The option needs pre-quantized MXFP4 weights, the input of the
 cake and cutedsl SM120 MegaMoE backends, whose packed FP4 tensors it shares. Where the nosync
 kernel cannot run (not compute capability 12.0, weights that are not MXFP4 such as the BF16
-weights of a ``SplitConfig`` layer, an unsupported geometry), the option does nothing and every
-call runs the configured layer.
+weights of a ``SplitConfig`` layer, a cake layer with its in-kernel shared expert, an unsupported
+geometry), the option does nothing and every call runs the configured layer.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import warnings
@@ -46,7 +47,10 @@ class NosyncOptions:
     (:class:`~flashinfer.moe_ep.Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig`); ``transport``
     ``None`` (default) takes the per-pair table the configured cake backend resolved
     (``transport_table``, including ``"auto"`` / ``"tuned"``), so both kernels move data
-    between each pair of ranks the same way; ``"p2p"`` with any other backend. ``top_k`` and
+    between each pair of ranks the same way; ``"p2p"`` with any other backend. The cake table
+    is resolved with the layer's default workspace, so the nosync kernel is then built at
+    :meth:`MoEEpNosyncLayer.warmup` or the first call: configure the default workspace
+    (``create_workspace``) before either. ``top_k`` and
     ``swiglu_limit`` (``inf`` for unclamped SwiGLU) default to the configured backend's when it
     is the cake or cutedsl SM120 MXFP4 backend; set them for any other backend.
     """
@@ -62,6 +66,12 @@ def _configured(backend: Any, name: str) -> Any:
     """``name`` of the configured backend's kernel config, when it has one."""
     kernel = getattr(backend, "megakernel", None) or getattr(backend, "kernel", None)
     return getattr(kernel, name, None)
+
+
+def _configured_quantize_input(base: nn.Module, backend: Any) -> bool:
+    """The configured layer's activation format (``MegaConfig.quantize_input``)."""
+    config = getattr(base, "_mega_config", None) or backend
+    return bool(getattr(config, "quantize_input", True))
 
 
 def _configured_swiglu_limit(backend: Any) -> float | None:
@@ -85,6 +95,10 @@ class MoEEpNosyncLayer(nn.Module):
     count during CUDA graph capture (a captured bucket holds the same padded count on every
     rank), and otherwise the largest token count of any rank (one all-reduce and a host
     synchronization). Attributes the layer does not define come from ``base``.
+
+    When the nosync kernel follows the cake table, it is built (collectively) at :meth:`warmup`
+    or the first call, after the default workspace is configured; call :meth:`warmup` on every
+    rank before capturing a CUDA graph.
     """
 
     def __init__(
@@ -103,14 +117,19 @@ class MoEEpNosyncLayer(nn.Module):
         self._group = bootstrap_comm_group(bootstrap)
         self._world = bootstrap.world_size
         self._staged: Optional[nn.Module] = None
+        # the nosync layer's arguments while it waits for the cake table (built by _ensure_nosync)
+        self._pending: Optional[tuple[Any, ...]] = None
         reason = self._build(bootstrap, fleet_params, weights, backend, options)
         if reason is not None:
-            warnings.warn(
-                f"NosyncOptions: the nosync kernel is off ({reason}); every call runs the "
-                "configured backend",
-                UserWarning,
-                stacklevel=3,
-            )
+            self._off(reason, stacklevel=4)
+
+    def _off(self, reason: str, stacklevel: int) -> None:
+        warnings.warn(
+            f"NosyncOptions: the nosync kernel is off ({reason}); every call runs the "
+            "configured backend",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
 
     def _build(self, bootstrap, fleet_params, weights, backend, options) -> str | None:
         from ..backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync import (
@@ -124,7 +143,7 @@ class MoEEpNosyncLayer(nn.Module):
             preprocess_mega_weights,
             shared_fp4,
         )
-        from .mega_layer import MoEEpMegaLayer
+        from ..core.kernel.registry import create_mega_kernel
 
         if not 1 <= options.max_tokens_per_rank <= MAX_TOKENS_PER_RANK:
             raise MoEEpConfigError(
@@ -137,6 +156,9 @@ class MoEEpNosyncLayer(nn.Module):
             return "it needs compute capability 12.0"
         if not is_mxfp4_pack(weights):
             return "the weights are not pre-quantized MXFP4"
+        if _configured(backend, "shared_expert") is not None:
+            # the nosync kernel computes the routed experts only
+            return "the configured backend adds a shared expert, which the nosync kernel does not"
         top_k = (
             options.top_k
             if options.top_k is not None
@@ -152,8 +174,32 @@ class MoEEpNosyncLayer(nn.Module):
             )
         intermediate = weights.w13.shape[1] // 2
         hidden = fleet_params.token_hidden_size
-        transformed = getattr(self.base, "_transformed", None)
         kernel_name = _configured(backend, "kernel_name")
+        follow_cake = (
+            options.transport is None and kernel_name == "sm120_mxfp4_mxfp8_bf16_cake"
+        )
+        config = Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
+            intermediate_size=intermediate,
+            top_k=top_k,
+            swiglu_limit=limit,
+            transport="p2p" if options.transport is None else options.transport,
+            tokens_per_item=options.tokens_per_item,
+        )
+        params = FleetParams(
+            num_experts=fleet_params.num_experts,
+            max_tokens_per_rank=min(
+                fleet_params.max_tokens_per_rank, options.max_tokens_per_rank
+            ),
+            token_hidden_size=hidden,
+        )
+        # the geometry the nosync kernel covers, before its weights are transformed
+        kernel = create_mega_kernel(config)
+        kernel.bind_ep_bootstrap(bootstrap)
+        try:
+            kernel.validate_init(bootstrap, params)
+        except MoEEpConfigError as error:
+            return str(error)
+        transformed = getattr(self.base, "_transformed", None)
         fp4 = shared_fp4(transformed, kernel_name) if transformed is not None else None
         nosync_weights = preprocess_mega_weights(
             weights, hidden_size=hidden, intermediate_size=intermediate, fp4=fp4
@@ -165,48 +211,60 @@ class MoEEpNosyncLayer(nn.Module):
                 "kernel holds a copy of the packed weights (%.2f GiB on this rank)",
                 extra / 2**30,
             )
-        transport = options.transport
-        if transport is None:
-            transport = "p2p"
-            if kernel_name == "sm120_mxfp4_mxfp8_bf16_cake":
-                # collective, like the nosync workspace below; cake resolves its table here
-                table = self.base._ensure_workspace().transport_table
-                transport = tuple(int(c) for c in table.cells)
-                logger.info(
-                    "NosyncOptions: transport follows the cake table %s %s",
-                    table.name,
-                    transport,
-                )
-        config = Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig(
-            intermediate_size=intermediate,
-            top_k=top_k,
-            swiglu_limit=limit,
-            transport=transport,
-            tokens_per_item=options.tokens_per_item,
+        self._limit = params.max_tokens_per_rank
+        mega = MegaConfig(
+            megakernel=config,
+            quantize_input=_configured_quantize_input(self.base, backend),
+            preprocess_weights=False,
+            transformed_weights=nosync_weights,
         )
-        params = FleetParams(
-            num_experts=fleet_params.num_experts,
-            max_tokens_per_rank=min(
-                fleet_params.max_tokens_per_rank, options.max_tokens_per_rank
-            ),
-            token_hidden_size=hidden,
-        )
-        try:
-            self.nosync = MoEEpMegaLayer(
-                bootstrap,
-                params,
-                weights,
-                MegaConfig(
-                    megakernel=config,
-                    preprocess_weights=False,
-                    transformed_weights=nosync_weights,
-                ),
+        # the layer takes the transformed weights; it does not keep the source pack
+        self._pending = (bootstrap, params, mega)
+        if follow_cake:
+            return None  # built at warmup() or the first call, once the cake table is known
+        return self._make_nosync(None)
+
+    def _make_nosync(self, transport: tuple[int, ...] | None) -> str | None:
+        from .mega_layer import MoEEpMegaLayer
+
+        bootstrap, params, mega = self._pending
+        self._pending = None
+        if transport is not None:
+            mega = dataclasses.replace(
+                mega, megakernel=dataclasses.replace(mega.megakernel, transport=transport)
             )
+        try:
+            self.nosync = MoEEpMegaLayer(bootstrap, params, None, mega)
         except MoEEpConfigError as error:  # geometry the nosync kernel does not cover
             return str(error)
         self.nosync._ensure_workspace()  # collective: every rank builds the layer together
-        self._limit = params.max_tokens_per_rank
         return None
+
+    def _ensure_nosync(self) -> None:
+        """Build the nosync layer on the cake table (collective) when it is still pending."""
+        if self._pending is None:
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError(
+                "the nosync kernel is built on the cake table at warmup() or the first call; "
+                "call warmup() on all EP ranks before capturing"
+            )
+        # collective, like the nosync workspace; the default workspace (lazy, or the handle
+        # create_workspace() made for the default profile) resolves the cake table
+        table = self.base._ensure_workspace().transport_table
+        transport = tuple(int(c) for c in table.cells)
+        logger.info(
+            "NosyncOptions: transport follows the cake table %s %s", table.name, transport
+        )
+        reason = self._make_nosync(transport)
+        if reason is not None:
+            self._off(reason, stacklevel=4)
+
+    def warmup(self, t: Optional["MoEEpTensors"] = None, **kwargs: Any) -> None:
+        """``base.warmup``, after building the nosync kernel when it waits for the cake table.
+        COLLECTIVE, like ``base.warmup``."""
+        self._ensure_nosync()
+        self.base.warmup(t, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         try:
@@ -215,6 +273,7 @@ class MoEEpNosyncLayer(nn.Module):
             return getattr(self._modules["base"], name)
 
     def _uses_nosync(self, rows: int, bound: int | None) -> bool:
+        self._ensure_nosync()
         if self.nosync is None:
             return False
         if bound is None:

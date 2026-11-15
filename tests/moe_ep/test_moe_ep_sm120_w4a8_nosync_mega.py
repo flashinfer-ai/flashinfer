@@ -16,6 +16,7 @@ Run with plain Python (workers are spawned here):
 import argparse
 import datetime
 import os
+import warnings
 
 import pytest
 import torch
@@ -132,7 +133,7 @@ def _fallback_config(args):
     )
 
 
-def _layer(args, rank, experts, raw1, raw2, nosync=True):
+def _layer(args, rank, experts, raw1, raw2, nosync=True, quantize_input=True):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -163,7 +164,7 @@ def _layer(args, rank, experts, raw1, raw2, nosync=True):
         # configured as without the option
         backend=MegaConfig(
             megakernel=_fallback_config(args),
-            quantize_input=True,
+            quantize_input=quantize_input,
             preprocess_weights=True,
         ),
         nosync=NosyncOptions(
@@ -224,10 +225,26 @@ def _worker(rank, args):
     raw1, ref1 = _weights(epr, ih * 2, h, generator)
     raw2, ref2 = _weights(epr, h, ih, generator)
     layer = _layer(args, rank, experts, raw1, raw2)
+    if args.default_knobs:
+        # the default profile is still configurable after construction (the cake table that
+        # the nosync kernel follows is resolved at warmup)
+        layer.create_workspace(args.capacity, knobs={})
     # the configured backend alone, on the same weights: large calls must match it bit for bit,
     # small calls agree with it up to the intermediate-quantization recipe
     alone = _layer(args, rank, experts, raw1, raw2, nosync=False)
+    # pre-quantized activations (quantize_input=False) through the public wrapper (cake takes
+    # them; cutedsl quantizes its own input)
+    prequantized = (
+        _layer(args, rank, experts, raw1, raw2, quantize_input=False)
+        if args.fallback == "cake"
+        else None
+    )
+    if layer.nosync is None:  # built on the cake table at warmup
+        layer.warmup()
     assert layer.nosync is not None, "the nosync kernel must be on for these shapes"
+    if args.epoch_start is not None:  # the next calls cross the epoch's 32-bit wrap
+        layer.nosync._workspace.set_epoch(args.epoch_start)
+        dist.barrier()
     # the nosync kernel reads the configured backend's packed FP4 weights, not a copy
     transformed = layer.base._transformed
     base_w13 = transformed.w1_fp4 if args.fallback == "cake" else transformed[0][0]
@@ -273,24 +290,20 @@ def _worker(rank, args):
                 first = y.clone()
             else:
                 assert torch.equal(y, first), "workspace reuse changed the output"
-        if nosync:
-            # pre-quantized activations (quantize_input=False): the same bits
+        if prequantized is not None and (nosync or with_alone):
+            # pre-quantized activations (quantize_input=False): the same bits, the same kernel
             codes, exponents = quantize_activations_k32(x)
-            kernel, ws = layer.nosync._kernel, layer.nosync._workspace
-            kernel.set_compile_tokens_per_rank(ws, m_all)
-            kernel.stage_inputs(
+            y = prequantized.forward(
                 MoEEpTensors(
                     hidden_states=codes.view(torch.float8_e4m3fn),
                     topk_ids=idx,
                     topk_weights=routing,
                     scales=exponents.view(torch.float8_e8m0fnu),
-                ),
-                ws,
-                quantize_input=False,
+                )
             )
-            y = kernel.compute(ws, layer.nosync._get_transformed_weights(), output=None)
             torch.cuda.synchronize()
-            assert torch.equal(y, first), "pre-quantized staging changed the output"
+            assert prequantized.last_call_nosync == nosync
+            assert torch.equal(y, first), "pre-quantized activations changed the output"
         # CUDA graph at this call's token bound: staging (quantization included) and the kernel
         out = layer.output_buffer
         # eager at the same bound first (cutedsl compiles per bucket before capture)
@@ -336,6 +349,8 @@ def _worker(rank, args):
             )
     layer.destroy()
     alone.destroy()
+    if prequantized is not None:
+        prequantized.destroy()
     dist.destroy_process_group()
 
 
@@ -361,6 +376,8 @@ def _args(**overrides):
         tokens_per_item=None,
         uneven=False,
         fallback="cake",
+        default_knobs=False,
+        epoch_start=None,
     )
     args.update(overrides)
     return argparse.Namespace(**args)
@@ -519,6 +536,207 @@ def test_sm120_nosync_follows_cake_table(cake_transport):
     )
 
 
+def test_sm120_nosync_follows_cake_table_after_create_workspace():
+    """transport=None on a P2P table (cake "all_lsa"): the default workspace can still be
+    configured (create_workspace with knobs) after the layer is built; the nosync kernel takes
+    the table at warmup."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    _run(
+        _args(
+            tokens=[1, 20, 128],
+            transport=None,
+            cake_transport="all_lsa",
+            default_knobs=True,
+        )
+    )
+
+
+@pytest.mark.parametrize("epoch_start", [2**31 - 3, 2**32 - 3], ids=["int32", "uint32"])
+def test_sm120_nosync_epoch_wrap(epoch_start):
+    """The calls cross the epoch's signed (2^31) and unsigned (2^32) wrap: no stale flag passes a
+    wait, every call matches the reference."""
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    _run(_args(tokens=[1, 20, 128], repeats=3, epoch_start=epoch_start))
+
+
+def _bootstrap_one(rank, ep):
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=ep,
+        timeout=datetime.timedelta(minutes=10),
+        device_id=torch.device("cuda", rank),
+    )
+    from flashinfer.moe_ep import BootstrapConfig
+
+    return BootstrapConfig(
+        world_size=ep,
+        rank=rank,
+        device=torch.cuda.current_device(),
+        process_group=dist.group.WORLD,
+    )
+
+
+def _off_reason(build):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        layer = build()
+    reasons = [str(w.message) for w in caught if "nosync kernel is off" in str(w.message)]
+    assert layer.nosync is None and len(reasons) == 1, reasons
+    return layer, reasons[0]
+
+
+def _shared_expert_worker(rank, ep):
+    """cake with its in-kernel FP8 shared expert: the routed experts are zero, so the output is
+    the shared expert alone; small calls must keep it (the nosync kernel stays off)."""
+    from flashinfer.moe_ep import (
+        CakePrequantizedMoEWeightsWithSharedExpert,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        NosyncOptions,
+        Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig,
+    )
+
+    bootstrap = _bootstrap_one(rank, ep)
+    h, ih, experts, topk = 512, 256, 64, 6
+    epr = experts // ep
+    generator = torch.Generator(device="cuda").manual_seed(31 + rank)
+
+    def fp8(n, k):
+        return (torch.randn(n, k, device="cuda", generator=generator) * 0.5).to(
+            torch.float8_e4m3fn
+        )
+
+    def build(nosync):
+        return MoEEpLayer(
+            bootstrap=bootstrap,
+            fleet_params=FleetParams(
+                num_experts=experts, max_tokens_per_rank=128, token_hidden_size=h
+            ),
+            weights=CakePrequantizedMoEWeightsWithSharedExpert(
+                w13=torch.zeros(epr, 2 * ih, h // 2, dtype=torch.uint8, device="cuda").view(
+                    torch.float4_e2m1fn_x2
+                ),
+                w2=torch.zeros(epr, h, ih // 2, dtype=torch.uint8, device="cuda").view(
+                    torch.float4_e2m1fn_x2
+                ),
+                w13_scale=torch.full(
+                    (epr, 2 * ih, h // 32), 127, dtype=torch.uint8, device="cuda"
+                ).view(torch.float8_e8m0fnu),
+                w2_scale=torch.full(
+                    (epr, h, ih // 32), 127, dtype=torch.uint8, device="cuda"
+                ).view(torch.float8_e8m0fnu),
+                shared_w13=shared[0],
+                shared_w2=shared[1],
+                shared_w13_scale=shared[2],
+                shared_w2_scale=shared[3],
+            ),
+            backend=MegaConfig(
+                megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(
+                    intermediate_size=ih,
+                    top_k=topk,
+                    shared_expert="fp8_in_kernel",
+                    transport_table="all_lsa",
+                )
+            ),
+            nosync=NosyncOptions() if nosync else None,
+        )
+
+    shared = (
+        fp8(2 * ih, h),
+        fp8(h, ih),
+        torch.full((2 * ih, h // 32), 124, dtype=torch.uint8, device="cuda").view(
+            torch.float8_e8m0fnu
+        ),
+        torch.full((h, ih // 32), 124, dtype=torch.uint8, device="cuda").view(
+            torch.float8_e8m0fnu
+        ),
+    )
+    layer, reason = _off_reason(lambda: build(True))
+    assert "shared expert" in reason, reason
+    alone = build(False)
+    for m in (1, 20, 128):
+        x = torch.randn(m, h, device="cuda", generator=generator, dtype=torch.bfloat16)
+        idx = torch.randint(0, experts, (m, topk), device="cuda", generator=generator)
+        routing = torch.rand(m, topk, device="cuda", generator=generator)
+        t = MoEEpTensors(hidden_states=x, topk_ids=idx, topk_weights=routing)
+        y = layer.forward(t)
+        y_alone = alone.forward(t)
+        torch.cuda.synchronize()
+        assert not layer.last_call_nosync
+        assert y.abs().amax() > 0, "the shared expert's contribution is missing"
+        assert torch.equal(y, y_alone)
+    if rank == 0:
+        print("PASS sm120 nosync off with cake's shared expert", flush=True)
+    layer.destroy()
+    alone.destroy()
+    dist.destroy_process_group()
+
+
+def test_sm120_nosync_off_with_cake_shared_expert():
+    if not _sm120_gpus(4):
+        pytest.skip("requires 4 SM120 GPUs")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29649")
+    torch.multiprocessing.spawn(_shared_expert_worker, args=(4,), nprocs=4)
+
+
+def _geometry_worker(rank, ep):
+    """A geometry the nosync kernel does not cover (intermediate 64) on a backend that does: the
+    option turns off before transforming the weights, the configured layer stays usable."""
+    from flashinfer.moe_ep import (
+        FleetParams,
+        MegaConfig,
+        MoEEpNosyncLayer,
+        NosyncOptions,
+        PrequantizedMoEWeights,
+        Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    bootstrap = _bootstrap_one(rank, ep)
+    h, ih, experts = 256, 64, 8
+    generator = torch.Generator(device="cuda").manual_seed(rank)
+    raw1, _ = _weights(experts // ep, 2 * ih, h, generator)
+    raw2, _ = _weights(experts // ep, h, ih, generator)
+    base = torch.nn.Identity()  # the configured layer is not exercised here
+    _, reason = _off_reason(
+        lambda: MoEEpNosyncLayer(
+            base,
+            bootstrap,
+            FleetParams(num_experts=experts, max_tokens_per_rank=128, token_hidden_size=h),
+            PrequantizedMoEWeights(
+                w13=raw1[0].view(torch.float4_e2m1fn_x2),
+                w2=raw2[0].view(torch.float4_e2m1fn_x2),
+                w13_scale=raw1[1].view(torch.float8_e8m0fnu),
+                w2_scale=raw2[1].view(torch.float8_e8m0fnu),
+            ),
+            MegaConfig(
+                megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+                    intermediate_size=ih, top_k=2
+                )
+            ),
+            NosyncOptions(),
+        )
+    )
+    assert "intermediate_size" in reason, reason
+    if rank == 0:
+        print("PASS sm120 nosync off for an unsupported geometry", flush=True)
+    dist.destroy_process_group()
+
+
+def test_sm120_nosync_off_for_unsupported_geometry():
+    if not _sm120_gpus(2):
+        pytest.skip("requires 2 SM120 GPUs")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29649")
+    torch.multiprocessing.spawn(_geometry_worker, args=(2,), nprocs=2)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ep", type=int, choices=[2, 4, 8], default=4)
@@ -539,4 +757,6 @@ if __name__ == "__main__":
         "--tokens-per-item", type=int, choices=[8, 16, 24, 32], default=None
     )
     parser.add_argument("--uneven", action="store_true")
+    parser.add_argument("--default-knobs", action="store_true")
+    parser.add_argument("--epoch-start", type=int, default=None)
     _run(parser.parse_args())
