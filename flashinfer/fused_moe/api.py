@@ -3411,6 +3411,18 @@ class BatchInvariantBf16Config:
         return "BatchInvariantBf16Config()"
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space and the two-atom stage follow Prims-TS (the open counterpart of
+# TRTLLM-Gen's MoE GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's MXFP8 decode tactics; the fused
+# requantization of the intermediate in GEMM1's epilogue follows Prims-TS's fused activation and TRTLLM-Gen's block-fp8
+# contract, whose surface this backend mirrors; the dense packing of the expanded rows with the scale factors at the padded atom
+# positions follows TRTLLM-Gen's routed-token layouts; GEMM1 reading the token rows through the routing (the gather form)
+# follows TRTLLM-Gen's in-GEMM row gather and the fp4 backend's gather record; the decode form (no plan launch and no scatter,
+# the GEMM's CTAs taking the routing's ids and building the group tables themselves) follows the Frost low-latency MoE's launch
+# structure; the PDL wait / trigger placement and the launch's tile bound on the persistent grid follow Prims-TS and
+# TRTLLM-Gen; the scatter's placement and the swapped epilogue's warpgroup split are the fp4 backend's; the routing,
+# permutation, combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same
+# bits, placed as those kernels place theirs.
 @dataclass(frozen=True)
 class BatchInvariantFp8BlockConfig:
     """The batch-invariant fp8-block MoE backend: the fp8 formats with block scales under one backend
