@@ -268,6 +268,13 @@ def _fakes(chain: GroupedEpilogueBlock, packing: str = "dense"):
         f["src"] = cute.runtime.make_fake_tensor(
             Int32, (cute.sym_int(32),), (1,), assumed_align=16
         )
+        # the in-kernel plan's ids (slot order) and its dest output
+        f["ids"] = cute.runtime.make_fake_tensor(
+            Int32, (cute.sym_int(32),), (1,), assumed_align=16
+        )
+        f["dest"] = cute.runtime.make_fake_tensor(
+            Int32, (cute.sym_int(32),), (1,), assumed_align=16
+        )
         return f
     sym_r, sym_m, sym_n, sym_k = (
         cute.sym_int(32),
@@ -443,8 +450,9 @@ def swapped_kernel_name(
     gather: bool = False,
     k_block: int = 0,
     sf_src: str = "128x4",
+    plan_in_kernel: bool = False,
 ) -> str:
-    """``swapped_<format>_<chain>_<record>[_gather][_sflin][_kb<K>][_e<W>]``: the swapped record (its weight and token tiles)
+    """``swapped_<format>_<chain>_<record>[_gather][_sflin][_kb<K>][_e<W>][_ikp]``: the swapped record (its weight and token tiles)
     names the object beside the chain; the bf16 gather form (the token box gathered from the unpermuted rows) appends ``_gather``
     (the block-scaled gather record carries its own suffix), the linear scale source ``_sflin``; a block-scaled body's stage of
     ``k_block`` elements of K (the MXFP8 classes' two-atom stage) appends ``_kb<k_block>``; an epilogue over several warpgroups
@@ -456,6 +464,7 @@ def swapped_kernel_name(
         + ("_gather" if gather else "")
         + ("_sflin" if (gather or cfg.gather_a) and sf_src == "linear" else "")
         + (f"_kb{k_block}" if k_block else "")
+        + ("_ikp" if plan_in_kernel else "")
         + (
             f"_e{_swap_epi_wgs(chain, knobs.tile_n)}"
             if _swap_epi_wgs(chain, knobs.tile_n) > 1
@@ -508,6 +517,7 @@ def compile_swapped_fn(
     gather: bool = False,
     k_block: int = 0,
     sf_src: str = "128x4",
+    plan_in_kernel: bool = False,
 ) -> Callable[[], Any]:
     """The zero-argument compile closure of one swapped specialisation: ``kernel(rows3, w3, out2, counts, [alpha, sa, si,]
     grid)`` -- ``rows (R, K, 1)`` the dense permuted rows (``R >= Tk``), ``w (N, K, E)``, ``out (Tk, Nout)``; the gather form
@@ -522,12 +532,36 @@ def compile_swapped_fn(
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
         body = SwappedGroupedGemm(
-            cfg, chain, gather=gather, sf_src=sf_src, k_block=k_block
+            cfg,
+            chain,
+            gather=gather,
+            sf_src=sf_src,
+            k_block=k_block,
+            plan_in_kernel=plan_in_kernel,
         )
         if _is_block_scaled(chain) and cfg.gather_a:
             sfx = f["sfa_lin"] if sf_src == "linear" else f["sfa"]
             if isinstance(chain, (MxChain, Mxfp4Chain)):
-                # the MX chains' gather entries: the fused requantization (the MXFP8 classes) or the plain chain
+                # the MX chains' gather entries: the fused requantization (the MXFP8 classes; with the in-kernel plan the
+                # decode form) or the plain chain
+                if chain.quant and plan_in_kernel:
+                    return cute.compile(
+                        body.block_scaled_quant_gathered_plan,
+                        f["rows"],
+                        sfx,
+                        f["ids"],
+                        Int32(1),
+                        Int32(1),
+                        f["b"],
+                        f["sfb"],
+                        f["out"],
+                        f["out_sf"],
+                        f["counts"],
+                        f["dest"],
+                        grid,
+                        stream_fake,
+                        options="--enable-tvm-ffi",
+                    )
                 if chain.quant:
                     return cute.compile(
                         body.block_scaled_quant_gathered,
@@ -690,6 +724,7 @@ def get_compiled_swapped(
     gather: bool = False,
     k_block: int = 0,
     sf_src: str = "128x4",
+    plan_in_kernel: bool = False,
 ) -> Any:
     """``kernel(rows3, w3, out2, counts, grid)`` (``kernel(rows3, w3, out2, counts, alpha, sa, si, grid)`` for a chain with
     scale operands; ``kernel(rows3, sfa, w3, sfw, out2, [out_sf,] counts, alpha, pts, [aux,] grid)`` for the block-scaled
@@ -705,8 +740,15 @@ def get_compiled_swapped(
     assert sf_src in ("128x4", "linear"), sf_src
     return jit.build_and_load(
         MODULE,
-        swapped_kernel_name(cfg, chain, gather=gather, k_block=k_block, sf_src=sf_src),
-        compile_swapped_fn(cfg, chain, gather, k_block, sf_src),
+        swapped_kernel_name(
+            cfg,
+            chain,
+            gather=gather,
+            k_block=k_block,
+            sf_src=sf_src,
+            plan_in_kernel=plan_in_kernel,
+        ),
+        compile_swapped_fn(cfg, chain, gather, k_block, sf_src, plan_in_kernel),
     )
 
 
