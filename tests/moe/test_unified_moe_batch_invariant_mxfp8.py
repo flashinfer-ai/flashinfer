@@ -549,11 +549,11 @@ def test_mx_classes_run_on_the_unified_bodies():
         assert is_swapped_record(sw, fmt)
         s = SwappedGroupedGemm(sw, plain.at(fmt), k_block=256)
         assert s.operands.block_scaled and s.k_block == 256
-        # the scale-factor warp follows the epilogue warpgroups: the shared epilogue's count at the token tile for the
-        # plain chains, the one warpgroup the fused requantization's own loop is written for
+        # the scale-factor warp follows the epilogue warpgroups (the token tile's count, for the plain chains on the shared
+        # epilogue and for the fused requantization's own loop alike)
         assert s.sf_warp == len(s.epilogue_warps) == 4 * s.epi_wgs
         q = SwappedGroupedGemm(sw, quant.at(fmt))
-        assert q.epi_wgs == 1 and q.sf_warp == 4
+        assert q.epi_wgs == s.epi_wgs and q.sf_warp == s.sf_warp
         assert C.can_implement_grouped_blockscaled(dense, 256, 2048, 8, quant, fmt)
         assert C.can_implement_swapped_blockscaled(sw, 256, 2048, 8, quant, fmt)
         assert not C.can_implement_grouped_blockscaled(dense, 256, 2064, 8, quant, fmt)
@@ -571,12 +571,14 @@ def test_mx_classes_run_on_the_unified_bodies():
         swapped_knobs_mx()[1], plain.at("mxfp8_k64"), k_block=256
     )
     # the plain chain on the shared swapped epilogue: the k-block and the epilogue warpgroups of the 16-token tile
-    assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith("_kb256_e2")
+    assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith(
+        "_kb256_e2"
+    )
     name = C.swapped_kernel_name(
         swapped_knobs_mx()[1], quant.at("mxfp8_k64"), k_block=256
     )
-    # the fused requantization's own loop: one warpgroup, no epilogue suffix
-    assert name.startswith("swapped_mxfp8k64_swiglu_mxfp8_") and name.endswith("_kb256")
+    # the fused requantization's own loop over the same warpgroups
+    assert name.startswith("swapped_mxfp8k64_swiglu_mxfp8_") and name.endswith("_kb256_e2")
     assert C.MODULE == SCATTER_MODULE == "batch_invariant_moe"
     assert "batch_invariant_moe_mxfp8" not in jit.MODULE_ROOTS
     srcs = jit.relative_sources("batch_invariant_moe")

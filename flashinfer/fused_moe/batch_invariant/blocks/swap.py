@@ -118,10 +118,8 @@ EPI_WARPGROUPS_MAX = 4
 def epi_warpgroups(token_tile: int, chain=None) -> int:
     """The swapped epilogue's warpgroups at a token tile: one per ``EPI_SUBTILE_N`` columns, at most ``EPI_WARPGROUPS_MAX``
     (a placement: every output element's chain is computed by one thread from the same accumulator value, in the same fp32
-    sequence, whichever warpgroup owns its subtile). A chain with its own swapped loop (the quantising MX chains' transposed
-    requantization, whose block reduction spans the warpgroup's lanes) runs the one warpgroup its loop is written for."""
-    if chain is not None and chain.swapped_loop() is not None:
-        return 1
+    sequence, whichever warpgroup owns its subtile), for the shared epilogue and for a chain's own swapped loop alike (the
+    quantising MX chains' block reduction spans a warp's lanes, orthogonal to the token columns the warpgroups split)."""
     return max(1, min(EPI_WARPGROUPS_MAX, token_tile // EPI_SUBTILE_N))
 
 
@@ -1165,7 +1163,7 @@ class SwappedGroupedGemm:
                 quant_loop(
                     st,
                     self.chain,
-                    tidx,
+                    tidx % 128,
                     tile_sched,
                     tCtAcc_base,
                     thr_mma,
@@ -1173,12 +1171,17 @@ class SwappedGroupedGemm:
                     mOutSf,
                     Tk,
                     N,
-                    epi_tile,
+                    (wt, tn // self.epi_wgs)
+                    if cutlass.const_expr(self.epi_wgs > 1)
+                    else epi_tile,
                     acc_pipeline,
                     sX,
                     s_off,
                     s_off_pad,
                     wt,
+                    subtile=tidx // 128
+                    if cutlass.const_expr(self.epi_wgs > 1)
+                    else None,
                 )
             else:
                 swapped_epilogue_loop(
@@ -1195,7 +1198,9 @@ class SwappedGroupedGemm:
                     if cutlass.const_expr(self.epi_wgs > 1)
                     else epi_tile,
                     acc_pipeline,
-                    subtile=tidx // 128 if cutlass.const_expr(self.epi_wgs > 1) else None,
+                    subtile=tidx // 128
+                    if cutlass.const_expr(self.epi_wgs > 1)
+                    else None,
                     mAlpha=mAlpha,
                     mSa=mSa,
                     mSi=mSi,
