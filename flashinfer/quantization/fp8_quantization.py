@@ -39,6 +39,7 @@ from ..utils import (
     get_compute_capability,
     register_custom_op,
     register_fake_op,
+    supported_compute_capability,
 )
 from ..tllm_enums import SfLayout
 
@@ -420,6 +421,7 @@ def _mxfp8_input_dtypes(device_type: str, backend: str) -> Tuple[torch.dtype, ..
     return (torch.float16, torch.bfloat16)
 
 
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment):
     """Check the native binding's tensor contract before loading its module."""
     if input.layout != torch.strided or not input.is_contiguous():
@@ -450,6 +452,7 @@ def _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment):
     _check_mxfp8_scale_layout(sf_swizzle_layout)
 
 
+@supported_compute_capability([90, 100, 103, 107, 110, 120, 121])
 def _check_mxfp8_cute_dsl_inputs(input, alignment):
     """Check CuTe inputs without importing its kernels or preparing tensors."""
     assert input.dtype in _mxfp8_input_dtypes("cuda", "cute-dsl"), (
@@ -509,11 +512,6 @@ def _validate_mxfp8_quantize_call(
     else:
         _check_mxfp8_native_inputs(input, sf_swizzle_layout, alignment)
         _check_mxfp8_cuda_capability(input.device)
-
-
-# Keep the native policy open to newer architectures, rather than enumerating
-# today's GPUs. CPU host calls are validated by the complete call checker.
-_check_mxfp8_native_inputs.is_compute_capability_supported = lambda cc: cc >= 100  # type: ignore[attr-defined]
 
 
 @backend_requirement(
@@ -619,9 +617,18 @@ def mxfp8_quantize(
     >>> x = torch.empty((2, 32), dtype=torch.float32)
     >>> mxfp8_quantize.validate_call(x, backend="cuda")
     """
-    sf_swizzle_layout = _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout)
-    _check_mxfp8_backend(input, backend, batch_invariant)
+    sf_vec_size = 32
+
+    if sf_swizzle_layout is None:
+        sf_swizzle_layout = (
+            SfLayout.layout_128x4 if is_sf_swizzled_layout else SfLayout.layout_linear
+        )
     if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "mxfp8_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
         from ..batch_invariant.quantization.mx_api import (
             mxfp8_quantize_batch_invariant,
         )
@@ -630,11 +637,14 @@ def mxfp8_quantize(
             input, sf_swizzle_layout, alignment, enable_pdl
         )
 
+    assert input.shape[-1] % sf_vec_size == 0
+    assert backend in ("auto", "cuda", "cute-dsl"), (
+        f"backend must be 'auto', 'cuda' or 'cute-dsl', got '{backend}'"
+    )
     if backend == "auto":
         backend = "cuda"
 
     if backend == "cute-dsl":
-        _check_mxfp8_scale_layout(sf_swizzle_layout)
         from ..cute_dsl import is_cute_dsl_available
 
         if not is_cute_dsl_available():
@@ -656,26 +666,6 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
-        # The FFI checks CUDA contiguity, rank, dtype and alignment multiples.
-        # Retain what must be checked before its Python preparation or what
-        # the host binding cannot catch; full admission belongs to validate_call.
-        _check_mxfp8_scale_layout(sf_swizzle_layout)
-        if input.device.type == "cpu":
-            if input.layout != torch.strided or not input.is_contiguous():
-                raise ValueError(
-                    "mxfp8_quantize on CPU requires contiguous strided input"
-                )
-            if sf_swizzle_layout == SfLayout.layout_8x4:
-                raise ValueError(
-                    f"{sf_swizzle_layout} is not supported for mxfp8 quantization on CPU."
-                )
-        elif input.device.type == "cuda":
-            if alignment <= 0:
-                raise ValueError("alignment must be positive")
-            if input.shape[-1] == 0:
-                raise ValueError(
-                    "mxfp8_quantize on CUDA requires a nonempty last dimension"
-                )
         _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
