@@ -143,8 +143,8 @@ class ScatterFp4Kernel:
             cute.make_layout((cute.size(mSfp) // 4,)),
         )
         n_groups = pcols // Int32(SF_COL_TILE)
-        nb = B // Int32(
-            self.block * self.elem_bits // 8
+        nb = (
+            B // Int32(self.block * self.elem_bits // 8)
         )  # scale blocks per row (K / block): the linear row's bytes per block at the token element's width
         # this lane's chunks and scale groups of a row: slab c of its phase (static bounds, the tail predicated), and their
         # dynamic counts for the chunks past the bounds

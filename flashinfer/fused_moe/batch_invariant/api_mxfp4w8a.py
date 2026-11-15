@@ -705,7 +705,14 @@ def fused_moe_mxfp4w8a(
         # re-tiled into the swizzled atoms at the padded positions (no per-token scale: placeholders unread)
         wpr = warps_per_row(Tk, H // 16, sm_count_of(dev))
         get_compiled_scatter_fp4(
-            k, wpr, "linear", False, True, BLOCK, elem_bits=8, **scatter_lanes(H, pcols, wpr)
+            k,
+            wpr,
+            "linear",
+            False,
+            True,
+            BLOCK,
+            elem_bits=8,
+            **scatter_lanes(H, pcols, wpr),
         )(
             xq.view(torch.uint8),
             xsf8.reshape(-1),
@@ -780,7 +787,14 @@ def fused_moe_mxfp4w8a(
     # the swizzled atoms); the padding rows are never written (unspecified bytes the MMA reads into rows no tile stores)
     wpr = warps_per_row(T * k, H // 16, sm_count_of(dev))
     get_compiled_scatter_fp4(
-        k, wpr, "linear", False, True, BLOCK, elem_bits=8, **scatter_lanes(H, pcols, wpr)
+        k,
+        wpr,
+        "linear",
+        False,
+        True,
+        BLOCK,
+        elem_bits=8,
+        **scatter_lanes(H, pcols, wpr),
     )(
         xq.view(torch.uint8),
         xsf8.reshape(-1),

@@ -125,9 +125,7 @@ SWAP_XCH_WARPS = 4  # the warps of one epilogue warpgroup of the swapped body: t
 def swap_xch_layout(token_tile: int, epi_warpgroups: int = 1):
     """The swapped body's half-block amax exchange of the gated chain: fp32 per (epilogue warpgroup, buffer, warp, token
     column of the tile)."""
-    return cute.make_layout(
-        (epi_warpgroups, XCH_BUFFERS, SWAP_XCH_WARPS, token_tile)
-    )
+    return cute.make_layout((epi_warpgroups, XCH_BUFFERS, SWAP_XCH_WARPS, token_tile))
 
 
 def swap_xch_bytes(chain, token_tile: int, epi_warpgroups: int = 1) -> int:
@@ -564,7 +562,9 @@ def swapped_epilogue_quant_loop(
     lane = cute.arch.lane_idx()
     warp = (tidx % Int32(128)) // Int32(32)
     partner = warp ^ Int32(1)
-    xw = Int32(0) if cutlass.const_expr(wg is None) else wg  # this warpgroup's exchange buffer and barrier
+    xw = (
+        Int32(0) if cutlass.const_expr(wg is None) else wg
+    )  # this warpgroup's exchange buffer and barrier
     bar = Int32(BAR_EPI_XCH) + xw
     parity = Int32(0)
     acc_state = pipeline.make_pipeline_state(
@@ -623,13 +623,17 @@ def swapped_epilogue_quant_loop(
             if cutlass.const_expr(chain.act in CHEAP_ACTS):
                 full = Boolean(True)
             else:
-                full = (col0 + Int32(span)) <= rows_left  # every token column of the subtile is a live token
+                full = (
+                    col0 + Int32(span)
+                ) <= rows_left  # every token column of the subtile is a live token
             if full:
                 # every token column's chain straight-line (the column chains interleave), its block amax across the lanes
                 # (the gate lanes' leaves ``+0``)
                 for v in cutlass.range_constexpr(nv):
                     yb = twin.elem(
-                        MoeF32, tTR_rAcc[v], gate[v] if cutlass.const_expr(pair) else None
+                        MoeF32,
+                        tTR_rAcc[v],
+                        gate[v] if cutlass.const_expr(pair) else None,
                     )
                     yf = yb.to(Float32)
                     ys[v] = yf
@@ -655,7 +659,9 @@ def swapped_epilogue_quant_loop(
                 for v in cutlass.range_constexpr(nv):
                     if col0 + Int32(cols[v]) < rows_left:
                         yb = twin.elem(
-                            MoeF32, tTR_rAcc[v], gate[v] if cutlass.const_expr(pair) else None
+                            MoeF32,
+                            tTR_rAcc[v],
+                            gate[v] if cutlass.const_expr(pair) else None,
                         )
                         yf = yb.to(Float32)
                         ys[v] = yf
@@ -667,12 +673,16 @@ def swapped_epilogue_quant_loop(
                             leaf = lf
                             for m in (1, 2, 4, 16):
                                 leaf = d.combine(
-                                    fp, leaf, cute.arch.shuffle_sync_bfly(leaf, offset=m)
+                                    fp,
+                                    leaf,
+                                    cute.arch.shuffle_sync_bfly(leaf, offset=m),
                                 )
                         else:
                             for m in (1, 2, 4, 8, 16):
                                 leaf = d.combine(
-                                    fp, leaf, cute.arch.shuffle_sync_bfly(leaf, offset=m)
+                                    fp,
+                                    leaf,
+                                    cute.arch.shuffle_sync_bfly(leaf, offset=m),
                                 )
                         am[v] = leaf
                     else:
