@@ -44,9 +44,12 @@ same build with ``pdl`` set, whose kernel waits for the preceding kernel on
 the stream (``griddepcontrol.wait``) before it reads ``qkv`` and before any
 store, launched with the programmatic-stream-serialization attribute.  A call
 that asks for programmatic dependent launch (``stage_for(...,
-enable_pdl=True)``) takes the twin when :func:`pdl_enabled` admits the problem
-(``PDL_POLICY``); every other call, and every call on SM90, launches the plain
-stage.
+enable_pdl=True)``) takes a twin when :func:`pdl_knobs` admits the problem
+(``PDL_POLICY``): the selected stage's, or for single-KV-head decode with
+fewer than ``hq8_decode_u2_min_clear_ctas`` clearing CTAs of at most
+``hq8_decode_u1_max_clear_units`` units per request the twin of the same stage
+with one clearing unit per warp; every other call, and every call on SM90,
+launches the plain stage.
 
 The program name ``cake_fused_qk_rope_append_<20 hex>`` is the first twenty
 hex digits of the SHA-256 of the compact JSON ``{"build": <build keywords,
@@ -3213,25 +3216,35 @@ STAGE_POLICY: dict[str, Any] = {
 }
 # The suffix of a pdl twin's record name (``stage_name`` of knobs with ``pdl``).
 PDL_SUFFIX = "_pdl"
-# Which calls that ask for programmatic dependent launch take the selected
-# stage's pdl twin; ``pdl_enabled`` is the executable form.  The twin overlaps
-# the kernel's metadata prologue (and, behind a kernel that triggers its
-# dependents early, its launch) with the preceding kernel; the problems the
-# rule keeps plain are those where the twin did not run faster.
+# Which calls that ask for programmatic dependent launch take which pdl twin;
+# ``pdl_knobs`` is the executable form.  The twin overlaps the kernel's metadata
+# prologue (and, behind a kernel that triggers its dependents early, its launch)
+# with the preceding kernel; the problems the rule keeps plain are those where
+# no twin ran faster, and the stage it swaps in is the twin that ran fastest
+# behind the QKV projection.
 PDL_POLICY: dict[str, Any] = {
     "arches": ("sm_100a", "sm_103a"),
     "constants": {
         "hq8_decode_off_requests": {"sm_100a": (512, 547), "sm_103a": (512, 547)},
         "hq64_off_min_rows": 600,
+        "hq8_decode_u2_min_clear_ctas": 1792,
+        "hq8_decode_u1_max_clear_units": 8,
     },
     "rule": (
-        "enable_pdl and arch in arches and not off -> the pdl twin, else the "
-        "plain stage; decode = (num_rows == num_requests); off = (Hq, Hkv) == (64, 8) "
-        "and num_rows >= hq64_off_min_rows, or (Hq, Hkv) == (8, 1) and decode and "
-        "lo <= num_requests <= hi for (lo, hi) = hq8_decode_off_requests[arch], or "
+        "enable_pdl and arch in arches and not off -> the pdl twin of the pdl "
+        "stage, else the plain stage; decode = (num_rows == num_requests); "
+        "units and clear_ctas as in the stage policy. pdl stage = the plain "
+        "stage, except (Hq, Hkv) == (8, 1) decode with clear_units_per_warp=2, "
+        "units <= hq8_decode_u1_max_clear_units and clear_ctas < "
+        "hq8_decode_u2_min_clear_ctas -> the same stage without "
+        "clear_units_per_warp and pt_window (one clearing unit per warp). off = "
+        "(Hq, Hkv) == (64, 8) and num_rows >= hq64_off_min_rows, or (Hq, Hkv) == "
+        "(8, 1) and decode and lo <= num_requests <= hi for (lo, hi) = "
+        "hq8_decode_off_requests[arch] and (the pdl stage is the plain stage or "
+        "num_requests == lo), or "
         "any other head configuration"
     ),
-    "version": "pdl1-2026-10-31",
+    "version": "pdl2-2026-10-31",
 }
 # Logical argument names the public API binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).
@@ -3486,6 +3499,63 @@ def policy_knobs(
     return out
 
 
+def pdl_knobs(
+    num_q_heads: int,
+    num_kv_heads: int,
+    knobs: dict[str, int | bool],
+    *,
+    arch: str,
+    num_rows: int,
+    num_requests: int,
+    page_size: int,
+) -> dict[str, int | bool] | None:
+    """The knobs of the pdl twin a call that asks for programmatic dependent
+    launch takes, given the ``knobs`` the stage policy selected for it
+    (``PDL_POLICY``), or ``None`` when the call launches the plain stage.
+
+    Single-KV-head decode with two clearing units per warp keeps one unit per
+    warp (and no page-table window) below ``hq8_decode_u2_min_clear_ctas``
+    clearing CTAs of at most ``hq8_decode_u1_max_clear_units`` units per request;
+    like the stage policy, the rule derives decode from ``num_rows ==
+    num_requests``.
+    """
+
+    if arch not in PDL_POLICY["arches"]:
+        return None
+    constants = PDL_POLICY["constants"]
+    heads = (int(num_q_heads), int(num_kv_heads))
+    rows, requests = int(num_rows), int(num_requests)
+    if heads == (64, 8):
+        if rows >= int(constants["hq64_off_min_rows"]):
+            return None
+        return {**knobs, "pdl": True}
+    if heads != (8, 1):
+        return None
+    decode = rows == requests
+    plain = knobs
+    if decode and int(knobs.get("clear_units_per_warp", 1)) == 2:
+        units = clear_units_per_request(
+            page_size,
+            num_kv_heads,
+            int(STAGE_POLICY["constants"]["clear_unit_chunks"]),
+        )
+        clear_ctas = _ceil_div(requests * units, WARPS_PER_CTA)
+        if units <= int(constants["hq8_decode_u1_max_clear_units"]) and (
+            clear_ctas < int(constants["hq8_decode_u2_min_clear_ctas"])
+        ):
+            knobs = {
+                key: value
+                for key, value in knobs.items()
+                if key not in ("clear_units_per_warp", "pt_window")
+            }
+    low, high = constants["hq8_decode_off_requests"][arch]
+    if decode and int(low) <= requests <= int(high):
+        # The window's low edge keeps PDL off for the one-unit twin as well.
+        if knobs == plain or requests == int(low):
+            return None
+    return {**knobs, "pdl": True}
+
+
 def pdl_enabled(
     num_q_heads: int,
     num_kv_heads: int,
@@ -3493,27 +3563,37 @@ def pdl_enabled(
     arch: str,
     num_rows: int,
     num_requests: int,
+    page_size: int,
+    num_sms: int,
     is_prefill: bool = False,
+    qk_norm_policy: int | None = None,
 ) -> bool:
-    """Whether a call that asks for programmatic dependent launch takes the
-    selected stage's pdl twin (``PDL_POLICY``).
+    """Whether a call that asks for programmatic dependent launch takes a pdl
+    twin (:func:`pdl_knobs` of the stage the policy selects)."""
 
-    ``is_prefill`` is accepted for the shared signature; like the stage policy,
-    the rule derives decode from ``num_rows == num_requests``.
-    """
-
-    del is_prefill
-    if arch not in PDL_POLICY["arches"]:
-        return False
-    constants = PDL_POLICY["constants"]
-    heads = (int(num_q_heads), int(num_kv_heads))
-    if heads == (64, 8):
-        return int(num_rows) < int(constants["hq64_off_min_rows"])
-    if heads == (8, 1):
-        low, high = constants["hq8_decode_off_requests"][arch]
-        decode = int(num_rows) == int(num_requests)
-        return not (decode and int(low) <= int(num_requests) <= int(high))
-    return False
+    knobs = policy_knobs(
+        num_q_heads,
+        num_kv_heads,
+        arch=arch,
+        num_rows=num_rows,
+        num_requests=num_requests,
+        page_size=page_size,
+        num_sms=num_sms,
+        is_prefill=is_prefill,
+        qk_norm_policy=qk_norm_policy,
+    )
+    return (
+        pdl_knobs(
+            num_q_heads,
+            num_kv_heads,
+            knobs,
+            arch=arch,
+            num_rows=num_rows,
+            num_requests=num_requests,
+            page_size=page_size,
+        )
+        is not None
+    )
 
 
 def stage_name(
@@ -3565,7 +3645,7 @@ def stage_for(
     """The module record the policy selects for one problem on ``arch``; a stage
     the package does not ship for the architecture is an error, never a silent
     fallback.  ``enable_pdl`` asks for the stage's pdl twin, which the call
-    takes when :func:`pdl_enabled` admits the problem."""
+    takes when :func:`pdl_knobs` admits the problem."""
 
     knobs = policy_knobs(
         num_q_heads,
@@ -3578,15 +3658,18 @@ def stage_for(
         is_prefill=is_prefill,
         qk_norm_policy=qk_norm_policy,
     )
-    if enable_pdl and pdl_enabled(
-        num_q_heads,
-        num_kv_heads,
-        arch=arch,
-        num_rows=num_rows,
-        num_requests=num_requests,
-        is_prefill=is_prefill,
-    ):
-        knobs = {**knobs, "pdl": True}
+    if enable_pdl:
+        twin = pdl_knobs(
+            num_q_heads,
+            num_kv_heads,
+            knobs,
+            arch=arch,
+            num_rows=num_rows,
+            num_requests=num_requests,
+            page_size=page_size,
+        )
+        if twin is not None:
+            knobs = twin
     name = stage_name(num_q_heads, num_kv_heads, knobs)
     shipped = stages_for(arch)
     if name not in shipped:
@@ -3711,6 +3794,7 @@ __all__ = [
     "library_name",
     "load",
     "pdl_enabled",
+    "pdl_knobs",
     "policy_knobs",
     "run_module",
     "sm_count",

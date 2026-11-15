@@ -51,6 +51,7 @@ from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
     FmhaConfig,
 )
+from flashinfer.quantization import mxfp8_quantize_bshd
 from flashinfer.utils import is_sm100a_supported
 
 
@@ -919,6 +920,8 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "v",
         "qo_indptr",
         "kv_indptr",
+        "q_scales",
+        "k_scales",
         "variable_window_token_starts",
         "variable_window_token_ends",
         "variable_window_cta_starts",
@@ -1288,8 +1291,10 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed_query=False, mask_type="dense", vc=None),
-        scale_softmax_log2=torch.empty(1),
+        geometry=SimpleNamespace(
+            packed_query=False, mask_type="dense", vc=None, qk_dtype=torch.bfloat16
+        ),
+        softmax_scale=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
         variable_window_padded_starts=None,
@@ -1331,7 +1336,7 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(device=torch.device("cpu"), out_dtype=torch.float32),
-        scale_softmax_log2=torch.empty(1),
+        softmax_scale=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *_: None,
         policy=(),
@@ -3645,6 +3650,155 @@ def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
     _assert_context_correct(output, case.reference)
 
 
+def _mxfp8_plan_options(*, batch_size: int, seq_len: int, num_heads: int, **overrides):
+    """Plan keywords of an MXFP8 Q/K plan: E8M0 Q/K dtype, E4M3 V, bf16 output."""
+    options = dict(
+        device="cuda:0",
+        batch_size=batch_size,
+        max_q_len=seq_len,
+        max_kv_len=seq_len,
+        num_qo_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=_HEAD_DIM,
+        q_dtype=torch.float8_e8m0fnu,
+        k_dtype=torch.float8_e8m0fnu,
+        out_dtype=torch.bfloat16,
+    )
+    options.update(overrides)
+    return options
+
+
+# Every run keyword the MXFP8 tests below pass, checked against the live signature.
+_MXFP8_RUN_KEYWORDS = ("q_scales", "k_scales", "output_scale", "softmax_scale")
+
+
+def _plan_mxfp8(*, batch_size: int, seq_len: int, num_heads: int, **overrides):
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        **_mxfp8_plan_options(
+            batch_size=batch_size, seq_len=seq_len, num_heads=num_heads, **overrides
+        )
+    )
+    return wrapper
+
+
+def test_attention_ts_context_mxfp8_tests_match_wrapper_signatures():
+    """The MXFP8 helpers pass only keywords the wrapper declares, on any host."""
+    plan_parameters = inspect.signature(BatchPrefillTSWrapper.plan).parameters
+    run_parameters = inspect.signature(BatchPrefillTSWrapper.run).parameters
+    options = _mxfp8_plan_options(
+        batch_size=1, seq_len=128, num_heads=2, mask_type="causal", window_left=64
+    )
+    assert set(options) <= set(plan_parameters)
+    assert set(_MXFP8_RUN_KEYWORDS) <= set(run_parameters)
+
+
+def _dequantize_mxfp8(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Undo ``mxfp8_quantize_bshd``: ``[B, S, H, D]`` fp32 from the data and atoms."""
+    batch_size, seq_len, num_heads, head_dim = data.shape
+    tiles = scales.shape[2]
+    # Atom byte 16 * (r % 32) + 4 * (r // 32) + block holds row r of the tile.
+    per_row = (
+        scales.view(batch_size, num_heads, tiles, 32, 4, head_dim // 32)
+        .permute(0, 1, 2, 4, 3, 5)
+        .reshape(batch_size, num_heads, tiles * 128, head_dim // 32)[:, :, :seq_len]
+    )
+    factor = torch.exp2(per_row.float() - 127.0).permute(0, 2, 1, 3)
+    return data.float() * factor.repeat_interleave(32, dim=-1)
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "seq_len", "num_heads", "mask_type"),
+    [
+        (1, 128, 2, "dense"),
+        (1, 128, 2, "causal"),
+        (1, 1024, 4, "dense"),
+        (1, 1024, 4, "causal"),
+        (2, 4176, 4, "dense"),
+    ],
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_qk_accuracy(
+    batch_size, seq_len, num_heads, mask_type
+):
+    """The kernel on MXFP8 Q/K equals fp32 attention on the dequantized operands."""
+    torch.manual_seed(0)
+    shape = (batch_size, seq_len, num_heads, _HEAD_DIM)
+    q, k, v = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    )
+    q8, q_scales = mxfp8_quantize_bshd(q)
+    k8, k_scales = mxfp8_quantize_bshd(k)
+    v_scale = v.abs().amax().float() / 448.0
+    v8 = (v.float() / v_scale).to(_FP8)
+    sm_scale = 1.0 / math.sqrt(_HEAD_DIM)
+    wrapper = _plan_mxfp8(
+        batch_size=batch_size, seq_len=seq_len, num_heads=num_heads, mask_type=mask_type
+    )
+    out = wrapper.run(
+        q8,
+        k8,
+        v8,
+        q_scales=q_scales,
+        k_scales=k_scales,
+        output_scale=v_scale.item(),
+        softmax_scale=sm_scale,
+    )
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        _dequantize_mxfp8(q8, q_scales).transpose(1, 2),
+        _dequantize_mxfp8(k8, k_scales).transpose(1, 2),
+        (v8.float() * v_scale).transpose(1, 2),
+        scale=sm_scale,
+        is_causal=mask_type == "causal",
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), expected, rtol=5e-2, atol=5e-2)
+    # E4M3 P and V bound the error; Gaussian data sits at 2.2e-2 to 2.7e-2.
+    assert ((out.float() - expected).norm() / expected.norm()).item() < 3e-2
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_qk_plan_contract():
+    """MXFP8 Q/K takes E4M3 V, and runs need both scale tensors."""
+    with pytest.raises(NotImplementedError):
+        _plan_mxfp8(batch_size=1, seq_len=128, num_heads=2, v_dtype=torch.bfloat16)
+    wrapper = _plan_mxfp8(batch_size=1, seq_len=128, num_heads=2)
+    q8 = torch.zeros((1, 128, 2, _HEAD_DIM), device="cuda", dtype=_FP8)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        wrapper.run(q8, q8, q8)
+    plain = BatchPrefillTSWrapper()
+    plain.plan(
+        device="cuda:0",
+        batch_size=1,
+        max_q_len=128,
+        max_kv_len=128,
+        num_qo_heads=2,
+        num_kv_heads=2,
+        head_dim=_HEAD_DIM,
+        q_dtype=_FP8,
+        k_dtype=_FP8,
+        out_dtype=torch.bfloat16,
+    )
+    scales = torch.zeros((1, 2, 1, 128, 4), device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        plain.run(q8, q8, q8, q_scales=scales, k_scales=scales)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        plain.run(q8, q8, q8, q_scales=scales)
+    with pytest.raises(ValueError, match="aligned"):
+        wrapper.run(q8, q8, q8, q_scales=scales.flatten()[1:513], k_scales=scales)
+    # The linear [tokens, 4] scales of mxfp8_quantize have the byte count of the
+    # atoms but not their order.
+    with pytest.raises(ValueError, match="scale atoms"):
+        wrapper.run(q8, q8, q8, q_scales=scales.reshape(256, 4), k_scales=scales)
+    with pytest.raises(ValueError, match="q_scales and k_scales"):
+        wrapper.run(q8, q8, q8, q_scales=scales)
+    with pytest.raises(NotImplementedError):
+        _plan_mxfp8(
+            batch_size=1, seq_len=128, num_heads=2, mask_type="causal", window_left=64
+        )
+
+
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.parametrize(
     "k_lengths",
@@ -5617,3 +5771,72 @@ def test_attention_ts_paged_context_compile_reuse_across_batch_and_q_sizes(
     assert first_state is not None
     assert second_state is not None
     assert first_state.compiled is second_state.compiled
+
+
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("paged", (False, True))
+def test_context_global_scales_graph_replay(paged):
+    """A mixed signature keeps a 0-D calibration scale live under capture."""
+    common = dict(
+        q_lengths=(64,),
+        k_lengths=(128,),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        mask_type="dense",
+        seed=17,
+    )
+    if paged:
+        case = _make_paged_context_case(
+            **common,
+            head_dim=128,
+            qk_dtype=torch.bfloat16,
+            v_dtype=_FP8,
+            out_dtype=torch.bfloat16,
+        )
+        reference = case.reference
+        scale = torch.tensor(reference.output_scale, device="cuda")
+        wrapper = BatchPrefillPagedTSWrapper()
+        metadata = _plan_paged_wrapper(
+            wrapper, replace(case, reference=replace(reference, output_scale=scale))
+        )
+        args = (
+            reference.q,
+            case.k_cache,
+            case.v_cache,
+            metadata.qo_indptr,
+            metadata.block_tables,
+            metadata.seq_lens_kv,
+        )
+        name = "output_scale"
+    else:
+        reference = _make_context_case(
+            **common,
+            qkv_dtype=_FP8,
+            packed_query=False,
+            out_dtype=torch.bfloat16,
+        )
+        scale = torch.tensor(reference.softmax_scale, device="cuda")
+        wrapper = BatchPrefillTSWrapper()
+        _plan_wrapper(wrapper, replace(reference, softmax_scale=scale))
+        args = (reference.q, reference.k, reference.v)
+        name = "softmax_scale"
+
+    def check(expected):
+        torch.testing.assert_close(
+            out.float(), _context_reference(expected), atol=2e-2, rtol=5e-2
+        )
+
+    out = wrapper.run(*args)
+    check(reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(*args, out=out, validate=False)
+    changed = getattr(reference, name) * 1.5
+    scale.fill_(changed)
+    graph.replay()
+    check(replace(reference, **{name: changed}))
+    override = torch.tensor([changed * 0.5], device="cuda")
+    wrapper.run(*args, out=out, validate=False, **{name: override})
+    check(replace(reference, **{name: changed * 0.5}))
+    wrapper.run(*args, out=out, validate=False)
+    check(replace(reference, **{name: changed}))

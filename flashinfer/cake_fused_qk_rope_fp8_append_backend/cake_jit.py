@@ -51,9 +51,14 @@ same build with ``pdl`` set, whose kernel waits for the preceding kernel on
 the stream (``griddepcontrol.wait``) before it reads ``qkv`` and before any
 store, launched with the programmatic-stream-serialization attribute.  A call
 that asks for programmatic dependent launch (``stage_for(...,
-enable_pdl=True)``) takes the twin when :func:`pdl_enabled` admits the problem
-(``PDL_POLICY``); every other call, and every call on SM90, launches the plain
-stage.
+enable_pdl=True)``) takes a twin when :func:`pdl_knobs` admits the problem
+(``PDL_POLICY``): the selected stage's, or for the single-KV-head clearing
+class the prefetching stage's; every other call, and every call on SM90,
+launches the plain stage.  The twins of the prefetching stages take one more
+launch argument, ``max_ctas_per_sm`` (:func:`cta_cap`): when it is positive,
+the binding launches at the smallest dynamic shared memory that holds the
+kernel to that many CTAs per SM, so CTAs that start while the preceding
+kernel still holds SMs do not pile up on the SMs it has already left.
 
 The program name ``cake_fused_qk_rope_fp8_append_<20 hex>`` is the first
 twenty hex digits of the SHA-256 of the compact JSON ``{"build": <build
@@ -1705,6 +1710,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "is_prefill"],
             ["parameter", "has_out_kv"],
             ["parameter", "upper_max"],
+            ["parameter", "max_ctas_per_sm"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -1731,7 +1737,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_9d2f3fca109ad1967f88",
         # The pdl twin of ``fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1``:
         # it waits for the preceding kernel before it reads ``qkv`` and before any
-        # store; launched with the PDL attribute.
+        # store; launched with the PDL attribute and, where ``cta_cap`` asks for it,
+        # with the dynamic shared memory that holds the kernel to ``max_ctas_per_sm``
+        # CTAs per SM.
         "launch": {
             "block": (96, 1, 1),
             "cluster": (1, 1, 1),
@@ -1747,6 +1755,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "k_norm_weight": "k_norm_weight",
             "k_scale": "k_scale",
             "key_cache": "key_cache",
+            "max_ctas_per_sm": "max_ctas_per_sm",
             "max_pages_per_request": "max_pages_per_request",
             "max_seqlen": "max_seqlen",
             "max_seqlen_aligned": "max_seqlen_aligned",
@@ -2020,6 +2029,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "is_prefill"],
             ["parameter", "has_out_kv"],
             ["parameter", "upper_max"],
+            ["parameter", "max_ctas_per_sm"],
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -2046,7 +2056,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_371b6c27760107c6590c",
         # The pdl twin of ``fp8_e4m3_early_rt21_page_prefetch1_clear_tie1``: it waits
         # for the preceding kernel before it reads ``qkv`` and before any store;
-        # launched with the PDL attribute.
+        # launched with the PDL attribute and, where ``cta_cap`` asks for it, with the
+        # dynamic shared memory that holds the kernel to ``max_ctas_per_sm`` CTAs per
+        # SM.
         "launch": {
             "block": (96, 1, 1),
             "cluster": (1, 1, 1),
@@ -2062,6 +2074,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "k_norm_weight": "k_norm_weight",
             "k_scale": "k_scale",
             "key_cache": "key_cache",
+            "max_ctas_per_sm": "max_ctas_per_sm",
             "max_pages_per_request": "max_pages_per_request",
             "max_seqlen": "max_seqlen",
             "max_seqlen_aligned": "max_seqlen_aligned",
@@ -2620,25 +2633,49 @@ STAGE_POLICY: dict[str, Any] = {
 }
 # The suffix of a pdl twin's record name (``stage_name`` of knobs with ``pdl``).
 PDL_SUFFIX = "_pdl"
-# Which calls that ask for programmatic dependent launch take the selected
-# stage's pdl twin; ``pdl_enabled`` is the executable form.  The twin overlaps
-# the kernel's metadata prologue (and, behind a kernel that triggers its
-# dependents early, its launch) with the preceding kernel; the problems the
-# rule keeps plain are those where the twin did not run faster.
+# Which calls that ask for programmatic dependent launch take which pdl twin,
+# and the CTA cap of a prefetching twin's launch; ``pdl_knobs`` and ``cta_cap``
+# are the executable form.  The twin overlaps the kernel's metadata prologue
+# (and, behind a kernel that triggers its dependents early, its launch) with the
+# preceding kernel; the problems the rule keeps plain are those where no twin
+# ran faster, and the stage it swaps in is the twin that ran fastest behind the
+# QKV projection.  CTAs that start while the preceding kernel still holds SMs
+# pile up on the SMs it has already left; the cap holds the prefetching kernel
+# to the CTAs per SM its grid needs where that ran faster.
 PDL_POLICY: dict[str, Any] = {
     "arches": ("sm_100a", "sm_103a"),
     "constants": {
         "hq8_decode_off_requests": {"sm_100a": (129, 223), "sm_103a": (187, 223)},
         "hq64_off_min_rows": 240,
+        "gb200_sms": 152,
+        "cap_min_ctas_per_sm": 2,
+        "hq8_decode_cap_min_requests": {
+            "b200": 129,
+            "gb200": 177,
+            "b300": 187,
+            "gb300": 187,
+        },
     },
     "rule": (
-        "enable_pdl and arch in arches and not off -> the pdl twin, else the "
-        "plain stage; decode = (num_rows == num_requests and not is_prefill); off = (Hq, Hkv) == (64, 8) "
-        "and num_rows >= hq64_off_min_rows, or (Hq, Hkv) == (8, 1) and decode and "
-        "lo <= num_requests <= hi for (lo, hi) = hq8_decode_off_requests[arch], or "
-        "any other head configuration"
+        "enable_pdl and arch in arches and not off -> the pdl twin of the pdl "
+        "stage, else the plain stage. pdl card = gb200 (sm_100a and num_sms == "
+        "gb200_sms) else the stage policy's card; decode = (num_rows == "
+        "num_requests and not is_prefill); prefetch_ok as in the stage policy; "
+        "prefetching stage = early_rt2 and page_prefetch. pdl stage = the plain "
+        "stage, except (Hq, Hkv) == (8, 1) with the plain stage clear_heads_per_cta=2, "
+        "zero_store_width=256 or grid_order=3, zero_store_width=256 (the clearing "
+        "class) and (pdl card != gb300 or prefetch_ok) -> early_rt2, "
+        "page_prefetch, clear_tie. off = (Hq, Hkv) == (64, 8) and num_rows >= "
+        "hq64_off_min_rows, or (Hq, Hkv) == (8, 1) and decode and lo <= "
+        "num_requests <= hi for (lo, hi) = hq8_decode_off_requests[arch] and the "
+        "pdl stage is no prefetching stage, or any other head configuration. "
+        "max_ctas_per_sm of a prefetching twin's launch = k = ceil(grid CTAs / "
+        "num_sms) when (Hq, Hkv) == (8, 1), k >= cap_min_ctas_per_sm and (not "
+        "decode or num_requests >= hq8_decode_cap_min_requests[pdl card]), else 0; "
+        "a positive k launches at the smallest dynamic shared memory that holds "
+        "the kernel to k CTAs per SM (none when it already holds at most k)"
     ),
-    "version": "pdl1-2026-10-31",
+    "version": "pdl2-2026-10-31",
 }
 # Logical argument names the public API binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).
@@ -2893,6 +2930,76 @@ def policy_knobs(
     return {}
 
 
+def pdl_card(arch: str, num_sms: int) -> str:
+    """The PDL policy's card: the stage policy's :func:`card`, with ``gb200``
+    for sm_100a with ``gb200_sms`` SMs."""
+
+    if arch == "sm_100a" and int(num_sms) == PDL_POLICY["constants"]["gb200_sms"]:
+        return "gb200"
+    return card(arch, num_sms)
+
+
+def prefetching(knobs: dict[str, int | bool]) -> bool:
+    """Whether a stage is the early request guess with the page-row prefetch:
+    its pdl twin takes the per-call CTA cap (:func:`cta_cap`)."""
+
+    return bool(knobs.get("early_rt2", False)) and bool(
+        knobs.get("page_prefetch", False)
+    )
+
+
+def pdl_knobs(
+    num_q_heads: int,
+    num_kv_heads: int,
+    knobs: dict[str, int | bool],
+    *,
+    arch: str,
+    num_rows: int,
+    num_requests: int,
+    num_sms: int,
+    is_prefill: bool,
+    max_pages_per_request: int,
+    has_out_kv: bool,
+) -> dict[str, int | bool] | None:
+    """The knobs of the pdl twin a call that asks for programmatic dependent
+    launch takes, given the ``knobs`` the stage policy selected for it
+    (``PDL_POLICY``), or ``None`` when the call launches the plain stage.
+
+    The single-KV-head clearing class (two KV heads per clearing CTA, or B200's
+    clear-first order, with 256-bit zero stores) takes the prefetching stage's
+    twin, on GB300 only where the prefetch serves the page row; the twin of a
+    prefetching stage also serves the single-KV-head decode window that keeps
+    every other stage plain.  Decode is ``num_rows == num_requests`` without
+    ``is_prefill``, as in the stage policy.
+    """
+
+    if arch not in PDL_POLICY["arches"]:
+        return None
+    constants = PDL_POLICY["constants"]
+    heads = (int(num_q_heads), int(num_kv_heads))
+    if heads == (64, 8):
+        if int(num_rows) >= int(constants["hq64_off_min_rows"]):
+            return None
+        return {**knobs, "pdl": True}
+    if heads != (8, 1):
+        return None
+    clearing = (
+        {"clear_heads_per_cta": 2, "zero_store_width": 256},
+        {"grid_order": 3, "zero_store_width": 256},
+    )
+    if knobs in clearing:
+        prefetch_ok = int(max_pages_per_request) <= int(
+            STAGE_POLICY["constants"]["prefetch_max_pages"]
+        ) and not bool(has_out_kv)
+        if pdl_card(arch, num_sms) != "gb300" or prefetch_ok:
+            knobs = {"early_rt2": True, "page_prefetch": True, "clear_tie": True}
+    low, high = constants["hq8_decode_off_requests"][arch]
+    decode = int(num_rows) == int(num_requests) and not bool(is_prefill)
+    if decode and int(low) <= int(num_requests) <= int(high) and not prefetching(knobs):
+        return None
+    return {**knobs, "pdl": True}
+
+
 def pdl_enabled(
     num_q_heads: int,
     num_kv_heads: int,
@@ -2900,23 +3007,83 @@ def pdl_enabled(
     arch: str,
     num_rows: int,
     num_requests: int,
+    page_size: int,
+    num_sms: int,
     is_prefill: bool,
+    max_pages_per_request: int,
+    has_out_kv: bool,
+    quant_policy: int | None = None,
 ) -> bool:
-    """Whether a call that asks for programmatic dependent launch takes the
-    selected stage's pdl twin (``PDL_POLICY``); decode is ``num_rows ==
-    num_requests`` without ``is_prefill``, as in the stage policy."""
+    """Whether a call that asks for programmatic dependent launch takes a pdl
+    twin (:func:`pdl_knobs` of the stage the policy selects)."""
 
-    if arch not in PDL_POLICY["arches"]:
-        return False
+    knobs = policy_knobs(
+        num_q_heads,
+        num_kv_heads,
+        arch=arch,
+        num_rows=num_rows,
+        num_requests=num_requests,
+        page_size=page_size,
+        num_sms=num_sms,
+        is_prefill=is_prefill,
+        max_pages_per_request=max_pages_per_request,
+        has_out_kv=has_out_kv,
+        quant_policy=quant_policy,
+    )
+    return (
+        pdl_knobs(
+            num_q_heads,
+            num_kv_heads,
+            knobs,
+            arch=arch,
+            num_rows=num_rows,
+            num_requests=num_requests,
+            num_sms=num_sms,
+            is_prefill=is_prefill,
+            max_pages_per_request=max_pages_per_request,
+            has_out_kv=has_out_kv,
+        )
+        is not None
+    )
+
+
+def cta_cap(
+    record: dict[str, Any],
+    *,
+    arch: str,
+    num_sms: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    num_rows: int,
+    num_requests: int,
+    is_prefill: bool,
+    grid: tuple[int, int, int],
+) -> int:
+    """``max_ctas_per_sm`` of one launch of a prefetching stage's pdl twin
+    (``PDL_POLICY``): the grid's CTAs per SM, rounded up, for a single-KV-head
+    call from ``cap_min_ctas_per_sm`` of them (decode from the card's
+    ``hq8_decode_cap_min_requests``), else 0 (no cap).  The binding launches a
+    positive cap at the smallest dynamic shared memory that holds the kernel to
+    that many CTAs per SM, and plainly when the kernel already holds at most
+    that many.
+    """
+
+    knobs = record["knobs"]
+    if not (knobs.get("pdl", False) and prefetching(knobs)):
+        return 0
+    if (int(num_q_heads), int(num_kv_heads)) != (8, 1):
+        return 0
     constants = PDL_POLICY["constants"]
-    heads = (int(num_q_heads), int(num_kv_heads))
-    if heads == (64, 8):
-        return int(num_rows) < int(constants["hq64_off_min_rows"])
-    if heads == (8, 1):
-        low, high = constants["hq8_decode_off_requests"][arch]
-        decode = int(num_rows) == int(num_requests) and not bool(is_prefill)
-        return not (decode and int(low) <= int(num_requests) <= int(high))
-    return False
+    ctas = int(grid[0]) * int(grid[1]) * int(grid[2])
+    cap = -(-ctas // int(num_sms))
+    if cap < int(constants["cap_min_ctas_per_sm"]):
+        return 0
+    decode = int(num_rows) == int(num_requests) and not bool(is_prefill)
+    if decode:
+        floor = constants["hq8_decode_cap_min_requests"][pdl_card(arch, num_sms)]
+        if int(num_requests) < int(floor):
+            return 0
+    return cap
 
 
 def stage_name(knobs: dict[str, int | bool]) -> str:
@@ -2949,8 +3116,8 @@ def stage_for(
 ) -> str:
     """The module record the policy selects for one problem on ``arch`` with
     ``num_sms`` SMs; a stage the package does not ship for the architecture is an
-    error, never a silent fallback.  ``enable_pdl`` asks for the stage's pdl
-    twin, which the call takes when :func:`pdl_enabled` admits the problem."""
+    error, never a silent fallback.  ``enable_pdl`` asks for a pdl twin, which
+    the call takes when :func:`pdl_knobs` admits the problem."""
 
     knobs = policy_knobs(
         num_q_heads,
@@ -2965,15 +3132,21 @@ def stage_for(
         has_out_kv=has_out_kv,
         quant_policy=quant_policy,
     )
-    if enable_pdl and pdl_enabled(
-        num_q_heads,
-        num_kv_heads,
-        arch=arch,
-        num_rows=num_rows,
-        num_requests=num_requests,
-        is_prefill=is_prefill,
-    ):
-        knobs = {**knobs, "pdl": True}
+    if enable_pdl:
+        twin = pdl_knobs(
+            num_q_heads,
+            num_kv_heads,
+            knobs,
+            arch=arch,
+            num_rows=num_rows,
+            num_requests=num_requests,
+            num_sms=num_sms,
+            is_prefill=is_prefill,
+            max_pages_per_request=max_pages_per_request,
+            has_out_kv=has_out_kv,
+        )
+        if twin is not None:
+            knobs = twin
     name = stage_name(knobs)
     shipped = stages_for(arch)
     if name not in shipped:
@@ -3102,20 +3275,37 @@ def run_module(name: str, values: dict[str, Any], *, device_index: int) -> None:
 
     ``values`` maps the logical names in ``LOGICAL_TENSORS`` / ``LOGICAL_SCALARS``
     to tensors and Python scalars; the grid is :func:`launch_grid` of the record
-    for the problem the scalars describe, and the kernel runs on the current
-    torch stream.
+    for the problem the scalars describe, ``max_ctas_per_sm`` (a prefetching
+    pdl twin's) is :func:`cta_cap` of that launch, and the kernel runs on the
+    current torch stream.
     """
 
     record = MODULES[name]
     logical = record["logical"]
+    num_sms = sm_count(device_index)
     grid = launch_grid(
         record,
         num_rows=int(values["num_rows"]),
         num_requests=int(values["num_requests"]),
         num_kv_heads=int(values["num_kv_heads"]),
-        num_sms=sm_count(device_index),
+        num_sms=num_sms,
     )
     grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
+    if "max_ctas_per_sm" in logical:
+        values = {
+            **values,
+            "max_ctas_per_sm": cta_cap(
+                record,
+                arch=device_arch(device_index),
+                num_sms=num_sms,
+                num_q_heads=int(values["num_q_heads"]),
+                num_kv_heads=int(values["num_kv_heads"]),
+                num_rows=int(values["num_rows"]),
+                num_requests=int(values["num_requests"]),
+                is_prefill=bool(values["is_prefill"]),
+                grid=grid,
+            ),
+        }
     args = []
     for kind, key in record["arg_plan"]:
         if kind == "grid":
@@ -3149,12 +3339,16 @@ __all__ = [
     "THREADS",
     "arch_for_capability",
     "card",
+    "cta_cap",
     "device_arch",
     "launch_grid",
     "library_name",
     "load",
+    "pdl_card",
     "pdl_enabled",
+    "pdl_knobs",
     "policy_knobs",
+    "prefetching",
     "run_module",
     "sm_count",
     "specs_for_arch",

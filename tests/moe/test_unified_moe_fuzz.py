@@ -19,7 +19,7 @@ weight-memory budget so one config never hogs the GPU (parallel-CI-friendly), pl
 larger-end shapes. Large expert counts are reached with small H/I and/or **expert-parallel shards**
 (global>local + ``local_expert_offset``, the real deployment shape), not by filling the GPU.
 
-A shared ledger (``tests/test_helpers/fuzz_ledger.py``) manages tracked
+A shared ledger (``tests/infra/test_helpers/fuzz_ledger.py``) manages tracked
 wrong-answer and crash-class findings. It is currently empty because gh #3547
 and #3957 are fixed and covered by regressions.
 
@@ -246,7 +246,7 @@ from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
 from tests.moe.utils import fp8_per_tensor_global_scale, fp8_per_tensor_requant_hook
 
-from tests.test_helpers.fuzz_ledger import FuzzLedger
+from tests.infra.test_helpers.fuzz_ledger import FuzzLedger
 
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "160"))
 # Debug knob: comma-separated backend_key allowlist (e.g. "cute_dsl") to run a
@@ -304,7 +304,7 @@ _DETERMINISTIC = {
 # absent until repeated-run bitwise calibration is completed on SM90 and
 # SM120/SM121 respectively.
 
-# Known-bug ledger (shared mechanism: tests/test_helpers/fuzz_ledger.py). Two severities:
+# Known-bug ledger (shared mechanism: tests/infra/test_helpers/fuzz_ledger.py). Two severities:
 # quarantine=False entries are RUN with a tolerated wrong answer (xpass flags the fix);
 # quarantine=True entries are xfailed up front and never launch (crash / device-state class --
 # one such config poisons the CUDA context for every later test in the process).

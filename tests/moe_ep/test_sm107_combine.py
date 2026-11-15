@@ -53,6 +53,23 @@ def test_nvfp4_combine_uses_bf16_amax_per_16_values():
     )
 
 
+@pytest.mark.parametrize("combine_dtype", ["nvfp4", "mxfp8"])
+def test_masked_reducer_does_not_clear_combine_buffers(monkeypatch, combine_dtype):
+    ws = _workspace()
+    ws.config = dataclasses.replace(ws.config, combine_dtype=combine_dtype)
+    ws.kernel.masks_invalid_combine_slots = True
+    ws._pre_reduced_activation = torch.full((4, 2, 128), 255, dtype=torch.uint8)
+    ws._pre_reduced_activation_sf = torch.full((4, 2, 16), 255, dtype=torch.uint8)
+    ws.topk_idx.fill_(-1)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda: SimpleNamespace(cuda_stream=11)
+    )
+    weights = (torch.empty(4), torch.empty(4))
+    ws.launch(weights, weights)
+    assert (ws._pre_reduced_activation == 255).all()
+    assert (ws._pre_reduced_activation_sf == 255).all()
+
+
 def test_nvfp4_combine_bulk_path_and_default_cache_fallback(monkeypatch):
     with pytest.raises(ValueError, match="token-back data path"):
         _config(combine_dtype="nvfp4", fc2_use_bulk=True)

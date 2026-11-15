@@ -27,6 +27,7 @@ class CustomCommunicator(CommBackend):
         return dist.get_world_size(self._group)
 
     def allgather(self, data: Any):
+        """Gather sizes as CUDA tensors and metadata as Python objects."""
         device = f"cuda:{torch.cuda.current_device()}"
         if isinstance(data, int):
             local_tensor = torch.tensor([data], device=device, dtype=torch.int32)

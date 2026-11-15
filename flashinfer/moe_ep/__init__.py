@@ -91,6 +91,7 @@ from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
 from .backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl import (
     Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
+from .backends.mega.kernel.sm100.kimi_k3 import Sm100_KimiK3_MegaMoeConfig
 from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
     Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
 )
@@ -139,6 +140,9 @@ from .backends.mega.kernel.sm90.fp8_nvfp4_bf16_pull_cutedsl import (
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
+)
+from .backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+    Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from .backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl import (
     Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -234,6 +238,9 @@ from .core.validation import (
 )
 from .layer import MoEEpLayer
 from .modes import (
+    AutoConfig,
+    MoEEpAutoLayer,
+    MoEEpAutoWorkspace,
     CakeAlltoAllConfig,
     FusedMoeKernelConfig,
     IdentityConfig,
@@ -261,6 +268,9 @@ from .weights import (
 )
 
 __all__ = [
+    "AutoConfig",
+    "MoEEpAutoLayer",
+    "MoEEpAutoWorkspace",
     "AlgoKnob",
     "BootstrapConfig",
     "CakeAlltoAll",
@@ -327,6 +337,7 @@ __all__ = [
     "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm100_KimiK3_MegaMoeConfig",
     "NCCLEPConfig",
     "NVLinkOneSidedAlltoAll",
     "NVLinkOneSidedConfig",
@@ -337,6 +348,7 @@ __all__ = [
     "CakePrequantizedMoEWeightsWithSharedExpert",
     "NvepConfig",
     "QuantType",
+    "Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",

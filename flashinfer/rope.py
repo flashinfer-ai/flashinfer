@@ -44,6 +44,21 @@ def get_rope_module():
     return gen_rope_module().build_and_load()
 
 
+def _set_rope_launch_override(
+    two_heads: Optional[bool] = None, split: Optional[int] = None
+) -> None:
+    """Test-only: force the token-parallel RoPE launch schedule.
+
+    ``two_heads`` picks the one- or two-heads-per-step kernel (``None``: automatic,
+    which is two heads only on SM107). ``split`` forces ``gridDim.y`` and the
+    token-parallel kernel (``None``: automatic). The setting is process-wide;
+    call with no arguments to restore the automatic schedule.
+    """
+    get_rope_module().rope_set_launch_override(
+        -1 if two_heads is None else int(two_heads), 0 if split is None else split
+    )
+
+
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
 def _apply_rope(
     q: torch.Tensor,
@@ -429,6 +444,14 @@ def _fake_apply_llama31_rope_pos_ids(
     pass
 
 
+def _check_rotary_dim(rotary_dim: int, q: torch.Tensor, k: torch.Tensor) -> None:
+    """Reject a ``rotary_dim`` that would read past a q/k head into the next one."""
+    if rotary_dim > min(q.size(-1), k.size(-1)):
+        raise ValueError(
+            f"head_dim (q={q.size(-1)}, k={k.size(-1)}) must be >= rotary_dim ({rotary_dim})"
+        )
+
+
 @flashinfer_api(trace=apply_rope_inplace_trace)
 def apply_rope_inplace(
     q: torch.Tensor,
@@ -464,6 +487,7 @@ def apply_rope_inplace(
     rotary_dim : Optional[int]
         The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
         otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -511,6 +535,7 @@ def apply_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_rope(
         q, k, q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -545,6 +570,7 @@ def apply_rope_pos_ids_inplace(
     rotary_dim : Optional[int]
         The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
         otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -566,6 +592,7 @@ def apply_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_rope_pos_ids(
         q, k, q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -609,6 +636,7 @@ def apply_llama31_rope_inplace(
     rotary_dim : Optional[int]
         The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
         otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -662,6 +690,7 @@ def apply_llama31_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_llama31_rope(
         q,
         k,
@@ -711,6 +740,7 @@ def apply_llama31_rope_pos_ids_inplace(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -738,6 +768,7 @@ def apply_llama31_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_llama31_rope_pos_ids(
         q,
         k,
@@ -789,6 +820,7 @@ def apply_rope(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -845,10 +877,11 @@ def apply_rope(
     --------
     apply_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_rope(
         q,
         k,
@@ -893,6 +926,7 @@ def apply_rope_pos_ids(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -919,10 +953,11 @@ def apply_rope_pos_ids(
     --------
     apply_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_rope_pos_ids(
         q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -967,6 +1002,7 @@ def apply_llama31_rope(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -1029,10 +1065,11 @@ def apply_llama31_rope(
     --------
     apply_llama31_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_llama31_rope(
         q,
         k,
@@ -1083,6 +1120,7 @@ def apply_llama31_rope_pos_ids(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -1114,10 +1152,11 @@ def apply_llama31_rope_pos_ids(
     --------
     apply_llama31_rope_pos_ids_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_llama31_rope_pos_ids(
         q,
         k,
@@ -1597,7 +1636,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
         For GQA/MHA: ``(k_cache, v_cache)`` where:
             - k_cache: ``(max_pages, page_size, num_kv_heads, head_dim)`` or
               ``(max_pages, num_kv_heads, page_size, head_dim)`` depending on layout, in FP8
-            - v_cache: same shape as k_cache, in FP8
+            - v_cache: same page size, head count and head dim as k_cache, in FP8; its
+              strides may differ from k_cache's, e.g. padded rows. Both caches are indexed
+              with the same ``kv_indices``, so each must hold every page listed there.
     kv_indices : torch.Tensor
         Page indices mapping, shape: ``(total_pages,)``. Typically ``torch.arange(total_pages)``.
     kv_indptr : torch.Tensor
@@ -1643,6 +1684,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
     - The ``batch_indices`` and ``positions`` tensors are typically obtained from
       ``flashinfer.get_batch_indices_positions()``.
     - Cache tensors must already be allocated in the target FP8 dtype.
+    - ``rope_dim`` and ``no_rope_dim`` must be multiples of 16, and the rows of every input,
+      Q output and cache tensor must start on 16-byte boundaries (strides that are multiples
+      of 16 bytes); otherwise a ``ValueError`` is raised.
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")

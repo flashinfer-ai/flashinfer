@@ -110,6 +110,26 @@ class RubinVariantBackend(MegaKernelBackend):
             dataclasses.replace(config, kernel_variant="inference")
         )
 
+    def ep_weight_pack(self, weights):
+        return self._fallback.ep_weight_pack(weights)
+
+    def ep_selected_config(self, workspace):
+        return workspace.kernel.ep_selected_config(workspace.workspace)
+
+    def ep_tuning_fallback(self):
+        return self._fallback.ep_tuning_fallback()
+
+    def ep_force_tune(self, workspace, tensors, weights, output):
+        self.stage_inputs(tensors, workspace, quantize_input=True)
+        AutoTuner.get().choose_with_protocol(
+            NAMESPACE,
+            _VariantProtocol(self, workspace, weights, output),
+            force_tune=True,
+        )
+
+    def ep_tuning_contract(self, fleet_params):
+        return self._fallback.ep_tuning_contract(fleet_params)
+
     @classmethod
     def kernel_name(cls):
         return NAMESPACE
@@ -322,12 +342,20 @@ class _VariantProtocol:
         owner: VariantWorkspace,
         weights: TransformedMegaWeights,
         output: torch.Tensor | None,
+        *,
+        candidates: dict[str, list[dict]] | None = None,
+        warmup_iters: int = 3,
+        timed_iters: int = 10,
+        install_winner: bool = True,
     ):
         if owner.tensors is None:
             raise RuntimeError("Stage inputs before selecting a variant")
         self.tensors = owner.tensors
         self.backend, self.owner = backend, owner
         self.weights, self.output = weights, output
+        self.candidates = candidates
+        self.warmup_iters, self.timed_iters = warmup_iters, timed_iters
+        self.install_winner = install_winner
 
     def _contract(self, variants, context):
         from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
@@ -356,6 +384,8 @@ class _VariantProtocol:
         )._contract()
         native["config"].pop("kernel_variant")
         return {
+            # Earlier outer winners could come from another workload's knobs.
+            "search_version": 2,
             "native": native,
             "timing_boundary": "complete_forward_candidates",
             "variants": variants,
@@ -443,9 +473,15 @@ class _VariantProtocol:
             context.disk_cache_enabled,
             _cache_identity(context)[1],
             measurement,
+            self.candidates,
+            self.warmup_iters,
+            self.timed_iters,
+            self.install_winner,
         )
         if any(value != controls for value in backend._gather(controls)):
             raise ValueError("EP ranks disagree on variant tuning controls")
+        if self.warmup_iters < 1 or self.timed_iters < 1:
+            raise ValueError("variant tuning requires positive iteration counts")
         if context.skipped:
             if state.winner is not None:
                 replacement = backend._allocate_workspace(owner.fleet)
@@ -523,6 +559,8 @@ class _VariantProtocol:
                 knobs_to_try = (
                     [{name: getattr(workspace.config, name) for name in KNOB_KEYS}]
                     if contract["native_skipped"]
+                    else self.candidates[variant]
+                    if self.candidates is not None
                     else sm107_candidates(
                         workspace.config.quant_kind,
                         kernel_variant=variant,
@@ -549,8 +587,7 @@ class _VariantProtocol:
                 )
                 candidate_sets = [knobs_to_try]
                 if knob_record is not None:
-                    # Recheck and time cached knobs at this workload. A bucket
-                    # fallback's old score cannot select the overall winner.
+                    # Remeasure each variant's cached winner before comparing them.
                     candidate_sets.insert(
                         0, [knob_cache._knobs_from_json(knob_record["knobs"])]
                     )
@@ -563,6 +600,8 @@ class _VariantProtocol:
                             workspace,
                             num_tokens=self.tensors.num_tokens,
                             candidates=choices,
+                            warmup_iters=self.warmup_iters,
+                            timed_iters=self.timed_iters,
                             process_group=group,
                             measurement=measurement,
                             make_trial=execution.make_trial,
@@ -585,8 +624,7 @@ class _VariantProtocol:
                         else {}
                     )
                     knob_record["profiling_policy"] = measurement
-                # Preserve a reused record's original capacity, live count and
-                # score; measuring one cached choice is not a new knob search.
+                # Remeasuring one cached choice does not replace its search score.
                 inner_records.append(knob_record)
                 candidates.append(
                     {
@@ -611,7 +649,8 @@ class _VariantProtocol:
 
         record = deepcopy(record)
         record["knobs"] = knob_cache._knobs_from_json(record["knobs"])
-        self._install(record)
+        if self.install_winner:
+            self._install(record)
         error = None
         if backend.ep_rank == 0:
             try:
@@ -637,11 +676,12 @@ class _VariantProtocol:
         errors = backend._gather(error)
         if any(errors):
             raise RuntimeError(f"Variant result publication failed: {errors}")
-        state.record_selection(
-            record,
-            _cache_identity(context),
-            _identity(context) if context.tuning_enabled else None,
-        )
+        if self.install_winner:
+            state.record_selection(
+                record,
+                _cache_identity(context),
+                _identity(context) if context.tuning_enabled else None,
+            )
         return TuningResult(
             record,
             cache_hit=cache_hit,

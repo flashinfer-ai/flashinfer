@@ -1084,7 +1084,7 @@ class BlockSparseAttentionWrapper:
             self._vsa_v_scale = v_scale
             return
 
-        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        # ---- VSA SM120 blk64 backend (persistent Cake program) --------------------
         if self._backend == "vsa_sm120_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
@@ -1122,8 +1122,15 @@ class BlockSparseAttentionWrapper:
 
             MB = M // R
             NB = N // C
-            # sm120 handles GQA natively via gqa_ratio; index is per QO head.
+            # The persistent Cake program reads each QO head's row of the
+            # selection (GQA heads map to their KV head in the kernel).
             H = num_qo_heads
+            from . import cake_vsa_sm120  # noqa: PLC0415
+
+            num_sms = torch.cuda.get_device_properties(
+                self.device
+            ).multi_processor_count
+            group_size = num_qo_heads // num_kv_heads
 
             if block_mask is not None:
                 if block_mask.shape != (H, MB, NB):
@@ -1131,8 +1138,8 @@ class BlockSparseAttentionWrapper:
                         f"block_mask must have shape (num_qo_heads={H}, MB={MB}, NB={NB}), "
                         f"got {tuple(block_mask.shape)}"
                     )
-                self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
-                    block_mask, self.device, non_blocking
+                self._vsa_sm120_plan = cake_vsa_sm120.plan_block_mask(
+                    block_mask, group_size, num_sms, self.device
                 )
             else:
                 if indptr is None or indices is None:
@@ -1140,8 +1147,8 @@ class BlockSparseAttentionWrapper:
                         "vsa_sm120_blk64 backend requires either block_mask or "
                         "(indptr, indices) to be provided."
                     )
-                self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
-                    indptr, indices, MB, NB, H, self.device, non_blocking
+                self._vsa_sm120_plan = cake_vsa_sm120.plan_bsr(
+                    indptr, indices, MB, H, NB, group_size, num_sms, self.device
                 )
 
             self.M = M
@@ -1529,19 +1536,15 @@ class BlockSparseAttentionWrapper:
                 self._vsa_sage_fp8_block_sparse_num,
             )
 
-        # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------
+        # ---- VSA SM120 blk64 backend (persistent Cake program) --------------------
         if self._backend == "vsa_sm120_blk64":
-            from flashinfer.cute_dsl.sparse.bsa_attn_sm120 import (
-                bsa_attn_sm120_blk64_fwd,
-            )  # noqa: PLC0415
+            from . import cake_vsa_sm120  # noqa: PLC0415
 
-            return _vsa_run_core(
-                bsa_attn_sm120_blk64_fwd,
+            return cake_vsa_sm120.run(
+                self._vsa_sm120_plan,
                 q,
                 k,
                 v,
-                self._vsa_q2k_index,
-                self._vsa_q2k_num,
                 self._sm_scale,
                 out,
                 lse,
@@ -2292,16 +2295,18 @@ class VariableBlockSparseAttentionWrapper:
 
 
 def _qsa_auto_backend(device: torch.device) -> str:
-    """The route ``backend="auto"`` takes for an NVFP4 cache: ``"cake"`` on a compute capability
-    the Cake package exports a library for (``cake_jit.ARCH_BY_CAPABILITY``: 8.x, 9.0, 10.0, 10.3,
-    10.7 and 12.0, capability-exact); ``"default"`` anywhere else, so the reference implementation
-    reports the device the way it always has (a 12.1 device included, until the package ships for
-    it)."""
+    """The route ``backend="auto"`` takes for an NVFP4 cache: ``"default"`` on compute capability
+    8.x and 9.0; ``"cake"`` on any other capability the Cake package exports a library for
+    (``cake_jit.ARCH_BY_CAPABILITY``: 10.0, 10.3, 10.7 and 12.0, capability-exact); ``"default"``
+    anywhere else, so the reference implementation reports the device the way it always has (a
+    12.1 device included, until the package ships for it)."""
     if device.type != "cuda":
+        return "default"
+    capability = get_compute_capability(device)
+    if capability[0] in (8, 9):
         return "default"
     from .experimental.cake_qsa_nvfp4.cake_jit import arch_for_capability
 
-    capability = get_compute_capability(device)
     return "cake" if arch_for_capability(capability) is not None else "default"
 
 
@@ -2358,11 +2363,12 @@ def qsa_sparse_paged_attention(
         NVFP4 only: E4M3 block scales ``[num_blocks, page_size, num_kv_heads, 16]``, one per 16
         dims.
     backend : str
-        ``"auto"`` (the default) runs NVFP4 on the Cake kernels of
-        :mod:`flashinfer.experimental.cake_qsa_nvfp4` on every compute capability the
-        package exports a library for (8.x, 9.0 and 12.0 on the ``mma.sync`` programs; 10.0,
-        10.3 and 10.7 on the tcgen05 programs; the table is capability-exact, so 12.1 is
-        not included), and on the reference implementation anywhere else, which then
+        ``"auto"`` (the default) runs NVFP4 on the reference implementation on compute
+        capability 8.x and 9.0, on the Cake kernels of
+        :mod:`flashinfer.experimental.cake_qsa_nvfp4` on the other capabilities the
+        package exports a library for (12.0 on the ``mma.sync`` programs; 10.0, 10.3 and
+        10.7 on the tcgen05 programs; the table is capability-exact, so 12.1 is not
+        included), and on the reference implementation anywhere else, which then
         reports the unsupported device; FP8 and BF16 always run on the reference
         implementation. ``"cake"`` selects
         the Cake kernels (the same contract, their own split and merge plan) and

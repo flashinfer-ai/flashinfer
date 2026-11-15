@@ -10,6 +10,7 @@ import shlex
 import sys
 import time
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -37,6 +38,7 @@ from scripts.test_sharding.runner import (
     visible_devices,
 )
 from scripts.test_sharding.planner import capacity_metrics
+from scripts.test_sharding.resource_monitor import monitor_from_env
 from scripts.test_sharding.state import (
     AttemptSettings,
     RunnerStateError,
@@ -390,6 +392,7 @@ def _shell_settings(argv: list[str]) -> int:
             raise ValueError("SAMPLE_OFFSET must be in [0, SAMPLE_RATE)")
         _pytest_command_prefix()
         _env_positive_float("MEMORY_MONITOR_INTERVAL", 2)
+        _env_positive_float("RESOURCE_MONITOR_INTERVAL", 5)
     except (RunnerStateError, ValueError) as error:
         parser.error(str(error))
     print(operation)
@@ -570,7 +573,18 @@ def main(argv: list[str] | None = None) -> int:
             started_at=operation_started_at,
             limit_seconds=getattr(args, "deadline_seconds", 0),
         )
-        result = _execute_command(args, operation_started_at)
+        monitor = (
+            monitor_from_env(args.junit_dir)
+            if args.command in {"run", "plan"}
+            else None
+        )
+        try:
+            with monitor if monitor is not None else nullcontext():
+                result = _execute_command(args, operation_started_at)
+        finally:
+            if monitor is not None:
+                os.environ.pop("FLASHINFER_RESOURCE_SNAPSHOT", None)
+                os.environ.pop("FLASHINFER_RESOURCE_MONITOR_PID", None)
     except CollectionTimeoutError as error:
         pending = "unknown" if error.pending_nodes is None else str(error.pending_nodes)
         deadline_fields = (

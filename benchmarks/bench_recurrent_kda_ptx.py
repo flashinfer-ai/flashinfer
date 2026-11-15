@@ -1,3 +1,4 @@
+# Copyright 2026 Co-developed by KDA (Kernel Design Agents)
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -110,7 +111,22 @@ def check(got, want):
     )
 
 
+def _driver_version():
+    """Return the NVIDIA driver version, or None if it cannot be queried."""
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    lines = output.strip().splitlines()
+    return lines[0].strip() if lines else None
+
+
 def main():
+    """Validate six INT21 workloads and report paired cold-L2 GPU timings."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--flash-kda-source-dir", required=True, type=Path)
     parser.add_argument("--output", type=Path)
@@ -146,7 +162,7 @@ def main():
     os.environ["FLA_TILELANG"] = "0"
     from fla.ops.kda import chunk_kda
 
-    from flashinfer.kda_kernels.ptx.static_runtime import SHIMS, _ptxas
+    from flashinfer.kda_kernels.ptx.static_runtime import SHIMS, _image_kind, _ptxas
     import flashinfer.kda_prefill_ptx as public_adapter
 
     report = {
@@ -156,7 +172,9 @@ def main():
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "tvm_ffi": importlib.metadata.version("apache-tvm-ffi"),
-        "ptxas": _ptxas()[1],
+        "ptxas": _ptxas()[1] if _image_kind() == "assembled_cubin" else None,
+        "ptx_image_kind": _image_kind(),
+        "nvidia_driver_version": _driver_version(),
         "ptx_manifest_sha256": hashlib.sha256(
             (SHIMS / "manifest.json").read_bytes()
         ).hexdigest(),

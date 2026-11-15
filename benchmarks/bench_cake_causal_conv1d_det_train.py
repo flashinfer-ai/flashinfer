@@ -81,8 +81,8 @@ from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace,
     is_cake_causal_conv1d_det_train_supported,
 )
-from flashinfer.cake_causal_conv1d_det_train_backend import BWD_GRID_MULTS
-from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train import BWD_GRID_MULTS
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
 WIDTH = 4
@@ -428,7 +428,10 @@ def _partial_rows(
     if bwd_grid_mult == 1:
         return layout["rows"]
     _, _, n_ch_tiles = loader.channel_split(
-        channels, geometry=record["grid_rule"]["geometry"], role=record["role"]
+        channels,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+        route=loader.record_route(record, loader.device_arch(device_index)),
     )
     return loader.partial_rows(int(layout["grid"]) * bwd_grid_mult, n_ch_tiles)
 

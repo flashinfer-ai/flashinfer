@@ -64,18 +64,28 @@ _KEEP_ALIVE: list[object] = []
 
 
 def _make_weights(
-    num_experts: int, seed: int, device: torch.device
+    num_experts: int, seed: int, device: torch.device, escape_rate: float = 0.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gaussian expert weights; ``escape_rate`` > 0 scales the first element of
+    that fraction of the 32-element row chunks by 2**-20, so those chunks escape
+    the WCX code (escape-heavy compressed copies)."""
     generator = torch.Generator(device="cpu").manual_seed(seed)
     w13 = (
         torch.randn(num_experts, 2 * INTERMEDIATE, HIDDEN, generator=generator)
         * HIDDEN**-0.5
-    ).to(device=device, dtype=torch.bfloat16)
+    )
     w2 = (
         torch.randn(num_experts, HIDDEN, INTERMEDIATE, generator=generator)
         * INTERMEDIATE**-0.5
-    ).to(device=device, dtype=torch.bfloat16)
-    return w13, w2
+    )
+    if escape_rate > 0:
+        for w in (w13, w2):
+            mask = torch.rand(w[..., ::32].shape, generator=generator) < escape_rate
+            w[..., ::32] *= torch.where(mask, 2.0**-20, 1.0)
+    return (
+        w13.to(device=device, dtype=torch.bfloat16),
+        w2.to(device=device, dtype=torch.bfloat16),
+    )
 
 
 def _make_inputs(
@@ -151,6 +161,7 @@ def _build_layer(
     compact_form: int | None = None,
     publish_form: int | None = None,
     top_k: int = TOP_K,
+    escape_rate: float = 0.0,
     **dispatch_kwargs,
 ):
     from flashinfer.moe_ep import (
@@ -163,7 +174,7 @@ def _build_layer(
     )
 
     total_experts = LOCAL_EXPERTS * world_size
-    w13, w2 = _make_weights(total_experts, seed, device)
+    w13, w2 = _make_weights(total_experts, seed, device, escape_rate=escape_rate)
     local_start = rank * LOCAL_EXPERTS
     local_end = local_start + LOCAL_EXPERTS
     process_group = None
@@ -410,6 +421,7 @@ def test_ep1_round_switch_defaults(monkeypatch) -> None:
     assert runner.direct_place is False
     assert runner.direct_place_min_tokens == 513
     assert runner.wcx_max_tokens == 0  # WCX is opt-in
+    assert runner.wcx_window is None
     x, ids, weights = _make_inputs(37, LOCAL_EXPERTS, 59, device)
     output = _forward(layer, x, ids, weights)
     torch.cuda.synchronize()
@@ -838,6 +850,8 @@ def test_ep1_wcx_window_bitwise(
 def test_ep1_wcx_default_off(monkeypatch) -> None:
     """wcx_max_tokens 0 (the default): no compressed copies, no WCX module, only the
     bf16 GEMM pairs; a layer without the early-start pair cannot enable WCX."""
+    import warnings
+
     from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_runner
 
     for name in ROUND_SWITCH_ENVS:
@@ -864,12 +878,24 @@ def test_ep1_wcx_default_off(monkeypatch) -> None:
     finally:
         runner.gemm = spy._gemm
     assert runner.wcx_rounds == 0
-    # WCX rides on the early-start pair: with it off the runner resolves WCX off too
-    layer2, _, _ = _build_layer(
-        1, 0, device, token_capacity=43, wcx_max_tokens=128, fc2_early_max_tokens=0
-    )
+    # WCX rides on the early-start pair: with it off the runner resolves WCX off too,
+    # and the layer encodes no WCX copies (config field, then the environment)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        layer2, _, _ = _build_layer(
+            1, 0, device, token_capacity=43, wcx_max_tokens=128, fc2_early_max_tokens=0
+        )
+    assert not [w for w in caught if "WCX" in str(w.message)], caught
     runner2 = _warm_runner(layer2, device)
     assert runner2.wcx_max_tokens == 0
+    assert _layer_weights(layer2).wcx is None
+    assert getattr(runner2.gemm, "_wcx", None) is None
+    monkeypatch.setenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV, "0")
+    layer4, _, _ = _build_layer(1, 0, device, token_capacity=51, wcx_max_tokens=128)
+    runner4 = _warm_runner(layer4, device)
+    assert runner4.wcx_max_tokens == 0
+    assert _layer_weights(layer4).wcx is None
+    monkeypatch.delenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV)
     # the environment fallback enables it (and is part of the pool key's resolved value)
     monkeypatch.setenv(cake_runner.WCX_MAX_TOKENS_ENV, "64")
     layer3, _, _ = _build_layer(1, 0, device, token_capacity=45)
@@ -877,6 +903,42 @@ def test_ep1_wcx_default_off(monkeypatch) -> None:
     assert runner3.wcx_max_tokens == 64
     assert _layer_weights(layer3).wcx is not None
     assert runner3.wcx_rounds == 1  # the warm-up round (1 token)
+
+
+def test_wcx_resolves_on_conditions(monkeypatch) -> None:
+    """WCX copies are needed only when the runner resolves WCX on: wcx_max_tokens
+    > 0, an effective fc2_early_max_tokens > 0 (argument, else the environment)
+    and an early-start geometry (CPU only)."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import cake_runner
+
+    monkeypatch.delenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV, raising=False)
+    monkeypatch.delenv("FLASHINFER_SM90_CAKE_BF16_DEV_LAUNCHER", raising=False)
+    base = dict(
+        wcx_max_tokens=128,
+        fc2_early_max_tokens=None,
+        num_local_experts=LOCAL_EXPERTS,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+    )
+    assert cake_runner.wcx_resolves_on(**base)
+    for change in (
+        {"wcx_max_tokens": 0},
+        {"fc2_early_max_tokens": 0},
+        {"num_local_experts": 1024},
+        {"hidden_size": 128},
+        {"intermediate_size": 128},
+    ):
+        assert not cake_runner.wcx_resolves_on(**{**base, **change}), change
+    monkeypatch.setenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV, "0")
+    assert not cake_runner.wcx_resolves_on(**base)
+    assert cake_runner.wcx_resolves_on(**{**base, "fc2_early_max_tokens": 16})
+    # with WCX off it reads neither the FC2 setting nor the development launcher
+    monkeypatch.setenv(cake_runner.FC2_EARLY_MAX_TOKENS_ENV, "not-an-int")
+    monkeypatch.setenv(
+        "FLASHINFER_SM90_CAKE_BF16_DEV_LAUNCHER", "flashinfer_no_such_module"
+    )
+    assert not cake_runner.wcx_resolves_on(**{**base, "wcx_max_tokens": 0})
+    assert not cake_runner.wcx_resolves_on(**{**base, "hidden_size": 128})
 
 
 @requires_sm90
@@ -938,6 +1000,243 @@ def test_ep1_wcx_encode_fallback() -> None:
         warnings.simplefilter("always")
         out = cw.encode_sm90_cake_wcx(cw.make_sm90_cake_bf16_weights(g13, g2))
     assert out.wcx is None and cw.wcx_fallback_layers() == before + 2
+
+
+# Shipped WCX windows above the decode window (runner WCX_WINDOWS).
+WCX_SHIPPED_WINDOWS = {
+    (7168, 2048, 256, 8, 2): (128, 1024),
+    (7168, 3072, 384, 6, 8): (128, 512),
+    (4096, 2048, 256, 6, 8): (128, 512),
+}
+
+
+def test_ep1_wcx_windows_table() -> None:
+    """The shipped WCX windows start at or above the decode-window limit, do not
+    overlap the shape's FC2 early-start window, and the round predicate switches
+    exactly at each window's bounds (host-only check)."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    assert cake_runner.WCX_WINDOWS == WCX_SHIPPED_WINDOWS
+    for key, (lo, hi) in cake_runner.WCX_WINDOWS.items():
+        assert cake_runner.WCX_MAX_TOKENS_LIMIT <= lo < hi, (key, lo, hi)
+        assert cake_runner.wcx_window_for(*key) == (lo, hi)
+        win = (lo, hi)
+        assert not cake_runner.wcx_round(lo, win), key
+        assert cake_runner.wcx_round(lo + 1, win), key
+        assert cake_runner.wcx_round(hi, win), key
+        assert not cake_runner.wcx_round(hi + 1, win), key
+        assert not cake_runner.wcx_round(0, win), key
+        assert not cake_runner.wcx_round(lo + 1, None), key
+        early = cake_runner.FC2_EARLY_WINDOWS.get(key)
+        assert early is None or early[1] <= lo or hi <= early[0], (key, early)
+        for other in (
+            (key[0], key[1], key[2], key[3], key[4] * 2),
+            (key[0], key[1], key[2], key[3] + 1, key[4]),
+        ):
+            expected = cake_runner.WCX_WINDOWS.get(other)
+            assert cake_runner.wcx_window_for(*other) == expected
+
+
+# A test-shape WCX window (lo, hi] above the decode window (runner WCX_WINDOWS
+# lists only measured model shapes) and round sizes around it: several 128-row
+# m-tiles per expert at 512 / 1024 tokens (hot routing: all on one expert).
+WCX_TEST_WINDOW = (128, 1024)
+WCX_WINDOW_TOKENS = (1, 128, 129, 512, 1024, 1025)
+
+
+@requires_sm90
+@pytest.mark.parametrize(
+    "clamp, mode, wire, escape_rate",
+    [
+        (clamp, mode, wire, 0.0)
+        for clamp in (None, 0.75)
+        for mode in ("random", "hot", "masked")
+        for wire in WIRES
+    ]
+    + [(None, mode, "prereduced", 0.25) for mode in ("random", "hot", "masked")],
+)
+def test_ep1_wcx_shape_window_bitwise(
+    clamp: float | None, mode: str, wire: str, escape_rate: float, monkeypatch
+) -> None:
+    """Rounds in the pipe shape's WCX window (lo, hi] read the compressed weights
+    through the swap-AB early-start pair (also with escape-heavy copies and several
+    m-tiles per expert) and write the same bytes as a layer with WCX off; rounds
+    above the window keep the bf16 pair; a CUDA graph of a window round replays
+    bitwise with new routing."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    monkeypatch.setitem(
+        cake_runner.WCX_WINDOWS,
+        (HIDDEN, INTERMEDIATE, LOCAL_EXPERTS, TOP_K, 1),
+        WCX_TEST_WINDOW,
+    )
+    device = torch.device("cuda", 0)
+    # a token capacity no other test uses: the pooled runner resolves its window at build
+    capacity = 1031
+    ref, w13, w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        token_capacity=capacity,
+        clamp_limit=clamp,
+        wcx_max_tokens=0,
+        escape_rate=escape_rate,
+    )
+    layer, _w13, _w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        token_capacity=capacity,
+        clamp_limit=clamp,
+        wcx_max_tokens=128,
+        fc2_early_max_tokens=128,
+        escape_rate=escape_rate,
+    )
+    assert _warm_runner(ref, device).wcx_window is None  # WCX off: no window
+    runner = _warm_runner(layer, device)
+    assert runner.wcx_window == WCX_TEST_WINDOW
+    assert runner.fc2_early_window is None  # no FC2 early window for this shape
+    packed = _layer_weights(layer)
+    assert packed.wcx is not None
+    if escape_rate:
+        assert min(packed.wcx.slots13, packed.wcx.slots2) >= 96, packed.wcx
+    lo, hi = WCX_TEST_WINDOW
+    spy = _WcxSpy(runner.gemm)
+    runner.gemm = spy
+    try:
+        for num_tokens in (0,) + WCX_WINDOW_TOKENS:
+            x, ids, weights = _make_inputs(
+                num_tokens, LOCAL_EXPERTS, 211 + num_tokens, device, mode=mode
+            )
+            spy.calls.clear()
+            rounds = runner.wcx_rounds
+            output = _forward(layer, x, ids, weights).clone()
+            reference = _forward(ref, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            if 0 < num_tokens <= hi:
+                assert spy.calls == [("fc1_wcx", True), ("fc2_wcx", True)], (
+                    num_tokens,
+                    spy.calls,
+                )
+                assert runner.wcx_rounds == rounds + 1
+            elif num_tokens:
+                assert spy.calls == [("fc1", False), ("fc2", False)], (
+                    num_tokens,
+                    spy.calls,
+                )
+                assert runner.wcx_rounds == rounds
+            else:
+                assert not any(e for _, e in spy.calls), spy.calls
+            assert torch.equal(output, reference), f"T={num_tokens}"
+            if num_tokens:
+                _check(
+                    output,
+                    x,
+                    ids,
+                    weights,
+                    w13,
+                    w2,
+                    clamp=clamp,
+                    label=f" ep1 {wire} {mode} clamp {clamp} esc {escape_rate} T={num_tokens} wcx window",
+                )
+        # graph of a window round, replayed with new routing / activations
+        inputs = [
+            _make_inputs(512, LOCAL_EXPERTS, 223 + i, device, mode=mode)
+            for i in range(2)
+        ]
+        static = [t.clone() for t in inputs[0]]
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            _forward(layer, *static)
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+        spy.calls.clear()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = _forward(layer, *static)
+        assert spy.calls == [("fc1_wcx", True), ("fc2_wcx", True)], spy.calls
+        for x, ids, weights in inputs:
+            for dst, src in zip(static, (x, ids, weights), strict=True):
+                dst.copy_(src)
+            for _ in range(3):
+                graph.replay()
+            torch.cuda.synchronize()
+            reference = _forward(ref, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            assert torch.equal(static_output, reference)
+    finally:
+        runner.gemm = spy._gemm
+
+
+@requires_sm90
+def test_ep1_wcx_shape_window_fallback_layer(monkeypatch) -> None:
+    """A layer whose weights fell back to bf16 (no WCX copies) keeps its bf16 path in
+    the rounds of the shape's WCX window: the regular pair, no WCX round."""
+    import warnings
+
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_weights as cw,
+    )
+
+    monkeypatch.setitem(
+        cake_runner.WCX_WINDOWS,
+        (HIDDEN, INTERMEDIATE, LOCAL_EXPERTS, TOP_K, 1),
+        WCX_TEST_WINDOW,
+    )
+    monkeypatch.setattr(cw, "wcx_supported_geometry", lambda *_: False)
+    device = torch.device("cuda", 0)
+    capacity = 1033
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        layer, w13, w2 = _build_layer(
+            1,
+            0,
+            device,
+            token_capacity=capacity,
+            wcx_max_tokens=128,
+            fc2_early_max_tokens=128,
+        )
+        runner = _warm_runner(layer, device)
+    assert _layer_weights(layer).wcx is None
+    assert runner.wcx_window == WCX_TEST_WINDOW
+    spy = _WcxSpy(runner.gemm)
+    runner.gemm = spy
+    try:
+        for num_tokens in (16, 129, 512, 1024):
+            x, ids, weights = _make_inputs(
+                num_tokens, LOCAL_EXPERTS, 229 + num_tokens, device
+            )
+            spy.calls.clear()
+            rounds = runner.wcx_rounds
+            output = _forward(layer, x, ids, weights)
+            torch.cuda.synchronize()
+            early = num_tokens <= 128
+            assert spy.calls == [("fc1", early), ("fc2", early)], (
+                num_tokens,
+                spy.calls,
+            )
+            assert runner.wcx_rounds == rounds
+            _check(
+                output,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep1 wcx window fallback layer T={num_tokens}",
+            )
+    finally:
+        runner.gemm = spy._gemm
 
 
 class _DispatchSpy:
@@ -2964,6 +3263,121 @@ def test_ep_wcx_straddle_bitwise(wire: str, mode: str) -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         static_output = _forward(layer, *static)
+    dist.barrier()
+    for index, (x, ids, weights) in enumerate(inputs):
+        for dst, src in zip(static, (x, ids, weights), strict=True):
+            dst.copy_(src)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(static_output, eager[index]), f"graph[{index}]"
+        dist.barrier()
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "masked"])
+def test_ep_wcx_window_straddle_bitwise(mode: str, monkeypatch) -> None:
+    """Rounds in the shape's WCX window (lo, hi] are rank-local: in one round some
+    ranks read the compressed weights through the swap-AB early-start pair (512 /
+    1024 tokens: several m-tiles per expert), others the decode window or the bf16
+    pairs; every layer stays bitwise equal to a layer with WCX off, also under a
+    CUDA graph of a window round replayed with new routing."""
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    monkeypatch.setitem(
+        cake_runner.WCX_WINDOWS,
+        (HIDDEN, INTERMEDIATE, total_experts, TOP_K, world_size),
+        WCX_TEST_WINDOW,
+    )
+    lo, hi = WCX_TEST_WINDOW
+    capacity = 1037
+    ref, w13, w2 = _build_layer(
+        world_size, rank, device, token_capacity=capacity, wcx_max_tokens=0
+    )
+    layer, _w13, _w2 = _build_layer(
+        world_size,
+        rank,
+        device,
+        token_capacity=capacity,
+        wcx_max_tokens=128,
+        fc2_early_max_tokens=128,
+    )
+    runner = _warm_runner(layer, device)
+    assert runner.wcx_window == WCX_TEST_WINDOW
+    plans = (
+        lambda r: 1024,
+        lambda r: 512 + r,
+        lambda r: 129 if r % 2 == 0 else 128,
+        lambda r: 1025 if r == 0 else 1024 - r,
+        lambda r: 0 if r == 0 else 640,
+        lambda r: 64 + r,
+    )
+    for index, plan in enumerate(plans):
+        num_tokens = plan(rank)
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            241 + 11 * index + rank,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        rounds = runner.wcx_rounds
+        reference = _forward(ref, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        output = _forward(layer, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        assert runner.wcx_rounds == rounds + int(0 < num_tokens <= hi)
+        assert torch.equal(output, reference), f"round {index} T={num_tokens}"
+        if num_tokens:
+            _check(
+                output,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep{world_size} rank{rank} {mode} round {index} T={num_tokens} wcx window",
+            )
+    # CUDA graph of a window round on every rank, replayed with new routing
+    inputs = [
+        _make_inputs(
+            512,
+            total_experts,
+            263 + 10 * index + rank,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        for index in range(2)
+    ]
+    eager = []
+    for x, ids, weights in inputs:
+        eager.append(_forward(ref, x, ids, weights).clone())
+        torch.cuda.synchronize()
+    static = [t.clone() for t in inputs[0]]
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        _forward(layer, *static)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    dist.barrier()
+    rounds = runner.wcx_rounds
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output = _forward(layer, *static)
+    assert runner.wcx_rounds == rounds + 1  # the captured round is a WCX round
     dist.barrier()
     for index, (x, ids, weights) in enumerate(inputs):
         for dst, src in zip(static, (x, ids, weights), strict=True):

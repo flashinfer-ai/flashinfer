@@ -1167,19 +1167,57 @@ def test_tinygemm2_tcgen05_windows(
 
     monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: capability)
     monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 148)
+    # The routes do not depend on the toolkit: take the CUDA 13.4 side of the
+    # sm_107a check, and clear the cached enable check around the case.
+    monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: True)
     monkeypatch.delenv("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05", raising=False)
     input = torch.empty(batch_size, input_features, dtype=torch.bfloat16)
     weight = torch.empty(output_features, input_features, dtype=torch.bfloat16)
     out = torch.empty(batch_size, output_features, dtype=torch.bfloat16)
-    program = routergemm._tinygemm2_tcgen05_program(
-        input, weight, out, has_bias, use_pdl
-    )
+    enabled = routergemm._tinygemm2_tcgen05_enabled
+    enabled.cache_clear()
+    try:
+        program = routergemm._tinygemm2_tcgen05_program(
+            input, weight, out, has_bias, use_pdl
+        )
+    finally:
+        enabled.cache_clear()
     expected = (
         None
         if tile is None
         else tile + ("" if has_bias else "_NOBIAS") + ("_PDL" if use_pdl else "")
     )
     assert program == expected
+
+
+def test_tinygemm2_tcgen05_sm107_needs_cuda_13_4(monkeypatch):
+    """On SM107 the generated programs serve a call only with CUDA 13.4 or later;
+    older toolkits keep the reference kernel."""
+    import flashinfer.gemm.routergemm as routergemm
+
+    monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: (10, 7))
+    monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 212)
+    input = torch.empty(9, 2048, dtype=torch.bfloat16)
+    weight = torch.empty(4224, 2048, dtype=torch.bfloat16)
+    out = torch.empty(9, 4224, dtype=torch.bfloat16)
+    # The enable check is cached per (escape hatch, capability): clear it around
+    # each patched toolkit version and after the test.
+    enabled = routergemm._tinygemm2_tcgen05_enabled
+    try:
+        monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: True)
+        enabled.cache_clear()
+        assert (
+            routergemm._tinygemm2_tcgen05_program(input, weight, out, False, False)
+            == "PACKED_NOBIAS"
+        )
+        monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: False)
+        enabled.cache_clear()
+        assert (
+            routergemm._tinygemm2_tcgen05_program(input, weight, out, False, False)
+            is None
+        )
+    finally:
+        enabled.cache_clear()
 
 
 def test_tinygemm2_tcgen05_disabled_and_unaligned(monkeypatch):

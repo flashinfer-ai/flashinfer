@@ -87,7 +87,9 @@ def _matching_kernels(
 ):
     first, second = [], []
     for root in roots:
-        for kernel in runtime.discover(root, quantized_output=quantized_output):
+        for kernel in runtime.discover(
+            root, quantized_output=quantized_output, include_gather=True
+        ):
             n, k = (intermediate, hidden) if kernel.fc1 else (hidden, intermediate)
             dims = dict(s=rows, n=n, k=k, experts=experts, groups=experts)
             if kernel.arch != arch or not can_implement(kernel, dims):
@@ -115,6 +117,7 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
         experts,
         topk,
         activation_name(activation),
+        common.cluster_capacities(device),
     )
 
 
@@ -131,6 +134,7 @@ def _selected_kernels_cached(
     experts,
     topk,
     name,
+    cluster_capacities=(),
 ):
     # Admission and packing share metadata only; per-call validation stays outside.
     profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
@@ -160,6 +164,7 @@ def _selected_kernels_cached(
         experts=experts,
         topk=topk,
         sm_count=sm_count,
+        cluster_capacities=cluster_capacities,
     )
 
 
@@ -176,13 +181,17 @@ def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
     return fma.tactic(activation_name(activation))
 
 
-def _capture_selection(roots, arch, sm_count, activation):
+def _capture_selection(roots, arch, sm_count, activation, cluster_capacities=()):
     name = activation_name(activation)
-    normal = seal_kernels(kernel for root in roots for kernel in runtime.discover(root))
+    normal = seal_kernels(
+        kernel
+        for root in roots
+        for kernel in runtime.discover(root, include_gather=True)
+    )
     fused = seal_kernels(
         kernel
         for root in roots
-        for kernel in runtime.discover(root, quantized_output=True)
+        for kernel in runtime.discover(root, quantized_output=True, include_gather=True)
     )
     select_fma, validate_fma_sources = capture_fma_selection(fma, name, arch)
     return SelectionSnapshot(
@@ -194,6 +203,7 @@ def _capture_selection(roots, arch, sm_count, activation):
             arch,
             name,
             sm_count,
+            cluster_capacities=cluster_capacities,
         ),
         select_fma,
         validate_fma_sources,
@@ -228,7 +238,10 @@ class _Plans:
             executor_key = (hidden, intermediate, experts, topk, swizzled, key)
             plan = executor_cache.get(executor_key)
             if plan is None:
-                plan = module.make_runner(
+                factory = (
+                    module.make_gather_runner if a.gathers_input else module.make_runner
+                )
+                plan = factory(
                     [common._load_kernel(a, device)],
                     [common._load_kernel(b, device)],
                     hidden,
@@ -301,7 +314,7 @@ class _Plans:
 
 
 def prepared_stage_inputs(inputs, *, tactic=None):
-    """Expose grouped inputs from a prepared call for offline stage measurements.
+    """Expose FC1/FC2 inputs from a prepared call for offline stage measurements.
 
     Executes routing, FC1, and intermediate quantization. Fused plans omit
     the BF16 ``fc1_output`` view. The
@@ -324,13 +337,35 @@ def prepared_stage_inputs(inputs, *, tactic=None):
         size = torch.empty((), dtype=dtype).element_size()
         return raw[start : start + count * size].view(dtype).view(shape)
 
+    index_offset, pitch = plan["gather_layout"](t)
     result = {
-        "fc1_tokens": view(xp, s * h, torch.float8_e4m3fn, (s, h)),
-        "fc1_token_scales": view(sp1, sf_rows * h // 32, torch.uint8, (-1,)),
+        "fc1_tokens": (
+            inputs[1]
+            if index_offset >= 0
+            else view(xp, s * h, torch.float8_e4m3fn, (s, h))
+        ),
+        "fc1_token_scales": (
+            None
+            if index_offset >= 0
+            else view(sp1, sf_rows * h // 32, torch.uint8, (-1,))
+        ),
         "fc2_tokens": view(qp, s * i, torch.float8_e4m3fn, (s, i)),
         "fc2_token_scales": view(sp2, sf_rows * i // 32, torch.uint8, (-1,)),
         "offsets": view(op, e + 1, torch.int32, (e + 1,)),
     }
+
+    if index_offset >= 0:
+        result["fc1_tokens"] = inputs[1]
+        # GATHER accepts row-major scales with a 16-byte-aligned row pitch.
+        # A linear input with that pitch is borrowed without a GPU copy.
+        input_sf = inputs[8]
+        if input_sf.ndim == 2 and pitch == h // 32:
+            result["fc1_token_scales"] = input_sf
+        else:
+            result["fc1_token_scales"] = view(sp1, t * pitch, torch.uint8, (t, pitch))[
+                :, : h // 32
+            ]
+        result["token_index"] = view(index_offset, s, torch.int32, (s,))
 
     if mp >= 0:
         result["fc1_output"] = view(mp, s * i, torch.bfloat16, (s, i))
@@ -384,7 +419,9 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(FrostRunnerMixin, MoERunner):
                     (kernel.source_path, kernel.source_sha256)
                     for root in _artifact_roots()
                     for quantized in (False, True)
-                    for kernel in runtime.discover(root, quantized_output=quantized)
+                    for kernel in runtime.discover(
+                        root, quantized_output=quantized, include_gather=True
+                    )
                     if kernel.arch == arch
                     and (not kernel.fc1 or kernel.activation == name)
                 }
@@ -409,7 +446,11 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(FrostRunnerMixin, MoERunner):
             require_assembler=get_compute_capability(device) == (10, 7),
             refresh_artifacts=runtime.clear_artifact_cache,
             capture_selection=lambda roots, arch, sm_count: _capture_selection(
-                roots, arch, sm_count, activation
+                roots,
+                arch,
+                sm_count,
+                activation,
+                common.cluster_capacities(device),
             ),
             build_plan=lambda shape, metadata, workspace_pool, executor_cache: _Plans(
                 *shape,

@@ -142,16 +142,18 @@ def test_norm_program_follows_target_and_destinations(
     from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
 
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    staged_from_m = {1: 32640, 2: 16736, 8: 6096}
     for P in (None, 1, 2, 4, 8):
         for out_format in ("nvfp4", "e4m3"):
-            for M in (None, 1, 4824, 6095, 6096, 13744):
+            for M in (None, 1, 4824, 6095, 6096, 13744, 16735, 16736, 32639, 32640):
                 norm, _ = ops.minimax_h3_nvfp4_programs(
                     torch.device("cuda"), out_format, P, M
                 )
                 staged = (target, P) == ("sm_103a", 4) or (
-                    (out_format, target, P) == ("nvfp4", "sm_103a", 8)
+                    (out_format, target) == ("nvfp4", "sm_103a")
+                    and P in staged_from_m
                     and M is not None
-                    and M >= 6096
+                    and staged_from_m[P] <= M
                 )
                 assert norm is (programs.NORM_V5 if staged else programs.NORM)
                 assert target in norm.targets
@@ -174,13 +176,17 @@ def test_gemm_program_follows_target_format_and_destinations(
         ("e4m3", "sm_100a"): programs.FUSED_E4M3_EPI8,
         ("e4m3", "sm_103a"): programs.FUSED_E4M3_K96,
     }
+    ring_from_m = {1: 32640, 2: 16736}
     for P in (None, 1, 2, 4, 8):
         for out_format in ("nvfp4", "e4m3"):
-            for M in (None, 1, 4824, 13744):
+            for M in (None, 1, 4824, 13744, 16735, 16736, 32639, 32640):
                 _, gemm = ops.minimax_h3_nvfp4_programs(
                     torch.device("cuda"), out_format, P, M
                 )
-                ring = (out_format, target, P) == ("nvfp4", "sm_103a", 8)
+                ring = (out_format, target) == ("nvfp4", "sm_103a") and (
+                    P == 8
+                    or (P in ring_from_m and M is not None and ring_from_m[P] <= M)
+                )
                 expected = (
                     programs.FUSED_PACK_K96_SFR5
                     if ring
@@ -1024,13 +1030,15 @@ def _e4m3_cast(values: torch.Tensor, out_scale: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize(
-    ("M", "P"), [(129, 4), (300, 4), (2048, 4), (6096, 8), (7368, 8)]
+    ("M", "P"),
+    [(129, 4), (300, 4), (2048, 4), (6096, 8), (7368, 8), (16736, 2), (32640, 1)],
 )
 def test_staged_norm_program_writes_the_norm_bytes(monkeypatch, M: int, P: int) -> None:
     """On ``sm_103a`` the staged norm program (``NORM_V5``) writes the bytes of ``NORM``.
 
     It serves four destinations and, for ``out_format="nvfp4"``, eight
-    destinations from ``M = 6096`` tokens on.  Reference: the ``NORM`` program
+    destinations from ``M = 6096``, two destinations from ``M = 16736`` and one
+    destination from ``M = 32640`` tokens on.  Reference: the ``NORM`` program
     on the same inputs, every output and debug buffer compared byte for byte.
     The (129, 4) and (300, 4) inputs put E2M1 rounding ties in the activation:
     the kernels form the encode factor with approximate reciprocals and the
@@ -1104,15 +1112,30 @@ def test_staged_norm_program_writes_the_norm_bytes(monkeypatch, M: int, P: int) 
         )
 
 
-@pytest.mark.parametrize("M", [1, 129, 4184, 4824, 8300, 13744])
-def test_sf_ring_gemm_program_writes_the_k96_bytes(monkeypatch, M: int) -> None:
-    """On ``sm_103a`` the eight-destination NVFP4 GEMM program
-    (``FUSED_PACK_K96_SFR5``) writes the bytes of ``FUSED_PACK_K96``.
+@pytest.mark.parametrize(
+    ("M", "P"),
+    [
+        (1, 8),
+        (129, 8),
+        (4184, 8),
+        (4824, 8),
+        (8300, 8),
+        (13744, 8),
+        (16736, 2),
+        (32640, 1),
+    ],
+)
+def test_sf_ring_gemm_program_writes_the_k96_bytes(monkeypatch, M: int, P: int) -> None:
+    """On ``sm_103a`` the NVFP4 GEMM program that keeps the block scales on a
+    ring of their own (``FUSED_PACK_K96_SFR5``) writes the bytes of
+    ``FUSED_PACK_K96``.
 
     Reference: the ``FUSED_PACK_K96`` program on the same inputs, every output
-    and debug buffer (debug output on) compared byte for byte; ``M`` covers a
-    partial row tile, one past a tile, the routed token counts and a count past
-    one 64-tile raster group.
+    and debug buffer (debug output on) compared byte for byte.  For eight
+    destinations ``M`` covers a partial row tile, one past a tile, the routed
+    token counts and a count past one 64-tile raster group; two destinations
+    and one destination take the program from ``M = 16736`` and ``M = 32640``
+    tokens on.
     """
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("requires SM103a")
@@ -1120,7 +1143,6 @@ def test_sf_ring_gemm_program_writes_the_k96_bytes(monkeypatch, M: int) -> None:
     from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
     from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
 
-    P = 8
     device = torch.device("cuda")
 
     def run() -> dict:
@@ -1174,6 +1196,7 @@ def test_sf_ring_gemm_program_writes_the_k96_bytes(monkeypatch, M: int) -> None:
     ring = run()
     with monkeypatch.context() as patch:
         patch.setattr(ops, "_GEMM_PROGRAMS_BY_P", {})
+        patch.setattr(ops, "_GEMM_PROGRAMS_FROM_M", {})
         assert ops.minimax_h3_nvfp4_programs(device, "nvfp4", P, M)[1] is (
             programs.FUSED_PACK_K96
         )
@@ -1191,16 +1214,23 @@ def test_sf_ring_gemm_program_writes_the_k96_bytes(monkeypatch, M: int) -> None:
         (6096, 8, "nvfp4", True, True),
         (6096, 8, "e4m3", False, False),
         (6096, 4, "nvfp4", True, False),
+        (16735, 2, "nvfp4", False, False),
+        (16736, 2, "nvfp4", True, True),
+        (16736, 2, "e4m3", False, False),
+        (32639, 1, "nvfp4", False, False),
+        (32640, 1, "nvfp4", True, True),
     ],
 )
 def test_prepared_operation_launches_the_routed_programs(
     M: int, P: int, out_format: str, staged: bool, ring: bool
 ) -> None:
     """A prepared operation on ``sm_103a`` launches the programs of its route:
-    ``NORM_V5`` for four destinations and, for eight destinations of
-    ``out_format="nvfp4"``, from ``M = 6096`` tokens on, ``NORM`` otherwise;
-    ``FUSED_PACK_K96_SFR5`` for eight destinations of ``out_format="nvfp4"``,
-    the format's K=96 program otherwise.
+    ``NORM_V5`` for four destinations and, for ``out_format="nvfp4"``, for
+    eight destinations from ``M = 6096``, two destinations from ``M = 16736``
+    and one destination from ``M = 32640`` tokens on, ``NORM`` otherwise;
+    ``FUSED_PACK_K96_SFR5`` for ``out_format="nvfp4"`` with eight destinations,
+    with two destinations from ``M = 16736`` and with one destination from
+    ``M = 32640`` tokens on, the format's K=96 program otherwise.
 
     The kernels of one run are read from the CUDA profiler trace, so the check
     covers the programs the operation prepared, not only the routing table.  A
@@ -1211,7 +1241,7 @@ def test_prepared_operation_launches_the_routed_programs(
         pytest.skip("requires SM103a")
     pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
     from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
-    from tests.test_helpers.cake_profiler import cuda_kernel_names
+    from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
     operation, values = _prepare_zero_smoke(-1, M=M, P=P, out_format=out_format)
     operation.run(**values)

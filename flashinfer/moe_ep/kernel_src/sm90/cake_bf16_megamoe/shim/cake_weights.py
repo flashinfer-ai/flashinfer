@@ -66,12 +66,13 @@ class Sm90CakeWcxWeights:
     """Lossless compressed (WCX codec version 2) copies of one layer's expert weights.
 
     Read by the swap-AB decode GEMMs of the early-start pair (runner
-    ``wcx_max_tokens``): ``w13c`` is ``[E, 2I / 256, H / 64, stage_bytes13]``
-    uint8 (the encoded gate/up-interleaved ``w13``), ``w2c`` is
-    ``[E, H / 256, I / 64, stage_bytes2]`` uint8.  ``slots13`` / ``slots2`` are
-    the escape slots per stage of each tensor (at most ``WCX2_S_CAP``).  The
-    kernels decode the operands back to the bf16 weights bit for bit, so a
-    round computes the same products in the same order as the bf16 pair.
+    ``wcx_max_tokens`` and ``WCX_WINDOWS``): ``w13c`` is
+    ``[E, 2I / 256, H / 64, stage_bytes13]`` uint8 (the encoded gate/up-interleaved
+    ``w13``), ``w2c`` is ``[E, H / 256, I / 64, stage_bytes2]`` uint8.  ``slots13`` /
+    ``slots2`` are the escape slots per stage of each tensor (at most
+    ``WCX2_S_CAP``).  The kernels decode the operands back to the bf16 weights bit
+    for bit, so a round computes the same products in the same order as the bf16
+    pair.
     """
 
     w13c: torch.Tensor

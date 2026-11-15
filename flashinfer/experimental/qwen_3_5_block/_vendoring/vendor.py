@@ -18,10 +18,11 @@ read live when a cuDNN Frontend install is importable, else from the recorded co
   alone (they resolve inside the vendored tree).  No regular expression touches anything that is not an import statement; the
   ONE string-literal site that importlib resolves at runtime (``engines/manifest.py``'s ``("cudnn._gemm_validate", ...)``
   family references) is rewritten by locating ``ast.Constant`` nodes in that one named file.
-* Six declared PATCHES (P0-P3, P5-P6, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
+* Seven declared PATCHES (P0-P3, P5-P7, listed in VENDOR.md): P0-P2, exact text, make the copy importable without the nanobind
   extension; P3, context-anchored regular expressions that name nothing themselves, rewords the comment / docstring lines that
   named internal hosts or internal file paths; P5-P6, exact text, prune what the vendored subset does not carry (the lazy
-  exports outside the closure, the sm120 arch family); everything else is byte-identical to the commit, SPDX headers included.
+  exports outside the closure, the sm120 arch family); P7 uses FlashInfer's Portalocker-backed descriptor adapter. Everything else is byte-identical
+  to the commit, SPDX headers included.
   P4 (the cache-write launcher's one-device check, carried ahead of its upstream landing) was RETIRED at the d8b0a7ed5
   re-vendor: the same hunk is in the pinned commit, so ``kernels/cache_write.py`` is byte-faithful again; a patch id is never
   reused.
@@ -79,7 +80,21 @@ GEN_HEADER = "# Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0
 #     through CUDNN_FRONTEND_GEMM_ARCH_FAMILY is refused by name, never a ModuleNotFoundError at the facade import), and
 #     kernel_registry.py drops the sm120 template registrations (their template files are not vendored, and their block-quant
 #     gate imported the sm120 compiler).
+# P7: use FlashInfer's Portalocker-backed descriptor adapter for persistent compilation,
+#     retaining the upstream best-effort error handling and stable lock paths.
 PATCHES = {
+    "frost/compiled_cache.py": [
+        (
+            "P7",
+            "        import fcntl\n",
+            "        import _flashinfer_filelock as filelock\n",
+        ),
+        (
+            "P7",
+            "        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)\n",
+            "        filelock.lock(lock_file.fileno())\n",
+        ),
+    ],
     "gated_attention_block/__init__.py": [
         (
             "P0",
@@ -787,6 +802,7 @@ def gen_vendor_md(
         "serve it for every device (the `compiler` / `epilogue_codegen` facades become the sm100 modules on any GPU and on no GPU; a `CUDNN_FRONTEND_GEMM_ARCH_FAMILY` pin on another "
         "family is refused by name, never a `ModuleNotFoundError` at the facade import), and `TEMPLATES` drops the sm120 registrations (their template files are not vendored, and their "
         "block-quant gate imported the sm120 compiler) |\n",
+        "| P7 | `frost/compiled_cache.py` (2) | use FlashInfer's Portalocker-backed descriptor adapter; preserve stable lock paths, release on close and upstream best-effort error handling |\n",
         '| string sites | `engines/manifest.py`, `gated_attention_block/qsa_topk.py` | the `("cudnn._gemm_validate", "validate_graph")`-style module references importlib resolves at runtime are rewritten to the vendored path (the same rule renames that module\'s logger, `logging.getLogger("cudnn.engines.manifest")`, into the vendored namespace), and the decode top-k facade\'s `QSA_TOPK_DECODE_KERNEL_MODULE` constant (the kernel module it imports by name at check_support) |\n',
         "## Excluded (not in the closure; a lazily imported excluded path raises `ModuleNotFoundError` at the call site, never silently)\n",
         "".join(f"- `{k}`: {v}\n" for k, v in closure["excluded"].items()),

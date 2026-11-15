@@ -74,7 +74,8 @@ def preprocess_mega_weights(
 
     Accepts canonical bf16 weights only: this backend never quantizes, so a
     pre-quantized :class:`MoEWeightPack` (with scales) is rejected.  With
-    ``wcx`` (the layer's ``wcx_max_tokens`` > 0) the lossless compressed (WCX)
+    ``wcx`` (the layer's runner resolves WCX on: ``wcx_max_tokens`` > 0 with the
+    FC2 early-start pair, see ``wcx_resolves_on``) the lossless compressed (WCX)
     copies used by the decode rounds are attached as well (dual format); a
     layer that cannot be encoded keeps the bf16 path only.
     """

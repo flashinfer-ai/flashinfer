@@ -6,10 +6,11 @@ the contract of vLLM's Triton `qsa_sparse_paged_attention` (same arguments, same
 and adds the NVFP4 block scales `k_sf` / `v_sf`.
 
 It is reached only through that experimental API: with `backend="default"`, with the
-entry's default `backend="auto"` for FP8 and BF16 caches, and for NVFP4 on a device
-the Cake package has no library for, where it reports the unsupported device (on every
-capability Cake exports, SM80 through SM90 included, `"auto"` runs NVFP4 on the Cake
-kernels of `flashinfer.experimental.cake_qsa_nvfp4`).
+entry's default `backend="auto"` for every cache on SM80 through SM90 and for FP8 and
+BF16 caches anywhere, and for NVFP4 on a device the Cake package has no library for,
+where it reports the unsupported device (on the capabilities above SM90 that Cake
+exports, `"auto"` runs NVFP4 on the Cake kernels of
+`flashinfer.experimental.cake_qsa_nvfp4`).
 No AOT packaging. The experimental
 lifecycle is owned by `@lesj0610`; the tracking issue is linked from the pull request
 that adds the package.

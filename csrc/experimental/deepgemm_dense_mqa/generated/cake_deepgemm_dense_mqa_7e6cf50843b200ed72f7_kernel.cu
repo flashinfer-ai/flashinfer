@@ -690,9 +690,9 @@ kernel_cake_deepgemm_dense_mqa_7e6cf50843b200ed72f7(const __grid_constant__ CUte
                             tma_2d_gmem2smem(smem_kv_addr + load_kv_stage * 33792, (&KV), 0, kv_row, kv_full_addr + (load_kv_stage) * 8);
                             tma_2d_gmem2smem(smem_kv_scales_addr + load_kv_stage * 33792, (&KV_scales), kv_row, 0, kv_full_addr + (load_kv_stage) * 8);
                             mbarrier_arrive_expect_tx(kv_full_addr + (load_kv_stage) * 8, 33792);
-                            load_kv_stage += 1;
-                            if (load_kv_stage == 5) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                         }
+                        load_kv_stage += 1;
+                        if (load_kv_stage == 5) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                         __syncwarp();
                     }
                 }

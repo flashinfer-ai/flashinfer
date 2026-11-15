@@ -73,7 +73,7 @@ from ..helpers.gather import (
 
 from .nvfp4_kv_load import load_nvfp4_kv_stage, publish_nvfp4_v
 from ..helpers.sparse_indices import cache_sparse_source_lengths
-from ..helpers.nvfp4_kv import prefetch_nvfp4_kv_row
+from ..helpers.nvfp4_kv import prefetch_nvfp4_kv_row, store_shared_u32x4
 from .config import (
     OUTPUT_TMA_STAGE_BYTES,
     V_SMEM_K_BLOCK_TOKENS,
@@ -108,6 +108,7 @@ from ..helpers.math import (
     fma_packed_f32x2,
     mul_packed_f32x2,
     output_dtype,
+    pack_float2_to_bf16,
     p_desc_layout,
     p_desc_leading_byte_offset,
     p_desc_stride_byte_offset,
@@ -4127,6 +4128,49 @@ class GmemOResource(HighThroughputMlaResource):
         )
 
     @cute.jit
+    def _store_staged_bf16_slice(self, values, flat_row, column, valid, local_tidx):
+        """TMA-store one warp's normalized 32-row x 128-column BF16 slice.
+
+        Each correction warp owns two 4 KiB boxes (32 rows x 64 BF16, 128-byte
+        swizzle) that it reuses across slices and work tiles. Its elected lane
+        issues and retires the bulk groups; a box is rewritten only after the
+        group that last read it has finished reading SMEM.
+        """
+        lane = local_tidx & Int32(31)
+        warp = local_tidx >> Int32(5)
+        # Consecutive lanes own consecutive flattened rows.
+        first_row = Int32(flat_row) - lane
+        for box in cutlass.range_constexpr(2):
+            slot = (warp * Int32(2) + Int32(box)) * Int32(4096)
+            if prims.elect_sync():
+                prims.cp_async_bulk_wait_group(1, read=True)
+            cute.arch.sync_warp()
+            for chunk in cutlass.range_constexpr(8):
+                base = box * 64 + chunk * 8
+                words = [
+                    pack_float2_to_bf16(values[base + 2 * w], values[base + 2 * w + 1])
+                    for w in range(4)
+                ]
+                offset = (
+                    slot
+                    + lane * Int32(128)
+                    + ((Int32(chunk) ^ (lane & Int32(7))) * Int32(16))
+                )
+                store_shared_u32x4(
+                    self.smem_o, offset, words[0], words[1], words[2], words[3]
+                )
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            if valid:
+                if prims.elect_sync():
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_o_desc,
+                        self.smem_o.subview(slot),
+                        (column + box * 64, first_row),
+                    )
+                    prims.cp_async_bulk_commit_group()
+
+    @cute.jit
     def _store_quantized_slice(
         self,
         values,
@@ -4640,7 +4684,24 @@ class GmemOResource(HighThroughputMlaResource):
                 qk_acc_regs[i] = scaled[0]
                 qk_acc_regs[i + 1] = scaled[1]
 
-        if row_in_tile < physical_tile_rows and query_is_valid:
+        if cutlass.const_expr(cfg.stage_bf16_output):
+            if cutlass.const_expr(self.cu_seqlens_q is not None):
+                staged_row = storage_flat_query_row
+            else:
+                staged_row = (
+                    logical_head_idx
+                    + logical_q_idx * logical_num_heads_q
+                    + batch_idx * logical_num_heads_q * Int32(self.output.shape[2])
+                )
+            self._store_staged_bf16_slice(
+                qk_acc_regs,
+                staged_row,
+                iter_n * tile_d + g_j,
+                row_in_tile < physical_tile_rows and query_is_valid,
+                local_tidx,
+            )
+        direct_store = Int32(0 if cfg.stage_bf16_output else 1)
+        if row_in_tile < physical_tile_rows and query_is_valid and direct_store != 0:
             if cutlass.const_expr(self.partial_output is not None):
                 S_q = (
                     cutlass.Int32(self.partial_output.shape[3])

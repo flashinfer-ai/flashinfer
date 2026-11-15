@@ -307,3 +307,51 @@ def test_granularity_fits_both_handle_types(monkeypatch, granularities, expected
     monkeypatch.setattr(mnnvl.cuda, "cuMemGetAllocationGranularity", granularity)
     monkeypatch.setattr(mnnvl.MnnvlMemory, "allocation_granularity", 0)
     assert mnnvl.MnnvlMemory.get_allocation_granularity(0) == expected
+
+
+@pytest.mark.cpu_only
+def test_access_descriptor_keeps_allocation_property_alive():
+    """The driver must receive the device location before its parent is freed."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    script = textwrap.dedent("""
+        from unittest.mock import patch
+        from flashinfer.comm import mnnvl
+
+        cuda = mnnvl.cuda
+        ok = cuda.CUresult.CUDA_SUCCESS
+        memory = mnnvl.MnnvlMemory
+        memory.dev_id = 3
+        seen = []
+
+        def set_access(ptr, size, descs, count):
+            assert count == 1
+            seen.append((descs[0].location.type, descs[0].location.id))
+            return (ok,)
+
+        with (
+            patch.object(cuda, "cuCtxGetDevice", return_value=(ok, 3)),
+            patch.object(
+                mnnvl, "allocate_mnnvl_handles",
+                return_value=([101, 102], mnnvl._POSIX_FD_HANDLE),
+            ),
+            patch.object(cuda, "cuMemMap", return_value=(ok,)),
+            patch.object(cuda, "cuMemSetAccess", side_effect=set_access),
+        ):
+            result = memory._create_and_map_handles(None, 64, 4096, 128, 16)
+        assert result == ([101, 102], mnnvl._POSIX_FD_HANDLE)
+        assert seen == [
+            (cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE, 3)
+        ] * 2, seen
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "PYTHONMALLOC": "debug", "PYTHONFAULTHANDLER": "1"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)

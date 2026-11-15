@@ -34,7 +34,7 @@ from flashinfer.cake_sampling import (
     top_k_top_p_sampling_from_probs,
 )
 from flashinfer.jit.cake_sampling import supported_capability
-from tests.test_helpers.sampling import (
+from tests.utils.test_helpers.sampling import (
     required_num_collision_rows,
     required_num_trials,
 )

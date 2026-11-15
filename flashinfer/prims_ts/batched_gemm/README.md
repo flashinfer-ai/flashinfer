@@ -108,6 +108,10 @@ Kernel-level performance/configuration gaps inherited by the MoE backend:
   one epilogue subtile, and no max-TMEM-overlap path. Treat this as a PrimsTS
   kernel/config limitation; the current TRT-LLM Gen tests do not establish
   DeepSeek FP8 `ClusterDimX=2` or tile-N 256 support.
+- DeepSeek FP8 scale blocks are 128x128 by default; `deepseek_fp8_block_size=32`
+  selects 32x32 blocks (vLLM's re-blocked TP shards) on the swap-AB split-M
+  epilogue (`mma_m=64`) only. The K tile stays 128 wide and is drained once per
+  32-wide sub-block, so expect roughly 4x the DeepSeek epilogue work per tile.
 - Output block scaling and sub-byte output formats are only available in the
   supported swap-AB/gated epilogue forms. The MXFP4 x BF16 cast-A path currently
   stores plain BF16/FP16 output.

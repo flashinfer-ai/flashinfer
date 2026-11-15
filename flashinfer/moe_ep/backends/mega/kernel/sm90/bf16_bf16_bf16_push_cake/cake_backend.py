@@ -319,6 +319,22 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 f"{_NAME} wcx_max_tokens (config field or environment): {exc}"
             ) from exc
 
+    def _wcx_copies_needed(self, fleet_params: FleetParams) -> bool:
+        """True when the runner will resolve WCX on (wcx_max_tokens > 0, an
+        effective fc2_early_max_tokens > 0, an early-start geometry and a GEMM
+        with the WCX pair), so the layer needs the WCX copies."""
+        from ......kernel_src.sm90.cake_bf16_megamoe.shim.cake_runner import (
+            wcx_resolves_on,
+        )
+
+        return wcx_resolves_on(
+            wcx_max_tokens=self._wcx_max_tokens(),
+            fc2_early_max_tokens=self._kernel_config.fc2_early_max_tokens,
+            num_local_experts=fleet_params.num_experts // self.ep_world_size,
+            hidden_size=fleet_params.token_hidden_size,
+            intermediate_size=self._kernel_config.intermediate_size,
+        )
+
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
     ) -> Any:
@@ -327,7 +343,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
-            wcx=self._wcx_max_tokens() > 0,
+            wcx=self._wcx_copies_needed(fleet_params),
         )
         self._transformed_weights = transformed
         return transformed
@@ -345,14 +361,12 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             hidden_size=fleet_params.token_hidden_size,
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
         )
-        if (
-            self._wcx_max_tokens() > 0
-            and getattr(transformed_weights, "wcx", None) is None
-        ):
+        copies = getattr(transformed_weights, "wcx", None)
+        if copies is None and self._wcx_copies_needed(fleet_params):
             warnings.warn(
-                f"{_NAME} wcx_max_tokens > 0 but the transformed weights carry no WCX "
-                "copies (attach them with encode_sm90_cake_wcx); decode rounds keep "
-                "the bf16 GEMMs",
+                f"{_NAME} WCX is on (wcx_max_tokens > 0 with the FC2 early-start pair) "
+                "but the transformed weights carry no WCX copies (attach them with "
+                "encode_sm90_cake_wcx); decode rounds keep the bf16 GEMMs",
                 RuntimeWarning,
                 stacklevel=2,
             )

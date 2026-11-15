@@ -815,8 +815,9 @@ class CuteDslSm120MoeMxfp8Mxfp4Fc1ActQ1:
         gW = cute.make_tensor(
             gB_e.iterator, cute.make_layout((N2, K, E), stride=(K, 1, N2 * K))
         )
-        m_padded_sf = cute.size(gSFA_u8, mode=[1])
         sf_dtype = cfg.load_sf.sf_dtype
+        # Size the packed scale extent in the TMA operand's element units.
+        m_padded_sf = cute.size(cute.recast_tensor(gSFA_u8, sf_dtype), mode=[1])
         swap = cfg.mma.swap_ab
         t_a, t_b = (gW, gA) if swap else (gA, gW)
         tok_ptr = cute.recast_ptr(gSFA_u8.iterator, dtype=sf_dtype)
