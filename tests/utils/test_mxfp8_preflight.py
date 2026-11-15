@@ -67,7 +67,7 @@ def test_explicit_host_layout_overrides_legacy_flag():
 
 
 @pytest.mark.parametrize("backend", ["auto", "cuda"])
-def test_native_rejects_integer_scale_layout_before_jit(monkeypatch, backend):
+def test_native_preflight_rejects_integer_scale_layout_before_jit(monkeypatch, backend):
     """IntEnum-equal integers must not reach the native consumer's .value read."""
     x = torch.empty((2, 32), dtype=torch.float32)
     unexpected = Mock(
@@ -77,9 +77,8 @@ def test_native_rejects_integer_scale_layout_before_jit(monkeypatch, backend):
     monkeypatch.setattr(fp8, "device_support_pdl", unexpected)
     monkeypatch.setattr(torch, "empty", unexpected)
     monkeypatch.setattr(torch, "zeros", unexpected)
-    for call in (mxfp8_quantize.validate_call, mxfp8_quantize):
-        with pytest.raises(ValueError, match="Invalid sf_swizzle_layout"):
-            call(x, backend=backend, sf_swizzle_layout=0)
+    with pytest.raises(ValueError, match="Invalid sf_swizzle_layout"):
+        mxfp8_quantize.validate_call(x, backend=backend, sf_swizzle_layout=0)
     unexpected.assert_not_called()
 
 
@@ -87,7 +86,7 @@ def test_native_rejects_integer_scale_layout_before_jit(monkeypatch, backend):
 def test_native_cuda_checks_both_entry_points_on_the_input_device(monkeypatch, backend):
     x = _fake_cuda()
     cc = Mock(return_value=(9, 0))
-    monkeypatch.setattr(utils, "get_compute_capability", cc)
+    monkeypatch.setattr(fp8, "get_compute_capability", cc)
     unexpected = Mock(
         side_effect=AssertionError("unsupported device reached execution")
     )
@@ -103,7 +102,11 @@ def test_native_cuda_checks_both_entry_points_on_the_input_device(monkeypatch, b
     assert mxfp8_quantize.validate_call(x, backend=backend) is None
     assert mxfp8_quantize.is_backend_supported("cuda", 90) is False
     assert mxfp8_quantize.is_backend_supported("cuda", 100) is True
-    assert mxfp8_quantize.is_backend_supported("cuda", 130) is True
+    assert mxfp8_quantize.is_backend_supported("cute-dsl", 90) is True
+    assert mxfp8_quantize.is_backend_supported("cute-dsl", 100) is True
+    assert mxfp8_quantize.is_backend_supported("cuda", 120) is True
+    assert mxfp8_quantize.is_backend_supported("cute-dsl", 120) is True
+    assert mxfp8_quantize.is_backend_supported("cute-dsl", 80) is False
 
 
 @pytest.mark.parametrize("sf_layout", list(SfLayout))
@@ -159,21 +162,21 @@ def test_cute_preflight_rejects_inputs_before_setup(
     unexpected.assert_not_called()
 
 
-def test_cute_execution_checks_inputs_once_before_preparation(monkeypatch):
-    """The real CuTe wrapper owns the one execution-time tensor check."""
+def test_cute_execution_keeps_existing_checks_without_repeating_preflight(monkeypatch):
+    """Explicit preflight adds no checker/import to the CuTe eager path."""
     pytest.importorskip("cutlass")
     from flashinfer import cute_dsl
     from flashinfer.quantization.kernels import mxfp8_quantize as cute_kernel
 
     x = _fake_cuda()
-    checker = Mock(wraps=fp8._check_mxfp8_cute_dsl_inputs)
+    checker = Mock(side_effect=AssertionError("eager repeated preflight"))
     monkeypatch.setattr(fp8, "_check_mxfp8_cute_dsl_inputs", checker)
     monkeypatch.setattr(cute_dsl, "is_cute_dsl_available", lambda: True)
     stop = Mock(side_effect=RuntimeError("stopped before CuTe preparation"))
     monkeypatch.setattr(utils, "device_support_pdl", stop)
     with pytest.raises(RuntimeError, match="stopped before CuTe preparation"):
         mxfp8_quantize(x, backend="cute-dsl")
-    checker.assert_called_once_with(x, 32)
+    checker.assert_not_called()
     stop.assert_called_once_with(x.device)
     assert callable(cute_kernel.mxfp8_quantize_cute_dsl)
 
@@ -193,7 +196,7 @@ def test_native_eager_does_not_repeat_full_preflight(
     )
     unexpected = Mock(side_effect=AssertionError("eager repeated full preflight"))
     monkeypatch.setattr(fp8, "_check_mxfp8_native_inputs", unexpected)
-    monkeypatch.setattr(utils, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(fp8, "get_compute_capability", lambda device: (10, 0))
     result = (object(), object())
     native = Mock(return_value=result)
     monkeypatch.setattr(
@@ -207,14 +210,14 @@ def test_native_eager_does_not_repeat_full_preflight(
 
 
 @pytest.mark.parametrize("case", ["host-strides", "cuda-alignment", "cuda-empty-k"])
-def test_native_eager_retains_preparation_guards(monkeypatch, case):
-    """Reject inputs that Python preparation or the host FFI cannot safely handle."""
+def test_native_preflight_rejects_invalid_inputs_before_preparation(monkeypatch, case):
+    """Full admission is explicit; ordinary execution keeps the native contract."""
     if case == "host-strides":
         x = torch.empty((2, 64), dtype=torch.float32)[:, ::2]
-        alignment, message = 32, "contiguous strided"
+        alignment, message = 32, "contiguous input"
     elif case == "cuda-alignment":
         x = _fake_cuda()
-        alignment, message = 0, "alignment must be positive"
+        alignment, message = 0, "positive multiple"
     else:
         x = _fake_cuda((2, 0))
         alignment, message = 32, "nonempty last dimension"
@@ -222,7 +225,7 @@ def test_native_eager_retains_preparation_guards(monkeypatch, case):
     monkeypatch.setattr(fp8, "get_mxfp8_quantization_sm100_module", unexpected)
     monkeypatch.setattr(fp8, "device_support_pdl", unexpected)
     with pytest.raises(ValueError, match=message):
-        mxfp8_quantize(x, alignment=alignment)
+        mxfp8_quantize.validate_call(x, alignment=alignment)
     unexpected.assert_not_called()
 
 
@@ -233,7 +236,9 @@ def test_native_cuda_rejects_inputs_that_require_a_copy():
 
 
 @pytest.mark.parametrize("sf_layout", [0, 999])
-def test_cute_rejects_invalid_scale_layout_before_runtime_setup(monkeypatch, sf_layout):
+def test_cute_preflight_rejects_invalid_scale_layout_before_runtime_setup(
+    monkeypatch, sf_layout
+):
     """Bare integers must not silently select a CuTe scale layout."""
     from flashinfer import cute_dsl
 
@@ -241,9 +246,8 @@ def test_cute_rejects_invalid_scale_layout_before_runtime_setup(monkeypatch, sf_
     unexpected = Mock(side_effect=AssertionError("invalid scale layout reached setup"))
     monkeypatch.setattr(cute_dsl, "is_cute_dsl_available", unexpected)
     monkeypatch.setattr(torch, "empty", unexpected)
-    for call in (mxfp8_quantize.validate_call, mxfp8_quantize):
-        with pytest.raises(ValueError, match="Invalid sf_swizzle_layout"):
-            call(x, backend="cute-dsl", sf_swizzle_layout=sf_layout)
+    with pytest.raises(ValueError, match="Invalid sf_swizzle_layout"):
+        mxfp8_quantize.validate_call(x, backend="cute-dsl", sf_swizzle_layout=sf_layout)
     unexpected.assert_not_called()
 
 
