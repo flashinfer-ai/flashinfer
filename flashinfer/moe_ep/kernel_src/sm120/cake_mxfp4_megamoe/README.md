@@ -1,7 +1,11 @@
 # `kernel_src/sm120/cake_mxfp4_megamoe/` — Cake SM120 MXFP4 x MXFP8 hybrid-transport MegaMoE
 
-The kernel package behind the moe_ep backend `sm120_mxfp4_mxfp8_bf16_cake`
-(`flashinfer/moe_ep/backends/mega/kernel/sm120/mxfp4_mxfp8_bf16_cake/`).  `src/` holds the
+The kernel package behind the moe_ep backends `sm120_mxfp4_mxfp8_bf16_cake`
+(`flashinfer/moe_ep/backends/mega/kernel/sm120/mxfp4_mxfp8_bf16_cake/`) and
+`sm120_nvfp4_nvfp4_bf16_cake` (`.../nvfp4_nvfp4_bf16_cake/`).  The activation codec is the
+build parameter `MOE_ACT_CODEC` (0 = MXFP8 activations with E8M0 block-32 scales, 1 = NVFP4
+activations and intermediate with E4M3 block-16 scales and per-expert global scales); both
+codecs come from one parametric device source.  `src/` holds the
 **generated, checksum-attested** device sources of the Cake persistent MegaMoE kernel for
 consumer Blackwell (`sm_120a`, CC 12.0) plus two hand-written files (the host binding and the
 cubin carrier); `shim/cake_jit.py` is the JIT loader.  Humans do not edit the generated device

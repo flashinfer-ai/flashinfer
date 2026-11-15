@@ -47,6 +47,7 @@
   "license_header_prepended": true,
   "parameters": {
    "MOE_ACTIVATION": "activation family: 0 SwiGLU silu(gate)*up, 1 SwiGLU with alpha / beta gate*sigmoid(alpha*gate)*(up+beta), 2 situ beta*tanh(gate/beta)*sigmoid(gate)*up' with up' = lb*tanh(up/lb) (up when lb = 0)",
+   "MOE_ACT_CODEC": "activation codec: 0 MXFP8 (e4m3, UE8M0 per 32), 1 NVFP4 (e2m1, E4M3 per 16; W4A4 with per-expert global scales)",
    "MOE_ACT_P0": "activation parameter 0 in 1/1000 units (alpha of family 1, situ beta); 0 for SwiGLU",
    "MOE_ACT_P1": "activation parameter 1 in 1/1000 units (beta of family 1, situ up beta lb; 0 = unset)",
    "MOE_CODEC_OVF_BLOCKS": "return-codec raw-overflow capacity, 64-value blocks per row (16..256, default 16)",
@@ -69,15 +70,15 @@
    "CakeTensorMapPack"
   ],
   "sources": {
-   "cake_sm120_megamoe_kernel.cuh": "9d6612f381602ab7e885e2a68466778df68d46b6489093706dbbaa78c72acf19",
-   "cake_sm120_megamoe_kernel_part001.cuh": "fe94f6638e222ea7d716f292f2ae3c7cdc57b4e79af65a169b39c76aabffe7d8",
-   "cake_sm120_megamoe_kernel_part003.cuh": "5a593520252a011afeca32505705e101a3168e96c6dae8a96f98720d3ec0eefb",
+   "cake_sm120_megamoe_kernel.cuh": "2189befbf44215cec2b3336527189d8c33eaad6c35f1f76db0cedb5c12db0b83",
+   "cake_sm120_megamoe_kernel_part001.cuh": "3217c72c782ed8c5df702a5421974b6ed977a578586c6655d580c19a976482a1",
+   "cake_sm120_megamoe_kernel_part003.cuh": "4e02cdbb6da3798d61acfa41a2748774758e407012f545ed9360e8e2437a7694",
    "cake_sm120_megamoe_kernel_part004.cuh": "c91c03c3ad71b3f48176a31fcbc5180e1719b0d59a7d66e74635f12c6028d106",
-   "cake_sm120_megamoe_kernel_part005.cuh": "f8bbd37de5a576e91e95125e1504f39052e2b9121104cf24e987d754ec64393c",
-   "cake_sm120_megamoe_kernel_part006.cuh": "f60bfaa96cbb506dd5408a31727426b19db63e15d99ea6621d7c190ac228d160",
-   "cake_sm120_megamoe_kernel_part008.cuh": "08992508792b6e8dfba154133bac60ea55b27d4495e6515ffa4513d6189bb064",
-   "cake_sm120_megamoe_kernel_part010.cuh": "42151045153d2a485cdcfc4ce71180e9d6770e7cc614ba03bb5eec19fbffcdd5",
-   "cake_sm120_megamoe_kernel_part013.cuh": "fb2c47f7518811cdecd1dfd69cc4833c945b9cc7cb15bf6b6d1928271fd702d6",
+   "cake_sm120_megamoe_kernel_part005.cuh": "d793ecfef5e838c91e483d4b571fb7828119aad648c0311d97c3d42559c5c484",
+   "cake_sm120_megamoe_kernel_part006.cuh": "91b38745d5a167dc28d266b0f94e6d98530e370054b26d34c236f1d72a223f32",
+   "cake_sm120_megamoe_kernel_part008.cuh": "a816ecbc834866dd66d0569dfaca3dd1ef49dd7727062ce2f33358c8f95070ec",
+   "cake_sm120_megamoe_kernel_part010.cuh": "51535e80a47711503ce746c1bf5221c5cb4d119d7beb95a96281ec1550dfc3be",
+   "cake_sm120_megamoe_kernel_part013.cuh": "b1b3d313c1af4a28f440a7ba0c0076f1fd75b430030c5ada38c36bc6bdc6868f",
    "cake_sm120_megamoe_kernel_part014.cuh": "c6991051fb7b27570093bc64d218f8db69098a95b9796ff838911a9610970ccc",
    "cake_sm120_megamoe_kernel_part015.cuh": "62668689565b7bbab9e2fddffa830aacc3e0ac3868f49dfde04c8076a261e125",
    "cake_sm120_megamoe_kernel_part016.cuh": "d40c36706dcbb5a2b00a246af4e96b0c719b09b6ba44456dedf240ebf72c69d8",
@@ -92,22 +93,26 @@
    "cake_sm120_megamoe_kernel_part025.cuh": "7ce447ed33ec711220fefdecd32a0181b0d149df3299878a1f9f5be162d2af27",
    "cake_sm120_megamoe_kernel_part026.cuh": "e815484c78602c85fe107f09a73175fdfad5ed289b29f9a9f9aa46381fc2dee7",
    "cake_sm120_megamoe_kernel_part027.cuh": "9346a98e14346b6da6d7dcb8b4d1441347dae5edba512670578488dd7c742c86",
-   "cake_sm120_megamoe_kernel_part028.cuh": "42bd327a90e1e387f3b9c7fcd12315382c9709f4b1f0aaa9a81c818ce4b9e9c0",
-   "cake_sm120_megamoe_kernel_part029.cuh": "82f5ea7fdabe82ec0185d58ee9052e03886d257b5200ba31692ba610d9af3832",
-   "cake_sm120_megamoe_kernel_part030.cuh": "17913d12be5f733da56c52f135682a236066490519c7a7fc5a9615a1f6326060",
-   "cake_sm120_megamoe_kernel_part031.cuh": "b286893cdb9cb7fa8d6133c5a28a34c01af095190f258586d6fd00f1767ffb8b"
+   "cake_sm120_megamoe_kernel_part028.cuh": "1982a89975d148d9f404f139330af0ad0ba2a7bf6dac03b33bdd1b57426af7c1",
+   "cake_sm120_megamoe_kernel_part029.cuh": "2fac91f6dfcb79ce666336e477273400e79739d415a42212d991fae935254b19",
+   "cake_sm120_megamoe_kernel_part030.cuh": "9407673e3df8d8879d574cbfaa89cb07990bbb4edae8d60b6fbe98c2784a28fe",
+   "cake_sm120_megamoe_kernel_part031.cuh": "200b9c7b00b512686eaf5fc763de8c2d394f67d31efc5f5f3099dcbb5c438ce4",
+   "cake_sm120_megamoe_kernel_part032.cuh": "9fb229039b041de474fcad181f0a758576d520235c95e97695c8b577490eb016",
+   "cake_sm120_megamoe_kernel_part033.cuh": "ceb7d0b60f1554522fa918e588ff1a8ebe2de3f7544547e82e764232cb9618d3",
+   "cake_sm120_megamoe_kernel_part034.cuh": "80b152729f662cd5260068ace37ad2d217380ad03edbfef5dfd7e9bc86f85b85",
+   "cake_sm120_megamoe_kernel_part035.cuh": "5469d80392732a52db7115107128b393f3bdd57e2cb3c18cc56dad72acef12ce"
   },
   "threads": 384
  },
  "format": "cake-sm120-megamoe-manifest/3",
  "geometry": {
   "path": "cake_sm120_megamoe_geometry.json",
-  "sha256": "b20cb10e2f68816d7a3ab21b4ac36d8afec3180785354210abec501380d5e127"
+  "sha256": "49d4c12d0e6b83c0b44c558a42b6358d7c9f38ba6e33c067a8050002fd2ee10b"
  },
  "provenance": {
-  "generator_commit": "5dfff2329",
-  "geometry_module_sha256": "fbf2d57f383ea5775f106da7c2cf7e49bb3aec0952ccd9c927627c574d8db7e2",
-  "single_file_sha256": "43ed3c59bd5b48510dac689a79f71a54600d5a9533dfa3bc5250d379b06a0408",
-  "unrenamed_sha256": "25759ead281e184432d3b218a1848fb739740044b2292cff5e0dbb4a726087d1"
+  "generator_commit": "2e97317e0",
+  "geometry_module_sha256": "f693bb5a67b78c09cd0d810747703c2dad2802d2c2e3a1d4292e5abee87d17a8",
+  "single_file_sha256": "f048da9095cbdeb198bae37ab90724e1178f159774649534b078c6b42423eac1",
+  "unrenamed_sha256": "0d6fbb14410b6f593ca920c14e8afd5db454984a1d65af9013a3495a36bcdab6"
  }
 }

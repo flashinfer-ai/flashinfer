@@ -62,8 +62,8 @@ ACTIVATION_FIELDS = {
 L2_FLUSH_BYTES = 256 << 20
 
 
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+def _parse_args(description: str = __doc__.splitlines()[0]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=description)
     p.add_argument("--shapes", nargs="+", default=["v4flash"], choices=sorted(SHAPES))
     p.add_argument(
         "--variants",
@@ -153,15 +153,51 @@ def _time_forward(run, iters: int, flush) -> list[float]:
     return spans
 
 
-def main() -> None:
+def _w4a8_layer(
+    rank,
+    world,
+    geometry,
+    capacity,
+    shared,
+    table,
+    limit,
+    activation_fields,
+    codec,
+    seed,
+):
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_synthetic import (
-        Geometry,
         make_layer,
-        random_inputs,
         random_weights,
     )
 
-    args = _parse_args()
+    weights = random_weights(rank, world, geometry, shared=shared, seed=seed)
+    return make_layer(
+        rank,
+        world,
+        weights,
+        geometry,
+        max_tokens_per_rank=capacity,
+        shared=shared,
+        transport_table=table,
+        swiglu_limit=limit,
+        activation_fields=activation_fields,
+        return_codec=codec,
+    )
+
+
+def main(
+    build=_w4a8_layer, kernel: str = "w4a8", description: str | None = None
+) -> None:
+    """``build(rank, world, geometry, capacity, shared, table, limit, activation_fields, codec,
+    seed)`` returns the layer of one (shape, variant, codec), or ``None`` to skip it (the NVFP4
+    benchmark passes its own builder)."""
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_synthetic import (
+        Geometry,
+        random_inputs,
+    )
+
+    args = _parse_args(description or __doc__.splitlines()[0])
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl", device_id=torch.cuda.current_device())
@@ -175,7 +211,7 @@ def main() -> None:
     rows = []
     if rank == 0:
         print(
-            f"# Cake SM120 MegaMoE, EP{world}, table={args.table}, "
+            f"# Cake SM120 MegaMoE ({kernel}), EP{world}, table={args.table}, "
             f"{torch.cuda.get_device_name()}, cold L2={flush is not None}"
         )
         print(
@@ -193,21 +229,22 @@ def main() -> None:
             (v, c) for v in args.variants for c in args.return_codecs
         ):
             shared = variant == "fp8shared"
-            weights = random_weights(
-                rank, world, geometry, shared=shared, seed=args.seed
-            )
-            layer = make_layer(
+            layer = build(
                 rank,
                 world,
-                weights,
                 geometry,
-                max_tokens_per_rank=capacity,
-                shared=shared,
-                transport_table=_table_spec(args.table, world),
-                swiglu_limit=limit,
-                activation_fields=ACTIVATION_FIELDS.get(shape),
-                return_codec=codec,
+                capacity,
+                shared,
+                _table_spec(args.table, world),
+                limit,
+                ACTIVATION_FIELDS.get(shape),
+                codec,
+                args.seed,
             )
+            if layer is None:
+                if rank == 0:
+                    print(f"# skip {shape} {variant}: outside the {kernel} region")
+                continue
             layer.warmup(
                 random_inputs(min(256, capacity), geometry, seed=args.seed + rank)
             )
@@ -251,6 +288,7 @@ def main() -> None:
                 row = {
                     "shape": shape,
                     "variant": variant,
+                    "kernel": kernel,
                     "return_codec": codec,
                     "ep": world,
                     "tokens_per_rank": tokens,

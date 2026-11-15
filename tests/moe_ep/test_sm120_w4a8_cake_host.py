@@ -842,15 +842,18 @@ def test_manifest_seals_the_parametric_closure() -> None:
     device = read_manifest()["device"]
     assert [w["name"] for w in device["instances"]] == list(INSTANCE_NAMES)
     assert set(device["parameters"]) == {*DEVICE_PARAMETERS, "MOE_INSTANCE"}
-    defines = device_defines((4, 256, 6, 8192, 4096, 2048, 1, 0, 32, 3, 1, 1702, 0, 1))
+    defines = device_defines(
+        (4, 256, 6, 8192, 4096, 2048, 1, 0, 32, 3, 1, 1702, 0, 1, 1)
+    )
     assert defines[0] == "-DMOE_RANKS=4" and "-DMOE_SWIGLU_LIMIT=0" in defines
-    assert defines[-6:] == [
+    assert defines[-7:] == [
         "-DMOE_CODEC_OVF_BLOCKS=32",
         "-DMOE_LSA_COPIERS=3",
         "-DMOE_ACTIVATION=1",
         "-DMOE_ACT_P0=1702",
         "-DMOE_ACT_P1=0",
         "-DMOE_RETURN_CODEC=1",
+        "-DMOE_ACT_CODEC=1",
     ]
     with pytest.raises(ValueError):
         device_defines((4, 256, 6, 8192, 4096, 2048, 1, 0))

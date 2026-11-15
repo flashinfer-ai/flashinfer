@@ -250,7 +250,8 @@ The SM120 MXFP4 x MXFP8 MegaMoE backend (`sm120_mxfp4_mxfp8_bf16_cake`: one
 Cake-generated parametric persistent kernel per deployment, JIT-compiled from
 `flashinfer/moe_ep/kernel_src/sm120/cake_mxfp4_megamoe/`) has its own target,
 `bash tests/moe_ep/run_tests.sh mega_sm120_cake` (4 GPUs; `NPROC_CAKE_SM120=8`
-for a full host). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
+for a full host); the target also runs the NVFP4 x NVFP4 twin built from the same
+kernel package (`sm120_nvfp4_nvfp4_bf16_cake`, `test_moe_ep_sm120_nvfp4_cake_mega.py`). It needs NCCL 2.30.7 with the Device API (`NCCL_HOME`), and on
 multi-GPU PCIe hosts a pinned `NCCL_TOPO_FILE`. The target is not part of `all`; PR CI runs only
 this script's `unit` target, which covers the backend's host tests
 (`test_sm120_w4a8_cake_host.py`) but none of its multi-GPU tests, so run
