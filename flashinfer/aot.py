@@ -108,12 +108,14 @@ from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
     gen_alphamoe_nvfp4_sm100_module,
+    gen_cutlass_fused_moe_sm80_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
     gen_trtllm_gen_routing_module,
+    gen_w4a16_moe_sm80_module,
 )
 from .jit.cake_fused_moe_warp_decode import (
     gen_cake_fused_moe_warp_decode_module,
@@ -971,6 +973,10 @@ def gen_all_modules(
             jit_specs.extend(gen_cake_selective_state_update_modules("sm_103a"))
         if has_sm80 and get_cuda_version() >= Version("12.8"):
             jit_specs.append(gen_fp4_quantization_sm80_module())
+            jit_specs.append(gen_cutlass_fused_moe_sm80_module())
+        if has_sm80 or has_sm90:
+            # One module emits the requested SM80/SM90 targets of the W4A16 MoE records.
+            jit_specs.append(gen_w4a16_moe_sm80_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)

@@ -2345,9 +2345,14 @@ class TestCuteDslMoeW4A16:
 )
 @pytest.mark.parametrize("gated", [True, False])
 def test_w4a16_records_tactics(gated: bool):
-    """Every records tactic gives the same output, within tolerance of the reference. GEMM1
-    takes three 128-column records; the gated GEMM2 K of 192 ends in a 64-wide tail."""
-    from flashinfer import cute_dsl_fused_moe
+    """Every records tactic gives the same output, within tolerance of the reference, also with
+    records prepared once and the weights' storage released. GEMM1 takes three 128-column
+    records; the gated GEMM2 K of 192 ends in a 64-wide tail."""
+    from flashinfer import autotune, cute_dsl_fused_moe
+    from flashinfer.fused_moe import (
+        cute_dsl_w4a16_sm80_supported,
+        cute_dsl_w4a16_sm80_weights,
+    )
     from flashinfer.fused_moe.cute_dsl.tuner import W4A16_SM80_TACTICS
 
     tensors = create_moe_tensors(
@@ -2360,18 +2365,21 @@ def test_w4a16_records_tactics(gated: bool):
         gated=gated,
     )
     activation = ActivationType.Swiglu if gated else ActivationType.Relu2
-    outputs = [
-        cute_dsl_fused_moe(
+    assert cute_dsl_w4a16_sm80_supported(8, activation_type=activation)
+    assert not cute_dsl_w4a16_sm80_supported(8, 4, activation_type=activation)
+
+    def run(w1, s1, w2, s2, tactic=None):
+        return cute_dsl_fused_moe(
             x=tensors["x_bf16"],
             x_sf=None,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
-            w1_weight=tensors["w1_weight"],
-            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_weight=w1,
+            w1_weight_sf=s1,
             w1_alpha=tensors["w1_alpha"],
             fc2_input_scale=None,
-            w2_weight=tensors["w2_weight"],
-            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_weight=w2,
+            w2_weight_sf=s2,
             w2_alpha=tensors["w2_alpha"],
             num_experts=8,
             top_k=2,
@@ -2380,8 +2388,11 @@ def test_w4a16_records_tactics(gated: bool):
             activation_type=activation,
             tactic=tactic,
         )
-        for tactic in W4A16_SM80_TACTICS
+
+    weights = [
+        tensors[k] for k in ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf")
     ]
+    outputs = [run(*weights, tactic) for tactic in W4A16_SM80_TACTICS]
     _assert_moe_quant_mode_reference(
         outputs[0],
         split_w4a16_reference_from_tensors(tensors, activation_type=activation),
@@ -2389,6 +2400,14 @@ def test_w4a16_records_tactics(gated: bool):
     )
     for tactic, output in zip(W4A16_SM80_TACTICS[1:], outputs[1:], strict=True):
         assert torch.equal(output, outputs[0]), tactic
+
+    r1, r2 = cute_dsl_w4a16_sm80_weights(*weights, gated)
+    w1, w2 = weights[0].clone(), weights[2].clone()
+    for w in (w1, w2):
+        w.untyped_storage().resize_(0)
+    with autotune(True):
+        assert torch.equal(run(w1, r1, w2, r2), outputs[0])
+    assert torch.equal(run(w1, r1, w2, r2), outputs[0])
 
 
 # =============================================================================

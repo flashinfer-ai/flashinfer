@@ -196,6 +196,8 @@ from .core import (
 )
 
 from .prepare import (
+    cute_dsl_w4a16_sm80_supported,
+    cute_dsl_w4a16_sm80_weights,
     cutlass_nvfp4_sm80_weights,
     interleave_cute_dsl_moe_weights,
     interleave_moe_scales_for_sm90_mixed_gemm,
@@ -463,6 +465,8 @@ __all__ = [
     "convert_to_block_layout",
     "cutlass_fused_moe",
     "cutlass_fused_moe_workspace_size",
+    "cute_dsl_w4a16_sm80_supported",
+    "cute_dsl_w4a16_sm80_weights",
     "cutlass_nvfp4_sm80_weights",
     "interleave_moe_scales_for_sm90_mixed_gemm",
     "interleave_cute_dsl_moe_weights",

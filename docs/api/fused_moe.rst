@@ -243,6 +243,8 @@ Utility Functions
     preprocess_moe_weights_for_sm90_mixed_gemm_humming
     cutlass_nvfp4_sm80_weights
     trtllm_nvfp4_sm80_weights
+    cute_dsl_w4a16_sm80_weights
+    cute_dsl_w4a16_sm80_supported
     fused_topk_deepseek
     hash_topk
 

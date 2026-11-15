@@ -39,7 +39,12 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
-from ..tllm_enums import ActivationType
+from ..tllm_enums import (
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+)
 from ..quantization.nvfp4_quantization_utils import (
     NVFP44Over6Config,
     make_nvfp4_global_scale,
@@ -2364,14 +2369,83 @@ def _w4a16_records(
     return out
 
 
-def w4a16_sm80_records(
+@flashinfer_api
+def cute_dsl_w4a16_sm80_supported(
+    num_experts: int,
+    num_local_experts: Optional[int] = None,
+    local_expert_offset: int = 0,
+    output_dtype: torch.dtype = torch.bfloat16,
+    activation_type: int = ActivationType.Swiglu,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+) -> bool:
+    """Whether ``cute_dsl_fused_moe`` with ``quant_mode="w4a16"`` and these arguments runs below
+    SM100 on the records of ``cute_dsl_w4a16_sm80_weights``.
+
+    The records run BF16 SwiGLU with default parameters, or ReLU2, over all experts. Other
+    configurations run on the weights and block scales instead.
+
+    Parameters
+    ----------
+    num_experts, num_local_experts, local_expert_offset, output_dtype, activation_type, \
+    swiglu_alpha, swiglu_beta, swiglu_limit, situ_beta, situ_linear_beta
+        As passed to ``cute_dsl_fused_moe``.
+
+    Returns
+    -------
+    bool
+        Whether the records run.
+    """
+    activation = ActivationType(activation_type)
+    swiglu = (swiglu_alpha, swiglu_beta, swiglu_limit)
+    default = (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT)
+    return (
+        output_dtype == torch.bfloat16
+        and situ_beta is None
+        and local_expert_offset == 0
+        and num_local_experts in (None, num_experts)
+        and (
+            activation == ActivationType.Relu2
+            or (activation == ActivationType.Swiglu and swiglu == default)
+        )
+    )
+
+
+@flashinfer_api
+def cute_dsl_w4a16_sm80_weights(
     w1: torch.Tensor, s1: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor, gated: bool
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The records below-SM100 W4A16 MoE reads, from CuTe-DSL weights (packed, any integer view;
-    gated FC1 rows alternating 64 up and 64 gate rows) and their 128x4 swizzled block scales."""
+    """The records below-SM100 W4A16 CuTe-DSL MoE reads, of its weights and block scales.
+
+    Below SM100 ``cute_dsl_fused_moe`` with ``quant_mode="w4a16"`` converts its block scales to
+    records on every call unless given these in their place, where
+    ``cute_dsl_w4a16_sm80_supported``. It then reads ``w1_weight`` and ``w2_weight`` for their
+    shapes only, so callers may release their storage.
+
+    Parameters
+    ----------
+    w1, w2 : torch.Tensor
+        FC1 and FC2 weights, packed, in any integer view; gated FC1 rows alternate 64 up and 64
+        gate rows.
+    s1, s2 : torch.Tensor
+        Their block scales in the MMA layout ``cute_dsl_fused_moe`` takes, or 128x4 swizzled.
+    gated : bool
+        FC1 holds gate and up rows (SwiGLU), not one projection (ReLU2).
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        FC1 and FC2 records, uint8 ``[num_experts, bytes]``, for ``w1_weight_sf`` and
+        ``w2_weight_sf``.
+    """
     from ..trace.templates.gemm import _unswizzle_batched_sf_128x4
 
     def records(w, s, fc1):
+        if s.dim() == 6:  # the MMA layout in byte order is the 128x4 swizzled layout
+            s = s.permute(5, 2, 4, 0, 1, 3)
         w = w.view(torch.uint8).view(w.shape[0], w.shape[1], -1)
         e, n, half_k = w.shape
         sf = _unswizzle_batched_sf_128x4(s.view(torch.uint8), e, n, half_k // 8)
@@ -3148,7 +3222,7 @@ def prepare_cute_dsl_weights(
         and activation in (SwiGLU(), ReLU2())
     ):
         # W4A16 runs on records; an expert-parallel shard converts the weights on every call.
-        records = w4a16_sm80_records(
+        records = cute_dsl_w4a16_sm80_weights(
             w1_weight, w1_sf_flat, w2_weight, w2_sf_flat, activation.is_gated
         )
         view.update(zip(_W4A16_SM80_RECORD_KEYS, records, strict=True))

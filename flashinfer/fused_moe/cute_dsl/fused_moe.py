@@ -1867,32 +1867,31 @@ def _cute_dsl_fused_moe_impl(
 
 
 def _w4a16_records_runnable(runner) -> bool:
-    """The records kernels run SwiGLU with default parameters and ReLU2, over all experts."""
-    swiglu = (runner.swiglu_alpha, runner.swiglu_beta, runner.swiglu_limit)
-    default = (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT)
-    return (
-        runner.situ_beta is None
-        and runner.local_expert_offset == 0
-        and runner.num_local_experts == runner.num_experts
-        and (
-            runner.activation_type == ActivationType.Relu2
-            or (runner.activation_type == ActivationType.Swiglu and swiglu == default)
-        )
+    from ..prepare import cute_dsl_w4a16_sm80_supported
+
+    return cute_dsl_w4a16_sm80_supported(
+        runner.num_experts,
+        runner.num_local_experts,
+        runner.local_expert_offset,
+        runner.output_dtype,
+        runner.activation_type,
+        runner.swiglu_alpha,
+        runner.swiglu_beta,
+        runner.swiglu_limit,
+        runner.situ_beta,
     )
 
 
 def _w4a16_records_inputs(runner, inputs):
     """W4A16 ``inputs`` with the records in the block scale slots where they run, converting the
     CuTe-DSL weights' MMA-layout block scales; records and CUTLASS operands unchanged."""
-    from ..prepare import w4a16_sm80_records
+    from ..prepare import cute_dsl_w4a16_sm80_weights
 
     s1, s2 = inputs[4], inputs[7]
     if not _w4a16_records_runnable(runner) or s1.dim() != 6:
         return inputs
-    # The MMA-layout scales in byte order are the 128x4 swizzled scales.
-    mma_bytes = (5, 2, 4, 0, 1, 3)
     gated = runner.activation_type == ActivationType.Swiglu
-    r1, r2 = w4a16_sm80_records(inputs[3], s1.permute(mma_bytes), inputs[6], s2.permute(mma_bytes), gated)  # fmt: skip
+    r1, r2 = cute_dsl_w4a16_sm80_weights(inputs[3], s1, inputs[6], s2, gated)
     return [*inputs[:4], r1, inputs[5], inputs[6], r2, *inputs[8:]]
 
 
@@ -1904,7 +1903,7 @@ def _w4a16_sm80_module():
 
 
 def _w4a16_moe_sm80(runner, inputs, tactic):
-    """Runs W4A16 ``inputs`` holding records (``w4a16_sm80_records``) as routing into row blocks,
+    """Runs W4A16 ``inputs`` holding records (``cute_dsl_w4a16_sm80_weights``) as routing into row blocks,
     GEMM1 with the activation, GEMM2 and the top-k weighted sum, with ``tactic`` from
     ``W4A16_SM80_TACTICS``."""
     from ..prepare import _w4a16_records_bytes, _w4a16_records_geometry
@@ -2125,7 +2124,10 @@ def cute_dsl_fused_moe(
         GEMM1 weights (gate + up fused for gated activations, or a single
         projection for non-gated activations).
     w1_weight_sf : torch.Tensor
-        Scale factors for ``w1_weight``.
+        Scale factors for ``w1_weight``. Below SM100, W4A16 also takes here
+        (and in ``w2_weight_sf``) the records of ``cute_dsl_w4a16_sm80_weights``
+        where ``cute_dsl_w4a16_sm80_supported``; ``w1_weight`` and
+        ``w2_weight`` then give only their shapes.
     w1_alpha : torch.Tensor
         Per-expert global scale for GEMM1.
     fc2_input_scale : Optional[torch.Tensor]
