@@ -256,12 +256,13 @@ class SwappedGroupedGemm:
             "the gather record is the block-scaled classes'",
             knobs,
         )
-        # the block-scaled gather form reads 4-bit token rows (the fp4 pairs: the token box one swizzle atom of K); the mixed
-        # operand block's 8-bit tokens against its 4-bit weights take the box form
-        assert (
-            not gather or not self.operands.block_scaled or not self.operands.mixed
-        ), (
-            "the block-scaled gather form is the fp4 pairs'; the mixed classes read the token box",
+        # the block-scaled gather form reads 4-bit token rows through the fp4 pairs' chains (the token box one swizzle atom
+        # of K); the MX epilogue block's chains (the MXFP8 classes, the mixed MXFP4 x MXFP8 classes: 8-bit tokens, the fused
+        # requantization's own epilogue) take the box form
+        from .epilogue_mx import MxChain
+
+        assert not gather or not isinstance(chain, MxChain), (
+            "the block-scaled gather form is the fp4 pairs' chains'; the MX chains read the token box",
             knobs,
             self.in_fmt,
         )
