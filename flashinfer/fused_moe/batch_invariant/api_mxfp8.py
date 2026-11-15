@@ -680,6 +680,18 @@ def permute_plan_padded(
     return counts, dest, src
 
 
+def scatter_mx(k: int, Tk: int, H: int, dev: torch.device):
+    """The MX row scatter's compiled kernel for ``Tk`` expanded rows of ``H`` e4m3 bytes: the warps per row from the row count
+    and the part, the lane's static bounds from the row width (placements of the same bytes)."""
+    from .mx_permute import get_compiled_scatter_mx, scatter_mx_lanes
+    from .permute import warps_per_row
+
+    wpr = warps_per_row(Tk, H // 16, sm_count_of(dev))
+    return get_compiled_scatter_mx(
+        k, wpr, **scatter_mx_lanes(H, padded_sf_cols(H), wpr)
+    )
+
+
 def permute_plan_dual_padded(
     experts: torch.Tensor, E: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -735,8 +747,6 @@ def fused_moe_mxfp8(
     `decode_form_ok`), True forces it (a refusal outside the rule), False never; the same integers and bits."""
     import dataclasses
 
-    from .mx_permute import get_compiled_scatter_mx
-    from .permute import warps_per_row
     from .schedule_mxfp8 import (
         GEMM2_CHAIN,
         default_configs_mx,
@@ -920,7 +930,7 @@ def fused_moe_mxfp8(
         else:
             x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
             x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
-            get_compiled_scatter_mx(k, warps_per_row(Tk, H // 16, sm_count_of(dev)))(
+            scatter_mx(k, Tk, H, dev)(
                 xq.view(torch.uint8),
                 xsf8.reshape(-1),
                 dest.reshape(-1),
@@ -981,7 +991,7 @@ def fused_moe_mxfp8(
     x_perm_sf = torch.empty(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     # one launch over the live rows: the e4m3 rows and the UE8M0 scales to their padded positions (the scales re-tiled into
     # the swizzled atoms); the padding rows are never written (unspecified bytes the MMA reads into rows no tile stores)
-    get_compiled_scatter_mx(k, warps_per_row(T * k, H // 16, sm_count_of(dev)))(
+    scatter_mx(k, T * k, H, dev)(
         xq.view(torch.uint8),
         xsf8.reshape(-1),
         dest.reshape(-1),
