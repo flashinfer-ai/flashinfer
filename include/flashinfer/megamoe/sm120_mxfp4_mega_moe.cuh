@@ -125,7 +125,8 @@ struct Peers {
   int* recv_flag[kMaxWorld];       // [W] epoch
   __nv_bfloat16* comb[kMaxWorld];  // [TCAP][TOPK][H]                    (src-owned)
   int* comb_flag[kMaxWorld];       // [W] epoch
-  int* route[kMaxWorld];       // [W][1 + TCAP*TOPK]: T, then the source's top-k ids (dest-owned)
+  int* route[kMaxWorld];  // [2][W][1 + TCAP*TOPK]: T, then the source's top-k ids, by epoch parity
+                          // (dest-owned)
   int* route_flag[kMaxWorld];  // [W] epoch
 };
 
@@ -529,13 +530,17 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
   // ---------------- routing exchange first (tiny): every rank learns the full expert load before
   // the rows land
   const int RS = 1 + TCAP * TOPK;
+  // the routes go to the half of the peer's route region this call's epoch parity picks: a peer
+  // whose done arrived may still have CTAs that have not read this call's routes when this rank
+  // posts the next call's (it cannot get two calls ahead: each call waits for every rank's routes)
+  const int rhalf = (epoch & 1) * W * RS;
   const size_t RX = pool_row_bytes(H);
   if (blockIdx.x == (a.T < int(gridDim.x) ? a.T : int(gridDim.x) - 1)) {
     const int n = 1 + a.T * TOPK;
     for (int u = threadIdx.x; u < W * n; u += blockDim.x) {
       const int dst = u / n, v = u % n;
       if (is_gin(a, dst)) continue;  // put below from this rank's own copy (dst == rank)
-      a.peers.route[dst][a.rank * RS + v] =
+      a.peers.route[dst][rhalf + a.rank * RS + v] =
           v == 0 ? a.T : route_at(a, (v - 1) / TOPK, (v - 1) % TOPK);
     }
     __threadfence_system();
@@ -544,7 +549,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
       for (int dst = 0; dst < W; ++dst) {
 #if MEGAMOE_SM120_GIN_DEVICE
         if (is_gin(a, dst)) {
-          const size_t off = a.gin.off_route + size_t(a.rank) * RS * sizeof(int);
+          const size_t off = a.gin.off_route + size_t(rhalf + a.rank * RS) * sizeof(int);
           gin_put(a, dst, off, off, size_t(1 + a.T * TOPK) * sizeof(int),
                   ncclGin_WeakSignalAdd{ncclGinSignal_t(kSigRoute + a.rank), 1});
           continue;
@@ -732,7 +737,7 @@ __global__ void __launch_bounds__(kWarps * 32) sm120_mega_moe_kernel(Args a) {
   {  // every source's routing in one parallel pass (all loads in flight together), then a warp scan
      // for the prefix
     __shared__ int s_T[kMaxWorld];
-    const int* rb = a.peers.route[a.rank];
+    const int* rb = a.peers.route[a.rank] + rhalf;
     for (int u = threadIdx.x; u < W * EL; u += blockDim.x) m.cnt[u / EL][u % EL] = 0;
     if (threadIdx.x < W) s_T[threadIdx.x] = __ldcv(rb + threadIdx.x * RS);
     __syncthreads();

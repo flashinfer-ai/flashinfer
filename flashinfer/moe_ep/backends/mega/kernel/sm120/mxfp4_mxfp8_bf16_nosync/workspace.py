@@ -82,7 +82,7 @@ def buffer_layout(
         ranks * 4,
         capacity * topk * hidden * 2,
         ranks * 4,
-        ranks * (1 + capacity * topk) * 4,
+        2 * ranks * (1 + capacity * topk) * 4,  # two halves, by epoch parity
         ranks * 4,
         rows * intermediate,
         rows * (intermediate // 128) * 4,
