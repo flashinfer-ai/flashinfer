@@ -884,6 +884,9 @@ def _validate_softmax_temperature(
                 "temperature tensor must have dtype float16, bfloat16, float32, "
                 f"or float64, got {temperature.dtype}"
             )
+        if not temperature.is_contiguous():
+            # Pack the row temperatures in the dtype consumed by the CUDA kernels.
+            temperature = temperature.float().contiguous()
         return temperature, 0.0, False
 
     if isinstance(temperature, bool) or not isinstance(temperature, Real):
