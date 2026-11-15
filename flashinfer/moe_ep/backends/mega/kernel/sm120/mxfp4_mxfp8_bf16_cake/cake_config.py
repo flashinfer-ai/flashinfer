@@ -36,9 +36,10 @@ TransportTableSpec = Union[str, tuple]
 class Sm120CakeMegaMoeConfigBase:
     """Fields and validation shared by the Cake SM120 MegaMoE configs.
 
-    Not a backend config itself: use :class:`Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig` (W4A8) or
-    ``Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig`` (NVFP4 W4A4).  The two are siblings, so an
-    ``isinstance`` check on either one does not match the other.
+    Not a backend config itself: use :class:`Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig` (W4A8),
+    ``Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig`` (NVFP4 W4A4) or
+    ``Sm120_Mxfp4_Mxfp4_Bf16_Cake_MegaMoeConfig`` (MXFP4 W4A4).  They are siblings, so an
+    ``isinstance`` check on one does not match another.
     """
 
     intermediate_size: int = 2048

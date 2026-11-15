@@ -12,20 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Forward-input validation and NVFP4 activation staging for the Cake SM120 W4A4 MegaMoE.
+"""Forward-input validation and FP4 activation staging for the Cake SM120 W4A4 MegaMoE backends.
 
 Kernel input contract (per rank, ``0 <= rows <= max_tokens_per_rank``):
 
 * ``x``  ``uint8 [rows, H // 2]``  packed E2M1 (low nibble first);
-* ``x_sf`` ``uint8 [rows, H // 16]`` E4M3 scale bytes, one per 16 values;
+* ``x_sf`` ``uint8 [rows, H // B]`` scale bytes, one per ``B`` values: E4M3 with ``B = 16``
+  (NVFP4, ``sm120_nvfp4_nvfp4_bf16_cake``) or UE8M0 with ``B = 32`` (MXFP4,
+  ``sm120_mxfp4_mxfp4_bf16_cake``);
 * routing as in the MXFP8 backend (``topk_idx`` int64 ``-1`` = masked, ``topk_weights`` float32).
 
-With ``quantize_input`` the BF16/FP16/FP32 activation is quantized as ``x * input_norm_const``
-with the NVFP4 rule of :func:`~.cake_nvfp4_weights.nvfp4_quantize_torch`; otherwise the caller passes
-packed ``uint8`` / ``float4_e2m1fn_x2`` ``[T, H // 2]`` and E4M3 scales ``[T, H // 16]``.
+With ``quantize_input`` the BF16/FP16/FP32 activation is quantized by the codec's rule
+(:func:`~.cake_nvfp4_weights.nvfp4_quantize_torch` as ``x * input_norm_const``, or
+``mxfp4_quantize_torch``); otherwise the caller passes packed ``uint8`` / ``float4_e2m1fn_x2``
+``[T, H // 2]`` and the scales ``[T, H // B]``.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
 
 import torch
 
@@ -37,11 +43,34 @@ from ..mxfp4_mxfp8_bf16_cake.cake_staging import (
 from .cake_nvfp4_quant import _HAVE_TRITON, nvfp4_quantize_fused
 from .cake_nvfp4_weights import NVFP4_BLOCK, nvfp4_quantize_torch
 
-# The fused Triton quantizer when Triton is available, else the pure-torch reference (bit-identical).
-_FUSED_QUANT = _HAVE_TRITON
+# The fused Triton quantizers when Triton is available, else the pure-torch references (bit-identical).
+FUSED_QUANT = _HAVE_TRITON
 
 
-def validate_nvfp4_forward_inputs(
+@dataclass(frozen=True)
+class Fp4ActivationCodec:
+    """How one FP4 activation format is validated, quantized and staged."""
+
+    name: str
+    block: int  # values per scale byte
+    scale_dtypes: tuple[torch.dtype, ...]
+    # (values, norm) -> (packed codes, scale bytes), the reference rule
+    quantize_torch: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+    # (values, norm, codes=, sf=) -> in-place fused twin (BF16/FP32 CUDA input)
+    quantize_fused: Callable[..., tuple[torch.Tensor, torch.Tensor]]
+
+
+NVFP4_CODEC = Fp4ActivationCodec(
+    name="NVFP4",
+    block=NVFP4_BLOCK,
+    scale_dtypes=(torch.uint8, torch.float8_e4m3fn),
+    quantize_torch=nvfp4_quantize_torch,
+    quantize_fused=nvfp4_quantize_fused,
+)
+
+
+def validate_fp4_forward_inputs(
+    codec: Fp4ActivationCodec,
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -72,15 +101,17 @@ def validate_nvfp4_forward_inputs(
         torch.float4_e2m1fn_x2,
     ):
         raise MoEEpConfigError(
-            f"pre-quantized NVFP4 activation must be packed uint8/float4_e2m1fn_x2 of shape ({tokens}, {hidden // 2})"
+            f"pre-quantized {codec.name} activation must be packed uint8/float4_e2m1fn_x2 of shape "
+            f"({tokens}, {hidden // 2})"
         )
     if (
         scales is None
-        or scales.dtype not in (torch.uint8, torch.float8_e4m3fn)
-        or tuple(scales.shape) != (tokens, hidden // NVFP4_BLOCK)
+        or scales.dtype not in codec.scale_dtypes
+        or tuple(scales.shape) != (tokens, hidden // codec.block)
     ):
         raise MoEEpConfigError(
-            f"pre-quantized NVFP4 activation requires E4M3 scales of shape ({tokens}, {hidden // NVFP4_BLOCK})"
+            f"pre-quantized {codec.name} activation requires {codec.scale_dtypes[-1]} scales of shape "
+            f"({tokens}, {hidden // codec.block})"
         )
     if tuple(topk_ids.shape) != (tokens, top_k) or topk_weights.shape != topk_ids.shape:
         raise MoEEpConfigError("routing tensors do not match token count/top-k")
@@ -90,7 +121,8 @@ def validate_nvfp4_forward_inputs(
         raise MoEEpConfigError("token count exceeds max_tokens_per_rank")
 
 
-def stage_nvfp4_inputs(
+def stage_fp4_inputs(
+    codec: Fp4ActivationCodec,
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -103,23 +135,23 @@ def stage_nvfp4_inputs(
     scales: torch.Tensor | None,
     input_norm_const: float = 1.0,
 ) -> int:
-    """Copy/quantize one step's inputs into the workspace's NVFP4 staging buffers; returns the row count."""
+    """Copy/quantize one step's inputs into the workspace's FP4 staging buffers; returns the row count."""
 
     if quantize_input:
         if (
-            _FUSED_QUANT
+            FUSED_QUANT
             and hidden_states.is_cuda
             and hidden_states.dtype in (torch.bfloat16, torch.float32)
         ):
             # the fused quantizer writes straight into the workspace's staging rows
             rows = int(hidden_states.shape[0])
-            nvfp4_quantize_fused(
+            codec.quantize_fused(
                 hidden_states, float(input_norm_const), codes=x, sf=x_sf
             )
             topk_idx_out[:rows].copy_(topk_ids)
             topk_weights_out[:rows].copy_(topk_weights)
             return rows
-        codes, sf = nvfp4_quantize_torch(hidden_states, input_norm_const)
+        codes, sf = codec.quantize_torch(hidden_states, input_norm_const)
     else:
         codes, sf = hidden_states.view(torch.uint8), scales.view(torch.uint8)  # type: ignore[union-attr]
     return stage_inputs(
@@ -135,4 +167,10 @@ def stage_nvfp4_inputs(
     )
 
 
-__all__ = ["stage_nvfp4_inputs", "validate_nvfp4_forward_inputs"]
+__all__ = [
+    "FUSED_QUANT",
+    "NVFP4_CODEC",
+    "Fp4ActivationCodec",
+    "stage_fp4_inputs",
+    "validate_fp4_forward_inputs",
+]

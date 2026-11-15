@@ -36,7 +36,11 @@ from .cake_nvfp4_config import (
     Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig,
     check_expert_scale,
 )
-from .cake_nvfp4_staging import stage_nvfp4_inputs, validate_nvfp4_forward_inputs
+from .cake_nvfp4_staging import (
+    NVFP4_CODEC,
+    stage_fp4_inputs,
+    validate_fp4_forward_inputs,
+)
 from .cake_nvfp4_weights import (
     NVFP4_BLOCK,
     TransformedCakeNvfp4MegaWeights,
@@ -155,7 +159,8 @@ class Sm120Nvfp4Nvfp4CakeMegaKernelBackend(Sm120Mxfp4Mxfp8CakeMegaKernelBackend)
     def validate_forward(
         self, t: MoEEpTensors, fleet_params: FleetParams, *, quantize_input: bool
     ) -> None:
-        validate_nvfp4_forward_inputs(
+        validate_fp4_forward_inputs(
+            NVFP4_CODEC,
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,
@@ -172,7 +177,8 @@ class Sm120Nvfp4Nvfp4CakeMegaKernelBackend(Sm120Mxfp4Mxfp8CakeMegaKernelBackend)
         self, t: MoEEpTensors, ws: Any, *, quantize_input: bool
     ) -> int:
         self._call_scales = {name: getattr(t, name, None) for name in _SCALE_FIELDS}
-        return stage_nvfp4_inputs(
+        return stage_fp4_inputs(
+            NVFP4_CODEC,
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,

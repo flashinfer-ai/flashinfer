@@ -108,6 +108,9 @@ from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
     TransformedCakeMegaWeights,
     preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_cake_mega_weights,
 )
+from .backends.mega.kernel.sm120.mxfp4_mxfp4_bf16_cake import (
+    Sm120_Mxfp4_Mxfp4_Bf16_Cake_MegaMoeConfig,
+)
 from .backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cake import (
     Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig,
     TransformedCakeNvfp4MegaWeights,
@@ -377,6 +380,7 @@ __all__ = [
     "Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig",
+    "Sm120_Mxfp4_Mxfp4_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig",
     "NosyncOptions",

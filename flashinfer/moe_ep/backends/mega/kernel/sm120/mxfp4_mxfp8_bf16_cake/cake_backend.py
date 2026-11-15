@@ -259,9 +259,9 @@ def scratch_specs(
     i32, u32, u64 = torch.int32, torch.uint32, torch.uint64
     # Pool / intermediate row widths (POOL_ACT_WORDS, INTER_ROW_BYTES), allocated pool rows (POOL_ALLOC_ROWS)
     # and the per-expert global-scale tail of the routing weights (EXPERT_SCALE_WORDS) depend on the
-    # activation codec: MXFP8 builds have POOL_ALLOC_ROWS == POOL_ROWS, EXPERT_SCALE_WORDS == 0; NVFP4 builds
-    # pack e2m1 rows, split the FP8 rows of the in-kernel shared expert and append [fc1_alpha | fc2_alpha |
-    # fc1_norm_const].
+    # activation codec: MXFP8 builds have POOL_ALLOC_ROWS == POOL_ROWS, EXPERT_SCALE_WORDS == 0; FP4 builds
+    # (NVFP4, MXFP4) pack e2m1 rows and split the FP8 rows of the in-kernel shared expert; NVFP4 builds also
+    # append [fc1_alpha | fc2_alpha | fc1_norm_const] (EXPERT_SCALE_WORDS == 0 for MXFP4).
     PA = C["POOL_ALLOC_ROWS"]
     specs: list[tuple[str, torch.dtype, tuple[int, ...], int | None]] = [
         (
@@ -744,7 +744,7 @@ class _CakeWorkspace:
 @register_mega_kernel(KERNEL_NAME)
 class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
-    # Activation codec of the device build (MOE_ACT_CODEC): 0 MXFP8 here, 1 NVFP4 in the W4A4 subclass.
+    # Activation codec of the device build (MOE_ACT_CODEC): 0 MXFP8 here, 1 NVFP4 / 2 MXFP4 in the W4A4 subclasses.
     ACT_CODEC = 0
     # Config class this backend accepts (the configs are siblings, not subclasses of each other).
     CONFIG_TYPE: type = Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig
@@ -907,7 +907,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         config = self._kernel_config
         return (
             KERNEL_NAME,
-            self.ACT_CODEC,  # a W4A8 and an NVFP4 layer must not share a workspace (different staging buffers)
+            self.ACT_CODEC,  # layers of different activation codecs never share a workspace (staging buffers)
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -1245,7 +1245,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             C = spec["constants"]
             b = views[inst_name]
             static_sources = {
-                # rows of POOL_ACT_WORDS words: H bytes (MXFP8) or H / 2 (NVFP4, plus the
+                # rows of POOL_ACT_WORDS words: H bytes (MXFP8) or H / 2 (NVFP4 / MXFP4, plus the
                 # split shared-expert rows of POOL_ALLOC_ROWS)
                 "W1_A": b["pool_fp8_u32"]
                 .view(torch.uint8)
@@ -1546,7 +1546,7 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         ws.staged_rows = self._stage_activations(t, ws, quantize_input=quantize_input)
         ws.staged_bound = bound
 
-    # Hooks of the activation codec (overridden by the NVFP4 W4A4 subclass).
+    # Hooks of the activation codec (overridden by the W4A4 subclasses).
 
     @staticmethod
     def _activation_shapes(
