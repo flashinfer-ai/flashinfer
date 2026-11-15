@@ -2220,8 +2220,10 @@ def test_mixed_classes_run_on_the_unified_bodies():
             assert s.operands.mixed and s.k_block == 0
             # the shared transposed epilogue runs over the record's warpgroups (one per eight-token subtile, at most four);
             # the scale-factor warp, the MMA warp and the TMA warp follow them
-            assert s.epi_wgs == epi_warpgroups_of(plain, sw.tile_n) == max(
-                1, min(4, sw.tile_n // 8)
+            assert (
+                s.epi_wgs
+                == epi_warpgroups_of(plain, sw.tile_n)
+                == max(1, min(4, sw.tile_n // 8))
             )
             assert (s.sf_warp, s.mma_warp, s.tma_warp) == (
                 4 * s.epi_wgs,

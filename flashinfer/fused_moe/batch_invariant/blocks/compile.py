@@ -532,7 +532,9 @@ def compile_swapped_fn(
         f = _fakes(chain)
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = GRID_PLACEHOLDER
-        body = SwappedGroupedGemm(cfg, chain, gather=gather, k_block=k_block, sf_src=sf_src)
+        body = SwappedGroupedGemm(
+            cfg, chain, gather=gather, k_block=k_block, sf_src=sf_src
+        )
         if _is_block_scaled(chain) and cfg.gather_a:
             sfx = f["sfa_lin"] if sf_src == "linear" else f["sfa"]
             if isinstance(chain, Mxfp4Chain):
