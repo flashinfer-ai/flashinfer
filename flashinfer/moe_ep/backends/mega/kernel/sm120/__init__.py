@@ -1,6 +1,7 @@
 """SM120 (Blackwell-consumer) mega-kernel backends."""
 
 from . import (
+    mxfp4_mxfp4_bf16_cake,
     mxfp4_mxfp8_bf16_cake,
     mxfp4_mxfp8_bf16_cutedsl,
     mxfp4_mxfp8_bf16_nosync,
@@ -9,6 +10,7 @@ from . import (
 )
 
 __all__ = [
+    "mxfp4_mxfp4_bf16_cake",
     "mxfp4_mxfp8_bf16_cake",
     "mxfp4_mxfp8_bf16_cutedsl",
     "mxfp4_mxfp8_bf16_nosync",

@@ -3451,6 +3451,27 @@
                                     unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (wait_owner_771482y_1);
                                     unsigned int _gc_old;
                                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
+#elif (MOE_INSTANCE == 3 && MOE_SW_ROLE_PEER_FOLD == 1) // moe-select
+        {
+            if (warp >= 8 && warp < 12) {
+                if (lane == 0) {
+                    int s3_is_self = 0;
+                    if (warp == 11) {
+                        s3_is_self = 1;
+                    }
+                    if (s3_is_self != 0) {
+                        int sp_records = source_record_counts[rank];
+                        int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                        int sp_q = _max_3f95d2;
+                        int sp_chunks = (sp_records + sp_q - 1) / sp_q;
+                        #pragma unroll 1
+                        for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
+                            {
+                                unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
+                                while (true) {
+                                    unsigned int _gca_v;
+                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                                    if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
 #elif (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_ROLE_PEER_FOLD == 0)))) // moe-select
         {
             if (warp >= (unsigned int)MOE_RANKS && warp < 12) {
@@ -4052,27 +4073,6 @@
                                     unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_ready) + (wait_owner_771482y_1);
                                     unsigned int _gc_old;
                                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
-#elif (MOE_INSTANCE == 3 && MOE_SW_ROLE_PEER_FOLD == 1) // moe-select
-        {
-            if (warp >= 8 && warp < 12) {
-                if (lane == 0) {
-                    int s3_is_self = 0;
-                    if (warp == 11) {
-                        s3_is_self = 1;
-                    }
-                    if (s3_is_self != 0) {
-                        int sp_records = source_record_counts[rank];
-                        int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                        int sp_q = _max_3f95d2;
-                        int sp_chunks = (sp_records + sp_q - 1) / sp_q;
-                        #pragma unroll 1
-                        for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
-                            {
-                                unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
-                                while (true) {
-                                    unsigned int _gca_v;
-                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                                    if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
 #elif (MOE_SW_POLICY_EP == 16 && ((MOE_INSTANCE == 2 && MOE_SW_WATCH_WIDE == 1) || (MOE_INSTANCE == 3 && MOE_SW_WATCH_WIDE == 1))) // moe-select
         {
             if (warp >= (unsigned int)MOE_RANKS && warp < 12) {
@@ -5436,83 +5436,7 @@
                                     unsigned int _gca_v;
                                     asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
                                     if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
-#elif ((MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8)) || (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8))) // moe-select
-        if (warp > (unsigned int)world_size && warp < (unsigned int)(2 * world_size)) {
-            int wait_owner = (unsigned int)rank + warp - (unsigned int)world_size;
-            if (wait_owner >= world_size) {
-                wait_owner = wait_owner - world_size;
-            }
-            if (elect_sync()) {
-                int owner_routes = owner_route_counts[wait_owner];
-                int _max_bdb2cb = ((owner_routes) > (0) ? (owner_routes) : (0));
-                int _min_e22beex = ((_max_bdb2cb) < (MOE_X_7830131351) ? (_max_bdb2cb) : (MOE_X_7830131351));
-                int safe_owner_routes = _min_e22beex;
-                int c41_wq = 128;
-                if (safe_owner_routes >= 768 && safe_owner_routes < 768 || safe_owner_routes >= 8192) {
-                    c41_wq = 64;
-                }
-                if (safe_owner_routes < 768) {
-                    c41_wq = 32;
-                }
-                int _max_e17473 = (((safe_owner_routes + c41_wq - 1) / c41_wq - 1) > (0) ? ((safe_owner_routes + c41_wq - 1) / c41_wq - 1) : (0));
-                int c41_wfull = _max_e17473;
-                int _max_4449e7 = ((c41_wfull + (safe_owner_routes - c41_wfull * c41_wq + 64 - 1) / 64) > (1) ? (c41_wfull + (safe_owner_routes - c41_wfull * c41_wq + 64 - 1) / 64) : (1));
-                int owner_chunk_count = _max_4449e7 + 1;
-                #pragma unroll 1
-                for (int h29_k = 1; h29_k < MOE_X_efe5fd2ddf; h29_k++) {
-                    if (owner_chunk_count < h29_k) {
-                        break;
-                    }
-                    int c13a_c = h29_k - 2;
-                    int _max_677b28 = ((source_route_counts[wait_owner]) > (0) ? (source_route_counts[wait_owner]) : (0));
-                    int _min_8d134ex = ((_max_677b28) < (MOE_X_7830131351) ? (_max_677b28) : (MOE_X_7830131351));
-                    int c13a2_dual_r = (int)(safe_owner_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || safe_owner_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_8d134ex * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
-                    if (c13a2_dual_r != 0 && c13a_c >= 0 && (c13a_c & 1) == 1) {
-                        if ((int)peer_transport[rank * world_size + wait_owner] == 2) {
-                            unsigned long long gw_t0_f02022y_3 = 0;
-                            while (1) {
-                                // gin_read_signal: acquire, 64-bit signal snapshot
-                                uint64_t _gin_signal_762279x;
-                                {
-                                    ncclGin __gin{*(gin_dev_comm), (int)(1)};
-                                    _gin_signal_762279x = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + wait_owner), 64, cuda::memory_order_acquire);
-                                }
-                                unsigned long long gw_seen_f2556cx = _gin_signal_762279x;
-                                if ((long long)(gw_seen_f2556cx - (unsigned long long)(result_signal_base_scratch[MOE_RANKS + wait_owner] + (unsigned long long)((c13a_c + 1) / 2))) >= 0) {
-                                    break;
-                                }
-                                unsigned long long gtimer_0_c4e315y_5;
-                                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_5) :: "memory");
-                                unsigned long long wd_now_99fb2cy_4 = gtimer_0_c4e315y_5;
-                                unsigned long long wd_t0_223846y_3 = gw_t0_f02022y_3;
-                                if (gw_t0_f02022y_3 == 0) {
-                                    wd_t0_223846y_3 = wd_now_99fb2cy_4;
-                                }
-                                if (wd_now_99fb2cy_4 - wd_t0_223846y_3 > 600000000000) {
-                                    asm volatile("trap;" ::: "memory");
-                                }
-                                gw_t0_f02022y_3 = wd_t0_223846y_3;
-                            }
-                        } else {
-                            unsigned int* lsa_wait_ptr_7550d4 = lsa_signals + ((MOE_X_0b051f4e86 + (MOE_X_1925e14f40 + wait_owner)) * 32);
-                            unsigned long long gtimer_0_840d2fy_4;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_840d2fy_4) :: "memory");
-                            unsigned long long lsa_wait_start_9eeeb5y_3 = gtimer_0_840d2fy_4;
-                            int lsa_waiting_44bae6y_3 = 1;
-                            while (lsa_waiting_44bae6y_3 != 0) {
-                                unsigned int _load_acquire_d37125y_4;
-                                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_d37125y_4) : "l"(reinterpret_cast<unsigned int*>(lsa_wait_ptr_7550d4)) : "memory");
-                                unsigned int lsa_seen_e9d73cx = _load_acquire_d37125y_4;
-                                unsigned int lsa_delta_cf66d4 = lsa_seen_e9d73cx - (unsigned int)(result_signal_base_scratch[MOE_RANKS + wait_owner] + (unsigned long long)((c13a_c + 1) / 2));
-                                if ((int)lsa_delta_cf66d4 >= 0) {
-                                    lsa_waiting_44bae6y_3 = 0;
-                                } else {
-                                    unsigned long long gtimer_1_53b30ay_4;
-                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_53b30ay_4) :: "memory");
-                                    if (gtimer_1_53b30ay_4 - lsa_wait_start_9eeeb5y_3 > 600000000000) {
-                                        asm volatile("trap;" ::: "memory");
-                                    }
-#elif (MOE_INSTANCE == 0 || MOE_INSTANCE == 1) // moe-select
+#elif MOE_SW_POLICY_EP == 16 // moe-select
         {
             if (warp >= (unsigned int)MOE_RANKS && warp < 12) {
                 #pragma unroll 1
@@ -5651,6 +5575,82 @@
                                                 }
                                             }
                                         }
+                                    }
+#elif (MOE_INSTANCE == 0 || MOE_INSTANCE == 1) // moe-select
+        if (warp > (unsigned int)world_size && warp < (unsigned int)(2 * world_size)) {
+            int wait_owner = (unsigned int)rank + warp - (unsigned int)world_size;
+            if (wait_owner >= world_size) {
+                wait_owner = wait_owner - world_size;
+            }
+            if (elect_sync()) {
+                int owner_routes = owner_route_counts[wait_owner];
+                int _max_bdb2cb = ((owner_routes) > (0) ? (owner_routes) : (0));
+                int _min_e22beex = ((_max_bdb2cb) < (MOE_X_7830131351) ? (_max_bdb2cb) : (MOE_X_7830131351));
+                int safe_owner_routes = _min_e22beex;
+                int c41_wq = 128;
+                if (safe_owner_routes >= 768 && safe_owner_routes < 768 || safe_owner_routes >= 8192) {
+                    c41_wq = 64;
+                }
+                if (safe_owner_routes < 768) {
+                    c41_wq = 32;
+                }
+                int _max_e17473 = (((safe_owner_routes + c41_wq - 1) / c41_wq - 1) > (0) ? ((safe_owner_routes + c41_wq - 1) / c41_wq - 1) : (0));
+                int c41_wfull = _max_e17473;
+                int _max_4449e7 = ((c41_wfull + (safe_owner_routes - c41_wfull * c41_wq + 64 - 1) / 64) > (1) ? (c41_wfull + (safe_owner_routes - c41_wfull * c41_wq + 64 - 1) / 64) : (1));
+                int owner_chunk_count = _max_4449e7 + 1;
+                #pragma unroll 1
+                for (int h29_k = 1; h29_k < MOE_X_efe5fd2ddf; h29_k++) {
+                    if (owner_chunk_count < h29_k) {
+                        break;
+                    }
+                    int c13a_c = h29_k - 2;
+                    int _max_677b28 = ((source_route_counts[wait_owner]) > (0) ? (source_route_counts[wait_owner]) : (0));
+                    int _min_8d134ex = ((_max_677b28) < (MOE_X_7830131351) ? (_max_677b28) : (MOE_X_7830131351));
+                    int c13a2_dual_r = (int)(safe_owner_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || safe_owner_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_8d134ex * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                    if (c13a2_dual_r != 0 && c13a_c >= 0 && (c13a_c & 1) == 1) {
+                        if ((int)peer_transport[rank * world_size + wait_owner] == 2) {
+                            unsigned long long gw_t0_f02022y_3 = 0;
+                            while (1) {
+                                // gin_read_signal: acquire, 64-bit signal snapshot
+                                uint64_t _gin_signal_762279x;
+                                {
+                                    ncclGin __gin{*(gin_dev_comm), (int)(1)};
+                                    _gin_signal_762279x = __gin.readSignal((ncclGinSignal_t)(MOE_X_1925e14f40 + wait_owner), 64, cuda::memory_order_acquire);
+                                }
+                                unsigned long long gw_seen_f2556cx = _gin_signal_762279x;
+                                if ((long long)(gw_seen_f2556cx - (unsigned long long)(result_signal_base_scratch[MOE_RANKS + wait_owner] + (unsigned long long)((c13a_c + 1) / 2))) >= 0) {
+                                    break;
+                                }
+                                unsigned long long gtimer_0_c4e315y_5;
+                                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_5) :: "memory");
+                                unsigned long long wd_now_99fb2cy_4 = gtimer_0_c4e315y_5;
+                                unsigned long long wd_t0_223846y_3 = gw_t0_f02022y_3;
+                                if (gw_t0_f02022y_3 == 0) {
+                                    wd_t0_223846y_3 = wd_now_99fb2cy_4;
+                                }
+                                if (wd_now_99fb2cy_4 - wd_t0_223846y_3 > 600000000000) {
+                                    asm volatile("trap;" ::: "memory");
+                                }
+                                gw_t0_f02022y_3 = wd_t0_223846y_3;
+                            }
+                        } else {
+                            unsigned int* lsa_wait_ptr_7550d4 = lsa_signals + ((MOE_X_0b051f4e86 + (MOE_X_1925e14f40 + wait_owner)) * 32);
+                            unsigned long long gtimer_0_840d2fy_4;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_840d2fy_4) :: "memory");
+                            unsigned long long lsa_wait_start_9eeeb5y_3 = gtimer_0_840d2fy_4;
+                            int lsa_waiting_44bae6y_3 = 1;
+                            while (lsa_waiting_44bae6y_3 != 0) {
+                                unsigned int _load_acquire_d37125y_4;
+                                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_load_acquire_d37125y_4) : "l"(reinterpret_cast<unsigned int*>(lsa_wait_ptr_7550d4)) : "memory");
+                                unsigned int lsa_seen_e9d73cx = _load_acquire_d37125y_4;
+                                unsigned int lsa_delta_cf66d4 = lsa_seen_e9d73cx - (unsigned int)(result_signal_base_scratch[MOE_RANKS + wait_owner] + (unsigned long long)((c13a_c + 1) / 2));
+                                if ((int)lsa_delta_cf66d4 >= 0) {
+                                    lsa_waiting_44bae6y_3 = 0;
+                                } else {
+                                    unsigned long long gtimer_1_53b30ay_4;
+                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_53b30ay_4) :: "memory");
+                                    if (gtimer_1_53b30ay_4 - lsa_wait_start_9eeeb5y_3 > 600000000000) {
+                                        asm volatile("trap;" ::: "memory");
                                     }
 #else // moe-select
         if (warp > (unsigned int)world_size && warp < (unsigned int)(2 * world_size)) {

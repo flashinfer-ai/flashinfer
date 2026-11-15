@@ -21,6 +21,7 @@
 #include "cake_sm120_megamoe_kernel_part006.cuh"
 #include "cake_sm120_megamoe_kernel_part028.cuh"
 #include "cake_sm120_megamoe_kernel_part008.cuh"
+#include "cake_sm120_megamoe_kernel_part039.cuh"
 #include "cake_sm120_megamoe_kernel_part029.cuh"
 #include "cake_sm120_megamoe_kernel_part010.cuh"
 #include "cake_sm120_megamoe_kernel_part030.cuh"

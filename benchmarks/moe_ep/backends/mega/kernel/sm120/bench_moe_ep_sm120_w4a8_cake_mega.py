@@ -189,8 +189,8 @@ def main(
     build=_w4a8_layer, kernel: str = "w4a8", description: str | None = None
 ) -> None:
     """``build(rank, world, geometry, capacity, shared, table, limit, activation_fields, codec,
-    seed)`` returns the layer of one (shape, variant, codec), or ``None`` to skip it (the NVFP4
-    benchmark passes its own builder)."""
+    seed)`` returns the layer of one (shape, variant, codec), or ``None`` to skip it (the W4A4
+    benchmarks pass their own builders)."""
 
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_synthetic import (
         Geometry,
