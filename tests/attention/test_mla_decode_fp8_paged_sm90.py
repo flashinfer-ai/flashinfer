@@ -292,3 +292,19 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     torch.cuda.synchronize()
     eager2 = _run(w, batch)
     assert torch.equal(out, eager2)
+
+
+def test_ragged_short_kv_b5_workspace_bound_regression():
+    """Regression: the plan-time split-workspace bound must cover the
+    repaired launcher's B>=5 ONE-PAGE-split path, where the split count can
+    reach pages_per_seq. The earlier two-page-only bound
+    min(256, ceil(pps/2)) undersized exactly this ragged short-kv B=5 shape
+    (pps=24) and run() refused fail-closed with 'workspace too small'."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([1500, 658, 760, 341, 863], device)
+    w = _plan_wrapper(batch, device)
+    out = _run(w, batch)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
+    ref = _reference(batch)
+    assert _matched_ratio(out, ref) >= MATCHED

@@ -329,8 +329,14 @@ def _mla_dec_fp8q_sm90_prepare(
         kv_lens_host[:B].to(torch.int32).to(device), non_blocking=True
     )
     # caller-owned split workspace, sized for the worst split count the
-    # launch arithmetic can choose for this (B, QL, pps) plan
-    ns_max = min(256, (pps + 1) // 2) if pps > 1 else 1
+    # launch arithmetic can choose for this (B, QL, pps) plan. The repaired
+    # launcher's B>=5 compact-dual path consumes ONE page per split (its
+    # pps_split is not forced even), so ns can reach pps; the other branches
+    # stay under this bound too (B==1 is capped by min(sm_count,
+    # ceil(pps/2), 256); B2-B4 even two-page splits sit under that). The
+    # earlier two-page-only bound min(256, ceil(pps/2)) undersized exactly
+    # the ragged short-kv B>=5 class and run() refused fail-closed.
+    ns_max = min(256, pps) if pps > 1 else 1
     ws_bytes = B * ns_max * QL * _NUM_HEADS * (_HEAD_DIM_CKV + 8)
     workspace = _buf("workspace", max(ws_bytes, 16), torch.uint8)
     q_descale = _buf("q_descale", 1, torch.float32)
