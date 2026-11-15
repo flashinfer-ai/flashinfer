@@ -560,7 +560,7 @@ def mxfp8_quantize(
         - ``"cuda"``: stable JIT-compiled kernel. CUDA inputs require
           SM100 or newer. CPU inputs use the host implementation and
           require ``torch.float32``.
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (SM90+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``. Native and CuTe backends require explicit
