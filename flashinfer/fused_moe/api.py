@@ -3411,6 +3411,18 @@ class BatchInvariantBf16Config:
         return "BatchInvariantBf16Config()"
 
 
+# Design notes: the kernels of this backend took optimisation ideas from the package's other MoE backends: the swapped-AB
+# decode records as ranked members of the dispatcher's space and the two-atom stage follow Prims-TS (the open counterpart of
+# TRTLLM-Gen's MoE GEMMs: its swap-AB low-latency templates and tile-N ladder) and TRTLLM-Gen's MXFP8 decode tactics; the fused
+# requantization of the intermediate in GEMM1's epilogue follows Prims-TS's fused activation and TRTLLM-Gen's block-fp8
+# contract, whose surface this backend mirrors; the dense packing of the expanded rows with the scale factors at the padded atom
+# positions follows TRTLLM-Gen's routed-token layouts; GEMM1 reading the token rows through the routing (the gather form)
+# follows TRTLLM-Gen's in-GEMM row gather and the fp4 backend's gather record; the decode form (no plan launch and no scatter,
+# the GEMM's CTAs taking the routing's ids and building the group tables themselves) follows the Frost low-latency MoE's launch
+# structure; the PDL wait / trigger placement and the launch's tile bound on the persistent grid follow Prims-TS and
+# TRTLLM-Gen; the scatter's placement and the swapped epilogue's warpgroup split are the fp4 backend's; the routing,
+# permutation, combine and the ranking contract are the bf16 backend's. Each is a placement of the class's dataflow: the same
+# bits, placed as those kernels place theirs.
 @dataclass(frozen=True)
 class BatchInvariantFp8BlockConfig:
     """The batch-invariant fp8-block MoE backend: the fp8 formats with block scales under one backend
@@ -3629,6 +3641,28 @@ def _fp4_pair(quant: Optional["QuantConfig"]) -> Tuple[QuantFormat, QuantFormat]
 # MXFP8 x MXFP4 backends, with every op the quantizer class's; its swapped decode records on the twin instruction (the e2m1
 # weight as the MMA's A operand) follow Prims-TS's swap-AB templates as the NVFP4 pair's do. Each is a placement of the
 # class's dataflow: the same bits, placed as those kernels place theirs.
+def _activation_arith_of(activation_arith: str, chain, pair) -> str:
+    """The chain arithmetic of ``BatchInvariantFp4Config.activation_arith`` for the activation: ``"exact"`` -> the declared
+    sequences; ``"hardware"`` -> the hardware-arithmetic class where the chain has an exponential or a division, the exact
+    class otherwise (the ReLU family), and a refusal for PowLU (no hardware form)."""
+    from ..batch_invariant.support import unsupported
+    from .batch_invariant.spec import hw_arith_applies
+
+    if activation_arith not in ("exact", "hardware"):
+        raise ValueError(
+            f"activation_arith must be 'exact' or 'hardware', got {activation_arith!r}."
+        )
+    if activation_arith == "exact":
+        return "exact"
+    if chain.act == "powlu":
+        raise unsupported(
+            "moe.nvfp4" if pair[0] == QuantFormat.NVFP4 else "moe.mxfp4",
+            "activation_arith='hardware' with PowLU",
+            "the exact class: the PowLU chain has no hardware form",
+        )
+    return "hw" if hw_arith_applies(chain.act, chain.gated) else "exact"
+
+
 @dataclass(frozen=True)
 class BatchInvariantFp4Config:
     """The batch-invariant fp4 MoE backend of the unified layer: one backend for the 4-bit-weight quantization pairs, grouped
@@ -3700,11 +3734,22 @@ class BatchInvariantFp4Config:
     """
 
     intermediate: str = "per_token"
+    #: the arithmetic of the activation chain's exponential and divisions: ``"exact"`` (the declared, correctly rounded
+    #: sequences: the classes ``moe.<pair>.<act>``, reproduced bit for bit on the CPU) or ``"hardware"`` (the classes
+    #: ``moe.<pair>.<act>.hw``: the part's ``ex2.approx`` / ``rcp.approx``, deterministic and batch-invariant per part, their
+    #: bits architecture-specific; the CPU model holds the part's two functions as tables). The field applies to every typed
+    #: activation whose chain has an exponential or a division (SwiGLU, SwiGLUStep, GeGLU, GeGLUTanh, SiTU, SiLU, GELU); the
+    #: ReLU family is the same class under either value; PowLU has no hardware form and is refused under ``"hardware"``.
+    activation_arith: str = "exact"
 
     def __post_init__(self) -> None:
         if self.intermediate not in ("per_token", "static"):
             raise ValueError(
                 f"BatchInvariantFp4Config.intermediate must be 'per_token' or 'static', got {self.intermediate!r}."
+            )
+        if self.activation_arith not in ("exact", "hardware"):
+            raise ValueError(
+                f"BatchInvariantFp4Config.activation_arith must be 'exact' or 'hardware', got {self.activation_arith!r}."
             )
 
     @classmethod
@@ -3724,6 +3769,7 @@ class BatchInvariantFp4Config:
         device: Optional[torch.device] = None,
         intermediate: str = "per_token",
         intermediate_scales: Optional[torch.Tensor] = None,
+        activation_arith: str = "exact",
     ) -> Dict[str, Any]:
         """The backend's weight view for the pair ``quant`` selects (``None``: NVFP4 x NVFP4), to register under
         ``BatchInvariantFp4Runner.backend_key``; the activation's chain is part of the view (``activation`` defaults to
@@ -3737,6 +3783,19 @@ class BatchInvariantFp4Config:
 
         pair = _fp4_pair(quant)
         chain = activation_of(activation if activation is not None else SwiGLU())
+        if (
+            pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+            and activation_arith != "exact"
+        ):
+            from ..batch_invariant.support import unsupported
+            from .batch_invariant.spec_mxfp4w8a import CLASS as MIXED_CLASS
+
+            raise unsupported(
+                MIXED_CLASS,
+                f"activation_arith={activation_arith!r}",
+                "the exact class: the mixed pair has no hardware-arithmetic class",
+            )
+        arith = _activation_arith_of(activation_arith, chain, pair)
         w1 = w1.to(device=device) if device is not None else w1
         w2 = w2.to(device=device) if device is not None else w2
         if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
@@ -3750,6 +3809,7 @@ class BatchInvariantFp4Config:
                 params=chain.params,
                 intermediate=intermediate,
                 intermediate_scales=intermediate_scales,
+                arith=arith,
             ).view()
         if pair == (QuantFormat.MXFP4, QuantFormat.MXFP4):
             from ..batch_invariant.support import unsupported
@@ -3770,6 +3830,7 @@ class BatchInvariantFp4Config:
                 gated=chain.gated,
                 act=chain.act,
                 params=chain.params,
+                arith=arith,
             ).view()
         if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
             from ..batch_invariant.support import unsupported

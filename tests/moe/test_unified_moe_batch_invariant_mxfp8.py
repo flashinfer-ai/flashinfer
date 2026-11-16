@@ -465,7 +465,7 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
     """The MX chains run the backend's swapped body (:mod:`blocks.swap`), which reads the plan's group counts under the
     chain's trigger rule (``pdl.BOX_FORM_TRIGGERS``: the dependents launch after the predecessor's own wait, the body's own
     wait before the tables is the margin) and whose builder asserts the shipped placement is one of them; the gather form
-    belongs to the bf16 classes; a k-block is whole instruction steps of the class."""
+    runs the one-atom stage; a k-block is whole instruction steps of the class."""
     from flashinfer.fused_moe.batch_invariant import pdl
     from flashinfer.fused_moe.batch_invariant.blocks.epilogue_mx import MxChain
     from flashinfer.fused_moe.batch_invariant.blocks.swap import SwappedGroupedGemm
@@ -482,8 +482,10 @@ def test_swapped_box_form_compiles_under_the_chain_trigger_rule_only(monkeypatch
         assert SwappedGroupedGemm(cfg, ch, k_block=256).k_block == 256
         with pytest.raises(AssertionError):
             SwappedGroupedGemm(cfg, ch, k_block=48)
+        # the gather form (the token rows read through the plan's map) runs the one-atom stage: no k-block with it
+        assert SwappedGroupedGemm(cfg, ch, gather=True).gather
         with pytest.raises(AssertionError):
-            SwappedGroupedGemm(cfg, ch, gather=True)
+            SwappedGroupedGemm(cfg, ch, gather=True, k_block=256)
     monkeypatch.setattr(pdl, "TRIGGER", "early")
     with pytest.raises(AssertionError):
         SwappedGroupedGemm(cfg, GEMM2_CHAIN)
@@ -548,19 +550,12 @@ def test_mx_classes_run_on_the_unified_bodies():
         sw = swapped_knobs_mx()[0]
         assert is_swapped_record(sw, fmt)
         s = SwappedGroupedGemm(sw, plain.at(fmt), k_block=256)
-        assert s.operands.block_scaled and s.k_block == 256 and s.sf_warp == 4
-        # the shared transposed epilogue runs over the record's warpgroups (one per eight-token subtile, at most four); the
-        # fused requantization's own epilogue on one
-        for sw2 in swapped_knobs_mx():
-            s2 = SwappedGroupedGemm(sw2, plain.at(fmt), k_block=256)
-            assert (
-                s2.epi_wgs == max(1, min(4, sw2.tile_n // 8))
-                and s2.sf_warp == 4 * s2.epi_wgs
-            )
-            assert (
-                SwappedGroupedGemm(sw2, quant.at(fmt), k_block=256).epi_wgs
-                == s2.epi_wgs
-            )
+        assert s.operands.block_scaled and s.k_block == 256
+        # the scale-factor warp follows the epilogue warpgroups (the token tile's count, for the plain chains on the shared
+        # epilogue and for the fused requantization's own loop alike)
+        assert s.sf_warp == len(s.epilogue_warps) == 4 * s.epi_wgs
+        q = SwappedGroupedGemm(sw, quant.at(fmt))
+        assert q.epi_wgs == s.epi_wgs and q.sf_warp == s.sf_warp
         assert C.can_implement_grouped_blockscaled(dense, 256, 2048, 8, quant, fmt)
         assert C.can_implement_swapped_blockscaled(sw, 256, 2048, 8, quant, fmt)
         assert not C.can_implement_grouped_blockscaled(dense, 256, 2064, 8, quant, fmt)
@@ -574,18 +569,20 @@ def test_mx_classes_run_on_the_unified_bodies():
     assert C.kernel_name(dense, quant, packing="padded").startswith(
         "grouped_mxfp8_swiglu_mxfp8_"
     )
-    # the plain chain's 16-token record: the record's k-block, then the shared transposed epilogue's two-warpgroup suffix
     name = C.swapped_kernel_name(
         swapped_knobs_mx()[1], plain.at("mxfp8_k64"), k_block=256
     )
+    # the plain chain on the shared swapped epilogue: the k-block and the epilogue warpgroups of the 16-token tile
     assert name.startswith("swapped_mxfp8k64_plain_bf16_") and name.endswith(
         "_kb256_e2"
     )
-    # the fused requantization's epilogue over the same warpgroups: the same suffix
     name = C.swapped_kernel_name(
         swapped_knobs_mx()[1], quant.at("mxfp8_k64"), k_block=256
     )
-    assert name.endswith("_kb256_e2")
+    # the fused requantization's own loop over the same warpgroups
+    assert name.startswith("swapped_mxfp8k64_swiglu_mxfp8_") and name.endswith(
+        "_kb256_e2"
+    )
     assert C.MODULE == SCATTER_MODULE == "batch_invariant_moe"
     assert "batch_invariant_moe_mxfp8" not in jit.MODULE_ROOTS
     srcs = jit.relative_sources("batch_invariant_moe")
@@ -1915,10 +1912,320 @@ def test_swapped_path_equals_the_padded_path(T, k, H, I, E, act):
 
 
 @needs_device
+@pytest.mark.parametrize(
+    "T, k, H, I, E, act, dropped",
+    [
+        (1, 2, 256, 128, 8, "swiglu", False),
+        (13, 8, 256, 128, 8, "swiglu", True),
+        (16, 8, 512, 256, 64, "swiglu", False),
+        (3, 6, 384, 256, 16, "relu2", True),
+    ],
+)
+def test_gather_form_gives_the_box_forms_bits(T, k, H, I, E, act, dropped):
+    """GEMM1's gather form (the swapped record reading the token rows and their scale bytes through the plan's map, no scatter
+    launch) gives the box form's bits at every swapped token tile: the op's output, the fused codes at the dense rows and the
+    scale bytes at the padded positions; a dropped slot (an id outside the expert range) is skipped by both forms; the default
+    form follows the structural rule (the gather form at the narrow swapped tile)."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.schedule import rows_per_expert
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        default_configs_mx,
+        gather_form_rule,
+        swapped_knobs_mx,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    a = activation_of(SwiGLU() if act == "swiglu" else ReLU2())
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=700 + T + E, gated=a.gated, adversarial=True
+    )
+    xq, xsf = _quant(x)
+    W = F.MoEWeightsMXFP8.prepare(w1, w2, gated=a.gated, act=a.act, params=a.params)
+    ids, weights = route(logits, k)
+    if dropped:
+        ids = ids.clone()
+        ids[0, 0] = E  # a dropped slot: no position, the term +0
+    sm_count, family = F._part(xq.device)
+    fmt = F.mx_class_of(xq.device)
+    _, s2 = default_configs_mx(
+        T, k, H, I, E, W.chain1, fmt, sm_count, family, swap=True
+    )
+    for s1 in swapped_knobs_mx():
+        box, im_b = F.fused_moe_mxfp8(
+            (xq, xsf),
+            ids,
+            weights,
+            W,
+            config1=s1,
+            config2=s2,
+            gather=False,
+            decode=False,
+            return_intermediates=True,
+        )
+        got, im_g = F.fused_moe_mxfp8(
+            (xq, xsf),
+            ids,
+            weights,
+            W,
+            config1=s1,
+            config2=s2,
+            gather=True,
+            decode=False,
+            return_intermediates=True,
+        )
+        assert not im_b["config1"].gather_a and im_g["config1"].gather_a
+        assert im_g["x_perm"] is None and im_b["x_perm"] is not None
+        assert torch.equal(bits(got), bits(box))
+        live = im_b["dest"].reshape(-1)
+        live = live[live >= 0].long()
+        assert torch.equal(
+            im_g["aq"].view(torch.uint8)[live], im_b["aq"].view(torch.uint8)[live]
+        )
+        pos = im_b["pos_pad"].reshape(-1)[: live.numel()].long()
+        assert torch.equal(
+            _unswizzle(im_g["a_sf"], im_g["Tk_sf"], I)[pos],
+            _unswizzle(im_b["a_sf"], im_b["Tk_sf"], I)[pos],
+        )
+        assert torch.equal(bits(im_g["y"][live].cpu()), bits(im_b["y"][live].cpu()))
+        # the default: the decode form where its rule holds (the gather record with the in-kernel plan), else the
+        # structural gather rule of the launch plan
+        auto, im_a = F.fused_moe_mxfp8(
+            (xq, xsf),
+            ids,
+            weights,
+            W,
+            config1=s1,
+            config2=s2,
+            return_intermediates=True,
+        )
+        structural = gather_form_rule(s1, rows_per_expert(T, k, E)).gather_a
+        if F.decode_form_default(T, k, E, H, s1, s2):
+            assert (
+                im_a["plan"] == "in_kernel" and im_a["config1"].gather_a and structural
+            )
+        else:
+            assert im_a["plan"] == "launch"
+            assert im_a["config1"].gather_a == structural
+        assert torch.equal(bits(auto), bits(box))
+        auto, im_a = F.fused_moe_mxfp8(
+            (xq, xsf),
+            ids,
+            weights,
+            W,
+            config1=s1,
+            config2=s2,
+            decode=False,
+            return_intermediates=True,
+        )
+        assert im_a["plan"] == "launch"
+        assert im_a["config1"].gather_a == structural
+        assert torch.equal(bits(auto), bits(box))
+    # the gather form is GEMM1's swapped record on the dense packing with the fused requantization
+    p1, p2 = default_configs_mx(
+        T, k, H, I, E, W.chain1, fmt, sm_count, family, swap=False
+    )
+    with pytest.raises(ValueError, match="gather form"):
+        F.fused_moe_mxfp8(
+            (xq, xsf), ids, weights, W, config1=p1, config2=p2, gather=True
+        )
+    with pytest.raises(ValueError, match="gather form"):
+        F.fused_moe_mxfp8(
+            (xq, xsf),
+            ids,
+            weights,
+            W,
+            config1=s1,
+            config2=s2,
+            gather=True,
+            requant="standalone",
+        )
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "T, k, H, I, E, act, dropped",
+    [
+        (1, 8, 256, 128, 8, "swiglu", False),
+        (4, 6, 384, 256, 16, "relu2", True),
+        (16, 8, 512, 256, 64, "swiglu", False),
+        (16, 8, 256, 128, 256, "swiglu", True),
+    ],
+)
+def test_decode_form_builds_the_plan_in_the_kernel(T, k, H, I, E, act, dropped):
+    """The decode form (both records swapped, the dense packing, the fused requantization, at most PLAN_MAX_SLOTS slots and
+    PLAN_MAX_E experts): GEMM1's gather record builds the group tables and the row map from the ids itself and its first CTA
+    stores the counts and the row map; the op's output, the fused codes and scales and GEMM2's rows equal the box form's, the
+    stored counts and row map equal the plan kernel's integers; the default form follows the rule."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.api import route
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import default_configs_mx
+    from flashinfer.fused_moe.batch_invariant.spec import activation_of
+
+    a = activation_of(SwiGLU() if act == "swiglu" else ReLU2())
+    x, logits, w1, w2 = _problem(
+        T, k, H, I, E, seed=900 + T + E, gated=a.gated, adversarial=True
+    )
+    xq, xsf = _quant(x)
+    W = F.MoEWeightsMXFP8.prepare(w1, w2, gated=a.gated, act=a.act, params=a.params)
+    ids, weights = route(logits, k)
+    if dropped:
+        ids = ids.clone()
+        ids[0, 0] = E  # a dropped slot: not counted, no position, the term +0
+        if T > 1:
+            ids[1, k - 1] = -3
+    sm_count, family = F._part(xq.device)
+    fmt = F.mx_class_of(xq.device)
+    s1, s2 = default_configs_mx(
+        T, k, H, I, E, W.chain1, fmt, sm_count, family, swap=True
+    )
+    box, im_b = F.fused_moe_mxfp8(
+        (xq, xsf),
+        ids,
+        weights,
+        W,
+        config1=s1,
+        config2=s2,
+        gather=False,
+        decode=False,
+        return_intermediates=True,
+    )
+    got, im_d = F.fused_moe_mxfp8(
+        (xq, xsf),
+        ids,
+        weights,
+        W,
+        config1=s1,
+        config2=s2,
+        decode=True,
+        return_intermediates=True,
+    )
+    assert (
+        im_d["plan"] == "in_kernel"
+        and im_b["plan"] == "launch"
+        and im_d["config1"].gather_a
+    )
+    assert torch.equal(bits(got), bits(box))
+    assert torch.equal(im_d["counts"], im_b["counts"])
+    assert torch.equal(im_d["dest"], im_b["dest"])
+    live = im_b["dest"].reshape(-1)
+    live = live[live >= 0].long()
+    assert torch.equal(
+        im_d["aq"].view(torch.uint8)[live], im_b["aq"].view(torch.uint8)[live]
+    )
+    pos = im_b["pos_pad"].reshape(-1)[: live.numel()].long()
+    assert torch.equal(
+        _unswizzle(im_d["a_sf"], im_d["Tk_sf"], I)[pos],
+        _unswizzle(im_b["a_sf"], im_b["Tk_sf"], I)[pos],
+    )
+    assert torch.equal(bits(im_d["y"][live].cpu()), bits(im_b["y"][live].cpu()))
+    # the rule: the default takes the decode form at one row per expert; a denser routing, a precomputed plan or a grouped
+    # record keeps the launch
+    auto, im_a = F.fused_moe_mxfp8(
+        (xq, xsf), ids, weights, W, config1=s1, config2=s2, return_intermediates=True
+    )
+    assert im_a["plan"] == (
+        "in_kernel" if F.decode_form_default(T, k, E, H, s1, s2) else "launch"
+    )
+    assert torch.equal(bits(auto), bits(box))
+    plan = F.permute_plan_dual_padded(ids, E)
+    planned, im_p = F.fused_moe_mxfp8(
+        (xq, xsf),
+        ids,
+        weights,
+        W,
+        config1=s1,
+        config2=s2,
+        plan=plan,
+        return_intermediates=True,
+    )
+    assert im_p["plan"] == "launch" and torch.equal(bits(planned), bits(box))
+    p1, p2 = default_configs_mx(
+        T, k, H, I, E, W.chain1, fmt, sm_count, family, swap=False
+    )
+    with pytest.raises(ValueError, match="decode form"):
+        F.fused_moe_mxfp8(
+            (xq, xsf), ids, weights, W, config1=p1, config2=p2, decode=True
+        )
+
+
+def test_decode_form_rule_is_a_shape_rule():
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.blocks.swap import (
+        PLAN_MAX_E,
+        PLAN_MAX_SLOTS,
+    )
+
+    assert F.decode_form_ok(16, 8, 256, 2048) and F.decode_form_ok(
+        1, 2, PLAN_MAX_E, 128
+    )
+    assert not F.decode_form_ok(PLAN_MAX_SLOTS // 8 + 1, 8, 8, 2048)  # the slots
+    assert not F.decode_form_ok(1, 8, PLAN_MAX_E + 1, 2048)  # the experts
+    assert not F.decode_form_ok(
+        1, 8, 8, 96
+    )  # the scale rows are not whole 4-byte groups
+
+
+def test_gather_form_rule_and_operand_contract():
+    """The gather form is a structural rule of the fused op (a swapped GEMM1 record at most `GATHER_TOKEN_TILE_MAX` tokens wide;
+    the scale rows whole 4-byte groups, i.e. a hidden size that is a multiple of 128) and a record attribute of the grouped
+    entry (``src`` and ``rows`` belong to it)."""
+    from flashinfer.fused_moe.batch_invariant import api_mxfp8 as F
+    from flashinfer.fused_moe.batch_invariant.schedule_mxfp8 import (
+        GATHER_ROWS_PER_EXPERT_MAX,
+        GATHER_TOKEN_TILE_MAX,
+        gather_form_rule,
+        grouped_knobs_mx,
+        swapped_knobs_mx,
+    )
+
+    for c in swapped_knobs_mx():
+        assert gather_form_rule(c).gather_a == (
+            c.mma_tiler_mn[1] <= GATHER_TOKEN_TILE_MAX
+        )
+        assert gather_form_rule(c, 1).gather_a == (
+            c.mma_tiler_mn[1] <= GATHER_TOKEN_TILE_MAX
+        )
+        assert not gather_form_rule(
+            c, GATHER_ROWS_PER_EXPERT_MAX + 1
+        ).gather_a  # several live rows per tile: the box
+    for c in grouped_knobs_mx("mxfp8")[:3]:
+        assert not gather_form_rule(c).gather_a
+    s8 = swapped_knobs_mx()[0]
+    assert F.decode_form_default(16, 8, 128, 2048, s8, s8)  # one row per expert
+    assert not F.decode_form_default(16, 2, 8, 4096, s8, s8)  # four rows per expert
+    assert not F.decode_form_default(16, 8, 128, 2048, grouped_knobs_mx("mxfp8")[0], s8)
+    assert not F.decode_form_default(16, 8, 128, 2048, s8, s8, path="padded")
+    assert F.gather_form_ok(2048) and F.gather_form_ok(128) and not F.gather_form_ok(96)
+    assert not F.gather_form_ok(64)
+    if not torch.cuda.is_available():
+        return
+    dev = torch.device("cuda")
+    a = torch.zeros(4, 256, dtype=torch.float8_e4m3fn, device=dev)
+    sf = torch.zeros(4 * 8, dtype=torch.uint8, device=dev)
+    w = torch.zeros(8, 256, 256, dtype=torch.float8_e4m3fn, device=dev)
+    w_sf = torch.zeros(8, F.sf_numel(256, 256), dtype=torch.uint8, device=dev)
+    counts = torch.zeros(8, dtype=torch.int32, device=dev)
+    box = swapped_knobs_mx()[0]
+    with pytest.raises(ValueError, match="gather record"):
+        F.grouped_gemm_mxfp8(
+            a,
+            sf,
+            w,
+            w_sf,
+            counts,
+            box,
+            F.MoEWeightsMXFP8(w, w_sf, w, w_sf).chain1_quant,
+            dense_a=True,
+            src=torch.zeros(8, dtype=torch.int32, device=dev),
+        )
+
+
+@needs_device
 def test_decode_tactics_include_the_swapped_records_and_agree():
     """At a decode-sized batch the ranked tactics include the swapped records (the swapped body on the dense packing, the
-    layer's routing-and-plan launch in its dual form) and every tactic gives one output; the tactic round-trips its swapped
-    flag; from logits and pre-routed agree."""
+    layer's routing launch alone in the decode form or its routing-and-plan launch in the dual form) and every tactic gives
+    one output; the tactic round-trips its swapped flag; from logits and pre-routed agree."""
     from flashinfer.fused_moe.batch_invariant.runner import _configs_from_tactic
 
     T, k, H, I, E = 4, 8, 512, 256, 128
@@ -1929,7 +2236,10 @@ def test_decode_tactics_include_the_swapped_records_and_agree():
     pack = _logits_pack(x, logits)
     ref = bits(layer(pack, W))
     inputs = runner.pack_inputs(pack, W)
-    assert len(inputs) == 14, "the dual plan: counts, dest, src, dest_pad, pos_pad"
+    if runner._plan_in_kernel(T, H):
+        assert len(inputs) == 9, "the decode form: the routing alone, no plan tensors"
+    else:
+        assert len(inputs) == 14, "the dual plan: counts, dest, src, dest_pad, pos_pad"
     tactics = runner.get_valid_tactics(inputs, None)
     assert 1 <= len(tactics) <= 9 and len(set(tactics)) == len(tactics)
     assert all(

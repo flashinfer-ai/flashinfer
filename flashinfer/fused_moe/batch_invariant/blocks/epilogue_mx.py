@@ -119,18 +119,17 @@ def xch_bytes(chain, epi_warpgroups: int) -> int:
     )
 
 
-SWAP_XCH_WARPS = 4  # the warps of one epilogue warpgroup of the swapped body: the gated chain's block spans warps 2q / 2q + 1
+SWAP_XCH_WARPS = 4  # the swapped body's one epilogue warpgroup: the gated chain's block spans warps 2q / 2q + 1
 
 
-def swap_xch_layout(token_tile: int, epi_warpgroups: int = 1):
-    """The swapped body's half-block amax exchange of the gated chain: fp32 per (epilogue warpgroup, buffer, warp, token
-    column of the tile)."""
-    return cute.make_layout((epi_warpgroups, XCH_BUFFERS, SWAP_XCH_WARPS, token_tile))
+def swap_xch_layout(token_tile: int):
+    """The swapped body's half-block amax exchange of the gated chain: fp32 per (buffer, warp, token column of the tile)."""
+    return cute.make_layout((XCH_BUFFERS, SWAP_XCH_WARPS, token_tile))
 
 
-def swap_xch_bytes(chain, token_tile: int, epi_warpgroups: int = 1) -> int:
+def swap_xch_bytes(chain, token_tile: int) -> int:
     return (
-        4 * epi_warpgroups * XCH_BUFFERS * SWAP_XCH_WARPS * token_tile
+        4 * XCH_BUFFERS * SWAP_XCH_WARPS * token_tile
         if chain.out_fmt == OUT_FMT and chain.pair
         else 0
     )
@@ -223,7 +222,7 @@ class MxChain(GroupedEpilogueBlock):
             return None
         if token_tile is None:
             return xch_layout(epi_warpgroups)
-        return swap_xch_layout(token_tile, epi_warpgroups)
+        return swap_xch_layout(token_tile)
 
     def grouped_loop(self):
         return grouped_epilogue_quant_loop if self.quant else None
@@ -486,25 +485,24 @@ def swapped_epilogue_quant_loop(
     s_off_pad: cute.Tensor,
     weight_tile: cutlass.Constexpr = 128,
     subtile=None,
-    wg=None,
 ):
     """The fused requantization in the swapped body's transposed orientation: the accumulator tile is (weight rows,
     tokens); thread ``t`` of an epilogue warpgroup holds weight row ``t`` of the tile and the token columns of its subtile
-    (``subtile``: this warpgroup's one token subtile of the tile when several warpgroups split the tile's columns, ``wg`` its
-    index into the exchange buffer and its named barrier; None: one warpgroup takes every subtile). Gated chain: the gate
-    accumulators come from lane ``+8`` (``shfl.sync.down``), the up lanes (row % 16 < 8) own output column ``(row // 16) * 8 +
-    row % 8`` of the tile's ``weight_tile / 2`` outputs, so a block of 32 output columns is the 16 up lanes of warp ``2q`` and
-    the 16 of warp ``2q + 1``: the block amax is the in-warp butterfly (xor 1, 2, 4 over the 8 consecutive up lanes, xor 16
-    over the two groups; the gate lanes' leaves ``+0``) combined with the partner warp's through ``sX``
-    (:func:`swap_xch_layout`, one named barrier per subtile). Ungated chain: output column = weight row, a block = one warp,
-    the butterfly xor 1 .. 16. Then the quantizer class's term per (token, block): the scale from the block amax, the code
-    of this lane's output; token ``j`` of the tile is dense row ``row0 + j``, stored iff ``j < rows_left`` (and the column
-    exists); the scale byte at the padded position ``row0 + j + (off_pad[e] - off[e])`` by the block's first lane. A subtile
-    whose token columns are all live runs every column's chain straight-line (the chains interleave); a subtile with dead
-    columns computes the chain and the block amax of the live columns only (a warp-uniform branch per column: every lane of
-    the warp holds the same token column, and a column's reduction never mixes with another's, so the stored bits are the
-    same); the ReLU family (``CHEAP_ACTS``) runs every column straight-line whatever the live count (its per-column cost is
-    the butterfly, which interleaves). ``mOut [Tk', N_out]`` uint8 codes, ``mSf`` the flat 128x4 bytes of the padded rows."""
+    (``subtile``: this warpgroup's one subtile of the tile when several warpgroups split the token columns, the accumulator
+    released once every warp has arrived; None: one warpgroup takes every subtile). A token column past the group's rows is
+    never stored, so its chain and reduction are skipped (a warp-uniform region) in a subtile with dead columns; a subtile
+    whose columns are all live, and every subtile of the ReLU family (``CHEAP_ACTS``: the per-column cost is the butterfly,
+    which interleaves), runs every column straight-line. Gated
+    chain: the gate accumulators come from lane ``+8`` (``shfl.sync.down``), the up lanes (row % 16 < 8) own output
+    column ``(row // 16) * 8 + row % 8`` of the tile's ``weight_tile / 2`` outputs, so a block of 32 output columns is
+    the 16 up lanes of warp ``2q`` and the 16 of warp ``2q + 1``: the block amax is the in-warp butterfly (xor 1, 2, 4
+    over the 8 consecutive up lanes, xor 16 over the two groups; the gate lanes' leaves ``+0``) combined with the partner
+    warp's through ``sX`` (:func:`swap_xch_layout`, one named barrier per subtile). Ungated chain: output column =
+    weight row, a block = one warp, the butterfly xor 1 .. 16. Then the quantizer class's term per (token, block): the
+    scale from the block amax, the code of this lane's output; token ``j`` of the tile is dense row ``row0 + j``, stored
+    iff ``j < rows_left`` (and the column exists); the scale byte at the padded position ``row0 + j + (off_pad[e] -
+    off[e])`` by the block's first lane. ``mOut [Tk', N_out]`` uint8 codes, ``mSf`` the flat 128x4 bytes of the padded
+    rows."""
     pair = chain.pair
     twin = bf16_twin(chain)
     fp = CuteF32
@@ -562,15 +560,13 @@ def swapped_epilogue_quant_loop(
     lane = cute.arch.lane_idx()
     warp = (tidx % Int32(128)) // Int32(32)
     partner = warp ^ Int32(1)
-    xw = (
-        Int32(0) if cutlass.const_expr(wg is None) else wg
-    )  # this warpgroup's exchange buffer and barrier
-    bar = Int32(BAR_EPI_XCH) + xw
     parity = Int32(0)
+    wg_id = Int32(0)
+    if cutlass.const_expr(subtile is not None):
+        wg_id = subtile  # the named barrier of this warpgroup's exchange
     acc_state = pipeline.make_pipeline_state(
         pipeline.PipelineUserType.Consumer, st.num_acc_stage
     )
-
     work_tile = tile_sched.initial_work_tile_info()
     while work_tile.is_valid_tile:
         row0, row_end, n_tile, e = (
@@ -598,13 +594,7 @@ def swapped_epilogue_quant_loop(
             wrow = crd0[0]  # this thread's weight row in the tile
             col0 = crd0[1] - Int32(offs[0][1])  # the subtile's first token column
             n_glob = n_tile * Int32(weight_tile) + wrow
-            gate = None
-            is_up = None
             if cutlass.const_expr(pair):
-                gate = [
-                    cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
-                    for v in range(nv)
-                ]
                 is_up = (wrow % Int32(2 * GROUP)) < Int32(GROUP)
                 out_loc = (wrow // Int32(2 * GROUP)) * Int32(GROUP) + wrow % Int32(
                     GROUP
@@ -618,8 +608,12 @@ def swapped_epilogue_quant_loop(
             leader = store_ok & (
                 (out_loc % Int32(BLOCK)) == Int32(0)
             )  # the block's first column stores its scale byte
-            # the dead-column skip pays where the per-column cost is the chain itself; the ReLU family keeps every column
-            # straight-line (its butterflies interleave)
+            # the chain and the block amax (the in-warp butterfly) of the token columns. The dead-column skip pays where the
+            # per-column cost is the chain itself: a subtile with a column past the group's end (never stored) computes the live
+            # columns only -- a warp-uniform region: every lane of the warpgroup holds the same column, so the shuffles inside
+            # see every lane; a dead column keeps a benign constant for the quantizer's division. A subtile whose columns are
+            # all live, and every subtile of the ReLU family (CHEAP_ACTS: the butterflies interleave), runs every column
+            # straight-line.
             if cutlass.const_expr(chain.act in CHEAP_ACTS):
                 full = Boolean(True)
             else:
@@ -627,16 +621,12 @@ def swapped_epilogue_quant_loop(
                     col0 + Int32(span)
                 ) <= rows_left  # every token column of the subtile is a live token
             if full:
-                # every token column's chain straight-line (the column chains interleave), its block amax across the lanes
-                # (the gate lanes' leaves ``+0``)
                 for v in cutlass.range_constexpr(nv):
-                    yb = twin.elem(
-                        MoeF32,
-                        tTR_rAcc[v],
-                        gate[v] if cutlass.const_expr(pair) else None,
-                    )
+                    g = None
+                    if cutlass.const_expr(pair):
+                        g = cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
+                    yb = twin.elem(MoeF32, tTR_rAcc[v], g)
                     yf = yb.to(Float32)
-                    ys[v] = yf
                     leaf = leaf_value(fp, yf)
                     if cutlass.const_expr(pair):
                         lf = Float32(0.0)
@@ -652,19 +642,18 @@ def swapped_epilogue_quant_loop(
                             leaf = d.combine(
                                 fp, leaf, cute.arch.shuffle_sync_bfly(leaf, offset=m)
                             )
+                    ys[v] = yf
                     am[v] = leaf
             else:
-                # the live columns only: a dead column (past the group's live tokens, never stored) costs no chain and no
-                # butterfly; its slots hold a benign constant for the straight-line quantization below
                 for v in cutlass.range_constexpr(nv):
+                    yf = Float32(DEAD_ACC)
+                    leaf = Float32(DEAD_ACC)
                     if col0 + Int32(cols[v]) < rows_left:
-                        yb = twin.elem(
-                            MoeF32,
-                            tTR_rAcc[v],
-                            gate[v] if cutlass.const_expr(pair) else None,
-                        )
+                        g = None
+                        if cutlass.const_expr(pair):
+                            g = cute.arch.shuffle_sync_down(tTR_rAcc[v], offset=8)
+                        yb = twin.elem(MoeF32, tTR_rAcc[v], g)
                         yf = yb.to(Float32)
-                        ys[v] = yf
                         leaf = leaf_value(fp, yf)
                         if cutlass.const_expr(pair):
                             lf = Float32(0.0)
@@ -684,65 +673,65 @@ def swapped_epilogue_quant_loop(
                                     leaf,
                                     cute.arch.shuffle_sync_bfly(leaf, offset=m),
                                 )
-                        am[v] = leaf
-                    else:
-                        ys[v] = Float32(DEAD_ACC)
-                        am[v] = Float32(DEAD_ACC)
+                    ys[v] = yf
+                    am[v] = leaf
             if cutlass.const_expr(pair):
+                # the partner warp's half of the block's amax (one named barrier per warpgroup and subtile)
                 if lane == Int32(0):
                     for v in cutlass.range_constexpr(nv):
-                        sX[(xw, parity, warp, Int32(cols[v]) + col0)] = am[v]
+                        sX[(parity, warp, Int32(cols[v]) + col0)] = am[v]
                 cute.arch.barrier(
-                    barrier_id=bar, number_of_threads=128
+                    barrier_id=Int32(BAR_EPI_XCH) + wg_id, number_of_threads=128
                 )  # the four warps' halves are in
                 for v in cutlass.range_constexpr(nv):
                     am[v] = d.combine(
-                        fp, am[v], sX[(xw, parity, partner, Int32(cols[v]) + col0)]
+                        fp, am[v], sX[(parity, partner, Int32(cols[v]) + col0)]
                     )
                 parity = Int32(1) - parity
             # the quantizer class's term per (token, block): the scale from the block amax, this lane's code; two tokens
-            # per conversion (each value's conversion is independent of its pairing)
+            # per conversion, a pair with a live column only
             for q in cutlass.range_constexpr(0, nv, 2):
                 v0, v1 = q, q + 1
                 j0 = col0 + Int32(cols[v0])
                 j1 = col0 + Int32(cols[v1])
-                sf0, sfd0 = cvt_f32_to_ue8m0(
-                    scale_norm(fp, am[v0], fmt, rule), rule.round
-                )
-                sf1, sfd1 = cvt_f32_to_ue8m0(
-                    scale_norm(fp, am[v1], fmt, rule), rule.round
-                )
-                y0 = saturate(
-                    fp,
-                    quant_pre(fp, ys[v0], inv_scale(fp, sfd0, rule), rule),
-                    fmt,
-                    rule,
-                )
-                y1 = saturate(
-                    fp,
-                    quant_pre(fp, ys[v1], inv_scale(fp, sfd1, rule), rule),
-                    fmt,
-                    rule,
-                )
-                pr = cvt_f32x2_to_fp8x2(y0, y1, fmt.elem_fmt)
-                ok0 = store_ok & (j0 < rows_left)
-                ok1 = store_ok & (j1 < rows_left)
-                if ok0:
-                    mOut[(row0 + j0, out_col)] = (pr & 0xFF).to(Uint8)
-                if ok1:
-                    mOut[(row0 + j1, out_col)] = (pr >> 8).to(Uint8)
-                if leader & (j0 < rows_left):
-                    mSf[
-                        sf_offset_128x4_dev(
-                            (row0 + j0 + sf_shift).to(Int64), blk, pcols
-                        )
-                    ] = sf0.to(Uint8)
-                if leader & (j1 < rows_left):
-                    mSf[
-                        sf_offset_128x4_dev(
-                            (row0 + j1 + sf_shift).to(Int64), blk, pcols
-                        )
-                    ] = sf1.to(Uint8)
+                if (j0 < rows_left) | (j1 < rows_left):
+                    sf0, sfd0 = cvt_f32_to_ue8m0(
+                        scale_norm(fp, am[v0], fmt, rule), rule.round
+                    )
+                    sf1, sfd1 = cvt_f32_to_ue8m0(
+                        scale_norm(fp, am[v1], fmt, rule), rule.round
+                    )
+                    y0 = saturate(
+                        fp,
+                        quant_pre(fp, ys[v0], inv_scale(fp, sfd0, rule), rule),
+                        fmt,
+                        rule,
+                    )
+                    y1 = saturate(
+                        fp,
+                        quant_pre(fp, ys[v1], inv_scale(fp, sfd1, rule), rule),
+                        fmt,
+                        rule,
+                    )
+                    pr = cvt_f32x2_to_fp8x2(y0, y1, fmt.elem_fmt)
+                    ok0 = store_ok & (j0 < rows_left)
+                    ok1 = store_ok & (j1 < rows_left)
+                    if ok0:
+                        mOut[(row0 + j0, out_col)] = (pr & 0xFF).to(Uint8)
+                    if ok1:
+                        mOut[(row0 + j1, out_col)] = (pr >> 8).to(Uint8)
+                    if leader & (j0 < rows_left):
+                        mSf[
+                            sf_offset_128x4_dev(
+                                (row0 + j0 + sf_shift).to(Int64), blk, pcols
+                            )
+                        ] = sf0.to(Uint8)
+                    if leader & (j1 < rows_left):
+                        mSf[
+                            sf_offset_128x4_dev(
+                                (row0 + j1 + sf_shift).to(Int64), blk, pcols
+                            )
+                        ] = sf1.to(Uint8)
         with cute.arch.elect_one():
             acc_pipeline.consumer_release(
                 acc_state

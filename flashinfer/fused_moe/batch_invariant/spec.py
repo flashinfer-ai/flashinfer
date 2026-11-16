@@ -69,9 +69,34 @@ EXP_COEFFS = tuple(
 )
 
 
-def exp_term(fp: Any, x: Any) -> Any:
+#: The arithmetic of a chain's transcendental steps: ``exact`` (the declared sequences below: correctly rounded binary32
+#: operations, reproduced bit for bit by the CPU) or ``hw`` (the hardware-arithmetic classes: ``ex2.approx.ftz`` for the
+#: exponential and ``rcp.approx.ftz`` for every division, each a deterministic function of the part; the CPU model holds
+#: the part's two functions as tables, :mod:`flashinfer.batch_invariant.fp_interface.sfu`).
+ARITHS = ("exact", "hw")
+#: The gated chains whose declared sequence has an exponential or a division: the hardware form exists for them (PowLU
+#: keeps the declared log / exp: no hardware form).
+HW_ACTS = ("silu", "gelu_tanh", "gelu", "swiglu_oai", "swiglu_step", "situ")
+#: The ungated chains with a hardware form.
+HW_UNGATED_ACTS = ("silu", "gelu")
+
+
+def hw_arith_applies(act: str, gated: bool) -> bool:
+    """Whether the hardware arithmetic changes the chain ``act``: the chains with an exponential or a division."""
+    return act in (HW_ACTS if gated else HW_UNGATED_ACTS)
+
+
+def _rdiv(fp: Any, a: Any, b: Any, hw: bool) -> Any:
+    """``div(a, b)``: the correctly rounded division, or the hardware form ``mul(a, rcp(b))``."""
+    return fp.mul(a, fp.rcp(b)) if hw else fp.div(a, b)
+
+
+def exp_term(fp: Any, x: Any, hw: bool = False) -> Any:
     """``exp(x)`` as the fixed op sequence of docs/moe_scoping.md section 3.4. Every op is a single correctly rounded
-    binary32 operation or exact, so the CPU reproduces the device bit for bit."""
+    binary32 operation or exact, so the CPU reproduces the device bit for bit. ``hw``: the hardware form
+    ``ex2(mul(x, log2 e))`` (``ex2.approx.ftz``: it saturates to ``+inf`` and flushes to ``+0`` on its own)."""
+    if hw:
+        return fp.ex2(fp.mul(x, fp.const(LOG2E)))
     x = fp.fmax(fp.fmin(x, fp.const(EXP_MAX)), fp.const(EXP_MIN))
     t = fp.add(fp.mul(x, fp.const(LOG2E)), fp.const(SHIFT))
     kf = fp.add(t, fp.const(-SHIFT))
@@ -83,19 +108,25 @@ def exp_term(fp: Any, x: Any) -> Any:
     return fp.mul(p, fp.exp2i(kf))
 
 
-def sigmoid_term(fp: Any, x: Any) -> Any:
-    """``1 / (1 + exp(-x))`` with the declared exp and one correctly rounded division."""
+def sigmoid_term(fp: Any, x: Any, hw: bool = False) -> Any:
+    """``1 / (1 + exp(-x))`` with the declared exp and one correctly rounded division; ``hw``: ``rcp(1 + ex2(-x log2 e))``."""
+    if hw:
+        return fp.rcp(fp.add(fp.const(1.0), exp_term(fp, fp.neg(x), True)))
     return fp.div(fp.const(1.0), fp.add(fp.const(1.0), exp_term(fp, fp.neg(x))))
 
 
-def silu_term(fp: Any, g: Any) -> Any:
-    """``g / (1 + exp(-g))``: one division, no separate sigmoid multiply."""
+def silu_term(fp: Any, g: Any, hw: bool = False) -> Any:
+    """``g / (1 + exp(-g))``: one division, no separate sigmoid multiply; ``hw``: ``mul(g, rcp(1 + ex2(-g log2 e)))``."""
+    if hw:
+        return fp.mul(g, sigmoid_term(fp, g, True))
     return fp.div(g, fp.add(fp.const(1.0), exp_term(fp, fp.neg(g))))
 
 
-def swiglu_elem(fp: Any, g: Any, u: Any, out_fmt: str = "bf16") -> Any:
+def swiglu_elem(
+    fp: Any, g: Any, u: Any, out_fmt: str = "bf16", hw: bool = False
+) -> Any:
     """The GEMM1 epilogue chain: ``cvt(silu(g) * u)`` from the two fp32 accumulators."""
-    return fp.cvt_out(fp.mul(silu_term(fp, g), u), out_fmt)
+    return fp.cvt_out(fp.mul(silu_term(fp, g, hw), u), out_fmt)
 
 
 # ----------------------------------------------------------------------------- routing
@@ -592,37 +623,39 @@ def _horner(fp: Any, x: Any, coeffs: Sequence[float]) -> Any:
     return p
 
 
-def gelu_tanh_term(fp: Any, x: Any) -> Any:
+def gelu_tanh_term(fp: Any, x: Any, hw: bool = False) -> Any:
     """``mul(x, sigmoid(mul(2, mul(C1, add(x, mul(C2, mul(x, mul(x, x))))))))`` with the declared sigmoid (hence the
     declared exp, clamped at [-87, 88]: the tail saturates at ``x / (1 + e^88)``, below any output format's
-    resolution). FlashInfer's ``GeGLUTanh``."""
+    resolution). FlashInfer's ``GeGLUTanh``. ``hw``: the hardware sigmoid."""
     x3 = fp.mul(x, fp.mul(x, x))
     y = fp.mul(fp.const(GELU_C1), fp.add(x, fp.mul(fp.const(GELU_C2), x3)))
-    return fp.mul(x, sigmoid_term(fp, fp.mul(fp.const(2.0), y)))
+    return fp.mul(x, sigmoid_term(fp, fp.mul(fp.const(2.0), y), hw))
 
 
-def tanh_term(fp: Any, z: Any) -> Any:
-    """``2 sigmoid(2 z) - 1`` with the declared sigmoid: saturates exactly at +-1 through the exp clamp."""
+def tanh_term(fp: Any, z: Any, hw: bool = False) -> Any:
+    """``2 sigmoid(2 z) - 1`` with the declared sigmoid: saturates exactly at +-1 through the exp clamp (``hw``: the
+    hardware sigmoid, which saturates through ``ex2``'s overflow and flush)."""
     return fp.add(
-        fp.mul(fp.const(2.0), sigmoid_term(fp, fp.mul(fp.const(2.0), z))),
+        fp.mul(fp.const(2.0), sigmoid_term(fp, fp.mul(fp.const(2.0), z), hw)),
         fp.const(-1.0),
     )
 
 
-def erf_pos_term(fp: Any, a: Any) -> Any:
-    """The declared erf of ``a >= 0``: ``1 - t p(t) exp(-a^2)``, ``t = 1 / (1 + P a)``."""
-    t = fp.div(fp.const(1.0), fp.add(fp.const(1.0), fp.mul(fp.const(ERF_P), a)))
-    e = exp_term(fp, fp.neg(fp.mul(a, a)))
+def erf_pos_term(fp: Any, a: Any, hw: bool = False) -> Any:
+    """The declared erf of ``a >= 0``: ``1 - t p(t) exp(-a^2)``, ``t = 1 / (1 + P a)`` (``hw``: ``t`` by ``rcp``, the
+    exponential by ``ex2``)."""
+    t = _rdiv(fp, fp.const(1.0), fp.add(fp.const(1.0), fp.mul(fp.const(ERF_P), a)), hw)
+    e = exp_term(fp, fp.neg(fp.mul(a, a)), hw)
     return fp.add(
         fp.const(1.0), fp.neg(fp.mul(fp.mul(t, _horner(fp, t, ERF_COEFFS)), e))
     )
 
 
-def gelu_term(fp: Any, x: Any) -> Any:
+def gelu_term(fp: Any, x: Any, hw: bool = False) -> Any:
     """``0.5 (x + |x| erf(|x| / sqrt 2))``: the exact GELU's form written on ``|x|`` (``x erf(x / sqrt 2)`` is even),
     with the declared erf. FlashInfer's ``GELU`` / ``GeGLU``."""
     ax = fp.fabs(x)
-    y = erf_pos_term(fp, fp.mul(ax, fp.const(INV_SQRT2)))
+    y = erf_pos_term(fp, fp.mul(ax, fp.const(INV_SQRT2)), hw)
     return fp.mul(fp.const(0.5), fp.add(x, fp.mul(ax, y)))
 
 
@@ -675,19 +708,19 @@ def _clamp_sym(fp: Any, u: Any, limit: float) -> Any:
     return fp.fmin(fp.fmax(u, fp.const(-limit)), fp.const(limit))
 
 
-def act_term(fp: Any, act: str, g: Any) -> Any:
+def act_term(fp: Any, act: str, g: Any, hw: bool = False) -> Any:
     """The gated chains' activation of the gate alone (``silu``, ``gelu_tanh``, ``gelu``): ``glu_pre`` multiplies it
     by the up accumulator. The parameterised chains (``swiglu_oai``, ``swiglu_step``, ``situ``, ``powlu``) mix the two
-    branches and live in :func:`glu_pre`."""
+    branches and live in :func:`glu_pre`. ``hw``: the hardware arithmetic of the transcendental steps."""
     assert act in ("silu", "gelu_tanh", "gelu"), act
     if act == "silu":
-        return silu_term(fp, g)
-    return gelu_tanh_term(fp, g) if act == "gelu_tanh" else gelu_term(fp, g)
+        return silu_term(fp, g, hw)
+    return gelu_tanh_term(fp, g, hw) if act == "gelu_tanh" else gelu_term(fp, g, hw)
 
 
-def ungated_term(fp: Any, act: str, x: Any) -> Any:
+def ungated_term(fp: Any, act: str, x: Any, hw: bool = False) -> Any:
     """The ungated chains on one accumulator: ReLU^2, the identity, ReLU (``fmaxc(x, 0)``: the device's zero rule, so an
-    accumulator of ``-0`` gives ``+0``), SiLU, GELU."""
+    accumulator of ``-0`` gives ``+0``), SiLU, GELU (the last two in the hardware arithmetic under ``hw``)."""
     assert act in UNGATED_ACTS, act
     if act == "relu2":
         return relu2_term(fp, x)
@@ -696,8 +729,8 @@ def ungated_term(fp: Any, act: str, x: Any) -> Any:
     if act == "relu":
         return fp.fmaxc(x, fp.const(0.0))
     if act == "silu":
-        return silu_term(fp, x)
-    return gelu_term(fp, x)
+        return silu_term(fp, x, hw)
+    return gelu_term(fp, x, hw)
 
 
 def act_elem(
@@ -706,15 +739,21 @@ def act_elem(
     act: str = "relu2",
     out_fmt: str = "bf16",
     params: Sequence[Optional[float]] = (),
+    hw: bool = False,
 ) -> Any:
     """The ungated GEMM1 epilogue chain: ``cvt(act(acc))`` from one fp32 accumulator, ``act`` in ``UNGATED_ACTS``
     (no ungated chain takes parameters)."""
     assert not tuple(params), (act, params)
-    return fp.cvt_out(ungated_term(fp, act, acc), out_fmt)
+    return fp.cvt_out(ungated_term(fp, act, acc, hw), out_fmt)
 
 
 def glu_pre(
-    fp: Any, g: Any, u: Any, act: str = "silu", params: Sequence[Optional[float]] = ()
+    fp: Any,
+    g: Any,
+    u: Any,
+    act: str = "silu",
+    params: Sequence[Optional[float]] = (),
+    hw: bool = False,
 ) -> Any:
     """The gated activation before any rounding, in fp32, on the (gate, up) accumulator pair:
 
@@ -733,24 +772,26 @@ def glu_pre(
       times ``clamp(u, +-limit)`` (``PowLU``).
 
     Every operation is a single correctly rounded binary32 operation, an exact one, or the declared ``exp`` / ``log``
-    / ``erf`` chains above."""
+    / ``erf`` chains above. ``hw``: the hardware arithmetic of the exponential and the divisions (``HW_ACTS``; the PowLU
+    chain has no hardware form)."""
     assert act in ACTS, act
     params = tuple(params)
+    assert not hw or act in HW_ACTS, (act, "no hardware form")
     if act in ("silu", "gelu_tanh", "gelu"):
         assert not params, (act, params)
-        return fp.mul(act_term(fp, act, g), u)
+        return fp.mul(act_term(fp, act, g, hw), u)
     if act == "swiglu_oai":
         alpha, beta, limit = params
         gl = fp.fmin(g, fp.const(limit))
         ul = _clamp_sym(fp, u, limit)
         return fp.mul(
-            fp.mul(gl, sigmoid_term(fp, fp.mul(fp.const(alpha), gl))),
+            fp.mul(gl, sigmoid_term(fp, fp.mul(fp.const(alpha), gl), hw)),
             fp.add(ul, fp.const(beta)),
         )
     if act == "swiglu_step":
         (limit,) = params
         return fp.mul(
-            fp.fmin(silu_term(fp, g), fp.const(limit)), _clamp_sym(fp, u, limit)
+            fp.fmin(silu_term(fp, g, hw), fp.const(limit)), _clamp_sym(fp, u, limit)
         )
     if act == "situ":
         gs, ls, cl = params
@@ -758,13 +799,13 @@ def glu_pre(
             g = fp.fmin(g, fp.const(cl))
             u = _clamp_sym(fp, u, cl)
         gt = fp.mul(
-            fp.mul(fp.const(gs), tanh_term(fp, fp.div(g, fp.const(gs)))),
-            sigmoid_term(fp, g),
+            fp.mul(fp.const(gs), tanh_term(fp, _rdiv(fp, g, fp.const(gs), hw), hw)),
+            sigmoid_term(fp, g, hw),
         )
         ut = (
             u
             if ls is None
-            else fp.mul(fp.const(ls), tanh_term(fp, fp.div(u, fp.const(ls))))
+            else fp.mul(fp.const(ls), tanh_term(fp, _rdiv(fp, u, fp.const(ls), hw), hw))
         )
         return fp.mul(gt, ut)
     m, limit = params
@@ -784,9 +825,10 @@ def glu_elem(
     act: str = "silu",
     out_fmt: str = "bf16",
     params: Sequence[Optional[float]] = (),
+    hw: bool = False,
 ) -> Any:
     """``cvt(glu_pre(g, u))``: ``swiglu_elem`` for ``act = "silu"`` (the same term), the other gated chains otherwise."""
-    return fp.cvt_out(glu_pre(fp, g, u, act, params), out_fmt)
+    return fp.cvt_out(glu_pre(fp, g, u, act, params, hw), out_fmt)
 
 
 def params_key(params: Sequence[Optional[float]]) -> Tuple[Optional[float], ...]:
@@ -951,9 +993,12 @@ class MoESpec:
     def gemm1(self, r: int = 0, j: int = 0) -> Term:
         """The GEMM1 epilogue term of the class: the gated chain on the (gate, up) pair, or the ungated chain on the
         single accumulator (``u``)."""
+        hw = getattr(
+            self, "hw", False
+        )  # the hardware-arithmetic classes set it after the base construction
         if not self.gated:
             return act_elem(
-                self.alg, self.acc("u", r, j), self.act, self.out_fmt, self.params
+                self.alg, self.acc("u", r, j), self.act, self.out_fmt, self.params, hw
             )
         return glu_elem(
             self.alg,
@@ -962,6 +1007,7 @@ class MoESpec:
             self.act,
             self.out_fmt,
             self.params,
+            hw,
         )
 
     def combine(self, h: int = 0, selected: Optional[Sequence[int]] = None) -> Term:

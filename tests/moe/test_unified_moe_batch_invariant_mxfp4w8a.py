@@ -273,6 +273,14 @@ def test_backend_is_registered_and_never_a_default_candidate():
     assert "MXFP4 x MXFP8" in str(excinfo.value) and "NVFP4 x NVFP4" in str(
         excinfo.value
     )
+    # the hardware-arithmetic activation classes are the one-format fp4 pairs': the mixed pair refuses the field
+    with pytest.raises(BatchInvariantUnsupportedError, match="activation_arith"):
+        BatchInvariantFp4Config.prepare_weights(
+            torch.zeros(2, 64, 32, dtype=torch.bfloat16),
+            torch.zeros(2, 32, 32, dtype=torch.bfloat16),
+            quant=_QUANT,
+            activation_arith="hardware",
+        )
 
 
 def test_fingerprint_dimensions_and_classes():
@@ -597,6 +605,15 @@ def test_unsupported_device_and_quant_raise_before_any_kernel():
         with pytest.raises(BatchInvariantUnsupportedError) as excinfo:
             runner._check_support()
         assert "moe.mxfp4w8a" in str(excinfo.value) and "cpu" in str(excinfo.value)
+    # the configuration's hardware arithmetic is refused as the class's rule, before the device
+    hw = MoEConfig(
+        routing=RoutingConfig(num_experts=64, top_k=8),
+        quant=_QUANT,
+        experts=ExpertConfig(intermediate_size=256),
+        backend=BackendOptions((BatchInvariantFp4Config(activation_arith="hardware"),)),
+    )
+    with pytest.raises(BatchInvariantUnsupportedError, match="activation_arith"):
+        BatchInvariantMoeMxfp4w8aRunner(hw, torch.device("cpu"))._check_support()
     cfg = MoEConfig(
         routing=RoutingConfig(num_experts=64, top_k=8),
         quant=QuantConfig(),
@@ -2181,7 +2198,7 @@ def test_mixed_classes_run_on_the_unified_bodies():
     )
     from flashinfer.fused_moe.batch_invariant.blocks.swap import (
         SwappedGroupedGemm,
-        epi_warpgroups_of,
+        epi_warpgroups,
         is_swapped_record,
     )
     from flashinfer.fused_moe.batch_invariant.mx_permute import MODULE as SCATTER_MODULE
@@ -2222,7 +2239,7 @@ def test_mixed_classes_run_on_the_unified_bodies():
             # the scale-factor warp, the MMA warp and the TMA warp follow them
             assert (
                 s.epi_wgs
-                == epi_warpgroups_of(plain, sw.tile_n)
+                == epi_warpgroups(sw.tile_n, plain)
                 == max(1, min(4, sw.tile_n // 8))
             )
             assert (s.sf_warp, s.mma_warp, s.tma_warp) == (

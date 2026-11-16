@@ -169,6 +169,32 @@ def grouped_knobs_mx(in_fmt: str = "mxfp8", clusters=None) -> List[Knobs]:
     ]
 
 
+#: The gather form's token tile: GEMM1's swapped record reads the token rows itself (through the plan's map) when its token tile
+#: is at most this wide; the one-warp scale producer keeps a narrow tile's row copies in flight, a wider tile exposes them
+#: (declared empirical: the in-op A/B of the two forms per token tile).
+GATHER_TOKEN_TILE_MAX = 8
+#: Rows per expert at most for the gather form (an empirical bound): the gather reads every distinct token row of a tile
+#: separately at each k-stage while the launches the form saves are fixed, so the form pays once the tiles hold several live
+#: rows.
+GATHER_ROWS_PER_EXPERT_MAX = 2
+
+
+def gather_form_rule(config1: Knobs, rows: Optional[int] = None) -> Knobs:
+    """The fused op's default form of GEMM1's record on the dense packing: the gather form (``gather_a``) of a swapped record at
+    most `GATHER_TOKEN_TILE_MAX` tokens wide at a routing of at most `GATHER_ROWS_PER_EXPERT_MAX` rows per expert (``rows``:
+    `schedule.rows_per_expert`; None: the record's rule alone) -- the standalone scatter launch the box form needs is then the
+    one launch the gather saves -- else the record as given. A placement: the same bits either way."""
+    import dataclasses
+
+    if (
+        config1.swap_ab
+        and config1.mma_tiler_mn[1] <= GATHER_TOKEN_TILE_MAX
+        and (rows is None or rows <= GATHER_ROWS_PER_EXPERT_MAX)
+    ):
+        return dataclasses.replace(config1, gather_a=True)
+    return config1
+
+
 def swapped_knobs_mx() -> List[Knobs]:
     """The swapped record space of the MXFP8 classes (:mod:`.blocks.swap`): the dense MX class's swapped 1-CTA records at the
     narrow token tiles (128 weight rows x 8 / 16 / 32 tokens), one per tile, the same list for both instruction classes.

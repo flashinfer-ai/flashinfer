@@ -50,6 +50,7 @@ from .api import (
 from .api import padded_rows_bound as _padded_rows_bound
 from .blocks.epilogue import GroupedEpilogueBlock
 from .blocks.epilogue_mx import MxChain
+from .blocks.swap import PLAN_MAX_E, PLAN_MAX_SLOTS
 from .spec_mxfp8 import BLOCK, CLASS, MX_CLASSES
 
 #: The padded group alignment (rows): one 128x4 scale-factor atom.
@@ -308,6 +309,10 @@ def grouped_gemm_mxfp8(
     sf_rows: Optional[int] = None,
     k_block: Optional[int] = None,
     grid: Optional[int] = None,
+    src: Optional[torch.Tensor] = None,
+    k_div: int = 1,
+    rows: Optional[int] = None,
+    in_kernel: Optional[Tuple[torch.Tensor, int, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """``out[p] = chain(a[p] @ w[e(p)].T)`` with the UE8M0 block scales applied inside the block-scaled step, on the padded
     expert segments ``counts`` (int32 ``[E]``; the rows of group ``e`` start at the exclusive prefix of the counts rounded
@@ -322,13 +327,40 @@ def grouped_gemm_mxfp8(
     128 weight rows x 8 / 16 / 32 tokens, the weights on the MMA's M side, :mod:`.blocks.swap`) the swapped body on
     the dense packing (``a`` carries at least the token tile's rows past the live rows: ``DENSE_TAIL``). Both bodies are the
     unified grouped bodies (:mod:`.blocks.kernel` / :mod:`.blocks.swap`) on the block-scaled operand block at the MX
-    chain's instruction class."""
+    chain's instruction class. The gather record (``config.gather_a``, a swapped record): ``a [T, K]`` the unpermuted token
+    rows, ``a_sf`` their token-major ``[T, K / 32]`` scale bytes (the activation pack's layout), ``src [>= Tk]`` int32 the
+    plan's slot of every dense row (``src[p] // k_div`` its token), ``rows`` the dense rows of the output (the live rows and
+    the tail); the body reads the rows itself (no scatter launch), the fused requantization's scale bytes land at the padded
+    positions of ``sf_rows`` rows as in the box form."""
     from .blocks.compile import get_compiled_grouped, get_compiled_swapped
     from .schedule_mxfp8 import (
         can_implement_grouped_mxfp8,
         can_implement_swapped_mxfp8,
         swap_k_block_arg,
     )
+
+    if config.gather_a:
+        return _grouped_gemm_mxfp8_gather(
+            a,
+            a_sf,
+            w,
+            w_sf,
+            counts,
+            config,
+            chain,
+            in_fmt,
+            out,
+            src,
+            k_div,
+            rows,
+            sf_rows,
+            grid,
+            in_kernel,
+        )
+    if src is not None or rows is not None or in_kernel is not None:
+        raise ValueError(
+            "grouped_gemm_mxfp8: src, rows and in_kernel belong to the gather record (config.gather_a)"
+        )
 
     # the shared operand rules at the class's alignment: K in whole scale blocks, N at the weight-row rule, every row 16 bytes
     _, K, E, N, Tk = _check_grouped_operands(
@@ -447,6 +479,194 @@ def grouped_gemm_mxfp8(
     return out
 
 
+def gather_form_ok(K: int) -> bool:
+    """The gather form's scale source: the pack's row-major UE8M0 bytes are read in 4-byte block groups, so a row's ``K / 32``
+    bytes must be whole groups."""
+    return K % (4 * BLOCK) == 0
+
+
+def decode_form_ok(T: int, k: int, E: int, H: int) -> bool:
+    """The decode form's shape rule: the routing's slots fit the in-kernel plan's registers (one warp's) and its membership
+    masks, the pack's scale rows are whole 4-byte groups."""
+    from .blocks.swap import PLAN_MAX_E, PLAN_MAX_SLOTS
+
+    return T * k <= PLAN_MAX_SLOTS and E <= PLAN_MAX_E and gather_form_ok(H)
+
+
+def decode_form_default(
+    T: int,
+    k: int,
+    E: int,
+    H: int,
+    config1,
+    config2,
+    path: str = "dense",
+    requant: str = "fused",
+) -> bool:
+    """Whether the fused op takes the decode form by default for this routing and these records: the dense packing with the
+    fused requantization, both records swapped, GEMM1's at the gather rule of the routing's rows per expert
+    (`schedule_mxfp8.gather_form_rule`) and the routing within the in-kernel plan's bounds (`decode_form_ok`)."""
+    from .schedule import rows_per_expert
+    from .schedule_mxfp8 import gather_form_rule
+
+    return bool(
+        path == "dense"
+        and requant == "fused"
+        and config1.swap_ab
+        and config2.swap_ab
+        and gather_form_rule(config1, rows_per_expert(T, k, E)).gather_a
+        and decode_form_ok(T, k, E, H)
+    )
+
+
+def _grouped_gemm_mxfp8_gather(
+    a,
+    a_sf,
+    w,
+    w_sf,
+    counts,
+    config,
+    chain,
+    in_fmt,
+    out,
+    src,
+    k_div,
+    rows,
+    sf_rows,
+    grid,
+    in_kernel=None,
+):
+    """The gather record of :func:`grouped_gemm_mxfp8` (its operand rules, the token rows in place of the permuted rows);
+    ``in_kernel = (ids, n_slots, dest)``: the decode form, the plan built by the kernel from the ids (``src`` unread, ``counts``
+    and ``dest`` written by it)."""
+    from .blocks.compile import get_compiled_swapped
+    from .schedule_mxfp8 import can_implement_swapped_mxfp8
+
+    T, K, E, N, _ = _check_grouped_operands(
+        "grouped_gemm_mxfp8",
+        a,
+        w,
+        counts,
+        a.shape[0],
+        None,
+        torch.float8_e4m3fn,
+        ALIGN_E4M3,
+        "e4m3",
+        k_align=BLOCK,
+        n_align=8,
+    )
+    if rows is None or (src is None and in_kernel is None):
+        raise ValueError(
+            "grouped_gemm_mxfp8: the gather record reads the token rows through the plan's map: src and rows"
+        )
+    if in_kernel is None and (
+        src.dtype != torch.int32
+        or src.dim() != 1
+        or not src.is_contiguous()
+        or k_div < 1
+        or rows < 0
+    ):
+        raise ValueError(
+            "grouped_gemm_mxfp8: src must be a contiguous int32 [>= Tk], k_div >= 1 and rows >= 0"
+        )
+    if in_kernel is not None:
+        ids, n_slots, dest = in_kernel
+        if (
+            ids.dtype != torch.int32
+            or ids.dim() != 1
+            or not ids.is_contiguous()
+            or dest.dtype != torch.int32
+            or dest.numel() < n_slots
+            or ids.numel() < n_slots
+            or counts.dtype != torch.int32
+            or not decode_form_ok(n_slots, 1, counts.numel(), K)
+        ):
+            raise ValueError(
+                "grouped_gemm_mxfp8: the in-kernel plan takes contiguous int32 ids [>= n_slots] and dest [>= n_slots], "
+                f"int32 counts [E] with at most {PLAN_MAX_SLOTS} slots and {PLAN_MAX_E} experts"
+            )
+    a_sf8 = _bytes(a_sf, "a_sf")
+    if a_sf8.numel() != T * (K // BLOCK) or not a_sf8.is_contiguous():
+        raise ValueError(
+            f"grouped_gemm_mxfp8: a_sf must be the token-major [T, {K // BLOCK}] UE8M0 scales of the T token rows"
+        )
+    if not gather_form_ok(K):
+        raise ValueError(
+            "grouped_gemm_mxfp8: the gather form reads the scale rows in 4-byte groups (K a multiple of 128)"
+        )
+    w_sf8 = _bytes(w_sf, "w_sf").reshape(-1)
+    if w_sf8.numel() < E * sf_numel(N, K):
+        raise ValueError(
+            "grouped_gemm_mxfp8: w_sf must hold E consecutive 128x4 swizzled scale buffers of (N, K)"
+        )
+    if sf_rows is None or sf_rows % GROUP_ALIGN or sf_rows < rows:
+        raise ValueError(
+            "grouped_gemm_mxfp8: the gather record takes the dense packing's scale rows (whole 128-row atoms covering the rows)"
+        )
+    in_fmt = in_fmt or mx_class_of(a.device)
+    if in_fmt not in MX_CLASSES:
+        raise ValueError(f"grouped_gemm_mxfp8: unknown instruction class {in_fmt!r}")
+    chain = MxChain.of(chain, in_fmt)
+    if not config.swap_ab or not can_implement_swapped_mxfp8(
+        config, N, K, E, chain, in_fmt, 0
+    ):
+        raise ValueError(
+            f"grouped_gemm_mxfp8: gather record {config.describe()} does not implement ({N}, {K}, {E}, {chain.describe()}, {in_fmt})"
+        )
+    n_out = _check_grouped_chain("grouped_gemm_mxfp8", N, chain)
+    grid_n = grid if grid is not None else launch_grid(a.device, config, rows, E, N)
+    kernel_of = lambda: get_compiled_swapped(  # noqa: E731
+        config, chain, sf_src="linear", plan_in_kernel=in_kernel is not None
+    )
+
+    def args(*outs):
+        if in_kernel is not None:
+            ids, n_slots, dest = in_kernel
+            return (
+                a.unsqueeze(-1),
+                a_sf8.reshape(-1),
+                ids,
+                n_slots,
+                k_div,
+                w.permute(1, 2, 0),
+                w_sf8,
+                *outs,
+                counts,
+                dest,
+                grid_n,
+            )
+        return (
+            a.unsqueeze(-1),
+            a_sf8.reshape(-1),
+            src,
+            k_div,
+            w.permute(1, 2, 0),
+            w_sf8,
+            *outs,
+            counts,
+            grid_n,
+        )
+
+    if chain.quant:
+        if out is not None:
+            raise ValueError(
+                "grouped_gemm_mxfp8: the fused requantization allocates its two outputs"
+            )
+        codes = _grouped_out(
+            "grouped_gemm_mxfp8", None, rows, n_out, torch.uint8, a.device
+        )
+        sf = torch.empty(sf_numel(sf_rows, n_out), dtype=torch.uint8, device=a.device)
+        if rows and T:
+            kernel_of()(*args(codes, sf))
+        return codes.view(torch.float8_e4m3fn), sf
+    out = _grouped_out(
+        "grouped_gemm_mxfp8", out, rows, n_out, _OUT[chain.out_fmt], a.device
+    )
+    if rows and T:
+        kernel_of()(*args(out))
+    return out
+
+
 # ----------------------------------------------------------------------------- the permutations
 
 
@@ -458,6 +678,18 @@ def permute_plan_padded(
     ``padded_rows_bound`` rows and ``-1`` in every padding slot (the shared plan's padded form)."""
     counts, dest, src = permute_plan(experts, E, align=GROUP_ALIGN)
     return counts, dest, src
+
+
+def scatter_mx(k: int, Tk: int, H: int, dev: torch.device):
+    """The MX row scatter's compiled kernel for ``Tk`` expanded rows of ``H`` e4m3 bytes: the warps per row from the row count
+    and the part, the lane's static bounds from the row width (placements of the same bytes)."""
+    from .mx_permute import get_compiled_scatter_mx, scatter_mx_lanes
+    from .permute import warps_per_row
+
+    wpr = warps_per_row(Tk, H // 16, sm_count_of(dev))
+    return get_compiled_scatter_mx(
+        k, wpr, **scatter_mx_lanes(H, padded_sf_cols(H), wpr)
+    )
 
 
 def permute_plan_dual_padded(
@@ -489,6 +721,8 @@ def fused_moe_mxfp8(
     plan: Optional[Tuple[torch.Tensor, ...]] = None,
     path: Optional[str] = None,
     w_round: bool = False,
+    gather: Optional[bool] = None,
+    decode: Optional[bool] = None,
 ) -> Any:
     """The MXFP8 x MXFP8 MoE FFN for pre-routed tokens: ``x`` a bf16 ``[T, H]`` (quantized here per token by the
     ``mxfp8.quant`` class) or the quantized pack ``(xq [T, H] e4m3, xsf [T, H / 32] uint8 / UE8M0)`` taken as given;
@@ -504,10 +738,21 @@ def fused_moe_mxfp8(
     ``dest``, ``src``, ``xq``, ``xsf``, ``x_perm`` / ``x_perm_sf``, ``a``, ``aq`` / ``a_sf``, ``y``; the dense packing adds
     ``dest_pad`` / ``pos_pad`` and the row counts ``Tk_a`` / ``Tk_sf``), the records used, the packing and the bodies.
     ``w_round``: the f32 weights enter the fold as their bf16 rounding, by the combine kernel (the pre-routed packed-word
-    convention), as in the bf16 op."""
-    from .mx_permute import get_compiled_scatter_mx
-    from .permute import warps_per_row
-    from .schedule_mxfp8 import GEMM2_CHAIN, default_configs_mx, packing_for
+    convention), as in the bf16 op. ``gather``: GEMM1's record reads the token rows itself through the plan's map (the
+    gather form of a swapped record on the dense packing: no scatter launch) -- None applies the structural rule
+    (`schedule_mxfp8.gather_form_rule`: the narrow swapped tiles), True forces it on a swapped GEMM1 record, False the box
+    form; a placement of the same fold. ``decode``: the decode form -- GEMM1's gather record builds the plan itself from the
+    ids (no plan launch, no scatter launch; its first CTA stores the counts and the row map for GEMM2 and the combine):
+    None takes it where the rule holds (both records swapped, the fused requantization, no precomputed plan,
+    `decode_form_ok`), True forces it (a refusal outside the rule), False never; the same integers and bits."""
+    import dataclasses
+
+    from .schedule_mxfp8 import (
+        GEMM2_CHAIN,
+        default_configs_mx,
+        gather_form_rule,
+        packing_for,
+    )
 
     H, I, E = w.hidden_size, w.intermediate_size, w.num_experts
     if isinstance(x, torch.Tensor):
@@ -581,6 +826,42 @@ def fused_moe_mxfp8(
         raise ValueError(
             "fused_moe_mxfp8: a swapped record reads the dense packing (path='dense')"
         )
+    if gather is None and path == "dense" and requant == "fused":
+        from .schedule import rows_per_expert
+
+        config1 = gather_form_rule(config1, rows_per_expert(T, k, E))
+    elif gather:
+        if not config1.swap_ab or path != "dense" or requant != "fused":
+            raise ValueError(
+                "fused_moe_mxfp8: the gather form is GEMM1's swapped record on the dense packing with the fused requantization"
+            )
+        config1 = dataclasses.replace(config1, gather_a=True)
+    elif gather is False:
+        config1 = dataclasses.replace(config1, gather_a=False)
+    if config1.gather_a and not gather_form_ok(H):
+        # the pack's scale rows are not whole 4-byte groups: the box form through the scatter
+        config1 = dataclasses.replace(config1, gather_a=False)
+    if config2.gather_a:
+        raise ValueError("fused_moe_mxfp8: the gather form is GEMM1's")
+    if decode and gather is not False:
+        config1 = dataclasses.replace(
+            config1, gather_a=True
+        )  # the decode form is the gather record's
+    decode_ok = (
+        plan is None
+        and path == "dense"
+        and requant == "fused"
+        and config1.swap_ab
+        and config2.swap_ab
+        and config1.gather_a
+        and decode_form_ok(T, k, E, H)
+    )
+    if decode and not decode_ok:
+        raise ValueError(
+            "fused_moe_mxfp8: the decode form takes two swapped records on the dense packing with the fused requantization, "
+            "no precomputed plan, the gather form and a routing within the in-kernel plan's bounds"
+        )
+    in_kernel = bool(decode) if decode is not None else decode_ok
     if plan is not None and len(plan) != (5 if path == "dense" else 3):
         raise ValueError(
             "fused_moe_mxfp8: the plan's form (padded: 3 tensors, dual: 5) must match the packing"
@@ -594,38 +875,85 @@ def fused_moe_mxfp8(
             raise ValueError(
                 "fused_moe_mxfp8: the dense packing runs the fused requantization"
             )
-        counts, dest, src, dest_pad, pos_pad = (
-            plan if plan is not None else permute_plan_dual_padded(experts, E)
-        )
         Tk = T * k
         Tk_pad = padded_rows_bound(T, k, E)
         Tk_a, Tk_sf = Tk + DENSE_TAIL, Tk_pad + DENSE_TAIL
-        x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
-        x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
-        get_compiled_scatter_mx(k, warps_per_row(Tk, H // 16, sm_count_of(dev)))(
-            xq.view(torch.uint8),
-            xsf8.reshape(-1),
-            dest.reshape(-1),
-            dest_pad.reshape(-1),
-            x_perm.view(torch.uint8),
-            x_perm_sf,
-            Tk,
-            H,
-            nb,
-            pcols,
-        )
-        aq, a_sf = grouped_gemm_mxfp8(
-            x_perm,
-            x_perm_sf,
-            w.w1,
-            w.w1_sf,
-            counts,
-            config1,
-            w.chain1_quant,
-            in_fmt,
-            dense_a=True,
-            sf_rows=Tk_sf,
-        )
+        x_perm = x_perm_sf = None
+        if in_kernel:
+            # the decode form: GEMM1 builds the plan from the ids itself and stores the counts and the row map
+            counts = torch.empty(E, dtype=torch.int32, device=dev)
+            dest = torch.empty(Tk, dtype=torch.int32, device=dev)
+            src = dest_pad = pos_pad = None
+            aq, a_sf = grouped_gemm_mxfp8(
+                xq,
+                xsf8,
+                w.w1,
+                w.w1_sf,
+                counts,
+                config1,
+                w.chain1_quant,
+                in_fmt,
+                dense_a=True,
+                sf_rows=Tk_sf,
+                src=None,
+                k_div=k,
+                rows=Tk_a,
+                in_kernel=(experts.reshape(-1), Tk, dest),
+            )
+            dest = dest.view(T, k)
+            if return_intermediates:
+                # the maps the kernel never materialises, for the intermediates (the same integers as its dest and counts)
+                _, _, src, dest_pad, pos_pad = permute_plan_dual_padded(experts, E)
+        else:
+            counts, dest, src, dest_pad, pos_pad = (
+                plan if plan is not None else permute_plan_dual_padded(experts, E)
+            )
+        if in_kernel:
+            pass
+        elif config1.gather_a:
+            # the gather form: GEMM1 reads the token rows and their scale bytes through the plan's map (no scatter launch)
+            aq, a_sf = grouped_gemm_mxfp8(
+                xq,
+                xsf8,
+                w.w1,
+                w.w1_sf,
+                counts,
+                config1,
+                w.chain1_quant,
+                in_fmt,
+                dense_a=True,
+                sf_rows=Tk_sf,
+                src=src,
+                k_div=k,
+                rows=Tk_a,
+            )
+        else:
+            x_perm = torch.empty(Tk_a, H, dtype=torch.float8_e4m3fn, device=dev)
+            x_perm_sf = torch.empty(sf_numel(Tk_sf, H), dtype=torch.uint8, device=dev)
+            scatter_mx(k, Tk, H, dev)(
+                xq.view(torch.uint8),
+                xsf8.reshape(-1),
+                dest.reshape(-1),
+                dest_pad.reshape(-1),
+                x_perm.view(torch.uint8),
+                x_perm_sf,
+                Tk,
+                H,
+                nb,
+                pcols,
+            )
+            aq, a_sf = grouped_gemm_mxfp8(
+                x_perm,
+                x_perm_sf,
+                w.w1,
+                w.w1_sf,
+                counts,
+                config1,
+                w.chain1_quant,
+                in_fmt,
+                dense_a=True,
+                sf_rows=Tk_sf,
+            )
         y = grouped_gemm_mxfp8(
             aq, a_sf, w.w2, w.w2_sf, counts, config2, GEMM2_CHAIN, in_fmt, dense_a=True
         )  # [Tk_a, H] bf16
@@ -641,6 +969,7 @@ def fused_moe_mxfp8(
                 xsf=xsf8,
                 x_perm=x_perm,
                 x_perm_sf=x_perm_sf,
+                plan="in_kernel" if in_kernel else "launch",
                 a=None,
                 aq=aq,
                 a_sf=a_sf,
@@ -662,7 +991,7 @@ def fused_moe_mxfp8(
     x_perm_sf = torch.empty(sf_numel(Tk_pad, H), dtype=torch.uint8, device=dev)
     # one launch over the live rows: the e4m3 rows and the UE8M0 scales to their padded positions (the scales re-tiled into
     # the swizzled atoms); the padding rows are never written (unspecified bytes the MMA reads into rows no tile stores)
-    get_compiled_scatter_mx(k, warps_per_row(T * k, H // 16, sm_count_of(dev)))(
+    scatter_mx(k, T * k, H, dev)(
         xq.view(torch.uint8),
         xsf8.reshape(-1),
         dest.reshape(-1),

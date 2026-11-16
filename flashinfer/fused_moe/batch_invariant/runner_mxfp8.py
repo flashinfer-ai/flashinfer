@@ -110,6 +110,22 @@ class BatchInvariantMxfp8Runner(BatchInvariantFp8BlockRunner):
         )
         return [x, sf]
 
+    def _plan_in_kernel(self, T: int, H: int) -> bool:
+        """The decode form's rule at this token count (`api_mxfp8.decode_form_default` at the first picks): GEMM1's gather
+        record then builds the plan from the ids and stores the counts and the row map for GEMM2 and the combine (a tactic of
+        another kind of record falls back to the plan computed by the op: the same integers)."""
+        from .api_mxfp8 import decode_form_default
+
+        k, E_local = self.config.routing.top_k, self._local_experts()[1]
+        r1, r2 = self._ranked(T, H)
+        return bool(
+            r1
+            and r2
+            and decode_form_default(
+                T, k, E_local, H, r1[0], r2[0], path=self._packing(T, H)
+            )
+        )
+
     def _plan_form(self, T: int, H: int) -> dict:
         """The fused route + plan launch in the form of the packing the ranked records run on at this token count: the
         dual plan (the dense rows with the padded scale positions) or the padded plan (whole 128-row atoms per group)."""

@@ -165,6 +165,8 @@ class BatchInvariantMoeRunnerBase(MoERunner):
       tensors at the head of the pack (one, or a quantized pack with its scales) with their rules; ``N_WEIGHT_TENSORS``:
       the weight view's tensors in the pack (after the activations, the ids and the weights, before the output);
       ``_plan_form``: the fused route + plan launch's form (the block-scaled classes' padded or dual plan);
+      ``_plan_in_kernel``: whether the class's GEMM1 builds the plan itself at this token count (the routing alone is
+      launched from logits, no plan tensors are packed);
     * ``_check_experts`` / ``_check_support_extra``: the class's rules beyond the shared ones (the expert-parallel shard's
       range or its refusal, the finalize mode);
     * ``_weights_from_view`` / ``_weight_tensors`` / ``_weights_from_tensors``: the weight view as the kernels consume it;
@@ -387,6 +389,12 @@ class BatchInvariantMoeRunnerBase(MoERunner):
         the dense plan by default."""
         return {}
 
+    def _plan_in_kernel(self, T: int, H: int) -> bool:
+        """Whether the class's first GEMM builds the permutation plan itself at this token count (its decode form): the
+        routing kernel alone is launched from logits and no plan tensors are packed; the class's op takes the ids. False
+        for the classes whose bodies read a plan."""
+        return False
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
@@ -468,9 +476,11 @@ class BatchInvariantMoeRunnerBase(MoERunner):
                 0 < T <= ROUTE_PLAN_MAX_TOKENS
                 and T * k <= ROUTE_PLAN_MAX_SLOTS
                 and cfg.routing.num_experts <= MAX_E
+                and not self._plan_in_kernel(T, x.shape[1])
             ):
                 # routing and the permutation plan in one launch (a placement: the same bits and integers), in the form the
-                # class's packing takes at this token count; a shard plans its local experts by their local ids
+                # class's packing takes at this token count; a shard plans its local experts by their local ids. A class
+                # whose first GEMM builds the plan itself at this token count launches the routing alone.
                 ids, wts, *plan = route_plan(
                     act.routing_logits,
                     k,

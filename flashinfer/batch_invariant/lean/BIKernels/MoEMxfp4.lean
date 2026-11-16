@@ -32,6 +32,18 @@ def mxActT (a : UAct) (acc : MTerm) : MTerm := actElemT a acc
 /-- GEMM2 of the MXFP4 classes: `cvt_bf16(acc)` (`spec_mxfp4.mx_out_elem`). -/
 def mxOutT (acc : MTerm) : MTerm := .cvt "bf16" acc
 
+/-! ### The hardware-arithmetic classes `moe.mxfp4.<act>.hw`: the chains of `MoE.gluHwT` / `MoE.actElemHwT` on the raw
+accumulators (the part's `ex2` / `rcp` in place of the declared exponential and divisions). -/
+
+/-- GEMM1 of the gated hardware classes. -/
+def mxGluHwT (a : GAct) (g u : MTerm) : MTerm := gluHwT a g u
+
+/-- GEMM1 of the ungated hardware classes. -/
+def mxActHwT (a : UAct) (acc : MTerm) : MTerm := actElemHwT a acc
+
+theorem mxGluHwT_is_gluHwT (a : GAct) (g u : MTerm) : mxGluHwT a g u = gluHwT a g u := rfl
+theorem mxActHwT_relu2 (acc : MTerm) : mxActHwT .relu2 acc = mxActT .relu2 acc := rfl
+
 /-- **The MXFP4 GEMM1 chain is the bf16 class's chain**: no scale enters the epilogue (the block scales are the
 instruction's), nothing of the bf16 chain is re-ordered. -/
 theorem mxGluT_is_gluT (a : GAct) (g u : MTerm) : mxGluT a g u = gluT a g u := rfl

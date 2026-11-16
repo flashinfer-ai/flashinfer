@@ -115,6 +115,12 @@ class BatchInvariantMoeMxfp4w8aRunner(_Fp4PairRunner):
                 f"BatchInvariantFp4Config(intermediate={self._intermediate!r})",
                 "the intermediate quantized per 32-element block by the class itself (the static class is the NVFP4 pair's)",
             )
+        if self._arith != "exact":
+            raise unsupported(
+                CLASS,
+                f"BatchInvariantFp4Config(activation_arith={self._arith_label()!r})",
+                "the exact class: the mixed pair has no hardware-arithmetic class",
+            )
         check_device(self.device, CLASS, MOE_MXFP4W8A_ARCHS)
         try:
             self._activation()

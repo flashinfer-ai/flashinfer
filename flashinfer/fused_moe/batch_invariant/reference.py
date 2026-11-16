@@ -17,7 +17,7 @@ import torch
 
 from ...batch_invariant.fp_interface import exact as fp32
 from . import spec as S
-from .mterm import frexpe_f32, frexpm_f32, rowmax_f32
+from .mterm import frexpe_f32, frexpm_f32, rowmax_f32, sfu_eval, sfu_tables
 
 
 class ExactF32:
@@ -43,6 +43,14 @@ class ExactF32:
     rowmax = staticmethod(
         rowmax_f32
     )  # the MoE rule: a NaN logit is skipped (the device's max.f32)
+
+    @staticmethod
+    def ex2(a: float) -> float:
+        return sfu_eval("ex2", a)
+
+    @staticmethod
+    def rcp(a: float) -> float:
+        return sfu_eval("rcp", a)
 
     @staticmethod
     def where_nan(x: float, a: float, b: float) -> float:
@@ -124,6 +132,20 @@ class TorchF32:
     def exp2i(k: torch.Tensor) -> torch.Tensor:
         n = k.to(torch.int32)
         return ((n + 127) << 23).view(torch.float32)
+
+    @staticmethod
+    def ex2(a: torch.Tensor) -> torch.Tensor:
+        """The bound part's ``ex2.approx.ftz`` (the hardware-arithmetic classes), from its tables."""
+        from ...batch_invariant.fp_interface import sfu
+
+        return sfu.ex2_hw(a.to(torch.float32), sfu_tables())
+
+    @staticmethod
+    def rcp(a: torch.Tensor) -> torch.Tensor:
+        """The bound part's ``rcp.approx.ftz``, from its tables."""
+        from ...batch_invariant.fp_interface import sfu
+
+        return sfu.rcp_hw(a.to(torch.float32), sfu_tables())
 
     @staticmethod
     def fabs(a: torch.Tensor) -> torch.Tensor:

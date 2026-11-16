@@ -29,3 +29,16 @@ import BIKernels.MoEMxfp8
 import BIKernels.MoEMxfp8Cases
 import BIKernels.MoEMxfp4w8a
 import BIKernels.MoEMxfp4w8aCases
+import BIKernels.NVFP4MegaMoE
+import BIKernels.NVFP4MegaMoECases
+import BIKernels.MXFP4MegaMoE
+import BIKernels.MXFP4MegaMoECases
+import BIKernels.MXFP8MegaMoE
+import BIKernels.MXFP8MegaMoECases
+import BIKernels.NumericalVariants
+import BIKernels.NumericalVariantsCases
+import BIKernels.A16MegaMoE
+import BIKernels.A16MegaMoECases
+import BIKernels.CombineWire
+import BIKernels.CombineWireCases
+import BIKernels.QuantizedStagePartition

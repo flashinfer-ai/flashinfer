@@ -390,7 +390,7 @@ def record_cost(
     in_fmt: str = "bf16",
     nominal: bool = False,
     *,
-    epi_warpgroups: int = _EPI_WARPGROUPS,
+    epi_warpgroups: Optional[int] = None,
     overrides: Optional[dict] = None,
     fill_fmt: Optional[str] = None,
 ) -> float:
@@ -398,7 +398,7 @@ def record_cost(
     every class's ``rank_grouped_*`` sorts by: the dense estimate with the MoE ranking's constant overrides
     (`estimate_overrides`, with a class's own ``overrides`` layered on top: its promotion counts and the like; the dense
     dispatcher's constants untouched), times the pair term and the swapped records' tiles term, plus the exposed epilogue
-    chain (over the body's ``epi_warpgroups``) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
+    chain (over the body's ``epi_warpgroups``: the format's default when not given) and the token box's exposed fill; in SM cycles (a launch's fixed cost is the
     same for both bodies on every measured part, so it is no term). The class-specific arguments are keyword-only: a class
     that does not pass them gets the shared defaults. ``fill_fmt``: the token rows' element format for the fill term where it
     differs from the class's (the mixed classes' e4m3 tokens against the e2m1 weights the class is named by)."""
@@ -413,13 +413,15 @@ def record_cost(
 
     canon = dataclasses.replace(cfg, raster_along="m")
     fp4 = in_fmt in FP4_FMTS
+    if epi_warpgroups is None:
+        epi_warpgroups = _EPI_WARPGROUPS_FP4 if fp4 else _EPI_WARPGROUPS
     epi = exposed_epilogue_cycles(
         cfg,
         rows,
         nodes,
         pair,
         scalar_store=fp4,
-        epi_warpgroups=_EPI_WARPGROUPS_FP4 if fp4 else epi_warpgroups,
+        epi_warpgroups=epi_warpgroups,
     )
     est = estimate_cycles(
         canon,

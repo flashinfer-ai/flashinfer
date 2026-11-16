@@ -153,6 +153,10 @@ class _Fp4PairRunner(MoERunner):
         # the intermediate's class (`per_token` / `static`): the bound backend config's field
         cands = [c for c in config.backend if hasattr(c, "intermediate")]
         self._intermediate: str = cands[0].intermediate if cands else "per_token"
+        # the chain's arithmetic (`exact` / `hw`): the bound backend config's `activation_arith` for this activation
+        self._arith: str = self._chain_arith(
+            getattr(cands[0], "activation_arith", "exact") if cands else "exact"
+        )
 
     # ---- support ---------------------------------------------------------------------------------------------------
     def _activation(self):
@@ -233,6 +237,20 @@ class _Fp4PairRunner(MoERunner):
             int(x.shape[0]), self._hidden_of(x), self._scatter_launch(x)
         )
         return [_tactic_nvfp4(c1, c2) for c1 in r1 for c2 in r2]
+
+    def _chain_arith(self, activation_arith: str) -> str:
+        """The chain arithmetic of the config's ``activation_arith`` for the layer's activation: ``hw`` where the chain has an
+        exponential or a division and the hardware form is requested, ``exact`` otherwise (the ReLU family under either
+        value; PowLU is refused at the weight preparation)."""
+        from .spec import hw_arith_applies
+
+        if activation_arith == "exact":
+            return "exact"
+        a = self._activation()
+        return "hw" if hw_arith_applies(a.act, a.gated) else "exact"
+
+    def _arith_label(self) -> str:
+        return "hardware" if self._arith == "hw" else "exact"
 
     def _scatter_launch(self, x: torch.Tensor) -> bool:
         """Whether the box form scatters the quantized rows in a launch of its own: a pre-quantized input (the bf16 input's
@@ -397,6 +415,12 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
                 f"intermediate={self._intermediate!r} with weights prepared for intermediate={w.intermediate!r}",
                 "weights prepared with the backend config's intermediate class",
             )
+        if w.arith != self._arith:
+            raise unsupported(
+                CLASS,
+                f"activation_arith={self._arith_label()!r} with weights prepared for {w.arith!r}",
+                "weights prepared with the backend config's activation arithmetic",
+            )
         check_shape_nvfp4(H, w.intermediate_size, E, k, w.gated)
         if x.dtype == torch.bfloat16:
             if act.hidden_states_scale is not None or act.per_token_scale is not None:
@@ -519,6 +543,7 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
             "nvfp4" if static else "bf16",
             a.params,
             "w4a4",
+            arith=self._arith,
         )
         chain2 = GEMM2_STATIC_CHAIN if static else GEMM2_CHAIN
         n1 = 2 * I if a.gated else I
@@ -535,7 +560,11 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
         return r1, list(r2)
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + ("moe.nvfp4-v4", self._intermediate)
+        return super()._cache_key_extras() + (
+            "moe.nvfp4-v5",
+            self._intermediate,
+            self._arith,
+        )
 
     # ---- launch ----------------------------------------------------------------------------------------------------
     def forward(
@@ -575,6 +604,7 @@ class BatchInvariantMoeNvfp4Runner(_Fp4PairRunner):
             self._intermediate,
             gs2 if static else None,
             inv2 if static else None,
+            self._arith,
         )
         # a pre-quantized pack: the empty per-token placeholder means unit scales (the per-tensor pack), the 2-D scale tensor the
         # linear layout; both are the op's own placements (no fill, no re-tiling launch)
