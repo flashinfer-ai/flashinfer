@@ -652,13 +652,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   static constexpr bool use_wfp4afp8 = false;
   static constexpr bool use_fp4 = false;
 #endif
-#if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100 NVFP4 runs on the SM80 16-bit x E2M1 GEMMs, with the activations restored, and
-  // MXFP8 x MXFP4 too, on this runner with MXFP8 input.
-  static constexpr bool use_restored_fp4 = use_fp4;
-#else
-  static constexpr bool use_restored_fp4 = false;
-#endif
+  static constexpr bool use_restored_fp4 = kRestoredFp4 && use_fp4;
   static constexpr bool use_restored_mx = use_restored_fp4 && use_fp8_input;
   using GemmInputType = std::conditional_t<use_restored_fp4, BackBoneType, T>;
 

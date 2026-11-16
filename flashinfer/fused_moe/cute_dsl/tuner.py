@@ -1376,10 +1376,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 use_2cta_instrs=mma_tiler_m == 256,
             )
 
-        if (
-            inputs[0].is_cuda
-            and torch.cuda.get_device_capability(inputs[0].device)[0] < 10
-        ):
+        x = inputs[0]
+        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
             records = inputs[4].dtype == torch.uint8 and inputs[4].dim() == 2
             return list(W4A16_SM80_TACTICS) if records else []
 

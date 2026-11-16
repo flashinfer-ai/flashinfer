@@ -39,12 +39,8 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
-from ..tllm_enums import (
-    DEFAULT_SWIGLU_ALPHA,
-    DEFAULT_SWIGLU_BETA,
-    DEFAULT_SWIGLU_LIMIT,
-    ActivationType,
-)
+from ..tllm_enums import ActivationType
+from ..tllm_enums import DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT
 from ..quantization.nvfp4_quantization_utils import (
     NVFP44Over6Config,
     make_nvfp4_global_scale,
@@ -2116,10 +2112,9 @@ def _sm80_nvfp4_operands(
     else:
         scales = scales.view(torch.float8_e4m3fn).float()
     scales = torch.nn.functional.pad(scales, (0, (k_pad - cols) // 16))
-    return (
-        w.contiguous().view(num_experts, rows, k_pad // 2).view(weight.dtype),
-        scales.to(dtype).transpose(1, 2).contiguous(),
-    )
+    w = w.contiguous().view(num_experts, rows, k_pad // 2).view(weight.dtype)
+    scales = scales.to(dtype).transpose(1, 2).contiguous()
+    return w[..., : cols // 2 // weight.element_size()], scales
 
 
 @flashinfer_api
@@ -2172,7 +2167,6 @@ def cutlass_nvfp4_sm80_weights(
     if interleaved:
         rows = torch.arange(w1.shape[1], device=w1.device)
         rows_from = (rows.view(-1, 2, 64).transpose(0, 1).flatten(), rows_from[1])
-    k1, k2 = k[0] or hidden_size, k[1] or inter_size
     w1_cols = hidden_size if k[0] is None else w1.shape[2] * w1.element_size() * 2
     p1, q1 = _sm80_nvfp4_operands(
         w1, s1, w1.shape[1], w1_cols, dtype, rows_from[0], mx, k[0], sm90
@@ -2180,12 +2174,7 @@ def cutlass_nvfp4_sm80_weights(
     p2, q2 = _sm80_nvfp4_operands(
         w2, s2, hidden_size, inter_size, dtype, rows_from[1], mx, k[1], sm90
     )
-    if sm90:
-        return p1, q1, p2, q2
-    return (
-        p1[..., : k1 // 2 // w1.element_size()], q1,
-        p2[..., : k2 // 2 // w2.element_size()], q2,
-    )  # fmt: skip
+    return p1, q1, p2, q2
 
 
 def cutlass_mxfp4_sm90_weights(
@@ -2208,26 +2197,19 @@ def _check_sm80_nvfp4_operands(
     """Checks operands against the shapes of their packed uint8 FP4 weights: the layout
     ``cutlass_nvfp4_sm80_weights`` returns, with BF16 scales, or with ``sm90`` MXFP4's SM90 one."""
     (num_experts, rows, half_k1), (_, hidden_size, half_k2) = w1_shape, w2_shape
-    k1, k2 = round_up(half_k1 * 2, 64), round_up(half_k2 * 2, 64)
-    layouts: tuple = (  # each expert's dtype, shape and strides
-        (torch.uint8, (rows, half_k1), (k1 // 2, 1)),
-        (torch.bfloat16, (k1 // 16, rows), (rows, 1)),
-        (torch.uint8, (hidden_size, half_k2), (k2 // 2, 1)),
-        (torch.bfloat16, (k2 // 16, hidden_size), (hidden_size, 1)),
-    )
-    if sm90:
-        # Interleaved weights; each 64-row x 128-K block's E8M0 scales as [16, 4] int32.
-        layouts = tuple(
-            layout
-            for m, half_k in ((rows, half_k1), (hidden_size, half_k2))
-            for layout in (
-                (torch.uint8, (m, half_k), (half_k, 1)),
-                (torch.int32, (m // 64, half_k // 64, 16, 4), (half_k, 64, 4, 1)),
-            )
-        )
+
+    def layouts(m, half_k):  # each expert's dtype, shape and strides
+        if sm90:  # Interleaved weights; each 64-row x 128-K block's E8M0 scales as [16, 4] int32.
+            scales = (torch.int32, (m // 64, half_k // 64, 16, 4), (half_k, 64, 4, 1))
+            return (torch.uint8, (m, half_k), (half_k, 1)), scales
+        k = round_up(half_k * 2, 64)
+        scales = (torch.bfloat16, (k // 16, m), (m, 1))
+        return (torch.uint8, (m, half_k), (k // 2, 1)), scales
+
     expected = [
         (device, dtype, (num_experts, *shape), (shape[0] * strides[0], *strides))
-        for dtype, shape, strides in layouts
+        for m, half_k in ((rows, half_k1), (hidden_size, half_k2))
+        for dtype, shape, strides in layouts(m, half_k)
     ]
     got = [(t.device, t.dtype, tuple(t.shape), t.stride()) for t in operands]
     if got != expected:
@@ -2263,9 +2245,8 @@ def _w4a16_u5_table(device: torch.device) -> torch.Tensor:
     (the block's codes are zeroed), 0x7F (NaN) -> 0xFF (BF16 NaN). The kernels decode U5 u as the
     BF16 bits 0x7000 | u << 4, s x 2^119. Built on ``device``, so CUDA graphs can capture it."""
     b = torch.arange(128, dtype=torch.uint8, device=device)
-    mant, exp = torch.frexp(
-        b.view(torch.float8_e4m3fn).float()
-    )  # s = mant x 2^exp, mant >= 0.5
+    # s = mant x 2^exp, mant >= 0.5
+    mant, exp = torch.frexp(b.view(torch.float8_e4m3fn).float())
     u5 = (exp + 21) << 3 | ((mant * 2 - 1) * 8).int()
     return torch.where(b == 0, 0, torch.where(b == 127, 0xFF, u5))
 
@@ -2294,14 +2275,11 @@ def _w4a16_records(
         c = torch.arange(chunks, device=dev).view(-1, 1, 1)
         wp = torch.arange(8, device=dev).view(1, -1, 1)
         j = torch.arange(16, device=dev).view(1, 1, -1)
-        perm = torch.where(
-            j < 8, 64 * c + 8 * wp + j, cols // 2 + 64 * c + 8 * wp + j - 8
-        )
-        perm = perm.flatten()
+        base = 64 * c + 8 * wp + j
+        perm = torch.where(j < 8, base, cols // 2 + base - 8).flatten()
     u5_table = _w4a16_u5_table(dev)
-    out = torch.empty(
-        num_experts, _w4a16_records_bytes(n, k, gated), dtype=torch.uint8, device=dev
-    )
+    size = _w4a16_records_bytes(n, k, gated)
+    out = torch.empty(num_experts, size, dtype=torch.uint8, device=dev)
     for e0 in range(0, num_experts, chunk):
         q, sb = w[e0 : e0 + chunk], scale[e0 : e0 + chunk]
         if rows_from is not None:
@@ -2336,10 +2314,8 @@ def _w4a16_records(
         # (m, C, W, hi, g, S, Jhi, Jlo) -> (m, C, S, W, g, Jhi, hi, Jlo)
         u5 = u5_table[mp][:, perm].view(m, chunks, 8, 2, 8, steps, 4, 2)
         sbytes = u5.permute(0, 1, 5, 2, 4, 6, 3, 7).contiguous().to(torch.uint8)
-        rec = torch.cat(
-            [wbytes.view(m, chunks, steps, 8192), sbytes.view(m, chunks, steps, 1024)],
-            dim=-1,
-        )
+        shape = (m, chunks, steps)
+        rec = torch.cat([wbytes.view(*shape, 8192), sbytes.view(*shape, 1024)], dim=-1)
         if half:
             tail = torch.cat([rec[:, :, -1, :4096], rec[:, :, -1, 8192:]], dim=-1)
             rec = torch.cat([rec[:, :, :-1].reshape(m, chunks, -1), tail], dim=-1)
@@ -2448,9 +2424,8 @@ def _trtllm_fc1_rows(
         raise ValueError(
             f"valid_intermediate_size must be in (0, {inter}], got {valid_intermediate_size}"
         )
-    rows = torch.arange(
-        min(round_up(valid_intermediate_size, 128), inter), device=device
-    )
+    kept = min(round_up(valid_intermediate_size, 128), inter)
+    rows = torch.arange(kept, device=device)
     return torch.cat([rows, rows + inter]) if gated else rows
 
 

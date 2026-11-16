@@ -285,10 +285,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         "103": gen_fp4_quantization_sm103_module,
         "100": gen_fp4_quantization_sm100_module,
         "90": gen_fp4_quantization_sm90_module,
-        "89": gen_fp4_quantization_sm80_module,
-        "87": gen_fp4_quantization_sm80_module,
-        "86": gen_fp4_quantization_sm80_module,
-        "80": gen_fp4_quantization_sm80_module,
+        **dict.fromkeys(("89", "87", "86", "80"), gen_fp4_quantization_sm80_module),
     }
 
     # Prefer 'f' (family / feature-set) variant for SM12x when CUDA >= 12.9,

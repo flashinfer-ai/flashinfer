@@ -1183,8 +1183,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
     static_assert(!HasActivationScale || decltype(size<1>(accum))::value == 1,
                   "One 64-row MMA per consumer warpgroup.");
     auto accum_blk = make_fragment_like(accum(_, Int<0>{}, Int<0>{}));
-    int act_factor_parity = 0;
-    int act_factor_buffer = 0;
+    int act_factor_parity = 0, act_factor_buffer = 0;
     if constexpr (HasActivationScale) {
       clear(accum);
     }

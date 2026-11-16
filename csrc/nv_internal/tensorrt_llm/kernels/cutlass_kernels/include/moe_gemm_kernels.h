@@ -38,6 +38,14 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
+// Below SM100 NVFP4, and MXFP8 x MXFP4 with MXFP8 input, run on the SM80 16-bit x E2M1 GEMMs
+// with the activations restored.
+#if defined(FLASHINFER_FP4_SW_CVT)
+constexpr bool kRestoredFp4 = true;
+#else
+constexpr bool kRestoredFp4 = false;
+#endif
+
 template <typename AType, typename BType, typename BScaleType, typename OType>
 struct GroupedGemmInput {
   AType const* A = nullptr;
@@ -318,12 +326,7 @@ class MoeGemmRunner {
   static constexpr bool use_fp4 = false;
   static constexpr bool use_wfp4afp8 = false;
 #endif
-#if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100 NVFP4 runs on the SM80 16-bit x E2M1 GEMMs, with the activations restored.
-  static constexpr bool use_restored_fp4 = use_fp4;
-#else
-  static constexpr bool use_restored_fp4 = false;
-#endif
+  static constexpr bool use_restored_fp4 = kRestoredFp4 && use_fp4;
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
   static constexpr bool use_sm90_wfp4afp8 =
       use_wfp4afp8 && Sm90Wfp4Afp8Mode != Sm90Wfp4Afp8ScaleMode::kDisabled;

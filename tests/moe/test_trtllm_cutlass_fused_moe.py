@@ -1150,10 +1150,6 @@ def test_moe_deterministic_mode_selects_unfused_finalize():
     [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Situ],
     ids=["swiglu", "swiglustep", "situ"],
 )
-@pytest.mark.skipif(
-    get_compute_capability(torch.device("cuda")) < (8, 9),
-    reason="CUTLASS FP8 fused MoE requires SM89 or later",
-)
 @_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8(
     batch_size,
@@ -1165,6 +1161,8 @@ def test_moe_fp8(
     wtype,
     activation_type,
 ):
+    if get_compute_capability(torch.device("cuda")) < (8, 9):
+        pytest.skip("CUTLASS FP8 fused MoE requires SM89 or later")
     # Skip invalid configurations
     if top_k > num_experts:
         pytest.skip(

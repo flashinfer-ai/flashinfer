@@ -108,7 +108,6 @@ def _skip_sm107_unimplemented_moe_features(request):
 
     if params.get("swap_ab"):
         pytest.skip("swap_ab requires Blackwell SM100 or SM103")
-    # Below SM100 the MoE runs on the CUTLASS MoE kernels, which have no swap_ab.
     if capability[0] < 10:
         return
 
@@ -1993,14 +1992,13 @@ class TestAutotunerBucketConfig:
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
-    # The wrapper call pins a native W4A16 tactic.
-    @pytest.mark.parametrize(
-        "use_wrapper", [False, pytest.param(True, marks=sm100_required)]
-    )
+    @pytest.mark.parametrize("use_wrapper", [False, True])
     @pytest.mark.parametrize("swap_ab", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool, swap_ab: bool):
         if swap_ab and is_sm107():
             pytest.skip("swap_ab requires Blackwell SM100 or SM103")
+        if use_wrapper and not is_sm100_family():
+            pytest.skip("The wrapper call pins a native W4A16 tactic")
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             DEFAULT_W4A16_MOE_TACTIC,
@@ -2059,11 +2057,8 @@ class TestCuteDslMoeW4A16:
         # Weight scales are serving-owned tensors and may be updated in place.
         # Reuse the same allocation to ensure W4A16 reads the current contents.
         result = run()
-        _assert_moe_quant_mode_reference(
-            result,
-            split_w4a16_reference_from_tensors(tensors, swap_ab=swap_ab),
-            "w4a16",
-        )
+        reference = split_w4a16_reference_from_tensors(tensors, swap_ab=swap_ab)
+        _assert_moe_quant_mode_reference(result, reference, "w4a16")
         assert torch.count_nonzero(result).item() > 0
         tensors["w1_weight_sf"].zero_()
         updated = run()
@@ -2267,7 +2262,6 @@ class TestCuteDslMoeW4A16:
 
         _assert_moe_quant_mode_reference(result, ref_output, "w4a16")
 
-    # Pins native W4A16 tactics.
     @sm100_required
     @pytest.mark.parametrize(
         "tactic",
@@ -2743,6 +2737,7 @@ class TestCuteDslFusedMoeFunctional:
             with pytest.raises(TypeError, match="GEMM1 and GEMM2 weights"):
                 cute_dsl_fused_moe(**invalid, **config, tactic=tactic)
 
+    @sm100_required
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
     @pytest.mark.parametrize("swap_ab", [False, True])
     def test_clamped_relu2_accuracy(
@@ -2753,8 +2748,6 @@ class TestCuteDslFusedMoeFunctional:
 
         if is_sm107():
             pytest.skip("SM107 gather grouped GEMM does not implement ClampedRelu2")
-        if not is_sm100_family():
-            pytest.skip("The CUTLASS MoE kernels do not implement ClampedRelu2")
 
         activation_type = ActivationType.ClampedRelu2
         num_tokens, hidden_size, intermediate_size = 128, 1024, 512

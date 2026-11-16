@@ -1706,6 +1706,15 @@ def _require_cutlass_tensor(
         raise ValueError(f"{name} shape {tuple(tensor.shape)} != expected {shape}.")
 
 
+def _sm80_view_operands(view, w1, w2, device):
+    """The SM80 operands prepared with ``view``, checked against the weights ``w1`` and ``w2``."""
+    from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
+
+    sm80 = tuple(view[k] for k in _CUTLASS_NVFP4_SM80_KEYS)
+    _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, device)
+    return sm80
+
+
 # ---------------------------------------------------------------------------
 # CUTLASS runners — dense BF16 and mixed-input W4A16
 # ---------------------------------------------------------------------------
@@ -2585,11 +2594,7 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
         )
         if self._device_arch < 100 and "sm80_fc1_expert_weights" in view:
             # Below SM100 the GEMMs read the SM80 operands prepared with the view, if any.
-            from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
-
-            sm80 = tuple(view[k] for k in _CUTLASS_NVFP4_SM80_KEYS)
-            _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, self.device)
-            w1, w1_scale, w2, w2_scale = sm80
+            w1, w1_scale, w2, w2_scale = _sm80_view_operands(view, w1, w2, self.device)
         # Flat NVFP4 CUTLASS selects the kernel from weight dtype int64.
         return [
             w1.view(torch.int64),
@@ -2827,11 +2832,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
             return [w1, w2, w1_scale, w2_scale, a1_scale, a2_scale]
         if self._device_arch < 100 and "sm80_fc1_expert_weights" in view:
             # Below SM100 the GEMMs read the SM80 operands prepared with the view, if any.
-            from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
-
-            sm80 = tuple(view[k] for k in _CUTLASS_NVFP4_SM80_KEYS)
-            _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, self.device)
-            w1, w1_scale, w2, w2_scale = sm80
+            w1, w1_scale, w2, w2_scale = _sm80_view_operands(view, w1, w2, self.device)
         return [
             w1.view(torch.int64),
             w2.view(torch.int64),
@@ -5332,22 +5333,16 @@ class CuteDslRunner(MoERunner):
             v = {**v, **dict(zip(keys, sm90, strict=True))}
         elif self._below_sm100() and "sm80_fc1_expert_weights" in v:
             # Below SM100 the GEMMs read the SM80 operands prepared with the view, if any.
-            from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
-
-            sm80 = tuple(map(v.get, _CUTLASS_NVFP4_SM80_KEYS))
-            device = act.hidden_states_q.device
-            _check_sm80_nvfp4_operands(
-                sm80, v["w1_weight"].shape, v["w2_weight"].shape, device
+            sm80 = _sm80_view_operands(
+                v, v["w1_weight"], v["w2_weight"], act.hidden_states_q.device
             )
             v = {**v, **dict(zip(keys, sm80, strict=True))}
         elif self._below_sm100() and "sm80_fc1_records" in v:
             # W4A16 reads the records prepared with the view over all experts; an
             # expert-parallel shard converts the weights on every call.
-            experts, num_experts = self.config.experts, self.config.routing.num_experts
-            if experts.local_expert_offset == 0 and experts.local_num_experts in (
-                None,
-                num_experts,
-            ):
+            experts = self.config.experts
+            whole = (None, self.config.routing.num_experts)
+            if experts.local_expert_offset == 0 and experts.local_num_experts in whole:
                 records = (v["sm80_fc1_records"], v["sm80_fc2_records"])
                 v = {**v, "w1_weight_sf": records[0], "w2_weight_sf": records[1]}
 
@@ -6132,11 +6127,9 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         )
         if self._sm80:
             from .prepare import (
-                _CUTLASS_MXFP4_SM90_KEYS,
-                _CUTLASS_NVFP4_SM80_KEYS,
-                _check_sm80_nvfp4_operands,
+                _CUTLASS_MXFP4_SM90_KEYS, _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands,
                 trtllm_nvfp4_sm80_weights,
-            )
+            )  # fmt: skip
 
             mx = self._pair[0] is QuantFormat.MXFP4
             device = act.hidden_states_q.device

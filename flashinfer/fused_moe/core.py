@@ -7669,6 +7669,7 @@ def trtllm_fp4_block_scale_routed_moe(
         # (32) weights by their scale count, and with fused shared experts each expert-major
         # tensor's extent. Operands from trtllm_nvfp4_sm80_weights (BF16 scales, int32 on SM90's
         # GEMM) are checked and used as they are.
+        device = hidden_states.device
         experts, dtype = local_num_experts + _nfse, hidden_states.dtype
         hidden_size = hidden_states.shape[1] * (2 if dtype == torch.uint8 else 1)
         gated = ActivationType(activation_type).is_gated
@@ -7734,45 +7735,39 @@ def trtllm_fp4_block_scale_routed_moe(
         # The FC1 rows kept, of the weights, biases and LoRA deltas alike.
         fc1_rows = _trtllm_fc1_rows(
             valid_intermediate_size, intermediate_size if prepared else gemm2_weights.shape[2] * 2,
-            gated, hidden_states.device,
+            gated, device,
         )  # fmt: skip
         if not do_finalize:  # as above SM100, the unfinalized rows are allocated
             output = None
         elif output is None:
             output = _alloc_trtllm_moe_output(
-                num_tokens, _trtllm_moe_output_width(hidden_size, valid_hidden_size), True,
-                hidden_states.device,
+                num_tokens, _trtllm_moe_output_width(hidden_size, valid_hidden_size), True, device
             )  # fmt: skip
         else:
             _check_trtllm_moe_output(
-                output, num_tokens, hidden_size, valid_hidden_size, hidden_states.device
+                output, num_tokens, hidden_size, valid_hidden_size, device
             )
         # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
-        sm90 = (
-            get_compute_capability(hidden_states.device)[0] == 9
-            and dtype == torch.float8_e4m3fn
-        )
+        sm90 = dtype == torch.float8_e4m3fn and get_compute_capability(device)[0] == 9
         weights = gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale
         if prepared:
             rows1 = intermediate_size * (2 if gated else 1)
             rows1 = rows1 if fc1_rows is None else fc1_rows.numel()
             _check_sm80_nvfp4_operands(
                 weights, (experts, rows1, output_hidden_size // 2),
-                (experts, output_hidden_size, rows1 // (2 if gated else 1) // 2),
-                hidden_states.device, sm90,
+                (experts, output_hidden_size, rows1 // (2 if gated else 1) // 2), device, sm90,
             )  # fmt: skip
         else:
             weights = trtllm_nvfp4_sm80_weights(
                 *weights, gated, sf_vec == 32, valid_intermediate_size, sm90
             )
         return _trtllm_fp4_routed_moe_sm80(
-            topk_ids_tensor, topk_weights, hidden_states, hidden_states_scale,
-            per_token_scale, weights, output1_scale_scalar, output1_scale_gate_scalar,
-            output2_scale_scalar, gemm1_alpha, gemm1_beta, gemm1_clamp_limit, num_experts,
-            local_expert_offset, local_num_experts, activation_type, enable_pdl, output,
-            tune_max_num_tokens,
-            gemm1_bias if gemm1_lora_delta is None else None, gemm2_bias, fc1_rows,
-            do_finalize, gemm1_lora_delta, nvfp4_4over6,
+            topk_ids_tensor, topk_weights, hidden_states, hidden_states_scale, per_token_scale,
+            weights, output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
+            gemm1_alpha, gemm1_beta, gemm1_clamp_limit, num_experts, local_expert_offset,
+            local_num_experts, activation_type, enable_pdl, output, tune_max_num_tokens,
+            gemm1_bias if gemm1_lora_delta is None else None, gemm2_bias, fc1_rows, do_finalize,
+            gemm1_lora_delta, nvfp4_4over6,
         )  # fmt: skip
 
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
@@ -7882,16 +7877,12 @@ def _trtllm_fp4_routed_moe_sm80(
     ):
         # The limit is given before the gate scale.
         gemm1_clamp_limit = gemm1_clamp_limit * fc1_dequant
-    situ = (
-        (ones if gemm1_alpha is None else gemm1_alpha, ones if gemm1_beta is None else gemm1_beta)
-        if act == ActivationType.Situ
-        else (None, None)
-    )  # fmt: skip
-    swiglu = (
-        (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
-        if act in (ActivationType.Swiglu, ActivationType.SwigluStep)
-        else (None, None, gemm1_clamp_limit if act == ActivationType.Situ else None)
-    )
+    situ, swiglu = (None, None), (None, None, None)
+    if act == ActivationType.Situ:
+        situ = tuple(ones if v is None else v for v in (gemm1_alpha, gemm1_beta))
+        swiglu = (None, None, gemm1_clamp_limit)
+    elif act in (ActivationType.Swiglu, ActivationType.SwigluStep):
+        swiglu = (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
     fc2_scale = scalar(output1_scale_scalar)
     if act.is_gated and act != ActivationType.Situ:
         # A zero gate scalar zeroes the FC1 output, whatever the GEMM2-input scale.
@@ -7905,8 +7896,7 @@ def _trtllm_fp4_routed_moe_sm80(
             if bias is None:
                 return weight.new_zeros(weight.shape[:2], dtype=torch.bfloat16)
             rows_from = permute(
-                _TRTLLM_PERMUTE_CACHE, bias[0].reshape(-1, 1), 128,
-                is_gated_act_gemm=act.is_gated,
+                _TRTLLM_PERMUTE_CACHE, bias[0].reshape(-1, 1), 128, is_gated_act_gemm=act.is_gated,
             ).argsort()  # fmt: skip
             rows_from = rows_from if rows is None else rows_from[rows]
             return (bias[:, rows_from] * dequant[:, None]).to(torch.bfloat16)
@@ -7928,28 +7918,24 @@ def _trtllm_fp4_routed_moe_sm80(
         )
     num_tokens = hidden_states.shape[0]
     mxfp8 = hidden_states.dtype == torch.float8_e4m3fn
+    x_sf = None
+    if mxfp8 or not mx:
+        x_sf = hidden_states_scale.view(torch.uint8).reshape(num_tokens, -1)
     width = hidden_states.shape[1] * (2 if hidden_states.dtype == torch.uint8 else 1)
     # A padded hidden size: GEMM1 reads the leading K, the FC2 rows.
     if width > w2.shape[1]:
-        if hidden_states_scale is not None:
-            sf_vec = 32 if mx else 16
-            sf = hidden_states_scale.view(torch.uint8).reshape(num_tokens, -1)
-            hidden_states_scale = sf[:, : w2.shape[1] // sf_vec].contiguous()
-        hidden_states = hidden_states[
-            :, : hidden_states.shape[1] * w2.shape[1] // width
-        ].contiguous()
+        if x_sf is not None:
+            x_sf = x_sf[:, : w2.shape[1] // (32 if mx else 16)].contiguous()
+        cols = hidden_states.shape[1] * w2.shape[1] // width
+        hidden_states = hidden_states[:, :cols].contiguous()
     if mx:  # MXFP4: the weight scales alone, as for NVFP4 W4A16
         # BF16 activations' global scales take back the 8 the SM80 weight scales are over.
         alpha = ones if mxfp8 else torch.full_like(ones, 8.0)
         quant_scales = [s1, alpha, s2, alpha]
-        x_sf = None
-        if mxfp8:
-            x_sf = hidden_states_scale.view(torch.uint8).reshape(num_tokens, -1)
     else:
         quant_scales = [
             ones[0], s1, fc1_dequant, fc2_scale, s2, fc2_dequant,
         ] + ([] if per_token_scale is None else [per_token_scale.float().contiguous()])  # fmt: skip
-        x_sf = hidden_states_scale.view(torch.uint8).reshape(num_tokens, -1)
         if x_sf.shape[1] % 4 or not x_sf.is_contiguous():
             x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))
     rows = fc2_inputs = None
@@ -7964,23 +7950,18 @@ def _trtllm_fp4_routed_moe_sm80(
             dtype=torch.uint8 if codes or mxfp8 else torch.bfloat16,
         )
     if output is None:
-        output = hidden_states.new_empty(
-            (num_tokens if do_finalize else rows.numel(), w2.shape[1]),
-            dtype=torch.bfloat16,
-        )
+        shape = (num_tokens if do_finalize else rows.numel(), w2.shape[1])
+        output = hidden_states.new_empty(shape, dtype=torch.bfloat16)
     major, minor = get_compute_capability(hidden_states.device)
     with torch.cuda.device(hidden_states.device):
         get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe(
-            output, hidden_states, local.int().contiguous(),
-            topk_weights.float().contiguous(), w1, biases[0],
-            w2, biases[1], torch.bfloat16, quant_scales, x_sf, *swiglu, None,
-            *situ, False, ep_size=1 if local_num_experts == num_experts else 2,
-            ep_rank=0, enable_pdl=enable_pdl,
-            activation_type=act, tune_max_num_tokens=tune_max_num_tokens,
-            use_mxfp8_act_scaling=mxfp8,
-            nvfp4_4over6_code=nvfp4_4over6_code(recipe), permuted_rows=rows,
-            do_finalize=do_finalize,
-            fc1_deltas=fc1_deltas, fc2_inputs=fc2_inputs,
+            output, hidden_states, local.int().contiguous(), topk_weights.float().contiguous(), w1,
+            biases[0], w2, biases[1], torch.bfloat16, quant_scales, x_sf, *swiglu, None, *situ,
+            False, ep_size=1 if local_num_experts == num_experts else 2, ep_rank=0,
+            enable_pdl=enable_pdl, activation_type=act, tune_max_num_tokens=tune_max_num_tokens,
+            use_mxfp8_act_scaling=mxfp8, nvfp4_4over6_code=nvfp4_4over6_code(recipe),
+            permuted_rows=rows, do_finalize=do_finalize, fc1_deltas=fc1_deltas,
+            fc2_inputs=fc2_inputs,
         )  # fmt: skip
     if rows is None:
         return [output]

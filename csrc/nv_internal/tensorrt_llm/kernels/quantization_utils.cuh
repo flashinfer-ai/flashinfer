@@ -629,8 +629,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     float error4 = 0.0f;
     float error6 = 0.0f;
     // Below SM100 in software, each element's errors are kept and added up after the loop.
-    [[maybe_unused]] float errors4[CVT_ELTS_PER_THREAD];
-    [[maybe_unused]] float errors6[CVT_ELTS_PER_THREAD];
+    [[maybe_unused]] float errors4[CVT_ELTS_PER_THREAD], errors6[CVT_ELTS_PER_THREAD];
     auto const addError = [](float& error, [[maybe_unused]] float& kept, float elementError) {
 #if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
       kept = elementError;

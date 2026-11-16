@@ -1846,14 +1846,6 @@ __global__ void nvfp4RowScalesKernel(float* row_scales, float const* expert_alph
     row_scales[row] = expert_alpha[expert] * row_scales[row];
   }
 }
-
-void nvfp4RowScales(float* row_scales, float const* expert_alpha,
-                    int64_t const* expert_first_token_offset, int64_t const num_experts_per_node,
-                    int64_t const num_rows, cudaStream_t stream) {
-  int64_t const blocks = std::max((num_rows + 255) / 256, int64_t{1});
-  nvfp4RowScalesKernel<<<blocks, 256, 0, stream>>>(row_scales, expert_alpha,
-                                                   expert_first_token_offset, num_experts_per_node);
-}
 #endif
 
 // ====================== Compute FP8 dequant scale only ===============================
@@ -4582,22 +4574,20 @@ void CutlassMoeFCRunner<
     }
 #endif
 
-    bool use_per_expert_act_scale = use_restored_fp4
-                                        ? quant_params.fp4.fc2.use_per_expert_act_scale
-                                        : quant_params.fp8.fc2_use_per_expert_act_scale;
+    bool use_per_expert_act_scale = use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale : false;
+    if (use_restored_fp4) use_per_expert_act_scale = quant_params.fp4.fc2.use_per_expert_act_scale;
     // FC2 activations stay 16-bit without FC2 scales (per-token, quantized per row after GEMM1) or
     // W4A16 (no FC2 activation global scale).
+    bool const fc2_scales = use_restored_mx || quant_params.fp4.fc2.act_global_scale;
+    auto* const act_sf = use_restored_fp4 && fc2_scales ? fc2_fp4_act_flat : nullptr;
     doActivation<GemmInputType, UnfusedGemmOutputType, ScaleBiasType,
                  std::conditional_t<use_restored_fp4, ClampedSituAdaptor, SituAdaptor>>(
         reinterpret_cast<GemmInputType*>(output),
         static_cast<UnfusedGemmOutputType const*>(intermediate_result), fc2_fp8_quant,
         fc1_expert_biases, bias_is_broadcast, expert_first_token_offset,
         permuted_token_selected_experts, num_experts_per_node, inter_size, expanded_num_rows,
-        fc1_activation_type, quant_params, use_per_expert_act_scale,
-        use_restored_fp4 && !use_restored_mx && !quant_params.fp4.fc2.act_global_scale
-            ? nullptr
-            : fc2_fp4_act_flat,
-        nullptr, nullptr, enable_pdl, stream);
+        fc1_activation_type, quant_params, use_per_expert_act_scale, act_sf, nullptr, nullptr,
+        enable_pdl, stream);
 
     sync_check_cuda_error(stream);
   } else if (!is_gated_activation) {
@@ -4747,13 +4737,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
       check_cuda_error(cudaMemsetAsync(
           final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
     }
-  } else if (use_fp8 || use_restored_fp4) {
+  } else if (use_fp8) {
+    alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
+                                                   fc2_fp8_dequant, stream);
+  } else if (use_restored_fp4) {  // no alpha (a null scale) with row scales or the token rows
+    bool const no_alpha = row_scales || w4a16TokenRows(quant_params);
     alpha_scale_ptr_array =
-        use_restored_fp4 && (row_scales || w4a16TokenRows(quant_params))
-            ? nullptr
-            : computeFP8DequantScale(
-                  alpha_scale_ptr_array, num_experts_per_node,
-                  use_restored_fp4 ? quant_params.fp4.fc2.global_scale : fc2_fp8_dequant, stream);
+        computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
+                               no_alpha ? nullptr : quant_params.fp4.fc2.global_scale, stream);
   }
   if (use_w4afp8) {
     alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
@@ -4827,8 +4818,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     return;
   }
 
-  bool has_different_output_type_ampere =
-      (use_w4afp8 || use_fp8 || use_restored_fp4) && !using_tma_ws_gemm2;
+  bool has_different_output_type_ampere = (use_w4afp8 || use_fp8) && !using_tma_ws_gemm2;
+  has_different_output_type_ampere |= use_restored_fp4 && !using_tma_ws_gemm2;
   bool using_fused_finalize =
       tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
   bool has_different_output_type_tma_ws = !using_fused_finalize && using_tma_ws_gemm2;
@@ -5377,9 +5368,9 @@ void CutlassMoeFCRunner<
     float* fc2_row_scales = nullptr;
     TLLM_CHECK_WITH_INFO(!per_token_scale || (restore_tokens && std::is_same_v<InputType, Fp4Type>),
                          "Per-token NVFP4 activations come quantized, without per-expert scales");
-    T* gemm1_input_expand = use_w4afp8         ? reinterpret_cast<T*>(smoothed_act_)
-                            : use_restored_fp4 ? reinterpret_cast<T*>(glu_inter_result_)
-                                               : reinterpret_cast<T*>(permuted_data_);
+    T* gemm1_input_expand =
+        use_w4afp8 ? reinterpret_cast<T*>(smoothed_act_) : reinterpret_cast<T*>(permuted_data_);
+    if (use_restored_fp4) gemm1_input_expand = reinterpret_cast<T*>(glu_inter_result_);
     float* fp8_token_dequant_scale = nullptr;
     float const* fp8_expert_residual_scale = nullptr;
     int const* humming_permuted_token_selected_experts = nullptr;
@@ -5590,8 +5581,9 @@ void CutlassMoeFCRunner<
                                          stream, enable_pdl, quant_params.fp4.fc2.act_global_scale);
         restoredRows<false>(activations, glu_inter_result_, fc2_fp4_act_scale_, nullptr, 0,
                             expanded_num_rows, inter_size, stream);
-        nvfp4RowScales(fc2_row_scales, quant_params.fp4.fc2.global_scale,
-                       expert_first_token_offset_, num_experts_per_node, expanded_num_rows, stream);
+        nvfp4RowScalesKernel<<<std::max((expanded_num_rows + 255) / 256, int64_t{1}), 256, 0,
+                               stream>>>(fc2_row_scales, quant_params.fp4.fc2.global_scale,
+                                         expert_first_token_offset_, num_experts_per_node);
       }
     }
 #endif

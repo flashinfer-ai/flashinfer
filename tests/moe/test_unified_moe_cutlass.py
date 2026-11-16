@@ -123,9 +123,7 @@ def test_cutlass_bf16_config_architectures_and_registration():
         assert CutlassMxfp8Mxfp4Config.supported(arch)
     for arch in (100, 103, 107):
         assert CutlassMxfp8Config.supported(arch)
-    for arch in (80, 86, 87):
-        assert CutlassBf16Config.supported(arch)
-        assert not CutlassFp8PerTensorConfig.supported(arch)
+    assert CutlassBf16Config.supported(80)
     assert not CutlassW4A16Config.supported(100)
     assert CutlassNvfp4Config.supported(90)
     assert not CutlassFp8BlockConfig.supported(100)

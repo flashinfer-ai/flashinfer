@@ -199,12 +199,11 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
-    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[8]
+    nvcc_flags = (
+        current_compilation_context.get_nvcc_flags_list(supported_major_versions=[8])
+        + _SM8X_NVCC_FLAGS
     )
-    return gen_cutlass_fused_moe_module(
-        nvcc_flags + _SM8X_NVCC_FLAGS, "80", use_fast_build
-    )
+    return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
 
 
 def gen_w4a16_moe_sm80_module() -> JitSpec:
@@ -212,12 +211,10 @@ def gen_w4a16_moe_sm80_module() -> JitSpec:
 
     SM86, SM87 and SM89 run the sm_80 code; SM90 gets its own sm_90 build.
     """
-    archs = current_compilation_context.TARGET_CUDA_ARCHS
-    nvcc_flags = []
-    if any(major == 8 for major, _ in archs):
-        nvcc_flags.append("-gencode=arch=compute_80,code=sm_80")
-    if any(major == 9 for major, _ in archs):
-        nvcc_flags.append("-gencode=arch=compute_90,code=sm_90")
+    majors = {major for major, _ in current_compilation_context.TARGET_CUDA_ARCHS}
+    nvcc_flags = [
+        f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors
+    ]
     if not nvcc_flags:
         raise RuntimeError("W4A16 MoE records kernels need an SM80 to SM90 target")
     return gen_jit_spec(

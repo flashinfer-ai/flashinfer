@@ -95,10 +95,8 @@ struct MoeFCGemm {
   using ElementA = typename MapArguments::ElementA;
   using LayoutA = typename MapArguments::LayoutA;
   using ElementB = typename MapArguments::ElementB;
-  // Weights that carry scales: INT8, INT4 and E2M1 (NVFP4, in groups of 16).
+  // E2M1 (NVFP4) weights carry scales like INT8 and INT4, one per 16 K values.
   static constexpr bool kE2m1B = platform::is_same<float_e2m1_t, ElementB>::value;
-  static constexpr bool kScaledB = platform::is_same<uint8_t, ElementB>::value ||
-                                   platform::is_same<uint4b_t, ElementB>::value || kE2m1B;
   using LayoutB = typename MapArguments::LayoutB;
   using ElementC = typename Epilogue::OutputTileIterator::Element;
   using LayoutC = typename MapArguments::LayoutC;
@@ -219,7 +217,8 @@ struct MoeFCGemm {
           gemm_n(gemm_n),
           gemm_k(gemm_k),
           host_problem_sizes(nullptr) {
-      if (kScaledB) {
+      if (platform::is_same<uint8_t, ElementB>::value ||
+          platform::is_same<uint4b_t, ElementB>::value || kE2m1B) {
         assert(weight_scales);
       }
       this->gather_A_indices = nullptr;
@@ -340,7 +339,8 @@ struct MoeFCGemm {
   }
 
   static Status can_implement(Arguments const& args) {
-    if constexpr (kScaledB) {
+    if constexpr (platform::is_same<uint8_t, ElementB>::value ||
+                  platform::is_same<uint4b_t, ElementB>::value || kE2m1B) {
       if (args.weight_scales == nullptr) {
         CUTLASS_TRACE_HOST(
             "MoeFCGemm::can_implement() - weight scales are required for uint8_t and uint4b_t");
@@ -467,10 +467,7 @@ struct MoeFCGemm {
   template <int MaxK, typename Run>
   CUTLASS_DEVICE static void run_with_live_m_blocks(int const live, Run&& run) {
     if constexpr (MaxK > 1) {
-      if (live < MaxK) {
-        run_with_live_m_blocks<MaxK - 1>(live, run);
-        return;
-      }
+      if (live < MaxK) return run_with_live_m_blocks<MaxK - 1>(live, run);
     }
     run(platform::integral_constant<int, MaxK>{});
   }
@@ -599,11 +596,9 @@ struct MoeFCGemm {
                 params.group_size);
 
         if constexpr (kE2m1B && Mma::Operator::MmaIterations::kRow >= 4) {
-          // Run only the mma operations of the warp tile's rows that cover problem rows, in a
-          // mainloop specialized for that count so no branch runs per mma. Broadcast from lane 0
-          // so the compiler sees a warp-uniform count and keeps the mma operations converged.
-          // Warp tiles with one or two rows of mma operations keep the single mainloop: one row
-          // leaves nothing to skip, and with two the specialized kernel measured slower.
+          // Run only the warp tile's mma rows that cover problem rows, in a mainloop specialized
+          // per count (no per-mma branch); the lane-0 broadcast keeps the count warp-uniform. One
+          // or two mma rows keep the single mainloop: one has nothing to skip, two measured slower.
           using WarpMma = typename Mma::Operator;
           int const warp_m =
               warp_idx % (Mma::WarpCount::kM * Mma::WarpCount::kN) % Mma::WarpCount::kM;

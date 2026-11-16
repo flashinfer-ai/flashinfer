@@ -223,6 +223,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                                          __nv_bfloat16, __nv_fp8_e4m3>>();
       }
     }
+    if (isSm90WMxfp4AMxfp8Quant()) {
+      TVM_FFI_ICHECK_EQ(sm, 90) << "uint8 MXFP4 weights with MXFP8 activations need SM90";
+      mInnerDimMultiplier = 2;
+      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act;
+      mKernelRunner =
+          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, false, false,
+                             kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
+    }
 #endif
 
 #if 0
@@ -244,17 +252,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       mKernelRunner = switch_output_type<
           __nv_fp8_e4m3, kernels::Fp4Type, false, false,
           kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
-    }
-#endif
-
-#if defined(FLASHINFER_FP4_SW_CVT)
-    if (isSm90WMxfp4AMxfp8Quant()) {
-      TVM_FFI_ICHECK_EQ(sm, 90) << "uint8 MXFP4 weights with MXFP8 activations need SM90";
-      mInnerDimMultiplier = 2;
-      mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act;
-      mKernelRunner =
-          switch_output_type<__nv_fp8_e4m3, kernels::Fp4Type, false, false,
-                             kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act>(mOutputDtype);
     }
 #endif
 
@@ -1020,12 +1017,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   bool mUsePackedWeights = false;
   bool mUseFusedFinalize = true;
   kernels::Sm90Wfp4Afp8ScaleMode mSm90Wfp4Afp8Mode = kernels::Sm90Wfp4Afp8ScaleMode::kDisabled;
-#if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100 MXFP8 x MXFP4 runs on the restored NVFP4 runner, with its W4A16 quant scales.
-  static constexpr bool kRestoredMxfp4 = true;
-#else
-  static constexpr bool kRestoredMxfp4 = false;
-#endif
+  static constexpr bool kRestoredMxfp4 = kernels::kRestoredFp4;
 
   using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
   std::vector<Profile> mAllProfiles;
@@ -1600,8 +1592,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     else if (isNvfp4Quant() || isWMxfp4AMxfp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for nvfp4 quantization";
 #if defined(FLASHINFER_FP4_SW_CVT)
-      // Below SM100 the 4 weight scales (fc1/fc2 block and global) alone keep 16-bit activations
-      // (W4A16), and a 7th scale gives per-token activation scales.
+      // Below SM100: 4 scales (weight block and global) mean W4A16, a 7th adds per-token scales.
       auto const num_scales = quant_scales.value().size();
       TVM_FFI_ICHECK(num_scales == 4 || num_scales == 6 || num_scales == 7)
           << "Expecting 4, 6 or 7 quant scales for nvfp4 quantization";
@@ -1832,12 +1823,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
   // SM90 MXFP8 x MXFP4 on uint8 weights, built below SM100 only.
   bool isSm90WMxfp4AMxfp8Quant() const {
-#if defined(FLASHINFER_FP4_SW_CVT)
-    return mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_uint8 &&
+    return kRestoredMxfp4 && mActivationDtype == dl_float8_e4m3fn && mWeightDtype == dl_uint8 &&
            mUseMxfp8ActScaling && !mUsePackedWeights;
-#else
-    return false;
-#endif
   }
 };
 

@@ -1985,6 +1985,7 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
         )
     if w4a16:  # no activation scales
         x, experts, scales, w1, s1, alpha1, w2, s2, alpha2 = inputs[:9]
+        x_sf = None
     else:
         x, x_sf, experts, scales, w1, s1, alpha1 = inputs[:7]
         fc2_scale, w2, s2, alpha2 = inputs[7:11]
@@ -2001,11 +2002,8 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
     if s1.dtype != torch.int32:  # the SM90 operands keep their uint8 weights
         w1, w2 = w1.view(torch.int64), w2.view(torch.int64)
     code = NVFP4_4OVER6_CODE_STANDARD
-    if w4a16:
-        quant_scales, x_sf = [s1, alpha1, s2, alpha2], None
-    elif w4a8:  # as W4A16, x_sf holding the MXFP8 scales
-        quant_scales = [s1, alpha1, s2, alpha2]
-    else:
+    quant_scales = [s1, alpha1, s2, alpha2]  # W4A8 as W4A16, x_sf holding MXFP8 scales
+    if not (w4a16 or w4a8):
         one = torch.ones((), device=x.device)
         quant_scales = [one, s1, alpha1, fc2_scale.reshape(-1)[0], s2, alpha2]
         quant_scales += inputs[11:-1]  # per-token activation scales

@@ -814,20 +814,13 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
         for token_tile in [16, 32, 64, 128, 256]:
             operations.append(
                 TrtLlm_GemmLauncher(
-                    GemmKind.Grouped,
-                    arch,
-                    *dtype_combo,
-                    TrtLlm_QuantOp.finegrained_scale_only,
-                    TrtLlm_EpilogueTag.epilogue_op_default,
-                    (128, token_tile, 128),
-                    warp_shape,
-                    stages,
-                    (1, 1, 1),
-                    KernelScheduleType.TmaWarpSpecializedCooperative,
+                    GemmKind.Grouped, arch, *dtype_combo, TrtLlm_QuantOp.finegrained_scale_only,
+                    TrtLlm_EpilogueTag.epilogue_op_default, (128, token_tile, 128), warp_shape,
+                    stages, (1, 1, 1), KernelScheduleType.TmaWarpSpecializedCooperative,
                     EpilogueScheduleType.TmaWarpSpecializedCooperative,
                     mixed_input_scale_mode="exact_block_e8m0",
                 )
-            )
+            )  # fmt: skip
     return operations
 
 
