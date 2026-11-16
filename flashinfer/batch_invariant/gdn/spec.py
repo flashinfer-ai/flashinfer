@@ -32,6 +32,8 @@ STEP_MAX_TOKENS = CHUNK
 TERM_SOURCES = (
     "gdn_kernels/blackwell/gated_delta_net_chunked.py",
     "gdn_kernels/qk_l2norm.py",
+    "gdn_kernels/gates.py",
+    "jit/gdn_batch_invariant.py",
 )
 TERM_INCLUDES = ("flashinfer/gdn/batch_invariant_decode.cuh",)
 
