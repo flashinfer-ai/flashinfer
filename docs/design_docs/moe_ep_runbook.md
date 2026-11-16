@@ -851,6 +851,34 @@ Distributed route changes and graph replay are covered by
 `test_mega_cuda_graph_multirank.py::test_blackwell_genphase_dtype_graph`,
 runnable with `torchrun --nproc_per_node=<2|4> -m pytest`.
 
+## SM120 NVFP4 Split MegaMoE
+
+`Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` selects the same-NUMA
+`p2p_direct` SM120/SM121 backend. `intermediate_size` is the post-SwiGLU
+width; the kernel receives twice that width for gate/up. BF16 inputs can be
+quantized during staging, or callers can supply packed E2M1 activations with
+block-16 E4M3 scales.
+
+The default `numerical_contract="ordinary_topk"` preserves direct top-k
+reduction. Set `numerical_contract="owner_bf16"` to permit rank-local combine,
+which rounds each owner partial to BF16 before final FP32 accumulation.
+An explicit `knobs={"rank_local_combine": True}` requires that permission.
+The numerical contract is part of the workspace sharing key.
+
+Warm up each compile bucket collectively before outer CUDA Graph capture.
+Layers of matching geometry can share workspace storage and Green Context
+resources while retaining per-layer weight/output graph bindings. Independent
+capacity handles use the public `create_workspace()` API; cold allocation
+must happen outside capture. The finalizer and K3 run on the caller stream
+after the K1/K2 Green Context graph. See the backend's `VENDOR.md` for source
+provenance and lifecycle details.
+
+Host contracts: `tests/moe_ep/test_sm120_nvfp4_cutedsl_host.py`.
+GPU replay, bucket and resource-lifetime tests:
+`tests/moe_ep/test_moe_ep_sm120_nvfp4_cutedsl_mega.py` (run `-m "not gpu_4"`
+on one GPU, and `torchrun --standalone --nproc_per_node=4 -m pytest ... -m gpu_4`
+on four same-NUMA GPUs).
+
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
