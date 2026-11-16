@@ -138,9 +138,9 @@ tests/kda/           @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jing
 tests/cpu/kda/       @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # ── Autotuner ──
-flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
-tests/autotuner/         @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
-tests/cpu/autotuner/     @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+flashinfer/autotuner/    @qiching @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/autotuner/         @qiching @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+tests/cpu/autotuner/     @qiching @yzh119 @bkryu @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
 # -- Test runner --
 scripts/test_sharding/      @righthandabacus @dierksen @bkryu @yongwww @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @Anerudhan
