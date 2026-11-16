@@ -1,9 +1,38 @@
+from concurrent.futures import ThreadPoolExecutor
 from functools import cache
+import os
 
 import torch
 
 from ...cute_dsl.moe_utils import allocate_moe_sort_buffers, moe_sort
 from ....jit.colonels import gen_colonels_module
+
+
+def precompile_kernels(tactics, activation, arch):
+    """Build unique module families in parallel before probing launch support."""
+    if os.environ.get("FLASHINFER_DISABLE_JIT"):
+        # Leave AOT loading and missing-cache errors to build_and_load().
+        return
+    specs = {}
+    for tactic in tactics:
+        spec = gen_colonels_module(
+            tactic.variant, tactic.compilation_parameters(), activation, arch
+        )
+        if not spec.is_aot:
+            specs[spec.name] = spec
+    if not specs:
+        return
+    workers = os.environ.get(
+        "FLASHINFER_JIT_PREBUILD_MAX_JOBS", os.environ.get("MAX_JOBS", "")
+    )
+    max_workers = int(workers) if workers.isdigit() and int(workers) > 0 else None
+
+    def build(spec):
+        # Keep the usual module-local Ninja logs so warm caches stay warm.
+        spec.build(need_lock=True)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        list(pool.map(build, specs.values()))
 
 
 @cache

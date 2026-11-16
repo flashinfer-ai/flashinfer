@@ -367,8 +367,8 @@ class ColonelsBf16Runner(MoERunner):
         if key not in self._valid:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm Colonels before CUDA graph capture")
-            self._valid[key] = [
-                tuple(asdict(t).values())
+            candidates = [
+                t
                 for t in self.tactics
                 if t.supports_shape(
                     key[1],
@@ -380,12 +380,18 @@ class ColonelsBf16Runner(MoERunner):
                     or not self.automatic_tactics
                     or key[0] <= 16
                 )
-                and self._run(inputs, t)
+            ]
+            if key[0]:
+                self.runtime.precompile_kernels(candidates, self.kind, self.arch)
+            self._valid[key] = [
+                tuple(asdict(t).values()) for t in candidates if self._run(inputs, t)
             ]
         return self._valid[key]
 
     def precompile_tactics(self, inputs, tactics, profile, **kwargs):
         # get_valid_tactics also checks runtime resource limits outside capture.
+        # therefore we need to have it compiled there and at this point we just 
+        # return that compilatinon is done
         return True
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
