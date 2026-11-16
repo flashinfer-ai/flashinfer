@@ -27,6 +27,7 @@ from typing import (
     Dict,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Sequence,
     Tuple,
@@ -481,6 +482,203 @@ def is_trtllm_moe_supported(
     return True
 
 
+_TRTLLM_MOE_PAD_HIDDEN_ALIGNMENT = 512
+_TRTLLM_MOE_PAD_INTERMEDIATE_ALIGNMENT = 128
+
+
+class TrtllmMoePaddedWeights(NamedTuple):
+    """Result of :func:`pad_trtllm_moe_weights`.
+
+    ``hidden_size`` and ``intermediate_size`` are the padded sizes the tensors
+    now have (pad the activations to ``hidden_size`` and pass
+    ``intermediate_size`` to the MoE op); ``valid_hidden_size`` and
+    ``valid_intermediate_size`` are the original sizes to pass as the op's
+    ``valid_hidden_size`` / ``valid_intermediate_size``.
+    """
+
+    gemm1_weights: torch.Tensor
+    gemm1_weights_scale: torch.Tensor
+    gemm2_weights: torch.Tensor
+    gemm2_weights_scale: torch.Tensor
+    hidden_size: int
+    intermediate_size: int
+    valid_hidden_size: int
+    valid_intermediate_size: int
+
+
+def _pad_bytes(t: torch.Tensor, dim: int, size: int, fill: int) -> torch.Tensor:
+    u8 = t.view(torch.uint8)
+    pad = size - u8.shape[dim]
+    if pad < 0:
+        raise ValueError(f"cannot pad dim {dim} of {tuple(t.shape)} down to {size}")
+    if pad == 0:
+        return t
+    shape = list(u8.shape)
+    shape[dim] = pad
+    tail = torch.full(shape, fill, dtype=torch.uint8, device=t.device)
+    return torch.cat([u8, tail], dim=dim).view(t.dtype)
+
+
+def pad_trtllm_moe_weights(
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    *,
+    is_gated_act: bool = True,
+    hidden_alignment: int = _TRTLLM_MOE_PAD_HIDDEN_ALIGNMENT,
+    intermediate_alignment: int = _TRTLLM_MOE_PAD_INTERMEDIATE_ALIGNMENT,
+) -> TrtllmMoePaddedWeights:
+    r"""Zero-pad block-scaled MoE expert weights to the sizes the trtllm-gen kernels accept.
+
+    The trtllm-gen fused MoE kernels (:func:`trtllm_fp8_block_scale_moe` with
+    MxFP8, :func:`trtllm_fp4_block_scale_moe` with NVFP4 or MxFP4) need
+    ``intermediate_size`` to be a multiple of 128 and ``hidden_size`` to be a
+    multiple of the GEMM1 K tile.  Models whose expert dimensions are not
+    (Nemotron Nano: hidden 2688, intermediate 1856, or 928 at TP2) pad their
+    weights and declare the real sizes through ``valid_hidden_size`` and
+    ``valid_intermediate_size``; GEMM2 then computes ``roundUp(hidden, 128)``
+    columns and the finalized output is cropped to the valid width.  This helper
+    performs that padding on already quantized weights and their block scales.
+
+    Weights are padded with zeros and block scales with the neutral scale of
+    their format (E8M0 ``127`` = 1.0 for the 32-element MX blocks, E4M3 ``1.0``
+    for the 16-element NVFP4 blocks), so a padded element dequantizes to zero.
+    The kernels read each padded dimension only up to ``roundUp(valid, 128)``,
+    so that stretch of the pad must dequantize to zero and the rest is never read.
+    For gated activations the gate and up halves of ``gemm1_weights`` are
+    padded independently, so the padded tensor is still
+    ``[gate (intermediate_size rows); up (intermediate_size rows)]`` with the
+    padded ``intermediate_size``.  Pass the result through the usual shuffle
+    helpers (:func:`reorder_rows_for_gated_act_gemm`,
+    :func:`~flashinfer.shuffle_matrix_a`, :func:`~flashinfer.shuffle_matrix_sf_a`
+    or the permute-index helpers) exactly as you would unpadded weights.
+
+    Parameters
+    ----------
+    gemm1_weights : torch.Tensor
+        FC1 weights ``[num_experts, F * intermediate_size, hidden_size / elems_per_byte]``
+        in row-major (unshuffled) layout, one byte per element (``float8_e4m3fn``
+        or ``uint8``); packed FP4 holds two elements per byte.  ``F`` is 2 for
+        gated activations and 1 otherwise.
+    gemm1_weights_scale : torch.Tensor
+        FC1 block scales ``[num_experts, F * intermediate_size, hidden_size / sf_vec_size]``
+        in linear (non-interleaved) layout, one byte per scale.
+    gemm2_weights : torch.Tensor
+        FC2 weights ``[num_experts, hidden_size, intermediate_size / elems_per_byte]``.
+    gemm2_weights_scale : torch.Tensor
+        FC2 block scales ``[num_experts, hidden_size, intermediate_size / sf_vec_size]``.
+    hidden_size : int
+        The model's (unpadded) hidden size.  Must be a multiple of ``sf_vec_size``.
+    intermediate_size : int
+        The model's (unpadded) per-rank intermediate size.  Must be a multiple of
+        ``sf_vec_size``.
+    is_gated_act : bool
+        Whether FC1 holds gate and up projections (``F = 2``).  Default ``True``.
+    hidden_alignment : int
+        Alignment of the padded hidden size (GEMM1's K).  Default ``512``.  Must
+        be a multiple of 256 for MxFP8 and NVFP4 (128 is rejected or gives
+        wrong results).
+    intermediate_alignment : int
+        Alignment of the padded intermediate size.  Default ``128``.
+
+    Returns
+    -------
+    TrtllmMoePaddedWeights
+        The padded tensors plus the padded and valid sizes.  ``gemm2_weights``
+        and ``gemm2_weights_scale`` have ``roundUp(hidden_size, 128)`` rows, which
+        is GEMM2's N when ``valid_hidden_size`` is given; ``gemm1_weights`` has
+        ``roundUp(hidden_size, hidden_alignment)`` columns, which is the width
+        to zero-pad the activations to.
+    """
+    if hidden_alignment % 128 or intermediate_alignment % 128:
+        raise ValueError(
+            "hidden_alignment and intermediate_alignment must be multiples of 128"
+        )
+    for name, t in (
+        ("gemm1_weights", gemm1_weights),
+        ("gemm1_weights_scale", gemm1_weights_scale),
+        ("gemm2_weights", gemm2_weights),
+        ("gemm2_weights_scale", gemm2_weights_scale),
+    ):
+        if t.dim() != 3 or t.element_size() != 1:
+            raise ValueError(
+                f"{name} must be a 3-D tensor with one byte per element, got {t.shape} {t.dtype}"
+            )
+    factor = 2 if is_gated_act else 1
+    num_experts, rows1, cols1 = gemm1_weights.shape
+    if rows1 != factor * intermediate_size:
+        raise ValueError(
+            f"gemm1_weights has {rows1} rows, expected {factor} * {intermediate_size}"
+        )
+    if hidden_size % cols1 or hidden_size // cols1 not in (1, 2):
+        raise ValueError(
+            f"gemm1_weights has {cols1} columns for hidden_size {hidden_size}; expected 1 or 2 elements per byte"
+        )
+    elems_per_byte = hidden_size // cols1
+    sf_cols1 = gemm1_weights_scale.shape[2]
+    if hidden_size % sf_cols1 or hidden_size // sf_cols1 not in (16, 32):
+        raise ValueError(
+            f"gemm1_weights_scale has {sf_cols1} columns for hidden_size {hidden_size}; expected 16 or 32 elements per scale"
+        )
+    sf_vec_size = hidden_size // sf_cols1
+    if intermediate_size % sf_vec_size or intermediate_size % elems_per_byte:
+        raise ValueError(
+            f"intermediate_size {intermediate_size} must be a multiple of the scale block {sf_vec_size}"
+        )
+    if tuple(gemm1_weights_scale.shape[:2]) != (num_experts, rows1):
+        raise ValueError(
+            f"gemm1_weights_scale {tuple(gemm1_weights_scale.shape)} does not match gemm1_weights {tuple(gemm1_weights.shape)}"
+        )
+    if tuple(gemm2_weights.shape) != (
+        num_experts,
+        hidden_size,
+        intermediate_size // elems_per_byte,
+    ):
+        raise ValueError(
+            f"gemm2_weights must be [{num_experts}, {hidden_size}, {intermediate_size // elems_per_byte}], got {tuple(gemm2_weights.shape)}"
+        )
+    if tuple(gemm2_weights_scale.shape) != (
+        num_experts,
+        hidden_size,
+        intermediate_size // sf_vec_size,
+    ):
+        raise ValueError(
+            f"gemm2_weights_scale must be [{num_experts}, {hidden_size}, {intermediate_size // sf_vec_size}], got {tuple(gemm2_weights_scale.shape)}"
+        )
+
+    # E8M0 127 and E4M3 0x38 both encode 1.0.
+    neutral_scale = 127 if sf_vec_size == 32 else 0x38
+    padded_hidden = _round_up(hidden_size, hidden_alignment)
+    gemm2_rows = _round_up(hidden_size, _TRTLLM_MOE_OUTPUT_HIDDEN_ALIGNMENT)
+    padded_intermediate = _round_up(intermediate_size, intermediate_alignment)
+
+    def pad_fc1(t: torch.Tensor, cols: int, fill: int) -> torch.Tensor:
+        halves = torch.chunk(t, factor, dim=1)
+        halves = [_pad_bytes(h, 1, padded_intermediate, fill) for h in halves]
+        return _pad_bytes(torch.cat(halves, dim=1), 2, cols, fill)
+
+    def pad_fc2(t: torch.Tensor, cols: int, fill: int) -> torch.Tensor:
+        return _pad_bytes(_pad_bytes(t, 1, gemm2_rows, fill), 2, cols, fill)
+
+    return TrtllmMoePaddedWeights(
+        gemm1_weights=pad_fc1(gemm1_weights, padded_hidden // elems_per_byte, 0),
+        gemm1_weights_scale=pad_fc1(
+            gemm1_weights_scale, padded_hidden // sf_vec_size, neutral_scale
+        ),
+        gemm2_weights=pad_fc2(gemm2_weights, padded_intermediate // elems_per_byte, 0),
+        gemm2_weights_scale=pad_fc2(
+            gemm2_weights_scale, padded_intermediate // sf_vec_size, neutral_scale
+        ),
+        hidden_size=padded_hidden,
+        intermediate_size=padded_intermediate,
+        valid_hidden_size=hidden_size,
+        valid_intermediate_size=intermediate_size,
+    )
+
+
 def _maybe_get_cached_w3_w1_permute_indices(
     _cache_permute_indices,
     dst_w3_w1_weight: torch.Tensor,
@@ -590,6 +788,13 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     gated-activation kernels can access the two halves with a single contiguous
     load.
 
+    The input holds the two FC1 halves stacked as ``[X1; X2]``: rows
+    ``[0, M // 2)`` are ``X1`` (the linear/up half) and rows ``[M // 2, M)`` are
+    ``X2`` (the gate half), the order the ``trtllm_*_moe`` entry points expect
+    for ``gemm1_weights``.  The output alternates one row of each
+    half, ``[X1[0], X2[0], X1[1], X2[1], ...]``; :func:`deinterleave_gated_rows`
+    with ``block=1`` undoes it.
+
     Parameters
     ----------
     x : torch.Tensor
@@ -607,6 +812,50 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     permute = lambda x: x[row_indices]
 
     return permute(x)
+
+
+def deinterleave_gated_rows(x: torch.Tensor, block: int) -> torch.Tensor:
+    r"""Undo a block interleave of the two FC1 halves along the row dimension.
+
+    Rows laid out as alternating ``block``-row chunks of two halves,
+    ``[A[0:b], B[0:b], A[b:2b], B[b:2b], ...]``, come back stacked as
+    ``[A; B]``.  The half whose chunk comes first in each pair becomes the
+    top half; order the result as ``[X1; X2]`` (linear/up half first, gate
+    half second) before handing it to a ``trtllm_*_moe`` entry point or to
+    :func:`reorder_rows_for_gated_act_gemm`.  ``block=1`` is the inverse of
+    :func:`reorder_rows_for_gated_act_gemm`.  Like that helper it permutes
+    dimension ``0``, so apply it to each expert's ``[M, hidden_size]`` slice,
+    not to a stacked ``[num_experts, M, hidden_size]`` tensor.  This is a
+    one-time host-side weight preparation; the kernels have no interleaved
+    FC1 variant.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Tensor whose row count is a multiple of ``2 * block``.  Any dtype is
+        accepted; only the row dimension is reordered.
+    block : int
+        Number of consecutive rows per chunk in the interleaved layout.
+
+    Returns
+    -------
+    torch.Tensor
+        Row-permuted contiguous tensor with shape equal to ``x.shape``; a copy
+        unless ``x.shape[0] == 2 * block``, where ``x`` is already ``[A; B]``
+        and a view of it is returned.
+    """
+    if block < 1:
+        raise ValueError(f"block must be >= 1, got {block}")
+    M = x.shape[0]
+    if M % (2 * block) != 0:
+        raise ValueError(
+            f"x.shape[0] ({M}) must be a multiple of 2 * block ({2 * block})"
+        )
+    return (
+        x.reshape(M // (2 * block), 2, block, *x.shape[1:])
+        .transpose(0, 1)
+        .reshape(M, *x.shape[1:])
+    )
 
 
 def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Tensor:
@@ -759,22 +1008,23 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         def get_cache_key_extras(self, _inputs: List[torch.Tensor]) -> tuple:
             # Stage profiling passes only activation and weight tensors, so the
             # profile key captures their shapes but not constructor-fixed options
-            # such as top-k, parallel ranks, quantization mode, or activation.
+            # such as top-k, parallel sizes, quantization mode, or activation.
             # The in-memory runner hash distinguishes instances, but it is
             # intentionally excluded from persisted file keys. Include those
             # options here to prevent runners with identical tensor profiles from
-            # reusing incompatible saved tactics.
+            # reusing incompatible saved tactics. Rank indices are excluded: ranks
+            # that tune together must share persisted entries, since a cache hit
+            # skips the set_autotune_process_group reduce. Ranks don't change the
+            # valid tactics; they can shift timings (bias only on TP rank 0, each
+            # EP rank profiles its own routing slice), which that reduce averages.
             return (
                 self.x_dtype,
                 self.weight_dtype,
                 self.output_dtype,
                 self.top_k,
                 self.tp_size,
-                self.tp_rank,
                 self.ep_size,
-                self.ep_rank,
                 self.cluster_size,
-                self.cluster_rank,
                 self.enable_alltoall,
                 self.use_deepseek_fp8_block_scale,
                 self.use_w4_group_scaling,
@@ -1319,7 +1569,7 @@ def cutlass_fused_moe(
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
     swizzled_input_sf: bool = True,
-    use_fused_finalize: bool = True,
+    use_fused_finalize: Optional[bool] = None,
     profile_ids: Optional[List[int]] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     *,
@@ -1392,13 +1642,21 @@ def cutlass_fused_moe(
         Input scaling factor for quantization.
 
     swiglu_alpha : Optional[torch.Tensor]
-        Swiglu alpha for swiglu activation.
+        Per-expert float32 SwiGLU alpha.  Passing any of ``swiglu_alpha``,
+        ``swiglu_beta`` or ``swiglu_limit`` with ``ActivationType.Swiglu``
+        selects the ``SwigluBias`` kernel, which computes
+        ``gate * sigmoid(alpha * gate) * (linear + beta)`` with ``linear``
+        clamped to ``[-limit, limit]`` and ``gate`` capped at ``limit``
+        (defaults ``alpha=1``, ``beta=0``, ``limit=inf``).
 
     swiglu_beta : Optional[torch.Tensor]
-        Swiglu beta for swiglu activation.
+        Per-expert float32 SwiGLU beta (offset added to the linear half).
 
     swiglu_limit : Optional[torch.Tensor]
-        Per-expert SwiGLU limits for SwiGLU variants.
+        Per-expert float32 SwiGLU clamp limit.  A trainer-side clamp value
+        ``v`` and linear offset ``o`` (Megatron-Core's
+        ``activation_func_clamp_value`` / ``glu_linear_offset``) map to
+        ``swiglu_limit=v``, ``swiglu_beta=o`` and ``swiglu_alpha=None``.
 
     clamped_relu2_limit : Optional[torch.Tensor]
         Model-wide positive clamp scale for ClampedRelu2, provided as a
@@ -1477,11 +1735,15 @@ def cutlass_fused_moe(
         communication where the scaling factors are received in linear (non-swizzled) format.
         Only relevant when input_sf is not None.
 
-    use_fused_finalize : bool = True
+    use_fused_finalize : Optional[bool]
         Whether to fuse the top-k expert reduction ("finalize") into the GEMM2 epilogue.
-        Defaults to True for best performance. The fused epilogue reduces expert outputs via
-        non-associative atomics, so results are not deterministic run-to-run. Set to
-        False to use the non-fused, deterministic finalize path.
+        The fused epilogue reduces expert outputs via non-associative atomics, so results
+        are not deterministic run-to-run. Set to False to use the non-fused, deterministic
+        finalize path. When ``None`` (default) the fused path is used unless
+        ``torch.are_deterministic_algorithms_enabled()`` is true, in which case the
+        autotuner never offers or replays a fused-finalize GEMM2 tactic. An explicit
+        True or False always wins. The flag is part of the autotune cache key, so pass the
+        same resolved value to :func:`cutlass_fused_moe_workspace_size`.
 
     profile_ids : Optional[List[int]]
         Optional ``[gemm1_profile, gemm2_profile]`` override. Both values are absolute indices in
@@ -1546,6 +1808,8 @@ def cutlass_fused_moe(
         are not implemented for Blackwell architecture.
 
     """
+    if use_fused_finalize is None:
+        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
     # Reject an unhonorable pinned recipe before any device work. The NVFP4
     # test mirrors the binding's isNvfp4Quant() plus the W4A16 flag.
     is_nvfp4 = (
@@ -1719,7 +1983,7 @@ def cutlass_fused_moe_workspace_size(
     use_deepseek_fp8_block_scale: bool = False,
     use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
-    use_fused_finalize: bool = True,
+    use_fused_finalize: Optional[bool] = None,
     use_packed_weights: bool = False,
     use_wfp4afp8_humming: bool = False,
     device: Optional[torch.device] = None,
@@ -1753,6 +2017,10 @@ def cutlass_fused_moe_workspace_size(
         Input and weight dtypes, used to select the kernel runner.
     output_dtype : torch.dtype, optional
         Output dtype (default: ``torch.bfloat16``).
+    use_fused_finalize : Optional[bool]
+        Must match the value :func:`cutlass_fused_moe` resolves to. ``None``
+        (default) follows the same rule: fused unless
+        ``torch.are_deterministic_algorithms_enabled()`` is true.
     device : torch.device, optional
         CUDA device on which the workspace will be used. Defaults to the
         current CUDA device.
@@ -1766,6 +2034,8 @@ def cutlass_fused_moe_workspace_size(
         ``"cake"`` returns the prepared SiTU scratch size using host metadata
         only. It requires BF16/uint8, TP8, SiTU and the documented fixed geometry.
     """
+    if use_fused_finalize is None:
+        use_fused_finalize = not torch.are_deterministic_algorithms_enabled()
     if backend == "cake":
         from .cake_kimi_k3_situ import _cake_situ_workspace_size
 
@@ -1954,17 +2224,48 @@ def _build_trtllm_moe_namespace(module):
             routing_metadata: TrtllmMoERoutingMetadataSlot,
             body_workspace: Sequence[torch.Tensor],
             **kwargs,
-        ) -> None:
-            """Launch one fixed body without routing, allocation, or DA policy lookup."""
+        ) -> List[Any]:
+            """Launch one fixed body without routing, allocation, or DA policy lookup.
+
+            Returns the native body outputs: the finalized output, or the FC2 output,
+            expert weights and expanded-to-permuted map when ``do_finalize`` is false.
+            """
             if body.tile_n != routing_metadata.tile_n:
                 raise ValueError("DA body and routing metadata tile_n must match")
-            self._moe_runner.forward(
+            return self._moe_runner.forward(
                 inputs,
                 tactic=[body.tile_n, body.tactic],
                 da_routing_metadata=routing_metadata.tensors(),
                 da_body_workspace=tuple(body_workspace),
                 **kwargs,
             )
+
+    def _run_fp4_body_from_routing_metadata(
+        moe_runner: "TrtllmMoERunner",
+        inputs: List[torch.Tensor],
+        runner_kwargs: Mapping[str, Any],
+        routing_metadata: TrtllmMoERoutingMetadataSlot,
+        *,
+        tactic: Any,
+        output: torch.Tensor,
+        do_finalize: bool,
+    ) -> List[torch.Tensor]:
+        """Launch the FP4 expert body from routing metadata populated by the caller."""
+        # Keep the tuned config only when it was chosen for the metadata's tile.
+        config = -1
+        if tactic != -1 and int(tactic[0]) == routing_metadata.tile_n:
+            config = int(tactic[1])
+        body = DABody(tactic=config, tile_n=routing_metadata.tile_n)
+        body_runner = DABodyRunner(moe_runner)
+        workspace = body_runner.prepare_body(
+            inputs, body, routing_metadata, **runner_kwargs
+        )
+        result = body_runner.forward_from_metadata(
+            inputs, body, routing_metadata, workspace, **runner_kwargs
+        )
+        if do_finalize:
+            return [output]
+        return [_torch_view_of_ffi_tensor(tensor) for tensor in result]
 
     class DAProfileRunner(TunableRunner):
         """Measure native replay preamble and typed body as one complete DA operation."""
@@ -3569,6 +3870,8 @@ def _build_trtllm_moe_namespace(module):
         workspace_buffer: Optional[torch.Tensor] = None,
         # 4over6 recipe (nvfp4_4over6_code()); the default reads the env.
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
+        routing_metadata: Optional[List[torch.Tensor]] = None,
+        routing_metadata_tile_n: int = -1,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3589,6 +3892,15 @@ def _build_trtllm_moe_namespace(module):
             num_experts,
             routing_method_type,
         )
+        if routing_metadata is not None and (
+            gemm1_lora_delta is not None
+            or n_fused_shared
+            or workspace_buffer is not None
+        ):
+            raise ValueError(
+                "routing_metadata supports neither gemm1_lora_delta, fused shared experts "
+                "nor workspace_buffer"
+            )
         total_experts_per_token = top_k + n_fused_shared
         # GEMM2's N (what the FC2 weights are sized for) and the narrower
         # caller-visible output width. They differ exactly when valid_hidden_size
@@ -3737,6 +4049,19 @@ def _build_trtllm_moe_namespace(module):
             moe_inputs.to_list(),
             **runner_kwargs,
         )
+
+        if routing_metadata is not None:
+            return _run_fp4_body_from_routing_metadata(
+                moe_runner,
+                moe_inputs.to_list(),
+                runner_kwargs,
+                TrtllmMoERoutingMetadataSlot(
+                    routing_metadata_tile_n, *routing_metadata
+                ),
+                tactic=tactic,
+                output=output,
+                do_finalize=do_finalize,
+            )
 
         def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
             """Launch the unchanged monolithic FP4 operation with one fixed tactic."""
@@ -3899,10 +4224,13 @@ def _build_trtllm_moe_namespace(module):
         workspace_buffer: Optional[torch.Tensor] = None,
         hidden_states_scale_layout: Optional[int] = None,
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
+        routing_metadata: Optional[List[torch.Tensor]] = None,
+        routing_metadata_tile_n: int = -1,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
         _ = hidden_states_scale_layout, nvfp4_4over6_code
+        _ = routing_metadata, routing_metadata_tile_n
         # Derive the padded hidden size exactly as the eager op does (NVFP4
         # activations arrive uint8-packed, two values per byte); GEMM2 then computes
         # roundUp(valid_hidden_size, 128) columns while finalize hands back only the
@@ -4950,6 +5278,16 @@ def trtllm_bf16_moe(
         weights, ``bfloat16``.  ``M`` equals ``2 * intermediate_size`` for
         gated activations and ``intermediate_size`` for non-gated
         activations.
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
+        interleaved FC1.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size // 128, intermediate_size, 128]``
         second-layer weights, ``bfloat16``.
@@ -5043,6 +5381,12 @@ def trtllm_bf16_moe(
         With ``SwigluStep``, clamps ``X1`` to ``[-limit, limit]`` and
         ``silu(X2)`` from above.  ``None`` uses a physical limit of ``7``.
         BF16 uses physical and raw accumulator units interchangeably.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -5176,6 +5520,16 @@ def trtllm_bf16_routed_moe(
         ``[num_experts, M // 128, hidden_size // 128, 128]`` first-layer
         weights, ``bfloat16``.  ``M`` equals ``2 * intermediate_size`` for
         gated activations and ``intermediate_size`` for non-gated activations.
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
+        interleaved FC1.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size // 128, intermediate_size, 128]``
         second-layer weights, ``bfloat16``.
@@ -5270,6 +5624,12 @@ def trtllm_bf16_routed_moe(
         BF16 has no global FC1 dequant scale, so raw accumulator and
         physical limits coincide. SwigluStep rejects ``gemm1_alpha`` and
         ``gemm1_beta``.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -6037,6 +6397,16 @@ def trtllm_fp8_block_scale_moe(
         ``weight_layout == WeightLayout.BlockMajorK`` (``2``).  ``M`` is
         ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated activations.
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
+        interleaved FC1.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2*intermediate_size // (32 if mxfp8 else 128), hidden_size // (32 if mxfp8 else 128)]``
         first-layer block scales.
@@ -6136,6 +6506,12 @@ def trtllm_fp8_block_scale_moe(
         ``X1`` and ``silu(X2)`` at the physical limit.  ``None`` uses
         physical ``7`` for SwigluStep.  MXFP8 has no global FC1 dequant
         scale, so raw accumulator and physical units coincide.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -6147,12 +6523,27 @@ def trtllm_fp8_block_scale_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For MxFP8 the padded
+        ``hidden_size`` must be a multiple of 256 (128 is rejected).  Default
+        ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+
+        The kernels tile expert weights in 128-row blocks, so
+        ``intermediate_size`` (and with it the FC1 row count ``M``) must be a
+        multiple of ``128``; a model dimension that is not (``1856``, ``928``)
+        is supported by padding and declaring, not by passing it directly.
+        Zero-pad the weights to a multiple of ``128`` (the gate and up halves
+        of FC1 separately, so the rows stay ``[gate; up]`` at the padded
+        size), fill the padded block scales with a neutral finite value
+        (E8M0 ``127``, i.e. ``2**0``, for MXFP8; ``1.0`` for the ``float32``
+        DeepSeek scales), pass the padded size as ``intermediate_size`` and
+        the real one here.  The kernel reads the ``[valid, roundUp(valid, 128))``
+        stretch of the padding and never reads the rest, so it must hold zeros and
+        finite scales.  ``hidden_size`` follows the same rule through
+        ``valid_hidden_size``.
     gemm1_bias : Optional[torch.Tensor]
         Optional FC1 bias, float32 (keyword-only).  Shape is
         ``[local_num_experts, 2 * intermediate_size]`` for gated activations
@@ -6315,6 +6706,16 @@ def trtllm_fp8_block_scale_routed_moe(
         ``[num_experts, M, hidden_size]`` first-layer weights where ``M`` is
         ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated.
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
+        interleaved FC1.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2*intermediate_size // (32 if mxfp8 else 128), hidden_size // (32 if mxfp8 else 128)]``
         first-layer block scales.
@@ -6418,6 +6819,12 @@ def trtllm_fp8_block_scale_routed_moe(
         it caps ``X1`` and ``silu(X2)`` at the physical limit, with a
         default of ``7`` when ``None``. MxFp8 has no global FC1 dequant
         scale, so raw accumulator and physical limits coincide.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
 
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
@@ -6427,8 +6834,9 @@ def trtllm_fp8_block_scale_routed_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For MxFP8 the padded
+        ``hidden_size`` must be a multiple of 256 (128 is rejected).  Default
+        ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
@@ -6741,12 +7149,27 @@ def trtllm_fp4_block_scale_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For NVFP4 the padded
+        ``hidden_size`` must be a multiple of 256 (128 gives wrong results).
+        Default ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+
+        The kernels tile expert weights in 128-row blocks, so
+        ``intermediate_size`` (and with it the FC1 row count ``M``) must be a
+        multiple of ``128``; a model dimension that is not (``1856``, ``928``)
+        is supported by padding and declaring, not by passing it directly.
+        Zero-pad the weights to a multiple of ``128`` (the gate and up halves
+        of FC1 separately, so the rows stay ``[gate; up]`` at the padded
+        size), fill the padded block scales with a neutral finite value
+        (E8M0 ``127``, i.e. ``2**0``, for MXFP4; E4M3 ``1.0`` for NVFP4),
+        pass the padded size as ``intermediate_size`` and the real one here.
+        The kernel reads the ``[valid, roundUp(valid, 128))``
+        stretch of the padding and never reads the rest, so it must hold zeros and
+        finite scales.  ``hidden_size`` follows the same rule through
+        ``valid_hidden_size``.
     workspace_buffer : Optional[torch.Tensor]
         Caller-owned 1-D ``uint8`` CUDA buffer of at least
         :func:`trtllm_fused_moe_workspace_size` bytes. When given, the launch
@@ -6882,6 +7305,7 @@ def trtllm_fp4_block_scale_routed_moe(
     hidden_states_scale_layout: Optional[SfLayout] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    routing_metadata: Optional[TrtllmMoERoutingMetadataSlot] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -7030,8 +7454,9 @@ def trtllm_fp4_block_scale_routed_moe(
         ``roundUp(valid_hidden_size, 128)`` columns (that is what the FC2
         weights, weight scales and bias are sized for) and finalize writes only
         the leading ``valid_hidden_size`` of them.  A caller-supplied ``output``
-        must therefore have ``valid_hidden_size`` columns.  Default ``None``
-        (use the full ``hidden_size``).
+        must therefore have ``valid_hidden_size`` columns.  For NVFP4 the padded
+        ``hidden_size`` must be a multiple of 256 (128 gives wrong results).
+        Default ``None`` (use the full ``hidden_size``).
     valid_intermediate_size : Optional[int]
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
@@ -7068,6 +7493,21 @@ def trtllm_fp4_block_scale_routed_moe(
         - :class:`NVFP44Over6Config`: that recipe. Requires ``per_token_scale``;
           no other path has a 4over6 requantization, so a pinned recipe
           raises :class:`ValueError`.
+
+    routing_metadata : Optional[TrtllmMoERoutingMetadataSlot]
+        A slot of routing metadata allocated with
+        :func:`trtllm_moe_allocate_routing_metadata_multi_tile` and already built
+        from ``topk_ids`` by :func:`populate_trtllm_moe_routing_metadata_`. When given, the call
+        skips the routing kernel and launches only the expert GEMMs with the
+        slot's tile, so the routing can run earlier, for example on another
+        stream while the activations are quantized. The caller must populate
+        the slot from the same ``topk_ids`` and order that population before
+        this call. Autotuning still profiles the ordinary routed operation,
+        routing included; the autotuned config is used only when the tuner chose
+        the slot's tile, otherwise that tile's default config runs. The body
+        allocates its own buffers. Not supported with ``gemm1_lora_delta``,
+        fused shared experts or ``workspace_buffer`` (``ValueError``).
+        Default ``None`` (route inside the call).
 
     Returns
     -------
@@ -7155,6 +7595,12 @@ def trtllm_fp4_block_scale_routed_moe(
         hidden_states_scale_layout,
         workspace_buffer=workspace_buffer,
         nvfp4_4over6_code=nvfp4_4over6_code_value,
+        routing_metadata=(
+            None if routing_metadata is None else list(routing_metadata.tensors())
+        ),
+        routing_metadata_tile_n=(
+            -1 if routing_metadata is None else routing_metadata.tile_n
+        ),
     )
 
 

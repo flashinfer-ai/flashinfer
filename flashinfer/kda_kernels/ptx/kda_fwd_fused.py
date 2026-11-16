@@ -1,3 +1,4 @@
+# Copyright 2026 Co-developed by KDA (Kernel Design Agents)
 # Copyright (c) 2026 KDA Team
 # SPDX-License-Identifier: MIT
 # See LICENSE.kda-for-kda.txt for the full license.
@@ -31,10 +32,14 @@ class KDAForwardLaunch:
         allow_approximate_split=False,
         use_expected_norm=False,
         offsets=None,
+        _prepare=prepare_fwd_pieces,
     ):
+        """Normalize gate-bias shape and prepare the selected exact scheduler."""
+        if dt_bias.ndim == 1:
+            dt_bias = dt_bias.view(q.shape[2], q.shape[3])
         self.out = out
         self.final_state = final_state
-        self._fused = prepare_fwd_pieces(
+        self._fused = _prepare(
             q,
             k,
             v,
@@ -55,17 +60,21 @@ class KDAForwardLaunch:
 
     @property
     def schedule(self):
+        """Describe the recurrent schedule selected for the prepared launch."""
         return self._fused.schedule
 
     @property
     def state_input_mode(self):
+        """Describe the prepared plan's recurrent-state precision and exchange."""
         return self._fused.state_input_mode
 
     @property
     def normalization_mode(self):
+        """Describe the query/key normalization used by the prepared plan."""
         return self._fused.normalization_mode
 
     def launch(self, g=None):
+        """Run the prepared plan and return its bound output and final state."""
         self._fused.launch(g=g)
         return self.out, self.final_state
 
@@ -115,6 +124,7 @@ def prepare_kda_forward(
 
 
 def kda_forward(*args, **kwargs):
+    """Prepare and immediately execute one KDA forward invocation."""
     return prepare_kda_forward(*args, **kwargs).launch()
 
 

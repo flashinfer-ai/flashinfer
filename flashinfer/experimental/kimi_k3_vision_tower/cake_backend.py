@@ -32,7 +32,8 @@ generated Cake program::
       layer_attention     packed-varlen noncausal BF16 attention per grid_thw segment  [T, 12, 128]
                           (``attention:<layout>[:wide][:split]``; a split plan writes the tail-round units'
                           K/V parts as FP32 partials and runs ``layer_attention_merge`` -- the exact
-                          fixed-order merge -- right after it)
+                          fixed-order merge -- right after it on SM100; the SM103 split builds merge the
+                          parts in the kernel)
       layer_out_proj      gemm residual_wo_sqxw: x += bf16(a @ Wo^T); xw = bf16(x * norm1), stats (in place)
       layer_norm_fc0_gelu gemm norm_gelu:      f  = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x)))) [T, 4096]
       layer_fc1           gemm residual_fc1_sqxw: x += bf16(f @ Wfc1^T); xw = bf16(x * norm0[l+1]), stats
@@ -64,6 +65,15 @@ from the form's census window (:func:`pdl_early_on`, Cake
 stream-K / tail / multicast / ``pos`` tiles (:func:`pdl_early_selected`); the
 registry names it ``gemm:<variant>:<tile>:pdle``.  Same numerics, same
 kernel parameters.
+On ``sm_103a`` the batches inside ``READY_COUNTER_WINDOWS`` (8192 tokens)
+replace that wait on the encoder's GEMM -> GEMM edges (fc1 -> the next
+layer's QKV, out-proj -> fc0, fc0 -> fc1) by per 128-row block readiness
+counters: a producer twin adds 1 (release) to the word of each row block it
+stored, a consumer twin acquires its item's row-block word before the item's
+first A load, so its first items start while its producer finishes its last
+ones; the last layer's fc1 twin zeroes the words for the next forward
+(:func:`ready_counter_edges`, :func:`ready_counter_launch`).  Same stored
+values as the base tiles.
 
 Host work is split exactly like the Cake production launcher:
 
@@ -108,6 +118,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional, Sequence, Union
 
@@ -222,9 +233,10 @@ MAX_KV_PARTS = 8  # Cake ``kimi_k3_vision_attention.MAX_KV_PARTS`` (= ``kimi_k3_
 #   the separate merge launch.
 IN_KERNEL_MERGE_ARCHES = ("sm_103a",)
 # * forced tail splits: (arch, non-empty segment lengths) -> the part count the automatic plan of that exact batch
-#   takes instead of the automatic split decision, on its automatic layout (unless a part of it could not run as its
-#   cluster's last item on the device's grid, where the automatic plan stays).  The one entry is the 4096 x 4096 image
-#   on sm_103a, where the four-way tail split measured faster than the unsplit plan the block model prefers.
+#   takes instead of the automatic split decision, on its automatic layout (unless it cuts no unit on the device's grid
+#   or a part of it could not run as its cluster's last item there, where the automatic plan stays).  The one entry is
+#   the 4096 x 4096 image on sm_103a, where the four-way tail split measured faster than the unsplit plan the block
+#   model prefers.
 FORCED_KV_SPLIT: dict[tuple[str, tuple[int, ...]], int] = {("sm_103a", (66564,)): 4}
 
 
@@ -1081,10 +1093,10 @@ def build_attention_plan(
             grid_policy=grid_policy,
             arch=arch,
         )
-        if int(probe["split_units"]) > 0 and not probe["merge_ok"]:
-            forced = (
-                None  # the parts cannot all run last on this grid: the automatic plan
-            )
+        if int(probe["split_units"]) == 0 or not probe["merge_ok"]:
+            # The split cuts no unit on this grid (the partial-output build would run idle), or its parts cannot all
+            # run last there: the automatic plan.
+            forced = None
     if forced is not None:
         # A measured batch: the automatic layout with its tail units split ``forced`` ways (``FORCED_KV_SPLIT``).
         selection = select_tiles_per_cta(lens, num_heads, grid_clusters, arch)
@@ -1683,21 +1695,104 @@ def _fc1_tma_tile(name: str, variant: str, M: int) -> str:
     return name
 
 
+# Pre-wait L2 weight prefetch twins (Cake ``kimi_k3_vision_gemm`` ``*_wpl``): the PDL_EARLY forms of norm_qkv_rope,
+# norm_gelu and the two fc1 forms at M <= TINY_M_LIMIT launch the twin of their tile on the arches of
+# ``WEIGHT_PF_LEAD_ARCHES``.  The twin is the base tile's program plus L2 prefetches, issued before the grid-dependency
+# wait, of the weight boxes its first item loads after the ring fill: same TileConfig, launch and stored rows.
+WEIGHT_PF_LEAD_ARCHES = frozenset({"sm_100a", "sm_103a"})
+WEIGHT_PF_LEAD_VARIANTS = (
+    "norm_qkv_rope",
+    "norm_gelu",
+    "residual_fc1",
+    "residual_fc1_sqxw",
+)
+WEIGHT_PF_LEAD_TWINS = {
+    "xs": "xs_wpl",
+    "xs_cs_pf": "xs_cs_pf_wpl",
+    "xs_k4_pf": "xs_k4_pf_wpl",
+}
+# 64-row A-box twins (Cake ``*_ab``) of the merger GEMMs' production tiles at M <= A_BOX_MAX_M outside the PDL_EARLY
+# window, on the arches of ``A_BOX_ARCHES``.  The twin loads a 64-row A box instead of 128 rows half of which are TMA
+# zero fill; the A rows it never writes feed only output rows >= M, which are not stored.  Its launcher refuses
+# M > A_BOX_MAX_M.  Same TileConfig and launch geometry as the base tile.
+A_BOX_ARCHES = frozenset({"sm_100a", "sm_103a"})
+A_BOX_TWINS = {("gelu_erf", "xs"): "xs_ab", ("rmsnorm", "s"): "s_ab"}
+A_BOX_MAX_M = 64
+# Same-tile pre-wait L2 weight prefetch twin of the QKV GEMM's PDL_EARLY half-N tile (Cake ``kimi_k3_vision_gemm``
+# ``s_cs_h_wpl``): where the QKV GEMM's own M is ``QKV_T576_M`` (a 576-token batch) inside its PDL_EARLY window, the
+# launch takes the twin of its tile on the arches of ``QKV_T576_ARCHES``.  Same TileConfig, launch geometry, K order
+# and stored rows as the base tile.
+QKV_T576_ARCHES = frozenset({"sm_103a"})
+QKV_T576_TWINS = {("norm_qkv_rope", "s_cs_h"): "s_cs_h_wpl"}
+QKV_T576_M = 576
+for _base, _twin in WEIGHT_PF_LEAD_TWINS.items():
+    TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
+for (_variant, _base), _twin in A_BOX_TWINS.items():
+    TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
+for (_variant, _base), _twin in QKV_T576_TWINS.items():
+    TILE_CONFIGS[_twin] = dataclasses.replace(TILE_CONFIGS[_base], name=_twin)
+
+
+def _weight_pf_lead_twin(name: str, variant: str, M: int, arch: Optional[str]) -> str:
+    """``name``'s pre-wait weight prefetch twin (``WEIGHT_PF_LEAD_TWINS``) where ``arch`` takes it and the launch is a
+    PDL_EARLY form of ``WEIGHT_PF_LEAD_VARIANTS`` at M <= TINY_M_LIMIT; ``name`` otherwise (and with no arch)."""
+    if (
+        arch in WEIGHT_PF_LEAD_ARCHES
+        and variant in WEIGHT_PF_LEAD_VARIANTS
+        and name in WEIGHT_PF_LEAD_TWINS
+        and int(M) <= TINY_M_LIMIT
+        and pdl_early_on(variant, M)
+    ):
+        return WEIGHT_PF_LEAD_TWINS[name]
+    return name
+
+
+def _qkv_t576_twin(name: str, variant: str, M: int, arch: Optional[str]) -> str:
+    """``name``'s same-tile weight prefetch twin (``QKV_T576_TWINS``) where ``arch`` takes it and M is ``QKV_T576_M``
+    inside the PDL_EARLY window; ``name`` otherwise (and with no arch)."""
+    if (
+        arch in QKV_T576_ARCHES
+        and (variant, name) in QKV_T576_TWINS
+        and int(M) == QKV_T576_M
+        and pdl_early_on(variant, M)
+    ):
+        return QKV_T576_TWINS[variant, name]
+    return name
+
+
+def _a_box_twin(name: str, variant: str, M: int, arch: Optional[str]) -> str:
+    """``name``'s 64-row A-box twin (``A_BOX_TWINS``) where ``arch`` takes it, M <= A_BOX_MAX_M and the launch is
+    outside the PDL_EARLY window; ``name`` otherwise (and with no arch)."""
+    if (
+        arch in A_BOX_ARCHES
+        and (variant, name) in A_BOX_TWINS
+        and int(M) <= A_BOX_MAX_M
+        and not pdl_early_on(variant, M)
+    ):
+        return A_BOX_TWINS[variant, name]
+    return name
+
+
 def select_tile_config(
     variant: str, M: int, sm_count: int = DEFAULT_SM_COUNT, arch: Optional[str] = None
 ) -> TileConfig:
     """Production tile config for ``(variant, M)``; mirrors ``kimi_k3_vision_gemm.select_tile_config``: the
     round-3 .. round-6 routing (:func:`_select_tile_config_base`), the half-N tail twin of the non-pos forms where the
     census tail fits one half-round (:func:`_half_twin`) and, as the outermost steps, the column-first raster twin of
-    the fc1 stream-K pair tile inside the windows of ``arch`` (:func:`_cols_first_twin`) and the fc1 forms'
-    TMA-epilogue tile inside ``FC1_TMA_WINDOWS`` (:func:`_fc1_tma_tile`)."""
+    the fc1 stream-K pair tile inside the windows of ``arch`` (:func:`_cols_first_twin`), the fc1 forms'
+    TMA-epilogue tile inside ``FC1_TMA_WINDOWS`` (:func:`_fc1_tma_tile`), the small-M twins of ``arch``
+    (:func:`_weight_pf_lead_twin`, :func:`_a_box_twin`) and the QKV tile's 576-token twin of ``arch``
+    (:func:`_qkv_t576_twin`)."""
     cfg = _select_tile_config_base(variant, M, sm_count, arch)
     n_total, _k_total, pos_split = GEMM_VARIANTS[variant]
     if pos_split:
         return cfg  # gemm_pos streams row pairs: no half-N tail
     name = _half_twin(cfg.name, n_total, M, sm_count, variant)
     name = _cols_first_twin(name, variant, M, arch)
-    return TILE_CONFIGS[_fc1_tma_tile(name, variant, M)]
+    name = _fc1_tma_tile(name, variant, M)
+    name = _weight_pf_lead_twin(name, variant, M, arch)
+    name = _qkv_t576_twin(name, variant, M, arch)
+    return TILE_CONFIGS[_a_box_twin(name, variant, M, arch)]
 
 
 def _select_tile_config_base(
@@ -1907,6 +2002,142 @@ def gemm_configs_for(
     return configs
 
 
+# Ready counters (Cake ``kimi_k3_vision_gemm`` ``*_rc*`` twins): on the arches of ``READY_COUNTER_ARCHES`` a plan may
+# replace the grid-dependency wait of the encoder's GEMM -> GEMM edges (E1 fc1 -> the next layer's qkv, E2 out-proj ->
+# fc0, E3 fc0 -> fc1) by per 128-row block readiness counters.  A producer twin adds 1 with release semantics to the
+# word of each row block it stored, once per CTA item; a consumer twin acquires its item's row-block word against the
+# launch's target (bound as ``tail_split``) before the item's first A load, in place of the load role's
+# grid-dependency wait (its epilogue keeps that wait); the last layer's fc1 twin zeroes every word after its epilogue's
+# grid-dependency wait.  A twin builds its base tile's program: same TileConfig, launch geometry and stored values.
+READY_COUNTER_ARCHES = frozenset({"sm_103a"})
+# variant -> (the base tile a counter-gated plan launches, the twin its launches take)
+READY_COUNTER_TILES = {
+    "norm_qkv_rope": ("l_e8_cs", "l_e8_cs_rcw"),
+    "residual_wo_sqxw": ("l_e8_tma1x", "l_e8_tma1x_rcp"),
+    "norm_gelu": ("l_e8", "l_e8_rcwp"),
+    "residual_fc1_sqxw": ("l_e8_pf", "l_e8_pf_rcwp"),
+    "residual_fc1": ("l_e8_pf", "l_e8_pf_rcc"),
+}
+READY_COUNTER_KEYS = tuple(
+    gemm_kernel_key(variant, twin, True)
+    for variant, (_base, twin) in READY_COUNTER_TILES.items()
+)
+# edge -> (producer variant, consumer variant, posts per row block: one per CTA item, N / acc_n items per row block)
+READY_COUNTER_EDGES = {
+    "E1": ("residual_fc1_sqxw", "norm_qkv_rope", 4),
+    "E2": ("residual_wo_sqxw", "norm_gelu", 4),
+    "E3": ("norm_gelu", "residual_fc1_sqxw", 16),
+}
+# The inclusive token-count windows where an edge may take the counters (frozen from paired screens).
+READY_COUNTER_WINDOWS = {
+    "E1": ((8192, 8192),),
+    "E2": ((8192, 8192),),
+    "E3": ((8192, 8192),),
+}
+# The counter words: one slot per edge (slot 0: E1, 1: E2, 2: E3; the offsets are compiled into the twins) of one u32
+# word per 128-row block.
+READY_COUNTER_SLOTS = 3
+READY_COUNTER_STRIDE = 2048
+
+
+def _ready_counter_row(
+    variant: str, cfg: TileConfig, m_tiles: int
+) -> Callable[[int], int]:
+    """CTA tile -> its row tile under the grouped raster of ``variant`` on ``cfg``."""
+    per_group = cfg.group_m * (GEMM_VARIANTS[variant][0] // cfg.acc_n)
+
+    def row(bid: int) -> int:
+        first_m = (bid // per_group) * cfg.group_m
+        return first_m + (bid % per_group) % min(cfg.group_m, m_tiles - first_m)
+
+    return row
+
+
+def _ready_counter_schedule(variant: str, cfg: TileConfig, M: int, sm_count: int):
+    """(geometry, clusters, items) of one launch's static persistent schedule: item i on cluster i mod C; the items
+    past ``full_tiles`` are the half items of tail tile ``full_tiles + (i - full_tiles) // 2`` (duration 1/2, else 1)."""
+    geometry = gemm_launch_geometry(variant, cfg, M, sm_count)
+    clusters = int(geometry.grid[0]) // cfg.cluster_x
+    full = int(geometry.full_tiles)
+    items = [
+        (i % clusters, 1.0, i)
+        if i < full
+        else (i % clusters, 0.5, full + (i - full) // 2)
+        for i in range(full + 2 * (int(geometry.cluster_tiles) - full))
+    ]
+    return geometry, clusters, items
+
+
+def ready_counter_early_clusters(
+    edge: str, M: int, sm_count: int, gemm_configs: dict[str, str]
+) -> int:
+    """The gate's schedule model of ``edge`` at ``M`` tokens on ``sm_count`` SMs, in units of one producer item: the
+    producer runs its static schedule; a row tile is ready when the last item covering it ends; an SM is free when its
+    producer cluster ends (SMs outside the producer grid at 0); consumer cluster k takes the k-th group of cluster_x
+    earliest-free SMs and starts its first item at max(its SMs free, that item's rows ready).  Returns the consumer
+    clusters that start before the producer ends (the grid-dependency wait starts every one at the producer's end)."""
+    producer, consumer, _posts = READY_COUNTER_EDGES[edge]
+    pcfg = TILE_CONFIGS[gemm_configs[producer]]
+    ccfg = TILE_CONFIGS[gemm_configs[consumer]]
+    pgeometry, pclusters, pitems = _ready_counter_schedule(producer, pcfg, M, sm_count)
+    prow = _ready_counter_row(producer, pcfg, int(pgeometry.m_tiles))
+    finish = [0.0] * pclusters
+    ready: dict[int, float] = {}
+    for cluster, duration, tile in pitems:
+        finish[cluster] += duration
+        for r in range(pcfg.cta_group):
+            row = prow(tile * pcfg.cta_group + r)
+            ready[row] = max(ready.get(row, 0.0), finish[cluster])
+    end = max(finish)
+    idle = int(sm_count) - pclusters * pcfg.cluster_x
+    free = sorted([f for f in finish for _ in range(pcfg.cluster_x)] + [0.0] * idle)
+    cgeometry, cclusters, citems = _ready_counter_schedule(consumer, ccfg, M, sm_count)
+    crow = _ready_counter_row(consumer, ccfg, int(cgeometry.m_tiles))
+    early = 0
+    for k in range(min(cclusters, len(citems))):
+        slots = free[k * ccfg.cluster_x : (k + 1) * ccfg.cluster_x]
+        if len(slots) < ccfg.cluster_x:
+            break
+        rows = [crow(citems[k][2] * ccfg.cta_group + r) for r in range(ccfg.cta_group)]
+        start = max(max(slots), max(ready.get(row, 0.0) for row in rows))
+        early += int(start < end)
+    return early
+
+
+def ready_counter_edges(
+    arch: Optional[str],
+    num_layers: int,
+    total_tokens: int,
+    sm_count: int,
+    gemm_configs: dict[str, str],
+    gemm_kernel_keys: dict[str, str],
+) -> tuple[str, ...]:
+    """The edges a plan takes the ready counters on: all three or none.  All three when ``arch`` is one of
+    ``READY_COUNTER_ARCHES``, the plan has two layers or more and at most ``READY_COUNTER_STRIDE`` row blocks, its
+    encoder GEMM keys are the twins' base keys (pair tiles posting N / acc_n items per row block), and on every edge
+    the token count lies in its window and the schedule model starts a consumer cluster before the producer ends."""
+    if arch not in READY_COUNTER_ARCHES or int(num_layers) < 2:
+        return ()
+    if -(-int(total_tokens) // GEMM_BLOCK_M) > READY_COUNTER_STRIDE:
+        return ()
+    for variant, (base, _twin) in READY_COUNTER_TILES.items():
+        if gemm_kernel_keys[variant] != gemm_kernel_key(variant, base, True):
+            return ()
+    for producer, _consumer, posts in READY_COUNTER_EDGES.values():
+        cfg = TILE_CONFIGS[gemm_configs[producer]]
+        if GEMM_VARIANTS[producer][0] // cfg.acc_n != posts or cfg.cta_group != 2:
+            return ()
+    for edge, windows in READY_COUNTER_WINDOWS.items():
+        if not any(lo <= int(total_tokens) <= hi for lo, hi in windows):
+            return ()
+        early = ready_counter_early_clusters(
+            edge, int(total_tokens), int(sm_count), gemm_configs
+        )
+        if early == 0:
+            return ()
+    return tuple(READY_COUNTER_EDGES)
+
+
 def stream_k_workspace_ctas(sm_count: int) -> int:
     """CTAs the stream-K partial workspace is sized for (the Cake launcher's ``_tail_buffers``: the
     largest pair grid plus one cluster)."""
@@ -1935,7 +2166,7 @@ def gemm_census_counts(variant: str) -> tuple[int, ...]:
     on the tile count), every token-count boundary of the tile rule and its neighbour, and every edge of the
     form's PDL_EARLY window, of the out-proj pair bands (``WO_PAIR_BANDS``), of its column-first twin windows
     (``COLS_FIRST_WINDOWS`` of every arch) and of its TMA-epilogue tile windows (``FC1_TMA_WINDOWS``; the windows are
-    on M, not on the tile count)."""
+    on M, not on the tile count), and the QKV 576-token twin's M and its neighbours."""
     counts = set(range(1, GEMM_CENSUS_LIMIT + 1, GEMM_BLOCK_M))
     for bound in (
         TINY_M_LIMIT,
@@ -1953,6 +2184,7 @@ def gemm_census_counts(variant: str) -> tuple[int, ...]:
         QKV_M_E8_MIN_M,
         L_E8_HALF_MAX_M,
         FC1_SK_L_MAX_M,
+        A_BOX_MAX_M,
     ):
         counts.update((bound, bound + 1))
     for lo, hi in PDL_EARLY_WINDOW.get(variant, PDL_EARLY_DEFAULT_WINDOW):
@@ -1965,6 +2197,8 @@ def gemm_census_counts(variant: str) -> tuple[int, ...]:
                 counts.update((lo - 1, lo, hi, hi + 1))
         for lo, hi, _name in FC1_TMA_WINDOWS:
             counts.update((lo - 1, lo, hi, hi + 1))
+    if any(twin_variant == variant for twin_variant, _base in QKV_T576_TWINS):
+        counts.update((QKV_T576_M - 1, QKV_T576_M, QKV_T576_M + 1))
     return tuple(sorted(c for c in counts if 1 <= c <= GEMM_CENSUS_LIMIT))
 
 
@@ -2003,7 +2237,8 @@ CONTRACT_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
 # Export-only coverage rows of the Cake export (``COVERAGE_GRIDS``, tag ``coverage``): the minimal grid_thws set reaching
 # every kernel key the 22 contract rows do not (half-N twins at token counts no row has, the plain two-tile form on
 # SM100, the plain / split one-tile forms on SM103, the QKV eight-warp tile's early form, the fc1 pair tile outside the
-# column-first windows on SM103 and above the stream-K window).  Exported and validated bitwise; not part of the acceptance geomean.
+# column-first windows on SM103 and above the stream-K window, the merger RMSNorm one-tile form above the A-box twins'
+# 64 rows).  Exported and validated bitwise; not part of the acceptance geomean.
 COVERAGE_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
     "cov_batch11_224": ((1, 16, 16),) * 11,
     "cov_img_476x476": ((1, 34, 34),),
@@ -2016,6 +2251,7 @@ COVERAGE_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
     "cov_img_2296x700": ((1, 50, 164),),
     "cov_video_720p_32f_28x28": ((4, 52, 92),) * 8 + ((1, 2, 2),),
     "cov_img_1568x896": ((1, 64, 112),),
+    "cov_img_280x224": ((1, 16, 20),),
 }
 
 
@@ -2080,14 +2316,25 @@ ATTENTION_FORM_KEYS: dict[str, tuple[str, ...]] = {
 
 def required_kernel_keys(arch: str) -> tuple[str, ...]:
     """Every logical kernel the production plan can select on ``arch`` (the tile / PDL-form census of every
-    GEMM form on the default SM count; the attention forms of the attention census + the split merge; merge;
-    rmsnorm apply).  Mirrors the Cake export's ``required_kernel_keys``."""
+    GEMM form on the default SM count; the ready-counter twins the gate windows reach; the attention forms of the
+    attention census + the split merge; merge; rmsnorm apply).  Mirrors the Cake export's ``required_kernel_keys``."""
     keys: list[str] = []
     for variant in PRODUCTION_GEMM_VARIANTS:
         for count in gemm_census_counts(variant):
             key = gemm_stage_key(variant, count, arch=arch)
             if key not in keys:
                 keys.append(key)
+    # The ready-counter twins of the plans the gate turns on at a token count of its windows (two layers; no
+    # ready-counter key depends on the merger GEMMs' rows).
+    windows = READY_COUNTER_WINDOWS.values()
+    for count in sorted(
+        {m for ranges in windows for lo, hi in ranges for m in range(lo, hi + 1)}
+    ):
+        merged = max(1, count // 4)
+        configs = gemm_configs_for(count, merged, arch=arch)
+        gemm_keys = gemm_kernel_keys_for(count, merged, arch=arch)
+        if ready_counter_edges(arch, 2, count, DEFAULT_SM_COUNT, configs, gemm_keys):
+            keys.extend(k for k in READY_COUNTER_KEYS if k not in keys)
     keys.extend(ATTENTION_FORM_KEYS[arch])
     keys.extend((MERGE_KERNEL_KEY, RMSNORM_APPLY_KERNEL_KEY))
     return tuple(keys)
@@ -2266,9 +2513,11 @@ def generated_program_available(device: torch.device) -> bool:
 
 
 def plan_kernel_keys(plan: "VisionTowerPlan") -> tuple[str, ...]:
-    """The logical kernels one plan launches: its GEMM keys, its attention build (+ the split merge), merge,
-    rmsnorm apply."""
+    """The logical kernels one plan launches: its GEMM keys, the ready-counter twins of a counter-gated plan, its
+    attention build (+ the split merge), merge, rmsnorm apply."""
     keys = list(dict.fromkeys(plan.gemm_kernel_keys.values()))
+    if plan.ready_counters:
+        keys.extend(k for k in READY_COUNTER_KEYS if k not in keys)
     keys.append(plan.attention.kernel_key)
     if plan.attention.num_merge_units > 0:
         keys.append(ATTENTION_MERGE_KERNEL_KEY)
@@ -2298,6 +2547,8 @@ class VisionTowerPlan:
         torch.Tensor
     )  # pack_rope_table(cos, sin): u32 [T, 64] f16x2 (cos, sin) words
     workspace: dict[str, torch.Tensor] = field(repr=False)
+    # The edges whose GEMM launches take the ready counters (:func:`ready_counter_edges`): all three or none.
+    ready_counters: tuple[str, ...] = ()
 
     @property
     def tiles_per_cta(self) -> int:
@@ -2478,7 +2729,10 @@ def build_kimi_k3_vision_plan(
             dtype=torch.uint64,
             device=device,
         )
-    return VisionTowerPlan(
+    ready_counters = ready_counter_edges(
+        arch, num_layers, total, sm_count, gemm_configs, gemm_kernel_keys
+    )
+    plan = VisionTowerPlan(
         grid_thws=grids,
         cu_seqlens=cu,
         total_tokens=total,
@@ -2495,7 +2749,17 @@ def build_kimi_k3_vision_plan(
         sin=sin,
         rope_cs=pack_rope_table(cos, sin),
         workspace=workspace,
+        ready_counters=ready_counters,
     )
+    if ready_counters:
+        # The counter words, allocated last so every other buffer keeps its address: READY_COUNTER_SLOTS x
+        # READY_COUNTER_STRIDE u32, zero; the last layer's fc1 zeroes them again at the end of every forward.
+        workspace["ready_counters"] = torch.zeros(
+            (READY_COUNTER_SLOTS * READY_COUNTER_STRIDE,),
+            dtype=torch.uint32,
+            device=device,
+        )
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -2547,7 +2811,12 @@ class KimiK3VisionTowerRunner:
     belongs to the caller).  Prepare a new runner when ``grid_thws``, the layer
     count or a tensor binding (``pixel_values``, ``out``, weights) changes;
     values may change freely.  ``stages`` exposes one launch per stage (layer
-    stages use layer 0) for per-operator tests and timing.
+    stages use layer 0) for per-operator tests and timing.  When ``launch()``
+    raises between two launches (an interrupt or an error on the host), it
+    first enqueues the zeroing of a counter-gated plan's ready counters on the
+    same stream, after the launches already enqueued, so the next forward
+    starts from clear counters; it then re-raises the original exception, also
+    when the zeroing raises (a note on Python 3.11+ records that failure).
     """
 
     plan: VisionTowerPlan
@@ -2556,11 +2825,28 @@ class KimiK3VisionTowerRunner:
     pos_rows: torch.Tensor
     out: torch.Tensor
     launches: tuple[_Launch, ...] = field(repr=False)
+    # The sequence without the ready counters (a counter-gated plan only): ``stages`` runs one stage alone, and a
+    # waiting twin alone would wait for a producer that never ran.
+    stage_launches: tuple[_Launch, ...] = field(default=(), repr=False)
 
     def launch(self) -> torch.Tensor:
         with tvm_ffi.use_torch_stream():
-            for item in self.launches:
-                item.entry(*item.arguments)
+            try:
+                for item in self.launches:
+                    item.entry(*item.arguments)
+            except BaseException as error:
+                # A forward cut short leaves the counts of the producer twins it enqueued, and the next forward's
+                # consumers would pass their waits before their producers store; the last FC1 never ran to clear them.
+                # The caller sees the original exception even when the clear fails too (as a note on it).
+                if self.plan.ready_counters:
+                    try:
+                        self.plan.workspace["ready_counters"].zero_()
+                    except BaseException as clear_error:
+                        if sys.version_info >= (3, 11):
+                            error.add_note(
+                                f"clearing the ready counters also failed: {clear_error!r}"
+                            )
+                raise
         return self.out
 
     __call__ = launch
@@ -2573,7 +2859,7 @@ class KimiK3VisionTowerRunner:
         complete attention operator, as the Cake stage function); the merge is also
         exposed alone as ``layer_attention_merge``."""
         result: dict[str, Callable[[], None]] = {}
-        launches = list(self.launches)
+        launches = list(self.stage_launches or self.launches)
         for index, item in enumerate(launches):
             if item.stage in result:
                 continue
@@ -2595,9 +2881,9 @@ class KimiK3VisionTowerRunner:
 
     @property
     def stage_modules(self) -> dict[str, str]:
-        """Physical generated module per stage (identical for every encoder layer)."""
+        """Physical generated module per stage, the one :attr:`stages` runs (identical for every encoder layer)."""
         result: dict[str, str] = {}
-        for item in self.launches:
+        for item in self.stage_launches or self.launches:
             result.setdefault(item.stage, item.module)
         return result
 
@@ -2608,6 +2894,9 @@ class KimiK3VisionTowerRunner:
     @property
     def route_metadata(self) -> dict[str, Any]:
         plan = self.plan
+        # The merge launch follows a split plan's attention, except where the split builds merge in the kernel.
+        merge = plan.attention.num_merge_units > 0 and not in_kernel_merge(plan.arch)
+        counters = plan.workspace.get("ready_counters")
         return dict(
             arch=plan.arch,
             layers=plan.num_layers,
@@ -2621,7 +2910,7 @@ class KimiK3VisionTowerRunner:
             kv_split_used=plan.attention.kv_split_used,
             split_units=plan.attention.split_units,
             attention_kernel_key=plan.attention.kernel_key,
-            attention_merge=plan.attention.num_merge_units > 0,
+            attention_merge=merge,
             attention_merge_units=plan.attention.num_merge_units,
             attention_items=plan.attention.total_tiles,
             attention_units=plan.attention.total_units,
@@ -2635,6 +2924,18 @@ class KimiK3VisionTowerRunner:
             },
             launch_count=len(self.launches),
             sm_count=plan.sm_count,
+            ready_counter_edges=list(plan.ready_counters),
+            ready_counter_keys={
+                variant: gemm_kernel_key(variant, twin, True)
+                for variant, (_base, twin) in READY_COUNTER_TILES.items()
+            }
+            if plan.ready_counters
+            else {},
+            ready_counter_launches=sum(
+                1
+                for item in self.launches
+                if counters is not None and item.kwargs.get("FLAGS") is counters
+            ),
         )
 
 
@@ -2669,6 +2970,7 @@ def _gemm_launch(
     XW: Optional[torch.Tensor] = None,
     WN: Optional[torch.Tensor] = None,
     eps: float = 0.0,
+    ready_counters: bool = False,
 ) -> _Launch:
     ws = plan.workspace
     M = int(A.shape[0])
@@ -2717,9 +3019,38 @@ def _gemm_launch(
     # The plan's key carries the tile AND the PDL form (production vs PDL_EARLY binary) of this launch.
     key = plan.gemm_kernel_keys[variant]
     assert key.split(":")[2] == cfg.name, (key, cfg.name)
+    counter = ready_counter_launch(plan, variant, layer) if ready_counters else None
+    if counter is not None:
+        # A ready-counter twin (same TileConfig and geometry): the plan's counter words and the launch's target.
+        key, target = counter
+        kwargs["FLAGS"] = ws["ready_counters"]
+        kwargs["tail_split"] = int(target)
     module = kernel_module_name(plan.arch, key)
     entry, arguments = _bind(module, plan.arch, kwargs)
     return _Launch(stage, layer, module, kwargs, entry, arguments)
+
+
+def ready_counter_launch(
+    plan: VisionTowerPlan, variant: str, layer: int
+) -> Optional[tuple[str, int]]:
+    """(twin key, wait target) of the launch of ``variant`` in encoder layer ``layer`` of a counter-gated plan, None
+    for the base launch.  A target counts the posts of every earlier forward layer on the slot (the words are zeroed
+    once per forward): the QKV of layer l >= 1 waits for 4 l (E1; layer 0 has no producing fc1 and keeps its base
+    key), fc0 for 4 (l + 1) (E2), the fc1 below the last layer for 16 (l + 1) (E3); the out-proj (posts) and the last
+    layer's fc1 (clears) wait for nothing."""
+    if not plan.ready_counters or variant not in READY_COUNTER_TILES:
+        return None
+    twin = gemm_kernel_key(variant, READY_COUNTER_TILES[variant][1], True)
+    posts = {edge: count for edge, (_p, _c, count) in READY_COUNTER_EDGES.items()}
+    if variant == "norm_qkv_rope":
+        return None if layer < 1 else (twin, posts["E1"] * layer)
+    if variant == "norm_gelu":
+        return twin, posts["E2"] * (layer + 1)
+    if variant == "residual_fc1_sqxw":
+        if layer >= plan.num_layers - 1:
+            raise RuntimeError("residual_fc1_sqxw runs below the last layer only")
+        return twin, posts["E3"] * (layer + 1)
+    return twin, 0
 
 
 def _attention_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
@@ -2820,7 +3151,9 @@ def _launch_sequence(
     pixel_values: torch.Tensor,
     pos_rows: torch.Tensor,
     out: torch.Tensor,
+    ready_counters: bool = True,
 ) -> tuple[_Launch, ...]:
+    """The launch sequence of one forward; ``ready_counters=False`` runs a counter-gated plan's base launches."""
     ws = plan.workspace
     T = plan.total_tokens
     pixels2d = pixel_values.view(T, PATCH_DIM)
@@ -2859,6 +3192,7 @@ def _launch_sequence(
                 CS=plan.rope_cs.view(torch.bfloat16),
                 SQ=stats,
                 eps=NORM_EPS,
+                ready_counters=ready_counters,
             )
         )
         launches.append(_attention_launch(plan, index))
@@ -2877,6 +3211,7 @@ def _launch_sequence(
                 SQ=stats,
                 XW=xw,
                 WN=lw["norm1"],
+                ready_counters=ready_counters,
             )
         )
         launches.append(
@@ -2890,6 +3225,7 @@ def _launch_sequence(
                 C=ws["ffn"],
                 SQ=stats,
                 eps=NORM_EPS,
+                ready_counters=ready_counters,
             )
         )
         if index + 1 < len(layers):
@@ -2906,6 +3242,7 @@ def _launch_sequence(
                     SQ=stats,
                     XW=xw,
                     WN=layers[index + 1]["norm0"],
+                    ready_counters=ready_counters,
                 )
             )
         else:
@@ -2920,6 +3257,7 @@ def _launch_sequence(
                     lw["fc1"],
                     C=ws["x"],
                     R=ws["x"],
+                    ready_counters=ready_counters,
                 )
             )
     launches.append(_merge_launch(plan, weights))
@@ -3033,8 +3371,15 @@ def prepare_kimi_k3_vision_tower(
         pos_rows = pos_emb_rows(prepared.pos_emb, prepared.time_weight, grids)
     _check_2d(pos_rows, (plan.total_tokens, HIDDEN), "pos_rows")
     launches = _launch_sequence(plan, prepared, pixel_values, pos_rows, out)
+    stage_launches = (
+        _launch_sequence(
+            plan, prepared, pixel_values, pos_rows, out, ready_counters=False
+        )
+        if plan.ready_counters
+        else ()
+    )
     return KimiK3VisionTowerRunner(
-        plan, prepared, pixel_values, pos_rows, out, launches
+        plan, prepared, pixel_values, pos_rows, out, launches, stage_launches
     )
 
 

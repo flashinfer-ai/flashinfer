@@ -13,7 +13,9 @@ from .....weights import MoEWeightPack
 from .bridge import (
     build_activation_pack,
     build_activation_pack_rank_major,
+    dispatch_quant_format,
     pack_mxfp8_dispatch_payload,
+    quantize_for_dispatch,
     reshape_for_combine,
 )
 from .config import FusedMoeKernelConfig
@@ -21,6 +23,7 @@ from .validate import validate_compute_consistency
 from .weights import materialize_fused_moe_weights
 
 if TYPE_CHECKING:
+    from ......fused_moe.api import RoutingInputMode
     from ......fused_moe.layer import MoELayer
 
 
@@ -36,6 +39,8 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         self._moe_config = config.moe_config
         self._mxfp8_dispatch = config.mxfp8_dispatch
         self._compute: Optional["MoELayer"] = None
+        self._fixed_tactic = None
+        self._global_routing_mode: Optional["RoutingInputMode"] = None
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -69,6 +74,21 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             return x
         return pack_mxfp8_dispatch_payload(x)
 
+    @property
+    def packs_dispatch_payload(self) -> bool:
+        return self._mxfp8_dispatch
+
+    def dispatch_format(self):
+        quant = self._moe_config.quant
+        return dispatch_quant_format(
+            quant,
+            per_token_activation=bool(quant.per_token_scale),
+            mxfp8_dispatch=self._mxfp8_dispatch,
+        )
+
+    def quantize_for_dispatch(self, x):
+        return quantize_for_dispatch(x, self._moe_config.quant)
+
     def preprocess_weights(
         self,
         weights: MoEWeightPack,
@@ -97,6 +117,20 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             self._compute = MoELayer(compute_cfg)
         return self._compute
 
+    def _global_ids_routing_mode(self, compute: "MoELayer") -> "RoutingInputMode":
+        """Pre-routed mode for received global ids: unpacked when every runner
+        takes it, so the ids and weights reach the routing kernel as they are."""
+        if self._global_routing_mode is None:
+            from ......fused_moe.api import RoutingInputMode
+
+            unpacked = RoutingInputMode.UnpackedPrecomputed
+            self._global_routing_mode = (
+                unpacked
+                if all(unpacked in r.supported_routing_modes for r in compute.runners)
+                else RoutingInputMode.PackedPrecomputed
+            )
+        return self._global_routing_mode
+
     def _recv_count_for_exclusion(self, ctx: SplitKernelContext):
         """Per-expert REAL token counts, to be used to drop EP padding.
 
@@ -112,14 +146,14 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             return None
         return ctx.recv_count
 
-    def compute(self, ctx: SplitKernelContext):
+    def _activation_pack(self, ctx: SplitKernelContext):
         expert_tensors = ctx.expert_tensors
         quant = self._moe_config.quant
         per_token_activation = bool(quant.per_token_scale)
         offset = self._moe_config.experts.local_expert_offset
-        dim0, dim1, _ = expert_tensors.shape
 
         fleet_params = ctx.fleet_params
+        compute = self._ensure_compute(fleet_params)
         is_ht = fleet_params.algorithm is EpAlgorithm.HIGH_THROUGHPUT
         if is_ht or fleet_params.layout is EpLayout.RANK_MAJOR:
             if ctx.recv_topk_idx is None or ctx.recv_topk_weights is None:
@@ -138,6 +172,13 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,
                 hidden_size=fleet_params.token_hidden_size,
+                recv_scale=ctx.expert_tensors_scale,
+                global_ids=ctx.recv_topk_idx_global,
+                routing_input_mode=(
+                    self._global_ids_routing_mode(compute)
+                    if ctx.recv_topk_idx_global
+                    else None
+                ),
             )
         else:
             act_pack = build_activation_pack(
@@ -151,5 +192,29 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 num_experts=self._moe_config.routing.num_experts,
             )
 
-        out_2d = self._ensure_compute(fleet_params)(act_pack, self._transformed_weights)
-        return reshape_for_combine(out_2d, dim0, dim1)
+        return act_pack
+
+    def tuning_candidates(self, ctx: SplitKernelContext):
+        act = self._activation_pack(ctx)
+        return self._compute._tuning_candidates(act, self._transformed_weights)
+
+    def prepare_tactic(self, ctx: SplitKernelContext, selection):
+        act = self._activation_pack(ctx)
+        self._compute._prepare_tactic(act, self._transformed_weights, selection)
+        self._fixed_tactic = selection
+
+    def compute(self, ctx: SplitKernelContext):
+        act = self._activation_pack(ctx)
+        if self._fixed_tactic is None:
+            out = self._compute(act, self._transformed_weights)
+        else:
+            out = self._compute._run_tactic(
+                act, self._transformed_weights, self._fixed_tactic
+            )
+        return reshape_for_combine(out, *ctx.expert_tensors.shape[:2])
+
+    def destroy(self) -> None:
+        # The runners keep the last routing tensors they were given (to seed
+        # tuning inputs), which are views of the transport's receive buffers.
+        self._compute = None
+        self._global_routing_mode = None

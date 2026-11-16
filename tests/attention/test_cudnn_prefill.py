@@ -238,10 +238,8 @@ def test_cudnn_prefill_fp8(
             f"cuDNN FP8 prefill is not supported on compute capability {major}, skipping test"
         )
 
-    # TODO: Remove this xfail once cuDNN fixes FP8 prefill on Blackwell
-    pytest.xfail(
-        "cuDNN FP8 prefill has known issues on Blackwell; expected to be fixed in a subsequent cuDNN release"
-    )
+    if cudnn.backend_version() < 92400:
+        pytest.xfail("Legacy Blackwell FP8 coverage is qualified from cuDNN 9.24")
 
     actual_seq_lens_q = torch.randint(
         1, s_qo + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
@@ -370,43 +368,75 @@ def test_cudnn_prefill_fp8(
         block_tables=block_tables,
     )
 
-    output = wrapper_cudnn.run(
-        q_fp8,
-        (k_cache_fp8.transpose(1, 2), v_cache_fp8.transpose(1, 2)),
+    cache_nhd = (k_cache_fp8.transpose(1, 2), v_cache_fp8.transpose(1, 2))
+    run_kwargs = dict(
         q_scale=q_scale,
         k_scale=k_scale_tensor,
         v_scale=v_scale_tensor,
+        return_lse=return_lse,
     )
+    result = wrapper_cudnn.run(q_fp8, cache_nhd, **run_kwargs)
+    output, stats = result if return_lse else (result, None)
 
-    qo_indptr = torch.cat(
-        [
-            torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
-        ]
-    ).int()
+    def check():
+        q_start = 0
+        for batch in range(batch_size):
+            lq = int(actual_seq_lens_q[batch].item())
+            lkv = int(actual_seq_lens_kv[batch].item())
+            qs = slice(q_start, q_start + lq)
+            qi = (q_fp8[qs].float() * q_scale).transpose(0, 1)
+            pages = block_tables[batch].long()
+            ki = (
+                k_cache_fp8[pages]
+                .float()
+                .permute(1, 0, 2, 3)
+                .reshape(num_kv_heads, -1, head_dim)[:, :lkv]
+                * k_scale_tensor
+            )
+            vi = (
+                v_cache_fp8[pages]
+                .float()
+                .permute(1, 0, 2, 3)
+                .reshape(num_kv_heads, -1, head_dim)[:, :lkv]
+                * v_scale_tensor
+            )
+            ki = ki.repeat_interleave(num_qo_heads // num_kv_heads, dim=0)
+            vi = vi.repeat_interleave(num_qo_heads // num_kv_heads, dim=0)
+            scores = qi @ ki.transpose(-1, -2) * scale
+            if causal:
+                row = torch.arange(lq, device=device)[:, None]
+                col = torch.arange(lkv, device=device)[None, :]
+                scores.masked_fill_(col > row + lkv - lq, -torch.inf)
+            ref = (scores.softmax(-1) @ vi).transpose(0, 1)
+            torch.testing.assert_close(output[qs].float(), ref, atol=1e-2, rtol=1e-2)
+            if stats is not None:
+                ref_lse = scores.logsumexp(-1).T * flashinfer.utils.log2e
+                torch.testing.assert_close(stats[qs], ref_lse, atol=1e-2, rtol=1e-2)
+            q_start += lq
 
-    # Workspace buffer
-    workspace_buffer_ref = torch.empty(
-        128 * 1024 * 1024, dtype=torch.int8, device=device
-    )
-
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer_ref, "HND", backend="fa2"
-    )
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        pos_encoding_mode="NONE",
-        causal=causal,
-        q_data_type=torch.bfloat16,
-    )
-
-    output_ref = wrapper.run(q, kv_cache)
-
-    torch.testing.assert_close(output, output_ref, atol=1e-2, rtol=1e-2)
+    check()
+    if is_cuda_graph_compatible:
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                wrapper_cudnn.run(q_fp8, cache_nhd, out=output, lse=stats, **run_kwargs)
+            # Captured execution must read current inputs, not just reproduce the
+            # values left by warmup. Poison every caller-visible output as well.
+            q_fp8.copy_((-q_fp8.float()).to(q_fp8.dtype))
+            output.fill_(torch.nan)
+            if stats is not None:
+                stats.fill_(torch.nan)
+            graph.replay()
+            check()
+            # GPU scale contents can change without recapturing or requantizing
+            # the payload. Check a scale-only replay separately from Q rebinding.
+            q_scale.mul_(0.5)
+            k_scale_tensor.mul_(0.75)
+            v_scale_tensor.mul_(1.25)
+            output.fill_(torch.nan)
+            if stats is not None:
+                stats.fill_(torch.nan)
+            graph.replay()
+            check()
+        finally:
+            graph.reset()

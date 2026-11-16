@@ -6,6 +6,7 @@ import torch
 from packaging.version import Version
 
 import flashinfer
+from flashinfer.utils import ceil_div
 
 
 def _has_required_cutlass_dsl() -> bool:
@@ -386,3 +387,219 @@ def test_prims_accepts_combined_hnd_cache_and_pdl():
     assert cache_after_runs.misses == cache_after_plan.misses
     assert cache_after_runs.currsize == cache_after_plan.currsize
     assert cache_after_runs.hits == cache_after_plan.hits + 2
+
+
+def _check_paged(q_lens, kv_lens, hq, hkv, d, page_size, causal, **plan_kwargs):
+    """Run random paged inputs through prims, compare with the reference, return the backend."""
+    pages = [ceil_div(kv, page_size) for kv in kv_lens]
+    qo = torch.tensor([0, *q_lens], dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    page_indptr = torch.tensor([0, *pages]).cumsum(0, dtype=torch.int32)
+    page_indices = torch.randperm(sum(pages), device="cuda").to(torch.int32)
+    last_page_len = torch.tensor(
+        [kv - (p - 1) * page_size for kv, p in zip(kv_lens, pages, strict=True)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q = _fp8((sum(q_lens), hq, d))
+    cache = _fp8((sum(pages), 2, hkv, page_size, d))
+    k_pool, v_pool = cache.unbind(dim=1)
+    refs, ref_lses = [], []
+    for b in range(len(q_lens)):
+        idx = page_indices[page_indptr[b] : page_indptr[b + 1]]
+        k = torch.cat([k_pool[p].transpose(0, 1) for p in idx])[: kv_lens[b]]
+        v = torch.cat([v_pool[p].transpose(0, 1) for p in idx])[: kv_lens[b]]
+        ref, ref_lse = _reference(q[qo[b] : qo[b + 1]], k, v, causal, 1 / math.sqrt(d))
+        refs.append(ref)
+        ref_lses.append(ref_lse)
+
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "HND", backend="cute-dsl-prims"
+    )
+    wrapper.plan(
+        qo.cuda(),
+        page_indptr.cuda(),
+        page_indices,
+        last_page_len,
+        hq,
+        hkv,
+        d,
+        page_size,
+        causal=causal,
+        q_data_type=q.dtype,
+        kv_data_type=cache.dtype,
+        o_data_type=torch.bfloat16,
+        **plan_kwargs,
+    )
+    out, lse = wrapper.run_return_lse(q, cache)
+    torch.testing.assert_close(out.float(), torch.cat(refs), atol=0.2, rtol=0.2)
+    torch.testing.assert_close(lse, torch.cat(ref_lses), atol=0.2, rtol=0.2)
+    return wrapper._prims_backend
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("split", ["auto", "fixed", "off"])
+def test_paged_pack_and_split_match_reference(causal, split):
+    backend = _check_paged(
+        [1, 9, 130],
+        [3000, 2000, 1500],
+        16,
+        2,
+        128,
+        16,
+        causal,
+        fixed_split_size=8 if split == "fixed" else None,
+        disable_split_kv=split == "off",
+    )
+    assert backend._gqa_pack_size == 8
+    assert (backend._kv_split is None) == (split == "off")
+
+
+def test_paged_head_dim_32_stays_unsplit():
+    assert _check_paged([8], [3000], 4, 2, 32, 32, True)._kv_split is None
+
+
+def test_paged_kv_split_bounds():
+    from flashinfer.attention.cute_dsl.sm120_fmha import _paged_kv_split_bounds
+
+    # Long prefix: split, with every inner boundary inside the prefix all rows see.
+    bounds = _paged_kv_split_bounds([2048], [34816], 16, True, 128, 188, 0, 128, 8)
+    assert len(bounds[0]) > 2 and bounds[0][0] == 0 and bounds[0][-1] == 272
+    assert max(bounds[0][1:-1]) <= (34816 - 2048) // 128
+    # Fresh causal prompt: no prefix all rows see, so no split.
+    assert _paged_kv_split_bounds([4096], [4096], 16, True, 128, 188, 0, 128, 8) is None
+    # Fixed size: a request's bounds do not depend on the rest of the batch.
+    alone = _paged_kv_split_bounds([64], [2112], 16, True, 128, 188, 512, 128, 8)
+    batch = _paged_kv_split_bounds(
+        [64, 8], [2112, 9000], 16, True, 128, 188, 512, 128, 8
+    )
+    assert alone == [[0, 4, 8, 12, 16, 17]]
+    assert batch[0][: len(alone[0])] == alone[0] and set(batch[0][len(alone[0]) :]) == {
+        17
+    }
+    # Fixed size needing more chunks than the float workspace holds.
+    with pytest.raises(ValueError, match="float workspace"):
+        _paged_kv_split_bounds([64], [2112], 16, True, 128, 188, 128, 4, 8)
+
+
+def test_paged_workspace_size_fits_the_split():
+    hq, hkv, d, page_size, q_lens, kv_lens = 16, 2, 128, 16, [8, 64], [3000, 2112]
+    pages = [ceil_div(kv, page_size) for kv in kv_lens]
+    args = (
+        torch.tensor([0, *q_lens], device="cuda").cumsum(0, dtype=torch.int32),
+        torch.tensor([0, *pages], device="cuda").cumsum(0, dtype=torch.int32),
+        torch.arange(sum(pages), dtype=torch.int32, device="cuda"),
+        torch.tensor(
+            [kv - (p - 1) * page_size for kv, p in zip(kv_lens, pages, strict=True)],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        hq,
+        hkv,
+        d,
+        page_size,
+    )
+    kwargs = dict(
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    chunks = []
+    for size in (64 << 20, None):
+        workspace = torch.empty(size or 1, dtype=torch.uint8, device="cuda")
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "HND", backend="cute-dsl-prims"
+        )
+        if size is None:
+            float_bytes, int_bytes = wrapper.workspace_size(*args, **kwargs)
+            assert float_bytes > 0 and int_bytes == 0
+            assert wrapper.workspace_size(*args, **kwargs, disable_split_kv=True) == (
+                0,
+                0,
+            )
+            wrapper.reset_workspace_buffer(
+                torch.empty(float_bytes, dtype=torch.uint8, device="cuda"),
+                torch.empty(1, dtype=torch.uint8, device="cuda"),
+            )
+        wrapper.plan(*args, **kwargs)
+        chunks.append(wrapper._prims_backend._kv_split.num_chunks)
+    assert chunks[0] == chunks[1] > 1
+
+
+def test_paged_fixed_split_is_batch_invariant():
+    hq, hkv, d, page_size = 16, 2, 128, 16
+    pages = [ceil_div(2112, page_size), ceil_div(9000, page_size)]
+    q = _fp8((64 + 8, hq, d))
+    cache = _fp8((sum(pages), 2, hkv, page_size, d))
+    outs = []
+    for kv_lens, q_lens in (([2112], [64]), ([2112, 9000], [64, 8])):
+        n = len(kv_lens)
+        workspace = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "HND", backend="cute-dsl-prims"
+        )
+        wrapper.plan(
+            torch.tensor([0, *q_lens], device="cuda").cumsum(0, dtype=torch.int32),
+            torch.tensor([0, *pages[:n]], device="cuda").cumsum(0, dtype=torch.int32),
+            torch.arange(sum(pages[:n]), dtype=torch.int32, device="cuda"),
+            torch.tensor(
+                [
+                    kv - (p - 1) * page_size
+                    for kv, p in zip(kv_lens, pages, strict=False)
+                ],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            hq,
+            hkv,
+            d,
+            page_size,
+            causal=True,
+            q_data_type=q.dtype,
+            kv_data_type=cache.dtype,
+            o_data_type=torch.bfloat16,
+            fixed_split_size=32,
+        )
+        assert wrapper._prims_backend._kv_split is not None
+        outs.append(wrapper.run(q[: sum(q_lens)], cache)[:64])
+    torch.testing.assert_close(outs[0], outs[1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("all_ones_v", [True, False])
+def test_p_prescale_keeps_diffuse_tail(all_ones_v):
+    """4 hot keys over 8188 cold ones: without the P pre-scale the cold P flush to 0 in FP8."""
+    hq, hkv, d, q_len, n_kv, hot = 16, 2, 128, 128, 8192, 4
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.zeros((q_len, hq, d), device="cuda")
+    q[..., 0] = 64.0
+    k = torch.zeros((n_kv, hkv, d), device="cuda")
+    k[..., 0] = 0.125
+    k[-hot:, :, 0] = 1.375
+    if all_ones_v:
+        v = torch.ones((n_kv, hkv, d), device="cuda")
+    else:
+        v = torch.randn((1, hkv, d), generator=g, device="cuda")
+        v = v + 0.25 * torch.randn((n_kv, hkv, d), generator=g, device="cuda")
+        v[-hot:] = torch.randn((hot, hkv, d), generator=g, device="cuda")
+    q, k, v = (x.to(torch.float8_e4m3fn) for x in (q, k, v))
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="cute-dsl-prims"
+    )
+    wrapper.plan(
+        torch.tensor([0, q_len], dtype=torch.int32, device="cuda"),
+        torch.tensor([0, n_kv], dtype=torch.int32, device="cuda"),
+        hq,
+        hkv,
+        d,
+        causal=False,
+        q_data_type=q.dtype,
+        kv_data_type=k.dtype,
+        o_data_type=torch.float16,
+    )
+    out, lse = wrapper.run_return_lse(q, k, v)
+    ref, ref_lse = _reference(q, k, v, False, 1 / math.sqrt(d))
+    rel_rms = (out.float() - ref).square().mean().sqrt() / ref.square().mean().sqrt()
+    assert rel_rms.item() < 0.03
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-3)

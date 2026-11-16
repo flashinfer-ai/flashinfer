@@ -14,6 +14,122 @@ single GB200 node (4x GPUs, EP=4) at a DeepSeek-V3-like geometry:
 recipe (hardware, container, versions, harness invocation) is in the
 "Sweep methodology" and "Runbook" sections below.
 
+## BF16 input and output fusion
+
+BF16 `batch_invariant=True` sessions tune M128/M256, N128/N256 and
+K64/K128/K256 tiles across the two load-balancing modes and three token-back
+carriers. M128 uses one CTA per cluster; M256 uses a two-CTA instruction
+group. Candidates retain the original ascending K16 fold: K must divide
+both hidden and intermediate dimensions after rounding each up to 64.
+Candidates that cannot fit at least one A/B pipeline stage in shared memory
+are filtered as well. The admitted tile variants share the existing arithmetic
+fingerprint, including the original K64 padding semantics. Explicit tile
+overrides derive the corresponding cluster and CTA mode unless provided.
+Batch-invariant tuning records use a separate admission-policy version so
+older single-tile records do not suppress the expanded search.
+
+The same BF16 backend supports SM107 with native `sm_107a` compilation. Its
+shared-memory admission uses the CUDA oversized-mode budget of 334848 bytes
+per CTA; SM100/SM103 retain 232448 bytes. Oversized mode requires a compatible
+CUDA/CuTe launcher; the standard driver opt-in attribute can still report
+232448 bytes on SM107. The existing K64 padding and ordered K16 arithmetic are unchanged.
+SM107 has an independent architecture fingerprint; compatibility targets
+captured for SM100 are rejected before allocating the compiled-kernel workspace on SM107.
+
+Multi-GPU SM107 NVLink execution needs a Rubin-aware NCCL, introduced in
+[NCCL 2.32.3](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2323/release-notes/rel_2-32-3.html).
+NCCL 2.30.7 only enumerates 18 NVLink ports per GPU; on 36-port Rubin systems,
+the incomplete topology can fail communicator initialization with
+`Failed to find reverse path`. NCCL 2.32.6 includes the 36-port support.
+When replacing NCCL in a prebuilt PyTorch environment, verify `ncclGetVersion`
+from the loaded `libnccl.so.2`: `torch.cuda.nccl.version()` can retain
+PyTorch's build-time version.
+
+BF16-activation CuTeDSL backends share a single staging launch for the
+activation, expert IDs, routing weights and full routing-capacity tail.
+The vectorized path requires contiguous CUDA tensors and 16-byte-aligned
+BF16 activation pointers. Unsupported layouts, overlapping planes and
+`FLASHINFER_MEGA_FUSED_STAGE=0` retain the Torch copies. Every captured
+invocation masks the full routing tail, including empty batches; it does
+not infer tail validity from host live-token counts.
+
+Prepared staging bindings are immutable and private to each host thread;
+only compiled code is shared. Every call rechecks tensor pointers, shapes,
+strides, dtypes and devices before reusing a binding. This avoids repeating
+eligibility checks and descriptor preparation without allowing interleaved
+calls to replace each other's launch arguments.
+
+For BF16×BF16 with the separate terminal reducer, a contiguous, aligned
+caller output is bound directly to that reducer. Its live row count bounds
+the reduction, avoiding both padded-row reduction and the workspace-to-output
+copy. Launch bindings include output shape and stride so views sharing an
+address can have different live lengths. In-kernel atomic reduction retains
+its full-capacity symmetric target. Empty, strided and unaligned caller
+outputs retain the workspace copy. Warm the required layouts before graph
+capture.
+
+### Rubin measurements (2026-10-29)
+
+Native SM107, eight Rubin GPUs, EP8, hidden 4096, intermediate 2048,
+256 experts, top-6, capacity 256, uniform routing and no shared experts.
+The BF16 intermediate and combine use early routing weights and a gate/up
+clamp of 10. GPU clocks were not locked. The baseline BF16 integration
+files match revision `9f51f1aa1415dbdd22ddbfe6aa29069196a5a2b7`.
+
+These are full public forward calls including input staging and caller
+output. Each value averages two runs; each run takes the maximum of the
+eight per-rank medians over five rounds of 40 CUDA Graph calls. Session
+order alternates by round. DeepGEMM is an unchanged control, averaged over
+the four before/after runs, with weight localization disabled. Its source
+revision is `5081f8513af57e61696de4f4f04b0e707ffb503e`, compiled for the
+compatible `sm_100f` target; FlashInfer targets native `sm_107a`.
+
+| Tokens/rank | Before (µs) | After (µs) | Latency reduction | DeepGEMM control (µs) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 268.27 | 263.09 | 1.93% | 206.77 |
+| 192 | 277.86 | 271.58 | 2.26% | 219.40 |
+| 256 | 278.34 | 273.59 | 1.70% | 221.64 |
+
+At 192 live tokens, every rank's profile drops from seven full-call
+launches to three: fused staging, the main kernel and terminal reduction.
+Numerical oracles and graph/eager parity pass at all measured points.
+Existing BF16/BF16×MXFP8 tests also passed at EP4 on SM107. This experiment
+did not qualify SM100/SM103 hardware. The remaining DeepGEMM gap is
+predominantly in the main compute kernel.
+
+### CPU submission follow-up (2026-10-29)
+
+Single-GPU SM107 staging-only measurements use H=4096, capacity=256,
+top-k=6, BF16 activations, int64 IDs and FP32 scores. CPU submission is
+the median of seven alternating rounds of 100 warmed calls, with CUDA
+synchronization after the timed submission interval. GPU intervals use
+40 staging calls per captured graph and 30 replays per round. Clocks are
+not locked. `copies` sets `FLASHINFER_MEGA_FUSED_STAGE=0`; `reviewed fused`
+is the implementation at `b5188e586`, and `prepared` uses thread-private
+bindings with runtime storage/layout checks.
+
+| Live rows | CPU copies (µs) | CPU reviewed fused (µs) | CPU prepared (µs) | GPU copies (µs) | GPU prepared (µs) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22.03 | 25.16 | 14.28 | 5.83 | 1.93 |
+| 32 | 21.91 | 24.96 | 14.03 | 5.84 | 1.97 |
+| 192 | 21.95 | 24.77 | 13.84 | 6.53 | 2.13 |
+| 256 | 15.13 | 24.06 | 13.29 | 5.76 | 2.15 |
+
+An EP8 full-forward comparison at the geometry above, intermediate=2048,
+256 experts and 192 live rows keeps direct output enabled on both sides
+and changes only staging. Five alternating batches of 20 eager calls give
+maximum per-rank median CPU submission of 202.43 µs for copies versus
+184.52 µs for prepared staging. Completed batch wall time, including the
+final CUDA synchronization, is approximately flat: 648.11 versus
+645.19 µs per call, with scheduling jitter in individual rounds. Full-call
+CUDA Graph intervals are 274.54 versus 270.90 µs. These scopes do not
+measure serving latency and are distinct from the full-PR table above.
+
+A forced two-thread interleaving with native GPU buffers reproduced the
+reviewed cache's pointer swap and passed with private bindings. Another
+400 concurrent calls and same-tensor storage/shape/stride changes passed
+staging equality checks.
+
 ## Microbenchmark results (2026-07-22, e2e_pipelined p50 µs)
 
 Measured with `nvidia-cutlass-dsl==4.5.2`, using the mainloop workaround

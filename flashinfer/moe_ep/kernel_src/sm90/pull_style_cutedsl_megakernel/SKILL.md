@@ -106,13 +106,15 @@ not picked them up):
   `make_ptr(..., assumed_align=16)` or autovec emits 16-bit stores; both
   scale modes; compiled out when off.  Host:
   `mega_runner.py --generate_c` + `_validate_c_output`, `ImplDesc.generate_c`
-  (works with any launch geometry, heuristic or explicit; no separate
-  training descriptor on Hopper), `mega_reference_fp8.py` `return_fc1_gateup`,
+  (heuristic or explicit geometry; no separate training descriptor on
+  Hopper), `mega_reference_fp8.py` `return_fc1_gateup`,
   `run_mega_tests.sh` GC01-03, `run_perf_test.sh` `FP8_GENERATE_C=1`,
   sweep `--generate-c` / `--training-geometry`.  FlashInfer side: shim
   `MegaMoEHopperFp8Config.generate_c`, `symm_buffer.fc1_c` /
   `frontend.fc1_c` read-back, backend config knob, bench `--generate-c`,
-  test `test_..._generate_c`.  Developed in the drop worktree first (branch
+  test `test_..._generate_c`. The FP8 shim rejects blockwise swap-AB N72/N80
+  with `generate_c=True`: its 128-row expert padding does not align the
+  activation-SF TMA bases to N72/N80. Developed in the drop worktree first (branch
   `hopper_fp8_generate_c`); the vendored `src/` copies match it.
 - `compact_pull_buffer` (2026-09-12, default True; `token_comm.py`
   `pull_buffer_bytes()`, Mega ctor kwarg, shim config, backend config /
@@ -128,12 +130,138 @@ not picked them up):
 - Humming MXFP4: adds packed MXFP4 weights on top of the FP8 implementation
   from #4688 and #5338, reusing its dispatch, scheduling and reduction code.
   See [TUNING.md](TUNING.md) for configurations and reproduction commands.
+- NVFP4 inherits the MXFP4 frontend, backend, configuration, and packed-FP4
+  kernel. Keep its K16 E4M3 scale layout, LUT conversion, stage budget, and
+  FC1 overlap overrides in `shim/`. The shared swap-AB entry uses the
+  `_allocate_weight_aux_smem` hook for NV scale storage and LUT initialization;
+  it is not copied into the NV kernel. MX folded-scale storage/view hooks and
+  `_convert_weight_group` retain their original defaults; the folded-layout
+  builder shares its byte/row parameters between formats. Reapply these hooks
+  when updating the drop, and
+  compare complete MX and NV cubins before accepting a refactor.
+  The NV scale ring overrides `_weight_sf_stage_count`; reapply the base
+  hook for scale barrier storage and pipeline sizing independently of AB.
+  Shared MX producer/FC2 loops use `_weight_sf_decoupled` (default false)
+  and `_weight_sf_state` (default identity); the NV shim supplies only the
+  delayed scale-producer loop and early-release policy. Preserve these hooks
+  when reapplying the scale-ring extension.
+- Dispatch pull batch + rotation and the shared swap-AB epilogue copy
+  (2026-10-26, measured on H200 MegaMoE shapes in October):
+  `src/src/token_comm.py` ctor knobs
+  `pull_batch` (default 1) / `pull_rotate` (default False) and properties
+  `pull_batch` / `pull_rotate`. `_dispatch_pull_batched` keeps R rows in
+  flight in the idle slots of the 4-slot pull buffer (R x
+  active_dispatch_warps <= 4; full buffer; BF16 combine; no dispatch-side
+  token-back, dedup or grouped token-back); it publishes each row after one
+  release fence per pass, so `flag_batch` applies to the serial loop only.
+  `_choose_pull_token` repeats the serial loop's token -> (expert, rank, row)
+  walk with register-held counts; it stays separate so that the serial path
+  compiles as before when rotation is off (FP8, BF16 and every tactic with
+  `pull_batch=1` and `pull_rotate=False`). Rotation makes pass k take row
+  `k*G + (g + k) % G`; the serial loop keeps that index incremental, and the
+  ctor rejects rotation for layouts with token-back warps (dispatch-side or
+  SF token-back), which keep the unrotated serial loop. `src/src/ptx_helpers.py` adds
+  `red_add_relaxed_gpu_s32_raw`. `megamoe_kernel_fp8.py` takes ctor kwargs
+  `dispatch_pull_batch` / `dispatch_pull_rotate`. `epilogue_fp8_swapab.py`
+  and the MX `run_wgmma_task_tile` take `n_half` as a runtime value, so with
+  `token_back_mode='epi_warps'` the two epilogue warpgroups share one code
+  copy (FP8 per-tensor / blockwise and packed FP4; the calls share
+  `fc1_args` / `store_args` / `fc2_args`). Blockwise N64 keeps one copy per
+  half: it already runs near the register limit and measured 2.5-4% slower
+  with the shared copy (blockwise N16/N32/N72/N80 tie or gain).
+  Dispatch-side token-back (`reuse_dispatch_warps` / `standalone_warps`)
+  keeps one copy per half: that path can give intermittent run-to-run output
+  differences without these changes too, which the shared copy made far more
+  frequent; the cause is open. Host side: `compact_pull_buffer`,
+  `dispatch_pull_batch` and `dispatch_pull_rotate` are tactic and config
+  fields of MX/NV (defaults in `shim/mxfp4_optimization.py::MXFP4_PULL_DEFAULTS`;
+  NV already had the first) and of FP8 (defaults in
+  `shim/tuner.py::PULL_KNOB_DEFAULTS`, compact buffer on);
+  `shim/tuner.py::validate_dispatch_pull` holds the constraints for both. A
+  normalized MX tactic omits them at their defaults; the FP8 `apply_knobs`
+  resets omitted ones to the defaults even for `{}` (`None` is a no-op).
+  Explicit frontend values override a cached or default tactic, as
+  `token_back_mode` does. MX/NV (and the MX
+  backend's `compact_pull_buffer`): an explicit compact buffer or
+  dispatch-side token-back drops the tactic's batch to 1 (dispatch-side
+  token-back also its rotation), and an explicit batch > 1 drops the
+  tactic's compact buffer and rejects a conflicting token-back, dedup or
+  dispatch-warp layout. FP8, where `compact_pull_buffer` is a plain bool
+  that a tactic's value overrides: the caller's dispatch-side token-back,
+  `dedup_dispatch` or dispatch-warp count drops the tactic's batch to 1
+  (token-back also its rotation), and an explicit batch > 1 takes the
+  4-slot buffer; explicit pull values and tactic overrides are validated
+  together using the final dispatch-warp count. The FP8 backend rejects
+  `knobs="auto"` with either explicit pull value, including batch 1 or
+  rotation False; leave both `None` to tune. Online autotuning also controls
+  `compact_pull_buffer` through the tactic instead of preserving the
+  caller's bool. `knobs=None` and knob dicts keep explicit pull precedence.
+  From 1024 tokens per rank the FP8 autotune adds pull
+  variants of its `epi_warps` candidates (`shim/autotune.py::_PULL_VARIANTS`).
+  The drop tree has none of this. When re-syncing, re-add the two token_comm
+  knobs with their properties and the rotation check,
+  `_choose_pull_token`, `_dispatch_pull_batched`, the `pull_batch > 1`
+  branch at the pull call site and the serial loop's rotated row index;
+  `red_add_relaxed_gpu_s32_raw` in `ptx_helpers.py`; the
+  `dispatch_pull_batch` / `dispatch_pull_rotate` kwargs of
+  `megamoe_kernel_fp8.py`; and the runtime `n_half` of the epilogue and the
+  MX `run_wgmma_task_tile` (drop `cutlass.Constexpr` from those parameters),
+  keeping the per-half copies under `_token_back_by_dispatch` and for
+  blockwise N64.
+- Paired BF16 FC2 stores for K128 MXFP4 tiles (2026-10-27, measured on
+  H2560/I640/E512/top10/EP2 in October):
+  `src/moe_hopper_fp8/mxfp4_policy.py` resolves `paired_stores` for tile K
+  128 as well as 256. Output-invariant; K256 tiles are unchanged. Not in the
+  drop tree; when re-syncing, re-apply the `tile[2] in (128, 256)` condition
+  in `resolve_mxfp4_optimizations`.
+- FC1/FC2 next-stage wait + LDSM under the WGMMAs for K128 MXFP4 tiles
+  (2026-10-27, measured on H2560/I640/E512/top10/EP2 in October):
+  `_mma_mxfp4_hybrid_fc1` and `_mma_mxfp4_hybrid_fc2` in
+  `kernel_mxfp4_fp8_glu_fc12_swapab.py` wait for and load stage 0 before
+  the K loop; each iteration waits for the next stage and loads its packed
+  weights after the (last) WGMMA commit, while the WGMMAs read the
+  converted registers (`_wait_and_load_stage`). Only token tiles N64, N72
+  and N80 use it (`_prefetch_next_stage`): N16/N32 tiles measured 2-3%
+  slower with it and keep the in-order K loop unchanged, as do the
+  unmeasured N128 tiles and dispatch-side token-back (the early wait made that path's run-to-run
+  differences far more frequent). The K256 paths (`*_k256*`, NV's FC1 K256
+  override) are unchanged. NV K128 tiles share these loops. Not in the drop
+  tree; when re-syncing, re-add `_prefetch_next_stage`,
+  `_wait_and_load_stage` and the `prefetch` branches of both K loops.
+- MXFP4 optimization version `fused_local_v4` (2026-10-27):
+  `src/moe_hopper_fp8/mxfp4_policy.py::MXFP4_OPTIMIZATION_VERSION` moves from
+  v3 for the two K128 changes above. It enters the MX compile key, candidate
+  SHA and tuning-cache provenance (which the NV provenance embeds), so MXFP4
+  and NVFP4 tuning caches re-tune; the kernels do not read it. Not in the
+  drop tree; when re-syncing, keep a version that differs from the drop's
+  while the K128 changes above stay local.
+- Swap-AB token tiles N72/N80 for packed FP4 (2026-10-28, measured on
+  H2560/I640/E512/top10/EP2): `src/moe_hopper_fp8/epilogue_fp8_swapab.py`
+  adds `SwapABTokenTileNChoicesN72N80` (with 72 and 80) and
+  `swapab_token_tile_n_choices`, which the swap-AB kernel and epilogue take
+  for `fp8_scale_mode="mxfp4_hybrid"` and, since 2026-11, `"blockwise"`
+  (the FP8 shim pads the activation-SF pool to a multiple of N and adds the
+  M256 N72/N80 tiles to the blockwise autotune candidates; those FP8 tiles
+  require `generate_c=False`); per-tensor FP8
+  keeps `SwapABTokenTileNChoices`, its N128 does not spill. The swap-AB kernel also rejects N72/N80 without M=256
+  and, for the scale modes with activation SF (`blockwise`, `mxfp4_hybrid`),
+  an `sf_padding_block` that is not a multiple of N, because the
+  activation-SF TMA addresses a tile as `(expert SF base + tile * N) // N`;
+  the MX frontend pads the SF pool accordingly, and every existing N keeps
+  128. `fused_comm_policy.py` enables paired BF16 stores for
+  M256 x N64/N72/N80. One N80 task holds an expert's 65-80 rows, where N64
+  needs a second, nearly empty tile. At H2560/I640/E512/EP2 the N80 K128
+  kernel uses a 72-byte stack (96 bytes with a 3-row pull batch, whose extra
+  local accesses sit in the pull's token selection, not in the GMMA loop).
+  Not in the drop tree; when re-syncing, re-add
+  the tile list and its helper, use it in the kernel and epilogue N checks,
+  keep the two kernel checks and the N64/N72/N80 store condition.
 
 ## Layout
 
 ```
 kernel_src/sm90/pull_style_cutedsl_megakernel/
-├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
+├── src/                    ← vendored drop with the documented local extensions above
 │   ├── common/             ← shared constants/host utils (SM90-drop revision)
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, token_comm, …)
 │   ├── moe_nvfp4_swapab/   ← NVFP4 package (hopper_fp8 reuses its runner_common,

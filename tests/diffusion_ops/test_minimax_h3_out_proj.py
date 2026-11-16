@@ -63,7 +63,7 @@ from flashinfer.diffusion_ops.minimax_h3_out_proj import (
     nvfp4_activation_scale_workspace_bytes,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.minimax_h3_out_proj_reference import (
+from tests.diffusion_ops.test_helpers.minimax_h3_out_proj_reference import (
     _reference_from_operands,
     minimax_h3_out_proj_reference,
     minimax_h3_unpack_attn_out,

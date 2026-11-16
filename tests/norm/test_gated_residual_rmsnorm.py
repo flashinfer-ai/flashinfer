@@ -150,6 +150,13 @@ def test_gated_residual_rmsnorm_dispatch(
             assert after == (before[0] + 1, before[1])
         else:
             assert after == (before[0], before[1] + 1)
+        # The support predicates answer for the device, the variant and the storage
+        # (cake) or for the call (auto, cute): all three stay true at the gap rows,
+        # which auto and cute run and an explicit cake call rejects.
+        for predicate_backend in ("auto", "cake", "cute"):
+            assert supports_gated_residual_rmsnorm(
+                *gap_inputs, backend=predicate_backend
+            )
         with pytest.raises(ValueError, match="backend must be one of"):
             gated_residual_rmsnorm(*inputs, backend="fast", **kwargs)
         monkeypatch.setattr(norm, "_HAS_CAKE_FUSED_NORM", False)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from .....config import FinalizeMode
@@ -17,32 +19,68 @@ from .....core.validation.common import (
     validate_mega_fleet_params,
 )
 from .....weights import PrequantizedMoEWeights
+from .genphase_config import GenphaseConfigMixin
+
+from .common.activation_batch_invariant import batch_invariant_numerical_metadata
+
+if TYPE_CHECKING:
+    from .mxfp8_mxfp4_bf16_cutedsl.config import (
+        Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from .mxfp8_mxfp8_bf16_cutedsl.config import (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from .nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
 
 
-class _StandardBlockScaledBackend(MegaKernelBackend):
+class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
+    _config: (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        | Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        | Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    )
     supports_output_view = True
+    supports_auto_workspaces = True
     quant_kind: str | None = None
 
     def __init__(self, config):
+        """Validate selector constraints and initialize output capabilities."""
         super().__init__(config)
-        if getattr(config, "kernel_variant", "inference") != "inference":
+        if getattr(config, "batch_invariant", False):
+            from .common.nvfp4_batch_invariant import nvfp4_batch_invariant_arch
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
+        if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(
-                "The standard backend requires kernel_variant='inference'."
+                f"unsupported kernel_variant {config.kernel_variant!r}"
             )
-        if config.knobs == "auto":
-            raise MoEEpConfigError(
-                "The standard backend requires fixed or default knobs."
-            )
-        if config.knobs is not None and not isinstance(config.knobs, dict):
-            raise MoEEpConfigError("knobs must be a dictionary or None.")
+        if config.kernel_variant == "genphase":
+            self._init_genphase_config()
+        if config.knobs not in (None, "auto") and not isinstance(config.knobs, dict):
+            raise MoEEpConfigError("knobs must be a dictionary, 'auto', or None.")
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
-        if any(
+        if config.kernel_variant == "inference" and any(
             getattr(config, name, None) is not None
             for name in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
         ):
             raise MoEEpConfigError("Use knobs for standard inference geometry.")
 
+    def coordinate_workspace_replacement(self, workspace):
+        from .automatic import coordinate_workspace_replacement
+
+        return coordinate_workspace_replacement(self, workspace)
+
+    def get_tuned_knobs(self, workspace=None):
+        from .automatic import get_tuned_knobs
+
+        return get_tuned_knobs(workspace)
+
     def _finalize_mode(self, fleet):
+        """Resolve AUTO for inference; GenPhase requires default finalization."""
+        if self._config.kernel_variant == "genphase":
+            return FinalizeMode.DEFAULT
         mode = self._config.finalize_mode
         if mode is not FinalizeMode.AUTO:
             return mode
@@ -70,6 +108,17 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
 
     def validate_init(self, bootstrap, fleet_params):
         validate_mega_arch()
+        if getattr(self._config, "batch_invariant", False):
+            from .common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            from .common.nvfp4_batch_invariant import nvfp4_batch_invariant_arch
+
+            self._arithmetic_arch = nvfp4_batch_invariant_arch()
+            validate_block_scaled_batch_invariant(
+                self._config, arch=self._arithmetic_arch
+            )
         self._ensure_ep_bootstrap(bootstrap)
         validate_mega_fleet_params(
             fleet_params,
@@ -80,11 +129,73 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         )
         self._workspace_config(fleet_params)
 
-    def _workspace_config(self, fleet):
+    def _default_knobs(self, fleet):
+        """Return the inherited block-scaled profile for this buffer capacity."""
+        if getattr(self._config, "batch_invariant", False):
+            from .common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_default_knobs,
+            )
+
+            return block_scaled_batch_invariant_default_knobs(
+                self._config, "standard", arch=self._arithmetic_arch
+            )
         from .....kernel_src.sm100.cutedsl_megamoe import default_knobs
+
+        return default_knobs(
+            fleet.max_tokens_per_rank,
+            dtype="nvfp4" if self._kind() == "nvfp4" else "mxfp8",
+            combine_dtype=getattr(self._config, "combine_dtype", "bf16"),
+            enable_in_kernel_fc2_reduce=self._config.enable_in_kernel_fc2_reduce,
+        )
+
+    def _workspace_config(self, fleet):
+        """Resolve GenPhase geometry or translate inference knobs to native options."""
+        if self._config.kernel_variant == "genphase":
+            config = self._genphase_config(fleet)
+            self._check_genphase_selection(config)
+            return config
         from .....kernel_src.sm100.next_cutedsl_megamoe import Sm100BlockScaledMoeConfig
 
         k = self._config
+        if getattr(k, "batch_invariant", False):
+            from .common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_default_knobs,
+                block_scaled_batch_invariant_metadata,
+                validate_block_scaled_batch_invariant,
+            )
+
+            knobs = block_scaled_batch_invariant_default_knobs(
+                self._config, "standard", arch=self._arithmetic_arch
+            )
+            if isinstance(k.knobs, dict):
+                knobs.update(k.knobs)
+            validate_block_scaled_batch_invariant(
+                k, knobs, implementation="standard", arch=self._arithmetic_arch
+            )
+            return Sm100BlockScaledMoeConfig(
+                num_total_experts=fleet.num_experts,
+                max_tokens_per_rank=fleet.max_tokens_per_rank,
+                num_topk=k.top_k,
+                hidden=fleet.token_hidden_size,
+                intermediate=k.intermediate_size,
+                rank=self.ep_rank,
+                world_size=self.ep_world_size,
+                quant_kind=self._kind(),
+                gate_up_clamp=k.gate_up_clamp
+                if k.gate_up_clamp is not None
+                else k.activation_clamp,
+                apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+                use_persistent_finalize_kernel=self._finalize_mode(fleet)
+                is FinalizeMode.PERSISTENT,
+                use_custom_finalize=self._finalize_mode(fleet)
+                in (FinalizeMode.NONE, FinalizeMode.CAKE),
+                batch_invariant_cake_finalize=self._finalize_mode(fleet)
+                is FinalizeMode.CAKE,
+                combine_dtype=getattr(k, "combine_dtype", "bf16"),
+                **block_scaled_batch_invariant_metadata(k),
+                **batch_invariant_numerical_metadata(k),
+                **knobs,
+            )
         mode = self._finalize_mode(fleet)
         if mode is FinalizeMode.CAKE and not self._cake_reducer_supported(fleet):
             raise MoEEpConfigError(
@@ -92,13 +203,20 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             )
         kind = self._kind()
         wire = getattr(k, "combine_dtype", "bf16")
-        knobs = default_knobs(
-            fleet.max_tokens_per_rank,
-            dtype="nvfp4" if kind == "nvfp4" else "mxfp8",
-            combine_dtype=wire,
-            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+        knobs = self._default_knobs(fleet)
+        from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+            STANDARD_KNOB_KEYS,
         )
-        knobs.update(k.knobs or {})
+
+        native = isinstance(k.knobs, dict) and bool(
+            set(k.knobs)
+            & (set(STANDARD_KNOB_KEYS) - {"mma_tiler_mnk", "token_back_mode"})
+        )
+        # Legacy FP4 permits N256/K256; standard inference requires K128 at N256.
+        if kind == "nvfp4" and knobs.get("mma_tiler_mnk") == (256, 256, 256):
+            knobs["mma_tiler_mnk"] = (256, 256, 128)
+        if isinstance(k.knobs, dict) and not native:
+            knobs.update(k.knobs)
         if not knobs.pop("force_static_sched", True):
             raise MoEEpConfigError(
                 "force_static_sched=False has no standard-kernel mapping."
@@ -114,6 +232,7 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             "cluster_shape_mnk",
             "use_2cta_instrs",
             "group_hint",
+            "schedule_mode",
             "flag_batch",
             "epi_flag_batch",
             "token_back_mode",
@@ -138,10 +257,24 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         balance = knobs.get("load_balance_mode", "static")
         if balance not in ("static", "atomic_counter"):
             raise MoEEpConfigError(f"Unsupported load_balance_mode {balance!r}.")
+        schedule = knobs.get("schedule_mode", "grouped")
+        if schedule not in ("grouped", "phase_interleave"):
+            raise MoEEpConfigError(f"Unsupported schedule_mode {schedule!r}.")
+        if schedule == "phase_interleave" and balance != "atomic_counter":
+            raise MoEEpConfigError(
+                "schedule_mode='phase_interleave' requires "
+                "load_balance_mode='atomic_counter'."
+            )
         reduce = bool(knobs.get("in_kernel_fc2_reduce", False))
+        if native:
+            if unknown := set(k.knobs) - set(STANDARD_KNOB_KEYS):
+                raise MoEEpConfigError(
+                    f"unknown Blackwell standard knob keys: {sorted(unknown)}"
+                )
+            reduce = k.knobs.get("reduce_topk_in_kernel", reduce)
         if reduce and not k.enable_in_kernel_fc2_reduce:
             raise MoEEpConfigError("In-kernel reduction must be enabled in the config.")
-        return Sm100BlockScaledMoeConfig(
+        options = dict(
             num_total_experts=fleet.num_experts,
             max_tokens_per_rank=fleet.max_tokens_per_rank,
             num_topk=k.top_k,
@@ -152,15 +285,15 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             quant_kind=kind,
             mma_tiler_mnk=tile,
             cluster_shape_mn=cluster[:2],
-            schedule_policy=("grouped", knobs.get("group_hint")),
+            schedule_policy=(schedule, knobs.get("group_hint")),
             work_id_mode="grid_stride" if balance == "static" else "atomic_counter",
             token_in_flag_batch=knobs.get("flag_batch", 1),
             epi_flag_batches=tuple(knobs.get("epi_flag_batch", (1, 1))),
             token_back_mode=token_back,
             fc2_use_bulk=not knobs.get("non_ubulk_fc2_store", True),
-            gate_up_clamp=k.gate_up_clamp
-            if k.gate_up_clamp is not None
-            else k.activation_clamp,
+            gate_up_clamp=(
+                k.gate_up_clamp if k.gate_up_clamp is not None else k.activation_clamp
+            ),
             activation=getattr(k, "activation", "swiglu"),
             situ_beta=getattr(k, "situ_beta", None),
             situ_linear_beta=getattr(k, "situ_linear_beta", None),
@@ -178,6 +311,13 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 k, "enable_fc1_activation_per_token_scale", False
             ),
         )
+        if native:
+            options.update(k.knobs)
+            try:
+                return Sm100BlockScaledMoeConfig(**options)
+            except (TypeError, ValueError) as exc:
+                raise MoEEpConfigError("Invalid native standard tuning knobs.") from exc
+        return Sm100BlockScaledMoeConfig(**options)
 
     def preprocess_weights(self, weights, fleet_params):
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
@@ -218,34 +358,57 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params):
+        """Allocate variant-specific buffers and initialize expert scale tensors."""
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             Sm100BlockScaledSymmBuffer,
+            Sm100GenphaseSymmBuffer,
         )
 
         cfg = self._workspace_config(fleet_params)
-        workspace = Sm100BlockScaledSymmBuffer(
-            cfg,
-            num_valid_tokens_tensor=self._config.num_valid_tokens_tensor
-            if cfg.use_persistent_finalize_kernel
-            else None,
+        process_group = self.ep_comm_group if self.ep_world_size > 1 else None
+        if cfg.kernel_variant == "genphase":
+            workspace = Sm100GenphaseSymmBuffer(cfg, process_group=process_group)
+        else:
+            workspace = Sm100BlockScaledSymmBuffer(
+                cfg,
+                process_group=process_group,
+                num_valid_tokens_tensor=(
+                    self._config.num_valid_tokens_tensor
+                    if cfg.use_persistent_finalize_kernel
+                    else None
+                ),
+            )
+
+        def prepare_outputs():
+            if self.supports_unfinalized_output:
+                workspace._unfinalized_route_map = torch.arange(
+                    cfg.max_tokens_per_rank * cfg.num_topk,
+                    dtype=torch.int32,
+                    device=workspace.device,
+                ).view(cfg.max_tokens_per_rank, cfg.num_topk)
+                workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
+            if self._kind() == "nvfp4":
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+                    value = getattr(self._config, name)
+                    if isinstance(value, (int, float)):
+                        getattr(workspace, name).fill_(value)
+                    elif value is not None:
+                        getattr(workspace, name).copy_(value)
+
+        from .....kernel_src.sm100.next_cutedsl_megamoe.shim import comm
+
+        comm.prepare_local(
+            prepare_outputs,
+            cfg.world_size,
+            process_group,
+            phase="backend output preparation",
         )
-        if self.supports_unfinalized_output:
-            workspace._unfinalized_route_map = torch.arange(
-                cfg.max_tokens_per_rank * cfg.num_topk,
-                dtype=torch.int32,
-                device=workspace.device,
-            ).view(cfg.max_tokens_per_rank, cfg.num_topk)
-            workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
-        if self._kind() == "nvfp4":
-            for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-                value = getattr(self._config, name)
-                if isinstance(value, (int, float)):
-                    getattr(workspace, name).fill_(value)
-                elif value is not None:
-                    getattr(workspace, name).copy_(value)
         return workspace
 
     def _workspace_pool_key(self, fleet_params):
+        """Key fixed workspaces by geometry, finalization and borrowed tensors."""
+        if self._config.knobs == "auto":
+            return None
         from .....core.kernel.workspace_pool import epilogue_pool_key
 
         return (
@@ -254,15 +417,33 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             self.ep_rank,
             id(self._ep_comm_group),
             self._workspace_config(fleet_params),
+            self.batch_invariant_fingerprint(fleet_params),
             self._finalize_mode(fleet_params),
-            epilogue_pool_key(self._config.num_valid_tokens_tensor)
-            if self._workspace_config(fleet_params).use_persistent_finalize_kernel
-            else None,
+            (
+                epilogue_pool_key(self._config.num_valid_tokens_tensor)
+                if getattr(
+                    self._workspace_config(fleet_params),
+                    "use_persistent_finalize_kernel",
+                    False,
+                )
+                else None
+            ),
             tuple(
                 epilogue_pool_key(getattr(self._config, name, None))
                 for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
             ),
         )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not getattr(self._config, "batch_invariant", False):
+            return None
+        from .common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_fingerprint,
+        )
+
+        # Resolve and validate the actual pinned/cached plan before issuing a receipt.
+        cfg = self._workspace_config(fleet_params)
+        return block_scaled_batch_invariant_fingerprint(cfg, arch=self._arithmetic_arch)
 
     def _legacy_backend(self):
         from . import mxfp8_mxfp8_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl
@@ -315,19 +496,30 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 )
 
     def stage_inputs(self, t, workspace, *, quantize_input):
+        """Stage quantized activations, mask padded routes and refresh live scales."""
         n = t.hidden_states.shape[0]
         cfg = workspace.config
         if self._kind() == "nvfp4":
             self._legacy_backend().staging.validate_fc1_activation_per_token_scale(
                 t.fc1_activation_per_token_scale,
                 num_tokens=n,
-                enabled=cfg.enable_fc1_activation_per_token_scale,
+                enabled=getattr(cfg, "enable_fc1_activation_per_token_scale", False),
             )
         if quantize_input:
             kwargs = (
-                dict(norm_const=self._config.input_norm_const)
+                dict(
+                    norm_const=self._config.input_norm_const,
+                    batch_invariant=self._config.batch_invariant,
+                )
                 if self._kind() == "nvfp4"
-                else dict(kind=self._kind())
+                else dict(
+                    kind=self._kind(),
+                    **(
+                        {"batch_invariant": True}
+                        if getattr(self._config, "batch_invariant", False)
+                        else {}
+                    ),
+                )
             )
             # The shared stager rounds scale columns to four; the native
             # workspace keeps a wider row stride for its TMA alignment.
@@ -348,8 +540,19 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             workspace.x_sf[:n, :width].view(torch.uint8).copy_(
                 t.scales[:, :width].view(torch.uint8)
             )
-            workspace.topk_idx[:n].copy_(t.topk_ids)
-            workspace.topk_weights[:n].copy_(t.topk_weights)
+            if self._kind() == "mxfp4_mxfp8":
+                from ..routing_staging import stage_routes
+
+                stage_routes(
+                    t.topk_ids,
+                    t.topk_weights,
+                    workspace.topk_idx,
+                    workspace.topk_weights,
+                    workspace=workspace,
+                )
+            else:
+                workspace.topk_idx[:n].copy_(t.topk_ids)
+                workspace.topk_weights[:n].copy_(t.topk_weights)
             workspace.topk_idx[n:].fill_(-1)
             from .....kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
@@ -366,7 +569,7 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 | (workspace.topk_idx[:n] >= cfg.num_total_experts),
                 0,
             )
-        if cfg.enable_fc1_activation_per_token_scale:
+        if getattr(cfg, "enable_fc1_activation_per_token_scale", False):
             workspace.fc1_activation_per_token_scale[:n].copy_(
                 t.fc1_activation_per_token_scale
             )
@@ -383,10 +586,11 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 target.copy_(value)
 
     def validate_capture_ready(self, workspace, transformed_weights):
+        """Require the workspace and any terminal reducer to be warmed up."""
         if workspace._compiled is None:
             raise RuntimeError("Warm up the standard workspace before graph capture.")
         if (
-            workspace.config.use_custom_finalize
+            getattr(workspace.config, "use_custom_finalize", False)
             and not self.supports_unfinalized_output
         ):
             from flashinfer.jit.cake_megamoe_topk_reduce import (
@@ -397,14 +601,21 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 raise RuntimeError("Warm up the terminal reducer before graph capture.")
 
     def compute(self, workspace, transformed_weights, *, output):
+        """Launch the prepared MoE and its selected BF16 finalization path."""
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             sm100_block_scaled_mega_launch_thunk,
             sm100_block_scaled_mega_moe,
         )
 
+        from .automatic import prepare_auto_configuration
+
+        if self._config.knobs == "auto":
+            prepare_auto_configuration(
+                self, workspace, transformed_weights, output, workspace.staged_tokens()
+            )
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
-        if not workspace.config.use_custom_finalize:
+        if not getattr(workspace.config, "use_custom_finalize", False):
             view = sm100_block_scaled_mega_moe(
                 output,
                 *transformed_weights,
@@ -424,7 +635,17 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         reducer = get_cake_megamoe_topk_reduce_module(workspace.device)
         stream = torch.cuda.current_stream().cuda_stream
         thunk()
-        reducer.run(partials, workspace.output_activation, n, stream)
+        if getattr(workspace.config, "batch_invariant", False):
+            reducer.run_batch_invariant(
+                partials,
+                workspace.topk_idx,
+                workspace.output_activation,
+                n,
+                workspace.config.num_total_experts,
+                stream,
+            )
+        else:
+            reducer.run(partials, workspace.output_activation, n, stream)
         if output is None:
             return workspace.output_activation[:n]
         output.copy_(workspace.output_activation[:n])
@@ -437,12 +658,28 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
 
         if not self.supports_unfinalized_output:
             raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        if self._config.knobs == "auto":
+            from .automatic import prepare_auto_configuration
+
+            prepare_auto_configuration(
+                self, workspace, transformed_weights, None, workspace.staged_tokens()
+            )
         n = workspace.staged_tokens()
         if n is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
         partials = workspace.custom_finalize_workspace()
         rows = partials[:n].view(n * workspace.config.num_topk, workspace.config.hidden)
         weights = workspace._unfinalized_weights[:n]
+        if workspace.config.batch_invariant:
+            if workspace.config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:n])
+            weights.masked_fill_(
+                (workspace.topk_idx[:n] < 0)
+                | (workspace.topk_idx[:n] >= workspace.config.num_total_experts),
+                0,
+            )
         route_map = workspace._unfinalized_route_map[:n]
         thunk = sm100_block_scaled_mega_launch_thunk(*transformed_weights, workspace)
         thunk()
@@ -463,3 +700,175 @@ class StandardMxfp8Backend(_StandardBlockScaledBackend):
     @classmethod
     def kernel_name(cls):
         return "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+
+
+@register_mega_kernel("sm100_mxfp8_mxfp4_bf16_cutedsl")
+class StandardMxfp8Mxfp4Backend(_StandardBlockScaledBackend):
+    quant_kind = "mxfp4_mxfp8"
+
+    # Expected rows per expert = world_size * capacity * top_k / num_experts.
+    # Capacity determines the profile, including underfilled graph replays.
+    _N64_MAX_ROWS = 64
+    _PHASE_INTERLEAVE_MIN_ROWS = 128
+    # Empirical FC1 depth needed to amortize the phase-interleave prologue.
+    _PHASE_INTERLEAVE_MIN_TILES_PER_CLUSTER = 7
+
+    def _active_clusters(self, cluster_size):
+        """Query cached cluster occupancy on the bound EP device."""
+        from .....kernel_src.sm100.next_cutedsl_megamoe import (
+            max_active_clusters,
+        )
+
+        if not torch.cuda.is_available():
+            raise MoEEpConfigError(
+                "Automatic MXFP4 schedule selection requires CUDA; "
+                "set knobs={'schedule_mode': 'grouped'} for CPU-only configuration."
+            )
+        device = self._ep_bootstrap.device if self._ep_bootstrap else None
+        with torch.cuda.device(device):
+            # Initialize the CUDA context before the driver's occupancy probe.
+            torch.cuda.current_stream()
+            return max_active_clusters(cluster_size)
+
+    def _gather_workspace_proposals(self, error, proposal=None):
+        """Share preparation errors before returning the ranks' proposals."""
+        import torch.distributed as dist
+
+        reports = [None] * self.ep_world_size
+        dist.all_gather_object(reports, (error, proposal), group=self.ep_comm_group)
+        failures = [
+            f"rank {rank}: {error}"
+            for rank, (error, _) in enumerate(reports)
+            if error is not None
+        ]
+        if failures:
+            raise MoEEpConfigError(
+                "MXFP4 workspace preparation failed on EP ranks: " + "; ".join(failures)
+            )
+        return [proposal for _, proposal in reports]
+
+    def validate_init(self, bootstrap, fleet_params):
+        """Coordinate validation failures when the EP group is available."""
+        self._ensure_ep_bootstrap(bootstrap)
+        # Initial construction validates before runtime bootstrap. Explicit
+        # workspace creation has an EP group and must fail collectively.
+        if (
+            self._config.kernel_variant != "inference"
+            or self.ep_world_size == 1
+            or self._ep_comm_group is None
+        ):
+            return super().validate_init(bootstrap, fleet_params)
+        error = None
+        try:
+            super().validate_init(bootstrap, fleet_params)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        self._gather_workspace_proposals(error)
+
+    def prepare_workspace(self, bootstrap, fleet_params):
+        """Agree on workspace proposals or local failures before pool lookup."""
+        self._ensure_ep_bootstrap(bootstrap)
+        if self._config.kernel_variant == "inference" and self.ep_world_size > 1:
+            import dataclasses
+
+            error, proposal = None, None
+            try:
+                config = self._workspace_config(fleet_params)
+                cluster = config.cluster_shape_mn
+                proposal = (
+                    dataclasses.replace(config, rank=0),
+                    self._active_clusters(cluster[0] * cluster[1]),
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            # Agree before pool lookup so every rank participates even when
+            # a peer's probe failed or another layer owns a matching workspace.
+            proposals = self._gather_workspace_proposals(error, proposal)
+            if any(p != proposal for p in proposals):
+                raise MoEEpConfigError(
+                    "MXFP4 configuration or active cluster count differs across EP ranks"
+                )
+        return super().prepare_workspace(bootstrap, fleet_params)
+
+    def _default_knobs(self, fleet):
+        """Choose MXFP4 defaults by expert fill and FC1 work per cluster."""
+        if getattr(self._config, "batch_invariant", False):
+            return super()._default_knobs(fleet)
+        # Deliberately retain the validated epi flag batches (2, 4) and
+        # the token-back switch at capacity 2048 from the MXFP8 profile.
+        knobs = super()._default_knobs(fleet)
+        routes = self.ep_world_size * fleet.max_tokens_per_rank * self._config.top_k
+        rows = routes / fleet.num_experts
+        small = rows < self._N64_MAX_ROWS
+        tile = (256, 64 if small else 128, 128)
+        knobs.update(
+            mma_tiler_mnk=tile,
+            group_hint=4096,
+            flag_batch=1,
+            load_balance_mode="atomic_counter" if small else "static",
+        )
+        overrides = self._config.knobs
+        if isinstance(overrides, dict) and set(overrides) & {
+            "mma_tiler_mnk",
+            "cluster_shape_mnk",
+            "cluster_shape_mn",
+            "fallback_cluster_shape_mn",
+            "max_sm_count",
+            "schedule_mode",
+            "schedule_policy",
+            "group_hint",
+            "load_balance_mode",
+            "work_id_mode",
+        }:
+            policy = overrides.get("schedule_policy")
+            if overrides.get("schedule_mode") == "phase_interleave" or (
+                isinstance(policy, (tuple, list))
+                and len(policy) == 2
+                and policy[0] == "phase_interleave"
+            ):
+                # Phase scheduling needs atomic claims and derives its own hint.
+                knobs["load_balance_mode"] = "atomic_counter"
+                knobs["group_hint"] = None
+            # Custom geometry/claims are outside the measured depth heuristic.
+            # Keep grouped as the compatible default; explicit schedules win later.
+            return knobs
+        if rows >= self._PHASE_INTERLEAVE_MIN_ROWS:
+            # The FC1 prologue leaves little to interleave in shallow workloads.
+            cluster = knobs.get("cluster_shape_mnk", (2, 1, 1))
+            clusters = self._active_clusters(cluster[0] * cluster[1])
+            token_tile_routes = fleet.num_experts * tile[1]
+            token_tiles = (routes + token_tile_routes - 1) // token_tile_routes
+            weight_tiles = (2 * self._config.intermediate_size + tile[0] - 1) // tile[0]
+            fc1_tiles = (
+                (fleet.num_experts // self.ep_world_size) * token_tiles * weight_tiles
+            )
+            if fc1_tiles >= clusters * self._PHASE_INTERLEAVE_MIN_TILES_PER_CLUSTER:
+                knobs.update(
+                    schedule_mode="phase_interleave",
+                    group_hint=None,
+                    load_balance_mode="atomic_counter",
+                )
+        return knobs
+
+    @classmethod
+    def kernel_name(cls):
+        return "sm100_mxfp8_mxfp4_bf16_cutedsl"
+
+    def validate_forward(self, t, fleet_params, *, quantize_input):
+        if t.hidden_states.ndim != 2 or t.topk_ids.ndim != 2:
+            raise MoEEpConfigError("Activations and expert IDs must be 2D.")
+        if quantize_input and t.hidden_states.dtype != torch.bfloat16:
+            raise MoEEpConfigError(
+                "MXFP4/MXFP8 quantize_input=True requires BF16 inputs."
+            )
+        if t.topk_ids.dtype not in (torch.int32, torch.int64):
+            raise MoEEpConfigError("Expert IDs must be int32 or int64.")
+        if t.topk_weights.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise MoEEpConfigError("Routing scores must be FP16, BF16 or FP32.")
+        device = torch.device("cuda", torch.cuda.current_device())
+        inputs = (t.hidden_states, t.topk_ids, t.topk_weights)
+        if t.scales is not None:
+            inputs += (t.scales,)
+        if any(tensor.device != device for tensor in inputs):
+            raise MoEEpConfigError("Inputs must be on the current CUDA device.")
+        super().validate_forward(t, fleet_params, quantize_input=quantize_input)

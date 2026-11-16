@@ -156,8 +156,9 @@ the plan has more than one split.
 
 Programmatic dependent launch is a per-plan switch (`cake_backend.pdl_for`,
 reported as `runner.route_metadata["pdl"]`): when the plan has a split merge
-and its decode is one wave of clusters (`items <= units`), the decode and the
-merge launch with the programmatic attribute (the `enable_pdl` argument of
+and its decode is one hardware wave (`items <= units + pairs`, the clusters
+of four plus the pairs), the decode and the merge launch with the
+programmatic attribute (the `enable_pdl` argument of
 their `run` entries), so each prologue overlaps its predecessor's tail; the
 quantizer triggers its dependents once its rows are stored and the decode once
 a role runs out of items, and each kernel syncs on its dependency before

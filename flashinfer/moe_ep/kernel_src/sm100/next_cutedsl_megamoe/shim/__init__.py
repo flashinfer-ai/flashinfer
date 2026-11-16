@@ -3,8 +3,12 @@
 """Blackwell adapters; raw source imports stay inside the shim."""
 
 from ._paths import bootstrap_paths
-from .autotune import autotune_sm100_genphase_mega_moe
+from .autotune import (
+    autotune_sm100_genphase_mega_moe,
+    autotune_sm100_block_scaled_mega_moe,
+)
 from .block_scaled import (
+    _max_active_clusters as max_active_clusters,
     block_scaled_mega_launch_thunk as sm100_block_scaled_mega_launch_thunk,
     block_scaled_mega_moe as sm100_block_scaled_mega_moe,
 )
@@ -26,6 +30,7 @@ from .genphase import (
 from .kernel_helpers import (
     preprocess_block_scaled_weights,
     preprocess_prequantized_block_scaled_weights,
+    quantize_mxfp4_block32,
     quantize_mxfp8_block32,
     quantize_nvfp4_block16,
 )
@@ -52,17 +57,20 @@ __all__ = [
     "Sm100GenphaseMoeConfig",
     "Sm100GenphaseSymmBuffer",
     "autotune_sm100_genphase_mega_moe",
+    "autotune_sm100_block_scaled_mega_moe",
     "bootstrap_paths",
     "concatenate_genphase_weights",
     "default_sm100_genphase_knobs",
     "genphase_live_token_buckets",
     "knob_cache_path",
+    "max_active_clusters",
     "output_error",
     "preprocess_block_scaled_weights",
     "preprocess_genphase_prequantized_weights",
     "preprocess_genphase_weights",
     "preprocess_prequantized_block_scaled_weights",
     "quantize_genphase_mxfp8",
+    "quantize_mxfp4_block32",
     "quantize_mxfp8_block32",
     "quantize_nvfp4_block16",
     "resolve_genphase_knobs",
