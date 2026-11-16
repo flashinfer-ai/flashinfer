@@ -109,6 +109,26 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(x + threadIdx.x * vec_size);
 
+  if ((rotary_dim / 2) % vec_size != 0) {
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      const uint32_t dim = threadIdx.x * vec_size + i;
+      if (dim < rotary_dim) {
+        const bool first_half = dim < rotary_dim / 2;
+        vec_t<float, 1> partner;
+        partner.cast_load(x + (first_half ? dim + rotary_dim / 2 : dim - rotary_dim / 2));
+        float cos, sin;
+        __sincosf(float(offset) * freq[i], &sin, &cos);
+        vec[i] = vec[i] * cos + (first_half ? -partner[0] : partner[0]) * sin;
+      }
+    }
+    // Finish all partner reads before the caller can write this head in place.
+    const uint32_t head_mask = (0xffffffffu >> (32 - bdx))
+                               << (((threadIdx.z * blockDim.y + threadIdx.y) * bdx) % 32);
+    __syncwarp(head_mask);
+    return vec;
+  }
+
   if (threadIdx.x * vec_size < rotary_dim) {
     permuted_vec.cast_load(x + ((threadIdx.x * vec_size < rotary_dim / 2)
                                     ? threadIdx.x * vec_size + rotary_dim / 2
@@ -132,6 +152,24 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin(
     const uint32_t rotary_dim = vec_size * bdx) {
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(x + threadIdx.x * vec_size);
+
+  if ((rotary_dim / 2) % vec_size != 0) {
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      const uint32_t dim = threadIdx.x * vec_size + i;
+      if (dim < rotary_dim) {
+        const bool first_half = dim < rotary_dim / 2;
+        vec_t<float, 1> partner;
+        partner.cast_load(x + (first_half ? dim + rotary_dim / 2 : dim - rotary_dim / 2));
+        vec[i] = vec[i] * cos[i] + (first_half ? -partner[0] : partner[0]) * sin[i];
+      }
+    }
+    // Tail threads also participate so no in-place store can precede a partner read.
+    const uint32_t head_mask = (0xffffffffu >> (32 - bdx))
+                               << (((threadIdx.z * blockDim.y + threadIdx.y) * bdx) % 32);
+    __syncwarp(head_mask);
+    return vec;
+  }
 
   if (threadIdx.x * vec_size < rotary_dim) {
     permuted_vec.cast_load(x + ((threadIdx.x * vec_size < rotary_dim / 2)
@@ -169,10 +207,12 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_interleav
     vec_before = vec;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      float embed = float(offset) * freq[i];
-      float cos, sin;
-      __sincosf(embed, &sin, &cos);
-      vec[i] = vec[i] * cos + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin;
+      if (threadIdx.x * vec_size + i < rotary_dim) {
+        float embed = float(offset) * freq[i];
+        float cos, sin;
+        __sincosf(embed, &sin, &cos);
+        vec[i] = vec[i] * cos + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin;
+      }
     }
   }
   return vec;
@@ -189,7 +229,9 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
     vec_before = vec;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      vec[i] = vec[i] * cos[i] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i];
+      if (threadIdx.x * vec_size + i < rotary_dim) {
+        vec[i] = vec[i] * cos[i] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i];
+      }
     }
   }
   return vec;
