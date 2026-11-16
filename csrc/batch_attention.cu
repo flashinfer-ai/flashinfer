@@ -31,6 +31,10 @@ template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, ui
 cudaError_t BatchPagedAttentionPersistent(const Params params_1, const Params params_2,
                                           const uint32_t num_blks_x, const uint32_t num_blks_y,
                                           const cudaStream_t stream);
+
+template <uint32_t CTA_TILE_Q_1, uint32_t CTA_TILE_Q_2, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          MaskMode MASK_MODE, bool EQUAL_KV_STRIDES, typename AttentionVariant, typename Params>
+cudaError_t BatchPagedAttentionPersistentResidentBlocks(int* blocks_per_sm, size_t* smem_size);
 }  // namespace flashinfer
 
 using namespace flashinfer;
@@ -51,12 +55,50 @@ Array<int64_t> BatchPagedAttentionPlan(TensorView float_workspace_buffer,
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
 
-  cudaError_t status = TwoStageHolisticPlan<IdType>(
+  // The persistent kernel is launched cooperatively, so the plan's grid has to fit what
+  // this device can keep resident. That depends on the shared memory this module's kernel
+  // requests, which in turn depends on the head dim and dtype the module was built for and
+  // on the device's per-SM budget, so it is measured for the actual kernel rather than
+  // inferred from the head dim.
+  int resident_ctas_per_sm = 0;
+  size_t kernel_smem_size = 0;
+  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  // The residency helper is instantiated for the stride variant this module launches. The
+  // stride split does not change the shared memory request, so the runtime variant can
+  // measure either; it asks for the equal-stride kernel.
+#if BATCH_ATTENTION_KV_STRIDE_MODE == BATCH_ATTENTION_KV_STRIDE_MODE_INDEPENDENT
+  constexpr bool kResidencyEqualKvStrides = false;
+#else
+  constexpr bool kResidencyEqualKvStrides = true;
+#endif
+  cudaError_t status = cudaErrorInvalidValue;
+  DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO,
+                   POS_ENCODING_MODE, AttentionVariant, PersistentParams, [&] {
+                     TVM_FFI_ICHECK(head_dim_o == HEAD_DIM_VO)
+                         << "BatchAttention planned head_dim_vo=" << head_dim_o
+                         << " against a module built for head_dim_vo=" << HEAD_DIM_VO;
+                     status = BatchPagedAttentionPersistentResidentBlocks<
+                         /*CTA_TILE_Q_1=*/128, /*CTA_TILE_Q_2=*/16, HEAD_DIM_QK, HEAD_DIM_VO,
+                         MASK_MODE, kResidencyEqualKvStrides, AttentionVariant, PersistentParams>(
+                         &resident_ctas_per_sm, &kernel_smem_size);
+                   });
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "Failed to query persistent paged attention residency, error: "
+      << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(resident_ctas_per_sm > 0)
+      << "The persistent paged attention kernel for head_dim_qk=" << HEAD_DIM_QK
+      << " head_dim_vo=" << HEAD_DIM_VO << " requests " << kernel_smem_size
+      << " bytes of shared memory, which does not fit a single CTA on this device's "
+      << "shared memory per SM. Use BatchPrefillWithPagedKVCacheWrapper(backend='fa2') "
+      << "or BatchDecodeWithPagedKVCacheWrapper(use_tensor_cores=True) instead.";
+
+  status = TwoStageHolisticPlan<IdType>(
       float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
       int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(qo_indptr.data_ptr()),
       static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len.data_ptr()),
-      batch_size, num_qo_heads, num_kv_heads, head_dim_o, causal, stream);
+      batch_size, num_qo_heads, num_kv_heads, head_dim_o, causal,
+      static_cast<uint32_t>(resident_ctas_per_sm), stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan persistent paged attention, error: " << cudaGetErrorString(status);

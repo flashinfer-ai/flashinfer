@@ -1289,7 +1289,7 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
                                         IdType* kv_indptr_h, IdType* kv_len_arr_h,
                                         uint32_t batch_size, uint32_t num_qo_heads,
                                         uint32_t num_kv_heads, uint32_t head_dim, bool causal,
-                                        cudaStream_t stream) {
+                                        uint32_t resident_ctas_per_sm, cudaStream_t stream) {
   constexpr uint32_t NUM_TASKS = 2;
   const uint32_t CTA_TILE_Q_SIZES[NUM_TASKS] = {128, 16};
   int num_sm = 0;
@@ -1299,14 +1299,17 @@ inline cudaError_t TwoStageHolisticPlan(void* float_buffer, size_t float_workspa
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 
-  if (head_dim >= 256) {
-    // NOTE (Yilong): optimize this code path
-    // constraint gridDim due to cooperative group
-    num_sm *= 1;
-  } else {
-    // NOTE(Zihao): two cta per sm
-    num_sm *= 2;
+  // The kernel is launched cooperatively, so every block has to be resident at once and
+  // the grid cannot exceed what the device holds. The caller measures that for the actual
+  // kernel (see BatchPagedAttentionPersistentResidentBlocks); the two-CTA target below is
+  // the most this planner asks for, so a device that fits more is not oversubscribed and
+  // one that fits less is not rejected at launch.
+  const uint32_t target_ctas_per_sm = head_dim >= 256 ? 1 : 2;
+  const uint32_t ctas_per_sm = std::min(resident_ctas_per_sm, target_ctas_per_sm);
+  if (ctas_per_sm == 0) {
+    return cudaErrorInvalidValue;
   }
+  num_sm *= ctas_per_sm;
 
   // step 0. determine the number of blocks in x and y dimensions
   std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec[NUM_TASKS];
