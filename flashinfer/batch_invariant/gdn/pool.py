@@ -44,7 +44,8 @@ def _module():
 
 
 def pool_key(pool: torch.Tensor) -> Tuple[int, int, int, torch.device]:
-    """The pool's identity: its storage, where it starts in it and its head count (any view of it is the same pool)."""
+    """The pool's identity: its storage, where it starts in it and its head count (a view from the same first slot is
+    the same pool; a view that starts at another slot is another pool with its own open rows)."""
     return (
         pool.untyped_storage().data_ptr(),
         pool.storage_offset(),
