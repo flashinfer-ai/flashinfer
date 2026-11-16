@@ -231,7 +231,8 @@ class MoEEpNosyncLayer(nn.Module):
         self._pending = None
         if transport is not None:
             mega = dataclasses.replace(
-                mega, megakernel=dataclasses.replace(mega.megakernel, transport=transport)
+                mega,
+                megakernel=dataclasses.replace(mega.megakernel, transport=transport),
             )
         try:
             self.nosync = MoEEpMegaLayer(bootstrap, params, None, mega)
@@ -254,7 +255,9 @@ class MoEEpNosyncLayer(nn.Module):
         table = self.base._ensure_workspace().transport_table
         transport = tuple(int(c) for c in table.cells)
         logger.info(
-            "NosyncOptions: transport follows the cake table %s %s", table.name, transport
+            "NosyncOptions: transport follows the cake table %s %s",
+            table.name,
+            transport,
         )
         reason = self._make_nosync(transport)
         if reason is not None:

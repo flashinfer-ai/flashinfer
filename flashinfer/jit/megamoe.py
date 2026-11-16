@@ -367,7 +367,7 @@ def gen_megamoe_sm120_mxfp4_module(
     uri = "megamoe_sm120_mxfp4"
     cflags = ["-std=c++17"]
     ldflags: list[str] = []
-    includes = [csrc, jit_env.FLASHINFER_CSRC_DIR]
+    includes: list[str | Path] = [csrc, jit_env.FLASHINFER_CSRC_DIR]
     if gin_type is not None:
         from ..moe_ep.kernel_src.sm120.cake_mxfp4_megamoe.shim.cake_jit import (
             GIN_BACKENDS,

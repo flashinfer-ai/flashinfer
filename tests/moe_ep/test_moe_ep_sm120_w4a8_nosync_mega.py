@@ -584,7 +584,9 @@ def _off_reason(build):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         layer = build()
-    reasons = [str(w.message) for w in caught if "nosync kernel is off" in str(w.message)]
+    reasons = [
+        str(w.message) for w in caught if "nosync kernel is off" in str(w.message)
+    ]
     assert layer.nosync is None and len(reasons) == 1, reasons
     return layer, reasons[0]
 
@@ -619,9 +621,9 @@ def _shared_expert_worker(rank, ep):
                 num_experts=experts, max_tokens_per_rank=128, token_hidden_size=h
             ),
             weights=CakePrequantizedMoEWeightsWithSharedExpert(
-                w13=torch.zeros(epr, 2 * ih, h // 2, dtype=torch.uint8, device="cuda").view(
-                    torch.float4_e2m1fn_x2
-                ),
+                w13=torch.zeros(
+                    epr, 2 * ih, h // 2, dtype=torch.uint8, device="cuda"
+                ).view(torch.float4_e2m1fn_x2),
                 w2=torch.zeros(epr, h, ih // 2, dtype=torch.uint8, device="cuda").view(
                     torch.float4_e2m1fn_x2
                 ),
@@ -708,7 +710,9 @@ def _geometry_worker(rank, ep):
         lambda: MoEEpNosyncLayer(
             base,
             bootstrap,
-            FleetParams(num_experts=experts, max_tokens_per_rank=128, token_hidden_size=h),
+            FleetParams(
+                num_experts=experts, max_tokens_per_rank=128, token_hidden_size=h
+            ),
             PrequantizedMoEWeights(
                 w13=raw1[0].view(torch.float4_e2m1fn_x2),
                 w2=raw2[0].view(torch.float4_e2m1fn_x2),
