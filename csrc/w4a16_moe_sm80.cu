@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 // Weight-only NVFP4 MoE for SM80 to SM90 with BF16 activations. NVFP4 weights are converted once
-// into records (w4a16_moe_sm80_records in flashinfer/fused_moe/prepare.py): per expert, 128 output
+// into records (flashinfer.fused_moe.cute_dsl_w4a16_sm80_weights): per expert, 128 output
 // columns and 128 k, 8192 B of E2M1 codes in MMA fragment order, then 1024 B of block scales (the
 // E4M3 magnitude as a 5-bit exponent and 3-bit mantissa; the sign moves into the codes); a K tail
 // of at most 64 k takes a 5120 B record. Products carry e2m1 x scale x 2^-7; the per-expert global

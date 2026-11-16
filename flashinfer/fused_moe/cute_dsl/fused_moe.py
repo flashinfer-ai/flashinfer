@@ -1128,8 +1128,8 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM80 to SM90 (on the SM80 kernels, without tactics), SM100, SM103,
-    and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
+    Supported architectures: SM80 to SM90 (on the SM80 kernels, with tactics for W4A16 only),
+    SM100, SM103, and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
     SM100 and SM103.
 
     Attributes:
@@ -2053,8 +2053,8 @@ def cute_dsl_fused_moe(
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM80 to SM90 (on the SM80 kernels, without tactics), SM100, SM103,
-    and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
+    Supported architectures: SM80 to SM90 (on the SM80 kernels, with tactics for W4A16 only),
+    SM100, SM103, and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
     SM100 and SM103. This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
