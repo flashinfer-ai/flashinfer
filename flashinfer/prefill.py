@@ -3303,8 +3303,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             that is a contiguous int32 CUDA tensor, so in-place updates are
             visible to :meth:`run`, and a converted plan-time snapshot
             otherwise. A CUDA-graph replan must keep the referenced page count,
-            per-page geometry and query dtype so captured addresses stay valid;
-            incompatible replans raise. The widening is exact for every finite
+            per-page geometry, query dtype and index dtype so captured
+            addresses stay valid; incompatible replans raise. The gather
+            kernel module is loaded in :meth:`plan`, so :meth:`run` performs
+            no JIT work. The widening is exact for every finite
             FP8 value; NaN/Inf inputs follow the same conversion convention as
             the in-kernel FP8 repack. Unsupported combinations raise; the
             option never silently falls back. Defaults to ``False``.
@@ -3460,6 +3462,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pw_src_indices: Optional[torch.Tensor] = None
         self._pw_num_ref_pages = 0
         self._pw_compact_indices: Optional[torch.Tensor] = None
+        self._pw_widen_module: Optional[Any] = None
         self._pw_k_shadow: Optional[torch.Tensor] = None
         self._pw_v_shadow: Optional[torch.Tensor] = None
         self._seq_lens_kv = None
@@ -4347,7 +4350,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
 
-        self._pw_active = False
         if self._prewiden_fp8_kv:
             if self._jit_module is not None:
                 raise ValueError(
@@ -4396,6 +4398,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "prewiden_fp8_kv supports only plain paged prefill (no custom "
                     "mask, soft cap, sinks, prefix lengths or item positions)"
                 )
+            # JIT build/load belongs to plan(), never to a captured run().
+            from .jit.fp8_kv_widen import get_fp8_kv_widen_module
+
+            self._pw_widen_module = get_fp8_kv_widen_module()
             num_ref_pages = int(paged_kv_indptr_host[-1])
             if len(paged_kv_indices) < num_ref_pages:
                 raise ValueError(
@@ -4408,9 +4414,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 shape_k = (num_ref_pages, page_size, num_kv_heads, head_dim_qk)
                 shape_v = (num_ref_pages, page_size, num_kv_heads, head_dim_vo)
-            # Captured graphs keep the shadow addresses: reuse compatible
-            # storage across replans and reject incompatible ones before any
-            # captured binding is replaced.
+            # Captured graphs keep the shadow and compact-table addresses:
+            # reuse compatible storage across replans and reject incompatible
+            # ones before any captured binding is replaced. The compact table
+            # must carry the indptr dtype: the FA2 module's IdType follows it.
             shadows_compatible = (
                 self._pw_k_shadow is not None
                 and tuple(self._pw_k_shadow.shape) == shape_k
@@ -4418,26 +4425,31 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 and tuple(self._pw_v_shadow.shape) == shape_v
                 and self._pw_v_shadow.dtype == q_data_type
             )
-            if not shadows_compatible:
+            compact_compatible = (
+                self._pw_compact_indices is not None
+                and self._pw_compact_indices.numel() == num_ref_pages
+                and self._pw_compact_indices.dtype == paged_kv_indptr.dtype
+            )
+            if not shadows_compatible or not compact_compatible:
                 if self.is_cuda_graph_enabled and self._pw_k_shadow is not None:
                     raise ValueError(
                         "prewiden_fp8_kv: a CUDA-graph replan must keep the "
-                        "referenced page count, per-page geometry and query dtype "
-                        "so captured shadow-cache addresses stay valid"
+                        "referenced page count, per-page geometry, query dtype "
+                        "and index dtype so captured addresses stay valid"
                     )
-                self._pw_k_shadow = torch.empty(
-                    shape_k, dtype=q_data_type, device=self.device
-                )
-                self._pw_v_shadow = torch.empty(
-                    shape_v, dtype=q_data_type, device=self.device
-                )
-            if (
-                self._pw_compact_indices is None
-                or self._pw_compact_indices.numel() != num_ref_pages
-            ):
-                self._pw_compact_indices = torch.arange(
-                    num_ref_pages, dtype=torch.int32, device=self.device
-                )
+                if not shadows_compatible:
+                    self._pw_k_shadow = torch.empty(
+                        shape_k, dtype=q_data_type, device=self.device
+                    )
+                    self._pw_v_shadow = torch.empty(
+                        shape_v, dtype=q_data_type, device=self.device
+                    )
+                if not compact_compatible:
+                    self._pw_compact_indices = torch.arange(
+                        num_ref_pages,
+                        dtype=paged_kv_indptr.dtype,
+                        device=self.device,
+                    )
             if self.is_cuda_graph_enabled:
                 # The caller's buffer keeps the physical page ids, matching the
                 # base wrapper's in-place update contract; the compact table
@@ -4467,10 +4479,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             planned_backend = "fa2"
             self._pw_active = True
         else:
+            self._pw_active = False
             self._pw_src_dtype = None
             self._pw_src_indices = None
             self._pw_num_ref_pages = 0
             self._pw_compact_indices = None
+            self._pw_widen_module = None
             self._pw_k_shadow = None
             self._pw_v_shadow = None
 
@@ -5398,9 +5412,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise ValueError(
                     "prewiden_fp8_kv requires contiguous K and V page caches"
                 )
-            from .jit.fp8_kv_widen import get_fp8_kv_widen_module
-
-            get_fp8_kv_widen_module().gather_widen_fp8_kv(
+            self._pw_widen_module.gather_widen_fp8_kv(
                 k_cache,
                 v_cache,
                 self._pw_k_shadow,
