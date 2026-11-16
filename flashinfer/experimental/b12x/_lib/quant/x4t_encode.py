@@ -15,17 +15,19 @@ import torch
 X4T_TILE_ROWS = 16
 X4T_POSITION_MASK = (1 << 24) - 1
 
-# Upper bound for the temporary memory of one row slab (see _slab_rows). It
-# covers the per-row histograms and the per-scale temporaries, not the input
-# or the returned planes.
+# Upper bound for the temporary device (or, on CPU, host) memory of one row slab
+# (see _slab_rows), not counting the input or the returned planes.
 _SLAB_BUDGET_BYTES = 256 << 20
-# Per row: int32 ``counts`` (256 bins) and ``window`` (255 bins) are alive
-# together while the base is chosen.
-_HISTOGRAM_BYTES_PER_ROW = (256 + 255) * 4
-# Worst-case temporary bytes per scale: int64 histogram index (8), or at the
-# exception stage int64 nonzero pairs (16) + gathered values (1) + int64 words
-# (8) + int64 value copy (8) + outlier mask (1), rounded up.
-_TEMP_BYTES_PER_SCALE = 40
+# Per row: int32 ``counts`` (256 bins) and ``window`` (255 bins) plus the int64
+# ``argmax`` result are alive together while the base is chosen.
+_HISTOGRAM_BYTES_PER_ROW = (256 + 255) * 4 + 8
+# Per scale, at the exception stage (the peak): int64 nonzero pairs (16), uint8
+# gathered values (1) and int64 words (8) are live together, i.e. 25 per
+# exception and at most cols - 1 exceptions per row, plus the fixed plane
+# (1 + ceil(cols / 8) bytes per row). That is below 26 * cols for every cols;
+# the histogram and bit-packing stages (<= 8 and ~4.2 per scale plus per-row
+# terms) stay below the per-row histogram term plus this bound.
+_TEMP_BYTES_PER_SCALE = 26
 
 
 def _slab_rows(rows: int, cols: int) -> int:
@@ -87,23 +89,36 @@ def _encode_slab(
         ),
         dim=1,
     )
+    del bases, bits
 
+    # Exception stage. Peak is hits (16 B/exception) + values (1) + one int64
+    # temporary (8); every intermediate is freed or updated in place.
     hits = outliers.nonzero()  # row-major: sorted by global row, then column
     del outliers
-    local_rows, hit_cols = hits[:, 0], hits[:, 1]
-    values = flat[local_rows, hit_cols].to(torch.int64)
-    global_rows = local_rows + first_row
-    experts = global_rows // rows
-    positions = (global_rows - experts * rows) * cols + hit_cols
-    words = (values << 24) | positions
+    hit_rows, hit_cols = hits[:, 0], hits[:, 1]  # views of ``hits``
+    values = flat[hit_rows, hit_cols]
+    hit_rows += first_row  # global row
     first_expert = first_row // rows
     last_expert = (first_row + n - 1) // rows
-    per_expert = torch.bincount(
-        experts - first_expert, minlength=last_expert - first_expert + 1
-    )
-    # One device-to-host copy: per-expert counts followed by the exception words.
-    packed = torch.cat((per_expert, words)).cpu()
     span = last_expert - first_expert + 1
+    experts = hit_rows // rows
+    experts -= first_expert
+    per_expert = torch.bincount(experts, minlength=span)
+    experts += first_expert
+    experts *= rows
+    hit_rows -= experts  # row within its expert
+    del experts
+    hit_rows *= cols
+    hit_rows += hit_cols  # position within the expert
+    words = values.to(torch.int64)
+    del values
+    words <<= 24
+    words |= hit_rows
+    del hits, hit_rows, hit_cols
+    # One device-to-host copy of the counts followed by the words (16 B per
+    # exception with the cat, below the 25 B peak above), one for ``fixed``.
+    packed = torch.cat((per_expert, words)).cpu()
+    del words
     return fixed.cpu(), packed[span:], packed[:span].tolist(), first_expert
 
 

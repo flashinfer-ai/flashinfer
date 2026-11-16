@@ -187,8 +187,41 @@ def test_tall_expert_is_processed_in_slabs(monkeypatch):
 
 
 def test_histogram_counted_in_row_estimate():
-    assert x4t_encode._HISTOGRAM_BYTES_PER_ROW == (256 + 255) * 4
+    assert x4t_encode._HISTOGRAM_BYTES_PER_ROW == (256 + 255) * 4 + 8
     assert x4t_encode._slab_rows(16, 1) % 16 == 0
+
+
+def test_exception_heavy_slabs_fit_the_budget(monkeypatch):
+    # Every row holds bytes 0..254 (253 exceptions per row, the most a row can
+    # have at cols=255), so each slab is dominated by the exception stage.
+    rows, cols = 64, 255
+    scales = (
+        (torch.arange(rows * cols, dtype=torch.int64) % cols)
+        .to(torch.uint8)
+        .reshape(1, rows, cols)
+        .roll(shifts=3, dims=2)
+    )
+    assert encode_x4t_scales(scales)[1][0].numel() == rows * 253
+    budget = 4 << 20
+    monkeypatch.setattr(x4t_encode, "_SLAB_BUDGET_BYTES", budget)
+    slab = x4t_encode._slab_rows(rows, cols)
+    per_row = x4t_encode._HISTOGRAM_BYTES_PER_ROW + cols * 26
+    assert slab == budget // per_row // 16 * 16
+    # Worst-case exception stage: 25 B per exception plus the fixed plane.
+    exception_stage = 25 * 253 + 1 + (cols + 7) // 8
+    assert x4t_encode._TEMP_BYTES_PER_SCALE * cols >= exception_stage
+    assert slab * per_row <= budget and 16 <= slab < 300 * rows
+    calls = []
+    original = x4t_encode._encode_slab
+    monkeypatch.setattr(
+        x4t_encode,
+        "_encode_slab",
+        lambda *args: calls.append(args[2]) or original(*args),
+    )
+    big = scales.expand(300, rows, cols).contiguous()
+    got = encode_x4t_scales(big)
+    assert len(calls) > 1
+    _check_planes(big, got)
 
 
 def test_planes_own_their_storage():
