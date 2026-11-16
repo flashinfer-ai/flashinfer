@@ -1373,6 +1373,7 @@ kernel_cake_tinygemm2_tcgen05_f1168c30e20d13d518cf(const __grid_constant__ CUten
             int m_run = blockIdx.x * 32 + lane / 16 * 16;
             float bias_run[16];
             int _min_0 = ((m_run + 0) < (M - 1) ? (m_run + 0) : (M - 1));
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             bias_run[0] = (float)bias[_min_0];
             int _min_1 = ((m_run + 1) < (M - 1) ? (m_run + 1) : (M - 1));
             bias_run[1] = (float)bias[_min_1];

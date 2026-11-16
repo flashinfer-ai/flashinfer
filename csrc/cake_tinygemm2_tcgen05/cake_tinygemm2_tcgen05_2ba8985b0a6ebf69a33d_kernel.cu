@@ -1163,6 +1163,7 @@ kernel_cake_tinygemm2_tcgen05_2ba8985b0a6ebf69a33d(const __grid_constant__ CUten
             int col_half = lane / 16;
             int bm0_1_0 = m0_e + epi_tid % 8;
             int _min_0_2 = ((bm0_1_0) < (M - 1) ? (bm0_1_0) : (M - 1));
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             float bv0_1_0 = bias[_min_0_2];
             unsigned int _phase_mma_epi_full_0 = 0;
             mbarrier_wait(mma_epi_full_addr, _phase_mma_epi_full_0);

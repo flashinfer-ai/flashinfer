@@ -16,6 +16,7 @@ from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
 from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
+from tests.test_helpers import pdl as pdl_helper
 
 
 # Curated smoke set. Randomized breadth over {m,n,k} x out-dtype x backend (tight
@@ -212,6 +213,74 @@ def test_mm_bf16_tgv_single_element_output(pdl):
     out = mm_bf16(a, w.T, pdl=pdl, backend="tgv")
     reference = (a.float() @ w.float().T).to(torch.bfloat16)
     torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+def test_mm_bf16_tinygemm_pdl_waits_for_bias(monkeypatch):
+    """tinygemm consumes a bias produced by the preceding PDL kernel."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("tinygemm", cc_num):
+        pytest.skip("tinygemm backend not supported on current compute capability.")
+
+    # Keep the producer alive through the first launch of the PDL instantiation.
+    monkeypatch.setattr(pdl_helper, "_LATE_STORE_SPIN_CYCLES", 1_000_000_000)
+    torch.cuda.init()
+    torch.cuda.synchronize()
+    # The middle shape routes to a generated tcgen05 PDL program; the other two
+    # stay on tinygemm2_sm100.
+    for m, n, k in ((8, 768, 7168), (28, 2048, 3072), (1, 4096, 4096)):
+        torch.manual_seed(42)
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(n, device="cuda", dtype=torch.bfloat16)
+        # Warm the JIT module before launching a producer that stays alive while
+        # the dependent kernel is launched.  This launch must not request PDL
+        # because there is no preceding programmatic-launch producer.
+        expected = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        mm_bf16(a, weight.T, bias, pdl=False, out=expected, backend="tinygemm")
+        out = torch.empty_like(expected)
+
+        from flashinfer.gemm import routergemm
+
+        if cc_num == 90:
+            program = routergemm._tinygemm2_wgmma_program(a, weight, True, True)
+            # No wgmma window admits (8, 768, 7168); that shape keeps the reference.
+            if (m, n, k) == (8, 768, 7168):
+                assert program is None
+            else:
+                assert program is not None
+        elif cc_num in (100, 103, 107):
+            program = routergemm._tinygemm2_tcgen05_program(a, weight, out, True, True)
+            if (m, n, k) == (28, 2048, 3072):
+                assert program == "PACKED_PDL"
+            else:
+                assert program is None
+                assert routergemm._use_tinygemm2_sm100(a.device)
+        else:
+            assert cc_num in (110, 120, 121)
+            assert (
+                routergemm._tinygemm2_tcgen05_program(a, weight, out, True, True)
+                is None
+            )
+            assert not routergemm._use_tinygemm2_sm100(a.device)
+        torch.cuda.synchronize()
+
+        # late_store takes an int32 destination.  The alias updates the first two
+        # bf16 bias entries as one raw word after triggering the dependent launch.
+        words = bias.view(torch.int32)
+        expected_word = words[0].item()
+
+        # Warm the PDL specialization with a producer that writes the current
+        # value.  The actual late store below must not overlap first-use loading.
+        pdl_helper.late_store(words[:1], expected_word)
+        mm_bf16(a, weight.T, bias, pdl=True, out=out, backend="tinygemm")
+        torch.cuda.synchronize()
+
+        words[0] = 0
+        pdl_helper.late_store(words[:1], expected_word)
+
+        mm_bf16(a, weight.T, bias, pdl=True, out=out, backend="tinygemm")
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
