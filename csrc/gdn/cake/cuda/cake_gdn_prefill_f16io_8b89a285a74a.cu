@@ -13,6 +13,9 @@
 // limitations under the License.
 
 // clang-format off
+#ifndef CAKE_GDN_STATE_VEC_ALIGNED
+#define CAKE_GDN_STATE_VEC_ALIGNED 0
+#endif
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
 
@@ -2049,6 +2052,9 @@ CAKE_GDN_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_const
                     if (o_cg1_stage == 2) { o_cg1_stage = 0; o_cg1_phase ^= 1; }
                 }
                 if ((STORE_FINAL_STATE != 0 || ENABLE_CHECKPOINTS != 0) && num_chunks_b_1 > 0) {
+                    #if !CAKE_GDN_STATE_VEC_ALIGNED
+                    bool final_vec_ok = (STORE_FINAL_STATE == 0 || ((unsigned long long)output_state + (unsigned long long)output_state_head_base_cg1 * 4ull & 15ull) == 0ull);
+                    #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                     mbarrier_wait(kv_acc_full_addr, _phase_kv_acc_full_0);
                     _phase_kv_acc_full_0 ^= 1;
                     int warp_in_wg_3 = warp % 4;
@@ -2066,6 +2072,7 @@ CAKE_GDN_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_const
                             : "=f"(_tmem_load_34[0]), "=f"(_tmem_load_34[1]), "=f"(_tmem_load_34[2]), "=f"(_tmem_load_34[3]), "=f"(_tmem_load_34[4]), "=f"(_tmem_load_34[5]), "=f"(_tmem_load_34[6]), "=f"(_tmem_load_34[7]), "=f"(_tmem_load_34[8]), "=f"(_tmem_load_34[9]), "=f"(_tmem_load_34[10]), "=f"(_tmem_load_34[11]), "=f"(_tmem_load_34[12]), "=f"(_tmem_load_34[13]), "=f"(_tmem_load_34[14]), "=f"(_tmem_load_34[15]), "=f"(_tmem_load_34[16]), "=f"(_tmem_load_34[17]), "=f"(_tmem_load_34[18]), "=f"(_tmem_load_34[19]), "=f"(_tmem_load_34[20]), "=f"(_tmem_load_34[21]), "=f"(_tmem_load_34[22]), "=f"(_tmem_load_34[23]), "=f"(_tmem_load_34[24]), "=f"(_tmem_load_34[25]), "=f"(_tmem_load_34[26]), "=f"(_tmem_load_34[27]), "=f"(_tmem_load_34[28]), "=f"(_tmem_load_34[29]), "=f"(_tmem_load_34[30]), "=f"(_tmem_load_34[31])
                             : "r"(final_state_addr_cg1));
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                        #if CAKE_GDN_STATE_VEC_ALIGNED
                         #pragma unroll
                         for (int state_vec_idx_cg1 = 0; state_vec_idx_cg1 < 8; state_vec_idx_cg1++) {
                             {
@@ -2077,6 +2084,34 @@ CAKE_GDN_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_const
                                 }
                             }
                         }
+                        #else  // CAKE_GDN_STATE_VEC_ALIGNED
+                        if (__builtin_expect(final_vec_ok, 1)) {
+                            #pragma unroll
+                            for (int state_vec_idx_cg1 = 0; state_vec_idx_cg1 < 8; state_vec_idx_cg1++) {
+                                {
+                                    long long final_state_vec_index_cg1 = state_base_idx_cg1 + (long long)(state_col_block_cg1 * 32) + (long long)(state_vec_idx_cg1 * 4);
+                                    {
+                                        asm volatile(
+                                            "st.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};"
+                                            :: "l"((output_state + final_state_vec_index_cg1) + 0), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 0]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 1]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 2]), "f"(_tmem_load_34[state_vec_idx_cg1 * 4 + 3]) : "memory");
+                                    }
+                                }
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int state_vec_idx_cg1 = 0; state_vec_idx_cg1 < 8; state_vec_idx_cg1++) {
+                                {
+                                    long long final_state_vec_index_cg1 = state_base_idx_cg1 + (long long)(state_col_block_cg1 * 32) + (long long)(state_vec_idx_cg1 * 4);
+                                    {
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 0];
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1 + 1ll)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 1];
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1 + 2ll)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 2];
+                                        *(reinterpret_cast<float*>(output_state + (final_state_vec_index_cg1 + 3ll)) + (0)) = _tmem_load_34[state_vec_idx_cg1 * 4 + 3];
+                                    }
+                                }
+                            }
+                        }
+                        #endif  // CAKE_GDN_STATE_VEC_ALIGNED
                     }
                     mbarrier_arrive(kv_acc_empty_addr);
                 }

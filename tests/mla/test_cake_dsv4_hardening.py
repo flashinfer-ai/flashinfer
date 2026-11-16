@@ -850,6 +850,8 @@ def _build_case(
     alias_compressed: bool = False,
     tile_padded: bool = False,
     beacon: bool = False,
+    newest_first: bool = False,
+    compressed_pages: int = 64,
     seed: Optional[int] = None,
 ) -> _Case:
     """Build one causal DSv4 case.
@@ -857,10 +859,12 @@ def _build_case(
     ``seq_lens`` / ``q_lens`` are per request (``layout="dense"`` needs equal
     ``q_lens``). SWA slot ``j < visible`` of a row holds the token
     ``token_idx - visible + 1 + j`` (ascending, ending at the query token's
-    position, the trtllm-gen table convention); slots beyond are ``-1``
+    position, the trtllm-gen table convention; ``newest_first``: slot ``j``
+    holds ``token_idx - j``, sglang's convention); slots beyond are ``-1``
     (``swa_tail="minus_one"``, sglang's padding) or stale valid rows of the
     SWA pool's poison page (``"stale"``). ``compressed_width`` compressed
-    columns hold random valid rows of a page-``compressed_page`` pool up to the
+    columns hold random valid rows of a page-``compressed_page`` pool of
+    ``compressed_pages`` pages up to the
     row's active count (``compressed_lens``, default: the width); columns at
     or beyond it point at that pool's poison page; ``minus_one_inside`` turns
     every seventh active compressed slot into ``-1``. ``alias_compressed``
@@ -928,7 +932,10 @@ def _build_case(
     token_idx = seq_lens_t.long()[batch] - length + q_off
     visible = (token_idx + 1).clamp(0, SWA_WINDOW)
     j = torch.arange(SWA_WINDOW, device="cuda:0")
-    token = (token_idx[:, None] - visible[:, None] + 1 + j[None, :]).clamp_min(0)
+    if newest_first:
+        token = (token_idx[:, None] - j[None, :]).clamp_min(0)
+    else:
+        token = (token_idx[:, None] - visible[:, None] + 1 + j[None, :]).clamp_min(0)
     page = (token // PAGE_SWA).clamp_max(page_table.shape[1] - 1)
     flat = page_table[batch[:, None], page] * PAGE_SWA + token % PAGE_SWA
     in_window = j[None, :] < visible[:, None]
@@ -948,7 +955,7 @@ def _build_case(
         )
     swa_table = swa_table.to(torch.int32)
     if compressed_width:
-        comp_pages = 64
+        comp_pages = compressed_pages
         comp_pool = _random_rows(
             (comp_pages + extra_pages, 1, compressed_page, 512),
             offset=0.25,
@@ -1534,10 +1541,15 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
 def test_enable_pdl_h64_cluster_body_matches_and_waits_for_the_query_producer(
     monkeypatch,
 ):
-    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program on
-    SM100/SM103; as a programmatic dependent it is bitwise equal to the plain
-    launch and, inside a graph, reads the query the copy right before it writes."""
+    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program (the
+    route on SM100; SM103 routes them to the persistent body, so the test
+    selects the program there); as a programmatic dependent it is bitwise
+    equal to the plain launch and, inside a graph, reads the query the copy
+    right before it writes."""
     _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    monkeypatch.setattr(cake, "_route", lambda **kwargs: "fp8_lowhead_h64")
     calls = _count_dispatches(monkeypatch)
     case = _build_case(
         num_heads=64,
@@ -1648,7 +1660,12 @@ def test_fixed_128mib_workspace_admits_1024_fp8_h128_rows(monkeypatch):
         alias_compressed=True,
     )
     req = case.requirement()
-    assert req.route == "fp8_h128_prefill_source_persistent" and req.num_splits == 1
+    # SM103 keeps SWA-only decode launches on the uniform-gather program.
+    assert req.route in (
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h128_prefill_source_persistent_uniform",
+    )
+    assert req.num_splits == 1
     assert req.single_launch_bytes <= WORKSPACE_128MIB
     assert req.rows_per_launch(WORKSPACE_128MIB) == 1024
     workspace = _workspace_128mib()
@@ -2025,7 +2042,7 @@ _OUT_ALIGN_CASES = [
     _align_case(
         "fp8_h128_prefill_source_persistent_uniform", 128, _FP8, [4] * 3, width=1024
     ),
-    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64]),
+    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64], width=512),
     _align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512),
     _align_case("fp8_h8_h16_source_exact", 16, _FP8, [5, 3, 4], "ragged", 128),
     _align_case("bf16_h8_h16_source_exact", 16, _BF16, [5, 3, 4], "ragged", 128),
@@ -2069,6 +2086,9 @@ def test_misaligned_caller_out_matches_aligned(
     _skip_unless_cake_gpu(sm107=route == "fp8_lowhead_prefill")
     import flashinfer.mla.cake_dsv4 as cake
 
+    if route == "fp8_lowhead_h64":
+        # The route on SM100; SM103 runs these rows on the persistent body.
+        monkeypatch.setattr(cake, "_route", lambda **kwargs: route)
     calls = _count_dispatches(monkeypatch)
     launched: list = []
     original = cake._prepare_variant
@@ -2113,6 +2133,158 @@ def test_misaligned_caller_out_matches_aligned(
     torch.cuda.synchronize()
     assert torch.equal(view.view(torch.int16), aligned.view(torch.int16))
     assert torch.isnan(raw[:start]).all() and torch.isnan(raw[start + numel :]).all()
+
+
+# --------------------------------------------------------------------------- DeepSeek-V4 layer rows
+#
+# The rows DeepSeek-V4 serves, FP8 cache: every layer has the 128-token window
+# (sglang's table: column j holds position pos - j, newest first); a C4 layer
+# adds the top 512 (Flash) or 1024 (Pro) compressed rows, a C128 layer one row
+# per 128 positions (page 2), 128 + context / 128 slots wide; in decode the
+# C128 table is as wide as the server's context allows (padded to 64), so a
+# 16K server's rows hold 128 + 128 live slots of 320.  Flash runs 64
+# heads per rank under DP attention and 32 / 16 / 8 at TP2 / TP4 / TP8; Pro
+# runs 128, and 64 / 32 / 16 at TP2 / TP4 / TP8.  Decode batches reach past one
+# wave of two CTAs per token; MTP rows take 4 tokens per request; prefill is
+# two ragged requests.
+
+# layer -> (compressed width, compressed page size, live compressed slots or
+# None: every slot the position has produced)
+_DSV4_LAYERS = {
+    "swa": (0, 64, None),
+    "c4flash": (512, 64, None),
+    "c4pro": (1024, 64, None),
+    "c128-16k": (128, 2, None),
+    "c128-16k-server": (192, 2, 128),
+    "c128-64k": (512, 2, None),
+    "c128-128k": (1024, 2, None),
+}
+_DSV4_FLASH_LAYERS = (
+    "swa",
+    "c4flash",
+    "c128-16k",
+    "c128-16k-server",
+    "c128-64k",
+    "c128-128k",
+)
+_DSV4_ROWS = [
+    pytest.param(h, layer, id=f"h{h}-{layer}")
+    for h in (64, 32, 16, 8)
+    for layer in _DSV4_FLASH_LAYERS
+] + [pytest.param(h, "c4pro", id=f"h{h}-c4pro") for h in (128, 64, 32, 16)]
+_DSV4_FORMS = ["decode-b8", "decode-b64", "decode-b256", "mtp-b32q4", "prefill"]
+
+
+def _dsv4_layer_case(h_q: int, layer: str, form: str, width: Optional[int] = None):
+    """One DeepSeek-V4 layer row (newest-first window table, FP8 cache).
+
+    C4 rows attend their whole selection; a C128 row attends the compressed
+    rows its position has produced, so its active count grows with the
+    position inside a request (``width`` overrides the layer's compressed
+    width)."""
+    compressed, page, live = _DSV4_LAYERS[layer]
+    if width is not None:
+        compressed = width - SWA_WINDOW
+    if form.startswith("decode"):
+        batch = int(form.split("-b")[1])
+        q_lens, seq = [1] * batch, [640 + 37 * i % 1024 for i in range(batch)]
+        layout = "dense"
+    elif form == "mtp-b32q4":
+        q_lens, seq = [4] * 32, [640 + 37 * i % 1024 for i in range(32)]
+        layout = "dense"
+    elif form == "prefill":
+        q_lens, seq = [171, 341], [1024 + 171, 2048 + 341]
+        layout = "ragged"
+    else:
+        raise ValueError(form)
+    lens = None
+    rows = sum(q_lens)
+    if live is not None:
+        lens = [live] * rows
+    elif compressed and page == 2:
+        lens = []
+        for q in q_lens:
+            lens += [max(compressed - (q - 1 - i) // 128, 1) for i in range(q)]
+    return _build_case(
+        num_heads=h_q,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=seq,
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=compressed,
+        compressed_page=page,
+        compressed_pages=max(64, rows * compressed // page // 4),
+        compressed_lens=lens,
+        alias_compressed=not compressed,
+        newest_first=True,
+    )
+
+
+@pytest.mark.parametrize("h_q,layer", _DSV4_ROWS)
+@pytest.mark.parametrize("form", _DSV4_FORMS)
+def test_dsv4_layer_rows(h_q, layer, form):
+    """Every DeepSeek-V4 layer row the FP8 route serves: the masked columns
+    contribute nothing and the output matches the reference.  Covers the
+    low-head decode rows wider than one producer partition and the 8-head
+    prefill rows, which run the persistent or the M64 body.  SM107 runs every
+    row too: its low-head decode rows over compressed items take the M64 body."""
+    _skip_unless_cake_gpu(sm107=True)
+    case = _dsv4_layer_case(h_q, layer, form)
+    _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
+
+
+@pytest.mark.parametrize("h_q", [128, 64, 32, 16, 8])
+@pytest.mark.parametrize("form", ["decode-b64", "mtp-b32q4", "prefill"])
+def test_dsv4_c128_rows_past_128k_raise_before_any_launch(h_q, form):
+    """A C128 layer past 128K context (128 + 2048 slots at 256K) is wider than
+    any FP8 body takes: the call raises before it launches anything and leaves
+    ``out`` untouched."""
+    _skip_unless_cake_gpu(sm107=True)
+    case = _dsv4_layer_case(h_q, "c128-128k", form, width=2176)
+    out = case.nan_out()
+    with pytest.raises(ValueError, match=r"sparse_topk 2176: .* at most 1152") as e:
+        case.run(workspace=_workspace_128mib(), out=out, float_scales=True)
+    torch.cuda.synchronize()
+    assert "nvfp4" not in str(e.value)
+    assert torch.isnan(out.float()).all()
+
+
+@pytest.mark.parametrize("h_q", [128, 64, 32, 16, 8])
+@pytest.mark.parametrize("width", [320, 704], ids=["c128-16k", "c128-64k"])
+@pytest.mark.parametrize("batch", [8, 32])
+@pytest.mark.parametrize("minus_one_inside", [False, True], ids=["", "minus-one"])
+def test_dsv4_c128_mtp_rows_at_the_compression_boundary(
+    h_q, width, batch, minus_one_inside
+):
+    """C128 MTP rows whose active counts come from their positions, across a
+    128-position boundary: request ``b`` ends at position 640 + 128 b, so its
+    four rows attend 4 + b, 4 + b, 4 + b and 5 + b compressed rows of a table
+    padded to the server's context (320 or 704 slots).  Columns past each
+    row's count point at a poison page (bit-identical output), every seventh
+    active slot is ``-1`` with ``minus_one_inside``, and the last visible
+    window slot and the last active compressed column read beacon rows whose
+    sign flip must move every row.  Runs the persistent and the M64 bodies
+    (and the one-partition producer at 8/16/32 heads, width 320, 8
+    requests)."""
+    _skip_unless_cake_gpu(sm107=True)
+    seq = [640 + 128 * b for b in range(batch)]
+    lens = [max((s - 4 + i + 1) // 128, 1) for s in seq for i in range(4)]
+    assert lens[:4] == [4, 4, 4, 5]
+    case = _build_case(
+        num_heads=h_q,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=seq,
+        q_lens=[4] * batch,
+        layout="dense",
+        compressed_width=width - SWA_WINDOW,
+        compressed_page=2,
+        compressed_pages=max(64, 4 * batch * (width - SWA_WINDOW) // 8),
+        compressed_lens=lens,
+        minus_one_inside=minus_one_inside,
+        newest_first=True,
+        beacon=True,
+    )
+    _assert_boundary_columns_attended(case, _workspace_128mib())
 
 
 # ---------------------------------------------------------- padded rows on the source-exact routes
