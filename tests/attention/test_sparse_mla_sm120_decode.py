@@ -357,3 +357,45 @@ def test_decode_single_kernel_boundary(impl, tmp_path, inline):
     assert (
         "dsv4_fp8_splitkv_decode" if impl == "decode-splitkv" else "cute_prefill"
     ) in nodes[0]
+
+
+@pytest.mark.parametrize("impl", ["auto", "decode-splitkv", "decode"])
+@pytest.mark.parametrize("tokens", [7, 140])
+def test_decode_gapped_inline_mutable_graph(impl, tokens):
+    from tests.attention.test_sparse_mla_sm120_dsv41_inline import (
+        _packed_block_view,
+        _row_indices,
+    )
+
+    f = fixture(tokens, 16, "v41_fp8", pool_tokens=256, inline=True)
+    lse = call(f, impl)
+    expected = [x.clone() for x in (f["out"].view(torch.uint8), f["scales"], lse)]
+    # Main and extra caches have different row pitches and whole-row page gaps.
+    for i, (cache, pitch, gap) in enumerate(
+        zip(f["caches"], (544, 1056), (3, 5), strict=True)
+    ):
+        page = cache.shape[1]
+        f["caches"][i], _ = _packed_block_view(cache, page + gap, pitch=pitch)
+        f["indices"][i] = _row_indices(f["indices"][i], page, page + gap)
+    lse = call(f, impl)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call(f, impl)
+    for changed in (False, True):
+        if changed:
+            for ids in f["indices"]:
+                ids.fill_(0)
+                ids[:, ::7] = -1
+            f["positions"].add_(1)
+            call(f, impl)
+            expected = [
+                x.clone() for x in (f["out"].view(torch.uint8), f["scales"], lse)
+            ]
+        f["out"].fill_(float("nan"))
+        f["scales"].fill_(255)
+        lse.fill_(float("nan"))
+        graph.replay()
+        for actual, wanted in zip(
+            (f["out"].view(torch.uint8), f["scales"], lse), expected, strict=True
+        ):
+            torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
