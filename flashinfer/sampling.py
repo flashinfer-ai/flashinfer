@@ -225,6 +225,22 @@ def _blackwell_softmax_launches_with_pdl(device_index: int) -> bool:
     return _blackwell_softmax_capability(device_index) in ((10, 3), (10, 7))
 
 
+def _pack_top_k_arr(
+    maybe_top_k_arr: Optional[torch.Tensor], dtype: torch.dtype
+) -> Optional[torch.Tensor]:
+    """Cast a per-row top-k tensor to the dtype the kernel reads and pack it.
+
+    The kernels index this array linearly (``top_k_arr[row_idx]``), while
+    ``Tensor.to`` preserves strides. A view such as ``params[:, 0]`` would
+    therefore make row ``i`` read ``params[2 * i]``. Contiguous tensors are
+    returned unchanged, so the common path does not copy.
+    """
+    if maybe_top_k_arr is None:
+        return None
+    top_k_arr = maybe_top_k_arr.to(dtype)
+    return top_k_arr if top_k_arr.is_contiguous() else top_k_arr.contiguous()
+
+
 @functools.cache
 def get_sampling_module():
     module = gen_sampling_module().build_and_load()
@@ -457,10 +473,9 @@ def get_sampling_module():
         # The kernel reads top_k_arr with the element type it uses for indices and
         # output (IdType), so the threshold tensor has to carry that dtype. Casting
         # unconditionally to int32 makes an int64 indices path reinterpret two int32
-        # entries as one int64 and read past the end of the array.
-        maybe_top_k_arr = (
-            maybe_top_k_arr.to(out_dtype) if maybe_top_k_arr is not None else None
-        )
+        # entries as one int64 and read past the end of the array. The array is also
+        # read linearly, so a strided view has to be packed.
+        maybe_top_k_arr = _pack_top_k_arr(maybe_top_k_arr, out_dtype)
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -595,9 +610,7 @@ def get_sampling_module():
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
         # See top_k_sampling_from_probs: top_k_arr is read as IdType by the kernel.
-        maybe_top_k_arr = (
-            maybe_top_k_arr.to(out_dtype) if maybe_top_k_arr is not None else None
-        )
+        maybe_top_k_arr = _pack_top_k_arr(maybe_top_k_arr, out_dtype)
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -698,7 +711,7 @@ def get_sampling_module():
         assert probs.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {probs.dtype}, expected float32, float16, or bfloat16"
         )
-        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+        maybe_top_k_arr = _pack_top_k_arr(maybe_top_k_arr, torch.int32)
         renorm_probs = torch.empty_like(probs)
         module.top_k_renorm_probs(
             probs,
@@ -735,7 +748,7 @@ def get_sampling_module():
         assert logits.dtype in [torch.float32, torch.float16, torch.bfloat16], (
             f"Unsupported dtype {logits.dtype}, expected float32, float16, or bfloat16"
         )
-        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+        maybe_top_k_arr = _pack_top_k_arr(maybe_top_k_arr, torch.int32)
         mask_logits = torch.empty_like(logits)
 
         module.top_k_mask_logits(

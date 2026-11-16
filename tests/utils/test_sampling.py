@@ -2556,6 +2556,67 @@ def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
     torch.testing.assert_close(actual, expected)
 
 
+def _strided_per_row_top_k(num_rows: int) -> torch.Tensor:
+    """A per-row top-k view with a non-unit stride, e.g. ``params[:, 0]``."""
+    backing = torch.tensor(
+        [1, 99, 10, 99, 50, 99, 128, 99, 3, 99, 65, 99, 7, 99, 2, 99],
+        dtype=torch.int32,
+        device="cuda:0",
+    )
+    top_k = backing[::2][:num_rows]
+    assert not top_k.is_contiguous()
+    return top_k
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs_strided_top_k_arr(dtype):
+    """A strided per-row top_k view must behave like its packed copy.
+
+    The kernel indexes the threshold array linearly, so ``params[::2]`` used to
+    be read as ``params[0], params[1], ...`` and rows got a neighbour's k.
+    """
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(8, 128, device="cuda:0"), dim=-1).to(dtype)
+    top_k = _strided_per_row_top_k(probs.size(0))
+
+    expected = flashinfer.sampling.top_k_renorm_probs(probs, top_k.contiguous())
+    actual = flashinfer.sampling.top_k_renorm_probs(probs, top_k)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_top_k_mask_logits_strided_top_k_arr():
+    torch.manual_seed(42)
+    logits = torch.randn(8, 128, device="cuda:0")
+    top_k = _strided_per_row_top_k(logits.size(0))
+
+    expected = flashinfer.sampling.top_k_mask_logits(logits, top_k.contiguous())
+    actual = flashinfer.sampling.top_k_mask_logits(logits, top_k)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("use_top_p", [False, True])
+def test_top_k_sampling_strided_top_k_arr(use_top_p):
+    """Sampling must draw the same tokens from a strided and a packed top_k.
+
+    The same seed and offset are passed to both calls, so the RNG stream is
+    identical and the sampled indices have to match exactly.
+    """
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(8, 128, device="cuda:0"), dim=-1)
+    top_k = _strided_per_row_top_k(probs.size(0))
+
+    def sample(k):
+        if use_top_p:
+            return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, k, 0.9, seed=7, offset=0
+            )
+        return flashinfer.sampling.top_k_sampling_from_probs(probs, k, seed=7, offset=0)
+
+    expected = sample(top_k.contiguous())
+    actual = sample(top_k)
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 500])
