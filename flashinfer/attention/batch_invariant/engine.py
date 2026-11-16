@@ -100,7 +100,8 @@ class AttnConfig:
     # replicated-row placement;
     # mixed batches take the row body either way (same bits)
     q2: bool = False  # with softmax_wgs = 2: the paired placement -- two Q tiles per unit, warpgroup k owns Q tile k (whole rows), one
-    # K / V stream for both; D = 64 (blocks/operands.py: S_A | S_B | O_c,A | O_m,A | O_c,B | O_m,B in TMEM)
+    # K / V stream for both; D = 64 and D = 128 (blocks/operands.py: both tiles' S and O_c in TMEM, O_m in smem; at D = 128 P over S,
+    # which fits 328 KB parts only)
 
     def describe(self) -> str:
         return (
@@ -121,7 +122,7 @@ class AttnConfig:
             and self.grid >= 0
             and self.merge in ("auto", "fixup", "inkernel")
             and self.small in ("rep", "swap")
-            and (not self.q2 or (self.softmax_wgs == 2 and D == 64))
+            and (not self.q2 or (self.softmax_wgs == 2 and D in (64, 128)))
         )
 
     def lean(self) -> str:
@@ -153,8 +154,17 @@ SWAPS_MAX_ROWS = 8  # units of at most this many live rows take the Swaps-AB ker
 SWAPS_DIMS = (64, 128, 256)  # head dims the Swaps-AB kernel implements
 
 
-Q2_MIN_UNITS_PER_SM = 4  # the paired placement halves the unit count: below this many units per SM the lost parallelism
-# outweighs the overlap of the two softmax warpgroups, so smaller batches take the one-warpgroup body (a placement rule: same bits)
+Q2_MIN_UNITS_PER_SM = {
+    64: 4,
+    128: 4,
+}  # the paired placement halves the unit count: below this many units per SM the lost parallelism outweighs the overlap of the two
+# softmax warpgroups, so smaller batches take the one-warpgroup body with the default ring (a placement rule: same bits); per head dim
+Q2_RING = {
+    64: {True: 4, False: 3},
+    128: {True: 2, False: 0},
+}  # the paired placement's ring depth per head dim, keyed by "a 328 KB part" (SM107) vs a 228 KB part (SM100 / SM103): the two Q
+# tiles and the smem O_m leave room for 4 / 3 slots at D = 64; at D = 128 (two 32 KB Q tiles, a 128 KB O_m) only the larger part
+# fits the placement at all (0: not available)
 
 
 def pair_units(desc: list, grid: int = 0) -> list:
@@ -349,7 +359,7 @@ def plan_attention(
     )
     if (
         config.q2
-        and len(plan.desc) >= Q2_MIN_UNITS_PER_SM * sm
+        and len(plan.desc) >= Q2_MIN_UNITS_PER_SM[D] * sm
         and not (config.small == "swap" and D in SWAPS_DIMS and swaps_n_pad(plan))
     ):
         paired = pair_units(plan.desc, sm)
@@ -652,16 +662,27 @@ def _run_attention_validated(
             int(grid),
         )
     else:
+        from .blocks.operands import arch_smem_cap
+
+        # the smem plan is sized for the execution device's shared memory: part of the kernel's identity, in-process and on disk
+        cap = arch_smem_cap(q.device)
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
         if (
             config.q2 and n_launch is None
-        ):  # too few units to pair: the one-warpgroup body (same bits)
+        ):  # too few units to pair: the one-warpgroup body with its default ring (same bits)
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, 1, False, ragged
+                D, g, page, DEFAULT_RING[D], 1, False, ragged, cap
             )
         else:
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, config.softmax_wgs, config.q2, ragged
+                D,
+                g,
+                page,
+                config.kv_slots,
+                config.softmax_wgs,
+                config.q2,
+                ragged,
+                cap,
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
