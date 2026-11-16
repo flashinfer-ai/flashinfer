@@ -2068,11 +2068,6 @@ class TmemSResource(DecodeGenResourceBase):
                         and (tile_offset_k <= window_start_idx)
                         and (next_tile_offset_k > window_start_idx)
                     )
-            if cutlass.const_expr(cfg.uses_per_row_causal_mask and not use_sparse):
-                # Every grouped row's causal end is at most seq_len_kv and the
-                # per-row path below applies the window start too, so it masks a
-                # superset of this tail/window mask on every tile that needs it.
-                should_apply_dense_mask = False
             if should_apply_dense_mask:
                 # Mask invalid S registers to -inf so they produce zero P and
                 # do not affect row max or row sum. This keeps the schedule
