@@ -720,12 +720,27 @@ cudaError_t BatchPagedAttentionPersistentResidentBlocks(int* blocks_per_sm, size
       BatchPagedAttentionPersistentConfig<CTA_TILE_Q_1, CTA_TILE_Q_2, HEAD_DIM_QK, HEAD_DIM_VO,
                                           MASK_MODE, EQUAL_KV_STRIDES, AttentionVariant, Params>;
   const size_t size = Config::smem_size();
+  *smem_size = size;
+
+  // Raising the opt-in limit is what fails for a kernel whose request exceeds the device's
+  // per-block budget, and the error it returns ("invalid argument") says nothing about the
+  // request. Answer that question here instead, so a size that cannot be hosted is reported
+  // as a kernel that does not fit rather than as a failed call.
+  int device = 0;
+  int max_smem_per_block_optin = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_block_optin,
+                                              cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+  if (size > static_cast<size_t>(max_smem_per_block_optin)) {
+    *blocks_per_sm = 0;
+    return cudaSuccess;
+  }
+
   auto kernel = Config::kernel();
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, size));
   FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(blocks_per_sm, kernel,
                                                                      Config::NUM_THREADS, size));
-  *smem_size = size;
   return cudaSuccess;
 }
 
