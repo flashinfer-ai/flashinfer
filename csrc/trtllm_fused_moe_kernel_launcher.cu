@@ -5642,10 +5642,15 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         localized.bmm1Workspaces[d] = workspace.bmm1_workspace;
         localized.bmm2Workspaces[d] = workspace.bmm2_workspace;
       } else {
-        scratch1[d] = _alloc_tensor({workspace_fc1.size(0)}, dl_int8, hidden_states.device());
-        scratch2[d] = _alloc_tensor({workspace_fc2.size(0)}, dl_int8, hidden_states.device());
-        localized.bmm1Workspaces[d] = scratch1[d].data_ptr();
-        localized.bmm2Workspaces[d] = scratch2[d].data_ptr();
+        // A config without split-K needs no scratch, and its workspace stays empty.
+        if (workspace_fc1.size(0) > 0) {
+          scratch1[d] = _alloc_tensor({workspace_fc1.size(0)}, dl_int8, hidden_states.device());
+          localized.bmm1Workspaces[d] = scratch1[d].data_ptr();
+        }
+        if (workspace_fc2.size(0) > 0) {
+          scratch2[d] = _alloc_tensor({workspace_fc2.size(0)}, dl_int8, hidden_states.device());
+          localized.bmm2Workspaces[d] = scratch2[d].data_ptr();
+        }
       }
     }
     // The caller's stream waits for both domains before this returns, so the scratch freed

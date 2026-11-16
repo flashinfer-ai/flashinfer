@@ -954,10 +954,10 @@ void Runner::runLocalized(MoERunnerArgs const& args, MoEWorkspace const& workspa
                    "Localized MoE needs two distinct domain streams, both different from the "
                    "caller's stream.");
   for (int d = 0; d < kDomains; ++d) {
+    // The BMM scratch may be null: a config without split-K needs none.
     FLASHINFER_CHECK(localized.gemm1Weights[d] && localized.gemm1WeightsScale[d] &&
-                         localized.gemm2Weights[d] && localized.gemm2WeightsScale[d] &&
-                         localized.bmm1Workspaces[d] && localized.bmm2Workspaces[d],
-                     "Localized MoE is missing a weight shard or workspace for domain ", d);
+                         localized.gemm2Weights[d] && localized.gemm2WeightsScale[d],
+                     "Localized MoE is missing a weight shard for domain ", d);
   }
   FLASHINFER_CHECK(
       isValidLocalizedConfigIndex(configIndex, totalExpertsPerToken, hiddenSize, intermediateSize,
