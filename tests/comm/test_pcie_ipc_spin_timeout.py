@@ -41,9 +41,13 @@ def test_timeout_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _spin_timeout_ns() == 0
     monkeypatch.setenv("FLASHINFER_PCIE_IPC_TIMEOUT_S", "2.5")
     assert _spin_timeout_ns() == 2_500_000_000
-    monkeypatch.setenv("FLASHINFER_PCIE_IPC_TIMEOUT_S", "soon")
-    with pytest.raises(ValueError, match="FLASHINFER_PCIE_IPC_TIMEOUT_S"):
-        _spin_timeout_ns()
+    # A tiny positive value rounds up instead of turning the guard off.
+    monkeypatch.setenv("FLASHINFER_PCIE_IPC_TIMEOUT_S", "1e-10")
+    assert _spin_timeout_ns() == 1
+    for bad in ("soon", "nan", "inf", "-inf", "-1", "1e12"):
+        monkeypatch.setenv("FLASHINFER_PCIE_IPC_TIMEOUT_S", bad)
+        with pytest.raises(ValueError, match="FLASHINFER_PCIE_IPC_TIMEOUT_S"):
+            _spin_timeout_ns()
 
 
 def test_default_module_is_unchanged() -> None:

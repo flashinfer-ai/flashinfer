@@ -237,16 +237,20 @@ struct SpinGuard {
   uint32_t iters = 0;
   unsigned long long start = 0;
 #endif
-  // Called once per failed poll. Reads the clock only every 4096 polls, so the
-  // cost in the loop is an increment and a predictable branch.
+  // Called once per failed poll. Reads the clock on the first failed poll (the
+  // deadline counts from there) and then every 4096 polls, so the cost in the
+  // loop is an increment and two predictable branches.
   __device__ __forceinline__ void tick(const char* where) {
 #if FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS > 0
-    if ((++iters & 0xFFFu) != 0) return;
+    ++iters;
+    if (iters == 1) {
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+      return;
+    }
+    if ((iters & 0xFFFu) != 0) return;
     unsigned long long now;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-    if (start == 0) {
-      start = now;
-    } else if (now - start > FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS) {
+    if (now - start > FLASHINFER_PCIE_IPC_SPIN_TIMEOUT_NS) {
       if (atomicExch(&spin_timeout_reported, 1) == 0) {
         printf(
             "flashinfer pcie_ipc: %s waited %llu ms for a peer (block %d, thread %d); trapping\n",
