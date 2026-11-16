@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <flashinfer/fp8_kv_widen.cuh>
+#include <limits>
 
 #include "tvm_ffi_utils.h"
 
@@ -51,6 +52,16 @@ void gather_widen_fp8_kv(TensorView k_src, TensorView v_src, TensorView k_dst, T
   CHECK_INPUT(k_dst);
   CHECK_INPUT(v_dst);
   CHECK_INPUT(page_indices);
+  // Widen16 issues 16-byte vector loads/stores; a contiguous view with a
+  // storage offset can still be misaligned.
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(k_src.data_ptr()) % 16 == 0)
+      << "k_src must be 16-byte aligned";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(v_src.data_ptr()) % 16 == 0)
+      << "v_src must be 16-byte aligned";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(k_dst.data_ptr()) % 16 == 0)
+      << "k_dst must be 16-byte aligned";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(v_dst.data_ptr()) % 16 == 0)
+      << "v_dst must be 16-byte aligned";
   CHECK_DEVICE(k_src, v_src);
   CHECK_DEVICE(k_src, k_dst);
   CHECK_DEVICE(k_src, v_dst);
@@ -61,6 +72,8 @@ void gather_widen_fp8_kv(TensorView k_src, TensorView v_src, TensorView k_dst, T
   CHECK_SAME_DTYPE(k_dst, v_dst);
 
   const int64_t num_pages = page_indices.size(0);
+  TVM_FFI_ICHECK(num_pages <= std::numeric_limits<int32_t>::max())
+      << "too many referenced pages for the gather grid";
   TVM_FFI_ICHECK_EQ(k_dst.size(0), num_pages) << "k_dst page count must match page_indices";
   TVM_FFI_ICHECK_EQ(v_dst.size(0), num_pages) << "v_dst page count must match page_indices";
   TVM_FFI_ICHECK_EQ(k_src.size(0), v_src.size(0))
@@ -98,8 +111,9 @@ void gather_widen_fp8_kv(TensorView k_src, TensorView v_src, TensorView k_dst, T
     });
   });
 
-  TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess)
-      << "gather_widen_fp8_kv failed: " << cudaGetErrorString(cudaGetLastError());
+  const cudaError_t launch_status = cudaGetLastError();
+  TVM_FFI_ICHECK(launch_status == cudaSuccess)
+      << "gather_widen_fp8_kv failed: " << cudaGetErrorString(launch_status);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gather_widen_fp8_kv, gather_widen_fp8_kv);

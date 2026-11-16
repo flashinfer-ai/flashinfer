@@ -67,6 +67,16 @@ def _make_wrapper(
     return wrapper
 
 
+def _stats(times):
+    times = sorted(times)
+    n = len(times)
+    return (
+        statistics.median(times),
+        times[min(n - 1, int(0.95 * n))],
+        times[min(n - 1, int(0.99 * n))],
+    )
+
+
 def _time(fn, warmup, iters):
     for _ in range(warmup):
         fn()
@@ -80,8 +90,7 @@ def _time(fn, warmup, iters):
         end.record()
         end.synchronize()
         times.append(start.elapsed_time(end))
-    times.sort()
-    return statistics.median(times), times[0], times[-1]
+    return _stats(times)
 
 
 def _graph_time(fn, warmup, iters):
@@ -104,8 +113,7 @@ def _graph_time(fn, warmup, iters):
         end.record()
         end.synchronize()
         times.append(start.elapsed_time(end))
-    times.sort()
-    return statistics.median(times), times[0], times[-1]
+    return _stats(times)
 
 
 def main():
@@ -187,8 +195,9 @@ def main():
         graph = _graph_time(fn, args.warmup, args.iters)
         print(
             f"{label:9s} eager median {eager[0]:8.3f} ms "
-            f"[{eager[1]:.3f}, {eager[2]:.3f}]  "
-            f"graph median {graph[0]:8.3f} ms [{graph[1]:.3f}, {graph[2]:.3f}]"
+            f"(p95 {eager[1]:.3f}, p99 {eager[2]:.3f})  "
+            f"graph median {graph[0]:8.3f} ms "
+            f"(p95 {graph[1]:.3f}, p99 {graph[2]:.3f})"
         )
 
 
