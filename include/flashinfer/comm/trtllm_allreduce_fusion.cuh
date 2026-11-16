@@ -29,6 +29,8 @@ namespace details {
 static constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
 static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 static constexpr int kBytesPerAccess = 16;
+// The Lamport clear-size slot counts 16-bit units (see LamportComm); one store clears this many.
+static constexpr int kClearUnitsPerAccess = kBytesPerAccess / 2;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 static constexpr float kFP8E4M3Max = 448.0f;
@@ -1081,6 +1083,11 @@ struct LamportComm {
   __device__ __forceinline__ LamportComm(void** workspace, int rank) {
     counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
+    // Size of the previous Lamport kernel's write to its sub-buffer, in 16-bit units. Every
+    // Lamport kernel on this workspace reads and writes it whatever its dtype, including the
+    // cake kernels (csrc/cake_trtllm_moe_allreduce_union, csrc/cake_moe_finalize_allreduce_fusion),
+    // which count bf16 / fp16 elements, so the unit is fixed at 2 bytes; readers round it up to
+    // whole 16-byte stores.
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
     flag_value = *flag_ptr;
     int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
@@ -1649,8 +1656,12 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   int access_id = index_helper.access_id;
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
-  vec_t<T, VEC_SIZE> clear_vec;
-  clear_vec.fill(neg_zero_v<T>);
+  // The clear pattern is fp32 -0 (0x80000000 per word) for every T. A later Lamport kernel of any
+  // dtype on this workspace must still see "not written": an fp32 reader needs the full word, a
+  // bf16 / fp16 reader (trtllm or cake) tests each 16-bit half for 0x8000 and finds it in the high
+  // half. bf16 -0 pairs (0x80008000) would read as a finished fp32 value.
+  vec_t<float, details::kBytesPerAccess / sizeof(float)> clear_vec;
+  clear_vec.fill(-0.0f);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -1663,7 +1674,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   // residual_in has completed.
   FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access = comm.clear_size / VEC_SIZE;
+  int clear_access = static_cast<int>((comm.clear_size + details::kClearUnitsPerAccess - 1) /
+                                      details::kClearUnitsPerAccess);
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
     vec_t<T, VEC_SIZE> val;
@@ -1678,7 +1690,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   }
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
     // Clear comm buffer that previous kernel used
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+    clear_vec.store(reinterpret_cast<float*>(comm.clear_buf) +
+                    idx * details::kClearUnitsPerAccess / 2);
   }
 
   for (int idx = access_id, tidx = token_id; idx < tot_access;
@@ -1701,7 +1714,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     fused_op(sum_val, tidx);
   }
 
-  comm.update(params.size * NRanks);
+  comm.update(params.size * NRanks * static_cast<int>(sizeof(T)) / 2);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (TriggerCompletionAtEnd) {
