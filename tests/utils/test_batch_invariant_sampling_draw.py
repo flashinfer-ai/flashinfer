@@ -1557,6 +1557,24 @@ def test_preallocated_outputs():
             xs, seed=ss, offset=os_, batch_invariant=True
         ),
     )
+    # a capture the cache cannot serve takes its buffer from the graph's private pool: neither cached nor retained (the
+    # pool holds it for the graph's lifetime and returns it when the graph is freed; retaining it kept 2 MiB of pool per
+    # capture reserved in review), and the replay is right
+    bi_support._scratch.clear()  # the next call cannot be served from the cache
+    n_keep = len(bi_support._scratch_keep)
+    tb3 = torch.empty(512, dtype=torch.int32, device="cuda")
+    g3 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g3):
+        flashinfer.sampling.sampling_from_logits(
+            xs, seed=ss, offset=os_, batch_invariant=True, out=tb3
+        )
+    assert len(bi_support._scratch_keep) == n_keep, "a capture-time buffer was retained"
+    assert (xs.device, torch.int32) not in bi_support._scratch, (
+        "a capture-time buffer was cached"
+    )
+    g3.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(tb3, tb2)
     # a CUDA graph on caller-owned buffers: new logits and new keys through the captured addresses
     xin, sin, oin = x.clone(), s.clone(), o.clone()
     tb = torch.empty(M, dtype=torch.int32, device="cuda")
