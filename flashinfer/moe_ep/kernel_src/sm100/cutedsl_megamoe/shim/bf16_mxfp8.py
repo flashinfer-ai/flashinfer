@@ -8,6 +8,8 @@ from typing import Any, Callable, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep.training import _bind_legacy_training_outputs, _training_launch
+
 from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -59,6 +61,7 @@ class MegaMoEBf16Mxfp8Config:
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
     batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    save_for_backward: bool = dataclasses.field(default=False, kw_only=True)
     activation: str = dataclasses.field(default="swiglu", kw_only=True)
     swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
     swiglu_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
@@ -66,6 +69,9 @@ class MegaMoEBf16Mxfp8Config:
     situ_linear_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
             validate_a16_batch_invariant,
         )
@@ -198,12 +204,14 @@ class MegaMoEBf16Mxfp8Frontend:
             ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
         self._mega = None
+        self._training_outputs = None
         self._mega_key = None
         self._compile_prepare = None
 
     def release(self) -> None:
         self._release_workspace()
         self._mega = None
+        self._training_outputs = None
         self._mega_key = None
 
     def apply_knobs(self, knobs: dict) -> None:
@@ -321,6 +329,7 @@ class MegaMoEBf16Mxfp8Frontend:
     def _runtime_kwargs(
         self, inputs: MegaMoEBf16Mxfp8Inputs, mega: _CompiledMega
     ) -> dict:
+        _bind_legacy_training_outputs(self, inputs, mega)
         import cuda.bindings.driver as cuda
         from src.sym_buffer import SymBufferHost
 
@@ -456,6 +465,7 @@ class MegaMoEBf16Mxfp8Frontend:
             generate_c=False,
             use_stg_fc1=False,
             batch_invariant=c.batch_invariant,
+            save_for_backward=c.save_for_backward,
             batch_invariant_activation=(
                 batch_invariant_activation(c, family="bf16")
                 if c.batch_invariant
@@ -512,7 +522,7 @@ class MegaMoEBf16Mxfp8Frontend:
         kwargs["max_active_clusters"] = p["max_active_clusters"]
         if self.config.enable_iket:
             kwargs["options"] = "iket"
-        mega.compiled = cute.compile(mega.kernel, **kwargs)
+        mega.compiled = _training_launch(self, cute.compile(mega.kernel, **kwargs))
         self._mega_key = p["key"]
         self._compile_prepare = None
         return mega
@@ -536,9 +546,11 @@ class MegaMoEBf16Mxfp8Frontend:
             inputs.fc2_weight.data_ptr(),
             inputs.fc2_weight_sf.data_ptr(),
             inputs.output_activation.data_ptr(),
-            None
-            if inputs.num_valid_tokens is None
-            else inputs.num_valid_tokens.data_ptr(),
+            (
+                None
+                if inputs.num_valid_tokens is None
+                else inputs.num_valid_tokens.data_ptr()
+            ),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
@@ -644,6 +656,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     knobs: Optional[dict] = None,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
     activation: str = "swiglu",
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
@@ -684,6 +697,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
             use_custom_finalize=use_custom_finalize,
             batch_invariant=batch_invariant,
+            save_for_backward=save_for_backward,
             apply_routing_weights_before_fc2=batch_invariant,
             activation=activation,
             swiglu_alpha=swiglu_alpha,
@@ -708,6 +722,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         use_custom_finalize=use_custom_finalize,
         batch_invariant=batch_invariant,
+        save_for_backward=save_for_backward,
         activation=activation,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,

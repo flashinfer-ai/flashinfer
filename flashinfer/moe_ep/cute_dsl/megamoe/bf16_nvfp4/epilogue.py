@@ -19,6 +19,7 @@ from cutlass.cutlass_dsl import Int64
 from cutlass.cute.nvgpu import tcgen05
 
 from .fc1_fc2_fuse_sched import BlockPhase
+from src.training import store_preact_fragment16
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import iket
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import fmin, fmax
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
@@ -683,6 +684,23 @@ class W4A16Fc1Epilogue(EpilogueContext):
             cute.arch.fence_view_async_tmem_load()
             gate.store(gate.load() * weight_alpha)
             up.store(up.load() * weight_alpha)
+            if cutlass.const_expr(self.optional_epi_args.training_preact is not None):
+                store_preact_fragment16(
+                    self.optional_epi_args.training_preact,
+                    self.optional_epi_args.training_expert_ids,
+                    gate,
+                    up,
+                    work_tile_info.cumulative_data_physical_row
+                    + work_tile_info.tile_n_idx * self.cta_tile_n,
+                    token_col,
+                    work_tile_info.valid_tokens_in_cta_tile,
+                    work_tile_info.tile_m_idx
+                    * self._EpilogueFc1IntermediateDownTileSize
+                    + warp_idx * 16,
+                    lane,
+                    self.intermediate_downproj,
+                    work_tile_info.expert_idx,
+                )
             # Preserve the prior W4A16 sequence: post-alpha gate upper clamp,
             # symmetric up clamp, then up * (gate * sigmoid(gate)).
             if cutlass.const_expr(

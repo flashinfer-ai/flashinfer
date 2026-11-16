@@ -20,6 +20,7 @@ def nvfp4_batch_invariant_metadata(config: Any) -> dict:
         return {}
     return dict(
         batch_invariant=True,
+        save_for_backward=getattr(config, "save_for_backward", False),
         input_norm_const=config.input_norm_const,
         has_fc1_alpha=True,
         has_fc2_alpha=True,
@@ -309,18 +310,20 @@ def nvfp4_batch_invariant_fingerprint(
             config,
             kind="nvfp4",
             arch=arch,
-            knobs=getattr(config, "knobs", None)
-            if isinstance(getattr(config, "knobs", None), dict)
-            else None,
+            knobs=(
+                getattr(config, "knobs", None)
+                if isinstance(getattr(config, "knobs", None), dict)
+                else None
+            ),
             hidden=hidden,
         )
     return spec_fingerprint(
         hidden=hidden if hidden is not None else config.hidden,
         intermediate=intermediate,
         top_k=getattr(config, "num_topk", getattr(config, "top_k", None)),
-        num_experts=num_experts
-        if num_experts is not None
-        else config.num_total_experts,
+        num_experts=(
+            num_experts if num_experts is not None else config.num_total_experts
+        ),
         arch=arch,
         implementation=implementation,
         apply_routing_weights_before_fc2=config.apply_routing_weights_before_fc2,

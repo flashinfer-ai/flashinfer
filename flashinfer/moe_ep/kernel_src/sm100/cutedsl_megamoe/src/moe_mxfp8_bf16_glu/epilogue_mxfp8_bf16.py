@@ -48,6 +48,7 @@ from moe_nvfp4_swapab.epilogue_refactor import (
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.token_comm import CombineFormat
+from src.training import store_preact_fragment16
 
 
 Fc1GateUpInterleave = 16
@@ -360,6 +361,18 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
                 gate = preload_acc[token_half * 2]
                 up = preload_acc[token_half * 2 + 1]
 
+            if cutlass.const_expr(self.optional_epi_args.training_preact is not None):
+                store_preact_fragment16(
+                    self.optional_epi_args.training_preact,
+                    self.optional_epi_args.training_expert_ids,
+                    gate, up,
+                    work_tile_info.cumulative_data_physical_row
+                    + work_tile_info.tile_n_idx * self.cta_tile_n,
+                    subtile_idx * self._EpilogueTokenTileSize + token_half * 32,
+                    valid_tokens, feature_base, self.lane_idx,
+                    self.intermediate_downproj, work_tile_info.expert_idx,
+                )
+
             if cutlass.const_expr(self.gate_up_clamp is not None and not self.batch_invariant_chain):
                 for i in cutlass.range_constexpr(Fc1GateUpInterleave):
                     gate[i] = fmin(gate[i], self.gate_up_clamp)
@@ -652,6 +665,8 @@ class MixedGluBf16Epilogue:
             fc2_alpha=None,
             fc1_norm_const=None,
             topk_scores=topk_scores,
+            training_preact=optional_epi_args.training_preact,
+            training_expert_ids=optional_epi_args.training_expert_ids,
         )
 
         tmem_acc = cute.make_tensor(

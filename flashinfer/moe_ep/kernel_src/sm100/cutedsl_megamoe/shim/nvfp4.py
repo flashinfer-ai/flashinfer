@@ -57,6 +57,7 @@ from moe_nvfp4_swapab.runner_common import (
 )
 
 from flashinfer.moe_ep._compat import deprecated_aliases
+from flashinfer.moe_ep.training import _bind_legacy_training_outputs, _training_launch
 
 from .comm import (
     _CompiledMega,
@@ -132,12 +133,16 @@ class MegaMoENvfp4Config:
     # quantize ``x_t / scale_t`` to NVFP4 without losing the per-token range.
     enable_fc1_activation_per_token_scale: bool = False
     batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    save_for_backward: bool = dataclasses.field(default=False, kw_only=True)
     input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
     has_fc1_alpha: bool = dataclasses.field(default=True, kw_only=True)
     has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
     has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool")
         if self.batch_invariant:
@@ -651,6 +656,7 @@ class MegaMoENvfp4Frontend:
             c.enable_iket,
             c.enable_fc1_activation_per_token_scale,
             c.batch_invariant,
+            c.save_for_backward,
             self.batch_invariant_fingerprint,
         )
 
@@ -760,6 +766,7 @@ class MegaMoENvfp4Frontend:
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
         kernel = Sm100MegaMoEKernel(
+            save_for_backward=c.save_for_backward,
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
@@ -852,7 +859,7 @@ class MegaMoENvfp4Frontend:
         kwargs["max_active_clusters"] = p["max_active_clusters"]
         if self.config.enable_iket:
             kwargs["options"] = "iket"
-        mega.compiled = cute.compile(mega.kernel, **kwargs)
+        mega.compiled = _training_launch(self, cute.compile(mega.kernel, **kwargs))
         self._mega_key = p["key"]
         self._compile_prepare = None
         return mega
@@ -864,12 +871,14 @@ class MegaMoENvfp4Frontend:
     def _invalidate_compile_cache(self) -> None:
         self._mega_key = None
         self._mega = None
+        self._training_outputs = None
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
         self._mega = None
+        self._training_outputs = None
         self._mega_key = None
         self._compile_prepare = None
 
@@ -1158,6 +1167,7 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         mega: _CompiledMega,
     ) -> dict:
+        _bind_legacy_training_outputs(self, inputs, mega)
         import cuda.bindings.driver as cuda
         from src.sym_buffer import SymBufferHost
 
@@ -1413,6 +1423,7 @@ def get_symm_buffer_for_mega_moe(
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     enable_fc1_activation_per_token_scale: bool = False,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
     input_norm_const: float = 1.0,
     has_fc1_alpha: bool = True,
     has_fc2_alpha: bool = True,
@@ -1516,6 +1527,7 @@ def get_symm_buffer_for_mega_moe(
             apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             use_custom_finalize=use_custom_finalize,
             batch_invariant=batch_invariant,
+            save_for_backward=save_for_backward,
             batch_invariant_version=(
                 NVFP4_BATCH_INVARIANT_VERSION if batch_invariant else None
             ),
@@ -1567,6 +1579,7 @@ def get_symm_buffer_for_mega_moe(
         combine_dtype=combine_dtype,
         enable_fc1_activation_per_token_scale=enable_fc1_activation_per_token_scale,
         batch_invariant=batch_invariant,
+        save_for_backward=save_for_backward,
         input_norm_const=input_norm_const,
         has_fc1_alpha=has_fc1_alpha,
         has_fc2_alpha=has_fc2_alpha,

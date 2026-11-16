@@ -69,6 +69,8 @@ def device_identity() -> str:
 def _key(config, device: str | None = None) -> dict:
     """Key operation attributes and capacity independently of rank and knobs."""
     spec = dataclasses.asdict(config)
+    if not spec.get("save_for_backward", False):
+        spec.pop("save_for_backward", None)
     for name in ("rank", *knob_keys(config)):
         spec.pop(name)
     if getattr(config, "batch_invariant", False):
@@ -91,9 +93,11 @@ def _key(config, device: str | None = None) -> dict:
         ):
             spec.pop(name, None)
     return dict(
-        backend_revision=_REVISION
-        if config.kernel_variant == "genphase"
-        else "sm100-standard-auto-v1",
+        backend_revision=(
+            _REVISION
+            if config.kernel_variant == "genphase"
+            else "sm100-standard-auto-v1"
+        ),
         device=(
             "sm100-genphase:"
             if config.kernel_variant == "genphase"

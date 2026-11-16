@@ -213,6 +213,27 @@ absorbs it.
   commit. If upstream merges the SM90 kernel into the mother repo, fold that
   tree into this one on the next re-sync.
 
+## BI training forward integration patch
+
+The optional `save_for_backward` construction field adds BF16 gate-then-up
+preactivation and Int32 local-expert-ID regions to the existing local device
+workspace. FC1 epilogues write these regions beside the unchanged rollout
+arithmetic, after dequantization and before activation/clamping. The flag does
+not change MMA geometry, padding, activation, handoff or combine arithmetic.
+Disabled kernels retain their previous names and allocate no auxiliary regions;
+enabled kernel names and compile/cache identities distinguish the extra writes.
+The main-output arithmetic receipt deliberately remains the rollout receipt.
+
+Contiguous BF16/MXFP8 feature fragments use packed 256-bit auxiliary stores;
+raw-fragment lane mappings retain their existing stores. This writeback-only
+change adds no shared memory or main-compute geometry restrictions.
+
+The FlashInfer shim exposes the auxiliary tensors and native input/handoff and
+route metadata as borrowed workspace views. It clears auxiliary validity before
+each launch and keeps training workspaces out of the inference sharing pool.
+Retain this FlashInfer-owned integration patch when refreshing the provider
+snapshot until it is incorporated upstream.
+
 ## Consumers
 
 - `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/`

@@ -23,6 +23,7 @@ class Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     kernel_name: str = field(default="sm107_mxfp8_mxfp4_bf16_cutedsl", init=False)
     kind: Literal["mxfp4_mxfp8"] = field(default="mxfp4_mxfp8", init=False)
     batch_invariant: bool = field(default=False, kw_only=True)
+    save_for_backward: bool = field(default=False, kw_only=True)
     gate_up_clamp: Optional[float] = None
     activation_clamp: Optional[float] = None  # deprecated alias of gate_up_clamp
     fast_math: bool = True  # accepted for mega API parity; no kernel toggle
@@ -59,6 +60,9 @@ class Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
 
     def __post_init__(self):
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         if not self.batch_invariant and (
             self.swiglu_alpha is not None or self.swiglu_beta is not None
         ):

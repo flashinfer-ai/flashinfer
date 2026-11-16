@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from ...config import BootstrapConfig, FleetParams
     from ...tensors import MoEEpTensors
+    from ...training import MoEEpMegaTrainingOutputs
     from ...weights import MoEWeightPack
 
 
@@ -326,6 +327,9 @@ class MegaKernelBackend(ABC):
         heap use and compiled sessions by the layer count.
         """
         self._ensure_ep_bootstrap(bootstrap)
+        if getattr(self._config, "save_for_backward", False):
+            # Saved tensors must survive forwards of other layers of the model.
+            return self._allocate_workspace(fleet_params)
         request = self._workspace_pool_request(fleet_params)
         if request is None:
             return self._allocate_workspace(fleet_params)
@@ -449,6 +453,24 @@ class MegaKernelBackend(ABC):
         quantize_input: bool,
     ) -> None:
         """Copy or quantize activations into workspace buffers."""
+
+    def training_outputs(self, workspace: Any) -> "MoEEpMegaTrainingOutputs":
+        """Return saved tensors owned by this exact prepared workspace."""
+        if hasattr(workspace, "kernel") and hasattr(workspace, "workspace"):
+            return workspace.kernel.training_outputs(workspace.workspace)
+        from ...training import MoEEpMegaTrainingOutputs
+
+        outputs = getattr(workspace, "_training_outputs", None)
+        if outputs is None:
+            outputs = getattr(
+                getattr(workspace, "_frontend", None), "_training_outputs", None
+            )
+        if not isinstance(outputs, MoEEpMegaTrainingOutputs):
+            raise RuntimeError(
+                "This workspace has no saved training outputs; enable "
+                "save_for_backward=True and warm up the layer first"
+            )
+        return outputs
 
     def workspace_output(self, workspace: Any) -> "torch.Tensor":
         """Return the stable output tensor owned by ``workspace``.

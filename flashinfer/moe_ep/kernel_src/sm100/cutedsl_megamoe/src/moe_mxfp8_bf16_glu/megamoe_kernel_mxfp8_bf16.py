@@ -98,11 +98,13 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         gate_up_clamp: Optional[float] = None,
         apply_topk_in_fc1: bool = True,
         generate_c: bool = False,
+        save_for_backward: bool = False,
         use_stg_fc1: bool = False,
         combine_format: Optional[CombineFormat] = None,
         batch_invariant: bool = False,
         batch_invariant_activation=None,
     ) -> None:
+        self.save_for_backward = save_for_backward
         self.batch_invariant = batch_invariant
         self.batch_invariant_activation = batch_invariant_activation
         if batch_invariant and (fc2_in_kernel_topk_reduce or mma_tiler_mnk != (256, 128, 128) or accumulator_overlap or transform_buffer != "tmem" or transform_k_tile != 128):
@@ -503,6 +505,17 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
                     128,
                 )
             )
+        if self.save_for_backward:
+            specs.extend([
+                _RegionSpec(
+                    "mega_moe.fc1_preact", cutlass.BFloat16,
+                    (self.pool_token_capacity, 2 * self.intermediate_downproj), 128,
+                ),
+                _RegionSpec(
+                    "mega_moe.fc1_expert_ids", cutlass.Int32,
+                    (self.pool_token_capacity,), 16,
+                ),
+            ])
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -999,7 +1012,14 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             16,
         )
 
+        training_preact = None
+        training_expert_ids = None
+        if cutlass.const_expr(self.save_for_backward):
+            training_preact = self._view_local(local_workspace, "mega_moe.fc1_preact")
+            training_expert_ids = self._view_local(local_workspace, "mega_moe.fc1_expert_ids")
         token_comm_args = ExtractedTokenCommArgs(
+            training_preact=training_preact,
+            training_expert_ids=training_expert_ids,
             input_token_buffer=activation,
             input_sf_buffer=None,
             topk_idx=topk_idx,

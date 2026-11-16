@@ -114,8 +114,10 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
         gate_up_clamp: Optional[float] = None,
         apply_topk_in_fc1: bool = False,
         generate_c: bool = False,
+        save_for_backward: bool = False,
         use_stg_fc1: bool = False,
     ) -> None:
+        self.save_for_backward = save_for_backward
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm100MegaMoEBf16Kernel requires static_expert_shape != None "
@@ -494,6 +496,17 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
                 )
             )
 
+        if self.save_for_backward:
+            specs.extend([
+                _RegionSpec(
+                    "mega_moe.fc1_preact", cutlass.BFloat16,
+                    (self.pool_token_capacity, 2 * self.intermediate_downproj), 128,
+                ),
+                _RegionSpec(
+                    "mega_moe.fc1_expert_ids", cutlass.Int32,
+                    (self.pool_token_capacity,), 16,
+                ),
+            ])
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -799,7 +812,14 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
             shared_workspace, 0, cutlass.Int32, (self.shared_zero_i32_count,), (1,), 16,
         )
 
+        training_preact = None
+        training_expert_ids = None
+        if cutlass.const_expr(self.save_for_backward):
+            training_preact = self._view_local(local_workspace, "mega_moe.fc1_preact")
+            training_expert_ids = self._view_local(local_workspace, "mega_moe.fc1_expert_ids")
         token_comm_args = ExtractedTokenCommArgs(
+            training_preact=training_preact,
+            training_expert_ids=training_expert_ids,
             input_token_buffer=activation,
             # BF16 tokens carry no scale-factor sideband: the SF slots ride the
             # TokenCommArgs None-skipping serialization, and dispatch's SF

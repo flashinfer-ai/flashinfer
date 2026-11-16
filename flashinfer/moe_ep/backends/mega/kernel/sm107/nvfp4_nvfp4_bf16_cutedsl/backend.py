@@ -122,9 +122,11 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         validate_nvfp4_scalars(
             self._scalar_values(),
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
-            device=torch.device("cuda", torch.cuda.current_device())
-            if torch.cuda.is_available()
-            else torch.device("cuda"),
+            device=(
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cuda")
+            ),
         )
         if torch.cuda.is_available():
             require_sm107_dsl()
@@ -190,6 +192,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
+            save_for_backward=k.save_for_backward,
             allow_nondeterministic=k.in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             activation=k.activation,
@@ -201,9 +204,9 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             swiglu_beta=getattr(k, "swiglu_beta", None),
             gate_up_clamp=k.gate_up_clamp,
             batch_invariant=k.batch_invariant,
-            batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
-            if k.batch_invariant
-            else None,
+            batch_invariant_version=(
+                NVFP4_BATCH_INVARIANT_VERSION if k.batch_invariant else None
+            ),
             input_norm_const=k.input_norm_const,
         )
 

@@ -288,6 +288,27 @@ captured launches. Retain this shim integration when refreshing the export.
 drop comes from upstream's `next/` generation, with relative imports and the
 `api.py` component model; it does not replace the older SM100 packages.
 
+## BI training forward integration patch
+
+The optional `save_for_backward` construction field adds BF16 gate-then-up
+preactivation and Int32 local-expert-ID regions to the existing local device
+workspace. FC1 epilogues write these regions beside the unchanged rollout
+arithmetic, after dequantization and before activation/clamping. The flag does
+not change MMA geometry, padding, activation, handoff or combine arithmetic.
+Disabled kernels retain their previous names and allocate no auxiliary regions;
+enabled kernel names and compile/cache identities distinguish the extra writes.
+The main-output arithmetic receipt deliberately remains the rollout receipt.
+
+The existing transpose gives each lane one contiguous feature fragment in the
+second half of FC1. Its auxiliary BF16 copies use 256-bit stores; the raw first
+half retains its lane mapping. This adds no shared memory or compute changes.
+
+The FlashInfer shim exposes the auxiliary tensors and native input/handoff and
+route metadata as borrowed workspace views. It clears auxiliary validity before
+each launch and keeps training workspaces out of the inference sharing pool.
+Retain this FlashInfer-owned integration patch when refreshing the provider
+snapshot until it is incorporated upstream.
+
 ## Consumers
 
 - `backends/mega/kernel/sm107/nvfp4_nvfp4_bf16_cutedsl/`

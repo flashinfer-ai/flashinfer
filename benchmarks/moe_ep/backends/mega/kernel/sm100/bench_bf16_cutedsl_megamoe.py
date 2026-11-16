@@ -33,6 +33,12 @@ def main() -> None:
     parser.add_argument("--hidden", type=int, default=7168)
     parser.add_argument("--intermediate", type=int, default=2048)
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument("--batch-invariant", action="store_true")
+    parser.add_argument(
+        "--save-for-backward",
+        action="store_true",
+        help="Enable BI forward with workspace-owned training auxiliary outputs.",
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -83,7 +89,10 @@ def main() -> None:
         weights=weights,
         backend=MegaConfig(
             megakernel=Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
-                intermediate_size=args.intermediate, top_k=args.top_k
+                intermediate_size=args.intermediate,
+                top_k=args.top_k,
+                batch_invariant=args.batch_invariant or args.save_for_backward,
+                save_for_backward=args.save_for_backward,
             )
         ),
     )
@@ -95,7 +104,11 @@ def main() -> None:
         enable_cupti=True,
     )
     if rank == 0:
-        print(f"bf16_cutedsl,{np.median(times_ms):.4f} ms,{np.std(times_ms):.4f} ms")
+        mode = "training" if args.save_for_backward else "rollout"
+        print(
+            f"bf16_cutedsl_{mode},{np.median(times_ms):.4f} ms,{np.std(times_ms):.4f} ms"
+        )
+    layer.destroy()
     dist.destroy_process_group()
 
 

@@ -282,6 +282,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             num_experts=fleet_params.num_experts,
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
+            save_for_backward=k.save_for_backward,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
             combine_dtype=k.combine_dtype,
@@ -291,6 +292,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
 
             key.update(
                 batch_invariant=True,
+                save_for_backward=k.save_for_backward,
                 batch_invariant_version=MXFP8_BATCH_INVARIANT_VERSION,
                 apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
                 gate_up_clamp=_resolve_gate_up_clamp(k),
@@ -324,6 +326,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
                 is FinalizeMode.PERSISTENT,
                 use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
                 batch_invariant=True,
+                save_for_backward=k.save_for_backward,
                 input_norm_const=1.0,
                 has_3_global_scales=False,
                 **batch_invariant_numerical_metadata(k),
@@ -373,6 +376,7 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
             **(
                 dict(
                     batch_invariant=True,
+                    save_for_backward=k.save_for_backward,
                     input_norm_const=1.0,
                     has_3_global_scales=False,
                     **batch_invariant_numerical_metadata(k),
@@ -636,9 +640,11 @@ class Mxfp8CutedslMegaKernelBackend(GenphaseConfigMixin, MegaKernelBackend):
         )
 
         return block_scaled_batch_invariant_fingerprint(
-            self._genphase_config(fleet_params)
-            if self._kernel_config.kernel_variant == "genphase"
-            else self._legacy_config(fleet_params),
+            (
+                self._genphase_config(fleet_params)
+                if self._kernel_config.kernel_variant == "genphase"
+                else self._legacy_config(fleet_params)
+            ),
             arch=self._arithmetic_arch,
         )
 

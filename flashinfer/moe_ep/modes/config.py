@@ -136,13 +136,17 @@ def _batch_invariant_numerical_contract(config: MegaConfig | SplitConfig):
                 top_k=kernel.top_k,
                 activation=kernel.activation,
                 gate_up_clamp_bits=None if clamp is None else f32_bits(abs(clamp)),
-                apply_routing_weights_before_fc2=kernel.apply_routing_weights_before_fc2
-                if isinstance(kernel, Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig)
-                else True,
+                apply_routing_weights_before_fc2=(
+                    kernel.apply_routing_weights_before_fc2
+                    if isinstance(kernel, Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig)
+                    else True
+                ),
                 handoff_norm=getattr(kernel, "fc1_norm_const", None) is not None,
-                output_mode="deferred"
-                if kernel.finalize_mode is FinalizeMode.NONE
-                else "finalized",
+                output_mode=(
+                    "deferred"
+                    if kernel.finalize_mode is FinalizeMode.NONE
+                    else "finalized"
+                ),
             ),
             family="w4a16" if kind == "w4a16" else "bf16",
         )
@@ -316,6 +320,14 @@ def _batch_invariant_numerical_contract(config: MegaConfig | SplitConfig):
 
 
 def _validate_batch_invariant_candidates(candidates):
+    saved_modes = {
+        bool(getattr(getattr(c, "megakernel", None), "save_for_backward", False))
+        for c in candidates
+    }
+    if len(saved_modes) != 1:
+        raise ValueError(
+            "AutoConfig candidates must use the same save_for_backward output contract"
+        )
     contracts = [_batch_invariant_numerical_contract(c) for c in candidates]
     if not any(contract is not None for contract in contracts):
         return

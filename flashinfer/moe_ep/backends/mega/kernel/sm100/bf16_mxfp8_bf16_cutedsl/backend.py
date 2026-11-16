@@ -126,6 +126,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             num_experts=fleet_params.num_experts,
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
+            save_for_backward=k.save_for_backward,
             # Ordinary entries retain their historical key convention.
             apply_routing_weights_before_fc2=k.batch_invariant,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
@@ -175,6 +176,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             num_valid_tokens_tensor=config.num_valid_tokens_tensor,
             knobs=self._workspace_knobs(fleet_params),
             batch_invariant=config.batch_invariant,
+            save_for_backward=config.save_for_backward,
             activation=config.activation,
             swiglu_alpha=config.swiglu_alpha,
             swiglu_beta=config.swiglu_beta,

@@ -511,11 +511,13 @@ def autotune_knobs(
         ):
             prepared = phase(
                 "local preparation",
-                lambda: frontend.prepare_tuning_local(
-                    knobs, config_overrides=config_overrides
-                )
-                if config_overrides
-                else frontend.prepare_tuning_local(knobs),
+                lambda: (
+                    frontend.prepare_tuning_local(
+                        knobs, config_overrides=config_overrides
+                    )
+                    if config_overrides
+                    else frontend.prepare_tuning_local(knobs)
+                ),
             )
             if multi_rank:
                 pending = getattr(prepared, "_compile_prepare", None)
@@ -751,6 +753,7 @@ def autotune_nvfp4_mega_moe(
                 p50_us=p50_s * 1e6,
                 source="autotune",
                 batch_invariant=getattr(cfg, "batch_invariant", False),
+                save_for_backward=getattr(cfg, "save_for_backward", False),
                 gate_up_clamp=cfg.gate_up_clamp,
                 input_norm_const=getattr(cfg, "input_norm_const", 1.0),
                 **(batch_invariant_variant_kwargs(cfg) if cfg.batch_invariant else {}),
@@ -767,12 +770,14 @@ def autotune_nvfp4_mega_moe(
         prepare_launch=prepare_launch,
         config_overrides=overrides,
         candidate_filter=(
-            lambda proposed: _session_candidates(
-                proposed, cfg, is_valid_nvfp4_for_config, what="NVFP4 MegaMoE"
+            (
+                lambda proposed: _session_candidates(
+                    proposed, cfg, is_valid_nvfp4_for_config, what="NVFP4 MegaMoE"
+                )
             )
-        )
-        if getattr(cfg, "batch_invariant", False)
-        else None,
+            if getattr(cfg, "batch_invariant", False)
+            else None
+        ),
     )
 
 
@@ -852,6 +857,7 @@ def autotune_mxfp8_mega_moe(
                 p50_us=p50_s * 1e6,
                 source="autotune",
                 batch_invariant=getattr(cfg, "batch_invariant", False),
+                save_for_backward=getattr(cfg, "save_for_backward", False),
                 gate_up_clamp=cfg.gate_up_clamp,
                 input_norm_const=getattr(cfg, "input_norm_const", 1.0),
                 **(batch_invariant_variant_kwargs(cfg) if cfg.batch_invariant else {}),
@@ -868,12 +874,14 @@ def autotune_mxfp8_mega_moe(
         prepare_launch=prepare_launch,
         config_overrides=overrides,
         candidate_filter=(
-            lambda proposed: _session_candidates(
-                proposed, cfg, is_valid_mxfp8_for_config, what="MXFP8 MegaMoE"
+            (
+                lambda proposed: _session_candidates(
+                    proposed, cfg, is_valid_mxfp8_for_config, what="MXFP8 MegaMoE"
+                )
             )
-        )
-        if getattr(cfg, "batch_invariant", False)
-        else None,
+            if getattr(cfg, "batch_invariant", False)
+            else None
+        ),
     )
 
 
@@ -961,6 +969,7 @@ def autotune_bf16_mega_moe(
                 apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
                 use_custom_finalize=cfg.use_custom_finalize,
                 batch_invariant=cfg.batch_invariant,
+                save_for_backward=getattr(cfg, "save_for_backward", False),
                 gate_up_clamp=cfg.gate_up_clamp,
                 p50_us=p50_s * 1e6,
                 source="autotune",
@@ -1045,6 +1054,7 @@ def autotune_bf16_mxfp8_mega_moe(
                 p50_us=p50_s * 1e6,
                 source="autotune",
                 batch_invariant=cfg.batch_invariant,
+                save_for_backward=getattr(cfg, "save_for_backward", False),
                 apply_routing_weights_before_fc2=cfg.batch_invariant,
                 gate_up_clamp=cfg.gate_up_clamp,
                 use_custom_finalize=cfg.use_custom_finalize,

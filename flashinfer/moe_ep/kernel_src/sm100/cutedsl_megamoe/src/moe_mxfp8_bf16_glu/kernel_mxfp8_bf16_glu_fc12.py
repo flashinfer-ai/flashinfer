@@ -2957,6 +2957,16 @@ class Sm100SwapABMxfp8Bf16Fc12Kernel:
                 fc1_alpha=None,
                 fc2_alpha=None,
                 fc1_norm_const=None,
+                training_preact=(
+                    token_comm_args.training_preact
+                    if cutlass.const_expr(token_comm_args is not None)
+                    else None
+                ),
+                training_expert_ids=(
+                    token_comm_args.training_expert_ids
+                    if cutlass.const_expr(token_comm_args is not None)
+                    else None
+                ),
                 topk_scores=(
                     topk_scores
                     if cutlass.const_expr(self.apply_topk_in_fc1)

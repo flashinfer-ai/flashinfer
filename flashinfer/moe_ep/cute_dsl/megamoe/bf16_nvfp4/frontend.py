@@ -11,6 +11,8 @@ from typing import Callable, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep.training import _bind_legacy_training_outputs, _training_launch
+
 from flashinfer.moe_ep._compat import deprecated_aliases
 from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
     _CompiledMega,
@@ -62,9 +64,13 @@ class MegaMoEBf16Nvfp4Config:
     situ_linear_beta: Optional[float] = None
     use_custom_finalize: bool = False
     batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    save_for_backward: bool = dataclasses.field(default=False, kw_only=True)
     has_fc1_norm_const: bool = dataclasses.field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
             validate_a16_batch_invariant,
         )
@@ -259,6 +265,7 @@ class MegaMoEBf16Nvfp4Frontend:
             ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
         self._mega = None
+        self._training_outputs = None
         self._staging_variants.clear()
         self._unstaged_variants.clear()
         self._launch_inputs = None
@@ -344,6 +351,7 @@ class MegaMoEBf16Nvfp4Frontend:
             situ_beta=c.situ_beta,
             situ_linear_beta=c.situ_linear_beta,
             batch_invariant=c.batch_invariant,
+            save_for_backward=c.save_for_backward,
         )
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
         return dict(kernel=kernel, local_bytes=local_bytes, shared_bytes=shared_bytes)
@@ -445,7 +453,7 @@ class MegaMoEBf16Nvfp4Frontend:
         kwargs["options"] = "--ptxas-options='-maxrregcount=96'"
         if c.enable_iket:
             kwargs["options"] += " iket"
-        return cute.compile(mega.kernel, **kwargs)
+        return _training_launch(self, cute.compile(mega.kernel, **kwargs))
 
     def _staging_key(self, sources) -> tuple[torch.dtype, bool]:
         hidden, ids, _ = sources
@@ -498,6 +506,7 @@ class MegaMoEBf16Nvfp4Frontend:
 
         from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import SymBufferHost
 
+        _bind_legacy_training_outputs(self, inputs, mega)
         c = self.config
         mapper = SymBufferHost(
             base_addr=mega.symmetric_base,
@@ -531,9 +540,11 @@ class MegaMoEBf16Nvfp4Frontend:
             "fc2_weight": self._to_cute(inputs.fc2_weight),
             "fc2_weight_sf": self._to_cute(inputs.fc2_weight_sf),
             "fc2_alpha": self._to_cute(inputs.fc2_alpha, assumed_align=4),
-            "fc1_norm_const": None
-            if inputs.fc1_norm_const is None
-            else self._to_cute(inputs.fc1_norm_const, assumed_align=4),
+            "fc1_norm_const": (
+                None
+                if inputs.fc1_norm_const is None
+                else self._to_cute(inputs.fc1_norm_const, assumed_align=4)
+            ),
             "combine_output": self._to_cute(inputs.combine_output, static_layout=True),
             "reduced_output": reduced_output,
             "local_workspace": self._to_cute(mega.local_workspace, static_layout=True),
@@ -553,12 +564,14 @@ class MegaMoEBf16Nvfp4Frontend:
         self._validate(inputs, n)
         mega = self._ensure_compiled(inputs)
         key = (
-            tuple(
-                (t.data_ptr(), t.dtype, tuple(t.shape), t.stride())
-                for t in inputs.staging_inputs
-            )
-            if inputs.staging_inputs is not None
-            else None,
+            (
+                tuple(
+                    (t.data_ptr(), t.dtype, tuple(t.shape), t.stride())
+                    for t in inputs.staging_inputs
+                )
+                if inputs.staging_inputs is not None
+                else None
+            ),
             inputs.activation.data_ptr(),
             inputs.topk_idx.data_ptr(),
             inputs.topk_weights.data_ptr(),
@@ -571,12 +584,14 @@ class MegaMoEBf16Nvfp4Frontend:
             None if inputs.fc1_norm_const is None else inputs.fc1_norm_const.data_ptr(),
             inputs.combine_output.data_ptr(),
             (
-                inputs.reduced_output.data_ptr(),
-                tuple(inputs.reduced_output.shape),
-                inputs.reduced_output.stride(),
-            )
-            if inputs.reduced_output is not None
-            else None,
+                (
+                    inputs.reduced_output.data_ptr(),
+                    tuple(inputs.reduced_output.shape),
+                    inputs.reduced_output.stride(),
+                )
+                if inputs.reduced_output is not None
+                else None
+            ),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
@@ -605,9 +620,11 @@ class MegaMoEBf16Nvfp4Frontend:
     def make_launch_thunk(self, inputs: MegaMoEBf16Nvfp4Inputs) -> Callable[[], None]:
         self._validate(
             inputs,
-            inputs.reduced_output.shape[0]
-            if inputs.reduced_output is not None
-            else inputs.activation.shape[0],
+            (
+                inputs.reduced_output.shape[0]
+                if inputs.reduced_output is not None
+                else inputs.activation.shape[0]
+            ),
         )
         mega = self._ensure_compiled(inputs)
         self._warm_staging_variants(inputs)
@@ -874,6 +891,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     situ_linear_beta: Optional[float] = None,
     use_custom_finalize: bool = False,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
 ) -> MegaMoEBf16Nvfp4SymmBuffer:
     """Allocate stable per-expert scales and BF16 transport buffers.
 
@@ -915,6 +933,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         situ_linear_beta=situ_linear_beta,
         use_custom_finalize=use_custom_finalize,
         batch_invariant=batch_invariant,
+        save_for_backward=save_for_backward,
         has_fc1_norm_const=fc1_norm_const is not None,
     )
 
@@ -934,6 +953,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
             apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
             use_custom_finalize=use_custom_finalize,
             batch_invariant=batch_invariant,
+            save_for_backward=save_for_backward,
             activation=activation,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,

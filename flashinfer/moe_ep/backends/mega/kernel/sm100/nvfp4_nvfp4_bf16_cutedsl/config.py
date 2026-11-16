@@ -40,6 +40,7 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     top_k: int
     kernel_name: str = "sm100_nvfp4_nvfp4_bf16_cutedsl"
     batch_invariant: bool = field(default=False, kw_only=True)
+    save_for_backward: bool = field(default=False, kw_only=True)
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     activation: Literal["swiglu", "situ"] = "swiglu"
@@ -99,6 +100,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool.")
         if self.batch_invariant:

@@ -60,8 +60,12 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # NONE makes MoEEpMegaLayer.forward return per-route outputs.
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
     batch_invariant: bool = field(default=False, kw_only=True)
+    save_for_backward: bool = field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         from ..common.a16_batch_invariant import validate_a16_batch_invariant
 
         validate_a16_batch_invariant(

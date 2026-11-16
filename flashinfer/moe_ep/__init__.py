@@ -237,6 +237,7 @@ from .core.validation import (
     validate_split_forward_inputs,
 )
 from .layer import MoEEpLayer
+from .training import MoEEpMegaTrainingOutputs
 from .modes import (
     AutoConfig,
     MoEEpAutoLayer,
@@ -325,6 +326,7 @@ __all__ = [
     "MoEEpLayer",
     "MoEEpMegaLayer",
     "MoEEpMegaWorkspace",
+    "MoEEpMegaTrainingOutputs",
     "MoEEpNotBuiltError",
     "MoEEpRankEvictedError",
     "MoEEpSplitGraphState",

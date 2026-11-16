@@ -44,6 +44,7 @@ from flashinfer.moe_ep.batch_invariant.mxfp8_device import PackedF32 as Mx8Packe
 from flashinfer.moe_ep.batch_invariant.mxfp8_spec import legacy_fc1_activation, legacy_quantize_block_precast
 from flashinfer.moe_ep.batch_invariant.nvfp4_spec import fc2_output
 from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
+from src.training import store_preact_row
 from cutlass.cute.typing import Float32
 from moe_nvfp4_swapab.epilogue import (
     _TmemTranspose16x32Core,
@@ -550,6 +551,8 @@ class GluMxfp8Epilogue:
         tma_atom_c: cute.CopyAtom,
         gmem_c: cute.Tensor,
         c_pipeline,
+        training_preact=None,
+        training_expert_ids=None,
     ) -> None:
         """MXFP8 fc1 task-tile: TmemTranspose16x32 TMEM loading + cross-warp E8M0 exchange."""
         real_fc1_output, _    = sched_ext.get_gmem_tensor("d",    gmem_fc1_output,    work_tile_info)
@@ -644,6 +647,8 @@ class GluMxfp8Epilogue:
                 gmem_c_subtile_view=gmem_c_subtile_arg,
                 c_buffer_idx=c_buffer_idx,
                 c_pipeline=c_pipeline,
+                training_preact=training_preact,
+                training_expert_ids=training_expert_ids,
             )
 
             tmem_gate, tmem_up = self._subtile_forward_tmem_tensor(tmem_gate, tmem_up, tmem_forward_cols)
@@ -737,6 +742,8 @@ class GluMxfp8Epilogue:
         gmem_c_subtile_view: cute.Tensor,
         c_buffer_idx,
         c_pipeline,
+        training_preact=None,
+        training_expert_ids=None,
     ) -> None:
         """MXFP8 fc1 subtile: GLU + E8M0 SF + fp8 R2S."""
         iket.range_push("fc1_epilogue_subtile")
@@ -753,6 +760,25 @@ class GluMxfp8Epilogue:
 
         if cutlass.const_expr(self._overlapping_accum):
             self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, acc_is_release)
+
+        if cutlass.const_expr(training_preact is not None):
+            lane = tidx % cutlass.Int32(WarpThreadCount)
+            token_in_cta = cutlass.Int32(warp_idx * WarpThreadCount) + lane
+            if token_in_cta < work_tile_info.valid_tokens_in_cta_tile:
+                pool_row = (
+                    work_tile_info.cumulative_data_physical_row
+                    + work_tile_info.tile_m_idx * self._cta_tile_m + token_in_cta
+                )
+                feature_start = (
+                    work_tile_info.tile_n_idx * (self._cta_tile_n // 2)
+                    + subtile_idx * Fc1GateUpInterleave
+                )
+                # Every admitted N tile and 32-feature subtile is 16-aligned.
+                store_preact_row(
+                    training_preact, training_expert_ids,
+                    r_gate, r_up, pool_row, feature_start,
+                    self._static_expert_shape[1] // 2, work_tile_info.expert_idx,
+                )
 
         # ── generate_c: store raw gate+up to GMEM C tensor via SMEM staging ──
         if cutlass.const_expr(self._generate_c):
@@ -1423,6 +1449,12 @@ class GluMxfp8Epilogue:
         else:
             _c_pipeline = None
 
+        training_preact = None
+        training_expert_ids = None
+        if cutlass.const_expr(token_comm_args is not None):
+            training_preact = token_comm_args.training_preact
+            training_expert_ids = token_comm_args.training_expert_ids
+
         task_tile_boundary_bar = pipeline.NamedBarrier(
             barrier_id=self._epilog_sync_bar_id,
             num_threads=32 * len(self._epilogue_warp_ids),
@@ -1483,6 +1515,8 @@ class GluMxfp8Epilogue:
                     tma_atom_c=_tma_atom_c,
                     gmem_c=_gmem_c,
                     c_pipeline=_c_pipeline,
+                    training_preact=training_preact,
+                    training_expert_ids=training_expert_ids,
                 )
             else:
                 self._run_fc2_task_tile(

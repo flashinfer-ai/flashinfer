@@ -394,6 +394,7 @@ def _matching_entries(
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
     input_norm_const: float = 1.0,
@@ -450,6 +451,7 @@ def _matching_entries(
         e
         for e in _load_entries(path)
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
+        and e.get("save_for_backward", False) == save_for_backward
         and e.get("apply_routing_weights_before_fc2")
         == apply_routing_weights_before_fc2
         and e.get("use_custom_finalize", False) == use_custom_finalize
@@ -516,6 +518,7 @@ def lookup_knobs(
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
     input_norm_const: float = 1.0,
@@ -543,6 +546,7 @@ def lookup_knobs(
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         use_custom_finalize=use_custom_finalize,
         batch_invariant=batch_invariant,
+        save_for_backward=save_for_backward,
         batch_invariant_version=batch_invariant_version,
         gate_up_clamp=gate_up_clamp,
         input_norm_const=input_norm_const,
@@ -592,6 +596,7 @@ def record_knobs(
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
     input_norm_const: float = 1.0,
@@ -688,6 +693,7 @@ def record_knobs(
         live_tokens=live_tokens,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         use_custom_finalize=use_custom_finalize,
+        save_for_backward=save_for_backward,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
@@ -706,6 +712,7 @@ def record_knobs(
             for e in entries
             if not (
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
+                and e.get("save_for_backward", False) == save_for_backward
                 and e.get("max_tokens") == max_tokens
                 and e.get("live_tokens", e["max_tokens"]) == live_tokens
                 and e.get("apply_routing_weights_before_fc2")
@@ -770,6 +777,7 @@ def resolve_knobs(
     apply_routing_weights_before_fc2: bool = False,
     use_custom_finalize: bool = False,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
     batch_invariant_version: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
     input_norm_const: float = 1.0,
@@ -809,6 +817,7 @@ def resolve_knobs(
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         use_custom_finalize=use_custom_finalize,
         batch_invariant=batch_invariant,
+        save_for_backward=save_for_backward,
         batch_invariant_version=batch_invariant_version,
         gate_up_clamp=gate_up_clamp,
         input_norm_const=input_norm_const,
@@ -836,9 +845,10 @@ def resolve_knobs(
             mxfp8_batch_invariant_default_knobs,
         )
 
-        return mxfp8_batch_invariant_default_knobs(
-            "legacy", quant_kind=dtype
-        ), "heuristic"
+        return (
+            mxfp8_batch_invariant_default_knobs("legacy", quant_kind=dtype),
+            "heuristic",
+        )
     if batch_invariant and dtype in (
         "bf16_nvfp4",
         "bf16_mxfp8_e4m3",

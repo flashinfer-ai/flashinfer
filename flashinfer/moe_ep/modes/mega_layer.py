@@ -30,6 +30,7 @@ from .config import MegaConfig
 if TYPE_CHECKING:
     from ..core.kernel.base import MegaKernelBackend
     from ..tensors import MoEEpTensors
+    from ..training import MoEEpMegaTrainingOutputs
 
 
 class MoEEpMegaWorkspace:
@@ -77,6 +78,14 @@ class MoEEpMegaWorkspace:
         """Whether this handle has released its backing workspace."""
 
         return self._destroyed
+
+    @property
+    def training_outputs(self) -> "MoEEpMegaTrainingOutputs":
+        """Saved tensors written by the last forward using this workspace."""
+        layer = self._layer_ref()
+        if layer is None:
+            raise MoEEpConfigError("owning MegaMoE layer no longer exists")
+        return layer.get_training_outputs(workspace=self)
 
     def destroy(self) -> None:
         """Collectively release this profile; idempotent on every rank."""
@@ -407,6 +416,27 @@ class MoEEpMegaLayer(nn.Module):
         """
         _, backend_workspace, kernel = self._resolve_workspace(None)
         return kernel.workspace_output(backend_workspace)
+
+    def get_training_outputs(
+        self, *, workspace: MoEEpMegaWorkspace | None = None
+    ) -> "MoEEpMegaTrainingOutputs":
+        """Borrow the current workspace's saved forward tensors.
+
+        Enable ``save_for_backward`` on the kernel config before construction.
+        A workspace overwrites these buffers on its next forward; use separate
+        explicit workspaces when several saved states must coexist. The method
+        does not clone tensors or refresh preprocessed weights after an optimizer
+        update. Update the caller-owned transformed weights in place while
+        preserving addresses bound by captured graphs.
+        """
+        if (
+            workspace is None
+            and self._workspace is None
+            and self._default_workspace_handle is None
+        ):
+            raise MoEEpConfigError("Warm up MegaMoE before reading training outputs")
+        _, backend_workspace, kernel = self._resolve_workspace(workspace)
+        return kernel.training_outputs(backend_workspace)
 
     def _get_transformed_weights(self) -> Any:
         """Return this layer's one-time backend weight transformation."""

@@ -150,6 +150,7 @@ class RubinTuningProtocol:
             swiglu_beta=getattr(cfg, "swiglu_beta", None),
             gate_up_clamp=cfg.gate_up_clamp,
             batch_invariant=getattr(cfg, "batch_invariant", False),
+            save_for_backward=getattr(cfg, "save_for_backward", False),
             input_norm_const=getattr(cfg, "input_norm_const", 1.0),
         )
 
@@ -158,6 +159,8 @@ class RubinTuningProtocol:
         from flashinfer.autotuner.autotuner import _collect_metadata
 
         config = dataclasses.asdict(self.cfg)
+        if not config.get("save_for_backward", False):
+            config.pop("save_for_backward", None)
         for key in (*KNOB_KEYS, "rank", "max_tokens_per_rank"):
             config.pop(key, None)
         if getattr(self.cfg, "batch_invariant", False):

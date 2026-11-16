@@ -32,6 +32,7 @@ class Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConf
     # forward.
     num_valid_tokens_tensor: Optional["torch.Tensor"] = None
     batch_invariant: bool = field(default=False, kw_only=True)
+    save_for_backward: bool = field(default=False, kw_only=True)
     activation: Literal["swiglu", "situ"] = field(default="swiglu", kw_only=True)
     swiglu_alpha: float | None = field(default=None, kw_only=True)
     swiglu_beta: float | None = field(default=None, kw_only=True)
@@ -39,6 +40,9 @@ class Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConf
     situ_linear_beta: float | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         from ..common.a16_batch_invariant import validate_a16_batch_invariant
         from ..common.activation_batch_invariant import (
             batch_invariant_activation_fields,

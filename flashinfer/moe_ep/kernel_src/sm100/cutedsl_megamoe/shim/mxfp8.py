@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional, Tuple  # noqa: F401
 
 import torch
+
+from flashinfer.moe_ep.training import _bind_legacy_training_outputs, _training_launch
 from common.megamoe_constants import Mxfp8BlockSize
 from moe_nvfp4_swapab.runner_common import ceil_div, round_up
 
@@ -77,6 +79,7 @@ class MegaMoEMxfp8Config:
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
     batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    save_for_backward: bool = dataclasses.field(default=False, kw_only=True)
     activation: str = dataclasses.field(default="swiglu", kw_only=True)
     swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
     swiglu_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
@@ -89,6 +92,9 @@ class MegaMoEMxfp8Config:
     )
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         if self.combine_dtype not in ("bf16", "mxfp8"):
             raise ValueError("legacy MXFP8 supports BF16 or MXFP8 combine")
         if self.combine_dtype != "bf16" and not self.batch_invariant:
@@ -495,6 +501,7 @@ class MegaMoEMxfp8Frontend:
             self._gate_up_clamp,
             c.enable_iket,
             c.batch_invariant,
+            c.save_for_backward,
             self.batch_invariant_fingerprint,
         )
 
@@ -586,6 +593,7 @@ class MegaMoEMxfp8Frontend:
 
             output_kwargs["combine_format"] = CombineFormat.parse("32e4m3xe8m0")
         kernel = Sm100MegaMoEMxfp8Kernel(
+            save_for_backward=c.save_for_backward,
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
@@ -691,7 +699,7 @@ class MegaMoEMxfp8Frontend:
         kwargs["max_active_clusters"] = p["max_active_clusters"]
         if self.config.enable_iket:
             kwargs["options"] = "iket"
-        mega.compiled = cute.compile(mega.kernel, **kwargs)
+        mega.compiled = _training_launch(self, cute.compile(mega.kernel, **kwargs))
         self._mega_key = p["key"]
         self._compile_prepare = None
         return mega
@@ -699,12 +707,14 @@ class MegaMoEMxfp8Frontend:
     def _invalidate_compile_cache(self) -> None:
         self._mega_key = None
         self._mega = None
+        self._training_outputs = None
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
         self._mega = None
+        self._training_outputs = None
         self._mega_key = None
         self._compile_prepare = None
 
@@ -923,6 +933,7 @@ class MegaMoEMxfp8Frontend:
         inputs: MegaMoEMxfp8Inputs,
         mega: _CompiledMega,
     ) -> dict:
+        _bind_legacy_training_outputs(self, inputs, mega)
         import cuda.bindings.driver as cuda
         from src.sym_buffer import SymBufferHost
 
@@ -1085,6 +1096,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     num_valid_tokens_tensor: Optional[torch.Tensor] = None,
     knobs: Optional[dict] = None,
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
     activation: str = "swiglu",
     swiglu_alpha: Optional[float] = None,
     swiglu_beta: Optional[float] = None,
@@ -1141,6 +1153,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         use_custom_finalize=use_custom_finalize,
         batch_invariant=batch_invariant,
+        save_for_backward=save_for_backward,
         activation=activation,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -1173,6 +1186,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
             combine_dtype=combine_dtype,
             use_custom_finalize=use_custom_finalize,
             batch_invariant=batch_invariant,
+            save_for_backward=save_for_backward,
             batch_invariant_version=(
                 MXFP8_BATCH_INVARIANT_VERSION if batch_invariant else None
             ),

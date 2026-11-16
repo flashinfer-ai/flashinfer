@@ -352,6 +352,8 @@ class W4A16EpiArgs:
     fc1_alpha: cute.Tensor
     fc2_alpha: cute.Tensor
     fc1_norm_const: Optional[cute.Tensor] = None
+    training_preact: Optional[cute.Tensor] = None
+    training_expert_ids: Optional[cute.Tensor] = None
 
 
 class EpilogueContext:

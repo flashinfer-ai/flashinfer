@@ -160,7 +160,9 @@ class Sm100W4A16MegaMoEKernel:
         situ_beta=None,
         situ_linear_beta=None,
         batch_invariant=False,
+        save_for_backward=False,
     ):
+        self.save_for_backward = save_for_backward
         self.batch_invariant = batch_invariant
         if batch_invariant:
             from flashinfer.fused_moe.cute_dsl.blackwell import moe_w4a16_utils
@@ -365,6 +367,7 @@ class Sm100W4A16MegaMoEKernel:
                 else ""
             )
             + bi_suffix
+            + ("_save_for_backward" if self.save_for_backward else "")
         )
 
     def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
@@ -640,7 +643,16 @@ class Sm100W4A16MegaMoEKernel:
             16,
         )
 
+        training_preact = None
+        training_expert_ids = None
+        if cutlass.const_expr(self.save_for_backward):
+            training_preact = self._view_local(local_workspace, "mega_moe.fc1_preact")
+            training_expert_ids = self._view_local(
+                local_workspace, "mega_moe.fc1_expert_ids"
+            )
         token_comm_args = ExtractedTokenCommArgs(
+            training_preact=training_preact,
+            training_expert_ids=training_expert_ids,
             input_token_buffer=activation,
             # BF16 tokens carry no scale-factor sideband: the SF slots ride the
             # TokenCommArgs None-skipping serialization, and dispatch's SF
@@ -1522,6 +1534,8 @@ class Sm100W4A16MegaMoEKernel:
                     fc1_alpha=fc1_alpha,
                     fc2_alpha=fc2_alpha,
                     fc1_norm_const=fc1_norm_const,
+                    training_preact=token_comm_args.training_preact,
+                    training_expert_ids=token_comm_args.training_expert_ids,
                 ),
                 token_comm_args=token_comm_args,
             )
@@ -1906,6 +1920,23 @@ class Sm100W4A16MegaMoEKernel:
                 )
             )
 
+        if self.save_for_backward:
+            specs.extend(
+                [
+                    _RegionSpec(
+                        "mega_moe.fc1_preact",
+                        cutlass.BFloat16,
+                        (self.pool_token_capacity, 2 * self.intermediate_downproj),
+                        128,
+                    ),
+                    _RegionSpec(
+                        "mega_moe.fc1_expert_ids",
+                        cutlass.Int32,
+                        (self.pool_token_capacity,),
+                        16,
+                    ),
+                ]
+            )
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
