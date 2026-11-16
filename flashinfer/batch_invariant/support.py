@@ -146,8 +146,11 @@ def byte_range(t: torch.Tensor) -> Tuple[int, int]:
     """The half-open byte range ``[start, end)`` a tensor's elements occupy, for any strides (the extent is the largest
     element offset plus one, times the element size); an empty tensor spans nothing."""
     start = t.data_ptr()
-    if t.numel() == 0:
+    numel = t.numel()
+    if numel == 0:
         return (start, start)
+    if t.is_contiguous():
+        return (start, start + numel * t.element_size())
     extent = 1 + sum(
         (n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True) if n > 1
     )
@@ -159,8 +162,11 @@ def check_no_overlap(outputs, inputs, in_place=()):
     values read after another row's store) -- except an output that IS the input it is allowed to replace in place:
     ``in_place`` lists the ``(output name, input name)`` pairs whose byte ranges must then coincide exactly (the kernel
     writes every element after the thread that owns it read it). ``outputs`` / ``inputs`` are ``(name, tensor | None)``
-    pairs; a violation raises ``ValueError``."""
+    pairs; a violation raises ``ValueError``. Without an output buffer there is nothing to check and no input is
+    touched: the eager entries that allocate their outputs pay nothing for it."""
     outs = [(n, byte_range(t)) for n, t in outputs if t is not None]
+    if not outs:
+        return
     ins = [(n, byte_range(t)) for n, t in inputs if t is not None]
 
     def overlap(a, b):
@@ -183,10 +189,10 @@ def check_no_overlap(outputs, inputs, in_place=()):
 
 
 _scratch: dict = {}
-#: Every eagerly allocated scratch buffer, kept alive for the process: a kernel captured into a CUDA graph, or still
-#: pending on another stream, writes into the buffer it was given, so a replaced buffer must never return to the
-#: allocator (its address would be reused by an unrelated tensor). The growth is geometric, so the retained total stays
-#: under twice the largest cached buffer.
+#: Every eagerly allocated scratch buffer, kept alive for the process (as ``utils._get_cache_buf`` keeps its replaced
+#: buffers in ``_cache_buf_retired``): a kernel captured into a CUDA graph, or still pending on another stream, writes
+#: into the buffer it was given, so a replaced buffer must never return to the allocator (its address would be reused by
+#: an unrelated tensor). The growth is geometric, so the retained total stays under twice the largest cached buffer.
 _scratch_keep: list = []
 
 
