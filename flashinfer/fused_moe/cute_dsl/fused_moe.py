@@ -164,12 +164,18 @@ def _check_clamped_relu2_supported(
             "ActivationType.ClampedRelu2 is not supported when quant_mode='w4a16'"
         )
     device = torch.device(device)
-    if device.type == "cuda" and torch.cuda.is_available():
-        capability = torch.cuda.get_device_capability(device)
-        if capability == (10, 7):
-            raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
-        if capability[0] < 10:
-            raise ValueError("ActivationType.ClampedRelu2 is not supported below SM100")
+    if (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device) == (10, 7)
+    ):
+        raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
+    if (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device)[0] < 10
+    ):
+        raise ValueError("ActivationType.ClampedRelu2 is not supported below SM100")
 
 
 #: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales
@@ -1870,29 +1876,10 @@ def _w4a16_records_runnable(runner) -> bool:
     from ..prepare import cute_dsl_w4a16_sm80_supported
 
     return cute_dsl_w4a16_sm80_supported(
-        runner.num_experts,
-        runner.num_local_experts,
-        runner.local_expert_offset,
-        runner.output_dtype,
-        runner.activation_type,
-        runner.swiglu_alpha,
-        runner.swiglu_beta,
-        runner.swiglu_limit,
-        runner.situ_beta,
-    )
-
-
-def _w4a16_records_inputs(runner, inputs):
-    """W4A16 ``inputs`` with the records in the block scale slots where they run, converting the
-    CuTe-DSL weights' MMA-layout block scales; records and CUTLASS operands unchanged."""
-    from ..prepare import cute_dsl_w4a16_sm80_weights
-
-    s1, s2 = inputs[4], inputs[7]
-    if not _w4a16_records_runnable(runner) or s1.dim() != 6:
-        return inputs
-    gated = runner.activation_type == ActivationType.Swiglu
-    r1, r2 = cute_dsl_w4a16_sm80_weights(inputs[3], s1, inputs[6], s2, gated)
-    return [*inputs[:4], r1, inputs[5], inputs[6], r2, *inputs[8:]]
+        runner.num_experts, runner.num_local_experts, runner.local_expert_offset,
+        runner.output_dtype, runner.activation_type, runner.swiglu_alpha, runner.swiglu_beta,
+        runner.swiglu_limit, runner.situ_beta,
+    )  # fmt: skip
 
 
 @functools.cache
@@ -1903,8 +1890,8 @@ def _w4a16_sm80_module():
 
 
 def _w4a16_moe_sm80(runner, inputs, tactic):
-    """Runs W4A16 ``inputs`` holding records (``cute_dsl_w4a16_sm80_weights``) as routing into row blocks,
-    GEMM1 with the activation, GEMM2 and the top-k weighted sum, with ``tactic`` from
+    """Runs W4A16 ``inputs`` holding records (``cute_dsl_w4a16_sm80_weights``) as routing into
+    row blocks, GEMM1 with the activation, GEMM2 and the top-k weighted sum, with ``tactic`` from
     ``W4A16_SM80_TACTICS``."""
     from ..prepare import _w4a16_records_bytes, _w4a16_records_geometry
 
@@ -1949,17 +1936,29 @@ def _w4a16_moe_sm80(runner, inputs, tactic):
     n2 = _w4a16_records_geometry(hidden, inter, False)[0]
     act = 1 if gated else 2
     x = x.contiguous()
-    module.gemm(r1, alpha1.float().contiguous(), x, meta, rowmap, blocked, row_tile, act, top_k, n1, hidden, inter, max_blocks, gemm1)  # fmt: skip
-    module.gemm(r2, alpha2.float().contiguous(), blocked, meta, rowmap, y, row_tile, 0, top_k, n2, inter, hidden, max_blocks, gemm2)  # fmt: skip
+    module.gemm(
+        r1, alpha1.float().contiguous(), x, meta, rowmap, blocked, row_tile, act, top_k, n1,
+        hidden, inter, max_blocks, gemm1,
+    )  # fmt: skip
+    module.gemm(
+        r2, alpha2.float().contiguous(), blocked, meta, rowmap, y, row_tile, 0, top_k, n2,
+        inter, hidden, max_blocks, gemm2,
+    )  # fmt: skip
     module.finalize(y, scales.float().contiguous(), ids, out, top_k)
     return out
 
 
 def _cute_dsl_fused_moe_below_sm100(op_name, runner, inputs, tactic, **recipe_kwargs):
     """``_cute_dsl_fused_moe_sm80`` for the functional and wrapper APIs: W4A16 runs on records
-    where they run, tuned among their tactics under ``op_name`` unless given ``tactic``."""
+    where they run, converted from the CuTe-DSL weights' MMA-layout block scales, tuned among
+    their tactics under ``op_name`` unless given ``tactic``."""
     if isinstance(runner, CuteDslFusedMoEW4A16Runner):
-        inputs = _w4a16_records_inputs(runner, inputs)
+        if inputs[4].dim() == 6 and _w4a16_records_runnable(runner):
+            from ..prepare import cute_dsl_w4a16_sm80_weights
+
+            gated = runner.activation_type == ActivationType.Swiglu
+            r1, r2 = cute_dsl_w4a16_sm80_weights(*inputs[3:5], *inputs[6:8], gated)
+            inputs = [*inputs[:4], r1, inputs[5], inputs[6], r2, *inputs[8:]]
         if tactic is None and inputs[4].dim() == 2:
             _, tactic = AutoTuner.get().choose_one(
                 op_name, [runner], runner.tuning_config, inputs
@@ -1987,9 +1986,8 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
     if w4a16:  # no activation scales
         x, experts, scales, w1, s1, alpha1, w2, s2, alpha2 = inputs[:9]
     else:
-        x, x_sf, experts, scales, w1, s1, alpha1, fc2_scale, w2, s2, alpha2 = inputs[
-            :11
-        ]
+        x, x_sf, experts, scales, w1, s1, alpha1 = inputs[:7]
+        fc2_scale, w2, s2, alpha2 = inputs[7:11]
     out = inputs[-1]
     major, minor = torch.cuda.get_device_capability(x.device)
     if s1.dtype not in (out.dtype, torch.int32):  # int32: SM90 W4A8's operands
@@ -1997,15 +1995,9 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
         mma_bytes = (5, 2, 4, 0, 1, 3)
         _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
         w1, s1, w2, s2 = cutlass_nvfp4_sm80_weights(
-            w1,
-            s1.permute(mma_bytes),
-            w2,
-            s2.permute(mma_bytes),
-            out.dtype,
-            gated,
-            mx=w4a8,
+            w1, s1.permute(mma_bytes), w2, s2.permute(mma_bytes), out.dtype, gated, mx=w4a8,
             sm90=w4a8 and major == 9,  # on the FP8 mixed-input GEMM, as CUTLASS MoE
-        )
+        )  # fmt: skip
     if s1.dtype != torch.int32:  # the SM90 operands keep their uint8 weights
         w1, w2 = w1.view(torch.int64), w2.view(torch.int64)
     code = NVFP4_4OVER6_CODE_STANDARD

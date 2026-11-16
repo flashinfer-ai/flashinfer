@@ -354,21 +354,11 @@ template <typename ElementA, typename LayoutA, int kAlignmentA, typename LayoutB
 struct DefaultMma<ElementA, LayoutA, kAlignmentA, float_e2m1_t, LayoutB, kAlignmentB,
                   ElementAccumulator, layout::RowMajor, arch::OpClassTensorOp, ArchTag,
                   ThreadblockShape, WarpShape, InstructionShape, kStages, Operator, false,
-                  SharedMemoryClear> {
- private:
-  static constexpr int kAlignmentScale = 128 / sizeof_bits<ElementA>::value;
-
-  using Mma = DqMma<ElementA, LayoutA, kAlignmentA, float_e2m1_t, LayoutB, kAlignmentB, ElementA,
-                    layout::RowMajor, kAlignmentScale, ElementAccumulator, layout::RowMajor,
-                    arch::OpClassTensorOp, ArchTag, ThreadblockShape, WarpShape, InstructionShape,
-                    kStages, Operator, SharedMemoryClear>;
-
- public:
-  using MmaCore = typename Mma::MmaCore;
-  using IteratorA = typename Mma::IteratorA;
-  using IteratorB = typename Mma::IteratorB;
-  using ThreadblockMma = typename Mma::ThreadblockMma;
-};
+                  SharedMemoryClear>
+    : DqMma<ElementA, LayoutA, kAlignmentA, float_e2m1_t, LayoutB, kAlignmentB, ElementA,
+            layout::RowMajor, 128 / sizeof_bits<ElementA>::value, ElementAccumulator,
+            layout::RowMajor, arch::OpClassTensorOp, ArchTag, ThreadblockShape, WarpShape,
+            InstructionShape, kStages, Operator, SharedMemoryClear> {};
 
 /// Two stages, as for int4, to stay more specialized than CUTLASS's generic two-stage DefaultMma
 template <typename ElementA, typename LayoutA, int kAlignmentA, typename LayoutB, int kAlignmentB,
@@ -376,21 +366,11 @@ template <typename ElementA, typename LayoutA, int kAlignmentA, typename LayoutB
           typename WarpShape, typename InstructionShape, typename Operator>
 struct DefaultMma<ElementA, LayoutA, kAlignmentA, float_e2m1_t, LayoutB, kAlignmentB,
                   ElementAccumulator, layout::RowMajor, arch::OpClassTensorOp, ArchTag,
-                  ThreadblockShape, WarpShape, InstructionShape, 2, Operator> {
- private:
-  static constexpr int kAlignmentScale = 128 / sizeof_bits<ElementA>::value;
-
-  using Mma = DqMma<ElementA, LayoutA, kAlignmentA, float_e2m1_t, LayoutB, kAlignmentB, ElementA,
-                    layout::RowMajor, kAlignmentScale, ElementAccumulator, layout::RowMajor,
-                    arch::OpClassTensorOp, ArchTag, ThreadblockShape, WarpShape, InstructionShape,
-                    2, Operator>;
-
- public:
-  using MmaCore = typename Mma::MmaCore;
-  using IteratorA = typename Mma::IteratorA;
-  using IteratorB = typename Mma::IteratorB;
-  using ThreadblockMma = typename Mma::ThreadblockMma;
-};
+                  ThreadblockShape, WarpShape, InstructionShape, 2, Operator>
+    : DqMma<ElementA, LayoutA, kAlignmentA, float_e2m1_t, LayoutB, kAlignmentB, ElementA,
+            layout::RowMajor, 128 / sizeof_bits<ElementA>::value, ElementAccumulator,
+            layout::RowMajor, arch::OpClassTensorOp, ArchTag, ThreadblockShape, WarpShape,
+            InstructionShape, 2, Operator> {};
 
 }  // namespace threadblock
 }  // namespace gemm

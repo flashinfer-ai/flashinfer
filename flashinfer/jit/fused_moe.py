@@ -185,13 +185,9 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
 
 # SM80 to SM89: NVFP4 runs on the SM80 16-bit x E2M1 kernels, with the FP4 conversions in software.
 _SM8X_NVCC_FLAGS = [
-    "-DENABLE_BF16",
-    "-DENABLE_FP8",
-    "-DUSING_OSS_CUTLASS_MOE_GEMM",
-    "-DENABLE_FP4",
-    "-DFLASHINFER_FP4_SW_CVT",
-    "-DFLASHINFER_FP4_QUANT_NO_TMA",
-]
+    "-DENABLE_BF16", "-DENABLE_FP8", "-DUSING_OSS_CUTLASS_MOE_GEMM", "-DENABLE_FP4",
+    "-DFLASHINFER_FP4_SW_CVT", "-DFLASHINFER_FP4_QUANT_NO_TMA",
+]  # fmt: skip
 
 
 def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:

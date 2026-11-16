@@ -351,9 +351,8 @@ struct QuantParams {
   } fp8_block_scaling;
 
 #if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100, MXFP8 x MXFP4: the MXFP8 input, and per GEMM1 row (permuted) whether an E8M0
-  // scale of its token is 244 to 254 (the restored BF16 row out of range), GEMM1 recomputing those
-  // rows from the codes.
+  // Below SM100, MXFP8 x MXFP4: the MXFP8 input, and per GEMM1 row (permuted) whether its token has
+  // an E8M0 scale of 244 to 254 (restored BF16 out of range), GEMM1 recomputing it from the codes.
   struct RestoredMxfp8Inputs {
     void const* codes = nullptr;
     uint8_t const* sf = nullptr;
@@ -362,9 +361,8 @@ struct QuantParams {
     int const* permuted_row_to_unpermuted_row = nullptr;
   } restored_mxfp8;
 
-  // Below SM100, BF16 W4A16 with both GEMMs on the small-M kernel: nothing restored, GEMM1 reading
-  // the token rows (GEMM row r takes token w4a16_token_rows[r] % the tokens) and both GEMMs scaling
-  // by their experts' global scales.
+  // Below SM100, BF16 W4A16 on the small-M kernel: nothing restored, GEMM1 reading the token rows
+  // (row r: token w4a16_token_rows[r] % the tokens), both GEMMs scaling by experts' global scales.
   int const* w4a16_token_rows = nullptr;
 #endif
 
@@ -658,12 +656,10 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   // Below SM100 NVFP4 runs on the SM80 16-bit x E2M1 GEMMs, with the activations restored, and
   // MXFP8 x MXFP4 too, on this runner with MXFP8 input.
   static constexpr bool use_restored_fp4 = use_fp4;
-  static constexpr bool use_restored_mx =
-      use_restored_fp4 && std::is_same_v<InputType, __nv_fp8_e4m3>;
 #else
   static constexpr bool use_restored_fp4 = false;
-  static constexpr bool use_restored_mx = false;
 #endif
+  static constexpr bool use_restored_mx = use_restored_fp4 && use_fp8_input;
   using GemmInputType = std::conditional_t<use_restored_fp4, BackBoneType, T>;
 
   static constexpr bool use_mxfp8 = use_fp8 && IsMXFPX;
@@ -689,8 +685,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   using UnfusedGemmOutputType = BackBoneType;
 
   // We introduce this as a separate parameter, so that if we ever remove the above condition we can
-  // decouple BackBoneType and OutputType easily. For now these are required to be equivalent, but
-  // below SM100 MXFP8 x MXFP4 runs on BF16 for either output.
+  // decouple BackBoneType and OutputType easily. For now these are required to be equivalent
   static_assert(std::is_same_v<OutputType, BackBoneType> ||
                     (use_restored_mx && std::is_same_v<BackBoneType, __nv_bfloat16>),
                 "Scale and bias types must match OutputType");

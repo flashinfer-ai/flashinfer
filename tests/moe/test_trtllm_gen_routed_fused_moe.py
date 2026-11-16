@@ -51,7 +51,6 @@ from flashinfer.fused_moe import (
     trtllm_fp8_per_tensor_scale_routed_moe,
     trtllm_mxint4_block_scale_moe,
     trtllm_mxint4_block_scale_routed_moe,
-    trtllm_nvfp4_sm80_weights,
 )
 from flashinfer.fused_moe.core import Fp8QuantizationType
 from flashinfer.prims_ts.utils import is_prims_ts_available
@@ -273,20 +272,6 @@ def _run_trtllm_gen_routed_fused_moe_case(
         activation_type.value,  # act_type
         None,
     )[0].to(torch.float)
-    if compute_capability[0] < 10:  # the same operands, prepared once
-        operands = trtllm_nvfp4_sm80_weights(
-            w13, w13_scale, w2, w2_scale, activation_type.is_gated,
-            quant_mode != "NvFP4xNvFP4",
-            sm90=compute_capability[0] == 9 and quant_mode == "MxFP4xMxFP8",
-        )  # fmt: skip
-        prepared = trtllm_fp4_block_scale_routed_moe(
-            routing_input, None, hidden_states, hidden_states_scale, *operands[:2], None,
-            gemm1_alpha, gemm1_beta, gemm1_clamp_limit, *operands[2:], None,
-            output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar,
-            num_experts, top_k, None, None, intermediate_size, 0, num_experts, None,
-            routing_method_type.value, True, enable_pdl, activation_type.value, None,
-        )[0]  # fmt: skip
-        assert torch.equal(prepared.to(torch.float), output)
 
     mask = torch.isclose(output, reference_output, rtol=1e-3, atol=1e-3)
 

@@ -405,7 +405,7 @@ struct FastE2M1NumericArrayConverter {
   using DType16 = std::conditional_t<platform::is_same<T, half_t>::value, half, __nv_bfloat16>;
 
   CUTLASS_DEVICE
-  static result_type convert(source_type const& source) {
+  result_type operator()(source_type const& source) {
     result_type result;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < N / 8; ++i) {
@@ -414,9 +414,6 @@ struct FastE2M1NumericArrayConverter {
     }
     return result;
   }
-
-  CUTLASS_DEVICE
-  result_type operator()(source_type const& s) { return convert(s); }
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

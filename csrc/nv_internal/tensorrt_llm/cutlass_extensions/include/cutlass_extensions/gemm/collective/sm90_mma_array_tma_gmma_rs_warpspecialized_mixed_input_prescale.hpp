@@ -115,6 +115,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
   using StrideScale = cute::Stride<cute::Int<1>, int64_t, int64_t>;
   using NonVoidStrideScale = cute::conditional_t<cute::is_void_v<StrideScale>,
                                                  cute::Stride<_1, int64_t, int64_t>, StrideScale>;
+  using StrideActivationScale = cute::Stride<int64_t, cute::Int<1>, int64_t>;
 
   static_assert(
       (IsATransformed && (cutlass::gemm::detail::is_k_major<StrideA>() ||
@@ -186,6 +187,23 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
   static constexpr int NumProducerThreadEvents = 1;
 
   static constexpr int RawActScaleChunksPerTileK = size<2>(TileShape{}) / ScalingGroupSize;
+  // Keep the derived value nonzero so the modulo static_assert below remains
+  // well-formed; RawActScaleChunksPerTileK carries the actual validity check.
+  static constexpr int ActScaleChunksPerTileK =
+      HasActivationScale ? ((RawActScaleChunksPerTileK > 0) ? RawActScaleChunksPerTileK : 1) : 1;
+  static constexpr int ActScaleTmaAlignmentChunks =
+      HasActivationScale ? (128 / cutlass::sizeof_bits<NonVoidElementActivationScale>::value) : 1;
+  static constexpr bool ActScaleTmaUsesMinWindow =
+      ActScaleChunksPerTileK <= ActScaleTmaAlignmentChunks;
+  static constexpr int ActScaleTmaChunks =
+      ActScaleTmaUsesMinWindow ? ActScaleTmaAlignmentChunks : ActScaleChunksPerTileK;
+  static_assert(!HasActivationScale || RawActScaleChunksPerTileK > 0,
+                "Activation scale TMA requires TileShapeK to cover at least one scale group.");
+  static_assert(
+      !HasActivationScale ||
+          (ActScaleTmaUsesMinWindow ? (ActScaleTmaAlignmentChunks % ActScaleChunksPerTileK == 0)
+                                    : (ActScaleChunksPerTileK % ActScaleTmaAlignmentChunks == 0)),
+      "Activation scale TileShapeK must divide or be a multiple of the 16B TMA scale window.");
   static constexpr int WeightScaleLogicalMPerFoldBlock = 64;
   static constexpr int WeightScaleLogicalKPerFoldBlock = 128;
   static constexpr int WeightScaleFoldedMPerFoldBlock = 16;
@@ -209,6 +227,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
                         cutlass::sizeof_bits<WeightScaleRawElement>::value ==
                     128,
                 "Folded weight scale must expose 16B per folded-M coordinate.");
+  static constexpr int ScaleNRawElementsPerStage = size<1>(TileShape{}) * ActScaleTmaChunks;
   static constexpr int ScaleNElementsPerStage = size<1>(TileShape{});
   static constexpr int WeightScaleRawElementsPerFoldBlock =
       WeightScaleLogicalMPerFoldBlock * WeightScaleLogicalKPerFoldBlock / ScalingGroupSize;
@@ -281,9 +300,8 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
           Stride<_0, Stride<_1, Int<WeightScaleFoldedMPerFoldBlock *
                                     WeightScalePhysicalColsPerFoldBlock>>>,
           Int<WeightScaleRawElementsPerStage>>>;
-  // Exact block exponents read the activation E8M0 in the SM100 128x4 layout: one 128-row x K128
-  // atom per 128 tile columns, row r and K32 block kb at byte (r % 32) * 16 + (r / 32) * 4 + kb.
-  // A narrower tile loads the atom holding its rows; mma() finds them from the tile's N coordinate.
+  // Exact mode: activation E8M0 in SM100 128x4 layout, one 128-row x K128 atom per 128 tile cols
+  // (narrower tiles load theirs); row r, K32 block kb at byte (r % 32) * 16 + (r / 32) * 4 + kb.
   static constexpr int ActScaleAtomRows = 128;
   static constexpr int ActScaleAtomBytes = ActScaleAtomRows * 4;
   static constexpr int ActScaleAtomsPerTile =
@@ -325,8 +343,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
   int current_group_n_ = 0;
   cute::TmaDescriptor const* current_tma_desc_b_ = nullptr;
 
-  // cute::for_each calls through a lambda that is not force-inlined; a large K-block body would
-  // then leave the wgmma pipeline at a call boundary.
+  // Force-inlined for_each: a call boundary in a large K-block body breaks the wgmma pipeline.
   template <int... I, class F>
   CUTLASS_DEVICE static void unroll(cute::int_sequence<I...>, F&& f) {
     (f(Int<I>{}), ...);
@@ -339,24 +356,18 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
     uint32_t bits = b == 255 ? 0x7fc00000u : (e > 0 ? uint32_t(e) << 23 : 0x00400000u >> -e);
     return __uint_as_float(bits);
   }
-  CUTLASS_DEVICE static float mul_rn(float a, float b) {
-    float d;
-    asm("mul.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
-    return d;
-  }
   CUTLASS_DEVICE static float fma_rn(float a, float b, float c) {
     float d;
     asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
     return d;
   }
-  CUTLASS_DEVICE static float min_nan(float a, float b) {
+  // c + (t * min(sw, sa)) * max(sw, sa) with NaN-propagating min / max.
+  CUTLASS_DEVICE static float minmax_fma_rn(float t, float sw, float sa, float c) {
     float d;
-    asm("min.NaN.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
-    return d;
-  }
-  CUTLASS_DEVICE static float max_nan(float a, float b) {
-    float d;
-    asm("max.NaN.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
+    asm("{ .reg .f32 lo, hi; min.NaN.f32 lo, %2, %3; max.NaN.f32 hi, %2, %3;"
+        " mul.rn.f32 lo, %1, lo; fma.rn.f32 %0, lo, hi, %4; }"
+        : "=f"(d)
+        : "f"(t), "f"(sw), "f"(sa), "f"(c));
     return d;
   }
 
@@ -414,8 +425,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
       CUTE_ALIGNAS(SmemAlignmentB)
       cute::ArrayEngine<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
       // Keep the member layout aligned with mixed_input.hpp for online collective
-      // switching.  Zero storage is empty; activation factors exist only in the
-      // exact block-exponent mode.
+      // switching.  Zero storage is empty; activation storage exists only in exact mode.
       cute::ArrayEngine<WeightScaleRawElement, scale_elements> smem_scale;
       cute::ArrayEngine<NonVoidElementActivationScale, activation_scale_elements>
           smem_activation_scale;
@@ -450,8 +460,10 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
     int chunk_size = 0;
     ElementZero const** ptr_Z = nullptr;
     NonVoidElementActivationScale const** ptr_ActivationScale = nullptr;
+    StrideActivationScale const* dActivationScale{};
     cute::TmaDescriptor const* ptr_A_prebuilt_tma_desc = nullptr;
     cute::TmaDescriptor const* ptr_B_prebuilt_tma_descs = nullptr;
+    cute::TmaDescriptor const* ptr_ActivationScale_prebuilt_tma_descs = nullptr;
   };
 
   // Device side kernel params
@@ -500,6 +512,8 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
     NonVoidElementScale const** ptr_S;
     NonVoidStrideScale const* dS;
     NonVoidElementActivationScale const** ptr_ActivationScale;
+    StrideActivationScale const* dActivationScale;
+    cute::TmaDescriptor const* ptr_ActivationScale_prebuilt_tma_descs;
     NonVoidElementZero const** ptr_Z;
     int64_t scale_k;
     int chunk_size;
@@ -622,6 +636,8 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
               reinterpret_cast<NonVoidElementScale const**>(args.ptr_S),
               args.dS,
               args.ptr_ActivationScale,
+              args.dActivationScale,
+              args.ptr_ActivationScale_prebuilt_tma_descs,
               reinterpret_cast<NonVoidElementZero const**>(args.ptr_Z),
               scale_k,
               chunk_size,
@@ -882,8 +898,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
                                  (act_row + atom * ActScaleAtomRows < current_group_n_ ? atom : 0);
             auto const* act_scale_gmem =
                 mainloop_params.ptr_ActivationScale[current_group_idx_] +
-                (int64_t(src_atom) * scale_total_k128_blocks + int64_t(*k_tile_iter)) *
-                    ActScaleAtomBytes;
+                scale_gmem_fold_block(src_atom, int(*k_tile_iter)) * ActScaleAtomBytes;
             cute::SM90_BULK_COPY_G2S::copy(act_scale_gmem, reinterpret_cast<uint64_t*>(tma_barrier),
                                            shared_tensors.smem_activation_scale.begin() +
                                                write_stage * ActScaleBulkCopyBytes +
@@ -1060,8 +1075,8 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
     constexpr int K_COMMIT_GROUPS = (K_BLOCK_MAX + K_COMMIT_GROUP_SIZE - 1) / K_COMMIT_GROUP_SIZE;
     constexpr int K_WAIT_MAX = (K_COMMIT_GROUPS - 1 < 7) ? K_COMMIT_GROUPS - 1 : 7;
     // Large-N tiles expose scale smem->RF latency; small-N best configs keep
-    // the rolling copy to avoid extending scale register lifetime.  Exact block
-    // exponents decide the fold from the whole K tile's weight exponents up front.
+    // the rolling copy to avoid extending scale register lifetime.
+    // Exact mode decides the fold from the whole K tile's weight exponents up front.
     constexpr bool PreloadAllScaleKblocks = size<1>(TileShape{}) >= 128 || HasActivationScale;
     static_assert(K_BLOCK_MAX >= 4, "Consider increasing TileShapeK");
     static_assert(ScalingGroupSize % cute::get<0, 1>(tCsB.shape())() == 0,
@@ -1093,11 +1108,9 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
         }
       }
     };
-    // Exact mode folds a warpgroup's weight exponents into A when its 64x128 block of them lies in
-    // [base + 1, base + 12] with base in [99, 121]: A becomes E2M1 x 2^(e - base - 6), exact in
-    // E4M3, and 2^(base - 121) joins the activation factors, exact for every code (see
-    // e8m0_block_factor).  Other K tiles convert A unscaled (offset 6) and apply both exponents
-    // after the MMA.  Every warp reads the whole block, so the warps agree without a barrier.
+    // Fold a warpgroup's 64x128 weight exponents into A when they lie in [base + 1, base + 12],
+    // base in [99, 121]: A = E2M1 x 2^(e - base - 6) is exact in E4M3, 2^(base - 121) joins the
+    // activation factors; else A stays unscaled.  All warps read the block, so no barrier.
     int fold_bias = 0;  // base - 121 for the next K tile, 0 unless it folds
     bool fold_next = false;
     bool fold = false;  // the K tile whose blocks are being accumulated
@@ -1165,19 +1178,11 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
       }
     };
 
-    // Exact block exponents: every K=32 FP8 MMA writes a fresh partial t for its columns, then
-    // accum += (t * min(Sw, Sa)) * max(Sw, Sa), the first product exact (t is a multiple of 2^-10
-    // below 2^17).  A folded K tile's t already carries Sw / 2^(base - 121), so accum += t * Sa'
-    // with the same product.
-    auto accum_blk = [&] {
-      if constexpr (HasActivationScale) {
-        static_assert(decltype(size<1>(accum))::value == 1,
-                      "One 64-row MMA per consumer warpgroup.");
-        return make_fragment_like(accum(_, Int<0>{}, Int<0>{}));
-      } else {
-        return cute::tuple<>{};
-      }
-    }();
+    // Each K=32 FP8 MMA writes a fresh partial t, then accum += (t * min(Sw, Sa)) * max(Sw, Sa),
+    // t * min exact (t is a multiple of 2^-10 below 2^17); a folded tile's t carries Sw already.
+    static_assert(!HasActivationScale || decltype(size<1>(accum))::value == 1,
+                  "One 64-row MMA per consumer warpgroup.");
+    auto accum_blk = make_fragment_like(accum(_, Int<0>{}, Int<0>{}));
     int act_factor_parity = 0;
     int act_factor_buffer = 0;
     if constexpr (HasActivationScale) {
@@ -1277,9 +1282,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
                    }
                    CUTLASS_PRAGMA_UNROLL
                    for (int i = 0; i < size(accum_n); ++i) {
-                     float lo = min_nan(tCrSw(i), tCrSa(i));
-                     float hi = max_nan(tCrSw(i), tCrSa(i));
-                     accum_n(i) = fma_rn(mul_rn(accum_blk(i), lo), hi, accum_n(i));
+                     accum_n(i) = minmax_fma_rn(accum_blk(i), tCrSw(i), tCrSa(i), accum_n(i));
                    }
                  }
                });
@@ -1474,10 +1477,9 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
   }
 
   template <class InputTensors, class ProblemShape_MNKL>
-  CUTLASS_DEVICE InputTensors tensors_perform_update(InputTensors const& input_tensors,
-                                                     [[maybe_unused]] Params const& mainloop_params,
-                                                     ProblemShape_MNKL problem_shape_mnkl,
-                                                     [[maybe_unused]] int32_t next_batch) {
+  CUTLASS_DEVICE InputTensors tensors_perform_update(
+      InputTensors const& input_tensors, [[maybe_unused]] Params const& mainloop_params,
+      [[maybe_unused]] ProblemShape_MNKL problem_shape_mnkl, [[maybe_unused]] int32_t next_batch) {
     current_group_idx_ = next_batch;
     current_group_n_ = int(get<1>(problem_shape_mnkl));
     current_tma_desc_b_ = mainloop_params.ptr_B_prebuilt_tma_descs + next_batch;

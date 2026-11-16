@@ -497,6 +497,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     kernels::MoeMinLatencyParams min_latency_params{};
 
     float const* per_token_scale = nullptr;
+    // TODO: support lora in the future
+    ::tensorrt_llm::kernels::LoraParams lora_params{};
 #if defined(FLASHINFER_FP4_SW_CVT)
     // Below SM100 a 7th NVFP4 quant scale gives per-token activation scales, one per input row.
     if (isNvfp4Quant() && quant_scales.value().size() == 7) {
@@ -508,8 +510,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       per_token_scale = static_cast<float const*>(token_scale.data_ptr());
     }
 
-    // Not the LoRA plugin (use_lora stays false): only TRT-LLM MoE's FC1 deltas and GEMM2 inputs.
-    ::tensorrt_llm::kernels::LoraParams lora_params{};
     // Finalize writes each row's leading output.size(1) columns, in 16-byte vectors.
     CHECK_DIM(2, output);
     int64_t const unpadded_hidden_size = output.size(1);
@@ -527,6 +527,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       CHECK_INPUT_AND_TYPE(permuted_rows.value(), dl_int32);
       TVM_FFI_ICHECK_EQ(permuted_rows.value().numel(), expanded_rows);
     }
+    // Not the LoRA plugin (use_lora stays false): only TRT-LLM MoE's FC1 deltas and GEMM2 inputs.
     Tensor fc1_row_biases;
     if (fc1_deltas.has_value()) {
       CHECK_INPUT_AND_TYPE(fc1_deltas.value(), bias_dtype);
@@ -556,8 +557,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK(!permuted_rows.has_value() && !skip_finalize && !fc1_deltas.has_value() &&
                    !fc2_inputs.has_value())
         << "permuted_rows, skip_finalize, fc1_deltas and fc2_inputs are below SM100 only";
-    // TODO: support lora in the future
-    ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
     int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
 #endif
@@ -1601,8 +1600,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     else if (isNvfp4Quant() || isWMxfp4AMxfp8Quant()) {
       TVM_FFI_ICHECK(quant_scales.has_value()) << "Expecting quant scales for nvfp4 quantization";
 #if defined(FLASHINFER_FP4_SW_CVT)
-      // Below SM100 a 7th scale may give per-token activation scales, and the 4 weight scales
-      // alone (fc1 block, fc1 global, fc2 block, fc2 global) keep the activations 16-bit (W4A16).
+      // Below SM100 the 4 weight scales (fc1/fc2 block and global) alone keep 16-bit activations
+      // (W4A16), and a 7th scale gives per-token activation scales.
       auto const num_scales = quant_scales.value().size();
       TVM_FFI_ICHECK(num_scales == 4 || num_scales == 6 || num_scales == 7)
           << "Expecting 4, 6 or 7 quant scales for nvfp4 quantization";
@@ -1622,9 +1621,16 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       auto const& fc2_global = quant_scales.value()[w4a16 ? 3 : 5];
 
 #if defined(FLASHINFER_FP4_SW_CVT)
-      // Below SM100 the weight block scales are [E, K / 16, N] in the output type (BF16 for
-      // MXFP8 x MXFP4), K padded to 64, prepared for the SM80 GEMMs.
+      // Below SM100: [E, K / 16, N] in the output type (BF16 for MXFP8 x MXFP4), K padded to 64.
       auto const weight_block_dtype = isWMxfp4AMxfp8Quant() ? dl_bfloat16 : mOutputDtype;
+      auto const check_block = [&](auto const& block, int64_t k, int64_t n, char const* msg) {
+        TVM_FFI_ICHECK(block.size(0) == num_experts_on_rank &&
+                       block.size(1) * 16 ==
+                           TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                               k, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) &&
+                       block.size(2) == n)
+            << msg;
+      };
 #else
       // The input for scale fc1_weight_block / fc2_weight_block is packed into INT32
       constexpr int FP8_PER_INT32 = 4;
@@ -1650,15 +1656,10 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(fc1_act_global.ndim() == 0 || fc1_act_global.size(0) == num_experts_on_rank)
           << "fc1 act global must be scalar or (num_experts_on_rank,)";
 #if defined(FLASHINFER_FP4_SW_CVT)
-      int64_t const fc1_n = isGatedActivation(base_activation_type) ? inter_size * 2 : inter_size;
-      TVM_FFI_ICHECK(
-          fc1_weight_block.size(0) == num_experts_on_rank &&
-          fc1_weight_block.size(1) * 16 ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) &&
-          fc1_weight_block.size(2) == fc1_n)
-          << "fc1 weight block size must be (num_experts_on_rank, padded hidden_size // 16, fc1 "
-             "rows)";
+      check_block(fc1_weight_block, hidden_size,
+                  isGatedActivation(base_activation_type) ? inter_size * 2 : inter_size,
+                  "fc1 weight block size must be (num_experts_on_rank, padded hidden_size // 16, "
+                  "fc1 rows)");
 #else
       if (isGatedActivation(base_activation_type)) {
         TVM_FFI_ICHECK(
@@ -1694,14 +1695,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       TVM_FFI_ICHECK(fc2_act_global.ndim() == 0 || fc2_act_global.size(0) == num_experts_on_rank)
           << "fc2 act global must be scalar or (num_experts_on_rank,)";
 #if defined(FLASHINFER_FP4_SW_CVT)
-      TVM_FFI_ICHECK(
-          fc2_weight_block.size(0) == num_experts_on_rank &&
-          fc2_weight_block.size(1) * 16 ==
-              TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
-                  inter_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4) &&
-          fc2_weight_block.size(2) == hidden_size)
-          << "fc2 weight block size must be (num_experts_on_rank, padded inter_size // 16, "
-             "hidden_size)";
+      check_block(fc2_weight_block, inter_size, hidden_size,
+                  "fc2 weight block size must be (num_experts_on_rank, padded inter_size // 16, "
+                  "hidden_size)");
 #else
       TVM_FFI_ICHECK(
           fc2_weight_block.size(0) == num_experts_on_rank &&

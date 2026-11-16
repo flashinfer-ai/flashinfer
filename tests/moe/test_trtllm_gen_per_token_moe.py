@@ -61,7 +61,7 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 
 # The 4-over-6 x per-token-scaling matrix is the coverage here (only file exercising
 # it); shape fan-out kept to boundary corners.
-def _skip_unless_sm80_to_sm10x(device: torch.device) -> None:
+def _skip_unless_sm10x(device: torch.device) -> None:
     if get_compute_capability(device)[0] not in [8, 9, 10]:
         pytest.skip("These tests are only guaranteed to work on SM80 to SM103 GPUs.")
 
@@ -383,7 +383,7 @@ def test_routed_fused_moe(
     zero_rows: bool,
 ):
     device = torch.device("cuda:0")
-    _skip_unless_sm80_to_sm10x(device)
+    _skip_unless_sm10x(device)
     kwargs, reference = _per_token_routed_case(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
@@ -432,7 +432,7 @@ def test_pinned_recipe_matches_env(recipe: NVFP44Over6Config, use_4over6: bool):
     (``globalScaleInv``) from ``1/(448*6)`` to ``1/(256*6)``.
     """
     device = torch.device("cuda:0")
-    _skip_unless_sm80_to_sm10x(device)
+    _skip_unless_sm10x(device)
     kwargs, _reference = _per_token_routed_case(
         num_tokens=64,
         hidden_size=1024,

@@ -76,8 +76,7 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
         "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
   return val;
 #elif defined(__CUDA_ARCH__) && defined(FLASHINFER_FP4_SW_CVT)
-  // fp32_to_e2m1_sw of tensorrt_llm/kernels/quantization_utils.cuh: ties-to-even at the E2M1
-  // midpoints, NaN -> +6.
+  // fp32_to_e2m1_sw of quantization_utils.cuh: ties-to-even at the E2M1 midpoints, NaN -> +6.
   uint32_t val = 0;
 #pragma unroll
   for (int i = 0; i < 8; ++i) {

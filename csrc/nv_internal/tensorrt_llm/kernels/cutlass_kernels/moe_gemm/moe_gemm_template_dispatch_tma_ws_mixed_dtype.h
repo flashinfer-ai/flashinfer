@@ -368,24 +368,21 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecializedMixedInput(int num_experts, int sm_
 #else
   constexpr int Ktile = 512;
 #endif
-  using _Ktile = Int<Ktile>;
+  using _Ktile = Int<Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act ? 128 : Ktile>;
   static constexpr auto ScaleMode =
       Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0
           ? cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0
       : Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act
           ? cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0
           : cutlass::gemm::collective::MixedInputScaleMode::kPostMma;
-  using WorkspaceTile =
-      std::conditional_t<ScaleMode ==
-                             cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0,
-                         Shape<_128, _128, _128>, Shape<_128, _64, _Ktile>>;
 
 #ifdef COMPILE_HOPPER_TMA_GROUPED_GEMMS
   GroupedGemmInput<T, WeightType, OutputType, OutputType> inputs{};
   inputs.num_experts = num_experts;
   sm90_generic_mixed_moe_gemm_kernelLauncher<
-      T, WeightType, OutputType, tensorrt_llm::cutlass_extensions::EpilogueOpDefault, WorkspaceTile,
-      Shape<_1, _1, _1>, cutlass::gemm::KernelTmaWarpSpecializedCooperative,
+      T, WeightType, OutputType, tensorrt_llm::cutlass_extensions::EpilogueOpDefault,
+      Shape<_128, _64, _Ktile>, Shape<_1, _1, _1>,
+      cutlass::gemm::KernelTmaWarpSpecializedCooperative,
       cutlass::epilogue::TmaWarpSpecializedCooperative,
       cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY, ScaleMode>(
       inputs, TmaWarpSpecializedGroupedGemmInput{}, sm_count_, &count);

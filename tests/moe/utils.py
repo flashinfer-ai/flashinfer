@@ -309,16 +309,17 @@ def skip_checks(
 
     if moe_gemm_backend is None:
         moe_gemm_backend = MoeGemmBackend.TRTLLM
-    # Check moe_impl class by name to avoid circular imports
-    is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     # TRT-LLM FP4 also runs below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
     if compute_capability[0] not in [10] and not (
-        is_fp4_moe
+        type(moe_impl).__name__ == "FP4Moe"
         and compute_capability[0] in [8, 9]
         and moe_gemm_backend == MoeGemmBackend.TRTLLM
     ):
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    # Check moe_impl class by name to avoid circular imports
+    is_fp4_moe = type(moe_impl).__name__ == "FP4Moe"
     is_fp8_per_tensor_moe = type(moe_impl).__name__ == "FP8PerTensorMoe"
     is_fp8_block_scale_moe = type(moe_impl).__name__ == "FP8BlockScaleMoe"
 

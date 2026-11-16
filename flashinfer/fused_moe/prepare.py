@@ -671,14 +671,9 @@ def prepare_trtllm_fp4_weights(
         # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
         sm90 = major == 9 and quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
         operands = trtllm_nvfp4_sm80_weights(
-            result["gemm1_weights"],
-            gemm1_scale,
-            result["gemm2_weights"],
-            gemm2_scale,
-            activation.is_gated,
-            is_mxfp4,
-            sm90=sm90,
-        )
+            result["gemm1_weights"], gemm1_scale, result["gemm2_weights"], gemm2_scale,
+            activation.is_gated, is_mxfp4, sm90=sm90,
+        )  # fmt: skip
         keys = _CUTLASS_MXFP4_SM90_KEYS if sm90 else _CUTLASS_NVFP4_SM80_KEYS
         result.update(zip(keys, operands, strict=True))
     from .api import SwiGLUStep
@@ -2074,32 +2069,22 @@ def prepare_cutlass_nvfp4_weights(
 # per 32-byte K group, 4 rows stored together; their block scales are [E, K / 16, N] BF16.
 # Views keep them beside the original weights, whose fields keep their meaning.
 _CUTLASS_NVFP4_SM80_KEYS = (
-    "sm80_fc1_expert_weights",
-    "sm80_fc1_weight_block_scale",
-    "sm80_fc2_expert_weights",
-    "sm80_fc2_weight_block_scale",
-)
+    "sm80_fc1_expert_weights", "sm80_fc1_weight_block_scale",
+    "sm80_fc2_expert_weights", "sm80_fc2_weight_block_scale",
+)  # fmt: skip
 # On SM90 MXFP8 x MXFP4 runs on the FP8 mixed-input GEMM, with uint8 weights interleaved for its
 # FP4 -> FP8 conversion and the raw E8M0 scales folded as it reads them.
 _CUTLASS_MXFP4_SM90_KEYS = (
-    "sm90_fc1_expert_weights",
-    "sm90_fc1_weight_block_scale",
-    "sm90_fc2_expert_weights",
-    "sm90_fc2_weight_block_scale",
-)
+    "sm90_fc1_expert_weights", "sm90_fc1_weight_block_scale",
+    "sm90_fc2_expert_weights", "sm90_fc2_weight_block_scale",
+)  # fmt: skip
 
 
 def _sm80_nvfp4_operands(
-    weight: torch.Tensor,
-    block_scale: torch.Tensor,
-    rows: int,
-    cols: int,
-    dtype: torch.dtype,
-    rows_from: Optional[torch.Tensor] = None,
-    mx: bool = False,
-    k: Optional[int] = None,
+    weight: torch.Tensor, block_scale: torch.Tensor, rows: int, cols: int, dtype: torch.dtype,
+    rows_from: Optional[torch.Tensor] = None, mx: bool = False, k: Optional[int] = None,
     sm90: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
     from ..trace.templates.gemm import _unswizzle_batched_sf_128x4
 
     num_experts, sf_vec = weight.shape[0], 32 if mx else 16
@@ -2174,7 +2159,7 @@ def cutlass_nvfp4_sm80_weights(
         FC1 and FC2's K when TRT-LLM stores them padded; the weights are cut to it. ``None``
         takes FC1's K from FC2's rows and FC2's K from its stored width, and cuts nothing.
     sm90 : bool
-        Return MXFP4's SM90 operands instead (``cutlass_mxfp4_sm90_weights``).
+        Return MXFP4's SM90 operands instead, for MXFP8 activations on SM90.
 
     Returns
     -------
@@ -2204,35 +2189,27 @@ def cutlass_nvfp4_sm80_weights(
 
 
 def cutlass_mxfp4_sm90_weights(
-    w1: torch.Tensor,
-    s1: torch.Tensor,
-    w2: torch.Tensor,
-    s2: torch.Tensor,
+    w1: torch.Tensor, s1: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor,
     interleaved: bool = False,
     rows_from: Tuple[Optional[torch.Tensor], Optional[torch.Tensor]] = (None, None),
     k: Tuple[Optional[int], Optional[int]] = (None, None),
-) -> Tuple[torch.Tensor, ...]:
-    """The SM90 operands of CUTLASS MXFP4 weights (packed, any integer view) and their swizzled
-    E8M0 block scales, for MXFP8 activations, rows and K given as to ``cutlass_nvfp4_sm80_weights``.
-    On SM90 ``cutlass_fused_moe`` converts on every call unless given these."""
+) -> Tuple[torch.Tensor, ...]:  # fmt: skip
+    """``cutlass_nvfp4_sm80_weights(..., mx=True, sm90=True)``: MXFP4's SM90 operands for MXFP8
+    activations."""
     return cutlass_nvfp4_sm80_weights(
         w1, s1, w2, s2, interleaved=interleaved, rows_from=rows_from, mx=True, k=k, sm90=True
     )  # fmt: skip
 
 
 def _check_sm80_nvfp4_operands(
-    operands: Tuple[torch.Tensor, ...],
-    w1_shape: Tuple[int, ...],
-    w2_shape: Tuple[int, ...],
-    device: torch.device,
-    sm90: bool = False,
-) -> None:
+    operands: Tuple[torch.Tensor, ...], w1_shape: Tuple[int, ...], w2_shape: Tuple[int, ...],
+    device: torch.device, sm90: bool = False,
+) -> None:  # fmt: skip
     """Checks operands against the shapes of their packed uint8 FP4 weights: the layout
     ``cutlass_nvfp4_sm80_weights`` returns, with BF16 scales, or with ``sm90`` MXFP4's SM90 one."""
     (num_experts, rows, half_k1), (_, hidden_size, half_k2) = w1_shape, w2_shape
     k1, k2 = round_up(half_k1 * 2, 64), round_up(half_k2 * 2, 64)
-    # each expert's dtype, shape and strides
-    layouts: tuple[tuple[torch.dtype, tuple[int, ...], tuple[int, ...]], ...] = (
+    layouts: tuple = (  # each expert's dtype, shape and strides
         (torch.uint8, (rows, half_k1), (k1 // 2, 1)),
         (torch.bfloat16, (k1 // 16, rows), (rows, 1)),
         (torch.uint8, (hidden_size, half_k2), (k2 // 2, 1)),
@@ -2294,11 +2271,8 @@ def _w4a16_u5_table(device: torch.device) -> torch.Tensor:
 
 
 def _w4a16_records(
-    w: torch.Tensor,
-    scale: torch.Tensor,
-    gated: bool,
-    rows_from: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    w: torch.Tensor, scale: torch.Tensor, gated: bool, rows_from: Optional[torch.Tensor] = None
+) -> torch.Tensor:  # fmt: skip
     """Packed NVFP4 [E, N, K / 2] (low nibble = even K) and E4M3 block scales [E, N, K / 16], rows
     taken from ``rows_from``, as records [E, record columns / 128 x K steps x record], as many
     experts at a time as fit in about 1 GiB of int32 work buffers. Codes are
@@ -2325,7 +2299,9 @@ def _w4a16_records(
         )
         perm = perm.flatten()
     u5_table = _w4a16_u5_table(dev)
-    out = torch.empty(num_experts, _w4a16_records_bytes(n, k, gated), dtype=torch.uint8, device=dev)  # fmt: skip
+    out = torch.empty(
+        num_experts, _w4a16_records_bytes(n, k, gated), dtype=torch.uint8, device=dev
+    )
     for e0 in range(0, num_experts, chunk):
         q, sb = w[e0 : e0 + chunk], scale[e0 : e0 + chunk]
         if rows_from is not None:
@@ -2462,11 +2438,8 @@ def cute_dsl_w4a16_sm80_weights(
 
 
 def _trtllm_fc1_rows(
-    valid_intermediate_size: Optional[int],
-    inter: int,
-    gated: bool,
-    device: torch.device,
-) -> Optional[torch.Tensor]:
+    valid_intermediate_size: Optional[int], inter: int, gated: bool, device: torch.device
+) -> Optional[torch.Tensor]:  # fmt: skip
     """The FC1 rows TRT-LLM MoE keeps of the padded intermediate size ``inter``: the leading
     roundUp(valid_intermediate_size, 128), of both halves when gated."""
     if valid_intermediate_size is None:
@@ -2522,9 +2495,8 @@ def trtllm_nvfp4_sm80_weights(
         ``(w1, s1, w2, s2)`` as ``cutlass_nvfp4_sm80_weights`` returns them with ``dtype`` BF16.
     """
     from .core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        get_w2_permute_indices_with_cache,
-    )
+        _maybe_get_cached_w3_w1_permute_indices, get_w2_permute_indices_with_cache,
+    )  # fmt: skip
 
     p1 = _maybe_get_cached_w3_w1_permute_indices(
         _TRTLLM_PERMUTE_CACHE, w1[0].view(torch.uint8), 128, is_gated_act_gemm=gated
@@ -2767,18 +2739,11 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
         "fc2_input_scale": fake_input_scale.clone(),
     }
     major = torch.cuda.get_device_capability(device)[0]
-    weights = (
-        view["fc1_expert_weights"],
-        view["fc1_expert_scales"],
-        view["fc2_expert_weights"],
-        view["fc2_expert_scales"],
-    )
-    if major == 9:
-        sm90 = cutlass_mxfp4_sm90_weights(*weights)
-        view.update(zip(_CUTLASS_MXFP4_SM90_KEYS, sm90, strict=True))
-    elif major < 10:
-        sm80 = cutlass_nvfp4_sm80_weights(*weights, mx=True)
-        view.update(zip(_CUTLASS_NVFP4_SM80_KEYS, sm80, strict=True))
+    if major < 10:
+        w = [view[f"fc{i}_expert_{n}"] for i in (1, 2) for n in ("weights", "scales")]
+        keys = _CUTLASS_MXFP4_SM90_KEYS if major == 9 else _CUTLASS_NVFP4_SM80_KEYS
+        operands = cutlass_nvfp4_sm80_weights(*w, mx=True, sm90=major == 9)
+        view.update(zip(keys, operands, strict=True))
     return view
 
 
@@ -3233,14 +3198,9 @@ def prepare_cute_dsl_weights(
         # SM90 runs W4A8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
         sm90 = major == 9 and is_mxfp4
         operands = cutlass_nvfp4_sm80_weights(
-            w1_weight,
-            w1_sf_flat,
-            w2_weight,
-            w2_sf_flat,
-            interleaved=activation.is_gated,
-            mx=is_mxfp4,
-            sm90=sm90,
-        )
+            w1_weight, w1_sf_flat, w2_weight, w2_sf_flat,
+            interleaved=activation.is_gated, mx=is_mxfp4, sm90=sm90,
+        )  # fmt: skip
         keys = _CUTLASS_MXFP4_SM90_KEYS if sm90 else _CUTLASS_NVFP4_SM80_KEYS
         view.update(zip(keys, operands, strict=True))
     if not (is_mxfp4 or is_mxfp8):

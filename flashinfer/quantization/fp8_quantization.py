@@ -177,15 +177,6 @@ def _check_mxfp8_cuda_capability(device: torch.device) -> None:
             )
 
 
-def _mxfp8_quantization_backend(device: torch.device) -> str:
-    """The module a device runs: SM80 to SM90 convert to E2M1 and E4M3 in software."""
-    if device.type == "cuda":
-        major, _ = get_compute_capability(device)
-        if major in (8, 9):
-            return f"{major}0"
-    return "100"
-
-
 @functools.cache
 def get_mxfp8_quantization_sm100_module(backend: str = "100"):
     gen_module = {
@@ -520,8 +511,10 @@ def mxfp8_quantize(
         _check_mxfp8_cuda_capability(input.device)
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
+        # SM80 to SM90 convert to E2M1 and E4M3 in software in their own modules.
+        major = get_compute_capability(input.device)[0] if input.is_cuda else 10
         x_q, sf = get_mxfp8_quantization_sm100_module(
-            _mxfp8_quantization_backend(input.device)
+            f"{major}0" if major in (8, 9) else "100"
         ).mxfp8_quantize_sm100(
             input,
             sf_swizzle_layout,

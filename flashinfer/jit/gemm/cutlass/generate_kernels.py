@@ -810,9 +810,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                 )
             )
     # MXFP8 x MXFP4 exact block exponents use cooperative 128xNx128 tiles.
-    for dtype_combo in supported_dtypes_fp4:
-        if dtype_combo[0] != DataType.e4m3:
-            continue
+    for dtype_combo in (c for c in supported_dtypes_fp4 if c[0] == DataType.e4m3):
         for token_tile in [16, 32, 64, 128, 256]:
             operations.append(
                 TrtLlm_GemmLauncher(

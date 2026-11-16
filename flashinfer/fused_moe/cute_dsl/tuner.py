@@ -1197,21 +1197,9 @@ W4A16_MOE_TACTICS = tuple(get_w4a16_moe_valid_tactics())
 # as 4 with vector scale loads; at row tile 96, 6 and 7 the 2-stage paths, 7 with 12 row parts.
 # Untuned calls take row tile 64.
 W4A16_SM80_TACTICS = (
-    (8, 0, 0),
-    (16, 0, 0),
-    (32, 0, 0),
-    (64, 0, 0),
-    (96, 0, 0),
-    (64, 1, 1),
-    (64, 1, 2),
-    (64, 3, 2),
-    (64, 3, 4),
-    (64, 1, 4),
-    (64, 3, 5),
-    (64, 1, 5),
-    (96, 6, 6),
-    (96, 7, 7),
-)
+    (8, 0, 0), (16, 0, 0), (32, 0, 0), (64, 0, 0), (96, 0, 0), (64, 1, 1), (64, 1, 2),
+    (64, 3, 2), (64, 3, 4), (64, 1, 4), (64, 3, 5), (64, 1, 5), (96, 6, 6), (96, 7, 7),
+)  # fmt: skip
 
 
 class CuteDslFusedMoEW4A16Runner(TunableRunner):

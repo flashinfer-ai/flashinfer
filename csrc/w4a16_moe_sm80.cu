@@ -13,34 +13,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Weight-only NVFP4 MoE for SM80 to SM90: BF16 activations, NVFP4 weights
-// converted once into records (w4a16_moe_sm80_records in
-// flashinfer/fused_moe/prepare.py). A record covers one expert, 128 output
-// columns and 128 k: 8192 B of E2M1 codes in MMA fragment order, then 1024 B of
-// block scales, each the E4M3 scale's magnitude as a 5-bit exponent and a
-// 3-bit mantissa (its sign moves into the codes). A K tail of at most 64 k takes
-// a 5120 B record. The MMA products carry e2m1 x scale x 2^-7, so the per-expert
-// global scale (x 2^7) scales the fp32 accumulator.
-//
-// A forward is prep (routing -> blocks of R rows), GEMM1 (+ activation), GEMM2
-// and finalize (the top-k weighted sum). prep places entry f = token * top_k +
-// slot at the rank of f among its expert's entries, so the placement, and with
-// it every fp32 sum order, repeats bit for bit between calls. R 8, 16 and 32
-// use 8 warps, each covering 16 columns of all R rows; R 64 uses 4 warps,
-// each covering 32 columns, with swizzled activation rows, after the
-// multi-CTA prep. R 96 and the two-record R 64 variants (kW64s, kG2W64x) cover
-// two 128-column records per CTA: 8 warps of 32 columns and 4 warps of 64
-// columns. kG2W64v is kG2W64x with one 16 B scale load per k128. kX96 and kQ12
-// are kBase where R 96 runs at 2 stages: the R 64 two-record epilogue, a hoisted
-// activation address and shift-only dequant; kQ12 also splits the rows in 12
-// parts instead of 6. One GEMM template covers every warp layout; the host
-// launches one whole output tile per CTA.
-//
-// The kernels need cp.async, ldmatrix and the bf16 mma.sync, so they build
-// for sm_80 and sm_90; sm_86, sm_87 and sm_89 run the sm_80 code. Every config
-// but R 96 at 3 stages fits the 99 KB per-block shared memory limit of sm_86
-// and sm_89 (at most 89088 B); R 96 takes 3 stages (133632 B) only where a
-// block can have that much and 2 stages otherwise.
+// Weight-only NVFP4 MoE for SM80 to SM90 with BF16 activations. NVFP4 weights are converted once
+// into records (w4a16_moe_sm80_records in flashinfer/fused_moe/prepare.py): per expert, 128 output
+// columns and 128 k, 8192 B of E2M1 codes in MMA fragment order, then 1024 B of block scales (the
+// E4M3 magnitude as a 5-bit exponent and 3-bit mantissa; the sign moves into the codes); a K tail
+// of at most 64 k takes a 5120 B record. Products carry e2m1 x scale x 2^-7; the per-expert global
+// scale x 2^7 scales the fp32 accumulator. A forward is prep (routing -> blocks of R rows), GEMM1
+// (+ activation), GEMM2 and finalize. prep places entry f = token * top_k + slot at the rank of f
+// among its expert's entries, so the placement and every fp32 sum order repeat bit for bit.
+// R 8, 16, 32: 8 warps of 16 columns; R 64: 4 warps of 32 columns, swizzled activation rows,
+// multi-CTA prep. R 96, kW64s (GEMM1), kG2W64x (GEMM2) and kG2W64v (kG2W64x, one 16 B scale load
+// per k128) cover two records per CTA, 8 warps of 32 or 4 of 64 columns; kX96 and kQ12 run R 96 at
+// 2 stages with the R 64 two-record epilogue, a hoisted activation address and shift-only dequant,
+// kQ12 in 12 row parts, not 6. One CTA per output tile. sm_80 and sm_90 builds (cp.async, ldmatrix,
+// bf16 mma.sync); sm_86/87/89 run sm_80 code. All configs but R 96 at 3 stages (133632 B, only
+// where a block has that much) fit sm_86/89's 99 KB per-block shared memory (at most 89088 B).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -48,7 +35,10 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "cute/arch/mma_sm80.hpp"
 #include "cutlass/fast_math.h"
+#include "flashinfer/cp_async.cuh"
+#include "flashinfer/math.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer::w4a16_moe_sm80 {
@@ -69,23 +59,9 @@ struct Cfg {
   static constexpr int kStageBytes = NC * kRec + kABytes;
 };
 
-__device__ __forceinline__ void cp16(uint32_t s, const void* g) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(g));
-}
 __device__ __forceinline__ void cp16z(uint32_t s, const void* g, bool valid) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(s), "l"(g),
                "r"(valid ? 16 : 0));
-}
-__device__ __forceinline__ void commit() { asm volatile("cp.async.commit_group;"); }
-template <int N>
-__device__ __forceinline__ void wait_group() {
-  asm volatile("cp.async.wait_group %0;" ::"n"(N));
-}
-__device__ __forceinline__ void lds64(uint32_t* d, uint32_t a) {
-  asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];" : "=r"(d[0]), "=r"(d[1]) : "r"(a));
-}
-__device__ __forceinline__ void lds32(uint32_t* d, uint32_t a) {
-  asm volatile("ld.shared.u32 %0, [%1];" : "=r"(d[0]) : "r"(a));
 }
 // Volatile shared loads: ptxas does not merge them into wider loads.
 __device__ __forceinline__ void lds32v(uint32_t* d, uint32_t a) {
@@ -95,13 +71,8 @@ __device__ __forceinline__ void lds32v(uint32_t* d, uint32_t a) {
 // over all 2^32 fp32 gt on sm_80): the division's own fast path (MUFU.RCP + 4
 // FFMA) with the cases its FCHK sends to the slow path written out as selects,
 // no branch.
-__device__ __forceinline__ float rcp_approx(float d) {
-  float r;
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(d));
-  return r;
-}
 __device__ __forceinline__ float div_fast(float n, float d) {
-  float r = rcp_approx(d);
+  float r = flashinfer::math::ptx_rcp(d);
   const float t = fmaf(-d, r, 1.f);
   r = fmaf(r, t, r);
   const float q0 = fmaf(n, r, 0.f);
@@ -135,12 +106,8 @@ __device__ __forceinline__ void ldsm_x2(uint32_t* d, uint32_t a) {
                : "r"(a));
 }
 __device__ __forceinline__ void mma_bf16(float* d, uint32_t const* a, uint32_t const* b) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, "
-      "{%4, %5, %6, %7}, "
-      "{%8, %9}, {%0, %1, %2, %3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+  cute::SM80_16x8x16_F32BF16BF16F32_TN::fma(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b[0],
+                                            b[1], d[0], d[1], d[2], d[3]);
 }
 // a x {lo(s2), lo(s2)} and a x {hi(s2), hi(s2)}, exact; the broadcast is built
 // inside the asm so ptxas can fold it into HFMA2's operand swizzle.
@@ -163,6 +130,12 @@ __device__ __forceinline__ uint32_t mul_hi(uint32_t a, uint32_t s2) {
   return r;
 }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+constexpr bool kSm90 = true;
+#else
+constexpr bool kSm90 = false;
+#endif
+
 // 3+1 layout -> four bf16x2 registers of e2m1 x 2^-126.
 template <bool SHF = false>
 __device__ __forceinline__ void cvt31(uint32_t w, uint32_t* d) {
@@ -173,17 +146,8 @@ __device__ __forceinline__ void cvt31(uint32_t w, uint32_t* d) {
   // 0x22000000 = 2^29 + 2^25, so __umulhi(m, 0x22000000) = (m >> 3) +
   // (m >> 7), two bit-disjoint shifts. SHF computes the same bits with shifts
   // instead of the IMAD.HI; sm_90 keeps the multiply.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  const uint32_t x = __umulhi(w & 0x2C002C00u, 0x22000000u);
-#else
-  uint32_t x;
-  if constexpr (SHF) {
-    const uint32_t m = w & 0x2C002C00u;
-    x = (m >> 3) | (m >> 7);
-  } else {
-    x = __umulhi(w & 0x2C002C00u, 0x22000000u);
-  }
-#endif
+  const uint32_t m = w & 0x2C002C00u;
+  const uint32_t x = SHF && !kSm90 ? (m >> 3) | (m >> 7) : __umulhi(m, 0x22000000u);
   d[3] = (x & 0x01C001C0u) | ((w & 0x40004000u) << 1);
 }
 // Two U5 scale pairs of one word: even j (bytes 0, 2) and odd j (bytes 1, 3),
@@ -194,26 +158,32 @@ __device__ __forceinline__ uint32_t u5_even(uint32_t q) {
 __device__ __forceinline__ uint32_t u5_odd(uint32_t q) {
   return ((q >> 4) & 0x0FF00FF0u) | 0x70007000u;
 }
+// The MMA A fragment of one 3+1 word w times the scale pair s2.
+template <bool SHF = false>
+__device__ __forceinline__ void dq4(uint32_t w, uint32_t s2, uint32_t* a) {
+  uint32_t d[4];
+  cvt31<SHF>(w, d);
+  a[0] = mul_lo(d[0], s2);
+  a[1] = mul_hi(d[1], s2);
+  a[2] = mul_lo(d[2], s2);
+  a[3] = mul_hi(d[3], s2);
+}
 
 struct GemmParams {
-  const uint8_t* w;          // prepared records [E][chunks][S]: 9216 B each, the last
-                             // 5120 B for kr <= 64
-  const float* alpha;        // [E] per-expert global dequant scale
-  const __nv_bfloat16* act;  // GEMM1: hidden [tokens][K]; GEMM2: blocked intermediate [nb][R][K]
-  const int* nblocks;        // device scalar
-  const int* block_expert;   // [nb]
-  const int* block_rows;     // [nb]
-  const int* rowmap;         // [nb][R]: token * top_k + slot, or -1
-  __nv_bfloat16* out;        // GEMM1: blocked intermediate [nb][R][Nout]; GEMM2:
-                             // [tokens*top_k][Nout]
-  float* ws;                 // unused: one whole tile per CTA, no split-tile partials
-  int* cnt;                  // unused, as ws
-  int top_k, N,
-      K;                        // N: record columns, a multiple of 128 (gated: 2 x I padded to 64)
+  const uint8_t* w;             // records [E][chunks][S]: 9216 B each, the last 5120 B for kr <= 64
+  const float* alpha;           // [E] per-expert global dequant scale
+  const __nv_bfloat16* act;     // GEMM1: hidden [tokens][K]; GEMM2: blocked intermediate [nb][R][K]
+  const int* nblocks;           // device scalar
+  const int* block_expert;      // [nb]
+  const int* block_rows;        // [nb]
+  const int* rowmap;            // [nb][R]: token * top_k + slot, or -1
+  __nv_bfloat16* out;           // GEMM1: [nb][R][Nout] (blocked); GEMM2: [tokens*top_k][Nout]
+  float* ws;                    // unused: one whole tile per CTA, no split-tile partials
+  int* cnt;                     // unused, as ws
+  int top_k, N, K;              // N: record columns, a multiple of 128 (gated: 2 x I padded to 64)
   int Nout;                     // output columns (gated: I)
   int units_per_cta;            // unused, as ws
-  cutlass::FastDivmod topk_dm;  // f / top_k via host-built magic (G1
-                                // only); appended to preserve layout
+  cutlass::FastDivmod topk_dm;  // f / top_k (G1 only); appended to preserve layout
 };
 
 // bf16 pair (lo in the low 16 bits) and an 8 x 8 b16 transpose across the warp
@@ -265,7 +235,6 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
   const long cbytes = static_cast<long>(S - 1) * kRec + (half ? kTailRec : kRec);
   if (blockIdx.x >= nb * chunks) return;
   const int upb = record_chunks * S;
-  const int u0 = 0, u1 = S;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g8 = lane >> 2, tq = lane & 3;
   const int wc = warp % WC, wt = warp / WC;
   const uint32_t sbase = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -366,11 +335,7 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           cp16z(sa, ga, av);
         }
       } else if constexpr (kLinSingle) {
-        const __nv_bfloat16* gj;
-        if constexpr (kLinSingle)
-          gj = gact[0] + static_cast<long>(j) * RP * K;
-        else
-          gj = gact[j];
+        const __nv_bfloat16* gj = gact[0] + static_cast<long>(j) * RP * K;
         if constexpr (KT) {
           const bool in = !tl || aq * 8 < kr;
           if (!hf || aq < 8) cp16z(sa, in ? gj : p.act, avalid[j] && in);
@@ -402,12 +367,10 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
   auto write_tile = [&](int b, int c, float(*v)[G][4]) {
     const float a = p.alpha[p.block_expert[b]] * 128.f;  // products carry 2^-7
     const int Nout = p.Nout;
-#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
     // R 8 GEMM1 with SiLU or relu2 on SM8x: rows at or past the block's row
     // count are padding that GEMM2 zero-fills on load, so they are not stored.
-    [[maybe_unused]] int prows = R;
-    if constexpr (R == 8 && (ACT == 1 || ACT == 2)) prows = p.block_rows[b];
-#endif
+    constexpr bool kSkipPad = !kSm90 && R == 8 && ACT != 0;
+    [[maybe_unused]] const int prows = kSkipPad ? p.block_rows[b] : R;
     if constexpr (ACT == 0 && (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))) {
       // v[s][gi][2 hh + h] is column ws 16 + 8 hh + g8, row gi 8 + 2 tq + h:
       // per (s, gi, hh) an 8 x 8 piece, columns x rows, one bf16 pair (rows 2
@@ -471,10 +434,7 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           if (i < Nout) {
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-              if constexpr (R == 8)
-                if (r0 + h >= prows) continue;  // padding row
-#endif
+              if (kSkipPad && r0 + h >= prows) continue;  // padding row
               const float gt = v[s][gi][h] * a, up = v[s][gi][2 + h] * a;
               float y;
               if constexpr (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))
@@ -489,10 +449,7 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
             const int nn = n + (q >> 1) * 8;
-#if !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900)
-            if constexpr (R == 8)
-              if (r0 + (q & 1) >= prows) continue;  // padding row
-#endif
+            if (kSkipPad && r0 + (q & 1) >= prows) continue;  // padding row
             if (nn < Nout) {
               const float x = fmaxf(v[s][gi][q] * a, 0.f);
               p.out[(static_cast<long>(b) * R + r0 + (q & 1)) * Nout + nn] =
@@ -553,11 +510,7 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
       // VS (GEMM2 without a K tail, below sm_90): a slot's four scale words
       // of the k128 are read once with one 16 B load, in place of one 4 B
       // load per k32.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-      constexpr bool kVS = false;
-#else
-      constexpr bool kVS = ACT == 0 && !KT && VS;
-#endif
+      constexpr bool kVS = !kSm90 && ACT == 0 && !KT && VS;
       uint32_t wn[SC][2], sn[SC];
       uint32_t sc[SC][4];
       if constexpr (kVS) {
@@ -583,58 +536,33 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           if constexpr (!kVS) sq[s] = sn[s];
         }
         if (j2 < 3 && !(KT && j2 == 1 && hf)) load_ws(j2 + 1);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-        constexpr bool kV3 = ACT != 0;  // sm_90 G1: v3 code (x4 spills there)
-#else
-        constexpr bool kV3 = false;
-#endif
-        if constexpr (kV3) {
-          uint32_t bf[NG][2];
+        constexpr bool kV3 = kSm90 && ACT != 0;  // sm_90 G1: v3 code (x4 spills there)
+        // Without kV3, one ldmatrix x4 per 8-row group and k32: chunks 4 j2 .. 4 j2 + 3
+        // of the row (both k16 halves; bf[gi] + 2 h is half h), in place of one x2 per
+        // half. Same fragments and MMA order, half the ldmatrix instructions.
+        uint32_t bf[NG][kV3 ? 2 : 4];
+        if constexpr (!kV3) {
 #pragma unroll
-          for (int h = 0; h < 2; ++h) {
+          for (int gi = 0; gi < NG; ++gi)
+            ldsm_x4(bf[gi], ((j2 & 1) ? sa_s1 : sa_s0) + sb + gi * 8 * AP + (j2 >> 1) * 128);
+        }
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          if constexpr (kV3) {
 #pragma unroll
             for (int gi = 0; gi < NG; ++gi) {
               const uint32_t address = sbase + NC * kRec + (wt * TW + gi * 8 + (lane & 7)) * AP +
                                        (((((lane >> 3) & 1) + 2 * h + 4 * j2) ^ (lane & 7)) * 16);
               ldsm_x2(bf[gi], address + sb);
             }
-#pragma unroll
-            for (int s = 0; s < SC; ++s) {
-              const uint32_t s2 = h ? u5_odd(sq[s]) : u5_even(sq[s]);
-              uint32_t d[4], a[4];
-              cvt31(wq[s][h], d);
-              a[0] = mul_lo(d[0], s2);
-              a[1] = mul_hi(d[1], s2);
-              a[2] = mul_lo(d[2], s2);
-              a[3] = mul_hi(d[3], s2);
-#pragma unroll
-              for (int gi = 0; gi < NG; ++gi) mma_bf16(acc[s][gi], a, bf[gi]);
-            }
           }
-        } else {
-          // One ldmatrix x4 per 8-row group and k32: chunks 4 j2 .. 4 j2 + 3 of
-          // the row (both k16 halves; bf[gi] + 2 h is half h), in place of one
-          // x2 per half. Same fragments and MMA order, half the ldmatrix
-          // instructions.
-          uint32_t bf[NG][4];
 #pragma unroll
-          for (int gi = 0; gi < NG; ++gi)
-            ldsm_x4(bf[gi], ((j2 & 1) ? sa_s1 : sa_s0) + sb + gi * 8 * AP + (j2 >> 1) * 128);
+          for (int s = 0; s < SC; ++s) {
+            const uint32_t sw = kVS ? sc[s][j2] : sq[s];
+            uint32_t a[4];
+            dq4(wq[s][h], h ? u5_odd(sw) : u5_even(sw), a);
 #pragma unroll
-          for (int h = 0; h < 2; ++h) {
-#pragma unroll
-            for (int s = 0; s < SC; ++s) {
-              const uint32_t sw = kVS ? sc[s][j2] : sq[s];
-              const uint32_t s2 = h ? u5_odd(sw) : u5_even(sw);
-              uint32_t d[4], a[4];
-              cvt31(wq[s][h], d);
-              a[0] = mul_lo(d[0], s2);
-              a[1] = mul_hi(d[1], s2);
-              a[2] = mul_lo(d[2], s2);
-              a[3] = mul_hi(d[3], s2);
-#pragma unroll
-              for (int gi = 0; gi < NG; ++gi) mma_bf16(acc[s][gi], a, bf[gi] + 2 * h);
-            }
+            for (int gi = 0; gi < NG; ++gi) mma_bf16(acc[s][gi], a, bf[gi] + (kV3 ? 0 : 2 * h));
           }
         }
       }
@@ -674,14 +602,9 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
           if constexpr (half_fragment) load_activation(h);
 #pragma unroll
           for (int s = 0; s < SC; ++s) {
-            const uint32_t s2 = h ? u5_odd(sq[s][j2]) : u5_even(sq[s][j2]);
-            uint32_t d[4], a[4];
-            constexpr bool kShfCvt = R == 96 && STAGES == 2 && G1E;
-            cvt31<kShfCvt>(wq[s][j2 * 2 + h], d);
-            a[0] = mul_lo(d[0], s2);
-            a[1] = mul_hi(d[1], s2);
-            a[2] = mul_lo(d[2], s2);
-            a[3] = mul_hi(d[3], s2);
+            uint32_t a[4];
+            dq4<R == 96 && STAGES == 2 && G1E>(wq[s][j2 * 2 + h],
+                                               h ? u5_odd(sq[s][j2]) : u5_even(sq[s][j2]), a);
 #pragma unroll
             for (int gi = 0; gi < NG; ++gi)
               mma_bf16(acc[s][gi], a, bf[gi] + (half_fragment ? 0 : 2 * h));
@@ -693,128 +616,36 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
 
 #pragma unroll
   for (int i = 0; i < STAGES - 1; ++i) {
-    if (u0 + i < u1) issue();
-    commit();
+    if (i < S) issue();
+    flashinfer::cp_async::commit_group();
   }
   uint32_t cslot = 0;
-  int u = u0;
   const int tile = blockIdx.x;
-  {
-    const int tstart = 0;
-    const int u_end = S;
-    // quarters of this warp's TW rows that hold a real row of the tile's block
-    const int nq =
-        SC == 1 ? 1 : min(Q, (max(0, p.block_rows[tile / chunks] - wt * TW) * Q + TW - 1) / TW);
-    for (; u < u_end; ++u) {
-      wait_group<STAGES - 2>();
-      __syncthreads();
-      if (u + STAGES - 1 < u1) issue();
-      commit();
-      const uint32_t sb = cslot;
-      cslot = cslot + kStage == kRing ? 0u : cslot + kStage;
-      bool hf = false;
-      if constexpr (KT) hf = half && u - tstart == S - 1;
-      if constexpr (Q == 4) {
-        switch (nq) {
-          case 0:
-            break;
-          case 1:
-            step(std::integral_constant<int, G / 4>{}, sb, hf);
-            break;
-          case 2:
-            step(std::integral_constant<int, G / 2>{}, sb, hf);
-            break;
-          case 3:
-            step(std::integral_constant<int, 3 * G / 4>{}, sb, hf);
-            break;
-          default:
-            step(std::integral_constant<int, G>{}, sb, hf);
-            break;
-        }
-      } else if constexpr (Q == 6) {
-        switch (nq) {
-          case 0:
-            break;
-          case 1:
-            step(std::integral_constant<int, G / 6>{}, sb, hf);
-            break;
-          case 2:
-            step(std::integral_constant<int, 2 * G / 6>{}, sb, hf);
-            break;
-          case 3:
-            step(std::integral_constant<int, 3 * G / 6>{}, sb, hf);
-            break;
-          case 4:
-            step(std::integral_constant<int, 4 * G / 6>{}, sb, hf);
-            break;
-          case 5:
-            step(std::integral_constant<int, 5 * G / 6>{}, sb, hf);
-            break;
-          default:
-            step(std::integral_constant<int, G>{}, sb, hf);
-            break;
-        }
-      } else if constexpr (Q == 12) {
-        switch (nq) {
-          case 0:
-            break;
-          case 1:
-            step(std::integral_constant<int, 1 * G / 12>{}, sb, hf);
-            break;
-          case 2:
-            step(std::integral_constant<int, 2 * G / 12>{}, sb, hf);
-            break;
-          case 3:
-            step(std::integral_constant<int, 3 * G / 12>{}, sb, hf);
-            break;
-          case 4:
-            step(std::integral_constant<int, 4 * G / 12>{}, sb, hf);
-            break;
-          case 5:
-            step(std::integral_constant<int, 5 * G / 12>{}, sb, hf);
-            break;
-          case 6:
-            step(std::integral_constant<int, 6 * G / 12>{}, sb, hf);
-            break;
-          case 7:
-            step(std::integral_constant<int, 7 * G / 12>{}, sb, hf);
-            break;
-          case 8:
-            step(std::integral_constant<int, 8 * G / 12>{}, sb, hf);
-            break;
-          case 9:
-            step(std::integral_constant<int, 9 * G / 12>{}, sb, hf);
-            break;
-          case 10:
-            step(std::integral_constant<int, 10 * G / 12>{}, sb, hf);
-            break;
-          case 11:
-            step(std::integral_constant<int, 11 * G / 12>{}, sb, hf);
-            break;
-          default:
-            step(std::integral_constant<int, G>{}, sb, hf);
-            break;
-        }
-      } else if constexpr (Q == 3) {
-        switch (nq) {
-          case 0:
-            break;
-          case 1:
-            step(std::integral_constant<int, G / 3>{}, sb, hf);
-            break;
-          case 2:
-            step(std::integral_constant<int, 2 * G / 3>{}, sb, hf);
-            break;
-          default:
-            step(std::integral_constant<int, G>{}, sb, hf);
-            break;
-        }
-      } else if (nq > 0) {
-        step(std::integral_constant<int, G>{}, sb, hf);
-      }
+  // quarters of this warp's TW rows that hold a real row of the tile's block
+  const int nq =
+      SC == 1 ? 1 : min(Q, (max(0, p.block_rows[tile / chunks] - wt * TW) * Q + TW - 1) / TW);
+  for (int u = 0; u < S; ++u) {
+    flashinfer::cp_async::wait_group<STAGES - 2>();
+    __syncthreads();
+    if (u + STAGES - 1 < S) issue();
+    flashinfer::cp_async::commit_group();
+    const uint32_t sb = cslot;
+    cslot = cslot + kStage == kRing ? 0u : cslot + kStage;
+    bool hf = false;
+    if constexpr (KT) hf = half && u == S - 1;
+    // clang-format off
+#define W4A16_STEP(n) case n: if constexpr (n < Q) { \
+        step(std::integral_constant<int, n * G / Q>{}, sb, hf); break; } [[fallthrough]];
+    switch (nq) {
+      case 0: break;
+      W4A16_STEP(1) W4A16_STEP(2) W4A16_STEP(3) W4A16_STEP(4) W4A16_STEP(5) W4A16_STEP(6)
+      W4A16_STEP(7) W4A16_STEP(8) W4A16_STEP(9) W4A16_STEP(10) W4A16_STEP(11)
+      default: step(std::integral_constant<int, G>{}, sb, hf);
     }
-    write_tile(tile / chunks, tile % chunks, acc);
+#undef W4A16_STEP
+    // clang-format on
   }
+  write_tile(tile / chunks, tile % chunks, acc);
 }
 
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
@@ -823,11 +654,7 @@ __global__ void __launch_bounds__(NW * 32) gemm(GemmParams p) {
   gemm_body<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS>(p);
 }
 
-// Routing -> blocks: one CTA, deterministic. Entry f = token * top_k + slot of
-// topk_ids takes the rank of f among its expert's entries; experts get
-// ceil(count / R) blocks in expert order. Warp w < W owns entries [w Q, (w + 1)
-// Q) (Q a multiple of 32) and counts them per expert in its own table row, so
-// ranks need no atomics: lower warps' counts, then lanes below in the same 32.
+// One-CTA prep: warp w < W counts entries [w Q, (w + 1) Q) per expert in its own table row.
 template <int R>
 __global__ void __launch_bounds__(1024)
     prep(const int* __restrict__ ids, int M, int E, int W, int Q, int* nblocks, int* block_expert,
@@ -1042,8 +869,7 @@ __global__ void __launch_bounds__(1024)
   }
 }
 
-// out[t][h] = sum_j w[t][j] * y[t * top_k + j][h], fp32 in slot order, over the slots with
-// an expert (prep leaves y unwritten for ids < 0). 8 columns per thread.
+// out[t] = sum_j w[t][j] y[t top_k + j], fp32 in slot order over ids >= 0; 8 columns a thread.
 __global__ void finalize(const __nv_bfloat16* __restrict__ y, const float* __restrict__ w,
                          const int* __restrict__ ids, __nv_bfloat16* __restrict__ out, int tokens,
                          int top_k, int H) {
@@ -1072,23 +898,16 @@ __global__ void finalize(const __nv_bfloat16* __restrict__ y, const float* __res
   *reinterpret_cast<uint4*>(out + static_cast<long>(t) * H + c * 8) = o;
 }
 
-int max_smem_optin() {  // per-block opt-in shared memory of the current device
+template <cudaDeviceAttr A>
+int dev_attr() {  // attribute A of the current device, cached per device
   static int cache[64] = {};
   int dev = 0;
   cudaGetDevice(&dev);
-  if (cache[dev] == 0)
-    cudaDeviceGetAttribute(&cache[dev], cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  if (cache[dev] == 0) cudaDeviceGetAttribute(&cache[dev], A, dev);
   return cache[dev];
 }
-
-int max_smem_per_sm() {  // shared memory per SM of the current device
-  static int cache[64] = {};
-  int dev = 0;
-  cudaGetDevice(&dev);
-  if (cache[dev] == 0)
-    cudaDeviceGetAttribute(&cache[dev], cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
-  return cache[dev];
-}
+int max_smem_optin() { return dev_attr<cudaDevAttrMaxSharedMemoryPerBlockOptin>(); }
+int max_smem_per_sm() { return dev_attr<cudaDevAttrMaxSharedMemoryPerMultiprocessor>(); }
 
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
           bool Q12F = false, bool VS = false>
@@ -1101,11 +920,7 @@ void launch_gemm(GemmParams const& p, int grid, cudaStream_t st) {
   gemm<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS><<<grid, NW * 32, smem, st>>>(p);
 }
 
-// R 8: 8 warps at 4 stages; R 16: 8 warps at 2 stages; R 32: 8 warps at 4
-// stages, 2 where an SM has at most 100 KiB of shared memory. R 96: two
-// records per CTA at 3 stages where the device allows it, else 2. R 64: one
-// row group at 3 stages (two CTAs per SM by shared memory); GEMM1 of kStage2
-// runs it at 2 stages.
+// R 32 at 2 stages where an SM has at most 100 KiB; R 64 at 3 stages fits two CTAs per SM.
 template <int ACT, bool KT, bool G1S2 = false, bool G1E = false, bool Q12F = false>
 void launch_tile(int R, GemmParams const& p, int grid, cudaStream_t st) {
   if (R == 8)
@@ -1138,11 +953,7 @@ int prep_static_smem() {  // prep's own __shared__ bytes (wsum)
 
 constexpr int kPrepChunk = 2048;  // multi-CTA prep: routed entries per CTA
 
-// GEMM configs at a given row tile. kBase covers every row tile; the rest run
-// row tile 64: kStage2 GEMM1 at 2 stages, kG2Lin GEMM2 at 2 stages, kW64s
-// GEMM1 and kG2W64x GEMM2 over two 128-column records per CTA (4 warps of 64
-// columns, 2 stages), kG2W64v kG2W64x with vector scale loads; kX96 and kQ12
-// run row tile 96 on the R 96 2-stage paths.
+// GEMM configs (see the file comment); kStage2 (GEMM1), kG2Lin (GEMM2): R 64 at 2 stages.
 enum Variant : int64_t {
   kBase = 0,
   kStage2 = 1,
@@ -1272,7 +1083,7 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
   ffi::CUDADeviceGuard device_guard(act.device().device_id);
   const cudaStream_t st = get_stream(act.device());
   const int* m = static_cast<const int*>(meta.data_ptr());
-  GemmParams p;
+  GemmParams p{};
   p.w = static_cast<const uint8_t*>(records.data_ptr());
   p.alpha = static_cast<const float*>(alpha.data_ptr());
   p.act = static_cast<const __nv_bfloat16*>(act.data_ptr());
@@ -1281,13 +1092,10 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
   p.block_rows = m + 1 + max_blocks;
   p.rowmap = static_cast<const int*>(rowmap.data_ptr());
   p.out = static_cast<__nv_bfloat16*>(out.data_ptr());
-  p.ws = nullptr;  // one whole tile per CTA: no split-tile partials
-  p.cnt = nullptr;
   if (g1) p.topk_dm = cutlass::FastDivmod(static_cast<int>(top_k));  // G1 only; G2 keeps identity
   p.N = static_cast<int>(N);
   p.K = static_cast<int>(K);
   p.Nout = static_cast<int>(Nout);
-  p.units_per_cta = static_cast<int>((K + kTileK - 1) / kTileK);  // all k steps of one tile
   const int columns = static_cast<int>(N / kTileN);
   const bool nc2 = row_tile == 96 || variant == kW64s || variant == kG2W64x || variant == kG2W64v;
   const int grid = static_cast<int>(max_blocks) * (nc2 ? (columns + 1) / 2 : columns);
@@ -1326,8 +1134,7 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
     run_kt(std::integral_constant<int, 2>{});
 }
 
-// out[t][h] = sum_j topk_weights[t][j] * y[t * top_k + j][h], fp32 in slot
-// order, over the slots whose topk_ids are not negative.
+// out = the top-k weighted sum of y: see the finalize kernel.
 void w4a16_moe_sm80_finalize(TensorView y, TensorView topk_weights, TensorView topk_ids,
                              TensorView out, int64_t top_k) {
   CHECK_INPUT_AND_TYPE(y, dl_bfloat16);

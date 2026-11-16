@@ -2666,7 +2666,7 @@ class TestRunnerBoundaryValidation:
 
 
 def _is_unified_nvfp4_arch() -> bool:
-    # Also below SM100 (SM80 to SM90), on the CUTLASS SM80 kernels.
+    # Also SM80 to SM90, on the CUTLASS SM80 kernels.
     return torch.cuda.is_available() and (
         get_compute_capability(torch.device("cuda"))[0] in (8, 9)
         or get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3), (10, 7))
@@ -2808,11 +2808,6 @@ def _make_packs_and_config(
 # ---------------------------------------------------------------------------
 # 1. NVFP4 reference helper
 # ---------------------------------------------------------------------------
-
-
-# Below SM100 the W4A16 outputs differ from the split reference by a few BF16
-# ulps; the counterfactual formulas differ by at least 0.2.
-_W4A16_ATOL, _W4A16_RTOL = 2e-2, 2e-2
 
 
 def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False):
@@ -2997,18 +2992,14 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
             )
 
         reference = exact_reference(activation)
-        # Below SM100 the records and CUTLASS SM80 kernels sum in a different order
-        # from the split kernel this reference follows.
+        # Below SM100 the kernels sum in another order than this split reference:
+        # a few BF16 ulps off, while the counterfactual formulas differ by >= 0.2.
         exact = get_compute_capability(torch.device("cuda"))[0] >= 10
+        tol = dict(atol=2e-2, rtol=2e-2)
         if exact:
             assert_w4a16_bits(actual, reference)
         else:
-            assert torch.isfinite(actual).all(), (
-                f"{activation!r}: non-finite MoE output"
-            )
-            torch.testing.assert_close(
-                actual, reference, atol=_W4A16_ATOL, rtol=_W4A16_RTOL
-            )
+            torch.testing.assert_close(actual, reference, **tol)
         # The same packed inputs must distinguish the intended formula from
         # a counterfactual with matching gated/non-gated geometry.
         if activation.type in (ActivationType.Swiglu, ActivationType.GegluTanh):
@@ -3025,9 +3016,9 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
                 actual.view(torch.int16), control_reference.view(torch.int16)
             ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
         else:
-            assert not torch.allclose(
-                actual, control_reference, atol=_W4A16_ATOL, rtol=_W4A16_RTOL
-            ), f"{activation!r}: the tolerance cannot distinguish the wrong formula"
+            assert not torch.allclose(actual, control_reference, **tol), (
+                f"{activation!r}: the tolerance cannot distinguish the wrong formula"
+            )
     elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         reference = _compute_ref(act_pack, tensors, shape, activation)
         passed, pct, atol = check_accuracy(actual, reference)

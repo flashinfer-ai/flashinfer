@@ -77,14 +77,9 @@ def get_sm_version(device: int | torch.device | str | None = None) -> int:
 _SW_REGS = ".reg .b32 sw_b, sw_m, sw_t, sw_s, sw_lo, sw_hi;\n.reg .f32 sw_f;\n.reg .pred sw_p;\n"
 # E2M1 midpoints as float bits; a tie rounds toward the even code.
 _E2M1_STEPS = (
-    ("gt", 0x3E800000),
-    ("ge", 0x3F400000),
-    ("gt", 0x3FA00000),
-    ("ge", 0x3FE00000),
-    ("gt", 0x40200000),
-    ("ge", 0x40600000),
-    ("gt", 0x40A00000),
-)
+    ("gt", 0x3E800000), ("ge", 0x3F400000), ("gt", 0x3FA00000), ("ge", 0x3FE00000),
+    ("gt", 0x40200000), ("ge", 0x40600000), ("gt", 0x40A00000),
+)  # fmt: skip
 
 
 def _sw_e2m1(src: str, dst: str) -> str:
@@ -144,9 +139,10 @@ def _sw_e4m3x2_to_f16x2(d: str, s: str) -> str:
         "and.b32 sw_g, sw_x, 0x8080;\nshl.b32 sw_c, sw_g, 8;\nor.b32 sw_g, sw_g, sw_c;\n"
         "and.b32 sw_g, sw_g, 0x800080;\nshl.b32 sw_g, sw_g, 8;\nor.b32 sw_a, sw_a, sw_g;\n"
         "mov.b32 sw_k, 0x5C005C00;\nmul.rn.f16x2 sw_a, sw_a, sw_k;\n"
-        "and.b32 sw_c, sw_x, 0x7F;\nsetp.eq.u32 sw_p, sw_c, 0x7F;\nand.b32 sw_c, sw_a, 0xFFFF0000;\n"
-        "or.b32 sw_c, sw_c, 0x7FFF;\nselp.b32 sw_a, sw_c, sw_a, sw_p;\n"
-        "and.b32 sw_c, sw_x, 0x7F00;\nsetp.eq.u32 sw_p, sw_c, 0x7F00;\nand.b32 sw_c, sw_a, 0xFFFF;\n"
+        "and.b32 sw_c, sw_x, 0x7F;\nsetp.eq.u32 sw_p, sw_c, 0x7F;\n"
+        "and.b32 sw_c, sw_a, 0xFFFF0000;\nor.b32 sw_c, sw_c, 0x7FFF;\n"
+        "selp.b32 sw_a, sw_c, sw_a, sw_p;\nand.b32 sw_c, sw_x, 0x7F00;\n"
+        "setp.eq.u32 sw_p, sw_c, 0x7F00;\nand.b32 sw_c, sw_a, 0xFFFF;\n"
         f"or.b32 sw_c, sw_c, 0x7FFF0000;\nselp.b32 {d}, sw_c, sw_a, sw_p;\n}}"
     )
 
@@ -154,39 +150,21 @@ def _sw_e4m3x2_to_f16x2(d: str, s: str) -> str:
 _OP = r"([^\s,;]+)"
 # (first target with the instruction, pattern, software replacement)
 _SW_RULES = (
-    (
-        (10, 0),
-        rf"cvt\.rn\.satfinite\.e2m1x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
-        lambda m: _sw_pair(_sw_e2m1, m[1], m[2], m[3], 4, "u8"),
-    ),
-    (
-        (10, 0),
-        rf"cvt\.rn\.f16x2\.e2m1x2\s+{_OP},\s*{_OP};",
-        lambda m: _sw_e2m1x2_to_f16x2(m[1], m[2]),
-    ),
-    (
-        (8, 9),
-        rf"cvt\.rn\.satfinite\.e4m3x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
-        lambda m: _sw_pair(_sw_e4m3, m[1], m[2], m[3], 8, "u16"),
-    ),
-    (
-        (8, 9),
-        rf"cvt(?:\.rn)?\.f16x2\.e4m3x2\s+{_OP},\s*{_OP};",
-        lambda m: _sw_e4m3x2_to_f16x2(m[1], m[2]),
-    ),
-    (
-        (9, 0),
-        rf"mul(?:\.rn)?\.bf16x2\s+{_OP},\s*{_OP},\s*{_OP};",
-        lambda m: f"{{\n.reg .b32 sw_z;\nmov.b32 sw_z, 0x80008000;\n"
-        f"fma.rn.bf16x2 {m[1]}, {m[2]}, {m[3]}, sw_z;\n}}",
-    ),
-    (
-        (10, 0),
-        r"ld\.global\.v8\.u32\s+\{([^}]*)\},\s*\[([^\]]+)\];",
-        lambda m: "ld.global.v4.u32 {%s}, [%s];\nld.global.v4.u32 {%s}, [%s+16];"
-        % (",".join(m[1].split(",")[:4]), m[2], ",".join(m[1].split(",")[4:]), m[2]),
-    ),
-)
+    ((10, 0), rf"cvt\.rn\.satfinite\.e2m1x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
+     lambda m: _sw_pair(_sw_e2m1, m[1], m[2], m[3], 4, "u8")),
+    ((10, 0), rf"cvt\.rn\.f16x2\.e2m1x2\s+{_OP},\s*{_OP};",
+     lambda m: _sw_e2m1x2_to_f16x2(m[1], m[2])),
+    ((8, 9), rf"cvt\.rn\.satfinite\.e4m3x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
+     lambda m: _sw_pair(_sw_e4m3, m[1], m[2], m[3], 8, "u16")),
+    ((8, 9), rf"cvt(?:\.rn)?\.f16x2\.e4m3x2\s+{_OP},\s*{_OP};",
+     lambda m: _sw_e4m3x2_to_f16x2(m[1], m[2])),
+    ((9, 0), rf"mul(?:\.rn)?\.bf16x2\s+{_OP},\s*{_OP},\s*{_OP};",
+     lambda m: f"{{\n.reg .b32 sw_z;\nmov.b32 sw_z, 0x80008000;\n"
+     f"fma.rn.bf16x2 {m[1]}, {m[2]}, {m[3]}, sw_z;\n}}"),
+    ((10, 0), r"ld\.global\.v8\.u32\s+\{([^}]*)\},\s*\[([^\]]+)\];",
+     lambda m: "ld.global.v4.u32 {%s}, [%s];\nld.global.v4.u32 {%s}, [%s+16];"
+     % (",".join(m[1].split(",")[:4]), m[2], ",".join(m[1].split(",")[4:]), m[2])),
+)  # fmt: skip
 
 
 def target_inline_asm(res, operands, asm: str, constraints: str, **kwargs):

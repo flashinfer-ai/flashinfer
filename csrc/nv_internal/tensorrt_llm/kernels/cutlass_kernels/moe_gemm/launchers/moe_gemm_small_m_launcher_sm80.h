@@ -23,6 +23,7 @@
 #include <type_traits>
 
 #include "../../include/moe_gemm_kernels.h"
+#include "cute/arch/mma_sm80.hpp"
 #include "flashinfer/cp_async.cuh"
 #include "flashinfer/mma.cuh"
 #include "flashinfer/vec_dtypes.cuh"
@@ -83,11 +84,8 @@ __device__ __forceinline__ void e2m1x8_to_bf16x8(uint32_t packed, uint32_t* d,
 }
 
 __device__ __forceinline__ void mma_bf16(float* d, uint32_t const* a, uint32_t const* b) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
-      "{%8, %9}, {%0, %1, %2, %3};\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+  cute::SM80_16x8x16_F32BF16BF16F32_TN::fma(d[0], d[1], d[2], d[3], a[0], a[1], a[2], a[3], b[0],
+                                            b[1], d[0], d[1], d[2], d[3]);
 }
 
 // a x {s, s} for two BF16 pairs, exact: an E2M1 value times a block scale (E4M3, or a power of two
@@ -360,11 +358,8 @@ void sm80FP4SmallMGemm(Sm80FP4SmallMInput<WeightType, ScaleBiasType> const& inpu
   using namespace sm80_fp4_small_m;
   static_assert(std::is_same_v<ScaleBiasType, __nv_bfloat16>, "BF16 block scales");
   auto const kernel_fn = kernel<kStages>;
-  cudaError_t result =
-      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-  TLLM_CHECK_WITH_INFO(result == cudaSuccess,
-                       "Fail to set the max smem size to %d for the small-M FP4 MoE kernel",
-                       kSmemBytes);
+  tensorrt_llm::common::check_cuda_error(
+      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
   if (inputs.occupancy) {
     tensorrt_llm::common::check_cuda_error(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         inputs.occupancy, kernel_fn, kThreads, kSmemBytes));
@@ -377,9 +372,7 @@ void sm80FP4SmallMGemm(Sm80FP4SmallMInput<WeightType, ScaleBiasType> const& inpu
       inputs.row_scales, inputs.alpha_scales, inputs.expert_scales, inputs.A, inputs.a_rows,
       inputs.a_tokens, inputs.total_tokens_including_expert, inputs.C, static_cast<int>(inputs.n),
       static_cast<int>(inputs.k), inputs.num_experts);
-  result = cudaGetLastError();
-  TLLM_CHECK_WITH_INFO(result == cudaSuccess,
-                       "Fail to execute the small-M FP4 MoE kernel, cuda error %d", (int)(result));
+  tensorrt_llm::common::check_cuda_error(cudaGetLastError());
 }
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels_oss

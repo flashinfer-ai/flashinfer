@@ -67,11 +67,10 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
   constexpr auto scale_bytes = cutlass::bits_to_bytes(s_bits * size<0>(TileShapeMNK{}) *
                                                       size<2>(TileShapeMNK{}) / scale_group_size);
   constexpr auto zero_bytes = cutlass::bits_to_bytes(z_bits * size<0>(TileShapeMNK{}));
-  // Activation E8M0 arrives as whole 128-row atoms.
-  constexpr int act_scale_rows = cute::max(int(size<1>(TileShapeMNK{})), 128);
-  constexpr auto act_scale_bytes =
-      cutlass::bits_to_bytes(get_bits_for_possibly_void_element<ElementActScale>() *
-                             act_scale_rows * size<2>(TileShapeMNK{}) / scale_group_size);
+  // Activation E8M0 bytes per tile row; it arrives as whole 128-row atoms.
+  constexpr int act_row_bytes = get_bits_for_possibly_void_element<ElementActScale>() / 8 *
+                                size<2>(TileShapeMNK{}) / scale_group_size;
+  constexpr int act_scale_bytes = act_row_bytes * cute::max(int(size<1>(TileShapeMNK{})), 128);
   static_assert(scale_bytes % 16 == 0,
                 "Folded weight-scale bulk copy must be at least 16B aligned.");
   static_assert(zero_bytes % 128 == 0, "Zero bytes must be a multiple of 128");
@@ -84,10 +83,8 @@ constexpr int compute_stage_count_or_override_folded_weight_scale(
   constexpr int stage_bytes =
       cutlass::round_up(stage_bytes_, alignment) + static_cast<int>(mainloop_pipeline_bytes);
   // Exact block exponents also keep FP32 activation factors, two buffers per consumer warpgroup.
-  constexpr int act_factor_bytes = cute::is_void_v<ElementActScale>
-                                       ? 0
-                                       : 2 * 2 * size<1>(TileShapeMNK{}) * size<2>(TileShapeMNK{}) /
-                                             scale_group_size * static_cast<int>(sizeof(float));
+  constexpr int act_factor_bytes =
+      act_row_bytes * size<1>(TileShapeMNK{}) * 2 * 2 * static_cast<int>(sizeof(float));
   constexpr int carveout_bytes = cutlass::round_up(carveout_bytes_ + act_factor_bytes, alignment);
   constexpr int capacity_bytes = capacity_bytes_ / alignment * alignment;
 

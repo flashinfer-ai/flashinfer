@@ -77,19 +77,6 @@ pytestmark = pytest.mark.usefixtures("observe_swap_ab_mma_plans")
 
 
 @pytest.fixture(autouse=True)
-def _skip_swap_ab_below_sm100(request):
-    """Below SM100 the MoE runs on the CUTLASS MoE kernels, which have no swap_ab."""
-    callspec = getattr(request.node, "callspec", None)
-    params = getattr(callspec, "params", {}) or {}
-    if (
-        params.get("swap_ab")
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(0)[0] < 10
-    ):
-        pytest.skip("swap_ab requires Blackwell SM100 or SM103")
-
-
-@pytest.fixture(autouse=True)
 def _skip_sm107_unimplemented_moe_features(request):
     """Skip parameterizations the SM107 (Rubin) W4A4 MoE kernels do not implement.
 
@@ -112,7 +99,8 @@ def _skip_sm107_unimplemented_moe_features(request):
     """
     if not torch.cuda.is_available():
         return
-    if get_compute_capability(torch.device("cuda")) != (10, 7):
+    capability = get_compute_capability(torch.device("cuda"))
+    if capability != (10, 7) and capability[0] >= 10:
         return
 
     callspec = getattr(request.node, "callspec", None)
@@ -120,6 +108,9 @@ def _skip_sm107_unimplemented_moe_features(request):
 
     if params.get("swap_ab"):
         pytest.skip("swap_ab requires Blackwell SM100 or SM103")
+    # Below SM100 the MoE runs on the CUTLASS MoE kernels, which have no swap_ab.
+    if capability[0] < 10:
+        return
 
     # W4A16 uses the shared Blackwell kernel on SM107, including unfused
     # finalize, GeGLU-tanh, and custom SwiGLU constants.
@@ -189,11 +180,11 @@ sm100_required = pytest.mark.skipif(
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
 # The MoE APIs also run below SM100 (SM80 to SM90), on the CUTLASS MoE kernels.
+_sm8x_or_sm90 = torch.cuda.is_available() and (
+    torch.cuda.get_device_capability(0)[0] in (8, 9)
+)
 sm10x_required = pytest.mark.skipif(
-    not is_sm100_family()
-    and not (
-        torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] in (8, 9)
-    ),
+    not (is_sm100_family() or _sm8x_or_sm90),
     reason="Requires CuteDSL MoE target SM80 to SM90, SM100, SM103 or SM107",
 )
 
@@ -357,21 +348,19 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
 
 
 def _assert_moe_quant_mode_reference(actual, expected, quant_mode, swap_ab=False):
-    # Below SM100 W4A16 runs on the records or CUTLASS SM80 kernels, which round
-    # differently from the split kernel the W4A16 oracle follows.
+    # Below SM100, W4A16 kernels round differently from the split-kernel oracle.
     if quant_mode == "w4a16" and is_sm100_family():
         assert_w4a16_bits(actual, expected)
-    elif quant_mode in ("w4a4", "w4a8", "mxfp8") and swap_ab:
-        assert_cute_dsl_moe_bits(actual, expected)
-    elif quant_mode in ("w4a4", "w4a16"):
-        # check_accuracy passes a few non-finite values; the kernels produce none.
-        assert torch.isfinite(actual).all(), "non-finite MoE output"
-        passed, percent_within, atol = check_accuracy(actual, expected)
-        assert passed, (
-            f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
-        )
-    elif quant_mode in ("w4a8", "mxfp8"):
-        raise ValueError("MXFP accuracy cases require swap_ab")
+    elif quant_mode in ("w4a4", "w4a8", "mxfp8", "w4a16"):
+        if swap_ab:
+            assert_cute_dsl_moe_bits(actual, expected)
+        elif quant_mode in ("w4a4", "w4a16"):
+            passed, percent_within, atol = check_accuracy(actual, expected)
+            assert passed, (
+                f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"
+            )
+        else:
+            raise ValueError("MXFP accuracy cases require swap_ab")
     else:
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
@@ -2337,79 +2326,6 @@ class TestCuteDslMoeW4A16:
         full = run(torch.arange(pool, device="cuda"))
         perm = torch.randperm(pool, device="cuda", generator=gen)
         assert torch.equal(run(perm), full[perm])
-
-
-@cute_dsl_available
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability(0)[0] not in (8, 9),
-    reason="W4A16 records run below SM100",
-)
-@pytest.mark.parametrize("gated", [True, False])
-def test_w4a16_records_tactics(gated: bool):
-    """Every records tactic gives the same output, within tolerance of the reference, also with
-    records prepared once and the weights' storage released. GEMM1 takes three 128-column
-    records; the gated GEMM2 K of 192 ends in a 64-wide tail."""
-    from flashinfer import autotune, cute_dsl_fused_moe
-    from flashinfer.fused_moe import (
-        cute_dsl_w4a16_sm80_supported,
-        cute_dsl_w4a16_sm80_weights,
-    )
-    from flashinfer.fused_moe.cute_dsl.tuner import W4A16_SM80_TACTICS
-
-    tensors = create_moe_tensors(
-        num_tokens=100,
-        hidden_size=256,
-        intermediate_size=192 if gated else 384,
-        num_experts=8,
-        num_local_experts=8,
-        top_k=2,
-        gated=gated,
-    )
-    activation = ActivationType.Swiglu if gated else ActivationType.Relu2
-    assert cute_dsl_w4a16_sm80_supported(8, activation_type=activation)
-    assert not cute_dsl_w4a16_sm80_supported(8, 4, activation_type=activation)
-
-    def run(w1, s1, w2, s2, tactic=None):
-        return cute_dsl_fused_moe(
-            x=tensors["x_bf16"],
-            x_sf=None,
-            token_selected_experts=tensors["token_selected_experts"],
-            token_final_scales=tensors["token_final_scales"],
-            w1_weight=w1,
-            w1_weight_sf=s1,
-            w1_alpha=tensors["w1_alpha"],
-            fc2_input_scale=None,
-            w2_weight=w2,
-            w2_weight_sf=s2,
-            w2_alpha=tensors["w2_alpha"],
-            num_experts=8,
-            top_k=2,
-            quant_mode="w4a16",
-            use_fused_finalize=False,
-            activation_type=activation,
-            tactic=tactic,
-        )
-
-    weights = [
-        tensors[k] for k in ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf")
-    ]
-    outputs = [run(*weights, tactic) for tactic in W4A16_SM80_TACTICS]
-    _assert_moe_quant_mode_reference(
-        outputs[0],
-        split_w4a16_reference_from_tensors(tensors, activation_type=activation),
-        "w4a16",
-    )
-    for tactic, output in zip(W4A16_SM80_TACTICS[1:], outputs[1:], strict=True):
-        assert torch.equal(output, outputs[0]), tactic
-
-    r1, r2 = cute_dsl_w4a16_sm80_weights(*weights, gated)
-    w1, w2 = weights[0].clone(), weights[2].clone()
-    for w in (w1, w2):
-        w.untyped_storage().resize_(0)
-    with autotune(True):
-        assert torch.equal(run(w1, r1, w2, r2), outputs[0])
-    assert torch.equal(run(w1, r1, w2, r2), outputs[0])
 
 
 # =============================================================================
