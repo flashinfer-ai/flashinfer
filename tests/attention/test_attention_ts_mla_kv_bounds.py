@@ -150,8 +150,9 @@ def _bounded_reference(
     *,
     qo_indptr: torch.Tensor | None = None,
     policy: dict[str, object] | None = None,
+    bf16_single_tile: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute independent FP32 stats, optionally modeling the FP8 P schedule."""
+    """Compute FP32 stats and model the selected low-precision PV operands."""
 
     query = case.query.reshape(-1, case.query.shape[-2], case.query.shape[-1])
     output = torch.zeros(
@@ -192,8 +193,17 @@ def _bounded_reference(
                     visible_kv_len=visible,
                 )
             else:
+                probabilities = weights
+                if bf16_single_tile:
+                    # This BF16 oracle covers one KV tile, without online or
+                    # split rescaling. PV rounds P; the denominator does not.
+                    assert case.query.dtype == torch.bfloat16 and policy is not None
+                    assert cache.shape[0] <= int(policy["tile_size_kv"])
+                    assert int(policy["split_kv"]) == 1
+                    assert int(policy["num_insts_kv"]) == 1
+                    probabilities = weights.to(torch.bfloat16).float()
                 output[query_idx] = (
-                    weights
+                    probabilities
                     @ visible_cache[:, :_LATENT_DIM]
                     / denominator[:, None]
                     * case.output_scale
@@ -241,9 +251,14 @@ def _assert_bounded_result(
     *,
     policy: dict[str, object],
     qo_indptr: torch.Tensor | None = None,
+    bf16_single_tile: bool = False,
 ) -> None:
     expected_output, expected_stats = _bounded_reference(
-        case, bounds, qo_indptr=qo_indptr, policy=policy
+        case,
+        bounds,
+        qo_indptr=qo_indptr,
+        policy=policy,
+        bf16_single_tile=bf16_single_tile,
     )
     assert output.dtype == case.out_dtype
     assert stats.dtype == torch.float32
@@ -281,6 +296,47 @@ def test_attention_ts_mla_kv_bounds_split_reduction() -> None:
     assert int(_policy_dict(wrapper)["split_kv"]) > 1
     output, stats = _run_bounds(wrapper, case, bounds)
     _assert_bounded_result(case, bounds, output, stats, policy=_policy_dict(wrapper))
+
+
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_kv_bounds_helix_page_boundary() -> None:
+    """BF16 PV rounding on short local prefixes must not corrupt merge statistics."""
+
+    case = _make_bounded_case(
+        seq_len_q=6, kv_lengths=(64, 5, 0), qkv_dtype=torch.bfloat16
+    )
+    case.query[1:].copy_(case.query[:1].expand(2, -1, -1, -1))
+    bounds = torch.tensor(
+        [64] * 6 + list(range(6)) + [0] * 6, dtype=torch.int32, device="cuda"
+    )
+    wrapper = _plan_bounds(case, max_q_len=6)
+    output, stats = _run_bounds(wrapper, case, bounds)
+    _assert_bounded_result(
+        case, bounds, output, stats, policy=_policy_dict(wrapper), bf16_single_tile=True
+    )
+
+    merged, merged_stats = _merge_reference(output, stats)
+    global_cache = torch.cat([_gather_request_cache(case, rank) for rank in range(3)])
+    expected_rows, expected_stats = [], []
+    for row in range(6):
+        visible = global_cache[: 64 + row]
+        logits = case.query[0, row].float() @ visible.T * case.softmax_scale
+        maximum = logits.max(dim=-1).values
+        weights = torch.exp(logits - maximum[:, None])
+        denominator = weights.sum(dim=-1)
+        expected_rows.append(
+            weights
+            @ visible[:, :_LATENT_DIM]
+            / denominator[:, None]
+            * case.output_scale
+        )
+        expected_stats.append(torch.stack((maximum, denominator), dim=-1))
+    # Keep an independent mathematical-attention gate for the merged output.
+    rtol, atol = _mla_tolerances(case.query.dtype)
+    torch.testing.assert_close(merged, torch.stack(expected_rows), rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        merged_stats, torch.stack(expected_stats), rtol=2e-3, atol=2e-4
+    )
 
 
 @pytest.mark.parametrize(
