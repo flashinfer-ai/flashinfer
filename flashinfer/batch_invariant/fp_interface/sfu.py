@@ -14,12 +14,12 @@ shift is exact on a part is itself tested against the device (:func:`check_model
 from __future__ import annotations
 
 import hashlib
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Float32, Int32, Int64
+from cutlass import Float32, Int64
 from .cute import ex2_approx_ftz, rcp_approx_ftz
 
 __all__ = [
@@ -36,7 +36,8 @@ __all__ = [
 #: Binary32 significand bits: the tables index the fraction / significand field.
 FRACTION_BITS = 23
 _N = 1 << FRACTION_BITS
-_FLT_MIN_EXP = -126  # the smallest normal exponent: results below 2^-126 flush to +0 (ftz)
+#: The smallest normal exponent: results below 2^-126 flush to +0 (ftz).
+_FLT_MIN_EXP = -126
 
 
 class SfuEvalKernel:
@@ -69,7 +70,7 @@ class SfuEvalKernel:
                 mY[i] = rcp_approx_ftz(x)
 
 
-_KERNELS: Dict[int, object] = {}
+_KERNELS: Dict[int, Callable[..., None]] = {}
 
 
 def _eval(which: int, x: torch.Tensor) -> torch.Tensor:
@@ -129,7 +130,8 @@ def dump_tables(device: torch.device) -> SfuTables:
     _, arch = part_of(device)
     j = torch.arange(_N, dtype=torch.int64, device=device)
     frac = (j.to(torch.float64) / float(_N)).to(torch.float32)  # exact: j / 2^23
-    sig = (1.0 + j.to(torch.float64) / float(_N)).to(torch.float32)  # exact: 1 + j / 2^23
+    # exact: 1 + j / 2^23
+    sig = (1.0 + j.to(torch.float64) / float(_N)).to(torch.float32)
     return SfuTables(arch, _eval(0, frac.contiguous()), _eval(1, sig.contiguous()))
 
 
@@ -202,19 +204,50 @@ def rcp_hw(x: torch.Tensor, tables: SfuTables) -> torch.Tensor:
 
 
 def check_model(
-    device: torch.device, n: int = 1 << 22, seed: int = 0, tables: Optional[SfuTables] = None
+    device: torch.device,
+    n: int = 1 << 22,
+    seed: int = 0,
+    tables: Optional[SfuTables] = None,
 ) -> Dict[str, int]:
     """The device's primitives against the CPU model over ``n`` random binary32 inputs of every exponent (the finite
     non-NaN patterns), plus the special values: the number of mismatching bit patterns per primitive (0 = the model is the
     part's function)."""
     tables = tables or tables_for(device)
     g = torch.Generator().manual_seed(seed)
-    bits = torch.randint(-(2**31), 2**31 - 1, (n,), dtype=torch.int64, generator=g).to(torch.int32)
+    bits = torch.randint(-(2**31), 2**31 - 1, (n,), dtype=torch.int64, generator=g).to(
+        torch.int32
+    )
     x = bits.view(torch.float32)
     x = torch.where(torch.isnan(x), torch.ones_like(x), x)
     special = torch.tensor(
-        [0.0, -0.0, 1.0, -1.0, -2.0, -3.0, -7.0, 0.5, -0.5, 2.0, 127.5, -126.0, -127.0, -149.0, -150.0, 128.0, 127.0,
-         1e-40, -1e-40, 1e-30, -1e-30, 0.3, -0.3, float("inf"), -float("inf"), float("nan")],
+        [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            -2.0,
+            -3.0,
+            -7.0,
+            0.5,
+            -0.5,
+            2.0,
+            127.5,
+            -126.0,
+            -127.0,
+            -149.0,
+            -150.0,
+            128.0,
+            127.0,
+            1e-40,
+            -1e-40,
+            1e-30,
+            -1e-30,
+            0.3,
+            -0.3,
+            float("inf"),
+            -float("inf"),
+            float("nan"),
+        ],
         dtype=torch.float32,
     )
     x = torch.cat([x, special])
