@@ -266,7 +266,7 @@ def _get_fp8_softmax_scales(device: torch.device):
         # Scale the softmax intermediate into FP8's range before the P @ V MMA.
         # Keep O's scale separate so this reciprocal pair does not rescale output.
         scales = tuple(
-            torch.full((1, 1, 1, 1), value, device=device, dtype=torch.float32)
+            torch.tensor([[[[value]]]], device=device, dtype=torch.float32)
             for value in (256.0, 1.0 / 256.0)
         )
         _fp8_softmax_scales[device] = scales
