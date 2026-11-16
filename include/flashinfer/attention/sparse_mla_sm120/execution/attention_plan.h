@@ -167,6 +167,8 @@ struct ExecutionPlan {
 };
 
 // QkBF16PvFP8 as a request permits that route; the resolver may still select FP8.
+void set_fp8_decode_resources(ExecutionPlan& plan);
+
 ExecutionPlan resolve_attention(const AttentionMetadata& metadata, NumericRoute requested,
                                 int requested_cpb, DeviceCaps caps);
 

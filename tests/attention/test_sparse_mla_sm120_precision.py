@@ -268,6 +268,9 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
         elif facts["variant"] != 0:
             assert "sparse_mla_prefill_kernel" in topology
             assert "sparse_mla_decode" not in topology
+        elif mixed is not True:
+            assert "dsv4_fp8_splitkv_decode" in topology
+            assert "merge" in topology
         else:
             assert "sparse_mla_decode_dsv4_kernel" in topology
             assert "sparse_mla_decode_dsv4_merge_kernel" in topology

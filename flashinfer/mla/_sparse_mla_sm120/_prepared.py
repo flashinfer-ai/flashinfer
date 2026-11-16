@@ -132,17 +132,9 @@ def resolve_execution(
         and (impl != "auto" or selected is None)
     ):
         sm, shared = device_caps(device)
-        # At fewer than two query-head rows per SM, footer gather and cluster
-        # finalization cost more than the legacy decode. Keep that automatic
-        # path while allowing either CuTe implementation to be requested.
-        if (
-            impl != "auto"
-            or m.model != policy._MODEL_TYPE_DSV4_1
-            or m.tokens * m.heads >= 2 * sm
-        ):
-            return get_sparse_mla_sm120_module().resolve_decode_attention(
-                m, {"auto": 0, "decode-splitkv": 1, "decode": 2}[impl], sm, shared
-            )
+        return get_sparse_mla_sm120_module().resolve_decode_attention(
+            m, {"auto": 0, "decode-splitkv": 1, "decode": 2}[impl], sm, shared
+        )
     if is_dsv4_nvfp4:
         from ._dsv4_nvfp4_policy import (
             plan_nvfp4_sparse_mla_sm120,

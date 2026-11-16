@@ -140,13 +140,13 @@ def test_caller_and_workspace_scheduling_cache_isolation(first, monkeypatch):
     assert plans[True].workspace[0][2] > 0
 
 
-def test_footer_auto_keeps_small_workloads_on_legacy_decode():
+def test_footer_auto_uses_cooperative_decode():
     f = fixture(1, 8, "v41_fp8", inline=False, extra_topk=0)
     call(f, "auto")
     plan = next(iter(f["wrapper"]._prepared_calls.values())).plan.inspect()
-    assert plan["implementation"] == "ordinary"
+    assert plan["implementation"] == "dsv4_fp8_splitkv_decode"
     assert plan["variant"] == 0
-    # The automatic cutoff must not restrict either explicit implementation.
+    # Both explicit implementations remain available.
     for impl, expected in (
         ("decode-splitkv", "dsv4_fp8_splitkv_decode"),
         ("decode", "dsv4_fp8_decode"),
@@ -175,6 +175,7 @@ def fp8_query_lse_reference(f):
         [
             d[ix.clamp_min(0).long()].double()
             for d, ix in zip(f["decoded"], f["indices"], strict=True)
+            if ix is not None
         ],
         1,
     )
@@ -183,6 +184,7 @@ def fp8_query_lse_reference(f):
             (ix >= 0)
             & (torch.arange(ix.shape[1], device=ix.device)[None] < ln[:, None])
             for ix, ln in zip(f["indices"], f["lengths"], strict=True)
+            if ix is not None
         ],
         1,
     )
@@ -301,8 +303,8 @@ def test_decode_parallelism_policy():
         (7, "decode-splitkv"),
         (49, "decode"),
         (91, "decode"),
-        (98, "decode-splitkv"),
-        (119, "decode-splitkv"),
+        (98, "decode"),
+        (119, "decode"),
         (126, "decode"),
     ],
 )
@@ -399,3 +401,87 @@ def test_decode_gapped_inline_mutable_graph(impl, tokens):
             (f["out"].view(torch.uint8), f["scales"], lse), expected, strict=True
         ):
             torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_caller_managed_more_than_warp_splits(inline):
+    from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+    f = fixture(1, 8, "v41_fp8", topk=2113, extra_topk=0, inline=inline)
+    f["prologue"]()
+    splits = 34
+    mid = torch.empty(1, 16, splits, 512, device="cuda", dtype=torch.bfloat16)
+    mid_lse = torch.empty(1, 16, splits, device="cuda")
+    lse = torch.empty(1, 8, device="cuda")
+    module = _get_sparse_mla_sm120_decode_module()
+    metadata = module.inspect_metadata(
+        f["rotated"],
+        f["caches"][0],
+        f["indices"][0],
+        f["context"],
+        f["lengths"][0],
+        f["sink"],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        6 if inline else 5,
+        False,
+        512,
+    )
+    plan = module.resolve_attention(metadata, 0, 1, 188, 101376)
+    assert plan.inspect()["active_splits"] == splits
+    module.execute_attention(
+        plan,
+        f["rotated"],
+        f["caches"][0],
+        f["indices"][0],
+        mid,
+        mid_lse,
+        f["context"],
+        lse,
+        512**-0.5,
+        f["lengths"][0],
+        f["sink"],
+        None,
+        None,
+        None,
+        0.6931471805599453,
+    )
+    f["post"]()
+    metric = numerical_metrics(f, lse)
+    assert metric["finite_output"] and metric["relative_l2"] < 0.07, metric
+    assert metric["lse_max_abs"] < 0.06, metric
+    torch.testing.assert_close(
+        lse.double(), fp8_query_lse_reference(f), atol=2e-5, rtol=0
+    )
+
+
+@pytest.mark.parametrize("heads", [8, 16])
+@pytest.mark.parametrize("inline", [False, True])
+def test_decode_multitile_score_reuse(heads, inline):
+    from tests.attention.sparse_mla_prefill_utils import assert_mega_outputs
+
+    # Both head tiles process multiple KV tiles per split. Keep this small
+    # enough for racecheck while exercising score reuse and changing live tails.
+    f = fixture(
+        1, heads, "v41_fp8", inline=inline, topk=1024, extra_topk=0, with_sink=False
+    )
+    call(f, "decode-splitkv")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        lse = call(f, "decode-splitkv")
+    for length in (1024, 513, 0):
+        f["lengths"][0].fill_(length)
+        expected = tuple(x.clone() for x in f["baseline"]())
+        f["out"].fill_(float("nan"))
+        f["scales"].fill_(255)
+        lse.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_mega_outputs((f["out"], f["scales"], lse), expected)
+        metric = numerical_metrics(f, lse)
+        assert metric["finite_output"] and metric["relative_l2"] < 0.07, metric
+        assert metric["lse_max_abs"] < 0.06, metric
