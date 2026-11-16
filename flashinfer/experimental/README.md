@@ -280,7 +280,7 @@ maintainability are **not** required at admission.
 
 ### Relaxations vs. the stable-API checklist
 
-Relative to the "Adding a New Operation" checklist in the root `CLAUDE.md`:
+Relative to the "Adding a New Operation" checklist in the root `AGENTS.md`:
 
 - **Trace templates** (`flashinfer/trace/templates/`) are optional for
   experimental APIs (needed for graduation).
@@ -343,6 +343,28 @@ default in supported framework releases. A request for default or supported
 release-path integration is a signal that the feature should be considered
 for graduation.
 
+Release wheels published to PyPI omit most experimental packages' generated
+kernel sources (`csrc/**` and `csrc/experimental/**`): the release
+workflow builds with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` so that
+`flashinfer-python` stays under PyPI's per-file size limit (#7977). The Python
+modules stay importable, but loads requiring omitted sources raise;
+`flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt` explains the omissions.
+Nightly wheels on https://flashinfer.ai/whl and source installs include the
+sources, matching the audience above.
+
+The HC sum-state backend's `binding.cu` and `kernels.cuh` are retained for JIT
+by an exact-path allowlist. The API remains experimental and JIT-only; including
+these sources does not enable it by default or register it in AOT.
+
+The Cake training backends under `flashinfer/experimental/cake/<module>/` are
+fully exempt (#8928). Each backs a stable top-level facade
+`flashinfer.cake_<op>_<det|nondet>_train[_kcp]` that is not an experimental
+API. The facade imports its backend inside its functions or through its module
+`__getattr__`, never at module level, and its top-level names in
+`flashinfer/__init__.py` are rows of the lazy-export table `_LAZY_EXPORTS`, so
+`import flashinfer` still loads no backend. Their `csrc/**` ships in every
+wheel, including the release wheel on PyPI.
+
 ## Graduation checklist
 
 To graduate a feature to stable:
@@ -353,7 +375,7 @@ To graduate a feature to stable:
    user-visible.
 3. Replace `@flashinfer_experimental_api` with `@flashinfer_api` and remove
    `require_experimental` calls from the entry point.
-4. Complete the full stable-API checklist in the root `CLAUDE.md` (trace
+4. Complete the full stable-API checklist in the root `AGENTS.md` (trace
    template, `tests/trace/example.py`, docs page, top-level export).
 5. Register in `flashinfer/aot.py` if the feature should ship pre-compiled.
 6. Move tests from `tests/experimental/` to the corresponding stable test

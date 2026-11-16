@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -659,6 +660,56 @@ def exported_names(source: str | None) -> dict[str, str]:
             for alias in node.names:
                 if alias.name != "*":
                     exports[alias.asname or alias.name] = module
+    exports.update(lazy_exported_names(tree))
+    return exports
+
+
+def lazy_exported_names(tree: ast.Module) -> dict[str, str]:
+    """Names served by the module-level ``_LAZY_EXPORTS`` table.
+
+    A row ``"name": (".module", "attribute")`` counts like
+    ``from .module import attribute as name``; a module-valued row
+    ``"name": (".package.module", None)`` counts like
+    ``from .package import module as name``. Rows spread in with ``**`` are
+    computed at runtime and are not read.
+    """
+    exports: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if not isinstance(value, ast.Dict) or not any(
+            isinstance(target, ast.Name) and target.id == "_LAZY_EXPORTS"
+            for target in targets
+        ):
+            continue
+        for key, row in zip(value.keys, value.values, strict=True):
+            if not (
+                isinstance(key, ast.Constant)
+                and isinstance(key.value, str)
+                and isinstance(row, ast.Tuple)
+                and len(row.elts) == 2
+                and all(isinstance(part, ast.Constant) for part in row.elts)
+            ):
+                continue
+            module, attribute = (part.value for part in row.elts)
+            if not isinstance(module, str) or not (
+                attribute is None or isinstance(attribute, str)
+            ):
+                continue
+            if module.startswith("."):
+                try:
+                    module = importlib.util.resolve_name(module, "flashinfer")
+                except ImportError:  # "..x" climbs above flashinfer
+                    continue
+            if module != "flashinfer" and not module.startswith("flashinfer."):
+                continue
+            if attribute is None:
+                module = module.rpartition(".")[0] or module
+            exports[key.value] = module
     return exports
 
 

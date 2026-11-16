@@ -276,7 +276,7 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         ("sm_100a", 8, "float16", True, 512, 8, "generic"),
         ("sm_100a", 8, "float16", True, 1536, 16, "two_shot_b5"),
         ("sm_100a", 8, "float16", True, 2048, 16, "two_shot_b5"),
-        ("sm_103a", 2, "bfloat16", False, 1, 8, "lat_t1"),
+        ("sm_103a", 2, "bfloat16", False, 1, 8, "lat_t1f"),
         ("sm_103a", 2, "bfloat16", False, 2, 8, "lat_t1"),
         ("sm_103a", 2, "bfloat16", False, 32, 8, "lat_t1"),
         ("sm_103a", 2, "bfloat16", False, 96, 16, "lat_b4"),

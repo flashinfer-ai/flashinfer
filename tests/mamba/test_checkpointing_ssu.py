@@ -541,7 +541,7 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
             dt1_proc[slot],
         )
 
-    def _run(k, *, algorithm=None, enable_pdl=False):
+    def _run(k, *, algorithm=None, enable_pdl=False, strided_trackers=False):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -558,13 +558,17 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
         if algorithm is not None:
             kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
             kw["algorithm"] = algorithm
+        rs = ring_start.clone()
+        pnat = torch.full((cache_size,), k, device=device, dtype=torch.int32)
+        if strided_trackers:
+            rs, pnat = _strided_trackers(rs, pnat)
         checkpointing_ssu(
             st,
             xc,
             bc,
             dtc,
-            ring_start.clone(),
-            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            rs,
+            pnat,
             x=x2,
             dt=dt2,
             A=A,
@@ -603,7 +607,9 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     request.addfinalizer(tuner.clear_cache)
     cache_path = tmp_path / "checkpointing_ssu_autotune.json"
     with autotune(True, cache=str(cache_path)):
-        tuned = _run(2, algorithm="auto")
+        # Tune with strided trackers; the contiguous warm call reuses the tactic
+        # (the cache key ignores strides), so the two must match bit-for-bit.
+        tuned = _run(2, algorithm="auto", strided_trackers=True)
         warm = _run(2, algorithm="auto")
 
     profiled_configs = {
@@ -2284,6 +2290,103 @@ def test_checkpointing_ssu_philox_with_checkpoint(
     _assert_ring_cache_matches(B_test, B_ref, f"B_cache (prev_k={prev_k})")
     _assert_ring_cache_matches(
         dt_test, dt_ref, f"dt_cache (prev_k={prev_k})", rtol=1e-4, atol=1e-4
+    )
+
+
+def _flush_fp8_slot_without_update(state, scales, philox_rounds):
+    """Flush slot 1 through a recurrence that adds nothing and decays nothing."""
+    device = state.device
+    _, nheads, dim, dstate = state.shape
+    window = 8
+    bf16 = dict(device=device, dtype=torch.bfloat16)
+    current = torch.zeros(1, 1, nheads, dim, **bf16)
+    bc = torch.zeros(1, 1, 1, dstate, **bf16)
+    out = torch.empty_like(current)
+    checkpointing_ssu(
+        state=state,
+        state_scale=scales,
+        x_cache=torch.zeros(2, nheads, window + 1, dim, **bf16),
+        B_cache=torch.zeros(2, 1, window + 1, dstate, **bf16),
+        dt_cache=torch.ones(2, nheads, window + 1, device=device),
+        ring_start=torch.zeros(2, device=device, dtype=torch.int32),
+        prev_num_accepted_tokens=torch.tensor(
+            [0, window], device=device, dtype=torch.int32
+        ),
+        x=current,
+        dt=torch.ones(1, 1, nheads, 1, **bf16).expand(-1, -1, -1, dim),
+        A=torch.zeros(nheads, 1, 1, device=device).expand(-1, dim, dstate),
+        B=bc,
+        C=bc,
+        out=out,
+        dt_softplus=False,
+        state_batch_indices=torch.tensor([1], device=device, dtype=torch.int32),
+        pad_slot_id=0,
+        algorithm="monolith",
+        d_split=1,
+        rand_seed=torch.tensor([123456789], device=device, dtype=torch.int64)
+        if philox_rounds
+        else None,
+        philox_rounds=philox_rounds,
+        enable_pdl=False,
+    )
+    return out
+
+
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+def test_checkpointing_ssu_fp8_flush_keeps_valid_scales(philox_rounds):
+    """A no-op recurrence must preserve tiny FP8 states across a flush."""
+    if philox_rounds and not is_cvt_rs_supported():
+        pytest.skip(f"FP8 SR requires HW cvt.rs on {cvt_rs_supported_arches_text()}")
+    device = "cuda"
+    nheads, dim, dstate = 16, 64, 128
+    floor = 2.0**-117
+    row_case = torch.arange(nheads * dim, device=device).reshape(nheads, dim) % 4
+    amplitudes = torch.tensor([1.0, 2.0**-118, 448.0 * floor, 448.0], device=device)
+    state = torch.ones(2, nheads, dim, dstate, device=device).to(torch.float8_e4m3fn)
+    state[1].view(torch.uint8)[row_case == 0] = 0
+    scales = torch.ones(2, nheads, dim, device=device)
+    scales[1] = amplitudes[row_case]
+    before = state[1].float() * scales[1, ..., None]
+
+    out = _flush_fp8_slot_without_update(state, scales, philox_rounds)
+
+    expected_scales = torch.tensor([1.0, floor, floor, 1.0], device=device)[row_case]
+    expected_state = torch.tensor([0.0, 0.5, 448.0, 448.0], device=device)[row_case]
+    torch.testing.assert_close(scales[1], expected_scales, rtol=0, atol=0)
+    torch.testing.assert_close(
+        state[1].float(),
+        expected_state[..., None].expand(-1, -1, dstate),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        state[1].float() * scales[1, ..., None], before, rtol=0, atol=0
+    )
+    assert torch.count_nonzero(out) == 0
+
+
+@pytest.mark.parametrize("philox_rounds", [0, 5])
+def test_checkpointing_ssu_fp8_flush_tiny_row_with_zeros_stays_finite(philox_rounds):
+    """A tiny row with exact zeros must not encode 0 * inf as an FP8 NaN."""
+    if philox_rounds and not is_cvt_rs_supported():
+        pytest.skip(f"FP8 SR requires HW cvt.rs on {cvt_rs_supported_arches_text()}")
+    device = "cuda"
+    nheads, dim, dstate = 16, 64, 128
+    # An unbounded encode scale, 448 / 2^-122, overflows FP32.
+    state = torch.ones(2, nheads, dim, dstate, device=device).to(torch.float8_e4m3fn)
+    state[1].view(torch.uint8)[..., 1::2] = 0
+    scales = torch.ones(2, nheads, dim, device=device)
+    scales[1] = 2.0**-122
+    before = state[1].float() * scales[1, ..., None]
+
+    _flush_fp8_slot_without_update(state, scales, philox_rounds)
+
+    assert not torch.isnan(state[1].float()).any()
+    torch.testing.assert_close(
+        scales[1], torch.full_like(scales[1], 2.0**-117), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        state[1].float() * scales[1, ..., None], before, rtol=0, atol=0
     )
 
 
@@ -5346,6 +5449,27 @@ def _pad_outer(t, pad):
     return full.narrow(1, 0, shape[1])
 
 
+def _strided_trackers(ring_start, prev_num_accepted, stride=3):
+    """Return the trackers as columns 0 and 1 of one buffer with row stride
+    `stride` (>= 3), as for trackers inside a per-slot cache page.  Only the
+    span the views touch is allocated.  Its first elements are prefilled with an
+    in-range value, so a kernel that ignores the stride reads wrong but valid
+    trackers for the other slots."""
+    n = ring_start.numel()
+    buf = torch.empty(
+        (n - 1) * stride + 2, dtype=ring_start.dtype, device=ring_start.device
+    )
+    buf[: min(buf.numel(), 2 * n + 2)].fill_(1)
+    rows = buf.as_strided((n, 2), (stride, 1))
+    rows[:, 0] = ring_start
+    rows[:, 1] = prev_num_accepted
+    return rows[:, 0], rows[:, 1]
+
+
+# Slot 3 * stride > 2**31: an int32 tracker index computation overflows.
+_LARGE_TRACKER_STRIDE = 3 * 2**28
+
+
 def _pad_inner(t, pad, dim):
     """Pad `t` along axis `dim` by `pad` rows, slice back to original.
     Result has stride(dim-1) > size(dim) * stride(dim)."""
@@ -5365,11 +5489,20 @@ def _pad_inner(t, pad, dim):
     ],
 )
 @pytest.mark.parametrize("varlen", [False, True], ids=["non_varlen", "varlen"])
-def test_checkpointing_ssu_noncontig(state_dtype, varlen):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+@pytest.mark.parametrize(
+    "tracker_stride",
+    [3, _LARGE_TRACKER_STRIDE],
+    ids=["tracker_stride3", "tracker_stride_gt_int32"],
+)
+def test_checkpointing_ssu_noncontig(state_dtype, varlen, two_kernel, tracker_stride):
     """Run the kernel on tensors with non-default (padded) strides and
     compare to a contiguous-clone reference.  Exercises stride plumbing
-    for x / dt / B / C / z / out / x_cache / B_cache / dt_cache.
+    for x / dt / B / C / z / out / x_cache / B_cache / dt_cache and the
+    ring_start / prev_num_accepted trackers.
     """
+    if two_kernel and state_dtype == torch.int8:
+        pytest.skip("8-bit state is monolith-only")
     device = "cuda"
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     dtype = torch.bfloat16
@@ -5388,6 +5521,12 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         cu_seqlens = None
     cache_size = batch
     total_tokens = sum(seq_lens)
+    # One int32 buffer spanning both tracker views (about 9 GiB when large).
+    tracker_bytes = ((cache_size - 1) * tracker_stride + 2) * 4
+    if torch.cuda.mem_get_info()[0] < tracker_bytes + (4 << 30):
+        pytest.skip(
+            f"needs {tracker_bytes / 2**30:.0f} GiB free for the tracker buffer"
+        )
 
     is_quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
     quant_max = 127.0 if state_dtype == torch.int8 else 448.0
@@ -5492,6 +5631,11 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted if varlen else None,
         **common_static,
+        **(
+            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
+            if two_kernel
+            else {}
+        ),
     )
 
     # ── Run 2: same data via non-contiguous tensors ──
@@ -5539,76 +5683,90 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
     # Cache writes: the _nc views alias the padded storage so written rows
     # persist there.  Compare via .contiguous() at the end.  (The views
     # already hold the contig data — _pad_inner copies it.)
-    pt_test = prev_tokens.clone()
+    ring_start_nc, pt_test = _strided_trackers(ring_start, prev_tokens, tracker_stride)
+    assert ring_start_nc.stride(0) == pt_test.stride(0) == tracker_stride
 
-    checkpointing_ssu(
-        state_test,
-        x_cache_nc,
-        B_cache_nc,
-        dt_cache_nc,
-        ring_start.clone(),
-        pt_test,
-        x=x_nc,
-        dt=dt_nc,
-        B=B_nc,
-        C=C_nc,
-        out=out_nc,
-        z=z_nc,
-        state_scale=state_scale_test,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=npredicted if varlen else None,
-        **common_static,
-    )
-
-    # ── Compare ──
-    # Output: same data layout (only outer-dim padding differs); .contiguous()
-    # the non-contig view to get the same layout as the reference.
-    torch.testing.assert_close(
-        out_nc.contiguous(),
-        out_ref,
-        rtol=0,
-        atol=0,
-        msg=f"output mismatch under non-contig (varlen={varlen})",
-    )
-
-    if is_quantized:
-        torch.testing.assert_close(
-            _dequantize_state(state_test, state_scale_test),
-            _dequantize_state(state_ref, state_scale_ref),
-            rtol=0,
-            atol=0,
-            msg=f"state (dequant) mismatch (varlen={varlen})",
-        )
-    else:
-        torch.testing.assert_close(
+    try:
+        checkpointing_ssu(
             state_test,
-            state_ref,
-            rtol=0,
-            atol=0,
-            msg=f"state mismatch (varlen={varlen})",
+            x_cache_nc,
+            B_cache_nc,
+            dt_cache_nc,
+            ring_start_nc,
+            pt_test,
+            x=x_nc,
+            dt=dt_nc,
+            B=B_nc,
+            C=C_nc,
+            out=out_nc,
+            z=z_nc,
+            state_scale=state_scale_test,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=npredicted if varlen else None,
+            **common_static,
+            **(
+                _two_kernel_scratch(
+                    batch, nheads, npredicted, max_window, dtype, device
+                )
+                if two_kernel
+                else {}
+            ),
         )
 
-    torch.testing.assert_close(
-        x_cache_nc.contiguous(),
-        x_ref,
-        rtol=0,
-        atol=0,
-        msg=f"x_cache mismatch (varlen={varlen})",
-    )
-    torch.testing.assert_close(
-        B_cache_nc.contiguous(),
-        B_ref,
-        rtol=0,
-        atol=0,
-        msg=f"B_cache mismatch (varlen={varlen})",
-    )
-    torch.testing.assert_close(
-        dt_cache_nc.contiguous(),
-        dt_ref,
-        rtol=0,
-        atol=0,
-        msg=f"dt_cache mismatch (varlen={varlen})",
-    )
+        # ── Compare ──
+        # Output: same data layout (only outer-dim padding differs); .contiguous()
+        # the non-contig view to get the same layout as the reference.
+        torch.testing.assert_close(
+            out_nc.contiguous(),
+            out_ref,
+            rtol=0,
+            atol=0,
+            msg=f"output mismatch under non-contig (varlen={varlen})",
+        )
+
+        if is_quantized:
+            torch.testing.assert_close(
+                _dequantize_state(state_test, state_scale_test),
+                _dequantize_state(state_ref, state_scale_ref),
+                rtol=0,
+                atol=0,
+                msg=f"state (dequant) mismatch (varlen={varlen})",
+            )
+        else:
+            torch.testing.assert_close(
+                state_test,
+                state_ref,
+                rtol=0,
+                atol=0,
+                msg=f"state mismatch (varlen={varlen})",
+            )
+
+        torch.testing.assert_close(
+            x_cache_nc.contiguous(),
+            x_ref,
+            rtol=0,
+            atol=0,
+            msg=f"x_cache mismatch (varlen={varlen})",
+        )
+        torch.testing.assert_close(
+            B_cache_nc.contiguous(),
+            B_ref,
+            rtol=0,
+            atol=0,
+            msg=f"B_cache mismatch (varlen={varlen})",
+        )
+        torch.testing.assert_close(
+            dt_cache_nc.contiguous(),
+            dt_ref,
+            rtol=0,
+            atol=0,
+            msg=f"dt_cache mismatch (varlen={varlen})",
+        )
+    finally:
+        # The large-stride buffer is ~9 GiB: release it even when a comparison
+        # fails, so later large-stride cases still pass the free-memory check.
+        del ring_start_nc, pt_test
+        torch.cuda.empty_cache()
 
 
 # ────────────────────────────────────────────────────────────────────────────

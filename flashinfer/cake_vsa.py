@@ -34,6 +34,24 @@ _MAX_DIRECT_TOPK = 32
 _MAX_LONGSEQ_BLOCKS = 192
 _BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS = 24
 _FP16_DIRECT_Q_TILE = 256
+# The block-64 balanced program (``flashinfer.jit.cake_vsa_balanced``) serves a
+# selection shared by every head where it is the faster program
+# (``_blk64_balanced_beats_per_head``, measured on B200 and GB300): at least
+# _BLK64_BALANCED_MIN_AVERAGE_BLOCKS selected blocks per query block on average
+# over at least _BLK64_BALANCED_MIN_TILES (query block, head) tiles, and, where
+# the per-head plan is the M64N256 WS program on any architecture but sm_103a,
+# at least _BLK64_BALANCED_WS_MIN_WAVES tiles per SM of its one-CTA-per-SM
+# persistent grid and rows of at most _BLK64_BALANCED_WS_MAX_ROW_BLOCKS blocks in
+# one group-count bucket of the kernel's histogram (_BLK64_BALANCED_NUM_BUCKETS)
+# or rows in several buckets over at least _BLK64_BALANCED_WS_RAGGED_MIN_WAVES
+# waves.
+_BLK64_BALANCED_BLOCKS_PER_GROUP = 4
+_BLK64_BALANCED_MIN_AVERAGE_BLOCKS = 7
+_BLK64_BALANCED_MIN_TILES = 8
+_BLK64_BALANCED_WS_MIN_WAVES = 0.8
+_BLK64_BALANCED_WS_MAX_ROW_BLOCKS = 64
+_BLK64_BALANCED_WS_RAGGED_MIN_WAVES = 1.05
+_BLK64_BALANCED_NUM_BUCKETS = 64
 
 
 def _device_index(device: torch.device) -> int:
@@ -411,6 +429,20 @@ def plan_cake_vsa(
             > _BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS * row_counts.numel()
             else "blk64_persistent"
         )
+    blk64_balanced = None
+    if R == 64 and dense is not None:
+        blk64_balanced = _plan_blk64_balanced(
+            dense,
+            row_counts,
+            planned_kv_block_lens,
+            C=C,
+            mb=mb,
+            num_qo_heads=num_qo_heads,
+            device=device,
+            per_head_profile=blk64_profile,
+            fewest=min_selected_blocks,
+            most=max_selected_blocks,
+        )
     shared_indptr = shared_indices = None
     if R != 64 and dense is not None and torch.equal(dense, dense[:1].expand_as(dense)):
         shared_indptr, shared_indices = _shared_bsr(
@@ -460,6 +492,7 @@ def plan_cake_vsa(
         "kv_block_lens": planned_kv_block_lens,
         "blk64_profile": blk64_profile,
         "blk64_selected_blocks_total": blk64_selected_blocks_total,
+        "blk64_balanced": blk64_balanced,
         "fp16_direct": fp16_direct,
         "workspace": {},
     }
@@ -642,6 +675,220 @@ def _run_blk64(
         )
 
 
+def cake_vsa_balanced_launch_grid(
+    total_tiles: int, sm_count: int
+) -> tuple[int, int, int]:
+    """The launch grid of the block-64 balanced program: one persistent CTA per
+    SM over the ``total_tiles`` (query block, head) tiles, never more CTAs than
+    tiles."""
+
+    return max(1, min(int(total_tiles), int(sm_count))), 1, 1
+
+
+def _blk64_group_bucket(count: int) -> int:
+    """The kernel's histogram bucket of a row of ``count`` selected blocks: its
+    group count (four blocks per group), capped at the last bucket."""
+
+    groups = -(-count // _BLK64_BALANCED_BLOCKS_PER_GROUP)
+    return min(groups, _BLK64_BALANCED_NUM_BUCKETS - 1)
+
+
+def _blk64_balanced_beats_per_head(
+    *,
+    arch: str,
+    per_head_profile: str,
+    selected: int,
+    mb: int,
+    fewest: int,
+    most: int,
+    tiles: int,
+    sm_count: int,
+) -> bool:
+    """Whether the balanced program is the faster block-64 program on ``arch``
+    for a shared selection of ``selected`` blocks over ``mb`` query blocks whose
+    rows select ``fewest`` to ``most`` blocks, over ``tiles`` (query block, head)
+    tiles, given the per-head plan's profile.
+
+    Measured on B200 and GB300 (FlashInfer's bench timer, cold L2, per-head
+    programs against the forced balanced program): with fewer than
+    ``_BLK64_BALANCED_MIN_AVERAGE_BLOCKS`` blocks per query block on average the
+    balanced program's groups of four are partly empty and it is not faster on
+    every grid. From there on it is faster than the per-head ordinary program on
+    every grid of at least ``_BLK64_BALANCED_MIN_TILES`` tiles. On sm_103a it is
+    also faster than the per-head M64N256 WS program
+    (``blk64_persistent_ws_m64n256``) on every such selection. On other
+    architectures it is faster than the WS program from
+    ``_BLK64_BALANCED_WS_MIN_WAVES`` waves on, on rows in one group-count bucket
+    of at most ``_BLK64_BALANCED_WS_MAX_ROW_BLOCKS`` blocks, and on rows in
+    several buckets once the grid holds ``_BLK64_BALANCED_WS_RAGGED_MIN_WAVES``
+    waves, which its count-ordered queue rebalances; on longer one-bucket rows,
+    on rows in several buckets in about one wave, and on shorter grids the WS
+    program is faster.
+    """
+
+    if selected < _BLK64_BALANCED_MIN_AVERAGE_BLOCKS * mb:
+        return False
+    if tiles < _BLK64_BALANCED_MIN_TILES:
+        return False
+    if arch == "sm_103a" or per_head_profile != "blk64_persistent_ws_m64n256":
+        return True
+    if tiles < _BLK64_BALANCED_WS_MIN_WAVES * sm_count:
+        return False
+    if _blk64_group_bucket(fewest) == _blk64_group_bucket(most):
+        return most <= _BLK64_BALANCED_WS_MAX_ROW_BLOCKS
+    return tiles >= _BLK64_BALANCED_WS_RAGGED_MIN_WAVES * sm_count
+
+
+def _plan_blk64_balanced(
+    dense: torch.Tensor,
+    row_counts: torch.Tensor,
+    kv_block_lens: torch.Tensor,
+    *,
+    C: int,
+    mb: int,
+    num_qo_heads: int,
+    device: torch.device,
+    per_head_profile: str,
+    fewest: int,
+    most: int,
+) -> Optional[dict[str, Any]]:
+    """Plan-time route and metadata of the block-64 balanced program, or ``None``.
+
+    The program walks one selection shared by every head (``indptr`` /
+    ``indices``, columns ascending) over full 64-token KV blocks. It serves a
+    plan whose selection holds more than four blocks per query block on average
+    where it is the faster program (``_blk64_balanced_beats_per_head``, from the
+    device's architecture and SM count, the per-head plan's ``per_head_profile``
+    and the caller's host-side row-count bounds ``fewest`` / ``most``); every row selects at least one block (validated by
+    the caller). Its ticket counter (four ``uint32``, zero between launches: the
+    kernel resets it at the end of every launch) belongs to the plan, so each
+    plan launches in stream order.
+    """
+
+    if not torch.equal(dense, dense[:1].expand_as(dense)):
+        return None
+    counts = row_counts[0]
+    selected = int(counts.sum().item())
+    if selected <= _BLK64_BALANCED_BLOCKS_PER_GROUP * mb:
+        return None
+    tiles = mb * num_qo_heads
+    sm_count = _sm_count(_device_index(device))
+    if not _blk64_balanced_beats_per_head(
+        arch=_arch_for_device(device),
+        per_head_profile=per_head_profile,
+        selected=selected,
+        mb=mb,
+        fewest=fewest,
+        most=most,
+        tiles=tiles,
+        sm_count=sm_count,
+    ):
+        return None
+    if not bool(torch.all(kv_block_lens == C).item()):
+        return None
+    indptr = torch.cat(
+        [
+            torch.zeros((1,), dtype=torch.int32, device=device),
+            counts.to(torch.int32).cumsum(0, dtype=torch.int32),
+        ]
+    )
+    indices = dense[0].nonzero(as_tuple=False)[:, 1].to(torch.int32).contiguous()
+    return {
+        "indptr": indptr,
+        "indices": indices,
+        "queue_counters": torch.zeros((4,), dtype=torch.uint32, device=device),
+        "order_debug": torch.empty(
+            (mb * num_qo_heads,), dtype=torch.int32, device=device
+        ),
+    }
+
+
+# The balanced binding's host parameters, in the kernel's order (then the grid).
+_BLK64_BALANCED_HOST_PARAMS = (
+    "q",
+    "k",
+    "v",
+    "out",
+    "lse",
+    "indptr",
+    "indices",
+    "sequence_q",
+    "query_blocks",
+    "total_tiles",
+    "num_heads",
+    "softmax_scale_log2",
+    "return_lse",
+    "queue_counters",
+    "order_debug",
+    "debug_order",
+)
+
+
+@functools.cache
+def _blk64_balanced_entry(target: str):
+    """The generated balanced program and its ``run`` entry on ``target``; the
+    record's arguments are checked against the host launch once, at load."""
+    from .jit import cake_vsa_balanced
+    from .jit.cake_program import GRID_ARGS
+
+    program = cake_vsa_balanced.VSA_BLK64_BALANCED_BF16
+    if tuple(program.args) != (*_BLK64_BALANCED_HOST_PARAMS, *GRID_ARGS):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {[*_BLK64_BALANCED_HOST_PARAMS, *GRID_ARGS]}"
+        )
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+        )
+    return program, program.entry(target)
+
+
+def _run_blk64_balanced(
+    plan: dict[str, Any],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    stats: torch.Tensor,
+    return_lse: bool,
+) -> None:
+    import tvm_ffi
+
+    from .jit.cake_program import CAPABILITY_TARGET
+
+    index = _device_index(q.device)
+    program, entry = _blk64_balanced_entry(
+        CAPABILITY_TARGET[torch.cuda.get_device_capability(index)]
+    )
+    metadata = plan["blk64_balanced"]
+    total_tiles = plan["mb"] * plan["num_qo_heads"]
+    grid = cake_vsa_balanced_launch_grid(total_tiles, _sm_count(index))
+    values = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "out": out,
+        "lse": stats,
+        "indptr": metadata["indptr"],
+        "indices": metadata["indices"],
+        "sequence_q": plan["M"],
+        "query_blocks": plan["mb"],
+        "total_tiles": total_tiles,
+        "num_heads": plan["num_qo_heads"],
+        "softmax_scale_log2": _softmax_scale_log2(plan),
+        "return_lse": int(return_lse),
+        "queue_counters": metadata["queue_counters"],
+        "order_debug": metadata["order_debug"],
+        "debug_order": 0,
+        "grid_x": grid[0],
+        "grid_y": grid[1],
+        "grid_z": grid[2],
+    }
+    with torch.cuda.device(q.device), tvm_ffi.use_torch_stream():
+        entry(*[values[name] for name in program.args])
+
+
 def _run_fp16(
     plan: dict[str, Any],
     q: torch.Tensor,
@@ -758,7 +1005,10 @@ def run_cake_vsa(
         return output
 
     if plan["R"] == 64:
-        _run_blk64(plan, q, k, v, output, stats, return_lse)
+        if plan.get("blk64_balanced") is not None:
+            _run_blk64_balanced(plan, q, k, v, output, stats, return_lse)
+        else:
+            _run_blk64(plan, q, k, v, output, stats, return_lse)
     elif q.dtype == torch.float16:
         if plan["num_qo_heads"] == plan["num_kv_heads"]:
             _run_standard(

@@ -1247,6 +1247,197 @@ static_assert(CheckPublicBoundaries({1, 3072, 384, 256, 256, 8}, Geometry::kH307
 static_assert(!SelectSm100aSchedule({1, 2048, 768, 128, 64, 8}).supported);
 static_assert(!SelectSm103aSchedule({1, 2048, 768, 128, 128, 4}).supported);
 
+// The tile-N8 FC2 programs. On the rows SelectTileN8Fc2 lists, one of them runs the FC2 in place of
+// the schedule's Fc2Schedule program; every other launch of the row is unchanged. Each one is
+// persistent: a 1-D grid of min(SMs, grid_m x route extent) CTAs claims (grid_m, route tile) work
+// items from a counter pair the program re-arms itself. Each output column keeps its K order, so
+// the partials are bit-identical to those of the FC2 it replaces.
+//   kK256Stage6    K256 stages, six deep.
+//   kExpertGather  kK256Stage6 that loads the direct route tiles of one expert row by row into one
+//                  8-row B tile (direct route layout only).
+//   kK256Stage9    K256 stages, nine deep.
+//   kK512Stage5    K512 stages (two K256 halves), five deep; the MMA K loop is unrolled by two when
+//                  the K256 count is even and at least four.
+enum class TileN8Fc2 : uint8_t {
+  kNone = 0,
+  kK256Stage6,
+  kExpertGather,
+  kK256Stage9,
+  kK512Stage5,
+};
+
+// The sm_100a rows of each tile-N8 FC2 program, the clamped SwiGLU (H4096 I2048) rows included.
+constexpr TileN8Fc2 SelectSm100aTileN8Fc2(const Shape& shape) {
+  const int32_t t = shape.num_tokens;
+  if (IsGeometry(shape, 2048, 512, 512, 10)) {
+    if (TokensIn(t, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+                 28, 29, 30, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 1536, 60, 4)) {
+    if (TokensIn(t, 11)) return TileN8Fc2::kExpertGather;
+    if (TokensIn(t, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 19, 20, 24, 25))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 2048, 256, 6)) {
+    if (TokensIn(t, 1, 2, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+                 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2560, 768, 384, 4)) {
+    if (TokensIn(t, 1, 4, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 768, 128, 8)) {
+    if (TokensIn(t, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 32))
+      return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 1, 5, 7, 8, 12, 31)) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 1536, 128, 8)) {
+    if (t >= 5 && t <= 11) return TileN8Fc2::kExpertGather;
+    if (TokensIn(t, 1, 2, 3, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 512, 256, 8)) {
+    if (TokensIn(t, 5, 6, 8, 9, 10, 11, 12, 13, 17, 19, 20, 21, 24, 27, 28, 29, 30, 31))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 1024, 512, 10)) {
+    if (t >= 2 && t <= 32) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 1536, 256, 8)) {
+    if (TokensIn(t, 4, 8, 9, 11, 12, 13, 14, 15)) return TileN8Fc2::kExpertGather;
+    if (TokensIn(t, 1, 2, 3, 5, 6, 7, 10, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+                 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 6144, 3072, 128, 4)) {
+    if (TokensIn(t, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                 24, 25, 26, 27, 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 512, 512, 10)) {
+    if (TokensIn(t, 6)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 3, 7, 8, 9, 11, 15)) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 768, 256, 8)) {
+    if (TokensIn(t, 1, 2, 4, 5, 9, 10, 11, 14, 19, 23)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 6, 25, 28)) return TileN8Fc2::kK256Stage9;
+    if (TokensIn(t, 7, 8, 12, 13, 15, 16, 17, 18, 20, 21, 22, 24, 26, 27, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 384, 256, 8)) {
+    if (TokensIn(t, 2, 3, 4, 5, 6, 9, 10)) return TileN8Fc2::kK256Stage6;
+  }
+  return TileN8Fc2::kNone;
+}
+
+// The sm_103a rows of each tile-N8 FC2 program.
+constexpr TileN8Fc2 SelectSm103aTileN8Fc2(const Shape& shape) {
+  const int32_t t = shape.num_tokens;
+  if (IsGeometry(shape, 2048, 512, 512, 10)) {
+    if (TokensIn(t, 1, 2, 3, 4, 5, 13, 20, 21, 22, 26, 27, 29)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 23, 24, 25, 28, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 1536, 60, 4)) {
+    if (TokensIn(t, 1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                 25, 26, 27, 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2560, 768, 384, 4)) {
+    if (TokensIn(t, 2, 3, 4, 5, 6, 7, 9, 11, 21, 23, 24, 26, 27, 29, 30, 32))
+      return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 1, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 25, 28, 31))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 768, 128, 8)) {
+    if (TokensIn(t, 3, 4, 10, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                 31, 32))
+      return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 1, 2, 5, 6, 7, 8, 9, 11, 12, 20)) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 1536, 128, 8)) {
+    if (t >= 1 && t <= 32) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 512, 256, 8)) {
+    if (TokensIn(t, 1, 2, 3, 4, 5, 7, 11, 12, 16, 17, 23, 24, 25, 28, 29))
+      return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 6, 8, 9, 10, 13, 14, 15, 18, 19, 20, 21, 22, 26, 27, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 1024, 512, 10)) {
+    if (t >= 1 && t <= 32) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 1536, 256, 8)) {
+    if (t >= 1 && t <= 32) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 6144, 3072, 128, 4)) {
+    if (TokensIn(t, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 25,
+                 26, 27, 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 512, 512, 10)) {
+    if (TokensIn(t, 1, 6, 7, 8, 11)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 3, 9, 10, 15)) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 768, 256, 8)) {
+    if (TokensIn(t, 1, 3)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                 25, 26, 27, 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 384, 256, 8)) {
+    if (TokensIn(t, 2, 4, 5, 6, 9)) return TileN8Fc2::kK256Stage6;
+  }
+  return TileN8Fc2::kNone;
+}
+
+constexpr TileN8Fc2 SelectTileN8Fc2(Target target, const Shape& shape) {
+  return target == Target::kSm100a ? SelectSm100aTileN8Fc2(shape) : SelectSm103aTileN8Fc2(shape);
+}
+
+// The rows of `form` on `target`, or -1 if a listed row breaks a rule: every listed row is a
+// supported row of its target; the SiLU and SiTU geometries list none; kExpertGather lists
+// direct-layout rows only; kExpertGather and kK256Stage9 list sm_100a rows only; the clamped SwiGLU
+// rows list kK512Stage5 only.
+constexpr int32_t TileN8Fc2RowCount(Target target, TileN8Fc2 form) {
+  const Shape geometries[] = {
+      Shape{0, 2048, 512, 512, 512, 10},  Shape{0, 2048, 1536, 60, 60, 4},
+      Shape{0, 6144, 1536, 192, 192, 4},  Shape{0, 4096, 2048, 256, 256, 6},
+      Shape{0, 2560, 768, 384, 384, 4},   Shape{0, 2048, 768, 128, 128, 8},
+      Shape{0, 4096, 1536, 128, 128, 8},  Shape{0, 2048, 512, 256, 256, 8},
+      Shape{0, 4096, 1024, 512, 512, 10}, Shape{0, 3072, 1536, 256, 256, 8},
+      Shape{0, 6144, 3072, 128, 128, 4},  Shape{0, 3584, 3072, 896, 896, 16},
+      Shape{0, 4096, 512, 512, 512, 10},  Shape{0, 4096, 256, 512, 512, 10},
+      Shape{0, 3072, 768, 256, 256, 8},   Shape{0, 3072, 384, 256, 256, 8}};
+  int32_t rows = 0;
+  for (Shape shape : geometries) {
+    for (int32_t t = 0; t <= 33; ++t) {
+      shape.num_tokens = t;
+      const TileN8Fc2 selected = SelectTileN8Fc2(target, shape);
+      if (selected == TileN8Fc2::kNone) continue;
+      const Schedule schedule =
+          target == Target::kSm100a ? SelectSm100aSchedule(shape) : SelectSm103aSchedule(shape);
+      const Activation activation = ActivationForGeometry(schedule.geometry);
+      if (!schedule.supported || activation == Activation::kSiLU ||
+          activation == Activation::kSiTU) {
+        return -1;
+      }
+      if (selected == TileN8Fc2::kExpertGather && schedule.route_layout != RouteLayout::kDirect) {
+        return -1;
+      }
+      if (target != Target::kSm100a &&
+          (selected == TileN8Fc2::kExpertGather || selected == TileN8Fc2::kK256Stage9)) {
+        return -1;
+      }
+      if (schedule.geometry == Geometry::kH4096I2048E256K6 && selected != TileN8Fc2::kK512Stage5) {
+        return -1;
+      }
+      if (selected == form) ++rows;
+    }
+  }
+  return rows;
+}
+static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kK256Stage6) == 34);
+static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kExpertGather) == 16);
+static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kK256Stage9) == 3);
+static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kK512Stage5) == 249);
+static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK256Stage6) == 77);
+static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kExpertGather) == 0);
+static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK256Stage9) == 0);
+static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK512Stage5) == 252);
+static_assert(SelectTileN8Fc2(Target::kSm100a, {3, 3072, 384, 256, 256, 8}) ==
+              TileN8Fc2::kK256Stage6);
+static_assert(SelectTileN8Fc2(Target::kSm100a, {4, 3072, 1536, 256, 256, 8}) ==
+              TileN8Fc2::kExpertGather);
+static_assert(SelectTileN8Fc2(Target::kSm100a, {25, 3072, 768, 256, 256, 8}) ==
+              TileN8Fc2::kK256Stage9);
+static_assert(SelectTileN8Fc2(Target::kSm100a, {27, 2048, 512, 256, 256, 8}) ==
+              TileN8Fc2::kK512Stage5);
+static_assert(SelectTileN8Fc2(Target::kSm103a, {3, 2560, 768, 384, 384, 4}) ==
+              TileN8Fc2::kK256Stage6);
+static_assert(SelectTileN8Fc2(Target::kSm103a, {15, 2560, 768, 384, 384, 4}) ==
+              TileN8Fc2::kK512Stage5);
+
 struct Invocation {
   Shape shape;
   void* output;

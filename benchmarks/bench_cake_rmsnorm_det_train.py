@@ -49,7 +49,7 @@ from flashinfer.cake_rmsnorm_det_train import (
     cake_rmsnorm_det_train_forward,
     is_cake_rmsnorm_det_train_supported,
 )
-from flashinfer.cake_rmsnorm_det_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_rmsnorm_det_train import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
 WIDTHS = ((6144, 1e-5), (4096, 1e-5), (2048, 1e-6), (1536, 1e-6), (512, 1e-6))

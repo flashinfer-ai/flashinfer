@@ -371,6 +371,9 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
     int mi = mib + warp_id * WARP_TILE_M;
     int tm = mi + lane_id / 4;
     int tn = ni + 2 * (lane_id % 4);
+    // The output holds batch_size * output_features (N * M) elements, which can exceed 2^31.
+    int64_t const row0 = static_cast<int64_t>(tn) * M;
+    int64_t const row1 = row0 + M;
 
     float4 accum1 = reduction_buffer[32 + threadIdx.x];
     float4 accum2 = reduction_buffer[64 + threadIdx.x];
@@ -385,16 +388,15 @@ __global__ __launch_bounds__(384, 1) void tinygemm_kernel(
       float bias_lo = __bfloat162float(sh_bias[tm - mib]);
       float bias_hi = __bfloat162float(sh_bias[tm + 8 - mib]);
 
-      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0] + bias_lo);
-      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1] + bias_lo);
-      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
-      if (tn + 1 < N && tm + 8 < M)
-        output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
+      if (tn < N && tm < M) output[row0 + tm] = __float2bfloat16(accum[0] + bias_lo);
+      if (tn + 1 < N && tm < M) output[row1 + tm] = __float2bfloat16(accum[1] + bias_lo);
+      if (tn < N && tm + 8 < M) output[row0 + tm + 8] = __float2bfloat16(accum[2] + bias_hi);
+      if (tn + 1 < N && tm + 8 < M) output[row1 + tm + 8] = __float2bfloat16(accum[3] + bias_hi);
     } else {
-      if (tn < N && tm < M) output[tn * M + tm] = __float2bfloat16(accum[0]);
-      if (tn + 1 < N && tm < M) output[(tn + 1) * M + tm] = __float2bfloat16(accum[1]);
-      if (tn < N && tm + 8 < M) output[tn * M + tm + 8] = __float2bfloat16(accum[2]);
-      if (tn + 1 < N && tm + 8 < M) output[(tn + 1) * M + tm + 8] = __float2bfloat16(accum[3]);
+      if (tn < N && tm < M) output[row0 + tm] = __float2bfloat16(accum[0]);
+      if (tn + 1 < N && tm < M) output[row1 + tm] = __float2bfloat16(accum[1]);
+      if (tn < N && tm + 8 < M) output[row0 + tm + 8] = __float2bfloat16(accum[2]);
+      if (tn + 1 < N && tm + 8 < M) output[row1 + tm + 8] = __float2bfloat16(accum[3]);
     }
   }
 #endif  // __CUDA_ARCH__ >= 900

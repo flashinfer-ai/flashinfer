@@ -704,7 +704,7 @@ void Run(TensorView arg_topk_idx_i32, TensorView arg_topk_weights, TensorView ar
   void* kargs[] = {&p_topk_idx_i32, &p_topk_weights, &p_x_fp8, &p_x_sf, &p_A, &p_pool_fp8, &p_pool_sf, &p_routing_weight_pool, &p_token_to_permuted, &p_meta_token, &p_meta_slot, &p_expert_counts, &p_expert_row_offsets, &p_expert_scatter_offsets, &p_tile_expert, &p_tile_m_local, &p_total_m_tiles_out, &p_B1, &p_SFB1, &p_I_fp8_w, &p_SF_I_w, &p_l1_bf16_capture, &p_A2, &p_SFA2, &p_B2, &p_SFB2, &p_expert_output, &p_y, &p_histogram_done, &p_prefix_done, &p_dispatch_done, &p_l1_arrival, &p_l2_done, &v_num_tokens, &v_top_k, &v_num_experts, &v_N1, &v_K1, &v_grid_n1, &v_K1_tiles, &v_N2, &v_K2, &v_grid_n2, &v_K2_tiles, &v_total_m_tiles, &v_M_total, &v_activation_clamp, &p_PrivateCounters, &p_PrivateMasks, &p_PublicExpertOutput, &p_PrivateSFBlockOffsets, &p_PrivateSF1, &p_PrivateSF2, &p_PrivateSF1Words, &p_PrivateSF2Bytes, &v_local_expert_offset};
 
   static const bool smem_ready = DeepgemmSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 229504);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 228480);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(512u, 1u, 1u);
@@ -726,7 +726,7 @@ void Run(TensorView arg_topk_idx_i32, TensorView arg_topk_weights, TensorView ar
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 229504u;
+  config.dynamicSmemBytes = 228480u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;

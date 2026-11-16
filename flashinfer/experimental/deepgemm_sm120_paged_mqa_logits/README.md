@@ -125,13 +125,33 @@ are unchanged.
 
 A device route named `sm120:fp8:h<H>:p<page_kv>:n<next_n>:a<atom>:<tag>` may
 run a different Q atom than the default rule, and its schedule is `static`
-(the shared scheduler) or `dyn`: the CTAs first walk static items, then draw
+(the shared scheduler, or its CTA-parallel version on a `par` route, below)
+or `dyn`: the CTAs first walk static items, then draw
 items from a pool by ticket. A `dyn` route schedules into a plan-private int32
 `[(1 + dyn_slots) * num_sms + 2, 2]` buffer (`plan.dyn_schedule`), allocated
 at prepare time; its scheduler writes every row, including the ticket counter,
 on every launch, so replay and repeated runs need no fill. On a `dyn` route
 the caller's `schedule_meta` keeps its `[num_sms + 1, 2]` shape and is checked
 but not written.
+
+A `static` device route whose tag ends in `par` runs the CTA-parallel version
+of the scheduler: one 256-thread CTA instead of one warp, writing the same
+`schedule_meta` bit for bit into the caller's buffer. There are two kinds:
+
+- `<tag>_par` is the twin of the tuned route `<tag>`: the same Q atom and the
+  same logits program (its unit is the tuned unit's text with the kernel
+  symbol renamed). Where a `<tag>_par` entry sits next to a `<tag>` entry with
+  unlisted batches between them, an extra `<tag>` entry at the batch nearest
+  the `<tag>_par` entry that can reach the key keeps `<tag>` on every batch
+  between them that can reach the key.
+- `par` (`sm120:fp8:h<H>:p<page_kv>:n<next_n>:a<atom>:par`) runs the default
+  route's Q atom with a logits program built without fast math. A table
+  selects it only at its own listed batches: between two `par` entries a
+  `null` entry keeps the default route.
+
+The standalone metadata route (`sm120:metadata`) keeps the single-warp
+scheduler, so `get_paged_mqa_logits_metadata` returns the schedule that a
+`par` route writes.
 
 ## Operands
 

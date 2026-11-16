@@ -14,7 +14,7 @@ cached step under ``set_sync_debug_mode("error")``; the compiled-plan cache's re
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_8_block_cases import (
+from tests.experimental.test_helpers.qwen_3_8_block_cases import (
     Qsa38PagedCase,
     bits,
     unified_kv_cache,
@@ -594,7 +594,7 @@ def test_the_two_bodies_of_the_sparse_core_agree_within_the_budget_at_batch_1():
     order vs one 256-d MMA chain), each body against the two-stage oracle; the readbacks and the workspace carve of each body
     (``qwen_3_8_block_workspace_size`` with the same knob equals the plan's; the lean split's wider slab exceeds the core's)."""
     from flashinfer.qwen_3_8_block import qwen_3_8_block_workspace_size
-    from tests.test_helpers.qwen_3_8_block_cases import OUT_COS
+    from tests.experimental.test_helpers.qwen_3_8_block_cases import OUT_COS
 
     g = _geometry("24_2")
     results = {}
@@ -671,7 +671,7 @@ def test_three_carried_steps_with_a_rejected_draft():
     keys; the re-step rewrites it from the accepted ones).  After every step the two-stage oracle holds; the cache rows of every complete
     block of the ACCEPTED stream equal a from-scratch compress of that stream's raw keys (the prefill rows, the rows a step completes and
     a re-stepped block are one chain)."""
-    from tests.test_helpers.qwen_3_5_block_reference import (
+    from tests.experimental.test_helpers.qwen_3_5_block_reference import (
         gated_attention_block_reference,
     )
 

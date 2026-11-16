@@ -93,9 +93,7 @@ def _reference(
     for token in range(x.shape[0]):
         for expert in ids[token].tolist():
             if not 0 <= expert < w1.shape[0]:
-                rows.append(
-                    torch.zeros(x.shape[1], device=x.device, dtype=torch.bfloat16)
-                )
+                rows.append(torch.zeros(x.shape[1], device=x.device, dtype=x.dtype))
                 continue
             values = (
                 _decode(
@@ -113,11 +111,11 @@ def _reference(
                     * view["fc1_dequant_scale"][expert, :, None]
                 )
                 .reshape(-1)
-                .bfloat16()
+                .to(x.dtype)
                 .float()
             )
             up, gate = values.chunk(2) if activation.is_gated else (values, None)
-            mid = _activation(up, gate, activation).bfloat16()
+            mid = _activation(up, gate, activation).to(x.dtype)
             rows.append(
                 (
                     (
@@ -130,7 +128,7 @@ def _reference(
                         @ mid.double()
                     ).float()
                     * view["fc2_dequant_scale"][expert]
-                ).bfloat16()
+                ).to(x.dtype)
             )
     raw = torch.stack(rows)
     effective = scores.bfloat16().float() if packed else scores.float()
@@ -139,7 +137,7 @@ def _reference(
         valid = (ids[:, slot] >= 0) & (ids[:, slot] < w1.shape[0])
         weight = torch.where(valid, effective[:, slot], 0.0)
         result = result + raw.view(*ids.shape, -1)[:, slot].float() * weight[:, None]
-    return raw, result.bfloat16(), effective
+    return raw, result.to(x.dtype), effective
 
 
 @pytest.mark.parametrize("index,activation", list(enumerate(ACTIVATIONS)))

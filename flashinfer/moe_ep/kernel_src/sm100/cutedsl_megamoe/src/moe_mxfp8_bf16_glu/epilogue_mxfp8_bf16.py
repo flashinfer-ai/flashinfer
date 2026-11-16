@@ -360,7 +360,7 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
                 gate = preload_acc[token_half * 2]
                 up = preload_acc[token_half * 2 + 1]
 
-            if cutlass.const_expr(self.gate_up_clamp is not None):
+            if cutlass.const_expr(self.gate_up_clamp is not None and not self.batch_invariant_chain):
                 for i in cutlass.range_constexpr(Fc1GateUpInterleave):
                     gate[i] = fmin(gate[i], self.gate_up_clamp)
                     up[i] = fmin(up[i], self.gate_up_clamp)
@@ -393,7 +393,17 @@ class _MixedSwapABFc1Epilogue(_ImmutableAfterInit):
             # and may run before the transpose, but the token-specific top-k
             # weight must wait until the transpose output, where lane_idx is
             # the token coordinate and all 16 values belong to that token.
-            swiglu_act(folded, up, gate, None)
+            if cutlass.const_expr(self.batch_invariant_chain):
+                from flashinfer.moe_ep.batch_invariant.activation_variants import activation_accumulator
+                from flashinfer.moe_ep.batch_invariant.device import PackedF32
+
+                for i in cutlass.range_constexpr(0, Fc1GateUpInterleave, 2):
+                    folded[i], folded[i + 1] = activation_accumulator(
+                        PackedF32, (gate[i], gate[i + 1]), (up[i], up[i + 1]),
+                        variant=self.batch_invariant_activation,
+                    )
+            else:
+                swiglu_act(folded, up, gate, None)
 
             transposed = TmemTranspose16x32(
                 half_ptr,
@@ -474,7 +484,11 @@ class MixedGluBf16Epilogue:
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         apply_topk_in_fc1: bool = False,
         accumulator_overlap: bool = False,
+        batch_invariant: bool = False,
+        batch_invariant_activation=None,
     ) -> None:
+        self.batch_invariant_chain = batch_invariant
+        self.batch_invariant_activation = batch_invariant_activation
         if fc1_output_dtype is not cutlass.BFloat16:
             raise NotImplementedError(
                 "MixedGluBf16Epilogue requires a BF16 FC1 hand-off; got "
