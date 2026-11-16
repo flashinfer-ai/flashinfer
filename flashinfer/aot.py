@@ -222,6 +222,7 @@ from .jit.qsa_sparse_paged import gen_qsa_sparse_paged_module
 from .jit.rope import gen_rope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
+from .jit.top_p_renorm_specialized import gen_top_p_renorm_specialized_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
@@ -1184,6 +1185,10 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        # Specialized cluster top-p renorm (top_p_renorm_probs on compute capability 10.3):
+        # one module, built for the exact sm_103a target only.
+        if has_sm103a_exact:
+            jit_specs.append(gen_top_p_renorm_specialized_module())
         if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
