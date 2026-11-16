@@ -55,6 +55,7 @@ def measure_samples(trial, weights, repeats, settings, process_group):
         _profile_measurement_scope,
     )
     from flashinfer.tllm_utils import delay_kernel
+    from flashinfer.utils import make_l2_flush
 
     tuner = AutoTuner.get()
     world = trial.config.world_size
@@ -99,16 +100,15 @@ def measure_samples(trial, weights, repeats, settings, process_group):
             torch.cuda.synchronize()
         run = graph.replay if graph is not None else launch
         if settings["cold_l2"]:
-            flush = torch.empty(
+            flush = make_l2_flush(
                 2 * tuner._get_l2_cache_size_in_bytes(trial.device.index),
-                dtype=torch.uint8,
-                device=trial.device,
+                trial.device,
             )
 
         def prologue():
             barrier()
             if flush is not None:
-                flush.zero_()
+                flush()
 
         def check_ready(error):
             errors = gather(error)
