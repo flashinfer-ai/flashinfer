@@ -81,6 +81,7 @@ def _plan_bounds(
     packed_query: bool = False,
     use_kv_bounds: bool = True,
     store_softmax_stats: bool = True,
+    zero_empty_rows: bool = True,
 ) -> BatchMLADecodePagedTSWrapper:
     wrapper = BatchMLADecodePagedTSWrapper()
     wrapper.plan(
@@ -99,6 +100,7 @@ def _plan_bounds(
         mask_type=case.mask_type,
         use_kv_bounds=use_kv_bounds,
         store_softmax_stats=store_softmax_stats,
+        zero_empty_rows=zero_empty_rows,
     )
     assert wrapper._plan_state is not None
     assert wrapper._plan_state.use_kv_bounds is use_kv_bounds
@@ -430,6 +432,7 @@ def _exercise_bounds_graph(
     max_q_len: int,
     qo_indptr: torch.Tensor | None = None,
     expected_kernel: str | None = None,
+    check_opt_out: bool = False,
 ) -> None:
     bounds = torch.tensor(initial, dtype=torch.int32, device=case.query.device)
     wrapper = _plan_bounds(
@@ -492,6 +495,48 @@ def _exercise_bounds_graph(
     _CUDA_GRAPH_ANCHOR_OWNERS.append(
         (graph, wrapper, case, bounds, qo_indptr, graph_out, graph_stats)
     )
+    if check_opt_out:
+        no_init = _plan_bounds(
+            case,
+            max_q_len=max_q_len,
+            packed_query=qo_indptr is not None,
+            zero_empty_rows=False,
+        )
+        assert no_init._plan_state.compiled is not wrapper._plan_state.compiled
+        assert (
+            no_init._plan_state.workspace_layout == wrapper._plan_state.workspace_layout
+        )
+        output, stats = _run_bounds(no_init, case, bounds, qo_indptr=qo_indptr)
+        no_init_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(no_init_graph):
+            _run_bounds(
+                no_init,
+                case,
+                bounds,
+                qo_indptr=qo_indptr,
+                out=output,
+                stats=stats,
+                validate=False,
+            )
+        output.fill_(float("nan"))
+        stats.fill_(float("nan"))
+        no_init_graph.replay()
+        torch.cuda.synchronize()
+        active = bounds > 0
+        # Opt-out leaves empty rows unspecified; nonempty rows retain exact parity.
+        torch.testing.assert_close(
+            output.flatten(0, -3)[active],
+            graph_out.flatten(0, -3)[active],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            stats.flatten(0, -3)[active],
+            graph_stats.flatten(0, -3)[active],
+            rtol=0,
+            atol=0,
+        )
+        _CUDA_GRAPH_ANCHOR_OWNERS.append((no_init_graph, no_init, output, stats))
 
 
 @pytest.mark.parametrize(
@@ -533,4 +578,5 @@ def test_attention_ts_mla_kv_bounds_page128_graph_smoke(
         updated + [kv_len] * seq_len_q,
         max_q_len=seq_len_q,
         expected_kernel=expected_kernel,
+        check_opt_out=seq_len_q in (1, 8),
     )

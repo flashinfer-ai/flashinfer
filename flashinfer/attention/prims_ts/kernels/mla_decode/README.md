@@ -165,6 +165,11 @@ readback. Retain the vector and mutate its contents between completed launches
 or graph replays. A zero prefix writes zero O, optional LSE `-inf`, and optional
 merge statistics `(-inf, 0)`. A bounds-only neutral initialization launch also
 covers requests with zero local KV when the ordinary task schedule skips them.
+`plan(zero_empty_rows=False)` omits this initialization launch while retaining
+per-query prefix masking. In that mode empty-row results are unspecified, not
+guaranteed preserved; initialize them or exclude them from merging. The default
+is `True`, including in the one-shot API. It is ignored without bounds and
+changes the compiled launch program, not workspace size.
 Unbounded zero-KV behavior is unchanged. The static K/V capacity remains
 positive; the one-shot API defaults it to one for an all-empty bounded rank.
 

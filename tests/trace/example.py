@@ -2967,6 +2967,7 @@ with contextlib.suppress(Exception):
         kv_bounds=torch.arange(
             _pmla_SK - _pmla_SQ + 1, _pmla_SK + 1, dtype=torch.int32, device=device
         ).repeat(_pmla_B),
+        zero_empty_rows=True,
     )
 
     _attention_ts_mla_decode(

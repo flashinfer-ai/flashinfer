@@ -68,6 +68,10 @@
       "type": "const",
       "value": 1
     },
+    "zero_empty_rows": {
+      "type": "const",
+      "value": 1
+    },
     "num_kv_bounds": {
       "type": "var",
       "description": "Number of logical Q tokens."
@@ -174,6 +178,11 @@
     "store_softmax_stats": {
       "shape": null,
       "dtype": "bool"
+    },
+    "zero_empty_rows": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
     },
     "kv_bounds": {
       "shape": [

@@ -1886,12 +1886,22 @@ prims_ts_decode_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_templat
 
 
 def _with_prims_ts_mla_kv_bounds(
-    template: TraceTemplate, *, enabled: bool, packed_query: bool
+    template: TraceTemplate,
+    *,
+    enabled: bool,
+    packed_query: bool,
+    zero_empty_rows: bool,
+    one_shot: bool = False,
 ) -> TraceTemplate:
     """Describe explicit per-query prefixes rather than bottom-right causality."""
     if enabled:
         template.name_prefix += "_kv_bounds"
         template.axes["use_kv_bounds"] = Const(abbrev="", value=1)
+        template.axes["zero_empty_rows"] = Const(abbrev="", value=int(zero_empty_rows))
+        if not zero_empty_rows:
+            template.name_prefix += "_no_zero_empty_rows"
+        if one_shot:
+            template.inputs["zero_empty_rows"] = Scalar("bool", optional=True)
         template.axes["num_kv_bounds"] = Var(description="Number of logical Q tokens.")
         template.inputs["kv_bounds"] = Tensor(
             ["num_kv_bounds"],
@@ -1916,9 +1926,11 @@ def _with_prims_ts_mla_kv_bounds(
             template.axes["causal"] = Const(abbrev="", value=0)
         template.tags = [tag for tag in template.tags if not tag.startswith("mask:")]
         template.tags.append("mask:kv_prefix")
+        template.description += " Explicit kv_bounds replaces dense/causal visibility."
         template.description += (
-            " Explicit kv_bounds replaces dense/causal visibility. Zero prefixes "
-            "produce zero output and, when requested, softmax stats (-inf, 0)."
+            " Zero prefixes produce zero output and, when requested, softmax stats (-inf, 0)."
+            if zero_empty_rows
+            else " Empty-row results are unspecified; initialize them or exclude them from merging."
         )
     return template
 
@@ -1930,6 +1942,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(
     packed_query: bool,
     store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
+    zero_empty_rows: bool = True,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -2017,6 +2030,8 @@ def _make_prims_ts_decode_mla_one_shot_trace(
         ),
         enabled=use_kv_bounds,
         packed_query=packed_query,
+        zero_empty_rows=zero_empty_rows,
+        one_shot=True,
     )
 
 
@@ -2026,6 +2041,7 @@ _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
         packed_query=packed_query,
         store_softmax_stats=False,
         use_kv_bounds=False,
+        zero_empty_rows=True,
     )
     for rank4_cache in (False, True)
     for packed_query in (False, True)
@@ -2039,6 +2055,11 @@ def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
         packed_query=kwargs.get("qo_indptr") is not None,
         store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
         use_kv_bounds=kwargs.get("kv_bounds") is not None,
+        zero_empty_rows=(
+            bool(kwargs.get("zero_empty_rows", True))
+            if kwargs.get("kv_bounds") is not None
+            else True
+        ),
     )
     return _prims_ts_scale_trace(base, kwargs)
 
@@ -2060,6 +2081,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     softmax_rescale_threshold_log2: float = 0.0,
     store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
+    zero_empty_rows: bool = True,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -2212,6 +2234,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats),
         enabled=use_kv_bounds,
         packed_query=packed_query,
+        zero_empty_rows=zero_empty_rows,
     )
 
 
@@ -2247,6 +2270,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     softmax_rescale_threshold_log2: float = 0.0,
     store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
+    zero_empty_rows: bool = True,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -2261,6 +2285,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         store_softmax_stats=store_softmax_stats,
         use_kv_bounds=use_kv_bounds,
+        zero_empty_rows=zero_empty_rows,
     )
 
 
@@ -2305,6 +2330,9 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         ),
         store_softmax_stats=bool(getattr(state, "store_softmax_stats", False)),
         use_kv_bounds=use_kv_bounds,
+        zero_empty_rows=(
+            bool(getattr(state, "zero_empty_rows", True)) if use_kv_bounds else True
+        ),
     )
     return _prims_ts_scale_trace(base, kwargs, bound=True)
 

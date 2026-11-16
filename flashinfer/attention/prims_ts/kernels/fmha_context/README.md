@@ -122,6 +122,10 @@ outputs, LSE, metadata, and plan-owned storage. Its presence is checked even
 with `validate=False`; CUDA graphs retain the captured address. One-shot APIs
 accept the same flag and buffer, and the LSE API/return value remain unchanged.
 No additional statistics scratch is required for prefill.
+The existing `lse_mode="base2"` / `return_lse` interface is independent and
+can be used at the same time. For a nonempty row its value is
+`(m + ln(s)) / ln(2)`. The pair directly serves maximum/sum consumers; it is
+not needed to implement a merge that already accepts LSE.
 Statistics-enabled softmax centers raw scores before scaling and retains FP32
 probability sums instead of the optional packed-FP16 exponent/sum path. The
 statistics-disabled exponent policy is unchanged.

@@ -1346,6 +1346,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "lse_mode",
         "store_softmax_stats",
         "use_kv_bounds",
+        "zero_empty_rows",
         "workspace_buffer",
         "validate",
         "tuning",
@@ -1394,6 +1395,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["validate"].default is True
     assert plan_parameters["store_softmax_stats"].default is False
     assert plan_parameters["use_kv_bounds"].default is False
+    assert plan_parameters["zero_empty_rows"].default is True
     assert run_parameters["softmax_stats"].default is None
     assert run_parameters["kv_bounds"].default is None
     assert run_parameters["kv_bounds"].kind is inspect.Parameter.KEYWORD_ONLY

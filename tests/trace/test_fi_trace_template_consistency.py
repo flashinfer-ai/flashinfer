@@ -1712,6 +1712,7 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
     for definition in (bounded, bounded_one_shot):
         assert "_kv_bounds" in definition["name"]
         assert definition["axes"]["use_kv_bounds"]["value"] == 1
+        assert definition["axes"]["zero_empty_rows"]["value"] == 1
         assert definition["inputs"]["kv_bounds"]["shape"] == ["num_kv_bounds"]
         assert definition["inputs"]["kv_bounds"]["dtype"] == "int32"
         assert not definition["inputs"]["kv_bounds"].get("optional", False)
@@ -1726,6 +1727,29 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
         ),
     ):
         assert_template_constraints_valid(template, label=template.name_prefix)
+
+    wrapper._plan_state.zero_empty_rows = False
+    opt_out = fi_trace(wrapper.run, **kwargs, kv_bounds=bounds)
+    opt_out_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
+        **one_shot_kwargs, kv_bounds=bounds, zero_empty_rows=False
+    )
+    for definition in (opt_out, opt_out_one_shot):
+        assert "_no_zero_empty_rows" in definition["name"]
+        assert definition["axes"]["zero_empty_rows"]["value"] == 0
+        assert "unspecified" in definition["description"]
+    assert opt_out["name"] != bounded["name"]
+    assert opt_out_one_shot["name"] != bounded_one_shot["name"]
+    assert "zero_empty_rows" in opt_out_one_shot["inputs"]
+    # Ignored flags must not break canonical template identity without bounds.
+    assert (
+        prims_ts_decode_mla_one_shot_trace_dispatch(
+            **{
+                name: value for name, value in kwargs.items() if name != "softmax_stats"
+            },
+            zero_empty_rows=False,
+        )
+        is default_template
+    )
 
 
 # ---------------------------------------------------------------------------

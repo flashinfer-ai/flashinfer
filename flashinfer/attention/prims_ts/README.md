@@ -217,7 +217,12 @@ packed Q. Counts are shared across a token's heads, replace dense/causal
 visibility, and must be nondecreasing within each request and no larger than
 that request's `seq_lens_kv`. Zero local lengths and prefixes return zero O
 and optional `(-inf, 0)` statistics. Bounds are per-run metadata, not retained
-plan values. See the [MLA contract](kernels/mla_decode/README.md) for validation,
+plan values. `plan(zero_empty_rows=False)` skips neutral-row initialization but
+retains prefix masking; empty-row results are then unspecified, not preserved.
+Callers must initialize those rows or exclude them from consumption/merging.
+The default is `True`; the flag is ignored without `use_kv_bounds` and does not
+change workspace sizing. One-shot MLA exposes the same flag.
+See the [MLA contract](kernels/mla_decode/README.md) for validation,
 empty-cache, and workspace details.
 
 ### Merge-compatible softmax statistics
@@ -235,7 +240,14 @@ For each query/head, the two values are the maximum scaled token logit `m`
 (natural-log units) and `s = sum(exp(logit - m))`, after masking and before
 output scaling. Internal FP8 probability scaling is removed. Decode attention
 sinks, when present, contribute to `s` exactly once and do not change `m`.
-This is a maximum/denominator pair, not an LSE tensor. Independently computed
+This is a maximum/denominator pair, not an LSE tensor. The existing
+`plan(lse_mode="base2")` and `run(..., lse=..., return_lse=True)` API remains
+independent and can be used alongside these statistics. For nonempty rows,
+`LSE_base2 = (m + ln(s)) / ln(2)`; an empty row's LSE is negative infinity.
+LSE is sufficient for an LSE-based partition merge but does not determine the
+original maximum and sum separately. Exporting the pair directly supports
+consumers such as TRT-LLM's MLA merge interface without changing their format.
+Independently computed
 partitions can be merged using weights `exp(m_i - max_j(m_j)) * s_i`; a sink
 must belong to only one partition. Empty rows, where supported by the existing
 attention API, produce `(-inf, 0)`.
