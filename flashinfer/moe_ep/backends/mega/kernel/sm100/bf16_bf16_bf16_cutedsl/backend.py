@@ -12,6 +12,7 @@ from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import bf16_cutedsl_runtime_requirements
 from ......core.validation.common import validate_mega_arch, validate_mega_fleet_params
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
 from ..common.bf16_staging import (
     stage_mega_moe_inputs,
     validate_bf16_forward_inputs,
@@ -21,6 +22,12 @@ from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
     validate_transformed_mega_weights,
+)
+
+from ..common.activation_batch_invariant import batch_invariant_numerical_metadata
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+    batch_invariant_variant_kwargs,
 )
 
 if TYPE_CHECKING:
@@ -38,7 +45,7 @@ def _clamp(config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
 @register_mega_kernel(
     "sm100_bf16_bf16_bf16_cutedsl", deprecated_aliases=("bf16_cutedsl",)
 )
-class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
+class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     supports_output_view = True
 
     @classmethod
@@ -136,6 +143,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
                 BF16_BATCH_INVARIANT_VERSION if k.batch_invariant else None
             ),
             gate_up_clamp=_clamp(k),
+            **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),
         )
 
     def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
@@ -170,6 +178,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             batch_invariant=config.batch_invariant,
+            **batch_invariant_numerical_metadata(config),
             knobs=self._workspace_knobs(fleet_params),
         )
         if config.finalize_mode is FinalizeMode.NONE:
@@ -181,7 +190,11 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
                 if config.apply_routing_weights_before_fc2
-                else workspace.topk_weights
+                else (
+                    torch.empty_like(workspace.topk_weights)
+                    if config.batch_invariant
+                    else workspace.topk_weights
+                )
             )
         return workspace
 
@@ -300,6 +313,17 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens=num_tokens,
         )
         partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        if self._kernel_config.batch_invariant:
+            weights = workspace._unfinalized_weights[:num_tokens]
+            if self._kernel_config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:num_tokens])
+            weights.masked_fill_(
+                (workspace.topk_idx[:num_tokens] < 0)
+                | (workspace.topk_idx[:num_tokens] >= workspace.num_total_experts),
+                0,
+            )
         return (
             partials[:num_tokens].view(
                 num_tokens * self._kernel_config.top_k, workspace.hidden
