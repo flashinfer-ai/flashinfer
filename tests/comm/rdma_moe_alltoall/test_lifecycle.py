@@ -44,6 +44,32 @@ def test_one_rank_invalid_config_fails_collectively(distributed_device):
     dist.barrier()
 
 
+@pytest.mark.parametrize("invalid", ("expert_capacity", "contexts"))
+def test_one_rank_resource_overflow_rejected_before_allocation(
+    distributed_device, invalid
+):
+    from flashinfer.comm import RdmaMoeAlltoAll, RdmaMoeAlltoAllConfig
+
+    capacity, contexts = 8, None
+    experts = EXPERTS
+    if dist.get_rank() == 0:
+        if invalid == "expert_capacity":
+            capacity = 2**31 // experts + 1
+        else:
+            contexts = EXPERTS // WORLD + 1
+    with pytest.raises(RuntimeError, match="range|contexts|local experts"):
+        RdmaMoeAlltoAll(
+            dist.group.WORLD,
+            capacity,
+            4096,
+            experts,
+            config=RdmaMoeAlltoAllConfig(
+                communication_dtype="nvfp4", num_contexts=contexts
+            ),
+        )
+    dist.barrier()
+
+
 def expect_rejection(call, message, device):
     error = None
     try:

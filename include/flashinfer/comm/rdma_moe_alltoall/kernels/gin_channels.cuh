@@ -193,12 +193,14 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_nvfp4
   const int total_threads = gridDim.x * blockDim.x;
   const int local_experts = num_experts / num_ranks;
   const int count_stride = local_experts + 1;
-  const bool source_ready =
-      phases == (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE) && gridDim.x > 1;
-  const int data_ctas = int(gridDim.x) - int(source_ready);
+  const int source_ready_ctas = phases == (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE)
+                                    ? gin_source_ready_ctas(num_ranks, int(gridDim.x), kWarps)
+                                    : 0;
+  const bool source_ready = source_ready_ctas != 0;
+  const int data_ctas = int(gridDim.x) - source_ready_ctas;
   auto grid = cg::this_grid();
   EP_DEVICE_ASSERT(launch.nvfp4_rank_packet && !launch.bf16_local_partial_planned &&
-                   (num_ranks == 4 || num_ranks == 8) && num_topk >= 1 && num_topk <= 8 &&
+                   num_ranks > 0 && num_topk >= 1 && num_topk <= 8 &&
                    launch.planned_counts != nullptr && launch.planned_fanout_cursors != nullptr);
   if (phases & LOW_LATENCY_SEND_PHASE) {
     for (int source = global_thread; source < num_ranks; source += total_threads)
@@ -259,10 +261,11 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_nvfp4
   if (!(phases & LOW_LATENCY_RECV_PHASE)) return;
 
   if (source_ready) {
-    if (int(blockIdx.x) == int(gridDim.x) - 1) {
-      if (local_warp < num_ranks)
-        gin_planned_publish_source_ready(launch, local_warp, local_experts, capacity,
-                                         packed_recv_count, packed_recv_layout_range,
+    if (int(blockIdx.x) >= data_ctas) {
+      const int source = (int(blockIdx.x) - data_ctas) * kWarps + local_warp;
+      if (source < num_ranks)
+        gin_planned_publish_source_ready(launch, source, local_experts, capacity, packed_recv_count,
+                                         packed_recv_layout_range,
                                          cumulative_local_expert_recv_stats);
       // No later grid join. Kernel completion joins every publisher's source
       // wait, every source leader and every public-output writer.
@@ -438,8 +441,10 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_plann
   const int total_threads = gridDim.x * blockDim.x;
   const int local_experts = num_experts / num_ranks;
   const int count_stride = local_experts + 1;
-  const bool source_ready = phases == (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE) &&
-                            num_ranks <= kWarps && gridDim.x > 1;
+  const int source_ready_ctas = phases == (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE)
+                                    ? gin_source_ready_ctas(num_ranks, int(gridDim.x), kWarps)
+                                    : 0;
+  const bool source_ready = source_ready_ctas != 0;
   const bool defer_source_completion =
       phases == (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE) && gridDim.x > 1 && !source_ready;
   // Reserve enough tail CTAs to keep one warp per QP at the normal recipe,
@@ -448,7 +453,7 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_plann
       defer_source_completion
           ? min((launch.active_context_count * num_ranks + kWarps - 1) / kWarps, int(gridDim.x) - 1)
           : 0;
-  const int data_ctas = int(gridDim.x) - (source_ready ? 1 : flush_ctas);
+  const int data_ctas = int(gridDim.x) - source_ready_ctas - flush_ctas;
   auto grid = cg::this_grid();
 
   EP_DEVICE_ASSERT(launch.bf16_local_partial_planned && num_topk >= 1 && num_topk <= kWarps &&
@@ -475,122 +480,89 @@ __global__ __launch_bounds__(kGinChannelThreads, 1) void dispatch_channels_plann
       packed_recv_count[expert] = 0;
     grid.sync();
 
-    if (num_ranks <= kWarps) {
-      // Every nonempty subset of two adjacent records is contiguous. Pack
-      // each record once, then one owner warp sends its selected one or two
-      // records without a peer-specific staging area or another barrier.
-      const size_t pairs = (size_t(num_tokens) + 1) / 2;
-      for (size_t pair = blockIdx.x; pair < pairs; pair += gridDim.x) {
-        const size_t first_token = pair * 2;
-        const int pair_tokens = first_token + 1 < size_t(num_tokens) ? 2 : 1;
-        if (int(threadIdx.x) < pair_tokens) {
-          const size_t token = first_token + threadIdx.x;
-          auto* message = static_cast<uint8_t*>(rdma_x) + token * kMsgBytes;
-          planned_pack_header(message, int(token), num_tokens, num_topk, topk_idx, launch);
-        }
-        // Each payload starts after its own 80-byte header. Treating both
-        // payloads as one contiguous array would overwrite the second header.
-        for (size_t i = threadIdx.x; i < size_t(pair_tokens) * kDataVecs; i += blockDim.x) {
-          const size_t token = first_token + i / kDataVecs;
-          const size_t vector = i % kDataVecs;
-          auto* data = reinterpret_cast<int4*>(static_cast<uint8_t*>(rdma_x) + token * kMsgBytes +
-                                               kHeaderBytes);
-          data[vector] = __ldg(static_cast<const int4*>(x) + token * kDataVecs + vector);
-        }
-        __syncthreads();
-
-        if (local_warp < num_ranks) {
-          const int peer = local_warp;
-          const int token_in_pair = lane / 8, k = lane % 8;
-          int expert = -1;
-          if (lane < 16 && token_in_pair < pair_tokens && k < num_topk) {
-            expert = __ldg(topk_idx + (first_token + token_in_pair) * num_topk + k);
-            EP_DEVICE_ASSERT(expert < num_experts);
-          }
-          const bool selected = expert >= 0 && expert / local_experts == peer;
-          if (selected)
-            atomicAdd(launch.send_counts + peer * count_stride + 1 + expert % local_experts, 1);
-          // All 32 lanes participate, including inactive K/tail/upper lanes.
-          const unsigned selected_mask = __ballot_sync(0xffffffff, selected);
-          const bool has_first = (selected_mask & 0xffu) != 0;
-          const bool has_second = (selected_mask & 0xff00u) != 0;
-          const int records = int(has_first) + int(has_second);
-          if (records != 0) {
-            int slot = lane == 0 ? atomicAdd(launch.send_counts + peer * count_stride, records) : 0;
-            slot = __shfl_sync(0xffffffff, slot, 0);
-            EP_DEVICE_ASSERT(slot >= 0 && size_t(slot) + records <= size_t(capacity));
-            const size_t first_selected = first_token + (has_first ? 0 : 1);
-            if (lane == 0) {
-              launch.planned_source_slots[size_t(peer) * capacity + first_selected] = slot;
-              if (records == 2)
-                launch.planned_source_slots[size_t(peer) * capacity + first_selected + 1] =
-                    slot + 1;
-            }
-            auto* dst =
-                static_cast<uint8_t*>(rdma_recv_x) + (size_t(rank) * capacity + slot) * kMsgBytes;
-            const auto* source = static_cast<const uint8_t*>(rdma_x) + first_selected * kMsgBytes;
-            // pair <= (INT_MAX - 1)/2 and peer < 8, so this seed fits int.
-            gin_put_warp(launch, dst, source, size_t(records) * kMsgBytes, peer, int(pair) + peer);
-          }
-        }
-        // These token records remain immutable until all QPs are completed.
-        __syncthreads();
+    // Every nonempty subset of two adjacent records is contiguous. Pack
+    // each record once, then one owner warp sends its selected one or two
+    // records without a peer-specific staging area or another barrier.
+    const size_t pairs = (size_t(num_tokens) + 1) / 2;
+    for (size_t pair = blockIdx.x; pair < pairs; pair += gridDim.x) {
+      const size_t first_token = pair * 2;
+      const int pair_tokens = first_token + 1 < size_t(num_tokens) ? 2 : 1;
+      if (int(threadIdx.x) < pair_tokens) {
+        const size_t token = first_token + threadIdx.x;
+        auto* message = static_cast<uint8_t*>(rdma_x) + token * kMsgBytes;
+        planned_pack_header(message, int(token), num_tokens, num_topk, topk_idx, launch);
       }
-    } else {
-      for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
-        auto* message = static_cast<uint8_t*>(rdma_x) + size_t(token) * kMsgBytes;
-        if (threadIdx.x == 0)
-          planned_pack_header(message, token, num_tokens, num_topk, topk_idx, launch);
-        auto* data = reinterpret_cast<int4*>(message + kHeaderBytes);
-        for (size_t i = threadIdx.x; i < kDataVecs; i += blockDim.x)
-          data[i] = __ldg(static_cast<const int4*>(x) + size_t(token) * kDataVecs + i);
-        __syncthreads();
-
-        if (local_warp < num_topk) {
-          const int expert = __ldg(topk_idx + size_t(token) * num_topk + local_warp);
-          if (expert >= 0) {
-            EP_DEVICE_ASSERT(expert < num_experts);
-            const int peer = expert / local_experts;
-            // Every valid route contributes exactly one expert count, while only
-            // the first route to this owner allocates/sends the shared full record.
-            if (lane == 0)
-              atomicAdd(launch.send_counts + peer * count_stride + 1 + expert % local_experts, 1);
-            bool first_owner = true;
-            for (int previous = 0; previous < local_warp; ++previous) {
-              const int earlier = __ldg(topk_idx + size_t(token) * num_topk + previous);
-              if (earlier >= 0 && earlier / local_experts == peer) first_owner = false;
-            }
-            if (first_owner) {
-              int slot = lane == 0 ? atomicAdd(launch.send_counts + peer * count_stride, 1) : 0;
-              slot = __shfl_sync(0xffffffff, slot, 0);
-              EP_DEVICE_ASSERT(slot >= 0 && slot < capacity);
-              if (lane == 0) launch.planned_source_slots[size_t(peer) * capacity + token] = slot;
-              auto* dst =
-                  static_cast<uint8_t*>(rdma_recv_x) + (size_t(rank) * capacity + slot) * kMsgBytes;
-              gin_put_warp(launch, dst, message, kMsgBytes, peer, global_warp);
-            }
-          }
-        }
-        // Full records are per-token and immutable through all QP completions.
-        __syncthreads();
+      // Each payload starts after its own 80-byte header. Treating both
+      // payloads as one contiguous array would overwrite the second header.
+      for (size_t i = threadIdx.x; i < size_t(pair_tokens) * kDataVecs; i += blockDim.x) {
+        const size_t token = first_token + i / kDataVecs;
+        const size_t vector = i % kDataVecs;
+        auto* data = reinterpret_cast<int4*>(static_cast<uint8_t*>(rdma_x) + token * kMsgBytes +
+                                             kHeaderBytes);
+        data[vector] = __ldg(static_cast<const int4*>(x) + token * kDataVecs + vector);
       }
+      __syncthreads();
+
+      // A pair has at most 2*K owners, independent of EP size. Elect one
+      // route lane per owner, then distribute just those owners over warps.
+      const int token_in_pair = lane / 8, k = lane % 8;
+      int expert = -1;
+      if (lane < 16 && token_in_pair < pair_tokens && k < num_topk) {
+        expert = __ldg(topk_idx + (first_token + token_in_pair) * num_topk + k);
+        EP_DEVICE_ASSERT(expert < num_experts);
+      }
+      const int owner = expert >= 0 ? expert / local_experts : -1;
+      const unsigned same_owner = __match_any_sync(0xffffffff, owner);
+      unsigned owners = __ballot_sync(0xffffffff, owner >= 0 && lane == __ffs(same_owner) - 1);
+      for (int owner_index = 0; owners; ++owner_index, owners &= owners - 1) {
+        if (owner_index % kWarps != local_warp) continue;
+        const int peer = __shfl_sync(0xffffffff, owner, __ffs(owners) - 1);
+        const bool selected = owner == peer;
+        if (selected)
+          atomicAdd(launch.send_counts + peer * count_stride + 1 + expert % local_experts, 1);
+        // All 32 lanes participate, including inactive K/tail/upper lanes.
+        const unsigned selected_mask = __ballot_sync(0xffffffff, selected);
+        const bool has_first = (selected_mask & 0xffu) != 0;
+        const bool has_second = (selected_mask & 0xff00u) != 0;
+        const int records = int(has_first) + int(has_second);
+        if (records != 0) {
+          int slot = lane == 0 ? atomicAdd(launch.send_counts + peer * count_stride, records) : 0;
+          slot = __shfl_sync(0xffffffff, slot, 0);
+          EP_DEVICE_ASSERT(slot >= 0 && size_t(slot) + records <= size_t(capacity));
+          const size_t first_selected = first_token + (has_first ? 0 : 1);
+          if (lane == 0) {
+            launch.planned_source_slots[size_t(peer) * capacity + first_selected] = slot;
+            if (records == 2)
+              launch.planned_source_slots[size_t(peer) * capacity + first_selected + 1] = slot + 1;
+          }
+          auto* dst =
+              static_cast<uint8_t*>(rdma_recv_x) + (size_t(rank) * capacity + slot) * kMsgBytes;
+          const auto* source = static_cast<const uint8_t*>(rdma_x) + first_selected * kMsgBytes;
+          // Reduce the seed before addition to keep large capacities in range.
+          const int channel_seed = int(pair % launch.active_context_count) + peer;
+          gin_put_warp(launch, dst, source, size_t(records) * kMsgBytes, peer, channel_seed);
+        }
+      }
+      // These token records remain immutable until all QPs are completed.
+      __syncthreads();
     }
     grid.sync();
     // The helper's vector length is generic: each peer now gets U followed by
     // all L expert counts. Channel signals/flushes are otherwise unchanged.
     // Preserve every strong signal. Source-ready uses original inline QP
     // completion: other CTAs can receive while publisher CTAs finish sources.
-    // The larger-EP fused fallback retains the old deferred-flush tail CTAs;
+    // Grids too small for source leaders retain deferred-flush tail CTAs;
     // hooks and one-CTA grids retain their original inline completion.
     gin_channels_publish(launch, count_stride, true, !defer_source_completion);
   }
   if (!(phases & LOW_LATENCY_RECV_PHASE)) return;
 
   if (source_ready) {
-    if (int(blockIdx.x) == int(gridDim.x) - 1) {
-      if (local_warp < num_ranks)
-        gin_planned_publish_source_ready(launch, local_warp, local_experts, capacity,
-                                         packed_recv_count, packed_recv_layout_range,
+    if (int(blockIdx.x) >= data_ctas) {
+      const int source = (int(blockIdx.x) - data_ctas) * kWarps + local_warp;
+      if (source < num_ranks)
+        gin_planned_publish_source_ready(launch, source, local_experts, capacity, packed_recv_count,
+                                         packed_recv_layout_range,
                                          cumulative_local_expert_recv_stats);
       // There are no later grid joins. Main-kernel completion includes every
       // source leader, inline publisher source wait, and packet expansion.

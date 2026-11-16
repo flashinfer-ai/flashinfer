@@ -11,6 +11,14 @@
 
 namespace deep_ep {
 
+// Give each source its own publisher warp and at least one consumer warp.
+// Small grids retain the same wire protocol with an all-context grid join.
+__host__ __device__ constexpr int gin_source_ready_ctas(int ranks, int ctas,
+                                                        int warps_per_cta = 8) {
+  const int leaders = (ranks - 1) / warps_per_cta + 1;
+  return ctas >= 2 * leaders ? leaders : 0;
+}
+
 // Every signal ID has one deterministic context: local expert modulo context
 // count in the legacy path, or the explicit channel in the coalesced path.
 // Epochs live on the device so captured CUDA graphs can replay without resetting
@@ -27,7 +35,7 @@ struct GinLaunch {
   // Typed NVFP4 legacy buffers pass the exact GDAKI completion admission.
   // Untyped and coalesced buffers retain their existing transport protocol.
   bool nvfp4_legacy_rank_dedup = false;
-  // Isolated typed NVFP4 EP4/8 legacy packet protocol; default paths stay unchanged.
+  // Typed NVFP4 rank packets; legacy/default buffer layouts stay unchanged.
   bool nvfp4_rank_packet = false;
   const float* planned_input_weights = nullptr;
   int64_t* planned_rows = nullptr;

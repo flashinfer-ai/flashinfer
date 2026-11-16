@@ -61,7 +61,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "nvfp4"), default="nvfp4")
     parser.add_argument("--tokens", type=int, nargs="+", default=[1, 128, 4096])
-    parser.add_argument("--hidden", type=int, choices=(4096, 6144, 7168), default=4096)
+    parser.add_argument(
+        "--hidden", type=int, choices=(4096, 5120, 6144, 7168), default=4096
+    )
     parser.add_argument("--experts", type=int, default=288)
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument(

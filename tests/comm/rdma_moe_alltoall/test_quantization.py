@@ -25,7 +25,7 @@ def quant_device():
     return torch.device("cuda")
 
 
-@pytest.mark.parametrize("hidden", (4096, 6144, 7168))
+@pytest.mark.parametrize("hidden", (4096, 5120, 6144, 7168))
 def test_exact_nvfp4_codes_and_roundtrip(quant_device, hidden):
     from flashinfer.comm import RdmaMoeAlltoAll
 
@@ -46,7 +46,7 @@ def test_exact_nvfp4_codes_and_roundtrip(quant_device, hidden):
     torch.testing.assert_close(restored, x, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("hidden", (4096, 6144, 7168))
+@pytest.mark.parametrize("hidden", (4096, 5120, 6144, 7168))
 def test_exact_fp8_codes_and_roundtrip(quant_device, hidden):
     from flashinfer.comm import RdmaMoeAlltoAll
 
@@ -66,7 +66,7 @@ def test_exact_fp8_codes_and_roundtrip(quant_device, hidden):
     )
 
 
-@pytest.mark.parametrize("hidden", (4096, 6144, 7168))
+@pytest.mark.parametrize("hidden", (4096, 5120, 6144, 7168))
 @pytest.mark.parametrize("rows", (0, 1, 3))
 @pytest.mark.parametrize("global_scale", (1.0, 128.0, 256.0))
 def test_nvfp4_scale_and_empty_rows_match_reference(

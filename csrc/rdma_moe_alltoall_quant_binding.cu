@@ -17,8 +17,8 @@ int hidden_and_tokens(TensorView input, DLDataType dtype, int hidden_multiplier,
   check_tensor(input, "input", dtype, input.ndim(), device);
   check_vector_alignment(input, "input");
   const auto hidden = input.size(input.ndim() - 1) * hidden_multiplier;
-  LL_CHECK(hidden == 4096 || hidden == 6144 || hidden == 7168,
-           "quantization supports hidden 4096, 6144, or 7168");
+  LL_CHECK(hidden == 4096 || hidden == 5120 || hidden == 6144 || hidden == 7168,
+           "quantization supports hidden 4096, 5120, 6144, or 7168");
   const auto rows = input.numel() / input.size(input.ndim() - 1);
   LL_CHECK(rows <= std::numeric_limits<int>::max(), "too many quantization rows");
   tokens = static_cast<int>(rows);

@@ -149,7 +149,7 @@ def test_partial_routes_weights_and_hooks(
             case["packed"].neg_()
 
 
-@pytest.mark.parametrize("hidden", (6144, 7168))
+@pytest.mark.parametrize("hidden", (5120, 6144, 7168))
 def test_partial_hidden_and_subset(distributed_device, hidden):
     with partial_buffer(hidden=hidden) as buffer:
         case = make_case(9, hidden, 7, dist.get_rank(), distributed_device, "bf16")
@@ -210,6 +210,7 @@ def planned_buffer(
     reduction="bf16_local_partial_planned",
     dispatch_mode=None,
     hidden=4096,
+    dispatch_num_sms=None,
 ):
     from flashinfer.comm import RdmaMoeAlltoAll, RdmaMoeAlltoAllConfig
 
@@ -223,6 +224,7 @@ def planned_buffer(
             communication_mode="legacy",
             combine_reduction=reduction,
             dispatch_mode=dispatch_mode,
+            dispatch_num_sms=dispatch_num_sms,
             combine_mode="legacy",
         ),
     )
@@ -336,7 +338,7 @@ def test_planned_three_retained_handles(planned_mode, distributed_device, hooks)
             check_partial(combine_planned(buffer, result, x, hooks), case)
 
 
-@pytest.mark.parametrize("hidden", (6144, 7168))
+@pytest.mark.parametrize("hidden", (5120, 6144, 7168))
 def test_planned_hidden_templates(planned_mode, distributed_device, hidden):
     with planned_buffer(hidden=hidden, dispatch_mode=planned_mode) as buffer:
         case = make_case(9, hidden, 7, dist.get_rank(), distributed_device, "bf16")
@@ -354,7 +356,9 @@ def planned_pair_runner(buffer, cases, hooks, device):
     rank = dist.get_rank()
     outs = [allocate_dispatch_out(case, buffer) for case in cases]
     outputs = [
-        torch.empty((case["tokens"], 4096), dtype=torch.bfloat16, device=device)
+        torch.empty(
+            (case["tokens"], buffer.hidden), dtype=torch.bfloat16, device=device
+        )
         for case in cases
     ]
     local_experts = torch.arange(

@@ -20,6 +20,8 @@ small actual batches within a much larger fixed capacity.
 This module only selects configuration. It does not modify a live GinBuffer,
 allocate communication resources, or synchronize ranks. Unknown profiles keep
 the C++ legacy launch defaults instead of imposing the measured GPU's budget.
+An absent performance profile does not disable rank-packet, owner deduplication,
+or source-ready receive: those capabilities use shape and launch geometry.
 """
 
 _PROFILE = "sm120_rtx6000d_ep8_e288_v1"

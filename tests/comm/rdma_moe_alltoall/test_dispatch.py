@@ -61,7 +61,7 @@ def test_bf16_rank_dedup_capacity_boundary(
         # one valid route. K>=3 still has followers after the leading negative.
 
 
-@pytest.mark.parametrize("hidden", (6144, 7168))
+@pytest.mark.parametrize("hidden", (5120, 6144, 7168))
 @pytest.mark.parametrize("hooks", (False, True))
 def test_bf16_rank_dedup_wide_graph(
     transport_factory, distributed_device, request, hidden, hooks
@@ -126,7 +126,7 @@ def _mutate(case):
 
 def _check_rank_reuse(buffer, capacity):
     info = buffer.backend_info()
-    packet = capacity > 32 and WORLD in (4, 8)
+    packet = capacity > 32
     assert info["dispatch_nvfp4_rank_packet"] == packet
     assert info["dispatch_nvfp4_rank_dedup"] == (capacity > 32 and not packet)
 
@@ -180,7 +180,7 @@ def test_nvfp4_rank_dedup_zero_tokens(
             )
 
 
-@pytest.mark.parametrize("hidden", (6144, 7168))
+@pytest.mark.parametrize("hidden", (5120, 6144, 7168))
 @pytest.mark.parametrize("hooks", (False, True))
 def test_nvfp4_rank_dedup_wide_graph(
     transport_factory, distributed_device, request, hidden, hooks

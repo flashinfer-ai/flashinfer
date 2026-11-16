@@ -20,6 +20,8 @@ namespace extensions {
   switch (hidden) {                                     \
     case 4096:                                          \
       case_macro(4096);                                 \
+    case 5120:                                          \
+      case_macro(5120);                                 \
     case 6144:                                          \
       case_macro(6144);                                 \
     case 7168:                                          \
@@ -378,11 +380,10 @@ void dispatch(int precision, void* packed_recv_x, void* packed_recv_x_scales,
   EP_HOST_ASSERT(precision == 2 ||
                  ((num_tokens == 0 || x_scales != nullptr) && packed_recv_x_scales != nullptr));
   if (gin_launch.nvfp4_rank_packet) {
-    EP_HOST_ASSERT(precision == 1 && num_max_dispatch_tokens_per_rank > 32 &&
-                   (num_ranks == 4 || num_ranks == 8) && gin_launch.num_ctas > 0 &&
-                   gin_launch.num_ctas <= num_device_sms && num_topk > 0 && num_topk <= 8 &&
-                   gin_launch.send_counts != nullptr && gin_launch.recv_counts != nullptr &&
-                   gin_launch.planned_counts != nullptr &&
+    EP_HOST_ASSERT(precision == 1 && num_max_dispatch_tokens_per_rank > 32 && num_ranks > 0 &&
+                   gin_launch.num_ctas > 0 && gin_launch.num_ctas <= num_device_sms &&
+                   num_topk > 0 && num_topk <= 8 && gin_launch.send_counts != nullptr &&
+                   gin_launch.recv_counts != nullptr && gin_launch.planned_counts != nullptr &&
                    gin_launch.planned_fanout_cursors != nullptr);
 #define NVFP4_RANK_PACKET_LAUNCH_CASE(hidden)                                                      \
   {                                                                                                \

@@ -18,10 +18,11 @@ or end-to-end decode improvement.
 
 ## Supported scope
 
-- SM120, hidden sizes **4096, 6144, 7168**, top-k **1–8**, positive fixed
+- SM120, hidden sizes **4096, 5120, 6144, 7168**, top-k **1–8**, positive fixed
   per-rank capacity, and expert count divisible by the EP group size.
   `world_size * capacity` must be divisible by four; at most 1024 experts
-  are assigned to each rank.
+  are assigned to each rank. `num_experts * capacity` and signal IDs must fit
+  signed 32-bit indices; the registered arena must fit device memory.
 - BF16, E4M3 FP8 with FP32 block scales per 128 values, and NVFP4 E2M1 with
   E4M3 block scales per 16 values. Communication dtype is fixed per buffer.
 - Audited **NCCL 2.30.7 GDAKI** host/device headers and runtime, with a working
@@ -45,13 +46,24 @@ The separate RTX 6000D profile is unchanged. These are capacity-based
 choices made before Graph capture, not rank-local token-count decisions;
 small actual batches inside a larger capacity may need explicit tuning.
 
+Rank-packet NVFP4 dispatch and planned BF16 pair batching do not use an EP-size
+whitelist. Runtime geometry covers EP4/8/16/32 without a size-specific protocol:
+one publisher warp per source, enough consumer warps to cover all sources, and
+the same packet format with a grid-join fallback when the grid is too small.
+Planned BF16 dispatch schedules the distinct owners of each adjacent token pair,
+at most `2 * top_k`, instead of assigning a warp to every possible rank.
+Measured `auto` profiles only select launch budgets; they do not gate these
+protocol optimizations. Larger EP groups may need different budgets for peak
+performance, and support does not imply a measured speedup.
+
 The current validation targets are four- and eight-GPU groups on RTX PRO 5000
 SM120 hosts with 400 Gb/s ConnectX-8 RoCE ports. Earlier GIN tests covered RTX
 6000D EP4/8. On the measured 110-SM device, EP4 unconfigured legacy launches
 resolve to 96 CTAs and 72 contexts. Report actual
 settings separately from manually tuned configurations.
-Cross-node/EP16, ARM/Grace and SM121 are not validated by this feature's
-current FlashInfer tests. Compile support alone is not performance evidence.
+Cross-node EP16, EP32, ARM/Grace and SM121 have not been validated by this
+feature's current FlashInfer tests. Generic launch geometry and compilation
+alone do not establish numerical correctness or performance on those systems.
 
 ## Setup and example
 
@@ -112,13 +124,14 @@ arrive. Values and the combine reduction order are unchanged. This reduces
 payload bytes, while retaining one communication request per expert route.
 
 Typed NVFP4 legacy dispatch reuses payloads when fixed capacity is greater
-than 32 and there are at least two experts. With four or eight ranks, it sends
-one complete packet per token/destination rank: a 48-byte header containing
+than 32 and there are at least two experts. It sends one complete packet per
+token/destination rank, independently of EP size: a 48-byte header containing
 the original token index and expert IDs, followed by the unchanged packed
 payload and block scales. The receiver expands each packet into contiguous
-rows for each source/expert pair. Other world sizes retain the full-payload
-plus 16-byte expert-reference scheme. Quantization, scale conventions, the
-expert-major output/handle contract and FP32 combine order are unchanged.
+rows for each source/expert pair. Small launch grids and separate receive
+hooks keep the same packet format and use a complete wait/reserve grid join.
+Quantization, scale conventions, the expert-major output/handle contract and
+FP32 combine order are unchanged.
 The guard uses fixed buffer capacity and the resolved legacy mode, not the
 current token count or a requested auto mode. Packet dispatch retains the
 expert-capacity arena needed by NVFP4 combine; it does not use the compact
