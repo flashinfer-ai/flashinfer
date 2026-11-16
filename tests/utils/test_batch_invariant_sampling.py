@@ -693,6 +693,84 @@ def test_log_softmax_16bit_output_member(dtype, N):
         assert same(one[0], ref16[i]), f"row {i} differs between M=1 and M={M}"
 
 
+@needs_device
+def test_preallocated_outputs():
+    """Caller-owned output buffers (``out=``, ``lse_out=``): written in place and returned as given, bit for bit the
+    allocating call's values, for every entry and output of the class; the contract (dtype, shape, contiguity, 16-byte
+    alignment of the row outputs) refused rather than copied; the default path refuses them; a CUDA graph captured on
+    caller-owned buffers replays into them for new inputs."""
+    N, M = 4096, 5
+    x = logits(M, N, torch.bfloat16)
+    ids = ids_for(x)
+    temps = torch.rand(M, device="cuda") + 0.5
+    ref_p = flashinfer.sampling.softmax(x, temps, batch_invariant=True)
+    buf = torch.empty_like(x)
+    r = flashinfer.sampling.softmax(x, temps, batch_invariant=True, out=buf)
+    assert r is buf and same(buf, ref_p)
+    ref_l = flashinfer.sampling.log_softmax(x, temps)
+    buf32 = torch.empty(M, N, dtype=torch.float32, device="cuda")
+    assert flashinfer.sampling.log_softmax(x, temps, out=buf32) is buf32
+    assert same(buf32, ref_l)
+    ref_l16 = flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.bfloat16)
+    buf16 = torch.empty_like(x)
+    assert (
+        flashinfer.sampling.log_softmax(x, temps, out_dtype=torch.bfloat16, out=buf16)
+        is buf16
+    )
+    assert same(buf16, ref_l16)
+    ref_t, ref_lse = flashinfer.sampling.log_probs(x, ids, temps, return_lse=True)
+    lpb = torch.empty(M, dtype=torch.float32, device="cuda")
+    lseb = torch.empty(M, dtype=torch.float32, device="cuda")
+    t2, l2 = flashinfer.sampling.log_probs(
+        x, ids, temps, return_lse=True, out=lpb, lse_out=lseb
+    )
+    assert t2 is lpb and l2 is lseb and same(lpb, ref_t) and same(lseb, ref_lse)
+    ids2 = torch.stack([ids, (ids + 1) % N], dim=-1)  # K ids per row
+    lpk = torch.empty(M, 2, dtype=torch.float32, device="cuda")
+    assert flashinfer.sampling.log_probs(x, ids2, temps, out=lpk) is lpk
+    assert same(lpk, flashinfer.sampling.log_probs(x, ids2, temps))
+    # the contract: refused, never copied
+    with pytest.raises(ValueError, match="dtype"):
+        flashinfer.sampling.softmax(x, batch_invariant=True, out=buf32)
+    with pytest.raises(ValueError, match="shape"):
+        flashinfer.sampling.log_softmax(
+            x, out=torch.empty(M + 1, N, dtype=torch.float32, device="cuda")
+        )
+    with pytest.raises(ValueError, match="contiguous"):
+        flashinfer.sampling.log_softmax(
+            x, out=torch.empty(M, 2 * N, dtype=torch.float32, device="cuda")[:, ::2]
+        )
+    with pytest.raises(ValueError, match="aligned"):
+        flashinfer.sampling.log_softmax(
+            x,
+            out=torch.empty(M * N + 1, dtype=torch.float32, device="cuda")[1:].view(
+                M, N
+            ),
+        )
+    with pytest.raises(ValueError, match="shape"):
+        flashinfer.sampling.log_probs(x, ids, temps, out=lpk)
+    with pytest.raises(ValueError, match="lse_out"):
+        flashinfer.sampling.log_probs(x, ids, temps, lse_out=lseb)
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.softmax(x, temps, batch_invariant=False, out=buf)
+    # a CUDA graph on caller-owned buffers: the replay writes the new inputs' values into them
+    xin = x.clone()
+    outb = torch.empty_like(x)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        flashinfer.sampling.softmax(xin, temps, batch_invariant=True, out=outb)
+        torch.cuda.current_stream().synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            flashinfer.sampling.softmax(xin, temps, batch_invariant=True, out=outb)
+    torch.cuda.synchronize()
+    x2 = logits(M, N, torch.bfloat16, seed=7)
+    xin.copy_(x2)
+    g.replay()
+    torch.cuda.synchronize()
+    assert same(outb, flashinfer.sampling.softmax(x2, temps, batch_invariant=True))
+
+
 def test_space_members_are_bounded_in_loads_per_thread():
     """Every member of the enumerated space issues at most ``LOADS_PER_THREAD_MAX`` loads per thread per pass: the
     re-read and staged forms unroll them, and beyond the bound the compile takes minutes or crashes (T32_R1_V1_RR at

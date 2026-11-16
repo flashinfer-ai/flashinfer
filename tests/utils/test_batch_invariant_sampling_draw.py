@@ -691,6 +691,11 @@ def _suite_specs(sm):
     t = _cfg_tuple(DS.draw_config(4096, 5, 2, sm))
     specs.append(("bf16", 4096, t, False, False, False, False, False))
     specs.append(("bf16", 4096, t, True, False, False, False, False))
+    # the caller-owned buffers test: the public entries at 4096 x 5 (probabilities; logits with a per-row temperature
+    # and the log-probability; the int64 gather)
+    specs.append(("bf16", 4096, t, False, False, False, False, _PDL))
+    specs.append(("bf16", 4096, t, True, True, False, True, _PDL))
+    specs.append(("bf16", 4096, t, True, False, True, False, _PDL))
     # the review round's tests (2026-11-11): the masked rows through the gather (2^16 draws; the 152064 row 2^14),
     # the chi-square draws (2^20 of a 32-token row), the SM-count test's row counts that split the parts' picks
     for N, _, _ in MASKED_HEAD_CASES:
@@ -1384,6 +1389,137 @@ def test_determinism_graph_replay_and_pdl():
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(tp, ref_p) and torch.equal(tx, ref_x)
+
+
+@needs_device
+def test_preallocated_outputs():
+    """Caller-owned output buffers on the public entries (``out=``, ``logprob_out=``): written in place and returned as
+    given, bit for bit the allocating call; an int64 buffer with int64 indices is filled by a cast (the operator's dtype
+    contract), an int32 one is the kernel's own output; the contract refused rather than copied; the default path refuses
+    them; a CUDA graph captured on caller-owned buffers replays into them for new logits and keys."""
+    N, M = 4096, 5
+    x = logits(M, N, torch.bfloat16)
+    s, o = keys(M, 21)
+    temps = torch.rand(M, device="cuda") + 0.5
+    ref_t, ref_lp = flashinfer.sampling.sampling_from_logits(
+        x,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        temperature=temps,
+        return_logprob=True,
+    )
+    ob = torch.empty(M, dtype=torch.int32, device="cuda")
+    lb = torch.empty(M, dtype=torch.float32, device="cuda")
+    t2, l2 = flashinfer.sampling.sampling_from_logits(
+        x,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        temperature=temps,
+        out=ob,
+        logprob_out=lb,
+    )  # logprob_out implies return_logprob
+    assert t2 is ob and l2 is lb and torch.equal(ob, ref_t) and same(lb, ref_lp)
+    w = torch.softmax(x.float(), dim=-1)
+    ref_w = flashinfer.sampling.sampling_from_probs(
+        w, seed=s, offset=o, batch_invariant=True
+    )
+    ob2 = torch.empty(M, dtype=torch.int32, device="cuda")
+    assert (
+        flashinfer.sampling.sampling_from_probs(
+            w, seed=s, offset=o, batch_invariant=True, out=ob2
+        )
+        is ob2
+    )
+    assert torch.equal(ob2, ref_w)
+    sm = device_sm_count(torch.device("cuda"))
+    if (
+        DS.draw_config(N, M, 2, sm).rows_per_cta == 1
+    ):  # the gather needs one row per CTA
+        idx = torch.tensor([0, 2, 2, 4, 1], device="cuda")
+        ref_i = flashinfer.sampling.sampling_from_logits(
+            x, indices=idx, seed=s, offset=o, batch_invariant=True
+        )
+        assert ref_i.dtype == torch.int64
+        o64 = torch.empty(M, dtype=torch.int64, device="cuda")
+        assert (
+            flashinfer.sampling.sampling_from_logits(
+                x, indices=idx, seed=s, offset=o, batch_invariant=True, out=o64
+            )
+            is o64
+        )
+        assert torch.equal(o64, ref_i)
+        o32 = torch.empty(M, dtype=torch.int32, device="cuda")
+        r = flashinfer.sampling.sampling_from_logits(
+            x, indices=idx, seed=s, offset=o, batch_invariant=True, out=o32
+        )
+        assert r is o32 and torch.equal(o32.long(), ref_i)
+    # the contract: refused, never copied; the default path refuses the buffers
+    with pytest.raises(ValueError, match="dtype"):
+        flashinfer.sampling.sampling_from_logits(
+            x, seed=s, offset=o, batch_invariant=True, out=lb
+        )
+    with pytest.raises(ValueError, match="shape"):
+        flashinfer.sampling.sampling_from_logits(
+            x,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=torch.empty(M + 1, dtype=torch.int32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="log-probability"):
+        draw(
+            w, s, o, logprob_out=lb
+        )  # a log-probability buffer on weights: the value is defined for logits
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.sampling_from_logits(x, seed=s, offset=o, out=ob)
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.sampling_from_probs(w, seed=s, offset=o, out=ob2)
+    # a CUDA graph on caller-owned buffers: new logits and new keys through the captured addresses
+    xin, sin, oin = x.clone(), s.clone(), o.clone()
+    tb = torch.empty(M, dtype=torch.int32, device="cuda")
+    pb = torch.empty(M, dtype=torch.float32, device="cuda")
+    st = torch.cuda.Stream()
+    with torch.cuda.stream(st):
+        flashinfer.sampling.sampling_from_logits(
+            xin,
+            seed=sin,
+            offset=oin,
+            batch_invariant=True,
+            temperature=temps,
+            out=tb,
+            logprob_out=pb,
+        )
+        torch.cuda.current_stream().synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=st):
+            flashinfer.sampling.sampling_from_logits(
+                xin,
+                seed=sin,
+                offset=oin,
+                batch_invariant=True,
+                temperature=temps,
+                out=tb,
+                logprob_out=pb,
+            )
+    torch.cuda.synchronize()
+    x2 = logits(M, N, torch.bfloat16, seed=9)
+    s2, o2 = keys(M, 22)
+    xin.copy_(x2)
+    sin.copy_(s2)
+    oin.copy_(o2)
+    g.replay()
+    torch.cuda.synchronize()
+    e_t, e_lp = flashinfer.sampling.sampling_from_logits(
+        x2,
+        seed=s2,
+        offset=o2,
+        batch_invariant=True,
+        temperature=temps,
+        return_logprob=True,
+    )
+    assert torch.equal(tb, e_t) and same(pb, e_lp)
 
 
 @needs_device

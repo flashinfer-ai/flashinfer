@@ -109,3 +109,34 @@ def _check_device_cached(
             "a CuTe DSL release that can target this device",
         )
     return cc
+
+
+def out_buffer(
+    t,
+    name: str,
+    shape: Tuple[int, ...],
+    dtype: torch.dtype,
+    like: torch.Tensor,
+    align: int = 16,
+):
+    """A caller-owned output buffer (an ``out=`` argument): ``None`` passes through; otherwise the tensor is checked and
+    returned as given -- on ``like``'s device, of ``dtype`` and exactly ``shape``, contiguous and ``align``-byte aligned
+    (the kernels store through vector copies). A buffer that fails is refused with ``ValueError``, never copied: an
+    ``out=`` is written in place or not at all (CUDA graphs and framework-owned structures rely on the address)."""
+    if t is None:
+        return None
+    if not isinstance(t, torch.Tensor):
+        raise ValueError(f"{name} must be a tensor, got {type(t).__name__}")
+    if t.device != like.device:
+        raise ValueError(f"{name} must be on {like.device}, got {t.device}")
+    if t.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {t.dtype}")
+    if tuple(t.shape) != tuple(shape):
+        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if t.data_ptr() % align:
+        raise ValueError(
+            f"{name} must be {align}-byte aligned (its storage offset is not)"
+        )
+    return t

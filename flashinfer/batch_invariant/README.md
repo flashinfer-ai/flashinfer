@@ -249,6 +249,19 @@ is a different rounding from the full row's and is not this class. Where it plug
 (`verl/workers/engine/utils.py`); Miles's `math_utils` log-probability path; NeMo RL's `_GenAlignedLogprob` and
 Megatron-Core's `batch_invariant_kernels.py` registration of `aten::_log_softmax`.
 
+**Caller-owned outputs.** Every sampling entry under the flag takes its outputs as optional caller-owned buffers --
+`softmax(..., out=)`, `log_softmax(..., out=)`, `log_probs(..., out=, lse_out=)`, `sampling_from_probs(..., out=)`,
+`sampling_from_logits(..., out=, logprob_out=)` -- written in place and returned as given, so a step allocates nothing:
+CUDA graphs captured on the caller's buffers replay into them, and a framework's persistent structures (a decode step's
+token and log-probability buffers, a trainer's chunk buffer for the batch x vocabulary log-softmax row) take the kernel's
+stores directly. A buffer must have the output dtype and shape, be contiguous and (the row outputs) 16-byte aligned; one
+that does not fit is refused with `ValueError`, never copied. The samples buffer is int32 (the kernel's output), or int64
+with int64 `indices` (filled by a cast from the kernel's int32 tokens, the operator's dtype contract). Without the buffers
+the entries allocate their outputs as the operator's own kernels do (graph-safe through torch's private pools). The
+inputs are read in place when they are in the kernels' form -- int64 or uint64 keys, an fp32 per-row temperature, int64
+indices, contiguous rows -- and conditioned (a cast or a copy) otherwise; the validity mask is formed only when asked
+for (`return_valid`). The default path (`batch_invariant=False`) refuses the buffers rather than copying into them.
+
 `ex2.approx.ftz.f32` and `lg2.approx.ftz.f32` are the class's two opaque primitives: deterministic per architecture,
 pinned as inline PTX in the kernel, and tabulated on the device for the exact CPU model (`sampling/mufu_device.py`).
 Everything else is a correctly rounded `.rn` operation or exact. The chains are the contract, named by the

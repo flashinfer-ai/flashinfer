@@ -963,6 +963,7 @@ def softmax(
     *,
     batch_invariant: bool = False,
     out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for `online safe softmax <https://arxiv.org/abs/1805.02867>`_ with temperature scaling.
 
@@ -1007,6 +1008,12 @@ def softmax(
         Only with ``batch_invariant=True``: ``None`` (default) returns the input dtype; ``torch.float32``
         returns the probabilities before the class's output conversion, which for a 16-bit input are the
         fp32 input's class bit for bit (the samplers' ``softmax(dtype=torch.float32)`` without the copy).
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned output buffer of the output dtype and ``logits.shape``
+        (contiguous, 16-byte aligned), written in place and returned, so nothing is allocated (CUDA graphs on
+        caller-owned buffers, a framework's persistent structures). A buffer that does not fit is refused with
+        ``ValueError``, never copied.
+
     Returns
     -------
     probs : torch.Tensor
@@ -1041,7 +1048,7 @@ def softmax(
         from .batch_invariant.sampling.api import softmax_batch_invariant
 
         return softmax_batch_invariant(
-            logits, temperature, enable_pdl, out_dtype=out_dtype
+            logits, temperature, enable_pdl, out_dtype=out_dtype, out=out
         )
 
     maybe_temperature_arr, temperature_val, temperature_is_none = (
@@ -1050,6 +1057,10 @@ def softmax(
     if out_dtype is not None:
         raise ValueError(
             "out_dtype is a parameter of the batch-invariant class (batch_invariant=True)"
+        )
+    if out is not None:
+        raise ValueError(
+            "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
     workspace_buffer = _get_cache_buf("softmax_workspace", 1024 * 1024, logits.device)
 
@@ -1089,6 +1100,8 @@ def log_probs(
     return_lse: bool = False,
     enable_pdl: Optional[bool] = None,
     batch_invariant: bool = False,
+    out: Optional[torch.Tensor] = None,
+    lse_out: Optional[torch.Tensor] = None,
 ):
     r"""The log-probability of one token per row under ``softmax(logits / temperature)``, with a batch-invariant
     dataflow: the teacher-forced score of a sampled token (a trainer re-scoring a rollout) and the returned
@@ -1127,6 +1140,11 @@ def log_probs(
         guarantees above). ``False`` (the default) runs the operator's regular kernel for this entry, which
         today is the same class: a future release may route it to a faster kernel without the invariance
         contract, so callers that need the contract pass ``True`` explicitly.
+    out : Optional[torch.Tensor]
+        A caller-owned buffer for ``logp`` (float32, the token ids' shape, contiguous), written in place and
+        returned; nothing is allocated for it.
+    lse_out : Optional[torch.Tensor]
+        With ``return_lse=True``: a caller-owned buffer for ``lse`` (float32, ``logits.shape[:-1]``, contiguous).
 
     Returns
     -------
@@ -1164,7 +1182,13 @@ def log_probs(
     from .batch_invariant.sampling.api import log_probs_batch_invariant
 
     return log_probs_batch_invariant(
-        logits, token_ids, temperature, enable_pdl, return_lse=return_lse
+        logits,
+        token_ids,
+        temperature,
+        enable_pdl,
+        return_lse=return_lse,
+        out=out,
+        lse_out=lse_out,
     )
 
 
@@ -1176,6 +1200,7 @@ def log_softmax(
     enable_pdl: Optional[bool] = None,
     batch_invariant: bool = False,
     out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     r"""The log-softmax row of ``logits / temperature`` in fp32 (or in the input's 16-bit dtype with ``out_dtype``), with a batch-invariant dataflow: the row every
     deterministic sampling path forms before gathering a token's log-probability (the top-k log-probabilities, the
@@ -1216,6 +1241,10 @@ def log_softmax(
         the shape of ``aten::_log_softmax`` on 16-bit inputs that the trainers' batch-invariant modes override. A
         different member of the class with its own receipt: ``fingerprint("log_softmax", N=, dtype=, temperature=,
         out_dtype=)``. Any other dtype raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`.
+    out : Optional[torch.Tensor]
+        A caller-owned output buffer of the output dtype and ``logits.shape`` (contiguous, 16-byte aligned), written
+        in place and returned, so nothing is allocated: a trainer re-scoring rows in chunks reuses one buffer instead
+        of allocating batch x vocabulary floats per chunk. A buffer that does not fit is refused, never copied.
 
     Returns
     -------
@@ -1234,7 +1263,7 @@ def log_softmax(
     from .batch_invariant.sampling.api import log_softmax_batch_invariant
 
     return log_softmax_batch_invariant(
-        logits, temperature, enable_pdl, out_dtype=out_dtype
+        logits, temperature, enable_pdl, out_dtype=out_dtype, out=out
     )
 
 
@@ -1251,6 +1280,8 @@ def sampling_from_logits(
     batch_invariant: bool = False,
     temperature: Optional[Union[torch.Tensor, float]] = None,
     return_logprob: bool = False,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for category sampling from logits. It's equivalent to sampling
     from the probabilities obtained by applying softmax to :attr:`logits`.
@@ -1341,6 +1372,14 @@ def sampling_from_logits(
         distribution at the given temperature (fp32, shape ``(batch_size,)``, NaN for an invalid row): bit for bit
         :func:`log_probs` ``(logits, samples, temperature)`` -- the value a trainer re-scoring the token computes, so
         the rollout's and the trainer's log-probabilities are the same bits with no second pass over the row.
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
+        (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
+        the dtype contract above) -- written in place and returned, so nothing is allocated. Refused, never copied, when
+        it does not fit.
+    logprob_out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned float32 buffer of shape ``(batch_size,)`` for the
+        log-probability (it implies ``return_logprob=True``), written in place and returned.
 
     Returns
     -------
@@ -1383,11 +1422,18 @@ def sampling_from_logits(
             offset,
             temperature=temperature,
             return_logprob=return_logprob,
+            out=out,
+            logprob_out=logprob_out,
         )
-    if temperature is not None or return_logprob:
+    if (
+        temperature is not None
+        or return_logprob
+        or out is not None
+        or logprob_out is not None
+    ):
         raise ValueError(
-            "temperature and return_logprob are available under batch_invariant=True only (the operator's kernel "
-            "takes neither)"
+            "temperature, return_logprob, out and logprob_out are available under batch_invariant=True only (the "
+            "operator's kernel takes none of them and allocates its output)"
         )
     return get_sampling_module().sampling_from_logits(
         logits, indices, deterministic, generator, seed, offset
@@ -1406,6 +1452,7 @@ def sampling_from_probs(
     return_valid: bool = False,
     *,
     batch_invariant: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for category sampling from probabilities.
 
@@ -1487,6 +1534,10 @@ def sampling_from_probs(
         row's weights do not sum to a positive finite number). Anything the class does not cover
         raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of
         falling back.
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``,
+        or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens) -- written in place and
+        returned, so nothing is allocated. Refused, never copied, when it does not fit.
 
     Returns
     -------
@@ -1529,7 +1580,11 @@ def sampling_from_probs(
         )
 
         return sampling_from_probs_batch_invariant(
-            probs, indices, generator, seed, offset, return_valid
+            probs, indices, generator, seed, offset, return_valid, out=out
+        )
+    if out is not None:
+        raise ValueError(
+            "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
     return get_sampling_module().sampling_from_probs(
         probs,
