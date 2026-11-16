@@ -34,6 +34,7 @@ from flashinfer.fused_moe import (
     MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
+    PowLU,
     QuantConfig,
     QuantFormat,
     ReLU2,
@@ -2246,6 +2247,304 @@ def test_linear_scale_unit_pack_equals_swizzled_pack_with_ones():
         unswizzle_sf_128x4(im["x_perm_sf"], im["Tk_pad"], H).cpu()[pos.cpu()],
         sf_lin.cpu()[torch.arange(T * k) // k],
     )
+
+
+@needs_device
+def test_sfu_cpu_model_is_the_parts_function():
+    """The CPU model of the two SFU primitives (``fp_interface.sfu``: ``ex2.approx.ftz`` as the device's fixed-point fraction
+    of the input, ``rcp.approx.ftz`` as an exponent shift of a significand table) is the part's function bit for bit over
+    random inputs of every exponent and the special values; the tables' digest is pinned per architecture."""
+    from flashinfer.batch_invariant.fp_interface import sfu
+
+    dev = torch.device("cuda")
+    tab = sfu.tables_for(dev)
+    assert sfu.check_model(dev, n=1 << 21, seed=1, tables=tab) == {"ex2": 0, "rcp": 0}
+    pinned = {"sm_100": "16dae096374535ab", "sm_107": "16dae096374535ab"}
+    if tab.arch in pinned:
+        assert tab.digest == pinned[tab.arch], (tab.arch, tab.digest)
+    else:
+        pytest.skip(f"no pinned SFU table digest for {tab.arch}: {tab.digest}")
+
+
+def _hw_tables():
+    from flashinfer.batch_invariant.fp_interface import sfu
+    from flashinfer.fused_moe.batch_invariant import mterm
+
+    tab = sfu.tables_for(torch.device("cuda"))
+    mterm.bind_sfu_tables(tab)
+    return tab
+
+
+@needs_device
+@pytest.mark.parametrize(
+    "act,params,gated",
+    [
+        ("silu", (), True),
+        ("gelu", (), True),
+        ("gelu_tanh", (), True),
+        ("swiglu_step", (7.0,), True),
+        ("swiglu_oai", (1.702, 1.0, 7.0), True),
+        ("situ", (4.0, 25.0, None), True),
+        ("silu", (), False),
+        ("gelu", (), False),
+    ],
+    ids=[
+        "swiglu",
+        "geglu",
+        "geglu_tanh",
+        "swiglu_step",
+        "swiglu_oai",
+        "situ",
+        "act_silu",
+        "act_gelu",
+    ],
+)
+def test_hardware_arith_class_is_deterministic_invariant_and_the_table_models_composition(
+    act, params, gated
+):
+    """The hardware-arithmetic class ``moe.nvfp4.<act>.hw`` (``MoEWeightsNVFP4.prepare(..., arith="hw")``): deterministic
+    across runs and under CUDA-graph replay; a sub-batch's rows equal the full batch's and a permutation permutes; every
+    ranked record of GEMM1 computes the same bits; GEMM1's device chain equals the table-driven CPU model
+    (``spec_nvfp4.glu_scaled_elem(..., hw=True)`` on the device's own fp32 accumulators) bit for bit, and differs from the
+    exact model where the two models differ; the output differs from the exact class's only through the intermediate
+    quantization's code flips (bit-equal rows where the intermediate rows agree); the fingerprint is its own (and the ReLU
+    family's is unchanged)."""
+    import dataclasses
+
+    from flashinfer.fused_moe.batch_invariant import reference as R
+    from flashinfer.fused_moe.batch_invariant import spec_nvfp4 as Q
+    from flashinfer.fused_moe.batch_invariant.api_nvfp4 import (
+        DENSE_TAIL,
+        F32_CHAIN,
+        MoEWeightsNVFP4,
+        fused_moe_nvfp4,
+        grouped_gemm_nvfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.schedule_nvfp4 import rank_grouped_nvfp4
+    from flashinfer.fused_moe.batch_invariant.spec_nvfp4 import (
+        MoENvfp4Spec,
+        expert_classes,
+        spec_fingerprint_nvfp4,
+    )
+    from flashinfer.batch_invariant.quantization.nvfp4_schedule import sf_numel
+
+    _hw_tables()
+    T, k, H, I, E = 61, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=31, gated=gated)
+    Wx = MoEWeightsNVFP4.prepare(w1, w2, gated=gated, act=act, params=params)
+    Wh = MoEWeightsNVFP4.prepare(
+        w1, w2, gated=gated, act=act, params=params, arith="hw"
+    )
+    assert Wh.chain1.hw and Wh.chain1.describe().endswith("_hw") and not Wx.chain1.hw
+    ids, wts = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, wts = ids.cuda(), wts.cuda()
+    ox = fused_moe_nvfp4(x, ids, wts, Wx)
+    oh, im = fused_moe_nvfp4(x, ids, wts, Wh, return_intermediates=True)
+    assert torch.equal(
+        bits(oh), bits(fused_moe_nvfp4(x, ids, wts, Wh))
+    )  # deterministic
+    # against the exact class: the two differ only through the intermediate's quantization (the bf16 rounding absorbs
+    # the SFU error almost everywhere; a chain value straddling a code boundary flips one code): a token whose
+    # intermediate rows agree bit for bit has the exact class's output row, every element is within a fraction of its
+    # row's magnitude
+    _, im_x = fused_moe_nvfp4(x, ids, wts, Wx, return_intermediates=True)
+    tok_eq = (bits(im["a"]) == bits(im_x["a"])).all(dim=1)[im["dest"].long()].all(dim=1)
+    assert tok_eq.any()
+    assert torch.equal(bits(oh[tok_eq]), bits(ox[tok_eq]))
+    amax_row = ox.float().abs().amax(dim=-1, keepdim=True)
+    assert ((oh.float() - ox.float()).abs() <= 2.0**-3 * amax_row).all()
+    # invariance: a sub-batch and a permutation
+    sub = fused_moe_nvfp4(
+        x[:7].contiguous(), ids[:7].contiguous(), wts[:7].contiguous(), Wh
+    )
+    assert torch.equal(bits(sub), bits(oh[:7]))
+    perm = torch.randperm(T, generator=torch.Generator().manual_seed(32)).cuda()
+    op = fused_moe_nvfp4(
+        x[perm].contiguous(), ids[perm].contiguous(), wts[perm].contiguous(), Wh
+    )
+    assert torch.equal(bits(op), bits(oh[perm]))
+    # graph replay
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        fused_moe_nvfp4(x, ids, wts, Wh)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            og = fused_moe_nvfp4(x, ids, wts, Wh)
+        og.zero_()
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(og), bits(oh))
+    # every ranked record of GEMM1 (both record spaces) computes the same bits
+    in1, in2 = expert_classes(H, I, _family(), gated)
+    n1 = 2 * I if gated else I
+    for rec in rank_grouped_nvfp4(
+        T * k // E, n1, H, E, Wh.chain1, in1, 212, _family(), 6, n_active=E
+    ):
+        if rec.gather_a:
+            continue
+        o_rec = fused_moe_nvfp4(x, ids, wts, Wh, config1=rec, config2=im["config2"])
+        assert torch.equal(bits(o_rec), bits(oh)), rec.describe()
+    # GEMM1's device chain vs the two CPU models on the device's own accumulators
+    c1 = dataclasses.replace(im["config1"], gather_a=False)
+    Tk, Tk_pad, counts = T * k, im["Tk_pad"], im["counts"]
+    x_buf = torch.zeros(Tk + DENSE_TAIL, H // 2, dtype=torch.uint8, device="cuda")
+    x_buf[:Tk] = im["x_perm4"]
+    xsf = torch.zeros(
+        sf_numel(Tk_pad + DENSE_TAIL, H), dtype=torch.uint8, device="cuda"
+    )
+    xsf[: im["x_perm_sf"].numel()] = im["x_perm_sf"]
+    xpts = torch.zeros(Tk_pad + DENSE_TAIL, dtype=torch.float32, device="cuda")
+    xpts[: im["x_perm_pts"].numel()] = im["x_perm_pts"]
+    acc = torch.zeros(Tk + DENSE_TAIL, n1, dtype=torch.float32, device="cuda")
+    grouped_gemm_nvfp4(
+        x_buf,
+        xsf,
+        xpts,
+        Wh.w1,
+        Wh.w1_sf,
+        Wh.w1_alpha,
+        counts,
+        c1,
+        F32_CHAIN,
+        in1,
+        out=acc,
+        dense_a=True,
+    )
+    e_of_row = torch.repeat_interleave(torch.arange(E, device="cuda"), counts.long())
+    pos_pad = im["pos_pad"].long()[:Tk]
+    s_row = (
+        (Wh.w1_alpha[e_of_row].reshape(-1).float() * im["x_perm_pts"].float()[pos_pad])
+        .cpu()
+        .unsqueeze(1)
+    )
+    acc_c = acc[:Tk].cpu()
+    if gated:
+        cols_u = torch.tensor([16 * q + r for q in range(n1 // 16) for r in range(8)])
+        args = (acc_c[:, cols_u + 8], acc_c[:, cols_u], s_row, act, "bf16", params)
+        a_hw = Q.glu_scaled_elem(R.TorchF32, *args, hw=True)
+        a_ex = Q.glu_scaled_elem(R.TorchF32, *args, hw=False)
+    else:
+        a_hw = Q.act_scaled_elem(R.TorchF32, acc_c, s_row, act, "bf16", params, hw=True)
+        a_ex = Q.act_scaled_elem(
+            R.TorchF32, acc_c, s_row, act, "bf16", params, hw=False
+        )
+    a_dev = im["a"].cpu()
+    assert torch.equal(bits(a_dev), bits(a_hw))
+    differ = bits(a_hw) != bits(a_ex)
+    if differ.any():  # the bf16 rounding hides the SFU error almost everywhere; where it shows, the device is the hw model
+        assert not torch.equal(bits(a_dev), bits(a_ex))
+    # the two models are different functions of the accumulators (shown on the fp32 chain values at scale)
+    g = torch.Generator().manual_seed(33)
+    acc_big = torch.randn(1 << 18, 2 if gated else 1, generator=g) * 4
+    s_one = torch.ones(1 << 18, 1)
+    if gated:
+        f_hw = Q.glu_scaled_pre(
+            R.TorchF32, acc_big[:, :1], acc_big[:, 1:], s_one, act, params, hw=True
+        )
+        f_ex = Q.glu_scaled_pre(
+            R.TorchF32, acc_big[:, :1], acc_big[:, 1:], s_one, act, params, hw=False
+        )
+    else:
+        f_hw = Q.act_scaled_pre(R.TorchF32, acc_big, s_one, act, params, hw=True)
+        f_ex = Q.act_scaled_pre(R.TorchF32, acc_big, s_one, act, params, hw=False)
+    assert (f_hw.view(torch.int32) != f_ex.view(torch.int32)).any()
+    # ... and close on the scale of the inputs: the SFU's relative error, amplified where a chain cancels (the erf GELU's
+    # tail, ``1 + erf``), stays far below the output formats' resolution
+    scale = (
+        1.0 + acc_big.abs().prod(dim=1, keepdim=True) if gated else 1.0 + acc_big.abs()
+    )
+    assert ((f_hw - f_ex).abs() <= 2.0**-16 * scale).all()
+    # the fingerprints: the hardware class is its own; the ReLU family keeps the exact class's
+    fx = spec_fingerprint_nvfp4(H, I, k, E, act=act, params=params, gated=gated)
+    fh = spec_fingerprint_nvfp4(
+        H, I, k, E, act=act, params=params, gated=gated, arith="hw"
+    )
+    assert fx != fh
+    name_h = MoENvfp4Spec(
+        H, I, k, E, act=act, params=params, gated=gated, arith="hw"
+    ).name
+    name_x = MoENvfp4Spec(H, I, k, E, act=act, params=params, gated=gated).name
+    assert name_h == name_x + ".hw"
+    assert spec_fingerprint_nvfp4(
+        H, I, k, E, act="relu2", gated=False, arith="hw"
+    ) == spec_fingerprint_nvfp4(H, I, k, E, act="relu2", gated=False)
+
+
+@needs_device
+def test_hardware_arith_class_through_the_layer_and_its_refusals():
+    """``BatchInvariantFp4Config(activation_arith="hardware")``: the layer computes the hardware class (its output differs
+    from the exact layer's somewhere, within two bf16 ulps everywhere), autotuning keeps its bits, a pack prepared for the
+    exact class is refused by the hardware layer and the converse, PowLU under the hardware value is refused at the weight
+    preparation, and the ReLU family's pack serves either value."""
+    from flashinfer.autotuner import autotune
+
+    _hw_tables()
+    T, k, H, I, E = 40, 4, 512, 256, 32
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=51)
+    cfg_h = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=E, top_k=k, method=RoutingMethodType.Renormalize
+        ),
+        quant=_NVFP4,
+        experts=ExpertConfig(intermediate_size=I),
+        activation=_SWIGLU,
+        backend=BackendOptions((BatchInvariantFp4Config(activation_arith="hardware"),)),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=4096),
+        finalize=MoEFinalizeConfig(do_finalize=True),
+    )
+    layer_h = MoELayer(cfg_h, device=torch.device("cuda"))
+    layer_x = _layer(k, E, I)
+    view_h = BatchInvariantFp4Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        activation=_SWIGLU,
+        activation_arith="hardware",
+    )
+    assert view_h["activation_arith"] == "hw"
+    pack_h = MoEWeightPack({})
+    pack_h.prepare_for(KEY, view_h)
+    pack_x = _weights(w1, w2)
+    out_h = layer_h(_logits_pack(x, logits), pack_h)
+    out_x = layer_x(_logits_pack(x, logits), pack_x)
+    assert torch.equal(bits(out_h), bits(layer_h(_logits_pack(x, logits), pack_h)))
+    ulp = torch.abs(out_x.float()) * 2.0**-7
+    assert ((out_h.float() - out_x.float()).abs() <= 2 * ulp + 1e-6).all()
+    with autotune(True):
+        assert torch.equal(bits(layer_h(_logits_pack(x, logits), pack_h)), bits(out_h))
+    assert torch.equal(bits(layer_h(_logits_pack(x, logits), pack_h)), bits(out_h))
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        layer_h(_logits_pack(x, logits), pack_x)
+    assert "activation_arith" in str(excinfo.value)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        layer_x(_logits_pack(x, logits), pack_h)
+    with pytest.raises(bi.BatchInvariantUnsupportedError) as excinfo:
+        BatchInvariantFp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=E,
+            hidden_size=H,
+            intermediate_size=I,
+            activation=PowLU(),
+            activation_arith="hardware",
+        )
+    assert "PowLU" in str(excinfo.value)
+    # the ReLU family: the same class under either value (an ungated pack serves both layers)
+    w1u = w1[:, :I].contiguous()
+    view_r = BatchInvariantFp4Config.prepare_weights(
+        w1u,
+        w2,
+        num_local_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        activation=ReLU2(),
+        activation_arith="hardware",
+    )
+    assert view_r["activation_arith"] == "exact"
+    with pytest.raises(ValueError):
+        BatchInvariantFp4Config(activation_arith="fast")
 
 
 @needs_device

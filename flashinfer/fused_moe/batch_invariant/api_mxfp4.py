@@ -120,6 +120,9 @@ class MoEWeightsMXFP4:
     gated: bool = True
     act: str = "silu"
     params: Tuple[Optional[float], ...] = ()
+    #: the chain's arithmetic (``spec.ARITHS``): ``exact`` (`moe.mxfp4.<act>`) or ``hw`` (`moe.mxfp4.<act>.hw`: the
+    #: hardware-arithmetic class; the chains without an exponential or a division stay the exact class)
+    arith: str = "exact"
 
     @staticmethod
     def prepare(
@@ -129,12 +132,15 @@ class MoEWeightsMXFP4:
         gated: bool = True,
         act: Optional[str] = None,
         params: Sequence[Optional[float]] = (),
+        arith: str = "exact",
     ) -> "MoEWeightsMXFP4":
         """Quantize bf16 experts (``fc1 [E, 2I, H]`` rows ``[up, gate]``, or ``[E, I, H]`` ungated; ``fc2 [E, H, I]``) with the
         batch-invariant MXFP4 class (one UE8M0 scale per 32 elements of a row, TransformerEngine's recipe). The gate / up
         interleave is a row permutation applied before the quantization (a block scale is a function of its row). ``act``
         defaults to the class's default chain of the gating."""
         act = act if act is not None else ("silu" if gated else "relu2")
+        if arith not in S.ARITHS:
+            raise ValueError(f"arith must be one of {S.ARITHS}, not {arith!r}")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
         key: Tuple[Optional[float], ...] = S.params_key(params)
@@ -178,6 +184,7 @@ class MoEWeightsMXFP4:
             gated,
             act,
             key,
+            arith,
         )
 
     @property
@@ -197,7 +204,13 @@ class MoEWeightsMXFP4:
     def chain1(self) -> Mxfp4Chain:
         """The GEMM1 chain of the class: the gated ``act`` on the (gate, up) pair or the ungated ``act`` on the accumulator, with
         the parameters; bf16 output."""
-        return Mxfp4Chain("glu" if self.gated else "act", self.act, "bf16", self.params)
+        return Mxfp4Chain(
+            "glu" if self.gated else "act",
+            self.act,
+            "bf16",
+            self.params,
+            arith=self.arith,
+        )
 
     @property
     def chain2(self) -> Mxfp4Chain:
@@ -218,6 +231,7 @@ class MoEWeightsMXFP4:
             "gated": self.gated,
             "act": self.act,
             "params": self.params,
+            "activation_arith": self.arith,
         }
 
     @staticmethod
@@ -233,6 +247,7 @@ class MoEWeightsMXFP4:
             gated,
             str(view.get("act", "silu" if gated else "relu2")),
             tuple(view.get("params", ())),  # type: ignore[arg-type]
+            str(view.get("activation_arith", "exact")),
         )
 
 

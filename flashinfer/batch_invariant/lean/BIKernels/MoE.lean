@@ -59,6 +59,8 @@ inductive MTerm where
   | frexpm (a : MTerm)
   | frexpe (a : MTerm)
   | exp2i (a : MTerm)
+  | ex2 (a : MTerm)
+  | rcp (a : MTerm)
   | rowmax (E : Nat)
   | cvt (fmt : String) (a : MTerm)
   deriving Repr, DecidableEq, Inhabited
@@ -89,6 +91,8 @@ def MTerm.sexpr : MTerm → String
   | .frexpm a => s!"(frexpm {a.sexpr})"
   | .frexpe a => s!"(frexpe {a.sexpr})"
   | .exp2i a => s!"(exp2i {a.sexpr})"
+  | .ex2 a => s!"(ex2 {a.sexpr})"
+  | .rcp a => s!"(rcp {a.sexpr})"
   | .rowmax E => "(rowmax" ++ logitsStr 0 E ++ ")"
   | .cvt f a => s!"(cvt {f} {a.sexpr})"
 
@@ -240,6 +244,72 @@ def gluPreT : GAct → MTerm → MTerm → MTerm
 /-- The gated GEMM1 chain (`spec.glu_elem(..., "bf16")`): `cvt_bf16(glu_pre(g, u))`; `swigluT` at `.silu`. -/
 def gluT (a : GAct) (g u : MTerm) : MTerm := .cvt "bf16" (gluPreT a g u)
 
+/-! ## The hardware-arithmetic classes (`moe.<pair>.<act>.hw`; `spec.*_term(..., hw=True)`)
+
+The same chains with the exponential as the part's `ex2.approx.ftz` (`.ex2`) of `mul(x, log2 e)` and every division as
+`mul(a, rcp(b))` with the part's `rcp.approx.ftz` (`.rcp`). The two primitives are opaque per-part functions (`ex2Approx`,
+`rcpApprox` below: deterministic on one part, their bits implementation-specific); the terms stay pure functions of their
+inputs, so the class's determinism, batch invariance and placement erasure are the exact class's. PowLU has no hardware
+form (its declared log / exp stay); the ReLU family has no exponential or division and is the same class. -/
+
+/-- `ex2.approx.ftz.f32` of a part (named by its architecture): an opaque function, deterministic on the part. -/
+opaque ex2Approx (part : String) : Float → Float
+/-- `rcp.approx.ftz.f32` of a part: an opaque function, deterministic on the part. -/
+opaque rcpApprox (part : String) : Float → Float
+
+def log2eC : String := "1.4426950216293335"
+
+/-- `spec.exp_term(..., hw=True)`: `ex2(mul(x, log2 e))`. -/
+def expHwT (x : MTerm) : MTerm := .ex2 (.mul x (c log2eC))
+
+/-- `spec.sigmoid_term(..., hw=True)`: `rcp(add(1, ex2(mul(neg x, log2 e))))`. -/
+def sigmoidHwT (x : MTerm) : MTerm := .rcp (.add (c "1.0") (expHwT (.neg x)))
+
+/-- `spec.silu_term(..., hw=True)`: `mul(g, sigmoid_hw(g))`. -/
+def siluHwT (g : MTerm) : MTerm := .mul g (sigmoidHwT g)
+
+/-- `spec.gelu_tanh_term(..., hw=True)`: the declared polynomial, the hardware sigmoid. -/
+def geluTanhHwT (x : MTerm) : MTerm :=
+  let x3 := MTerm.mul x (.mul x x)
+  let y := MTerm.mul (c "0.7978845834732056") (.add x (.mul (c "0.044714998453855515") x3))
+  .mul x (sigmoidHwT (.mul (c "2.0") y))
+
+/-- `spec.tanh_term(..., hw=True)`: `2 sigmoid_hw(2 z) - 1`. -/
+def tanhHwT (z : MTerm) : MTerm := .add (.mul (c "2.0") (sigmoidHwT (.mul (c "2.0") z))) (c "-1.0")
+
+/-- `spec.erf_pos_term(..., hw=True)`: `t = mul(1, rcp(add(1, mul(P, a))))`, the exponential by `ex2`. -/
+def erfPosHwT (a : MTerm) : MTerm :=
+  let t := MTerm.mul (c "1.0") (.rcp (.add (c "1.0") (.mul (c "0.32759109139442444") a)))
+  let e := expHwT (.neg (.mul a a))
+  .add (c "1.0") (.neg (.mul (.mul t (horner t erfCoeffsTail (c "1.0614054203033447"))) e))
+
+/-- `spec.gelu_term(..., hw=True)`. -/
+def geluHwT (x : MTerm) : MTerm :=
+  let ax := MTerm.fabs x
+  let y := erfPosHwT (.mul ax (c "0.7071067690849304"))
+  .mul (c "0.5") (.add x (.mul ax y))
+
+/-- `spec.glu_pre(..., hw=True)` on the chains with a hardware form (`spec.HW_ACTS`); PowLU has none. -/
+def gluPreHwT : GAct → MTerm → MTerm → MTerm
+  | .silu, g, u => .mul (siluHwT g) u
+  | .geluTanh, g, u => .mul (geluTanhHwT g) u
+  | .gelu, g, u => .mul (geluHwT g) u
+  | .swigluOai alpha beta limit, g, u =>
+    let gl := MTerm.fmin g (c limit)
+    .mul (.mul gl (sigmoidHwT (.mul (c alpha) gl))) (.add (clampSymT u limit) (c beta))
+  | .swigluStep limit, g, u => .mul (.fmin (siluHwT g) (c limit)) (clampSymT u limit)
+  | .situ gs ls cl, g, u =>
+    let g := match cl with | some cl => MTerm.fmin g (c cl) | none => g
+    let u := match cl with | some cl => clampSymT u cl | none => u
+    let gt := MTerm.mul (.mul (c gs) (tanhHwT (.mul g (.rcp (c gs))))) (sigmoidHwT g)
+    let ut := match ls with | some ls => MTerm.mul (c ls) (tanhHwT (.mul u (.rcp (c ls)))) | none => u
+    .mul gt ut
+  | .powlu m limit, g, u => gluPreT (.powlu m limit) g u
+
+/-- The gated GEMM1 chain of the hardware class: `cvt_bf16(glu_pre_hw(g, u))`. -/
+def gluHwT (a : GAct) (g u : MTerm) : MTerm := .cvt "bf16" (gluPreHwT a g u)
+
+
 theorem gluT_silu_is_swiglu (g u : MTerm) : gluT .silu g u = swigluT g u := rfl
 
 /-- The unparameterised gated chains activate the gate alone and multiply by `u` (`spec.act_term`). -/
@@ -270,6 +340,19 @@ def ungatedT : UAct → MTerm → MTerm
 
 /-- The ungated GEMM1 chain (`spec.act_elem(..., "bf16")`): `cvt_bf16(act(acc))`, one accumulator. -/
 def actElemT (a : UAct) (x : MTerm) : MTerm := .cvt "bf16" (ungatedT a x)
+
+/-- `spec.ungated_term(..., hw=True)`: SiLU and GELU in the hardware arithmetic; the others as the exact class. -/
+def ungatedHwT : UAct → MTerm → MTerm
+  | .silu, x => siluHwT x
+  | .gelu, x => geluHwT x
+  | a, x => ungatedT a x
+
+/-- The ungated GEMM1 chain of the hardware class. -/
+def actElemHwT (a : UAct) (x : MTerm) : MTerm := .cvt "bf16" (ungatedHwT a x)
+
+theorem gluPreHwT_powlu_is_exact (m : String) (l : Option String) (g u : MTerm) :
+    gluPreHwT (.powlu m l) g u = gluPreT (.powlu m l) g u := rfl
+theorem ungatedHwT_relu2_is_exact (x : MTerm) : ungatedHwT .relu2 x = ungatedT .relu2 x := rfl
 
 /-- The ReLU^2 class's chain (`spec.act_elem`, act `relu2`): `cvt_bf16(mul(r, r))` with `r = fmax(acc, 0)`. -/
 def relu2T (x : MTerm) : MTerm := .cvt "bf16" (.mul (.fmax x (c "0.0")) (.fmax x (c "0.0")))

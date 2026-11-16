@@ -67,10 +67,11 @@ def glu_scaled_elem(
     act: str = "silu",
     out_fmt: str = "bf16",
     params: Sequence[Optional[float]] = (),
+    hw: bool = False,
 ) -> Any:
     """GEMM1 of the gated W4A4 classes: ``cvt_bf16(glu_pre(mul(g, s), mul(u, s)))`` from the two raw accumulators (the
-    bf16 class's gated chain ``act`` with its parameters on the scaled pair)."""
-    return S.glu_elem(fp, fp.mul(g, s), fp.mul(u, s), act, out_fmt, params)
+    bf16 class's gated chain ``act`` with its parameters on the scaled pair; ``hw``: the hardware arithmetic)."""
+    return S.glu_elem(fp, fp.mul(g, s), fp.mul(u, s), act, out_fmt, params, hw)
 
 
 def act_scaled_elem(
@@ -80,10 +81,11 @@ def act_scaled_elem(
     act: str = "relu2",
     out_fmt: str = "bf16",
     params: Sequence[Optional[float]] = (),
+    hw: bool = False,
 ) -> Any:
     """GEMM1 of the ungated W4A4 classes: ``cvt_bf16(act(mul(acc, s)))`` from the single raw accumulator (the row scale
-    first, then the bf16 class's ungated chain)."""
-    return S.act_elem(fp, fp.mul(acc, s), act, out_fmt, params)
+    first, then the bf16 class's ungated chain; ``hw``: the hardware arithmetic)."""
+    return S.act_elem(fp, fp.mul(acc, s), act, out_fmt, params, hw)
 
 
 def scaled_out_elem(fp: Any, acc: Any, s: Any, out_fmt: str = "bf16") -> Any:
@@ -104,9 +106,10 @@ def glu_scaled_pre(
     s: Any,
     act: str = "silu",
     params: Sequence[Optional[float]] = (),
+    hw: bool = False,
 ) -> Any:
     """The fp32 gated value of the W4A4 chain before any rounding: ``glu_pre(mul(g, s), mul(u, s))``."""
-    return S.glu_pre(fp, fp.mul(g, s), fp.mul(u, s), act, params)
+    return S.glu_pre(fp, fp.mul(g, s), fp.mul(u, s), act, params, hw)
 
 
 def act_scaled_pre(
@@ -115,10 +118,11 @@ def act_scaled_pre(
     s: Any,
     act: str = "relu2",
     params: Sequence[Optional[float]] = (),
+    hw: bool = False,
 ) -> Any:
     """The fp32 ungated value of the W4A4 chain before any rounding: ``act(mul(acc, s))``."""
     assert not tuple(params), (act, params)
-    return S.ungated_term(fp, act, fp.mul(acc, s))
+    return S.ungated_term(fp, act, fp.mul(acc, s), hw)
 
 
 def nvfp4_block_amax(fp: Any, xs: Sequence[Any]) -> Any:
@@ -193,12 +197,17 @@ class MoENvfp4Spec(S.MoESpec):
         fp4_class: Tuple[str, str] = ("nvfp4", "nvfp4"),
         alg: Optional[TermAlgebra] = None,
         intermediate: str = "per_token",
+        arith: str = "exact",
     ):
         super().__init__(H, I, k, E, method, "bf16", alg, act, params, gated)
         assert all(c in NVFP4_FMTS for c in fp4_class), fp4_class
         assert intermediate in INTERMEDIATES, intermediate
+        assert arith in S.ARITHS, arith
         self.fp4_class = fp4_class
         self.intermediate = intermediate
+        # the hardware-arithmetic class: the chain's exponential and divisions on the part's SFU functions (a class of its own
+        # where the chain has them; the other chains are the exact class whatever the request)
+        self.hw = arith == "hw" and S.hw_arith_applies(self.act, self.gated)
 
     def alpha(self, which: int, r: int = 0) -> Term:
         """The expert's alpha of GEMM ``which`` (1 / 2) for slot ``r``: a per-expert leaf."""
@@ -224,10 +233,16 @@ class MoENvfp4Spec(S.MoESpec):
         s = self.row_scale(1, r)
         if not self.gated:
             return act_scaled_pre(
-                self.alg, self.acc("u", r, j), s, self.act, self.params
+                self.alg, self.acc("u", r, j), s, self.act, self.params, self.hw
             )
         return glu_scaled_pre(
-            self.alg, self.acc("g", r, j), self.acc("u", r, j), s, self.act, self.params
+            self.alg,
+            self.acc("g", r, j),
+            self.acc("u", r, j),
+            s,
+            self.act,
+            self.params,
+            self.hw,
         )
 
     def gemm1_block(self, r: int = 0, b: int = 0) -> Dict[str, Any]:
@@ -242,7 +257,7 @@ class MoENvfp4Spec(S.MoESpec):
         s = self.row_scale(1, r)
         if not self.gated:
             return act_scaled_elem(
-                self.alg, self.acc("u", r, j), s, self.act, "bf16", self.params
+                self.alg, self.acc("u", r, j), s, self.act, "bf16", self.params, self.hw
             )
         return glu_scaled_elem(
             self.alg,
@@ -252,6 +267,7 @@ class MoENvfp4Spec(S.MoESpec):
             self.act,
             "bf16",
             self.params,
+            self.hw,
         )
 
     def gemm2(self, r: int = 0, h: int = 0) -> Term:
@@ -261,8 +277,10 @@ class MoENvfp4Spec(S.MoESpec):
 
     @property
     def name(self) -> str:
-        return f"{CLASS}.{self.act}" + (
-            ".static" if self.intermediate == "static" else ""
+        return (
+            f"{CLASS}.{self.act}"
+            + (".static" if self.intermediate == "static" else "")
+            + (".hw" if self.hw else "")
         )
 
 
@@ -277,6 +295,7 @@ def spec_fingerprint_nvfp4(
     gated: Optional[bool] = None,
     fp4_class: Tuple[str, str] = ("nvfp4", "nvfp4"),
     intermediate: str = "per_token",
+    arith: str = "exact",
 ) -> str:
     """Identifier of the class: the routing weights of slots 0 and k-1, the GEMM1 chain, the dense NVFP4 GEMM classes of
     both expert weights (named per GEMM: the instruction class is a dimension), the input quantization class at row length
@@ -290,7 +309,17 @@ def spec_fingerprint_nvfp4(
     )
 
     s = MoENvfp4Spec(
-        H, I, k, E, method, act, params, gated, fp4_class, intermediate=intermediate
+        H,
+        I,
+        k,
+        E,
+        method,
+        act,
+        params,
+        gated,
+        fp4_class,
+        intermediate=intermediate,
+        arith=arith,
     )
     if intermediate == "static":
         blk = s.gemm1_block(0, 0)

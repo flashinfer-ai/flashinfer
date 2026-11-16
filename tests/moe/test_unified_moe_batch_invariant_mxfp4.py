@@ -836,6 +836,92 @@ def test_every_tactic_computes_the_class_and_autotuning_keeps_the_bits(T):
 
 
 @needs_device
+def test_hardware_arith_class_of_the_mx_pair():
+    """``moe.mxfp4.<act>.hw`` (``BatchInvariantFp4Config(activation_arith="hardware")`` on the MXFP4 pair): deterministic across
+    runs and under graph replay, a sub-batch's rows equal the full batch's, differs from the exact class only through the
+    intermediate quantization's code flips, its fingerprint its own (the ReLU family's unchanged), a pack of the other
+    arithmetic refused."""
+    from flashinfer.batch_invariant.fp_interface import sfu
+    from flashinfer.fused_moe.batch_invariant import mterm
+    from flashinfer.fused_moe.batch_invariant.api_mxfp4 import (
+        MoEWeightsMXFP4,
+        fused_moe_mxfp4,
+    )
+    from flashinfer.fused_moe.batch_invariant.spec_mxfp4 import (
+        MoEMxfp4Spec,
+        spec_fingerprint_mxfp4,
+    )
+
+    mterm.bind_sfu_tables(sfu.tables_for(torch.device("cuda")))
+    T, k, H, I, E = 45, 4, 512, 256, 16
+    x, logits, w1, w2 = _problem(T, k, H, I, E, seed=61)
+    ids, weights = _reference_route(logits, k, RoutingMethodType.Renormalize)
+    ids, weights = ids.cuda(), weights.cuda()
+    Wx = _weights_of(_weights(w1, w2))
+    Wh = MoEWeightsMXFP4.prepare(w1, w2, arith="hw")
+    assert Wh.chain1.hw and Wh.chain1.describe().endswith("_hw")
+    ox, im_x = fused_moe_mxfp4(x, ids, weights, Wx, return_intermediates=True)
+    oh, im_h = fused_moe_mxfp4(x, ids, weights, Wh, return_intermediates=True)
+    assert torch.equal(bits(oh), bits(fused_moe_mxfp4(x, ids, weights, Wh)))
+    # against the exact class: the two differ only through the intermediate's quantization (a token whose intermediate
+    # rows agree bit for bit has the exact class's output row; every element within a fraction of its row's magnitude)
+    tok_eq = (
+        (bits(im_h["a"]) == bits(im_x["a"])).all(dim=1)[im_h["dest"].long()].all(dim=1)
+    )
+    assert tok_eq.any()
+    assert torch.equal(bits(oh[tok_eq]), bits(ox[tok_eq]))
+    amax_row = ox.float().abs().amax(dim=-1, keepdim=True)
+    assert ((oh.float() - ox.float()).abs() <= 2.0**-3 * amax_row).all()
+    sub = fused_moe_mxfp4(
+        x[:9].contiguous(), ids[:9].contiguous(), weights[:9].contiguous(), Wh
+    )
+    assert torch.equal(bits(sub), bits(oh[:9]))
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        fused_moe_mxfp4(x, ids, weights, Wh)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            og = fused_moe_mxfp4(x, ids, weights, Wh)
+        og.zero_()
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(og), bits(oh))
+    fx = spec_fingerprint_mxfp4(H, I, k, E)
+    fh = spec_fingerprint_mxfp4(H, I, k, E, arith="hw")
+    assert fx != fh
+    assert (
+        MoEMxfp4Spec(H, I, k, E, arith="hw").name
+        == MoEMxfp4Spec(H, I, k, E).name + ".hw"
+    )
+    assert spec_fingerprint_mxfp4(
+        H, I, k, E, act="relu2", gated=False, arith="hw"
+    ) == spec_fingerprint_mxfp4(H, I, k, E, act="relu2", gated=False)
+    # the layer: the hardware config computes the class; a pack of the exact class is refused and the converse
+    cfg_h = _config(
+        k, E, I, backend=BatchInvariantFp4Config(activation_arith="hardware")
+    )
+    layer_h = MoELayer(cfg_h, device=torch.device("cuda"))
+    view_h = BatchInvariantFp4Config.prepare_weights(
+        w1,
+        w2,
+        quant=_MX,
+        num_local_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        activation_arith="hardware",
+    )
+    assert view_h["activation_arith"] == "hw"
+    pack_h = MoEWeightPack({})
+    pack_h.prepare_for(KEY, view_h)
+    out_h = layer_h(_logits_pack(x, logits), pack_h)
+    assert torch.equal(bits(out_h), bits(layer_h(_logits_pack(x, logits), pack_h)))
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        layer_h(_logits_pack(x, logits), _weights(w1, w2))
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        _layer(k, E, I)(_logits_pack(x, logits), pack_h)
+
+
+@needs_device
 def test_swapped_gather_record_gives_the_box_forms_bits_on_every_pack_form():
     """The MXFP4 pair's swapped gather records (:func:`...api_nvfp4.fused_moe_nvfp4`'s form on this class): the box form's bits for
     the bf16 input, the pre-quantized pair with the 128x4 and with the linear scale layout, every token tile; the padded

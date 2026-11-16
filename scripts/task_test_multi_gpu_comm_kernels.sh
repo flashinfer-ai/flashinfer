@@ -31,6 +31,12 @@ TORCHRUN_TEST_FILES="tests/attention/test_parallel_attention.py tests/gemm/test_
 SM107_TEST_FILES="tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py tests/moe_ep/test_sm107_routing_graph_multirank.py tests/moe_ep/test_sm107_auto_multirank.py tests/moe_ep/test_sm107_variant_selection_multirank.py"
 : "${TORCHRUN_PREFIX:=torchrun --nproc_per_node=4}"
 
+# BI qualification needs an allocation-wide torchrun, not a one-GPU pytest
+# shard. Enroll only explicitly selected targets; ordinary bare comm runs keep
+# their existing scope. The strict qualifier supplies per-rank JUnit results.
+MEGAMOE_BI_TEST_FILES="tests/moe_ep/test_bf16_megamoe_batch_invariant.py tests/moe_ep/test_nvfp4_megamoe_batch_invariant.py tests/moe_ep/test_mxfp4_megamoe_batch_invariant.py tests/moe_ep/test_mxfp8_megamoe_batch_invariant.py tests/moe_ep/test_a16_megamoe_batch_invariant.py tests/moe_ep/test_megamoe_quantized_tiles_batch_invariant.py tests/moe_ep/test_megamoe_numerical_variants.py tests/moe_ep/test_blackwell_bi_outer_autoconfig.py"
+: "${MEGAMOE_BI_WORLD_SIZE:=4}"
+
 _run_pytest_group() {
     local files="$1"
     if [ -z "$files" ]; then
@@ -70,7 +76,48 @@ print(int(bool(torch.version.cuda)
             SM107_TEST_FILES=""
         fi
     fi
-    if [ -n "${TEST_PATH:-}" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}" ]; then
+    if [ -n "${TEST_PATH:-}" ]; then
+        MEGAMOE_BI_TEST_FILES="$(filter_files_by_test_path "$MEGAMOE_BI_TEST_FILES")"
+    else
+        MEGAMOE_BI_TEST_FILES=""
+    fi
+    local -a bi_families=() bi_command=()
+    local bi_file family
+    for bi_file in $MEGAMOE_BI_TEST_FILES; do
+        if [[ "$bi_file" == *test_blackwell_bi_outer_autoconfig.py ]]; then
+            for family in bf16 nvfp4 a16; do
+                [[ " ${bi_families[*]} " == *" $family "* ]] || bi_families+=("$family")
+            done
+            continue
+        fi
+        if [[ "$bi_file" == *test_megamoe_numerical_variants.py ]]; then
+            for family in bf16 nvfp4 mxfp4 mxfp8; do
+                [[ " ${bi_families[*]} " == *" $family "* ]] || bi_families+=("$family")
+            done
+            continue
+        fi
+        if [[ "$bi_file" == *test_megamoe_quantized_tiles_batch_invariant.py ]]; then
+            for family in nvfp4 mxfp4 mxfp8; do
+                [[ " ${bi_families[*]} " == *" $family "* ]] || bi_families+=("$family")
+            done
+            continue
+        fi
+        family=${bi_file#tests/moe_ep/test_}
+        family=${family%_megamoe_batch_invariant.py}
+        [[ " ${bi_families[*]} " == *" $family "* ]] || bi_families+=("$family")
+    done
+    if [ "${#bi_families[@]}" -gt 0 ]; then
+        bi_command=("${PYTHON:-python}" tests/moe_ep/qualify_batch_invariant.py
+            --suite multi --families "${bi_families[@]}"
+            --world-size "${MEGAMOE_BI_WORLD_SIZE}" --output-dir "${JUNIT_DIR}/megamoe-bi")
+        # Scope/launcher inspection must not install packages or touch GPUs.
+        if [ "$DRY_RUN" == "true" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}" ]; then
+            "${bi_command[@]}" --plan
+            test_status_complete 0
+            exit 0
+        fi
+    fi
+    if [ -n "${TEST_PATH:-}" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}${MEGAMOE_BI_TEST_FILES}" ]; then
         echo "No multi-GPU files overlap TEST_PATH=${TEST_PATH}; skipping."
         test_status_complete 0
         exit 0
@@ -101,6 +148,25 @@ print(int(bool(torch.version.cuda)
     for test_file in $TORCHRUN_TEST_FILES; do
         echo "  $test_file"
     done
+
+    if [ "${#bi_families[@]}" -gt 0 ]; then
+        echo "MegaMoE BI qualification (physical EP${MEGAMOE_BI_WORLD_SIZE}): ${bi_families[*]}"
+        if [ "$DRY_RUN" == "true" ]; then
+            "${bi_command[@]}" --plan
+        else
+            local bi_status=0 bi_receipt
+            bi_receipt=$(test_status_start)
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+            "${bi_command[@]}" || bi_status=$?
+            if [ "$bi_status" -eq 0 ]; then
+                PASSED_TESTS=$((PASSED_TESTS + 1))
+            else
+                record_failed_test "MegaMoE BI qualification"
+                EXIT_CODE=1
+            fi
+            test_status_finish "${bi_receipt}" "${bi_status}"
+        fi
+    fi
     echo ""
 
     for test_file in $TORCHRUN_TEST_FILES; do
@@ -144,7 +210,7 @@ print(int(bool(torch.version.cuda)
     done
 
     # Counters are cumulative across all groups, so this is the overall summary.
-    if [ "$DRY_RUN" != "true" ] && [ -n "$TORCHRUN_TEST_FILES" ]; then
+    if [ "$DRY_RUN" != "true" ] && [ -n "${TORCHRUN_TEST_FILES}${MEGAMOE_BI_TEST_FILES}" ]; then
         print_execution_summary
     fi
 

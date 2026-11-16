@@ -167,6 +167,9 @@ class MoEWeightsNVFP4:
     intermediate: str = "per_token"
     gs2: Optional[torch.Tensor] = None
     inv2: Optional[torch.Tensor] = None
+    #: the chain's arithmetic (``spec.ARITHS``): ``exact`` (`moe.nvfp4.<act>`) or ``hw`` (`moe.nvfp4.<act>.hw`: the
+    #: hardware-arithmetic class, the part's ``ex2`` / ``rcp`` in the chain; the chains without them stay the exact class)
+    arith: str = "exact"
 
     @staticmethod
     def prepare(
@@ -179,6 +182,7 @@ class MoEWeightsNVFP4:
         global_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         intermediate: str = "per_token",
         intermediate_scales: Optional[torch.Tensor] = None,
+        arith: str = "exact",
     ) -> "MoEWeightsNVFP4":
         """Quantize bf16 experts (``fc1 [E, 2I, H]`` rows ``[up, gate]``, or ``[E, I, H]`` ungated; ``fc2 [E, H, I]``) with the
         batch-invariant per-tensor NVFP4 class, one global scale per expert and GEMM (``global_scales = (gs1 [E], gs2 [E])``,
@@ -192,6 +196,8 @@ class MoEWeightsNVFP4:
             raise ValueError(
                 f"intermediate must be one of {INTERMEDIATES}, not {intermediate!r}"
             )
+        if arith not in S.ARITHS:
+            raise ValueError(f"arith must be one of {S.ARITHS}, not {arith!r}")
         act = act if act is not None else ("silu" if gated else "relu2")
         if act not in (S.ACTS if gated else S.UNGATED_ACTS):
             raise ValueError(f"no {'gated' if gated else 'ungated'} chain {act!r}")
@@ -273,6 +279,7 @@ class MoEWeightsNVFP4:
             intermediate,
             gs_inter,
             inv_inter,
+            arith,
         )
 
     @property
@@ -304,6 +311,7 @@ class MoEWeightsNVFP4:
             "nvfp4" if self.static else "bf16",
             self.params,
             "w4a4",
+            arith=self.arith,
         )
 
     @property
@@ -330,6 +338,7 @@ class MoEWeightsNVFP4:
             "intermediate": self.intermediate,
             "intermediate_scale": self.gs2,
             "intermediate_inv_scale": self.inv2,
+            "activation_arith": self.arith,
         }
 
     @staticmethod
@@ -350,6 +359,7 @@ class MoEWeightsNVFP4:
             str(view.get("intermediate", "per_token")),
             view.get("intermediate_scale"),  # type: ignore[arg-type]
             view.get("intermediate_inv_scale"),  # type: ignore[arg-type]
+            str(view.get("activation_arith", "exact")),
         )
 
 

@@ -61,8 +61,15 @@ class MegaMoEBf16Nvfp4Config:
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
     use_custom_finalize: bool = False
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    has_fc1_norm_const: bool = dataclasses.field(default=False, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+            validate_a16_batch_invariant,
+        )
+
+        validate_a16_batch_invariant(self)
         if self.use_custom_finalize and (
             self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
         ):
@@ -89,7 +96,7 @@ class MegaMoEBf16Nvfp4Config:
                 raise ValueError(
                     "situ_linear_beta must be positive and finite when set."
                 )
-            if self.gate_up_clamp is not None:
+            if self.gate_up_clamp is not None and not self.batch_invariant:
                 raise ValueError("gate_up_clamp is not supported with SiTU.")
         elif self.situ_beta is not None or self.situ_linear_beta is not None:
             raise ValueError("SiTU parameters require activation='situ'.")
@@ -180,10 +187,21 @@ class MegaMoEBf16Nvfp4Frontend:
         self._staging_variants: dict[tuple[torch.dtype, bool, bool], Callable] = {}
         self._unstaged_variants: dict[bool, Callable] = {}
         self._launch_inputs: Optional[MegaMoEBf16Nvfp4Inputs] = None
+        self._compile_prepare: Optional[dict] = None
 
     @property
     def config(self) -> MegaMoEBf16Nvfp4Config:
         return self._config
+
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        if not self.config.batch_invariant:
+            return None
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.a16_batch_invariant import (
+            a16_batch_invariant_fingerprint,
+        )
+
+        return a16_batch_invariant_fingerprint(self.config)
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         if self._config.gate_up_clamp != clamp:
@@ -228,6 +246,7 @@ class MegaMoEBf16Nvfp4Frontend:
                 "situ_beta": self.config.situ_beta,
                 "situ_linear_beta": self.config.situ_linear_beta,
                 "use_custom_finalize": self.config.use_custom_finalize,
+                "batch_invariant": self.config.batch_invariant,
             },
         )
         if new_config != self._config:
@@ -243,6 +262,7 @@ class MegaMoEBf16Nvfp4Frontend:
         self._staging_variants.clear()
         self._unstaged_variants.clear()
         self._launch_inputs = None
+        self._compile_prepare = None
 
     @staticmethod
     def _to_cute(
@@ -257,65 +277,115 @@ class MegaMoEBf16Nvfp4Frontend:
             leading_dim=cutlass_torch.get_leading_dim(tensor)
         )
 
+    def prepare_tuning_local(self, knobs, *, config_overrides=None):
+        """Construct a candidate before any rank enters a storage collective."""
+        from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import tuner
+
+        trial = type(self)(tuner.with_checked_knobs(self.config, knobs))
+        overrides = dict(config_overrides or {})
+        if "gate_up_clamp" in overrides:
+            trial.set_gate_up_clamp(overrides.pop("gate_up_clamp"))
+        if overrides:
+            trial._config = dataclasses.replace(trial.config, **overrides)
+        trial._compile_prepare = trial._prepare_compile_local()
+        return trial
+
+    def prepare_tuning_release(self, prepared):
+        if type(prepared) is not type(self):
+            raise TypeError("incompatible W4A16 tuning preparation")
+        self.release()
+        self.__dict__.update(prepared.__dict__)
+
+    def prepare_tuning_allocate_local(self, prepared):
+        self._allocate_compile_local()
+
+    def prepare_tuning_collective(self, prepared):
+        self._prepare_compile_symmetric()
+
+    def _prepare_compile_local(self):
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+        import cutlass
+
+        from .megamoe_kernel import Sm100W4A16MegaMoEKernel
+
+        c = self.config
+        cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
+        sm_count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        max_active_clusters = max(1, sm_count // cluster_size)
+        kernel = Sm100W4A16MegaMoEKernel(
+            mma_tiler_mnk=c.mma_tiler_mnk,
+            cluster_shape_mnk=c.cluster_shape_mnk,
+            use_2cta_instrs=c.use_2cta_instrs,
+            group_hint=c.group_hint or max_active_clusters,
+            token_padding_block=c.mma_tiler_mnk[1],
+            load_balance_mode=c.load_balance_mode,
+            static_expert_shape=(
+                c.num_experts_per_rank,
+                2 * c.intermediate,
+                c.hidden,
+            ),
+            force_static_sched=c.force_static_sched,
+            num_sched_stages=c.num_sched_stages,
+            ab_dtype=cutlass.BFloat16,
+            world_size=c.world_size,
+            num_topk=c.num_topk,
+            max_tokens_per_rank=c.num_tokens_per_rank,
+            hidden=c.hidden,
+            in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
+            token_back_mode=c.token_back_mode,
+            epi_flag_batch=c.epi_flag_batch,
+            flag_batch=c.flag_batch,
+            gate_up_clamp=c.gate_up_clamp,
+            apply_routing_weights_before_fc2=(c.apply_routing_weights_before_fc2),
+            swiglu_alpha=c.swiglu_alpha,
+            swiglu_beta=c.swiglu_beta,
+            situ_beta=c.situ_beta,
+            situ_linear_beta=c.situ_linear_beta,
+            batch_invariant=c.batch_invariant,
+        )
+        local_bytes, shared_bytes = kernel.get_workspace_sizes()
+        return dict(kernel=kernel, local_bytes=local_bytes, shared_bytes=shared_bytes)
+
+    def _allocate_compile_local(self):
+        p = self._compile_prepare
+        if p is None:
+            raise RuntimeError("missing local W4A16 preparation")
+        try:
+            p["local_workspace"] = torch.zeros(
+                p["local_bytes"], dtype=torch.uint8, device="cuda"
+            )
+        except Exception:
+            p.clear()
+            self._compile_prepare = None
+            raise
+
+    def _prepare_compile_symmetric(self):
+        p = self._compile_prepare
+        if p is None:
+            raise RuntimeError("missing local W4A16 preparation")
+        shared_workspace = sym_zeros((p["shared_bytes"],), torch.uint8)
+        # Keep ownership if peer mapping or compilation subsequently fails.
+        self._mega = _CompiledMega(
+            compiled=None,
+            kernel=p["kernel"],
+            local_workspace=p["local_workspace"],
+            shared_workspace=shared_workspace,
+            symmetric_base=0,
+            peer_offsets_list=(),
+        )
+        self._mega.symmetric_base, self._mega.peer_offsets_list = _compute_peer_offsets(
+            shared_workspace, self.config.world_size
+        )
+
     def _ensure_compiled(self, inputs: MegaMoEBf16Nvfp4Inputs) -> _CompiledMega:
         # All input specializations share one collective workspace allocation.
         if self._mega is None:
-            ensure_not_capturing("cute.compile + symmetric-heap allocation")
-            import cutlass
-
-            from .megamoe_kernel import Sm100W4A16MegaMoEKernel
-
-            c = self.config
-            cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
-            sm_count = torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            max_active_clusters = max(1, sm_count // cluster_size)
-            kernel = Sm100W4A16MegaMoEKernel(
-                mma_tiler_mnk=c.mma_tiler_mnk,
-                cluster_shape_mnk=c.cluster_shape_mnk,
-                use_2cta_instrs=c.use_2cta_instrs,
-                group_hint=c.group_hint or max_active_clusters,
-                token_padding_block=c.mma_tiler_mnk[1],
-                load_balance_mode=c.load_balance_mode,
-                static_expert_shape=(
-                    c.num_experts_per_rank,
-                    2 * c.intermediate,
-                    c.hidden,
-                ),
-                force_static_sched=c.force_static_sched,
-                num_sched_stages=c.num_sched_stages,
-                ab_dtype=cutlass.BFloat16,
-                world_size=c.world_size,
-                num_topk=c.num_topk,
-                max_tokens_per_rank=c.num_tokens_per_rank,
-                hidden=c.hidden,
-                in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
-                token_back_mode=c.token_back_mode,
-                epi_flag_batch=c.epi_flag_batch,
-                flag_batch=c.flag_batch,
-                gate_up_clamp=c.gate_up_clamp,
-                apply_routing_weights_before_fc2=(c.apply_routing_weights_before_fc2),
-                swiglu_alpha=c.swiglu_alpha,
-                swiglu_beta=c.swiglu_beta,
-                situ_beta=c.situ_beta,
-                situ_linear_beta=c.situ_linear_beta,
-            )
-            local_bytes, shared_bytes = kernel.get_workspace_sizes()
-            local_workspace = torch.zeros(local_bytes, dtype=torch.uint8, device="cuda")
-            shared_workspace = sym_zeros((shared_bytes,), torch.uint8)
-            symmetric_base, peer_offsets_list = _compute_peer_offsets(
-                shared_workspace, c.world_size
-            )
-            mega = _CompiledMega(
-                compiled=None,
-                kernel=kernel,
-                local_workspace=local_workspace,
-                shared_workspace=shared_workspace,
-                symmetric_base=symmetric_base,
-                peer_offsets_list=peer_offsets_list,
-            )
-            self._mega = mega
+            if self._compile_prepare is None:
+                self._compile_prepare = self._prepare_compile_local()
+                self._allocate_compile_local()
+            self._prepare_compile_symmetric()
         mega = self._mega
         use_norm = inputs.fc1_norm_const is not None
         if inputs.staging_inputs is None:
@@ -326,6 +396,7 @@ class MegaMoEBf16Nvfp4Frontend:
             key = (*self._staging_key(inputs.staging_inputs), use_norm)
             if key not in self._staging_variants:
                 self._staging_variants[key] = self._compile(inputs, mega, key)
+        self._compile_prepare = None
         return mega
 
     def _warm_staging_variants(
@@ -512,7 +583,9 @@ class MegaMoEBf16Nvfp4Frontend:
             mega.launch_kwargs = self._runtime_kwargs(inputs, mega)
             mega.launch_key = key
             self._launch_inputs = inputs
-        if self.config.in_kernel_fc2_reduce:
+        if self.config.in_kernel_fc2_reduce or (
+            self.config.batch_invariant and self.config.use_custom_finalize
+        ):
             inputs.combine_output.zero_()
         compiled = (
             mega.compiled
@@ -549,7 +622,9 @@ class MegaMoEBf16Nvfp4Frontend:
                 )
             ]
         )
-        if self.config.in_kernel_fc2_reduce:
+        if self.config.in_kernel_fc2_reduce or (
+            self.config.batch_invariant and self.config.use_custom_finalize
+        ):
 
             def thunk(_inputs=inputs):
                 _inputs.combine_output.zero_()
@@ -600,6 +675,10 @@ class MegaMoEBf16Nvfp4Frontend:
             raise ValueError("topk_idx/topk_weights must be int64/float32.")
         packed_dtypes = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", None))
         norm = inputs.fc1_norm_const
+        if c.batch_invariant and (norm is not None) != c.has_fc1_norm_const:
+            raise ValueError(
+                "batch_invariant W4A16 normalization presence is fixed at construction"
+            )
         if norm is not None and (
             norm.shape != (c.num_experts_per_rank,)
             or norm.dtype != torch.float32
@@ -663,8 +742,12 @@ class MegaMoEBf16Nvfp4Frontend:
                 f"with shape ({num_tokens}, {c.hidden})."
             )
 
-    def reduce_topk(self, combined, scores, output):
+    def reduce_topk(self, combined, scores, output, topk_idx=None):
         """Combine BF16 FC2 partials in FP32, weighting if FC1 did not."""
+        if self.config.batch_invariant and topk_idx is None:
+            raise ValueError(
+                "batch_invariant top-k reduction requires current topk_idx"
+            )
         # Empty source ranks still execute the collective fused kernel, but
         # have no local rows to reduce and must not launch a zero-block grid.
         if output.shape[0] == 0:
@@ -697,9 +780,18 @@ class MegaMoEBf16Nvfp4Frontend:
                 self.config.num_topk,
                 CombineFormat.parse("bf16"),
                 sm_arch=get_cutedsl_target_arch(),
+                num_experts=self.config.num_total_experts,
+                batch_invariant=self.config.batch_invariant,
             )
-            self._reduce = cute.compile(reducer, *args)
-        self._reduce(*args)
+            self._reduce = cute.compile(
+                reducer,
+                *args,
+                topk_indices=compact(topk_idx) if self.config.batch_invariant else None,
+            )
+        self._reduce(
+            *args,
+            topk_indices=compact(topk_idx) if self.config.batch_invariant else None,
+        )
 
 
 @dataclass
@@ -781,6 +873,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
 ) -> MegaMoEBf16Nvfp4SymmBuffer:
     """Allocate stable per-expert scales and BF16 transport buffers.
 
@@ -813,6 +906,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         gate_up_clamp=clamp,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -820,6 +914,8 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         use_custom_finalize=use_custom_finalize,
+        batch_invariant=batch_invariant,
+        has_fc1_norm_const=fc1_norm_const is not None,
     )
 
     # Match the existing Mega cache contract: None is a pure capacity-keyed
@@ -837,6 +933,14 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
             use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            gate_up_clamp=clamp,
+            handoff_norm=fc1_norm_const is not None,
         )
     else:
         resolved_knobs = {}
@@ -854,6 +958,8 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         "situ_beta": situ_beta,
         "situ_linear_beta": situ_linear_beta,
         "use_custom_finalize": use_custom_finalize,
+        "batch_invariant": batch_invariant,
+        "has_fc1_norm_const": fc1_norm_const is not None,
     }
     if not tuner.is_valid_bf16_nvfp4_for_config(cfg, optional_config):
         raise ValueError(
