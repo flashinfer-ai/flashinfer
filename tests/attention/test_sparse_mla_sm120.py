@@ -1445,6 +1445,8 @@ def test_sparse_mla_sm120_prefill_dsv3_2_runtime_heads(num_heads: int) -> None:
         graph.replay()
         check_reference()
     if num_heads in (48, 96):
+        output.fill_(float("nan"))
+        out_lse.fill_(float("nan"))
         run("mg")
         check_reference()
 
