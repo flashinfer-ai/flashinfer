@@ -1237,8 +1237,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
@@ -1607,8 +1607,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
 
-        scale_softmax_log2 = softmax_scale * LOG2_E
-
         kernel_split_kv = (
             Int32(self.static_split_kv)
             if cutlass.const_expr(self.static_split_kv is not None)
@@ -1675,6 +1673,12 @@ class MlaDecodeTs(Nvfp4KVConfig):
         # before reading partials. Persistent schedules retain stream ordering.
         use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
+        # Host FP32 scales enter the device kernel in log2 units. Device
+        # buffers retain natural units until they are loaded by the kernel.
+        softmax_scale_operand = softmax_scale
+        if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
+            softmax_scale_operand = softmax_scale * LOG2_E
+
         self.split_kv_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -1692,7 +1696,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cache_seqs,
             cu_seqlens_q,
             block_split_kvs,
-            scale_softmax_log2,
+            softmax_scale_operand,
             output_scale,
             tile_sched_params,
             clc_tile_sched_params,
@@ -1917,8 +1921,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
-        scale_softmax_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale_operand: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
         output_quant_args=None,
@@ -1930,10 +1934,20 @@ class MlaDecodeTs(Nvfp4KVConfig):
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
+        if cutlass.const_expr(acc_o is not None and not self.is_persistent):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * LOG2_E
+        else:
+            scale_softmax_log2 = softmax_scale_operand
+        if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
+            output_scale = output_scale[0]
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
             si, ci, sl, cl, sinks, ks = block_split_kvs
+            if cutlass.const_expr(isinstance(ks, cute.Tensor)):
+                ks = ks[0]
             capacity = ((Int32(si.shape[-1]) + 127) // 128) * 128
             if cutlass.const_expr(self.direct_sparse_capacities[1] > 0):
                 capacity = capacity + ((Int32(ci.shape[-1]) + 127) // 128) * 128

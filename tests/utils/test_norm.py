@@ -20,8 +20,11 @@ import os
 import pytest
 import torch
 import torch.nn.functional as F
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
-from tests.test_helpers.pdl import late_store
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
+from tests.utils.test_helpers.pdl import late_store
 
 import flashinfer
 from flashinfer.jit import env as jit_env
@@ -658,6 +661,7 @@ def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
     """
     cutlass = pytest.importorskip("cutlass")
     from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
+    from flashinfer.norm.utils import max_cluster_n
 
     cute_dtype = {
         torch.float16: cutlass.Float16,
@@ -677,7 +681,8 @@ def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
     affordable = [
         cluster_n
         for cluster_n in (1, 2, 4, 8, 16)
-        if hidden_size % cluster_n == 0
+        if cluster_n <= max_cluster_n(kernel.sm_version)
+        and hidden_size % cluster_n == 0
         and RMSNormKernel._estimate_smem_bytes(hidden_size, cluster_n, elem_size)
         <= optin // 2
     ]
@@ -693,6 +698,54 @@ def test_norm_cluster_budget_keeps_async_copy(hidden_size, dtype):
         f"{'on' if kernel.use_async_copy else 'off'}"
     )
     assert kernel.use_async_copy
+
+
+@pytest.mark.parametrize("probed", [8, None])
+@pytest.mark.parametrize("sm_version", [120, 121])
+@pytest.mark.parametrize(
+    "hidden_size,dtype",
+    [
+        (131072, torch.float32),
+        (163840, torch.float32),
+        (524288, torch.float16),
+        (1048576, torch.bfloat16),
+    ],
+)
+def test_norm_cluster_n_capped_on_sm12x(
+    monkeypatch, probed, sm_version, hidden_size, dtype
+):
+    """DGX Spark (SM121) rejects 16-CTA clusters (#8745).
+
+    The norm kernels must stay at or below the driver's largest cluster, and at
+    the portable 8 on SM12x when the driver cannot answer.
+    """
+    cutlass = pytest.importorskip("cutlass")
+    from types import SimpleNamespace
+
+    import flashinfer.norm.utils as norm_utils
+    from flashinfer.norm.kernels.fused_add_rmsnorm import FusedAddRMSNormKernel
+    from flashinfer.norm.kernels.rmsnorm import RMSNormKernel
+
+    monkeypatch.setattr(norm_utils, "_probe_max_cluster_n", lambda *_: probed)
+
+    # SM120 / SM121 opt-in shared memory per block (99 KiB).
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_: SimpleNamespace(shared_memory_per_block_optin=101376),
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    cute_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[dtype]
+    for kernel_cls in (RMSNormKernel, FusedAddRMSNormKernel):
+        cluster_n = kernel_cls._compute_cluster_n(hidden_size, cute_dtype, sm_version)
+        assert cluster_n <= 8 and hidden_size % cluster_n == 0, (
+            kernel_cls.__name__,
+            cluster_n,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1161,6 +1214,29 @@ def test_layernorm_cuda_row_stride(
 
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(storage, storage_before, rtol=0, atol=0)
+
+
+def test_layernorm_cuda_row_offset_beyond_int32(monkeypatch):
+    """The second row starts past INT32_MAX, so it needs the 64-bit offset path."""
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    hidden_size, eps = 128, 1e-6
+    # An odd stride selects the scalar path, where offsets count single elements.
+    row_stride = 2**31 + 1
+    numel = row_stride + hidden_size
+    if torch.cuda.mem_get_info()[0] < numel * 2 + (1 << 30):
+        pytest.skip("needs about 5 GB of free GPU memory")
+
+    torch.manual_seed(0)
+    storage = torch.empty(numel, dtype=torch.bfloat16, device="cuda")
+    x = storage.as_strided((2, hidden_size), (row_stride, 1))
+    x.copy_(torch.randn(2, hidden_size, dtype=torch.bfloat16, device="cuda"))
+    gamma = torch.randn(hidden_size, device="cuda")
+    beta = torch.randn(hidden_size, device="cuda")
+
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+    out_ref = F.layer_norm(x.float(), (hidden_size,), gamma, beta, eps).to(x.dtype)
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])

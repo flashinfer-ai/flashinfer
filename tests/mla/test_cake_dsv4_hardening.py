@@ -67,15 +67,38 @@ SEED_BASE = ref.TEST_SEED_BASE + 10_000
 _seed_counter = 0
 
 
-def _skip_unless_cake_gpu() -> None:
+def _skip_unless_cake_gpu(*, sm107: bool = False) -> None:
+    """Skip unless the GPU is SM100 or SM103, or SM107 when ``sm107`` is set
+    (the tests whose programs SM107 builds)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for CAKE DSv4 hardening tests")
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability not in ((10, 0), (10, 3)):
+    supported = ((10, 0), (10, 3), (10, 7)) if sm107 else ((10, 0), (10, 3))
+    if compute_capability not in supported:
+        names = "SM100/SM103/SM107" if sm107 else "SM100/SM103"
         pytest.skip(
-            "CAKE DeepSeek V4 sparse MLA requires SM100/SM103, "
+            f"CAKE DeepSeek V4 sparse MLA requires {names}, "
             f"got SM{compute_capability[0]}{compute_capability[1]}"
         )
+
+
+def _lowhead_prefill_variant(rows: int) -> str:
+    """The variant the host launches for a low-head prefill launch of ``rows``
+    query rows on this GPU: on SM107 the V-block sibling up to 27 rows and the
+    early-PV sibling up to 64 rows (both ceilings scaled down with the SM count
+    below 216 SMs), the route's program above them; elsewhere the route's
+    program."""
+    import flashinfer.mla.cake_dsv4 as cake
+
+    route = "fp8_lowhead_prefill"
+    if cake._target_arch(torch.device("cuda", 0)) != "sm_107a":
+        return route
+    sm_count = min(torch.cuda.get_device_properties(0).multi_processor_count, 216)
+    if rows <= 27 * sm_count // 216:
+        return f"{route}_vblock"
+    if rows <= 64 * sm_count // 216:
+        return f"{route}_overlap"
+    return route
 
 
 def _compressed_topk(h_q: int) -> int:
@@ -827,6 +850,8 @@ def _build_case(
     alias_compressed: bool = False,
     tile_padded: bool = False,
     beacon: bool = False,
+    newest_first: bool = False,
+    compressed_pages: int = 64,
     seed: Optional[int] = None,
 ) -> _Case:
     """Build one causal DSv4 case.
@@ -834,10 +859,12 @@ def _build_case(
     ``seq_lens`` / ``q_lens`` are per request (``layout="dense"`` needs equal
     ``q_lens``). SWA slot ``j < visible`` of a row holds the token
     ``token_idx - visible + 1 + j`` (ascending, ending at the query token's
-    position, the trtllm-gen table convention); slots beyond are ``-1``
+    position, the trtllm-gen table convention; ``newest_first``: slot ``j``
+    holds ``token_idx - j``, sglang's convention); slots beyond are ``-1``
     (``swa_tail="minus_one"``, sglang's padding) or stale valid rows of the
     SWA pool's poison page (``"stale"``). ``compressed_width`` compressed
-    columns hold random valid rows of a page-``compressed_page`` pool up to the
+    columns hold random valid rows of a page-``compressed_page`` pool of
+    ``compressed_pages`` pages up to the
     row's active count (``compressed_lens``, default: the width); columns at
     or beyond it point at that pool's poison page; ``minus_one_inside`` turns
     every seventh active compressed slot into ``-1``. ``alias_compressed``
@@ -905,7 +932,10 @@ def _build_case(
     token_idx = seq_lens_t.long()[batch] - length + q_off
     visible = (token_idx + 1).clamp(0, SWA_WINDOW)
     j = torch.arange(SWA_WINDOW, device="cuda:0")
-    token = (token_idx[:, None] - visible[:, None] + 1 + j[None, :]).clamp_min(0)
+    if newest_first:
+        token = (token_idx[:, None] - j[None, :]).clamp_min(0)
+    else:
+        token = (token_idx[:, None] - visible[:, None] + 1 + j[None, :]).clamp_min(0)
     page = (token // PAGE_SWA).clamp_max(page_table.shape[1] - 1)
     flat = page_table[batch[:, None], page] * PAGE_SWA + token % PAGE_SWA
     in_window = j[None, :] < visible[:, None]
@@ -925,7 +955,7 @@ def _build_case(
         )
     swa_table = swa_table.to(torch.int32)
     if compressed_width:
-        comp_pages = 64
+        comp_pages = compressed_pages
         comp_pool = _random_rows(
             (comp_pages + extra_pages, 1, compressed_page, 512),
             offset=0.25,
@@ -1385,9 +1415,10 @@ def _sglang_case(h_q: int, form: str, *, compressed: bool, tail: str) -> _Case:
     """sglang's DSv4 trtllm-backend call shapes (FP8 query, float scales).
 
     decode: ``[B, 1, H, 512]`` with one ``seq_lens`` entry per row; mtp-dense:
-    ``[B, 4, H, 512]``; mtp-flat: the same batch as sglang passes it (one row per
-    draft token, per-row causal ``seq_lens``); prefill: ragged rows with
-    ``cum_seq_lens_q`` / ``max_q_len`` and 64-row tile-padded tables.
+    ``[B, 4, H, 512]``; mtp-wide: the same with 17 requests (68 rows); mtp-flat:
+    the same batch as mtp-dense as sglang passes it (one row per draft token,
+    per-row causal ``seq_lens``); prefill: ragged rows with ``cum_seq_lens_q`` /
+    ``max_q_len`` and 64-row tile-padded tables.
     """
     width = _compressed_width(h_q) if compressed else 0
     kwargs = dict(
@@ -1408,8 +1439,10 @@ def _sglang_case(h_q: int, form: str, *, compressed: bool, tail: str) -> _Case:
             compressed_lens=_mixed_compressed_lens(rows, width) if width else None,
             **kwargs,
         )
-    if form in ("mtp-dense", "mtp-flat"):
+    if form in ("mtp-dense", "mtp-flat", "mtp-wide"):
         seq = [4, 70, 127, 300, 2048]
+        if form == "mtp-wide":
+            seq = seq * 3 + [513, 1025]
         rows = 4 * len(seq)
         case = _build_case(
             seq_lens=seq,
@@ -1449,13 +1482,29 @@ def test_sglang_swa_only_convention(h_q, form, tail):
     _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
 
 
-@pytest.mark.parametrize("form", ["decode", "mtp-dense"])
-def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(form):
-    """The SWA-only FP8/H64 rows of one wave run the low-head prefill program; as
-    a programmatic dependent it is bitwise equal to the plain launch and, inside
-    a graph, reads the query the copy right before it writes."""
-    _skip_unless_cake_gpu()
+@pytest.mark.parametrize("form", ["decode", "mtp-dense", "mtp-wide"])
+def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(
+    monkeypatch, form
+):
+    """The SWA-only FP8/H64 rows of one wave run the low-head prefill route: on
+    SM107 its V-block sibling up to 27 rows (8 and 20 rows) and the route's
+    program above the early-PV sibling's 64 rows (68 rows), elsewhere the
+    route's program.  As a programmatic dependent each is bitwise equal to the
+    plain launch and, inside a graph, reads the query the copy right before it
+    writes."""
+    _skip_unless_cake_gpu(sm107=True)
+    import flashinfer.mla.cake_dsv4 as cake
+
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
     case = _sglang_case(64, form, compressed=False, tail="minus_one")
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
     route = _route(
         dtype=case.dtype,
         num_heads=case.num_heads,
@@ -1465,11 +1514,12 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(for
         batch_size=case.batch_size,
         compressed_page_size=int(case.compressed_kv_cache.shape[-2]),
         num_query_tokens=case.rows,
-        sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
+        sm_count=sm_count,
     )
     assert route == "fp8_lowhead_prefill", route
     workspace = _workspace_128mib()
     plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    assert set(launched) == {_lowhead_prefill_variant(case.rows)}, launched
     pdl = case.run(
         workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
     )
@@ -1491,10 +1541,15 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(for
 def test_enable_pdl_h64_cluster_body_matches_and_waits_for_the_query_producer(
     monkeypatch,
 ):
-    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program on
-    SM100/SM103; as a programmatic dependent it is bitwise equal to the plain
-    launch and, inside a graph, reads the query the copy right before it writes."""
+    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program (the
+    route on SM100; SM103 routes them to the persistent body, so the test
+    selects the program there); as a programmatic dependent it is bitwise
+    equal to the plain launch and, inside a graph, reads the query the copy
+    right before it writes."""
     _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    monkeypatch.setattr(cake, "_route", lambda **kwargs: "fp8_lowhead_h64")
     calls = _count_dispatches(monkeypatch)
     case = _build_case(
         num_heads=64,
@@ -1605,7 +1660,12 @@ def test_fixed_128mib_workspace_admits_1024_fp8_h128_rows(monkeypatch):
         alias_compressed=True,
     )
     req = case.requirement()
-    assert req.route == "fp8_h128_prefill_source_persistent" and req.num_splits == 1
+    # SM103 keeps SWA-only decode launches on the uniform-gather program.
+    assert req.route in (
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h128_prefill_source_persistent_uniform",
+    )
+    assert req.num_splits == 1
     assert req.single_launch_bytes <= WORKSPACE_128MIB
     assert req.rows_per_launch(WORKSPACE_128MIB) == 1024
     workspace = _workspace_128mib()
@@ -1786,6 +1846,177 @@ def _align_case(route, heads, dtype, q_lens, layout="dense", width=0, page=64, f
     return pytest.param(*args, id=f"{route}-{form}" if form else route)
 
 
+# ---------------------------------------------------------- index tables off the 16-byte row loads
+# The SWA-only FP8 8-head rows of the low-head prefill route on SM107's early-PV
+# sibling (48 rows: above the V-block sibling's 26 rows on 212 SMs and 27 on
+# 216, at most 62 rows on 212 SMs and 64 on 216) and on the route's own program
+# above it (68 rows); elsewhere both run the route's program.  Then
+# the persistent FP8/H128 route, whose topk4x rows every architecture builds and
+# routes there, and two routes SM107 does not build (the tests skip there).
+_INDEX_ALIGN_CASES = [
+    _align_case("fp8_lowhead_prefill", 8, _FP8, [4] * 12, form="48-rows"),
+    _align_case("fp8_lowhead_prefill", 8, _FP8, [4] * 17, form="68-rows"),
+    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64], width=512),
+    _align_case("fp8_lowhead_one_partition", 8, _FP8, [4] * 6, width=128),
+    _align_case(
+        "bf16_h128_topk128x", 128, _BF16, [20] * 2, width=256, page=2, form="row_first"
+    ),
+]
+_SM107_INDEX_ALIGN_ROUTES = (
+    "fp8_lowhead_prefill",
+    "fp8_h128_prefill_source_persistent",
+)
+
+
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,layout,width,page", _INDEX_ALIGN_CASES
+)
+def test_index_tables_off_the_row_loads_raise_before_launch(
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page
+):
+    """The BF16 / FP8 programs load index rows 16 bytes at a time.  A table 4
+    bytes into its parent (``parent[:, 1:]`` of a ``[T, W + 1]`` parent) or one
+    with an odd row stride (``parent[:, :W]``) raises ValueError before any
+    launch and leaves ``out`` untouched; a view 16 bytes into a ``[T, W + 4]``
+    parent runs in place (same launches and programs, nothing allocated) with
+    bitwise the output of the contiguous table."""
+    _skip_unless_cake_gpu(sm107=route in _SM107_INDEX_ALIGN_ROUTES)
+    import flashinfer.mla.cake_dsv4 as cake
+
+    calls = _count_dispatches(monkeypatch)
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
+    case = _build_case(
+        num_heads=num_heads,
+        dtype=dtype,
+        seq_lens=[_LONG_SEQ + 37 * i for i in range(len(q_lens))],
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=width,
+        compressed_page=page,
+    )
+    table = case.sparse_indices
+    assert table.is_contiguous() and table.data_ptr() % 16 == 0
+    rows, cols = table.shape
+    workspace = _workspace_128mib()
+    expected = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert calls and {r for r, _ in calls} == {route}
+    if route == "fp8_lowhead_prefill":
+        assert set(launched) == {_lowhead_prefill_variant(rows)}, launched
+    contiguous = (list(calls), set(launched))
+
+    off = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    off[:, 1:] = table
+    odd = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    odd[:, :cols] = table
+    calls.clear()
+    launched.clear()
+    for bad, message in (
+        (off[:, 1:], r"^sparse_indices must start at a 16-byte aligned address"),
+        (odd[:, :cols], r"^sparse_indices must have a row stride that is a multiple"),
+    ):
+        out = case.nan_out()
+        with pytest.raises(ValueError, match=message):
+            dataclasses.replace(case, sparse_indices=bad).run(
+                workspace=workspace, out=out, float_scales=True
+            )
+        torch.cuda.synchronize()
+        assert not calls and not launched, (calls, launched)
+        assert torch.isnan(out).all()
+
+    wide = torch.full((rows, cols + 4), -1, dtype=torch.int32, device="cuda:0")
+    wide[:, 4:] = table
+    view = wide[:, 4:]
+    assert view.data_ptr() == wide.data_ptr() + 16 and view.stride(0) == cols + 4
+    in_place = dataclasses.replace(case, sparse_indices=view)
+    out = case.nan_out()
+    # Only the allocation count needs the native caching allocator.
+    native = torch.cuda.get_allocator_backend() == "native"
+    requests = _allocation_requests() if native else None
+    got = in_place.run(workspace=workspace, out=out, float_scales=True)
+    torch.cuda.synchronize()
+    assert (list(calls), set(launched)) == contiguous, (calls, launched)
+    if native:
+        assert _allocation_requests() == requests, "an aligned index view was copied"
+    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+
+
+def test_row_tiled_launches_bind_an_aligned_index_view_in_place(monkeypatch):
+    """Row-tiled launches slice the index table by row.  A view 16 bytes into a
+    ``[T, W + 4]`` parent binds every chunk's rows in place, including chunks
+    that start at a row that is not a multiple of 4, with bitwise the tiled
+    output of the contiguous table; an odd row stride raises before the first
+    chunk."""
+    _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    bound: list = []
+    original = cake._dispatch_route
+
+    def spy(route, launcher):
+        values = launcher.values
+        bound.append(
+            (route, values["num_query_tokens"], values["swa_indices"].data_ptr())
+        )
+        return original(route, launcher)
+
+    monkeypatch.setattr(cake, "_dispatch_route", spy)
+    case = _tiling_case(layout="dense")
+    req = case.requirement()
+    assert req.route == "bf16_h32_topk128x_early_v47" and req.num_splits == 3
+    rows = case.rows
+    chunk = 37
+    small_bytes = cake_dsv4_workspace_layout(
+        chunk, 32, req.num_splits, num_query_offsets=case.batch_size + 1
+    ).total_bytes
+    assert req.rows_per_launch(small_bytes) == chunk
+    small = torch.zeros(small_bytes, dtype=torch.uint8, device="cuda:0")
+    firsts = list(range(0, rows, chunk))
+    assert len(firsts) > 1 and any(first % 4 for first in firsts)
+    expected = case.run(workspace=small, out=case.nan_out())
+    torch.cuda.synchronize()
+    tiles = [(req.route, min(chunk, rows - first)) for first in firsts]
+    assert [(r, n) for r, n, _ in bound] == tiles
+
+    table = case.sparse_indices
+    cols = int(table.shape[1])
+    wide = torch.full((rows, cols + 4), -1, dtype=torch.int32, device="cuda:0")
+    wide[:, 4:] = table
+    view = wide[:, 4:]
+    assert view.data_ptr() == wide.data_ptr() + 16 and view.stride(0) == cols + 4
+    bound.clear()
+    got = dataclasses.replace(case, sparse_indices=view).run(
+        workspace=small, out=case.nan_out()
+    )
+    torch.cuda.synchronize()
+    row_bytes = view.stride(0) * view.element_size()
+    assert bound == [
+        (r, n, view.data_ptr() + first * row_bytes)
+        for (r, n), first in zip(tiles, firsts, strict=True)
+    ]
+    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+
+    odd = torch.full((rows, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    odd[:, :cols] = table
+    bound.clear()
+    out = case.nan_out()
+    with pytest.raises(
+        ValueError, match=r"^sparse_indices must have a row stride that is a multiple"
+    ):
+        dataclasses.replace(case, sparse_indices=odd[:, :cols]).run(
+            workspace=small, out=out
+        )
+    torch.cuda.synchronize()
+    assert not bound and torch.isnan(out).all()
+
+
 # One call per route, and per O-writing program of the multi-program routes.
 _OUT_ALIGN_CASES = [
     _align_case(
@@ -1800,6 +2031,8 @@ _OUT_ALIGN_CASES = [
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [4] * 3, width=256, form="q4"),
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [1] * 3, width=256, form="q1"),
     _align_case("fp8_lowhead_prefill", 32, _FP8, [4] * 3),
+    # 66 tokens: above SM107's early-PV sibling ceiling, the route's own program there.
+    _align_case("fp8_lowhead_prefill", 32, _FP8, [22] * 3, form="66-rows"),
     # 12 tokens, sparse_topk 260: two complete tiles and a partial third.
     _align_case("fp8_lowhead_h64", 64, _FP8, [5, 4, 3], "ragged", 132, page=2),
     _align_case("fp8_h64_prefill_source_persistent_m64", 32, _FP8, [257]),
@@ -1809,7 +2042,7 @@ _OUT_ALIGN_CASES = [
     _align_case(
         "fp8_h128_prefill_source_persistent_uniform", 128, _FP8, [4] * 3, width=1024
     ),
-    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64]),
+    _align_case("fp8_h128_prefill_source_persistent", 128, _FP8, [64, 64], width=512),
     _align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512),
     _align_case("fp8_h8_h16_source_exact", 16, _FP8, [5, 3, 4], "ragged", 128),
     _align_case("bf16_h8_h16_source_exact", 16, _BF16, [5, 3, 4], "ragged", 128),
@@ -1847,9 +2080,24 @@ def test_misaligned_caller_out_matches_aligned(
     (``_OUT_ALIGN_BY_ROUTE``). A contiguous caller ``out`` 2 or 16 bytes off a
     32-byte boundary gets bitwise the aligned call's result through an aligned
     staging buffer, the bytes around it stay untouched, and an aligned ``out``
-    allocates nothing."""
-    _skip_unless_cake_gpu()
+    allocates nothing.  On SM107 the low-head prefill cases run the V-block
+    sibling up to its row ceiling (12 rows) and the route's program above the
+    early-PV sibling's (66 rows); elsewhere they run the route's program."""
+    _skip_unless_cake_gpu(sm107=route == "fp8_lowhead_prefill")
+    import flashinfer.mla.cake_dsv4 as cake
+
+    if route == "fp8_lowhead_h64":
+        # The route on SM100; SM103 runs these rows on the persistent body.
+        monkeypatch.setattr(cake, "_route", lambda **kwargs: route)
     calls = _count_dispatches(monkeypatch)
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
     case = _build_case(
         num_heads=num_heads,
         dtype=dtype,
@@ -1865,6 +2113,8 @@ def test_misaligned_caller_out_matches_aligned(
     case.run(workspace=workspace, out=aligned, float_scales=True)
     torch.cuda.synchronize()
     assert calls and {r for r, _ in calls} == {route}
+    if route == "fp8_lowhead_prefill":
+        assert set(launched) == {_lowhead_prefill_variant(sum(q_lens))}, launched
 
     again = case.nan_out()
     after_alloc = _allocation_requests()
@@ -1883,3 +2133,270 @@ def test_misaligned_caller_out_matches_aligned(
     torch.cuda.synchronize()
     assert torch.equal(view.view(torch.int16), aligned.view(torch.int16))
     assert torch.isnan(raw[:start]).all() and torch.isnan(raw[start + numel :]).all()
+
+
+# --------------------------------------------------------------------------- DeepSeek-V4 layer rows
+#
+# The rows DeepSeek-V4 serves, FP8 cache: every layer has the 128-token window
+# (sglang's table: column j holds position pos - j, newest first); a C4 layer
+# adds the top 512 (Flash) or 1024 (Pro) compressed rows, a C128 layer one row
+# per 128 positions (page 2), 128 + context / 128 slots wide; in decode the
+# C128 table is as wide as the server's context allows (padded to 64), so a
+# 16K server's rows hold 128 + 128 live slots of 320.  Flash runs 64
+# heads per rank under DP attention and 32 / 16 / 8 at TP2 / TP4 / TP8; Pro
+# runs 128, and 64 / 32 / 16 at TP2 / TP4 / TP8.  Decode batches reach past one
+# wave of two CTAs per token; MTP rows take 4 tokens per request; prefill is
+# two ragged requests.
+
+# layer -> (compressed width, compressed page size, live compressed slots or
+# None: every slot the position has produced)
+_DSV4_LAYERS = {
+    "swa": (0, 64, None),
+    "c4flash": (512, 64, None),
+    "c4pro": (1024, 64, None),
+    "c128-16k": (128, 2, None),
+    "c128-16k-server": (192, 2, 128),
+    "c128-64k": (512, 2, None),
+    "c128-128k": (1024, 2, None),
+}
+_DSV4_FLASH_LAYERS = (
+    "swa",
+    "c4flash",
+    "c128-16k",
+    "c128-16k-server",
+    "c128-64k",
+    "c128-128k",
+)
+_DSV4_ROWS = [
+    pytest.param(h, layer, id=f"h{h}-{layer}")
+    for h in (64, 32, 16, 8)
+    for layer in _DSV4_FLASH_LAYERS
+] + [pytest.param(h, "c4pro", id=f"h{h}-c4pro") for h in (128, 64, 32, 16)]
+_DSV4_FORMS = ["decode-b8", "decode-b64", "decode-b256", "mtp-b32q4", "prefill"]
+
+
+def _dsv4_layer_case(h_q: int, layer: str, form: str, width: Optional[int] = None):
+    """One DeepSeek-V4 layer row (newest-first window table, FP8 cache).
+
+    C4 rows attend their whole selection; a C128 row attends the compressed
+    rows its position has produced, so its active count grows with the
+    position inside a request (``width`` overrides the layer's compressed
+    width)."""
+    compressed, page, live = _DSV4_LAYERS[layer]
+    if width is not None:
+        compressed = width - SWA_WINDOW
+    if form.startswith("decode"):
+        batch = int(form.split("-b")[1])
+        q_lens, seq = [1] * batch, [640 + 37 * i % 1024 for i in range(batch)]
+        layout = "dense"
+    elif form == "mtp-b32q4":
+        q_lens, seq = [4] * 32, [640 + 37 * i % 1024 for i in range(32)]
+        layout = "dense"
+    elif form == "prefill":
+        q_lens, seq = [171, 341], [1024 + 171, 2048 + 341]
+        layout = "ragged"
+    else:
+        raise ValueError(form)
+    lens = None
+    rows = sum(q_lens)
+    if live is not None:
+        lens = [live] * rows
+    elif compressed and page == 2:
+        lens = []
+        for q in q_lens:
+            lens += [max(compressed - (q - 1 - i) // 128, 1) for i in range(q)]
+    return _build_case(
+        num_heads=h_q,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=seq,
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=compressed,
+        compressed_page=page,
+        compressed_pages=max(64, rows * compressed // page // 4),
+        compressed_lens=lens,
+        alias_compressed=not compressed,
+        newest_first=True,
+    )
+
+
+@pytest.mark.parametrize("h_q,layer", _DSV4_ROWS)
+@pytest.mark.parametrize("form", _DSV4_FORMS)
+def test_dsv4_layer_rows(h_q, layer, form):
+    """Every DeepSeek-V4 layer row the FP8 route serves: the masked columns
+    contribute nothing and the output matches the reference.  Covers the
+    low-head decode rows wider than one producer partition and the 8-head
+    prefill rows, which run the persistent or the M64 body.  SM107 runs every
+    row too: its low-head decode rows over compressed items take the M64 body."""
+    _skip_unless_cake_gpu(sm107=True)
+    case = _dsv4_layer_case(h_q, layer, form)
+    _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
+
+
+@pytest.mark.parametrize("h_q", [128, 64, 32, 16, 8])
+@pytest.mark.parametrize("form", ["decode-b64", "mtp-b32q4", "prefill"])
+def test_dsv4_c128_rows_past_128k_raise_before_any_launch(h_q, form):
+    """A C128 layer past 128K context (128 + 2048 slots at 256K) is wider than
+    any FP8 body takes: the call raises before it launches anything and leaves
+    ``out`` untouched."""
+    _skip_unless_cake_gpu(sm107=True)
+    case = _dsv4_layer_case(h_q, "c128-128k", form, width=2176)
+    out = case.nan_out()
+    with pytest.raises(ValueError, match=r"sparse_topk 2176: .* at most 1152") as e:
+        case.run(workspace=_workspace_128mib(), out=out, float_scales=True)
+    torch.cuda.synchronize()
+    assert "nvfp4" not in str(e.value)
+    assert torch.isnan(out.float()).all()
+
+
+@pytest.mark.parametrize("h_q", [128, 64, 32, 16, 8])
+@pytest.mark.parametrize("width", [320, 704], ids=["c128-16k", "c128-64k"])
+@pytest.mark.parametrize("batch", [8, 32])
+@pytest.mark.parametrize("minus_one_inside", [False, True], ids=["", "minus-one"])
+def test_dsv4_c128_mtp_rows_at_the_compression_boundary(
+    h_q, width, batch, minus_one_inside
+):
+    """C128 MTP rows whose active counts come from their positions, across a
+    128-position boundary: request ``b`` ends at position 640 + 128 b, so its
+    four rows attend 4 + b, 4 + b, 4 + b and 5 + b compressed rows of a table
+    padded to the server's context (320 or 704 slots).  Columns past each
+    row's count point at a poison page (bit-identical output), every seventh
+    active slot is ``-1`` with ``minus_one_inside``, and the last visible
+    window slot and the last active compressed column read beacon rows whose
+    sign flip must move every row.  Runs the persistent and the M64 bodies
+    (and the one-partition producer at 8/16/32 heads, width 320, 8
+    requests)."""
+    _skip_unless_cake_gpu(sm107=True)
+    seq = [640 + 128 * b for b in range(batch)]
+    lens = [max((s - 4 + i + 1) // 128, 1) for s in seq for i in range(4)]
+    assert lens[:4] == [4, 4, 4, 5]
+    case = _build_case(
+        num_heads=h_q,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=seq,
+        q_lens=[4] * batch,
+        layout="dense",
+        compressed_width=width - SWA_WINDOW,
+        compressed_page=2,
+        compressed_pages=max(64, 4 * batch * (width - SWA_WINDOW) // 8),
+        compressed_lens=lens,
+        minus_one_inside=minus_one_inside,
+        newest_first=True,
+        beacon=True,
+    )
+    _assert_boundary_columns_attended(case, _workspace_128mib())
+
+
+# ---------------------------------------------------------- padded rows on the source-exact routes
+# The routes whose programs launch one CTA per request position (max_q_len x
+# batch_size, whatever the metadata rows), at every head count and sparse
+# width they take.  The H8/H16 routes run request lengths 5, 3, 4 and 1, 5, 5:
+# with a one-row first request, T = 1 ends at a request boundary and both
+# later requests start at or past T.
+_SOURCE_EXACT_PADDED_CASES = [
+    _align_case(route, heads, dtype, q_lens, "ragged", width, page, form=form + tag)
+    for route, dtype in (
+        ("bf16_h8_h16_source_exact", _BF16),
+        ("fp8_h8_h16_source_exact", _FP8),
+    )
+    for heads, width, page, form in (
+        (8, 64, 64, "h8-192"),
+        (16, 128, 64, "h16-256"),
+        (8, 132, 2, "h8-260"),
+        (16, 132, 2, "h16-260"),
+    )
+    for q_lens, tag in (([5, 3, 4], ""), ([1, 5, 5], "-q1-5-5"))
+] + [_align_case("fp8_h64_source_exact", 64, _FP8, [257, 100], "ragged", 512)]
+
+
+@pytest.mark.parametrize("swa", ["long", "short-stale"])
+@pytest.mark.parametrize(
+    "route,num_heads,dtype,q_lens,layout,width,page", _SOURCE_EXACT_PADDED_CASES
+)
+def test_source_exact_padded_rows_match_the_unpadded_call(
+    monkeypatch, route, num_heads, dtype, q_lens, layout, width, page, swa
+):
+    """A padded ragged call on a source-exact route: the metadata of the first
+    ``T`` rows alone (tables and lengths of exactly ``T`` rows) under the
+    query and ``cum_seq_lens_q`` of every row, for ``T`` = 1, the first
+    request boundary and one row short of the end.  Rows below ``T`` get
+    bitwise the unpadded call's output, in an aligned ``out`` and in one 2
+    bytes off its store alignment (the program writes a ``T``-row staging
+    buffer, which the host copies into ``out``).  In the aligned ``out``
+    every row at or past ``T`` keeps its NaN: the program wrote none of them.
+    In the staged call those rows are out of the program's reach, so the same
+    check holds by construction.  The bytes around ``out`` stay untouched.
+    ``T = 1`` also runs with its one row viewed out of a ``[1, W + 1]``
+    parent (odd row stride), whose next row would be a misaligned 16-byte
+    index load.  These checks see what lands in ``out`` only: a read of a
+    metadata row at or past ``T``, or a write past the end of the staging
+    buffer, leaves ``out`` as it is.  Those show under ``compute-sanitizer
+    --tool memcheck`` with ``PYTORCH_NO_CUDA_MEMORY_CACHING=1`` (each
+    ``T``-row table, the lengths and the staging buffer an allocation of its
+    own).  ``swa="short-stale"`` gives every request
+    an SWA cache a few tokens longer than its query, with valid stale slots
+    past the causal window: the rows of the requests ``T`` cuts see fewer than
+    128 SWA slots, so a window taken from the cut length instead of the
+    request's would attend a stale slot and move a row below ``T``."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    short = swa == "short-stale"
+    case = _build_case(
+        num_heads=num_heads,
+        dtype=dtype,
+        seq_lens=(
+            [q + 3 + 7 * i for i, q in enumerate(q_lens)]
+            if short
+            else [_LONG_SEQ + 37 * i for i in range(len(q_lens))]
+        ),
+        q_lens=q_lens,
+        layout=layout,
+        compressed_width=width,
+        compressed_page=page,
+        swa_tail="stale" if short else "minus_one",
+    )
+    if short:
+        # The rows below T of a request T cuts see fewer than 128 SWA slots:
+        # the first row (T = 1 cuts a first request longer than one row) and
+        # the last row below T = cum[B] - 1 (which cuts the last request).
+        visible = case.visible()
+        assert int(visible[0]) < SWA_WINDOW and int(visible[-2]) < SWA_WINDOW
+    workspace = _workspace_128mib()
+    expected = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert calls == [(route, case.rows)], calls
+    assert not torch.isnan(expected).any()
+
+    table, lens = case.sparse_indices, case.sparse_topk_lens
+    cols = int(table.shape[1])
+    ends = case.cum_seq_lens_q.tolist()
+    one_row = torch.full((1, cols + 1), -1, dtype=torch.int32, device="cuda:0")
+    one_row[:, :cols] = table[:1]
+    assert one_row[:, :cols].stride(0) % 4 != 0
+    metadata = [
+        (rows, table[:rows].clone()) for rows in sorted({1, ends[1], ends[-1] - 1})
+    ]
+    metadata.append((1, one_row[:, :cols]))
+    numel = expected.numel()
+    for rows, rows_table in metadata:
+        padded = dataclasses.replace(
+            case, sparse_indices=rows_table, sparse_topk_lens=lens[:rows].clone()
+        )
+        for offset_bytes in (0, 2):
+            raw = torch.full(
+                (numel + 32,), float("nan"), dtype=torch.bfloat16, device="cuda:0"
+            )
+            start = ((-raw.data_ptr()) % 32 + offset_bytes) // raw.element_size()
+            out = raw[start : start + numel].view(case.query.shape)
+            assert out.data_ptr() % 32 == offset_bytes
+            calls.clear()
+            got = padded.run(workspace=workspace, out=out, float_scales=True)
+            torch.cuda.synchronize()
+            where = f"T={rows} of {case.rows}, stride {rows_table.stride(0)}, out +{offset_bytes} B"
+            assert calls == [(route, rows)], (where, calls)
+            assert torch.equal(
+                got[:rows].view(torch.int16), expected[:rows].view(torch.int16)
+            ), where
+            assert torch.isnan(got[rows:]).all(), where
+            assert torch.isnan(raw[:start]).all(), where
+            assert torch.isnan(raw[start + numel :]).all(), where

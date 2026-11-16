@@ -31,7 +31,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tests.test_helpers.rope_reference import RotaryEmbedding
+from tests.attention.test_helpers.rope_reference import RotaryEmbedding
 
 import flashinfer
 from flashinfer.utils import get_compute_capability

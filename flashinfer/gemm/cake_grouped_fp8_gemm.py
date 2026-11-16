@@ -118,6 +118,16 @@ BS_N256_RUN32_ROUTE = "bs_ue8m0_n256_run32"
 # The store16 programs of the single-run routes (:func:`bs_store16`).
 BS_N128_S16_ROUTE = "bs_ue8m0_n128_s16"
 BS_N256_S16_ROUTE = "bs_ue8m0_n256_s16"
+# The SM107a lead-prefetch program of the BLOCK_N 256 single-run route
+# (:func:`bs_lead_prefetch`; only layouts the host routes to BLOCK_N 256 take it).
+BS_N256_LPF_ROUTE = "bs_ue8m0_n256_lpf"
+BS_LPF_ROUTES = {BS_N256_ROUTE: BS_N256_LPF_ROUTE}
+# The lead-prefetch rule's bounds (:func:`bs_lead_prefetch`): K of at most two K
+# blocks, the routed rows per group at or below which such a layout always takes
+# it, and the routed rows per group from which a longer-K layout takes it.
+BS_LPF_SHORT_K = 2 * K_BLOCK
+BS_LPF_SHORT_K_MAX_ROWS = 10
+BS_LPF_LONG_K_MIN_ROWS = 160
 BS_ROUTES = frozenset(
     {
         BS_N128_ROUTE,
@@ -126,6 +136,7 @@ BS_ROUTES = frozenset(
         BS_N256_RUN32_ROUTE,
         BS_N128_S16_ROUTE,
         BS_N256_S16_ROUTE,
+        BS_N256_LPF_ROUTE,
     }
 )
 BS_BLOCK_M = 128
@@ -779,6 +790,43 @@ BS_STORE16_ARCHS = frozenset({"sm_100a", "sm_103a"})
 FP32_SCALE_ARCHS = frozenset({"sm_100a", "sm_103a"})
 
 
+def bs_lead_prefetch(
+    m: int, k: int, *, alignment: int, num_groups: int | None, arch: str | None
+) -> bool:
+    """Whether a single-run block-scaled problem takes the SM107a lead-prefetch program.
+
+    Each CTA writes the leading ``m_indices`` entry of each of its first 224
+    tiles to a shared table before its prologue barrier, and each role reads
+    its tile's entry from there (a later tile reads ``m_indices``), so a
+    padding tile costs no dependent global load.  The rule reads host-known
+    values only, with ``routed = m - num_groups * (alignment - 1)`` routed rows
+    and ``routed / num_groups`` routed rows per group:
+
+    * at most two K blocks (K <= 256) with the valid blocks bounded as in
+      :func:`bs_block_n` (``min(routed, num_groups + routed // 128)``) at most
+      four fifths of the M blocks, or at most 10 routed rows per group;
+    * more than two K blocks (K > 256) with at least 160 routed rows per group.
+
+    Between those bounds (and at K <= 256 above 10 rows per group on a layout
+    of mostly routed blocks) the table costs as much as it saves.  The program
+    computes every output as the single-run program does, so the routed rows
+    keep their bits.
+    """
+    if arch != BS_SM107A_ARCH or not num_groups or alignment % BS_BLOCK_M:
+        return False
+    routed = m - num_groups * (alignment - 1)
+    if routed <= 0:
+        return False
+    if k > BS_LPF_SHORT_K:
+        # rows = routed / num_groups >= 160; compared without division.
+        return routed >= BS_LPF_LONG_K_MIN_ROWS * num_groups
+    if routed <= BS_LPF_SHORT_K_MAX_ROWS * num_groups:
+        return True
+    valid_blocks = min(routed, num_groups + routed // BS_BLOCK_M)
+    m_blocks = (m + BS_BLOCK_M - 1) // BS_BLOCK_M
+    return 5 * valid_blocks <= 4 * m_blocks
+
+
 def bs_store16(m: int, *, alignment: int, num_groups: int | None) -> bool:
     """Whether a single-run block-scaled problem takes the store16 programs.
 
@@ -898,6 +946,10 @@ def _launch_plan(
             num_groups=num_groups,
             arch=device_arch or arch,
         )
+        if route in BS_LPF_ROUTES and bs_lead_prefetch(
+            m, k, alignment=alignment, num_groups=num_groups, arch=device_arch or arch
+        ):
+            route = BS_LPF_ROUTES[route]
         if arch is not None:
             route = (
                 bs_swap_route_for_shape(
@@ -1904,6 +1956,7 @@ __all__ = [
     "argument_slots",
     "bind_arguments",
     "bs_block_n",
+    "bs_lead_prefetch",
     "bs_route_for_shape",
     "device_sm_count",
     "is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available",

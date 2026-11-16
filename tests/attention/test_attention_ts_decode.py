@@ -1043,6 +1043,8 @@ def _make_mixed_precision_decode_case(
     seed: int,
     splits_kv: int = 1,
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
+    q_tokens_per_cta: int = 1,
+    mask_type: str = "dense",
 ) -> tuple[_DecodeCase, Optional[tuple[torch.Tensor, torch.Tensor]]]:
     """Build a nonzero mixed-Q/KV case and its independent reference."""
 
@@ -1148,9 +1150,10 @@ def _make_mixed_precision_decode_case(
             output_scale=1.0,
             out_dtype=out_dtype,
             o_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
             splits_kv=splits_kv,
             num_insts_kv=num_insts_kv,
+            q_tokens_per_cta=q_tokens_per_cta,
         )
     else:
         reference = _decode_reference(
@@ -1164,7 +1167,7 @@ def _make_mixed_precision_decode_case(
             q_scale=1.0,
             k_scale=1.0,
             v_scale=1.0,
-            mask_type="dense",
+            mask_type=mask_type,
         )
     reference = reference.to(out_dtype).float()
     return (
@@ -1182,7 +1185,7 @@ def _make_mixed_precision_decode_case(
             paged_kv_last_page_len=last_page_len,
             reference_real=reference,
             out_dtype=out_dtype,
-            mask_type="dense",
+            mask_type=mask_type,
             softmax_scale=softmax_scale,
             output_scale=1.0,
             q_scale=1.0,
@@ -1616,6 +1619,7 @@ def _plan_case(
     max_q_len: Optional[int] = None,
     kv_scale_factors=None,
     dynamic_kv: bool = True,
+    lse_mode: str = "none",
 ):
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
@@ -1645,6 +1649,7 @@ def _plan_case(
         window_left=case.window_left,
         max_q_len=seq_len_q if max_q_len is None else max_q_len,
         seq_lens_kv=seq_lens_kv,
+        lse_mode=lse_mode,
     )
 
     return wrapper
@@ -2719,6 +2724,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "split_kv",
         "validate",
         "initialize_workspace",
+        "softmax_scale",
+        "output_scale",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -4591,7 +4598,10 @@ def _check_workspace_and_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run_with_workspace(False)
+    # Clear the eager result so a replay that writes nothing cannot pass.
+    explicit_out.fill_(float("nan"))
     graph.replay()
+    torch.cuda.synchronize()
     _assert_case_correct(explicit_out, case)
 
     plan = prepare_prims_ts_batch_decode_with_kv_cache(
@@ -4620,7 +4630,9 @@ def _check_workspace_and_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run_plan()
+    explicit_out.fill_(float("nan"))
     graph.replay()
+    torch.cuda.synchronize()
     _assert_case_correct(explicit_out, case)
 
 
@@ -5115,6 +5127,7 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
         "_TrustedDecodePlanState",
         (),
         {
+            "device": torch.device("cpu"),
             "out_dtype": torch.bfloat16,
             "lse_mode": "none",
             "use_attention_sinks": False,
@@ -5126,6 +5139,8 @@ def test_attention_ts_decode_run_validate_false_skips_explicit_checks(
             "workspace": object(),
             "compiled_main": object(),
             "compiled_reducer": None,
+            "softmax_scale": 1.0,
+            "output_scale": 1.0,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
         },
@@ -5189,6 +5204,8 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
             "packed_query": True,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
+            "softmax_scale": 1.0,
+            "output_scale": 1.0,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
         },
@@ -5212,6 +5229,8 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
             "packed_query": False,
             "device": torch.device("cuda:0"),
             "batch_size": 2,
+            "softmax_scale": 1.0,
+            "output_scale": 1.0,
             "planned_seq_lens_kv_host": None,
             "planned_seq_lens_kv_device": None,
         },
@@ -6606,6 +6625,177 @@ def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(
     assert cfg.use_cluster_smem_reduction is True
     assert cfg.use_separate_reduction_kernel is False
     assert cfg.use_persistent_scheduler is False
+
+
+def test_attention_ts_decode_split_workspace_is_plan_invariant(monkeypatch) -> None:
+    """Plans bound to one buffer share counters placed after every partial."""
+    _mock_decode_hardware(monkeypatch)
+
+    from contextlib import nullcontext
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    sm_count = 152
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: sm_count // cluster_size,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args, **_kwargs: nullcontext())
+    decode_module._resolve_decode_launch_spec.cache_clear()
+    specs = []
+    try:
+        # Fused, separate and cluster splits of several fanouts, then no split.
+        for seq_len_q in (2, 4):
+            for batch_size in (1, 2, 3, 4, 5, 8, 26, 39):
+                spec = decode_module._resolve_decode_launch_spec(
+                    0,
+                    batch_size,
+                    16,
+                    2,
+                    128,
+                    32,
+                    131072,
+                    seq_len_q,
+                    "float16",
+                    "float16",
+                    "float16",
+                    "float16",
+                    "HND",
+                    "causal",
+                    False,
+                    -1,
+                )
+                if spec.config.uses_compact_split_grid:
+                    assert spec.scratch_shapes[0] == (
+                        batch_size * 2 * spec.requested_splits,
+                        8 * seq_len_q,
+                        128,
+                    )
+                specs.append(spec)
+        # FP8 page-4 subpage plans always split with the separate reducer.
+        # At batch 160 / Hkv 2, their 320 counters exceed the reserve but still plan.
+        assert (
+            decode_module.get_prims_ts_batch_decode_workspace_size(
+                batch_size=160,
+                num_qo_heads=16,
+                num_kv_heads=2,
+                head_dim=128,
+                page_size=4,
+                max_kv_len=4096,
+                q_dtype=torch.float8_e4m3fn,
+                kv_dtype=torch.float8_e4m3fn,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                storage_page_size=16,
+                device=0,
+            )
+            > 0
+        )
+    finally:
+        decode_module._resolve_decode_launch_spec.cache_clear()
+    assert specs
+    compact_fanouts = {
+        spec.requested_splits for spec in specs if spec.config.uses_compact_split_grid
+    }
+    assert len(compact_fanouts) > 1
+
+    layouts = [
+        decode_module._make_decode_workspace_layout(
+            spec.scratch_shapes,
+            torch.float16,
+            use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+            use_split_kv=spec.config.use_split_kv,
+            scratch_reserve=spec.scratch_reserve,
+        )
+        for spec in specs
+    ]
+    buffer = torch.zeros(
+        max(layout.total_bytes for layout in layouts), dtype=torch.uint8
+    )
+    views = [decode_module._bind_decode_workspace(buffer, layout) for layout in layouts]
+    assert len({view.split_kv_counter.data_ptr() for view in views}) == 1
+    state_begin = min(
+        tensor.data_ptr()
+        for view in views
+        for tensor in (view.split_kv_counter, view.cu_seqlens_q, view.attention_sinks)
+    )
+    for view in views:
+        for partial in (view.partial_o, view.partial_stats):
+            assert partial.data_ptr() + partial.nbytes <= state_begin
+
+
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+def test_attention_ts_decode_plans_share_one_zeroed_workspace():
+    """Split plans of different fanouts alternate on one zeroed buffer."""
+    torch.manual_seed(8078)
+    heads_q, heads_kv, dim, page, context, seq_len_q = 8, 1, 64, 32, 131072, 2
+    dtype = torch.bfloat16
+    pages = context // page
+    k = torch.randn(pages, heads_kv, page, dim, device="cuda", dtype=dtype) * 0.25
+    v = torch.randn_like(k)
+    # Fused (32 and 24 splits) and separate-reducer (32 and 18 splits) plans
+    # on 148-SM parts.
+    batches = (1, 3, 4, 8)
+    workspace = torch.zeros(
+        max(
+            get_prims_ts_batch_decode_workspace_size(
+                batch,
+                heads_q,
+                heads_kv,
+                dim,
+                page,
+                context,
+                seq_len_q=seq_len_q,
+                q_dtype=dtype,
+                out_dtype=dtype,
+                mask_type="causal",
+                device="cuda",
+            )
+            for batch in batches
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    plans = []
+    for batch in batches:
+        query = torch.randn(batch, seq_len_q, heads_q, dim, device="cuda", dtype=dtype)
+        table = torch.stack(
+            [
+                torch.randperm(pages, device="cuda", dtype=torch.int32)
+                for _ in range(batch)
+            ]
+        )
+        lengths = torch.randint(
+            context // 2, context + 1, (batch,), device="cuda", dtype=torch.int32
+        )
+        shared, private = BatchDecodePagedTSWrapper(), BatchDecodePagedTSWrapper()
+        for wrapper, buffer in ((shared, workspace), (private, None)):
+            wrapper.plan(
+                torch.device("cuda"),
+                batch,
+                heads_q,
+                heads_kv,
+                dim,
+                page,
+                context,
+                max_q_len=seq_len_q,
+                q_dtype=dtype,
+                out_dtype=dtype,
+                mask_type="causal",
+                workspace_buffer=buffer,
+            )
+        expected = private.run(query, (k, v), lengths, table)
+        plans.append((shared, (query, (k, v), lengths, table), expected))
+    assert len({dict(plan[0]._policy)["splits_kv"] for plan in plans}) > 1
+
+    for index in (0, 1, 0, 2, 3, 2, 1, 3, 0):
+        shared, args, expected = plans[index]
+        assert torch.equal(shared.run(*args), expected)
+    torch.cuda.synchronize()
+    for shared, _, _ in plans:
+        assert not torch.any(shared._plan_state.workspace.split_kv_counter)
 
 
 def test_attention_ts_decode_explicit_kv_does_not_change_sq1_q_policy(
@@ -9804,6 +9994,7 @@ def test_attention_ts_decode_final_statistics(
         (128, _FP8, _FP8, 8, 128, 1, 5),
         (256, _FP8, torch.float16, 16, 64, 1, 5),
         (128, _FP8, _FP8, 64, 64, 3, 5),
+        (128, _FP8, torch.float16, 64, 64, 4, 8),
         (256, _FP8, torch.float16, 128, 128, 3, 5),
         (64, _FP8, _FP8, 4, 8, 4, 1),
         (256, _FP8, torch.float16, 128, 8, 4, 1),
@@ -9917,4 +10108,432 @@ def test_attention_ts_decode_fp8_speculative_runtime_reduction(out_dtype):
         case.seq_lens_kv,
         max_kv_len=16384,
         exercise_all_paths=True,
+    )
+
+
+@_REQUIRES_PRIMTS_GPU
+def test_decode_global_scales_graph_and_prepared(monkeypatch):
+    """Device scales stay live through the standalone reducer and prepared API."""
+    original = fmha_decode_config.make_decode_config
+
+    def configured(*args, **kwargs):
+        profile = dict(
+            use_keeps_mma_ab=False,
+            tile_size_q=16,
+            tile_size_kv=128,
+            use_persistent_scheduler=False,
+        )
+        kwargs["args"] = (kwargs["args"], profile) if kwargs.get("args") else profile
+        kwargs.update(
+            split_kv_mode="gmem_reduction_with_separate_kernel",
+            splits_kv=2,
+            max_splits_kv=2,
+            auto_tuner=False,
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
+    _resolve_decode_launch_spec.cache_clear()
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(81)
+        dtype = torch.bfloat16
+        q = (torch.randn((1, 8, 128), device="cuda", generator=generator) * 0.5).to(
+            dtype
+        )
+        k = (
+            torch.randn((128, 1, 16, 128), device="cuda", generator=generator) * 0.5
+        ).to(dtype)
+        v = torch.randn(k.shape, device="cuda", generator=generator).to(dtype)
+        lengths = torch.tensor([2048], dtype=torch.int32, device="cuda")
+        table = torch.arange(128, dtype=torch.int32, device="cuda").view(1, -1)
+        out = torch.empty(q.shape, dtype=torch.bfloat16, device="cuda")
+        scales = dict(
+            softmax_scale=torch.tensor(0.125, device="cuda"),
+            output_scale=torch.tensor(0.75, device="cuda"),
+        )
+        wrapper = BatchDecodePagedTSWrapper()
+        wrapper.plan(
+            "cuda",
+            1,
+            8,
+            1,
+            128,
+            16,
+            2048,
+            q_dtype=dtype,
+            k_dtype=dtype,
+            v_dtype=dtype,
+            out_dtype=out.dtype,
+            **scales,
+        )
+        assert wrapper._plan_state.config.use_separate_reduction_kernel
+        args = (q, (k, v), lengths, table)
+
+        def check(sm, output):
+            scores = q[0].float() @ k[:, 0].reshape(-1, 128).float().T * sm
+            expected = (scores.softmax(-1) @ v[:, 0].reshape(-1, 128).float() * output)[
+                None
+            ]
+            torch.testing.assert_close(out.float(), expected, atol=0.02, rtol=0.05)
+
+        wrapper.run(*args, out=out)
+        check(0.125, 0.75)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            wrapper.run(*args, out=out, validate=False)
+        for scale in scales.values():
+            scale.mul_(1.5)
+        graph.replay()
+        check(0.1875, 1.125)
+        workspace = wrapper._plan_state.workspace_buffer
+        batch_decode_with_paged_kv_cache(
+            q,
+            (k, v),
+            table,
+            lengths,
+            max_kv_len=2048,
+            out=out,
+            workspace_buffer=workspace,
+            validate=False,
+            **scales,
+        )
+        check(0.1875, 1.125)
+        prepared = prepare_prims_ts_batch_decode_with_kv_cache(
+            q,
+            (k, v),
+            workspace,
+            table,
+            lengths,
+            2048,
+            out=out,
+            **scales,
+        )
+        prepared_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(prepared_graph):
+            prepared.run(q, out=out, validate=False)
+        for scale in scales.values():
+            scale.mul_(0.5)
+        prepared_graph.replay()
+        check(0.09375, 0.5625)
+    finally:
+        _resolve_decode_launch_spec.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "head_dim,keeps,tile,overrides,error",
+    (
+        (128, True, 64, {"transformed_kv_stages": 0}, None),
+        (256, True, 64, {"transformed_kv_stages": 0}, None),
+        (128, True, 64, {"transformed_kv_stages": 3}, None),
+        (256, True, 64, {"transformed_kv_stages": 3}, None),
+        (128, True, 64, {"transform_kv1_num_warps": 2}, "KeepsMmaAb transform-KV"),
+        (256, True, 64, {"transform_kv1_num_warps": 2}, "KeepsMmaAb transform-KV"),
+        (128, False, 48, {"tmem_stats_cols": 24}, "sufficient TMEM"),
+        (128, False, 48, {"tmem_stats_cols": 31}, "sufficient TMEM"),
+        (128, False, 48, {"tmem_stats_cols": 32}, None),
+    ),
+)
+def test_attention_ts_decode_nvfp4_resource_overrides(
+    head_dim, keeps, tile, overrides, error
+):
+    """Explicit NVFP4 resources honor auto depth and reject incomplete coverage."""
+
+    def make_config():
+        return make_decode_config(
+            headdim=head_dim,
+            args={
+                "use_keeps_mma_ab": keeps,
+                "groups_tokens_heads_q": True,
+                "tile_size_q": tile,
+                "kv_stages": 4,
+                "use_persistent_scheduler": False,
+                **overrides,
+            },
+            seq_len_q=6 if tile == 48 else 8,
+            seq_len_kv=769,
+            batch_size=2,
+            num_heads_q=8,
+            num_heads_kv=1,
+            q_dtype=Float8E4M3FN,
+            k_dtype=Float4E2M1FN,
+            v_dtype=Float4E2M1FN,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=64,
+            mask_type="causal",
+            split_kv_mode="disabled",
+            auto_tuner=False,
+        )
+
+    if error is not None:
+        with pytest.raises(ValueError, match=error):
+            make_config()
+    else:
+        cfg = make_config()
+        if "transformed_kv_stages" in overrides:
+            requested = overrides["transformed_kv_stages"]
+            assert cfg.transformed_kv_stages > 0
+            if requested:
+                assert cfg.transformed_kv_stages == requested
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "head_dim,tile_size_q,seq_len_q,seq_len_kv,heads_q_per_kv,output_dtype,split_kv_mode,page_size,use_keeps_mma_ab",
+    (
+        (128, 48, 6, 65, 8, torch.float16, "disabled", 64, False),
+        (256, 48, 7, 769, 16, torch.bfloat16, "gmem_reduction", 32, False),
+        (
+            128,
+            48,
+            7,
+            769,
+            8,
+            torch.float16,
+            "gmem_reduction_with_separate_kernel",
+            64,
+            False,
+        ),
+        (128, 64, 6, 769, 8, torch.float16, "gmem_reduction", 32, False),
+        (
+            128,
+            64,
+            8,
+            8193,
+            8,
+            torch.float16,
+            "gmem_reduction_with_separate_kernel",
+            64,
+            False,
+        ),
+        (256, 64, 6, 65, 16, torch.bfloat16, "disabled", 64, False),
+        (128, 128, 12, 769, 8, torch.float16, "disabled", 64, False),
+        (
+            256,
+            128,
+            7,
+            8193,
+            16,
+            torch.bfloat16,
+            "gmem_reduction_with_separate_kernel",
+            32,
+            False,
+        ),
+        (512, 64, 6, 769, 8, torch.float16, "gmem_reduction", 16, False),
+        # Page64 enables D512 V-scale swizzling. Five/six query tokens exercise
+        # partial/aligned 16-row output bands, including LSE publication.
+        (512, 64, 5, 769, 8, torch.float16, "disabled", 64, False),
+        (512, 64, 6, 769, 8, torch.float16, "disabled", 64, False),
+        (512, 128, 12, 769, 8, torch.float16, "disabled", 32, False),
+        # Keeps Q64 with SMEM-converted NVFP4 K/V: per-instance converters at
+        # D128, separate K and V converters at D256.
+        (128, 64, 8, 769, 8, torch.float16, "disabled", 64, True),
+        (128, 64, 7, 8193, 8, torch.bfloat16, "gmem_reduction", 32, True),
+        (
+            128,
+            64,
+            8,
+            8193,
+            8,
+            torch.float16,
+            "gmem_reduction_with_separate_kernel",
+            16,
+            True,
+        ),
+        (256, 64, 8, 769, 8, torch.bfloat16, "disabled", 64, True),
+        (256, 64, 7, 8193, 16, torch.float16, "gmem_reduction", 32, True),
+    ),
+)
+def test_attention_ts_decode_large_tile_size_q(
+    monkeypatch,
+    head_dim: int,
+    tile_size_q: int,
+    split_kv_mode: str,
+    heads_q_per_kv: int,
+    output_dtype: torch.dtype,
+    seq_len_kv: int,
+    seq_len_q: int,
+    page_size: int,
+    use_keeps_mma_ab: bool,
+) -> None:
+    """Q48/Q64/Q128 NVFP4 tiles preserve every row through tails and split merge."""
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    def make_config():
+        return make_decode_config(
+            headdim=head_dim,
+            args={
+                "use_keeps_mma_ab": use_keeps_mma_ab,
+                "groups_tokens_heads_q": True,
+                "tile_size_q": tile_size_q,
+                "use_persistent_scheduler": False,
+            },
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            batch_size=2,
+            num_heads_q=heads_q_per_kv,
+            num_heads_kv=1,
+            q_dtype=Float8E4M3FN,
+            k_dtype=Float4E2M1FN,
+            v_dtype=Float4E2M1FN,
+            o_dtype=Float16 if output_dtype == torch.float16 else BFloat16,
+            qkv_layout="pagedKv",
+            num_tokens_per_page=page_size,
+            mask_type="causal",
+            split_kv_mode=split_kv_mode,
+            splits_kv=2 if split_kv_mode != "disabled" else -1,
+            max_splits_kv=2 if split_kv_mode != "disabled" else None,
+            auto_tuner=False,
+            split_kv=split_kv_mode != "disabled",
+        )
+
+    if head_dim == 512 and tile_size_q == 128:
+        with pytest.raises(ValueError, match="O stages cannot wrap TMEM rows"):
+            make_config()
+        return
+    cfg = make_config()
+    spec = decode_module._decode_launch_spec_from_config(
+        cfg,
+        batch_size=2,
+        num_qo_heads=heads_q_per_kv,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        max_active_clusters=fmha_decode_config.get_max_active_clusters_for_cluster_size(
+            1
+        ),
+    )
+    monkeypatch.setattr(
+        decode_module, "_resolve_decode_launch_spec", lambda *_args, **_kwargs: spec
+    )
+    case, scale_factors = _make_mixed_precision_decode_case(
+        batch_size=2,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=heads_q_per_kv,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        out_dtype=output_dtype,
+        device="cuda",
+        seed=6979,
+        splits_kv=cfg.splits_kv,
+        num_insts_kv=cfg.num_insts_kv,
+        q_tokens_per_cta=cfg.q_tokens_per_cta,
+        mask_type="causal",
+    )
+    check_lse = not cfg.use_split_kv and not use_keeps_mma_ab
+    wrapper = _plan_case(
+        case,
+        max_kv_len=seq_len_kv,
+        kv_scale_factors=scale_factors,
+        lse_mode="base2" if check_lse else "none",
+    )
+    out = torch.empty_like(case.q, dtype=output_dtype)
+    lse = None
+    if check_lse:
+        from tests.attention.test_attention_ts_context import (
+            _softmax_statistics_reference,
+        )
+
+        lse = torch.full(case.q.shape[:-1], torch.nan, device="cuda")
+        k_cache = _dequantize_nvfp4_cache(case.k_cache, scale_factors[0], _FP8)
+        expected_lse = []
+        sinks = torch.full((heads_q_per_kv,), -torch.inf, device="cuda")
+        for batch in range(case.q.shape[0]):
+            length = int(case.seq_lens_kv[batch])
+            pages = case.block_tables[batch, : (length + page_size - 1) // page_size]
+            keys = k_cache[pages.long()].transpose(1, 2).reshape(-1, 1, head_dim)
+            keys = keys[:length]
+            _, stats = _softmax_statistics_reference(
+                case.q[batch],
+                keys,
+                torch.zeros_like(keys, dtype=torch.float32),
+                scale=case.softmax_scale,
+                sinks=sinks,
+            )
+            expected_lse.append(stats / math.log(2))
+        expected_lse = torch.stack(expected_lse)
+
+    def run():
+        return wrapper.run(
+            case.q,
+            case.paged_kv_cache,
+            case.seq_lens_kv,
+            case.block_tables,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
+            kv_scale_factors=scale_factors,
+            out=out,
+            lse=lse,
+            validate=False,
+        )
+
+    run()
+    _assert_case_correct(out, case)
+    if check_lse:
+        torch.testing.assert_close(lse, expected_lse, atol=0.015, rtol=0.002)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(float("nan"))
+    if check_lse:
+        lse.fill_(torch.nan)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_case_correct(out, case)
+    if check_lse:
+        torch.testing.assert_close(lse, expected_lse, atol=0.015, rtol=0.002)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("queries", (1, 12), ids=lambda value: f"q{value}")
+@pytest.mark.parametrize("page", (64, 128), ids=lambda value: f"p{value}")
+def test_attention_ts_decode_large_grouped_nvfp4_grid(queries: int, page: int):
+    """Padded Q1 and large grouped grids share public workspace and graph paths."""
+    batch, heads_q, heads_kv, dim, context = 64, 32, 4, 256, 2048
+    spec = _resolve_decode_launch_spec(
+        torch.cuda.current_device(),
+        batch,
+        heads_q,
+        heads_kv,
+        dim,
+        page,
+        context,
+        queries,
+        "float8_e4m3fn",
+        "float4_e2m1fn",
+        "float4_e2m1fn",
+        "bfloat16",
+        "HND",
+        "dense",
+        False,
+        -1,
+    )
+    case, scales = _make_mixed_precision_decode_case(
+        batch_size=batch,
+        seq_len_kv=context,
+        num_qo_heads=heads_q,
+        num_kv_heads=heads_kv,
+        head_dim=dim,
+        seq_len_q=queries,
+        page_size=page,
+        q_dtype=_FP8,
+        kv_dtype=torch.uint8,
+        out_dtype=torch.bfloat16,
+        device="cuda",
+        seed=9311,
+        splits_kv=spec.requested_splits or 1,
+        num_insts_kv=spec.config.num_insts_kv,
+        q_tokens_per_cta=spec.config.q_tokens_per_cta,
+        mask_type="dense",
+    )
+    _check_workspace_and_graph(
+        case,
+        scales,
+        seq_len_kv=context,
+        seq_len_q=queries,
+        page_size=page,
     )

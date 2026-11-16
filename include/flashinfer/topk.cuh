@@ -1350,6 +1350,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKKernel_Unified(
           }
         }
       } else {
+        // red_release (thread 0) releases only what the CTA wrote before its last __syncthreads():
+        // make every thread's pass-2 row_output writes part of it before the peers read them.
+        __syncthreads();
         // Barrier to ensure all CTAs finished writing indices
         AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
 
@@ -1471,6 +1474,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
       if constexpr (!SINGLE_CTA) {
         constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;  // ORDERED_BITS / RADIX_BITS
         uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
+        // The buffer cleared here can be the one the previous ordinary row's last radix round
+        // read, and a peer may still be reading it (no barrier follows that read): every CTA of
+        // the group passes this barrier before the first CTA clears it.
+        AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
         if (cta_in_group == 0) {
           for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
             state->histogram[next_first_hist_idx][i] = 0;
@@ -1691,6 +1698,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
         // fixed-point integer atomics (order-independent); the default path
         // keeps float atomicAdd, whose CTA-arrival-order-dependent rounding
         // makes results vary across invocations.
+        // A peer may still be reading the previous row's sum (no barrier follows that read):
+        // every CTA of the group passes this barrier before the first CTA resets it.
+        AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
         if (tx == 0) {
           if (cta_in_group == 0) {
             if constexpr (DETERMINISTIC) {

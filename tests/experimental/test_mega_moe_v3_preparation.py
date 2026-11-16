@@ -340,6 +340,37 @@ def test_pipeline_bindings_take_the_a_map_from_the_stated_source(a_source):
         assert A.data_ptr() == pool.data_ptr()
 
 
+def test_pipeline_bindings_launch_the_routes_persistent_grid():
+    """The bindings launch one CTA per SM, or the persistent grid a route's
+    metadata states (``num_ctas``); nothing else the preparation binds depends
+    on it. A count of no CTA or past the device's SMs is refused."""
+    torch = cuda_torch()
+
+    def bind(**metadata):
+        inputs = small_pipeline_inputs(torch)
+        return preparation.prepare_pipeline_bindings(
+            inputs, 4, route_metadata=dict(SHORT_ROW_METADATA, **metadata)
+        )
+
+    def form(bindings):
+        out = {}
+        for name, v in bindings.items():
+            if isinstance(v, torch.Tensor):
+                v = (tuple(v.shape), v.dtype, tuple(v.stride()))
+            out[name] = v
+        out.pop("grid")
+        return out
+
+    full, smaller = bind(), bind(num_ctas=2)
+    assert full["grid"] == full["bindings"]["grid"] == (4, 1, 1)
+    assert smaller["grid"] == smaller["bindings"]["grid"] == (2, 1, 1)
+    assert form(full["bindings"]) == form(smaller["bindings"])
+    assert bind(num_ctas=4)["grid"] == (4, 1, 1)
+    for bad in (0, 6):
+        with pytest.raises(ValueError, match="'num_ctas' must be a persistent grid"):
+            bind(num_ctas=bad)
+
+
 def test_pipeline_bindings_refuse_an_unknown_a_source():
     """The metadata is refused before any input is touched, so the inputs
     may live on the host here."""
@@ -581,3 +612,168 @@ def test_control_arena_knob_refuses_an_unknown_value(monkeypatch):
         preparation.prepare_pipeline_bindings(
             inputs, 4, route_metadata=SHORT_ROW_METADATA
         )
+
+
+# The TP route metadata of a W2D program (the 384-expert, intermediate-384 /
+# 640 sm_103a routes at 32 tokens and above) beside its dense W2 image widths.
+TP_ROUTE_METADATA = {
+    "block_m": 16,
+    "readiness": "block",
+    "slot_list": False,
+    "local_expert_filter": True,
+    "w1_expert_map": True,
+    "a_source": "pool",
+}
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"w2_dense_k": 288},
+        {"w2_logical_k": 288},
+        {"w2_dense_k": 288.0, "w2_logical_k": 288},
+        {"w2_dense_k": 300, "w2_logical_k": 288},
+        {"w2_dense_k": 352, "w2_logical_k": 288},
+        {"w2_dense_k": 576, "w2_logical_k": 576},
+    ],
+)
+def test_pipeline_bindings_refuse_malformed_w2_image_metadata(metadata):
+    """The dense W2 image widths come together, as positive multiples of the
+    scale group, at a width the route's shape takes (intermediate 384: logical
+    288, image 288 or 320; intermediate 640: 576 and 576). The metadata is
+    refused before any input is touched, so the inputs may live on the host."""
+    torch = pytest.importorskip("torch")
+    inputs = dict(
+        GEOMETRY,
+        num_tokens=128,
+        num_experts=384,
+        intermediate=288,
+        x_fp8_packed=torch.zeros(1, dtype=torch.uint8),
+    )
+    with pytest.raises(ValueError, match="w2_"):
+        preparation.prepare_pipeline_bindings(
+            inputs, 152, route_metadata=dict(TP_ROUTE_METADATA, **metadata)
+        )
+
+
+def tp_pipeline_inputs(torch, logical, dtype, num_tokens=4):
+    """A packed FP4 call of the 384-expert TP shape at the ``logical``
+    intermediate width: random weight bytes in ``dtype`` (a one-byte dtype),
+    unit scales, routes over the first 24 experts; nothing is launched."""
+    E, H, T = 384, 5120, num_tokens
+    generator = torch.Generator(device="cuda").manual_seed(logical)
+
+    def packed(*shape):
+        return torch.randint(
+            0, 256, shape, dtype=torch.uint8, device="cuda", generator=generator
+        )
+
+    def scales(*shape):
+        return torch.ones(shape, dtype=torch.float32, device="cuda")
+
+    routes = torch.arange(T * 6, device="cuda").remainder(24).reshape(T, 6)
+    return dict(
+        GEOMETRY,
+        num_tokens=T,
+        num_experts=E,
+        intermediate=logical,
+        x_fp8_packed=packed(T, H),
+        x_sf_packed=packed(T, H // SF_GRAN).view(torch.int32),
+        topk_idx=routes,
+        topk_weights=torch.ones(T, 6, dtype=torch.float32, device="cuda"),
+        w1_fp4=packed(E, 2 * logical, H // 2).view(dtype),
+        w1_sf=scales(E, 2 * logical, H // SF_GRAN),
+        w2_fp4=packed(E, H, logical // 2).view(dtype),
+        w2_sf=scales(E, H, logical // SF_GRAN),
+    )
+
+
+def assert_same_bindings(a, b, skip=()):
+    """Every binding of ``a`` but ``skip`` is ``b``'s: equal scalars, and
+    tensors of one dtype and shape holding the same bytes."""
+    import torch
+
+    assert set(a) == set(b)
+    for name in sorted(set(a) - set(skip)):
+        x, y = a[name], b[name]
+        if isinstance(x, torch.Tensor):
+            assert x.dtype == y.dtype and x.shape == y.shape, name
+            assert torch.equal(x.view(torch.uint8), y.view(torch.uint8)), name
+        else:
+            assert x == y, name
+
+
+@pytest.mark.parametrize(
+    ("logical", "physical", "dense"),
+    [(288, 384, 288), (288, 384, 320), (576, 640, 576)],
+)
+@pytest.mark.parametrize("dtype_name", ["uint8", "int8"])
+def test_pipeline_bindings_bind_the_dense_w2_image_on_a_w2d_route(
+    logical, physical, dense, dtype_name
+):
+    """On a route stating ``w2_dense_k`` / ``w2_logical_k`` a call at the
+    logical width binds ``B2`` as a fresh, 256-byte aligned ``[E * H + 1,
+    w2_dense_k / 2]`` copy of the caller's W2 bytes (zero bytes past the
+    logical width, and a last row of zeros the final K step of the last
+    weight row reads into), whether the caller's W2 is uint8 or int8, and
+    ``K2`` as ``w2_dense_k``. Every other binding, ``SFB2`` included, is the one the same
+    route without the two keys binds; that route binds the padded ``B2`` with
+    ``K2`` the physical width."""
+    torch = cuda_torch()
+    dtype = getattr(torch, dtype_name, None)
+    if dtype is None:
+        pytest.skip(f"torch has no {dtype_name}")
+    inputs = tp_pipeline_inputs(torch, logical, dtype)
+    metadata = dict(TP_ROUTE_METADATA, w2_dense_k=dense, w2_logical_k=logical)
+    dense_data = preparation.prepare_pipeline_bindings(
+        inputs, 152, route_metadata=metadata
+    )
+    padded_data = preparation.prepare_pipeline_bindings(
+        inputs, 152, route_metadata=TP_ROUTE_METADATA
+    )
+    bindings, padded = dense_data["bindings"], padded_data["bindings"]
+    E, H = 384, 5120
+    caller = inputs["w2_fp4"].view(torch.uint8).reshape(E * H, logical // 2)
+    B2 = bindings["B2"]
+    assert B2.dtype == torch.uint8 and B2.shape == (E * H + 1, dense // 2)
+    assert B2.is_contiguous() and B2.data_ptr() % 256 == 0 and owns_its_storage(B2)
+    assert torch.equal(B2[: E * H, : logical // 2], caller)
+    assert not B2[: E * H, logical // 2 :].any().item()
+    assert not B2[E * H :].any().item()
+    first, end = byte_range(B2)
+    caller_first, caller_end = byte_range(inputs["w2_fp4"])
+    assert end <= caller_first or caller_end <= first, "B2 aliases the caller's W2"
+    assert bindings["K2"] == dense and padded["K2"] == physical
+    assert padded["B2"].shape == (E * H, physical // 2)
+    assert torch.equal(padded["B2"][:, : logical // 2], caller)
+    assert not padded["B2"][:, logical // 2 :].any().item()
+    assert_same_bindings(bindings, padded, skip=("B2", "K2"))
+
+
+@pytest.mark.parametrize(
+    ("logical", "physical", "dense", "w2_logical"),
+    [
+        (320, 384, 288, 288),
+        (352, 384, 288, 288),
+        (384, 384, 288, 288),
+        (544, 640, 576, 576),
+        (608, 640, 576, 576),
+        (640, 640, 576, 576),
+    ],
+)
+def test_pipeline_bindings_bind_the_padded_w2_at_other_widths_of_a_w2d_route(
+    logical, physical, dense, w2_logical
+):
+    """A call on a route stating the dense W2 image at a logical width other
+    than ``w2_logical_k`` binds what the same route without the keys binds:
+    the padded ``B2`` and ``K2`` the physical width, every binding alike."""
+    torch = cuda_torch()
+    inputs = tp_pipeline_inputs(torch, logical, torch.uint8)
+    metadata = dict(TP_ROUTE_METADATA, w2_dense_k=dense, w2_logical_k=w2_logical)
+    stated = preparation.prepare_pipeline_bindings(inputs, 152, route_metadata=metadata)
+    plain = preparation.prepare_pipeline_bindings(
+        inputs, 152, route_metadata=TP_ROUTE_METADATA
+    )
+    assert stated["bindings"]["K2"] == physical
+    assert stated["bindings"]["B2"].shape == (384 * 5120, physical // 2)
+    assert_same_bindings(stated["bindings"], plain["bindings"])

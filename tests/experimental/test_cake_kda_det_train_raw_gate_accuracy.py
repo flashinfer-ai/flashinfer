@@ -21,10 +21,10 @@ Arms, each against the exact FP64 recurrence whose gate is activated from the
 same BF16 raw gate and FP32 parameters in FP64
 (:func:`kda_exact_raw_with_grads`):
 
-* ``R``: the raw path, ``chunk_kda_det(raw, use_gate_in_kernel=True, A_log=...,
+* ``R``: the raw path, ``cake_kda_det(raw, use_gate_in_kernel=True, A_log=...,
   dt_bias=..., lower_bound=-5.0)``;
 * ``E_T``: the explicit path with a torch FP32 gate, autograd on the BF16 raw
-  gate and the FP32 parameters, then ``chunk_kda_det(g FP32)``;
+  gate and the FP32 parameters, then ``cake_kda_det(g FP32)``;
 * ``E_F``: the explicit path with flash-linear-attention's gate (where it
   imports on the node; the arm is left out otherwise, never the test).
 
@@ -88,7 +88,7 @@ import torch
 if __name__ == "__main__":  # script mode: the repository root on the path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     GateFn,
     check_fla_gate,
@@ -100,10 +100,10 @@ from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     raw_gate,
     t_quantile,
 )
-from tests.test_helpers.cake_package import cake_package  # noqa: E402
+from tests.cake.test_helpers.cake_package import cake_package  # noqa: E402
 
-cake_backend = cake_package("cake_kda_det_train", "cake_backend")
-cake_jit = cake_package("cake_kda_det_train", "cake_jit")
+cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
 
 ENV_RUN = "FLASHINFER_CAKE_KDA_TRAIN_RAW_GATE_ACCURACY"
 ENV_JSON = "FLASHINFER_CAKE_KDA_TRAIN_RAW_GATE_ACCURACY_JSON"
@@ -183,7 +183,7 @@ def arm_raw(inputs: dict) -> dict:
     """``R``: the raw path through the autograd entry."""
     leaves = _leaves(inputs)
     q, k, v, raw, beta, a_log, dt_bias = leaves
-    out = cake_backend.chunk_kda_det(
+    out = cake_backend.cake_kda_det(
         q,
         k,
         v,
@@ -201,14 +201,12 @@ def arm_raw(inputs: dict) -> dict:
 
 def arm_explicit(inputs: dict, gate_fn: GateFn) -> dict:
     """An explicit arm: ``gate_fn`` activates the gate (FP32, differentiable in the raw gate and the parameters),
-    then ``chunk_kda_det(g)``; autograd carries ``dg`` back through the gate."""
+    then ``cake_kda_det(g)``; autograd carries ``dg`` back through the gate."""
     leaves = _leaves(inputs)
     q, k, v, raw, beta, a_log, dt_bias = leaves
     g = gate_fn(raw, a_log, dt_bias)
     assert g.dtype == torch.float32 and g.shape == raw.shape, (g.dtype, g.shape)
-    out = cake_backend.chunk_kda_det(
-        q, k, v, g.contiguous(), beta, inputs["cu_seqlens"]
-    )
+    out = cake_backend.cake_kda_det(q, k, v, g.contiguous(), beta, inputs["cu_seqlens"])
     out.backward(inputs["dout"])
     return _results(out, leaves)
 
@@ -296,11 +294,11 @@ def _log_ratio(num: float, den: float) -> float:
 # ---- the run ----------------------------------------------------------------------------------------------------
 # the files whose bytes identify the code under test (the commit alone does not when the tree is dirty)
 CODE_FILES = (
-    "flashinfer/experimental/cake_kda_det_train/cake_backend.py",
-    "flashinfer/experimental/cake_kda_det_train/cake_jit.py",
+    "flashinfer/experimental/cake/cake_kda_det_train/cake_backend.py",
+    "flashinfer/experimental/cake/cake_kda_det_train/cake_jit.py",
     "flashinfer/cake_kda_det_train.py",
     "tests/experimental/test_cake_kda_det_train_raw_gate_accuracy.py",
-    "tests/test_helpers/cake_kda_det_train_reference.py",
+    "tests/experimental/test_helpers/cake_kda_det_train_reference.py",
 )
 
 

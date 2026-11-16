@@ -967,7 +967,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_deepgemm_mega_moe_v3_grouped_fused(DeepgemmTensorMap const* A, DeepgemmTensorMap const* B1, uint8_t* __restrict__ SFA1, uint8_t* __restrict__ SFB1, float* __restrict__ routing_weights, uint8_t* __restrict__ I_fp8_w, uint8_t* __restrict__ SF_I_w, DeepgemmTensorMap const* A2, DeepgemmTensorMap const* B2, unsigned int* __restrict__ SFA2, unsigned int* __restrict__ SFB2, __nv_bfloat16* __restrict__ Out, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, unsigned int* __restrict__ l1_arrival, int M_total, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles)
+kernel_deepgemm_mega_moe_v3_grouped_fused(DeepgemmTensorMap const* A, DeepgemmTensorMap const* B1, uint8_t* __restrict__ SFA1, uint8_t* __restrict__ SFB1, float* __restrict__ routing_weights, uint8_t* __restrict__ I_fp8_w, uint8_t* SF_I_w, DeepgemmTensorMap const* A2, DeepgemmTensorMap const* B2, unsigned int* SFA2, unsigned int* __restrict__ SFB2, __nv_bfloat16* __restrict__ Out, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, unsigned int* __restrict__ l1_arrival, int M_total, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1586,7 +1586,7 @@ kernel_deepgemm_mega_moe_v3_grouped_fused(DeepgemmTensorMap const* A, DeepgemmTe
                         unsigned int* _gca_p = reinterpret_cast<unsigned int*>(l1_arrival) + (m_tile2_1 * K2_tiles + iter_k_3);
                         while (true) {
                             unsigned int _gca_v;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p));
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
                             if (_gca_v >= (unsigned int)(4)) break;
                         }
                     }
@@ -1656,6 +1656,7 @@ kernel_deepgemm_mega_moe_v3_grouped_fused(DeepgemmTensorMap const* A, DeepgemmTe
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
                         tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 51200, A2, 0, off_m2_1, iter_k_3 * 2, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_4d_gmem2smem_cta2(smem_b_addr + load_stage * 51200, B2, 0, off_n2 + cta_rank * 64, iter_k_3 * 2, exp_id2_1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         asm volatile(

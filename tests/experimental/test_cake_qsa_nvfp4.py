@@ -30,7 +30,7 @@ zero-allocation workspace path, and the ``build.json`` contract of the package.
 The suite calls the package's host entry directly; the public route
 ``flashinfer.sparse.qsa_sparse_paged_attention(..., backend="cake")`` is covered by
 ``test_cake_qsa_nvfp4_api.py``.  Besides the package it imports nothing of flashinfer: the
-cache the kernel reads is filled by ``tests.test_helpers.cake_qsa_nvfp4_reference``, a torch
+cache the kernel reads is filled by ``tests.experimental.test_helpers.cake_qsa_nvfp4_reference``, a torch
 port of FlashInfer's NVFP4 paged writer (the API file compares the two).
 """
 
@@ -52,7 +52,7 @@ from flashinfer.experimental.cake_qsa_nvfp4.cake_backend import (
     SPLIT_OVERRIDES,
     num_splits,
 )
-from tests.test_helpers.cake_qsa_nvfp4_reference import write_slots
+from tests.experimental.test_helpers.cake_qsa_nvfp4_reference import write_slots
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 
@@ -210,7 +210,7 @@ def _dequant(data, sf, scale):
 
 def _make_cache(num_kv_heads, layout, seed):
     """Quantize random K/V into every slot in the NVFP4 writer's format (the torch port of
-    ``tests.test_helpers.cake_qsa_nvfp4_reference``), using one buffer of [data | scales]
+    ``tests.experimental.test_helpers.cake_qsa_nvfp4_reference``), using one buffer of [data | scales]
     rows per side like a packed vLLM page. Returns the kernel's [blocks, tokens, heads, *]
     views, the global scales and the dequantized cache."""
     gen = torch.Generator(device="cuda").manual_seed(seed)

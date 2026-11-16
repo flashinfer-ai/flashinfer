@@ -58,6 +58,7 @@ from cutlass.experimental.task_scheduling.task_manager import TaskManager
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+from ..._hardware import is_sm107_compile_target
 from ..._block_sparse.common import (
     _block_sparse_contiguous_kv_copy_geometry,
     _block_sparse_proxy_summary_geometry,
@@ -109,6 +110,8 @@ from .fmha_decode_resources.sage_scales import (
     SageVScalesResource,
 )
 from .fmha_decode_tasks import (
+    create_kv_operand_transform_task,
+    create_mma_task_dual_transform_kv,
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
     SparseMembershipLifetimeResource,
@@ -543,7 +546,7 @@ def _build_decode_gen_schedule(
     # (including Int8 K with E4M3 V) share one ring.
     use_shared_inst_kv_rings = (
         cfg.k_dtype_bytes != cfg.v_dtype_bytes and cfg.tile_size_kv != 256
-    )
+    ) or cfg.uses_dual_kv_transform
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
     # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
     # smaller stage tiles can prefetch farther without increasing the budget.
@@ -602,10 +605,14 @@ def _build_decode_gen_schedule(
     )
     if use_shared_inst_kv_rings and not use_one_inst_qkv:
         # One K and one V stage per unit of depth.
-        shared_inst_kv_stages = max(
-            (MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB)
-            // (cfg.smem_k_tile_bytes + cfg.smem_v_tile_bytes),
-            1,
+        shared_inst_kv_stages = (
+            max(cfg.kv_stages // 2, 1)
+            if cfg.uses_dual_kv_transform
+            else max(
+                (MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB)
+                // (cfg.smem_k_tile_bytes + cfg.smem_v_tile_bytes),
+                1,
+            )
         )
         split_k0_stages = shared_inst_kv_stages
         split_v0_stages = shared_inst_kv_stages
@@ -986,9 +993,9 @@ def _build_decode_gen_schedule(
             pipeline_config=smem_page_offsets_cfg,
             cfg=cfg,
             stage_page_ids_per_tile=stage_page_ids_per_tile,
-            # The full membership row has no static allocation extent when
-            # KV lengths are runtime. Read its immutable GMEM words on demand.
-            cache_memberships_in_smem=cfg.fixed_seqlen,
+            # Runtime query planes use a bounded prefix cache with a GMEM
+            # fallback, so its allocation never specializes sequence lengths.
+            cache_memberships_in_smem=(cfg.fixed_seqlen or cfg.query_major_memberships),
             page_idx_kv=page_idx_kv,
             page_table_stride=page_table_stride,
             num_heads_kv=num_heads_kv,
@@ -1211,15 +1218,41 @@ def _build_decode_gen_schedule(
             name="smemKv",
         )
     transformed_kv = None
+    transformed_v = None
+    transformed_kv1 = None
     mma_smem_kv = smem_kv
     if cfg.use_transform_kv:
         if cfg.store_transformed_kv_in_tmem:
-            assert smem_kv is not None
+            source_k = smem_k0 if cfg.uses_dual_kv_transform else smem_kv
+            assert source_k is not None
             transformed_kv = TmemTransformedKvResource(
                 pipeline_config=smem_transformed_kv_cfg,
                 cfg=cfg,
-                src_smem_kv=smem_kv,
+                src_smem_kv=source_k,
                 name="tmemTransformedKv",
+            )
+            if cfg.uses_dual_kv_transform:
+                assert smem_v0 is not None
+                transformed_v = TmemTransformedKvResource(
+                    pipeline_config=smem_transformed_kv_cfg,
+                    cfg=cfg,
+                    src_smem_kv=smem_v0,
+                    name="tmemTransformedV",
+                )
+        elif cfg.uses_dual_smem_transform:
+            # One-instance Keeps: separate K and V rings replace the raw K and
+            # V rings at the MMA.
+            transformed_kv = SmemTransformedKvResource(
+                pipeline_config=smem_transformed_kv_cfg,
+                cfg=cfg,
+                src_smem_k0=smem_k0,
+                name="smemTransformedK",
+            )
+            transformed_kv1 = SmemTransformedKvResource(
+                pipeline_config=smem_transformed_kv_cfg,
+                cfg=cfg,
+                src_smem_v0=smem_v0,
+                name="smemTransformedV",
             )
         else:
             transformed_kv = SmemTransformedKvResource(
@@ -1234,6 +1267,20 @@ def _build_decode_gen_schedule(
                 num_heads_kv=num_heads_kv,
                 name="smemTransformedKv",
             )
+            if cfg.uses_per_inst_smem_transform:
+                # KV instance 1 converts into its own ring.
+                transformed_kv1 = SmemTransformedKvResource(
+                    pipeline_config=smem_transformed_kv_cfg,
+                    cfg=cfg,
+                    src_smem_kv=smem_kv,
+                    src_smem_k0=smem_k0,
+                    src_smem_k1=smem_k1,
+                    src_smem_v0=smem_v0,
+                    src_smem_v1=smem_v1,
+                    page_idx_kv=page_idx_kv,
+                    num_heads_kv=num_heads_kv,
+                    name="smemTransformedKv1",
+                )
         mma_smem_kv = transformed_kv
 
     # The correction task stages and reads the work tile's V scales itself.
@@ -1430,6 +1477,14 @@ def _build_decode_gen_schedule(
         tmem_softmax_global1.p_ref = smem_p1
         tmem_softmax_global1.tmem_s_ref = tmem_s1
 
+    # Compact runtime splits pack partials by the launch fanout.
+    partial_split_stride = None
+    if cfg.uses_compact_split_grid and requested_splits is not None:
+        partial_split_stride = (
+            requested_splits[0]
+            if isinstance(requested_splits, tuple)
+            else requested_splits
+        )
     tmem_corr0 = TmemCorrResource(
         inst_id=0,
         cfg=cfg,
@@ -1452,6 +1507,7 @@ def _build_decode_gen_schedule(
         q_token_offset=q_token_offset,
         seq_len_q=seq_len_q,
         active_splits_kv=active_splits_kv,
+        partial_split_stride=partial_split_stride,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr0",
         sage_v_scales_ref=sage_v_scales,
@@ -1483,6 +1539,7 @@ def _build_decode_gen_schedule(
             q_token_offset=q_token_offset,
             seq_len_q=seq_len_q,
             active_splits_kv=active_splits_kv,
+            partial_split_stride=partial_split_stride,
             static_full_split_prefix=static_full_split_prefix,
             name="tmemCorr1",
             sage_v_scales_ref=sage_v_scales,
@@ -1526,6 +1583,10 @@ def _build_decode_gen_schedule(
         smem_resources.append(smem_kv)
     if transformed_kv is not None:
         smem_resources.append(transformed_kv)
+    if transformed_v is not None:
+        smem_resources.append(transformed_v)
+    if transformed_kv1 is not None:
+        smem_resources.append(transformed_kv1)
     smem_resources.append(smem_p0)
     if not use_one_inst_kv:
         smem_resources.append(smem_p1)
@@ -1580,8 +1641,11 @@ def _build_decode_gen_schedule(
         ) // cfg.stensor_align * cfg.stensor_align + allocator.barrier_smem_bytes
 
     # The static profile checks bound only the Q and K/V pipelines; check the
-    # complete layout against the SM100-family SMEM capacity.
-    smem_capacity_bytes = SMEM_CAPACITY_KIB * BYTES_PER_KIB
+    # complete layout against the compile target's SMEM capacity.
+    # Native SM107 targets can use 327 KiB. A family
+    # sm_100f compilation must retain the portable 227-KiB limit.
+    target_smem_kib = 327 if is_sm107_compile_target() else SMEM_CAPACITY_KIB
+    smem_capacity_bytes = target_smem_kib * BYTES_PER_KIB
     smem_allocator, clc_response_alloc = allocate_smem()
     if (
         cfg.uses_q_token_kv_block_sparse_page_membership
@@ -1773,11 +1837,25 @@ def _build_decode_gen_schedule(
                 else None,
                 **task_runtime_kwargs,
             )
-    if use_one_inst_qkv:
+    if cfg.uses_dual_kv_transform:
+        assert transformed_kv is not None and transformed_v is not None
+        mma_task = create_mma_task_dual_transform_kv(
+            smem_q,
+            transformed_kv,
+            transformed_v,
+            tmem_s0,
+            smem_p0,
+            tmem_o,
+            cfg,
+            domain=mma_domain,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+    elif use_one_inst_qkv:
         mma_task = create_mma_task_one_inst_qkv(
             smem_q,
-            smem_k0,
-            smem_v0,
+            transformed_kv if cfg.uses_dual_smem_transform else smem_k0,
+            transformed_kv1 if cfg.uses_dual_smem_transform else smem_v0,
             tmem_s0,
             smem_p0,
             tmem_o,
@@ -1821,10 +1899,66 @@ def _build_decode_gen_schedule(
             cfg,
             domain=mma_domain,
             domain_bias=0,
+            smem_kv1=transformed_kv1,
             **task_runtime_kwargs,
         )
     transform_kv_task = None
-    if cfg.use_transform_kv:
+    transform_v_task = None
+    transform_kv1_task = None
+    if cfg.uses_dual_kv_transform:
+        transform_kv_task = create_kv_operand_transform_task(
+            smem_k0,
+            transformed_kv,
+            cfg,
+            domain=load_domain,
+            is_v=False,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+        transform_v_task = create_kv_operand_transform_task(
+            smem_v0,
+            transformed_v,
+            cfg,
+            domain=load_domain,
+            is_v=True,
+            domain_bias=0,
+            **task_runtime_kwargs,
+        )
+    elif cfg.uses_dual_smem_transform:
+        transform_kv_task, transform_kv1_task = (
+            create_kv_operand_transform_task(
+                raw,
+                ring,
+                cfg,
+                domain=load_domain,
+                is_v=is_v,
+                domain_bias=0,
+                **task_runtime_kwargs,
+            )
+            for raw, ring, is_v in (
+                (smem_k0, transformed_kv, False),
+                (smem_v0, transformed_kv1, True),
+            )
+        )
+    elif cfg.uses_per_inst_smem_transform:
+        transform_kv_task, transform_kv1_task = (
+            create_transform_kv_task(
+                smem_kv,
+                smem_k0,
+                smem_k1,
+                smem_v0,
+                smem_v1,
+                ring,
+                work_queue,
+                cfg,
+                domain=load_domain,
+                domain_bias=0,
+                inst_id=inst_id,
+                **task_runtime_kwargs,
+            )
+            for inst_id, ring in ((0, transformed_kv), (1, transformed_kv1))
+        )
+    elif cfg.use_transform_kv:
         transform_kv_task = create_transform_kv_task(
             smem_kv,
             smem_k0,
@@ -1934,6 +2068,10 @@ def _build_decode_gen_schedule(
     task_list.extend(load_tasks)
     if transform_kv_task is not None:
         task_list.append(transform_kv_task)
+    if transform_v_task is not None:
+        task_list.append(transform_v_task)
+    if transform_kv1_task is not None:
+        task_list.append(transform_kv1_task)
     if use_one_inst_qkv and not use_clc_dynamic:
         task_list.extend([correction_task, mma_task])
         task_list.append(softmax0_task)
@@ -1956,15 +2094,36 @@ def _build_decode_gen_schedule(
         [smem_page_offsets_v] if smem_page_offsets_v is not None else list(smem_kv_deps)
     )
     if use_one_inst_qkv:
+        mma_k = transformed_kv if cfg.uses_dual_smem_transform else smem_k0
+        mma_v = transformed_kv1 if cfg.uses_dual_smem_transform else smem_v0
         resource_dependency_graph = {
             smem_q: [],
             smem_k0: smem_kv_deps,
             smem_v0: smem_kv_deps,
-            tmem_s0: [smem_k0, smem_q],
+            **(
+                {transformed_kv: [smem_k0], transformed_kv1: [smem_v0]}
+                if cfg.uses_dual_smem_transform
+                else {}
+            ),
+            tmem_s0: [mma_k, smem_q],
             smem_p0: [tmem_s0],
             tmem_softmax_local0: [tmem_s0],
             tmem_softmax_global0: [tmem_s0],
-            tmem_o: [smem_p0, smem_v0],
+            tmem_o: [smem_p0, mma_v],
+            tmem_corr0: [tmem_softmax_local0, tmem_o],
+        }
+    elif cfg.uses_dual_kv_transform:
+        resource_dependency_graph = {
+            smem_q: [],
+            smem_k0: smem_k_deps,
+            smem_v0: smem_v_deps,
+            transformed_kv: [smem_k0],
+            transformed_v: [smem_v0],
+            tmem_s0: [transformed_kv, smem_q],
+            smem_p0: [tmem_s0],
+            tmem_softmax_local0: [tmem_s0],
+            tmem_softmax_global0: [tmem_s0],
+            tmem_o: [smem_p0, transformed_v],
             tmem_corr0: [tmem_softmax_local0, tmem_o],
         }
     elif cfg.use_transform_kv and use_per_inst_kv_resources:
@@ -1974,7 +2133,14 @@ def _build_decode_gen_schedule(
             smem_k1: smem_k_deps,
             smem_v0: smem_v_deps,
             smem_v1: smem_v_deps,
-            transformed_kv: [smem_k0, smem_k1, smem_v0, smem_v1],
+            transformed_kv: [smem_k0, smem_v0]
+            if transformed_kv1 is not None
+            else [smem_k0, smem_k1, smem_v0, smem_v1],
+            **(
+                {transformed_kv1: [smem_k1, smem_v1]}
+                if transformed_kv1 is not None
+                else {}
+            ),
             tmem_s0: [transformed_kv, smem_q],
             smem_p0: [tmem_s0],
             tmem_softmax_local0: [tmem_s0],
@@ -1985,11 +2151,15 @@ def _build_decode_gen_schedule(
         if not use_one_inst_kv:
             resource_dependency_graph.update(
                 {
-                    tmem_s1: [transformed_kv, smem_q],
+                    tmem_s1: [
+                        transformed_kv if transformed_kv1 is None else transformed_kv1,
+                        smem_q,
+                    ],
                     smem_p1: [tmem_s1],
                     tmem_softmax_local1: [tmem_s1],
                     tmem_softmax_global1: [tmem_s1],
-                    tmem_o: [smem_p0, smem_p1, transformed_kv],
+                    tmem_o: [smem_p0, smem_p1, transformed_kv]
+                    + ([transformed_kv1] if transformed_kv1 is not None else []),
                     tmem_corr1: [
                         tmem_softmax_local0,
                         tmem_softmax_local1,
@@ -2153,9 +2323,21 @@ def _build_decode_gen_schedule(
     dma_consumer_release_labels: dict[
         tuple[MemoryResource, MemoryResource], set[str]
     ] = {}
-    if transformed_kv is not None:
+    if cfg.uses_dual_smem_transform:
+        # One-instance Keeps reads K from one ring and V from the other.
+        dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"kv_desc"}
+        dma_consumer_release_labels[(transformed_kv1, tmem_o)] = {"v_desc"}
+    elif transformed_kv1 is not None:
+        # Each instance ring publishes its own K and V descriptors.
         dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"k_desc_0"}
         dma_consumer_release_labels[(transformed_kv, tmem_o)] = {"v_desc_0"}
+        dma_consumer_release_labels[(transformed_kv1, tmem_s1)] = {"k_desc_1"}
+        dma_consumer_release_labels[(transformed_kv1, tmem_o)] = {"v_desc_1"}
+    elif transformed_kv is not None:
+        dma_consumer_release_labels[(transformed_kv, tmem_s0)] = {"k_desc_0"}
+        dma_consumer_release_labels[
+            (transformed_kv if transformed_v is None else transformed_v, tmem_o)
+        ] = {"v_desc_0"}
         if not use_one_inst_kv:
             dma_consumer_release_labels[(transformed_kv, tmem_s1)] = {"k_desc_1"}
             dma_consumer_release_labels[(transformed_kv, tmem_o)].add("v_desc_1")
@@ -2285,6 +2467,8 @@ def _build_decode_gen_schedule(
     if cfg.store_transformed_kv_in_tmem:
         assert transformed_kv is not None
         tmem_allocator.add_resource(transformed_kv)
+        if transformed_v is not None:
+            tmem_allocator.add_resource(transformed_v)
     tmem_allocator.compute_layout()
     if cfg.use_keeps_mma_ab and not use_one_inst_qkv and not cfg.uses_tmem_p:
         # Two-inst Keeps with SMEM P (Q64/KV128 and 8-bit Q128/KV128) keeps the
@@ -2576,8 +2760,8 @@ def _run_decode_gen_active(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    softmax_scale_operand: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -2731,9 +2915,15 @@ def _run_decode_gen_active(
     ) = _build_decode_gen_schedule(
         cfg,
         total_kv_tiles,
-        scale_softmax_log2=scale_softmax_log2,
+        scale_softmax_log2=(
+            Float32(1.0)
+            if isinstance(softmax_scale_operand, cute.Pointer)
+            else softmax_scale_operand
+        ),
         o_ptr=o_iter,
-        output_scale=output_scale,
+        output_scale=(
+            Float32(1.0) if isinstance(output_scale, cute.Pointer) else output_scale
+        ),
         partial_o_ptr=g_partial_o,
         partial_stats_ptr=g_partial_stats,
         split_kv_counter_ptr=g_split_kv_counter,
@@ -2877,6 +3067,31 @@ def _run_decode_gen_active(
             Int32(tmem_alloc_cols),
             cfg,
         )
+    # Scales are first consumed by the task bodies. Bind their device values
+    # after the producer acquire so resource initialization can overlap it.
+    if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Pointer)):
+        scale_softmax_log2 = cute.make_tensor(
+            softmax_scale_operand, cute.make_layout(1)
+        )[0] * Float32(math.log2(math.e))
+        for resource in task_manager.resources:
+            if cutlass.const_expr(
+                isinstance(
+                    resource,
+                    (
+                        TmemSResource,
+                        SmemPResource,
+                        TmemOResource,
+                        TmemSoftmaxGlobalResource,
+                        TmemCorrResource,
+                    ),
+                )
+            ):
+                resource.scale_softmax_log2 = scale_softmax_log2
+    if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
+        resolved_output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
+        for resource in task_manager.resources:
+            if cutlass.const_expr(isinstance(resource, TmemCorrResource)):
+                resource.output_scale = resolved_output_scale
     task_manager.run()
 
     # Every peer async-stores into an owner CTA's distributed SMEM and charges
@@ -2937,8 +3152,8 @@ def _run_decode_gen_runtime_prefix(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    softmax_scale_operand: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -3027,7 +3242,7 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3084,7 +3299,7 @@ def _run_decode_gen_runtime_prefix(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3142,8 +3357,8 @@ def decode_gen_kernel(
     o_iter: cute.Pointer,
     g_s_k: Int32,
     g_h_k: Int32,
-    scale_softmax_log2: Float32,
-    output_scale: Float32,
+    softmax_scale_operand: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
     g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
@@ -3226,6 +3441,20 @@ def decode_gen_kernel(
     q_token_base = Int32(0)
     q_tile_is_active = cutlass.Boolean(True)
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
+        if cutlass.const_expr(
+            cfg.use_pdl
+            and (
+                (
+                    cfg.use_variable_seqlens_q
+                    and not isinstance(g_cu_seqlens_q, UniformQueryOffsets)
+                )
+                or use_variable_seqlens_kv
+                or (use_native_paged_kv and not use_static_native_seqlens_kv)
+            )
+        ):
+            # Static tile pruning reads producer-owned Q/KV metadata here;
+            # persistent schedules defer those reads until TaskManager runs.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
         q_token_base = _q_group_token_base(cfg, q_group_idx)
@@ -3234,8 +3463,6 @@ def decode_gen_kernel(
             use_variable_seqlens_kv
             or (use_native_paged_kv and not use_static_native_seqlens_kv)
         ):
-            if cutlass.const_expr(cfg.use_pdl):
-                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
             q_tile_is_active = q_tile_is_active & (
                 Int32(g_seqlens_kv[b_idx]) > Int32(0)
             )
@@ -3256,7 +3483,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3310,7 +3537,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3364,7 +3591,7 @@ def decode_gen_kernel(
                 o_iter,
                 g_s_k,
                 g_h_k,
-                scale_softmax_log2,
+                softmax_scale_operand,
                 output_scale,
                 g_seqlens_kv,
                 g_cu_seqlens_q,
@@ -3429,8 +3656,8 @@ def fmha_decode_launch(
     partial_stats_iter: cute.Pointer,
     split_kv_counter_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    softmax_scale: Float32,
-    output_scale: Float32,
+    softmax_scale: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     kv_b_stride: Int32,
     max_active_clusters: Int32,
     stream: cuda_drv.CUstream,
@@ -3467,6 +3694,9 @@ def fmha_decode_launch(
     its Q, K and V scales from the prepared scales (``_SageScaleLayout``).
     """
     log2_e = math.log2(math.e)
+    softmax_scale_operand = softmax_scale
+    if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
+        softmax_scale_operand = Float32(softmax_scale * log2_e)
     if cutlass.const_expr(requested_splits is not None):
         # Prepare the reciprocal once on the host; counts stay runtime operands.
         requested_splits = (
@@ -3630,6 +3860,11 @@ def fmha_decode_launch(
             tma_box0_v = cfg.head_dim_kv_stage // 2
             tma_swizzle_k = cuda.TensorMapSwizzle.none
             tma_swizzle_v = cuda.TensorMapSwizzle.none
+            if cutlass.const_expr(cfg.uses_fast_smem_nvfp4_transform):
+                # 64-byte packed rows; the 64B swizzle gives conflict-free
+                # 16-byte row loads in the fast SMEM converter.
+                tma_swizzle_k = cuda.TensorMapSwizzle.s64b
+                tma_swizzle_v = cuda.TensorMapSwizzle.s64b
     if cutlass.const_expr(cfg.tile_size_kv == 256):
         # The 2x2 datapath consumes K in a (0, 2, 1, 3) KV64 permutation.
         # A KV64 TensorMap atom lets the shared load resource place each
@@ -3801,7 +4036,9 @@ def fmha_decode_launch(
             v_sf_tma,
             box_dims=(sf_inner, sf_box_tokens_outer, 1, 1),
             stride_order=(0, 1, 2, 3),
-            swizzle=cuda.TensorMapSwizzle.none,
+            swizzle=cuda.TensorMapSwizzle.s128b
+            if cutlass.const_expr(cfg.swizzles_v_scale_factors)
+            else cuda.TensorMapSwizzle.none,
         )
 
     grid_x = q_groups
@@ -3850,12 +4087,15 @@ def fmha_decode_launch(
         and not cfg.use_sliding_window_causal
         and not cfg.uses_scattered_page_route
         and not cfg.use_block_sparse
-        and cfg.num_insts_kv * (cfg.tile_size_kv // cfg.num_tokens_per_page) <= 32
+        and cfg.num_insts_kv * (cfg.tile_size_kv // cfg.num_tokens_per_page)
+        <= cfg.runtime_page_window_pages
     )
     use_runtime_window = cutlass.Boolean(False)
     if cutlass.const_expr(can_hold_runtime_window):
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
-        window_tiles = (32 // pages_per_tile // cfg.num_insts_kv) * cfg.num_insts_kv
+        window_tiles = (
+            cfg.runtime_page_window_pages // pages_per_tile // cfg.num_insts_kv
+        ) * cfg.num_insts_kv
         use_runtime_window = s_k <= requested_splits[0] * Int32(
             window_tiles * cfg.tile_size_kv
         )
@@ -3873,7 +4113,7 @@ def fmha_decode_launch(
                 o_iter,
                 s_k,
                 h_k,
-                Float32(softmax_scale * log2_e),
+                softmax_scale_operand,
                 output_scale,
                 seqlens_kv_iter,
                 cu_seqlens_q_iter,
@@ -3930,7 +4170,8 @@ def fmha_block_sparse_launch(
     row_route_offsets_iter: cute.Pointer,
     row_route_counts_iter: cute.Pointer,
     route_metadata_iter: cute.Pointer,
-    softmax_scale: Float32,
+    softmax_scale: Float32 | cute.Pointer,
+    output_scale: Float32 | cute.Pointer,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     seq_len_kv: cutlass.Constexpr[int | None],
@@ -3956,7 +4197,9 @@ def fmha_block_sparse_launch(
     if cutlass.const_expr(cfg.use_block_sparse_proxy_routes and cfg.use_paged_kv):
         raise ValueError("block-sparse proxy routes require contiguous K/V")
 
-    log2_e = math.log2(math.e)
+    softmax_scale_operand = softmax_scale
+    if cutlass.const_expr(not isinstance(softmax_scale, cute.Pointer)):
+        softmax_scale_operand = Float32(softmax_scale * math.log2(math.e))
     b, h_q, h_k, s_k, d = problem_shape
     h_r = h_q // h_k
     q_seq = Int32(cfg.max_seq_len_q)
@@ -4184,8 +4427,8 @@ def fmha_block_sparse_launch(
         o_iter,
         s_k,
         h_k,
-        Float32(softmax_scale * log2_e),
-        Float32(1.0),
+        softmax_scale_operand,
+        output_scale,
         seqlens_kv_iter,
         null_i32_ptr,
         null_i32_ptr,

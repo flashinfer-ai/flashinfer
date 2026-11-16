@@ -256,6 +256,247 @@ def test_xband_plan_for_keeps_the_band_policy():
             plans.plan_for(small, "bshd", 0, arch=arch, xband=True)
 
 
+def test_xband_below_pair_min_m_runs_the_grouped_pair_tile():
+    """From ``XBAND_MIN_M_FLOOR`` to ``PAIR_MIN_M`` rows a fired cross-destination-band gate takes the pair geometry
+    the band rule does not give: the grouped order with ``m_tiles // PAIR_MIN_GROUPS`` token tiles per group; the band
+    plan of the same row stays the single-CTA 128-column tile."""
+
+    for arch in ("sm_100a", "sm_103a"):
+        geometry = plans.Geometry(world_size=8, batch=1, s_local=2048, hidden=3072)
+        band_policy = plans.plan_policy(geometry, arch=arch)
+        assert (band_policy.bn, band_policy.pair) == (128, False)
+        xb_policy = plans.plan_policy(geometry, arch=arch, xband=True)
+        assert (xb_policy.bn, xb_policy.pair, xb_policy.order, xb_policy.group_m) == (
+            128,
+            True,
+            "grouped",
+            4,
+        )
+        gates = plans.default_shape_gates(arch, world_size=8)
+        verdict, policy, plan = plans.plan_row(
+            geometry,
+            "bshd",
+            1,
+            arch=arch,
+            gates=gates,
+            k_table=plans.default_shape_gate_k_table(arch, world_size=8),
+            xband_min_m=plans.default_xband_min_m(arch, world_size=8),
+        )
+        assert (
+            verdict.xband is True
+            and plan.xband
+            and (plan.bn, plan.pair, plan.group_m) == (256, True, 4)
+        )
+        below = plans.Geometry(world_size=8, batch=1, s_local=2047, hidden=3072)
+        assert not plans.plan_policy(below, arch=arch, xband=True).pair
+
+
+def test_blackwell_bn128_pair_tile_table():
+    """``BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD`` (SM100 / SM103 with 8 ranks at hidden 4096, up to 512 rows): a pair row
+    of the cell runs the 128-column pair tile with the band policy's order and ``group_m``; a larger row, another
+    cell and ``bn128_max_m=0`` keep the 256-column pair tile."""
+
+    assert plans.BLACKWELL_BN128_MAX_M_BY_ARCH_WORLD == {
+        ("sm_100a", 8): {4096: 512},
+        ("sm_103a", 8): {4096: 512},
+    }
+    for arch in ("sm_100a", "sm_103a"):
+        assert plans.default_bn128_max_m(arch, 8, 4096) == 512
+        assert plans.default_bn128_max_m(arch, 4, 4096) == 0
+        geometry = plans.Geometry(world_size=8, batch=1, s_local=512, hidden=4096)
+        band = plans.plan_policy(geometry, arch=arch)
+        assert (band.bn, band.pair) == (256, True)
+        policy, plan = plans.plan_for(geometry, "bshd", 2, arch=arch)
+        assert (policy.bn, policy.pair, plan.bn, plan.pair) == (128, True, 128, True)
+        assert (plan.order, plan.group_m) == (band.order, band.group_m)
+        off_policy, off = plans.plan_for(geometry, "bshd", 2, arch=arch, bn128_max_m=0)
+        assert (off.bn, off.pair) == (256, True)
+        _p, single = plans.plan_for(
+            geometry, "bshd", 2, arch=arch, pair_available=False
+        )
+        assert (single.bn, single.pair) == (256, False)
+        larger = plans.Geometry(world_size=8, batch=1, s_local=1024, hidden=4096)
+        assert plans.plan_for(larger, "bshd", 2, arch=arch)[1].bn == 256
+    assert plans.default_bn128_max_m("sm_90a", 4, 3072) == 1024
+
+
+def test_dest_interleave_orders_the_table():
+    """The destination interleave (``DEST_INTERLEAVE_MIN_M_BY_ARCH_WORLD`` bands, ``DEST_INTERLEAVE_DEFAULT_BY_ARCH_WORLD``
+    modes): every mode keeps the set of tile rows (each row's destination, word and ticket) and only reorders them;
+    ``plan_row`` applies the default mode on a band row, where a fired per-destination launch gate yields to it, and
+    keeps the destination blocks off the band and above the cap."""
+
+    assert plans.DEST_INTERLEAVE_MODES == ("off", "il", "lt", "ls")
+    assert plans.resolve_dest_interleave("sm_100a", 2) == ("lt", True, 16384)
+    assert plans.resolve_dest_interleave("sm_103a", 2) == ("lt", True, 16384)
+    assert plans.resolve_dest_interleave("sm_103a", 4) == ("lt", True, None)
+    assert plans.resolve_dest_interleave("sm_90a", 4) == ("il", False, None)
+    assert plans.resolve_dest_interleave("sm_90a", 2) == ("il", False, None)
+    assert sorted(plans.DEST_INTERLEAVE_DEFAULT_WITHOUT_PD) == [
+        ("sm_90a", 2),
+        ("sm_90a", 4),
+    ]
+    assert plans.resolve_dest_interleave("sm_107a", 4) == ("off", False, None)
+    assert plans.resolve_dest_interleave("sm_90a", 4, "il") == ("il", False, None)
+    with pytest.raises(ValueError, match="refused on sm_107a"):
+        plans.resolve_dest_interleave("sm_107a", 4, "lt")
+    with pytest.raises(ValueError, match="dest_interleave_pd"):
+        plans.resolve_dest_interleave("sm_100a", 4, "off", pd=True)
+    geometry = plans.Geometry(world_size=4, batch=1, s_local=32768, hidden=3072)
+    _policy, base = plans.plan_for(geometry, "bshd", 1, arch="sm_103a")
+    key = lambda table: sorted(map(tuple, table.tolist()))  # noqa: E731
+    for mode in ("il", "lt", "ls"):
+        _policy, plan = plans.plan_for(
+            geometry, "bshd", 1, arch="sm_103a", dest_interleave=mode
+        )
+        assert plan.dest_interleave == mode and plan.num_tiles == base.num_tiles
+        assert key(plan.tiles) == key(base.tiles) and not torch.equal(
+            plan.tiles, base.tiles
+        )
+        assert (plan.interleave_tail_rows > 0) is (mode == "lt")
+        with pytest.raises(ValueError, match="per-destination runs"):
+            plans.dest_parts(plan)
+    _policy, lt = plans.plan_for(
+        geometry, "bshd", 1, arch="sm_103a", dest_interleave="lt"
+    )
+    assert lt.interleave_tail_rows == 146 - 146 % lt.lockstep
+    assert int(lt.tiles[-1, plans.TILE_DEST]) in (1, -1)
+    gates = plans.default_shape_gates("sm_103a", world_size=4)
+    k_table = plans.default_shape_gate_k_table("sm_103a", world_size=4)
+    verdict, _policy, row = plans.plan_row(
+        geometry, "bshd", 1, arch="sm_103a", gates=gates, k_table=k_table
+    )
+    assert row.dest_interleave == "lt" and verdict.producer_launches == "persistent"
+    assert verdict.dest_interleave_suppressed == ("per_dest_large_m",)
+    assert verdict.summary()["dest_interleave_suppressed"] == ["per_dest_large_m"]
+    off_verdict, _policy, off = plans.plan_row(
+        geometry,
+        "bshd",
+        1,
+        arch="sm_103a",
+        gates=gates,
+        k_table=k_table,
+        dest_interleave="off",
+    )
+    assert off.dest_interleave == "off" and off_verdict.producer_launches == "per_dest"
+    no_pd, _policy, kept = plans.plan_row(
+        geometry,
+        "bshd",
+        1,
+        arch="sm_103a",
+        gates=gates,
+        k_table=k_table,
+        dest_interleave="lt",
+    )
+    assert no_pd.producer_launches == "per_dest" and kept.dest_interleave == "off"
+    capped = plans.Geometry(world_size=2, batch=1, s_local=32768, hidden=3072)
+    _v, _p, above = plans.plan_row(
+        capped,
+        "bshd",
+        0,
+        arch="sm_100a",
+        gates=plans.default_shape_gates("sm_100a", world_size=2),
+        k_table=plans.default_shape_gate_k_table("sm_100a", world_size=2),
+    )
+    assert above.dest_interleave == "off"
+    small = plans.Geometry(world_size=4, batch=1, s_local=4096, hidden=3072)
+    assert (
+        plans.plan_row(small, "bshd", 0, arch="sm_103a", gates=gates, k_table=k_table)[
+            2
+        ].dest_interleave
+        == "off"
+    )
+    # SM90 group of 4 (HP1): the band rows take ``il`` alone (no per-destination
+    # launch precedence, no local tail); the rows below the band keep the blocks.
+    h_gates = plans.default_shape_gates("sm_90a", world_size=4)
+    h_k_table = plans.default_shape_gate_k_table("sm_90a", world_size=4)
+    for s_local, mode in ((8192, "il"), (2048, "off")):
+        hopper = plans.Geometry(world_size=4, batch=1, s_local=s_local, hidden=3072)
+        h_verdict, _policy, h_row = plans.plan_row(
+            hopper, "bshd", 1, arch="sm_90a", gates=h_gates, k_table=h_k_table
+        )
+        assert h_row.dest_interleave == mode and h_row.interleave_tail_rows == 0
+        assert h_verdict.dest_interleave_suppressed == ()
+
+
+def test_hopper_bn128_tile_table():
+    """The 128-column tile table (``HOPPER_BN128_MAX_M_BY_ARCH_WORLD``: SM90 with 4 ranks at hidden 3072, up to 1024
+    rows): a row of the cell at or below the bound runs the 128-column tile with the band policy's tile order,
+    ``group_m`` and pair flag; a larger row, another cell and ``bn128_max_m=0`` keep the band tile; ``plan_row``
+    reads its gates with the band width."""
+
+    assert plans.HOPPER_BN128_MAX_M_BY_ARCH_WORLD == {("sm_90a", 4): {3072: 1024}}
+    assert plans.HOPPER_BN128_BN == 128
+    assert plans.hopper_bn128_max_m("sm_90a", 4, 3072) == 1024
+    for arch, world_size, hidden in (
+        ("sm_90a", 4, 4096),
+        ("sm_90a", 4, 6144),
+        ("sm_90a", 8, 3072),
+        ("sm_90a", 2, 3072),
+        ("sm_100a", 4, 3072),
+        ("sm_103a", 4, 3072),
+        ("sm_107a", 4, 3072),
+    ):
+        assert plans.hopper_bn128_max_m(arch, world_size, hidden) == 0
+    gates = plans.default_shape_gates("sm_90a", world_size=4)
+    for s_local, swapped in (
+        (1, True),
+        (256, True),
+        (1024, True),
+        (1025, False),
+        (2048, False),
+    ):
+        geometry = plans.Geometry(world_size=4, batch=1, s_local=s_local, hidden=3072)
+        assert plans.block_n_for(geometry) == 256
+        band_policy, band = plans.plan_for(
+            geometry,
+            "bshd",
+            1,
+            arch="sm_90a",
+            bn128_max_m=0,
+        )
+        policy, plan = plans.plan_for(geometry, "bshd", 1, arch="sm_90a")
+        assert band_policy.bn == band.bn == 256
+        assert policy.bn == plan.bn == (128 if swapped else 256)
+        assert (policy.order, policy.group_m, policy.pair) == (
+            band_policy.order,
+            band_policy.group_m,
+            band_policy.pair,
+        )
+        assert (plan.order, plan.group_m, plan.pair) == (
+            band.order,
+            band.group_m,
+            band.pair,
+        )
+        if swapped:
+            assert policy.reasons[:-1] == band_policy.reasons
+            assert "HOPPER_BN128_MAX_M_BY_ARCH_WORLD" in policy.reasons[-1]
+            assert plan.num_tiles == 2 * band.num_tiles
+        else:
+            assert policy == band_policy
+        verdict, row_policy, row_plan = plans.plan_row(
+            geometry, "bshd", 1, arch="sm_90a", gates=gates
+        )
+        assert verdict.bn == 256 and row_policy == policy and row_plan.bn == plan.bn
+        explicit_policy, _plan = plans.plan_for(
+            geometry, "bshd", 1, arch="sm_90a", bn128_max_m=1024
+        )
+        assert explicit_policy == policy
+    # The swapped plan writes every destination element once, like the band plan.
+    geometry = plans.Geometry(world_size=4, batch=1, s_local=200, hidden=3072)
+    for rank in range(4):
+        _policy, plan = plans.plan_for(geometry, "fused", rank, arch="sm_90a")
+        assert plan.bn == 128
+        counts = _destination_writes(plan)
+        per_dest = plan.M * 3 * geometry.h_local * HEAD_DIM
+        for dest in range(4):
+            assert int((counts[dest] == 1).sum()) == per_dest
+            assert int(counts[dest].max()) == 1
+    for bad in (-1, True, 1.5, plans.SHAPE_GATE_ALL_ROWS):
+        with pytest.raises(ValueError, match="bn128_max_m"):
+            plans.plan_for(geometry, "bshd", 0, arch="sm_90a", bn128_max_m=bad)
+
+
 def test_plan_policy_rules():
     small = plans.Geometry(world_size=8, batch=1, s_local=512, hidden=3072)
     assert plans.block_n_for(small) == 128
@@ -911,9 +1152,10 @@ def test_shape_gate_k_table_and_xband_defaults():
         ("sm_103a", 2): ((0, 32768), (4096, 16384)),
     }
     assert plans.XBAND_MIN_M_DEFAULT_BY_ARCH_WORLD == {
-        ("sm_103a", 8): 4096,
-        ("sm_100a", 8): 4096,
+        ("sm_103a", 8): 2048,
+        ("sm_100a", 8): 2048,
     }
+    assert plans.XBAND_MIN_M_FLOOR == 2048
     assert plans.XBAND_BN == plans.PAIR_BN == 256
     xb_fields = plans.TILE_FIELDS_XB
     assert xb_fields == (*plans.TILE_FIELDS, "dest1", "base_elem1")
@@ -989,7 +1231,7 @@ def test_shape_gate_k_table_and_xband_defaults():
     assert plans.check_xband_min_m("sm_100a", 8192) == 8192
     for arch, value in (
         ("sm_90a", 4096),
-        ("sm_103a", 2048),
+        ("sm_103a", 2047),
         ("sm_103a", -1),
         ("sm_103a", True),
         ("sm_103a", plans.SHAPE_GATE_ALL_ROWS),
@@ -1034,11 +1276,18 @@ def test_shape_gate_k_table_and_xband_defaults():
         gates=gates,
         k_table=sm103_8,
         xband_min_m=4096,
+        dest_interleave="off",
     )
     assert row_verdict.xband is True and plan.xband and plan.bn == 256
     assert policy.bn == 128 and policy.pair
     band_verdict, band_policy, band = plans.plan_row(
-        xb_geometry, "bshd", 2, arch="sm_103a", gates=gates, k_table=sm103_8
+        xb_geometry,
+        "bshd",
+        2,
+        arch="sm_103a",
+        gates=gates,
+        k_table=sm103_8,
+        dest_interleave="off",
     )
     assert band_verdict.xband is None and not band.xband and band.bn == 128
     assert (plan.order, plan.group_m) == (band.order, band.group_m)
@@ -1101,7 +1350,7 @@ def test_shape_gate_k_table_and_xband_resolution(monkeypatch):
             else:
                 with pytest.raises(ValueError, match=env):
                     backend.resolve_xband_min_m(arch, world_size)
-            for bad in ("xband_min_m=2048", "xband_min_m=x", "xband_min_m=-1"):
+            for bad in ("xband_min_m=2047", "xband_min_m=x", "xband_min_m=-1"):
                 monkeypatch.setenv(env, bad)
                 with pytest.raises(ValueError, match=env):
                     backend.resolve_xband_min_m(arch, world_size)
@@ -1222,6 +1471,7 @@ def test_producer_key_grammar():
         "fma",
         "ow256_fma",
         "bulk_ow256_fma",
+        "sw3",
     )
     assert loader.SHIPPED_VARIANT == ""
     assert loader.PRODUCER_VARIANT_OPERAND_LOAD_WIDTH == {
@@ -1232,6 +1482,7 @@ def test_producer_key_grammar():
         "fma": 128,
         "ow256_fma": 256,
         "bulk_ow256_fma": 256,
+        "sw3": 128,
     }
     assert loader.producer_key(256, True) == "producer_bn256_pair"
     assert loader.producer_key(128, False) == "producer_bn128"
@@ -1347,7 +1598,8 @@ def test_producer_variant_default_table():
         pytest.skip("program tables are filled by the exporter")
     table = loader.PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD
     assert table == {
-        "sm_90a": {2: "", 4: "", 8: ""},
+        # SM90: the build whose epilogue stages each head for three storer warps
+        "sm_90a": {2: "sw3", 4: "sw3", 8: "sw3"},
         # SM100 / SM103: the fused multiply-add epilogue builds
         "sm_100a": {2: "fma", 4: "ow256_fma", 8: "bulk_ow256_fma"},
         "sm_103a": {2: "fma", 4: "ow256_fma", 8: "ow256_fma"},
@@ -1421,10 +1673,46 @@ def test_producer_variant_default_table():
                 assert not delivered or delivered[0] == loader.SHIPPED_VARIANT
         if arch == "sm_90a":
             assert all(
-                loader.parse_producer_key(key).variant == ""
+                loader.parse_producer_key(key).variant in ("", "sw3")
                 for key in routes
                 if key.startswith("producer_bn")
             )
+
+
+def test_producer_shipped_rows_table():
+    """The rows that keep the baseline build under the default build
+    (``PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD``: SM90 with 8 ranks at hidden 6144 and above from 8192 rows on), the
+    session's per-row build (the baseline build on such a row under the default build only) and its delivery: the
+    baseline build of every SM90 tile width that delivers the default build, with both rendezvous phases."""
+
+    assert plans.PRODUCER_SHIPPED_ROWS_BY_ARCH_WORLD == {("sm_90a", 8): (6144, 8192)}
+    gated = {
+        (hidden, rows)
+        for hidden in (3072, 4096, 6144, 8192)
+        for rows in (4096, 8191, 8192, 16384)
+        if plans.default_shipped_producer_row("sm_90a", 8, hidden, rows)
+    }
+    assert gated == {(6144, 8192), (6144, 16384), (8192, 8192), (8192, 16384)}
+    for arch in ("sm_90a", "sm_100a", "sm_103a", "sm_107a"):
+        for world_size in plans.SUPPORTED_WORLD_SIZES:
+            if (arch, world_size) != ("sm_90a", 8):
+                assert not plans.default_shipped_producer_row(
+                    arch, world_size, 8192, 65536
+                )
+    session = backend.CakeQkvExchangeSession.__new__(backend.CakeQkvExchangeSession)
+    session.arch, session.world_size, session.hidden = "sm_90a", 8, 8192
+    session.producer_variant, session.producer_variant_source = "sw3", "default"
+    assert session._row_variant(16384) == loader.SHIPPED_VARIANT
+    assert session._row_variant(4096) == "sw3"
+    session.producer_variant_source = "env"
+    assert session._row_variant(16384) == "sw3"
+    if not loader.ROUTES:
+        return
+    for block_n in plans.BLOCK_N_CHOICES:
+        for pair in (False, True):
+            if loader.has_producer("sm_90a", block_n, pair, "sw3"):
+                assert loader.has_producer("sm_90a", block_n, pair)
+                assert loader.has_fold_producer("sm_90a", block_n, pair)
 
 
 def test_producer_variant_resolution(monkeypatch):
@@ -1765,6 +2053,20 @@ def test_loader_tables_are_consistent():
             ) == loader.fold_producers_delivered(arch)
             assert loader.has_producer(arch, policy.bn, policy.pair)
             assert loader.has_fold_producer(arch, policy.bn, policy.pair)
+            # The row's plan (with the 128-column tile table) selects a delivered producer too.
+            row_policy, _plan = plans.plan_for(
+                geometry,
+                "bshd",
+                0,
+                arch=arch,
+                pair_available=loader.has_producer(
+                    arch, plans.block_n_for(geometry), True, variant
+                ),
+            )
+            assert loader.has_producer(arch, row_policy.bn, row_policy.pair, variant)
+            assert loader.has_fold_producer(
+                arch, row_policy.bn, row_policy.pair, variant
+            ) == loader.fold_producers_delivered(arch)
 
 
 # --------------------------------------------------------------------------- multi-GPU
@@ -2730,6 +3032,77 @@ def _run_worker(rank, world_size, port):
             finally:
                 xband_path.close()
                 band_path.close()
+            torch.cuda.synchronize(device)
+            dist.barrier(group=group)
+
+        # 10. 128-column tile table (``HOPPER_BN128_MAX_M_BY_ARCH_WORLD``: SM90 with 4 ranks at hidden 3072): one
+        #     256-column session runs a row at the bound on the 128-column producer and a larger row on its own; both
+        #     against the reference, the bound programs and the prepared rows name the row's tile width.
+        bn128_hidden = 3072
+        bn128_bound = plans.hopper_bn128_max_m(arch, world_size, bn128_hidden)
+        if bn128_bound:
+            bn128_session = QkvNormRopeExchangeOverlap(
+                group,
+                hidden=bn128_hidden,
+                num_heads=bn128_hidden // HEAD_DIM,
+                layout="bshd",
+                max_tokens=2 * bn128_bound,
+                backend="nvlink",
+                device=device,
+            )
+            try:
+                info = bn128_session.describe()
+                assert info["block_n"] == 256
+                assert info["bn128_max_m"] == {
+                    "value": bn128_bound,
+                    "source": "default",
+                    "default": bn128_bound,
+                }
+                launched = {
+                    name
+                    for bn in (plans.HOPPER_BN128_BN, 256)
+                    for name in (
+                        [
+                            loader.fold_producer_program(
+                                arch, bn, False, phase, default_variant
+                            )
+                            for phase in loader.FOLD_PHASES
+                        ]
+                        if fold_default
+                        else [loader.producer_program(arch, bn, False, default_variant)]
+                    )
+                }
+                assert launched <= set(info["programs"]["producers"])
+                for s_local, row_bn in (
+                    (bn128_bound, plans.HOPPER_BN128_BN),
+                    (2 * bn128_bound, 256),
+                ):
+                    x, w_qkv, q_scale, k_scale, cos_sin = _operands(
+                        device,
+                        batch=1,
+                        s_local=s_local,
+                        hidden=bn128_hidden,
+                        seed=61 + rank,
+                    )
+                    expected = _expected(
+                        x, w_qkv, q_scale, k_scale, cos_sin, group, world_size, rank
+                    )
+                    bound = bn128_session.bound_programs(1, s_local)
+                    assert bound["producer"] == loader.producer_program(
+                        arch, row_bn, False, default_variant
+                    )
+                    row = bn128_session.describe()["prepared_row_plans"][f"1x{s_local}"]
+                    assert row.get("block_n", 256) == row_bn
+                    assert "xband" not in row
+                    for _call in range(2):
+                        _check_outputs(
+                            bn128_session,
+                            bn128_session(x, w_qkv, q_scale, k_scale, cos_sin),
+                            expected,
+                        )
+                    torch.cuda.synchronize(device)
+            finally:
+                bn128_session.close()
             torch.cuda.synchronize(device)
             dist.barrier(group=group)
     finally:

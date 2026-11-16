@@ -246,7 +246,9 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
             state["backward_recv_indices"],
         )
         self._state = None
-        combined = torch.sum(per_slot.view(num_tokens, top_k, -1), dim=1)
+        combined = torch.sum(
+            per_slot.view(num_tokens, top_k, expert_output.shape[1]), dim=1
+        )
         if output is not None:
             output.copy_(combined)
             return output

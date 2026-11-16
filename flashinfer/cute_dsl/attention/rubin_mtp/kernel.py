@@ -67,6 +67,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.utils as utils
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
 import cutlass.pipeline as pipeline
@@ -159,6 +160,39 @@ def _wait_cluster_mbarrier(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None
     wait (SASS has no cluster membar scope).
     """
     cute.arch.mbarrier_wait(mbar_ptr, phase)
+
+
+@cute.jit
+def _wait_cluster_mbarrier_acquire(
+    mbar_ptr: cute.Pointer, phase: cutlass.Int32
+) -> None:
+    """Cluster-scope acquire wait on a local mbarrier, shared memory only.
+
+    Needed when the data read after the wait was written by a PEER CTA's
+    thread via ``st.async`` (its complete-tx releases at cluster scope). The
+    default ``.acquire.cta`` wait only synchronizes with releases by this
+    CTA's own threads (and its own async proxy), so the plain wait gives no
+    happens-before edge to the peer's store.
+
+    A ``mbarrier.try_wait.parity.acquire.cluster`` would also do, but a
+    cluster-scope acquire covers every state space, global included, so
+    ptxas has to invalidate L1 after each try_wait. The payload here is
+    shared memory, which never lives in L1, so this uses the PTX ISA's own
+    form for acquiring shared memory through the generic proxy: a relaxed
+    cluster-scope wait that observes the completion, followed by
+    ``fence.acquire.sync_restrict::shared::cluster.cluster`` (the acquire
+    pattern of ISA section 8.8), which emits no SASS instruction.
+    ``cute.arch.mbarrier_wait`` has no scope or order argument, so this uses
+    the Primitives wrappers. Used only on the corr RAW site.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr,
+        phase,
+        scope=prims.MBarrierScope.CLUSTER,
+        order=prims.MemOrder.RELAXED,
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @cute.jit
@@ -5077,8 +5111,9 @@ class RubinMultiHeadLatentAttentionForwardFP8TwoPlusTwo:
                 common_params.cor_full_mbar.arrive_mbarrier(p_cor_consumer_state.index)
 
         if_generate(is_sync_warp, _arrive_cor_full)
-        common_params.cor_full_mbar.wait(
-            p_cor_consumer_state.index, p_cor_consumer_state.phase
+        _wait_cluster_mbarrier_acquire(
+            common_params.cor_full_mbar.get_barrier(p_cor_consumer_state.index),
+            cutlass.Int32(p_cor_consumer_state.phase),
         )
 
         # Each thread reads its own row's metadata from the corr SMEM stage.

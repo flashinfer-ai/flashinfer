@@ -81,8 +81,8 @@ from flashinfer.cake_causal_conv1d_det_train import (
     cake_causal_conv1d_det_train_forward_workspace,
     is_cake_causal_conv1d_det_train_supported,
 )
-from flashinfer.cake_causal_conv1d_det_train_backend import BWD_GRID_MULTS
-from flashinfer.cake_causal_conv1d_det_train_backend import cake_jit as loader
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train import BWD_GRID_MULTS
+from flashinfer.experimental.cake.cake_causal_conv1d_det_train import cake_jit as loader
 from flashinfer.testing import bench_gpu_time
 
 WIDTH = 4
