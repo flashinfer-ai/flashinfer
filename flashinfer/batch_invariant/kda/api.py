@@ -263,7 +263,9 @@ def recurrent_kda_batch_invariant(
     ep = get_pool(initial_state)
 
     if decode:
-        out = output if output is not None else torch.empty_like(v)
+        out = output
+        if out is None:
+            out = torch.empty(v.shape, dtype=_IO, device=dev)
         rows = out.view(N, HV, HEAD_DIM)
         ep.step(
             initial_state,

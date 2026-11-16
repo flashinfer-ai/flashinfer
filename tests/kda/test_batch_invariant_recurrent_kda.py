@@ -379,6 +379,31 @@ def test_fixed_layout_prefill_and_output_buffer():
 
 
 @needs_device
+def test_decode_takes_strided_activations():
+    """Dense activations with another stride order than their shape (a transposed buffer) decode to the same rows."""
+    h = 16
+    p = params(h)
+    seqs = [make_seq(4, h, SEED + 30 + i, GATES["steep"]) for i in range(2)]
+    tok = tokens(seqs, [0, 0])
+    ref = bi_decode(tok, new_pool(seqs, [0, 1]), [0, 1], p, packed=False)
+    args = {key: t[:, None] for key, t in tok.items()}
+    for key in ("q", "k", "v", "g"):
+        args[key] = args[key].transpose(2, 3).contiguous().transpose(2, 3)
+        assert not args[key].is_contiguous()
+    out, _ = recurrent_kda(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["g"],
+        args["beta"],
+        initial_state=new_pool(seqs, [0, 1]),
+        batch_invariant=True,
+        **_fused(p),
+    )
+    assert out.is_contiguous() and torch.equal(out[:, 0], ref)
+
+
+@needs_device
 @pytest.mark.parametrize("h", HEADS)
 def test_graph_replay_equals_eager(h):
     p = params(h)
