@@ -13,7 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdint>
 #include <flashinfer/kda/batch_invariant_decode.cuh>
+#include <initializer_list>
 
 #include "tvm_ffi_utils.h"
 
@@ -29,6 +31,14 @@ T* ptr(TensorView t) {
 void check_dtype(TensorView t, DLDataTypeCode code, int bits, const char* name) {
   TVM_FFI_ICHECK(t.dtype().code == code && t.dtype().bits == bits && t.dtype().lanes == 1)
       << name << " has an unexpected dtype";
+}
+
+// the kernels read these `bytes` at a time; a misaligned pointer faults the device
+void check_aligned(std::initializer_list<TensorView> tensors, uintptr_t bytes = 16) {
+  for (TensorView t : tensors) {
+    TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0)
+        << "a tensor read " << bytes << " bytes at a time does not start at such a boundary";
+  }
 }
 
 }  // namespace
@@ -73,6 +83,9 @@ void kda_batch_invariant_decode_step(TensorView q, TensorView k, TensorView v, T
     CHECK_CONTIGUOUS(t);
   }
   CHECK_DEVICE(q, state);
+  check_aligned(
+      {q, k, state, state_bf16, k_inv_rows, k_inv_f32_rows, rhs_rows, update_rows, stamp});
+  check_aligned({v}, 4);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
@@ -141,6 +154,8 @@ void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, T
   CHECK_DEVICE(slots, state);
   CHECK_DEVICE(starts, state);
   CHECK_DEVICE(lens, state);
+  check_aligned(
+      {q, k, v, g, state, state_bf16, k_inv_rows, k_inv_f32_rows, rhs_rows, update_rows, stamp});
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
@@ -177,6 +192,7 @@ void kda_batch_invariant_begin(TensorView slots, TensorView state, TensorView st
     CHECK_CONTIGUOUS(t);
   }
   CHECK_DEVICE(slots, state);
+  check_aligned({state, state_bf16});
 
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
   cudaError_t status =

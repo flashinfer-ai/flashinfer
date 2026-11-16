@@ -698,6 +698,26 @@ def test_pool_aliases_share_one_state():
 
 
 @needs_device
+def test_misaligned_buffers_are_refused():
+    """A pool or a token row that does not start at a 16-byte boundary is refused before a kernel loads from it."""
+    h = 16
+    p = params(h)
+    s = make_seq(4, h, SEED + 87, GATES["steep"])
+    tok = token(s, 0)
+    buf = torch.zeros(h * D * D + 1, dtype=torch.float32, device="cuda")
+    pool = buf[1:].view(1, h, D, D)
+    assert pool.is_contiguous() and pool.data_ptr() % 16
+    with pytest.raises(BatchInvariantUnsupportedError, match="16-byte"):
+        bi_decode(tok, pool, [0], p)
+    flat = torch.zeros(h * D + 2, dtype=torch.bfloat16, device="cuda")
+    flat[2:].copy_(tok["q"].flatten())
+    shifted = dict(tok, q=flat[2:].view(1, h, D))
+    with pytest.raises(RuntimeError, match="boundary"):
+        bi_decode(shifted, new_pool([s], [0]), [0], p)
+    torch.cuda.synchronize()
+
+
+@needs_device
 def test_first_use_inside_a_graph_capture_is_refused():
     h = 16
     p = params(h)

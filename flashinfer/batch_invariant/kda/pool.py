@@ -62,6 +62,12 @@ def get_pool(pool: torch.Tensor) -> "ExactPool":
 
     for dead in [k for k, (_, ref) in _POOLS.items() if ref.expired()]:
         del _POOLS[dead]
+    if pool.data_ptr() % 16:
+        raise unsupported(
+            CLASS,
+            "a state pool that does not start at a 16-byte boundary",
+            "a pool whose first element is 16-byte aligned (the kernels load 16 bytes at a time)",
+        )
     ep = ExactPool(pool)
     _POOLS[key] = (ep, StorageWeakRef(pool.untyped_storage()))
     return ep
