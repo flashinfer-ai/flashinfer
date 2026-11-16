@@ -138,7 +138,14 @@ def test_benchmark_reports_staging_and_capture_allocation(
     benchmark_module, mode, execution, no_flush, staging, ownership, allocation
 ):
     protocol = benchmark_module._timing_protocol(
-        SimpleNamespace(mode=mode, execution=execution, no_l2_flush=no_flush, warmup=20)
+        SimpleNamespace(
+            mode=mode,
+            execution=execution,
+            no_l2_flush=no_flush,
+            warmup=20,
+            eager_completed_wall=False,
+            prequantized=False,
+        )
     )
     assert protocol["input_staging_in_timed_span"] is staging
     assert protocol["output_ownership"] == ownership

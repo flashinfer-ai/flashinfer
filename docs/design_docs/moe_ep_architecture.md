@@ -348,7 +348,8 @@ slots. Dropped slots contribute zero, including when their unused routing
 weight is NaN; they do not read a prior invocation's combine cells.
 
 Batch-invariant mode disables in-kernel FC2 atomic reduction and uses an ordered
-finalizer. It requires finalized output; `FinalizeMode.NONE` is unsupported.
+finalizer. `FinalizeMode.NONE` selects a separate deferred-output numerical class;
+its buffer and routing-weight contract is described below.
 Permitted tile geometries preserve the same ordered K16 accumulation,
 activation and routing-weight placement. In particular,
 `apply_routing_weights_before_fc2` selects a numerical calculation: keep its
@@ -371,12 +372,12 @@ remain eligible, giving up to 72 plans before shape and resource filtering.
 Integer task counters do not accumulate output values. An unrecognized knob or
 numerical implementation is rejected rather than silently admitted.
 
-Use this backend directly for the initial implementation. SM100 BF16 does not
-yet implement the outer `AutoConfig` complete-EP selection protocol. An
-`AutoConfig` containing a batch-invariant candidate rejects ordinary or
-unsupported candidates and candidates with different activation clamps,
-expert geometry or routing-weight placement, even with a pinned candidate
-index; it cannot silently fall back to an ordinary calculation.
+An `AutoConfig` containing a batch-invariant candidate rejects ordinary or
+unsupported candidates and candidates with different numerical recipes, expert
+geometry or routing-weight placement, even with a pinned candidate index.
+Candidate selection cannot silently fall back to an ordinary calculation.
+A backend must also implement the complete-EP selection contract before it can
+participate in that outer selection.
 
 #### Arithmetic fingerprint and Lean model
 
@@ -444,6 +445,325 @@ pinned Lean toolchain is installed; without it, the generated-file consistency
 test still runs. Keep a fingerprint with its FlashInfer/compiler versions,
 architecture, EP topology and expert placement when recording an output receipt.
 
+### Batch-invariant NVFP4 MegaMoE
+
+Set `batch_invariant=True` on
+`Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` or
+`Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig`. The mode reuses the existing
+legacy, standard and GenPhase kernels with explicit arithmetic branches.
+SM100/SM103 and SM107 have separate receipts; cross-architecture output
+equality is outside the guarantee. The numerical implementation is also part
+of the receipt, so legacy, standard and GenPhase candidates are not mixed.
+
+The geometry allowlist is explicit; the alternative K stages below apply only
+to standard inference and compatible shapes:
+
+| Architecture | Implementation | Tile M/N/K | Cluster M/N | Instruction K |
+| --- | --- | --- | --- | --- |
+| SM100/SM103 | legacy | 256/128/256 | 2/1 | 64 |
+| SM100/SM103 | standard | 256/128/128 or 256/128/256 | 2/1 | 64 |
+| SM100/SM103 | GenPhase | 256/128/256 | 4/1 | 64 |
+| SM107 | standard | 256/128/256 or 256/128/512 | 2/1 | 128 |
+| SM107 | GenPhase | 256/128/256 | 4/1 | 128 |
+
+BI pins the MMA N descriptor and matching peer-CTA input mapping instead of
+changing instruction shape with the number of live tokens. Each accumulator
+uses one initialization instruction followed by ordered native K steps,
+including the selected stage's zero padding. Standard SwiGLU, the FP32 global
+scale multiplications, the per-16 E4M3 scale and E2M1 conversion, and the BF16
+FC2 wire follow the shared ordered specification. Separate finalization starts
+at +0 and visits every original route slot, using add for early routing weights
+or FMA for late weights. Invalid slots replace both operands with zero before
+the operation, without reading stale payloads.
+
+The core computation takes packed NVFP4 values and their block scales as inputs.
+The specification also describes the optional BF16 input staging to that
+boundary. BI staging always uses the fixed fused offline recipe; it does not
+fall back to a different Torch quantizer. It requires aligned contiguous CUDA
+BF16 activations and routing tensors. Prequantized callers provide the packed
+inputs and scales directly. Weight preprocessing stays outside the batch-varying
+execution; weights, scales, routing and global scale tensor values must remain
+the same when comparing batches.
+
+Both routing-weight placements and `gate_up_clamp` are supported as separate
+numerical classes. The three per-expert FP32 scale tensors remain runtime
+inputs; omitted public values become tensors of ones. The calibrated
+`input_norm_const` is part of the receipt. Custom SwiGLU and SiTU are distinct
+classes. Blackwell legacy and standard additionally admit per-token FC1 scales.
+Legacy and standard admit quantized combine wires; deferred output and CAKE have
+the narrower ABI restrictions in the numerical-variant table below. In-kernel
+atomic FC2 reduction remains rejected. Default and persistent ordered
+finalization are supported where the backend exposes them; GenPhase retains
+default finalization and its epilogue carrier. Integer task assignment and
+admitted carriers may vary without changing the receipt; flag batching remains
+fixed. Additional K stages must preserve both original padded extents.
+Autotune candidates, cached winners and pooled
+workspaces are checked against this same policy and arithmetic fingerprint.
+
+`layer.batch_invariant_fingerprint` returns the actual receipt. A device-free
+query supplies the architecture and implementation explicitly:
+
+```python
+from flashinfer.batch_invariant import fingerprint
+
+receipt = fingerprint(
+    "megamoe_nvfp4", hidden=384, intermediate=192, top_k=3, num_experts=4,
+    arch="sm_100", implementation="legacy", input_norm_const=1.7,
+    apply_routing_weights_before_fc2=True, gate_up_clamp=2.5,
+)
+```
+
+`moe_ep/batch_invariant/nvfp4_spec.py` and the independent Lean model describe
+the compositional trace. Generated cases compare their ordered terms, including
+input/FC1 quantization, native K steps and masked finalization. As with BF16,
+opaque MMA and approximate-instruction semantics, generated CUDA and distributed
+publication require device validation. Tests compare output representations
+across batches, plans and graph replays within each class; numerical oracles
+check accuracy separately. Keep software/compiler versions and the fixed EP
+topology/expert placement with every receipt.
+
+### Batch-invariant MXFP4 MegaMoE
+
+Set `batch_invariant=True` on the existing MXFP4-weight configs. Blackwell
+SM100/SM103 supports MXFP8 E4M3 activations with MXFP4 weights
+(`quant_kind="mxfp4_mxfp8"`); Rubin SM107 additionally supports MXFP4 activations
+(`quant_kind="mxfp4"`). Both standard and GenPhase reuse their existing kernel
+folders. Blackwell mixed GenPhase uses
+`Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(kind="mxfp4_mxfp8", kernel_variant="genphase", batch_invariant=True)`;
+the dedicated `Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` selects standard.
+Rubin uses `Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` or
+`Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig`. Rubin GenPhase retains its
+explicit cluster `(4, 1)` and bulk FC2 requirements.
+
+The allowlist fixes M256/N128, one paired-CTA instruction group, and
+hidden/post-activation intermediate widths divisible by 128:
+
+| Architecture | Quantization kind | Instruction K | Stage K | Standard / GenPhase cluster |
+| --- | --- | --- | --- | --- |
+| SM100/SM103 | MXFP4 weights / MXFP8 E4M3 activations | 32 | 128 or 256 | `(2, 1)` / `(4, 1)` |
+| SM107 | MXFP4 weights / MXFP8 E4M3 activations | 64 | 128 or 256 | `(2, 1)` / `(4, 1)` |
+| SM107 | MXFP4 weights / MXFP4 activations | 128 | 256 or 512 | `(2, 1)` / `(4, 1)` |
+
+Each native MMA fold keeps its initialization instruction, K order and full
+stage padding. FC1 quantization uses UE8M0 scales per 32 values, with a fixed
+logical low-half/high-half amax order, explicit round-up scale conversion,
+BF16 scale round-trip, approximate reciprocal and soft mask. BF16 input
+staging has its own specified normal-scale floor and omits that soft mask.
+BI always uses the pinned fused stager for aligned contiguous inputs; a
+prequantized caller supplies the packed data and scales directly. Hardware
+E2M1 conversion preserves negative zero, including when a negative value rounds
+to zero; a Torch numerical quantizer may encode that zero with the other sign.
+
+Standard/custom SwiGLU, SiTU, optional SwiGLU clamp and early/late routing
+weights are separate numerical classes. MX classes do not accept NVFP4's
+global normalization or per-expert alpha/norm tensors. Standard inference admits
+quantized combine; Blackwell standard additionally admits BF16 deferred output.
+IKR, CAKE, N64/N256, mixed-CGA launches and non-default flag batching remain
+rejected. Integer task assignment and admitted carriers may change. The second
+K value in the table is a standard-only alternative with equal-padding and
+output-mode guards; GenPhase keeps its first K. Blackwell standard also admits
+its existing persistent live-count finalizer; Rubin retains its existing
+finalization interface.
+
+`layer.batch_invariant_fingerprint` returns the actual receipt. The public
+query uses `fingerprint("megamoe_mxfp4", hidden=, intermediate=, top_k=,
+num_experts=, arch=, quant_kind=, implementation=,
+apply_routing_weights_before_fc2=, gate_up_clamp=)`. Quantization kind,
+architecture, implementation and routing-weight placement define distinct
+classes. Batch size, capacity and eligible scheduling choices are excluded.
+Autotune, native/managed caches and pooled workspaces keep this numerical
+identity; existing NVFP4/BF16 receipts remain unchanged.
+
+`moe_ep/batch_invariant/mxfp4_spec.py` and its independent Lean model describe
+15 ordered components. Their equality does not prove generated CUDA or remote
+publication. Device tests separately check component semantics, bitwise batch/
+plan/graph consistency and whole-operator numerical accuracy. As for NVFP4,
+keep weights, scales, routing, compiler/software versions, EP topology and
+expert placement fixed when comparing the same token across batches.
+
+### Batch-invariant MXFP8 MegaMoE
+
+W8A8 supports both `kind="mxfp8_e4m3"` and `kind="mxfp8_e5m2"`, with
+block-32 UE8M0 scales and BF16 output. Set `batch_invariant=True` on
+`Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` or
+`Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig`. Blackwell's default provider
+is legacy; select `kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"` for
+standard, or `kernel_variant="genphase"` for GenPhase. Rubin uses inference
+or GenPhase, with the existing explicit `(4, 1)` cluster and bulk FC2 settings
+for GenPhase.
+
+The allowlist requires hidden and post-activation intermediate widths
+divisible by 128 and top-k in `[1, 32]`. Standard/custom SwiGLU and SiTU have
+separate receipts. It pins the following MMA geometry:
+
+| Architecture / provider | M / N / stage K | Native instruction K | Cluster |
+| --- | --- | --- | --- |
+| SM100/SM103 legacy | 256 / 256 / 128 | 32 | `(2, 1, 1)` |
+| SM100/SM103 standard / GenPhase | 256 / 128 / 128 (standard also 256) | 32 | `(2, 1)` / `(4, 1)` |
+| SM107 standard / GenPhase | 256 / 128 / 128 (standard also 256) | 64 | `(2, 1)` / `(4, 1)` |
+
+Legacy retains its early-routing-only interface. Next standard and GenPhase
+admit early and late routing. Legacy's FC1 activation association, operand
+orientation and block-32 quantization differ from next's paired-half recipe;
+they have separate receipts. Each receipt fixes MMA initialization, K order,
+full stage padding, activation/scale conversion and ascending top-k reduction.
+BF16 input staging always uses the specified fused normal-scale-floor recipe,
+including on Blackwell where ordinary W8A8 can use the full UE8M0 range.
+Prequantized inputs bypass this stager and retain the supplied bytes/scales.
+
+The admitted legacy plans vary static/atomic task assignment and epi/reuse
+carriers. Next standard admits grouped grid-stride, grouped atomic and
+phase-interleaved atomic assignment with three carriers. GenPhase keeps its
+existing admitted scheduling interface. None of these changes the receipt.
+Standard inference additionally admits an equal-padding K256 stage and
+quantized combine. Blackwell legacy also supports `combine_dtype="mxfp8"`;
+its encoder consumes the FP32 FC2 accumulator directly and has a separate
+receipt from next's BF16-first encoder. BF16 deferred output is available on Blackwell legacy and
+standard. Other tile changes, mixed clusters, IKR, CAKE, global normalization/
+alpha tensors and non-default flag batching remain rejected. Blackwell
+legacy/standard retain their persistent live-count finalizer. Autotune, cache
+hits and heuristic fallbacks pass the same admission checks.
+
+Query `fingerprint("megamoe_mxfp8", hidden=, intermediate=, top_k=,
+num_experts=, arch=, quant_kind=, implementation=,
+apply_routing_weights_before_fc2=, gate_up_clamp=)` or read
+`layer.batch_invariant_fingerprint`. E4M3/E5M2, architecture, provider and
+routing placement define distinct numerical classes. Existing BF16, NVFP4 and
+MXFP4 receipts do not change.
+
+`mxfp8_spec.py` and its independent Lean model define ordered arithmetic
+components; their equality does not prove generated CUDA or communication.
+Native device tests separately check those components, whole-operator accuracy
+and bitwise batch/plan/graph consistency. Comparisons require fixed input,
+weights/scales, routing, software/compiler, EP topology and expert placement.
+
+### Numerical variants and output contracts
+
+The default SwiGLU/BF16-wire/finalized recipes retain their existing arithmetic
+fingerprints. The following options select additional ordered recipes:
+
+| Option | BI support | Numerical identity |
+| --- | --- | --- |
+| Custom SwiGLU | BF16, NVFP4, MXFP4, MXFP8 and A16 providers | Both `swiglu_alpha` and `swiglu_beta`; MiniMax uses 1.702 and 1.0 |
+| SiTU | The same families, with required `situ_beta` and optional `situ_linear_beta` | Bounded and unbounded up branches are distinct |
+| Per-token FC1 scale | NVFP4 Blackwell legacy/standard | Presence is static; FP32 values are runtime per-token inputs |
+| `combine_dtype="nvfp4"` or `"mxfp8"` | Standard block-scaled inference; Blackwell legacy NVFP4 | Each wire has its own encoder, scale, decode and slot-fold terms |
+| `combine_dtype="mxfp8"` | Blackwell legacy MXFP8 | FP32 FC2 producer, legacy amax/scale recipe and E4M3 return data |
+| `FinalizeMode.NONE` | BF16, A16 and Blackwell legacy/standard block-scaled BF16 combine | Deferred numerical class; quantized-wire deferred output is rejected |
+| `FinalizeMode.CAKE` | Blackwell standard NVFP4, early routing, BF16 combine, H4096/top-k6, capacity 256/4096 | Same finalized arithmetic receipt as DEFAULT |
+
+Admission is provider-specific: GenPhase keeps BF16 combine and default
+finalization; Rubin block-scaled providers do not expose the Blackwell deferred
+ABI. In-kernel floating-point atomic reduction remains disabled in every BI
+class. New modes do not relax the existing dtype, geometry or transport ABI.
+
+A receipt records the FP32 coefficient bits actually emitted, including
+host-folded coefficients. The specification preserves separate rounding and
+operand association, so explicitly setting SwiGLU `(alpha=1, beta=0)` does not
+collapse into the default recipe. SiTU retains its expanded exp2/reciprocal
+chain. Per-token NVFP4 scaling first computes the RN product of token scale and
+expert alpha, then applies the specified FC1 activation chain. Keep numerical
+settings fixed for a layer; the tuner only varies admitted physical plans.
+
+Quantized return wires are distinct from the FC1 activation quantizer. NVFP4
+uses per-16 scale/data and MXFP8 return uses E4M3 data with per-32 UE8M0 scale,
+even when the input/weight format is E5M2. Native producers canonicalize logical
+hidden order before amax. Finalization seeds +0 and visits every original slot;
+it masks payload, scale and score before loading invalid cells. Provider-specific
+FP32-versus-BF16 producer boundaries remain explicit in the receipt.
+
+Deferred output returns per-route numerical partials and their routing weights.
+BI wrappers clear the physical BF16 partial buffer before every launch and
+return +0 weights for invalid routes, including masked NaN scores. Their row-map
+indices describe physical placement, so compare numerical partials at the same
+logical token/slot after applying that map. An external reducer is outside the
+deferred class's guarantee. Use DEFAULT/PERSISTENT or the admitted BI CAKE
+specialization for a complete finalized-output guarantee. CAKE's BI specialization
+uses the same +0 seed, ascending slot additions and lazy route mask as the
+specified early-routing finalizer; ordinary CAKE keeps its existing path.
+
+For an alternative standard K stage, both
+`ceil(hidden / newK) * newK == ceil(hidden / canonicalK) * canonicalK` and the
+same equality for post-activation intermediate size must hold. Native K,
+initialization, M256/N128 and paired-CTA ownership remain fixed; no zero MMA is
+removed as an assumed identity. This first extended K set requires BF16 combine
+without per-token FC1 scaling. New K stages do not expand the GenPhase or legacy
+geometry set. Policy/cache version changes permit a fresh candidate search while
+leaving existing default arithmetic receipts unchanged.
+
+### Batch-invariant W4A16 and W8A16 MegaMoE
+
+Set `batch_invariant=True` on
+`Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` (W4A16), or
+`Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` with
+`kind="bf16_mxfp8_e4m3"` / `"bf16_mxfp8_e5m2"` (W8A16). These entrypoints
+compile natively on SM100, SM103 and SM107. Weights are decoded and multiplied
+by their block scale in BF16 before dense K16 MMA, rather than using native
+block-scaled MMA. These are three additional numerical families.
+
+| Family | Fixed tile M/N/K | Weight data / block scale | FC1 routing weights |
+| --- | --- | --- | --- |
+| W4A16 | 256/128/256 | E2M1 / per-16 E4M3 | Early or late |
+| W8A16 E4M3/E5M2 | 256/128/128 | E4M3 or E5M2 / per-32 UE8M0 | Early only |
+
+The actual instruction N and paired TMA split stay fixed at 128, including
+small batches. W4A16 BI requires the CUDA 13.2+ native BF16 decoder; older
+FP16-intermediate decoder implementations remain outside this class. W4A16
+always applies its expert FP32 FC1/FC2 alphas after each MMA and before the
+specified output conversion. Optional `fc1_norm_const` multiplies the completed
+activation after early routing weights and before the BF16 FC1 handoff, without
+implicitly compensating FC2 alpha. Normalization presence must be selected when
+constructing the BI layer; values remain runtime inputs.
+
+Both families admit custom SwiGLU/SiTU and BF16 deferred output. A16 schedules
+may use static or integer atomic-counter task assignment and `epi_warps` or
+`reuse_dispatch_warps` return. Their tile, cluster `(2,1,1)`, flag batching,
+group hint and pipeline setup remain pinned; overlapping accumulators, standalone
+return warps and floating-point atomic reduction are rejected.
+Shared W8A16 also supports `FinalizeMode.PERSISTENT` with a borrowed device
+live-count tensor on SM100, SM103 and SM107, using the same finalized arithmetic
+receipt as DEFAULT.
+
+Read `layer.batch_invariant_fingerprint`, or query
+`fingerprint("megamoe_w4a16", ...)`, `fingerprint("megamoe_w8a16_e4m3", ...)`
+or `fingerprint("megamoe_w8a16_e5m2", ...)`. Supply the geometry, expert count,
+architecture, numerical activation parameters and `output_mode`; W4A16 also
+has the static `handoff_norm` flag. A16 receipts, architectures and early/late
+classes are distinct from the existing BF16 and W4A4/W8A8 receipts.
+
+`a16_spec.py` and the independent A16 Lean model fix decoded-weight MMA operand
+roles (A=weight, B=activation), padded K16 initialization/accumulation, expert
+scales, activation, BF16 handoff and finalization. `NumericalVariants`,
+`CombineWire` and `QuantizedStagePartition` add coefficient-bit, return-wire and
+K-regrouping proofs. Generated pins and executable conformance compare the full
+ordered terms; opaque hardware operations and distributed publication still
+require native GPU and physical EP conformance.
+
+### Strict batch-invariant qualification
+
+The focused entrypoint combines Lean conformance and the axiom-policy check,
+public outer-selection contracts and a two-rank preparation-failure regression
+with native whole-operator accuracy, batch/plan/graph invariance, representative
+numerical variants, K stages and physical EP tests:
+
+```bash
+python tests/moe_ep/qualify_batch_invariant.py \
+    --suite all --arch sm_100 --world-size 4 \
+    --output-dir ../tmp/megamoe-bi-qualification
+```
+
+Use `sm_103` or `sm_107` for those native targets. `--suite host` runs without
+visible GPUs but requires the pinned Lean toolchain. It does not repeat the
+individual helper and arithmetic-component unit suites. `--suite single` requires
+one native GPU; `--suite multi` launches two, four or eight physical peer-access
+GPUs through `torchrun`. The runner records per-rank results and rejects skips,
+missing dependencies, empty runs and selected source files with no passing
+cases. Unsupported architecture/provider combinations are explicitly deselected
+before execution. A source-tree `.lake` directory is not needed: the host stage
+copies Lean sources into the chosen output directory before building.
+The normal e2e matrix uses representative numerical combinations; direct pytest
+invocations with `--full` can additionally expand scheduling and capacity checks.
+
 ### Complete EP selection
 
 `AutoConfig` compares explicitly configured Mega and split candidates during an
@@ -455,15 +775,30 @@ int32/int64 expert IDs and float32 weights. FC1 rows use the unified MoE API's
 Routing-weight placement, the NVFP4 activation recipe and the combine format
 must also agree. In particular, mixing a split candidate with Rubin Mega
 requires `apply_routing_weights_before_fc2=False` and `combine_dtype="bf16"`.
+Ordinary outer selection requires the default SwiGLU constants, matching the
+split-candidate contract. Direct Mega execution retains its custom constants;
+BI outer selection admits explicit activation recipes through their fingerprint.
 Candidate preparation converts native weight layouts before tuning. Mega
-candidates currently use the Rubin block-scaled
-adapters. Split candidates use `FusedMoeKernelConfig` and its existing prepared
+candidates use the shared BF16/W4A16/W8A16 adapters and Blackwell/Rubin
+block-scaled adapters, including next standard/GenPhase quantized providers.
+Split candidates use `FusedMoeKernelConfig` and its existing prepared
 weight views. The layer prepares and retains each candidate's weights once;
 workspaces share those views. Each split configuration pins its communication
 backend, including its default; the selector does not enumerate other transports.
 Raw allocator callbacks and CUDA stream handles carry process-local addresses
 and are not supported in automatic-selection cache contracts. The built-in
 `FleetAlgoKnobAllocator(torch_caching=True)` remains serializable.
+
+BI outer selection admits only BI candidates with the same arithmetic
+fingerprint. Canonical BF16 input/weight sources and finalized BF16 output are
+required. Candidates also share the same rank-local transformed-weight and
+configuration-tensor sources, including expert alpha/norm tensors; equal-valued
+clones are different sources. Scalar settings preserve their FP32 bit identity,
+including signed zero. Runtime tensor values are not included in the arithmetic
+fingerprint. Complete-forward timing records are isolated from kernel-only
+records, including native cache entries. Standard and GenPhase recipes have
+different fingerprints, so BI `kernel_variant="auto"` remains rejected; use
+explicit variants and numerically compatible candidates.
 
 ```python
 from flashinfer import autotune_v2
@@ -494,7 +829,8 @@ happen before measurement. All EP ranks use the median of the per-iteration
 maximum rank latency.
 
 The managed v2 store holds split backend winners and the overall plan in
-separate namespaces. Rubin keeps its existing variant and knob records. Outer
+separate namespaces. Blackwell and Rubin keep their provider-specific variant
+and knob records. Outer
 records match the configured candidates, capacity, rank-local input shapes,
 numerical settings, environment and measurement policy. A replay context loads
 one complete plan without measuring; a miss prepares the first eligible

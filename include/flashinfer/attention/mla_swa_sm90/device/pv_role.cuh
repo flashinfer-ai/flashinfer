@@ -16,6 +16,18 @@ __forceinline__ __device__ void run_pv_role(
   const int slice_begin = Ownership::begin(pv_group);
   const int slice_end = Ownership::end(pv_group);
   constexpr int kSliceStride = Ownership::Stride;
+  if constexpr (C::LookAhead > 0) {
+    if (warpgroup == T::NUM_PV_WARPGROUPS && idx_in_warpgroup == 0) {
+      const int first = start_page < end_page && start_page < max_pages
+                            ? block_table[batch_idx * block_table_stride_b + start_page]
+                            : -1;
+      const int second = start_page + 1 < end_page && start_page + 1 < max_pages
+                             ? block_table[batch_idx * block_table_stride_b + start_page + 1]
+                             : -1;
+      if (first >= 0)
+        issue_prologue_selected_aux_descending<T::LOOKAHEAD_K - 1, T>(plan, second, 0, tma_params);
+    }
+  }
   Tensor output_fragment_all = partition_fragment_C(
       typename T::TiledMMAPV{}, Shape<Int<MaxSlices * T::TILE_K>, Int<T::BLOCK_M>>{});
   cute::fill(output_fragment_all, 0.0f);
@@ -40,10 +52,11 @@ __forceinline__ __device__ void run_pv_role(
                     out_stride_s,
                     out_stride_h};
   bool p_ready_phase = 1;
+  SoftmaxRowState row_state{-CUDART_INF_F, 0.0f};
   for (int page_idx : mla_swa::PageRange<C>{start_page, end_page}) {
     PVRoleOps<C>::template step<MaxSlices, T>(output_fragment_all, slice_begin, slice_end,
                                               kSliceStride, sKV, sP, sV, plan, task, pv_group,
-                                              page_idx, p_ready_phase, tma_params);
+                                              page_idx, p_ready_phase, tma_params, row_state);
   }
   PVRoleOps<C>::template finish<MaxSlices, T>(output_fragment_all, slice_begin, slice_end,
                                               kSliceStride, plan, out, task, pv_group);
