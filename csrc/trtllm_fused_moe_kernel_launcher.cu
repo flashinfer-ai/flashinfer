@@ -5175,10 +5175,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     std::vector<int32_t> tiles(mBaseSupportedTileNums.begin(), mBaseSupportedTileNums.end());
     if (dtype_act != btg::Dtype::Bfloat16) {
       tiles.push_back(128);
-      // NVFP4 tile-192 kernels do not support the MN-bias LoRA epilogue.
+      // NVFP4 and MXFP4 x MXFP8 have no tile-192 MN-bias export.
       if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1 &&
            gemm1_bias_type != batchedGemm::gemm::BiasType::Mn) ||
-          (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3)) {
+          (dtype_weights == btg::Dtype::MxE2m1 && dtype_act == btg::Dtype::MxE4m3 &&
+           gemm1_bias_type != batchedGemm::gemm::BiasType::Mn)) {
         tiles.push_back(192);
       }
       tiles.push_back(256);
