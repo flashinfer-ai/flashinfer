@@ -297,6 +297,11 @@ def _b12x_gemm_mxfp8_runner(
                 kernel_a_sf.data_ptr(),
                 kernel_b_sf.data_ptr(),
                 alpha_for_launch,
+                # Optional SVDQuant operands: a kernel reloaded from the disk
+                # cache has no Python defaults, so pass them explicitly.
+                None,
+                None,
+                None,
             )
             return out
 
