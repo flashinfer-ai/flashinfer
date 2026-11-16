@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Measurement policies over the native MegaMoE kernel boundary."""
+"""Measurement policies for collective MegaMoE trials."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def measurement_settings(context, *, native_graph_calls=None, native_warmups=0):
 
 
 def measure_samples(trial, weights, repeats, settings, process_group):
-    """Return matched rank-local samples in microseconds; exclude input staging."""
+    """Return matched rank-local samples in microseconds for ``trial.launch``."""
     import torch
     import torch.distributed as dist
 
@@ -51,9 +51,7 @@ def measure_samples(trial, weights, repeats, settings, process_group):
     from flashinfer.autotuner.autotuner import (
         _CuptiInfraError,
         _cupti_measure_spans,
-        _flush_l2,
         _load_cupti,
-        _make_l2_flush_buffer,
         _profile_measurement_scope,
     )
     from flashinfer.tllm_utils import delay_kernel
@@ -101,15 +99,16 @@ def measure_samples(trial, weights, repeats, settings, process_group):
             torch.cuda.synchronize()
         run = graph.replay if graph is not None else launch
         if settings["cold_l2"]:
-            flush = _make_l2_flush_buffer(
+            flush = torch.empty(
                 2 * tuner._get_l2_cache_size_in_bytes(trial.device.index),
-                trial.device,
+                dtype=torch.uint8,
+                device=trial.device,
             )
 
         def prologue():
             barrier()
             if flush is not None:
-                _flush_l2(flush)
+                flush.zero_()
 
         def check_ready(error):
             errors = gather(error)

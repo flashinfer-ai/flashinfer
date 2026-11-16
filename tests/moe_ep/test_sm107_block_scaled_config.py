@@ -19,6 +19,7 @@ import pytest
 from flashinfer.moe_ep import (
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl import (
@@ -36,7 +37,16 @@ from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl.backe
     Sm107Mxfp8Mxfp4MegaKernelBackend,
 )
 
+from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+    Sm107Mxfp4MegaKernelBackend,
+)
+
 _BACKENDS = (
+    (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm107Mxfp4MegaKernelBackend,
+        "sm107_mxfp4_mxfp4_bf16_cutedsl",
+    ),
     (
         Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm107Mxfp8Mxfp4MegaKernelBackend,

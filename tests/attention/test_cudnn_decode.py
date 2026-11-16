@@ -10,9 +10,7 @@ import torch
 import flashinfer
 import flashinfer.cudnn.decode as cudnn_decode
 from flashinfer.cudnn.utils import (
-    cudnn_frontend_accepts_cuda_graph_replay_hint,
     cudnn_frontend_frost_runtime_available,
-    cudnn_frontend_leads_short_caches,
     cudnn_frontend_serves_frost_decode,
 )
 from flashinfer.decode import _DECODE_AUTO_CUDNN_ENV
@@ -1604,15 +1602,15 @@ def test_auto_backend_gate_keeps_fa2_outside_the_envelope(monkeypatch, changes):
     "q_len_per_req,num_qo_heads,num_kv_heads,batch_size",
     [(4, 64, 8, 8), (4, 64, 4, 16), (2, 64, 4, 16), (3, 64, 4, 16)],
 )
-def test_auto_backend_resolves_cudnn_on_frontend_1_30(
+def test_auto_backend_resolves_cudnn_on_supported_frontend(
     q_len_per_req, num_qo_heads, num_kv_heads, batch_size
 ):
-    """No switch, no flag: with cudnn-frontend 1.30+ installed, auto resolves to
+    """No switch, no flag: with a supported frontend installed, auto resolves to
     cudnn on SM100 for multi-token rows inside the envelope, the plan it runs is
     the frontend's FROST engine (not a backend plan), and it matches fa2 on
     output and LSE."""
     if not _auto_cudnn_available():
-        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+        pytest.skip("needs the FROST runtime and an SM100 / SM103 GPU")
     wrapper, args = _plan_auto(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
@@ -1663,9 +1661,7 @@ def test_auto_cudnn_fast_plan_capture_reuses_prepared(
     kwargs = dict(q_data_type=q.dtype, q_len_per_req=q_len_per_req)
     table = None
     if caller_block_table:
-        # As wide as the wrapper's declared-cache bucket: a narrower caller
-        # table keeps fa2 on cudnn-frontend 1.30 (see
-        # test_auto_backend_short_caller_table_keeps_fa2).
+        # A caller-owned table declares the captured cache capacity.
         table = torch.zeros((b, 2048 // page), dtype=torch.int32, device=q.device)
         offsets = indptr.cpu().tolist()
         for i in range(b):
@@ -1940,21 +1936,11 @@ def test_auto_backend_fast_plan_reevaluates_per_plan(monkeypatch):
 
 
 @requires_cudnn_graph
-@pytest.mark.parametrize("table_tokens,expect_cudnn", [(512, False), (2048, True)])
-def test_auto_backend_short_caller_table_keeps_fa2(
-    monkeypatch, table_tokens, expect_cudnn
-):
-    """A caller-owned block table declares its own cache length to cuDNN. Below
-    2048 tokens cudnn-frontend 1.30 ranks the backend's prefill-class engine
-    ahead of the decode tile for multi-token rows (~8x fa2), so auto keeps fa2
-    there; a table as wide as the bucket takes cudnn."""
-    if not _sm100_class():
-        pytest.skip("auto -> cudnn is an SM100 / SM103 rule")
-    if cudnn_frontend_leads_short_caches():
-        pytest.skip(
-            "this cudnn-frontend ranks the decode tile first at every cache length"
-        )
-    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "1")
+@pytest.mark.parametrize("table_tokens", [512, 2048])
+def test_auto_backend_short_caller_table_uses_cudnn(table_tokens):
+    """Supported FE releases rank the decode tile at both table widths."""
+    if not _auto_cudnn_available():
+        pytest.skip("needs the FROST runtime and an SM100 / SM103 GPU")
     torch.manual_seed(0)
     device = "cuda:0"
     b, h, hk, d, page = 8, 64, 8, 128, 16
@@ -1981,7 +1967,7 @@ def test_auto_backend_short_caller_table_keeps_fa2(
         q_len_per_req=4,
         block_tables=table,
     )
-    assert (wrapper.resolved_backend == "cudnn") is expect_cudnn
+    assert wrapper.resolved_backend == "cudnn"
     out, lse = wrapper.run(q, cache, return_lse=True)
     ref, ref_lse = _run_wrapper(
         "fa2",
@@ -2009,7 +1995,7 @@ def test_auto_backend_keeps_fa2_without_the_frost_runtime(monkeypatch):
     applies the rule (benchmarking), and multi-token rows without tensor cores,
     which have no fa2 kernel, still go to cudnn."""
     if not _auto_cudnn_available():
-        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+        pytest.skip("needs the FROST runtime and an SM100 / SM103 GPU")
     monkeypatch.setattr(
         flashinfer.decode, "cudnn_frontend_frost_runtime_available", lambda: False
     )
@@ -2039,7 +2025,7 @@ def test_auto_backend_split_controls_keep_fa2_batch_invariant(control):
     shape without them resolves to cudnn), and the first four requests of a
     b=8 batch match the b=4 batch of those requests bitwise, on O and LSE."""
     if not _auto_cudnn_available():
-        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+        pytest.skip("needs the FROST runtime and an SM100 / SM103 GPU")
     torch.manual_seed(0)
     device = "cuda:0"
     h, hk, d, page, qlen = 64, 8, 128, 16, 4
@@ -2118,31 +2104,13 @@ def _caller_block_table(indptr, indices, page_size, min_tokens=2048):
     return table
 
 
-@pytest.mark.parametrize("frontend_accepts", [True, False])
-def test_cudnn_wrapper_cuda_graph_passes_the_replay_hint(monkeypatch, frontend_accepts):
-    """A ``use_cuda_graph=True`` cudnn wrapper declares CUDA-graph replay to
-    cudnn-frontend (1.31+ takes ``is_cuda_graph_replay_expected``): the built
-    graph carries the hint and the prepared key differs from an eager wrapper's,
-    so neither serves the other. On the d256 serving shape (32/2 at b=32 over
-    4096 keys) the frontend's leading plan then splits KV where the eager graph
-    does not; both match, and the hinted graph captures and replays. On a
-    frontend without the keyword (here: the probe says no) the graph is built
-    without it and nothing else changes."""
+def test_cudnn_wrapper_cuda_graph_passes_the_replay_hint():
+    """Eager and captured wrappers keep separate hinted plans and replay correctly."""
     if not _auto_cudnn_available():
-        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
-    if frontend_accepts and not cudnn_frontend_accepts_cuda_graph_replay_hint():
-        pytest.skip(
-            "needs a cudnn-frontend whose pygraph takes is_cuda_graph_replay_expected (1.31+)"
-        )
-    if not frontend_accepts:
-        monkeypatch.setattr(
-            cudnn_decode, "cudnn_frontend_accepts_cuda_graph_replay_hint", lambda: False
-        )
+        pytest.skip("needs the FROST runtime and an SM100 / SM103 GPU")
     torch.manual_seed(0)
     device = "cuda:0"
-    # Distinct shapes per case: the graph cache keys on the replay flag, not on
-    # whether the frontend was handed the hint.
-    b = 32 if frontend_accepts else 4
+    b = 32
     h, hk, d, page, s_kv = 32, 2, 256, 16, 4096
     q, cache, indptr, indices, last = _wrapper_inputs(
         b, s_kv, page, hk, h, d, torch.bfloat16, "HND", device
@@ -2179,10 +2147,7 @@ def test_cudnn_wrapper_cuda_graph_passes_the_replay_hint(monkeypatch, frontend_a
     g_eager = eager._cudnn_prepared.graph
     g_captured = captured._cudnn_prepared.graph
     assert getattr(g_eager, "is_cuda_graph_replay_expected", False) is False
-    assert (
-        bool(getattr(g_captured, "is_cuda_graph_replay_expected", False))
-        is frontend_accepts
-    )
+    assert g_captured.is_cuda_graph_replay_expected is True
     assert eager._cudnn_prepared.key != captured._cudnn_prepared.key
     torch.testing.assert_close(out_captured, out_eager, rtol=1e-2, atol=1e-2)
     out = torch.empty_like(q)
@@ -2193,11 +2158,7 @@ def test_cudnn_wrapper_cuda_graph_passes_the_replay_hint(monkeypatch, frontend_a
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(out, out_eager, rtol=1e-2, atol=1e-2)
-    if (
-        frontend_accepts
-        and hasattr(g_captured, "plans")
-        and hasattr(g_captured, "_plan_index")
-    ):
+    if hasattr(g_captured, "plans") and hasattr(g_captured, "_plan_index"):
         # The hinted graph's leading plan is the GPU-time optimum: at 64 units
         # over 4096 keys the decode tile splits KV, which the eager-safe lead
         # does not (split 2 vs 1 on a 148-SM part; the model is SM-count aware).
@@ -2214,10 +2175,10 @@ def test_auto_backend_resolves_cudnn_for_single_token_d256(
     num_qo_heads, num_kv_heads, batch_size
 ):
     """Single-token head_dim-256 GQA decode inside the d256 band (128 / 96 / 256
-    CTAs) resolves to cudnn on SM100 with cudnn-frontend 1.30+ and matches fa2
+    CTAs) resolves to cudnn on SM100 with a supported frontend and matches fa2
     on output and LSE."""
     if not _auto_cudnn_available():
-        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+        pytest.skip("needs the FROST runtime and an SM100 / SM103 GPU")
     wrapper, args = _plan_auto(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
@@ -2236,10 +2197,9 @@ def test_auto_backend_d256_band_starts_lower_under_cuda_graph_replay():
     """64 CTAs of single-token d256 (32/4 at b=16) stay on fa2 for an eager
     wrapper (the unsplit decode tile loses at 4k) but go to cudnn under
     use_cuda_graph=True with a caller-owned block table on a frontend that takes
-    the replay hint (1.31+, the tile then splits KV); without that frontend the
-    CUDA-graph wrapper keeps fa2 too."""
+    the replay hint, which every supported frontend accepts."""
     if not _auto_cudnn_available():
-        pytest.skip("needs cudnn-frontend 1.30+, its CuTe DSL and an SM100 / SM103 GPU")
+        pytest.skip("needs the FROST runtime and an SM100 / SM103 GPU")
     torch.manual_seed(0)
     b, h, hk, d, page = 16, 32, 4, 256, 16
     q, cache, indptr, indices, last = _wrapper_inputs(
@@ -2273,9 +2233,6 @@ def test_auto_backend_d256_band_starts_lower_under_cuda_graph_replay():
         block_tables=_caller_block_table(indptr, indices, page, min_tokens=4096),
         **plan_kwargs,
     )
-    if not cudnn_frontend_accepts_cuda_graph_replay_hint():
-        assert captured.resolved_backend in ("fa2", "fa3")
-        return
     assert captured.resolved_backend == "cudnn"
     out_ref, lse_ref = _run_wrapper(
         "fa2", q, cache, indptr, indices, last, page, hk, h, d, torch.bfloat16, "HND"

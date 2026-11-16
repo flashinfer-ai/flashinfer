@@ -3085,22 +3085,6 @@
             "NUM_KV_HEADS": 4,
             "NUM_Q_HEADS": 32,
             "Q_LEN": 1,
-            "RETAIN_KV_L2": 1,
-            "USE_SCALE_PTR": 0
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_native_bf16/sm_100a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu",
-            "sm_103a": "cuda/decode_native_bf16/sm_103a/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l21_use_scale_ptr0.cu"
-          }
-        },
-        {
-          "selector": {
-            "BATCH_SIZE": 128,
-            "HAS_SINK": 0,
-            "HAS_WINDOW": 0,
-            "NUM_KV_HEADS": 4,
-            "NUM_Q_HEADS": 32,
-            "Q_LEN": 1,
             "RETAIN_KV_L2": 0,
             "USE_SCALE_PTR": 0
           },

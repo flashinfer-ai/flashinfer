@@ -29,7 +29,7 @@ if _REPO_ROOT not in sys.path:
 import pytest
 import torch.distributed as dist
 
-from tests.test_helpers.ulysses import rendezvous_path
+from tests.comm.test_helpers.ulysses import rendezvous_path
 
 
 @pytest.fixture

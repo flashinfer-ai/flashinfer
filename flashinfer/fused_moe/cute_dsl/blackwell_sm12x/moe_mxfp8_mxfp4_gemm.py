@@ -198,7 +198,9 @@ _COMPILED: dict = {}
 def compiled_kernel(
     sample_args, *, op: CuteDslSm120GroupedMxfp8Mxfp4Op, grid_x: int, sm_version: str
 ):
-    key = (op.tactic, op.out_dtype, op.enable_pdl, grid_x, sm_version)
+    # Scale recasts are specialized to the input tensor element types.
+    scale_dtypes = tuple(arg.element_type for arg in sample_args[2:4])
+    key = (op.tactic, op.out_dtype, op.enable_pdl, grid_x, sm_version, scale_dtypes)
     hit = _COMPILED.get(key)
     if hit is None:
         hit = cute.compile(op.build(grid_x), *sample_args)

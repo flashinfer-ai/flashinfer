@@ -286,6 +286,9 @@ tinygemm2_kernel(__nv_bfloat16* __restrict__ output, __nv_bfloat16* __restrict__
                 }
                 int tm = mib_c + lane / 4;
                 int tn = ni_c + 2 * (lane % 4);
+                // The output holds batch_size * output_features (N * M) elements, which can exceed 2^31.
+                int64_t row0 = static_cast<int64_t>(tn) * M;
+                int64_t row1 = row0 + M;
                 float bias_lo = smem_bias[lane / 4];
                 float bias_hi = smem_bias[lane / 4 + 8];
                 float o00 = accum[0] + bias_lo;
@@ -294,22 +297,22 @@ tinygemm2_kernel(__nv_bfloat16* __restrict__ output, __nv_bfloat16* __restrict__
                 float o11 = accum[3] + bias_hi;
                 if (tn < N) {
                     if (tm < M) {
-                        *(reinterpret_cast<__nv_bfloat16*>(output + (tn * M + tm)) + (0)) = __float2bfloat16_rn(o00);
+                        *(reinterpret_cast<__nv_bfloat16*>(output + (row0 + tm)) + (0)) = __float2bfloat16_rn(o00);
                     }
                 }
                 if (tn + 1 < N) {
                     if (tm < M) {
-                        *(reinterpret_cast<__nv_bfloat16*>(output + ((tn + 1) * M + tm)) + (0)) = __float2bfloat16_rn(o01);
+                        *(reinterpret_cast<__nv_bfloat16*>(output + (row1 + tm)) + (0)) = __float2bfloat16_rn(o01);
                     }
                 }
                 if (tn < N) {
                     if (tm + 8 < M) {
-                        *(reinterpret_cast<__nv_bfloat16*>(output + (tn * M + tm + 8)) + (0)) = __float2bfloat16_rn(o10);
+                        *(reinterpret_cast<__nv_bfloat16*>(output + (row0 + tm + 8)) + (0)) = __float2bfloat16_rn(o10);
                     }
                 }
                 if (tn + 1 < N) {
                     if (tm + 8 < M) {
-                        *(reinterpret_cast<__nv_bfloat16*>(output + ((tn + 1) * M + tm + 8)) + (0)) = __float2bfloat16_rn(o11);
+                        *(reinterpret_cast<__nv_bfloat16*>(output + (row1 + tm + 8)) + (0)) = __float2bfloat16_rn(o11);
                     }
                 }
             }

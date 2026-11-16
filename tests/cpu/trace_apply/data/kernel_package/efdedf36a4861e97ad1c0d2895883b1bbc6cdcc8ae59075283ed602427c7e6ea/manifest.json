@@ -1,0 +1,9 @@
+{
+  "bundle_dir": "bundle",
+  "bundle_sha256": "6cd50814e198532a895c3d89f931fa4bac3b3588d8ebe10a07d88ced4177d656",
+  "files": {
+    "solution.json": "ce8e9c1feac245516fdf86eef9d7ea2f3e4bfaa203d9fa7fa84019bae35e74fc",
+    "stock.py": "7034baf258004ec8b0027b6f9961012c29eca5713bdf8bbfb252cc8e03f9dace"
+  },
+  "qualification_sha256": "4ae637f534f79d7d4a7f0d8ab7fe72f8b55bbf523f2b450795ec7dfc77fc6442"
+}

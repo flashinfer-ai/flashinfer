@@ -782,7 +782,8 @@ def test_split_merge_up_to_and_past_32_splits():
     # then 20 double ranges = 40 partial slots per row (the eight-warp form's 48-slot program), a 3072-row problem at two
     # partials (the one-warp merge above 2048 rows), a 1536-row one at three (two warps: that grid is one wave
     # up to 1664 rows), 28 one-token H16 requests (448 rows) at 24 partials (the four-warp column merge of the
-    # 385-448-row box) and a 768-row problem at 24 partials (the four-warp, two-rows-per-CTA merge above it).
+    # 385-448-row box) and a 768-row problem at 24 partials (the four-warp form's 24-slot program, two rows per
+    # CTA, above it).
     case = _make_case([65536], 1, 96, seed=625030, device=device, return_lse=True)
     out, lse, runner = _run(case, dense=True)
     assert runner.plan.max_splits > 1 and runner.plan.merge_record == "merge_w8_pal"
@@ -822,7 +823,7 @@ def test_split_merge_up_to_and_past_32_splits():
     _check_lse(lse, ref_lse)
     four = _make_case([65536], 8, 96, seed=625034, device=device, return_lse=True)
     out, lse, runner = _run(four, dense=True, split=24)  # 768 rows
-    assert runner.plan.max_splits == 24 and runner.plan.merge_record == "merge_w4"
+    assert runner.plan.max_splits == 24 and runner.plan.merge_record == "merge_w4_b24"
     ref, ref_lse = _reference(four)
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
@@ -1174,6 +1175,7 @@ def test_registry_records_follow_the_plan_vocabulary():
     assert cake_jit.records_of_stage("merge") == (
         "merge_w1",
         "merge_w4",
+        "merge_w4_b24",
         "merge_w2_pal",
         "merge_w8_pal",
         "merge_w8_b48_pal",
@@ -1210,8 +1212,9 @@ def test_select_rules_and_grids():
     # (rows, partials per row, record, rows per merge CTA): eight warps per row up to 384 rows or over 32
     # partials (``merge_w8_pal``; up to 384 rows at 33-48 partials its 48-slot program, ``merge_w8_b48_pal``);
     # two warps up to 16 partials up to 1664 rows, and over 8 up to 2048 rows
-    # (``merge_w2_pal``); four warps over 17-32 partials (the four-warp column form up to 448 rows, ``merge_w4``
-    # above); one warp above 2048 rows or up to 8 partials above 1664 rows.
+    # (``merge_w2_pal``); four warps over 17-32 partials (the four-warp column form up to 448 rows; above,
+    # ``merge_w4_b24`` at 17-24 and ``merge_w4`` at 25-32); one warp above 2048 rows or up to 8 partials above
+    # 1664 rows.
     cases = (
         (96, 24, "merge_w8_pal", 1),
         (192, 52, "merge_w8_pal", 1),
@@ -1228,16 +1231,23 @@ def test_select_rules_and_grids():
         (448, 25, "merge_w4_c4_col_pal", 1),
         (448, 32, "merge_w4_c4_col_pal", 1),
         (448, 33, "merge_w8_pal", 1),
-        (449, 24, "merge_w4", 2),
+        (449, 17, "merge_w4_b24", 2),
+        (449, 24, "merge_w4_b24", 2),
+        (449, 25, "merge_w4", 2),
         (768, 12, "merge_w2_pal", 4),
         (768, 16, "merge_w2_pal", 4),
-        (768, 20, "merge_w4", 2),
+        (768, 20, "merge_w4_b24", 2),
+        (768, 24, "merge_w4_b24", 2),
+        (768, 25, "merge_w4", 2),
+        (768, 32, "merge_w4", 2),
         (768, 33, "merge_w8_pal", 1),
         (1536, 8, "merge_w2_pal", 4),
         (1664, 8, "merge_w2_pal", 4),
         (1665, 8, "merge_w1", 8),
         (1792, 6, "merge_w1", 8),
         (1792, 12, "merge_w2_pal", 4),
+        (2048, 24, "merge_w4_b24", 2),
+        (2048, 32, "merge_w4", 2),
         (2048, 33, "merge_w8_pal", 1),
         (2049, 33, "merge_w1", 8),
         (3072, 10, "merge_w1", 8),
@@ -1348,7 +1358,7 @@ def test_one_full_half_request_fills_the_wave(units, pairs, kv_len):
             pairs=pairs,
         )
         assert (q.items, q.n_full, q.max_splits) == (52, 32, 20)
-        assert q.merge_record == "merge_w4"
+        assert q.merge_record == "merge_w4_b24"
         _check_plan(q, [kv_len, kv_len], [4, 4], 96)
 
 

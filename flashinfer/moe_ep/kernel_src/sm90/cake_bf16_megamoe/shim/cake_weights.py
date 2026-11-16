@@ -16,6 +16,8 @@ limitations under the License.
 
 from __future__ import annotations
 
+import dataclasses
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -23,8 +25,12 @@ import torch
 __all__ = [
     "GATE_UP_GROUP",
     "Sm90CakeBf16Weights",
+    "Sm90CakeWcxWeights",
+    "encode_sm90_cake_wcx",
     "interleave_gate_up",
     "make_sm90_cake_bf16_weights",
+    "wcx_fallback_layers",
+    "wcx_supported_geometry",
 ]
 
 # The Cake FC1 kernel consumes gate/up rows in alternating groups of this many
@@ -56,6 +62,49 @@ def interleave_gate_up(
 
 
 @dataclass(frozen=True)
+class Sm90CakeWcxWeights:
+    """Lossless compressed (WCX codec version 2) copies of one layer's expert weights.
+
+    Read by the swap-AB decode GEMMs of the early-start pair (runner
+    ``wcx_max_tokens`` and ``WCX_WINDOWS``): ``w13c`` is
+    ``[E, 2I / 256, H / 64, stage_bytes13]`` uint8 (the encoded gate/up-interleaved
+    ``w13``), ``w2c`` is ``[E, H / 256, I / 64, stage_bytes2]`` uint8.  ``slots13`` /
+    ``slots2`` are the escape slots per stage of each tensor (at most
+    ``WCX2_S_CAP``).  The kernels decode the operands back to the bf16 weights bit
+    for bit, so a round computes the same products in the same order as the bf16
+    pair.
+    """
+
+    w13c: torch.Tensor
+    w2c: torch.Tensor
+    stage_bytes13: int
+    stage_bytes2: int
+    slots13: int
+    slots2: int
+
+    def __post_init__(self) -> None:
+        from .cake_wcx import wcx2_stage_bytes
+
+        for name, tensor, sb, slots in (
+            ("w13c", self.w13c, self.stage_bytes13, self.slots13),
+            ("w2c", self.w2c, self.stage_bytes2, self.slots2),
+        ):
+            if tensor.dtype != torch.uint8 or tensor.ndim != 4:
+                raise ValueError(f"{name} must be a rank-4 uint8 tensor")
+            if not tensor.is_cuda or not tensor.is_contiguous():
+                raise ValueError(f"{name} must be a contiguous CUDA tensor")
+            if tensor.shape[3] != sb or wcx2_stage_bytes(slots) != sb:
+                raise ValueError(
+                    f"{name} stage bytes {tensor.shape[3]} do not match {slots} escape slots"
+                )
+
+    @property
+    def nbytes(self) -> int:
+        """Device bytes of both compressed tensors."""
+        return int(self.w13c.numel() + self.w2c.numel())
+
+
+@dataclass(frozen=True)
 class Sm90CakeBf16Weights:
     """Kernel-ready BF16 expert weights for ``sm90_bf16_bf16_bf16_push_cake``.
 
@@ -71,6 +120,9 @@ class Sm90CakeBf16Weights:
     hidden_size: int
     intermediate_size: int
     w13_interleaved: bool = True
+    # optional WCX copies for the decode rounds of the runner's ``wcx_max_tokens``
+    # (dual format: the bf16 tensors above stay and serve every other round)
+    wcx: Sm90CakeWcxWeights | None = None
 
     def __post_init__(self) -> None:
         if self.w13.dtype != torch.bfloat16 or self.w2.dtype != torch.bfloat16:
@@ -93,6 +145,21 @@ class Sm90CakeBf16Weights:
             raise ValueError("w13 and w2 must be contiguous")
         if not self.w13_interleaved:
             raise ValueError("the Cake FC1 kernel requires gate/up-interleaved w13")
+        if self.wcx is not None:
+            nst = (
+                (e, 2 * i // 256, h // 64),
+                (e, h // 256, i // 64),
+            )
+            if (
+                tuple(self.wcx.w13c.shape[:3]) != nst[0]
+                or tuple(self.wcx.w2c.shape[:3]) != nst[1]
+            ):
+                raise ValueError(
+                    f"wcx stage grids {tuple(self.wcx.w13c.shape[:3])} / {tuple(self.wcx.w2c.shape[:3])} "
+                    f"do not match the weights ({nst[0]} / {nst[1]})"
+                )
+            if self.wcx.w13c.device != self.w13.device:
+                raise ValueError("wcx tensors must be on the weights' device")
 
     @property
     def device(self) -> torch.device:
@@ -127,4 +194,78 @@ def make_sm90_cake_bf16_weights(
         num_local_experts=num_experts,
         hidden_size=hidden,
         intermediate_size=intermediate,
+    )
+
+
+_WCX_FALLBACK = {"layers": 0, "warned": False}
+
+
+def wcx_fallback_layers() -> int:
+    """Layers whose WCX encoding fell back to the bf16 path in this process."""
+    return _WCX_FALLBACK["layers"]
+
+
+def wcx_supported_geometry(hidden_size: int, intermediate_size: int) -> bool:
+    """Geometries of the WCX decode units: both GEMMs pair their 256-column
+    n-tiles (``2I / 256`` and ``H / 256`` even), FC2 needs >= 4 k-steps."""
+    return (
+        hidden_size % 512 == 0
+        and intermediate_size % 256 == 0
+        and intermediate_size >= 256
+    )
+
+
+def encode_sm90_cake_wcx(weights: Sm90CakeBf16Weights) -> Sm90CakeBf16Weights:
+    """Attach WCX (codec version 2) copies of ``w13`` / ``w2`` to ``weights``.
+
+    The bf16 tensors are kept (dual format), so the layer's device memory grows
+    by the compressed bytes (about 0.77 x the bf16 expert bytes on Gaussian
+    weights).  A layer falls back to the bf16 path (returned unchanged, with
+    ``wcx`` None) when a stage of either tensor needs more than ``WCX2_S_CAP``
+    escape slots or the geometry has no WCX unit; fallbacks are counted
+    (:func:`wcx_fallback_layers`) and warned about once per process.
+    """
+    from .cake_wcx import WCX2_S_CAP, wcx2_encode, wcx2_stage_escape_counts
+
+    reason = None
+    slots = []
+    if not wcx_supported_geometry(weights.hidden_size, weights.intermediate_size):
+        reason = (
+            f"geometry H={weights.hidden_size}, I={weights.intermediate_size} has no WCX unit "
+            "(needs H % 512 == 0 and I % 256 == 0)"
+        )
+    else:
+        for name, tensor in (("w13", weights.w13), ("w2", weights.w2)):
+            s = 0
+            for e in range(tensor.shape[0]):
+                counts = wcx2_stage_escape_counts(tensor[e])
+                if counts.numel():
+                    s = max(s, int(counts.max()))
+            slots.append(s)
+            if s > WCX2_S_CAP:
+                reason = f"{name} needs {s} escape slots per stage (> WCX2_S_CAP {WCX2_S_CAP})"
+                break
+    if reason is not None:
+        _WCX_FALLBACK["layers"] += 1
+        if not _WCX_FALLBACK["warned"]:
+            _WCX_FALLBACK["warned"] = True
+            warnings.warn(
+                f"sm90_cake_bf16 WCX: a layer keeps the bf16 expert GEMMs: {reason} "
+                "(further fallbacks are counted, not warned)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return dataclasses.replace(weights, wcx=None)
+    w13c, st13 = wcx2_encode(weights.w13, slots=slots[0])
+    w2c, st2 = wcx2_encode(weights.w2, slots=slots[1])
+    return dataclasses.replace(
+        weights,
+        wcx=Sm90CakeWcxWeights(
+            w13c=w13c,
+            w2c=w2c,
+            stage_bytes13=st13.stage_bytes,
+            stage_bytes2=st2.stage_bytes,
+            slots13=st13.slots,
+            slots2=st2.slots,
+        ),
     )

@@ -47,10 +47,9 @@ from .fp4_common import (
     get_ptr_as_int64,
     rcp_approx_ftz,
     fmin_f32,
+    fmax_f32,
     hmax2,
     hmax_to_f32,
-    bfloat2_hmax2,
-    bfloat2_hmax_to_f32,
     cvt_f32_to_e4m3,
     fp8_e4m3_to_f32_and_rcp,
     cvt_f32_to_ue8m0,
@@ -58,12 +57,11 @@ from .fp4_common import (
     # Helper functions for block processing
     load_8_half2,
     half2_mul_8,
-    bfloat2_mul_8,
     half2_max_abs_8,
-    bfloat2_max_abs_8,
     half2_to_float16,
     bfloat2_to_float16,
     quantize_and_pack_16,
+    compute_y_and_max_abs_f32,
     # Reduction utilities
     row_reduce,
     zero_swizzled_sf_padding,
@@ -526,13 +524,13 @@ class RMSNormFP4QuantKernel:
                             max_xw_h2 = half2_max_abs_8(xw_h2)
                             max_xw = hmax_to_f32(max_xw_h2)
                             y_f32 = half2_to_float16(xw_h2, rstd)
+                            max_abs = max_xw * rstd
                         else:
-                            xw_h2 = bfloat2_mul_8(x_h2, w_h2)
-                            max_xw_h2 = bfloat2_max_abs_8(xw_h2)
-                            max_xw = bfloat2_hmax_to_f32(max_xw_h2)
-                            y_f32 = bfloat2_to_float16(xw_h2, rstd)
-
-                        max_abs = max_xw * rstd
+                            y_f32, max_abs = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2, Float32(1.0)),
+                                bfloat2_to_float16(w_h2, Float32(1.0)),
+                                rstd,
+                            )
 
                         # Compute scale factor (FP8 E4M3) - Branchless clamping
                         scale_float = global_scale_val * max_abs * fp4_max_rcp
@@ -596,17 +594,21 @@ class RMSNormFP4QuantKernel:
                             max_xw = hmax_to_f32(max_xw_h2)
                             y_f32_c0 = half2_to_float16(xw_h2_c0, rstd)
                             y_f32_c1 = half2_to_float16(xw_h2_c1, rstd)
+                            max_abs = max_xw * rstd
                         else:
-                            xw_h2_c0 = bfloat2_mul_8(x_h2_c0, w_h2_c0)
-                            xw_h2_c1 = bfloat2_mul_8(x_h2_c1, w_h2_c1)
-                            max_c0_h2 = bfloat2_max_abs_8(xw_h2_c0)
-                            max_c1_h2 = bfloat2_max_abs_8(xw_h2_c1)
-                            max_xw_h2 = bfloat2_hmax2(max_c0_h2, max_c1_h2)
-                            max_xw = bfloat2_hmax_to_f32(max_xw_h2)
-                            y_f32_c0 = bfloat2_to_float16(xw_h2_c0, rstd)
-                            y_f32_c1 = bfloat2_to_float16(xw_h2_c1, rstd)
-
-                        max_abs = max_xw * rstd
+                            # Rounding x * weight to BF16 before normalization
+                            # can move a value across an FP4 rounding midpoint.
+                            y_f32_c0, max_abs_c0 = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2_c0, Float32(1.0)),
+                                bfloat2_to_float16(w_h2_c0, Float32(1.0)),
+                                rstd,
+                            )
+                            y_f32_c1, max_abs_c1 = compute_y_and_max_abs_f32(
+                                bfloat2_to_float16(x_h2_c1, Float32(1.0)),
+                                bfloat2_to_float16(w_h2_c1, Float32(1.0)),
+                                rstd,
+                            )
+                            max_abs = fmax_f32(max_abs_c0, max_abs_c1)
 
                         # Compute scale factor (E4M3 or UE8M0 based on scale_format)
                         if cutlass.const_expr(self.scale_format == "ue8m0"):

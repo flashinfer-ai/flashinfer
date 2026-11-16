@@ -103,8 +103,12 @@ def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
         ["--arch", "sm100", "--fc1-alpha", "0.5"],
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
+        ["--arch", "sm100", "--kernel-variant", "auto"],
+        ["--dtype", "sm90_fp8_e4m3", "--kernel-variant", "auto"],
+        ["--dtype", "sm120_mxfp4_mxfp8", "--kernel-variant", "auto"],
+        ["--arch", "sm107", "--kernel-variant", "auto", "--max-candidates", "0"],
+        ["--arch", "sm107", "--kernel-variant", "auto", "--timed-iters", "0"],
         ["--arch", "sm100", "--dtype", "bf16", "--no-do-finalize"],
-        ["--arch", "sm107", "--no-apply-routing-weights-before-fc2"],
         ["--arch", "sm100", "--no-do-finalize", "--allow-nondeterministic"],
         [
             "--arch",
@@ -163,6 +167,20 @@ def test_finalization_and_routing_options_reach_nvfp4_tuner(
 
 
 @pytest.mark.cpu_only
+def test_post_fc2_routing_weights_reach_sm107_nvfp4_tuner(monkeypatch):
+    received = []
+    monkeypatch.setattr(
+        tune.importlib,
+        "import_module",
+        lambda *args: SimpleNamespace(run_tuning=lambda args: received.append(args)),
+    )
+    tune.main([*_GEOMETRY, "--arch", "sm107", "--no-apply-routing-weights-before-fc2"])
+    (args,) = received
+    assert args.do_finalize
+    assert not args.apply_routing_weights_before_fc2
+
+
+@pytest.mark.cpu_only
 def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
     received = []
     monkeypatch.setattr(
@@ -191,9 +209,11 @@ def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
             "0.25",
             "--fc1-norm-const",
             "4",
+            "--no-apply-routing-weights-before-fc2",
         ]
     )
     (args,) = received
+    assert not args.apply_routing_weights_before_fc2
     assert (args.activation, args.situ_beta, args.situ_linear_beta) == (
         "situ",
         1.25,
@@ -220,6 +240,48 @@ def test_invalid_tuning_scalar_identifies_argument(field):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("allow_nondeterministic", [False, True])
+def test_sm107_schedule_base_respects_nondeterminism(
+    monkeypatch, tmp_path, variant, allow_nondeterministic
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.tuning import _candidates
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        knob_cache,
+    )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    args = tune._parse_args(
+        [
+            *_GEOMETRY,
+            "--arch",
+            "sm107",
+            "--kernel-variant",
+            variant,
+            "--sweep",
+            "schedule",
+            *(["--allow-nondeterministic"] if allow_nondeterministic else []),
+        ]
+    )
+    knob_cache.record_knobs(
+        {"reduce_topk_in_kernel": True},
+        dtype="nvfp4",
+        kernel_variant=variant,
+        world_size=1,
+        hidden=args.hidden,
+        intermediate=args.intermediate,
+        num_experts=args.num_experts,
+        topk=args.topk,
+        max_tokens=64,
+        allow_nondeterministic=True,
+    )
+    choices = _candidates(args, 0, 1, 64, "nvfp4", variant)
+    assert choices
+    assert all(k["reduce_topk_in_kernel"] == allow_nondeterministic for k in choices)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm90", "sm100"])
 def test_mxfp4_tuner_rejects_unwired_architecture(arch, capsys):
     assert tune.main([*_GEOMETRY, "--arch", arch, "--dtype", "mxfp4_mxfp8"]) == 2
@@ -227,11 +289,34 @@ def test_mxfp4_tuner_rejects_unwired_architecture(arch, capsys):
 
 
 @pytest.mark.cpu_only
-def test_genphase_reaches_sm107_tuner(dispatched):
+@pytest.mark.parametrize("variant", ["genphase", "auto"])
+@pytest.mark.parametrize(
+    "dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8", "mxfp4"]
+)
+def test_variant_reaches_sm107_tuner(dispatched, variant, dtype):
     assert (
-        tune.main([*_GEOMETRY, "--arch", "sm107", "--kernel-variant", "genphase"]) == 17
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm107",
+                "--dtype",
+                dtype,
+                "--kernel-variant",
+                variant,
+            ]
+        )
+        == 17
     )
     assert len(dispatched) == 1
+
+
+@pytest.mark.cpu_only
+def test_auto_variant_rejects_detected_blackwell(dispatched, monkeypatch, capsys):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    assert tune.main([*_GEOMETRY, "--kernel-variant", "auto"]) == 2
+    assert not dispatched
+    assert "requires SM107" in capsys.readouterr().err
 
 
 @pytest.mark.cpu_only

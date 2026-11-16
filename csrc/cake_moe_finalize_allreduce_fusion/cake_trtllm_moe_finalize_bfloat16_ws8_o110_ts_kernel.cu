@@ -40,19 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_REDUCE_SMEM_OFF 0
-#define SMEM_REDUCE_SMEM_STAGE_BYTES 132
-#define SMEM_REDUCE_SMEM_STRIDE 132
-#define SMEM_RMS_SCALAR_OFF 132
-#define SMEM_RMS_SCALAR_STAGE_BYTES 4
-#define SMEM_RMS_SCALAR_STRIDE 4
-#define SMEM_RMS_SLOTS_OFF 136
-#define SMEM_RMS_SLOTS_STAGE_BYTES 32
-#define SMEM_RMS_SLOTS_STRIDE 32
-#define SMEM_TOTAL 256
-#define THREADS 224
 #define LAUNCH_MIN_BLOCKS 4
 
 #include <math_constants.h>
@@ -89,15 +76,6 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 
 
 namespace flashinfer_cake_moe_finalize_allreduce_fusion {
-__device__ inline unsigned int laneId()
-{
-    uint32_t id;
-    asm volatile("mov.u32 %0, %%laneid;" : "=r"(id));
-    return id;
-}
-} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
-
-namespace flashinfer_cake_moe_finalize_allreduce_fusion {
 __device__ __forceinline__ unsigned int cake_ag_esc_enc(unsigned int w)
 {
     unsigned int lo = w & 65535;
@@ -107,9 +85,7 @@ __device__ __forceinline__ unsigned int cake_ag_esc_enc(unsigned int w)
     unsigned int esc_word = lo | hi << 16;
     return esc_word;
 }
-} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
 
-namespace flashinfer_cake_moe_finalize_allreduce_fusion {
 __device__ __forceinline__ unsigned int cake_ag_esc_dec(unsigned int w)
 {
     unsigned int lo = w & 65535;
@@ -127,8 +103,9 @@ __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) voi
 kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__ allreduce_in, int* __restrict__ inverse_indices, __nv_bfloat16* __restrict__ expert_scales, __nv_bfloat16* __restrict__ shared_expert_output, __nv_bfloat16* __restrict__ residual, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ residual_out, __nv_bfloat16* __restrict__ norm_out, __nv_bfloat16* __restrict__ quant_out, __nv_bfloat16* __restrict__ scale_out, long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k, int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, float scale_factor)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t lane = flashinfer_cake_moe_finalize_allreduce_fusion::laneId();
+    const uint32_t warp = __shfl_sync(0xFFFFFFFF, threadIdx.x / 32, 0);
+    uint32_t lane;
+    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -146,7 +123,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* reduce_smem = reinterpret_cast<float*>(smem_raw + 0);
     const int reduce_smem_addr = smem + 0;
     float* rms_scalar = reinterpret_cast<float*>(smem_raw + 132);
@@ -159,7 +136,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
     long long control_address = workspace_tensor[24];
     int* control_0 = reinterpret_cast<int*>(control_address);
     int control_bytes_per_buffer_word = control_0[3];
-    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2;
+    long long comm_stride_elems = (long long)control_bytes_per_buffer_word / 2ll;
     long long workspace_address = workspace_tensor[16 + rank];
     __nv_bfloat16* workspace_local = reinterpret_cast<__nv_bfloat16*>(workspace_address);
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -191,7 +168,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
     unsigned int clear_words[4];
     #pragma unroll
     for (int word = 0; word < 4; word++) {
-        clear_words[word] = 2147516416;
+        clear_words[word] = 2147516416ll;
     }
     long long clear_base = (long long)control_dirty * comm_stride_elems;
     int access = first_access;
@@ -279,7 +256,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                     next_index_qd = _vec_load_7[0];
                 }
                 if (route_index_qa >= 0) {
-                    long long expert_elem = (long long)route_index_qa * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem = (long long)route_index_qa * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_8[4];
                     {
                         uint4 _uv4_0 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
@@ -300,7 +277,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                     route_scales[0] = _vec_load_9[0];
                 }
                 if (route_index_qb >= 0) {
-                    long long expert_elem_1 = (long long)route_index_qb * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_1 = (long long)route_index_qb * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_10[4];
                     {
                         uint4 _uv4_2 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_1 + 0);
@@ -321,7 +298,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                     route_scales[1] = _vec_load_11[0];
                 }
                 if (route_index_qc >= 0) {
-                    long long expert_elem_2 = (long long)route_index_qc * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_2 = (long long)route_index_qc * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_12[4];
                     {
                         uint4 _uv4_4 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_2 + 0);
@@ -342,7 +319,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                     route_scales[2] = _vec_load_13[0];
                 }
                 if (route_index_qd >= 0) {
-                    long long expert_elem_3 = (long long)route_index_qd * 7168 + (long long)(cluster_thread * 8);
+                    long long expert_elem_3 = (long long)route_index_qd * 7168ll + (long long)(cluster_thread * 8);
                     unsigned int _vec_load_14[4];
                     {
                         uint4 _uv4_6 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem_3 + 0);
@@ -364,7 +341,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                 }
                 if (route_index_qa >= 0) {
                     float scaled[8];
-                    float _unpack_bf16_0[8];
+                    float unpack_bf16[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -372,20 +349,20 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_0[_pair * 2])[0]), "=f"((&_unpack_bf16_0[_pair * 2])[1])
+                            : "=f"((&unpack_bf16[_pair * 2])[0]), "=f"((&unpack_bf16[_pair * 2])[1])
                             : "r"(route_words[_pair]));
                     }
                     #pragma unroll
                     for (int j_1 = 0; j_1 < 8; j_1++) {
-                        scaled[j_1] = _unpack_bf16_0[j_1] * route_scales[0];
+                        scaled[j_1] = unpack_bf16[j_1] * route_scales[0];
                     }
-                    unsigned int scaled_bf16[4];
+                    unsigned int scaled_f16[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(scaled[_lp*2 + 0], scaled[_lp*2+1 + 0]));
-                        scaled_bf16[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    float _unpack_bf16_1[8];
+                    float unpack_bf16_0[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -393,18 +370,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_1[_pair * 2])[0]), "=f"((&_unpack_bf16_1[_pair * 2])[1])
-                            : "r"(scaled_bf16[_pair]));
+                            : "=f"((&unpack_bf16_0[_pair * 2])[0]), "=f"((&unpack_bf16_0[_pair * 2])[1])
+                            : "r"(scaled_f16[_pair]));
                     }
                     #pragma unroll
                     for (int j_2 = 0; j_2 < 8; j_2++) {
-                        acc[j_2] = acc[j_2] + _unpack_bf16_1[j_2];
+                        acc[j_2] = acc[j_2] + unpack_bf16_0[j_2];
                     }
-                    unsigned int acc_bf16[4];
+                    unsigned int scaled_f16_0[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                        acc_bf16[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16_0[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
@@ -414,12 +391,12 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
                             : "=f"((&acc[_pair * 2])[0]), "=f"((&acc[_pair * 2])[1])
-                            : "r"(acc_bf16[_pair]));
+                            : "r"(scaled_f16_0[_pair]));
                     }
                 }
                 if (route_index_qb >= 0) {
                     float scaled_1[8];
-                    float _unpack_bf16_2[8];
+                    float unpack_bf16_1[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -427,20 +404,20 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_2[_pair * 2])[0]), "=f"((&_unpack_bf16_2[_pair * 2])[1])
+                            : "=f"((&unpack_bf16_1[_pair * 2])[0]), "=f"((&unpack_bf16_1[_pair * 2])[1])
                             : "r"(route_words[4 + _pair]));
                     }
                     #pragma unroll
                     for (int j_3 = 0; j_3 < 8; j_3++) {
-                        scaled_1[j_3] = _unpack_bf16_2[j_3] * route_scales[1];
+                        scaled_1[j_3] = unpack_bf16_1[j_3] * route_scales[1];
                     }
-                    unsigned int scaled_bf16_1[4];
+                    unsigned int scaled_f16_1[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(scaled_1[_lp*2 + 0], scaled_1[_lp*2+1 + 0]));
-                        scaled_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16_1[_lp] = *(uint32_t*)&_bf2;
                     }
-                    float _unpack_bf16_3[8];
+                    float unpack_bf16_1_1[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -448,18 +425,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_3[_pair * 2])[0]), "=f"((&_unpack_bf16_3[_pair * 2])[1])
-                            : "r"(scaled_bf16_1[_pair]));
+                            : "=f"((&unpack_bf16_1_1[_pair * 2])[0]), "=f"((&unpack_bf16_1_1[_pair * 2])[1])
+                            : "r"(scaled_f16_1[_pair]));
                     }
                     #pragma unroll
                     for (int j_4 = 0; j_4 < 8; j_4++) {
-                        acc[j_4] = acc[j_4] + _unpack_bf16_3[j_4];
+                        acc[j_4] = acc[j_4] + unpack_bf16_1_1[j_4];
                     }
-                    unsigned int acc_bf16_1[4];
+                    unsigned int scaled_f16_1_1[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                        acc_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16_1_1[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
@@ -469,12 +446,12 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
                             : "=f"((&acc[_pair * 2])[0]), "=f"((&acc[_pair * 2])[1])
-                            : "r"(acc_bf16_1[_pair]));
+                            : "r"(scaled_f16_1_1[_pair]));
                     }
                 }
                 if (route_index_qc >= 0) {
                     float scaled_2[8];
-                    float _unpack_bf16_4[8];
+                    float unpack_bf16_2[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -482,20 +459,20 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_4[_pair * 2])[0]), "=f"((&_unpack_bf16_4[_pair * 2])[1])
+                            : "=f"((&unpack_bf16_2[_pair * 2])[0]), "=f"((&unpack_bf16_2[_pair * 2])[1])
                             : "r"(route_words[8 + _pair]));
                     }
                     #pragma unroll
                     for (int j_5 = 0; j_5 < 8; j_5++) {
-                        scaled_2[j_5] = _unpack_bf16_4[j_5] * route_scales[2];
+                        scaled_2[j_5] = unpack_bf16_2[j_5] * route_scales[2];
                     }
-                    unsigned int scaled_bf16_2[4];
+                    unsigned int scaled_f16_2[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(scaled_2[_lp*2 + 0], scaled_2[_lp*2+1 + 0]));
-                        scaled_bf16_2[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16_2[_lp] = *(uint32_t*)&_bf2;
                     }
-                    float _unpack_bf16_5[8];
+                    float unpack_bf16_2_1[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -503,18 +480,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_5[_pair * 2])[0]), "=f"((&_unpack_bf16_5[_pair * 2])[1])
-                            : "r"(scaled_bf16_2[_pair]));
+                            : "=f"((&unpack_bf16_2_1[_pair * 2])[0]), "=f"((&unpack_bf16_2_1[_pair * 2])[1])
+                            : "r"(scaled_f16_2[_pair]));
                     }
                     #pragma unroll
                     for (int j_6 = 0; j_6 < 8; j_6++) {
-                        acc[j_6] = acc[j_6] + _unpack_bf16_5[j_6];
+                        acc[j_6] = acc[j_6] + unpack_bf16_2_1[j_6];
                     }
-                    unsigned int acc_bf16_2[4];
+                    unsigned int scaled_f16_2_1[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                        acc_bf16_2[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16_2_1[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
@@ -524,12 +501,12 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
                             : "=f"((&acc[_pair * 2])[0]), "=f"((&acc[_pair * 2])[1])
-                            : "r"(acc_bf16_2[_pair]));
+                            : "r"(scaled_f16_2_1[_pair]));
                     }
                 }
                 if (route_index_qd >= 0) {
                     float scaled_3[8];
-                    float _unpack_bf16_6[8];
+                    float unpack_bf16_3[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -537,20 +514,20 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_6[_pair * 2])[0]), "=f"((&_unpack_bf16_6[_pair * 2])[1])
+                            : "=f"((&unpack_bf16_3[_pair * 2])[0]), "=f"((&unpack_bf16_3[_pair * 2])[1])
                             : "r"(route_words[12 + _pair]));
                     }
                     #pragma unroll
                     for (int j_7 = 0; j_7 < 8; j_7++) {
-                        scaled_3[j_7] = _unpack_bf16_6[j_7] * route_scales[3];
+                        scaled_3[j_7] = unpack_bf16_3[j_7] * route_scales[3];
                     }
-                    unsigned int scaled_bf16_3[4];
+                    unsigned int scaled_f16_3[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(scaled_3[_lp*2 + 0], scaled_3[_lp*2+1 + 0]));
-                        scaled_bf16_3[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16_3[_lp] = *(uint32_t*)&_bf2;
                     }
-                    float _unpack_bf16_7[8];
+                    float unpack_bf16_3_1[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
                         asm volatile(
@@ -558,18 +535,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "shl.b32 %0, %2, 16;\n\t"
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
-                            : "=f"((&_unpack_bf16_7[_pair * 2])[0]), "=f"((&_unpack_bf16_7[_pair * 2])[1])
-                            : "r"(scaled_bf16_3[_pair]));
+                            : "=f"((&unpack_bf16_3_1[_pair * 2])[0]), "=f"((&unpack_bf16_3_1[_pair * 2])[1])
+                            : "r"(scaled_f16_3[_pair]));
                     }
                     #pragma unroll
                     for (int j_8 = 0; j_8 < 8; j_8++) {
-                        acc[j_8] = acc[j_8] + _unpack_bf16_7[j_8];
+                        acc[j_8] = acc[j_8] + unpack_bf16_3_1[j_8];
                     }
-                    unsigned int acc_bf16_3[4];
+                    unsigned int scaled_f16_3_1[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                        acc_bf16_3[_lp] = *(uint32_t*)&_bf2;
+                        scaled_f16_3_1[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
@@ -579,7 +556,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                             "and.b32 %1, %2, 0xffff0000;\n\t"
                             "}\n"
                             : "=f"((&acc[_pair * 2])[0]), "=f"((&acc[_pair * 2])[1])
-                            : "r"(acc_bf16_3[_pair]));
+                            : "r"(scaled_f16_3_1[_pair]));
                     }
                 }
                 route_index_qa = next_index_qa;
@@ -592,11 +569,11 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                 for (int j_9 = 0; j_9 < 8; j_9++) {
                     acc[j_9] = acc[j_9] * routed_scaling_factor;
                 }
-                unsigned int acc_bf16_4[4];
+                unsigned int scaled_f16_4[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                    acc_bf16_4[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_4[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -606,7 +583,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&acc[_pair * 2])[0]), "=f"((&acc[_pair * 2])[1])
-                        : "r"(acc_bf16_4[_pair]));
+                        : "r"(scaled_f16_4[_pair]));
                 }
             }
             if (has_shared_expert != 0) {
@@ -635,11 +612,11 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                 for (int j_10 = 0; j_10 < 8; j_10++) {
                     acc[j_10] = acc[j_10] + _vec_load_16[j_10];
                 }
-                unsigned int acc_bf16_5[4];
+                unsigned int scaled_f16_5[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                    acc_bf16_5[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_5[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -649,31 +626,31 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&acc[_pair * 2])[0]), "=f"((&acc[_pair * 2])[1])
-                        : "r"(acc_bf16_5[_pair]));
+                        : "r"(scaled_f16_5[_pair]));
                 }
             }
             #pragma unroll
             for (int j_11 = 0; j_11 < 8; j_11++) {
                 acc[j_11] = ((acc[j_11] == 0.0f) ? 0.0f : acc[j_11]);
             }
-            unsigned int acc_bf16_6[4];
+            unsigned int scaled_f16_6[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(acc[_lp*2 + 0], acc[_lp*2+1 + 0]));
-                acc_bf16_6[_lp] = *(uint32_t*)&_bf2;
+                scaled_f16_6[_lp] = *(uint32_t*)&_bf2;
             }
             int chunk = cluster_thread / 112;
             int owner = published_token + chunk & 7;
-            long long scatter_offset = ((long long)rank * (long long)tokens + (long long)published_token) * 896 + (long long)(cluster_thread - chunk * 112) * 8;
+            long long scatter_offset = ((long long)rank * (long long)tokens + (long long)published_token) * 896ll + (long long)(cluster_thread - chunk * 112) * 8ll;
             __nv_bfloat16* scatter_dst = reinterpret_cast<__nv_bfloat16*>(workspace_tensor[16 + owner]) + data_base + scatter_offset;
-            asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(scatter_dst), "r"((acc_bf16_6)[0]), "r"((acc_bf16_6)[1]), "r"((acc_bf16_6)[2]), "r"((acc_bf16_6)[3]) : "memory");
+            asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(scatter_dst), "r"((scaled_f16_6)[0]), "r"((scaled_f16_6)[1]), "r"((scaled_f16_6)[2]), "r"((scaled_f16_6)[3]) : "memory");
         }
         int clear_end = clear_next + clear_per_step * access_stride;
         clear_end = ((clear_end > clear_limit) ? clear_limit : clear_end);
         #pragma unroll 1
         for (int clear_access = clear_next; clear_access < clear_end; clear_access += access_stride) {
             {
-                auto _gst_9 = workspace_local + (clear_base + (long long)clear_access * 8);
+                auto _gst_9 = workspace_local + (clear_base + (long long)clear_access * 8ll);
                 __builtin_assume(__isGlobal(_gst_9));
                 reinterpret_cast<int4*>(_gst_9)[0] = reinterpret_cast<int4*>(clear_words)[0];
             }
@@ -686,15 +663,15 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
             int owned_token = token_begin + (step - 1) * token_stride;
             int owned_chunk = cluster_thread / 112;
             if ((owned_token + owned_chunk & 7) == rank) {
-                long long owned_offset = (long long)owned_token * 896 + (long long)(cluster_thread - owned_chunk * 112) * 8;
-                long long sender_stride = (long long)tokens * 896;
+                long long owned_offset = (long long)owned_token * 896ll + (long long)(cluster_thread - owned_chunk * 112) * 8ll;
+                long long sender_stride = (long long)tokens * 896ll;
                 int owned_access = owned_token * 896 + cluster_thread;
                 uint32_t _sysv_poll_group_0[16];
                 do {
                     asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[0]), "=r"(_sysv_poll_group_0[1]), "=r"(_sysv_poll_group_0[2]), "=r"(_sysv_poll_group_0[3]) : "l"(workspace_local + (data_base + owned_offset)) : "memory");
                     asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4]), "=r"(_sysv_poll_group_0[5]), "=r"(_sysv_poll_group_0[6]), "=r"(_sysv_poll_group_0[7]) : "l"(workspace_local + (data_base + sender_stride + owned_offset)) : "memory");
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(workspace_local + (data_base + 2 * sender_stride + owned_offset)) : "memory");
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(workspace_local + (data_base + 3 * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[8]), "=r"(_sysv_poll_group_0[9]), "=r"(_sysv_poll_group_0[10]), "=r"(_sysv_poll_group_0[11]) : "l"(workspace_local + (data_base + 2ll * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[12]), "=r"(_sysv_poll_group_0[13]), "=r"(_sysv_poll_group_0[14]), "=r"(_sysv_poll_group_0[15]) : "l"(workspace_local + (data_base + 3ll * sender_stride + owned_offset)) : "memory");
                 } while (
                     (((_sysv_poll_group_0[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[1] >> 16) & 0xffffu) == 0x8000u) ||
                     (((_sysv_poll_group_0[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[3] >> 16) & 0xffffu) == 0x8000u) ||
@@ -705,7 +682,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                     (((_sysv_poll_group_0[12] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[12] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[13] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[13] >> 16) & 0xffffu) == 0x8000u) ||
                     (((_sysv_poll_group_0[14] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[14] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[15] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[15] >> 16) & 0xffffu) == 0x8000u)
                 );
-                float _unpack_bf16_8[8];
+                float unpack_bf16_4[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -713,15 +690,15 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_8[_pair * 2])[0]), "=f"((&_unpack_bf16_8[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_4[_pair * 2])[0]), "=f"((&unpack_bf16_4[_pair * 2])[1])
                         : "r"(_sysv_poll_group_0[_pair]));
                 }
                 float sum_value[8];
                 #pragma unroll
                 for (int j_12 = 0; j_12 < 8; j_12++) {
-                    sum_value[j_12] = _unpack_bf16_8[j_12];
+                    sum_value[j_12] = unpack_bf16_4[j_12];
                 }
-                float _unpack_bf16_9[8];
+                float unpack_bf16_4_1[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -729,18 +706,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_9[_pair * 2])[0]), "=f"((&_unpack_bf16_9[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_4_1[_pair * 2])[0]), "=f"((&unpack_bf16_4_1[_pair * 2])[1])
                         : "r"(_sysv_poll_group_0[4 + _pair]));
                 }
                 #pragma unroll
                 for (int j_13 = 0; j_13 < 8; j_13++) {
-                    sum_value[j_13] = sum_value[j_13] + _unpack_bf16_9[j_13];
+                    sum_value[j_13] = sum_value[j_13] + unpack_bf16_4_1[j_13];
                 }
-                unsigned int sum_value_bf16[4];
+                unsigned int scaled_f16_7[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sum_value[_lp*2 + 0], sum_value[_lp*2+1 + 0]));
-                    sum_value_bf16[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_7[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -750,9 +727,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&sum_value[_pair * 2])[0]), "=f"((&sum_value[_pair * 2])[1])
-                        : "r"(sum_value_bf16[_pair]));
+                        : "r"(scaled_f16_7[_pair]));
                 }
-                float _unpack_bf16_10[8];
+                float unpack_bf16_5[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -760,18 +737,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_10[_pair * 2])[0]), "=f"((&_unpack_bf16_10[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_5[_pair * 2])[0]), "=f"((&unpack_bf16_5[_pair * 2])[1])
                         : "r"(_sysv_poll_group_0[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_14 = 0; j_14 < 8; j_14++) {
-                    sum_value[j_14] = sum_value[j_14] + _unpack_bf16_10[j_14];
+                for (int j_0 = 0; j_0 < 8; j_0++) {
+                    sum_value[j_0] = sum_value[j_0] + unpack_bf16_5[j_0];
                 }
-                unsigned int sum_value_bf16_0[4];
+                unsigned int scaled_f16_4_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sum_value[_lp*2 + 0], sum_value[_lp*2+1 + 0]));
-                    sum_value_bf16_0[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_4_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -781,9 +758,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&sum_value[_pair * 2])[0]), "=f"((&sum_value[_pair * 2])[1])
-                        : "r"(sum_value_bf16_0[_pair]));
+                        : "r"(scaled_f16_4_1[_pair]));
                 }
-                float _unpack_bf16_11[8];
+                float unpack_bf16_6[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -791,18 +768,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_11[_pair * 2])[0]), "=f"((&_unpack_bf16_11[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_6[_pair * 2])[0]), "=f"((&unpack_bf16_6[_pair * 2])[1])
                         : "r"(_sysv_poll_group_0[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_15 = 0; j_15 < 8; j_15++) {
-                    sum_value[j_15] = sum_value[j_15] + _unpack_bf16_11[j_15];
+                for (int j_1_1 = 0; j_1_1 < 8; j_1_1++) {
+                    sum_value[j_1_1] = sum_value[j_1_1] + unpack_bf16_6[j_1_1];
                 }
-                unsigned int sum_value_bf16_1[4];
+                unsigned int scaled_f16_5_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sum_value[_lp*2 + 0], sum_value[_lp*2+1 + 0]));
-                    sum_value_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_5_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -812,14 +789,14 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&sum_value[_pair * 2])[0]), "=f"((&sum_value[_pair * 2])[1])
-                        : "r"(sum_value_bf16_1[_pair]));
+                        : "r"(scaled_f16_5_1[_pair]));
                 }
                 uint32_t _sysv_poll_group_1[16];
                 do {
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[0]), "=r"(_sysv_poll_group_1[1]), "=r"(_sysv_poll_group_1[2]), "=r"(_sysv_poll_group_1[3]) : "l"(workspace_local + (data_base + 4 * sender_stride + owned_offset)) : "memory");
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[4]), "=r"(_sysv_poll_group_1[5]), "=r"(_sysv_poll_group_1[6]), "=r"(_sysv_poll_group_1[7]) : "l"(workspace_local + (data_base + 5 * sender_stride + owned_offset)) : "memory");
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[8]), "=r"(_sysv_poll_group_1[9]), "=r"(_sysv_poll_group_1[10]), "=r"(_sysv_poll_group_1[11]) : "l"(workspace_local + (data_base + 6 * sender_stride + owned_offset)) : "memory");
-                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[12]), "=r"(_sysv_poll_group_1[13]), "=r"(_sysv_poll_group_1[14]), "=r"(_sysv_poll_group_1[15]) : "l"(workspace_local + (data_base + 7 * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[0]), "=r"(_sysv_poll_group_1[1]), "=r"(_sysv_poll_group_1[2]), "=r"(_sysv_poll_group_1[3]) : "l"(workspace_local + (data_base + 4ll * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[4]), "=r"(_sysv_poll_group_1[5]), "=r"(_sysv_poll_group_1[6]), "=r"(_sysv_poll_group_1[7]) : "l"(workspace_local + (data_base + 5ll * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[8]), "=r"(_sysv_poll_group_1[9]), "=r"(_sysv_poll_group_1[10]), "=r"(_sysv_poll_group_1[11]) : "l"(workspace_local + (data_base + 6ll * sender_stride + owned_offset)) : "memory");
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[12]), "=r"(_sysv_poll_group_1[13]), "=r"(_sysv_poll_group_1[14]), "=r"(_sysv_poll_group_1[15]) : "l"(workspace_local + (data_base + 7ll * sender_stride + owned_offset)) : "memory");
                 } while (
                     (((_sysv_poll_group_1[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 16) & 0xffffu) == 0x8000u) ||
                     (((_sysv_poll_group_1[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 16) & 0xffffu) == 0x8000u) ||
@@ -830,7 +807,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                     (((_sysv_poll_group_1[12] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[12] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[13] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[13] >> 16) & 0xffffu) == 0x8000u) ||
                     (((_sysv_poll_group_1[14] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[14] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[15] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[15] >> 16) & 0xffffu) == 0x8000u)
                 );
-                float _unpack_bf16_12[8];
+                float unpack_bf16_7[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -838,18 +815,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_12[_pair * 2])[0]), "=f"((&_unpack_bf16_12[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_7[_pair * 2])[0]), "=f"((&unpack_bf16_7[_pair * 2])[1])
                         : "r"(_sysv_poll_group_1[_pair]));
                 }
                 #pragma unroll
-                for (int j_16 = 0; j_16 < 8; j_16++) {
-                    sum_value[j_16] = sum_value[j_16] + _unpack_bf16_12[j_16];
+                for (int j_14 = 0; j_14 < 8; j_14++) {
+                    sum_value[j_14] = sum_value[j_14] + unpack_bf16_7[j_14];
                 }
-                unsigned int sum_value_bf16_2[4];
+                unsigned int scaled_f16_6_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sum_value[_lp*2 + 0], sum_value[_lp*2+1 + 0]));
-                    sum_value_bf16_2[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_6_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -859,9 +836,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&sum_value[_pair * 2])[0]), "=f"((&sum_value[_pair * 2])[1])
-                        : "r"(sum_value_bf16_2[_pair]));
+                        : "r"(scaled_f16_6_1[_pair]));
                 }
-                float _unpack_bf16_13[8];
+                float unpack_bf16_8[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -869,18 +846,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_13[_pair * 2])[0]), "=f"((&_unpack_bf16_13[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_8[_pair * 2])[0]), "=f"((&unpack_bf16_8[_pair * 2])[1])
                         : "r"(_sysv_poll_group_1[4 + _pair]));
                 }
                 #pragma unroll
-                for (int j_17 = 0; j_17 < 8; j_17++) {
-                    sum_value[j_17] = sum_value[j_17] + _unpack_bf16_13[j_17];
+                for (int j_2_1 = 0; j_2_1 < 8; j_2_1++) {
+                    sum_value[j_2_1] = sum_value[j_2_1] + unpack_bf16_8[j_2_1];
                 }
-                unsigned int sum_value_bf16_3[4];
+                unsigned int scaled_f16_7_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sum_value[_lp*2 + 0], sum_value[_lp*2+1 + 0]));
-                    sum_value_bf16_3[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_7_1[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -890,9 +867,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&sum_value[_pair * 2])[0]), "=f"((&sum_value[_pair * 2])[1])
-                        : "r"(sum_value_bf16_3[_pair]));
+                        : "r"(scaled_f16_7_1[_pair]));
                 }
-                float _unpack_bf16_14[8];
+                float unpack_bf16_9[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -900,18 +877,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_14[_pair * 2])[0]), "=f"((&_unpack_bf16_14[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_9[_pair * 2])[0]), "=f"((&unpack_bf16_9[_pair * 2])[1])
                         : "r"(_sysv_poll_group_1[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_18 = 0; j_18 < 8; j_18++) {
-                    sum_value[j_18] = sum_value[j_18] + _unpack_bf16_14[j_18];
+                for (int j_3_1 = 0; j_3_1 < 8; j_3_1++) {
+                    sum_value[j_3_1] = sum_value[j_3_1] + unpack_bf16_9[j_3_1];
                 }
-                unsigned int sum_value_bf16_4[4];
+                unsigned int scaled_f16_8[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sum_value[_lp*2 + 0], sum_value[_lp*2+1 + 0]));
-                    sum_value_bf16_4[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_8[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -921,9 +898,9 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&sum_value[_pair * 2])[0]), "=f"((&sum_value[_pair * 2])[1])
-                        : "r"(sum_value_bf16_4[_pair]));
+                        : "r"(scaled_f16_8[_pair]));
                 }
-                float _unpack_bf16_15[8];
+                float unpack_bf16_10[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -931,18 +908,18 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "shl.b32 %0, %2, 16;\n\t"
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
-                        : "=f"((&_unpack_bf16_15[_pair * 2])[0]), "=f"((&_unpack_bf16_15[_pair * 2])[1])
+                        : "=f"((&unpack_bf16_10[_pair * 2])[0]), "=f"((&unpack_bf16_10[_pair * 2])[1])
                         : "r"(_sysv_poll_group_1[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_19 = 0; j_19 < 8; j_19++) {
-                    sum_value[j_19] = sum_value[j_19] + _unpack_bf16_15[j_19];
+                for (int j_4_1 = 0; j_4_1 < 8; j_4_1++) {
+                    sum_value[j_4_1] = sum_value[j_4_1] + unpack_bf16_10[j_4_1];
                 }
-                unsigned int sum_value_bf16_5[4];
+                unsigned int scaled_f16_9[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(sum_value[_lp*2 + 0], sum_value[_lp*2+1 + 0]));
-                    sum_value_bf16_5[_lp] = *(uint32_t*)&_bf2;
+                    scaled_f16_9[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -952,13 +929,13 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         "and.b32 %1, %2, 0xffff0000;\n\t"
                         "}\n"
                         : "=f"((&sum_value[_pair * 2])[0]), "=f"((&sum_value[_pair * 2])[1])
-                        : "r"(sum_value_bf16_5[_pair]));
+                        : "r"(scaled_f16_9[_pair]));
                 }
-                long long gather_offset = (long long)tokens * 7168 + (long long)owned_access * 8;
+                long long gather_offset = (long long)tokens * 7168ll + (long long)owned_access * 8ll;
                 unsigned int gathered[4];
                 #pragma unroll
                 for (int w_4 = 0; w_4 < 4; w_4++) {
-                    gathered[w_4] = flashinfer_cake_moe_finalize_allreduce_fusion::cake_ag_esc_enc(sum_value_bf16_5[w_4]);
+                    gathered[w_4] = flashinfer_cake_moe_finalize_allreduce_fusion::cake_ag_esc_enc(scaled_f16_9[w_4]);
                 }
                 long long peer_base_0[1];
                 {
@@ -1036,8 +1013,21 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
         }
         if (step >= 2) {
             int reduced_token = token_begin + (step - 2) * token_stride;
+            unsigned int residual_words[4];
+            {
+                uint32_t _uv4_18_0;
+                uint32_t _uv4_18_1;
+                uint32_t _uv4_18_2;
+                uint32_t _uv4_18_3;
+                asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_18_0), "=r"(_uv4_18_1), "=r"(_uv4_18_2), "=r"(_uv4_18_3) : "l"((const void*)(residual + access * 8 + (0))));
+                residual_words[0 + 0] = _uv4_18_0;
+                residual_words[0 + 1] = _uv4_18_1;
+                residual_words[0 + 2] = _uv4_18_2;
+                residual_words[0 + 3] = _uv4_18_3;
+            }
             float sum_value_1[8];
-            long long gather_in = data_base + (long long)tokens * 7168 + (long long)access * 8;
+            long long gather_in = data_base + (long long)tokens * 7168ll + (long long)access * 8ll;
             uint32_t gathered_1[4];
             do {
                 asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(gathered_1[0]), "=r"(gathered_1[1]), "=r"(gathered_1[2]), "=r"(gathered_1[3]) : "l"(workspace_local + gather_in) : "memory");
@@ -1062,28 +1052,19 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
             int access_in_token = cluster_thread;
             int elem = access * 8;
             float _vec_load_17[8];
-            {
-                const uint4* _vptr_18 = reinterpret_cast<const uint4*>(residual + elem + 0);
-                uint4 _vld_18[1];
-                #pragma unroll
-                for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_18[_blk] = _vptr_18[_blk];
-                    uint32_t* _vpairs_18 = reinterpret_cast<uint32_t*>(&_vld_18[_blk]);
-                    #pragma unroll
-                    for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_17[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_17[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_18[_pair]));
-                    }
-                }
+            #pragma unroll
+            for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_vec_load_17[_pair * 2])[0]), "=f"((&_vec_load_17[_pair * 2])[1])
+                    : "r"(residual_words[_pair]));
             }
             float _vec_load_18[8];
             {
-                const uint4* _vptr_19 = reinterpret_cast<const uint4*>(norm_weight + (access_in_token * 8) + 0);
+                const uint4* _vptr_19 = reinterpret_cast<const uint4*>(norm_weight + access_in_token * 8 + 0);
                 uint4 _vld_19[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -1102,14 +1083,14 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                 }
             }
             #pragma unroll
-            for (int j_20 = 0; j_20 < 8; j_20++) {
-                _vec_load_17[j_20] = _vec_load_17[j_20] + sum_value_1[j_20];
+            for (int j_15 = 0; j_15 < 8; j_15++) {
+                _vec_load_17[j_15] = _vec_load_17[j_15] + sum_value_1[j_15];
             }
-            unsigned int _vec_load_17_bf16[4];
+            unsigned int scaled_f16_10[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_vec_load_17[_lp*2 + 0], _vec_load_17[_lp*2+1 + 0]));
-                _vec_load_17_bf16[_lp] = *(uint32_t*)&_bf2;
+                scaled_f16_10[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1119,7 +1100,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
                     : "=f"((&_vec_load_17[_pair * 2])[0]), "=f"((&_vec_load_17[_pair * 2])[1])
-                    : "r"(_vec_load_17_bf16[_pair]));
+                    : "r"(scaled_f16_10[_pair]));
             }
             unsigned int _packed_0[4];
             #pragma unroll
@@ -1145,8 +1126,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
             reinterpret_cast<int4*>(residual_out + elem)[0] = reinterpret_cast<int4*>(_packed_0)[0];
             float square_sum = 0.0f;
             #pragma unroll
-            for (int j_21 = 0; j_21 < 8; j_21++) {
-                square_sum = __fmaf_rn(_vec_load_17[j_21], _vec_load_17[j_21], square_sum);
+            for (int j_16 = 0; j_16 < 8; j_16++) {
+                square_sum = __fmaf_rn(_vec_load_17[j_16], _vec_load_17[j_16], square_sum);
             }
             float _warp_reduce_20 = square_sum;
             #pragma unroll
@@ -1237,16 +1218,16 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
             float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
             float norm_value[8];
             #pragma unroll
-            for (int j_22 = 0; j_22 < 8; j_22++) {
-                norm_value[j_22] = _vec_load_17[j_22] * rstd * (_vec_load_18[j_22] + weight_bias);
+            for (int j_17 = 0; j_17 < 8; j_17++) {
+                norm_value[j_17] = _vec_load_17[j_17] * rstd * (_vec_load_18[j_17] + weight_bias);
             }
-            unsigned int norm_value_bf16[4];
+            unsigned int scaled_f16_10_1[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(norm_value[_lp*2 + 0], norm_value[_lp*2+1 + 0]));
-                norm_value_bf16[_lp] = *(uint32_t*)&_bf2;
+                scaled_f16_10_1[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(norm_out + elem)[0] = reinterpret_cast<int4*>(norm_value_bf16)[0];
+            reinterpret_cast<int4*>(norm_out + elem)[0] = reinterpret_cast<int4*>(scaled_f16_10_1)[0];
             access += access_stride;
             rms_parity += 1;
             if (rms_parity == 2) { rms_parity = 0; _phase_rms_bar ^= 1; }
@@ -1258,7 +1239,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
     #pragma unroll 1
     for (int clear_access_1 = clear_next; clear_access_1 < clear_limit; clear_access_1 += access_stride) {
         {
-            auto _gst_29 = workspace_local + (clear_base + (long long)clear_access_1 * 8);
+            auto _gst_29 = workspace_local + (clear_base + (long long)clear_access_1 * 8ll);
             __builtin_assume(__isGlobal(_gst_29));
             reinterpret_cast<int4*>(_gst_29)[0] = reinterpret_cast<int4*>(clear_words)[0];
         }

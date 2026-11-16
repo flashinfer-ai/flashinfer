@@ -29,7 +29,7 @@ import re
 
 import pytest
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_build = cake_package("cake_gdp", "cake_build")
 loader = cake_package("cake_gdp", "cake_jit")

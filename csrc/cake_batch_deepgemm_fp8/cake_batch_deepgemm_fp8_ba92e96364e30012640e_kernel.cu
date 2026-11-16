@@ -109,6 +109,8 @@ kernel_cake_batch_deepgemm_fp8_ba92e96364e30012640e(const __grid_constant__ CUte
 
     __syncwarp();
 
+    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     // TMEM alloc (512 columns, 272 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 64);
     if (warp == 0) {
@@ -119,8 +121,6 @@ kernel_cake_batch_deepgemm_fp8_ba92e96364e30012640e(const __grid_constant__ CUte
     }
 
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];

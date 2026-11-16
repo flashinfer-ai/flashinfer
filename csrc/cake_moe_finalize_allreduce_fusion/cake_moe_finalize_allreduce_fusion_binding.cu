@@ -6,13 +6,19 @@
 // Host launcher for the Cake MoE finalize + all-reduce fusion kernels. One module per
 // architecture links the programs of each dtype x world size x optional NVFP4 epilogue: a
 // small-token program at every world size, a persistent program at world sizes 2 and 4, a
-// large-token program at world size 2 and a two-shot program at world sizes 4 and 8. The
-// one-shot programs (small-token, persistent, large-token) publish every rank's partial to
-// every peer; the two-shot program sends each token chunk to one owner rank, which adds the
-// partials in rank order and sends the sum back (reduce-scatter + all-gather in the same
-// Lamport buffer). Both give the same bits. The choice between one-shot and two-shot depends
-// only on the token count, the world size and small_token_max, so every rank makes the same
-// choice. The launch configuration is shared and PDL is a launch attribute chosen at run time.
+// large-token program at world size 2 and a two-shot program at world sizes 4 and 8, the latter
+// also in a deferred form. The one-shot programs (small-token, persistent, large-token) publish
+// every rank's partial to every peer; the two-shot program sends each token chunk to one owner
+// rank, which adds the partials in rank order and sends the sum back (reduce-scatter +
+// all-gather in the same Lamport buffer). The deferred two-shot program runs the same exchange
+// and finishes each token (RMS wait, norm, stores) during a later token's reduce, keeping the
+// pending sums in dynamic shared memory. All give the same bits. The choice between one-shot
+// and two-shot depends only on the token count, the world size and small_token_max, so every
+// rank makes the same choice; the two two-shot forms use the same workspace and messages, so
+// ranks may run different forms in one call. Two-shot batches up to a token count per world size
+// run the two-shot early form, which issues the first token's route-index loads ahead of the
+// control words and otherwise runs the same exchange. The launch configuration is shared and
+// PDL is a launch attribute chosen at run time.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -58,10 +64,30 @@ CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_small)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_small)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_small)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o110_quad)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_quad)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_quad)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o110_lt)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lt)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_lt)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_lt)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o110_lts)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_lts)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_lts)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tss)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tses)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tss)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tses)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tss)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tses)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tss)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tses)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o110_tss)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tss)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tss)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tss)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_ts)
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o110_ts)
@@ -70,6 +96,29 @@ CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts)
 CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o110_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tsd)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tsds)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tse)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o110_tse)
+CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tse)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tse)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tse)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tse)
+CAKE_MOE_FINALIZE_KERNEL(__nv_bfloat16, kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tse)
 
 #undef CAKE_MOE_FINALIZE_KERNEL
 
@@ -97,6 +146,19 @@ const void* const kKernels[2][3][2] = {
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111)},
      {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110),
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111)},
+     {nullptr, nullptr}},
+};
+
+// World-size-2 quad-gather programs (route quad rounds, one cluster per token), same order as
+// kKernels; world size 2 only.
+const void* const kW2QuadKernels[2][3][2] = {
+    {{reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws2_o110_quad),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws2_o111_quad)},
+     {nullptr, nullptr},
+     {nullptr, nullptr}},
+    {{reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_quad),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_quad)},
+     {nullptr, nullptr},
      {nullptr, nullptr}},
 };
 
@@ -128,6 +190,20 @@ const void* const kLargeTokenKernels[2][3][2] = {
      {nullptr, nullptr}},
 };
 
+// Large-token programs that also prefetch the token's shared-expert row to L2, same order as
+// kKernels; world size 2 only. They run the same exchange as kLargeTokenKernels, so a rank
+// with a shared-expert operand may run them while another rank runs kLargeTokenKernels.
+const void* const kLargeTokenSharedKernels[2][3][2] = {
+    {{reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws2_o110_lts),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws2_o111_lts)},
+     {nullptr, nullptr},
+     {nullptr, nullptr}},
+    {{reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_lts),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o111_lts)},
+     {nullptr, nullptr},
+     {nullptr, nullptr}},
+};
+
 // Two-shot programs, same order as kKernels; world sizes 4 and 8 only.
 const void* const kTwoShotKernels[2][3][2] = {
     {{nullptr, nullptr},
@@ -142,19 +218,121 @@ const void* const kTwoShotKernels[2][3][2] = {
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_ts)}},
 };
 
-// Token counts above small_token_max that still run the small-token program at world sizes 2
-// and 4, except for top_k 4 without a shared expert, as long as the device holds one resident
-// cluster of the small-token program per token.
+// Deferred two-shot programs, same order as kKernels; world sizes 4 and 8 only.
+const void* const kTwoShotDeferKernels[2][3][2] = {
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsd),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsd)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o110_tsd),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tsd)}},
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsd),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsd)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tsd),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tsd)}},
+};
+
+// Deferred two-shot programs that also prefetch the token's shared-expert row to L2, same order
+// as kKernels; world sizes 4 and 8. They run the same exchange as kTwoShotDeferKernels, so a rank
+// with a shared-expert operand may run them while another rank runs kTwoShotDeferKernels. At
+// world size 8 the binding runs them for top_k 8 only, and the float16 o110 slot is empty (that
+// program spills), so it keeps the deferred two-shot program.
+const void* const kTwoShotDeferSharedKernels[2][3][2] = {
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tsds),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tsds)},
+     {nullptr,
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tsds)}},
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tsds),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tsds)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tsds),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tsds)}},
+};
+
+// Two-shot early programs, same order as kKernels; world sizes 4 and 8 only.
+const void* const kTwoShotEarlyKernels[2][3][2] = {
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tse),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tse)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o110_tse),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tse)}},
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tse),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tse)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tse),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tse)}},
+};
+
+// Two-shot programs that also prefetch the token's shared-expert row to L2 and load it
+// read-only, same order as kKernels; world sizes 4 and 8. They run the same exchange as
+// kTwoShotKernels, so a rank with a shared-expert operand may run them while another rank
+// runs kTwoShotKernels; the binding runs them for top_k 4 only.
+const void* const kTwoShotSharedKernels[2][3][2] = {
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tss),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tss)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o110_tss),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws8_o111_tss)}},
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tss),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tss)},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_tss),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tss)}},
+};
+
+// Two-shot early programs that also prefetch the token's shared-expert row to L2 and load it
+// read-only, same order as kKernels; world size 4 only (world size 8 keeps kTwoShotEarlyKernels).
+// They run the same exchange as kTwoShotEarlyKernels, so a rank with a shared-expert operand may
+// run them while another rank runs kTwoShotEarlyKernels; the binding runs them for top_k 4 only.
+const void* const kTwoShotEarlySharedKernels[2][3][2] = {
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o110_tses),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_float16_ws4_o111_tses)},
+     {nullptr, nullptr}},
+    {{nullptr, nullptr},
+     {reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110_tses),
+      reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_tses)},
+     {nullptr, nullptr}},
+};
+
+// Token counts above small_token_max that still run the small-token program at world size 4,
+// and at world size 2 except for top_k 4 without a shared expert, as long as the device holds
+// one resident cluster of the small-token program per token.
 constexpr int64_t kSmallTokenExtendedMax = 71;
 
-// World size 4 runs the two-shot program from this token count on; world size 8 runs it for every
-// batch above small_token_max.
-constexpr int64_t kTwoShotMinTokensWorldSize4 = 96;
+// World sizes 4 and 8 run the two-shot program from these token counts on, tested ahead of the
+// small-token tests; world size 8 also runs it for every batch above small_token_max.
+constexpr int64_t kTwoShotMinTokensWorldSize4 = 72;
+constexpr int64_t kTwoShotMinTokensWorldSize8 = 56;
+
+// A two-shot batch of at least these token counts runs the deferred two-shot program, except
+// at world size 8 with top_k 4, no shared-expert operand and no NVFP4 epilogue.
+constexpr int64_t kTwoShotDeferMinTokensWorldSize4 = 1536;
+constexpr int64_t kTwoShotDeferMinTokensWorldSize8 = 768;
+
+// A two-shot batch of at most these token counts runs the two-shot early program; it lies below
+// the deferred range, so the early and deferred forms never compete for one batch.
+constexpr int64_t kTwoShotEarlyMaxTokensWorldSize4 = 128;
+constexpr int64_t kTwoShotEarlyMaxTokensWorldSize8 = 128;
+static_assert(kTwoShotEarlyMaxTokensWorldSize4 >= kTwoShotMinTokensWorldSize4 &&
+                  kTwoShotEarlyMaxTokensWorldSize4 < kTwoShotDeferMinTokensWorldSize4,
+              "the world size 4 two-shot early range must end inside the two-shot range");
+static_assert(kTwoShotEarlyMaxTokensWorldSize8 >= kTwoShotMinTokensWorldSize8 &&
+                  kTwoShotEarlyMaxTokensWorldSize8 < kTwoShotDeferMinTokensWorldSize8,
+              "the world size 8 two-shot early range must end inside the two-shot range");
 
 // World size 2 runs the large-token program for top_k 4 above these token counts, without and
 // with the shared-expert operand; every other world-size-2 batch runs the persistent program.
 constexpr int64_t kLargeTokenMinTokens = 512;
-constexpr int64_t kLargeTokenMinTokensSharedExpert = 1280;
+constexpr int64_t kLargeTokenMinTokensSharedExpert = 895;
+
+// World size 2 runs the quad-gather program for batches above the small-token test up to this
+// token count (one wave: at most 142 resident clusters at 4 CTAs per SM).
+constexpr int64_t kW2QuadMaxTokens = 142;
+static_assert(kW2QuadMaxTokens > kSmallTokenExtendedMax && kW2QuadMaxTokens <= 142 &&
+                  kW2QuadMaxTokens < kLargeTokenMinTokens,
+              "the world size 2 quad-gather range must end inside one wave below the large-token range");
 
 int sm_count(int device_id) {
   TVM_FFI_CHECK(device_id >= 0 && device_id < kMaxDevices, ValueError)
@@ -229,12 +407,17 @@ int64_t byte_size(const TensorView& t) { return t.numel() * get_element_size(t);
 // expanded_idx_to_permuted_idx is [tokens, top_k]; allreduce_in is the permuted expert
 // output [num_permuted_rows, 7168]. quant_out / scale_out carry packed FP4 data and E4M3
 // scales (SWIZZLED_128x4); they are checked by byte size and accept any element type.
-// Batches of at most small_token_max tokens run the small-token program (at world sizes 2 and
-// 4 up to kSmallTokenExtendedMax tokens for every class but top_k 4 without a shared expert).
-// Larger batches run the two-shot program at world size 8 and at world size 4 from
-// kTwoShotMinTokensWorldSize4 tokens, the large-token program at world size 2 for top_k 4 above
-// kLargeTokenMinTokens (kLargeTokenMinTokensSharedExpert with a shared expert), and the
-// persistent program otherwise.
+// Batches of at least kTwoShotMinTokensWorldSize4 tokens at world size 4 and
+// kTwoShotMinTokensWorldSize8 at world size 8 run the two-shot program (its deferred form from
+// kTwoShotDeferMinTokensWorldSize4 / kTwoShotDeferMinTokensWorldSize8 tokens; for a rank with a
+// shared expert its deferred shared form, at world size 8 for top_k 8 only, and below the
+// deferred range its two-shot shared or two-shot early shared form for top_k 4). Other batches of
+// at most small_token_max tokens run the small-token program (up to kSmallTokenExtendedMax at
+// world size 4, and at world size 2 for every class but top_k 4 without a shared expert). Larger
+// batches run the two-shot program at world size 8, the large-token program at world size 2 for
+// top_k 4 above kLargeTokenMinTokens (kLargeTokenMinTokensSharedExpert and the large-token
+// shared program with a shared expert),
+// and the persistent program otherwise.
 void cake_moe_finalize_allreduce_fusion(
     TensorView allreduce_in, TensorView residual_in, TensorView norm_weight,
     TensorView expanded_idx_to_permuted_idx, TensorView expert_scale_factor,
@@ -396,22 +579,56 @@ void cake_moe_finalize_allreduce_fusion(
   };
   const void* small_token = kSmallKernels[dtype_index][ws_index][quant_index];
   const void* two_shot = kTwoShotKernels[dtype_index][ws_index][quant_index];
+  const void* two_shot_defer = kTwoShotDeferKernels[dtype_index][ws_index][quant_index];
+  const void* defer_shared = kTwoShotDeferSharedKernels[dtype_index][ws_index][quant_index];
+  const bool defer_excluded =
+      world_size == 8 && top_k == 4 && v_has_shared_expert == 0 && !quantize;
+  const bool two_shot_deferred =
+      two_shot_defer != nullptr && !defer_excluded &&
+      tokens >= (world_size == 8 ? kTwoShotDeferMinTokensWorldSize8
+                                 : kTwoShotDeferMinTokensWorldSize4);
+  // Keyed on the token count and the world size alone, like the two-shot test itself.
+  const void* two_shot_early = kTwoShotEarlyKernels[dtype_index][ws_index][quant_index];
+  const void* two_shot_now =
+      (two_shot_early != nullptr &&
+       tokens <= (world_size == 8 ? kTwoShotEarlyMaxTokensWorldSize8
+                                  : kTwoShotEarlyMaxTokensWorldSize4))
+          ? two_shot_early
+          : two_shot;
+  // The shared form of the two-shot or two-shot early program two_shot_now names (same class).
+  const bool two_shot_early_class =
+      two_shot_early != nullptr &&
+      tokens <= (world_size == 8 ? kTwoShotEarlyMaxTokensWorldSize8 : kTwoShotEarlyMaxTokensWorldSize4);
+  const void* two_shot_now_shared =
+      two_shot_early_class ? kTwoShotEarlySharedKernels[dtype_index][ws_index][quant_index]
+                           : kTwoShotSharedKernels[dtype_index][ws_index][quant_index];
   const void* large_token = kLargeTokenKernels[dtype_index][ws_index][quant_index];
-  const bool small_token_extended = world_size != 8 && (top_k != 4 || v_has_shared_expert != 0);
+  const void* large_token_shared = kLargeTokenSharedKernels[dtype_index][ws_index][quant_index];
+  const void* w2_quad = kW2QuadKernels[dtype_index][ws_index][quant_index];
+  const bool small_token_extended =
+      world_size == 4 || (world_size == 2 && (top_k != 4 || v_has_shared_expert != 0));
   const void* kernel = nullptr;
-  if (tokens <= small_token_max ||
-      (small_token_extended && tokens <= kSmallTokenExtendedMax &&
-       tokens <= cluster_capacity(small_token))) {
+  if (two_shot != nullptr &&
+      tokens >= (world_size == 8 ? kTwoShotMinTokensWorldSize8 : kTwoShotMinTokensWorldSize4)) {
+    // Keyed on the token count and the world size alone, ahead of the small-token extension
+    // (class-keyed at world size 2) and its device-local capacity term. All two-shot forms use
+    // the same workspace and messages, so a rank may run any of them.
+    kernel = two_shot_deferred ? ((v_has_shared_expert != 0 && (world_size != 8 || top_k == 8) && defer_shared != nullptr) ? defer_shared : two_shot_defer) : ((v_has_shared_expert != 0 && top_k == 4 && !(world_size == 8 && two_shot_early_class) && two_shot_now_shared != nullptr) ? two_shot_now_shared : two_shot_now);
+  } else if (tokens <= small_token_max ||
+             (small_token_extended && tokens <= kSmallTokenExtendedMax &&
+              tokens <= cluster_capacity(small_token))) {
     // Small-token and persistent programs share the one-shot protocol, so this device-local
     // capacity term may differ between ranks.
     kernel = small_token;
-  } else if (two_shot != nullptr &&
-             (world_size == 8 || tokens >= kTwoShotMinTokensWorldSize4)) {
-    kernel = two_shot;
+  } else if (two_shot != nullptr && world_size == 8) {
+    kernel = two_shot_deferred ? ((v_has_shared_expert != 0 && (world_size != 8 || top_k == 8) && defer_shared != nullptr) ? defer_shared : two_shot_defer) : ((v_has_shared_expert != 0 && top_k == 4 && !(world_size == 8 && two_shot_early_class) && two_shot_now_shared != nullptr) ? two_shot_now_shared : two_shot_now);
   } else if (large_token != nullptr && top_k == 4 &&
              tokens > (v_has_shared_expert != 0 ? kLargeTokenMinTokensSharedExpert
                                                 : kLargeTokenMinTokens)) {
-    kernel = large_token;
+    kernel = (v_has_shared_expert != 0 && large_token_shared != nullptr) ? large_token_shared : large_token;
+  } else if (w2_quad != nullptr && tokens <= kW2QuadMaxTokens) {
+    // Keyed on the token count and the world size alone (the table holds world size 2 only).
+    kernel = w2_quad;
   } else {
     kernel = kKernels[dtype_index][ws_index][quant_index];
   }

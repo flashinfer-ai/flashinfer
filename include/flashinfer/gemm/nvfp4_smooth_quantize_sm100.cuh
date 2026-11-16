@@ -230,7 +230,9 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
   SFValue = static_cast<float>(tmp);
   // Get the output scale.
   // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
-  outputScale = vecMax != 0
+  // Guard the post-rounding SFValue, not vecMax: the fp8 SF conversion can underflow small
+  // vecMax values to zero, and reciprocal(0) = inf turns zero elements into NaN (see #2441).
+  outputScale = SFValue != 0
                     ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
                     : 0.0f;
 
@@ -379,8 +381,8 @@ __device__ __forceinline__ uint64_t quantizeSmoothed16(Bf16x8& lo, Bf16x8& hi, B
   uint8_t const fp8SFVal = tmp.__x;
   SFValue = static_cast<float>(tmp);
   float const outputScale =
-      vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                  : 0.0f;
+      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                   : 0.0f;
 
   if (SFout != nullptr) *SFout = fp8SFVal;
 
