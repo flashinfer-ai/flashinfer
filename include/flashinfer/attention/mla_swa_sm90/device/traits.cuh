@@ -60,6 +60,21 @@ struct Traits {
   static constexpr int OUTPUT_FLOATS_PER_PV_THREAD =
       OUTPUT_FLOATS_PER_THREAD_PER_SLICE * OUTPUT_SLICES_PER_PV_WG;
   using SharedMemoryPlan = PhysicalStorage<Traits<InputT_, Config_>, Config::StorageKind>;
+  static_assert(Config::StorageKind != 5 || std::is_standard_layout_v<SharedMemoryPlan>,
+                "M16 ready/ACK storage must support offsetof without extension");
+  static_assert(
+      [] {
+        if constexpr (Config::StorageKind == 5) {
+          using BaseStorage = PhysicalStorage<Traits<InputT_, Config_>, 1>;
+          return offsetof(SharedMemoryPlan, m16_ready) == sizeof(BaseStorage) &&
+                 offsetof(SharedMemoryPlan, m16_ack) ==
+                     sizeof(BaseStorage) + 5 * sizeof(cutlass::arch::ClusterBarrier) &&
+                 offsetof(SharedMemoryPlan, m16_weights_ready) ==
+                     sizeof(BaseStorage) + 10 * sizeof(cutlass::arch::ClusterBarrier);
+        }
+        return true;
+      }(),
+      "M16 ready/ACK events must follow the common storage prefix");
 
   static constexpr int SHARED_BYTES = sizeof(SharedMemoryPlan);
   static_assert(SHARED_BYTES < 227 * 1024,

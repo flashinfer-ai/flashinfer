@@ -54,6 +54,7 @@ def test_live_tokens_distinguish_workloads(
 ):
     import importlib.util
     import json
+    import sys
     from importlib import resources
 
     # Load the host-only cache without importing conflicting kernel namespaces.
@@ -66,7 +67,9 @@ def test_live_tokens_distinguish_workloads(
         )
         assert spec is not None and spec.loader is not None
         cache = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cache)
+        with monkeypatch.context() as context:
+            context.setitem(sys.modules, spec.name, cache)
+            spec.loader.exec_module(cache)
     path = _cache_env(monkeypatch, tmp_path)
     key = dict(_KEY, max_tokens=512, device="testgpu")
     if backend.startswith("sm90."):

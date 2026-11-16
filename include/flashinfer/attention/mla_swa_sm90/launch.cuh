@@ -67,6 +67,51 @@ cudaError_t launch(const Arguments& a) {
     auto partial = static_cast<float*>(a.workspace);
     auto lse = reinterpret_cast<float*>(static_cast<char*>(a.workspace) +
                                         align256(rows * Config::S * 1024 * sizeof(float)));
+    if constexpr ((Config::M == 16 && Config::S == 4) || Config::M == 8) {
+      if (rows <= 512) {
+        auto cooperative = &dense_swa_cooperative_split_kernel<T, decltype(params)>;
+        status = cudaFuncSetAttribute(cooperative, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                      T::SHARED_BYTES);
+        if (status != cudaSuccess) return status;
+        struct Capacity {
+          int device = -1;
+          int max_blocks = 0;
+        };
+        static thread_local Capacity capacity;
+        int device;
+        status = cudaGetDevice(&device);
+        if (status != cudaSuccess) return status;
+        if (capacity.device != device) {
+          int supported, sms, blocks_per_sm;
+          status = cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, device);
+          if (status != cudaSuccess) return status;
+          status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+          if (status != cudaSuccess) return status;
+          status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, cooperative,
+                                                                 T::NUM_THREADS, T::SHARED_BYTES);
+          if (status != cudaSuccess) return status;
+          capacity = {device, supported ? blocks_per_sm * sms : 0};
+        }
+        if (a.batch * tiles * Config::S <= capacity.max_blocks) {
+          cudaLaunchAttribute attribute{};
+          attribute.id = cudaLaunchAttributeCooperative;
+          attribute.val.cooperative = 1;
+          cudaLaunchConfig_t config{};
+          config.gridDim = dim3(a.batch, tiles, Config::S);
+          config.blockDim = dim3(T::NUM_THREADS);
+          config.dynamicSmemBytes = T::SHARED_BYTES;
+          config.stream = a.stream;
+          config.attrs = &attribute;
+          config.numAttrs = 1;
+          return cudaLaunchKernelEx(&config, cooperative, a.q, a.kv, a.table, a.lengths,
+                                    reinterpret_cast<InputT*>(partial), lse, Config::S,
+                                    int64_t{1024 * 2}, a.batch, a.sq, a.heads, a.table_cols,
+                                    a.window, a.scale, a.q_stride_b, q_s, int64_t{1088},
+                                    int64_t{1088}, a.table_stride_b, out_b * Config::S,
+                                    out_s * Config::S, int64_t{Config::S * 1024}, params, a.out);
+        }
+      }
+    }
     // Device entry retains its historical InputT* ABI. The split strides are
     // expressed in BF16 elements (x2), while the epilogue stores FP32.
     kernel<<<dim3(a.batch, tiles, Config::S), T::NUM_THREADS, T::SHARED_BYTES, a.stream>>>(
