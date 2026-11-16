@@ -436,6 +436,11 @@ struct QuantParams {
     qp.fp4.fc2 = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale,
                   fc2_global_scale};
     qp.fp4.nvfp4_4over6_code = nvfp4_4over6_code;
+#if defined(FLASHINFER_FP4_SW_CVT)
+    qp.groupwise = GroupWise(TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
+                             fc1_weight_block_scale, fc2_weight_block_scale)
+                       .groupwise;
+#endif
     return qp;
   }
 

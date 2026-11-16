@@ -180,7 +180,6 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
                     (RequiresTileInterleave && (Shape::kK == LayoutDetailsForB::ThreadblockK)),
                 "Layout K must match threadblockK");
 
-  // Rows of scales per stage: one for INT4/INT8 groups; with E2M1, one per 16-wide warp mma step.
   static constexpr int kScaleRows = Base::kScaleRowsPerStage;
   static_assert(kScaleRows == 1 ||
                     (kScaleRows == Base::kWarpGemmIterations && Policy::kPartitionsK == 1),
@@ -223,8 +222,8 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
         smem_iterator_A_(shared_storage.operand_A_ref(), thread_idx),
         smem_iterator_B_(shared_storage.operand_B_ref(), thread_idx),
         smem_iterator_scale_(LayoutScale(Shape::kN), shared_storage.operand_scale.data(),
-                             shared_storage.operand_zero.data(),
-                             {Base::kStages * kScaleRows, Shape::kN}, thread_idx, group_size) {
+                             shared_storage.operand_zero.data(), {Base::ScalebiasStages, Shape::kN},
+                             thread_idx, group_size) {
     // Compute warp location within threadblock tile by mapping the warp_id to
     // three coordinates:
     //   _m: the warp's position within the threadblock along the M dimension
@@ -252,11 +251,9 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
       // E2M1: every row is a group of its own (no zeros).
       CUTLASS_PRAGMA_UNROLL
       for (int row = 0; row < kScaleRows; ++row) {
-        cutlass::arch::cp_async<sizeof_bits<typename IteratorScale::Element>::value *
-                                    IteratorScale::kAlignment / 8,
-                                kCacheOpB>(reinterpret_cast<typename IteratorScale::AccessType*>(
-                                               this->smem_iterator_scale_.get_scale()),
-                                           iterator_scale.get_scale(), iterator_scale.valid());
+        cutlass::arch::cp_async<sizeof(typename IteratorScale::AccessType), kCacheOpB>(
+            this->smem_iterator_scale_.get_scale(), iterator_scale.get_scale(),
+            iterator_scale.valid());
         iterator_scale.add_tile_offset({1, 0});
         this->smem_iterator_scale_.add_tile_offset({1, 0});
       }
@@ -521,7 +518,6 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
     WarpFragmentB warp_frag_B[2];
     typename Dequantizer::FragmentScale warp_frag_scales[kScaleRows];
     typename Dequantizer::FragmentZero warp_frag_zeros[kScaleRows];
-    // The scales of a stage, one row per group.
     auto load_scales = [&]() {
       CUTLASS_PRAGMA_UNROLL
       for (int row = 0; row < kScaleRows; ++row) {
@@ -582,9 +578,8 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
 
         typename TransformBAfterLDS::result_type converted_frag_B =
             lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
-        int const scale_row = kScaleRows == 1 ? 0 : warp_mma_k;
-        warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales[scale_row],
-                                     warp_frag_zeros[scale_row]);
+        warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales[warp_mma_k % kScaleRows],
+                                     warp_frag_zeros[warp_mma_k % kScaleRows]);
 
         using FragmentOperandB = cutlass::Array<ElementA, Operator::FragmentB::kElements>;
         constexpr cutlass::FloatRoundStyle RoundStyle = cutlass::FloatRoundStyle::round_to_nearest;
@@ -667,13 +662,12 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
         }
       }
 
-      // Load the scales needed for the next tile iteration.
+      // Load the scale needed for the next tile iteration.
       load_scales();
     }
 
     // E2M1 weights drain too: the prologue zero-fills unconditionally; the epilogue reuses smem.
-    if (SharedMemoryClear == SharedMemoryClearOption::kZfill ||
-        platform::is_same<ElementB, float_e2m1_t>::value) {
+    if (SharedMemoryClear == SharedMemoryClearOption::kZfill || kScaleRows > 1) {
       // commit and drain all pending and predicated LDGSTS pnz from the GEMM mainloop
       cutlass::arch::cp_async_fence();
       cutlass::arch::cp_async_wait<0>();

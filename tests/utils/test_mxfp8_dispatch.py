@@ -24,7 +24,7 @@ def direct_sm100_module(monkeypatch):
     monkeypatch.setattr(
         fp8_quantization,
         "gen_mxfp8_quantization_sm100_module",
-        lambda: SimpleNamespace(build_and_load=lambda: native),
+        lambda _: SimpleNamespace(build_and_load=lambda: native),
     )
     # Exercise the real exported factory without caching this test's native stub.
     return get_mxfp8_quantization_sm100_module.__wrapped__(), native

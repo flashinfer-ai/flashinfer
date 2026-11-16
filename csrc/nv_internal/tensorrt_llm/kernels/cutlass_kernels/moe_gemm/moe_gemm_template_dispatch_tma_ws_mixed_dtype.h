@@ -93,10 +93,8 @@ void sm90_dispatch_mainloop_schedules(
 
   constexpr bool use_exact_block_scale =
       ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kExactBlockE8M0;
-  constexpr int tile_n = get<1>(CTAShape{});
-  constexpr bool exact_block_tile =
-      get<0>(CTAShape{}) == 128 && get<2>(CTAShape{}) == 128 &&
-      (tile_n == 16 || tile_n == 32 || tile_n == 64 || tile_n == 128 || tile_n == 256);
+  constexpr bool exact_block_tile = get<0>(CTAShape{}) == 128 && get<2>(CTAShape{}) == 128 &&
+                                    256 % get<1>(CTAShape{}) == 0 && get<1>(CTAShape{}) >= 16;
   switch (inputs.gemm_config.mainloop_schedule) {
     case tkc::MainloopScheduleType::COOPERATIVE:
       if constexpr (get<0>(CTAShape{}) < 128) {

@@ -2975,8 +2975,6 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
         # Below SM100 the kernels sum in another order than this split reference.
         if cc[0] >= 10:
             assert_w4a16_bits(actual, reference)
-        else:
-            torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
         # The same packed inputs must distinguish the intended formula from
         # a counterfactual with matching gated/non-gated geometry.
         if activation.type in (ActivationType.Swiglu, ActivationType.GegluTanh):
@@ -2992,6 +2990,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
             actual.view(torch.int16), control_reference.view(torch.int16)
         ), f"{activation!r}: the exact fixture cannot distinguish the wrong formula"
         if cc[0] < 10:
+            torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
             assert not torch.allclose(actual, control_reference, atol=2e-2, rtol=2e-2)
     elif quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
         reference = _compute_ref(act_pack, tensors, shape, activation)

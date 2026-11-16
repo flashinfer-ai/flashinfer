@@ -107,6 +107,12 @@ from .api import (
     QuantFormat,
     RoutingInputMode,
 )
+from .prepare import (
+    _SM80_KEYS,
+    _check_sm80_nvfp4_operands,
+    cutlass_nvfp4_sm80_weights,
+    trtllm_nvfp4_sm80_weights,
+)
 from .utils import (
     _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS,
     _cutile_max_permuted_rows,
@@ -1706,12 +1712,10 @@ def _require_cutlass_tensor(
         raise ValueError(f"{name} shape {tuple(tensor.shape)} != expected {shape}.")
 
 
-def _sm80_view_operands(view, w1, w2, device):
+def _sm80_view_operands(view, w1, w2, device, sm90=False):
     """The SM80 operands prepared with ``view``, checked against the weights ``w1`` and ``w2``."""
-    from .prepare import _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands
-
-    sm80 = tuple(view[k] for k in _CUTLASS_NVFP4_SM80_KEYS)
-    _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, device)
+    sm80 = tuple(view[k] for k in _SM80_KEYS[sm90])
+    _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, device, sm90)
     return sm80
 
 
@@ -2821,11 +2825,8 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
         )
         if self._device_arch == 90:
             # SM90 reads the uint8 operands prepared with the view, if any.
-            from .prepare import _CUTLASS_MXFP4_SM90_KEYS, cutlass_nvfp4_sm80_weights
-
             w1, w1_scale, w2, w2_scale = (
-                tuple(view[k] for k in _CUTLASS_MXFP4_SM90_KEYS)
-                if _CUTLASS_MXFP4_SM90_KEYS[0] in view
+                [view[k] for k in _SM80_KEYS[True]] if "sm90_fc1_expert_weights" in view
                 else cutlass_nvfp4_sm80_weights(w1, w1_scale, w2, w2_scale, mx=True, sm90=True)
             )  # fmt: skip
             return [w1, w2, w1_scale, w2_scale, a1_scale, a2_scale]
@@ -5081,9 +5082,7 @@ class CuteDslRunner(MoERunner):
             if get_compute_capability(self.device) == (10, 7):
                 raise NotImplementedError(f"CuTe-DSL {mode} does not support SM107.")
             if mode == "MXFP8" and self._below_sm100():
-                raise NotImplementedError(
-                    "Below SM100 CuTe-DSL MoE runs W4A4, W4A8 and W4A16."
-                )
+                raise NotImplementedError("CuTe-DSL MXFP8 requires SM100 or newer.")
         if (
             isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
             and not self.config.quant.per_token_scale
@@ -5241,9 +5240,7 @@ class CuteDslRunner(MoERunner):
         self._require_built()
         # Below SM100 only W4A16 records have tactics; the CUTLASS SM80 kernels pick their own.
         if self._below_sm100():
-            from .cute_dsl.tuner import CuteDslFusedMoEW4A16Runner
-
-            w4a16 = isinstance(self._inner, CuteDslFusedMoEW4A16Runner)
+            w4a16 = self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
             return (w4a16 and self._inner.get_valid_tactics(inputs, profile)) or [-1]
         return self._inner.get_valid_tactics(inputs, profile)
 
@@ -5267,7 +5264,6 @@ class CuteDslRunner(MoERunner):
         if self._below_sm100():
             from .cute_dsl.fused_moe import _cute_dsl_fused_moe_sm80
 
-            tactic = None if tactic == -1 else tactic
             return _cute_dsl_fused_moe_sm80(
                 self._inner, inputs, tactic, **self._forward_kwargs
             )
@@ -5324,14 +5320,10 @@ class CuteDslRunner(MoERunner):
         keys = ("w1_weight", "w1_weight_sf", "w2_weight", "w2_weight_sf")
         if self._below_sm100() and "sm90_fc1_expert_weights" in v:
             # SM90 W4A8 reads the FP8 mixed-input GEMM's operands prepared with the view.
-            from .prepare import _CUTLASS_MXFP4_SM90_KEYS
-
-            sm90 = map(v.get, _CUTLASS_MXFP4_SM90_KEYS)
-            v = {**v, **dict(zip(keys, sm90, strict=True))}
+            v = {**v, **dict(zip(keys, map(v.get, _SM80_KEYS[True]), strict=True))}
         elif self._below_sm100() and "sm80_fc1_expert_weights" in v:
-            sm80 = _sm80_view_operands(
-                v, v["w1_weight"], v["w2_weight"], act.hidden_states_q.device
-            )
+            device = act.hidden_states_q.device
+            sm80 = _sm80_view_operands(v, v["w1_weight"], v["w2_weight"], device)
             v = {**v, **dict(zip(keys, sm80, strict=True))}
         elif self._below_sm100() and "sm80_fc1_records" in v:
             # W4A16 reads the view's records, but an expert-parallel shard converts per call.
@@ -5782,15 +5774,15 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     f"{type(self).__name__} does not support SiTU on SM107 with "
                     "the currently pinned Rubin BMM artifact."
                 )
-            if compute_capability[0] < 10:
-                self._sm80 = supported = True
-            elif pair in (
+            if pair in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
             ):
                 supported = compute_capability in ((10, 0), (10, 3), (10, 7))
             else:
                 supported = compute_capability in ((10, 0), (10, 7))
+            self._sm80 = compute_capability[0] < 10
+            supported = supported or self._sm80
             if not supported:
                 raise NotImplementedError(
                     f"TRTLLM {pair[0].name}×{pair[1].name} is unsupported on "
@@ -5907,24 +5899,22 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             output, logits, topk_ids, topk_weights, x, x_sf, _, per_token_scale = inputs
             if k["routing_input_mode"] is RoutingInputMode.FromLogits:
                 topk_ids, topk_weights = _trtllm_routing_sm80(
-                    logits, k["routing_bias"], k["routing_method_type"],
-                    self.config.routing.top_k, k["n_group"], k["topk_group"],
-                    k["routed_scaling_factor"], k.get("norm_topk_prob", True),
-                    self._enable_pdl, self._num_fused_shared_experts,
+                    logits, k["routing_bias"], k["routing_method_type"], self.config.routing.top_k,
+                    k["n_group"], k["topk_group"], k["routed_scaling_factor"],
+                    k.get("norm_topk_prob", True), self._enable_pdl, self._num_fused_shared_experts,
                 )  # fmt: skip
             elif k["routing_input_mode"] is RoutingInputMode.PackedPrecomputed:
                 topk_weights = None  # packed in topk_ids
-            finalize = self.config.finalize.do_finalize
             result = _trtllm_fp4_routed_moe_sm80(
                 topk_ids, topk_weights, x, x_sf, per_token_scale, k["sm80_weights"],
                 k["output1_scale_scalar"], k["output1_scale_gate_scalar"],
                 k["output2_scale_scalar"], k["gemm1_alpha"], k["gemm1_beta"],
                 k["gemm1_clamp_limit"], k["num_experts"], k["local_expert_offset"],
-                self._num_local_experts, self._activation_type, self._enable_pdl,
-                output if finalize else None, self._tune_max_num_tokens, do_finalize=finalize,
+                self._num_local_experts, self._activation_type, self._enable_pdl, output,
+                self._tune_max_num_tokens, do_finalize=self.config.finalize.do_finalize,
                 nvfp4_4over6=self.config.quant.nvfp4_4over6,
             )  # fmt: skip
-            return result[0] if finalize else result
+            return result[0] if self.config.finalize.do_finalize else result
         # Finalized calls write into inputs[0]; unfinalized calls return the flat
         # API's three-tensor result. Launch kwargs come from the same packed call
         # even when another pack_inputs invocation interleaves before forward.
@@ -6121,27 +6111,17 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             enable_pdl=self._enable_pdl,
         )
         if self._sm80:
-            from .prepare import (
-                _CUTLASS_MXFP4_SM90_KEYS, _CUTLASS_NVFP4_SM80_KEYS, _check_sm80_nvfp4_operands,
-                trtllm_nvfp4_sm80_weights,
-            )  # fmt: skip
-
-            mx = self._pair[0] is QuantFormat.MXFP4
             device = act.hidden_states_q.device
-            sm90 = get_compute_capability(device)[0] == 9 and self._pair == (
-                QuantFormat.MXFP4, QuantFormat.MXFP8,
-            )  # fmt: skip
-            keys = _CUTLASS_MXFP4_SM90_KEYS if sm90 else _CUTLASS_NVFP4_SM80_KEYS
+            major = get_compute_capability(device)[0]
+            sm90 = major == 9 and self._pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
             w1, w2 = v["gemm1_weights"], v["gemm2_weights"]
-            static_kwargs["sm80_weights"] = sm80 = (
-                tuple(v[key] for key in keys)
-                if keys[0] in v
-                else trtllm_nvfp4_sm80_weights(
+            if _SM80_KEYS[sm90][0] not in v:
+                sm80 = trtllm_nvfp4_sm80_weights(
                     w1, v["gemm1_weights_scale"], w2, v["gemm2_weights_scale"],
-                    self.config.activation.is_gated, mx, sm90=sm90,
-                )
-            )  # fmt: skip
-            _check_sm80_nvfp4_operands(sm80, w1.shape, w2.shape, device, sm90)
+                    self.config.activation.is_gated, self._pair[0] is QuantFormat.MXFP4, sm90=sm90,
+                )  # fmt: skip
+                v = {**v, **dict(zip(_SM80_KEYS[sm90], sm80, strict=True))}
+            static_kwargs["sm80_weights"] = _sm80_view_operands(v, w1, w2, device, sm90)
             return _TrtllmPackedInputs(
                 moe_inputs.to_list(),
                 tuning_config=TuningConfig(),

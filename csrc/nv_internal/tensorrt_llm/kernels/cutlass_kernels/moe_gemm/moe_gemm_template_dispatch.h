@@ -149,14 +149,12 @@ struct genericMoeGemmKernelLauncher {
         epilogue_op.alpha_ptr_array = inputs.alpha_scales;
       }
 #endif
-#if defined(ENABLE_FP4)
       // NVFP4: each expert's global scale, in the row scales if any (none for the occupancy query).
-      if constexpr (std::is_same_v<WeightType, Fp4Type>) {
+      if constexpr (std::is_same_v<CutlassWeightType, cutlass::float_e2m1_t>) {
         TLLM_CHECK_WITH_INFO(inputs.occupancy || inputs.alpha_scales || inputs.row_scales,
                              "FP4 weights take alpha_scale_ptr_array or row scales.");
         epilogue_op.alpha_ptr_array = inputs.row_scales ? nullptr : inputs.alpha_scales;
       }
-#endif
 
       // Finally, set up the kernel.
       using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<
@@ -275,13 +273,8 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
   constexpr bool isFp4Weight = false;
 #endif
 
-  if constexpr (isFp4Weight) {
-    // E2M1 weights: a 16-bit scale per 16 K values.
-    tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<
-        T, WeightType, GemmOutputType, Arch, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY,
-        EpilogueTag, ThreadblockShape, WarpShape, Stages>::call(inputs, sm_count_);
-  } else if constexpr ((Stages == 2 || Arch::kMinComputeCapability >= 80) &&
-                       (!isFp8 || std::is_same_v<Arch, cutlass::arch::Sm89>) && !isFp4) {
+  if constexpr ((Stages == 2 || Arch::kMinComputeCapability >= 80) &&
+                (!isFp8 || std::is_same_v<Arch, cutlass::arch::Sm89>) && !isFp4 && !isFp4Weight) {
     // dispatch for quant op type
     auto* launcher = tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<
         T, WeightType, GemmOutputType, Arch, cutlass::WeightOnlyQuantOp::UNDEFINED, EpilogueTag,
@@ -298,6 +291,11 @@ static void dispatch(GroupedGemmInput<T, WeightType, GemmOutputType, GemmOutputT
                            ThreadblockShape, WarpShape, Stages>::call;
     }
     launcher(inputs, sm_count_);
+  } else if constexpr (isFp4Weight) {
+    // E2M1 weights: a 16-bit scale per 16 K values.
+    tensorrt_llm::kernels::cutlass_kernels_oss::genericMoeGemmKernelLauncher<
+        T, WeightType, GemmOutputType, Arch, cutlass::WeightOnlyQuantOp::FINEGRAINED_SCALE_ONLY,
+        EpilogueTag, ThreadblockShape, WarpShape, Stages>::call(inputs, sm_count_);
   } else {
     TLLM_THROW("Cutlass gemm. Not instantiated for arch %d with stages set to %d",
                Arch::kMinComputeCapability, Stages);
@@ -686,6 +684,17 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
         tma_ws_configs.end());
   }
 
+  if (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act && sm == 90) {
+    // MXFP8 x MXFP4 exact block exponents are generated for these configs only.
+    using Tile = cutlass_extensions::CutlassTileConfigSM90;
+    for (Tile tile :
+         {Tile::CtaShape128x128x128B, Tile::CtaShape128x256x128B, Tile::CtaShape128x64x128B,
+          Tile::CtaShape128x32x128B, Tile::CtaShape128x16x128B}) {
+      tma_ws_configs.emplace_back(tile, cutlass_extensions::MainloopScheduleType::COOPERATIVE,
+                                  cutlass_extensions::EpilogueScheduleType::AUTO,
+                                  cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
+    }
+  }
   auto swap_ab_configs = tma_ws_configs;
   std::transform(swap_ab_configs.begin(), swap_ab_configs.end(), std::back_inserter(tma_ws_configs),
                  [](auto& config) {
@@ -715,21 +724,6 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
           config.swap_ab = true;
           tma_ws_configs.push_back(config);
         }
-      }
-    }
-  }
-  if constexpr (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
-    if (sm == 90) {
-      // MXFP8 x MXFP4 exact block exponents are generated for these configs only.
-      using Tile = cutlass_extensions::CutlassTileConfigSM90;
-      for (Tile tile :
-           {Tile::CtaShape128x128x128B, Tile::CtaShape128x256x128B, Tile::CtaShape128x64x128B,
-            Tile::CtaShape128x32x128B, Tile::CtaShape128x16x128B}) {
-        CutlassGemmConfig config(tile, cutlass_extensions::MainloopScheduleType::COOPERATIVE,
-                                 cutlass_extensions::EpilogueScheduleType::AUTO,
-                                 cutlass_extensions::ClusterShape::ClusterShape_1x1x1);
-        config.swap_ab = true;
-        tma_ws_configs.push_back(config);
       }
     }
   }

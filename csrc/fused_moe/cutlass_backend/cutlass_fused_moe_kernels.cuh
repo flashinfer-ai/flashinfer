@@ -38,6 +38,7 @@
 #endif
 #include "cute/tensor.hpp"
 #include "cutlass/arch/memory.h"
+#include "cutlass/arch/mma.h"
 #include "cutlass/conv/convolution.h"
 // Order matters here, packed_stride.hpp is missing cute and convolution includes
 #include "cutlass/array.h"
@@ -411,8 +412,6 @@ void buildMinLatencyActiveExpertMaps(
 
 #if defined(FLASHINFER_FP4_SW_CVT)
 constexpr static int SMALL_PROLOGUE_THREADS = 256;
-template <class T>
-__device__ inline int64_t findTotalEltsLessThanTarget(T const*, int64_t, T);
 
 // One CTA, a thread per expanded row: its permuted row counts the (expert, row) keys below its own.
 __global__ void smallBuildExpertMapsSortFirstTokenKernel(
@@ -461,7 +460,17 @@ __global__ void smallBuildExpertMapsSortFirstTokenKernel(
   }
   int const num_local = __syncthreads_count(expert < num_experts_per_node);
   for (int64_t e = threadIdx.x; e <= num_experts_per_node; e += SMALL_PROLOGUE_THREADS) {
-    expert_first_token_offset[e] = findTotalEltsLessThanTarget<int>(sorted, num_local, e);
+    int first = 0;
+    for (int count = num_local; count > 0;) {  // the first sorted expert at least e
+      int const half = count / 2;
+      if (sorted[first + half] < e) {
+        first += half + 1;
+        count -= half + 1;
+      } else {
+        count = half;
+      }
+    }
+    expert_first_token_offset[e] = first;
   }
 }
 #endif
@@ -679,6 +688,12 @@ bool fusedBuildExpertMapsSortFirstToken(
     int* unpermuted_row_to_permuted_row, int64_t* expert_first_token_offset,
     int64_t const num_tokens, int const num_experts_per_node, int const experts_per_token,
     int const start_expert, int const end_expert, bool enable_pdl, cudaStream_t stream) {
+#if defined(FLASHINFER_FP4_SW_CVT)
+  // Rows <= experts sort faster in one CTA (scan over rows) than the fused radix rank (experts).
+  if (num_tokens * experts_per_token <= std::min(SMALL_PROLOGUE_THREADS, num_experts_per_node)) {
+    return false;
+  }
+#endif
   // We need enough bits to represent [0, num_experts_per_node+1] (inclusive) i.e.
   // num_experts_per_node + 2 values This is floor(log2(num_experts_per_node+1)) + 1
   int expert_log = static_cast<int>(log2(num_experts_per_node + 1)) + 1;
@@ -707,6 +722,10 @@ int64_t computeNumTokensPerBlock(int64_t const num_tokens, int64_t const num_exp
   for (int64_t num_tokens_per_block = 32; num_tokens_per_block <= 1024; num_tokens_per_block *= 2) {
     int64_t const num_blocks_per_seq =
         tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+#if defined(FLASHINFER_FP4_SW_CVT)
+    // Tokens in one block need only a power of two covering them, not the global scan's size.
+    if (num_blocks_per_seq == 1) return num_tokens_per_block;
+#endif
     if (num_blocks_per_seq * num_experts_per_node <= num_tokens_per_block) {
       return num_tokens_per_block;
     }
@@ -1028,27 +1047,19 @@ void threeStepBuildExpertMapsSortFirstToken(
                              smallBuildExpertMapsSortFirstTokenKernel, 1, SMALL_PROLOGUE_THREADS, 0,
                              stream, token_selected_experts, permuted_token_selected_experts,
                              permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row,
-                             expert_first_token_offset, static_cast<int>(num_tokens),
-                             static_cast<int>(num_experts_per_token),
-                             static_cast<int>(num_experts_per_node), start_expert_id);
+                             expert_first_token_offset, num_tokens, num_experts_per_token,
+                             num_experts_per_node, start_expert_id);
     return;
   }
 #endif
   int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
   int64_t const num_blocks_per_seq =
       tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
-  int64_t block_threads = num_tokens_per_block;
-#if defined(FLASHINFER_FP4_SW_CVT)
-  // The global scan's size sets num_tokens_per_block; when the tokens fit in one block, the
-  // per-expert blocks only need a power of two covering them.
-  if (num_blocks_per_seq == 1) {
-    while (block_threads > 32 && block_threads / 2 >= num_tokens) block_threads /= 2;
-  }
-#endif
 
   blockExpertPrefixSum(token_selected_experts, blocked_expert_counts, blocked_row_to_unpermuted_row,
-                       num_tokens, num_experts_per_node, num_experts_per_token, block_threads,
-                       num_blocks_per_seq, start_expert_id, enable_pdl, stream);
+                       num_tokens, num_experts_per_node, num_experts_per_token,
+                       num_tokens_per_block, num_blocks_per_seq, start_expert_id, enable_pdl,
+                       stream);
   sync_check_cuda_error(stream);
 
   globalExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
@@ -1059,7 +1070,8 @@ void threeStepBuildExpertMapsSortFirstToken(
   mergeExpertPrefixSum(blocked_expert_counts, blocked_expert_counts_cumsum,
                        blocked_row_to_unpermuted_row, permuted_token_selected_experts,
                        permuted_row_to_unpermuted_row, unpermuted_row_to_permuted_row, num_tokens,
-                       num_experts_per_node, block_threads, num_blocks_per_seq, enable_pdl, stream);
+                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, enable_pdl,
+                       stream);
 }
 
 // ============================== Infer GEMM sizes =================================
@@ -1161,7 +1173,6 @@ __host__ __device__ constexpr int64_t padNvfp4K(int64_t k) {
       k, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4);
 }
 
-// Below SM100 the token rows GEMM1 reads for BF16 W4A16 on the small-M kernel; none from SM100.
 inline int const* w4a16TokenRows(QuantParams const& quant_params) {
 #if defined(FLASHINFER_FP4_SW_CVT)
   return quant_params.w4a16_token_rows;
@@ -1205,8 +1216,7 @@ __device__ inline void restoreMxfp8x8Scaled(uint64_t codes, uint8_t sf, int shif
 }
 
 template <class GemmOutputType, class QuantizedType, class ComputeElem, int VecSize,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type,
-          bool RestoreMXFP8 = false>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
 __device__ auto quantizePackedFPXValue(
     ComputeElem& post_act_val, float global_scale_val, int64_t num_tokens_before_expert,
     int64_t expert_id, int64_t token_id, int64_t elem_idx, int64_t num_cols,
@@ -1239,16 +1249,16 @@ __device__ auto quantizePackedFPXValue(
 
   // Do the conversion and set the output and scaling factor
   auto func = [&]() {
-    if constexpr (is_fp8 && RestoreMXFP8) {
+    if constexpr (std::is_same_v<QuantizedType, __nv_bfloat16> &&
+                  VecSize == TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize) {
       // cvt_warp_fp16_to_mxfp8, then the E4M3 values times 2^(sf - 128) in BF16. Halved, the
       // largest (256 x 2^120) is 2^127, finite, and every nonzero value (at least 2^-126) exact.
       return [](PackedVec<GemmOutputType>& vec, float /* ignored */, uint8_t* SFout,
                 float /* ignored */, uint8_t* /* ignored */) -> uint4 {
-        static_assert(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize == VecSize);
         float2 values[CVT_ELTS_PER_THREAD / 2];
         uint8_t sf = 255;
-        scale_warp_fp16_for_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout, &sf,
-                                                                                values);
+        cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout, &sf,
+                                                                             values);
         uint4 out;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
         restoreMxfp8x8Scaled(fp32_vec_to_e4m3(values), sf, -1, reinterpret_cast<uint32_t*>(&out));
@@ -1267,10 +1277,9 @@ __device__ auto quantizePackedFPXValue(
       };
     } else if constexpr (is_fp8) {
       return [](PackedVec<GemmOutputType>& vec, float /* ignored */, uint8_t* SFout,
-                float /* ignored */, uint8_t* SFlocal) -> uint64_t {
+                float /* ignored */, uint8_t* /* ignored */) -> uint64_t {
         static_assert(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize == VecSize);
-        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout,
-                                                                                    SFlocal);
+        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout);
       };
     } else {
       if (scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4) {
@@ -1340,68 +1349,91 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
 template <class T>
 __device__ inline void restoreNvfp4x8(uint32_t codes, uint8_t sf, uint32_t* out) {
   using T2 = std::conditional_t<std::is_same_v<T, half>, half2, __nv_bfloat162>;
-  __nv_fp8_e4m3 scale;
-  scale.__x = sf;
+  auto const& scale = reinterpret_cast<__nv_fp8_e4m3 const&>(sf);
   T2 const scale2 = tensorrt_llm::common::cuda_cast<T2>(float(scale));
   flashinfer::e2m1x8_to_16bx8<T>(codes, out);
   auto* pairs = reinterpret_cast<T2*>(out);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    pairs[i] = __hmul2(pairs[i], scale2);
-  }
+  for (int i = 0; i < 4; ++i) pairs[i] = __hmul2(pairs[i], scale2);
 }
 
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
-// A warp per row, restored rows K padded. Restore (NVFP4): codes times their 128x4 block scales,
-// permuted rows (per-expert scales) given expert_first_token_offset, else num_rows token rows.
-// Pack: permuted rows back to codes, over their block scale (NVFP4) or twice over their E8M0 scale
-// (MXFP8), exact.
-template <class T, bool Pack, bool IsMX>
-__global__ void restoredRowsKernel(T* values, void* codes,
-                                   TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
-                                   int64_t const* expert_first_token_offset,
-                                   int64_t const num_experts_per_node, int64_t const num_rows,
-                                   int64_t const cols) {
+// Row `row`'s scale `block` of `blocks`, 128x4-swizzled or linear.
+__device__ inline uint8_t readSF(uint8_t const* sf, int row, int block, int blocks, bool swizzled) {
+  return *cvt_quant_get_sf_out_offset<uint8_t, 1>(
+      std::nullopt, row, block, std::nullopt, blocks, const_cast<uint8_t*>(sf),
+      swizzled ? QuantizationSFLayout::SWIZZLED_128x4 : QuantizationSFLayout::LINEAR);
+}
+
+// One warp per row, written with K padded to the NVFP4 K alignment (the GEMMs' K step). The rows
+// are the permuted rows with their per-expert scales when expert_first_token_offset is given, else
+// num_rows token rows with 128x4 or linear scales.
+template <class T>
+__global__ void restoreNvfp4RowsKernel(T* output, void const* input, uint8_t const* sf,
+                                       bool const swizzled_sf,
+                                       int64_t const* expert_first_token_offset,
+                                       int64_t const num_experts_per_node, int64_t const num_rows,
+                                       int64_t const cols) {
+  using Gemm = TmaWarpSpecializedGroupedGemmInput;
+  int64_t const vecs = cols / Gemm::NVFP4BlockScaleVectorSize;
+  int64_t const padded_vecs = padNvfp4K(cols) / Gemm::NVFP4BlockScaleVectorSize;
+  int64_t const rows =
+      expert_first_token_offset ? expert_first_token_offset[num_experts_per_node] : num_rows;
+  int64_t const warps = int64_t(gridDim.x) * blockDim.x / 32;
+  for (int64_t row = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32; row < rows;
+       row += warps) {
+    int64_t expert = 0, first = 0;
+    if (expert_first_token_offset) {
+      expert =
+          findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, row + 1) - 1;
+      first = expert_first_token_offset[expert];
+    }
+    auto const* row_sf =
+        sf + getOffsetActivationSF(expert, first, cols, Gemm::FpXBlockScalingType::NVFP4);
+    for (int64_t v = threadIdx.x % 32; v < padded_vecs; v += 32) {
+      uint4 out[2] = {};
+      if (v < vecs) {
+        uint8_t const scale = readSF(row_sf, row - first, v, padded_vecs, swizzled_sf);
+        uint2 const codes = static_cast<uint2 const*>(input)[row * vecs + v];
+        restoreNvfp4x8<T>(codes.x, scale, reinterpret_cast<uint32_t*>(&out[0]));
+        restoreNvfp4x8<T>(codes.y, scale, reinterpret_cast<uint32_t*>(&out[1]));
+      }
+      reinterpret_cast<uint4*>(output)[2 * (row * padded_vecs + v)] = out[0];
+      reinterpret_cast<uint4*>(output)[2 * (row * padded_vecs + v) + 1] = out[1];
+    }
+  }
+}
+
+// 256-thread CTAs for num_rows rows, a warp a row.
+inline int64_t rowWarpCtas(int64_t const num_rows) {
+  int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+  return std::min(smCount * 16, std::max((num_rows + 7) / 8, int64_t{1}));
+}
+
+// Restored NVFP4 (K padded) or MXFP8 permuted rows back to their codes, one warp per row: each
+// value over its per-expert block scale (NVFP4) or twice over its E8M0 scale (MXFP8), exact.
+template <class T, bool IsMX>
+__global__ void packRestoredRowsKernel(void* codes, T const* values, uint8_t const* sf,
+                                       int64_t const* expert_first_token_offset,
+                                       int64_t const num_experts_per_node, int64_t const cols) {
   using Gemm = TmaWarpSpecializedGroupedGemmInput;
   constexpr int64_t VecSize =
       IsMX ? Gemm::MXFPXBlockScaleVectorSize : Gemm::NVFP4BlockScaleVectorSize;
   int64_t const padded_cols =
       Gemm::alignToSfDim(cols, IsMX ? Gemm::MinKDimAlignmentMXFPX : Gemm::MinKDimAlignmentNVFP4);
-  int64_t const vecs = cols / VecSize, padded_vecs = padded_cols / VecSize;
-  bool const permuted = Pack || expert_first_token_offset;
-  int64_t const rows = permuted ? expert_first_token_offset[num_experts_per_node] : num_rows;
+  int64_t const rows = expert_first_token_offset[num_experts_per_node];
   int64_t const warps = int64_t(gridDim.x) * blockDim.x / 32;
   for (int64_t row = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32; row < rows;
        row += warps) {
-    int64_t expert = 0, first = 0;
-    if (permuted) {
-      expert =
-          findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, row + 1) - 1;
-      first = expert_first_token_offset[expert];
-    }
-    auto* row_sf = const_cast<Gemm::ElementSF*>(sf) +
-                   getOffsetActivationSF(
-                       expert, first, cols,
-                       IsMX ? Gemm::FpXBlockScalingType::MXFPX : Gemm::FpXBlockScalingType::NVFP4);
-    for (int64_t v = threadIdx.x % 32; !Pack && v < padded_vecs; v += 32) {
-      uint4 out[2] = {};
-      if (v < vecs) {
-        uint8_t const scale = *cvt_quant_get_sf_out_offset<Gemm::ElementSF, 1>(
-            std::nullopt, row - first, v, std::nullopt, padded_vecs, row_sf,
-            QuantizationSFLayout::SWIZZLED_128x4);
-        uint2 const in = static_cast<uint2 const*>(codes)[row * vecs + v];
-        restoreNvfp4x8<T>(in.x, scale, reinterpret_cast<uint32_t*>(&out[0]));
-        restoreNvfp4x8<T>(in.y, scale, reinterpret_cast<uint32_t*>(&out[1]));
-      }
-      reinterpret_cast<uint4*>(values)[2 * (row * padded_vecs + v)] = out[0];
-      reinterpret_cast<uint4*>(values)[2 * (row * padded_vecs + v) + 1] = out[1];
-    }
-    for (int64_t v = threadIdx.x % 32; Pack && v < cols / 8; v += 32) {
-      uint8_t const s = *cvt_quant_get_sf_out_offset<Gemm::ElementSF, 1>(
-          std::nullopt, row - first, v * 8 / VecSize, std::nullopt, cols / VecSize, row_sf,
-          QuantizationSFLayout::SWIZZLED_128x4);
-      __nv_fp8_e4m3 scale;
-      scale.__x = s;
+    int64_t const expert =
+        findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, row + 1) - 1;
+    int64_t const first = expert_first_token_offset[expert];
+    auto const* row_sf = sf + getOffsetActivationSF(expert, first, cols,
+                                                    IsMX ? Gemm::FpXBlockScalingType::MXFPX
+                                                         : Gemm::FpXBlockScalingType::NVFP4);
+    for (int64_t v = threadIdx.x % 32; v < cols / 8; v += 32) {
+      uint8_t const s = readSF(row_sf, row - first, v * 8 / VecSize, cols / VecSize, true);
+      auto const& scale = reinterpret_cast<__nv_fp8_e4m3 const&>(s);
       float const nvfp4_scale = float(scale) == 0.f ? 1.f : float(scale);  // zero blocks stay 0
       float x[8];
 #pragma unroll
@@ -1413,25 +1445,13 @@ __global__ void restoredRowsKernel(T* values, void* codes,
       if constexpr (IsMX) {
         uint64_t out = 0;
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-          out |= uint64_t(__nv_fp8_e4m3(x[i]).__x) << (8 * i);
-        }
+        for (int i = 0; i < 8; ++i) out |= uint64_t(__nv_fp8_e4m3(x[i]).__x) << (8 * i);
         reinterpret_cast<uint64_t*>(codes)[row * (cols / 8) + v] = out;
       } else {
         reinterpret_cast<uint32_t*>(codes)[row * (cols / 8) + v] = fp32_vec_to_e2m1(x);
       }
     }
   }
-}
-
-template <bool Pack, bool IsMX = false, class T>
-void restoredRows(T* values, void* codes, TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
-                  int64_t const* expert_first_token_offset, int64_t const num_experts_per_node,
-                  int64_t const num_rows, int64_t const cols, cudaStream_t stream) {
-  int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-  int64_t const blocks = std::min(smCount * 16, std::max((num_rows + 7) / 8, int64_t{1}));
-  restoredRowsKernel<T, Pack, IsMX><<<blocks, 256, 0, stream>>>(
-      values, codes, sf, expert_first_token_offset, num_experts_per_node, num_rows, cols);
 }
 
 // Token rows restored to 16 bits (K padded) into their local (k, token) permuted rows, a CTA a row
@@ -1452,11 +1472,6 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
                                        int* wide_rows) {
   static_assert(!IsMX || std::is_same_v<T, __nv_bfloat16>);
   int64_t const vecs = cols / 8, padded_vecs = padNvfp4K(cols) / 8;  // of 8 values
-  auto block_sf = [&](int64_t row, int64_t block, int64_t blocks) {
-    return *cvt_quant_get_sf_out_offset<uint8_t, 1>(
-        std::nullopt, row, block, std::nullopt, blocks, const_cast<uint8_t*>(sf),
-        swizzled_sf ? QuantizationSFLayout::SWIZZLED_128x4 : QuantizationSFLayout::LINEAR);
-  };
   // Words of 8 values v (codes, block scale; zeros in the K padding), read ahead of their stores.
   struct Words {
     uint4 q;
@@ -1465,10 +1480,10 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
   auto read = [&](int64_t row, int64_t v) {
     Words w{};
     if constexpr (IsMX) {
-      w.e = block_sf(row, v / 4, vecs / 4);
+      w.e = readSF(sf, row, v / 4, vecs / 4, swizzled_sf);
       *reinterpret_cast<uint64_t*>(&w.q) = static_cast<uint64_t const*>(input)[row * vecs + v];
     } else if (v < vecs && sf) {
-      w.e = block_sf(row, v / 2, swizzled_sf ? padded_vecs / 2 : vecs / 2);
+      w.e = readSF(sf, row, v / 2, swizzled_sf ? padded_vecs / 2 : vecs / 2, swizzled_sf);
       w.q.x = static_cast<uint32_t const*>(input)[row * vecs + v];
     } else if (v < vecs) {
       w.q = static_cast<uint4 const*>(input)[row * vecs + v];
@@ -1524,9 +1539,7 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
       if (permuted_row >= 0 && blockIdx.y == 0) {
         fc1_row_scales[permuted_row] = fc1_scale;
         fc2_row_scales[permuted_row] = fc2_scale;
-        if constexpr (IsMX) {
-          wide_rows[permuted_row] = wide;
-        }
+        if constexpr (IsMX) wide_rows[permuted_row] = wide;
       }
     }
   }
@@ -1540,11 +1553,16 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
 // 4 blocks at a time, the next 4 loading meanwhile (cols % 128 == 0).
 template <class OutT>
 __global__ void __launch_bounds__(128)
-    completeWideMxfp8RowsKernel(OutT* output, QuantParams::RestoredMxfp8Inputs const input,
-                                void const* weights, void const* weight_scales,
-                                float const* row_scales, int64_t const* expert_first_token_offset,
-                                int64_t const num_rows, int64_t const cols, int64_t const n) {
-  auto const* codes = static_cast<uint8_t const*>(input.codes);
+    completeWideMxfp8RowsKernel(OutT* output, uint8_t const* codes, uint8_t const* sf,
+                                bool const swizzled_sf, int const* wide_rows,
+                                int const* permuted_row_to_unpermuted_row, uint8_t const* weights,
+                                uint16_t const* weight_scales, float const* row_scales,
+                                int64_t const* expert_first_token_offset, int64_t const num_rows,
+                                int64_t const cols, int64_t const n) {
+  using Mma = cutlass::arch::Mma<cutlass::gemm::GemmShape<16, 8, 16>, 32, cutlass::bfloat16_t,
+                                 cutlass::layout::RowMajor, cutlass::bfloat16_t,
+                                 cutlass::layout::ColumnMajor, float, cutlass::layout::RowMajor,
+                                 cutlass::arch::OpMultiplyAdd>;
   int64_t const blocks = cols / TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize;
   unsigned const tiles = n / 128;  // column tiles
   int64_t const expert = blockIdx.x / tiles;
@@ -1559,8 +1577,10 @@ __global__ void __launch_bounds__(128)
   uint32_t const* warp_scales =
       reinterpret_cast<uint32_t const*>(weight_scales) + expert * (cols / 16) * n / 2 + col0 / 2;
   constexpr unsigned ABlocks = 4;
-  // A: the tile's 32 rows of ABlocks blocks (codes as loaded, two chunks, then BF16 with 8 values
-  // more a row: ldmatrix rows in other banks) and E8M0 scales; rows past count unfilled, unused.
+  __shared__ uint16_t code_bf16[256];
+  // A: the tile's 32 rows of ABlocks blocks (codes as loaded, two chunks, then in BF16, each row 8
+  // values more: ldmatrix rows in other banks) and their E8M0 scales; rows past the tile's count
+  // not filled, their mma rows unused.
   __shared__ alignas(16) uint8_t tile_codes[2][32][ABlocks * 32];
   __shared__ alignas(16) uint16_t tile_a[32][ABlocks * 32 + 8];
   __shared__ alignas(16) float tile_sf[ABlocks][8][4];  // as 2^(ea - 127): row 8i + g at [g][i]
@@ -1574,13 +1594,12 @@ __global__ void __launch_bounds__(128)
   __shared__ int64_t tile_rows[32 + 128], tile_tokens[32 + 128];  // flagged, not yet computed
   __shared__ int warp_counts[4];
   int pending = 0;
+  bool tables = false;
   for (int64_t start = first; start < last; start += blockDim.x) {
     // This piece's flagged rows after the pending ones, in order.
     int64_t const row = start + threadIdx.x;
-    unsigned const ballot = __ballot_sync(~0u, row < last && input.wide_rows[row]);
-    if (lane == 0) {
-      warp_counts[warp] = __popc(ballot);
-    }
+    unsigned const ballot = __ballot_sync(~0u, row < last && wide_rows[row]);
+    if (lane == 0) warp_counts[warp] = __popc(ballot);
     __syncthreads();  // also the last tile's rows read
     int offset = pending, total = pending;
     for (int w = 0; w < 4; ++w) {
@@ -1590,7 +1609,15 @@ __global__ void __launch_bounds__(128)
     if (ballot >> lane & 1) {
       int const pos = offset + __popc(ballot & ((1u << lane) - 1));
       tile_rows[pos] = row;
-      tile_tokens[pos] = input.permuted_row_to_unpermuted_row[row] % num_rows;
+      tile_tokens[pos] = permuted_row_to_unpermuted_row[row] % num_rows;
+    }
+    if (total > 0 && !tables) {  // the code table, at the first flagged row
+      tables = true;
+      for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+        __nv_fp8_e4m3 code;
+        code.__x = i;
+        code_bf16[i] = __bfloat16_as_ushort(__float2bfloat16(float(code)));
+      }
     }
     __syncthreads();
     bool const end = start + blockDim.x >= last;
@@ -1627,11 +1654,8 @@ __global__ void __launch_bounds__(128)
             warp_scales + (block0 + lane / 4 % ABlocks) * n + lane % 4 * 4, lane < 4 * ABlocks);
         cutlass::arch::cp_async_fence();
         if (int(threadIdx.x / ABlocks) < count) {
-          sf_next = *cvt_quant_get_sf_out_offset<uint8_t, 1>(
-              std::nullopt, tile_tokens[done + threadIdx.x / ABlocks],
-              block0 + threadIdx.x % ABlocks, std::nullopt, blocks, const_cast<uint8_t*>(input.sf),
-              input.swizzled_sf ? QuantizationSFLayout::SWIZZLED_128x4
-                                : QuantizationSFLayout::LINEAR);
+          sf_next = readSF(sf, tile_tokens[done + threadIdx.x / ABlocks],
+                           block0 + threadIdx.x % ABlocks, blocks, swizzled_sf);
         }
       };
       load(0, 0);
@@ -1640,26 +1664,23 @@ __global__ void __launch_bounds__(128)
         cutlass::arch::cp_async_wait<0>();
         __syncthreads();  // this chunk in buffer buf, the last one's read
         uint8_t const sf_now = sf_next;
-        if (block0 + ABlocks < blocks) {
-          load(block0 + ABlocks, buf ^ 1);
-        }
+        if (block0 + ABlocks < blocks) load(block0 + ABlocks, buf ^ 1);
 #pragma unroll
         for (unsigned i = threadIdx.x; i < 32 * ABlocks * 2; i += 128) {
           unsigned const row = i / (ABlocks * 2), part = i % (ABlocks * 2);  // 16 codes
-          if (int(row) >= count) {
-            break;
-          }
+          if (int(row) >= count) break;
           uint4 const v =
               *reinterpret_cast<uint4 const*>(&tile_codes[buf][row][(part ^ row % 4 * 2) * 16]);
           uint32_t w[4] = {v.x, v.y, v.z, v.w}, p[8], nan = 0;
 #pragma unroll
-          for (int k = 0; k < 4; ++k) {
-            nan |= (w[k] & 0x7f7f7f7fu) + 0x01010101u;
-          }
+          for (int k = 0; k < 4; ++k) nan |= (w[k] & 0x7f7f7f7fu) + 0x01010101u;
           // fast_dequant_f8f16x4 is exact but for NaN (codes 0x7f, 0xff: 480).
           if (nan & 0x80808080u) {
-            restoreMxfp8x8Scaled(w[0] | uint64_t(w[1]) << 32, 127, 0, p);
-            restoreMxfp8x8Scaled(w[2] | uint64_t(w[3]) << 32, 127, 0, p + 4);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+              p[k] = code_bf16[w[k / 2] >> 16 * (k % 2) & 0xff] |
+                     uint32_t(code_bf16[w[k / 2] >> (16 * (k % 2) + 8) & 0xff]) << 16;
+            }
           } else {
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
@@ -1710,16 +1731,12 @@ __global__ void __launch_bounds__(128)
           // Each MX scale fills two 16-wide K steps; this thread's columns 2t, 2t + 1 of each j.
           uint32_t u2[4];
 #pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            u2[j] = tile_u[buf][warp][block][4 * j + t];
-          }
+          for (int j = 0; j < 4; ++j) u2[j] = tile_u[buf][warp][block][4 * j + t];
           float4 const r = *reinterpret_cast<float4 const*>(&tile_sf[block][g][0]);
           float const ra[4] = {r.x, r.y, r.z, r.w};  // rows g + 8i
           int ea[4];
 #pragma unroll
-          for (int i = 0; i < 4; ++i) {
-            ea[i] = __float_as_uint(ra[i]) >> 23;
-          }
+          for (int i = 0; i < 4; ++i) ea[i] = __float_as_uint(ra[i]) >> 23;
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
             // B: column col0 + 8j + g, bytes 4t to 4t + 3 of its block (cutlass_nvfp4_sm80_weights:
@@ -1741,12 +1758,13 @@ __global__ void __launch_bounds__(128)
             }
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-              if (h >= hs) {
-                break;
-              }
-              float sum[4] = {};
-              cutlass_kernels_oss::sm80_fp4_small_m::mma_bf16(sum, a[h][0].data(), b);
-              cutlass_kernels_oss::sm80_fp4_small_m::mma_bf16(sum, a[h][1].data(), b + 2);
+              if (h >= hs) break;
+              Mma::FragmentC sum, zero;
+              zero.clear();
+              Mma{}(sum, reinterpret_cast<Mma::FragmentA const&>(a[h][0]),
+                    reinterpret_cast<Mma::FragmentB const&>(b[0]), zero);
+              Mma{}(sum, reinterpret_cast<Mma::FragmentA const&>(a[h][1]),
+                    reinterpret_cast<Mma::FragmentB const&>(b[2]), sum);
               if (fast) {
                 float const rw[2] = {__uint_as_float((u2[j] << 16 & 0x7f800000u) + (3u << 23)),
                                      __uint_as_float((u2[j] & 0x7f800000u) + (3u << 23))};
@@ -1761,9 +1779,7 @@ __global__ void __launch_bounds__(128)
               for (int i = 0; i < 4; ++i) {
                 uint32_t const u = u2[j] >> 16 * (i % 2) & 0xffff;
                 float s = sum[i];
-                if (ea[2 * h + i / 2] == 255 || u >> 7 == 0xff) {
-                  s = __uint_as_float(0x7fc00000u);
-                }
+                if (ea[2 * h + i / 2] == 255 || u >> 7 == 0xff) s = __uint_as_float(0x7fc00000u);
                 int const e = ea[2 * h + i / 2] + (u >> 7 ? (u >> 7) + 3 : __ffs(u) - 4) - 254;
                 acc[h][j][i] = fmaf(s * exp2Int(e >> 1), exp2Int(e - (e >> 1)), acc[h][j][i]);
               }
@@ -1772,24 +1788,16 @@ __global__ void __launch_bounds__(128)
         };
         if (split && halves == 2) {
 #pragma unroll
-          for (unsigned block = 0; block < ABlocks; ++block) {
-            block_step(block, true, 2);
-          }
+          for (unsigned block = 0; block < ABlocks; ++block) block_step(block, true, 2);
         } else if (split && count > 8) {
 #pragma unroll
-          for (unsigned block = 0; block < ABlocks; ++block) {
-            block_step(block, true, 1);
-          }
+          for (unsigned block = 0; block < ABlocks; ++block) block_step(block, true, 1);
         } else if (split) {
 #pragma unroll
-          for (unsigned block = 0; block < ABlocks; ++block) {
-            block_step(block, true, 1, 2);
-          }
+          for (unsigned block = 0; block < ABlocks; ++block) block_step(block, true, 1, 2);
         } else {
 #pragma unroll 1
-          for (unsigned block = 0; block < ABlocks; ++block) {
-            block_step(block, false, halves);
-          }
+          for (unsigned block = 0; block < ABlocks; ++block) block_step(block, false, halves);
         }
       }
       __syncthreads();  // the tile's buffers read
@@ -2675,9 +2683,7 @@ __global__ void finalizeMoeRoutingKernel(
     float scale = 0.f;
     if (expert_id >= 0 && expert_id < num_experts_per_node) {
       expanded_permuted_row = unpermuted_row_to_permuted_row[original_row + k_idx * num_rows];
-      if (expanded_permuted_row >= num_rows * experts_per_token) {
-        expanded_permuted_row = -1;
-      }
+      if (expanded_permuted_row >= num_rows * experts_per_token) expanded_permuted_row = -1;
       scale = (SCALE_MODE == ScaleMode::NO_SCALE) ? 1.f : scales[k_offset];
     }
     return Entry{static_cast<int>(std::max<int64_t>(expanded_permuted_row, -1)),
@@ -2731,9 +2737,7 @@ __global__ void finalizeMoeRoutingKernel(
       }
 #pragma unroll
       for (int j = 0; j < kLoads; ++j) {
-        if (entries[j].row < 0) {
-          continue;
-        }
+        if (entries[j].row < 0) continue;
         ComputeElem expert_result = arrayConvert<InputElem, ComputeElem>(expert_rows[j]);
         if (bias) {
           auto const* bias_ptr = bias_v + entries[j].expert * num_elems_in_padded_col;
@@ -2937,19 +2941,13 @@ void finalizeMoeRoutingKernelLauncher(
 #if defined(FLASHINFER_FP4_SW_CVT)
     // Few rows: a row's columns split over more CTAs, threads halved to 64 while CTAs have an SM.
     static int const smCount = tensorrt_llm::common::getMultiProcessorCount();
-    int64_t const elem_per_thread =
-        128 / std::min(sizeof_bits<OutputType>::value, sizeof_bits<GemmOutputType>::value);
-    int64_t const vecs = unpadded_cols / elem_per_thread;
+    int64_t const vecs = unpadded_cols * std::min(sizeof(OutputType), sizeof(GemmOutputType)) / 16;
     int64_t const sms_per_row = std::max<int64_t>(smCount / std::max<int64_t>(blocks, 1), 1);
     int64_t threads = FINALIZE_THREADS_PER_BLOCK;
-    while (threads > 64 && tensorrt_llm::common::ceilDiv(vecs, threads / 2) <= sms_per_row) {
-      threads /= 2;
-    }
-    int64_t const splits = std::min(tensorrt_llm::common::ceilDiv(vecs, threads), sms_per_row);
-    config.gridDim = dim3(blocks, std::max<int64_t>(splits, 1));
+    while (threads > 64 && ceilDiv(vecs, threads / 2) <= sms_per_row) threads /= 2;
+    config.gridDim = dim3(blocks, std::clamp<int64_t>(ceilDiv(vecs, threads), 1, sms_per_row));
     config.dynamicSmemBytes =
-        tensorrt_llm::common::roundUp(std::min<int64_t>(experts_per_token, FINALIZE_CACHED_K),
-                                      int64_t{FINALIZE_K_LOADS}) *
+        roundUp(std::min<int64_t>(experts_per_token, FINALIZE_CACHED_K), FINALIZE_K_LOADS) *
         (2 * sizeof(int) + sizeof(float));
 #else
     int64_t const threads = FINALIZE_THREADS_PER_BLOCK;
@@ -3081,9 +3079,7 @@ struct ClampedSituAdaptor : SituAdaptor {
       gate = cutlass::minimum<T, true>{}(gate, limit);
       linear = cutlass::maximum<T, true>{}(cutlass::minimum<T, true>{}(linear, limit), -limit);
     }
-    if (linear_beta != inf) {
-      return SituAdaptor::operator()(gate, linear);
-    }
+    if (linear_beta != inf) return SituAdaptor::operator()(gate, linear);
     T up_scale;
     up_scale.fill(inf);
     return SituAdaptor{beta, 1.0f}(gate, up_scale) * linear;
@@ -3250,7 +3246,6 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     float const* fc2_act_global_scale, bool use_per_expert_act_scale,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, float* fp8_token_dequant_scale,
     float const* fp8_expert_residual_scale, ActivationParams activation_params) {
-#ifdef ENABLE_FP4
   // FP16/BF16 output of the NVFP4 values restored (code x scale), K padded, for 16-bit GEMMs.
   constexpr bool IsRestoredNVFP4 =
       (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) &&
@@ -3260,6 +3255,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
   constexpr bool IsRestoredMXFP8 =
       std::is_same_v<T, __nv_bfloat16> && std::is_same_v<GemmOutputType, T> &&
       BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+#ifdef ENABLE_FP4
   constexpr bool IsNVFP4 =
       (std::is_same_v<T, Fp4Type> || IsRestoredNVFP4) &&
       BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
@@ -3267,8 +3263,6 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
       (std::is_same_v<T, __nv_fp8_e4m3> || IsRestoredMXFP8) &&
       BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
 #else
-  constexpr bool IsRestoredNVFP4 = false;
-  constexpr bool IsRestoredMXFP8 = false;
   constexpr bool IsNVFP4 = cute::dependent_false<T>;
   constexpr bool IsMXFP8 = cute::dependent_false<T>;
 #endif
@@ -3432,9 +3426,8 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
         // We use GemmOutputType as the intermediate compute type as that should always be
         // unquantized
         TmaWarpSpecializedGroupedGemmInput::ElementSF sf = 0;
-        auto res = quantizePackedFPXValue<
-            GemmOutputType, std::conditional_t<IsRestoredMXFP8, __nv_fp8_e4m3, T>, ComputeElem,
-            VecSize, DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG, IsRestoredMXFP8>(
+        auto res = quantizePackedFPXValue<GemmOutputType, T, ComputeElem, VecSize,
+                                          DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
             post_act_val, global_scale_val, num_tokens_before_expert, expert, token, elem_index,
             inter_size, fc2_act_sf_flat,
             IsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
@@ -3544,13 +3537,6 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
       tensorrt_llm::common::ceilDiv(int64_t{8} * MAX_ACTIVATION_THREADS_PER_BLOCK, threads));
   int64_t const blocks =
       std::min(smCount * blocks_per_sm, std::max(expanded_num_tokens, int64_t{1}));
-  int64_t splits = 1;
-#if defined(FLASHINFER_FP4_SW_CVT)
-  // Fewer rows: a row's columns split over more CTAs, but not per-token FP8 quant (a row per CTA).
-  if (fp8_token_dequant_scale == nullptr) {
-    splits = std::min(ceilDiv(loads_per_row, threads), smCount * blocks_per_sm / blocks);
-  }
-#endif
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type, auto disableFP4QuantFastMathTag,
@@ -3663,7 +3649,13 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
   }();
 
   cudaLaunchConfig_t config;
-  config.gridDim = dim3(blocks, splits);
+  config.gridDim = blocks;
+#if defined(FLASHINFER_FP4_SW_CVT)
+  // Fewer rows: a row's columns split over more CTAs, but not per-token FP8 quant (a row per CTA).
+  if (fp8_token_dequant_scale == nullptr) {
+    config.gridDim.y = std::min(ceilDiv(loads_per_row, threads), smCount * blocks_per_sm / blocks);
+  }
+#endif
   config.blockDim = threads;
   config.dynamicSmemBytes = 0;
   config.stream = stream;
@@ -3889,7 +3881,6 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
                                                           bool min_latency_mode, bool use_awq) {
   size_t num_moe_inputs =
       min_latency_mode ? num_experts_per_node * num_rows : experts_per_token * num_rows;
-  // Below SM100 the restored activations are padded to the NVFP4 K alignment.
   int64_t const k_hidden = use_restored_fp4 ? padNvfp4K(hidden_size) : hidden_size;
   int64_t const k_inter = use_restored_fp4 ? padNvfp4K(inter_size) : inter_size;
   size_t const permuted_elems = num_moe_inputs * k_hidden;
@@ -3947,9 +3938,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
 #if defined(FLASHINFER_FP4_SW_CVT)
   // Below SM100 the one-CTA sort keeps every expanded row, even an expert a token picks twice
   // (the three-step sort keeps it once).
-  if (!min_latency_mode && num_moe_inputs <= SMALL_PROLOGUE_THREADS) {
-    act_sf_rows = num_moe_inputs;
-  }
+  if (!min_latency_mode && num_moe_inputs <= SMALL_PROLOGUE_THREADS) act_sf_rows = num_moe_inputs;
 #endif
   size_t const sf_size =
       getScalingType() == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX
@@ -4507,13 +4496,11 @@ void CutlassMoeFCRunner<
     TLLM_CHECK(!use_block_scaling || use_restored_fp4);
 
     // Row scales carry the experts' global scales; with token rows the small-M kernel takes them.
-    alpha_scale_ptr_array =
-        use_restored_fp4 && (act_fp8_token_scale || w4a16TokenRows(quant_params))
-            ? nullptr
-            : computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                                     use_restored_fp4 ? quant_params.fp4.fc1.global_scale
-                                                      : quant_params.fp8.dequant_fc1,
-                                     stream);
+    bool const no_alpha = use_restored_fp4 && (act_fp8_token_scale || w4a16TokenRows(quant_params));
+    float const* const fc1_alpha =
+        use_restored_fp4 ? quant_params.fp4.fc1.global_scale : quant_params.fp8.dequant_fc1;
+    alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
+                                                   no_alpha ? nullptr : fc1_alpha, stream);
 
     auto universal_input = GroupedGemmInput<T, WeightType, BackBoneType, BackBoneType>{
         input,
@@ -4545,11 +4532,13 @@ void CutlassMoeFCRunner<
     gemm_runner.moeGemm(universal_input, TmaWarpSpecializedGroupedGemmInput{});
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
     if constexpr (use_restored_mx) {
-      if (quant_params.restored_mxfp8.wide_rows) {  // none from the profiler
+      if (auto const& in = quant_params.restored_mxfp8; in.wide_rows) {  // none from the profiler
         completeWideMxfp8RowsKernel<<<num_experts_per_node*(fc1_out_size / 128), 128, 0, stream>>>(
-            static_cast<UnfusedGemmOutputType*>(intermediate_result), quant_params.restored_mxfp8,
-            fc1_expert_weights, quant_params.groupwise.fc1.weight_scales, act_fp8_token_scale,
-            expert_first_token_offset, num_rows, hidden_size, fc1_out_size);
+            static_cast<UnfusedGemmOutputType*>(intermediate_result),
+            static_cast<uint8_t const*>(in.codes), in.sf, in.swizzled_sf, in.wide_rows,
+            in.permuted_row_to_unpermuted_row, reinterpret_cast<uint8_t const*>(fc1_expert_weights),
+            static_cast<uint16_t const*>(quant_params.groupwise.fc1.weight_scales),
+            act_fp8_token_scale, expert_first_token_offset, num_rows, hidden_size, fc1_out_size);
       }
     }
 #endif
@@ -4798,7 +4787,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
   }
 
   bool has_different_output_type_ampere = (use_w4afp8 || use_fp8) && !using_tma_ws_gemm2;
-  has_different_output_type_ampere |= use_restored_fp4 && !using_tma_ws_gemm2;
   bool using_fused_finalize =
       tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
   bool has_different_output_type_tma_ws = !using_fused_finalize && using_tma_ws_gemm2;
@@ -5293,13 +5281,7 @@ void CutlassMoeFCRunner<
     sync_check_cuda_error(stream);
   } else {
     bool fused_prologue_result = false;
-    bool try_fused_prologue = true;
-#if defined(FLASHINFER_FP4_SW_CVT)
-    // Rows <= experts sort faster in one CTA (scan over rows) than the fused radix rank (experts).
-    try_fused_prologue = num_rows * experts_per_token >
-                         std::min<int64_t>(SMALL_PROLOGUE_THREADS, num_experts_per_node);
-#endif
-    if (!use_sm90_mixed_input_gemm && try_fused_prologue) {
+    if (!use_sm90_mixed_input_gemm) {
       // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
       // W4AFP8
       fused_prologue_result = fusedBuildExpertMapsSortFirstToken(
@@ -5374,6 +5356,7 @@ void CutlassMoeFCRunner<
           enable_pdl, stream);
     }
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
+    int64_t const fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size;
     if constexpr (use_restored_fp4) {
       auto* scratch = reinterpret_cast<BackBoneType*>(glu_inter_result_);
       // BF16 W4A16 with both GEMMs small-M restores nothing: GEMM1 reads the token rows in place
@@ -5382,8 +5365,7 @@ void CutlassMoeFCRunner<
           restore_tokens && !quant_params.fp4.fc1.act_global_scale && !use_lora &&
           gemm1_config_->enableCudaKernel && gemm2_config_->enableCudaKernel &&
           cutlass_kernels_oss::sm80FP4SmallMSupportsShape(
-              inter_size * (is_gated_activation ? 2 : 1), hidden_size, expanded_num_rows,
-              num_experts_per_node) &&
+              fc1_out_size, hidden_size, expanded_num_rows, num_experts_per_node) &&
           cutlass_kernels_oss::sm80FP4SmallMSupportsShape(
               hidden_size, padNvfp4K(inter_size), expanded_num_rows, num_experts_per_node)) {
         quant_params.w4a16_token_rows = permuted_row_to_unpermuted_row_;
@@ -5394,8 +5376,9 @@ void CutlassMoeFCRunner<
                                         hidden_size % 64 == 0 && inter_size % 64 == 0),
                              "NVFP4 W4A16 takes 16-bit activations, hidden and inter sizes "
                              "divisible by 64");
+        int64_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
         void const* codes = input_activations;
-        auto const* sf = input_sf;
+        auto const* sf = w4a16 ? nullptr : input_sf;
         bool swizzled = swizzled_input_sf;
         if constexpr (!std::is_same_v<InputType, Fp4Type> && !use_restored_mx) {
           if (!w4a16) {
@@ -5403,8 +5386,7 @@ void CutlassMoeFCRunner<
                                   TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize>(
                 1, num_rows, hidden_size, input_activations, quant_params.fp4.fc1.act_global_scale,
                 reinterpret_cast<int64_t*>(scratch), reinterpret_cast<int32_t*>(fc1_fp4_act_scale_),
-                false, QuantizationSFLayout::SWIZZLED_128x4,
-                tensorrt_llm::common::getMultiProcessorCount(), enable_pdl, false, false,
+                false, QuantizationSFLayout::SWIZZLED_128x4, sm_count, enable_pdl, false, false,
                 resolveNVFP4Recipe(quant_params.fp4.nvfp4_4over6_code), stream);
             codes = scratch;
             sf = fc1_fp4_act_scale_;
@@ -5417,33 +5399,27 @@ void CutlassMoeFCRunner<
             use_restored_mx ? reinterpret_cast<int*>(fc2_row_scales + expanded_num_rows + 128)
                             : nullptr;
         // Few rows: columns split over more CTAs as in finalize, but not MXFP8 (wide flag per row).
-        int64_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
         int64_t const ctas = std::min(sm_count * 8, std::max(num_rows, int64_t{1}));
         int64_t const padded_vecs = padNvfp4K(hidden_size) / 8;
         int64_t const sms_per_row = use_restored_mx ? 1 : std::max<int64_t>(sm_count / ctas, 1);
         int64_t threads = 256;
-        while (threads > 64 && ceilDiv(padded_vecs, threads / 2) <= sms_per_row) {
-          threads /= 2;
-        }
+        while (threads > 64 && ceilDiv(padded_vecs, threads / 2) <= sms_per_row) threads /= 2;
         int64_t const splits = std::min(ceilDiv(padded_vecs, threads), sms_per_row);
         // The chunk's permuted rows, rounded up to 16 bytes: sm_90a loads them 4 at a time.
         size_t const smem = roundUp(std::min<int64_t>(experts_per_token, threads), 4) * sizeof(int);
         restoreTokenRowsKernel<BackBoneType, use_restored_mx>
             <<<dim3(ctas, splits), threads, smem, stream>>>(
-                reinterpret_cast<BackBoneType*>(permuted_data_), codes, w4a16 ? nullptr : sf,
-                swizzled, num_rows, hidden_size, token_selected_experts,
-                unpermuted_row_to_permuted_row, experts_per_token, start_expert,
-                num_experts_per_node, quant_params.fp4.fc1.global_scale,
-                quant_params.fp4.fc2.global_scale, per_token_scale, row_scales, fc2_row_scales,
-                wide_rows);
-        if constexpr (use_restored_mx) {
-          quant_params.restored_mxfp8 = {input_activations, input_sf, swizzled_input_sf, wide_rows,
-                                         permuted_row_to_unpermuted_row_};
-        }
+                reinterpret_cast<BackBoneType*>(permuted_data_), codes, sf, swizzled, num_rows,
+                hidden_size, token_selected_experts, unpermuted_row_to_permuted_row,
+                experts_per_token, start_expert, num_experts_per_node,
+                quant_params.fp4.fc1.global_scale, quant_params.fp4.fc2.global_scale,
+                per_token_scale, row_scales, fc2_row_scales, wide_rows);
+        quant_params.restored_mxfp8 = {input_activations, input_sf, swizzled_input_sf, wide_rows,
+                                       permuted_row_to_unpermuted_row_};
       } else {
-        restoredRows<false>(reinterpret_cast<BackBoneType*>(permuted_data_), scratch,
-                            fc1_fp4_act_scale_, expert_first_token_offset_, num_experts_per_node,
-                            expanded_num_rows, hidden_size, stream);
+        restoreNvfp4RowsKernel<<<rowWarpCtas(expanded_num_rows), 256, 0, stream>>>(
+            reinterpret_cast<BackBoneType*>(permuted_data_), scratch, fc1_fp4_act_scale_, true,
+            expert_first_token_offset_, num_experts_per_node, expanded_num_rows, hidden_size);
       }
     }
 #endif
@@ -5490,17 +5466,14 @@ void CutlassMoeFCRunner<
         use_restored_fp4 || use_sm90_mx || !(lora_params.fc1_deltas || lora_params.fc2_inputs),
         "Only the restored FP4 and SM90 MXFP8 x MXFP4 runners take TRT-LLM's LoRA");
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
-    if constexpr (use_restored_fp4 || use_sm90_mx) {
-      if (lora_params.fc1_deltas) {  // GEMM1's row biases, the (k, token) rows permuted
-        expandInputRowsKernelLauncher(static_cast<ScaleBiasType const*>(lora_params.fc1_deltas),
-                                      static_cast<ScaleBiasType*>(lora_params.fc1_row_biases),
-                                      nullptr, nullptr, permuted_row_to_unpermuted_row_, nullptr,
-                                      expanded_num_rows, inter_size * (is_gated_activation ? 2 : 1),
-                                      1, num_experts_per_node, QuantParams{}, false,
-                                      expert_first_token_offset_, nullptr, nullptr, true, nullptr,
-                                      nullptr, nullptr, nullptr, enable_pdl, stream);
-        fc1_expert_biases = static_cast<ScaleBiasType const*>(lora_params.fc1_row_biases);
-      }
+    if (lora_params.fc1_deltas) {  // GEMM1's row biases, the (k, token) rows permuted
+      expandInputRowsKernelLauncher(
+          static_cast<ScaleBiasType const*>(lora_params.fc1_deltas),
+          static_cast<ScaleBiasType*>(lora_params.fc1_row_biases), nullptr, nullptr,
+          permuted_row_to_unpermuted_row_, nullptr, expanded_num_rows, fc1_out_size, 1,
+          num_experts_per_node, QuantParams{}, false, expert_first_token_offset_, nullptr, nullptr,
+          true, nullptr, nullptr, nullptr, nullptr, enable_pdl, stream);
+      fc1_expert_biases = static_cast<ScaleBiasType const*>(lora_params.fc1_row_biases);
     }
 #endif
 
@@ -5509,9 +5482,7 @@ void CutlassMoeFCRunner<
           applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
                              num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
     }
-    if (w4a16TokenRows(quant_params)) {
-      gemm1_input = static_cast<T const*>(input_activations_void);
-    }
+    if (w4a16TokenRows(quant_params)) gemm1_input = static_cast<T const*>(input_activations_void);
     sync_check_cuda_error(stream);
     // Restored FP4: activation reads rows' experts from the unfused prologue's map (fused: none).
     Self::gemm1(
@@ -5528,21 +5499,20 @@ void CutlassMoeFCRunner<
         false, nullptr, nullptr, enable_pdl);
     sync_check_cuda_error(stream);
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
-    if constexpr (use_restored_fp4 || use_sm90_mx) {
-      if (lora_params.fc2_inputs) {
-        // GEMM2's inputs in the permuted rows: restored NVFP4 or MXFP8 packed to their codes, else
-        // (W4A16, per-token NVFP4 before its quantization, SM90 MXFP8 codes) as they are.
-        if (!use_restored_mx &&
-            (use_sm90_mx || !quant_params.fp4.fc2.act_global_scale || per_token_scale)) {
-          TLLM_CUDA_CHECK(cudaMemcpyAsync(lora_params.fc2_inputs, gemm1_result,
-                                          expanded_num_rows * inter_size * sizeof(GemmInputType),
-                                          cudaMemcpyDeviceToDevice, stream));
-        } else if constexpr (use_restored_fp4) {
-          restoredRows<true, use_restored_mx>(reinterpret_cast<BackBoneType*>(gemm1_result),
-                                              lora_params.fc2_inputs, fc2_fp4_act_scale_,
-                                              expert_first_token_offset_, num_experts_per_node,
-                                              expanded_num_rows, inter_size, stream);
-        }
+    if (lora_params.fc2_inputs) {
+      // GEMM2's inputs in the permuted rows: restored NVFP4 or MXFP8 packed to their codes, else
+      // (W4A16, per-token NVFP4 before its quantization, SM90 MXFP8 codes) as they are.
+      if (!use_restored_mx &&
+          (use_sm90_mx || !quant_params.fp4.fc2.act_global_scale || per_token_scale)) {
+        TLLM_CUDA_CHECK(cudaMemcpyAsync(lora_params.fc2_inputs, gemm1_result,
+                                        expanded_num_rows * inter_size * sizeof(GemmInputType),
+                                        cudaMemcpyDeviceToDevice, stream));
+      } else if constexpr (use_restored_fp4) {
+        auto* kernel = use_restored_mx ? &packRestoredRowsKernel<BackBoneType, true>
+                                       : &packRestoredRowsKernel<BackBoneType, false>;
+        kernel<<<rowWarpCtas(expanded_num_rows), 256, 0, stream>>>(
+            lora_params.fc2_inputs, reinterpret_cast<BackBoneType const*>(gemm1_result),
+            fc2_fp4_act_scale_, expert_first_token_offset_, num_experts_per_node, inter_size);
       }
     }
     if constexpr (use_restored_fp4) {
@@ -5556,8 +5526,9 @@ void CutlassMoeFCRunner<
                                          QuantizationSFLayout::SWIZZLED_128x4,
                                          resolveNVFP4Recipe(quant_params.fp4.nvfp4_4over6_code),
                                          stream, enable_pdl, quant_params.fp4.fc2.act_global_scale);
-        restoredRows<false>(activations, glu_inter_result_, fc2_fp4_act_scale_, nullptr, 0,
-                            expanded_num_rows, inter_size, stream);
+        restoreNvfp4RowsKernel<<<rowWarpCtas(expanded_num_rows), 256, 0, stream>>>(
+            activations, glu_inter_result_, fc2_fp4_act_scale_, true, nullptr, 0, expanded_num_rows,
+            inter_size);
         nvfp4RowScalesKernel<<<std::max((expanded_num_rows + 255) / 256, int64_t{1}), 256, 0,
                                stream>>>(fc2_row_scales, quant_params.fp4.fc2.global_scale,
                                          expert_first_token_offset_, num_experts_per_node);
@@ -6457,12 +6428,6 @@ void GemmProfilerBackend::prepareQuantParams(int num_tokens, char* workspace_ptr
         static_cast<float const*>(quant_3), static_cast<float const*>(quant_4),
         static_cast<TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const*>(quant_5),
         static_cast<float const*>(quant_6));
-#if defined(FLASHINFER_FP4_SW_CVT)
-    mQuantParams.groupwise =
-        QuantParams::GroupWise(TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize,
-                               quant_2, quant_5)
-            .groupwise;
-#endif
   }
 }
 
@@ -6474,9 +6439,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(
     return;
   }
 #if defined(FLASHINFER_FP4_SW_CVT)
-  if (isNativeWfp4Afp4Family()) {
-    return;  // Below SM100 NVFP4 runs on the SM80 GEMMs.
-  }
+  if (isNativeWfp4Afp4Family()) return;  // Below SM100 NVFP4 runs on the SM80 GEMMs.
 #endif
 
   bool const use_sm90_mixed_input_gemm = isSm90MixedInputFamily();

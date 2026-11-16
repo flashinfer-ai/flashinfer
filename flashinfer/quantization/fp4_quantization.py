@@ -41,10 +41,9 @@ from ..jit import (
     sm103a_nvcc_flags,
     sm100a_nvcc_flags,
     sm100f_nvcc_flags,
-    sm90a_nvcc_flags,
 )
 from ..jit.cpp_ext import is_cuda_version_at_least
-from ..jit.fp4_quantization import gen_fp4_quantization_sm80_module
+from ..jit.fp4_quantization import gen_fp4_quantization_sm80_module, sw_cvt_nvcc_flags
 from ..utils import (
     _check_block_scale_quantization_support,
     backend_requirement,
@@ -222,9 +221,7 @@ def gen_fp4_quantization_sm107_module() -> JitSpec:
 
 
 def gen_fp4_quantization_sm90_module() -> JitSpec:
-    return gen_fp4_quantization_module(
-        sm90a_nvcc_flags + ["-DFLASHINFER_FP4_SW_CVT"], "90"
-    )
+    return gen_fp4_quantization_module(sw_cvt_nvcc_flags("90"), "90")
 
 
 def gen_fp4_quantization_sm110_module() -> JitSpec:

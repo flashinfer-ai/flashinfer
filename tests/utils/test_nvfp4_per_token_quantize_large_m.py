@@ -27,15 +27,9 @@ wraps negative there and faults with cudaErrorIllegalAddress.
 
 import pytest
 import torch
+from tests.utils.test_fp4_quantize import _is_fp4_supported
 
 from flashinfer.cute_dsl import is_cute_dsl_available
-from flashinfer.utils import (
-    get_compute_capability,
-    is_sm100a_supported,
-    is_sm110a_supported,
-    is_sm12x_supported,
-    version_at_least,
-)
 
 K = 2688
 # First row whose element offset row * K exceeds 2**31 - 1 is
@@ -60,13 +54,7 @@ def _is_nvfp4_supported() -> bool:
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
-    return (
-        get_compute_capability(device)[0] in (8, 9)
-        and version_at_least(torch.version.cuda, "12.8")
-        or is_sm100a_supported(device)
-        or is_sm110a_supported(device)
-        or is_sm12x_supported(device)
-    )
+    return _is_fp4_supported(device)
 
 
 @pytest.mark.skipif(

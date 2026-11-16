@@ -293,12 +293,8 @@ struct DqMma<
 
   using SmemIteratorScale = typename ScaleIterators::SmemIteratorScale;
 
-  // E2M1 codes keep their natural order and have no bias (see LayoutDetailsB).
-  static constexpr int kConvertedElements = MmaCore::MmaPolicy::Operator::FragmentB::kElements;
-  using Converter = std::conditional_t<
-      platform::is_same<ElementB, float_e2m1_t>::value,
-      FastE2M1NumericArrayConverter<ElementScale, kConvertedElements>,
-      FastInterleavedAndBiasedNumericArrayConverter<ElementScale, ElementB, kConvertedElements>>;
+  using Converter = FastInterleavedAndBiasedNumericArrayConverter<
+      ElementScale, ElementB, MmaCore::MmaPolicy::Operator::FragmentB::kElements>;
 
   // Define the threadblock-scoped pipelined matrix multiply
   using ThreadblockMma = cutlass::gemm::threadblock::DqMmaMultistage<

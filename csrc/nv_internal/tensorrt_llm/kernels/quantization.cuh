@@ -486,8 +486,7 @@ quantize_with_block_size_tma(
     int32_t numbatches, int32_t numRows, int32_t numCols, int32_t numPaddedCols, Type const* in,
     float const* SFScale, uint32_t* out, uint32_t* SFout, QuantizationSFLayout layout,
     const __grid_constant__ CUtensorMap tensor_map) {
-#if defined(__CUDA_ARCH__) && \
-    (__CUDA_ARCH__ >= 1000 || (defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ >= 900))
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || defined(FLASHINFER_FP4_SW_CVT))
   using Traits = TmaKernelTraits<Type>;
   using SmemType = typename Traits::SmemType;
 

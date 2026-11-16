@@ -55,11 +55,11 @@ pytestmark = pytest.mark.long_running
 def _is_fp4_supported(device: torch.device) -> bool:
     """Check if FP4 quantization is supported on this device."""
     return (
-        get_compute_capability(device)[0] in (8, 9)
-        and version_at_least(torch.version.cuda, "12.8")
-        or is_sm100a_supported(device)
+        is_sm100a_supported(device)
         or is_sm110a_supported(device)
         or is_sm12x_supported(device)
+        or get_compute_capability(device)[0] in (8, 9)
+        and version_at_least(torch.version.cuda, "12.8")
     )
 
 

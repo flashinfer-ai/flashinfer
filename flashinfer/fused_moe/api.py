@@ -582,9 +582,8 @@ _CUTLASS_FP8_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 # DeepSeek-style 128x128 FP8 block scaling is Hopper-only in the flat API.
 _CUTLASS_FP8_BLOCK_ARCHS = (90,)
 
-# MXFP8 x MXFP4: SM100/SM110/SM12x natively, SM80 to SM90 on the SM80 kernels.
-# Wider than MXFP8 x MXFP8; do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
-_CUTLASS_MXFP8_MXFP4_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
+# MXFP8 x MXFP4 runs where NVFP4 does: do not collapse it to ``_CUTLASS_MXFP8_ARCHS``.
+_CUTLASS_MXFP8_MXFP4_ARCHS = _CUTLASS_NVFP4_ARCHS
 
 # MXFP8 x MXFP8 follows the narrower flat skip: ``capability[0] not in [10]``
 # (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x.
@@ -1485,7 +1484,8 @@ class TrtllmMxInt4Config:
 class CutlassBf16Config:
     """CUTLASS BF16 backend for the unified MoE API.
 
-    Architecture coverage follows the dense-BF16 legacy flat API.
+    Architecture coverage follows the dense-BF16 legacy flat API. The unified
+    GPU tests currently exercise SM90.
 
     This backend supports packed precomputed routing with all flat CUTLASS
     activation semantics and requires ``do_finalize=True``.

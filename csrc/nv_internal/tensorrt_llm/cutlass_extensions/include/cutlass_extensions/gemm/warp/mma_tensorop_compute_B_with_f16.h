@@ -205,8 +205,8 @@ class MmaTensorOpComputeBWithF16 {
   CUTLASS_DEVICE
   MmaTensorOpComputeBWithF16() {}
 
-  /// Performs a warp-level matrix multiply-accumulate operation. On SM80+, only the first
-  /// LiveMBlocks rows of mma operations run; D keeps C in the rows after them.
+  /// Performs a warp-level matrix multiply-accumulate operation
+  /// (on SM80+ only over the first LiveMBlocks mma rows; D keeps C in the rows after them)
   template <int LiveMBlocks = MmaIterations::kRow>
   CUTLASS_DEVICE void operator()(FragmentC& D, TransformedFragmentA const& A,
                                  TransformedFragmentB const& B, FragmentC const& C,

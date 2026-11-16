@@ -163,7 +163,6 @@ struct MoeFCGemm {
 
     // Included so we can use Gemm Universal
     int batch_stride_D = 0;
-
 #if defined(FLASHINFER_FP4_SW_CVT)
     // E2M1 weights with per-token activations: FP32 scale per row of A, padded by a tile.
     float const* row_scales = nullptr;
@@ -595,18 +594,14 @@ struct MoeFCGemm {
                 {scale_row_extent, problem_size.n()}, thread_idx, tb_offset_scale,
                 params.group_size);
 
-        if constexpr (kE2m1B && Mma::Operator::MmaIterations::kRow >= 4) {
+        if constexpr (kE2m1B && Operator::MmaIterations::kRow >= 4) {
           // Only mma rows covering problem rows run, a mainloop per warp-uniform count (no per-mma
           // branch). One or two rows keep one mainloop: one skips nothing, two measured slower.
-          using WarpMma = typename Mma::Operator;
-          int const warp_m =
-              warp_idx % (Mma::WarpCount::kM * Mma::WarpCount::kN) % Mma::WarpCount::kM;
-          int const warp_rows =
-              problem_size.m() - threadblock_offset.m() - warp_m * WarpMma::Shape::kM;
-          int const live_m_blocks = __shfl_sync(
-              0xffffffff,
-              (warp_rows + WarpMma::InstructionShape::kM - 1) / WarpMma::InstructionShape::kM, 0);
-          run_with_live_m_blocks<WarpMma::MmaIterations::kRow>(live_m_blocks, [&](auto live) {
+          int const warp_m = warp_idx % (WarpCount::kM * WarpCount::kN) % WarpCount::kM;
+          int const warp_rows = problem_size.m() - threadblock_offset.m() - warp_m * WarpShape::kM;
+          int const live_m_blocks =
+              __shfl_sync(0xffffffff, ceil_div(warp_rows, InstructionShape::kM), 0);
+          run_with_live_m_blocks<Operator::MmaIterations::kRow>(live_m_blocks, [&](auto live) {
             mma(gemm_k_iterations, accumulators, iterator_A, iterator_B, iterator_scale,
                 accumulators, live);
           });
@@ -623,12 +618,11 @@ struct MoeFCGemm {
         if (params.row_scales) {
           // Each accumulator row times its FP32 scale, read in the accumulators' own fragment
           // layout: a column-major view with zero column stride repeats row_scales[row].
-          using IteratorC = typename Mma::Operator::IteratorC;
+          using IteratorC = typename Operator::IteratorC;
           using IteratorRowScale = warp::MmaTensorOpAccumulatorTileIterator<
               typename IteratorC::Shape, float, layout::ColumnMajor,
               typename IteratorC::InstructionShape, typename IteratorC::OpDelta>;
-          int const warp_m =
-              warp_idx % (Mma::WarpCount::kM * Mma::WarpCount::kN) % Mma::WarpCount::kM;
+          int const warp_m = warp_idx % (WarpCount::kM * WarpCount::kN) % WarpCount::kM;
           float* row_scale = const_cast<float*>(params.row_scales) + rows_to_jump +
                              threadblock_offset.m() + warp_m * IteratorC::Shape::kRow;
           typename IteratorRowScale::Fragment scales;

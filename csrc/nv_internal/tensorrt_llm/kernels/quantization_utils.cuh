@@ -176,7 +176,11 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
         "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
   return val;
 #elif defined(FLASHINFER_FP4_SW_CVT)
-  return fp32_vec_to_e2m1(reinterpret_cast<float(&)[8]>(array));
+  uint32_t val = 0;
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    val |= (fp32_to_e2m1_sw(array[i].x) | fp32_to_e2m1_sw(array[i].y) << 4) << (8 * i);
+  return val;
 #else
   // static_assert(false, "not supported.");
   return 0;
@@ -400,11 +404,9 @@ __device__ __forceinline__ float2 e2m1x2_byte_scaled_e4m3_to_float2(uint32_t byt
       : "r"(byteVal), "r"(static_cast<uint32_t>(scaleVal)));
 #elif defined(FLASHINFER_FP4_SW_CVT)
   // Exact in fp32, as in f16: the factors carry at most 2 and 4 significant bits.
-  __nv_fp8_e4m3 scale;
-  scale.__x = scaleVal;
   result = e2m1x2_byte_to_float2(byteVal);
-  result.x *= static_cast<float>(scale);
-  result.y *= static_cast<float>(scale);
+  float const scale = static_cast<float>(reinterpret_cast<__nv_fp8_e4m3&>(scaleVal));
+  result = make_float2(result.x * scale, result.y * scale);
 #else
   result.x = 0.0f;
   result.y = 0.0f;
@@ -482,11 +484,6 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
                 "NVFP4 4over6 requires NVFP4 scale blocks");
 
   using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t>;
-  // Block scale to SFout (one writer per block) and to every thread's SFlocal for immediate use.
-  auto const storeSF = [&](uint8_t sf) {
-    if (SFout) *SFout = sf;
-    if (SFlocal) *SFlocal = sf;
-  };
 
   // Get absolute maximum values among the local 8 values.
   auto localMax = cuda_abs(vec.elts[0]);
@@ -556,7 +553,9 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
 #if !(defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000)
     if (vecMax == 0.0f) {
-      storeSF(0);
+      if (SFout) {
+        *SFout = 0;
+      }
       return ReturnType{0};
     }
 #endif
@@ -709,6 +708,12 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       error4 = __shfl_sync(uint32_t(-1), error4, 1, 2);
       error6 = __shfl_sync(uint32_t(-1), error6, 1, 2);
     }
+    // A zero block returns only now: every lane in the warp must reach the full-mask shuffles.
+    if (vecMax == 0.0f) {
+      if (SFout) *SFout = 0;
+      if (SFlocal) *SFlocal = 0;  // Every thread's copy, for callers that use it right away.
+      return ReturnType{0};
+    }
 #else
     if constexpr (CVT_NUM_THREADS_PER_SF >= 2) {
       error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 1));
@@ -719,23 +724,26 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       error4 = __fadd_rn(error4, __shfl_xor_sync(uint32_t(-1), error4, 2));
       error6 = __fadd_rn(error6, __shfl_xor_sync(uint32_t(-1), error6, 2));
     }
-#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
-    // A zero block returns only now: every lane in the warp must reach the full-mask shuffles.
-    if (vecMax == 0.0f) {
-      storeSF(0);
-      return ReturnType{0};
-    }
-#endif
 
     if (error4 < error6) {
-      storeSF(fp8SFVal4);
+      if (SFout) {
+        *SFout = fp8SFVal4;
+      }
+      if (SFlocal) *SFlocal = fp8SFVal4;
       return e2m1Vec4;
     }
-    storeSF(fp8SFVal6);
+    if (SFout) {
+      *SFout = fp8SFVal6;
+    }
+    if (SFlocal) *SFlocal = fp8SFVal6;
     return e2m1Vec6;
   }
 
-  storeSF(fp8SFVal);
+  if (SFout) {
+    // Write the SF to global memory (STG.8).
+    *SFout = fp8SFVal;
+  }
+  if (SFlocal) *SFlocal = fp8SFVal;
 
   // Convert the input to float.
   float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
@@ -933,12 +941,13 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 #endif
 }
 
-// cvt_warp_fp16_to_mxfp8's scaling: E8M0 SF to SFout/SFlocal if given, fp2Vals = values / SF
-// saturated to +/-448.
+// Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
+// SFlocal and fp2ValsOut, if given, also take the SF and the scaled values before the conversion.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
-__device__ void scale_warp_fp16_for_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout,
-                                          uint8_t* SFlocal,
-                                          float2 (&fp2Vals)[CVT_ELTS_PER_THREAD / 2]) {
+__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
+    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout, uint8_t* SFlocal = nullptr,
+    float2* fp2ValsOut = nullptr) {
+  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || defined(FLASHINFER_FP4_SW_CVT))
   static_assert(CVT_ELTS_PER_THREAD == 8 || CVT_ELTS_PER_THREAD == 16,
                 "CVT_ELTS_PER_THREAD must be 8 or 16");
@@ -979,6 +988,8 @@ __device__ void scale_warp_fp16_for_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& 
   if (SFlocal) *SFlocal = fp8SFVal;  // Every thread's copy, for callers that use it right away.
 
   // Convert the input to float.
+  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
+
 #pragma unroll
   for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++) {
     if constexpr (std::is_same_v<Type, half>) {
@@ -992,18 +1003,8 @@ __device__ void scale_warp_fp16_for_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& 
     // value instead of NaN. This matches torch's saturating float8_e4m3fn cast.
     fp2Vals[i].x = fmaxf(fminf(fp2Vals[i].x, 448.0f), -448.0f);
     fp2Vals[i].y = fmaxf(fminf(fp2Vals[i].y, 448.0f), -448.0f);
+    if (fp2ValsOut) fp2ValsOut[i] = fp2Vals[i];
   }
-#endif
-}
-
-// Quantizes the provided PackedVec into the uint64_t (8 e4m3) or uint4 (16 e4m3) output.
-template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
-__device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_warp_fp16_to_mxfp8(
-    PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout, uint8_t* SFlocal = nullptr) {
-  using ReturnType = std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t>;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 || defined(FLASHINFER_FP4_SW_CVT))
-  float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
-  scale_warp_fp16_for_mxfp8<Type, SF_VEC_SIZE, CVT_ELTS_PER_THREAD>(vec, SFout, SFlocal, fp2Vals);
 
   // Convert to e4m3 values. Overload selected by `fp2Vals` array length:
   // ELTS_PER_THREAD=8 -> uint64_t (8 e4m3); ELTS_PER_THREAD=16 -> uint4 (16 e4m3).

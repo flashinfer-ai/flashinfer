@@ -81,15 +81,16 @@ from ...quantization.kernels.nvfp4_quantize import (
 from ...quantization.nvfp4_quantization_utils import (
     nvfp4_per_token_scale_inv,
     NVFP4_PER_TOKEN_SCALE_RTOL,
-    NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP4_4OVER6_CODE_STANDARD,
     _UNSET,
     NVFP44Over6Config,
-    nvfp4_4over6_code,
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
-from ...utils import device_support_pdl, supported_compute_capability
+from ...utils import supported_compute_capability
+from ...jit.fused_moe import gen_w4a16_moe_sm80_module
+from ..prepare import _w4a16_records_geometry, cute_dsl_w4a16_sm80_supported
+from ..prepare import cute_dsl_w4a16_sm80_weights, cutlass_nvfp4_sm80_weights
 from .moe_utils import (
     moe_output_memset_inplace,
     moe_sort,
@@ -1694,8 +1695,8 @@ class CuteDslMoEWrapper:
             nvfp4_4over6, self.quant_mode, per_token_scale
         )
         if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-            return _cute_dsl_fused_moe_below_sm100(
-                op_name, runner, inputs, tactic, **recipe_kwargs
+            return _cute_dsl_fused_moe_sm80(
+                runner, inputs, tactic, op_name, **recipe_kwargs
             )
         if tactic is not None:
             return runner(inputs, tactic=tactic, **recipe_kwargs)
@@ -1871,29 +1872,15 @@ def _cute_dsl_fused_moe_impl(
     )
 
 
-def _w4a16_records_runnable(runner) -> bool:
-    from ..prepare import cute_dsl_w4a16_sm80_supported
-
-    return cute_dsl_w4a16_sm80_supported(
-        runner.num_experts, runner.num_local_experts, runner.local_expert_offset,
-        runner.output_dtype, runner.activation_type, runner.swiglu_alpha, runner.swiglu_beta,
-        runner.swiglu_limit, runner.situ_beta,
-    )  # fmt: skip
-
-
 @functools.cache
 def _w4a16_sm80_module():
-    from ...jit.fused_moe import gen_w4a16_moe_sm80_module
-
     return gen_w4a16_moe_sm80_module().build_and_load()
 
 
-def _w4a16_moe_sm80(runner, inputs, tactic):
+def _w4a16_moe_sm80(runner, inputs, tactic, gated, runnable):
     """Runs W4A16 on records: routing into row blocks, GEMM1 with the activation, GEMM2 and the
     top-k weighted sum, with ``tactic`` from ``W4A16_SM80_TACTICS``."""
-    from ..prepare import _w4a16_records_bytes, _w4a16_records_geometry
-
-    if not _w4a16_records_runnable(runner):
+    if not runnable:
         raise ValueError(
             "Below SM100 W4A16 records run SwiGLU with default parameters and ReLU2 over all "
             "experts; pass the CuTe-DSL weights for other configurations."
@@ -1905,14 +1892,12 @@ def _w4a16_moe_sm80(runner, inputs, tactic):
             f"W4A16 records take a tactic of {W4A16_SM80_TACTICS}, got {tactic}."
         )
     row_tile, gemm1, gemm2 = tactic
-    gated = runner.activation_type == ActivationType.Swiglu
     tokens, hidden = x.shape
     num_experts, rows1, top_k = w1.shape[0], w1.shape[1], experts.shape[1]
     inter = rows1 // 2 if gated else rows1
-    expected = (
-        (num_experts, _w4a16_records_bytes(rows1, hidden, gated)),
-        (num_experts, _w4a16_records_bytes(hidden, inter, False)),
-    )
+    n1, _, _, bytes1 = _w4a16_records_geometry(rows1, hidden, gated)
+    n2, _, _, bytes2 = _w4a16_records_geometry(hidden, inter, False)
+    expected = ((num_experts, bytes1), (num_experts, bytes2))
     if (tuple(r1.shape), tuple(r2.shape)) != expected:
         raise ValueError(
             f"W4A16 records must be {expected}, got {r1.shape} and {r2.shape}."
@@ -1921,22 +1906,17 @@ def _w4a16_moe_sm80(runner, inputs, tactic):
         return out
     m = experts.numel()
     max_blocks = -(-m // row_tile) + min(num_experts, m)
-    dev, i32, bf16 = x.device, torch.int32, torch.bfloat16
-    meta = torch.empty(1 + 2 * max_blocks, dtype=i32, device=dev)
-    rowmap = torch.empty(max_blocks * row_tile, dtype=i32, device=dev)
-    workspace = torch.empty((-(-m // 2048) + 1) * num_experts, dtype=i32, device=dev)
-    blocked = torch.empty(max_blocks * row_tile, inter, dtype=bf16, device=dev)
-    y = torch.empty(m, hidden, dtype=bf16, device=dev)
+    ids = experts.to(torch.int32).contiguous()
+    meta = ids.new_empty(1 + 2 * max_blocks)
+    rowmap = ids.new_empty(max_blocks * row_tile)
+    workspace = ids.new_empty((-(-m // 2048) + 1) * num_experts)
+    blocked = x.new_empty(max_blocks * row_tile, inter)
+    y = x.new_empty(m, hidden)
     module = _w4a16_sm80_module()
-    ids = experts.to(i32).contiguous()
     module.prep(ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks)  # fmt: skip
-    n1 = _w4a16_records_geometry(rows1, hidden, gated)[0]
-    n2 = _w4a16_records_geometry(hidden, inter, False)[0]
-    act = 1 if gated else 2
-    x = x.contiguous()
     module.gemm(
-        r1, alpha1.float().contiguous(), x, meta, rowmap, blocked, row_tile, act, top_k, n1,
-        hidden, inter, max_blocks, gemm1,
+        r1, alpha1.float().contiguous(), x.contiguous(), meta, rowmap, blocked, row_tile,
+        1 if gated else 2, top_k, n1, hidden, inter, max_blocks, gemm1,
     )  # fmt: skip
     module.gemm(
         r2, alpha2.float().contiguous(), blocked, meta, rowmap, y, row_tile, 0, top_k, n2,
@@ -1946,33 +1926,30 @@ def _w4a16_moe_sm80(runner, inputs, tactic):
     return out
 
 
-def _cute_dsl_fused_moe_below_sm100(op_name, runner, inputs, tactic, **recipe_kwargs):
-    """``_cute_dsl_fused_moe_sm80`` for the public APIs: W4A16 converts MMA-layout scales to
-    records where they run, tuned under ``op_name`` unless given ``tactic``."""
-    if isinstance(runner, CuteDslFusedMoEW4A16Runner):
-        if inputs[4].dim() == 6 and _w4a16_records_runnable(runner):
-            from ..prepare import cute_dsl_w4a16_sm80_weights
-
-            gated = runner.activation_type == ActivationType.Swiglu
-            r1, r2 = cute_dsl_w4a16_sm80_weights(*inputs[3:5], *inputs[6:8], gated)
-            inputs = [*inputs[:4], r1, inputs[5], inputs[6], r2, *inputs[8:]]
-        if tactic is None and inputs[4].dim() == 2:
-            _, tactic = AutoTuner.get().choose_one(
-                op_name, [runner], runner.tuning_config, inputs
-            )
-    return _cute_dsl_fused_moe_sm80(runner, inputs, tactic, **recipe_kwargs)
-
-
-def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
+def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, op_name=None, nvfp4_4over6=_UNSET):
     """Runs ``runner`` on the CUTLASS SM80 kernels (W4A8 as W4A16 with MXFP8 activations, on SM90
     the FP8 mixed-input GEMM), converting weights unless given operands. As from SM100 the GEMM2
-    input is standard NVFP4, or per token the pinned 4over6 recipe, else the environment's."""
-    from ..core import get_cutlass_fused_moe_module
-    from ..prepare import cutlass_nvfp4_sm80_weights
+    input is standard NVFP4, or per token the pinned 4over6 recipe, else the environment's.
+    From the public APIs (``op_name``), W4A16 converts MMA-layout scales to records where they
+    run, tuned under ``op_name`` unless given ``tactic``."""
+    from ..core import _trtllm_fp4_nvfp4_4over6_code, get_cutlass_fused_moe_module
 
     w4a16 = isinstance(runner, CuteDslFusedMoEW4A16Runner)
+    _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
+    runnable = w4a16 and cute_dsl_w4a16_sm80_supported(
+        runner.num_experts, runner.num_local_experts, runner.local_expert_offset,
+        runner.output_dtype, runner.activation_type, runner.swiglu_alpha, runner.swiglu_beta,
+        runner.swiglu_limit, runner.situ_beta,
+    )  # fmt: skip
+    if runnable and op_name and inputs[4].dim() == 6:
+        r1, r2 = cute_dsl_w4a16_sm80_weights(*inputs[3:5], *inputs[6:8], gated)
+        inputs = [*inputs[:4], r1, inputs[5], inputs[6], r2, *inputs[8:]]
+    if w4a16 and op_name and tactic is None and inputs[4].dim() == 2:
+        _, tactic = AutoTuner.get().choose_one(
+            op_name, [runner], runner.tuning_config, inputs
+        )
     if w4a16 and inputs[4].dtype == torch.uint8 and inputs[4].dim() == 2:
-        return _w4a16_moe_sm80(runner, inputs, tactic)
+        return _w4a16_moe_sm80(runner, inputs, tactic, gated, runnable)
     w4a8 = getattr(runner, "quant_mode", None) == "w4a8"
     situ = runner.situ_beta is not None
     if not (w4a16 or w4a8 or runner.quant_mode == "w4a4") or tactic not in (None, -1):
@@ -1980,16 +1957,12 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
             "Below SM100 CuTe-DSL MoE runs W4A4, W4A8 and W4A16, without tactics."
         )
     if w4a16:  # no activation scales
-        x, experts, scales, w1, s1, alpha1, w2, s2, alpha2 = inputs[:9]
-        x_sf = None
-    else:
-        x, x_sf, experts, scales, w1, s1, alpha1 = inputs[:7]
-        fc2_scale, w2, s2, alpha2 = inputs[7:11]
+        inputs = [inputs[0], None, *inputs[1:6], None, *inputs[6:]]
+    x, x_sf, experts, scales, w1, s1, alpha1, fc2_scale, w2, s2, alpha2 = inputs[:11]
     out = inputs[-1]
     major, minor = torch.cuda.get_device_capability(x.device)
     if s1.dtype not in (out.dtype, torch.int32):  # int32: SM90 W4A8's operands
         mma_bytes = (5, 2, 4, 0, 1, 3)  # MMA-layout scale bytes are 128x4 swizzled
-        _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
         w1, s1, w2, s2 = cutlass_nvfp4_sm80_weights(
             w1, s1.permute(mma_bytes), w2, s2.permute(mma_bytes), out.dtype, gated, mx=w4a8,
             sm90=w4a8 and major == 9,  # on the FP8 mixed-input GEMM, as CUTLASS MoE
@@ -2006,16 +1979,13 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
         if x_sf.shape[1] % 4 or not x_sf.is_contiguous():  # K padded to 64
             x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))
         if len(quant_scales) == 7:
-            code = NVFP4_4OVER6_CODE_FROM_ENV
             if nvfp4_4over6 is not _UNSET:
-                recipe = resolve_nvfp4_4over6(nvfp4_4over6)
-                _check_gemm2_input_scale(fc2_scale, recipe)
-                code = nvfp4_4over6_code(recipe)
+                _check_gemm2_input_scale(fc2_scale, resolve_nvfp4_4over6(nvfp4_4over6))
+            code = _trtllm_fp4_nvfp4_4over6_code(nvfp4_4over6, inputs[11], x)
     experts_here = runner.num_local_experts
-
-    def per_expert(v):
-        return None if v is None else torch.full((experts_here,), v, device=x.device)
-
+    per_expert = (
+        lambda v: None if v is None else torch.full((experts_here,), v, device=x.device)
+    )
     swiglu = (runner.swiglu_alpha, runner.swiglu_beta, runner.swiglu_limit)
     if swiglu == (DEFAULT_SWIGLU_ALPHA, DEFAULT_SWIGLU_BETA, DEFAULT_SWIGLU_LIMIT):
         swiglu = (None, None, None)
@@ -2028,7 +1998,7 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
             per_expert(runner.situ_linear_beta or (float("inf") if situ else None)), False,
             # Local expert ids, as EP rank 0 of 2: ids outside the local experts are skipped.
             ep_size=1 if experts_here == runner.num_experts else 2, ep_rank=0,
-            enable_pdl=runner.enable_pdl and device_support_pdl(x.device),
+            enable_pdl=None if runner.enable_pdl else False,  # None: on where the device has PDL
             activation_type=ActivationType.Situ if situ else ActivationType(runner.activation_type),
             use_mxfp8_act_scaling=w4a8, nvfp4_4over6_code=code,
         )  # fmt: skip
@@ -2459,8 +2429,8 @@ def cute_dsl_fused_moe(
     if swap_ab:
         op_name += "::SwapAB"
     if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-        return _cute_dsl_fused_moe_below_sm100(
-            op_name, runners[0], inputs, tactic, **recipe_kwargs
+        return _cute_dsl_fused_moe_sm80(
+            runners[0], inputs, tactic, op_name, **recipe_kwargs
         )
     if tactic is not None:
         return runners[0](inputs, tactic=tactic, aux_stream=aux_stream, **recipe_kwargs)

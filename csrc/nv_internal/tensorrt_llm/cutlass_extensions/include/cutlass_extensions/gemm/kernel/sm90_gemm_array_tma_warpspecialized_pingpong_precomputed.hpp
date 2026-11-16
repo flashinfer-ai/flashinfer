@@ -898,7 +898,7 @@ class GemmUniversalPrecomputedScheduler<
 
           collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
                                   work_k_tile_count, mma_thread_idx,
-                                  shared_storage.tensors.mainloop, params.mainloop, n_coord);
+                                  shared_storage.tensors.mainloop, params.mainloop);
 
           math_wg_order_barrier.arrive();
 

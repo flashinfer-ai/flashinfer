@@ -361,8 +361,7 @@ class SingleWarpgroupPersistentGemm
 
       collective_mainloop.mma_with_released_stage_producer(
           mainloop_pipeline, mainloop_pipe_consumer_state, accumulators, work_k_tile_count,
-          mma_thread_idx, shared_storage.tensors.mainloop, params.mainloop, n_coord,
-          produce_released_stage);
+          mma_thread_idx, shared_storage.tensors.mainloop, params.mainloop, produce_released_stage);
       collective_mainloop.mma_tail(mainloop_pipeline, mainloop_pipe_consumer_state,
                                    work_k_tile_count);
       CUTLASS_ASSERT(current_k_tiles_to_refill == 0);

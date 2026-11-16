@@ -31,11 +31,7 @@ from ..jit.cake_grouped_mxfp8_quantize import (
     TILED_WIDE_F16 as _CAKE_GROUPED_MXFP8_TILED_WIDE_F16,
 )
 from ..jit.cake_program import CakeProgram
-from ..jit.fp8_quantization import (
-    gen_mxfp8_quantization_sm80_module,
-    gen_mxfp8_quantization_sm90_module,
-    gen_mxfp8_quantization_sm100_module,
-)
+from ..jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from ..jit.quantization import gen_quantization_module
 from ..utils import (
     device_support_pdl,
@@ -179,12 +175,7 @@ def _check_mxfp8_cuda_capability(device: torch.device) -> None:
 
 @functools.cache
 def get_mxfp8_quantization_sm100_module(backend: str = "100"):
-    gen_module = {
-        "80": gen_mxfp8_quantization_sm80_module,
-        "90": gen_mxfp8_quantization_sm90_module,
-        "100": gen_mxfp8_quantization_sm100_module,
-    }[backend]
-    module = gen_module().build_and_load()
+    module = gen_mxfp8_quantization_sm100_module(backend).build_and_load()
 
     @register_custom_op(
         "flashinfer::mxfp8_quantize_sm100",
@@ -513,9 +504,8 @@ def mxfp8_quantize(
             enable_pdl = device_support_pdl(input.device)
         # SM80 to SM90 convert to E2M1 and E4M3 in software in their own modules.
         major = get_compute_capability(input.device)[0] if input.is_cuda else 10
-        x_q, sf = get_mxfp8_quantization_sm100_module(
-            f"{major}0" if major in (8, 9) else "100"
-        ).mxfp8_quantize_sm100(
+        module = get_mxfp8_quantization_sm100_module(f"{min(major, 10)}0")
+        x_q, sf = module.mxfp8_quantize_sm100(
             input,
             sf_swizzle_layout,
             alignment,

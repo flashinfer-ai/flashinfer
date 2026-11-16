@@ -348,12 +348,14 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
 
 def _assert_moe_quant_mode_reference(actual, expected, quant_mode, swap_ab=False):
     # Below SM100, W4A16 kernels round differently from the split-kernel oracle.
-    if quant_mode == "w4a16" and is_sm100_family():
+    if quant_mode == "w4a16" and not is_sm100_family():
+        quant_mode = "w4a4"
+    if quant_mode == "w4a16":
         assert_w4a16_bits(actual, expected)
-    elif quant_mode in ("w4a4", "w4a8", "mxfp8", "w4a16"):
+    elif quant_mode in ("w4a4", "w4a8", "mxfp8"):
         if swap_ab:
             assert_cute_dsl_moe_bits(actual, expected)
-        elif quant_mode in ("w4a4", "w4a16"):
+        elif quant_mode == "w4a4":
             passed, percent_within, atol = check_accuracy(actual, expected)
             assert passed, (
                 f"Only {percent_within * 100:.2f}% within tolerance (atol={atol:.4f})"

@@ -36,6 +36,7 @@ from .cubin_loader import (
     ensure_symlink,
     verify_symlinked_headers,
 )
+from .fp4_quantization import sw_cvt_nvcc_flags
 from .gemm.cutlass.generate_kernels import generate_gemm_operations
 from .trtllm_gen_metainfo import (
     BLACKWELL_CUBIN_ARCHS,
@@ -184,40 +185,39 @@ def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
 
 
 # SM80 to SM89: NVFP4 runs on the SM80 16-bit x E2M1 kernels, with the FP4 conversions in software.
-_SM8X_NVCC_FLAGS = [
-    "-DENABLE_BF16", "-DENABLE_FP8", "-DUSING_OSS_CUTLASS_MOE_GEMM", "-DENABLE_FP4",
-    "-DFLASHINFER_FP4_SW_CVT", "-DFLASHINFER_FP4_QUANT_NO_TMA",
-]  # fmt: skip
-
-
 def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm89_nvcc_flags + [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
         "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
-        *_SM8X_NVCC_FLAGS,
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+        "-DENABLE_FP4",
+        "-DFLASHINFER_FP4_SW_CVT",
+        "-DFLASHINFER_FP4_QUANT_NO_TMA",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
 
 
 def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
-    nvcc_flags = (
-        current_compilation_context.get_nvcc_flags_list(supported_major_versions=[8])
-        + _SM8X_NVCC_FLAGS
-    )
+    nvcc_flags = sw_cvt_nvcc_flags("80") + [
+        "-DENABLE_BF16",
+        "-DENABLE_FP8",
+        "-DENABLE_FP4",
+        "-DUSING_OSS_CUTLASS_MOE_GEMM",
+    ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
 
 
 def gen_w4a16_moe_sm80_module() -> JitSpec:
     """BF16 x NVFP4 MoE records kernels: sm_80 code for SM80 to SM89, sm_90 for SM90."""
     majors = {major for major, _ in current_compilation_context.TARGET_CUDA_ARCHS}
-    nvcc_flags = [
-        f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors
-    ]
-    if not nvcc_flags:
+    flags = [f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors]
+    if not flags:
         raise RuntimeError("W4A16 MoE records kernels need an SM80 to SM90 target")
     return gen_jit_spec(
         "w4a16_moe_sm80",
         [jit_env.FLASHINFER_CSRC_DIR / "w4a16_moe_sm80.cu"],
-        extra_cuda_cflags=nvcc_flags,
+        extra_cuda_cflags=flags,
         use_fast_math=False,
     )
 

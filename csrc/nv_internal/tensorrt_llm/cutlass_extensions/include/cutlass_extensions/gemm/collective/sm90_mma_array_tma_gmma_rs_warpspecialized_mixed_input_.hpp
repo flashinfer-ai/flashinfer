@@ -933,8 +933,7 @@ struct CollectiveMmaArrayMixedInput<
   template <class FrgTensorC>
   CUTLASS_DEVICE void mma(MainloopPipeline pipeline, PipelineState smem_pipe_read,
                           FrgTensorC& accum, int k_tile_count, int thread_idx,
-                          TensorStorage& shared_tensors, Params const& mainloop_params,
-                          int /* n_coord */) {
+                          TensorStorage& shared_tensors, Params const& mainloop_params, int = 0) {
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
     static_assert(cute::rank(SmemLayoutA{}) == 3, "Smem layout must be rank 3.");
     static_assert(cute::rank(SmemLayoutB{}) == 3, "Smem layout must be rank 3.");

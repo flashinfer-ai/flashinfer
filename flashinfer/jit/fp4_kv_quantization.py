@@ -29,7 +29,6 @@ def gen_fp4_kv_quantization_module() -> JitSpec:
         + [
             "-DFLASHINFER_ENABLE_BF16",
             "-DFLASHINFER_ENABLE_F16",
-            "-DFLASHINFER_FP4_SW_CVT",
             "--expt-relaxed-constexpr",
         ],
     )

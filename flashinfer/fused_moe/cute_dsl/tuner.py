@@ -1349,6 +1349,10 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
 
         from .moe_utils import get_max_num_permuted_tokens
 
+        x = inputs[0]
+        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
+            records = inputs[4].dtype == torch.uint8 and inputs[4].dim() == 2
+            return list(W4A16_SM80_TACTICS) if records else []
         w1_weight = inputs[3]
         w2_weight = inputs[6]
         num_tokens = inputs[0].shape[0]
@@ -1374,11 +1378,6 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 cluster_shape_mn=cluster_shape_mn,
                 use_2cta_instrs=mma_tiler_m == 256,
             )
-
-        x = inputs[0]
-        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-            records = inputs[4].dtype == torch.uint8 and inputs[4].dim() == 2
-            return list(W4A16_SM80_TACTICS) if records else []
 
         valid_tactics = []
         for tactic in W4A16_MOE_TACTICS:

@@ -1836,13 +1836,13 @@ def test_cutlass_reuses_geometric_workspace_capacities(monkeypatch):
         runner._ensure_workspace(32, 256)
 
 
-def _is_cutlass_bf16_runtime_supported() -> bool:
+def _is_cutlass_bf16_runtime_supported(config_cls=CutlassBf16Config) -> bool:
     if not torch.cuda.is_available():
         return False
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
     arch = major * 10 + minor
-    if not CutlassBf16Config.supported(arch):
+    if not config_cls.supported(arch):
         return False
     if arch == 90:
         return is_sm90a_supported(device)
@@ -2829,10 +2829,7 @@ def test_cutlass_nvfp4_autotuned_compound_tactic_and_cuda_graph():
 
 
 def _is_cutlass_fp8_runtime_supported() -> bool:
-    if not _is_cutlass_bf16_runtime_supported():
-        return False
-    major, minor = get_compute_capability(torch.device("cuda"))
-    return CutlassFp8PerTensorConfig.supported(major * 10 + minor)
+    return _is_cutlass_bf16_runtime_supported(CutlassFp8PerTensorConfig)
 
 
 cutlass_fp8_required = pytest.mark.skipif(

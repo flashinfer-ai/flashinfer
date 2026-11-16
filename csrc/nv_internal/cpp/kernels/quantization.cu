@@ -444,8 +444,7 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
   // Kernel packs 16 values per thread via PackedVec load/store.
   TLLM_CHECK_WITH_INFO(n % 16 == 0, "n must be a multiple of 16 for NVFP4 quantization");
 #if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100 the fp16/bf16 kernel may read the inverse global scale from device memory.
-  TLLM_CHECK(!(globalScaleInvPtr && std::is_same_v<T, float>));
+  TLLM_CHECK(!(globalScaleInvPtr && std::is_same_v<T, float>));  // Only fp16/bf16 kernels read it.
 #else
   TLLM_CHECK(!globalScaleInvPtr);
 #endif
@@ -483,12 +482,11 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                            decltype(disableFP4QuantFastMathTag)::value,
                                            decltype(nvfp4_4over6_config_tag)>,
           grid, block, smem_size, stream, m, n, input, globalScaleInv, expandedIdxToPermutedIdx,
-          weightOutput, scaleOutput, perTokenScaleOutput
 #if defined(FLASHINFER_FP4_SW_CVT)
-          ,
-          globalScaleInvPtr
+          weightOutput, scaleOutput, perTokenScaleOutput, globalScaleInvPtr);
+#else
+          weightOutput, scaleOutput, perTokenScaleOutput);
 #endif
-      );
     }
   };
 

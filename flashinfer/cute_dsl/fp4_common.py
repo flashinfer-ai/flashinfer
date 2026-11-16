@@ -117,61 +117,49 @@ def _sw_pair(conv, d: str, a: str, b: str, width: int, cvt_dst: str) -> str:
     )
 
 
-def _sw_e2m1x2_to_f16x2(d: str, s: str) -> str:
-    # The f16 high byte of each E2M1 magnitude comes from a prmt table; low bytes are 0.
-    return (
-        "{\n.reg .b32 sw_x, sw_a, sw_c, sw_g, sw_l0, sw_l1;\n"
-        f"cvt.u32.u8 sw_x, {s};\nand.b32 sw_a, sw_x, 7;\nshl.b32 sw_a, sw_a, 4;\n"
-        "and.b32 sw_c, sw_x, 0x70;\nshl.b32 sw_c, sw_c, 8;\nor.b32 sw_a, sw_a, sw_c;\n"
-        "mov.b32 sw_l0, 0x3E3C3800;\nmov.b32 sw_l1, 0x46444240;\n"
-        "prmt.b32 sw_a, sw_l0, sw_l1, sw_a;\nand.b32 sw_g, sw_x, 0x8;\nshl.b32 sw_g, sw_g, 12;\n"
-        "or.b32 sw_a, sw_a, sw_g;\nand.b32 sw_g, sw_x, 0x80;\nshl.b32 sw_g, sw_g, 24;\n"
-        f"or.b32 {d}, sw_a, sw_g;\n}}"
-    )
-
-
-def _sw_e4m3x2_to_f16x2(d: str, s: str) -> str:
-    # E4M3 bits shifted into f16 read as value * 2^-8, subnormals included; scale by 256.
-    return (
-        "{\n.reg .b32 sw_x, sw_a, sw_c, sw_g, sw_k;\n.reg .pred sw_p;\n"
-        f"cvt.u32.u16 sw_x, {s};\nand.b32 sw_a, sw_x, 0x7F7F;\nshl.b32 sw_c, sw_a, 8;\n"
-        "or.b32 sw_a, sw_a, sw_c;\nand.b32 sw_a, sw_a, 0x7F007F;\nshl.b32 sw_a, sw_a, 7;\n"
-        "and.b32 sw_g, sw_x, 0x8080;\nshl.b32 sw_c, sw_g, 8;\nor.b32 sw_g, sw_g, sw_c;\n"
-        "and.b32 sw_g, sw_g, 0x800080;\nshl.b32 sw_g, sw_g, 8;\nor.b32 sw_a, sw_a, sw_g;\n"
-        "mov.b32 sw_k, 0x5C005C00;\nmul.rn.f16x2 sw_a, sw_a, sw_k;\n"
-        "and.b32 sw_c, sw_x, 0x7F;\nsetp.eq.u32 sw_p, sw_c, 0x7F;\n"
-        "and.b32 sw_c, sw_a, 0xFFFF0000;\nor.b32 sw_c, sw_c, 0x7FFF;\n"
-        "selp.b32 sw_a, sw_c, sw_a, sw_p;\nand.b32 sw_c, sw_x, 0x7F00;\n"
-        "setp.eq.u32 sw_p, sw_c, 0x7F00;\nand.b32 sw_c, sw_a, 0xFFFF;\n"
-        f"or.b32 sw_c, sw_c, 0x7FFF0000;\nselp.b32 {d}, sw_c, sw_a, sw_p;\n}}"
-    )
-
-
+# The f16 high byte of each E2M1 magnitude comes from a prmt table; low bytes are 0.
+_SW_E2M1X2_TO_F16X2 = (
+    r"{\n.reg .b32 sw_x, sw_a, sw_c, sw_g, sw_l0, sw_l1;\n"
+    r"cvt.u32.u8 sw_x, \2;\nand.b32 sw_a, sw_x, 7;\nshl.b32 sw_a, sw_a, 4;\n"
+    r"and.b32 sw_c, sw_x, 0x70;\nshl.b32 sw_c, sw_c, 8;\nor.b32 sw_a, sw_a, sw_c;\n"
+    r"mov.b32 sw_l0, 0x3E3C3800;\nmov.b32 sw_l1, 0x46444240;\n"
+    r"prmt.b32 sw_a, sw_l0, sw_l1, sw_a;\nand.b32 sw_g, sw_x, 0x8;\nshl.b32 sw_g, sw_g, 12;\n"
+    r"or.b32 sw_a, sw_a, sw_g;\nand.b32 sw_g, sw_x, 0x80;\nshl.b32 sw_g, sw_g, 24;\n"
+    r"or.b32 \1, sw_a, sw_g;\n}"
+)
+# E4M3 bits shifted into f16 read as value * 2^-8, subnormals included; scale by 256.
+_SW_E4M3X2_TO_F16X2 = (
+    r"{\n.reg .b32 sw_x, sw_a, sw_c, sw_g, sw_k;\n.reg .pred sw_p;\n"
+    r"cvt.u32.u16 sw_x, \2;\nand.b32 sw_a, sw_x, 0x7F7F;\nshl.b32 sw_c, sw_a, 8;\n"
+    r"or.b32 sw_a, sw_a, sw_c;\nand.b32 sw_a, sw_a, 0x7F007F;\nshl.b32 sw_a, sw_a, 7;\n"
+    r"and.b32 sw_g, sw_x, 0x8080;\nshl.b32 sw_c, sw_g, 8;\nor.b32 sw_g, sw_g, sw_c;\n"
+    r"and.b32 sw_g, sw_g, 0x800080;\nshl.b32 sw_g, sw_g, 8;\nor.b32 sw_a, sw_a, sw_g;\n"
+    r"mov.b32 sw_k, 0x5C005C00;\nmul.rn.f16x2 sw_a, sw_a, sw_k;\n"
+    r"and.b32 sw_c, sw_x, 0x7F;\nsetp.eq.u32 sw_p, sw_c, 0x7F;\n"
+    r"and.b32 sw_c, sw_a, 0xFFFF0000;\nor.b32 sw_c, sw_c, 0x7FFF;\n"
+    r"selp.b32 sw_a, sw_c, sw_a, sw_p;\nand.b32 sw_c, sw_x, 0x7F00;\n"
+    r"setp.eq.u32 sw_p, sw_c, 0x7F00;\nand.b32 sw_c, sw_a, 0xFFFF;\n"
+    r"or.b32 sw_c, sw_c, 0x7FFF0000;\nselp.b32 \1, sw_c, sw_a, sw_p;\n}"
+)
 _OP = r"([^\s,;]+)"
 # (first target with the instruction, pattern, software replacement)
 _SW_RULES = (
     ((10, 0), rf"cvt\.rn\.satfinite\.e2m1x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
-     lambda m: _sw_pair(_sw_e2m1, m[1], m[2], m[3], 4, "u8")),
-    ((10, 0), rf"cvt\.rn\.f16x2\.e2m1x2\s+{_OP},\s*{_OP};",
-     lambda m: _sw_e2m1x2_to_f16x2(m[1], m[2])),
+     _sw_pair(_sw_e2m1, r"\1", r"\2", r"\3", 4, "u8")),
+    ((10, 0), rf"cvt\.rn\.f16x2\.e2m1x2\s+{_OP},\s*{_OP};", _SW_E2M1X2_TO_F16X2),
     ((8, 9), rf"cvt\.rn\.satfinite\.e4m3x2\.f32\s+{_OP},\s*{_OP},\s*{_OP};",
-     lambda m: _sw_pair(_sw_e4m3, m[1], m[2], m[3], 8, "u16")),
-    ((8, 9), rf"cvt(?:\.rn)?\.f16x2\.e4m3x2\s+{_OP},\s*{_OP};",
-     lambda m: _sw_e4m3x2_to_f16x2(m[1], m[2])),
+     _sw_pair(_sw_e4m3, r"\1", r"\2", r"\3", 8, "u16")),
+    ((8, 9), rf"cvt(?:\.rn)?\.f16x2\.e4m3x2\s+{_OP},\s*{_OP};", _SW_E4M3X2_TO_F16X2),
     ((9, 0), rf"mul(?:\.rn)?\.bf16x2\s+{_OP},\s*{_OP},\s*{_OP};",
-     lambda m: f"{{\n.reg .b32 sw_z;\nmov.b32 sw_z, 0x80008000;\n"
-     f"fma.rn.bf16x2 {m[1]}, {m[2]}, {m[3]}, sw_z;\n}}"),
-    ((10, 0), r"ld\.global\.v8\.u32\s+\{([^}]*)\},\s*\[([^\]]+)\];",
-     lambda m: "ld.global.v4.u32 {%s}, [%s];\nld.global.v4.u32 {%s}, [%s+16];"
-     % (",".join(m[1].split(",")[:4]), m[2], ",".join(m[1].split(",")[4:]), m[2])),
+     r"{\n.reg .b32 sw_z;\nmov.b32 sw_z, 0x80008000;\nfma.rn.bf16x2 \1, \2, \3, sw_z;\n}"),
+    ((10, 0), r"ld\.global\.v8\.u32\s+\{((?:[^,}]*,){3}[^,}]*),([^}]*)\},\s*\[([^\]]+)\];",
+     r"ld.global.v4.u32 {\1}, [\3];\nld.global.v4.u32 {\2}, [\3+16];"),
 )  # fmt: skip
 
 
 def target_inline_asm(res, operands, asm: str, constraints: str, **kwargs):
     """``llvm.inline_asm`` with the conversions above lowered for the traced target."""
-    from cutlass.cutlass_dsl import CuTeDSL
-
-    arch = CuTeDSL._get_dsl().get_arch_enum().value[:2]
+    arch = cutlass.cutlass_dsl.CuTeDSL._get_dsl().get_arch_enum().value[:2]
     for first, pattern, replace in _SW_RULES:
         if arch < first:
             asm = re.sub(pattern, replace, asm)

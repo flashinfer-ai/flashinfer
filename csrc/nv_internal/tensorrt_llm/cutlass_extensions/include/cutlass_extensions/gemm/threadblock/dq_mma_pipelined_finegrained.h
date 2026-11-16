@@ -276,16 +276,14 @@ class DqMmaPipelined<Shape_, IteratorA_, SmemIteratorA_, IteratorB_, SmemIterato
   }
 
   /// Perform a threadblock-scoped matrix multiply-accumulate
-  template <int LiveMBlocks = Operator::MmaIterations::kRow>
-  CUTLASS_DEVICE void operator()(
-      int gemm_k_iterations,         ///< number of iterations of the mainloop
-      FragmentC& accum,              ///< destination accumulator tile
-      IteratorA iterator_A,          ///< iterator over A operand in global memory
-      IteratorB iterator_B,          ///< iterator over B operand in global memory
-      IteratorScale iterator_scale,  ///< iterator over scale operand in global memory
-      FragmentC const& src_accum,    ///< source accumulator tile
-      ///< rows of mma operations of the warp tile to run (all by default)
-      platform::integral_constant<int, LiveMBlocks> live_m_blocks = {}) {
+  CUTLASS_DEVICE
+  void operator()(int gemm_k_iterations,         ///< number of iterations of the mainloop
+                  FragmentC& accum,              ///< destination accumulator tile
+                  IteratorA iterator_A,          ///< iterator over A operand in global memory
+                  IteratorB iterator_B,          ///< iterator over B operand in global memory
+                  IteratorScale iterator_scale,  ///< iterator over scale operand in global memory
+                  FragmentC const& src_accum) {  ///< source accumulator tile
+
     //
     // Prologue
     //
@@ -433,7 +431,7 @@ class DqMmaPipelined<Shape_, IteratorA_, SmemIteratorA_, IteratorB_, SmemIterato
             lds_converter(warp_frag_B[warp_tileB_k_load_offset % 2]);
         warp_dequantizer_.dequantize(converted_frag_B, warp_frag_scales, warp_frag_zero);
         warp_mma(accum, warp_frag_A[warp_mma_k % 2], converted_frag_B, accum,
-                 warp_tileB_k_compute_offset, live_m_blocks);
+                 warp_tileB_k_compute_offset);
       }
 
       // Load the scales needed for the next tile iteration
