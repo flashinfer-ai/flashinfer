@@ -530,6 +530,18 @@ def test_prewiden_rejected_replan_keeps_previous_plan():
     out.zero_()
     _run(w, q, k, v, out)
     assert torch.equal(out, ref)
+    # a rejected use_token_head_sf replan must not leak the flag into run()
+    with pytest.raises(ValueError, match="use_token_head_sf"):
+        w.plan(
+            paged_kv_indices=idx,
+            kv_data_type=torch.float8_e4m3fn,
+            use_token_head_sf=True,
+            **args,
+        )
+    assert not w._use_token_head_sf
+    out.zero_()
+    _run(w, q, k, v, out)
+    assert torch.equal(out, ref)
 
 
 @needs_cuda

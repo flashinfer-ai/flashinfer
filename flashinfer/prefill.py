@@ -4327,7 +4327,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "use_token_head_sf is only supported with backend='fa2', "
                     f"got backend={self._requested_backend!r}"
                 )
-        self._use_token_head_sf = use_token_head_sf
         if (
             self._jit_module is not None
             and self._jit_use_token_head_sf != use_token_head_sf
@@ -4487,6 +4486,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._pw_widen_module = None
             self._pw_k_shadow = None
             self._pw_v_shadow = None
+        # Commit only after prewiden validation: a rejected replan must leave
+        # the accepted plan's run() state intact.
+        self._use_token_head_sf = use_token_head_sf
 
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_page_mask_indptr(
