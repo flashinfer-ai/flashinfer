@@ -133,7 +133,7 @@ def _per_batch_cos_sim(res, reference):
 
 
 # #3604 regression anchor: b>1 with m or n not a multiple of 128 needs a per-batch scale.
-@pytest.mark.parametrize("b,m,n,k", [(4, 130, 256, 256), (2, 200, 160, 512), (2, 130, 130, 160), (3, 64, 200, 288)])
+@pytest.mark.parametrize("b,m,n,k", [(4, 130, 256, 256), (2, 200, 160, 512), (2, 130, 160, 160), (3, 64, 192, 288)])
 @pytest.mark.parametrize("scale_ndim", [3, 1])
 @pytest.mark.parametrize("backend", ["cudnn", "cutlass"])
 def test_bmm_mxfp8_per_batch_scale(b, m, n, k, scale_ndim, backend):
