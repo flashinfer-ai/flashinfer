@@ -831,6 +831,27 @@ def test_in_place_row_output_at_a_large_shape():
         )
 
 
+def test_overlap_check_is_skipped_without_buffers():
+    """Without an output buffer the overlap check touches no input (the eager entries that allocate their outputs pay no
+    host time for it); with one, a contiguous tensor's byte range is its element count times the element size, a strided
+    view's the largest offset plus one, and the partial overlap is refused."""
+    from flashinfer.batch_invariant import support as bi_support
+
+    bi_support.check_no_overlap(
+        [("out", None), ("lse_out", None)], [("logits", object()), ("ids", object())]
+    )
+    x = torch.empty(4, 8)
+    assert bi_support.byte_range(x) == (x.data_ptr(), x.data_ptr() + 32 * 4)
+    v = x[:, ::2]
+    assert bi_support.byte_range(v) == (
+        x.data_ptr(),
+        x.data_ptr() + (3 * 8 + 3 * 2 + 1) * 4,
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        bi_support.check_no_overlap([("out", v)], [("x", x)])
+    bi_support.check_no_overlap([("out", x)], [("x", x)], in_place=(("out", "x"),))
+
+
 def test_space_members_are_bounded_in_loads_per_thread():
     """Every member of the enumerated space issues at most ``LOADS_PER_THREAD_MAX`` loads per thread per pass: the
     re-read and staged forms unroll them, and beyond the bound the compile takes minutes or crashes (T32_R1_V1_RR at
