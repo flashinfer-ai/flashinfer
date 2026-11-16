@@ -795,6 +795,19 @@ def test_output_inside_the_pool_is_refused():
 
 
 @needs_device
+def test_decode_skips_a_slot_outside_the_pool():
+    """A decode step does not read its slots back; a slot past the pool is skipped on the device, like a negative one."""
+    h = 16
+    p = params(h)
+    seqs = [make_seq(4, h, SEED + 91 + i, GATES["steep"]) for i in range(2)]
+    ref, _ = one_shot(seqs[0], p)
+    pool = new_pool(seqs, [0, 1])
+    rows = bi_decode(tokens(seqs, [0, 0]), pool, [0, pool.shape[0] + 5], p)
+    assert same_bits(rows[0], ref[0]) and same_bits(pool[1], seqs[1]["s0"])
+    assert bi_pool.get_pool(pool).cnt[1].sum().item() == 0
+
+
+@needs_device
 def test_first_use_inside_a_graph_capture_is_refused():
     h = 16
     p = params(h)

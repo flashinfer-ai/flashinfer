@@ -199,12 +199,12 @@ __global__ void __launch_bounds__(NTHR, MINB)
                  uint16_t* __restrict__ out, float* state, uint16_t* state16, int* cnt, float* pref,
                  uint16_t* Kc, float* Kf, uint16_t* Rc, uint16_t* Uc, uint16_t* Lc, float* stamp,
                  const float* __restrict__ a_log, const float* __restrict__ dt_bias, float scale,
-                 float half_scale, int H) {
+                 float half_scale, int H, int S) {
   extern __shared__ __align__(16) unsigned char smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
   const int h = blockIdx.x % H, b = blockIdx.x / H;
   const int slot = idx[b];
-  if (slot < 0) return;
+  if (slot < 0 || slot >= S) return;
   const int n = SPAN ? (starts ? lens[b] : stride) : 1;
   if (n <= 0) return;
   const size_t row0 = SPAN ? (starts ? (size_t)starts[b] : (size_t)b * stride) : (size_t)b;
@@ -680,10 +680,10 @@ __global__ void __launch_bounds__(NTHR, MINB)
 
 // The slots' fp32 states become chunk boundaries (bf16 copy, stamp, count); CTA = (slot, head).
 __global__ void BeginKernel(const int* __restrict__ idx, const float* __restrict__ state,
-                            uint16_t* state16, int* cnt, float* stamp, int H) {
+                            uint16_t* state16, int* cnt, float* stamp, int H, int S) {
   const int tid = threadIdx.x, h = blockIdx.x % H;
   const int slot = idx[blockIdx.x / H];
-  if (slot < 0) return;
+  if (slot < 0 || slot >= S) return;
   const size_t sh = (size_t)slot * H + h;
   const float* S32 = state + sh * D * D;
   uint16_t* S16 = state16 + sh * D * D;
@@ -706,9 +706,10 @@ __global__ void BeginKernel(const int* __restrict__ idx, const float* __restrict
 }
 
 inline cudaError_t Begin(const int* slots, const float* state, uint16_t* state_bf16, int* cnt,
-                         float* stamp, int batch, int num_heads, cudaStream_t stream) {
+                         float* stamp, int batch, int num_heads, int num_slots,
+                         cudaStream_t stream) {
   BeginKernel<<<batch * num_heads, NTHR, 0, stream>>>(slots, state, state_bf16, cnt, stamp,
-                                                      num_heads);
+                                                      num_heads, num_slots);
   return cudaGetLastError();
 }
 
@@ -718,7 +719,7 @@ inline cudaError_t DecodeStep(const uint16_t* q, const uint16_t* k, const uint16
                               float* prefix, uint16_t* k_inv_rows, float* k_inv_f32_rows,
                               uint16_t* rhs_rows, uint16_t* update_rows, uint16_t* l_rows,
                               float* stamp, const float* a_log, const float* dt_bias, float scale,
-                              float half_gate_scale_log2, int batch, int num_heads,
+                              float half_gate_scale_log2, int batch, int num_heads, int num_slots,
                               cudaStream_t stream) {
   cudaError_t status =
       cudaFuncSetAttribute(DecodeKernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -727,7 +728,7 @@ inline cudaError_t DecodeStep(const uint16_t* q, const uint16_t* k, const uint16
   DecodeKernel<false><<<batch * num_heads, NTHR, kSmemBytes, stream>>>(
       q, k, v, g, beta, slots, nullptr, nullptr, 0, out, state, state_bf16, cnt, prefix, k_inv_rows,
       k_inv_f32_rows, rhs_rows, update_rows, l_rows, stamp, a_log, dt_bias, scale,
-      half_gate_scale_log2, num_heads);
+      half_gate_scale_log2, num_heads, num_slots);
   return cudaGetLastError();
 }
 
@@ -739,7 +740,7 @@ inline cudaError_t DecodeSpan(const uint16_t* q, const uint16_t* k, const uint16
                               uint16_t* k_inv_rows, float* k_inv_f32_rows, uint16_t* rhs_rows,
                               uint16_t* update_rows, uint16_t* l_rows, float* stamp,
                               const float* a_log, const float* dt_bias, float scale,
-                              float half_gate_scale_log2, int batch, int num_heads,
+                              float half_gate_scale_log2, int batch, int num_heads, int num_slots,
                               cudaStream_t stream) {
   cudaError_t status =
       cudaFuncSetAttribute(DecodeKernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -748,7 +749,7 @@ inline cudaError_t DecodeSpan(const uint16_t* q, const uint16_t* k, const uint16
   DecodeKernel<true><<<batch * num_heads, NTHR, kSpanSmemBytes, stream>>>(
       q, k, v, g, beta, slots, starts, lens, stride, out, state, state_bf16, cnt, prefix,
       k_inv_rows, k_inv_f32_rows, rhs_rows, update_rows, l_rows, stamp, a_log, dt_bias, scale,
-      half_gate_scale_log2, num_heads);
+      half_gate_scale_log2, num_heads, num_slots);
   return cudaGetLastError();
 }
 

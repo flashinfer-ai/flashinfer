@@ -98,7 +98,7 @@ void kda_batch_invariant_decode_step(TensorView q, TensorView k, TensorView v, T
       ptr<uint16_t>(update_rows), ptr<uint16_t>(l_rows), ptr<float>(stamp), ptr<const float>(a_log),
       ptr<const float>(dt_bias), static_cast<float>(scale),
       static_cast<float>(half_gate_scale_log2), static_cast<int>(batch),
-      static_cast<int>(num_heads), stream);
+      static_cast<int>(num_heads), static_cast<int>(num_slots), stream);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "kda_batch_invariant_decode_step failed: " << cudaGetErrorString(status);
 }
@@ -169,7 +169,7 @@ void kda_batch_invariant_decode_span(TensorView q, TensorView k, TensorView v, T
       ptr<uint16_t>(rhs_rows), ptr<uint16_t>(update_rows), ptr<uint16_t>(l_rows), ptr<float>(stamp),
       ptr<const float>(a_log), ptr<const float>(dt_bias), static_cast<float>(scale),
       static_cast<float>(half_gate_scale_log2), static_cast<int>(batch),
-      static_cast<int>(num_heads), stream);
+      static_cast<int>(num_heads), static_cast<int>(num_slots), stream);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "kda_batch_invariant_decode_span failed: " << cudaGetErrorString(status);
 }
@@ -180,7 +180,7 @@ void kda_batch_invariant_begin(TensorView slots, TensorView state, TensorView st
                                TensorView cnt, TensorView stamp) {
   namespace bi = kda::bi_decode;
   CHECK_DIM(4, state);
-  const int64_t num_heads = state.size(1), sh = state.size(0) * num_heads;
+  const int64_t num_heads = state.size(1), num_slots = state.size(0), sh = num_slots * num_heads;
   TVM_FFI_ICHECK(state.size(2) == bi::D && state.size(3) == bi::D);
   TVM_FFI_ICHECK(state_bf16.numel() == state.numel() && cnt.numel() == sh &&
                  stamp.numel() == sh * bi::STAMP);
@@ -196,10 +196,10 @@ void kda_batch_invariant_begin(TensorView slots, TensorView state, TensorView st
   check_aligned({state, state_bf16});
 
   ffi::CUDADeviceGuard device_guard(state.device().device_id);
-  cudaError_t status =
-      bi::Begin(ptr<const int>(slots), ptr<const float>(state), ptr<uint16_t>(state_bf16),
-                ptr<int>(cnt), ptr<float>(stamp), static_cast<int>(slots.numel()),
-                static_cast<int>(num_heads), get_stream(state.device()));
+  cudaError_t status = bi::Begin(ptr<const int>(slots), ptr<const float>(state),
+                                 ptr<uint16_t>(state_bf16), ptr<int>(cnt), ptr<float>(stamp),
+                                 static_cast<int>(slots.numel()), static_cast<int>(num_heads),
+                                 static_cast<int>(num_slots), get_stream(state.device()));
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "kda_batch_invariant_begin failed: " << cudaGetErrorString(status);
 }

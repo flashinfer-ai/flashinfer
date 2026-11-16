@@ -27,7 +27,8 @@ cannot see is a state replaced by one with the same first eight values per head 
 reset after a request shorter than 16 tokens, which never moved its boundary state, or a saved boundary state loaded
 back): such a slot's next request must be prefilled with more than one token, since a one-token call is a decode step.
 Every slot index must be unique and in range: a prefill checks it, a decode step (which reads nothing back to the
-host) does not, and its ``cu_seqlens`` are taken to be ``arange(N + 1)`` without being read. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
+host) does not: its kernel skips a slot outside the pool (that row of the output is left unwritten), and its
+``cu_seqlens`` are taken to be ``arange(N + 1)`` without being read. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
