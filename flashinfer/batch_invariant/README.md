@@ -302,5 +302,5 @@ a packed call is the per-sequence terms (`batch_term`). R3 is not claimed: the k
 configuration space; the fingerprint digests its source. `lake exe kdaconformance` prints the replay arithmetic for the
 generated cases (`lean/BIKernels/KdaCases.lean`, rendered by `kda/lean_cases.py`; kernel `decide` only), which the
 device-free test `tests/batch_invariant/test_kda_lean.py` compares with the Python specification. Tests:
-`tests/kda/test_batch_invariant_recurrent_kda.py` (every comparison `torch.equal`; `FLASHINFER_KDA_BI_HASH_DIR` records the
+`tests/kda/test_batch_invariant_recurrent_kda.py` (every comparison bitwise; `FLASHINFER_KDA_BI_HASH_DIR` records the
 output hashes in one process and asserts them in another).

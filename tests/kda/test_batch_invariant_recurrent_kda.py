@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The batch-invariant KDA class ``kda.bf16.c16`` behind ``recurrent_kda(batch_invariant=True)`` (SM100 / SM103 / SM107).
 
-Every comparison is ``torch.equal``; nothing uses a tolerance. The reference term is the pinned chunked prefill of the
+Every comparison is bitwise (``same_bits``); nothing uses a tolerance. The reference term is the pinned chunked prefill of the
 whole sequence in one call. Set ``FLASHINFER_KDA_BI_HASH_DIR`` to a directory to record the output hashes in one process
 and assert them in another.
 """
@@ -190,6 +190,14 @@ def decode_all(s, pool, slot, p, start, stop):
     )
 
 
+def same_bits(a, b):
+    """Shape, dtype and every bit equal (``torch.equal`` takes ``-0.0`` for ``0.0``)."""
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    as_int = {2: torch.int16, 4: torch.int32}[a.element_size()]
+    return torch.equal(a.contiguous().view(as_int), b.contiguous().view(as_int))
+
+
 def _hash(t):
     return hashlib.sha256(
         t.contiguous().view(torch.uint8).cpu().numpy().tobytes()
@@ -256,8 +264,8 @@ def test_prefill_then_decode_equals_one_shot(h, gate, n0):
     rows0 = bi_prefill([sub(s, 0, n0)], pool, [0], p)
     rows = decode_all(s, pool, 0, p, n0, L)
     got = torch.cat([rows0, rows], 0)
-    assert torch.equal(got, ref)
-    assert torch.equal(
+    assert same_bits(got, ref)
+    assert same_bits(
         pool[0], ref_state
     )  # L is a multiple of 16: the slot holds the final state
     _check_hash(f"prefill_then_decode_h{h}_{gate}_n{n0}", got)
@@ -282,7 +290,7 @@ def test_packed_requests_at_mixed_positions(h, gate):
     )
     off = 0
     for n0, ref in zip(BATCH_POSITIONS, refs, strict=True):
-        assert torch.equal(pre[off : off + n0], ref[:n0])
+        assert same_bits(pre[off : off + n0], ref[:n0])
         off += n0
     steps = 40
     got = []
@@ -298,17 +306,15 @@ def test_packed_requests_at_mixed_positions(h, gate):
         )
     got = torch.stack(got, 1)  # [B, steps, HV, D]
     for i, (n0, ref) in enumerate(zip(BATCH_POSITIONS, refs, strict=True)):
-        assert torch.equal(got[i], ref[n0 : n0 + steps]), (
-            f"request {i} at position {n0}"
-        )
+        assert same_bits(got[i], ref[n0 : n0 + steps]), f"request {i} at position {n0}"
     # the same requests decoded alone give the same bits, and a slot's committed state is the prefix prefill's
     for i, (s, n0) in enumerate(zip(seqs, BATCH_POSITIONS, strict=True)):
         alone = new_pool([s], [0])
         bi_prefill([sub(s, 0, n0)], alone, [0], p)
         rows = decode_all(s, alone, 0, p, n0, n0 + steps)
-        assert torch.equal(rows, got[i])
+        assert same_bits(rows, got[i])
         b = CHUNK * ((n0 + steps) // CHUNK)
-        assert torch.equal(pool[SCATTERED[i]], one_shot(s, p, b)[1])
+        assert same_bits(pool[SCATTERED[i]], one_shot(s, p, b)[1])
     _check_hash(f"packed_mixed_h{h}_{gate}", got)
 
 
@@ -330,7 +336,7 @@ def test_chunked_prefill_cut_at_chunk_multiples_equals_one_shot():
         for a, b in zip(cuts, cuts[1:], strict=False)
     ]
     rows.append(decode_all(s, pool, 0, p, 2071, 3000))
-    assert torch.equal(torch.cat(rows, 0), ref)
+    assert same_bits(torch.cat(rows, 0), ref)
 
 
 @needs_device
@@ -359,7 +365,7 @@ def test_fixed_layout_prefill_and_output_buffer():
     )
     assert got is out and st is pool
     for i, ref in enumerate(refs):
-        assert torch.equal(got[i], ref[:200])
+        assert same_bits(got[i], ref[:200])
     tok = tokens(seqs, [200, 200, 200])
     out1 = torch.empty(3, 1, h, D, dtype=torch.bfloat16, device="cuda")
     got1, st1 = recurrent_kda(
@@ -375,7 +381,7 @@ def test_fixed_layout_prefill_and_output_buffer():
     )
     assert got1 is out1 and st1 is None
     for i, ref in enumerate(refs):
-        assert torch.equal(got1[i, 0], ref[200])
+        assert same_bits(got1[i, 0], ref[200])
 
 
 @needs_device
@@ -400,7 +406,7 @@ def test_decode_takes_strided_activations():
         batch_invariant=True,
         **_fused(p),
     )
-    assert out.is_contiguous() and torch.equal(out[:, 0], ref)
+    assert out.is_contiguous() and same_bits(out[:, 0], ref)
 
 
 @needs_device
@@ -414,7 +420,7 @@ def test_pool_first_used_under_another_default_dtype():
         got = bi_decode(token(s, 0), new_pool([s], [0]), [0], p)
     finally:
         torch.set_default_dtype(torch.float32)
-    assert torch.equal(got, ref)
+    assert same_bits(got, ref)
 
 
 @needs_device
@@ -449,7 +455,7 @@ def test_graph_replay_equals_eager(h):
 
     first = step()  # eager (warms the kernels and the class's buffers); token n0
     for i, ref in enumerate(refs):
-        assert torch.equal(first[0, i], ref[n0[i]])
+        assert same_bits(first[0, i], ref[n0[i]])
     s_ = torch.cuda.Stream()
     s_.wait_stream(torch.cuda.current_stream())
     g = torch.cuda.CUDAGraph()
@@ -464,7 +470,7 @@ def test_graph_replay_equals_eager(h):
         g.replay()
         torch.cuda.synchronize()
         for i, ref in enumerate(refs):
-            assert torch.equal(out[0, i], ref[n0[i] + t]), f"step {t}, request {i}"
+            assert same_bits(out[0, i], ref[n0[i] + t]), f"step {t}, request {i}"
 
 
 @needs_device
@@ -486,7 +492,7 @@ def test_cached_rows_past_the_count_are_inert(fill):
     ):
         rows_buf[0, :, 5:].fill_(fill)  # cached rows past the live count (37 % 16 = 5)
     rows = decode_all(s, pool, 0, p, 37, 80)
-    assert torch.equal(rows, ref[37:80])
+    assert same_bits(rows, ref[37:80])
 
 
 @needs_device
@@ -501,13 +507,13 @@ def test_decode_lengths_from_a_nonzero_state(h, gate, length):
     ref, _ = one_shot(s, p)
     pool = new_pool([s], [0])
     rows = decode_all(s, pool, 0, p, 0, length)
-    assert torch.equal(rows, ref[:length])
+    assert same_bits(rows, ref[:length])
     b = 16 * (length // 16)
     if b:
         _, st = one_shot(sub(s, 0, b), p)
-        assert torch.equal(pool[0], st)
+        assert same_bits(pool[0], st)
     else:
-        assert torch.equal(pool[0], s["s0"])
+        assert same_bits(pool[0], s["s0"])
     _check_hash(f"decode_len{length}_h{h}_{gate}", rows)
 
 
@@ -555,14 +561,14 @@ def test_multi_token_steps_equal_one_shot(h, T):
             ssm_state_indices=ids,
         )
         for i, ref in enumerate(refs):
-            assert torch.equal(out[i], ref[pos[i] : pos[i] + T]), (
+            assert same_bits(out[i], ref[pos[i] : pos[i] + T]), (
                 f"request {i} at {pos[i]}"
             )
         outs.append(out)
         pos = [q0 + T for q0 in pos]
         rows = bi_decode(tokens(seqs, pos), pool, slots, p)
         for i, ref in enumerate(refs):
-            assert torch.equal(rows[i], ref[pos[i]]), f"request {i} decode at {pos[i]}"
+            assert same_bits(rows[i], ref[pos[i]]), f"request {i} decode at {pos[i]}"
         pos = [q0 + 1 for q0 in pos]
     _check_hash(f"extend_T{T}_h{h}", torch.cat(outs, 0))
 
@@ -606,7 +612,7 @@ def test_multi_token_step_replayed_as_a_graph(T):
 
     first = step()
     for i, ref in enumerate(refs):
-        assert torch.equal(first[i], ref[n0[i] : n0[i] + T])
+        assert same_bits(first[i], ref[n0[i] : n0[i] + T])
     s_ = torch.cuda.Stream()
     s_.wait_stream(torch.cuda.current_stream())
     g = torch.cuda.CUDAGraph()
@@ -621,7 +627,7 @@ def test_multi_token_step_replayed_as_a_graph(T):
         g.replay()
         torch.cuda.synchronize()
         for i, ref in enumerate(refs):
-            assert torch.equal(out[i], ref[pos[i] : pos[i] + T]), (
+            assert same_bits(out[i], ref[pos[i] : pos[i] + T]), (
                 f"round {r}, request {i}"
             )
 
@@ -646,9 +652,9 @@ def test_multi_token_steps_after_a_replaced_state():
         initial_state=pool,
         lower_bound=LB,
     )
-    assert torch.equal(out[0], ref_new[:30])
+    assert same_bits(out[0], ref_new[:30])
     rows = decode_all(new, pool, 0, p, 30, 50)
-    assert torch.equal(rows, ref_new[30:50])
+    assert same_bits(rows, ref_new[30:50])
 
 
 @needs_device
@@ -670,7 +676,7 @@ def test_explicit_reset_of_a_recycled_slot():
         pool, torch.zeros(1, dtype=torch.int32, device="cuda")
     )
     rows = decode_all(new, pool, 0, p, 0, 40)
-    assert torch.equal(rows, ref_new)
+    assert same_bits(rows, ref_new)
 
 
 @needs_device
@@ -684,7 +690,7 @@ def test_pool_aliases_share_one_state():
     rows = torch.cat(
         [bi_decode(token(s, pos), pool.detach(), [0], p) for pos in range(40)], 0
     )
-    assert torch.equal(rows, ref[:40])
+    assert same_bits(rows, ref[:40])
     assert (
         len(
             {
@@ -735,7 +741,7 @@ def test_overlapping_pool_extent_is_refused():
         token(s, 0), big[2], [0], p
     )  # a disjoint extent of the same buffer is a pool of its own
     rows += [bi_decode(token(s, pos), pool, [0], p) for pos in range(5, 20)]
-    assert torch.equal(torch.cat(rows, 0), ref[:20])
+    assert same_bits(torch.cat(rows, 0), ref[:20])
 
 
 @needs_device
@@ -751,7 +757,7 @@ def test_output_inside_the_pool_is_refused():
         recurrent_kda(
             *args, initial_state=pool, output=alias, batch_invariant=True, **_fused(p)
         )
-    assert torch.equal(pool, before)
+    assert same_bits(pool, before)
 
 
 @needs_device
@@ -824,7 +830,7 @@ def test_other_lower_bound_and_head_count():
     pool = new_pool([s], [0])
     pre = bi_prefill([sub(s, 0, 37)], pool, [0], p)
     rows = decode_all(s, pool, 0, p, 37, 70)
-    assert torch.equal(torch.cat([pre, rows], 0), ref)
+    assert same_bits(torch.cat([pre, rows], 0), ref)
 
 
 @needs_device
@@ -841,11 +847,11 @@ def test_slot_reuse_with_a_replaced_state():
     decode_all(old, pool, 0, p, 21, 27)  # slot 0 holds 11 history rows
     pool[0].copy_(new["s0"])  # the caller loads another request's state
     rows = decode_all(new, pool, 0, p, 0, 40)
-    assert torch.equal(rows, ref_new[:40])
+    assert same_bits(rows, ref_new[:40])
     pool[0].copy_(new["s0"])
     pre = bi_prefill([sub(new, 0, 23)], pool, [0], p)
     rows = decode_all(new, pool, 0, p, 23, 60)
-    assert torch.equal(torch.cat([pre, rows], 0), ref_new)
+    assert same_bits(torch.cat([pre, rows], 0), ref_new)
 
 
 @needs_device
@@ -877,18 +883,18 @@ def test_negative_controls():
         output_final_state=True,
         **_fused(p),
     )[0][0, 0]
-    if torch.equal(other, ref) or torch.equal(today, ref[0]):
+    if same_bits(other, ref) or same_bits(today, ref[0]):
         pytest.skip(
             "the other terms agree with the pinned prefill on this input; the control is void here"
         )
     unpinned = recurrent_kda(*seq, **{**call, "initial_state": s["s0"][None].clone()})[
         0
     ][0]
-    assert torch.equal(
+    assert same_bits(
         unpinned, other
     )  # one sequence at 16 heads takes the decomposition on these parts
     pool = new_pool([s], [0])
-    assert torch.equal(bi_decode(token(s, 0), pool, [0], p)[0], ref[0])
+    assert same_bits(bi_decode(token(s, 0), pool, [0], p)[0], ref[0])
 
 
 @needs_device
@@ -902,7 +908,7 @@ def test_pool_passed_as_a_fresh_view_each_call():
     big[1, 2].copy_(s["s0"])
     bi_prefill([sub(s, 0, 21)], big[1], [2], p)
     rows = [bi_decode(token(s, pos), big[1], [2], p) for pos in range(21, 120)]
-    assert torch.equal(torch.cat(rows, 0), ref[21:])
+    assert same_bits(torch.cat(rows, 0), ref[21:])
 
 
 @needs_device
@@ -976,7 +982,7 @@ def test_unsupported_inputs_raise_and_nothing_runs():
         recurrent_kda(
             *(a.to(torch.float16) for a in args), cu_seqlens=cu, **_fused(p), **base
         )
-    assert torch.equal(pool, before)
+    assert same_bits(pool, before)
     assert (
         bi_pool.pool_key(pool) not in bi_pool._POOLS
         or bi_pool._POOLS[bi_pool.pool_key(pool)][0].cnt.sum().item() == 0
@@ -1013,14 +1019,14 @@ def test_rows_do_not_depend_on_the_head_count(h, n0):
     s = make_seq(stop, wide, SEED + 900 + h + n0, GATES["steep"])
     if h >= 16:
         got, state = _prefill_and_decode(s, p, n0, stop)
-        assert torch.equal(got, one_shot(s, p)[0])
+        assert same_bits(got, one_shot(s, p)[0])
         for a in sorted({*range(0, h - 15, 16), h - 16}):
             ref, ref_state = _prefill_and_decode(*_heads(s, p, a, a + 16), n0, stop)
-            assert torch.equal(got[:, a : a + 16], ref)
-            assert torch.equal(state[a : a + 16], ref_state)
+            assert same_bits(got[:, a : a + 16], ref)
+            assert same_bits(state[a : a + 16], ref_state)
     else:
         ref, ref_state = _prefill_and_decode(s, p, n0, stop)
         got, state = _prefill_and_decode(*_heads(s, p, 0, h), n0, stop)
-        assert torch.equal(got, ref[:, :h])
-        assert torch.equal(state, ref_state[:h])
+        assert same_bits(got, ref[:, :h])
+        assert same_bits(state, ref_state[:h])
     _check_hash(f"head_count_h{h}_n{n0}", got)
