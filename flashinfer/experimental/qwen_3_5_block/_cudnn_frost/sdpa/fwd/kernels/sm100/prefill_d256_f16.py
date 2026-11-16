@@ -138,7 +138,14 @@ _resolve_seqlen_kv = _sdpa_h.resolve_seqlen_kv
 _resolve_seqlen_q = _sdpa_h.resolve_seqlen_q
 
 
-from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.thd_origins import build_thd_origins, origin_tensors, origin_tma_slice
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.thd_origins import (
+    COMPACT_MAP_SEQUENCE,
+    build_thd_origins,
+    origin_map_ptr,
+    origin_tensors,
+    origin_tma_slice,
+    thd_origins_compact_word,
+)
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.frost.tile_dsl.thd import thd_port_origin
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.kernels.thd_helpers import build_thd_meta_o_descs_kernel as _build_thd_meta_o_descs_kernel, TENSOR_MAP_QWORDS, THD_SETUP_THREADS
 
@@ -730,6 +737,17 @@ def _tmaldg_warp_group(
 
     if cutlass.const_expr(thd_origins is not None):
         tma_q = lambda d, h, r, b: origin_tma_slice(o_desc_words, 1, n_batch, b, d, h, r)
+        # Setup records whether the load ports hold one map each (every live
+        # origin equals its compact prefix) or a map per sequence.
+        origins_word = thd_origins_compact_word(thd_origins, n_batch)
+        origins_single_map = origins_word != cutlass.Int64(0)
+        origins_per_sequence = origins_word == cutlass.Int64(0)
+        if origins_single_map:
+            # One map per load port, acquired once like the compact-prefix path.
+            tma_tensormap_acquire(origin_map_ptr(o_desc_words, 1, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+            if cutlass.const_expr(not PAGED_KV):
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 2, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
+                tma_tensormap_acquire(origin_map_ptr(o_desc_words, 3, n_batch, cutlass.Int32(COMPACT_MAP_SEQUENCE)))
     else:
         tma_q = GmemTileTma(tma_q_desc)
     tma_gate = GmemTileTma(tma_gate_desc) if cutlass.const_expr(EPILOGUE_GATE) else None
@@ -811,18 +829,24 @@ def _tmaldg_warp_group(
 
     while is_valid_tile > cutlass.Int32(0):
         if cutlass.const_expr(thd_origins is not None):
-            # Sequence-local maps have independent caller-port bases and clip
-            # every interior tail. Acquire again when a persistent unit changes.
-            stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
-            base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
-            q_map = (base + stride).tospace(cutlass.AddressSpace.generic)
-            tma_tensormap_acquire(q_map)
-            if cutlass.const_expr(not PAGED_KV):
-                k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
-                v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
-                tma_tensormap_acquire(k_map)
-                tma_tensormap_acquire(v_map)
-            q_seq_off, kv_seq_off, tma_batch = cutlass.Int32(0), cutlass.Int32(0), batch_idx
+            if origins_per_sequence:
+                # Sequence-local maps have independent caller-port bases and clip
+                # every interior tail. Acquire again when a persistent unit changes.
+                stride = (n_batch + cutlass.Int32(1)) * cutlass.Int32(TENSOR_MAP_QWORDS)
+                base = o_desc_words.iterator.raw_ptr() + batch_idx * cutlass.Int32(TENSOR_MAP_QWORDS)
+                q_map = (base + stride).tospace(cutlass.AddressSpace.generic)
+                tma_tensormap_acquire(q_map)
+                if cutlass.const_expr(not PAGED_KV):
+                    k_map = (base + 2 * stride).tospace(cutlass.AddressSpace.generic)
+                    v_map = (base + 3 * stride).tospace(cutlass.AddressSpace.generic)
+                    tma_tensormap_acquire(k_map)
+                    tma_tensormap_acquire(v_map)
+            # Single maps keep the compact prefix offsets at batch coordinate 0;
+            # sequence-local maps carry the origin in their base and are
+            # selected by the batch coordinate.
+            q_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), q_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            kv_seq_off = cutlass.Int32(arith.select(origins_single_map.ir_value(), kv_seq_off.ir_value(), cutlass.Int32(0).ir_value()))
+            tma_batch = cutlass.Int32(arith.select(origins_single_map.ir_value(), cutlass.Int32(0).ir_value(), batch_idx.ir_value()))
         read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
         bars.mb_q_o_alias.wait(q_o_alias_phase)
@@ -849,6 +873,9 @@ def _tmaldg_warp_group(
                 bars.mb_q_full.smem_ptr,
                 cta_group=CFG.CTA_MMA,
                 mcast_mask=tma_mcast_mask,
+                # A runtime Q map is acquired by this warp itself (once for a
+                # single map, per unit for sequence-local maps).
+                acquire=thd_origins is None,
             )
 
             for kv_loop in cutlass.range(kv_left, kv_right, 1, unroll=1):
@@ -1954,6 +1981,11 @@ def _correction_warp_group(
                 bars.mb_stat_empty.arrive()
                 stat_mbar_state = stat_mbar_state ^ cutlass.Int32(1)
 
+                # Prepare P1 while the preceding PV may still be in flight.
+                # Keep its TMEM store after the existing reuse/rescale handshake.
+                scaled = RegTile(raw_hi, size=64) * scale_log2 - max_safe
+                high_p = cute.math.exp2(scaled.vec, fastmath=True)
+
                 if kv_loop != bounds.left:
                     all_alpha_one = vote_sync(0xFFFFFFFF, alpha == cutlass.Float32(1.0), VoteSync.ALL)
                     previous_phase = (bmm2_done_phase_pair >> parity_prev_rt) & cutlass.Int32(1)
@@ -1971,8 +2003,6 @@ def _correction_warp_group(
                 _fused_before_sync()
                 bars.mb_bmm2_ready[parity_cur_rt * cutlass.Int32(CFG.N_BMM2_CHUNKS)].arrive(leader_cta_id=leader_cta_id, cta_group=CFG.CTA_MMA)
 
-                scaled = RegTile(raw_hi, size=64) * scale_log2 - max_safe
-                high_p = cute.math.exp2(scaled.vec, fastmath=True)
                 nvvm.tcgen05_st("32x32b", nvvm.make_tmem_ptr(tmem_base_iter + p_off + cutlass.Int32(32), cutlass.Float32), high_p.to(STORAGE_DTYPE))
                 nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.STORE)
                 _fused_before_sync()
@@ -2503,6 +2533,7 @@ def _host(
                 n_thd_units,
                 paged=PAGED_KV,
                 rank_by_kv=PAGED_KV and bool(CFG.BOTTOM_RIGHT) and (CFG.MASK_FLAGS & MASK_SWA) == 0,
+                single_maps=True,
             ).launch(grid=(1, 1, 1), block=(THD_SETUP_THREADS, 1, 1), stream=stream)
         else:
             _build_thd_meta_o_descs_kernel(

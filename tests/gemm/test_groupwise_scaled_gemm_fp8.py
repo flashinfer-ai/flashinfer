@@ -31,7 +31,7 @@ from flashinfer.gemm import (
 from flashinfer.gemm import is_cuda_tile_available
 from flashinfer.cute_dsl import is_cute_dsl_available, is_rubin_cute_dsl_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, is_sm12x_supported
 
 # Peak host RSS 124-200 GiB in 9 of 35 flashinfer-ci nightly runs (2026-10),
 # from JIT-building the blockscale GEMM module when no earlier file in the job
@@ -170,6 +170,34 @@ def test_fp8_groupwise_gemm(
         backend=backend,
     )
     torch.testing.assert_close(c, ref_c, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("n", [192, 200])
+def test_fp8_groupwise_gemm_sm12x_unsupported_shape_raises(n):
+    # The SM12x kernel rejects n % 128 != 0; the error must reach the caller
+    # instead of returning with `out` unwritten.
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("SM12x only")
+    m, k = 128, 256
+    a = torch.randn((m, k), device="cuda").to(torch.float8_e4m3fn)
+    b = torch.randn((n, k), device="cuda").to(torch.float8_e4m3fn)
+    a_scale = torch.ones((k // 128, m), device="cuda")
+    b_scale = torch.ones((k // 128, math.ceil(n / 128)), device="cuda")
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="sm120"):
+        gemm_fp8_nt_groupwise(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            "MN",
+            out=out,
+            out_dtype=torch.bfloat16,
+            backend="cutlass",
+        )
+        torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(

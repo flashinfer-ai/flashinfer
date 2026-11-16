@@ -63,12 +63,19 @@ def row_max_reduction(vec):
     return elems[0]
 
 
-def row_reduction_pair(vec):
+def row_reduction_pair(vec, balanced=False):
+    """Sum even/odd lanes; optionally shorten dependencies with a pairwise tree."""
     n = int(vec.shape[0])
     assert n % 2 == 0, f"row_reduction_pair: N={n} must be even"
     half = n // 2
     paired_ty = _ir.VectorType.get([half, 2], T_.f32())
     paired = vector.shape_cast(paired_ty, vec.ir_value())
+
+    if balanced:
+        nodes = [vector.extract(paired, dynamic_position=[], static_position=[i]) for i in range(half)]
+        while len(nodes) > 1:
+            nodes = [arith.addf(nodes[i], nodes[i + 1]) if i + 1 < len(nodes) else nodes[i] for i in range(0, len(nodes), 2)]
+        return cutlass.Vector(nodes[0], dtype=cutlass.Float32)
 
     acc = vector.extract(paired, dynamic_position=[], static_position=[0])
     for i in range(1, half):
@@ -638,9 +645,17 @@ def opaque_i32_zero():
 
 
 @cutlass.cute.jit
-def opaque_i32(value: cutlass.Int32) -> cutlass.Int32:
-    """Identity mov.b32 that pins a per-lane loop invariant in its register."""
-    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=[value])
+def opaque_i32(value: cutlass.Int32, anchor=None) -> cutlass.Int32:
+    """Identity mov.b32 that pins a per-lane loop invariant in its register.
+
+    ``anchor`` (optional, append-only): a loop-VARIANT ``Int32`` (the q-tile counter) passed as an extra, unreferenced asm operand -- the
+    :func:`~cudnn.frost.tile_dsl.mma.desc_opaque` form for a 32-bit address term.  Without it an item-invariant SMEM address and every
+    ``base + vec`` add derived from it are hoisted by LLVM's LICM to the item loop's preheader and stay live across the whole tile body
+    (the sm100 d128 2-CTA softmax's 8 dS STS addresses: 8 registers, 4 of them spilled at the 144-register split, 2026-10-27); anchored,
+    the mov and the adds that depend on it sit inside the tile next to the STS that consumes them, so their live range is one tile.  The
+    default path (no anchor) emits exactly the asm it always did."""
+    args = [value] if cutlass.const_expr(anchor is None) else [value, anchor]
+    return inline_ptx("mov.b32 $0, $1;", write_only_types=[cutlass.Int32], read_only_args=args)
 
 
 @cutlass.cute.jit
@@ -872,6 +887,62 @@ def rope_rotate_half(
     partner = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
     signed = -partner if lane < cutlass.Int32(half_lanes) else partner
     return y * cos_v + signed * sin_v
+
+
+@cute.jit
+def round_pair_io(lo: cutlass.Float32, hi: cutlass.Float32, io_dtype):
+    """Two fp32 values rounded to ``io_dtype`` (bf16 / f16: ``cvt.rn.{bf16,f16}x2.f32``, round-to-nearest-even -- the SAME
+    instruction the store path rounds with) and widened back EXACTLY: the io-dtype ROUNDING POINT of a value that stays in fp32
+    registers (``x.to(io).to(fp32)`` in torch terms).  The pair form is the hardware's (one ``cvt`` rounds two values); a lone
+    value rounds as ``round_pair_io(x, x, dt)[0]``.  Used by the ``"hf"`` rounding arm of the QSA indexer's compress chains
+    (``gated_attention_block/kernels/qsa_compress.py``: the pooled key before its norm, the normed row before its rotation, the
+    rotation's three operations); :func:`round_values_io` is the row form."""
+    return f16x2_to_f32(fp32_to_fp16(lo, hi, dtype=io_dtype), dtype=io_dtype)
+
+
+def round_values_io(values, io_dtype):
+    """:func:`round_pair_io` over an EVEN-length Python list of fp32 values (a lane's chunk of a row), pairwise; returns the new
+    list.  Plain Python at trace time (no staged control flow), so it is callable from a kernel body like the unpack comprehensions."""
+    assert len(values) % 2 == 0, f"round_values_io: an even number of values is needed, got {len(values)}"
+    out = []
+    for i in range(0, len(values), 2):
+        lo, hi = round_pair_io(values[i], values[i + 1], io_dtype)
+        out.append(lo)
+        out.append(hi)
+    return out
+
+
+@cute.jit
+def rope_rotate_half_io(
+    y0: cutlass.Float32,
+    y1: cutlass.Float32,
+    cos0: cutlass.Float32,
+    cos1: cutlass.Float32,
+    sin0: cutlass.Float32,
+    sin1: cutlass.Float32,
+    lane: cutlass.Int32,
+    half_lanes: cutlass.Constexpr[int],
+    io_dtype,
+):
+    """:func:`rope_rotate_half` for a PAIR of adjacent elements with the io-dtype rotation of the HF / vLLM-prepare dtype flow:
+    ``a = io(y * cos)``, ``b = io(signed_partner * sin)``, ``out = io(a + b)`` -- each of the three operations rounded to ``io_dtype``
+    (torch's bf16 ops and Triton's bf16 ops both round per op; ``a - b == a + (-b)`` exactly, so the sign convention of
+    :func:`rope_rotate_half` is kept).  The TABLES are rounded to ``io_dtype`` first -- the HF reference rotates with ``cos`` / ``sin``
+    cast to the key dtype, so a 16-bit table of the OTHER width (f16 tables under bf16 io, or the converse) meets the oracle's rounding
+    point here, and a table already in the io dtype passes unchanged (an exact identity: every io value is a fixed point of its own
+    ``cvt.rn``).  With that, every input is io-representable (the caller rounded the normed row), so the fp32 products are exact and
+    the ONE rounding per op is the io one.  Same partner shuffle (every lane of the warp must reach this call), same lane rules;
+    returns ``(out0, out1)``.  Pairs so that one ``cvt`` rounds two values (:func:`round_pair_io`)."""
+    cos0, cos1 = round_pair_io(cos0, cos1, io_dtype)
+    sin0, sin1 = round_pair_io(sin0, sin1, io_dtype)
+    p0 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y0, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    p1 = cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, y1, cutlass.Int32(half_lanes), 31, kind=nvvm.Shfl.BFLY))
+    lower = lane < cutlass.Int32(half_lanes)
+    s0 = -p0 if lower else p0
+    s1 = -p1 if lower else p1
+    a0, a1 = round_pair_io(y0 * cos0, y1 * cos1, io_dtype)
+    b0, b1 = round_pair_io(s0 * sin0, s1 * sin1, io_dtype)
+    return round_pair_io(a0 + b0, a1 + b1, io_dtype)
 
 
 @cute.jit

@@ -90,6 +90,7 @@ def _run_fp8_swa(monkeypatch, *, num_heads, out, out_shape=None):
 
     monkeypatch.setattr(cake, "_dispatch_route", fake_dispatch)
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: 148)
     rows = 12
     query = torch.zeros((rows, num_heads, 512), dtype=torch.bfloat16).to(
         torch.float8_e4m3fn

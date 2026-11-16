@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
 
+from .host_cpu import (
+    read_host_cpu_times as _read_host_cpu_times,
+    host_cpu_percentages as _host_cpu_percentages,
+)
 from .io import atomic_write_json, atomic_write_text
 from .junit import annotate_batch_xml, validate_batch_xml
 from .models import Batch, Unit
@@ -94,13 +98,6 @@ _OUTPUT_DRAIN_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
-class _HostCpuTimes:
-    total: int
-    idle: int
-    iowait: int
-
-
-@dataclass(frozen=True)
 class _ProcessTreeStats:
     worker_cpu_seconds: float
     descendant_cpu_seconds: float
@@ -120,7 +117,7 @@ class _ProcessCpuStat:
 class _ResourceSample:
     timestamp: float
     host_rss_mib: float
-    gpu_memory_mib: float
+    gpu_memory_mib: float | None
     host_cpu_percent: float | None
     host_iowait_percent: float | None
     load1: float
@@ -154,25 +151,27 @@ class _OutputDrainState:
 
 
 def _descendant_pids(root_pid: int) -> set[int]:
+    children: dict[int, list[int]] = {}
+    for process_dir in Path("/proc").iterdir():
+        if not process_dir.name.isdigit():
+            continue
+        try:
+            content = (process_dir / "status").read_text(encoding="utf-8")
+            parent_line = next(
+                line for line in content.splitlines() if line.startswith("PPid:")
+            )
+            children.setdefault(int(parent_line.split()[1]), []).append(
+                int(process_dir.name)
+            )
+        except (OSError, StopIteration, ValueError):
+            continue
     pids = {root_pid}
-    changed = True
-    while changed:
-        changed = False
-        for process_dir in Path("/proc").iterdir():
-            if not process_dir.name.isdigit():
-                continue
-            try:
-                content = (process_dir / "status").read_text(encoding="utf-8")
-                pid = int(process_dir.name)
-                parent_line = next(
-                    line for line in content.splitlines() if line.startswith("PPid:")
-                )
-                parent = int(parent_line.split()[1])
-            except (OSError, StopIteration, ValueError):
-                continue
-            if parent in pids and pid not in pids:
+    pending = [root_pid]
+    while pending:
+        for pid in children.get(pending.pop(), []):
+            if pid not in pids:
                 pids.add(pid)
-                changed = True
+                pending.append(pid)
     return pids
 
 
@@ -191,7 +190,21 @@ def _rss_mib(pids: set[int]) -> float:
     return total_kib / 1024
 
 
-def _gpu_mib(pids: set[int]) -> float:
+def _gpu_mib(pids: set[int]) -> float | None:
+    snapshot_path = os.environ.get("FLASHINFER_RESOURCE_SNAPSHOT")
+    if snapshot_path:
+        try:
+            snapshot = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+            age = time.time() - float(snapshot["timestamp"])
+            if age > max(10, 3 * float(snapshot["interval_seconds"])) or age < 0:
+                return None
+            memory = snapshot["process_memory_mib"]
+            if memory is None:
+                return None
+            values = [memory.get(str(pid), 0) for pid in pids]
+            return None if any(value is None for value in values) else sum(values)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
     try:
         result = subprocess.run(
             [
@@ -215,35 +228,6 @@ def _gpu_mib(pids: set[int]) -> float:
         except ValueError:
             continue
     return total
-
-
-def _read_host_cpu_times() -> _HostCpuTimes | None:
-    try:
-        fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
-        if not fields or fields[0] != "cpu":
-            return None
-        values = [int(value) for value in fields[1:]]
-    except (OSError, ValueError):
-        return None
-    if len(values) < 5:
-        return None
-    # Linux reports guest time again inside user/nice, so only the first eight
-    # non-guest counters belong in the total.
-    return _HostCpuTimes(total=sum(values[:8]), idle=values[3], iowait=values[4])
-
-
-def _host_cpu_percentages(
-    previous: _HostCpuTimes | None, current: _HostCpuTimes | None
-) -> tuple[float | None, float | None]:
-    if previous is None or current is None:
-        return None, None
-    total = current.total - previous.total
-    if total <= 0:
-        return None, None
-    idle = max(0, current.idle - previous.idle)
-    iowait = max(0, current.iowait - previous.iowait)
-    busy = max(0, total - idle - iowait)
-    return 100 * busy / total, 100 * iowait / total
 
 
 def _parse_process_cpu_stat(stat: str, ticks_per_second: float) -> _ProcessCpuStat:
@@ -622,6 +606,12 @@ def _run_pytest(
             stop_monitor.set()
             if monitor is not None:
                 monitor.join(timeout=max(1.0, request.memory_interval + 1))
+            # Keep observed samples even if pytest crashed or its XML cannot
+            # be finalized. Allocation CSVs are additionally flushed live.
+            atomic_write_text(
+                artifacts.final_xml.with_name(f"{request.batch.id}.memory.csv"),
+                _resource_csv(tuple(samples)),
+            )
             output_thread.join(timeout=_OUTPUT_DRAIN_SECONDS)
             if output_thread.is_alive():
                 drain_state.disable_console()
@@ -673,7 +663,7 @@ def _resource_csv(samples: tuple[_ResourceSample, ...]) -> str:
             [
                 f"{sample.timestamp:.6f}",
                 f"{sample.host_rss_mib:.3f}",
-                f"{sample.gpu_memory_mib:.3f}",
+                "" if sample.gpu_memory_mib is None else f"{sample.gpu_memory_mib:.3f}",
                 ""
                 if sample.host_cpu_percent is None
                 else f"{sample.host_cpu_percent:.3f}",
@@ -754,10 +744,6 @@ def _promote_batch_artifacts(
             artifacts.temporary_telemetry,
             artifacts.final_xml.with_name(f"{batch.id}.telemetry.json"),
         )
-    atomic_write_text(
-        artifacts.final_xml.with_name(f"{batch.id}.memory.csv"),
-        _resource_csv(outcome.samples),
-    )
     atomic_write_json(
         artifacts.final_xml.with_name(f"{batch.id}.meta.json"),
         {

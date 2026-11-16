@@ -41,6 +41,7 @@ click
 cuda-python>=12.0
 cuda-tile>=1.4.0
 einops
+filelock
 nccl-extensions>=0.1.0
 nccl4py>=0.4.1
 ninja
@@ -49,6 +50,7 @@ nvidia-cudnn-frontend>=1.32.0
 nvidia-cutlass-dsl>=4.8.0
 nvidia-ml-py
 packaging>=24.2
+portalocker[win32]>=4.4.2
 requests
 tabulate
 torch

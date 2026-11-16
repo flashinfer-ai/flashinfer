@@ -62,7 +62,7 @@ cb.prepare_nvfp4_per_token_quantize(x, gs_inv, ws)()      # quantizer alone
 cb.prepare_mm_fp4_per_token(ws.fp4, ws.sf, w_fp4, w_sf, ws.scale, out)()   # GEMM alone
 ```
 
-Validated matrix (`validated_problems` in `tests/test_helpers/cake_nvfp4_per_token.py`):
+Validated matrix (`validated_problems` in `tests/quantization/test_helpers/cake_nvfp4_per_token.py`):
 `(K, N)` in {(7168, 2112),
 (7168, 1536), (16384, 7168), (7168, 18432), (18432, 7168), (8192, 8192),
 (8192, 28672), (28672, 8192)} x `M` in {1, 8, 17, 32, 128, 130, 257, 512, 2048, 8192}

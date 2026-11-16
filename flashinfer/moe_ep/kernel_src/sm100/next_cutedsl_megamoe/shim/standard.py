@@ -29,6 +29,7 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
     use_custom_finalize: bool = False
+    batch_invariant_cake_finalize: bool = dataclasses.field(default=False, kw_only=True)
     use_persistent_finalize_kernel: bool = False
 
     @property
@@ -37,7 +38,7 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
 
     @property
     def hidden_alignment(self) -> int:
-        return 64
+        return 128 if self.quant_kind == "mxfp4_mxfp8" else 64
 
     @property
     def resolved_mma_tiler_mnk(self) -> tuple[int, int, int]:
@@ -71,10 +72,6 @@ class Sm100BlockScaledMoeConfig(BlockScaledMoeConfig):
             )
         if self.kernel_variant != "inference":
             raise ValueError("Use Sm100GenphaseMoeConfig for GenPhase.")
-        if self.quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"):
-            raise ValueError(
-                "This adapter supports NVFP4 and MXFP8 standard inference."
-            )
 
 
 class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
@@ -82,6 +79,7 @@ class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
 
     _architecture = "sm_100"
     config: Sm100BlockScaledMoeConfig
+    fc1_activation_per_token_scale: torch.Tensor | None
 
     @staticmethod
     def _require_device() -> None:
@@ -107,24 +105,37 @@ class Sm100BlockScaledSymmBuffer(BlockScaledSymmBuffer):
         config: Sm100BlockScaledMoeConfig,
         *,
         num_valid_tokens_tensor: torch.Tensor | None = None,
+        process_group=None,
     ) -> None:
+        from . import comm
+
         if not isinstance(config, Sm100BlockScaledMoeConfig):
             raise TypeError("Standard inference requires Sm100BlockScaledMoeConfig.")
-        if config.use_persistent_finalize_kernel:
-            if (
-                num_valid_tokens_tensor is None
-                or not num_valid_tokens_tensor.is_cuda
-                or num_valid_tokens_tensor.dtype != torch.int32
-                or tuple(num_valid_tokens_tensor.shape) != (1,)
-                or num_valid_tokens_tensor.device.index != torch.cuda.current_device()
-            ):
-                raise ValueError(
-                    "Persistent finalization requires a CUDA int32 (1,) live count on the workspace device."
-                )
-        elif num_valid_tokens_tensor is not None:
-            raise ValueError("A live count requires persistent finalization.")
+
+        def validate_local():
+            if config.use_persistent_finalize_kernel:
+                if (
+                    num_valid_tokens_tensor is None
+                    or not num_valid_tokens_tensor.is_cuda
+                    or num_valid_tokens_tensor.dtype != torch.int32
+                    or tuple(num_valid_tokens_tensor.shape) != (1,)
+                    or num_valid_tokens_tensor.device.index
+                    != torch.cuda.current_device()
+                ):
+                    raise ValueError(
+                        "Persistent finalization requires a CUDA int32 (1,) live count on the workspace device."
+                    )
+            elif num_valid_tokens_tensor is not None:
+                raise ValueError("A live count requires persistent finalization.")
+
+        comm.prepare_local(
+            validate_local,
+            config.world_size,
+            process_group,
+            phase="persistent finalization validation",
+        )
         self.num_valid_tokens = num_valid_tokens_tensor
-        super().__init__(config)
+        super().__init__(config, process_group=process_group)
 
     def _runtime_kwargs(self, transformed_l1, transformed_l2) -> dict:
         from .block_scaled import _to_cute

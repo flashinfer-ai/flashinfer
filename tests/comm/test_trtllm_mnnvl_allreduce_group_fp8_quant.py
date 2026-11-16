@@ -8,7 +8,10 @@ from mpi4py import MPI
 
 import flashinfer.comm as comm
 from flashinfer.comm.mnnvl import TorchDistBackend
-from tests.test_helpers.comm import init_torch_distributed_from_mpi
+from tests.comm.test_helpers.comm import (
+    _get_rank_info_from_env,
+    init_torch_distributed_from_mpi,
+)
 
 
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -33,6 +36,24 @@ def _prefer_mpi_launcher_env() -> None:
 
     for key in ("SLURM_PROCID", "SLURM_NTASKS", "SLURM_LOCALID", "SLURM_NODEID"):
         os.environ.pop(key, None)
+
+
+def _init_distributed_and_device() -> tuple[int, int, torch.device]:
+    """Keep NCCL, workspace allocation, and tensors on the launcher's local GPU."""
+    device_count = torch.cuda.device_count()
+    if device_count == 0:
+        pytest.skip("requires CUDA")
+
+    _prefer_mpi_launcher_env()
+    rank, world_size, local_rank = _get_rank_info_from_env()
+    if world_size < 2:
+        pytest.skip(f"requires at least 2 ranks, got {world_size}")
+
+    # Global rank modulo visible GPUs is wrong when ranks do not fill each node.
+    # Select the local device before NCCL binds the process group to a GPU.
+    torch.cuda.set_device(local_rank % device_count)
+    init_torch_distributed_from_mpi()
+    return rank, world_size, torch.device("cuda", torch.cuda.current_device())
 
 
 def _scale_storage_size(token_num: int, groups_per_row: int) -> int:
@@ -202,19 +223,7 @@ def test_mnnvl_allreduce_group_fp8_quant(
     if dtype == torch.float32 and hidden_dim == 4224:
         expected_error = "no exact CTA partition"
 
-    if torch.cuda.device_count() == 0:
-        pytest.skip("requires CUDA")
-
-    _prefer_mpi_launcher_env()
-    init_torch_distributed_from_mpi()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    if world_size < 2:
-        pytest.skip(f"requires at least 2 ranks, got {world_size}")
-
-    local_rank = rank % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+    rank, world_size, device = _init_distributed_and_device()
     eps = 1e-6
 
     workspace = None
@@ -307,19 +316,7 @@ def test_mnnvl_allreduce_group_fp8_cuda_graph_replay(
     use_oneshot: bool, launch_with_pdl: bool
 ) -> None:
     """Validate MNNVL packed group FP8 CUDA Graph replay."""
-    if torch.cuda.device_count() == 0:
-        pytest.skip("requires CUDA")
-
-    _prefer_mpi_launcher_env()
-    init_torch_distributed_from_mpi()
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    if world_size < 2:
-        pytest.skip(f"requires at least 2 ranks, got {world_size}")
-
-    local_rank = rank % torch.cuda.device_count()
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+    rank, world_size, device = _init_distributed_and_device()
     token_num = 16 if use_oneshot else 128
     hidden_dim = 4096
     group_size = 128
@@ -403,6 +400,58 @@ def test_mnnvl_allreduce_group_fp8_cuda_graph_replay(
         if workspace is not None:
             workspace.destroy()
         dist.barrier()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("launcher", ["slurm", "torchrun"])
+@pytest.mark.parametrize(
+    "rank,world_size,local_rank,device_count,expected_device",
+    [
+        (1, 2, 0, 4, 0),  # One rank per node, several visible GPUs.
+        (3, 4, 1, 4, 1),  # Two ranks per node, several visible GPUs.
+        (5, 8, 1, 4, 1),  # Full nodes retain the existing device assignment.
+        (3, 4, 1, 1, 0),  # A launcher can expose only this rank's GPU.
+    ],
+)
+def test_group_fp8_uses_launcher_device_before_nccl(
+    monkeypatch, launcher, rank, world_size, local_rank, device_count, expected_device
+):
+    """Sparse multi-node ranks must not rebind tensors to global-rank GPU IDs."""
+    for key in (
+        "SLURM_PROCID",
+        "SLURM_NTASKS",
+        "SLURM_LOCALID",
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_RANK",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    keys = (
+        ("SLURM_PROCID", "SLURM_NTASKS", "SLURM_LOCALID")
+        if launcher == "slurm"
+        else ("RANK", "WORLD_SIZE", "LOCAL_RANK")
+    )
+    for key, value in zip(keys, (rank, world_size, local_rank), strict=True):
+        monkeypatch.setenv(key, str(value))
+    monkeypatch.setattr(f"{__name__}._prefer_mpi_launcher_env", lambda: None)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: device_count)
+    selected = []
+    monkeypatch.setattr(torch.cuda, "set_device", selected.append)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: selected[-1])
+    initialized = []
+
+    def init_nccl():
+        assert selected == [expected_device]
+        initialized.append(True)
+
+    monkeypatch.setattr(f"{__name__}.init_torch_distributed_from_mpi", init_nccl)
+    assert _init_distributed_and_device() == (
+        rank,
+        world_size,
+        torch.device("cuda", expected_device),
+    )
+    assert initialized == [True]
+    assert selected == [expected_device]
 
 
 @pytest.mark.parametrize(

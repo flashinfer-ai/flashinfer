@@ -224,6 +224,22 @@ def _qk_mma_operand_contract_for_config(
     return False, cfg.tile_size_kv, cfg.tile_size_q
 
 
+def swaps_score_load_chunks(q_repeats: int) -> tuple[tuple[int, int], ...]:
+    """Split ``q_repeats`` Swaps row-pair repeats into power-of-two TMEM loads.
+
+    Returns ``(first_repeat, num_repeats)`` pairs, largest first. One repeat is
+    eight Q rows (eight TMEM columns of a 16x256b load), so Q48's six repeats
+    become ``((0, 4), (4, 2))`` and every power-of-two tile is a single load.
+    """
+    chunks = []
+    start = 0
+    while start < q_repeats:
+        size = 1 << ((q_repeats - start).bit_length() - 1)
+        chunks.append((start, size))
+        start += size
+    return tuple(chunks)
+
+
 @dataclass(kw_only=True)
 class TmemSResource(DecodeGenResourceBase):
     """TMEM score resource for BMM1 and softmax.
@@ -1557,6 +1573,141 @@ class TmemSResource(DecodeGenResourceBase):
                     s_vals[s_idx] = _neg_max_f32()
 
     @cute.jit
+    def compute_softmax_loop_swaps_streamed(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+    ) -> tuple[object, object, object, object]:
+        """Mask/reduce Q32 fragments in TMEM instead of carrying a full Q128 row."""
+        cfg = self.cfg
+        cache = _decode_gen_task_cache(stage_info)
+        thread_idx = cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        lane = cache[_TASK_CACHE_LANE_IDX]
+        warp = cache[_TASK_CACHE_WARP_IDX]
+        col_group = lane & Int32(3)
+        local_row = (lane >> Int32(2)) & Int32(3)
+        q_group = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
+        q_base = _q_group_token_base(cfg, q_group)
+        seq_len = Int32(self.max_seq_len_kv)
+        if cutlass.const_expr(self.seqlens_kv is not None):
+            seq_len = _load_runtime_seq_len_kv(
+                self.seqlens_kv, self.max_seq_len_kv, stage_info, Int32(0), Int32(0)
+            )
+        local_tile = _softmax_tile_idx(cfg, stage_info, self.inst_id)
+        effective_tile = _runtime_split_kv_global_tile_idx(
+            cfg, stage_info, local_tile, seq_len, self.seq_len_q, q_base
+        )
+        total_tiles = _runtime_total_kv_tiles(cfg, seq_len, self.seq_len_q, q_base)
+        tile = _runtime_clamp_valid_tile_idx(
+            cfg, effective_tile, seq_len, self.seq_len_q, q_base
+        )
+        tile_offset = tile * Int32(cfg.tile_size_kv)
+        valid_tile = effective_tile < total_tiles and tile_offset < seq_len
+        base = self._softmax_loop_score_tmem_addr(stage_info)
+        if stage_info.loop_offset == stage_info.loop_start:
+            _init_softmax_scratch_u32(
+                self._softmax_scratch_u32, thread_idx, cfg.tile_size_q
+            )
+            prims.barrier_cta_sync(self.sync_barrier_id, thread_count=128)
+        for q_band in cutlass.range_constexpr(cfg.tile_size_q // 32):
+            scores = cutlass.Array(Float32, 32, space=cutlass.AddressSpace.rmem)
+            for idx in cutlass.range_constexpr(32):
+                scores[idx] = _neg_max_f32()
+            addr = base + Int32(q_band * 32)
+            if valid_tile:
+                lo = prims.tcgen05_ld(
+                    "16x256b", prims.make_tmem_ptr(addr, Float32), num=4
+                )
+                hi = prims.tcgen05_ld(
+                    "16x256b",
+                    prims.make_tmem_ptr(addr + Int32(16 << 16), Float32),
+                    num=4,
+                )
+                cute.arch.fence_view_async_tmem_load()
+                for idx in cutlass.range_constexpr(16):
+                    scores[idx] = lo[idx]
+                    scores[idx + 16] = hi[idx]
+            maxima = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
+            for scale_idx in cutlass.range_constexpr(8):
+                repeat = scale_idx // 2
+                pair = scale_idx % 2
+                row = Int32(q_band * 32 + repeat * 8 + pair) + col_group * Int32(2)
+                valid_row = _q_row_is_valid_for_seq(
+                    cfg, self.h_r, q_group, row, self.seq_len_q
+                )
+                visible_end = seq_len
+                if cutlass.const_expr(cfg.mask_type == CAUSAL):
+                    token, _ = _q_row_token_and_local_head(cfg, self.h_r, q_group, row)
+                    visible_end = seq_len - self.seq_len_q + token + Int32(1)
+                for k_group in cutlass.range_constexpr(4):
+                    k = (
+                        tile_offset
+                        + warp * Int32(32)
+                        + (lane >> Int32(2))
+                        + Int32(k_group * 8)
+                    )
+                    idx = repeat * 4 + pair + (k_group % 2) * 2 + (k_group // 2) * 16
+                    if not valid_row or k >= visible_end:
+                        scores[idx] = _neg_max_f32()
+                idx = repeat * 4 + pair
+                val = cute.math.max(
+                    cute.math.max(scores[idx], scores[idx + 2], ftz=True),
+                    cute.math.max(scores[idx + 16], scores[idx + 18], ftz=True),
+                    ftz=True,
+                )
+                maxima[scale_idx] = cute.math.max(
+                    val, new_max_arr[q_band * 8 + scale_idx], ftz=True
+                )
+            for scale_base in cutlass.range_constexpr(0, 8, 4):
+                val = _wspro_reduce_max4(
+                    maxima[scale_base],
+                    maxima[scale_base + 1],
+                    maxima[scale_base + 2],
+                    maxima[scale_base + 3],
+                    local_row,
+                )
+                _smem_atomic_max_u32(
+                    self._softmax_scratch_u32.data_ptr()
+                    + col_group * Int32(cfg.num_softmax_scale_groups)
+                    + Int32(q_band * 8 + scale_base)
+                    + local_row,
+                    _float_to_u32_for_atomic_max(val),
+                )
+            # P reloads these masked scores while the task retains the S credit.
+            prims.tcgen05_st(
+                "16x256b",
+                prims.make_tmem_ptr(addr, Float32),
+                cutlass.Vector.from_elements(
+                    tuple(scores[idx] for idx in range(16)), Float32
+                ),
+            )
+            prims.tcgen05_st(
+                "16x256b",
+                prims.make_tmem_ptr(addr + Int32(16 << 16), Float32),
+                cutlass.Vector.from_elements(
+                    tuple(scores[idx + 16] for idx in range(16)), Float32
+                ),
+            )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        cute.arch.fence_view_async_tmem_store()
+        prims.barrier_cta_sync(self.sync_barrier_id, thread_count=128)
+        for q_band in cutlass.range_constexpr(cfg.tile_size_q // 32):
+            vals = (
+                self._softmax_scratch_u32.data_ptr()
+                + col_group * Int32(cfg.num_softmax_scale_groups)
+                + Int32(q_band * 8)
+            ).load(count=8, alignment=16)
+            for idx in cutlass.range_constexpr(8):
+                scale = q_band * 8 + idx
+                old_max_arr[scale] = new_max_arr[scale]
+                new_max_arr[scale] = _u32_to_float_for_atomic_max(vals[idx])
+        return old_max_arr, sum_arr, new_max_arr, s_arr
+
+    @cute.jit
     def _compute_softmax_loop_swaps(
         self,
         stage_info: StageInfo,
@@ -1580,7 +1731,16 @@ class TmemSResource(DecodeGenResourceBase):
         correction consumes.
         """
         cfg = self.cfg
+        gates_unchanged_max: Constexpr[bool] = cfg.skips_unchanged_max_work
         assert not cfg.use_keeps_mma_ab
+        if cutlass.const_expr(cfg.streams_scores_in_q32_bands):
+            return self.compute_softmax_loop_swaps_streamed(
+                stage_info,
+                old_max_arr=old_max_arr,
+                sum_arr=sum_arr,
+                new_max_arr=new_max_arr,
+                s_arr=s_arr,
+            )
         # ConsWork: consume the committed S tile, update the running max state,
         # and forward masked S registers to the P producer.
         # Start from the previously published running max/sum and a fresh
@@ -1606,6 +1766,7 @@ class TmemSResource(DecodeGenResourceBase):
             self.seqlens_kv is not None
             and cfg.use_paged_kv
             and not cfg.use_split_kv
+            and cfg.fixed_seqlen
             and cfg.max_seq_len_q == 1
             and not cfg.use_sliding_window_causal
         )
@@ -1637,8 +1798,8 @@ class TmemSResource(DecodeGenResourceBase):
             element_mask_end_idx = seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
         should_load_s = True
         if cutlass.const_expr(not use_sparse):
-            use_runtime_kv_domain = (
-                self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
+            use_runtime_kv_domain = self.seqlens_kv is not None or (
+                not cfg.fixed_seqlen or cfg.uses_runtime_q_kv_union
             )
             local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
             if cutlass.const_expr(not use_runtime_kv_domain):
@@ -1722,28 +1883,27 @@ class TmemSResource(DecodeGenResourceBase):
             # -inf so the later P path contributes zero probability.
             base_addr = self._softmax_loop_score_tmem_addr(stage_info)
 
-            shape = "16x256b"
-            loaded0 = prims.tcgen05_ld(
-                shape,
-                prims.make_tmem_ptr(base_addr, Float32),
-                num=q_repeats,
-            )
-            loaded1 = prims.tcgen05_ld(
-                shape,
-                prims.make_tmem_ptr(base_addr + Int32(16 << 16), Float32),
-                num=q_repeats,
-            )
+            # TMEM loads take a power-of-two repeat count, so Q48 loads its
+            # six row-pair repeats as 4 + 2. Low and high K halves land in
+            # s_vals[0, 4*q_repeats) and s_vals[4*q_repeats, 8*q_repeats).
+            load_chunks = swaps_score_load_chunks(q_repeats)
+            for chunk_idx in cutlass.range_constexpr(len(load_chunks)):
+                chunk_start, chunk_repeats = load_chunks[chunk_idx]
+                chunk_addr = base_addr + Int32(chunk_start * 8)
+                loaded_lo = prims.tcgen05_ld(
+                    "16x256b",
+                    prims.make_tmem_ptr(chunk_addr, Float32),
+                    num=chunk_repeats,
+                )
+                loaded_hi = prims.tcgen05_ld(
+                    "16x256b",
+                    prims.make_tmem_ptr(chunk_addr + Int32(16 << 16), Float32),
+                    num=chunk_repeats,
+                )
+                for idx in cutlass.range_constexpr(chunk_repeats * 4):
+                    s_vals[chunk_start * 4 + idx] = loaded_lo[idx]
+                    s_vals[q_repeats * 4 + chunk_start * 4 + idx] = loaded_hi[idx]
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            for repeat_idx in cutlass.range_constexpr(q_repeats):
-                ld_base = repeat_idx * 4
-                s_vals[ld_base + 0] = loaded0[ld_base + 0]
-                s_vals[ld_base + 1] = loaded0[ld_base + 1]
-                s_vals[ld_base + 2] = loaded0[ld_base + 2]
-                s_vals[ld_base + 3] = loaded0[ld_base + 3]
-                s_vals[q_repeats * 4 + ld_base + 0] = loaded1[ld_base + 0]
-                s_vals[q_repeats * 4 + ld_base + 1] = loaded1[ld_base + 1]
-                s_vals[q_repeats * 4 + ld_base + 2] = loaded1[ld_base + 2]
-                s_vals[q_repeats * 4 + ld_base + 3] = loaded1[ld_base + 3]
 
         route_is_proxy = cutlass.Boolean(False)
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
@@ -1842,7 +2002,16 @@ class TmemSResource(DecodeGenResourceBase):
         # Determine whether this tile crosses the active right endpoint or the
         # start of the causal sliding window. Dense full tiles skip per-element
         # masking.
-        if cutlass.const_expr(use_sparse):
+        if cutlass.const_expr(
+            use_sparse or (cfg.uses_per_row_causal_mask and cfg.tile_size_q >= 48)
+        ):
+            # The per-row causal mask below subsumes this one: every valid
+            # row's causal end is at most seq_len_kv, its window start is at
+            # least the CTA-wide start, and padded rows are masked entirely.
+            # In length-generic kernels the compiler otherwise issues this
+            # mask predicated-off on every interior tile. Q48+ softmax is the
+            # bottleneck there (D128 Q48: 1.68 -> 1.58 ms on GB300); Q16/Q32
+            # measured mixed (+/-6%) and keep the mask.
             should_apply_dense_mask = False
         elif cutlass.const_expr(
             not use_runtime_kv_domain and not cfg.uses_uniform_causal_mask
@@ -2019,7 +2188,7 @@ class TmemSResource(DecodeGenResourceBase):
             proxy_max_shift, tail_shift = self._proxy_score_shifts(
                 route_is_proxy_uniform
             )
-            if cutlass.const_expr(tail_log2_delta != 0.0):
+            if cutlass.const_expr(not cfg.fixed_seqlen or tail_log2_delta != 0.0):
                 if route_is_proxy_uniform:
                     for token_group_idx in cutlass.range_constexpr(4):
                         atom_origin, logical_summary = _swaps_routed_coordinate(
@@ -2049,6 +2218,7 @@ class TmemSResource(DecodeGenResourceBase):
                                 s_vals[tail_s_base + 1] = (
                                     s_vals[tail_s_base + 1] + tail_shift
                                 )
+        lane_has_new_max = cutlass.Boolean(False)
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Reduce this lane's S registers to one candidate per scale group.
             repeat_idx = scale_idx // 2
@@ -2063,50 +2233,64 @@ class TmemSResource(DecodeGenResourceBase):
             if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
                 # The mass enters before the anchor, so the P range is unchanged.
                 local_max = local_max + proxy_max_shift
+            if cutlass.const_expr(gates_unchanged_max):
+                lane_has_new_max = lane_has_new_max | (
+                    local_max > old_max_vals[scale_idx]
+                )
             local_max = cute.math.max(local_max, old_max_vals[scale_idx], ftz=True)
             local_max_vals[scale_idx] = local_max
 
+        warp_has_new_max = cutlass.Boolean(True)
+        if cutlass.const_expr(gates_unchanged_max):
+            # Every old maximum came from the previous CTA-wide reload. A
+            # warp with no larger candidate cannot change the shared running
+            # maxima, so its shuffle reductions and atomics are exact no-ops.
+            # The first iteration still populates freshly initialized scratch.
+            warp_has_new_max = cute.arch.vote_any_sync(lane_has_new_max) | (
+                stage_info.loop_offset == stage_info.loop_start
+            )
         local_row_idx = (lane_idx >> Int32(2)) & Int32(0x3)
-        if cutlass.const_expr(num_scale_groups > 2):
-            # Transpose each four-scale block across four strided warp rows.
-            # Every lane then owns one reduced scale group per block.
-            for scale_base in cutlass.range_constexpr(0, num_scale_groups, 4):
-                local_max_vals[scale_base] = _wspro_reduce_max4(
-                    local_max_vals[scale_base],
-                    local_max_vals[scale_base + 1],
-                    local_max_vals[scale_base + 2],
-                    local_max_vals[scale_base + 3],
-                    local_row_idx,
-                )
-        else:
-            # Two scale groups use the compact partial reduction.
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                local_max = cute.math.max(
-                    local_max_vals[scale_idx],
-                    Float32(
-                        prims.shfl_sync(
-                            thread_mask=0xFFFFFFFF,
-                            val=local_max_vals[scale_idx],
-                            offset=16,
-                            mask_and_clamp=0x1F,
-                            kind=prims.Shfl.BFLY,
-                        )
-                    ),
-                    ftz=True,
-                )
-                local_max_vals[scale_idx] = cute.math.max(
-                    local_max,
-                    Float32(
-                        prims.shfl_sync(
-                            thread_mask=0xFFFFFFFF,
-                            val=local_max,
-                            offset=8,
-                            mask_and_clamp=0x1F,
-                            kind=prims.Shfl.BFLY,
-                        )
-                    ),
-                    ftz=True,
-                )
+        if warp_has_new_max:
+            if cutlass.const_expr(num_scale_groups > 2):
+                # Transpose each four-scale block across four strided warp rows.
+                # Every lane then owns one reduced scale group per block.
+                for scale_base in cutlass.range_constexpr(0, num_scale_groups, 4):
+                    local_max_vals[scale_base] = _wspro_reduce_max4(
+                        local_max_vals[scale_base],
+                        local_max_vals[scale_base + 1],
+                        local_max_vals[scale_base + 2],
+                        local_max_vals[scale_base + 3],
+                        local_row_idx,
+                    )
+            else:
+                # Two scale groups use the compact partial reduction.
+                for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                    local_max = cute.math.max(
+                        local_max_vals[scale_idx],
+                        Float32(
+                            prims.shfl_sync(
+                                thread_mask=0xFFFFFFFF,
+                                val=local_max_vals[scale_idx],
+                                offset=16,
+                                mask_and_clamp=0x1F,
+                                kind=prims.Shfl.BFLY,
+                            )
+                        ),
+                        ftz=True,
+                    )
+                    local_max_vals[scale_idx] = cute.math.max(
+                        local_max,
+                        Float32(
+                            prims.shfl_sync(
+                                thread_mask=0xFFFFFFFF,
+                                val=local_max,
+                                offset=8,
+                                mask_and_clamp=0x1F,
+                                kind=prims.Shfl.BFLY,
+                            )
+                        ),
+                        ftz=True,
+                    )
 
         if stage_info.loop_offset == stage_info.loop_start:
             # Softmax consumes S in the loop stage. Persistent CTAs reuse this
@@ -2120,25 +2304,30 @@ class TmemSResource(DecodeGenResourceBase):
 
         col_group_idx = lane_idx & Int32(0x3)
         atomic_reduce_base = col_group_idx * Int32(num_scale_groups)
-        if cutlass.const_expr(num_scale_groups > 2):
-            # Two row groups publish one partial per distributed scale group.
-            for scale_base in cutlass.range_constexpr(0, num_scale_groups, 4):
-                scale_idx = local_row_idx + Int32(scale_base)
-                _smem_atomic_max_u32(
-                    self._softmax_scratch_u32.data_ptr()
-                    + atomic_reduce_base
-                    + scale_idx,
-                    _float_to_u32_for_atomic_max(local_max_vals[scale_base]),
-                )
-        elif lane_idx < Int32(8):
-            # The compact fallback publishes both scale groups from eight lanes.
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                _smem_atomic_max_u32(
-                    self._softmax_scratch_u32.data_ptr()
-                    + atomic_reduce_base
-                    + Int32(scale_idx),
-                    _float_to_u32_for_atomic_max(local_max_vals[scale_idx]),
-                )
+        if warp_has_new_max:
+            if cutlass.const_expr(num_scale_groups > 2):
+                # Two row groups publish one partial per distributed scale group.
+                for publish_scale_base in cutlass.range_constexpr(
+                    0, num_scale_groups, 4
+                ):
+                    publish_scale_idx = local_row_idx + Int32(publish_scale_base)
+                    _smem_atomic_max_u32(
+                        self._softmax_scratch_u32.data_ptr()
+                        + atomic_reduce_base
+                        + publish_scale_idx,
+                        _float_to_u32_for_atomic_max(
+                            local_max_vals[publish_scale_base]
+                        ),
+                    )
+            elif lane_idx < Int32(8):
+                # The compact fallback publishes both scale groups from eight lanes.
+                for publish_scale_idx in cutlass.range_constexpr(num_scale_groups):
+                    _smem_atomic_max_u32(
+                        self._softmax_scratch_u32.data_ptr()
+                        + atomic_reduce_base
+                        + Int32(publish_scale_idx),
+                        _float_to_u32_for_atomic_max(local_max_vals[publish_scale_idx]),
+                    )
         # Wait for every SMEM atomic max to finish before reloading the
         # reduced maxima. Without this barrier, the vector reload below can
         # race a late writer from another softmax warp.
@@ -2289,7 +2478,10 @@ class TmemSResource(DecodeGenResourceBase):
             # back into the running state. This keeps the denominator
             # consistent with the quantized P actually consumed by BMM2.
             for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
-                sum_arr[scale_idx] = self.load_global_sum(scale_idx)
+                if cutlass.const_expr(cfg.streams_scores_in_q32_bands):
+                    sum_arr[scale_idx] = self.load_p_local_sum(scale_idx)
+                else:
+                    sum_arr[scale_idx] = self.load_global_sum(scale_idx)
             return sum_arr
         num_scale_groups = cfg.num_softmax_scale_groups
         for scale_base in cutlass.range_constexpr(0, num_scale_groups, 2):
@@ -2525,7 +2717,7 @@ class TmemSResource(DecodeGenResourceBase):
         proxy_max_shift = Float32(0.0)
         tail_shift = Float32(0.0)
         tail_fragment_mask = Int32(0)
-        tail_lane: Constexpr[int] = 0
+        tail_lane = Int32(0)
         shifts_tail: Constexpr[bool] = False
         dequantizes_scores: Constexpr[bool] = (
             cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
@@ -2546,7 +2738,7 @@ class TmemSResource(DecodeGenResourceBase):
             )
             tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
             tail_lane = tail_summary_idx % fragment_regs
-            shifts_tail = tail_log2_delta != 0.0
+            shifts_tail = not cfg.fixed_seqlen or tail_log2_delta != 0.0
             proxy_max_shift, tail_shift = self._proxy_score_shifts(route_is_proxy)
             if cutlass.const_expr(shifts_tail and cfg.use_sage_attention):
                 # Sage scores are quantized: the shift is divided by the row's
@@ -2554,17 +2746,17 @@ class TmemSResource(DecodeGenResourceBase):
                 tail_shift = tail_shift * cute.math.rcp(sage_q_scale, approx=True)
             if cutlass.const_expr(shifts_tail):
                 # One mask bit per fragment marks the one holding the ragged
-                # final summary, whose half and fragment are compile-time
-                # (``proxy_static_tail_fragment``). A thread holds it on a
+                # final summary. Its half and fragment follow the live KV
+                # length. A thread holds it on a
                 # proxy route of the last summary group, in the tail's half;
                 # with several groups, ``origin0`` identifies the last one.
-                tail_half, tail_fragment = cfg.proxy_static_tail_fragment
+                tail_half, tail_fragment = cfg.proxy_tail_fragment
                 holds_tail = cutlass.Boolean(
                     route_is_proxy
                     and _keeps_spatial_half(cfg, warp_grp_thread_idx)
                     == Int32(tail_half)
                 )
-                if cutlass.const_expr(cfg.num_proxy_groups > 1):
+                if cfg.num_proxy_groups > 1:
                     # The half's first atom is atom ``tail_half`` of the group.
                     tail_group_origin0 = (
                         cfg.num_proxy_groups - 1
@@ -2791,7 +2983,7 @@ class TmemSResource(DecodeGenResourceBase):
         may_hold_tail: Constexpr[bool],
         tail_fragment_mask: Int32,
         tail_shift: Float32,
-        tail_lane: Constexpr[int],
+        tail_lane: Int32,
     ) -> None:
         """Mask, fold and write back every fragment in one rolled loop.
 
@@ -2842,11 +3034,13 @@ class TmemSResource(DecodeGenResourceBase):
                         score = Float32(float("-inf"))
                     else:
                         score = _neg_max_f32()
-                if cutlass.const_expr(may_hold_tail and score_idx == tail_lane):
-                    if ((tail_fragment_mask >> Int32(fragment)) & Int32(1)) != Int32(0):
+                if cutlass.const_expr(may_hold_tail):
+                    if score_idx == tail_lane and (
+                        (tail_fragment_mask >> Int32(fragment)) & Int32(1)
+                    ) != Int32(0):
                         lane_shift = tail_shift
                         if cutlass.const_expr(cfg.use_sage_attention):
-                            tail_group: Constexpr[int] = tail_lane // (
+                            tail_group: Constexpr[int] = score_idx // (
                                 fragment_regs // groups
                             )
                             lane_shift = tail_shift * cute.math.rcp(

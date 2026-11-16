@@ -533,8 +533,8 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                 unsigned int p_bm_3 = (unsigned int)(-(p_item_1 >> 1 & 1));
                 p_lt |= p_eq & p_bm_3 & ~p_cb_3;
                 p_eq &= ~(p_cb_3 ^ p_bm_3);
-                unsigned int p_cb_4 = __ballot_sync(0xFFFFFFFF, (p_item_1 >> 0 & 1) != 0);
-                unsigned int p_bm_4 = (unsigned int)(-(p_item_1 >> 0 & 1));
+                unsigned int p_cb_4 = __ballot_sync(0xFFFFFFFF, (p_item_1 & 1) != 0);
+                unsigned int p_bm_4 = (unsigned int)(-(p_item_1 & 1));
                 p_lt |= p_eq & p_bm_4 & ~p_cb_4;
                 p_eq &= ~(p_cb_4 ^ p_bm_4);
                 p_lower = p_lt | p_eq & lanemask_lt;
@@ -546,10 +546,10 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                 unsigned int p_keys[8];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
-                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 0 + 0) * 4)));
+                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64) * 4)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
-                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 0 + 4) * 4)));
+                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 4) * 4)));
                 p_ra += ((p_keys[0] > p_key) ? 1 : 0);
                 p_rb += ((p_keys[1] > p_key) ? 1 : 0);
                 p_rc += ((p_keys[2] > p_key) ? 1 : 0);
@@ -560,7 +560,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                 p_rd += ((p_keys[7] > p_key) ? 1 : 0);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
-                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 8 + 0) * 4)));
+                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 8) * 4)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
                     : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 8 + 4) * 4)));
@@ -575,7 +575,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                 if (p_total > 16) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 16 + 0) * 4)));
+                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 16) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
                         : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 16 + 4) * 4)));
@@ -591,7 +591,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                 if (p_total > 24) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 24 + 0) * 4)));
+                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 24) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
                         : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 24 + 4) * 4)));
@@ -751,10 +751,10 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     q_eq_hl &= ~(q_cl_3 ^ q_bh_3);
                     q_lt_hh |= q_eq_hh & q_bh_3 & ~q_ch_3;
                     q_eq_hh &= ~(q_ch_3 ^ q_bh_3);
-                    unsigned int q_cl_4 = __ballot_sync(0xFFFFFFFF, (q_it_lo >> 0 & 1) != 0);
-                    unsigned int q_ch_4 = __ballot_sync(0xFFFFFFFF, (q_it_hi >> 0 & 1) != 0);
-                    unsigned int q_bl_4 = (unsigned int)(-(q_it_lo >> 0 & 1));
-                    unsigned int q_bh_4 = (unsigned int)(-(q_it_hi >> 0 & 1));
+                    unsigned int q_cl_4 = __ballot_sync(0xFFFFFFFF, (q_it_lo & 1) != 0);
+                    unsigned int q_ch_4 = __ballot_sync(0xFFFFFFFF, (q_it_hi & 1) != 0);
+                    unsigned int q_bl_4 = (unsigned int)(-(q_it_lo & 1));
+                    unsigned int q_bh_4 = (unsigned int)(-(q_it_hi & 1));
                     q_lt_ll |= q_eq_ll & q_bl_4 & ~q_cl_4;
                     q_eq_ll &= ~(q_cl_4 ^ q_bl_4);
                     q_lt_lh |= q_eq_lh & q_bl_4 & ~q_ch_4;
@@ -775,10 +775,10 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     unsigned int q_keys[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 0 + 0) * 4)));
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 0 + 4) * 4)));
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 4) * 4)));
                     q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
                     q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
                     q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
@@ -797,7 +797,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 8 + 0) * 4)));
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 8) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
                         : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 8 + 4) * 4)));
@@ -819,7 +819,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 16 + 0) * 4)));
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 16) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
                         : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 16 + 4) * 4)));
@@ -841,7 +841,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 24 + 0) * 4)));
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 24) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
                         : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 24 + 4) * 4)));
@@ -864,10 +864,10 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     if (p_total > 32) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 0 + 0) * 4)));
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 0 + 4) * 4)));
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 4) * 4)));
                         q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
                         q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
                         q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
@@ -888,7 +888,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     if (p_total > 40) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 8 + 0) * 4)));
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 8) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
                             : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 8 + 4) * 4)));
@@ -912,7 +912,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     if (p_total > 48) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 16 + 0) * 4)));
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 16) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
                             : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 16 + 4) * 4)));
@@ -936,7 +936,7 @@ kernel_cake_kimi_k3_fused_router_a140805ed9d697427fbe(float* __restrict__ logits
                     if (p_total > 56) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 24 + 0) * 4)));
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 24) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
                             : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 24 + 4) * 4)));

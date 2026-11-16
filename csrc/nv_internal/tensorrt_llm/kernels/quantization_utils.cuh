@@ -502,6 +502,9 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
     // TODO: use half as compute data type.
+    // Compute this independent reciprocal before the E4M3 zero-scale check,
+    // so the scale conversion does not delay it.
+    float const reciprocalSFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
     auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
 
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
@@ -511,9 +514,7 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
     // A nonzero block can round to a zero E4M3 scale; match the CuTe zero-scale contract.
-    outputScale = fp8SFVal != 0
-                      ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                      : 0.0f;
+    outputScale = fp8SFVal != 0 ? reciprocal_approximate_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
   }
 
   if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
@@ -1215,6 +1216,8 @@ struct TmaKernelTraitsTwoBytes {
   static constexpr int ROW_ITERATIONS = TMA_ROW_TILE / ROWS_PER_WARP;  // 2
   static constexpr int ELTS_PER_THREAD = 16;
   static constexpr int NUM_CONSUMER_WARPS = 8;
+  // Columns per producer step; the kernel walks n only in whole chunks.
+  static constexpr int TMA_COL_CHUNK = NUM_CONSUMER_WARPS * TMA_COL_TILE;
 
   static constexpr size_t SMEM_DATA_SIZE = NUM_STAGES * SMEM_ROWS * SMEM_COLS * sizeof(SmemType);
   static constexpr int SMEM_STAGE_SIZE = SMEM_ROWS * SMEM_COLS;
@@ -1294,6 +1297,8 @@ struct TmaKernelTraits<__nv_fp8_e4m3> {
   static constexpr int ROW_ITERATIONS = TMA_ROW_TILE / ROWS_PER_WARP;  // 2
   static constexpr int ELTS_PER_THREAD = 16;
   static constexpr int NUM_CONSUMER_WARPS = 8;
+  // Columns per producer step; the kernel walks n only in whole chunks.
+  static constexpr int TMA_COL_CHUNK = NUM_CONSUMER_WARPS * TMA_COL_TILE;
 
   static constexpr size_t SMEM_DATA_SIZE = NUM_STAGES * SMEM_ROWS * SMEM_COLS * sizeof(SmemType);
   static constexpr int SMEM_STAGE_SIZE = SMEM_ROWS * SMEM_COLS;

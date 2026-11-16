@@ -1503,6 +1503,15 @@ def create_scheduler_task(
     )
 
 
+class MlaStagedOutputTask(MlaTask):
+    """Correction task that drains its per-warp output TMA stores at exit."""
+
+    @cute.jit
+    def _drain_mla_work_tile_tails(self):
+        MlaTask._drain_mla_work_tile_tails(self)
+        prims.cp_async_bulk_wait_group(0)
+
+
 class MlaOutputTmaTask(MlaTask):
     """Drain global TMA writes once after the persistent work loop."""
 

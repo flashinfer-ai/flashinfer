@@ -19,17 +19,26 @@ limitations under the License.
 # Every row plans a ``BlockSparseAttentionWrapper(backend="cake")`` once and
 # times ``run()`` with CUPTI-correlated GPU time (cold L2 per iteration):
 #
-#     python benchmarks/bench_cake_vsa.py [--rows all|tests|deployment] [--json out.json]
+#     python benchmarks/bench_cake_vsa.py [--rows all|tests|deployment|standings] [--json out.json]
+#
+# ``--routes`` times each row on several block-64 routes: ``served`` (the
+# plan's own choice), ``per-head`` (the per-head persistent programs) and
+# ``balanced`` (the shared-selection balanced program, wherever the selection
+# holds more than four blocks per query block on average, even where the plan
+# keeps the faster per-head programs); ``--graph`` adds a
+# CUDA-graph timing of every route beside the eager one.
 
 from __future__ import annotations
 
 import argparse
 import json
 import statistics
+import contextlib
 from dataclasses import asdict, dataclass
 
 import torch
 
+from flashinfer import cake_vsa
 from flashinfer.sparse import BlockSparseAttentionWrapper
 from flashinfer.testing import bench_gpu_time
 
@@ -81,6 +90,39 @@ DEPLOYMENT_ROWS = (
 )
 
 
+# Shared block-64 selections of round(density x NB) blocks per query block,
+# M = N = S, eight heads: S in {1024, 2048, 4096} at densities 0.25 / 0.5 / 0.75.
+STANDINGS_ROWS = tuple(
+    Row(64, "bfloat16", 8, 8, 128, seq, seq, round(density * seq // 64))
+    for seq, density in (
+        (1024, 0.50),
+        (1024, 0.75),
+        (2048, 0.25),
+        (2048, 0.50),
+        (2048, 0.75),
+        (4096, 0.25),
+        (4096, 0.50),
+        (4096, 0.75),
+    )
+)
+
+ROUTES = ("served", "per-head", "balanced")
+
+
+@contextlib.contextmanager
+def blk64_route(route: str):
+    """Plan under one block-64 route: ``served`` keeps the plan's own choice,
+    ``per-head`` never selects the balanced program, ``balanced`` selects it
+    without the comparison with the per-head programs."""
+    saved_beats = cake_vsa._blk64_balanced_beats_per_head
+    if route != "served":
+        cake_vsa._blk64_balanced_beats_per_head = lambda **_: route == "balanced"
+    try:
+        yield
+    finally:
+        cake_vsa._blk64_balanced_beats_per_head = saved_beats
+
+
 def strided_mask(row: Row, device: torch.device) -> torch.Tensor:
     mb, nb = row.M // row.block_size, row.N // row.block_size
     mask = torch.zeros((row.num_qo_heads, mb, nb), dtype=torch.bool, device=device)
@@ -119,37 +161,81 @@ def plan_wrapper(row: Row, mask: torch.Tensor, workspace: torch.Tensor):
     return wrapper
 
 
-def bench_row(row: Row, device: torch.device, workspace: torch.Tensor) -> float:
+def bench_row(
+    row: Row,
+    device: torch.device,
+    workspace: torch.Tensor,
+    route: str = "served",
+    graph: bool = False,
+) -> tuple[float, str]:
+    """Median GPU time (ms) of one row on one route, and the block-64 program
+    the plan selected (``balanced``, the per-head profile, or ``-``)."""
     q, k, v, mask = make_inputs(row, device)
-    wrapper = plan_wrapper(row, mask, workspace)
+    with blk64_route(route):
+        wrapper = plan_wrapper(row, mask, workspace)
+    plan = wrapper._cake_vsa_plan
+    program = "-"
+    if row.block_size == 64:
+        program = (
+            "balanced"
+            if plan.get("blk64_balanced") is not None
+            else plan["blk64_profile"]
+        )
     wrapper.run(q, k, v, return_lse=row.return_lse)
     torch.cuda.synchronize()
     times = bench_gpu_time(
         lambda: wrapper.run(q, k, v, return_lse=row.return_lse),
         enable_cupti=True,
+        use_cuda_graph=graph,
         cold_l2_cache=True,
     )
-    return float(statistics.median(list(times)))
+    return float(statistics.median(list(times))), program
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", choices=("all", "tests", "deployment"), default="all")
+    parser.add_argument(
+        "--rows",
+        choices=("all", "tests", "deployment", "standings"),
+        default="all",
+    )
+    parser.add_argument("--routes", type=str, default="served")
+    parser.add_argument("--graph", action="store_true")
     parser.add_argument("--json", type=str, default=None)
     args = parser.parse_args()
     rows = {
         "tests": TEST_ROWS,
         "deployment": DEPLOYMENT_ROWS,
+        "standings": STANDINGS_ROWS,
         "all": TEST_ROWS + DEPLOYMENT_ROWS,
     }[args.rows]
+    routes = args.routes.split(",")
+    if any(route not in ROUTES for route in routes):
+        parser.error(f"--routes takes a comma list of {', '.join(ROUTES)}")
+    modes = (False, True) if args.graph else (False,)
     device = torch.device("cuda")
     workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
     results = []
-    print("| row | median_ms |\n|---|---|")
+    print("| row | route | program | mode | median_ms |\n|---|---|---|---|---|")
     for row in rows:
-        median_ms = bench_row(row, device, workspace)
-        results.append({**asdict(row), "label": row.label, "median_ms": median_ms})
-        print(f"| {row.label} | {median_ms:.4f} |", flush=True)
+        for route in routes:
+            for graph in modes:
+                median_ms, program = bench_row(row, device, workspace, route, graph)
+                mode = "graph" if graph else "eager"
+                results.append(
+                    {
+                        **asdict(row),
+                        "label": row.label,
+                        "route": route,
+                        "program": program,
+                        "mode": mode,
+                        "median_ms": median_ms,
+                    }
+                )
+                print(
+                    f"| {row.label} | {route} | {program} | {mode} | {median_ms:.4f} |",
+                    flush=True,
+                )
     if args.json:
         with open(args.json, "w", encoding="utf-8") as handle:
             json.dump(results, handle, indent=1)
