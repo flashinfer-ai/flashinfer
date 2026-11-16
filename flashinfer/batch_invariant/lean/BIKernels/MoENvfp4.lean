@@ -1,3 +1,5 @@
+-- Copyright (c) 2026 by FlashInfer team.
+-- SPDX-License-Identifier: Apache-2.0
 import BIKernels.MoE
 /-!
 # The NVFP4 MoE classes (`moe.nvfp4.<act>`): the W4A4 chains on the bf16 MoE model
