@@ -22,9 +22,9 @@ namespace moe::dev::routing {
 namespace routingCustom {
 // Forward declarations of launch functions.
 // Block/DynBlock/Cluster return whether a compiled tier covered (numExperts, topK)
-// and the kernel was actually launched; the definitions live in
-// trtllm_fused_moe_routing_custom.cuh. Keep these signatures in sync (the return
-// type is not part of the mangled name, so a mismatch would silently be UB).
+// and the kernel was actually launched; the definitions live in the per-family
+// routing translation units. Keep these signatures in sync (the return type is
+// not part of the mangled name, so a mismatch would silently be UB).
 bool launchBlockKernel(Data const& data, void* stream);
 bool launchDynBlockKernel(Data const& data, uint32_t numThreadsHist, void* stream);
 bool launchClusterKernel(Data const& data, void* stream);
