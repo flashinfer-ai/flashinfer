@@ -193,6 +193,27 @@ def test_mm_mxfp8_b12x_tail_padding_parity(m, k, out_dtype):
     torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("k", [32, 64, 96])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_b12x_tail_single_tile(k, out_dtype):
+    _skip_if_not_b12x()
+    from flashinfer.gemm.gemm_mm_mxfp8_cute_dsl import _b12x_gemm_mxfp8_runner
+
+    torch.manual_seed(5175)
+    a, sa, ap, sap = _mxfp8_tail_operand(6, k, guard=True)
+    b, sb, bp, sbp = _mxfp8_tail_operand(128, k, guard=True)
+    # Exercise a partial tile with no full-tile prologue through the internal
+    # runner; the public API must retain its existing K >= 128 floor.
+    with pytest.raises(ValueError, match="n >= 128 and k >= 128"):
+        mm_mxfp8(a, b.T, sa, sb, out_dtype=out_dtype, backend="b12x")
+    reference = mm_mxfp8(ap, bp.T, sap, sbp, out_dtype=out_dtype, backend="b12x")
+    out = torch.full_like(reference, float("nan"))
+    major, minor = get_compute_capability(a.device)
+    runner = _b12x_gemm_mxfp8_runner(major, minor, True, out_dtype)
+    runner.forward([a, b.T, sa, sb, out_dtype, out, None])
+    torch.testing.assert_close(out, reference, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("k", [544, 576, 608])
 def test_mm_mxfp8_b12x_tail_auto_graph(k, monkeypatch):
     _skip_if_not_b12x()
