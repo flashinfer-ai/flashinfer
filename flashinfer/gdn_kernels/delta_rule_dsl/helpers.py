@@ -1,3 +1,5 @@
+import ctypes
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -408,3 +410,44 @@ class SM90:
         operand_as_acc = cute.make_tensor(operand.iterator, acc.layout)
         operand_as_acc.store(acc.load().to(dtype))
         return operand
+
+
+_NSMID_SRC = b"""extern "C" __global__ void nsmid_probe(unsigned int* out) {
+    unsigned int n;
+    asm volatile("mov.u32 %0, %%nsmid;" : "=r"(n));
+    *out = n;
+}
+"""
+
+
+@functools.cache
+def get_device_nsmid(device: torch.device) -> int:
+    """Upper bound (exclusive) on ``%smid``, read on the device.
+
+    Under CUDA MPS with a reduced thread share, ``multi_processor_count`` shrinks
+    but ``%smid`` still spans the physical SM ids, which ``%nsmid`` bounds.
+    """
+    from cuda.bindings import driver, nvrtc
+
+    def check(res):
+        if res[0].value != 0:
+            raise RuntimeError(f"%nsmid probe failed: {res[0]}")
+        return res[1] if len(res) == 2 else None
+
+    major, minor = torch.cuda.get_device_capability(device)
+    out = torch.zeros(1, dtype=torch.int32, device=device)
+    prog = check(nvrtc.nvrtcCreateProgram(_NSMID_SRC, b"nsmid_probe.cu", 0, [], []))
+    opts = [f"--gpu-architecture=compute_{major}{minor}".encode()]
+    check(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+    ptx_size = check(nvrtc.nvrtcGetPTXSize(prog))
+    ptx = b" " * ptx_size
+    check(nvrtc.nvrtcGetPTX(prog, ptx))
+    with torch.cuda.device(device):
+        torch.cuda.current_stream(device).synchronize()
+        module = check(driver.cuModuleLoadData(ptx))
+        kernel = check(driver.cuModuleGetFunction(module, b"nsmid_probe"))
+        params = ((out.data_ptr(),), (ctypes.c_void_p,))
+        check(driver.cuLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0, 0, params, 0))
+        check(driver.cuCtxSynchronize())
+        check(driver.cuModuleUnload(module))
+    return int(out.item())

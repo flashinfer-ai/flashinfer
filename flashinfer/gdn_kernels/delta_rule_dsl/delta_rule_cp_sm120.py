@@ -26,6 +26,7 @@ from .custom_compile_cache import (
     sm12x_compile_options,
 )
 from .helpers import (
+    get_device_nsmid,
     SM80,
     TF32,
     WarpMmaTF32Op,
@@ -5439,7 +5440,7 @@ def cp_delta_rule_prefill_dsl_sm120(
         torch.bfloat16: cutlass.BFloat16,
     }[q.dtype]
 
-    workspace_size = get_device_sm_count(device) * 128
+    workspace_size = get_device_nsmid(device) * 128
     tensormaps_t = _get_cache_buf(
         "gdn_cp_sm120_prefill_tensormaps", workspace_size, device
     )
