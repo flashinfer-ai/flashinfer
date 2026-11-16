@@ -143,9 +143,8 @@ def test_act_and_mul_jit_zero_tokens(act, shape):
     assert out.shape == expected_shape
     assert out.numel() == 0
 
-@pytest.mark.parametrize(
-    "op", ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"]
-)
+
+@pytest.mark.parametrize("op", ["silu_and_mul", "gelu_and_mul", "gelu_tanh_and_mul"])
 @pytest.mark.parametrize("shape", [(0, 2048), (2, 0, 2048), (4, 0)])
 @pytest.mark.parametrize("use_out", [False, True])
 def test_act_and_mul_zero_tokens(op, shape, use_out):
@@ -153,9 +152,7 @@ def test_act_and_mul_zero_tokens(op, shape, use_out):
     expected_shape = shape[:-1] + (shape[-1] // 2,)
 
     out = (
-        torch.empty(expected_shape, device=x.device, dtype=x.dtype)
-        if use_out
-        else None
+        torch.empty(expected_shape, device=x.device, dtype=x.dtype) if use_out else None
     )
 
     fn = getattr(flashinfer.activation, op)
@@ -168,6 +165,7 @@ def test_act_and_mul_zero_tokens(op, shape, use_out):
 
     if use_out:
         assert y is out
+
 
 if __name__ == "__main__":
     test_fused_silu_mul(128, 1, 1, True)
