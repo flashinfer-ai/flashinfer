@@ -326,6 +326,8 @@ constexpr auto get_cluster_shape() {
 }
 
 struct CutlassGemmConfig {
+  enum class RasterOrder { Heuristic, AlongM, AlongN };
+
   enum CandidateConfigTypeParam : int {
     NONE = 0,
     WEIGHT_ONLY = 1u << 0,
@@ -356,6 +358,8 @@ struct CutlassGemmConfig {
   bool swap_ab = false;  // Default false only implemented for SM120/SM121, but generalizable
   bool use_stream_k =
       false;  // SM120/SM121: false = DP scheduler (default), true = StreamK scheduler
+  int max_swizzle_size = 1;
+  RasterOrder raster_order = RasterOrder::Heuristic;  // Original, unswapped problem axes.
 
   CutlassGemmConfig() = default;
 
@@ -424,6 +428,8 @@ struct CutlassGemmConfig {
       // SM120/SM121 specific: StreamK scheduler option
       if (sm_version == 120 || sm_version == 121) {
         tactic << "\n\tscheduler: " << (use_stream_k ? "StreamK (auto heuristic)" : "DP (default)");
+        tactic << "\n\tmax swizzle size: " << max_swizzle_size
+               << "\n\tlogical raster order: " << static_cast<int>(raster_order);
       }
     } else if (tile_config_sm80 != flashinfer::gemm::CutlassTileConfig::ChooseWithHeuristic) {
       assert(sm_version < 90 && "Invalid cutlass GEMM config");
