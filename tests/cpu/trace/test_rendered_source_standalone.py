@@ -81,6 +81,27 @@ def test_dcp_token_json_init_uses_schema_head_dim():
 
 
 @pytest.mark.cpu_only
+def test_dcp_trace_dispatch_selects_template_for_fi_init():
+    """fi_init passes axis values, so dispatch must not require partial_o."""
+    from flashinfer.trace.templates.comm import (
+        decode_cp_a2a_lse_reduce_token_trace,
+        decode_cp_a2a_lse_reduce_trace,
+        decode_cp_a2a_lse_reduce_trace_dispatch,
+    )
+
+    tpl = decode_cp_a2a_lse_reduce_trace_dispatch(batch=4, heads=2, cp_size=8)
+    assert tpl is decode_cp_a2a_lse_reduce_token_trace
+    inputs = tpl.init(batch=4, heads=2, cp_size=8, device="cpu")
+    assert inputs["partial_o"].shape == (4, 8, 2, 512)
+    assert inputs["mask"].shape == (4,)
+
+    tpl = decode_cp_a2a_lse_reduce_trace_dispatch(heads=2, cp_size=8)
+    assert tpl is decode_cp_a2a_lse_reduce_trace
+    inputs = tpl.init(heads=2, cp_size=8, device="cpu")
+    assert inputs["partial_o"].shape == (8, 2, 128)
+
+
+@pytest.mark.cpu_only
 def test_dense_trtllm_decode_reference_renders_standalone():
     """The dense decode reference shares helpers; its rendered source must too."""
     from flashinfer.trace.template import _render_reference_source

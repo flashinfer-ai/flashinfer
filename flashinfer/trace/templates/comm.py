@@ -1228,7 +1228,12 @@ decode_cp_a2a_lse_reduce_token_trace = TraceTemplate(
 
 def decode_cp_a2a_lse_reduce_trace_dispatch(**kwargs):
     partial_o = kwargs.get("partial_o")
-    if partial_o is not None and partial_o.ndim == 4:
+    if partial_o is not None:
+        batched = partial_o.ndim == 4
+    else:
+        # fi_init passes axis values instead of tensors.
+        batched = "batch" in kwargs
+    if batched:
         return decode_cp_a2a_lse_reduce_token_trace
     return decode_cp_a2a_lse_reduce_trace
 
