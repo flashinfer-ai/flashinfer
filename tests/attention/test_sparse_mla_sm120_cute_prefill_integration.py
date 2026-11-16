@@ -8,6 +8,7 @@ from tests.attention.sparse_mla_prefill_utils import (
     numerical_metrics,
     poison_mega_destinations,
     assert_mega_outputs,
+    decode_call,
 )
 
 
@@ -45,6 +46,7 @@ def test_public_prefill_specializations(heads, rank, inline):
             extra_indices=f["indices"][1],
             extra_topk_length=f["lengths"][1],
             out_lse=actual_lse,
+            impl="decode",
             return_lse=True,
             lse_scale=0.6931471805599453,
         )
@@ -64,7 +66,8 @@ def test_public_prefill_specializations(heads, rank, inline):
             ids[66, :] = -1
         f["positions"].add_(1)
         # Keep the reference before poisoning every captured destination.
-        expected = tuple(x.clone() for x in f["baseline"]())
+        expected_lse = decode_call(f, "decode", mega=False)
+        expected = tuple(x.clone() for x in (f["out"], f["scales"], expected_lse))
         metrics = numerical_metrics(f, expected[2], rows)
         assert metrics["finite_output"], metrics
         assert metrics["relative_l2"] < 0.07, metrics
