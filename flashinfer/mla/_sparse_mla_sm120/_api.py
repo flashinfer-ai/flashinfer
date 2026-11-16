@@ -1048,6 +1048,64 @@ class _SparseMLAPagedAttentionRunner:
         self._max_num_heads = max_num_heads
         self._d_v = d_v
 
+    def run_mega(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        output: torch.Tensor,
+        sm_scale: float,
+        *,
+        positions: torch.Tensor,
+        cos_sin: torch.Tensor,
+        output_scales: torch.Tensor,
+        **kwargs,
+    ) -> Optional[torch.Tensor]:
+        """Experimental V4 sparse MLA with fused Q RoPE and FP8 output.
+
+        ``q`` is unrotated BF16 [T,H,512]. RoPE rotates adjacent pairs in
+        its final 64 features. ``positions`` is contiguous int32 [T], with
+        values in [0, cos_sin.shape[0]). ``cos_sin`` is contiguous FP32
+        [num_positions,64]: 32 cosines followed by 32 sines per position.
+        Cached keys must already have RoPE applied.
+
+        ``output`` is contiguous float8_e4m3fn [T,H,512]; ``output_scales``
+        is contiguous uint8 [T,H,16] with one UE8M0 exponent per 32 features.
+        Decode each scale as exp2(output_scales.float() - 127), repeat it
+        over its 32 features, and multiply by output.float(). The context
+        is rounded to BF16 before FP32 inverse RoPE and FP8 quantization.
+        The caller handles Q normalization and learned projections.
+
+        Requires backend="sparse" and an FP8 cache; full-BF16 attention plans are unsupported.
+        Other keyword arguments follow ``run``, including sinks, sparse
+        lengths, extra cache and LSE. Warm up before CUDA graph capture;
+        replay reads the current positions and sparse inputs.
+        Inputs and output buffers must not overlap.
+        """
+        if self._backend != "sparse":
+            raise ValueError("run_mega requires backend='sparse'")
+        if self._kv_cache_format != "fp8":
+            raise ValueError("run_mega requires an FP8 cache")
+        if q.ndim != 3 or q.shape[-1] != 512 or self._d_v != 512:
+            raise ValueError("run_mega requires q [T,H,512] and d_v=512")
+        if output.dtype != torch.float8_e4m3fn:
+            raise ValueError("run_mega output must have dtype float8_e4m3fn")
+        from ._prepared import wrapper_run
+
+        # Pass Q as the unused BF16-output descriptor to avoid allocating a
+        # full context buffer. Fused routes write only to output/output_scales;
+        # split decode still uses its partial-output scratch buffers.
+        return wrapper_run(
+            self,
+            q,
+            kv_cache,
+            indices,
+            q,
+            sm_scale,
+            mega=(positions, cos_sin, output.view(torch.uint8), output_scales),
+            **kwargs,
+        )
+
     # The runner owns out_lse internally so no separate template is needed.
     def run(
         self,
