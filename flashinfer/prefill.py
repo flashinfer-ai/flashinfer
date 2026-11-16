@@ -3387,12 +3387,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
             16-bit query/output dtypes, and contiguous ``(k_cache, v_cache)``
             page caches. The compact caches cost
             ``2 * sum(page_elems) * sizeof(query dtype)`` bytes on top of the
-            caller's FP8 cache and are allocated in :meth:`plan`. The
-            planned page count is fixed; the page ids are read at :meth:`run`
-            from the plan-time index tensor (or its int32 copy), so in CUDA-graph
-            mode keep that tensor fixed or update it in place without changing
-            the planned page count. Unsupported combinations raise; the option
-            never silently falls back. Defaults to ``False``.
+            caller's FP8 cache and are allocated in :meth:`plan`.
+            Page ids are read at :meth:`run` from physical index storage fixed
+            at :meth:`plan`: in CUDA-graph mode this is ``paged_kv_indices_buf``
+            (plan copies the ``paged_kv_indices`` argument into it, and replays
+            may update it in place without changing the referenced page count);
+            in eager mode it is the ``paged_kv_indices`` argument itself when
+            that is a contiguous int32 CUDA tensor, so in-place updates are
+            visible to :meth:`run`, and a converted plan-time snapshot
+            otherwise. A CUDA-graph replan must keep the referenced page count,
+            per-page geometry and query dtype so captured addresses stay valid;
+            incompatible replans raise. The widening is exact for every finite
+            FP8 value; NaN/Inf inputs follow the same conversion convention as
+            the in-kernel FP8 repack. Unsupported combinations raise; the
+            option never silently falls back. Defaults to ``False``.
         """
         if batch_invariant and prewiden_fp8_kv:
             raise ValueError(
@@ -3543,6 +3551,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pw_active = False
         self._pw_src_dtype: Optional[torch.dtype] = None
         self._pw_src_indices: Optional[torch.Tensor] = None
+        self._pw_num_ref_pages = 0
+        self._pw_compact_indices: Optional[torch.Tensor] = None
         self._pw_k_shadow: Optional[torch.Tensor] = None
         self._pw_v_shadow: Optional[torch.Tensor] = None
         self._seq_lens_kv = None
@@ -3909,7 +3919,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         batch_size, self._fixed_batch_size
                     )
                 )
-            if len(paged_kv_indices) > len(self._paged_kv_indices_buf):
+            indices_capacity_buf = (
+                self._pw_src_indices if self._pw_active else self._paged_kv_indices_buf
+            )
+            if len(paged_kv_indices) > len(indices_capacity_buf):
                 raise ValueError(
                     "The length of paged_kv_indices exceeds the allocated buffer size."
                 )
@@ -4474,6 +4487,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if (
                 custom_mask is not None
                 or packed_custom_mask is not None
+                or self._custom_mask_buf is not None
                 or logits_soft_cap != 0.0
                 or prefix_len_ptr is not None
                 or token_pos_in_items_ptr is not None
@@ -4485,33 +4499,80 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "mask, soft cap, sinks, prefix lengths or item positions)"
                 )
             num_ref_pages = int(paged_kv_indptr_host[-1])
+            if len(paged_kv_indices) < num_ref_pages:
+                raise ValueError(
+                    "prewiden_fp8_kv: paged_kv_indices holds fewer pages than "
+                    "paged_kv_indptr[-1] references"
+                )
             if self._kv_layout == "HND":
                 shape_k = (num_ref_pages, num_kv_heads, page_size, head_dim_qk)
                 shape_v = (num_ref_pages, num_kv_heads, page_size, head_dim_vo)
             else:
                 shape_k = (num_ref_pages, page_size, num_kv_heads, head_dim_qk)
                 shape_v = (num_ref_pages, page_size, num_kv_heads, head_dim_vo)
+            # Captured graphs keep the shadow addresses: reuse compatible
+            # storage across replans and reject incompatible ones before any
+            # captured binding is replaced.
+            shadows_compatible = (
+                self._pw_k_shadow is not None
+                and tuple(self._pw_k_shadow.shape) == shape_k
+                and self._pw_k_shadow.dtype == q_data_type
+                and tuple(self._pw_v_shadow.shape) == shape_v
+                and self._pw_v_shadow.dtype == q_data_type
+            )
+            if not shadows_compatible:
+                if self.is_cuda_graph_enabled and self._pw_k_shadow is not None:
+                    raise ValueError(
+                        "prewiden_fp8_kv: a CUDA-graph replan must keep the "
+                        "referenced page count, per-page geometry and query dtype "
+                        "so captured shadow-cache addresses stay valid"
+                    )
+                self._pw_k_shadow = torch.empty(
+                    shape_k, dtype=q_data_type, device=self.device
+                )
+                self._pw_v_shadow = torch.empty(
+                    shape_v, dtype=q_data_type, device=self.device
+                )
+            if (
+                self._pw_compact_indices is None
+                or self._pw_compact_indices.numel() != num_ref_pages
+            ):
+                self._pw_compact_indices = torch.arange(
+                    num_ref_pages, dtype=torch.int32, device=self.device
+                )
+            if self.is_cuda_graph_enabled:
+                # The caller's buffer keeps the physical page ids, matching the
+                # base wrapper's in-place update contract; the compact table
+                # below is what the FA2 kernel reads.
+                if self._pw_src_indices is None:
+                    indices_buf = self._paged_kv_indices_buf
+                    if (
+                        indices_buf.dtype != torch.int32
+                        or indices_buf.device != self.device
+                    ):
+                        raise ValueError(
+                            "prewiden_fp8_kv requires an int32 CUDA "
+                            f"paged_kv_indices_buf on {self.device}, got "
+                            f"{indices_buf.dtype} on {indices_buf.device}"
+                        )
+                    self._pw_src_indices = indices_buf
+            else:
+                self._pw_src_indices = paged_kv_indices.to(
+                    device=self.device, dtype=torch.int32, non_blocking=non_blocking
+                ).contiguous()
+            self._pw_num_ref_pages = num_ref_pages
             self._pw_src_dtype = kv_data_type
-            self._pw_src_indices = paged_kv_indices.to(
-                device=self.device, dtype=torch.int32, non_blocking=non_blocking
-            ).contiguous()
-            self._pw_k_shadow = torch.empty(
-                shape_k, dtype=q_data_type, device=self.device
-            )
-            self._pw_v_shadow = torch.empty(
-                shape_v, dtype=q_data_type, device=self.device
-            )
-            # The planned module reads the compact cache; run() fills it by
-            # gathering the caller's pages through _pw_src_indices.
-            paged_kv_indices = torch.arange(
-                num_ref_pages, dtype=paged_kv_indices.dtype, device=self.device
-            )
+            # FA2 reads the compact table; run() fills the shadows by gathering
+            # the physical pages through _pw_src_indices.
+            self._paged_kv_indices_buf = self._pw_compact_indices
             kv_data_type = q_data_type
             planned_backend = "fa2"
             self._pw_active = True
         else:
             self._pw_src_dtype = None
             self._pw_src_indices = None
+            self._pw_num_ref_pages = 0
+            self._pw_compact_indices = None
             self._pw_k_shadow = None
             self._pw_v_shadow = None
 
@@ -4617,7 +4678,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         batch_size, self._fixed_batch_size
                     )
                 )
-            if len(paged_kv_indices) > len(self._paged_kv_indices_buf):
+            # With pre-widening the caller's buffer stays the physical page
+            # table (the gather source); FA2 reads the wrapper-owned compact
+            # table bound to _paged_kv_indices_buf by plan().
+            indices_copy_target = (
+                self._pw_src_indices if self._pw_active else self._paged_kv_indices_buf
+            )
+            if len(paged_kv_indices) > len(indices_copy_target):
                 raise ValueError(
                     "The length of paged_kv_indices exceeds the allocated buffer size."
                 )
@@ -4627,7 +4694,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._paged_kv_last_page_len_buf.copy_(
                 paged_kv_last_page_len, non_blocking=non_blocking
             )
-            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+            indices_copy_target[: len(paged_kv_indices)].copy_(
                 paged_kv_indices,
                 non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
             )
@@ -4679,9 +4746,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(
                     self.device, non_blocking=non_blocking
                 )
-            self._paged_kv_indices_buf = paged_kv_indices.to(
-                self.device, non_blocking=non_blocking
-            )
+            if not self._pw_active:
+                self._paged_kv_indices_buf = paged_kv_indices.to(
+                    self.device, non_blocking=non_blocking
+                )
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask.to(
                     self.device, non_blocking=non_blocking
@@ -5445,7 +5513,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 v_cache,
                 self._pw_k_shadow,
                 self._pw_v_shadow,
-                self._pw_src_indices,
+                self._pw_src_indices[: self._pw_num_ref_pages],
             )
             k_cache, v_cache = self._pw_k_shadow, self._pw_v_shadow
         check_lse_base(lse_base)
