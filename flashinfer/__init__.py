@@ -564,6 +564,7 @@ from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )
+from .sparse import qsa_sparse_paged_attention as qsa_sparse_paged_attention
 from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
