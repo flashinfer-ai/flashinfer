@@ -83,6 +83,7 @@ void kda_batch_invariant_decode_step(TensorView q, TensorView k, TensorView v, T
     CHECK_CONTIGUOUS(t);
   }
   CHECK_DEVICE(q, state);
+  CHECK_DEVICE(slots, state);
   check_aligned(
       {q, k, state, state_bf16, k_inv_rows, k_inv_f32_rows, rhs_rows, update_rows, stamp});
   check_aligned({v}, 4);
