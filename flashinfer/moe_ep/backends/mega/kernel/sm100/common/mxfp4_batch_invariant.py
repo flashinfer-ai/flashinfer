@@ -55,6 +55,7 @@ def mxfp4_batch_invariant_metadata(config):
         return {}
     return dict(
         batch_invariant=True,
+        save_for_backward=getattr(config, "save_for_backward", False),
         input_norm_const=1.0,
         has_fc1_alpha=False,
         has_fc2_alpha=False,
@@ -210,9 +211,11 @@ def mxfp4_batch_invariant_fingerprint(
             config,
             kind=mxfp4_quant_kind(config),
             arch=arch,
-            knobs=getattr(config, "knobs", None)
-            if isinstance(getattr(config, "knobs", None), dict)
-            else None,
+            knobs=(
+                getattr(config, "knobs", None)
+                if isinstance(getattr(config, "knobs", None), dict)
+                else None
+            ),
             hidden=hidden,
         )
     return spec_fingerprint(
@@ -221,9 +224,9 @@ def mxfp4_batch_invariant_fingerprint(
             config, "intermediate", getattr(config, "intermediate_size", None)
         ),
         top_k=getattr(config, "num_topk", getattr(config, "top_k", None)),
-        num_experts=num_experts
-        if num_experts is not None
-        else config.num_total_experts,
+        num_experts=(
+            num_experts if num_experts is not None else config.num_total_experts
+        ),
         arch=arch,
         implementation=implementation,
         quant_kind=mxfp4_quant_kind(config),

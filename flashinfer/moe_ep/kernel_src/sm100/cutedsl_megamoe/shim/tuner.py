@@ -658,6 +658,7 @@ _EXPLICIT_CONFIG_FIELDS = frozenset(
         "combine_dtype",
         "enable_fc1_activation_per_token_scale",
         "batch_invariant",
+        "save_for_backward",
         "input_norm_const",
         "has_fc1_alpha",
         "has_fc2_alpha",

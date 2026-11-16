@@ -2310,6 +2310,14 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                     else None
                 ),
                 fc1_activation_per_token_scale=fc1_activation_per_token_scale,
+                training_preact=(
+                    token_comm_args.training_preact
+                    if cutlass.const_expr(token_comm_args is not None) else None
+                ),
+                training_expert_ids=(
+                    token_comm_args.training_expert_ids
+                    if cutlass.const_expr(token_comm_args is not None) else None
+                ),
             )
 
             self.epilogue.run(

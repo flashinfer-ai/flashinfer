@@ -117,6 +117,7 @@ def sm107_candidates(
     allow_in_kernel_fc2_reduce: bool = False,
     kernel_variant: str = "inference",
     batch_invariant: bool = False,
+    save_for_backward: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
@@ -142,6 +143,10 @@ def sm107_candidates(
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
+    from .knob_cache import _validate_training_mode
+
+    # Saved outputs are a fixed compilation mode, never a tunable candidate axis.
+    _validate_training_mode(save_for_backward, batch_invariant)
     if batch_invariant:
         if (
             quant_kind
@@ -372,6 +377,7 @@ def _sweep_sm107_block_scaled_mega_moe(
             cfg.quant_kind,
             kernel_variant=cfg.kernel_variant,
             batch_invariant=getattr(cfg, "batch_invariant", False),
+            save_for_backward=getattr(cfg, "save_for_backward", False),
         )
         if candidates is None
         else candidates

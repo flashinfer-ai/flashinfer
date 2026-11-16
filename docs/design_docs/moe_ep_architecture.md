@@ -445,6 +445,76 @@ pinned Lean toolchain is installed; without it, the generated-file consistency
 test still runs. Keep a fingerprint with its FlashInfer/compiler versions,
 architecture, EP topology and expert placement when recording an output receipt.
 
+### Training forward auxiliary outputs
+
+Set `save_for_backward=True` together with `batch_invariant=True` on a BI
+CuTeDSL MegaMoE configuration to compile auxiliary writes into the existing
+rollout kernel. This applies to BF16, NVFP4, MXFP4, MXFP8, W4A16 and W8A16
+within each backend's existing architecture and numerical-recipe support.
+`forward()` still returns the ordinary BF16 output. Its input quantization,
+MMA sequence, activation, handoff and ordered combine are unchanged, so the
+main-output arithmetic fingerprint is shared with the corresponding rollout.
+The compile/cache identity separately includes the save flag. Autotuning and
+outer selection cannot mix candidates with different auxiliary-output modes.
+
+Contiguous feature fragments are rounded into BF16 register copies and saved
+with 256-bit stores. Native raw fragments keep their existing lane mapping;
+the vector stores apply after the existing transpose when it gives each lane
+contiguous features. This changes only auxiliary writeback, preserving the
+provider's A/B orientation and main FP32 registers without additional shared
+memory or changes to the compute pipeline.
+
+```python
+from dataclasses import replace
+
+training_config = replace(rollout_config, save_for_backward=True)
+# Construct a MoEEpMegaLayer with training_config, then warm up before capture.
+y = training_layer.forward(tensors)
+saved = training_layer.get_training_outputs()
+preactivation = saved.fc1_preact
+```
+
+`MoEEpMegaTrainingOutputs` contains borrowed, workspace-owned views:
+
+- `fc1_preact`: BF16 `[P, 2 * intermediate_size]`, all gates followed by all
+  ups, after FC1 dequantization and before activation/clamping. Saving a BF16
+  copy does not replace the main path's FP32 registers. Only rows whose
+  `expert_ids` are nonnegative contain defined preactivations.
+- `expert_ids`: Int32 `[P]` local expert indices; `-1` marks padding.
+- `fc1_input`, `fc2_input` and their optional scale tensors: the native
+  dispatched input and handoff representations. Only valid rows are defined.
+  GenPhase retains gathered source inputs instead of materializing the same
+  receiver-pool layout as the standard kernel.
+- `route_metadata`: native receiver-pool metadata, including packed Int64
+  `token_src_metadata`. `route_metadata_format` identifies the packing:
+  `token32_slot16_rank16` uses source token bits 0--31, top-k slot bits 32--47
+  and source rank bits 48--63. The Blackwell next kernels use
+  `token16_slot8_rank8`: token bits 0--15, slot bits 16--23, rank bits 24--31;
+  the remaining bits hold provider metadata. `layout` identifies the
+  backend-specific operand representation.
+
+The physical pool order can change with routing and scheduling. Compare
+preactivations after resolving their logical source rank/token/slot, rather
+than comparing whole raw pools. This API does not produce token-axis-quantized
+WGrad operands or implement backward/autograd registration.
+
+Training workspaces are not shared between layers through the rollout pool.
+Their saved tensors are overwritten by the next forward using that workspace.
+Keep the workspace alive through its matching backward; use independent
+explicit workspace handles when several saved forwards must coexist. A handle
+exposes the same bundle through `workspace.training_outputs`. Warm up each
+specialization before CUDA Graph capture and retain all captured workspaces.
+Reacquire views after automatic selection replaces scratch storage.
+
+The extra persistent storage includes approximately `4 * P * intermediate_size`
+bytes for preactivation and `4 * P` bytes for expert IDs, plus alignment. These
+buffers are absent when the flag is false. Existing input/handoff views add no
+copies. They are not interchangeable with independently rounded or requantized
+training inputs: matching rollout still requires the same weights, scales,
+routing and numerical recipe. Packed weights keep their existing explicit
+ownership/update contract; updating an original weight pack does not rerun the
+layer's one-time preprocessing automatically.
+
 ### Batch-invariant NVFP4 MegaMoE
 
 Set `batch_invariant=True` on

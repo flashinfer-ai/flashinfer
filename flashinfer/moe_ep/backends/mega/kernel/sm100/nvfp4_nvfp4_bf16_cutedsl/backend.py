@@ -189,15 +189,16 @@ class Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
             num_experts=fleet_params.num_experts,
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
+            save_for_backward=k.save_for_backward,
             combine_dtype=k.combine_dtype,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             use_custom_finalize=self._finalize_mode(fleet_params)
             in (FinalizeMode.NONE, FinalizeMode.CAKE),
             batch_invariant=k.batch_invariant,
-            batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
-            if k.batch_invariant
-            else None,
+            batch_invariant_version=(
+                NVFP4_BATCH_INVARIANT_VERSION if k.batch_invariant else None
+            ),
             gate_up_clamp=_resolve_gate_up_clamp(k),
             input_norm_const=k.input_norm_const,
             **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),

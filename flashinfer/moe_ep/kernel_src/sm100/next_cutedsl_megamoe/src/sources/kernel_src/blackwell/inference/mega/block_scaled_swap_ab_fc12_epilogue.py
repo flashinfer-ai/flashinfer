@@ -1101,6 +1101,7 @@ class SwapABGatedActEpilogue(KernelComponent):
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
         self.batch_invariant = bool(problem_desc.get("batch_invariant", False))
+        self.save_for_backward = bool(problem_desc.get("save_for_backward", False))
         self.batch_invariant_activation = problem_desc.get("batch_invariant_activation")
         self.acc_dtype = tcgen05_block_scaled_acc_dtype
         self.hidden_size = problem_desc["hidden_size"]
@@ -1405,6 +1406,8 @@ class SwapABGatedActEpilogue(KernelComponent):
         fc2_output_sf: Optional[cute.Tensor],
         peer_rank_ptr_mapper: Optional[SymmetricBufferDevice],
         optional_epi_args: Optional[GatedActEpilogueArgs] = None,
+        fc1_preact: Optional[cute.Tensor] = None,
+        fc1_expert_ids: Optional[cute.Tensor] = None,
     ):
         if cutlass.const_expr(not smem_workspace.finalized):
             raise RuntimeError("SwapABGatedActEpilogue.run requires a finalized SmemWorkspace.")
@@ -1452,6 +1455,8 @@ class SwapABGatedActEpilogue(KernelComponent):
             fc1_output_sf,
             fc1_done_counter,
             optional_epi_args,
+            fc1_preact,
+            fc1_expert_ids,
         )
         fc2_epi = SwapABFc2Epilogue(
             self,
@@ -1591,6 +1596,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.Tensor,  # fake (m,n,l) domain
         fc1_done_counter: cute.Tensor,  # 1D tensor
         optional_epi_args: GatedActEpilogueArgs,
+        fc1_preact: Optional[cute.Tensor] = None,
+        fc1_expert_ids: Optional[cute.Tensor] = None,
     ):
         self.base = base
         self.tidx = tidx % (base._EpilogueWarpCnt * 32)
@@ -1627,6 +1634,8 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         self.fc1_output_sf = fc1_output_sf
         self.fc1_done_counter = fc1_done_counter
         self.optional_epi_args = optional_epi_args
+        self.fc1_preact = fc1_preact
+        self.fc1_expert_ids = fc1_expert_ids
         self._freeze()
 
     def __getattr__(self, name):
@@ -1697,6 +1706,91 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 cutlass.Int32((subtile * self._EpilogueWarpCnt) * 32) + self.warp_idx * cutlass.Int32(32) + own_slot_offset
             ] = staged_scale
         cute.arch.sync_warp()
+
+    @cute.jit
+    def save_preact(
+        self,
+        work_tile_info: SwapAbFc12WorkTileInfo,
+        subtile_idx: cutlass.Int32,
+        gate_rmem: cute.Tensor,
+        up_rmem: cute.Tensor,
+        alpha_val: Optional[cutlass.Float32],
+        *,
+        transposed: cutlass.Constexpr[bool],
+        dequant_scale: Optional[cutlass.Float32] = None,
+        dequant_scales: Optional[cute.Tensor] = None,
+    ):
+        # The first half still has the native Ld16x64b register distribution;
+        # the second half has already reached token-lane/intermediate-register
+        # order. Write a copy before clamp without changing the live FP32 values.
+        intermediate = self.fc1_preact.shape[1] // 2
+        token_base = work_tile_info.tile_n_idx * self.cta_tile_n + subtile_idx * self._EpilogueTokenTileSize
+        if cutlass.const_expr(transposed and intermediate % 16 == 0 and (self.cta_tile_m // 2) % 16 == 0):
+            # A transposed lane owns 16 consecutive BF16 features. The workspace
+            # base is 128-byte aligned; row stride (2*I), channel offset (I), and
+            # feature_start are multiples of 16 elements, so each STG is 32-byte
+            # aligned. These same divisibilities make feature tails whole vectors.
+            token_in_tile = subtile_idx * self._EpilogueTokenTileSize + self.lane_idx + 32
+            token = token_base + self.lane_idx + 32
+            feature_start = work_tile_info.tile_m_idx * (self.cta_tile_m // 2) + self.warp_idx * 16
+            if (token_in_tile < work_tile_info.valid_tokens_in_cta_tile) & (feature_start < intermediate):
+                row = work_tile_info.cumulative_data_physical_row + token
+                atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=256)
+                for channel in cutlass.range_constexpr(2):
+                    if cutlass.const_expr(channel == 0):
+                        source = gate_rmem
+                    else:
+                        source = up_rmem
+                    packed = cute.make_rmem_tensor((16,), cutlass.BFloat16)
+                    for i in cutlass.range_constexpr(16):
+                        value = source[i]
+                        if cutlass.const_expr(dequant_scales is not None):
+                            value = ScalarF32.mul(value, dequant_scales[i])
+                        elif cutlass.const_expr(dequant_scale is not None):
+                            value = ScalarF32.mul(value, dequant_scale)
+                        elif cutlass.const_expr(alpha_val is not None):
+                            value = ScalarF32.mul(value, alpha_val)
+                        packed[i] = value.to(cutlass.BFloat16)
+                    pointer = self.fc1_preact.iterator + row * (2 * intermediate) + channel * intermediate + feature_start
+                    aligned = cute.make_ptr(cutlass.BFloat16, pointer.toint(), cute.AddressSpace.gmem, assumed_align=32)
+                    destination = cute.make_tensor(aligned, cute.make_layout((16,)))
+                    cute.copy(atom, packed, destination)
+                if feature_start == 0:
+                    self.fc1_expert_ids[row] = work_tile_info.expert_idx
+        else:
+            for i in cutlass.range_constexpr(16):
+                if cutlass.const_expr(transposed):
+                    token_in_tile = subtile_idx * self._EpilogueTokenTileSize + self.lane_idx + 32
+                    token = token_base + self.lane_idx + 32
+                    feature = work_tile_info.tile_m_idx * (self.cta_tile_m // 2) + self.warp_idx * 16 + i
+                else:
+                    token_offset = i * 2 + (self.lane_idx // 2) % 2
+                    token_in_tile = subtile_idx * self._EpilogueTokenTileSize + token_offset
+                    token = token_base + token_offset
+                    feature = (
+                        work_tile_info.tile_m_idx * (self.cta_tile_m // 2)
+                        + self.warp_idx * 16
+                        + (self.lane_idx % 2) * 8
+                        + self.lane_idx // 4
+                    )
+                if (token_in_tile < work_tile_info.valid_tokens_in_cta_tile) & (feature < intermediate):
+                    row = work_tile_info.cumulative_data_physical_row + token
+                    gate = gate_rmem[i]
+                    up = up_rmem[i]
+                    if cutlass.const_expr(dequant_scales is not None):
+                        gate = ScalarF32.mul(gate, dequant_scales[i])
+                        up = ScalarF32.mul(up, dequant_scales[i])
+                    elif cutlass.const_expr(dequant_scale is not None):
+                        gate = ScalarF32.mul(gate, dequant_scale)
+                        up = ScalarF32.mul(up, dequant_scale)
+                    elif cutlass.const_expr(alpha_val is not None):
+                        gate = ScalarF32.mul(gate, alpha_val)
+                        up = ScalarF32.mul(up, alpha_val)
+                    self.fc1_preact[row, feature] = gate.to(cutlass.BFloat16)
+                    self.fc1_preact[row, intermediate + feature] = up.to(cutlass.BFloat16)
+                    # One feature owner per routed row, including duplicate routes.
+                    if feature == 0:
+                        self.fc1_expert_ids[row] = work_tile_info.expert_idx
 
     @cute.jit
     def signal_fc1_done(self, work_tile_info, next_work_tile_info, flag_tracker):
@@ -1980,6 +2074,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 wrap_into_copy_standard_layout(up_token_32_64),
             )
 
+        if cutlass.const_expr(self.save_for_backward):
+            self.save_preact(
+                work_tile_info, subtile_idx, gate_token_0_32, up_token_0_32,
+                activation_alpha, transposed=False, dequant_scales=dequant_scales_token_0_32,
+            )
+
         # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
         token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
             gate_token_0_32, up_token_0_32, activation_alpha, dequant_scales=dequant_scales_token_0_32
@@ -1996,6 +2096,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act = (
             token_32_64_tmem_trans.from_r1_perm_until_last_store()
         )
+
+        if cutlass.const_expr(self.save_for_backward):
+            self.save_preact(
+                work_tile_info, subtile_idx, gate_token_32_64_trans_pre_act, up_token_32_64_trans_pre_act,
+                activation_alpha, transposed=True, dequant_scale=dequant_scale_token_32_64,
+            )
 
         token_32_64_pre_quant = self.alpha_swiglu_clamp(
             gate_token_32_64_trans_pre_act,

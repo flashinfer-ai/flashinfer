@@ -45,6 +45,7 @@ from common.megamoe_constants import (
 )
 from common.moe_utils import cvt_f32_to_f8_to_f32
 from src.token_comm import CombineFormat, TokenCommArgs, TokenSrcMetadata
+from src.training import store_preact_fragment16
 from src.ptx_helpers import (
     cp_async_bulk_s2g as _cp_async_bulk_s2g,
     cp_reduce_async_bulk_add_noftz_bf16_s2g as _cp_reduce_async_bulk_add_noftz_bf16_s2g,
@@ -952,6 +953,8 @@ class NvFp4OptinalEpiArgs:
     # MoE domain (token,), nvfp4 only: per-token fp32 activation scale in pool
     # order, folded into the fc1 dequant (before clamp / gated activation).
     fc1_activation_per_token_scale: Optional[cute.Tensor] = None
+    training_preact: Optional[cute.Tensor] = None
+    training_expert_ids: Optional[cute.Tensor] = None
 
 
 # TODO: Need to remove `Swiglu` and `Fp4` out of name, later this should be extended to other activations and dtypes.
@@ -1545,6 +1548,31 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 wrap_into_copy_standard_layout(up_token_32_64),
             )
         
+        if cutlass.const_expr(self.optional_epi_args.training_preact is not None):
+            pool_base = (
+                work_tile_info.cumulative_data_physical_row
+                + work_tile_info.tile_n_idx * self.cta_tile_n
+            )
+            feature_start = (
+                work_tile_info.tile_m_idx * (self.cta_tile_m // 2)
+                + self.warp_idx * 16
+            )
+            for half in cutlass.range_constexpr(2):
+                if cutlass.const_expr(half == 0):
+                    saved_gate, saved_up = gate_token_0_32, up_token_0_32
+                else:
+                    saved_gate, saved_up = gate_token_32_64, up_token_32_64
+                store_preact_fragment16(
+                    self.optional_epi_args.training_preact,
+                    self.optional_epi_args.training_expert_ids,
+                    saved_gate, saved_up, pool_base,
+                    subtile_idx * self._EpilogueTokenTileSize + half * 32,
+                    work_tile_info.valid_tokens_in_cta_tile,
+                    feature_start, self.lane_idx, self.intermediate_downproj,
+                    work_tile_info.expert_idx, alpha=alpha_val,
+                    token_scale=self.optional_epi_args.fc1_activation_per_token_scale,
+                )
+
         # Step 1: perform swiglu on the first part, interleave with the second's 32x32 tmem transpose.
         token_0_32_pre_quant_pre_trans = self.alpha_swiglu_clamp(
             gate_token_0_32,

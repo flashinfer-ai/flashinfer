@@ -271,6 +271,7 @@ def autotune_bf16_nvfp4_mega_moe(
                 use_custom_finalize=current.use_custom_finalize,
                 gate_up_clamp=current.gate_up_clamp,
                 batch_invariant=current.batch_invariant,
+                save_for_backward=current.save_for_backward,
                 handoff_norm=current.has_fc1_norm_const,
                 **(
                     batch_invariant_variant_kwargs(current)

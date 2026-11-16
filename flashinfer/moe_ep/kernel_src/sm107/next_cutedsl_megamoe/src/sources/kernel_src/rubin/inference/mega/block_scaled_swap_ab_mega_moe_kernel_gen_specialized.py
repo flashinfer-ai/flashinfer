@@ -41,7 +41,7 @@ from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cutlass_dsl import Int32, Int64
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from .....api import ImplDesc, KernelClass, ProblemDesc, StaticOrRuntimeIntegerType
+from .....api import ImplDesc, KernelClass, OptionalRequirement, ProblemDesc, StaticOrRuntimeIntegerType
 from .....communication.nvlink_domain.symmetric_buffer import SymmetricBufferDevice
 from .....helpers.cute_py_helpers import Tcgen05MmaInstruction, make_tcgen05_tmem_plan, tcgen05_block_scaled_acc_dtype
 from .....helpers.device_workspace import DeviceWorkspace
@@ -68,6 +68,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
 
     fc1_output_region: ClassVar[str] = "rubin.genphase_moe.fc1_output"
     fc1_output_sf_region: ClassVar[str] = "rubin.genphase_moe.fc1_output_sf"
+    fc1_preact_region: ClassVar[str] = "mega_moe.fc1_preact"
+    fc1_expert_ids_region: ClassVar[str] = "mega_moe.fc1_expert_ids"
     fc1_done_counter_region: ClassVar[str] = "rubin.genphase_moe.fc1_done_counter"
     pre_reduced_activation_region: ClassVar[str] = "rubin.genphase_moe.pre_reduced_activation"
 
@@ -108,6 +110,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             "topk_index_dtype": type,
             "max_tokens_per_rank": int,
             "apply_topk_at_fc1": bool,
+            "save_for_backward": OptionalRequirement(bool),
         }
 
     @classmethod
@@ -152,6 +155,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
+        self.save_for_backward = bool(problem_desc.get("save_for_backward", False))
+        if self.save_for_backward and not problem_desc.get("batch_invariant", False):
+            raise ValueError("save_for_backward requires batch_invariant=True")
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
         self.sf_dtype = self.quant_kind.sf_dtype
@@ -484,6 +490,22 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.scheduler.register_device_workspace(device_workspace)
         self.tail_barrier.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
+        if self.save_for_backward:
+            device_workspace.register(
+                self.fc1_preact_region,
+                cutlass.BFloat16,
+                (self.max_routed_rows, self.intermediate_gateup_size),
+                buffer_space="local",
+                mem_order=(1, 0),
+                byte_alignment=128,
+            )
+            device_workspace.register(
+                self.fc1_expert_ids_region,
+                cutlass.Int32,
+                (self.max_routed_rows,),
+                buffer_space="local",
+                byte_alignment=16,
+            )
         device_workspace.finalize()
         return device_workspace
 
@@ -559,6 +581,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"{'inkernel_reduce' if self.reduce_topk_in_kernel else 'separate_reduce'}_"
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
             + bi_suffix
+            + ("_save_for_backward" if self.save_for_backward else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -1159,6 +1182,12 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
             barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
+            if cutlass.const_expr(self.save_for_backward):
+                fc1_preact = self._device_workspace.tensor(self.fc1_preact_region)
+                fc1_expert_ids = self._device_workspace.tensor(self.fc1_expert_ids_region)
+            else:
+                fc1_preact = None
+                fc1_expert_ids = None
             self.epilogue.run(
                 self._smem_workspace,
                 smem_base,
@@ -1179,6 +1208,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 None,
                 peer_rank_ptr_mapper,
                 optional_epilogue_args,
+                fc1_preact=fc1_preact,
+                fc1_expert_ids=fc1_expert_ids,
             )
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)

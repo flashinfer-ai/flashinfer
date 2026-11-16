@@ -21,6 +21,7 @@ from flashinfer.fused_moe.layer import NoEligibleBackend
 from ..algo_knobs import AlgoKnob
 from ..config import BootstrapConfig, FleetParams
 from ..tensors import MoEEpTensors
+from ..training import MoEEpMegaTrainingOutputs
 from ..weights import MoEWeightPack
 from ..backends.split.kernel.fused_moe.backend import FusedMoeSplitKernelBackend
 from ..core.kernel.registry import create_mega_kernel
@@ -89,9 +90,11 @@ def _signature(t, row_bound=None):
         [
             [
                 name,
-                layout(getattr(t, name))
-                if name == "fc1_activation_per_token_scale"
-                else tensor_layout(getattr(t, name)),
+                (
+                    layout(getattr(t, name))
+                    if name == "fc1_activation_per_token_scale"
+                    else tensor_layout(getattr(t, name))
+                ),
             ]
             for name in (
                 "scales",
@@ -189,6 +192,14 @@ class MoEEpAutoWorkspace:
                 previous.destroy()
         self._plan, self._selection = plan, selection
         self._state.graph_captured = False
+
+    @property
+    def training_outputs(self) -> MoEEpMegaTrainingOutputs:
+        """Saved tensors of this workspace's currently selected Mega plan."""
+        layer = self._owner()
+        if layer is None:
+            raise RuntimeError("owning EP layer no longer exists")
+        return layer.get_training_outputs(workspace=self)
 
     def destroy(self):
         """Release all plan storage after its graphs have been retired."""
@@ -592,6 +603,23 @@ class MoEEpAutoLayer(nn.Module):
         if torch.cuda.is_current_stream_capturing():
             workspace._state.graph_captured = True
         return workspace._plan.forward(tensors)
+
+    def get_training_outputs(
+        self, *, workspace: MoEEpAutoWorkspace | None = None
+    ) -> MoEEpMegaTrainingOutputs:
+        """Borrow saved forward tensors from the currently selected plan."""
+        workspace = workspace or self._default
+        if (
+            self._destroyed
+            or workspace is None
+            or workspace._owner() is not self
+            or workspace._destroyed
+            or not isinstance(workspace._plan, MegaPlan)
+        ):
+            raise RuntimeError(
+                "Prepare a training Mega plan before reading its outputs"
+            )
+        return workspace._plan.layer.get_training_outputs()
 
     def get_selected_plan(self, *, workspace: MoEEpAutoWorkspace | None = None) -> dict:
         """Return the candidate index and its fixed variant/knobs or compute tactic."""

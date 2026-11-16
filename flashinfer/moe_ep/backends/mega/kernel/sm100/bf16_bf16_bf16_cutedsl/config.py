@@ -27,6 +27,7 @@ class Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConfi
     # False weights the rounded BF16 FC2 rows in the FP32 top-k finalizer.
     apply_routing_weights_before_fc2: bool = True
     batch_invariant: bool = field(default=False, kw_only=True)
+    save_for_backward: bool = field(default=False, kw_only=True)
     activation: str = field(default="swiglu", kw_only=True)
     swiglu_alpha: float | None = field(default=None, kw_only=True)
     swiglu_beta: float | None = field(default=None, kw_only=True)
@@ -34,6 +35,9 @@ class Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConfi
     situ_linear_beta: float | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         if type(self.batch_invariant) is not bool:
             raise ValueError("batch_invariant must be a bool.")
         if not self.batch_invariant:

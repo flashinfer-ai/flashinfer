@@ -6,6 +6,7 @@ The JSON format and file location are shared with SM100. An ``sm107:`` device
 prefix keeps the architectures' entries separate. Implementation revision,
 quantization, EP size, geometry, combine format, activation and beta parameters,
 gate/up clamp, nondeterminism permission, and routing-weight policy must match.
+Saved-output mode also keys plans; it does not change the BI arithmetic receipt.
 
 Populate entries with ``python -m flashinfer.moe_ep.tune``. Set
 ``FLASHINFER_MOE_EP_KNOB_CACHE`` to a path, or ``0``/``off`` to disable it;
@@ -46,10 +47,25 @@ _KEY_FIELDS = (
     "situ_beta",
     "situ_linear_beta",
     "gate_up_clamp",
+    "save_for_backward",
     "batch_invariant",
     "batch_invariant_version",
     "batch_invariant_fingerprint",
 )
+
+
+def _key_value(record, field):
+    # Records predating these opt-ins describe ordinary rollout execution.
+    return record.get(
+        field, False if field in ("batch_invariant", "save_for_backward") else None
+    )
+
+
+def _validate_training_mode(save_for_backward, batch_invariant):
+    if type(save_for_backward) is not bool:
+        raise ValueError("save_for_backward must be a bool")
+    if save_for_backward and not batch_invariant:
+        raise ValueError("save_for_backward requires batch_invariant=True")
 
 
 def _bi_key(
@@ -299,6 +315,7 @@ def _matching_entries(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    save_for_backward: bool = False,
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
@@ -307,6 +324,7 @@ def _matching_entries(
     per_token_scale: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return records with a compatible numerical and execution contract."""
+    _validate_training_mode(save_for_backward, batch_invariant)
     if entries is None:
         path = _cache_path()
         entries = [] if path is None else _load_entries(path)
@@ -339,6 +357,7 @@ def _matching_entries(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        save_for_backward=save_for_backward,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -351,10 +370,8 @@ def _matching_entries(
     matches = [
         e
         for e in entries
-        if all(
-            e.get(f, False if f == "batch_invariant" else None) == key[f]
-            for f in _KEY_FIELDS
-        )
+        if all(_key_value(e, f) == key[f] for f in _KEY_FIELDS)
+        and type(e.get("save_for_backward", False)) is bool
         and isinstance(e.get("knobs"), dict)
         and (
             not batch_invariant
@@ -402,6 +419,7 @@ def lookup_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    save_for_backward: bool = False,
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
@@ -429,6 +447,7 @@ def lookup_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        save_for_backward=save_for_backward,
         batch_invariant=batch_invariant,
         batch_invariant_version=batch_invariant_version,
         input_norm_const=input_norm_const,
@@ -448,9 +467,11 @@ def lookup_record(
 
 
 @deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
-def lookup_knobs(**kwargs: Any) -> Optional[Dict[str, Any]]:
+def lookup_knobs(
+    *, save_for_backward: bool = False, **kwargs: Any
+) -> Optional[Dict[str, Any]]:
     """Resolve knobs using the same record lookup as the shared autotuner."""
-    record = lookup_record(**kwargs)
+    record = lookup_record(save_for_backward=save_for_backward, **kwargs)
     return None if record is None else _knobs_from_json(record["knobs"])
 
 
@@ -476,6 +497,7 @@ def make_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    save_for_backward: bool = False,
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
@@ -484,6 +506,7 @@ def make_record(
     per_token_scale: bool = False,
 ) -> Dict[str, Any]:
     """Build a tuning record shared by FlashInfer and the MegaMoE file."""
+    _validate_training_mode(save_for_backward, batch_invariant)
     if batch_invariant and not _bi_plan_valid(
         knobs,
         kernel_variant,
@@ -530,6 +553,7 @@ def make_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        save_for_backward=save_for_backward,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -550,6 +574,9 @@ def make_record(
 
 def write_record(entry: Dict[str, Any]) -> Optional[str]:
     """Write a selected record to the configured MegaMoE cache file."""
+    _validate_training_mode(
+        _key_value(entry, "save_for_backward"), _key_value(entry, "batch_invariant")
+    )
     path = _cache_path()
     if path is None:
         return None
@@ -561,10 +588,7 @@ def write_record(entry: Dict[str, Any]) -> Optional[str]:
             e
             for e in entries
             if not (
-                all(
-                    e.get(f, False if f == "batch_invariant" else None) == entry[f]
-                    for f in _KEY_FIELDS
-                )
+                all(_key_value(e, f) == _key_value(entry, f) for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
                 and e.get("live_tokens", e["max_tokens"]) == live_tokens
             )
@@ -596,9 +620,13 @@ def write_record(entry: Dict[str, Any]) -> Optional[str]:
 
 
 @deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
-def record_knobs(knobs: Dict[str, Any], **kwargs: Any) -> Optional[str]:
+def record_knobs(
+    knobs: Dict[str, Any], *, save_for_backward: bool = False, **kwargs: Any
+) -> Optional[str]:
     """Record a winner in the MegaMoE file; return its path if written."""
-    return write_record(make_record(knobs, **kwargs))
+    return write_record(
+        make_record(knobs, save_for_backward=save_for_backward, **kwargs)
+    )
 
 
 def default_knobs(
@@ -672,6 +700,7 @@ def resolve_knobs(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    save_for_backward: bool = False,
     batch_invariant: bool = False,
     batch_invariant_version: Optional[int] = None,
     input_norm_const: float = 1.0,
@@ -700,6 +729,7 @@ def resolve_knobs(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        save_for_backward=save_for_backward,
         batch_invariant=batch_invariant,
         batch_invariant_version=batch_invariant_version,
         input_norm_const=input_norm_const,

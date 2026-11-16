@@ -135,6 +135,7 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
             num_experts=fleet_params.num_experts,
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
+            save_for_backward=k.save_for_backward,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
@@ -178,6 +179,7 @@ class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             batch_invariant=config.batch_invariant,
+            save_for_backward=config.save_for_backward,
             **batch_invariant_numerical_metadata(config),
             knobs=self._workspace_knobs(fleet_params),
         )

@@ -43,9 +43,11 @@ if TYPE_CHECKING:
 
 
 def _resolve_gate_up_clamp(
-    config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
-    | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    config: (
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    ),
 ) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
@@ -62,9 +64,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     def __init__(
         self,
-        config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
-        | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        config: (
+            Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+            | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+            | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        ),
     ) -> None:
         super().__init__(config)
         self._kernel_config = config
@@ -204,6 +208,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
+            save_for_backward=k.save_for_backward,
             allow_nondeterministic=k.in_kernel_fc2_reduce,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             activation=k.activation,
@@ -215,9 +220,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             swiglu_beta=getattr(k, "swiglu_beta", None),
             gate_up_clamp=_resolve_gate_up_clamp(k),
             batch_invariant=getattr(k, "batch_invariant", False),
-            batch_invariant_version=block_scaled_batch_invariant_version(k)
-            if getattr(k, "batch_invariant", False)
-            else None,
+            batch_invariant_version=(
+                block_scaled_batch_invariant_version(k)
+                if getattr(k, "batch_invariant", False)
+                else None
+            ),
         )
 
     def batch_invariant_fingerprint(self, fleet_params):

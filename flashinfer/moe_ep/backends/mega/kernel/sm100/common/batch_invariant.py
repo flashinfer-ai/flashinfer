@@ -56,6 +56,7 @@ _CONTRACT_FIELDS = frozenset(
         "gate_up_clamp",
         "apply_routing_weights_before_fc2",
         "batch_invariant",
+        "save_for_backward",
         "intermediate_size",
         "top_k",
         "kernel_name",
@@ -349,9 +350,11 @@ def bf16_batch_invariant_fingerprint(
         hidden if hidden is not None else getattr(config, "hidden", None),
         getattr(config, "intermediate", getattr(config, "intermediate_size", None)),
         getattr(config, "num_topk", getattr(config, "top_k", None)),
-        num_experts
-        if num_experts is not None
-        else getattr(config, "num_total_experts", None),
+        (
+            num_experts
+            if num_experts is not None
+            else getattr(config, "num_total_experts", None)
+        ),
         apply_routing_weights_before_fc2=config.apply_routing_weights_before_fc2,
         gate_up_clamp=(
             config.gate_up_clamp

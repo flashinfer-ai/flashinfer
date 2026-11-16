@@ -218,6 +218,8 @@ _MLIR_VALUE_FIELDS = (
     "shared_zero_prefix",
     "peer_rank_ptr_mapper",
     "local_rank",
+    "training_preact",
+    "training_expert_ids",
 )
 
 _CONST_FIELDS = (
@@ -278,6 +280,8 @@ class TokenCommArgs:
         # on the symmetric heap (peer-pulled) and its pool-ordered local copy.
         input_fc1_activation_per_token_scale_buffer: cute.Tensor = None,
         dispatched_fc1_activation_per_token_scale_buffer: cute.Tensor = None,
+        training_preact: cute.Tensor = None,
+        training_expert_ids: cute.Tensor = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -321,6 +325,8 @@ class TokenCommArgs:
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
         self.sm_count = sm_count
+        self.training_preact = training_preact
+        self.training_expert_ids = training_expert_ids
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []

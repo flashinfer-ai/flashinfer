@@ -203,6 +203,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
         enable_fc1_activation_per_token_scale: bool = False,
+        save_for_backward: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         flag_batch: int = 1,
         topk_reduce_persistent: bool = False,
@@ -241,6 +242,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 f"{combine_format} combine requires non_ubulk_fc2_store=True "
                 "(the UBLK fc2 store path cannot scalar-dereference FP4)."
             )
+        self.save_for_backward = save_for_backward
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm100MegaMoEKernel currently requires "
@@ -763,6 +765,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 )
             )
 
+        if self.save_for_backward:
+            specs.extend([
+                _RegionSpec(
+                    "mega_moe.fc1_preact", cutlass.BFloat16,
+                    (self.pool_token_capacity, 2 * self.intermediate_downproj), 128,
+                ),
+                _RegionSpec(
+                    "mega_moe.fc1_expert_ids", cutlass.Int32,
+                    (self.pool_token_capacity,), 16,
+                ),
+            ])
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -1036,6 +1049,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
             + bi_suffix
+            + ("_save_for_backward" if self.save_for_backward else "")
         )
 
     # -- AOT compile / load (TVM-FFI calling convention) ----------------------
@@ -1455,7 +1469,14 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         shared_zero_prefix = self._make_typed_view(
             shared_workspace, 0, cutlass.Int32, (self.shared_zero_i32_count,), (1,), 16,
         )
+        training_preact = None
+        training_expert_ids = None
+        if cutlass.const_expr(self.save_for_backward):
+            training_preact = self._view_local(local_workspace, "mega_moe.fc1_preact")
+            training_expert_ids = self._view_local(local_workspace, "mega_moe.fc1_expert_ids")
         token_comm_args = ExtractedTokenCommArgs(
+            training_preact=training_preact,
+            training_expert_ids=training_expert_ids,
             input_token_buffer=activation,
             input_sf_buffer=activation_sf,
             topk_idx=topk_idx,

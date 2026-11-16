@@ -46,6 +46,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     top_k: int
     kernel_name: str = "sm100_mxfp8_mxfp8_bf16_cutedsl"
     batch_invariant: bool = field(default=False, kw_only=True)
+    save_for_backward: bool = field(default=False, kw_only=True)
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = field(
         default="bf16", kw_only=True
     )
@@ -94,6 +95,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     apply_routing_weights_before_fc2: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         if self.combine_dtype not in ("bf16", "nvfp4", "mxfp8"):
             raise ValueError("unsupported combine_dtype")
         if self.combine_dtype != "bf16" and self.kernel_variant == "genphase":

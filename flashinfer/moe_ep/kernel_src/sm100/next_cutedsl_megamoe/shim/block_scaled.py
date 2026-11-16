@@ -14,6 +14,8 @@ from typing import Any, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep.training import _bind_next_training_outputs, _training_launch
+
 from flashinfer.moe_ep._compat import deprecated_aliases
 
 from flashinfer.moe_ep.core.tuning_state import AutoTuningState
@@ -132,12 +134,16 @@ class BlockScaledMoeConfig:
     kernel_variant: Literal["inference", "genphase"] = "inference"
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
     batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    save_for_backward: bool = dataclasses.field(default=False, kw_only=True)
     input_norm_const: float = dataclasses.field(default=1.0, kw_only=True)
     has_fc1_alpha: bool = dataclasses.field(default=True, kw_only=True)
     has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
     has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.training import _validate_save_for_backward
+
+        _validate_save_for_backward(self)
         """Validate dtype, geometry, epilogue and architecture-specific constraints."""
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
@@ -707,6 +713,7 @@ class BlockScaledSymmBuffer:
         )
         self._symmetric_base = base
         self._peer_offsets = peer_offsets
+        _bind_next_training_outputs(self, kernel)
 
     @classmethod
     def _build_kernel(cls, cfg: BlockScaledMoeConfig):
@@ -778,6 +785,7 @@ class BlockScaledSymmBuffer:
             {
                 "expert_count": cfg.num_total_experts,
                 "batch_invariant": cfg.batch_invariant,
+                "save_for_backward": cfg.save_for_backward,
                 **(
                     {"batch_invariant_activation": activation_variant}
                     if activation_variant is not None
@@ -795,13 +803,13 @@ class BlockScaledSymmBuffer:
                         "mxfp8": "32e4m3xe8m0",
                     }[cfg.combine_dtype]
                 ),
-                "gate_up_clamp": None
-                if activation_variant is not None
-                else cfg.gate_up_clamp,
+                "gate_up_clamp": (
+                    None if activation_variant is not None else cfg.gate_up_clamp
+                ),
                 "situ_beta": None if activation_variant is not None else cfg.situ_beta,
-                "situ_linear_beta": None
-                if activation_variant is not None
-                else cfg.situ_linear_beta,
+                "situ_linear_beta": (
+                    None if activation_variant is not None else cfg.situ_linear_beta
+                ),
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
@@ -929,6 +937,7 @@ class BlockScaledSymmBuffer:
         self._validate_batch_invariant_scalars()
         key = (
             self.batch_invariant_fingerprint,
+            self.config.save_for_backward,
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),
@@ -942,7 +951,9 @@ class BlockScaledSymmBuffer:
             # A warmed workspace may bind another layer or stream in capture.
             kwargs = self._runtime_kwargs(transformed_l1, transformed_l2)
             if self._compiled is None:
-                self._compiled = cute.compile(self.kernel, **kwargs)
+                self._compiled = _training_launch(
+                    self, cute.compile(self.kernel, **kwargs)
+                )
             self._launch_key = key
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
@@ -1049,6 +1060,7 @@ class BlockScaledSymmBuffer:
         if self._destroyed:
             return
         comm.ensure_not_capturing("block-scaled mega workspace free")
+        self._training_outputs = None
         # nvshmem free is collective and does not wait for in-flight work;
         # drain this rank's device before releasing symmetric memory that a
         # still-running launch (ours or a peer's dispatch pull) may touch.

@@ -43,6 +43,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
 
     fc1_output_region: ClassVar[str] = "rubin.mega_moe.fc1_output"
     fc1_output_sf_region: ClassVar[str] = "rubin.mega_moe.fc1_output_sf"
+    fc1_preact_region: ClassVar[str] = "mega_moe.fc1_preact"
+    fc1_expert_ids_region: ClassVar[str] = "mega_moe.fc1_expert_ids"
     fc1_done_counter_region: ClassVar[str] = "rubin.mega_moe.fc1_done_counter"
     epilogue_warp_ids: ClassVar[Tuple[int, int, int, int]] = (0, 1, 2, 3)
     mma_warp_id: ClassVar[int] = 4
@@ -73,6 +75,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             "topk_index_dtype": type,
             "max_tokens_per_rank": int,
             "apply_topk_at_fc1": bool,
+            "save_for_backward": OptionalRequirement(bool),
         }
 
     @classmethod
@@ -105,6 +108,9 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self.intermediate_gateup_size = problem_desc["intermediate_gateup_size"]
         self.hidden_size = problem_desc["hidden_size"]
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
+        self.save_for_backward = bool(problem_desc.get("save_for_backward", False))
+        if self.save_for_backward and not problem_desc.get("batch_invariant", False):
+            raise ValueError("save_for_backward requires batch_invariant=True")
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
         self.sf_dtype = self.quant_kind.sf_dtype
@@ -419,6 +425,22 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         )
         self.scheduler.register_device_workspace(device_workspace)
         self.token_comm.register_device_workspace(device_workspace)
+        if self.save_for_backward:
+            device_workspace.register(
+                self.fc1_preact_region,
+                cutlass.BFloat16,
+                (self.max_tokens, self.intermediate_gateup_size),
+                buffer_space="local",
+                mem_order=(1, 0),
+                byte_alignment=128,
+            )
+            device_workspace.register(
+                self.fc1_expert_ids_region,
+                cutlass.Int32,
+                (self.max_tokens,),
+                buffer_space="local",
+                byte_alignment=16,
+            )
         device_workspace.finalize()
         return device_workspace
 
@@ -481,6 +503,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_redg' if self.reduce_topk_in_kernel else 'separate_reduce'}"
             + bi_suffix
+            + ("_save_for_backward" if self.save_for_backward else "")
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -1096,6 +1119,12 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
             tmem_allocator.allocate(self._mainloop.num_tmem_alloc_cols)
             barrier_sync_unaligned(self._mainloop.tmem_allocation_barrier_id, 32 * (1 + self._mainloop.num_accumulator_consumer_warps_per_cta))
             tmem_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
+            if cutlass.const_expr(self.save_for_backward):
+                fc1_preact = self._device_workspace.tensor(self.fc1_preact_region)
+                fc1_expert_ids = self._device_workspace.tensor(self.fc1_expert_ids_region)
+            else:
+                fc1_preact = None
+                fc1_expert_ids = None
             self.epilogue.run(
                 self._smem_workspace,
                 smem_base,
@@ -1116,6 +1145,8 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
                 fc2_output_sf,
                 peer_rank_ptr_mapper,
                 optional_epilogue_args,
+                fc1_preact=fc1_preact,
+                fc1_expert_ids=fc1_expert_ids,
             )
             tmem_allocator.relinquish_alloc_permit()
             tmem_allocator.free(tmem_allocator.retrieve_ptr(self.acc_dtype), self._mainloop.num_tmem_alloc_cols)
