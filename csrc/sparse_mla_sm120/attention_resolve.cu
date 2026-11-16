@@ -203,7 +203,7 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
     } else if (m.variant == 4) {
       TVM_FFI_ICHECK(!dual) << "unsupported sparse-MLA swapAB metadata";
       p.implementation = Implementation::SwapAB;
-      p.head_blocks = m.heads / 64;
+      p.head_blocks = (m.heads + 63) / 64;
     } else {
       TVM_FFI_ICHECK(m.variant == 3 ? (mt == ModelType::DSV4 && dual) : !dual)
           << "sparse-MLA MG dual metadata mismatch";
@@ -213,13 +213,19 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
       if (mt == ModelType::DSV4 && (dual || m.topk <= 256)) p.numeric = NumericRoute::QkBF16PvFP8;
       TVM_FFI_ICHECK(requested != NumericRoute::FP8 || p.numeric == NumericRoute::FP8)
           << "explicit FP8 forbids hybrid numerical route";
-      p.head_blocks = m.heads <= 16 ? 1 : m.heads / 32;
+      p.head_blocks = (m.heads + 31) / 32;
     }
     p.cpb = 1;
     p.chunk_capacity = (m.topk + 63) / 64 + (m.extra_topk + 63) / 64;
     p.active_splits = 1;
     p.merge = Merge::Direct;
-    p.specialized_heads = m.heads;
+    const bool runtime_heads =
+        mt == ModelType::DSV3_2 &&
+        ((m.variant == 1 && m.heads != 8 && m.heads != 16) ||
+         (m.variant == 2 && m.heads != 32 && m.heads != 64 && m.heads != 128));
+    const bool runtime_swap =
+        mt == ModelType::DSV3_2 && m.variant == 4 && m.heads != 64 && m.heads != 128;
+    p.specialized_heads = runtime_heads || runtime_swap ? 0 : m.heads;
 #define RES(M)                          \
   case ModelType::M:                    \
     prefill_resources<ModelType::M>(p); \

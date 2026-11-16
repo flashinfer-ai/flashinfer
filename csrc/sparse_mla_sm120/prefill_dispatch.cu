@@ -100,6 +100,7 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
                          {}};
   cold.lse_scale = p.lse_scale;
   cold.mega = p.mega;
+  cold.num_heads = m.heads;
   if (cache_format_info(mt).inline_scale) {
     cold.kv_stride_bytes = m.row_stride_bytes;
     // Inline-scale extra sections address flat rows at their row pitch.
