@@ -127,8 +127,13 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
            "invalid dispatch capacity");
   LL_CHECK((int64_t(max_tokens) * world_size) % 4 == 0,
            "EP size * capacity must be divisible by 4");
-  LL_CHECK(hidden == 4096 || hidden == 6144 || hidden == 7168,
-           "the inherited dispatch/combine kernels support hidden 4096, 6144, or 7168");
+  LL_CHECK(hidden == 4096 || hidden == 5120 || hidden == 6144 || hidden == 7168,
+           "dispatch/combine kernels support hidden 4096, 5120, 6144, or 7168");
+  LL_CHECK(int64_t(max_tokens) * num_experts <= std::numeric_limits<int>::max(),
+           "expert capacity exceeds the kernel int32 index range");
+  LL_CHECK(4LL * (int64_t(num_experts) + (bf16_local_partial_ ? world_size : 0)) <=
+               std::numeric_limits<int>::max(),
+           "GIN signal count exceeds the int32 range");
   LL_CHECK(unique_id.size() == sizeof(ncclUniqueId), "invalid NCCL unique ID");
   GIN_CUDA(cudaGetDevice(&device_));
   cudaDeviceProp prop{};
@@ -180,8 +185,7 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
   compact_rank_arena_ = communication_precision_ == 2 && bf16_local_partial_planned_ &&
                         dispatch_strategy_.mode == "coalesced";
   nvfp4_rank_packet_ = communication_precision_ == 1 && dispatch_strategy_.mode == "legacy" &&
-                       max_tokens_ > 32 && num_experts_ >= 2 &&
-                       (world_size_ == 4 || world_size_ == 8);
+                       max_tokens_ > 32 && num_experts_ >= 2;
   communication_mode_ =
       dispatch_strategy_.mode == combine_strategy_.mode ? dispatch_strategy_.mode : "mixed";
   const bool any_coalesced =
@@ -251,6 +255,8 @@ GinBuffer::GinBuffer(int rank, int world_size, const std::string& unique_id, int
                "local-partial signal count overflow");
       signal_count_ += 4 * world_size_;
     }
+    LL_CHECK(arena_bytes_ <= prop.totalGlobalMem, "RDMA arena requires ", arena_bytes_,
+             " bytes, exceeding device memory ", prop.totalGlobalMem);
     GIN_NCCL(ncclMemAlloc(&arena_, arena_bytes_));
     GIN_CUDA(cudaMemset(arena_, 0, arena_bytes_));
     GIN_CUDA(cudaMalloc(&workspace_, NUM_WORKSPACE_BYTES));
@@ -580,18 +586,20 @@ Info GinBuffer::backend_info() const {
       bf16_local_partial_planned_ && dispatch_strategy_.mode == "coalesced";
   info.Set("dispatch_planned_rank_major", planned_rank_major);
   info.Set("dispatch_planned_rank_fanout", planned_rank_major);
-  const bool planned_pair2 = planned_rank_major && world_size_ <= 8;
+  const bool planned_pair2 = planned_rank_major;
   info.Set("dispatch_planned_put_batching",
            planned_rank_major ? Any(planned_pair2 ? "adjacent_token_pair_contiguous_subset"
                                                   : "single_token_fallback")
                               : Any(nullptr));
+  info.Set("dispatch_planned_owner_schedule",
+           planned_rank_major ? Any("adjacent_pair_distinct_owner_union") : Any(nullptr));
   info.Set("dispatch_planned_max_records_per_put",
            planned_rank_major ? Any(planned_pair2 ? 2 : 1) : Any(nullptr));
   info.Set("dispatch_planned_qp_seed",
            planned_rank_major ? Any(planned_pair2 ? "pair_index_plus_owner" : "global_warp")
                               : Any(nullptr));
-  const bool planned_source_ready =
-      planned_rank_major && world_size_ <= 8 && dispatch_strategy_.num_ctas > 1;
+  const int source_ready_ctas = gin_source_ready_ctas(world_size_, dispatch_strategy_.num_ctas);
+  const bool planned_source_ready = planned_rank_major && source_ready_ctas != 0;
   const int fused_flush_ctas =
       planned_rank_major && dispatch_strategy_.num_ctas > 1 && !planned_source_ready
           ? std::min((dispatch_strategy_.num_contexts * world_size_ + 7) / 8,
@@ -605,12 +613,12 @@ Info GinBuffer::backend_info() const {
   info.Set("dispatch_planned_fused_flush_ctas",
            planned_rank_major ? Any(fused_flush_ctas) : Any(nullptr));
   info.Set("dispatch_planned_fused_data_ctas",
-           planned_rank_major
-               ? Any(dispatch_strategy_.num_ctas - (planned_source_ready ? 1 : fused_flush_ctas))
-               : Any(nullptr));
+           planned_rank_major ? Any(dispatch_strategy_.num_ctas -
+                                    (planned_source_ready ? source_ready_ctas : fused_flush_ctas))
+                              : Any(nullptr));
   info.Set("dispatch_planned_source_ready", planned_source_ready);
   info.Set("dispatch_planned_source_ready_leader_ctas",
-           planned_rank_major ? Any(planned_source_ready ? 1 : 0) : Any(nullptr));
+           planned_rank_major ? Any(planned_source_ready ? source_ready_ctas : 0) : Any(nullptr));
   info.Set("dispatch_planned_inline_publisher_ctas",
            planned_rank_major
                ? Any(planned_source_ready
@@ -653,8 +661,12 @@ Info GinBuffer::backend_info() const {
            nvfp4_rank_packet_ ? Any("first_route_global_warp") : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_count_stride",
            nvfp4_rank_packet_ ? Any(local_experts_ + 1) : Any(nullptr));
-  info.Set("dispatch_nvfp4_packet_source_ready",
-           nvfp4_rank_packet_ && dispatch_strategy_.num_ctas > 1);
+  info.Set("dispatch_nvfp4_packet_source_ready", nvfp4_rank_packet_ && source_ready_ctas != 0);
+  info.Set("dispatch_nvfp4_packet_source_ready_leader_ctas",
+           nvfp4_rank_packet_ ? Any(source_ready_ctas) : Any(nullptr));
+  info.Set(
+      "dispatch_nvfp4_packet_data_ctas",
+      nvfp4_rank_packet_ ? Any(dispatch_strategy_.num_ctas - source_ready_ctas) : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_hook_receive",
            nvfp4_rank_packet_ ? Any("all_context_wait_reserve_then_grid_join") : Any(nullptr));
   info.Set("dispatch_nvfp4_packet_source_completion",

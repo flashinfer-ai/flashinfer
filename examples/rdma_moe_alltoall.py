@@ -10,7 +10,7 @@ Run on an eight-GPU SM120 host:
   NCCL_GIN_TYPE=3 torchrun --standalone --nproc-per-node=8 \
       examples/rdma_moe_alltoall.py --dtype nvfp4
 
-Four or eight ranks are supported. For planned BF16, add:
+Use 4, 8, 16, or 32 ranks across the hosts. For planned BF16, add:
   --dtype bf16 --combine-reduction bf16_local_partial_planned
 
 Use --dtype bf16 for a lossless communication reference. The NVFP4 example
@@ -52,7 +52,9 @@ def nvfp4_roundtrip_reference(x):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("nvfp4", "bf16"), default="nvfp4")
-    parser.add_argument("--hidden", type=int, choices=(4096, 6144, 7168), default=4096)
+    parser.add_argument(
+        "--hidden", type=int, choices=(4096, 5120, 6144, 7168), default=4096
+    )
     parser.add_argument("--tokens", type=int, default=8)
     parser.add_argument(
         "--combine-reduction",
@@ -69,8 +71,8 @@ def main():
     device = torch.device("cuda", torch.cuda.current_device())
     dist.init_process_group("gloo", timeout=timedelta(minutes=5))
     rank, world = dist.get_rank(), dist.get_world_size()
-    if world not in (4, 8):
-        raise ValueError("This example requires four or eight ranks")
+    if world not in (4, 8, 16, 32):
+        raise ValueError("This example requires 4, 8, 16, or 32 ranks")
     options = {}
     if planned:
         # Select the rank-fanout dispatch and compact registered arena.

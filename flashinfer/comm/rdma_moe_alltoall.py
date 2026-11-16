@@ -28,7 +28,7 @@ from .rdma_moe_alltoall_policy import select_rdma_strategy
 from ..jit.rdma_moe_alltoall import get_gin_module, get_quantization_module
 
 _PRECISION = {"fp8": 0, "nvfp4": 1, "bf16": 2}
-_HIDDEN = (4096, 6144, 7168)
+_HIDDEN = (4096, 5120, 6144, 7168)
 _PLANNED_REDUCTION = "bf16_local_partial_planned"
 
 
@@ -178,7 +178,7 @@ class RdmaMoeAlltoAll:
         Fixed token capacity per rank. Dispatch output tensors have shape
         ``[num_experts / world_size, world_size * capacity, payload_width]``.
     hidden : int
-        Logical hidden width: 4096, 6144 or 7168.
+        Logical hidden width: 4096, 5120, 6144 or 7168.
     num_experts : int
         Total expert count, divisible by the process-group size.
     config : RdmaMoeAlltoAllConfig or None
@@ -304,10 +304,13 @@ class RdmaMoeAlltoAll:
                 raise ValueError(
                     "experts must divide EP size with at most 1024 local experts"
                 )
-            if num_max_dispatch_tokens_per_rank * self.num_ranks >= 2**31:
-                raise ValueError(
-                    "dispatch capacity exceeds the kernel int32 index range"
-                )
+            if num_max_dispatch_tokens_per_rank * num_experts >= 2**31:
+                raise ValueError("expert capacity exceeds the kernel int32 index range")
+            signals = 4 * (
+                num_experts + (self.num_ranks if combine_reduction != "fp32" else 0)
+            )
+            if signals >= 2**31:
+                raise ValueError("GIN signal count exceeds the int32 range")
             if communication_dtype not in _PRECISION:
                 raise ValueError(
                     "communication_dtype must be 'bf16', 'fp8', or 'nvfp4'"

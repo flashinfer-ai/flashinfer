@@ -34,7 +34,7 @@ from .test_combine import (
 
 def _mixed_routes(case):
     # Four distinct experts on owner0, two on owner1, then one each on owners2
-    # and3. EP4/8 both exercise self/remote, shared packets and unequal fanout.
+    # and3. All group sizes exercise self/remote, shared packets and unequal fanout.
     local = EXPERTS // WORLD
     ids = (0, 1, 2, 3, local, local + 1, 2 * local, 3 * local)
     case["routes"].copy_(
@@ -183,3 +183,44 @@ def test_planned_rank_major_boundary(
             record_property(
                 f"common_fp32_error_rank{dist.get_rank()}_phase{phase}", metrics
             )
+
+
+@pytest.mark.parametrize("dispatch_sms", (1, 8))
+def test_pair_owner_union_graph_and_small_grid(distributed_device, dispatch_sms):
+    # EP16/32 exercise a pair with 16 distinct owners, including the highest
+    # rank. One CTA exercises the same-wire fallback, eight enable publishers.
+    hidden, tokens = 5120, 3
+    with planned_buffer(
+        capacity=4,
+        hidden=hidden,
+        dispatch_mode="coalesced",
+        dispatch_num_sms=dispatch_sms,
+    ) as buffer:
+        info = buffer.backend_info()
+        leaders = (WORLD + 7) // 8 if dispatch_sms >= 2 * ((WORLD + 7) // 8) else 0
+        assert info["dispatch_planned_source_ready_leader_ctas"] == leaders
+        assert info["dispatch_planned_max_records_per_put"] == 2
+        case = make_case(tokens, hidden, 8, dist.get_rank(), distributed_device, "bf16")
+        arbitrary_weights(case)
+        token = torch.arange(tokens, device=distributed_device)[:, None]
+        route = torch.arange(8, device=distributed_device)[None, :]
+        owners = (token * 8 + route + WORLD - 1) % WORLD
+        # Distinct experts even where EP4/8 makes several routes share an owner.
+        routes = (owners * (EXPERTS // WORLD) + route).to(torch.int32)
+        case["routes"].copy_(routes.expand_as(case["routes"]))
+        run_pair = planned_pair_runner(buffer, [case], False, distributed_device)
+        with captured_graph(run_pair, distributed_device) as (
+            graph,
+            (results, outputs),
+            _,
+        ):
+            for phase in range(3):
+                case["routes"].copy_(routes.expand_as(case["routes"]))
+                if phase == 1:
+                    case["routes"].fill_(-1)
+                case["packed"].neg_().add_(0.125)
+                dist.barrier()
+                graph.replay()
+                torch.cuda.synchronize()
+                check_dispatch(results[0], case)
+                check_partial(outputs[0], case)

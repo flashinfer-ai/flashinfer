@@ -4,7 +4,7 @@
 # You may obtain a copy of the License at
 # http://www.apache.org/licenses/LICENSE-2.0
 
-"""Opt-in four/eight-rank transport tests; ordinary pytest runs skip GPU collectives."""
+"""Opt-in multi-rank transport tests; ordinary pytest runs skip GPU collectives."""
 
 import os
 from datetime import timedelta
@@ -20,7 +20,7 @@ def pytest_addoption(parser):
         "--rdma-moe-dtype", choices=("bf16", "fp8", "nvfp4"), default="nvfp4"
     )
     group.addoption(
-        "--rdma-moe-hidden", type=int, choices=(4096, 6144, 7168), default=4096
+        "--rdma-moe-hidden", type=int, choices=(4096, 5120, 6144, 7168), default=4096
     )
     group.addoption(
         "--rdma-moe-mode", choices=("auto", "legacy", "coalesced"), default="auto"
@@ -35,7 +35,7 @@ def pytest_generate_tests(metafunc):
         values = [
             (dtype, hidden)
             for dtype in ("bf16", "fp8", "nvfp4")
-            for hidden in (4096, 6144, 7168)
+            for hidden in (4096, 5120, 6144, 7168)
         ]
     else:
         values = [
@@ -53,10 +53,8 @@ def pytest_generate_tests(metafunc):
 
 @pytest.fixture(scope="session")
 def distributed_device():
-    if int(os.environ.get("WORLD_SIZE", "1")) not in (4, 8):
-        pytest.skip(
-            "Launch with torchrun --nproc-per-node=4 or 8 to test GPU collectives"
-        )
+    if int(os.environ.get("WORLD_SIZE", "1")) not in (4, 8, 16, 32):
+        pytest.skip("Launch with torchrun using a total of 4, 8, 16, or 32 ranks")
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     local_rank = int(os.environ["LOCAL_RANK"])
