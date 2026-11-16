@@ -1072,3 +1072,60 @@ def test_head_count_rule_is_the_prefill_route_rule(h):
             bi_decode(token(s, 0), new_pool([s], [0]), [0], p)
         with pytest.raises(ValueError):
             one_shot(s, p)
+
+
+@needs_device
+@pytest.mark.parametrize("h", [6, 12])
+def test_packed_requests_off_a_multiple_of_eight_heads(h):
+    """Several sequences at unaligned starts on 6 and 12 heads, their activations views at odd token offsets."""
+    p = params(h)
+    seqs = [make_seq(90, h, SEED + 970 + h + i, GATES["long"]) for i in range(3)]
+    starts, n0, slots = [1, 3, 0], [37, 16, 5], [2, 0, 1]
+    views = [sub(s, a, 90) for s, a in zip(seqs, starts, strict=True)]
+    refs = [one_shot({key: t.clone() for key, t in v.items()}, p)[0] for v in views]
+    pool = new_pool(seqs, slots)
+    pre = bi_prefill(
+        [sub(v, 0, n) for v, n in zip(views, n0, strict=True)], pool, slots, p
+    )
+    off = 0
+    for n, ref in zip(n0, refs, strict=True):
+        assert same_bits(pre[off : off + n], ref[:n])
+        off += n
+    for t in range(30):
+        rows = bi_decode(tokens(views, [n + t for n in n0]), pool, slots, p)
+        for i, ref in enumerate(refs):
+            assert same_bits(rows[i], ref[n0[i] + t]), f"step {t}, request {i}"
+    alone = new_pool([seqs[0]], [0])
+    beta = views[0]["beta"][None, :32]
+    out, _ = recurrent_kda(
+        *(views[0][key][None, :32] for key in ("q", "k", "v", "g")),
+        beta,
+        initial_state=alone,
+        cu_seqlens=torch.tensor([0, 32], device="cuda"),
+        batch_invariant=True,
+        **_fused(p),
+    )
+    assert beta.data_ptr() % 16 and same_bits(out[0], refs[0][:32])
+
+
+@needs_device
+def test_multi_token_step_staged_on_per_segment_states():
+    """A multi-token step long enough that its whole chunks run on the caller's rows with one state per segment."""
+    from flashinfer.batch_invariant.kda.api import recurrent_kda_batch_invariant_extend
+
+    h, n0, T = 16, 5, 700
+    p = params(h)
+    s = make_seq(n0 + T + 4, h, SEED + 990, GATES["steep"])
+    ref, _ = one_shot(s, p)
+    pool = new_pool([s], [0])
+    bi_prefill([sub(s, 0, n0)], pool, [0], p)
+    out = recurrent_kda_batch_invariant_extend(
+        *(s[key][None, n0 : n0 + T] for key in ("q", "k", "v", "g", "beta")),
+        A_log=p["A_log"],
+        dt_bias=p["dt_bias"],
+        initial_state=pool,
+        lower_bound=LB,
+    )
+    assert same_bits(out[0], ref[n0 : n0 + T])
+    rows = decode_all(s, pool, 0, p, n0 + T, n0 + T + 4)
+    assert same_bits(rows, ref[n0 + T :])

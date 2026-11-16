@@ -353,7 +353,9 @@ def _pinned(
     from ... import kda_prefill_cute
     from ...kda import recurrent_kda
 
-    q, k, v, g, beta = packed
+    # the route takes 16-byte aligned operands (a beta view at an odd token offset is not, off a multiple of 8 heads)
+    q, k, v, g, beta = (t if t.data_ptr() % 16 == 0 else t.clone() for t in packed)
+    dt_bias = dt_bias.reshape(-1, HEAD_DIM)
     with kda_prefill_cute.force_route(ROUTE):
         out, final = recurrent_kda(
             q[None],
