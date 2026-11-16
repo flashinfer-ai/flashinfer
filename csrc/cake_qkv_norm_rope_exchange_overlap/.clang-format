@@ -1,0 +1,3 @@
+# Receipt-bound generated sources: bytes are attested by the JIT loader's SHA-256 registry.
+DisableFormat: true
+SortIncludes: Never

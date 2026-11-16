@@ -22,7 +22,11 @@
       "value": 4,
       "description": "Fixed query length per request."
     },
-    "max_seq_len_q": {
+    "split_kv_allowed": {
+      "type": "const",
+      "value": 1
+    },
+    "max_q_len": {
       "type": "const",
       "value": 4,
       "description": "Query-length capacity frozen by plan()."
@@ -84,16 +88,28 @@
     "len_qo_indptr": {
       "type": "var",
       "description": "Length of cumulative Q offsets."
+    },
+    "kv_storage_head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Stored K/V width; D/2 for packed NVFP4."
+    },
+    "kv_scale_groups": {
+      "type": "var",
+      "description": "NVFP4 scale groups; one per 16 logical values."
     }
   },
   "constraints": [
-    "head_dim in (64, 128, 256)",
-    "page_size in (16, 32, 64, 128)",
+    "head_dim in (64, 128, 256, 512)",
+    "head_dim != 512 or (q.dtype == 'float8_e4m3fn' and kv_storage_head_dim == head_dim // 2 and k_sf_cache is not None and v_sf_cache is not None)",
+    "page_size in (4, 8, 16, 32, 64, 128)",
+    "kv_storage_head_dim in (head_dim, head_dim // 2)",
+    "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
     "num_qo_heads % num_kv_heads == 0",
-    "1 <= num_qo_heads // num_kv_heads <= 32",
-    "max_pages_per_seq * page_size >= max(seq_lens)",
-    "min(seq_lens) >= 1",
-    "max(seq_lens) <= max_kv_len",
+    "1 <= num_qo_heads // num_kv_heads <= 128",
+    "max_pages_per_seq * page_size >= max(seq_lens_kv)",
+    "min(seq_lens_kv) >= 1",
+    "max(seq_lens_kv) <= max_kv_len",
     "seq_len_q >= 2"
   ],
   "inputs": {
@@ -111,7 +127,7 @@
         "num_pages",
         "num_kv_heads",
         "page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -120,7 +136,7 @@
         "num_pages",
         "num_kv_heads",
         "page_size",
-        "head_dim"
+        "kv_storage_head_dim"
       ],
       "dtype": "bfloat16"
     },
@@ -132,12 +148,12 @@
       "dtype": "int32",
       "description": "Required fixed row-strided physical page table supplied to run()."
     },
-    "seq_lens": {
+    "seq_lens_kv": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32",
-      "description": "Required per-request KV lengths supplied to run()."
+      "description": "Required per-request K/V lengths supplied to run()."
     },
     "qo_indptr": {
       "shape": [
@@ -147,12 +163,32 @@
       "optional": true,
       "description": "Cumulative Q offsets required by a packed-Q run."
     },
-    "bmm1_scale": {
+    "k_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "v_sf_cache": {
+      "shape": [
+        "num_pages",
+        "num_kv_heads",
+        "page_size",
+        "kv_scale_groups"
+      ],
+      "dtype": "float8_e4m3fn",
+      "optional": true
+    },
+    "softmax_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
     },
-    "bmm2_scale": {
+    "output_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true

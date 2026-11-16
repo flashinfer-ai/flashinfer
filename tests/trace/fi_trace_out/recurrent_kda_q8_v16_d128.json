@@ -1,9 +1,10 @@
 {
   "name": "recurrent_kda_q8_v16_d128",
-  "description": "Recurrent Key-Driven Attention decode with per-key-dimension gating and an optional read-only committed-state source.",
+  "description": "Recurrent Key-Driven Attention with per-key-dimension gating and an optional read-only committed-state source. Classifies the call's phase and serves prefill or decode accordingly.",
   "op_type": "kda",
   "tags": [
-    "fi_api:flashinfer.kda_decode.recurrent_kda",
+    "fi_api:flashinfer.kda.recurrent_kda",
+    "stage:prefill",
     "stage:decode",
     "status:verified"
   ],
@@ -42,11 +43,24 @@
     "num_sequences": {
       "type": "var",
       "description": "Number of state-source indices."
+    },
+    "num_checkpoints": {
+      "type": "var",
+      "description": "Number of packed prefill checkpoints."
+    },
+    "num_checkpoint_offsets": {
+      "type": "var",
+      "description": "Number of packed checkpoint cumulative offsets."
+    },
+    "kg_dim": {
+      "type": "var",
+      "description": "Key/gate cache row width (2 * head_dim)."
     }
   },
   "constraints": [
     "num_v_heads % num_q_heads == 0",
-    "head_dim in (64, 128)"
+    "head_dim in (64, 128)",
+    "num_checkpoint_offsets == num_sequences + 1"
   ],
   "inputs": {
     "q": {
@@ -122,6 +136,33 @@
       "optional": true,
       "description": "Committed-state slot selected for each sequence."
     },
+    "ssm_state_indices": {
+      "shape": [
+        "num_sequences"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Writable state-pool slot selected for each prefill sequence."
+    },
+    "state_checkpoints": {
+      "shape": [
+        "num_checkpoints",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Caller-owned packed KDA pre-block state output."
+    },
+    "checkpoint_cu_starts": {
+      "shape": [
+        "num_checkpoint_offsets"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Per-sequence cumulative packed checkpoint counts."
+    },
     "scale": {
       "shape": null,
       "dtype": "float32",
@@ -156,6 +197,38 @@
       "shape": null,
       "dtype": "int32",
       "optional": true
+    },
+    "disable_state_update": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
+    },
+    "correction_cache": {
+      "shape": [
+        "source_pool_size",
+        "num_v_heads",
+        "seq_len",
+        "head_dim"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Frozen-verify only: slot-indexed float32 per-token delta-rule corrections for a commit/recovery kernel."
+    },
+    "kg_cache": {
+      "shape": [
+        "source_pool_size",
+        "num_v_heads",
+        "seq_len",
+        "kg_dim"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Frozen-verify only: slot-indexed (normalized key | raw gate) cache; kg_dim == 2 * head_dim."
+    },
+    "checkpoint_every_n_tokens": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true
     }
   },
   "outputs": {
@@ -177,7 +250,19 @@
       ],
       "dtype": "bfloat16",
       "optional": true
+    },
+    "state_checkpoints": {
+      "shape": [
+        "num_checkpoints",
+        "num_v_heads",
+        "head_dim",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "param": "state_checkpoints"
     }
   },
-  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _recurrent_kda_reference(\n    q, k, v, g, beta,\n    initial_state=None,\n    initial_state_source=None,\n    initial_state_indices=None,\n    ssm_state_indices=None,\n    state_checkpoints=None,\n    checkpoint_cu_starts=None,\n    scale=None,\n    output_final_state=False,\n    use_qk_l2norm_in_kernel=True,\n    use_gate_in_kernel=True,\n    lower_bound=-5.0,\n    num_spec_tokens=0,\n    beta_is_logit=True,\n    disable_state_update=False,\n    correction_cache=None,\n    kg_cache=None,\n    checkpoint_every_n_tokens=0,\n):\n    \"\"\"FP64 token recurrence for recurrent KDA (no BF16 rounding of state).\n\n    Mirrors the oracle in tests/kda/test_recurrent_kda_tirx.py with the full\n    trace-definition signature.  Optional arguments that the minimal oracle\n    does not exercise are accepted and ignored so that flashinfer-bench can\n    call this with whatever the trace axes expand to.\n\n    Supports num_q_heads != num_v_heads (GQA-style).  q and k carry\n    num_q_heads; v, g, beta, state, and output carry num_v_heads.\n    \"\"\"\n    B, T, H_q, D = q.shape\n    H_v = v.shape[2]\n    device = q.device\n    if scale is None or scale == 0.0:\n        scale = 1.0 / math.sqrt(D)\n\n    # Flatten to [B*T, H, D].  Repeat q/k from H_q -> H_v.\n    q_f64 = q.double().reshape(-1, H_q, D)\n    k_f64 = k.double().reshape(-1, H_q, D)\n    if use_qk_l2norm_in_kernel:\n        q_f64 = q_f64 * torch.rsqrt(q_f64.square().sum(-1, keepdim=True) + 1e-6)\n        k_f64 = k_f64 * torch.rsqrt(k_f64.square().sum(-1, keepdim=True) + 1e-6)\n    repeats = H_v // H_q\n    q_f64 = q_f64.repeat_interleave(repeats, dim=1)  # [B*T, H_v, D]\n    k_f64 = k_f64.repeat_interleave(repeats, dim=1)  # [B*T, H_v, D]\n\n    v_f64 = v.double().reshape(-1, H_v, D)\n\n    if use_gate_in_kernel:\n        gate = g.double().reshape(-1, H_v, D)\n    else:\n        gate = torch.zeros_like(v_f64)\n\n    if beta_is_logit:\n        beta_f64 = beta.double().sigmoid().reshape(-1, H_v)\n    else:\n        beta_f64 = beta.double().reshape(-1, H_v)\n\n    offsets = list(range(0, B * T + 1, T))\n\n    if initial_state is not None:\n        state = initial_state.double().clone()\n    elif initial_state_source is not None and initial_state_indices is not None:\n        state = initial_state_source.double()[initial_state_indices.long()]\n    else:\n        state = torch.zeros(B, H_v, D, D, dtype=torch.float64, device=device)\n\n    out = torch.empty_like(q_f64)\n    for i, (start, end) in enumerate(zip(offsets, offsets[1:])):\n        si = int(ssm_state_indices[i]) if ssm_state_indices is not None else i\n        s = state[si]\n        for t in range(start, end):\n            decay = (lower_bound * torch.sigmoid(gate[t])).exp().unsqueeze(-2)\n            s = s * decay\n            delta = beta_f64[t].unsqueeze(-1) * (\n                v_f64[t] - (s * k_f64[t].unsqueeze(-2)).sum(-1)\n            )\n            s = s + delta.unsqueeze(-1) * k_f64[t].unsqueeze(-2)\n            out[t] = scale * (s * q_f64[t].unsqueeze(-2)).sum(-1)\n        state[si] = s\n\n    output = out.reshape(B, T, H_v, D).float()\n    final_state = state.float() if output_final_state else None\n\n    if final_state is not None:\n        return {\"output\": output.to(torch.bfloat16), \"final_state\": final_state.to(torch.bfloat16)}\n    return {\"output\": output.to(torch.bfloat16)}\n"
 }

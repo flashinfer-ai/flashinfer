@@ -21,11 +21,29 @@ from .config_mapper import (
     PrimsTsMoeGemmConfig,
     map_trtllm_bf16_moe_tactic,
 )
+from .partition import (
+    MoePartitionResources,
+    MoeShardedWeights,
+    PartitionStrategy,
+    PreparedWeightLayout,
+    PreparedWeightLayoutKind,
+    ScaleFactorLayout,
+    prepared_weight_layouts,
+    shard_prepared_moe_weights,
+)
 from .support import is_prims_ts_bf16_supported
 
 __all__ = [
+    "MoePartitionResources",
+    "MoeShardedWeights",
+    "PartitionStrategy",
+    "PreparedWeightLayout",
+    "PreparedWeightLayoutKind",
     "PrimsTsGemmPair",
     "PrimsTsMoeGemmConfig",
+    "ScaleFactorLayout",
     "is_prims_ts_bf16_supported",
     "map_trtllm_bf16_moe_tactic",
+    "prepared_weight_layouts",
+    "shard_prepared_moe_weights",
 ]

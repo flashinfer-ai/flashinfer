@@ -24,6 +24,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 #ifdef ENABLE_FP4
 #include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
 #endif
@@ -121,6 +122,8 @@ struct ActivationParams {
   // SiTU-GLU per-expert tanh scales; nullptr uses the SituAdaptor compile-time defaults.
   float const* situ_beta = nullptr;
   float const* situ_linear_beta = nullptr;
+  // Model-wide scalar used only by the fused ClampedRelu2 epilogue.
+  float const* clamped_relu2_limit = nullptr;
 
   explicit ActivationParams(ActivationType activation_type) : activation_type(activation_type) {
     TLLM_CHECK_WITH_INFO(
@@ -137,6 +140,12 @@ struct ActivationParams {
         swiglu_limit(swiglu_limit),
         situ_beta(situ_beta),
         situ_linear_beta(situ_linear_beta) {}
+
+  static ActivationParams ClampedRelu2(float const* limit) {
+    ActivationParams params(ActivationType::ClampedRelu2);
+    params.clamped_relu2_limit = limit;
+    return params;
+  }
 
   // TODO Port everything properly and get rid of these implicit conversions
   operator ActivationType() const { return activation_type; }
@@ -304,6 +313,10 @@ struct QuantParams {
 
     GemmInputs fc1;
     GemmInputs fc2;
+    // 4over6 recipe for both NVFP4 activation quantizations (GEMM1 input when
+    // the activations arrive unquantized, GEMM2 input), as the code decoded by
+    // resolveNVFP4Recipe(). The default reads FLASHINFER_NVFP4_4OVER6*.
+    int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv;
   } fp4;
 
   // GPTQ/AWQ quantization params
@@ -395,14 +408,14 @@ struct QuantParams {
       float const* fc2_act_global_scale,
       TmaWarpSpecializedGroupedGemmInput::NVFP4ElementSF const* fc2_weight_block_scale,
       float const* fc2_global_scale,  //
-      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false)
-
-  {
+      bool fc1_use_per_expert_act_scale = false, bool fc2_use_per_expert_act_scale = false,
+      int64_t nvfp4_4over6_code = kNVFP44Over6FromEnv) {
     QuantParams qp;
     qp.fp4.fc1 = {fc1_use_per_expert_act_scale, fc1_act_global_scale, fc1_weight_block_scale,
                   fc1_global_scale};
     qp.fp4.fc2 = {fc2_use_per_expert_act_scale, fc2_act_global_scale, fc2_weight_block_scale,
                   fc2_global_scale};
+    qp.fp4.nvfp4_4over6_code = nvfp4_4over6_code;
     return qp;
   }
 
@@ -1159,6 +1172,15 @@ struct GemmProfilerBackend {
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
  private:
+  bool profilesClampedRelu2Epilogue() const {
+    bool const is_mxfp8 = mUseMxfp8ActScaling && mDType == nvinfer1::DataType::kFP8 &&
+                          mWType == nvinfer1::DataType::kFP8;
+    bool const is_bf16 = mDType == nvinfer1::DataType::kBF16 && mWType == nvinfer1::DataType::kBF16;
+    return mSM >= 100 && mSM < 110 && mGemmToProfile == GemmToProfile::GEMM_1 &&
+           mActivationType == ActivationType::ClampedRelu2 && !mBias && !mUseLora &&
+           !mMinLatencyMode && (is_mxfp8 || is_bf16);
+  }
+
   bool isNativeWfp4Afp8Family() const {
     return mSM >= 100 && mDType == nvinfer1::DataType::kFP8 &&
            (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);

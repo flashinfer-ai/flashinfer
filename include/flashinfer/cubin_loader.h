@@ -34,7 +34,10 @@
 void (*callbackGetCubin)(const char* path, const char* sha256) = nullptr;
 
 // Set the python callback, called by the python code using ctypes.
-extern "C" void FlashInferSetCubinCallback(void (*callback)(const char* path, const char* sha256)) {
+// Looked up through ctypes on every JIT library, so keep default visibility even when a library
+// is otherwise built with hidden host symbols.
+extern "C" __attribute__((visibility("default"))) void FlashInferSetCubinCallback(
+    void (*callback)(const char* path, const char* sha256)) {
   callbackGetCubin = callback;
 }
 
@@ -43,7 +46,8 @@ extern "C" void FlashInferSetCubinCallback(void (*callback)(const char* path, co
 thread_local std::string current_cubin;
 
 // Called by the callback to set the current cubin.
-extern "C" void FlashInferSetCurrentCubin(const char* binary, int size) {
+extern "C" __attribute__((visibility("default"))) void FlashInferSetCurrentCubin(const char* binary,
+                                                                                 int size) {
   current_cubin = std::string(binary, size);
 }
 

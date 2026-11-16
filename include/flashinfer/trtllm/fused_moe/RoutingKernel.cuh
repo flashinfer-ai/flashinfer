@@ -21,6 +21,7 @@
 #include <flashinfer/exception.h>
 #include <flashinfer/logging.h>
 
+#include <cstdint>
 #include <cstdlib>
 #include <cub/cub.cuh>
 #include <cute/arch/cluster_sm90.hpp>
@@ -49,6 +50,21 @@ static constexpr int NumEltsPerOffsetTilePerThread = 8;
 static constexpr int kDefaultReservedSMsForOverlapping = 8;
 static constexpr char kReservedSMsForOverlappingEnv[] =
     "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS";
+
+// PDL trigger for a routing kernel whose global writes are read by the kernels after it. Every
+// thread of the CTA must call it after its last global write.
+// - The trigger counts for the whole CTA as soon as one thread runs it, so without the barrier
+//   a thread that finishes early lets the next kernel start while other threads still write.
+// - A trigger is not a memory fence. Writes are guaranteed visible at the start of the dependent
+//   grid only if a GPU-scope release fence comes before the trigger in the triggering thread
+//   (PTX ISA, griddepcontrol). The fence after the barrier covers the writes of the whole CTA.
+__device__ __forceinline__ void triggerDependentLaunchAfterWrites() {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  __syncthreads();
+  __threadfence();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
 
 // Parsed reserved-SM value and whether it came from the environment.
 struct ReservedSMsForOverlappingConfig {
@@ -163,6 +179,25 @@ __host__ __device__ constexpr T divUpTileN(T a, T tileN) {
 template <typename T>
 __host__ __device__ constexpr T divUpMulTileN(T a, T tileN) {
   return divUpTileN(a, tileN) * tileN;
+}
+
+// The thread writing a tile's MnLimit owns its unused routing-map entries.
+// TMA gathers may read these rows even though the GEMM masks their outputs.
+// Write -1 to suppress those loads, without touching live rows or allocation slack.
+__device__ __forceinline__ void initRoutingTilePadding(int32_t* tokenIdx, int32_t begin,
+                                                       int32_t end) {
+  if (tokenIdx == nullptr) return;
+  // Vectorize the bulk stores, including when a caller supplies an offset view.
+  for (; begin < end && reinterpret_cast<uintptr_t>(tokenIdx + begin) % alignof(int4) != 0;
+       ++begin) {
+    tokenIdx[begin] = -1;
+  }
+  for (; end - begin >= 4; begin += 4) {
+    *reinterpret_cast<int4*>(tokenIdx + begin) = make_int4(-1, -1, -1, -1);
+  }
+  for (; begin < end; ++begin) {
+    tokenIdx[begin] = -1;
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -462,6 +497,7 @@ __device__ void routingPermutation(KernelParams params,
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
 
       // get the padded offset associated with this expert (token-space, CGA granularity)
@@ -531,11 +567,11 @@ __device__ void routingPermutation(KernelParams params,
   // mPtrCtaIdxXyToMnLimit, mPtrNumNonExitingCtas, mPtrPermutedIdxSize, AND
   // mPtrExpandedIdxToPermutedIdx / mPtrPermutedIdxToTokenIdx.
   // Triggering before the permutation writes causes the consumer to read stale data → NaN.
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // The trigger takes effect for the whole CTA when its first thread reaches it, so trigger only
+  // after every thread of the CTA has written its part (see triggerDependentLaunchAfterWrites).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -768,6 +804,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
           mnLimit2 = mulTileN<int32_t>(ctaOffset[e], params.mTileTokensDim) + count[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
+        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
       }
     }
   }
@@ -916,12 +953,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger secondary kernel.
+  // Trigger the secondary kernel only after every thread of the CTA wrote its permutation
+  // indices (see routingPermutation).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
-#endif  // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1149,6 +1185,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
       mnLimit2 = mulTileN<int32_t>(ctaOffset, params.mTileTokensDim) + count;
     }
     params.mPtrCtaIdxXyToMnLimit[ctaOffset + cta] = min(mnLimit1, mnLimit2);
+    initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
   }
 
   // get the padded offset associated with this expert (token-space, CGA granularity)
@@ -1203,9 +1240,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     }
   }
 
-  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
+  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices)
+  // of every thread in the CTA (see routingPermutation).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
 }
 #else

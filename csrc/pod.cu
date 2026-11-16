@@ -123,15 +123,10 @@ void pod_with_kv_cache_tensor(
   const auto q_stride_n_d = q_d.stride(0);
   const auto q_stride_h_d = q_d.stride(1);
 
-  // get kv_cache_strides
-  const int64_t* kv_cache_strides_d = nullptr;
+  // get independent K/V cache strides
   auto k_strides_d = paged_k_cache_d.strides();
   auto v_strides_d = paged_v_cache_d.strides();
   TVM_FFI_ICHECK_EQ(k_strides_d.size(), v_strides_d.size());
-  for (int i = 0; i < k_strides_d.size(); ++i) {
-    TVM_FFI_ICHECK_EQ(k_strides_d[i], v_strides_d[i]);
-  }
-  kv_cache_strides_d = k_strides_d.data();
 
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer_d.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer_d.device());
@@ -187,8 +182,8 @@ void pod_with_kv_cache_tensor(
           paged_kv_t<DTypeKV, IdType> paged_kv(
               num_kv_heads, page_size_d, HEAD_DIM_VO, batch_size, kv_layout_d,
               static_cast<DTypeKV*>(paged_k_cache_d.data_ptr()),
-              static_cast<DTypeKV*>(paged_v_cache_d.data_ptr()), kv_cache_strides_d,
-              static_cast<IdType*>(paged_kv_indices_d.data_ptr()),
+              static_cast<DTypeKV*>(paged_v_cache_d.data_ptr()), k_strides_d.data(),
+              v_strides_d.data(), static_cast<IdType*>(paged_kv_indices_d.data_ptr()),
               static_cast<IdType*>(paged_kv_indptr_d.data_ptr()),
               static_cast<IdType*>(paged_kv_last_page_len_d.data_ptr()));
           params.paged_kv = paged_kv;
@@ -242,14 +237,12 @@ void pod_with_kv_cache_tensor(
                 GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
             tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
             tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
-            if (plan_info.enable_cuda_graph) {
-              params.block_valid_mask =
-                  GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
-            }
           }
           params.padded_batch_size = plan_info.padded_batch_size;
           params.max_total_num_rows = plan_info.total_num_rows;
           if (plan_info.enable_cuda_graph) {
+            params.block_valid_mask =
+                GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
             params.total_num_rows =
                 GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
           }

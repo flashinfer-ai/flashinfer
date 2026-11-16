@@ -96,6 +96,8 @@ struct is_same<T, T> : true_type {};
 // They are only needed for CGA/cluster support (USE_CLUSTER=true), which this
 // OSS engine does not use. All USE_CLUSTER code paths are guarded with
 // "if constexpr" so dead branches are not compiled.
+// The MSVC-hosted nvcc front end still resolves the names inside those dead
+// branches, so the cluster code is also excluded under _MSC_VER.
 
 // ============================================================
 // Fixed-width integer typedefs for NVRTC (no <cstdint> available)
@@ -287,7 +289,7 @@ struct Zeros<float2> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __device__ __inline__ uint8_t float_to_e8m0(float val) {
-  // CL-15277: use rounding-up mode for float -> e8m0 conversion
+  // Use rounding-up mode for float -> e8m0 conversion
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) &&                           \
     (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM101_ALL) || \
      defined(__CUDA_ARCH_FEAT_SM110_ALL) || defined(__CUDA_ARCH_FEAT_SM120_ALL))
@@ -694,7 +696,7 @@ struct Reducer : public Reducer<T, 1, WARPS_M, WARPS_N, USE_CLUSTER, WHOLE_CTA> 
     data = Base::reduce(data, op, warps_m);
 
     if constexpr (USE_CLUSTER) {
-#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080)
+#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080) && !defined(_MSC_VER)
       auto cluster = cooperative_groups::this_cluster();
 
       // NOTE: right now only lane 0 has the valid value so that a intra-warp broadcast is required
@@ -1021,7 +1023,7 @@ struct Stats {
         block_stats_.template compute<isRMSNorm, LDGS, NUM_ELTS>(elts, block_rn, warps_m);
 
     if constexpr (USE_CLUSTER) {
-#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080)
+#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080) && !defined(_MSC_VER)
       auto cluster = cooperative_groups::this_cluster();
 
       // Broadcast local results to other CTAs inside the CGA
@@ -1106,10 +1108,10 @@ struct Stats {
       // We need to check for the case where we are using CTA > 1 and WARP_M > 1 and N == 1
       // Because in this case we cannot rely on the __syncThreads in template<typename T, uint32_t
       // WARPS_M, uint32_t WARPS_N>::compute (because we will use the specialized template <typename
-      // T, uint32_t WARPS_M>::compute which does not have a sync) Bug 5221388: For WARPS_M > 1 and
+      // T, uint32_t WARPS_M>::compute which does not have a sync). Also, for WARPS_M > 1 and
       // WARPS_N > 1, we also need the sync here, otherwise the stats received in `workspace[lane_]`
-      // may be NaN (as if some stats from the other CTAs are not initialized). Reason unknown yet
-      // and tracked in CL-16775.
+      // may be NaN (as if some stats from the other CTAs are not initialized);
+      // reason unknown yet.
       if (CTAS_PER_ROW > 1 && WARPS_M > 1) {
         utils::namedBarrierSync(0, warps_m * WARPS_N * 32);
       }
@@ -1253,7 +1255,7 @@ struct Stats<T, 1, WARPS_M, 1, USE_CLUSTER, WHOLE_CTA> {
 
     T m = Zeros<T>::get();
     if (!isRMSNorm) {
-// CL-14115: The unroll factor 128 for LDGS was chosen based on the compilation/perf results for
+// The unroll factor 128 for LDGS was chosen based on the compilation/perf results for
 // APEX LN_fwd engines
 #pragma unroll(128 * NUM_ELTS)
       for (int it = 0; it < N; it++) {

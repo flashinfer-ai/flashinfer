@@ -76,8 +76,10 @@ def bench_deepgemm_grouped_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtyp
     return tflops_per_second
 
 
-def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype):
-    """Benchmark DeepGEMM-based batch GEMM with FP8 quantization."""
+def bench_deepgemm_batch_fp8_blackwell(
+    batch_size, m, n, k, in_dtype, out_dtype, backend="deepgemm"
+):
+    """Benchmark the masked batch FP8 GEMM (``backend`` = ``deepgemm`` or ``cake``)."""
 
     a = torch.randn((batch_size, m, k), device="cuda", dtype=torch.float32)
     b = torch.randn((batch_size, n, k), device="cuda", dtype=torch.float32)
@@ -101,6 +103,7 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
             expected_m,
             out=out,
             out_dtype=out_dtype,
+            backend=backend,
         ),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
@@ -119,8 +122,8 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
         / ms
     )
     print(
-        f"group_deepgemm_fp8_nt_groupwise batch_size={batch_size} m={m} n={n} k={k} "
-        f"in_dtype={in_dtype} out_dtype={out_dtype}: {tflops_per_second:.2f} TFLOPs/s"
+        f"batch_deepgemm_fp8_nt_groupwise[{backend}] batch_size={batch_size} m={m} n={n} k={k} "
+        f"in_dtype={in_dtype} out_dtype={out_dtype}: {tflops_per_second:.2f} TFLOPs/s "
         f"memory_bandwidth: {memory_bandwidth_per_second:.2f} TB/s"
     )
 
@@ -128,6 +131,19 @@ def bench_deepgemm_batch_fp8_blackwell(batch_size, m, n, k, in_dtype, out_dtype)
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--batch-backend",
+        choices=["deepgemm", "cake", "both"],
+        default="deepgemm",
+        help="backend(s) of batch_deepgemm_fp8_nt_groupwise to benchmark",
+    )
+    args = parser.parse_args()
+    batch_backends = (
+        ["deepgemm", "cake"] if args.batch_backend == "both" else [args.batch_backend]
+    )
     print("=== DeepGEMM Grouped FP8 GEMM Benchmark ===\n")
 
     for batch_size in [1, 4, 8, 64, 128, 256]:
@@ -144,6 +160,13 @@ if __name__ == "__main__":
         for m in [128, 256, 1024, 8192, 16384]:
             for n, k in [(128, 512), (512, 128), (4096, 7168), (7168, 2048)]:
                 if m * batch_size <= 16384:  # Limit total problem size
-                    bench_deepgemm_batch_fp8_blackwell(
-                        batch_size, m, n, k, torch.float8_e4m3fn, torch.bfloat16
-                    )
+                    for backend in batch_backends:
+                        bench_deepgemm_batch_fp8_blackwell(
+                            batch_size,
+                            m,
+                            n,
+                            k,
+                            torch.float8_e4m3fn,
+                            torch.bfloat16,
+                            backend=backend,
+                        )

@@ -6,18 +6,28 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import bf16_cutedsl_runtime_requirements
 from ......core.validation.common import validate_mega_arch, validate_mega_fleet_params
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
+from ..common.bf16_staging import (
+    stage_mega_moe_inputs,
+    validate_bf16_forward_inputs,
+)
 from .config import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
-from .staging import stage_mega_moe_inputs, validate_bf16_forward_inputs
 from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
     validate_transformed_mega_weights,
+)
+
+from ..common.activation_batch_invariant import batch_invariant_numerical_metadata
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+    batch_invariant_variant_kwargs,
 )
 
 if TYPE_CHECKING:
@@ -35,14 +45,21 @@ def _clamp(config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
 @register_mega_kernel(
     "sm100_bf16_bf16_bf16_cutedsl", deprecated_aliases=("bf16_cutedsl",)
 )
-class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
+class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
+    supports_output_view = True
+
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_bf16_bf16_bf16_cutedsl"
 
     def __init__(self, config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        # Configs are mutable: also validate a caller-edited instance before
+        # any collective setup or workspace allocation.
+        config.__post_init__()
         super().__init__(config)
         self._kernel_config = config
+        self._arithmetic_arch: str | None = None
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._autotune_pending = config.knobs == "auto"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
@@ -51,13 +68,21 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     def validate_init(
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
+        if self._kernel_config.batch_invariant:
+            from ..common.batch_invariant import (
+                bf16_batch_invariant_arch,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            self._arithmetic_arch = bf16_batch_invariant_arch()
         validate_mega_arch()
         validate_mega_fleet_params(
             fleet_params,
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
-            # The drop's own shim bound (kernel_src/cutedsl_megamoe/shim/
+            # The drop's own shim bound (kernel_src/sm100/cutedsl_megamoe/shim/
             # bf16.py): hidden % 32, intermediate % 64 — not the deep_gemm
             # SF-word 128 default. 32 covers hidden here; the stricter
             # intermediate bound is enforced below.
@@ -91,11 +116,56 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        from ..common.batch_invariant import (
+            BF16_BATCH_INVARIANT_VERSION,
+        )
+
+        k = self._kernel_config
+        return dict(
+            dtype="bf16",
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=(
+                BF16_BATCH_INVARIANT_VERSION if k.batch_invariant else None
+            ),
+            gate_up_clamp=_clamp(k),
+            **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Return this layer's arithmetic receipt without creating a workspace."""
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.batch_invariant import bf16_batch_invariant_fingerprint
+
+        return bf16_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
+        )
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import get_symm_buffer_for_bf16_mega_moe
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            get_symm_buffer_for_bf16_mega_moe,
+        )
 
         config = self._kernel_config
-        return get_symm_buffer_for_bf16_mega_moe(
+        workspace = get_symm_buffer_for_bf16_mega_moe(
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
             config.top_k,
@@ -104,10 +174,29 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
-            in_kernel_fc2_reduce=config.in_kernel_fc2_reduce,
-            token_back_mode=config.token_back_mode,
-            knobs=config.knobs if isinstance(config.knobs, dict) else None,
+            apply_routing_weights_before_fc2=config.apply_routing_weights_before_fc2,
+            enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=config.batch_invariant,
+            **batch_invariant_numerical_metadata(config),
+            knobs=self._workspace_knobs(fleet_params),
         )
+        if config.finalize_mode is FinalizeMode.NONE:
+            workspace._unfinalized_route_map = torch.arange(
+                fleet_params.max_tokens_per_rank * config.top_k,
+                dtype=torch.int32,
+                device=workspace.topk_idx.device,
+            ).view(fleet_params.max_tokens_per_rank, config.top_k)
+            workspace._unfinalized_weights = (
+                torch.ones_like(workspace.topk_weights)
+                if config.apply_routing_weights_before_fc2
+                else (
+                    torch.empty_like(workspace.topk_weights)
+                    if config.batch_invariant
+                    else workspace.topk_weights
+                )
+            )
+        return workspace
 
     def validate_forward(
         self,
@@ -116,13 +205,13 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        del quantize_input
         validate_bf16_forward_inputs(
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,
             fleet_params,
             top_k=self._kernel_config.top_k,
-            quantize_input=quantize_input,
             scales=t.scales,
         )
 
@@ -130,6 +219,8 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         del quantize_input
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
+
         stage_mega_moe_inputs(
             t.hidden_states,
             t.topk_weights,
@@ -138,40 +229,146 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.topk_idx,
             workspace.topk_weights,
         )
+        note_staged_tokens(workspace.topk_idx, t.hidden_states.shape[0])
 
     def compute(
         self,
         workspace: Any,
         transformed_weights: TransformedMegaWeights,
         *,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import bf16_mega_moe
+        from ......kernel_src.sm100.cutedsl_megamoe import bf16_mega_moe, staged_tokens
+
+        if self.supports_unfinalized_output:
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
+        if output is not None:
+            num_tokens = output.shape[0]
+        else:
+            if self._autotune_pending:
+                raise ValueError(
+                    "compute(output=None) is incompatible with knobs='auto' "
+                    "(the autotune sweep needs a caller output buffer)"
+                )
+            staged = staged_tokens(workspace.topk_idx)
+            if staged is None:
+                raise ValueError(
+                    "compute(output=None) requires stage_inputs() to have "
+                    "staged this workspace first"
+                )
+            num_tokens = staged
 
         if self._autotune_pending:
-            from ......kernel_src.cutedsl_megamoe import autotune_bf16_mega_moe
+            from ......kernel_src.sm100.cutedsl_megamoe import autotune_bf16_mega_moe
 
-            autotune_bf16_mega_moe(
+            self._autotune_winner = autotune_bf16_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
                 workspace,
-                num_tokens=output.shape[0],
+                num_tokens=num_tokens,
                 gate_up_clamp=_clamp(self._kernel_config),
                 activation_clamp=self._kernel_config.activation_clamp,
             )
             self._autotune_pending = False
-        bf16_mega_moe(
+        view = bf16_mega_moe(
             output,
             transformed_weights[0],
             transformed_weights[1],
             workspace,
-            num_tokens=output.shape[0],
+            num_tokens=num_tokens,
             gate_up_clamp=_clamp(self._kernel_config),
             fast_math=self._kernel_config.fast_math,
         )
-        return output
+        return output if output is not None else view
 
-    def destroy(self, workspace: Any) -> None:
-        if workspace is not None:
-            workspace.destroy()
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            MegaMoEBf16Inputs,
+            staged_tokens,
+        )
+
+        if not self.supports_unfinalized_output:
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        num_tokens = staged_tokens(workspace.topk_idx)
+        if num_tokens is None:
+            raise ValueError("compute_unfinalized() requires stage_inputs() first")
+        clamp = _clamp(self._kernel_config)
+        if clamp is not None:
+            workspace._frontend.set_gate_up_clamp(clamp)
+        # Launch at full capacity even when this rank has no live tokens.
+        workspace._frontend.run(
+            MegaMoEBf16Inputs(
+                workspace.x,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                transformed_weights[0][0],
+                transformed_weights[1][0],
+                workspace.output_activation,
+            ),
+            num_tokens=num_tokens,
+        )
+        partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        if self._kernel_config.batch_invariant:
+            weights = workspace._unfinalized_weights[:num_tokens]
+            if self._kernel_config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:num_tokens])
+            weights.masked_fill_(
+                (workspace.topk_idx[:num_tokens] < 0)
+                | (workspace.topk_idx[:num_tokens] >= workspace.num_total_experts),
+                0,
+            )
+        return (
+            partials[:num_tokens].view(
+                num_tokens * self._kernel_config.top_k, workspace.hidden
+            ),
+            workspace._unfinalized_weights[:num_tokens],
+            workspace._unfinalized_route_map[:num_tokens],
+        )
+
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        config = self._kernel_config
+        if config.knobs == "auto":
+            return None
+
+        from ......core.kernel.workspace_pool import knobs_pool_key
+
+        return (
+            "sm100_bf16_bf16_bf16_cutedsl",
+            torch.cuda.current_device(),
+            self.ep_rank,
+            self.ep_world_size,
+            id(self._ep_comm_group),
+            fleet_params.num_experts,
+            fleet_params.max_tokens_per_rank,
+            config.top_k,
+            fleet_params.token_hidden_size,
+            config.intermediate_size,
+            _clamp(config),
+            config.apply_routing_weights_before_fc2,
+            config.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
+            config.enable_in_kernel_fc2_reduce,
+            config.finalize_mode,
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
+        )
+
+    def _forget_workspace_state(self, workspace) -> None:
+        # stage_inputs() memoizes the live-token count on topk_idx.data_ptr();
+        # the symmetric heap reuses freed addresses, so evict before the buffer
+        # dies. sys.modules lookup (not an import): if the shim was never
+        # loaded, no memo exists and the heavy import must not happen.
+        import sys
+
+        quant_stage = sys.modules.get(
+            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
+        )
+        topk_idx = getattr(workspace, "topk_idx", None)
+        if quant_stage is not None and topk_idx is not None:
+            quant_stage.forget_staged_tokens(topk_idx)

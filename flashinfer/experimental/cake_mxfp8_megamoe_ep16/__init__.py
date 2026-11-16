@@ -41,6 +41,7 @@ def create_session(
     topk_ids: torch.Tensor,
     *,
     process_group: dist.ProcessGroup | None = None,
+    backend: str = "cuda",
 ) -> Any:
     from .backend import CakeMxfp8MegaMoeEp16
 
@@ -48,6 +49,7 @@ def create_session(
         weights,
         topk_ids,
         process_group=process_group,
+        backend=backend,
     )
 
 

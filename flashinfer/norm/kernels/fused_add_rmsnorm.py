@@ -41,13 +41,14 @@ from ..utils import (
     has_hw_fp8_cvt,
     get_ptr_as_int64,
     get_sm_version,
+    max_cluster_n,
     row_reduce_sum_multirow,
     predicate_k,
     _torch_dtype_to_str,
     get_cutlass_dtype,
 )
 
-from .rmsnorm import RMSNormKernel
+from .rmsnorm import _LATENCY_BOUND_SMS, RMSNormKernel
 
 
 # =============================================================================
@@ -124,8 +125,12 @@ class FusedAddRMSNormKernel:
         elem_size = dtype.width // 8
         occupancy_target = max_smem_bytes // 2
 
+        max_cluster = max_cluster_n(sm_version)
+
         best_fit = 1
         for cluster_n in [1, 2, 4, 8, 16]:
+            if cluster_n > max_cluster:
+                break
             if H % cluster_n != 0:
                 continue
             smem_needed = FusedAddRMSNormKernel._estimate_smem_bytes(
@@ -459,7 +464,13 @@ class FusedAddRMSNormQuantKernel:
 
         self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
         self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
-        if self.H_per_cta > 8192 and self.num_threads < 256:
+        # Two rows per CTA for H > 8192 doubles the smem tiles and halves resident
+        # CTAs, which costs bandwidth on Blackwell and Rubin.
+        if (
+            self.H_per_cta > 8192
+            and self.num_threads < 256
+            and self.sm_version not in _LATENCY_BOUND_SMS
+        ):
             self.num_threads = 256
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)

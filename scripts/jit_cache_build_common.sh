@@ -4,12 +4,21 @@
 #   - scripts/build_flashinfer_jit_cache_whl.sh         (release/nightly)
 #   - scripts/build_jit_cache_provider_wheelhouse.sh    (provider experiment)
 #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
+#   - scripts/run_with_test_sccache.sh                  (PR GPU test lanes)
 
-SCCACHE_VERSION="0.17.0"
-SCCACHE_CUDA_134_REVISION="e9b15a35f7240a7edd1b9644583edb388c6cb5f9"
-SCCACHE_CUDA_134_SOURCE_SHA256="9e444cc5097a839f03c81c59c5cadebc20090aad1fc699e398d5c1c18c44118c"
-# The v0.17 client-side architecture remains opt-in while this change isolates
-# the version upgrade from a separate execution-mode change.
+SCCACHE_VERSION="0.18.0"
+
+# rapidsai/sccache fork used for nvcc when FLASHINFER_SCCACHE_NVCC_IMPL=rapids
+# (see setup_sccache). Pinned by release tag and the sha256 digests GitHub
+# publishes for the release assets; the checksums are pinned here rather than
+# fetched from the same origin as the tarball.
+SCCACHE_RAPIDS_VERSION="0.18.0-rapids.8"
+SCCACHE_RAPIDS_SHA256_x86_64="6b479c4d4903c8f738f031d4a18f2937a1090827ed553b6bfd7beed0e9aeebeb"
+SCCACHE_RAPIDS_SHA256_aarch64="2994d493d18566af0d55dc4ebc678be6b6f91b6856d1c6837325c121da755b6d"
+# Installed in a directory of its own under the name "sccache": invoked under any
+# other name (e.g. sccache-rapids), sccache treats that name as a compiler to
+# wrap, and even `--version` hangs. Not overridable from the environment.
+SCCACHE_RAPIDS_BIN=/usr/local/libexec/sccache-rapids/sccache
 
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
@@ -79,6 +88,131 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
+# Signal PID and everything below it: killing only a background subshell leaves
+# its `python -m build`, ninja and nvcc children running.
+_kill_process_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
+# The pool's polling runs with xtrace off: callers use `set -x`, and a trace of
+# every 0.2 s check would bury the build output. Restoring is done by each helper.
+#
+# Collect the status of items that have finished, without blocking. Works on the
+# caller's `pids` (items still counted as running) and `failed` variables: bash
+# forgets finished jobs in `jobs`, so the pids are tracked here. A pid is waited
+# for exactly once, so its status is never lost or read twice.
+_reap_finished_items() {
+  { local pid alive=() xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    else
+      wait "$pid" || failed=1
+    fi
+  done
+  pids=(${alive[@]+"${alive[@]}"})
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until a slot is free or an item has failed (`failed` is set then).
+# Uses the caller's `limit`, `pids` and `failed`.
+_wait_for_free_slot() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while :; do
+    _reap_finished_items
+    if (( failed || ${#pids[@]} < limit )); then break; fi
+    sleep 0.2
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Block until every item has finished or one has failed.
+_wait_for_all_items() {
+  { local xtrace=0; [[ $- == *x* ]] && xtrace=1; set +x; } 2>/dev/null
+  while (( ${#pids[@]} > 0 && ! failed )); do
+    sleep 0.2
+    _reap_finished_items
+  done
+  if (( xtrace )); then set -x; fi
+  return 0
+}
+
+# Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
+# finished item frees its slot for the next one. Output of different items
+# interleaves, so FUNCTION should prefix its own lines. On the first failure,
+# including one after the last item has started, the running items are killed
+# with their descendants and no more start. Finished items are polled every
+# 0.2 s, which is negligible against builds that take minutes.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2 - function name, $3... - items.
+# Returns 0 when every item succeeded, else 1.
+run_bounded_parallel() {
+  local limit=$1 fn=$2
+  shift 2
+  local item pid failed=0 pids=()
+  for item in "$@"; do
+    _wait_for_free_slot
+    if (( failed )); then break; fi
+    "$fn" "$item" &
+    pids+=($!)
+  done
+  # Drain what is still running, stopping it at the first failure.
+  _wait_for_all_items
+  if (( failed )); then
+    for pid in ${pids[@]+"${pids[@]}"}; do _kill_process_tree "$pid"; done
+  fi
+  # Reaps the killed items.
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    wait "$pid" || failed=1
+  done
+  return $failed
+}
+
+# Lint the AOT spec list of each provider architecture: no spec may name a CUDA
+# target its provider cannot carry (see check_jit_spec_gencodes.py). Generates
+# specs only, so it needs the CUDA image and flashinfer installed but no GPU and
+# no compiling. One process per provider: the target list is fixed when flashinfer
+# is first imported.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2... - provider architectures.
+# Returns 0 when every provider passed, else 1.
+_JIT_CACHE_COMMON_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+lint_provider_specs() {
+  local provider_architecture=$1
+  python3 "${_JIT_CACHE_COMMON_DIR}/check_jit_spec_gencodes.py" \
+    --provider "${provider_architecture}" 2>&1 \
+    | sed -u "s/^/[${provider_architecture}] /"
+}
+
+run_provider_spec_lint() {
+  local concurrency=$1
+  shift
+  if ! [[ "${concurrency}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: spec lint concurrency must be a positive integer, got '${concurrency}'"
+    return 1
+  fi
+  local started_at=${SECONDS}
+  # Cold metadata downloads can outlast a peer's artifact-lock timeout. Fill
+  # the shared header cache before the fail-fast pool starts any arch workers.
+  if (( concurrency > 1 && $# > 1 )); then
+    python3 "${_JIT_CACHE_COMMON_DIR}/prefetch_jit_spec_headers.py" || {
+      echo "ERROR: Failed to prefetch provider spec headers"
+      return 1
+    }
+  fi
+  run_bounded_parallel "${concurrency}" lint_provider_specs "$@" || {
+    echo "ERROR: A provider spec lists CUDA targets the provider cannot carry"
+    return 1
+  }
+  echo "✓ Provider spec CUDA targets linted in $(( SECONDS - started_at )) s"
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:
@@ -101,8 +235,9 @@ validate_jit_cache_cuda_toolchain() {
   echo "nvcc CUDA version check passed: ${nvcc_cuda_version}"
 }
 
-# Install the matrix-selected PyTorch build environment and constrain the
-# isolated PEP 517 build to that exact distribution.
+# Install the matrix-selected PyTorch build environment and constrain every
+# later pip install, including the wheel's build requirements, to that exact
+# distribution.
 #
 # Args:
 #   $1 - Python executable used to invoke the build frontend.
@@ -118,7 +253,14 @@ setup_jit_cache_python_build() {
   local pytorch_index=$3
   local pytorch_index_url="https://download.pytorch.org/whl/${pytorch_index}"
 
-  "${python_bin}" -m pip install --upgrade build
+  # pip 26.2.1 fixed ProtocolError from truncated downloads bypassing its
+  # resume logic. Provider builds download CUDA wheels hundreds of MB in size,
+  # so use that fix and allow more connection/resume attempts by default.
+  export PIP_RETRIES="${PIP_RETRIES:-10}"
+  export PIP_RESUME_RETRIES="${PIP_RESUME_RETRIES:-10}"
+  export PIP_DEFAULT_TIMEOUT="${PIP_DEFAULT_TIMEOUT:-120}"
+  env -u PIP_CONSTRAINT -u PIP_BUILD_CONSTRAINT \
+    "${python_bin}" -m pip install --upgrade "pip>=26.2.1" build
 
   if "${python_bin}" - "${expected_cuda_version}" <<'PY'
 import sys
@@ -209,19 +351,30 @@ cleanup_jit_cache_python_build() {
   unset JIT_CACHE_RESTORE_PIP_BUILD_CONSTRAINT
 }
 
-# Download and install a released sccache binary to /usr/local/bin/sccache,
-# verifying the upstream sha256 checksum.
+# Download, verify and install a released sccache binary.
+#
+# Args:
+#   $1 - Release version (without the leading "v").
+#   $2 - Architecture (x86_64 or aarch64).
+#   $3 - GitHub repository (default mozilla/sccache).
+#   $4 - Install path (default /usr/local/bin/sccache).
+#   $5 - Expected sha256 (default: the release's published .sha256 file).
+# Exits on a checksum mismatch, before the archive is extracted, even when the
+# caller runs with errexit off.
 install_released_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
+  local sccache_repo=${3:-mozilla/sccache}
+  local sccache_dest=${4:-/usr/local/bin/sccache}
+  local sccache_sha256=${5:-}
   local sccache_package="sccache-v${sccache_version}-${sccache_arch}-unknown-linux-musl"
   local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/mozilla/sccache/releases/download/v${sccache_version}/${sccache_archive}"
+  local sccache_url="https://github.com/${sccache_repo}/releases/download/v${sccache_version}/${sccache_archive}"
   local sccache_tmpdir
-  local sccache_sha256
   local sccache_install_started_at=${SECONDS}
+  local suffix attempt delay http_status
 
-  echo "::group::Install sccache v${sccache_version} (${sccache_arch})"
+  echo "::group::Install ${sccache_repo} v${sccache_version} (${sccache_arch})"
 
   if ! command -v sha256sum >/dev/null 2>&1; then
     echo "ERROR: sha256sum is required to verify sccache downloads"
@@ -229,96 +382,57 @@ install_released_sccache() {
   fi
 
   sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  curl -fsSL "${sccache_url}.sha256" -o "${sccache_tmpdir}/${sccache_archive}.sha256"
-  sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  # Match the Docker image pull policy: four attempts with 5/10/20s backoff.
+  # Retry each file independently so a checksum retry keeps the downloaded archive.
+  # A pinned checksum (e.g. the rapidsai fork) skips the .sha256 download.
+  local suffixes=("")
+  if [ -z "${sccache_sha256}" ]; then
+    suffixes+=(".sha256")
+  fi
+  for suffix in "${suffixes[@]}"; do
+    for attempt in 1 2 3 4; do
+      if http_status=$(curl -fsSL -w '%{http_code}' "${sccache_url}${suffix}" -o "${sccache_tmpdir}/${sccache_archive}${suffix}"); then
+        break
+      fi
+      # Missing release files will not recover with another download attempt.
+      if [ "${http_status}" = "404" ]; then
+        echo "Release file not found (HTTP 404): ${sccache_archive}${suffix}" >&2
+        return 1
+      fi
+      if (( attempt == 4 )); then
+        echo "Failed to download ${sccache_archive}${suffix} after ${attempt} attempts" >&2
+        return 1
+      fi
+      delay=$(( 5 * 2 ** (attempt - 1) ))
+      echo "sccache download failed; retrying in ${delay}s (attempt $(( attempt + 1 ))/4)" >&2
+      sleep "${delay}"
+    done
+  done
+  if [ -z "${sccache_sha256}" ]; then
+    sccache_sha256=$(awk '{print $1}' "${sccache_tmpdir}/${sccache_archive}.sha256")
+  fi
   if [ -z "${sccache_sha256}" ]; then
     echo "ERROR: Missing checksum for ${sccache_archive}"
     exit 1
   fi
 
-  printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
+  if ! printf '%s  %s\n' "${sccache_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -; then
+    echo "ERROR: Checksum mismatch for ${sccache_archive}"
+    rm -rf "${sccache_tmpdir}"
+    exit 1
+  fi
   tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-  mv "${sccache_tmpdir}/${sccache_package}/sccache" /usr/local/bin/
+  mkdir -p "$(dirname "${sccache_dest}")"
+  mv "${sccache_tmpdir}/${sccache_package}/sccache" "${sccache_dest}"
   rm -rf "${sccache_tmpdir}"
-  chmod +x /usr/local/bin/sccache
+  chmod +x "${sccache_dest}"
   echo "::endgroup::"
   echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
 }
 
-# Build a pinned sccache revision natively. Building inside each manylinux
-# builder produces the matching x86_64 or aarch64 binary without relying on an
-# unpublished binary artifact.
-build_patched_sccache() {
-  local sccache_revision=$1
-  local expected_sha256=$2
-  local output_path=$3
-  local sccache_package="sccache-${sccache_revision}"
-  local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/mozilla/sccache/archive/${sccache_revision}.tar.gz"
-  local sccache_tmpdir
-  local required_command
-  local sccache_build_started_at=${SECONDS}
-
-  for required_command in cargo curl env install make perl sha256sum tar; do
-    if ! command -v "${required_command}" >/dev/null 2>&1; then
-      echo "ERROR: ${required_command} is required to build patched sccache"
-      exit 1
-    fi
-  done
-
-  sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  printf '%s  %s\n' "${expected_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
-  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-
-  echo "Building sccache revision ${sccache_revision} for $(uname -m)"
-  # Do not expose cache credentials to third-party Cargo build scripts.
-  env \
-    -u AWS_ACCESS_KEY_ID \
-    -u AWS_SECRET_ACCESS_KEY \
-    -u AWS_SESSION_TOKEN \
-    CARGO_INCREMENTAL=0 \
-    cargo build \
-    --locked \
-    --release \
-    --no-default-features \
-    --features s3,vendored-openssl \
-    --bin sccache \
-    --manifest-path "${sccache_tmpdir}/${sccache_package}/Cargo.toml"
-  mkdir -p "$(dirname "${output_path}")"
-  install -m 0755 \
-    "${sccache_tmpdir}/${sccache_package}/target/release/sccache" \
-    "${output_path}"
-  rm -rf "${sccache_tmpdir}"
-  echo "patched sccache build duration: $((SECONDS - sccache_build_started_at)) seconds"
-}
-
-# Install the pinned source build, reusing a binary produced by a dedicated
-# workflow step when available. Other call sites retain a self-contained
-# fallback that builds directly into /usr/local/bin.
-install_patched_sccache() {
-  local sccache_revision=$1
-  local expected_sha256=$2
-
-  if [ -n "${SCCACHE_PATCHED_BINARY_PATH:-}" ]; then
-    if [ ! -x "${SCCACHE_PATCHED_BINARY_PATH}" ]; then
-      echo "ERROR: Prebuilt patched sccache not found: ${SCCACHE_PATCHED_BINARY_PATH}"
-      exit 1
-    fi
-    echo "Installing prebuilt patched sccache from ${SCCACHE_PATCHED_BINARY_PATH}"
-    install -m 0755 "${SCCACHE_PATCHED_BINARY_PATH}" /usr/local/bin/sccache
-  else
-    build_patched_sccache \
-      "${sccache_revision}" \
-      "${expected_sha256}" \
-      /usr/local/bin/sccache
-  fi
-}
-
-# Install the official release by default. CUDA 13.4 uses the first upstream
-# revision containing the CUDA 13.3+ dry-run parser fix while that fix remains
-# unreleased: https://github.com/mozilla/sccache/pull/2722
+# Install the official sccache release. v0.18.0 is the first release that
+# includes the CUDA 13.3+ nvcc dry-run parser fix required for CUDA 13.4:
+# https://github.com/mozilla/sccache/pull/2722
 install_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
@@ -332,20 +446,30 @@ install_sccache() {
       ;;
   esac
 
-  case "${CUDA_VERSION:-}" in
-    13.4|134)
-      install_patched_sccache \
-        "${SCCACHE_CUDA_134_REVISION}" \
-        "${SCCACHE_CUDA_134_SOURCE_SHA256}"
-      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-source"
-      export FLASHINFER_SCCACHE_REVISION="${SCCACHE_CUDA_134_REVISION}"
-      ;;
+  install_released_sccache "${sccache_version}" "${sccache_arch}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
+  export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
+}
+
+# Install the pinned rapidsai/sccache fork as SCCACHE_RAPIDS_BIN, next to (not
+# replacing) an upstream /usr/local/bin/sccache.
+install_rapids_sccache() {
+  local sccache_arch=$1
+  local sccache_sha256
+
+  case "${sccache_arch}" in
+    x86_64) sccache_sha256="${SCCACHE_RAPIDS_SHA256_x86_64}" ;;
+    aarch64) sccache_sha256="${SCCACHE_RAPIDS_SHA256_aarch64}" ;;
     *)
-      install_released_sccache "${sccache_version}" "${sccache_arch}"
-      export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
-      export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
+      echo "ERROR: Unsupported sccache build architecture: ${sccache_arch}"
+      exit 1
       ;;
   esac
+
+  install_released_sccache "${SCCACHE_RAPIDS_VERSION}" "${sccache_arch}" \
+    rapidsai/sccache "${SCCACHE_RAPIDS_BIN}" "${sccache_sha256}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release-rapidsai"
+  export FLASHINFER_SCCACHE_REVISION="v${SCCACHE_RAPIDS_VERSION}"
 }
 
 # Install sccache (if missing), configure environment, and start the server.
@@ -356,21 +480,58 @@ install_sccache() {
 #   $2 - Source root directory for SCCACHE_BASEDIRS.
 #
 # Reads (optional): SCCACHE_REGION, SCCACHE_STATS_DIR,
-# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, FLASHINFER_SCCACHE_NVCC_IMPL.
+#
+# FLASHINFER_SCCACHE_NVCC_IMPL=rapids runs the rapidsai/sccache fork
+# (SCCACHE_RAPIDS_VERSION) instead of upstream. Its nvcc hashing lists
+# dependencies (-M) and caches that list, so a hit skips nvcc's preprocessing:
+# on the sm80 provider, about 0.3 instead of 7.4 host CPU-s per hit. Its keys
+# differ from upstream's, so it uses the key prefix "<tag>-rapids". Host C++
+# is left uncached: the fork fails fatally (no fallback) on `g++ -MMD` of files
+# that include <vector> ("Error computing digest: while reading '/'").
 # Sets/exports: SCCACHE_*, FLASHINFER_NVCC_LAUNCHER, FLASHINFER_CXX_LAUNCHER.
+# Launchers and ACTIVE are enabled only after startup and zero-stats succeed.
+# Each setup starts a new stats session, discarding inherited runtime state.
 setup_sccache() {
   local key_prefix=$1
   local source_root=$2
   local sccache_arch
+  local setup_status
+  unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
+  unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
   sccache_arch=$(uname -m)
-  install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  local nvcc_impl="${FLASHINFER_SCCACHE_NVCC_IMPL:-upstream}"
+  case "${nvcc_impl}" in
+    upstream|rapids) ;;
+    *)
+      echo "ERROR: Unsupported FLASHINFER_SCCACHE_NVCC_IMPL=${nvcc_impl} (upstream|rapids)"
+      return 1
+      ;;
+  esac
+  export FLASHINFER_SCCACHE_BIN=sccache
+  if [ "${nvcc_impl}" = "rapids" ]; then
+    export FLASHINFER_SCCACHE_BIN="${SCCACHE_RAPIDS_BIN}"
+    key_prefix="${key_prefix}-rapids"
+    # Always installed: nothing preinstalls the fork, unlike the upstream
+    # probe below.
+    install_rapids_sccache "${sccache_arch}"
+  elif [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
+    # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
+    export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
+    export FLASHINFER_SCCACHE_REVISION="${FLASHINFER_SCCACHE_REVISION:-v${SCCACHE_VERSION}}"
+  else
+    install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  fi
 
   export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="${key_prefix}"
   export SCCACHE_IDLE_TIMEOUT=0
-  export FLASHINFER_CXX_LAUNCHER="sccache"
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
+  # Server-side mode is intentional. Client-side mode adds compiler probes for
+  # nvcc and reduced provider-build throughput in CI. The build watchdog scans
+  # /proc system-wide, including daemon-owned compilers, and docker --rm is the
+  # final containment boundary if the watchdog cannot signal one of them.
+  unset SCCACHE_CLIENT_SIDE
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
@@ -387,17 +548,34 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  sccache --start-server
-  sccache --zero-stats
+  # Explicit returns: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see failed control commands.
+  "${FLASHINFER_SCCACHE_BIN}" --start-server || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  "${FLASHINFER_SCCACHE_BIN}" --zero-stats || {
+    setup_status=$?
+    stop_sccache_after_setup_failure
+    return "${setup_status}"
+  }
+  if [ "${nvcc_impl}" = "rapids" ]; then
+    # Host C++ uncached; see the FLASHINFER_SCCACHE_NVCC_IMPL note above.
+    export FLASHINFER_CXX_LAUNCHER=""
+  else
+    export FLASHINFER_CXX_LAUNCHER="sccache"
+  fi
+  export FLASHINFER_NVCC_LAUNCHER="${FLASHINFER_SCCACHE_BIN}"
   export FLASHINFER_SCCACHE_ACTIVE=true
-  echo "sccache version: $(sccache --version)"
+  echo "sccache version: $("${FLASHINFER_SCCACHE_BIN}" --version)"
   echo "sccache install source: ${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
   echo "sccache revision: ${FLASHINFER_SCCACHE_REVISION}"
   echo "sccache bucket: ${SCCACHE_BUCKET}"
   echo "sccache region: ${SCCACHE_REGION}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
   echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
-  echo "sccache cxx launcher: ${FLASHINFER_CXX_LAUNCHER}"
+  echo "sccache cxx launcher: ${FLASHINFER_CXX_LAUNCHER:-disabled}"
   echo "sccache nvcc launcher: ${FLASHINFER_NVCC_LAUNCHER:-disabled}"
 
   if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
@@ -406,7 +584,8 @@ setup_sccache() {
     git_commit=$(git -C "${source_root}" rev-parse HEAD 2>/dev/null || true)
     {
       printf 'git_commit=%s\n' "${git_commit:-unknown}"
-      printf 'sccache_version=%s\n' "$(sccache --version)"
+      printf 'sccache_version=%s\n' "$("${FLASHINFER_SCCACHE_BIN}" --version)"
+      printf 'sccache_nvcc_impl=%s\n' "${nvcc_impl}"
       printf 'sccache_install_source=%s\n' "${FLASHINFER_SCCACHE_INSTALL_SOURCE}"
       printf 'sccache_revision=%s\n' "${FLASHINFER_SCCACHE_REVISION}"
       printf 'sccache_cache_mode=%s\n' "${FLASHINFER_SCCACHE_CACHE_MODE}"
@@ -422,6 +601,21 @@ setup_sccache() {
   fi
 }
 
+# Best-effort cleanup must not mask the original setup failure.
+stop_sccache_after_setup_failure() {
+  if ! run_sccache_control_command --stop-server >/dev/null 2>&1; then
+    echo "WARNING: Failed to stop sccache after setup failure; daemon may remain running" >&2
+  fi
+}
+
+run_sccache_control_command() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=5s 30s "${FLASHINFER_SCCACHE_BIN:-sccache}" "$@"
+  else
+    "${FLASHINFER_SCCACHE_BIN:-sccache}" "$@"
+  fi
+}
+
 # When SCCACHE_STATS_DIR is configured, retain text/JSON stats for a dedicated
 # workflow log step and artifact upload. Otherwise, print the stats directly.
 # This helper is intended for EXIT traps; callers should ignore failures so
@@ -429,29 +623,30 @@ setup_sccache() {
 collect_sccache_stats() {
   if [ "${FLASHINFER_SCCACHE_ACTIVE:-false}" != "true" ] || \
      [ "${FLASHINFER_SCCACHE_STATS_COLLECTED:-false}" = "true" ] || \
-     ! command -v sccache >/dev/null 2>&1; then
+     ! command -v "${FLASHINFER_SCCACHE_BIN:-sccache}" >/dev/null 2>&1; then
     return 0
   fi
   export FLASHINFER_SCCACHE_STATS_COLLECTED=true
 
   if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
     mkdir -p "${SCCACHE_STATS_DIR}"
-    if ! sccache --show-stats > "${SCCACHE_STATS_DIR}/sccache-stats.txt"; then
+    if ! run_sccache_control_command --show-stats \
+        > "${SCCACHE_STATS_DIR}/sccache-stats.txt"; then
       echo "WARNING: Failed to collect text sccache stats" >&2
     fi
-    if ! sccache --show-stats --stats-format=json \
+    if ! run_sccache_control_command --show-stats --stats-format=json \
         > "${SCCACHE_STATS_DIR}/sccache-stats.json"; then
       echo "WARNING: Failed to collect JSON sccache stats" >&2
     fi
-    if ! sccache --show-adv-stats --stats-format=json \
+    if ! run_sccache_control_command --show-adv-stats --stats-format=json \
         > "${SCCACHE_STATS_DIR}/sccache-advanced-stats.json"; then
       echo "WARNING: Failed to collect advanced JSON sccache stats" >&2
     fi
   else
     echo "::group::sccache stats"
-    sccache --show-stats || true
+    run_sccache_control_command --show-stats || true
     echo "::endgroup::"
   fi
-  sccache --stop-server >/dev/null 2>&1 || true
+  run_sccache_control_command --stop-server >/dev/null 2>&1 || true
   export FLASHINFER_SCCACHE_ACTIVE=false
 }

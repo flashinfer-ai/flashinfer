@@ -1,0 +1,69 @@
+{
+  "name": "sdsa_top_k_from_candidates_pair2_range2",
+  "description": "Each query row's exact Top-K keys among the (key, score bits) candidate and tie pairs that single-head threshold select stored in its range of slots.",
+  "op_type": "sdsa_top_k_from_candidates",
+  "tags": [
+    "fi_api:flashinfer.sdsa.indexer.top_k_from_candidates",
+    "arch:sm100",
+    "arch:sm103"
+  ],
+  "axes": {
+    "rows": {
+      "type": "var",
+      "description": "Query rows."
+    },
+    "slots": {
+      "type": "var",
+      "description": "Tie slots, then candidate slots."
+    },
+    "pair": {
+      "type": "const",
+      "value": 2,
+      "description": "Key index and score bits."
+    },
+    "range": {
+      "type": "const",
+      "value": 2,
+      "description": "A row's first and past-last Top-K slot."
+    },
+    "top_k": {
+      "type": "var",
+      "description": "Keys per row."
+    }
+  },
+  "inputs": {
+    "candidates": {
+      "shape": [
+        "rows",
+        "slots",
+        "pair"
+      ],
+      "dtype": "int32"
+    },
+    "ranges": {
+      "shape": [
+        "range",
+        "rows"
+      ],
+      "dtype": "int32"
+    },
+    "top_keys": {
+      "shape": [
+        "rows",
+        "top_k"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "top_keys": {
+      "shape": [
+        "rows",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "param": "top_keys"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

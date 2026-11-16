@@ -5,6 +5,7 @@ import importlib
 import importlib.metadata
 import io
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -92,6 +93,8 @@ class SourceSummary(TypedDict):
 class RunSummary(TypedDict):
     schema_version: int
     complete: bool
+    gpu_name: str
+    lane_id: str
     planned_nodes: int
     finalized_nodes: int
     pending_nodes: list[str]
@@ -166,7 +169,9 @@ def _memory_samples(path: Path) -> list[dict[str, float]]:
                     {
                         "timestamp": float(row["timestamp"]),
                         "host_rss_mib": float(row["host_rss_mib"]),
-                        "gpu_memory_mib": float(row["gpu_memory_mib"]),
+                        # Preserve host samples when GPU telemetry is unavailable.
+                        "gpu_memory_mib": float(row["gpu_memory_mib"] or 0),
+                        "gpu_memory_available": float(bool(row["gpu_memory_mib"])),
                     }
                 )
     except (OSError, KeyError, TypeError, ValueError):
@@ -182,12 +187,20 @@ def _json_sidecar(path: Path, suffix: str) -> dict[str, Any]:
         return {}
 
 
-def _max_memory(samples: list[dict[str, float]]) -> tuple[float, float]:
-    if not samples:
-        return 0.0, 0.0
+_MemoryPeak = tuple[float, float | None]
+
+
+def _max_memory(samples: list[dict[str, float]]) -> _MemoryPeak:
     return (
-        max(sample["host_rss_mib"] for sample in samples),
-        max(sample["gpu_memory_mib"] for sample in samples),
+        max((sample["host_rss_mib"] for sample in samples), default=0.0),
+        max(
+            (
+                sample["gpu_memory_mib"]
+                for sample in samples
+                if sample["gpu_memory_available"]
+            ),
+            default=None,
+        ),
     )
 
 
@@ -201,12 +214,12 @@ class _SummaryScan:
     shard_finalized: Counter[int] = field(default_factory=Counter)
     pending: list[str] = field(default_factory=list)
     synthetic_count: int = 0
-    batch_memory: dict[str, tuple[float, float]] = field(default_factory=dict)
-    node_memory: dict[str, tuple[float, float]] = field(default_factory=dict)
-    unit_memory: dict[str, list[tuple[float, float]]] = field(
+    batch_memory: dict[str, _MemoryPeak] = field(default_factory=dict)
+    node_memory: dict[str, _MemoryPeak] = field(default_factory=dict)
+    unit_memory: dict[str, list[_MemoryPeak]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    shard_memory: dict[int, list[tuple[float, float]]] = field(
+    shard_memory: dict[int, list[_MemoryPeak]] = field(
         default_factory=lambda: defaultdict(list)
     )
 
@@ -224,13 +237,11 @@ def _record_pending(scan: _SummaryScan, unit: Unit, batch: Batch) -> None:
     scan.shard_pending[unit.shard_index] += len(batch.nodeids)
 
 
-def _case_memory(
-    samples: list[dict[str, float]], phase: dict[str, Any]
-) -> tuple[float, float]:
+def _case_memory(samples: list[dict[str, float]], phase: dict[str, Any]) -> _MemoryPeak:
     started_at = phase.get("started_at")
     finished_at = phase.get("finished_at")
     if started_at is None or finished_at is None:
-        return 0.0, 0.0
+        return 0.0, None
     return _max_memory(
         [
             sample
@@ -317,30 +328,27 @@ def _write_memory_csv(junit_dir: Path, scan: _SummaryScan) -> None:
     memory_stream = io.StringIO(newline="")
     memory_writer = csv.writer(memory_stream, lineterminator="\n")
     memory_writer.writerow(["level", "id", "max_host_rss_mib", "max_gpu_memory_mib"])
+
+    def write(level: str, identity: str, memory: _MemoryPeak) -> None:
+        host, gpu = memory
+        memory_writer.writerow(
+            [level, identity, f"{host:.3f}", "" if gpu is None else f"{gpu:.3f}"]
+        )
+
     for nodeid, memory in sorted(scan.node_memory.items()):
-        memory_writer.writerow(["node", nodeid, f"{memory[0]:.3f}", f"{memory[1]:.3f}"])
+        write("node", nodeid, memory)
     for batch_id, memory in sorted(scan.batch_memory.items()):
-        memory_writer.writerow(
-            ["batch", batch_id, f"{memory[0]:.3f}", f"{memory[1]:.3f}"]
-        )
-    for unit_id, memories in sorted(scan.unit_memory.items()):
-        memory_writer.writerow(
-            [
-                "unit",
-                unit_id,
-                f"{max(value[0] for value in memories):.3f}",
-                f"{max(value[1] for value in memories):.3f}",
-            ]
-        )
-    for shard_index, memories in sorted(scan.shard_memory.items()):
-        memory_writer.writerow(
-            [
-                "shard",
-                shard_index,
-                f"{max(value[0] for value in memories):.3f}",
-                f"{max(value[1] for value in memories):.3f}",
-            ]
-        )
+        write("batch", batch_id, memory)
+    for level, groups in (("unit", scan.unit_memory), ("shard", scan.shard_memory)):
+        for identity, memories in sorted(groups.items()):
+            write(
+                level,
+                str(identity),
+                (
+                    max(host for host, _ in memories),
+                    max((gpu for _, gpu in memories if gpu is not None), default=None),
+                ),
+            )
     atomic_write_text(junit_dir / "memory_summary.csv", memory_stream.getvalue())
 
 
@@ -420,7 +428,8 @@ def _source_and_failure_summaries(
             samples = _memory_samples(path)
             memory = _max_memory(samples)
             row["max_host_rss_mib"] = max(row["max_host_rss_mib"], memory[0])
-            row["max_gpu_memory_mib"] = max(row["max_gpu_memory_mib"], memory[1])
+            if memory[1] is not None:
+                row["max_gpu_memory_mib"] = max(row["max_gpu_memory_mib"], memory[1])
             row["memory_samples"] += len(samples)
             launched = telemetry.get("process_launch", meta.get("launched_at"))
             exited = telemetry.get("process_exit", meta.get("exited_at"))
@@ -430,7 +439,9 @@ def _source_and_failure_summaries(
                 if not bool(meta.get("synthetic", False)):
                     row["partial_resources"] = True
             if not bool(meta.get("synthetic", False)) and (
-                not bool(meta.get("monitor_memory", True)) or not samples
+                not bool(meta.get("monitor_memory", True))
+                or not samples
+                or any(not sample["gpu_memory_available"] for sample in samples)
             ):
                 row["partial_resources"] = True
             for case in validation.cases:
@@ -577,8 +588,10 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
     )
     capacity = _capacity_for_latest_attempt(plan, attempt_paths)
     summary: RunSummary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "complete": not scan.pending,
+        "gpu_name": _detect_gpu_name(),
+        "lane_id": _detect_lane_id(),
         "planned_nodes": len(plan.nodes),
         "finalized_nodes": len(scan.rows),
         "pending_nodes": sorted(scan.pending, key=lambda value: value.encode("utf-8")),
@@ -710,7 +723,46 @@ def _cudnn_backend_version() -> str:
 
 
 @lru_cache(maxsize=1)
+def _detect_gpu_name() -> str:
+    """Return the GPU name from the ``CI_GPU_NAME`` environment variable.
+
+    This variable is set by the CI workflow matrix and forwarded into the
+    Docker container, avoiding the cost of initialising a CUDA context just
+    to query the device name.
+    """
+    name = os.environ.get("CI_GPU_NAME", "") or ""
+    if not name:
+        print(
+            "WARNING: CI_GPU_NAME is not set; gpu_name will be 'unknown'. "
+            "Ensure the workflow matrix sets gpu_name and ci/bash.sh forwards it.",
+            file=sys.stderr,
+        )
+        return "unknown"
+    return name
+
+
+def _detect_lane_id() -> str:
+    """Build a composite lane identifier from CI environment variables.
+
+    Format: ``{script} - {gpu_name}@{cuda}``, e.g.
+    ``task_run_unit_tests.sh - H100@cu124``.  Falls back to ``gpu_name``
+    alone when the other variables are unavailable.
+    """
+    gpu = _detect_gpu_name()
+    script = os.environ.get("CI_TEST_SCRIPT", "") or ""
+    cuda = os.environ.get("CI_MATRIX_CUDA", "") or ""
+    if script and cuda:
+        return f"{script} - {gpu}@{cuda}"
+    if script:
+        return f"{script} - {gpu}"
+    if cuda:
+        return f"{gpu}@{cuda}"
+    return gpu
+
+
+@lru_cache(maxsize=1)
 def _runtime_version_line() -> str:
+    """Format runtime and dependency versions as space-separated name=value pairs."""
     versions = [
         ("python", sys.version.split()[0]),
         ("flashinfer", _package_version("flashinfer-python")),

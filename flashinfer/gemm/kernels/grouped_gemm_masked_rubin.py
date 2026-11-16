@@ -6,6 +6,7 @@
 
 from typing import Callable, List, Literal, NamedTuple, Optional, Tuple, Type, Union
 import functools
+import logging
 
 import cuda.bindings.driver as cuda
 import torch
@@ -42,6 +43,8 @@ from cutlass.cutlass_dsl import (
     Uint8,
     Uint64,
 )
+
+logger = logging.getLogger(__name__)
 
 
 """
@@ -2211,7 +2214,8 @@ class Sm107BlockScaledPersistentDenseGemmKernel(
                 m, n, k, l, a_dtype, b_dtype, c_dtype, a_major, b_major, c_major
             )
         except testing.CantImplementError as e:
-            print(f"[DSL ERROR] CantImplementError: {e}")
+            # Unsupported autotuning candidates are expected, not kernel failures.
+            logger.debug("Skipping unsupported GEMM candidate: %s", e)
             return False
         return True
 

@@ -25,6 +25,10 @@ from flashinfer.utils import (
 )
 from flashinfer.jit.gemm import gen_gemm_module, gen_gemm_sm90_module
 
+
+# H100 CI peak GPU memory: 63.8 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
 DTYPES = [torch.float16]
 CUDA_DEVICES = ["cuda:0"]
 

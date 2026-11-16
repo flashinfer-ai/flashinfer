@@ -3,6 +3,7 @@
 import functools
 import logging
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import torch
 from . import env as jit_env
 from ..compilation_context import CompilationContext
 
+is_windows = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
 
 
@@ -110,6 +112,18 @@ def get_nvcc_parallelism_flags() -> List[str]:
         threads = default
 
     return [f"--threads={threads}"]
+
+
+@functools.lru_cache(maxsize=1)
+def host_compiler_is_gcc() -> bool:
+    """Whether the compiler nvcc forwards -Xcompiler flags to is GCC.
+
+    Cached because the underlying torch helper shells out to the compiler.
+    """
+    from torch.utils.cpp_extension import check_compiler_is_gcc, get_cxx_compiler
+
+    host_compiler = os.environ.get("CC", get_cxx_compiler())
+    return check_compiler_is_gcc(host_compiler)
 
 
 def join_multiline(vs: List[str]) -> str:
@@ -237,6 +251,11 @@ def build_cuda_cflags(
     return cuda_cflags
 
 
+def _ninja_windows_path(path) -> str:
+    # In a ninja build line, ":" ends the outputs and a space separates paths.
+    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":\\", "$:\\")
+
+
 def generate_ninja_build_for_op(
     name: str,
     sources: List[Path],
@@ -246,11 +265,17 @@ def generate_ninja_build_for_op(
     extra_include_dirs: Optional[List[Path]],
     needs_device_linking: bool = False,
     embedded_cubins: Optional[Mapping[str, Path]] = None,
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None,
 ) -> str:
     cuda_home = get_cuda_path()
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+    cuda_arch_flags = [flag for flag in cuda_cflags if flag.startswith("-gencode=")]
+    cuda_cflags_by_source = {
+        Path(source).resolve(): build_cuda_cflags(common_cflags, flags)
+        for source, flags in (extra_cuda_cflags_by_source or {}).items()
+    }
 
     ldflags = [
         "-shared",
@@ -287,6 +312,7 @@ def generate_ninja_build_for_op(
         "post_cflags =",
         "cuda_cflags = " + join_multiline(cuda_cflags),
         "cuda_post_cflags =",
+        "cuda_arch_flags = " + join_multiline(cuda_arch_flags),
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
@@ -301,7 +327,23 @@ def generate_ninja_build_for_op(
         "",
     ]
 
-    if embedded_cubins:
+    if embedded_cubins and is_windows:
+        # The MSVC toolchain has no GNU ld/objcopy: write each cubin as its own
+        # COFF object and link it next to the host objects.
+        coff_machine = (
+            "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+        )
+        embed_script = Path(__file__).with_name("embed_cubin_coff.py")
+        lines.extend(
+            [
+                "rule embed_cubin",
+                f'  command = "{sys.executable}" "{embed_script}" '
+                f'--machine {coff_machine} --name $cubin_name --cubin "$in" '
+                '--output-obj "$out"',
+                "",
+            ]
+        )
+    elif embedded_cubins:
         lines.extend(
             [
                 "rule embed_cubin",
@@ -316,7 +358,7 @@ def generate_ninja_build_for_op(
         lines.extend(
             [
                 "rule nvcc_link",
-                "  command = $nvcc -shared $in $ldflags -o $out",
+                "  command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out",
                 "",
             ]
         )
@@ -343,6 +385,11 @@ def generate_ninja_build_for_op(
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        if source.resolve() in cuda_cflags_by_source:
+            lines.append(
+                "  cuda_cflags = "
+                + join_multiline(cuda_cflags_by_source[source.resolve()])
+            )
 
     if embedded_cubins:
         if not objects:
@@ -354,6 +401,19 @@ def generate_ninja_build_for_op(
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cubin_name) is None:
                 raise ValueError(f"invalid embedded cubin identifier: {cubin_name!r}")
             resolved_cubin = Path(cubin_path).resolve(strict=True)
+            if is_windows:
+                cubin_obj = _ninja_windows_path(
+                    (output_dir / f"embedded_cubin_{cubin_name}.o").resolve()
+                )
+                lines.extend(
+                    [
+                        f"build {cubin_obj}: embed_cubin "
+                        f"{_ninja_windows_path(resolved_cubin)}",
+                        f"  cubin_name = {cubin_name}",
+                    ]
+                )
+                objects.append(cubin_obj)
+                continue
             embedded_obj = str(
                 (output_dir / f"embedded_{index}_{Path(current_obj).name}").resolve()
             )
@@ -384,7 +444,12 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
-def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+def run_ninja(
+    workdir: Path,
+    ninja_file: Path,
+    verbose: bool,
+    max_jobs: Optional[int] = None,
+) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
@@ -394,7 +459,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers()
+    num_workers = max_jobs if max_jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 

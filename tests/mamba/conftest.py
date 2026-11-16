@@ -1022,7 +1022,7 @@ def _triton_supports_current_arch() -> bool:
     unskippable at test time, so probe the matching ``ptxas`` binary in a
     subprocess instead. Defaults to True on any probe uncertainty.
     """
-    import glob
+    import contextlib
     import os
     import subprocess
 
@@ -1031,15 +1031,17 @@ def _triton_supports_current_arch() -> bool:
             return True
         major, minor = torch.cuda.get_device_capability()
 
-        import triton
+        # Imported for the side effect: flashinfer.triton's
+        # _patch_triton_ptxas_blackwell() exports TRITON_PTXAS_BLACKWELL_PATH
+        with contextlib.suppress(Exception):
+            import flashinfer.triton  # noqa: F401
 
-        troot = os.path.dirname(triton.__file__)
-        cands = glob.glob(os.path.join(troot, "backends", "nvidia", "bin", "ptxas"))
-        if not cands:
-            return True
+        from triton.backends.nvidia.compiler import get_ptxas
+
+        ptxas = get_ptxas(major * 10 + minor).path
         for gpu_name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
             r = subprocess.run(
-                [cands[0], "--gpu-name", gpu_name, os.devnull, "-o", os.devnull],
+                [ptxas, "--gpu-name", gpu_name, os.devnull, "-o", os.devnull],
                 capture_output=True,
                 text=True,
                 timeout=30,

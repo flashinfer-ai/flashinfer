@@ -30,8 +30,20 @@ class MoEEpTensors:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
+    # ``(num_tokens,)`` fp32 per-token fc1 activation scale (NVFP4 mega path,
+    # requires ``enable_fc1_activation_per_token_scale`` on the kernel config):
+    # multiplied into the dequantized fc1 output before the clamp / activation.
+    fc1_activation_per_token_scale: Optional["torch.Tensor"] = None
     recv_count: Optional["torch.Tensor"] = None
     num_tokens_per_expert: Optional["torch.Tensor"] = None
+    output: Optional["torch.Tensor"] = None
+    # Largest ``num_tokens`` over the EP ranks for this step, the same on
+    # every rank. ``MoEEpSplitLayer`` passes it to
+    # :meth:`MoEEpCommunication.dispatch` as ``runtime_max_tokens_per_rank``,
+    # which sizes the receive rows and the inner kernel's batch; ``None``
+    # uses ``FleetParams.max_tokens_per_rank``. Fleet/Handle transports and
+    # ``MoEEpMegaLayer`` ignore it.
+    runtime_max_tokens_per_rank: Optional[int] = None
 
     @property
     def num_tokens(self) -> int:

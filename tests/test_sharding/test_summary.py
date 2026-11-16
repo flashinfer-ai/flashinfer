@@ -55,7 +55,7 @@ def test_summary_publication_waits_for_the_state_lock(
         executor.shutdown()
 
     assert summary["complete"] is True
-    assert summary["schema_version"] == 3
+    assert summary["schema_version"] == 4
 
 
 def test_failure_exit_code_wins_over_incomplete() -> None:
@@ -221,6 +221,59 @@ def test_source_summary_aggregates_local_resources_and_failed_diagnostics(
     assert "[diagnostic truncated at 8 bytes]" in terminal
     assert "log:" in terminal
     assert "  - tests/test_sample.py::test_case_1" in terminal
+
+
+@pytest.mark.parametrize(
+    "gpu_values", [("", ""), ("0", ""), ("1200", ""), ("", "1200")]
+)
+def test_missing_gpu_sample_preserves_host_memory_and_marks_partial(
+    tmp_path: Path,
+    gpu_values: tuple[str, str],
+) -> None:
+    plan = _summary_plan()
+    for index, unit in enumerate(plan.units):
+        _write_final_batch(
+            tmp_path,
+            unit,
+            failed=False,
+            launched_at=10,
+            exited_at=12,
+            rss_mib=100 + index * 200,
+            gpu_mib=900,
+            monitor_memory=True,
+        )
+        batch = unit.batches[0]
+        path = summary_module.batch_xml_path(tmp_path, unit, batch).with_name(
+            f"{batch.id}.memory.csv"
+        )
+        path.write_text(
+            f"timestamp,host_rss_mib,gpu_memory_mib\n1,{100 + index * 200},\n"
+            f"2,{100 + index * 200},{gpu_values[index]}\n"
+        )
+        phase_path = path.with_name(f"{batch.id}.results.json")
+        phases = json.loads(phase_path.read_text())
+        phases["results"][0].update(started_at=0, finished_at=3)
+        phase_path.write_text(json.dumps(phases))
+    source = summary_module.publish_summary(tmp_path, plan)["sources"][0]
+    assert source["max_host_rss_mib"] == 300
+    assert source["memory_samples"] == 4
+    expected_peak = max((float(value) for value in gpu_values if value), default=None)
+    assert source["max_gpu_memory_mib"] == (expected_peak or 0)
+    assert source["partial_resources"]
+    rows = list(csv.DictReader((tmp_path / "memory_summary.csv").open()))
+    assert {row["level"] for row in rows} == {"node", "batch", "unit", "shard"}
+    for row in rows:
+        if row["level"] == "shard":
+            value = expected_peak
+        else:
+            index = next(
+                i
+                for i, unit in enumerate(plan.units)
+                if row["id"]
+                in (unit.id, unit.batches[0].id, unit.batches[0].nodeids[0])
+            )
+            value = float(gpu_values[index]) if gpu_values[index] else None
+        assert row["max_gpu_memory_mib"] == ("" if value is None else f"{value:.3f}")
 
 
 def test_terminal_summary_lists_detailed_failures_before_deduplicated_files(

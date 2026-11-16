@@ -41,7 +41,7 @@ tuned answer cannot be used.
 import os
 import warnings
 from functools import lru_cache
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -54,6 +54,7 @@ from ..autotuner import (
 )
 from .pcie_ipc_topology import PROFILE_ROOTCPLX
 from .pcie_ipc_policy import (
+    CE_MAX_PIECES,
     MAX_BLOCKS,
     IpcLaunchConfig,
     IpcVariant,
@@ -69,6 +70,11 @@ PCIE_IPC_CUSTOM_OP = "flashinfer::pcie_ipc_all_reduce"
 # driver versions but nothing about this op, and a dev checkout does not move
 # the FlashInfer version.
 PCIE_IPC_TUNE_VERSION = 3
+# Only workspaces that admit stream publication search the additional tactics.
+# Preserve their existing namespace without invalidating original-path caches.
+# 5: the pipelined ring joined the candidates, and its chunk geometry follows
+# the ring's slow hops, which the key now carries.
+_PCIE_IPC_MEMOP_TUNE_VERSION = 5
 
 # Not all powers of two: the extra entries are block counts the search selected
 # on real hardware, and it cannot converge on a configuration its own grid
@@ -111,6 +117,18 @@ INIT_MAX_VALUE = 16
 PREFILL_SCREEN_BYTES = 4 * 1024 * 1024
 PREFILL_MIN_THREADS = 256
 
+# Below this many bytes per rank's chunk the pipelined ring is not measured.
+# It pays a flag publication and a cross-stream edge per piece and per step,
+# several microseconds each, that the single-piece ring does not. On the
+# 8-GPU two-socket fabric it was measured on, 1.5 and 3 MiB chunks ran it
+# anywhere from 1.7 % faster to 2.8 % slower than the single-piece ring from
+# one run to the next under cold-L2 graph replay, while 6 MiB chunks won every
+# run; tuning's warm-L2 timing picked it at 1.5 and 3 MiB all the same.
+# Unlike a block-count bound this cannot drop a winner the tuner used to have:
+# it only withholds the newer schedule, so a shape below it tunes exactly as
+# it did before that schedule existed.
+PIPED_MIN_CHUNK_BYTES = 4 * 1024 * 1024
+
 
 def candidate_tactics(
     world_size: int,
@@ -120,6 +138,7 @@ def candidate_tactics(
     numel: Optional[int] = None,
     elem_size: int = 2,
     profile: Optional[str] = None,
+    memop_supported: bool = False,
 ) -> Tuple[Tuple[int, int, int], ...]:
     """Every launch configuration worth profiling for this shape, as tactics.
 
@@ -132,17 +151,30 @@ def candidate_tactics(
     worth measuring here", and returns the unscreened grid.
     """
     return _candidate_tactics_cached(
-        world_size, max_blocks, blocks, threads, numel, elem_size, profile
+        world_size,
+        max_blocks,
+        blocks,
+        threads,
+        numel,
+        elem_size,
+        profile,
+        memop_supported,
     )
 
 
 @lru_cache(maxsize=None)
 def _candidate_tactics_cached(
-    world_size, max_blocks, blocks, threads, numel, elem_size, profile
+    world_size, max_blocks, blocks, threads, numel, elem_size, profile, memop_supported
 ):
     screen = numel is not None and numel * elem_size >= PREFILL_SCREEN_BYTES
     out = []
     for variant in IpcVariant:
+        if (
+            variant
+            in (IpcVariant.COPY_ENGINE_RING_MEMOP, IpcVariant.COPY_ENGINE_RING_PIPED)
+            and not memop_supported
+        ):
+            continue
         # The island schedule's 4+4 grouping describes one topology, and on
         # fabrics it does not describe it measured worse than the flat ring and
         # the SM path it competes with, so leaving it reachable is worse than
@@ -155,7 +187,23 @@ def _candidate_tactics_cached(
             and profile != PROFILE_ROOTCPLX
         ):
             continue
-        for b in blocks:
+        if (
+            variant == IpcVariant.COPY_ENGINE_RING_PIPED
+            and numel is not None
+            and numel * elem_size < PIPED_MIN_CHUNK_BYTES * world_size
+        ):
+            continue
+        # The pipelined ring's depth is its own small grid, not a block count:
+        # depth 3 wins shapes on the fabric it was measured on, and the block
+        # grid has no 3.
+        depths = (
+            tuple(range(1, CE_MAX_PIECES + 1))
+            if variant == IpcVariant.COPY_ENGINE_RING_PIPED
+            else blocks
+        )
+        for b in depths:
+            if variant == IpcVariant.COPY_ENGINE_RING_MEMOP and b != 1:
+                continue
             for t in threads:
                 if screen and t < PREFILL_MIN_THREADS:
                     continue
@@ -192,8 +240,33 @@ def tactic_to_config(tactic: Sequence[int]) -> IpcLaunchConfig:
         raise ValueError(f"tactic {tactic!r} names no variant: {exc}") from exc
 
 
+def _cache_key_head(
+    world_size: int,
+    profile: str,
+    max_blocks: int,
+    max_numel: int,
+    memop_supported: bool,
+    slow_hops: int = 0,
+) -> Tuple:
+    head = (
+        _PCIE_IPC_MEMOP_TUNE_VERSION if memop_supported else PCIE_IPC_TUNE_VERSION,
+        int(world_size),
+        str(profile),
+        int(max_blocks),
+        int(max_numel),
+    )
+    # Only stream-publication workspaces search the pipelined ring, the one
+    # schedule whose geometry follows the slow hops.
+    return head + (True, int(slow_hops)) if memop_supported else head
+
+
 def cache_covers_workspace(
-    world_size: int, profile: str, max_blocks: int, max_numel: int
+    world_size: int,
+    profile: str,
+    max_blocks: int,
+    max_numel: int,
+    memop_supported: bool = False,
+    slow_hops: int = 0,
 ) -> bool:
     """Whether the loaded cache holds any entry written for this workspace.
 
@@ -215,12 +288,8 @@ def cache_covers_workspace(
     prefix = f"('{PCIE_IPC_CUSTOM_OP}'"
     # cache_key_extras up to the dtype, with the closing paren traded for the
     # separator that must follow it.
-    head = (
-        PCIE_IPC_TUNE_VERSION,
-        int(world_size),
-        str(profile),
-        int(max_blocks),
-        int(max_numel),
+    head = _cache_key_head(
+        world_size, profile, max_blocks, max_numel, memop_supported, slow_hops
     )
     needle = repr(head)[:-1] + ", "
     return any(
@@ -325,6 +394,8 @@ def cache_key_extras(
     max_blocks: int,
     max_numel: int,
     dtype: torch.dtype,
+    memop_supported: bool = False,
+    slow_hops: int = 0,
 ) -> Tuple:
     """Everything the autotuner's own cache key leaves out.
 
@@ -339,14 +410,9 @@ def cache_key_extras(
     autotuner requires: the tuple must come out the same for the caller's real
     tensors and for the ones it synthesizes.
     """
-    return (
-        PCIE_IPC_TUNE_VERSION,
-        int(world_size),
-        str(profile),
-        int(max_blocks),
-        int(max_numel),
-        str(dtype),
-    )
+    return _cache_key_head(
+        world_size, profile, max_blocks, max_numel, memop_supported, slow_hops
+    ) + (str(dtype),)
 
 
 def pack_config(config: IpcLaunchConfig) -> int:
@@ -382,6 +448,16 @@ TUNE_SURVIVORS = 48
 # clocks, a larger repeat, a longer capture window for small shapes -- live
 # outside get_valid_tactics.
 TUNE_RANK_ROUNDS = 3
+
+
+def _round_order(n: int, round_index: int) -> Iterable[int]:
+    """Candidate indices for one ranking round; odd rounds run backward.
+
+    In one fixed order the first copy-engine candidate always followed the last
+    SM candidate, so every sample carried that switch and the minimum kept it.
+    Depends only on its arguments, so every rank launches in the same order.
+    """
+    return reversed(range(n)) if round_index % 2 else range(n)
 
 
 def reduce_timings(times: "torch.Tensor", group) -> "torch.Tensor":
@@ -526,18 +602,27 @@ class PcieIpcAllReduceRunner(TunableRunner):
         return hash(
             (
                 type(self).__name__,
-                PCIE_IPC_TUNE_VERSION,
-                ws.world_size,
-                ws.profile,
-                ws.max_blocks,
-                ws.max_numel,
+                *_cache_key_head(
+                    ws.world_size,
+                    ws.profile,
+                    ws.max_blocks,
+                    ws.max_numel,
+                    ws.memop_supported,
+                    getattr(ws, "slow_hops", 0),
+                ),
             )
         )
 
     def get_cache_key_extras(self, inputs) -> Tuple:
         ws = self._ws
         return cache_key_extras(
-            ws.world_size, ws.profile, ws.max_blocks, ws.max_numel, inputs[0].dtype
+            ws.world_size,
+            ws.profile,
+            ws.max_blocks,
+            ws.max_numel,
+            inputs[0].dtype,
+            ws.memop_supported,
+            getattr(ws, "slow_hops", 0),
         )
 
     def _output_for(self, inp: torch.Tensor) -> torch.Tensor:
@@ -579,9 +664,9 @@ class PcieIpcAllReduceRunner(TunableRunner):
         Cardinality is the hazard. Every rank must issue exactly these launches
         in exactly this order; an early return between the first launch and the
         verdict reduction leaves peers spinning inside a kernel this rank never
-        issued, with no timeout. Hence: barrier first, every buffer allocated
-        before the loop, and a loop body that does not allocate, synchronise
-        with the host, or branch.
+        issued, with no timeout. Hence: a barrier before the first collective
+        launch, every persistent buffer allocated before it, and nothing between
+        it and the reductions that branches on anything rank-local.
         """
         inp = inputs[0]
         ws = self._ws
@@ -606,6 +691,7 @@ class PcieIpcAllReduceRunner(TunableRunner):
             numel=inp.numel(),
             elem_size=inp.element_size(),
             profile=ws.profile,
+            memop_supported=ws.memop_supported,
         )
         configs = [table_config] + [tactic_to_config(t) for t in tactics]
 
@@ -629,7 +715,10 @@ class PcieIpcAllReduceRunner(TunableRunner):
         # loads its module, which shows up as an order-of-magnitude outlier and
         # would demote whichever candidate happened to be that variant's first.
         # Per variant, not per candidate: block and thread counts do not pull in
-        # a new module.
+        # a new module. These are collective launches already, so the barrier
+        # goes in front of them: a rank that failed before this point leaves its
+        # peers waiting in NCCL, which can be aborted, rather than in a kernel.
+        dist.barrier(group=ws.group)
         seen_variants = set()
         for config in configs:
             if config.variant not in seen_variants:
@@ -638,7 +727,8 @@ class PcieIpcAllReduceRunner(TunableRunner):
 
         dist.barrier(group=ws.group)
         for r in range(TUNE_RANK_ROUNDS):
-            for i, config in enumerate(configs):
+            for i in _round_order(len(configs), r):
+                config = configs[i]
                 # A kernel that leaves part of the payload unwritten would
                 # otherwise show the previous candidate's correct result.
                 out.fill_(float("nan"))

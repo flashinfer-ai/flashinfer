@@ -1,0 +1,2293 @@
+{
+  "schema": "cake.w8a8_megamoe_ep16.device_sources.v1",
+  "operator": "cake_w8a8_megamoe_ep16",
+  "arch": "sm_103a",
+  "tma_abi": "grid_constant",
+  "cake": {
+    "route_id": "w8a8_megamoe_ep16_staged_v4",
+    "minimum_arch": "sm_103a"
+  },
+  "frozen_build_knobs": {
+    "INPUT_TOKEN_READINESS": "0",
+    "PDL_CHAIN": "1",
+    "PDL_PREFETCH_KSTEPS": "0",
+    "SWAP_ROUTE_N": "32",
+    "FC1_SWAP_STAGES": "4",
+    "FC2_SWAP_STAGES": "8",
+    "FI_SWIGLU_EX2_RCP": "0",
+    "STRICT_FP32_SWIGLU_STAGING": "0",
+    "WEIGHT_KTILE_MAJOR": "1",
+    "SOURCE_PREQUANT": "1",
+    "FC2_TOKEN_BACK_PUSH": "1",
+    "PREPROCESS_VEC128": "0",
+    "SWAP_FC12_ONE_LAUNCH": "0",
+    "SINGLE_LAUNCH_MEGA": "0",
+    "BALANCED_DIRECT_DISPATCH": "0",
+    "BALANCED_SHARED_FC1_INPUT": "0",
+    "BALANCED_OWNER_REDUCE": "0",
+    "HOTSET_OWNER_REDUCE": "0",
+    "FC12_INDEPENDENT_COMPLETION": "0",
+    "FC12_G1_M128": "0",
+    "FINE_GRAINED_TOPK_REDUCE": "0",
+    "PUBLISH_FOLDED_RESET": "1",
+    "COMBINE_SLICES": "3",
+    "PUSH_DISPATCH": "1",
+    "PUSH_WAIT_TIMEOUT_CYCLES": "0",
+    "FC2_COMPLETION_COUNTERS": "1"
+  },
+  "frozen_build_knobs_note": "Cake build-system knobs the exported programs were traced and measured with; the common environment prefix is elided here (the Cake-side pin module carries the full names).",
+  "route_contract": {
+    "world_size": 16,
+    "local_experts": 32,
+    "experts": 512,
+    "top_k": 8,
+    "hidden": 3072,
+    "intermediate": 5120,
+    "packed_fc1_n": 10240,
+    "max_tokens_per_rank": 64,
+    "max_recv_tokens": 1024,
+    "max_routes": 8192,
+    "max_rows_per_expert": 128,
+    "total_expert_rows": 4096,
+    "swap_route_n": 32,
+    "fc1_k128_tiles": 24,
+    "fc2_k128_tiles": 40,
+    "fc1_n256_tiles": 40,
+    "fc2_hidden_m128_tiles": 24,
+    "source_scale_blocks": 96,
+    "fc1_tiles": 1280,
+    "fc2_tiles": 768,
+    "persistent_grid_rule": "largest g with ceil(3 * sm_count / 4) <= g <= sm_count and fc1_tiles % g == 0 and fc2_tiles % g == 0 (fc1_tiles = 1280, fc2_tiles = 768: the full-envelope SwapAB tile counts, so every CTA runs exactly fc1_tiles / g FC1 tiles and fc2_tiles / g FC2 tiles without a partial last wave); sm_count & ~1 when no such divisor exists.  148- and 152-SM Blackwell parts: 128.",
+    "combine_ctas_per_token": 3,
+    "w13_fp8_layout": "ktile_major_r256_k128",
+    "w2_fp8_layout": "ktile_major_r128_k128",
+    "weight_layout_rule": "quantize_weights with ktile_major_rows = R > 0 stores FP8 byte (expert e, packed row r, column k) of a [experts, rows, K] weight at (((e * (rows // R) + r // R) * (K // 128) + k // 128) * R + r % R) * 128 + k % 128, i.e. [experts][rows // R][K // 128][R][128 B]: one 128 B x R-row TMA box per contiguous R * 128-byte block, a tile's K // 128 boxes adjacent.  w13 (packed rows 10240 after the up128|gate128 interleave, K = 3072): R = 256; w2 (rows 3072, K = 5120): R = 128.  Torch reference on the row-major quantized bytes q [E, rows, K]: q.view(E, rows // R, R, K // 128, 128).permute(0, 1, 3, 2, 4).contiguous().view(E, rows, K).  The FC1/FC2 A tensor maps view the same [E, rows, K] buffer as (128, R, K // 128, E * rows // R) with byte strides (128, R * 128, R * K) and load box (128, R, 1, 1) at coordinates (0, 0, k_tile, e * (rows // R) + r0 // R); the UE8M0 scale carriers keep their mode-1 / mode-2 layouts.  ktile_major_rows = 0 is the row-major payload of the pre-M2 route and is not what the exported FC1/FC2 programs address.",
+    "combine_window_rule": "publish_push zeroes rows [source_rank * tokens_per_rank * 8, (source_rank + 1) * tokens_per_rank * 8) of the [1024 * 8, 3072] bf16 term buffer (this rank's combine read window) before it releases its inbox flags (a remote fc2 of the forward writes a token's window only after that rank's local_pack consumed the token's flag; the previous forward's remote fc2 stores were all consumed by this rank's combine, which waited for every rank's fc2 completion signal, route_contract.fc2_completion); the host performs no memset",
+    "function_attributes": {
+      "local_pack": {
+        "preferred_shared_memory_carveout": 100
+      }
+    },
+    "function_attribute_rule": "Before the first launch of local_pack (exactly the program whose launch.preferred_shared_memory_carveout is non-null), call cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100) once, next to the max-dynamic-shared-memory opt-in (a function attribute, not a launch attribute; the generated reference binding shows the exact call).  No other program sets a carveout.",
+    "pdl_edges": [
+      [
+        "local_pack",
+        "fc1"
+      ],
+      [
+        "fc1",
+        "fc2"
+      ],
+      [
+        "fc2",
+        "combine"
+      ]
+    ],
+    "pdl_programs": {
+      "local_pack": [
+        "launch_dependents"
+      ],
+      "fc1": [
+        "wait",
+        "launch_dependents"
+      ],
+      "fc2": [
+        "wait",
+        "launch_dependents"
+      ],
+      "combine": [
+        "wait"
+      ]
+    },
+    "pdl_rule": "Launch fc1, fc2 and combine (exactly the programs whose launch.use_pdl is true) with cudaLaunchAttributeProgrammaticStreamSerialization (programmaticStreamSerializationAllowed = 1) in the cudaLaunchKernelExC attribute list; every other program launches without launch attributes.  local_pack executes griddepcontrol.launch_dependents at entry (before it waits on its inbox flags), fc1 and fc2 when a CTA starts its last tile (after their own wait); fc1 / fc2 prefill their first tile's expert-weight ring (A / SFA, addressed through the static tile map) and L2-prefetch the next PDL_PREFETCH_KSTEPS weight k-steps (0 in the frozen table: no L2 prefetch, measured as a net cost) before griddepcontrol.wait, then read the routed operands (B / SFB) and route_map / route_weights only after it, so the dependent never observes the primary's output early; combine executes griddepcontrol.wait in every thread before its first global read and only then polls the local fc2 completion counter (route_contract.fc2_completion.pdl_rule).  publish_push contains no griddepcontrol instruction.  Under CUDA-graph capture the three attributed launches become programmatic graph edges (CUDA >= 12.3).  The device programs are correct without the attribute (griddepcontrol is then a no-op); the attribute only enables the overlap.",
+    "routing_capacity": "<= 32 owned routes per expert (one N32 SwapAB tile); local_pack flags more in `overflow` when active_rows_per_expert = 32",
+    "push_dispatch": {
+      "inbox_bytes_per_rank": 3309568,
+      "inbox_shape": [
+        16,
+        64,
+        3232
+      ],
+      "slot_bytes": 3232,
+      "slot_layout": {
+        "row_fp8_e4m3": [
+          0,
+          3072
+        ],
+        "scales_ue8m0": [
+          3072,
+          96
+        ],
+        "ids_i32": [
+          3168,
+          32
+        ],
+        "weights_f32": [
+          3200,
+          32
+        ]
+      },
+      "slot_offset_rule": "(source_rank * 64 + source_token) * 3232 bytes (MAX_TOKENS_PER_RANK stride)",
+      "flags_shape": [
+        16,
+        64
+      ],
+      "flags_bytes_per_rank": 4096,
+      "flag_index_rule": "source_rank * 64 + source_token (u32)",
+      "generation_words": 2,
+      "generation_rule": "push_generation is a rank-local u32[2] (zero-initialized once with the flags): [0] counts the completed forwards of this rank, [1] is the local_pack CTA arrival counter.  publish_push reads [0] = g and stores g + 1 into push_flags[this_rank][token] of every destination rank after its inbox pushes completed; local_pack CTA (src, token) reads [0] = g, waits until its LOCAL push_flags[src][token] == g + 1, and the last CTA of the grid ([1] reaches gridDim.x) stores [1] = 0 and [0] = g + 1.  Flags are never reset, so a slot that is not pushed in a forward (token >= tokens_per_rank, or a shrunken token count) keeps an older value that never equals the expected generation; every rank must execute the same number of forwards (eager prewarm before capture, then graph replays), exactly as the pull route's barriers required.",
+      "push_rule": "for every destination rank d < world: if any of the token's 8 expert ids has owner id // 32 == d, one cp.async.bulk of the whole 3232-byte slot; else one 64-byte cp.async.bulk of the ids+weights tail only (so the destination can see that none of the routes is its own); then cp.async.bulk.commit_group, cp.async.bulk.wait_group 0, fence.proxy.async.global, fence.release.sys and one st.relaxed.sys.u32 of g + 1 into each destination's flag.  Masked ids (< 0 or >= 512) select no destination.",
+      "wait_rule": "local_pack thread 0 polls its LOCAL flag until == g + 1 with ld.acquire.sys.global.u32, UNTIMED (the contract of the input barrier this program replaces: a late peer stalls this rank, it never traps the context), then fence.acquire.sys and fence.proxy.alias, then bar.sync; all threads then read the slot with explicit coherent ld.global loads (inbox_read_rule).",
+      "wait_timeout_knob": "the PUSH_WAIT_TIMEOUT_CYCLES build knob (frozen_build_knobs; frozen table and code default 0 = untimed, the shipped program text).  A positive value is a build-time switch for diagnostic builds only: local_pack then polls ld.relaxed.sys.u32 and traps the context (trap;) when the flag has not arrived within that many clock64 cycles.  The exported manifest records the built value.",
+      "inbox_read_rule": "local_pack reads ids / weights / row chunks / scale bytes of the slot through explicit coherent ld.global instructions (ld.global.b32 / ld.global.v4.b32 / ld.global.u8; never the non-coherent read-only ld.global.nc path, whose observation of the peers' released writes is not guaranteed by the PTX memory model), and its local push_inbox / push_flags pointers are declared without __restrict__ (plain uint8_t* / unsigned int*: peers write them while the kernel runs).",
+      "initialization_rule": "push_flags and push_generation are zero-initialized exactly once, at allocation, on every rank, and the host never writes them afterwards.  That zeroing (and the symmetric mapping of push_inbox / push_flags) must be complete and visible on EVERY rank before ANY rank's first publish_push: a collective rendezvous after allocation (device synchronize, then a process-group barrier) is required, which the in-tree runtime and the FlashInfer workspace allocation perform.  A rank that pushed into a destination whose flags were zeroed afterwards would lose that forward's flag.",
+      "peer_table_rule": "push_inbox_peers / push_flags_peers / pg_flags are by-value CakePeerPointerTable<T, 32> aggregates (capacity 32 pointer slots; entries [0, pg_world) = 16 are used, the rest are ignored); entry r is rank r's base pointer of the same symmetric buffer.  Self-entry equality: on every rank the table's own entry IS the local pointer bound beside it, push_inbox_peers[pg_rank] == push_inbox and push_flags_peers[pg_rank] == push_flags (publish_push and local_pack): local_pack polls its flags and reads its inbox through the local pointers while the sources write them through the tables, so a mismatch is a silent hang.  The generated reference bindings check it per launch with TVM_FFI_CHECK; the workspace must assert it once at allocation (pg_flags has no local pointer: no self-entry check).",
+      "local_pack_scalar_rule": "local_pack scalars: tokens_per_rank = this forward's token count (identical on every rank, <= 64); active_rows_per_expert = 32 (the SwapAB route tile; routes at or beyond it are counted in overflow[0]); scale_tile_k128 = 1 (the exported fc1 reads the K128 SFA tile layout, fc1_k128_tiles = 24; 0 selects the K256 layout no exported program reads).  The exported fc1 / fc2 programs fix the last two values; a routing-generic host passes them as constants.",
+      "reuse_rule": "inbox and flag slots of forward g are overwritten by forward g + 1's publish_push only after every destination finished local_pack(g).  With FC2_COMPLETION_COUNTERS=1 (the exported route; no partial_barrier program): source S's publish_push(g + 1) is stream-ordered after S's combine(g), which waited until fc2_completion[0] on S reached 16 * (g + 1), i.e. until EVERY rank's fc2(g) had signalled; a rank signals only at the exit of its fc2(g), which is stream-ordered after its local_pack(g) (the only reader of S's inbox slots and flags) and after its fc1(g).  So every destination has finished reading S's slots and flags, and every remote fc2(g) has finished writing S's combine window, before S zeroes that window and re-pushes; a remote fc2(g + 1) writes S's window only after that rank's local_pack(g + 1) consumed S's flags of g + 1, which S releases after the zeroing.  With the knob 0 the same ordering comes from partial_barrier(g), which every rank enters after its fc2(g); that launch is then required."
+    },
+    "fc2_completion": {
+      "counter_words": 2,
+      "counter_bytes_per_rank": 8,
+      "done_word": 0,
+      "arrivals_word": 1,
+      "counter_layout": "fc2_completion is a symmetric u32[2] every rank owns (8 bytes, zero-initialized once at allocation): word 0 (fc2_done) receives one +1 from EVERY rank per forward (monotonic, 16 per forward, never reset); word 1 (fc2_arrivals) is the rank-LOCAL CTA arrival counter of one fc2 grid (returns to 0 at the end of every forward; peers never touch it).  Bound to fc2 as the plain local pointer fc2_completion (no __restrict__) + by-value CakePeerPointerTable<unsigned int, 32> fc2_completion_peers (entries [0, 16) used; entry r = rank r's base pointer), and to combine as the same pointer + table.  Self-entry equality: on every rank the table's own entry IS the local pointer, fc2_completion_peers[remote_pg_rank] == fc2_completion (fc2) and fc2_completion_peers[pg_rank] == fc2_completion (combine), the same way remote_terms_peers[remote_pg_rank] == remote_terms (fc2): fc2 counts arrivals and resets word 1 through the local pointer but sends its own +1 through the table, and combine polls word 0 through the local pointer, so a mismatch is a silent hang.  The generated reference bindings check it per launch with TVM_FFI_CHECK; the workspace must assert it once at allocation.",
+      "signal_rule": "each fc2 CTA, in its epilogue warps after its last tile: bar.sync 15, 128 (every remote route store of the CTA, a generic st.global.v4 through the peer pointer, happens-before the arrival; the terms are not async-proxy writes, so no bulk wait and no fence.proxy.async is involved); lane 0 of epilogue warp 0 atom.acq_rel.gpu.global.add.u32 +1 on fc2_completion[1]; the last arriver (old + 1 == gridDim.x) stores fc2_completion[1] = 0; the verdict is broadcast to the warp (shfl.sync) and ordered by bar.warp.sync; then the warp issues ONE red.release.sys.global.add.u32 +1 in which lane d < pg_world targets fc2_completion[0] of rank d through the peer table (itself included): 16 adds in one warp-wide instruction.  No separate fence.release.sys precedes the reduction: its .release qualifier is the signal's one system-scope release, cumulative (PTX memory model) over lane 0's acquire and so over every CTA's route stores.  Exactly one system fence (red.release.sys lowers to one MEMBAR.ALL.SYS + one REDG) and 16 remote adds per rank per forward; nothing per tile or per route, no per-add fence (a one-thread loop would serialise 16 system fences) and no explicit fence in front of the reduction (a second MEMBAR.ALL.SYS that drains nothing new).",
+      "wait_rule": "combine CTA thread 0 reads generation = push_generation[0] (== g + 1 during forward g) and polls its LOCAL fc2_completion[0] UNTIMED with ld.acquire.sys.global.u32 until (observed - 16 * generation) < 2^31 unsigned, i.e. a wrap-safe observed >= 16 * generation (a late peer stalls this rank, it never traps the context); then fence.acquire.sys, then bar.sync; every thread then reads the eight term rows with explicit coherent ld.global.v4.b32 loads through a plain (no __restrict__) local_terms pointer, never ld.global.nc.  No fence.proxy.alias is needed: every writer of the term buffer (publish_push's window zero, fc2's remote stores) is a generic-proxy store.",
+      "generation_rule": "the wait target reuses push_generation[0] (route_contract.push_dispatch.generation_rule): the last CTA of local_pack(g) stores g + 1 before that grid completes; fc1(g), fc2(g) and combine(g) follow it in stream order (under PDL each dependent's griddepcontrol.wait returns only after its primary completed, so combine(g)'s read of the word follows local_pack(g)'s store).  Exactly 16 adds land per forward and no add of forward g + 1 can land before combine(g) passed: a rank's fc2(g + 1) follows its local_pack(g + 1), which waits for every source's flags of g + 1, and every source releases those flags in publish_push(g + 1), after its combine(g).  So fc2_completion[0] equals exactly 16 * (g + 1) when combine(g) passes; the modular compare stays valid across the u32 wrap (every 2^28 forwards) because the sender is never more than one forward ahead of the receiver's target.  Every rank must execute the same number of forwards (eager prewarm, then graph replays).",
+      "initialization_rule": "fc2_completion is zero-initialized exactly once, at allocation, on every rank, together with push_flags / push_generation, and the host never writes it afterwards; that zeroing must be complete and visible on EVERY rank before ANY rank's first fc2 (collective rendezvous after allocation: device synchronize, then a process-group barrier; the rendezvous route_contract.push_dispatch.initialization_rule already requires).",
+      "pdl_rule": "fc2 executes griddepcontrol.launch_dependents when a CTA starts its last tile (after its own griddepcontrol.wait, so the combine is never launched while fc1 runs); combine is launched with cudaLaunchAttributeProgrammaticStreamSerialization and executes griddepcontrol.wait (every thread, before any global read) and only then the counter poll.  Combine CTAs (128 threads, no shared memory, at most 3 * 64 = 192 per rank) become resident on the SMs the 128-CTA fc2 grid leaves idle or beside its CTAs and block in griddepcontrol.wait without consuming issue slots until fc2 completed; fc2 is fully resident before any dependent launches, so the overlap can neither starve nor deadlock it.  The programs are correct without the attribute (griddepcontrol is then a no-op).",
+      "forward_rule": "forward = publish_push, local_pack, fc1, fc2, combine (five launches, no partial_barrier program); fc2 and combine both bind fc2_completion / fc2_completion_peers; combine additionally binds push_generation and the pg_world / pg_rank / pg_flags process-group arguments."
+    }
+  },
+  "grid_formulas": {
+    "publish_push": "(tokens_per_rank, 1, 1)",
+    "local_pack": "(16 * tokens_per_rank, 1, 1)",
+    "fc1": "(persistent_grid, 1, 1)",
+    "fc2": "(persistent_grid, 1, 1)",
+    "combine": "(3 * tokens_per_rank, 1, 1)",
+    "quantize_weights": "(4 * sm_count, 1, 1)"
+  },
+  "grid_formula_variables": {
+    "tokens_per_rank": "rank-uniform published token count per rank (1..64); padding rows carry topk_ids -1",
+    "sm_count": "multiprocessor count of the device (query once in Python)",
+    "persistent_grid": "largest g with ceil(3 * sm_count / 4) <= g <= sm_count and fc1_tiles % g == 0 and fc2_tiles % g == 0 (fc1_tiles = 1280, fc2_tiles = 768: the full-envelope SwapAB tile counts, so every CTA runs exactly fc1_tiles / g FC1 tiles and fc2_tiles / g FC2 tiles without a partial last wave); sm_count & ~1 when no such divisor exists.  148- and 152-SM Blackwell parts: 128.; the FC1/FC2 persistent grids"
+  },
+  "persistent_grid_by_sm_count": {
+    "132": 128,
+    "148": 128,
+    "152": 128,
+    "160": 128
+  },
+  "forward_stages": [
+    "publish_push",
+    "local_pack",
+    "fc1",
+    "fc2",
+    "combine"
+  ],
+  "setup_stages": [
+    "quantize_weights"
+  ],
+  "forward_launch_order_note": "Launch the five forward programs back to back on one stream in forward_stages order with no host memset or copy between them; there is no input barrier and no partial barrier: publish_push pushes each token's quantized slot into the owners' inbox and flags it, local_pack waits on its local flags (route_contract.push_dispatch), publish_push zeroes this rank's combine read window and resets the routing state, FC2 stores route rows into the source rank's term buffer and signals its completion into every rank's fc2_completion counter, combine waits on its local counter and reads only local memory (route_contract.fc2_completion).  fc1, fc2 and combine (launch.use_pdl) carry the programmatic-stream-serialization launch attribute (route_contract.pdl_edges / pdl_rule); local_pack (launch.preferred_shared_memory_carveout) sets the max-shared carveout function attribute once before its first launch (route_contract.function_attribute_rule).",
+  "programs": [
+    {
+      "stage": "publish_push",
+      "role": "forward",
+      "forward_index": 0,
+      "file": "cake_w8a8_megamoe_ep16_publish_push_kernel.cu",
+      "sha256": "ebd6af1eca5d08039bff377b72b4d1272fbabd2c9f6581811290137198825c5a",
+      "bytes": 14592,
+      "lines": 393,
+      "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_publish_push",
+      "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_publish_push(__nv_bfloat16* __restrict__ source_hidden, long long* __restrict__ source_ids, float* __restrict__ source_weights, __nv_bfloat16* __restrict__ local_terms, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ overflow, unsigned int* __restrict__ push_generation, int tokens, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_publish_push(__nv_bfloat16* __restrict__ source_hidden, long long* __restrict__ source_ids, float* __restrict__ source_weights, __nv_bfloat16* __restrict__ local_terms, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ overflow, unsigned int* __restrict__ push_generation, int tokens, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+      "kernel_attributes": "__launch_bounds__(128)",
+      "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+      "arguments": {
+        "device_arguments": [
+          {
+            "index": 0,
+            "name": "source_hidden",
+            "c_name": "source_hidden",
+            "c_type": "__nv_bfloat16* __restrict__",
+            "kind": "buffer",
+            "dtype": "bf16",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 1,
+            "name": "source_ids",
+            "c_name": "source_ids",
+            "c_type": "long long* __restrict__",
+            "kind": "buffer",
+            "dtype": "i64",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 2,
+            "name": "source_weights",
+            "c_name": "source_weights",
+            "c_type": "float* __restrict__",
+            "kind": "buffer",
+            "dtype": "f32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 3,
+            "name": "local_terms",
+            "c_name": "local_terms",
+            "c_type": "__nv_bfloat16* __restrict__",
+            "kind": "buffer",
+            "dtype": "bf16",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 4,
+            "name": "expert_counts",
+            "c_name": "expert_counts",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 5,
+            "name": "route_map",
+            "c_name": "route_map",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 6,
+            "name": "overflow",
+            "c_name": "overflow",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 7,
+            "name": "push_generation",
+            "c_name": "push_generation",
+            "c_type": "unsigned int* __restrict__",
+            "kind": "buffer",
+            "dtype": "u32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 8,
+            "name": "tokens",
+            "c_name": "tokens",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 9,
+            "name": "pg_world",
+            "c_name": "pg_world",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "pg",
+            "role": "world"
+          },
+          {
+            "index": 10,
+            "name": "pg_rank",
+            "c_name": "pg_rank",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "pg",
+            "role": "rank"
+          },
+          {
+            "index": 11,
+            "name": "pg_flags",
+            "c_name": "pg_flags",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "process_group": "pg",
+              "role": "flags"
+            }
+          },
+          {
+            "index": 12,
+            "name": "push_inbox",
+            "c_name": "push_inbox",
+            "c_type": "uint8_t*",
+            "kind": "buffer",
+            "dtype": "u8",
+            "shape": [
+              "16",
+              "64",
+              "3232"
+            ],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem",
+            "symmetric_memory": "push_inbox",
+            "peers_arg": "push_inbox_peers"
+          },
+          {
+            "index": 13,
+            "name": "push_inbox_peers",
+            "c_name": "push_inbox_peers",
+            "c_type": "CakePeerPointerTable<uint8_t, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u8",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "symmetric_memory": "push_inbox",
+              "role": "peers"
+            }
+          },
+          {
+            "index": 14,
+            "name": "push_flags",
+            "c_name": "push_flags",
+            "c_type": "unsigned int*",
+            "kind": "buffer",
+            "dtype": "u32",
+            "shape": [
+              "16",
+              "64"
+            ],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem",
+            "symmetric_memory": "push_flags",
+            "peers_arg": "push_flags_peers"
+          },
+          {
+            "index": 15,
+            "name": "push_flags_peers",
+            "c_name": "push_flags_peers",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "symmetric_memory": "push_flags",
+              "role": "peers"
+            }
+          }
+        ],
+        "host_only_resource_arguments": [],
+        "process_groups": [
+          {
+            "name": "pg",
+            "world_size": 16,
+            "world_arg": "pg_world",
+            "rank_arg": "pg_rank",
+            "flags_arg": "pg_flags"
+          }
+        ],
+        "symmetric_memories": [
+          {
+            "name": "push_inbox",
+            "dtype": "u8",
+            "shape": [
+              "16",
+              "64",
+              "3232"
+            ],
+            "local_arg": "push_inbox",
+            "peers_arg": "push_inbox_peers",
+            "process_group": "pg"
+          },
+          {
+            "name": "push_flags",
+            "dtype": "u32",
+            "shape": [
+              "16",
+              "64"
+            ],
+            "local_arg": "push_flags",
+            "peers_arg": "push_flags_peers",
+            "process_group": "pg"
+          }
+        ],
+        "tma_argument_count": 0,
+        "peer_table_argument_count": 3
+      },
+      "launch": {
+        "threads_per_block": 128,
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "dynamic_smem_bytes": 3328,
+        "static_smem_bytes": 0,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "explicit_cluster_launch": false,
+        "preferred_cluster_dims": null,
+        "launch_bounds_max_threads": 128,
+        "min_blocks": 0,
+        "max_blocks_per_cluster": 0,
+        "max_registers_per_thread": 0,
+        "function_attributes": [],
+        "preferred_shared_memory_carveout": null,
+        "needs_cluster_launch_attribute": false,
+        "needs_max_dynamic_shared_size_attribute": false,
+        "use_pdl": false
+      },
+      "grid_formula": "(tokens_per_rank, 1, 1)",
+      "compile": {
+        "source": "Cake NVRTC build option assembly",
+        "base_options": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device"
+        ],
+        "receipt_options": [
+          "--use_fast_math"
+        ],
+        "appended_when_nvrtc_ge_12_9": [
+          "--no-cache"
+        ],
+        "effective_order": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device",
+          "<-I per cuda include dir (+ its cccl subdir when present)>",
+          "--use_fast_math",
+          "--no-cache"
+        ],
+        "recommended_nvcc_flags": [
+          "-std=c++17",
+          "-O3",
+          "--use_fast_math",
+          "-gencode=arch=compute_103a,code=sm_103a"
+        ],
+        "nvcc_flags_note": "FlashInfer's gen_jit_spec adds its own -std/-O3/arch flags (sm103a_nvcc_flags); keep the receipt's numerics option --use_fast_math in extra_cuda_cflags so the delivered kernels keep the measured FTZ/fast-division semantics."
+      },
+      "state_reset_contract": "besides quantizing and pushing tokens_per_rank rows, every CTA zeroes its token's eight [3072] bf16 rows of the term buffer (local_terms[(pg_rank * tokens + token) * 8 + slot]) and the grid resets overflow[0] = 0, expert_counts[0:32] = 0, route_map[0:4096] = -1; the host must not memset the term buffer and there is no route_reset program.  inverse_rows is not reset (the route only writes it).",
+      "push_contract": "push_inbox / push_flags are symmetric buffers (every rank: inbox 16 x 64 x 3232 bytes, flags 16 x 64 u32 zero-initialized once) bound as a plain local pointer (no __restrict__: peers write them during the kernel) + by-value CakePeerPointerTable<T, 32> peer table (capacity 32, entries [0, pg_world) = 16 used); push_generation is a rank-local u32[2] zero-initialized once with the flags and never touched by the host afterwards (route_contract.push_dispatch.generation_rule).  That one-time zeroing must be complete on EVERY rank before ANY rank's first launch of this program: rendezvous after allocation (device synchronize, then a process-group barrier), see route_contract.push_dispatch.initialization_rule.  pg_world / pg_rank / pg_flags are the process-group scalars and flag pad shared with the barriers."
+    },
+    {
+      "stage": "local_pack",
+      "role": "forward",
+      "forward_index": 1,
+      "file": "cake_w8a8_megamoe_ep16_local_pack_kernel.cu",
+      "sha256": "2551ea9051b690fba694b763b7b6ad98361ec3950f5cc270fd465ba3ec4dfa26",
+      "bytes": 9427,
+      "lines": 250,
+      "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_local_pack",
+      "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_local_pack(float* __restrict__ recv_weights, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ inverse_rows, int* __restrict__ overflow, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, unsigned int* __restrict__ push_generation, int tokens_per_rank, int active_rows_per_expert, int scale_tile_k128, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_local_pack(float* __restrict__ recv_weights, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ inverse_rows, int* __restrict__ overflow, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, unsigned int* __restrict__ push_generation, int tokens_per_rank, int active_rows_per_expert, int scale_tile_k128, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+      "kernel_attributes": "__launch_bounds__(256)",
+      "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+      "arguments": {
+        "device_arguments": [
+          {
+            "index": 0,
+            "name": "recv_weights",
+            "c_name": "recv_weights",
+            "c_type": "float* __restrict__",
+            "kind": "buffer",
+            "dtype": "f32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 1,
+            "name": "expert_counts",
+            "c_name": "expert_counts",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 2,
+            "name": "route_map",
+            "c_name": "route_map",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 3,
+            "name": "inverse_rows",
+            "c_name": "inverse_rows",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 4,
+            "name": "overflow",
+            "c_name": "overflow",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 5,
+            "name": "quantized",
+            "c_name": "quantized",
+            "c_type": "uint8_t* __restrict__",
+            "kind": "buffer",
+            "dtype": "u8",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 6,
+            "name": "scales_cp",
+            "c_name": "scales_cp",
+            "c_type": "uint8_t* __restrict__",
+            "kind": "buffer",
+            "dtype": "u8",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 7,
+            "name": "push_generation",
+            "c_name": "push_generation",
+            "c_type": "unsigned int* __restrict__",
+            "kind": "buffer",
+            "dtype": "u32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 8,
+            "name": "tokens_per_rank",
+            "c_name": "tokens_per_rank",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 9,
+            "name": "active_rows_per_expert",
+            "c_name": "active_rows_per_expert",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 10,
+            "name": "scale_tile_k128",
+            "c_name": "scale_tile_k128",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 11,
+            "name": "pg_world",
+            "c_name": "pg_world",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "pg",
+            "role": "world"
+          },
+          {
+            "index": 12,
+            "name": "pg_rank",
+            "c_name": "pg_rank",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "pg",
+            "role": "rank"
+          },
+          {
+            "index": 13,
+            "name": "pg_flags",
+            "c_name": "pg_flags",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "process_group": "pg",
+              "role": "flags"
+            }
+          },
+          {
+            "index": 14,
+            "name": "push_inbox",
+            "c_name": "push_inbox",
+            "c_type": "uint8_t*",
+            "kind": "buffer",
+            "dtype": "u8",
+            "shape": [
+              "16",
+              "64",
+              "3232"
+            ],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem",
+            "symmetric_memory": "push_inbox",
+            "peers_arg": "push_inbox_peers"
+          },
+          {
+            "index": 15,
+            "name": "push_inbox_peers",
+            "c_name": "push_inbox_peers",
+            "c_type": "CakePeerPointerTable<uint8_t, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u8",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "symmetric_memory": "push_inbox",
+              "role": "peers"
+            }
+          },
+          {
+            "index": 16,
+            "name": "push_flags",
+            "c_name": "push_flags",
+            "c_type": "unsigned int*",
+            "kind": "buffer",
+            "dtype": "u32",
+            "shape": [
+              "16",
+              "64"
+            ],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem",
+            "symmetric_memory": "push_flags",
+            "peers_arg": "push_flags_peers"
+          },
+          {
+            "index": 17,
+            "name": "push_flags_peers",
+            "c_name": "push_flags_peers",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "symmetric_memory": "push_flags",
+              "role": "peers"
+            }
+          }
+        ],
+        "host_only_resource_arguments": [],
+        "process_groups": [
+          {
+            "name": "pg",
+            "world_size": 16,
+            "world_arg": "pg_world",
+            "rank_arg": "pg_rank",
+            "flags_arg": "pg_flags"
+          }
+        ],
+        "symmetric_memories": [
+          {
+            "name": "push_inbox",
+            "dtype": "u8",
+            "shape": [
+              "16",
+              "64",
+              "3232"
+            ],
+            "local_arg": "push_inbox",
+            "peers_arg": "push_inbox_peers",
+            "process_group": "pg"
+          },
+          {
+            "name": "push_flags",
+            "dtype": "u32",
+            "shape": [
+              "16",
+              "64"
+            ],
+            "local_arg": "push_flags",
+            "peers_arg": "push_flags_peers",
+            "process_group": "pg"
+          }
+        ],
+        "tma_argument_count": 0,
+        "peer_table_argument_count": 3
+      },
+      "launch": {
+        "threads_per_block": 256,
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "dynamic_smem_bytes": 0,
+        "static_smem_bytes": 0,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "explicit_cluster_launch": false,
+        "preferred_cluster_dims": null,
+        "launch_bounds_max_threads": 256,
+        "min_blocks": 0,
+        "max_blocks_per_cluster": 0,
+        "max_registers_per_thread": 0,
+        "function_attributes": [
+          {
+            "kind": "preferred_shared_memory_carveout",
+            "value": 100
+          }
+        ],
+        "preferred_shared_memory_carveout": 100,
+        "needs_cluster_launch_attribute": false,
+        "needs_max_dynamic_shared_size_attribute": false,
+        "use_pdl": false
+      },
+      "grid_formula": "(16 * tokens_per_rank, 1, 1)",
+      "compile": {
+        "source": "Cake NVRTC build option assembly",
+        "base_options": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device"
+        ],
+        "receipt_options": [
+          "--use_fast_math"
+        ],
+        "appended_when_nvrtc_ge_12_9": [
+          "--no-cache"
+        ],
+        "effective_order": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device",
+          "<-I per cuda include dir (+ its cccl subdir when present)>",
+          "--use_fast_math",
+          "--no-cache"
+        ],
+        "recommended_nvcc_flags": [
+          "-std=c++17",
+          "-O3",
+          "--use_fast_math",
+          "-gencode=arch=compute_103a,code=sm_103a"
+        ],
+        "nvcc_flags_note": "FlashInfer's gen_jit_spec adds its own -std/-O3/arch flags (sm103a_nvcc_flags); keep the receipt's numerics option --use_fast_math in extra_cuda_cflags so the delivered kernels keep the measured FTZ/fast-division semantics."
+      },
+      "pdl_instructions": [
+        "launch_dependents"
+      ],
+      "routing_capacity_contract": "bind active_rows_per_expert = 32 (the SwapAB route tile) so the kernel neither packs rows at or beyond that capacity nor maps them, and counts each such route once in overflow[0] (reset to 0 by publish_push every forward); the in-tree runtime binds 128 and never reads overflow.",
+      "push_wait_contract": "CTA recv_token = src * tokens_per_rank + token waits only on its LOCAL push_flags[src][token] (== push_generation[0] + 1; untimed ld.acquire.sys.global.u32 poll, the contract of the input barrier this program replaces: a late peer stalls, never traps; the exported text is built with the PUSH_WAIT_TIMEOUT_CYCLES knob = 0, see route_contract.push_dispatch.wait_timeout_knob) and reads the LOCAL inbox slot; bind the same push_inbox / push_flags symmetric buffers, peer tables and push_generation words as publish_push (route_contract.push_dispatch).  No input barrier precedes this program.",
+      "inbox_read_contract": "the local push_inbox / push_flags parameters are plain pointers (no __restrict__: peers write them while this kernel runs) and every slot read is an explicit coherent ld.global instruction (ld.global.b32 ids / weights, ld.global.v4.b32 row chunks, ld.global.u8 scale bytes; the device text contains no ld.global.nc), see route_contract.push_dispatch.inbox_read_rule.",
+      "scalar_binding_contract": "bind tokens_per_rank = this forward's token count (identical on every rank, <= 64), active_rows_per_expert = 32 and scale_tile_k128 = 1: the exported fc1 is the SwapAB N32 tile program reading the K128 SFA tile layout (fc1_k128_tiles = 24), so a routing-generic host passes the last two as constants (route_contract.push_dispatch.local_pack_scalar_rule)."
+    },
+    {
+      "stage": "fc1",
+      "role": "forward",
+      "forward_index": 2,
+      "file": "cake_w8a8_megamoe_ep16_fc1_kernel.cu",
+      "sha256": "acafb79a8a422c34025434a927342e4def34b175a6dc58ae689cb7c66109498b",
+      "bytes": 27081,
+      "lines": 654,
+      "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_fc1",
+      "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_fc1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, uint8_t* __restrict__ C_fp8, uint8_t* __restrict__ SF_out, int* __restrict__ route_map, float* __restrict__ route_weights, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int N, int K_tiles, int grid_m, int grid_n, int rows_per_expert);",
+      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, uint8_t* __restrict__ C_fp8, uint8_t* __restrict__ SF_out, int* __restrict__ route_map, float* __restrict__ route_weights, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int N, int K_tiles, int grid_m, int grid_n, int rows_per_expert);",
+      "kernel_attributes": "__launch_bounds__(192)",
+      "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+      "arguments": {
+        "device_arguments": [
+          {
+            "index": 0,
+            "name": "A",
+            "c_name": "A",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "A",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "A",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "128",
+                "256",
+                "lm.axis[-1] // 128",
+                "lm.axis.outer(2) * lm.axis[-2] // 256"
+              ],
+              "global_strides_elements": [
+                "128",
+                "32768",
+                "256 * lm.axis[-1]"
+              ],
+              "box_dim": [
+                "128",
+                "256",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.SZ_128B",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [
+                "lm.axis[-1] % 128 == 0",
+                "lm.axis.outer(2) * lm.axis[-2] % 256 == 0"
+              ],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 1,
+            "name": "B",
+            "c_name": "B",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "B",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "B",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "128",
+                "lm.axis[-2]",
+                "lm.axis[-1] // 128",
+                "lm.axis.outer(2)"
+              ],
+              "global_strides_elements": [
+                "lm.axis[-1]",
+                "128",
+                "lm.axis[-2] * lm.axis[-1]"
+              ],
+              "box_dim": [
+                "128",
+                "32",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.SZ_128B",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [
+                "lm.axis[-1] % 128 == 0"
+              ],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 2,
+            "name": "SFA",
+            "c_name": "SFA",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "SFA",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "SFA",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "lm.axis[-1]",
+                "lm.axis[-2]",
+                "lm.axis[-3]",
+                "lm.axis.outer(3)"
+              ],
+              "global_strides_elements": [
+                "lm.axis[-1]",
+                "lm.axis[-1] * lm.axis[-2]",
+                "lm.axis[-1] * lm.axis[-2] * lm.axis[-3]"
+              ],
+              "box_dim": [
+                "32",
+                "32",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.NONE",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 3,
+            "name": "SFB",
+            "c_name": "SFB",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "SFB",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "SFB",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "lm.axis[-1]",
+                "lm.axis[-2]",
+                "lm.axis[-3]",
+                "lm.axis.outer(3)"
+              ],
+              "global_strides_elements": [
+                "lm.axis[-1]",
+                "lm.axis[-1] * lm.axis[-2]",
+                "lm.axis[-1] * lm.axis[-2] * lm.axis[-3]"
+              ],
+              "box_dim": [
+                "32",
+                "16",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.NONE",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 4,
+            "name": "C_fp8",
+            "c_name": "C_fp8",
+            "c_type": "uint8_t* __restrict__",
+            "kind": "buffer",
+            "dtype": "fp8_e4m3",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 5,
+            "name": "SF_out",
+            "c_name": "SF_out",
+            "c_type": "uint8_t* __restrict__",
+            "kind": "buffer",
+            "dtype": "u8",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 6,
+            "name": "route_map",
+            "c_name": "route_map",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 7,
+            "name": "route_weights",
+            "c_name": "route_weights",
+            "c_type": "float* __restrict__",
+            "kind": "buffer",
+            "dtype": "f32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 8,
+            "name": "tile_expert",
+            "c_name": "tile_expert",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 9,
+            "name": "tile_m_local",
+            "c_name": "tile_m_local",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 10,
+            "name": "expert_row_offsets",
+            "c_name": "expert_row_offsets",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 11,
+            "name": "scale_gate",
+            "c_name": "scale_gate",
+            "c_type": "float* __restrict__",
+            "kind": "buffer",
+            "dtype": "f32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 12,
+            "name": "clamp_limit",
+            "c_name": "clamp_limit",
+            "c_type": "float* __restrict__",
+            "kind": "buffer",
+            "dtype": "f32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 13,
+            "name": "act_alpha",
+            "c_name": "act_alpha",
+            "c_type": "float* __restrict__",
+            "kind": "buffer",
+            "dtype": "f32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 14,
+            "name": "act_beta",
+            "c_name": "act_beta",
+            "c_type": "float* __restrict__",
+            "kind": "buffer",
+            "dtype": "f32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 15,
+            "name": "N",
+            "c_name": "N",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 16,
+            "name": "K_tiles",
+            "c_name": "K_tiles",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 17,
+            "name": "grid_m",
+            "c_name": "grid_m",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 18,
+            "name": "grid_n",
+            "c_name": "grid_n",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 19,
+            "name": "rows_per_expert",
+            "c_name": "rows_per_expert",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          }
+        ],
+        "host_only_resource_arguments": [],
+        "process_groups": [],
+        "symmetric_memories": [],
+        "tma_argument_count": 4,
+        "peer_table_argument_count": 0
+      },
+      "launch": {
+        "threads_per_block": 192,
+        "block": [
+          192,
+          1,
+          1
+        ],
+        "dynamic_smem_bytes": 162816,
+        "static_smem_bytes": 0,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "explicit_cluster_launch": false,
+        "preferred_cluster_dims": null,
+        "launch_bounds_max_threads": 192,
+        "min_blocks": 0,
+        "max_blocks_per_cluster": 0,
+        "max_registers_per_thread": 0,
+        "function_attributes": [],
+        "preferred_shared_memory_carveout": null,
+        "needs_cluster_launch_attribute": false,
+        "needs_max_dynamic_shared_size_attribute": true,
+        "use_pdl": true
+      },
+      "grid_formula": "(persistent_grid, 1, 1)",
+      "compile": {
+        "source": "Cake NVRTC build option assembly",
+        "base_options": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device"
+        ],
+        "receipt_options": [
+          "--use_fast_math"
+        ],
+        "appended_when_nvrtc_ge_12_9": [
+          "--no-cache"
+        ],
+        "effective_order": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device",
+          "<-I per cuda include dir (+ its cccl subdir when present)>",
+          "--use_fast_math",
+          "--no-cache"
+        ],
+        "recommended_nvcc_flags": [
+          "-std=c++17",
+          "-O3",
+          "--use_fast_math",
+          "-gencode=arch=compute_103a,code=sm_103a"
+        ],
+        "nvcc_flags_note": "FlashInfer's gen_jit_spec adds its own -std/-O3/arch flags (sm103a_nvcc_flags); keep the receipt's numerics option --use_fast_math in extra_cuda_cflags so the delivered kernels keep the measured FTZ/fast-division semantics."
+      },
+      "pdl_instructions": [
+        "wait",
+        "launch_dependents"
+      ],
+      "weight_operand_layout": "A is the k-tile-major FP8 weight payload (route_contract.w13_fp8_layout for fc1, w2_fp8_layout for fc2): encode its tensor map from the arguments[].tma record of A (global_dim / global_strides_elements over the contiguous [experts, rows, K] host tensor), not from the row-major (K, 128, rows * K) stride form used for B."
+    },
+    {
+      "stage": "fc2",
+      "role": "forward",
+      "forward_index": 3,
+      "file": "cake_w8a8_megamoe_ep16_fc2_kernel.cu",
+      "sha256": "7f7ec800818e20394a40e5a6323dd73cd378c3ae68d5144ab9e0ecb71b10df29",
+      "bytes": 22567,
+      "lines": 557,
+      "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_fc2",
+      "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_fc2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, int routes_per_rank, int N, int K_tiles, int grid_m, int32_t remote_pg_world, int32_t remote_pg_rank, CakePeerPointerTable<unsigned int, 32> remote_pg_flags, __nv_bfloat16* __restrict__ remote_terms, CakePeerPointerTable<__nv_bfloat16, 32> remote_terms_peers, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, int routes_per_rank, int N, int K_tiles, int grid_m, int32_t remote_pg_world, int32_t remote_pg_rank, CakePeerPointerTable<unsigned int, 32> remote_pg_flags, __nv_bfloat16* __restrict__ remote_terms, CakePeerPointerTable<__nv_bfloat16, 32> remote_terms_peers, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+      "kernel_attributes": "__launch_bounds__(192)",
+      "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+      "arguments": {
+        "device_arguments": [
+          {
+            "index": 0,
+            "name": "A",
+            "c_name": "A",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "A",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "A",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "128",
+                "128",
+                "lm.axis[-1] // 128",
+                "lm.axis.outer(2) * lm.axis[-2] // 128"
+              ],
+              "global_strides_elements": [
+                "128",
+                "16384",
+                "128 * lm.axis[-1]"
+              ],
+              "box_dim": [
+                "128",
+                "128",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.SZ_128B",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [
+                "lm.axis[-1] % 128 == 0",
+                "lm.axis.outer(2) * lm.axis[-2] % 128 == 0"
+              ],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 1,
+            "name": "B",
+            "c_name": "B",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "B",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "B",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "128",
+                "lm.axis[-2]",
+                "lm.axis[-1] // 128",
+                "lm.axis.outer(2)"
+              ],
+              "global_strides_elements": [
+                "lm.axis[-1]",
+                "128",
+                "lm.axis[-2] * lm.axis[-1]"
+              ],
+              "box_dim": [
+                "128",
+                "32",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.SZ_128B",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [
+                "lm.axis[-1] % 128 == 0"
+              ],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 2,
+            "name": "SFA",
+            "c_name": "SFA",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "SFA",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "SFA",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "lm.axis[-1]",
+                "lm.axis[-2]",
+                "lm.axis[-3]",
+                "lm.axis.outer(3)"
+              ],
+              "global_strides_elements": [
+                "lm.axis[-1]",
+                "lm.axis[-1] * lm.axis[-2]",
+                "lm.axis[-1] * lm.axis[-2] * lm.axis[-3]"
+              ],
+              "box_dim": [
+                "32",
+                "16",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.NONE",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 3,
+            "name": "SFB",
+            "c_name": "SFB",
+            "c_type": "const __grid_constant__ CUtensorMap",
+            "kind": "tma",
+            "abi": "by-value __grid_constant__ CUtensorMap (128 bytes, 128-byte aligned), encoded on the host",
+            "owner_buffer": "SFB",
+            "tma": {
+              "tensor_dtype": "u8",
+              "carrier_dtype": "u8",
+              "logical_element_bits": 8,
+              "rank": 4,
+              "host_tensor": "SFB",
+              "view_name": null,
+              "buffer_shape": [],
+              "global_dim": [
+                "lm.axis[-1]",
+                "lm.axis[-2]",
+                "lm.axis[-3]",
+                "lm.axis.outer(3)"
+              ],
+              "global_strides_elements": [
+                "lm.axis[-1]",
+                "lm.axis[-1] * lm.axis[-2]",
+                "lm.axis[-1] * lm.axis[-2] * lm.axis[-3]"
+              ],
+              "box_dim": [
+                "32",
+                "16",
+                "1",
+                "1"
+              ],
+              "element_strides": [
+                "1",
+                "1",
+                "1",
+                "1"
+              ],
+              "global_address_offset_elements": "0",
+              "tma_base_offset_elements": 0,
+              "swizzle": "Swizzle.NONE",
+              "l2_promotion": "none",
+              "l2_promotion_is_runtime_scalar": false,
+              "oob_fill": "none",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "cu_tensor_map_enums": {
+                "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+                "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
+                "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+                "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE"
+              },
+              "checks": [],
+              "block_scale_layout": null,
+              "fp4_format": "unpacked",
+              "coord_order": [],
+              "leaf_convention": "lm.axis[-i] = logical size of the host tensor's i-th axis from the end; lm.stride[-i] = its exact physical stride in elements; lm.axis.outer(k) = product of the remaining leading axes; lm.ceil_div(a, b) = (a + b - 1) // b; lm.scalar['p'] = the integer kernel scalar p. Strides are element units: multiply by logical_element_bits / 8 for cuTensorMapEncodeTiled."
+            }
+          },
+          {
+            "index": 4,
+            "name": "C",
+            "c_name": "C",
+            "c_type": "__nv_bfloat16* __restrict__",
+            "kind": "buffer",
+            "dtype": "bf16",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 5,
+            "name": "route_map",
+            "c_name": "route_map",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 6,
+            "name": "tile_expert",
+            "c_name": "tile_expert",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 7,
+            "name": "tile_m_local",
+            "c_name": "tile_m_local",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 8,
+            "name": "expert_row_offsets",
+            "c_name": "expert_row_offsets",
+            "c_type": "int* __restrict__",
+            "kind": "buffer",
+            "dtype": "i32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 9,
+            "name": "routes_per_rank",
+            "c_name": "routes_per_rank",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 10,
+            "name": "N",
+            "c_name": "N",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 11,
+            "name": "K_tiles",
+            "c_name": "K_tiles",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 12,
+            "name": "grid_m",
+            "c_name": "grid_m",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 13,
+            "name": "remote_pg_world",
+            "c_name": "remote_pg_world",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "remote_pg",
+            "role": "world"
+          },
+          {
+            "index": 14,
+            "name": "remote_pg_rank",
+            "c_name": "remote_pg_rank",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "remote_pg",
+            "role": "rank"
+          },
+          {
+            "index": 15,
+            "name": "remote_pg_flags",
+            "c_name": "remote_pg_flags",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "process_group": "remote_pg",
+              "role": "flags"
+            }
+          },
+          {
+            "index": 16,
+            "name": "remote_terms",
+            "c_name": "remote_terms",
+            "c_type": "__nv_bfloat16* __restrict__",
+            "kind": "buffer",
+            "dtype": "bf16",
+            "shape": [
+              "1024",
+              "8",
+              "3072"
+            ],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem",
+            "symmetric_memory": "remote_terms",
+            "peers_arg": "remote_terms_peers"
+          },
+          {
+            "index": 17,
+            "name": "remote_terms_peers",
+            "c_name": "remote_terms_peers",
+            "c_type": "CakePeerPointerTable<__nv_bfloat16, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "bf16",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "symmetric_memory": "remote_terms",
+              "role": "peers"
+            }
+          },
+          {
+            "index": 18,
+            "name": "fc2_completion",
+            "c_name": "fc2_completion",
+            "c_type": "unsigned int*",
+            "kind": "buffer",
+            "dtype": "u32",
+            "shape": [
+              "2"
+            ],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem",
+            "symmetric_memory": "fc2_completion",
+            "peers_arg": "fc2_completion_peers"
+          },
+          {
+            "index": 19,
+            "name": "fc2_completion_peers",
+            "c_name": "fc2_completion_peers",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "symmetric_memory": "fc2_completion",
+              "role": "peers"
+            }
+          }
+        ],
+        "host_only_resource_arguments": [],
+        "process_groups": [
+          {
+            "name": "remote_pg",
+            "world_size": 16,
+            "world_arg": "remote_pg_world",
+            "rank_arg": "remote_pg_rank",
+            "flags_arg": "remote_pg_flags"
+          }
+        ],
+        "symmetric_memories": [
+          {
+            "name": "remote_terms",
+            "dtype": "bf16",
+            "shape": [
+              "1024",
+              "8",
+              "3072"
+            ],
+            "local_arg": "remote_terms",
+            "peers_arg": "remote_terms_peers",
+            "process_group": "remote_pg"
+          },
+          {
+            "name": "fc2_completion",
+            "dtype": "u32",
+            "shape": [
+              "2"
+            ],
+            "local_arg": "fc2_completion",
+            "peers_arg": "fc2_completion_peers",
+            "process_group": "remote_pg"
+          }
+        ],
+        "tma_argument_count": 4,
+        "peer_table_argument_count": 3
+      },
+      "launch": {
+        "threads_per_block": 192,
+        "block": [
+          192,
+          1,
+          1
+        ],
+        "dynamic_smem_bytes": 181248,
+        "static_smem_bytes": 0,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "explicit_cluster_launch": false,
+        "preferred_cluster_dims": null,
+        "launch_bounds_max_threads": 192,
+        "min_blocks": 0,
+        "max_blocks_per_cluster": 0,
+        "max_registers_per_thread": 0,
+        "function_attributes": [],
+        "preferred_shared_memory_carveout": null,
+        "needs_cluster_launch_attribute": false,
+        "needs_max_dynamic_shared_size_attribute": true,
+        "use_pdl": true
+      },
+      "grid_formula": "(persistent_grid, 1, 1)",
+      "compile": {
+        "source": "Cake NVRTC build option assembly",
+        "base_options": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device"
+        ],
+        "receipt_options": [
+          "--use_fast_math"
+        ],
+        "appended_when_nvrtc_ge_12_9": [
+          "--no-cache"
+        ],
+        "effective_order": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device",
+          "<-I per cuda include dir (+ its cccl subdir when present)>",
+          "--use_fast_math",
+          "--no-cache"
+        ],
+        "recommended_nvcc_flags": [
+          "-std=c++17",
+          "-O3",
+          "--use_fast_math",
+          "-gencode=arch=compute_103a,code=sm_103a"
+        ],
+        "nvcc_flags_note": "FlashInfer's gen_jit_spec adds its own -std/-O3/arch flags (sm103a_nvcc_flags); keep the receipt's numerics option --use_fast_math in extra_cuda_cflags so the delivered kernels keep the measured FTZ/fast-division semantics."
+      },
+      "pdl_instructions": [
+        "wait",
+        "launch_dependents"
+      ],
+      "completion_signal_contract": "bind fc2_completion (plain local pointer of the symmetric u32[2] counter, no __restrict__) and fc2_completion_peers (by-value CakePeerPointerTable<unsigned int, 32>, entries [0, pg_world) = 16; fc2_completion_peers[remote_pg_rank] == fc2_completion, checked by the reference binding); the last CTA of the grid issues one warp-wide red.release.sys.global.add.u32 +1 (lane d -> word 0 of rank d's counter; its .release is the signal's one system fence, no separate fence.release.sys) after every CTA's remote route stores (route_contract.fc2_completion.signal_rule); word 1 is this rank's CTA arrival counter and returns to 0.  No partial_barrier program follows; combine waits on the counter.  Zeroed once at allocation (route_contract.fc2_completion.initialization_rule).",
+      "weight_operand_layout": "A is the k-tile-major FP8 weight payload (route_contract.w13_fp8_layout for fc1, w2_fp8_layout for fc2): encode its tensor map from the arguments[].tma record of A (global_dim / global_strides_elements over the contiguous [experts, rows, K] host tensor), not from the row-major (K, 128, rows * K) stride form used for B."
+    },
+    {
+      "stage": "combine",
+      "role": "forward",
+      "forward_index": 4,
+      "file": "cake_w8a8_megamoe_ep16_combine_kernel.cu",
+      "sha256": "6df2ff07970c04c01a539d74fd27e98c836d7f1bf6b582f5787fcc17c1b7e0ce",
+      "bytes": 6101,
+      "lines": 169,
+      "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_combine",
+      "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_combine(__nv_bfloat16* local_terms, __nv_bfloat16* __restrict__ output, unsigned int* __restrict__ push_generation, int tokens_per_rank, int source_rank, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_combine(__nv_bfloat16* local_terms, __nv_bfloat16* __restrict__ output, unsigned int* __restrict__ push_generation, int tokens_per_rank, int source_rank, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+      "kernel_attributes": "__launch_bounds__(128)",
+      "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+      "arguments": {
+        "device_arguments": [
+          {
+            "index": 0,
+            "name": "local_terms",
+            "c_name": "local_terms",
+            "c_type": "__nv_bfloat16*",
+            "kind": "buffer",
+            "dtype": "bf16",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 1,
+            "name": "output",
+            "c_name": "output",
+            "c_type": "__nv_bfloat16* __restrict__",
+            "kind": "buffer",
+            "dtype": "bf16",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 2,
+            "name": "push_generation",
+            "c_name": "push_generation",
+            "c_type": "unsigned int* __restrict__",
+            "kind": "buffer",
+            "dtype": "u32",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 3,
+            "name": "tokens_per_rank",
+            "c_name": "tokens_per_rank",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 4,
+            "name": "source_rank",
+            "c_name": "source_rank",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 5,
+            "name": "pg_world",
+            "c_name": "pg_world",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "pg",
+            "role": "world"
+          },
+          {
+            "index": 6,
+            "name": "pg_rank",
+            "c_name": "pg_rank",
+            "c_type": "int32_t",
+            "kind": "process_group_scalar",
+            "process_group": "pg",
+            "role": "rank"
+          },
+          {
+            "index": 7,
+            "name": "pg_flags",
+            "c_name": "pg_flags",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "process_group": "pg",
+              "role": "flags"
+            }
+          },
+          {
+            "index": 8,
+            "name": "fc2_completion",
+            "c_name": "fc2_completion",
+            "c_type": "unsigned int*",
+            "kind": "buffer",
+            "dtype": "u32",
+            "shape": [
+              "2"
+            ],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem",
+            "symmetric_memory": "fc2_completion",
+            "peers_arg": "fc2_completion_peers"
+          },
+          {
+            "index": 9,
+            "name": "fc2_completion_peers",
+            "c_name": "fc2_completion_peers",
+            "c_type": "CakePeerPointerTable<unsigned int, 32>",
+            "kind": "peer_table",
+            "capacity": 32,
+            "element_dtype": "u32",
+            "abi": "by-value table of <capacity> uint64 device addresses (16-byte aligned, 8 bytes per slot); slot r = peer rank r's base address of the owning symmetric buffer (or flag pad); the binding takes an int64 Shape/tensor with exactly <world> entries and copies them into slots 0..world-1",
+            "owner": {
+              "symmetric_memory": "fc2_completion",
+              "role": "peers"
+            }
+          }
+        ],
+        "host_only_resource_arguments": [],
+        "process_groups": [
+          {
+            "name": "pg",
+            "world_size": 16,
+            "world_arg": "pg_world",
+            "rank_arg": "pg_rank",
+            "flags_arg": "pg_flags"
+          }
+        ],
+        "symmetric_memories": [
+          {
+            "name": "fc2_completion",
+            "dtype": "u32",
+            "shape": [
+              "2"
+            ],
+            "local_arg": "fc2_completion",
+            "peers_arg": "fc2_completion_peers",
+            "process_group": "pg"
+          }
+        ],
+        "tma_argument_count": 0,
+        "peer_table_argument_count": 2
+      },
+      "launch": {
+        "threads_per_block": 128,
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "dynamic_smem_bytes": 0,
+        "static_smem_bytes": 0,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "explicit_cluster_launch": false,
+        "preferred_cluster_dims": null,
+        "launch_bounds_max_threads": 128,
+        "min_blocks": 0,
+        "max_blocks_per_cluster": 0,
+        "max_registers_per_thread": 0,
+        "function_attributes": [],
+        "preferred_shared_memory_carveout": null,
+        "needs_cluster_launch_attribute": false,
+        "needs_max_dynamic_shared_size_attribute": false,
+        "use_pdl": true
+      },
+      "grid_formula": "(3 * tokens_per_rank, 1, 1)",
+      "compile": {
+        "source": "Cake NVRTC build option assembly",
+        "base_options": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device"
+        ],
+        "receipt_options": [
+          "--use_fast_math"
+        ],
+        "appended_when_nvrtc_ge_12_9": [
+          "--no-cache"
+        ],
+        "effective_order": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device",
+          "<-I per cuda include dir (+ its cccl subdir when present)>",
+          "--use_fast_math",
+          "--no-cache"
+        ],
+        "recommended_nvcc_flags": [
+          "-std=c++17",
+          "-O3",
+          "--use_fast_math",
+          "-gencode=arch=compute_103a,code=sm_103a"
+        ],
+        "nvcc_flags_note": "FlashInfer's gen_jit_spec adds its own -std/-O3/arch flags (sm103a_nvcc_flags); keep the receipt's numerics option --use_fast_math in extra_cuda_cflags so the delivered kernels keep the measured FTZ/fast-division semantics."
+      },
+      "pdl_instructions": [
+        "wait"
+      ],
+      "completion_wait_contract": "bind the same fc2_completion / fc2_completion_peers as fc2 (fc2_completion_peers[pg_rank] == fc2_completion, checked by the reference binding), push_generation (the rank-local u32[2] of publish_push / local_pack) and the pg_world / pg_rank / pg_flags process-group arguments; launched with the programmatic-stream-serialization attribute behind fc2 (launch.use_pdl).  Thread 0 of each CTA waits UNTIMED (ld.acquire.sys.global.u32) until fc2_completion[0] >= 16 * push_generation[0] (wrap-safe modular compare), then fence.acquire.sys and bar.sync; the term rows are read with coherent ld.global.v4.b32 through a plain local_terms pointer (route_contract.fc2_completion.wait_rule / generation_rule)."
+    },
+    {
+      "stage": "quantize_weights",
+      "role": "setup",
+      "forward_index": null,
+      "file": "cake_w8a8_megamoe_ep16_quantize_weights_kernel.cu",
+      "sha256": "752de857ba046a3148f645bda8f3dfa75c7d7d2e49b58fb644b0880a29e1748c",
+      "bytes": 10290,
+      "lines": 270,
+      "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_quantize_weights",
+      "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_quantize_weights(__nv_bfloat16* __restrict__ source, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, int experts, int rows, int columns, int gate_width, int interleave_gate_up, int scale_tile_n256_k128, int ktile_major_rows);",
+      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_quantize_weights(__nv_bfloat16* __restrict__ source, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, int experts, int rows, int columns, int gate_width, int interleave_gate_up, int scale_tile_n256_k128, int ktile_major_rows);",
+      "kernel_attributes": "__launch_bounds__(256)",
+      "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+      "arguments": {
+        "device_arguments": [
+          {
+            "index": 0,
+            "name": "source",
+            "c_name": "source",
+            "c_type": "__nv_bfloat16* __restrict__",
+            "kind": "buffer",
+            "dtype": "bf16",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 1,
+            "name": "quantized",
+            "c_name": "quantized",
+            "c_type": "uint8_t* __restrict__",
+            "kind": "buffer",
+            "dtype": "fp8_e4m3",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 2,
+            "name": "scales_cp",
+            "c_name": "scales_cp",
+            "c_type": "uint8_t* __restrict__",
+            "kind": "buffer",
+            "dtype": "u8",
+            "shape": [],
+            "abi_kind": "buffer",
+            "nullable": false,
+            "space": "gmem"
+          },
+          {
+            "index": 3,
+            "name": "experts",
+            "c_name": "experts",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 4,
+            "name": "rows",
+            "c_name": "rows",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 5,
+            "name": "columns",
+            "c_name": "columns",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 6,
+            "name": "gate_width",
+            "c_name": "gate_width",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 7,
+            "name": "interleave_gate_up",
+            "c_name": "interleave_gate_up",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 8,
+            "name": "scale_tile_n256_k128",
+            "c_name": "scale_tile_n256_k128",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          },
+          {
+            "index": 9,
+            "name": "ktile_major_rows",
+            "c_name": "ktile_major_rows",
+            "c_type": "int",
+            "kind": "parameter",
+            "dtype": "i32"
+          }
+        ],
+        "host_only_resource_arguments": [],
+        "process_groups": [],
+        "symmetric_memories": [],
+        "tma_argument_count": 0,
+        "peer_table_argument_count": 0
+      },
+      "launch": {
+        "threads_per_block": 256,
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "dynamic_smem_bytes": 0,
+        "static_smem_bytes": 0,
+        "cluster_dims": [
+          1,
+          1,
+          1
+        ],
+        "explicit_cluster_launch": false,
+        "preferred_cluster_dims": null,
+        "launch_bounds_max_threads": 256,
+        "min_blocks": 0,
+        "max_blocks_per_cluster": 0,
+        "max_registers_per_thread": 0,
+        "function_attributes": [],
+        "preferred_shared_memory_carveout": null,
+        "needs_cluster_launch_attribute": false,
+        "needs_max_dynamic_shared_size_attribute": false,
+        "use_pdl": false
+      },
+      "grid_formula": "(4 * sm_count, 1, 1)",
+      "compile": {
+        "source": "Cake NVRTC build option assembly",
+        "base_options": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device"
+        ],
+        "receipt_options": [
+          "--use_fast_math"
+        ],
+        "appended_when_nvrtc_ge_12_9": [
+          "--no-cache"
+        ],
+        "effective_order": [
+          "--gpu-architecture=sm_103a",
+          "-std=c++17",
+          "-default-device",
+          "<-I per cuda include dir (+ its cccl subdir when present)>",
+          "--use_fast_math",
+          "--no-cache"
+        ],
+        "recommended_nvcc_flags": [
+          "-std=c++17",
+          "-O3",
+          "--use_fast_math",
+          "-gencode=arch=compute_103a,code=sm_103a"
+        ],
+        "nvcc_flags_note": "FlashInfer's gen_jit_spec adds its own -std/-O3/arch flags (sm103a_nvcc_flags); keep the receipt's numerics option --use_fast_math in extra_cuda_cflags so the delivered kernels keep the measured FTZ/fast-division semantics."
+      },
+      "weight_layout_contract": "the trailing int32 scalar ktile_major_rows selects the FP8 payload placement: bind 256 for the w13 launch (gate_width 5120, interleave_gate_up 1, scale_tile_n256_k128 1) and 128 for the w2 launch (gate_width 0, interleave_gate_up 0, scale_tile_n256_k128 2); these are the layouts the fc1 / fc2 A tensor maps address (route_contract.weight_layout_rule).  0 writes the row-major payload, which the exported fc1 / fc2 programs do not read.  The scale carriers are unaffected."
+    }
+  ],
+  "license_header_source": "csrc/tvm_ffi_utils.h (FlashInfer), year 2026",
+  "formatting": {
+    "tool": "clang-format",
+    "version": "19.1.1",
+    "version_source": ".pre-commit-config.yaml (mirrors-clang-format rev v19.1.1)",
+    "style_source": ".clang-format (FlashInfer repository root)",
+    "style_sha256": "dab5ab0d28ed16eeb39d95c931f4e4c45782ea57ed7eb6981e009912ab6486b5",
+    "note": "every *_kernel.cu is the fixed point of that clang-format release under that style, so the repository's pre-commit hook leaves it unchanged; programs[*].sha256 are digests of the formatted text"
+  },
+  "public_material_check": {
+    "files_scanned": [
+      "cake_w8a8_megamoe_ep16_publish_push_kernel.cu",
+      "cake_w8a8_megamoe_ep16_local_pack_kernel.cu",
+      "cake_w8a8_megamoe_ep16_fc1_kernel.cu",
+      "cake_w8a8_megamoe_ep16_fc2_kernel.cu",
+      "cake_w8a8_megamoe_ep16_combine_kernel.cu",
+      "cake_w8a8_megamoe_ep16_quantize_weights_kernel.cu",
+      "cake_w8a8_megamoe_ep16_manifest.json"
+    ],
+    "result": "clean"
+  }
+}

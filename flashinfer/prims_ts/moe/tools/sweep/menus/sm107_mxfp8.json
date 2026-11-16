@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "sm_arch": 107,
+  "dtype": "MxFP8xMxFP8",
+  "routings": [
+    "uniform",
+    "zipf:0.8",
+    "balanced_round_robin"
+  ],
+  "routing_seed": 42,
+  "autotune_cost": {
+    "seconds_per_pair": 0.02,
+    "seconds_per_compile": 15.0
+  },
+  "deployments": [
+    {
+      "name": "deepseek-v3-mxfp8",
+      "hidden": 7168,
+      "intermediate": 2048,
+      "num_experts": 256,
+      "top_k": 8,
+      "activation": "Swiglu",
+      "weight": 1.0,
+      "tp_ep": [
+        {
+          "tp_ep": "8:1",
+          "tokens": [1, 2, 4, 16, 32, 64, 256, 1024, 2048, 4096]
+        },
+        {
+          "tp_ep": "4:2",
+          "tokens": [1, 2, 4, 16, 32, 64, 256, 1024, 2048, 4096, 8192]
+        },
+        {
+          "tp_ep": "8:8",
+          "tokens": [32, 64, 256, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768]
+        },
+        {
+          "tp_ep": "1:32",
+          "tokens": [256, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768]
+        }
+      ]
+    },
+    {
+      "model": "deepseek-v4.1-flash-mxfp8",
+      "weight": 0.33,
+      "tp_ep": [
+        {
+          "tp_ep": "2:2",
+          "tokens": [1, 2, 4, 16, 32, 64, 256, 1024, 2048, 4096, 8192, 16384]
+        }
+      ]
+    },
+    {
+      "_comment": "DeepSeek-V4.1-Flash at TP=4, padded from 2304 to 2560 (576 -> 640 per rank) because MXFP8xMXFP8 needs 128-aligned K. Weighted with the 2:2 entry as one model.",
+      "name": "deepseek-v4.1-flash-mxfp8-tp4-pad640",
+      "hidden": 5120,
+      "intermediate": 2560,
+      "num_experts": 384,
+      "top_k": 6,
+      "activation": "Swiglu",
+      "gemm1_clamp_limit": 10.0,
+      "weight": 0.67,
+      "tp_ep": [
+        {
+          "tp_ep": "4:1",
+          "tokens": [1, 2, 4, 16, 32, 64, 256, 1024, 2048, 4096]
+        },
+        {
+          "tp_ep": "4:4",
+          "tokens": [32, 64, 256, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768]
+        }
+      ]
+    },
+    {
+      "model": "minimax-m3-mxfp8",
+      "weight": 1.0,
+      "tp_ep": [
+        {
+          "tp_ep": "4:1",
+          "tokens": [1, 2, 4, 16, 32, 64, 256, 1024, 2048, 4096]
+        }
+      ]
+    }
+  ]
+}

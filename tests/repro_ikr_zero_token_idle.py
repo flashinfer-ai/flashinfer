@@ -4,7 +4,7 @@ for in_kernel_fc2_reduce (MXFP8).
 SGLang's mechanism for keeping DP ranks in lockstep (prepare_mlp_sync_batch_raw
 / dp_attn.py) is: every idle DP rank still calls forward() every step, but
 with a synthetic ZERO-TOKEN batch. The bug: mxfp8_mega_moe()
-(kernel_src/cutedsl_megamoe/shim/mxfp8.py) had
+(kernel_src/sm100/cutedsl_megamoe/shim/mxfp8.py) had
 
     if n == 0 and symm_buffer._frontend.config.in_kernel_fc2_reduce:
         return symm_buffer.output_activation[:0] if y is None else None
@@ -141,7 +141,7 @@ def main() -> None:
         intermediate_size=intermediate,
         top_k=top_k,
         kind="mxfp8_e4m3",
-        in_kernel_fc2_reduce=ikr,
+        enable_in_kernel_fc2_reduce=ikr,
     )
 
     log(rank, "constructing MoEEpMegaLayer...")

@@ -1,7 +1,8 @@
 """Multi-GPU functional correctness for LL EXPERT_MAJOR + RANK_MAJOR (NVFP4).
 
-Mirrors ``test_moe_ep_compute_correctness.py`` (bf16) but exercises the
-``trtllm_fp4_routed`` path through ``FusedMoeSplitKernelBackend``.
+Exercises explicit TRT-LLM and CuTe/TRT-LLM selection through
+``FusedMoeSplitKernelBackend``. Multi-backend cases also check graph replay
+with changed activation and routing bytes.
 
 Asserts ``EP == non-EP kernel``; the ``non-EP kernel == torch oracle`` anchor
 for this dtype path is the single-GPU
@@ -10,7 +11,7 @@ for this dtype path is the single-GPU
 Launch (4 GPU, SM100+):
     torchrun --nproc_per_node=4 -m pytest \\
         tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py -v -s \\
-        -m "nvep and gpu_4 and arch_blackwell"
+        -m "nvep and gpu_4"
 """
 
 from __future__ import annotations
@@ -102,10 +103,18 @@ def _kernel_full_moe_reference(x, w1_full, w2_full, topk_ids, topk_weights):
     return MoELayer(cfg)(act, wp)
 
 
-def _run_one_layout(layout_str):
+def _run_one_layout(layout_str, compute_backends="trtllm"):
+    from dataclasses import replace
+
     import torch
     import torch.distributed as dist
 
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        CuteDslConfig,
+        MoEFinalizeConfig,
+        TrtllmFp4Config,
+    )
     from flashinfer.moe_ep import (
         BootstrapConfig,
         EpAlgorithm,
@@ -160,6 +169,15 @@ def _run_one_layout(layout_str):
         local_num_experts=local_num_experts,
         max_tokens=max_tokens,
     )
+    if compute_backends != "trtllm":
+        candidates = (CuteDslConfig(), TrtllmFp4Config())
+        if compute_backends == "trtllm_first":
+            candidates = candidates[::-1]
+        moe_config = replace(
+            moe_config,
+            backend=BackendOptions(candidates=candidates),
+            finalize=MoEFinalizeConfig(use_fused_finalize=True),
+        )
     canonical_weights = MoEWeightPack(
         w13=w1_full[offset : offset + local_num_experts].contiguous(),
         w2=w2_full[offset : offset + local_num_experts].contiguous(),
@@ -204,6 +222,39 @@ def _run_one_layout(layout_str):
         print(f"[nvfp4 {layout_str}] EP-vs-kernel rel-err={ep_vs_kernel:.4f}")
 
     torch.testing.assert_close(yf, kf, rtol=RTOL, atol=ATOL)
+    if compute_backends != "trtllm":
+        compute = layer._kernel._compute
+        assert {r.backend_key for r in compute.runners} == {
+            "cute_dsl",
+            "trtllm_fp4_routed",
+        }
+        assert compute.winner_backend in {"cute_dsl", "trtllm_fp4_routed"}
+        winners = dict(compute._winners)
+        state = layer.create_graph_state(t)
+        layer.forward(t, graph_state=state)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_y = layer.forward(t, graph_state=state)
+        # Change both activation and routing bytes at the captured addresses.
+        x.mul_(0.75)
+        topk_ids.add_(1).remainder_(NUM_EXPERTS)
+        expected = _kernel_full_moe_reference(
+            x, w1_full, w2_full, topk_ids, topk_weights
+        )
+        graph_y.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_y.float(), expected.float(), rtol=RTOL, atol=ATOL
+        )
+        assert dict(compute._winners) == winners
+        print(
+            f"rank {rank}: {layout_str} {compute_backends} winner={compute.winner_backend}"
+        )
+        graph.reset()
+        state.destroy()
     layer.destroy()
     return rank, ep_vs_kernel
 
@@ -215,12 +266,20 @@ def pytest_generate_tests(metafunc):
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
-def test_moe_ep_nvfp4_compute_matches_dense_reference(layout):
+@pytest.mark.parametrize("compute_backends", ["trtllm", "cute_first", "trtllm_first"])
+def test_moe_ep_nvfp4_compute_matches_dense_reference(layout, compute_backends):
     import torch
+
+    from flashinfer.fused_moe.api import CuteDslConfig, TrtllmFp4Config
 
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("NVFP4 EP compute requires SM100+")
+    major, minor = torch.cuda.get_device_capability()
+    if not TrtllmFp4Config.supported(major * 10 + minor):
+        pytest.skip("requires TRT-LLM NVFP4")
+    if compute_backends != "trtllm":
+        if not CuteDslConfig.supported(major * 10 + minor):
+            pytest.skip("requires both CuTe and TRT-LLM NVFP4 backends")
 
     import torch.distributed as dist
 
@@ -232,6 +291,6 @@ def test_moe_ep_nvfp4_compute_matches_dense_reference(layout):
             f"num_experts={NUM_EXPERTS} not divisible by world_size={world_size}"
         )
 
-    rank, ep_vs_kernel = _run_one_layout(layout)
+    rank, ep_vs_kernel = _run_one_layout(layout, compute_backends)
     dist.barrier()
     print(f"rank {rank}: nvfp4 {layout} EP==kernel OK (rel-err={ep_vs_kernel:.4f})")

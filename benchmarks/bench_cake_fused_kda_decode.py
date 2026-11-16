@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict paired Cake fused KDA decode benchmark on B200 or B300 (official21)."""
+"""Strict paired Cake fused KDA decode benchmark on B200 or B300.
+
+``--shapes official21`` measures the H=12..96 evaluator shapes with FP32
+state, ``--shapes h8`` measures the Kimi-K3 TP12 (H=8) power-of-two row
+ladder with FP32 or BF16 state, and ``--shapes full-domain`` runs the dense
+B200-only H=12..96 protocol.
+"""
 
 import argparse
 import ast
@@ -69,6 +75,11 @@ _OFFICIAL_SHAPES = (
     (12, 32),
     (12, 256),
 )
+# Kimi-K3 TP12 serving ladder: eight heads, power-of-two decode batch sizes.
+_H8_ROWS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+_H8_SHAPES = tuple((8, num_rows) for num_rows in _H8_ROWS)
+_PAIRED_SHAPE_SETS = {"official21": _OFFICIAL_SHAPES, "h8": _H8_SHAPES}
+_STATE_DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 _ABBA_ORDER = ("baseline", "candidate", "candidate", "baseline")
 _ORIGINAL_SHAPES = tuple(shape for shape in _OFFICIAL_SHAPES if shape[0] != 32)
 _FULL_DOMAIN_HEADS = (12, 24, 32, 48, 96)
@@ -100,15 +111,15 @@ _EXACT_PR_FALLBACK_SYMBOLS = (
 )
 
 
-def _page_strides(num_heads):
+def _page_strides(num_heads, state_dtype=torch.float32):
     hidden_size = num_heads * _HEAD_DIM
     conv_slot_bytes = 3 * hidden_size * 3 * torch.bfloat16.itemsize
-    state_slot_bytes = num_heads * _HEAD_DIM * _HEAD_DIM * torch.float32.itemsize
+    state_slot_bytes = num_heads * _HEAD_DIM * _HEAD_DIM * state_dtype.itemsize
     page_bytes = conv_slot_bytes + state_slot_bytes
-    return page_bytes // torch.bfloat16.itemsize, page_bytes // torch.float32.itemsize
+    return page_bytes // torch.bfloat16.itemsize, page_bytes // state_dtype.itemsize
 
 
-def _make_inputs(num_heads, num_rows, seed=42):
+def _make_inputs(num_heads, num_rows, seed=42, state_dtype=torch.float32):
     device = torch.device("cuda")
     hidden_size = num_heads * _HEAD_DIM
     num_slots = num_rows + 1
@@ -120,7 +131,7 @@ def _make_inputs(num_heads, num_rows, seed=42):
         ).to(dtype)
 
     x_storage = randn((num_rows, 3 * hidden_size + 17), torch.bfloat16)
-    conv_slot_stride, state_slot_stride = _page_strides(num_heads)
+    conv_slot_stride, state_slot_stride = _page_strides(num_heads, state_dtype)
     conv_state = torch.empty_strided(
         (num_slots, 3 * hidden_size, 3),
         (conv_slot_stride, 1, 3 * hidden_size),
@@ -131,7 +142,7 @@ def _make_inputs(num_heads, num_rows, seed=42):
     state = torch.empty_strided(
         (num_slots, num_heads, _HEAD_DIM, _HEAD_DIM),
         (state_slot_stride, _HEAD_DIM * _HEAD_DIM, _HEAD_DIM, 1),
-        dtype=torch.float32,
+        dtype=state_dtype,
         device=device,
     )
     state_values = randn((num_slots, num_heads, _HEAD_DIM, _HEAD_DIM), torch.float32)
@@ -282,7 +293,11 @@ def _cake_program_record(repo_root, target="sm100a"):
 
 def _run_worker(args):
     _require_gpu_and_cupti(allow_b300=True)
-    inputs = _make_inputs(args.worker_heads, args.worker_rows)
+    inputs = _make_inputs(
+        args.worker_heads,
+        args.worker_rows,
+        state_dtype=_STATE_DTYPES[args.worker_state_dtype],
+    )
     variant_name = None
 
     if args.worker_backend == "baseline":
@@ -349,6 +364,7 @@ def _run_worker(args):
         "backend": args.worker_backend,
         "num_heads": args.worker_heads,
         "num_rows": args.worker_rows,
+        "state_dtype": args.worker_state_dtype,
         "variant_name": variant_name,
         "samples_ms": [float(value) for value in samples],
     }
@@ -367,6 +383,8 @@ def _worker_command(args, backend, num_heads, num_rows, output_path):
         str(num_heads),
         "--worker-rows",
         str(num_rows),
+        "--worker-state-dtype",
+        args.state_dtype,
         "--worker-json",
         str(output_path),
         "--dry-run-iters",
@@ -407,7 +425,7 @@ def _validate_samples(samples, repeat_iters, description):
     return samples
 
 
-def _validate_row(row, index, repeat_iters):
+def _validate_row(row, index, repeat_iters, shapes=_OFFICIAL_SHAPES):
     if not isinstance(row, dict):
         raise RuntimeError("checkpoint row must be an object")
     expected_row_fields = {
@@ -421,7 +439,7 @@ def _validate_row(row, index, repeat_iters):
     }
     if set(row) != expected_row_fields:
         raise RuntimeError("checkpoint row schema is invalid")
-    num_heads, num_rows = _OFFICIAL_SHAPES[index]
+    num_heads, num_rows = shapes[index]
     shape = f"h{num_heads}_rows{num_rows}"
     if (
         row.get("shape") != shape
@@ -430,7 +448,7 @@ def _validate_row(row, index, repeat_iters):
         or type(row.get("num_rows")) is not int
         or row.get("num_rows") != num_rows
     ):
-        raise RuntimeError("checkpoint rows are not an official-shape prefix")
+        raise RuntimeError("checkpoint rows are not a prefix of the requested shapes")
     measurements = row.get("measurements")
     if not isinstance(measurements, list) or len(measurements) != len(_ABBA_ORDER):
         raise RuntimeError(f"{shape} does not contain the four ABBA cells")
@@ -488,25 +506,31 @@ def _geometric_mean(values):
     return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
-def _summarize(rows):
+def _summarize(rows, shapes=_OFFICIAL_SHAPES):
     speedups = [row["speedup"] for row in rows]
-    original_shapes = set(_ORIGINAL_SHAPES)
-    original_speedups = [
-        row["speedup"]
-        for row in rows
-        if (row["num_heads"], row["num_rows"]) in original_shapes
-    ]
-    if len(original_speedups) != len(_ORIGINAL_SHAPES):
-        raise RuntimeError("rows do not cover the original 17 shapes")
-    return {
+    if len(rows) != len(shapes):
+        raise RuntimeError("rows do not cover every requested shape")
+    summary = {
         "shape_count": len(rows),
         "baseline_geomean_ms": _geometric_mean([row["baseline_ms"] for row in rows]),
         "candidate_geomean_ms": _geometric_mean([row["candidate_ms"] for row in rows]),
-        "official21_geomean_speedup": _geometric_mean(speedups),
-        "original17_geomean_speedup": _geometric_mean(original_speedups),
-        "minimum_speedup": min(speedups),
-        "every_shape_faster": all(speedup > 1.0 for speedup in speedups),
     }
+    if shapes is _OFFICIAL_SHAPES:
+        original_shapes = set(_ORIGINAL_SHAPES)
+        original_speedups = [
+            row["speedup"]
+            for row in rows
+            if (row["num_heads"], row["num_rows"]) in original_shapes
+        ]
+        if len(original_speedups) != len(_ORIGINAL_SHAPES):
+            raise RuntimeError("rows do not cover the original 17 shapes")
+        summary["official21_geomean_speedup"] = _geometric_mean(speedups)
+        summary["original17_geomean_speedup"] = _geometric_mean(original_speedups)
+    else:
+        summary["geomean_speedup"] = _geometric_mean(speedups)
+    summary["minimum_speedup"] = min(speedups)
+    summary["every_shape_faster"] = all(speedup > 1.0 for speedup in speedups)
+    return summary
 
 
 def _validate_summary(observed, expected):
@@ -523,7 +547,7 @@ def _validate_summary(observed, expected):
             _require_close(observed.get(field), value, f"checkpoint summary {field}")
 
 
-def _load_checkpoint(path, *, identity, measurement_config):
+def _load_checkpoint(path, *, identity, measurement_config, shapes):
     if not path.is_file():
         return [], False
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -541,17 +565,17 @@ def _load_checkpoint(path, *, identity, measurement_config):
     if payload.get("measurement") != measurement_config:
         raise RuntimeError("checkpoint measurement settings do not match this run")
     rows = payload.get("rows")
-    if not isinstance(rows, list) or len(rows) > len(_OFFICIAL_SHAPES):
+    if not isinstance(rows, list) or len(rows) > len(shapes):
         raise RuntimeError("checkpoint rows are invalid")
     for index, row in enumerate(rows):
-        _validate_row(row, index, measurement_config["repeat_iters_per_cell"])
+        _validate_row(row, index, measurement_config["repeat_iters_per_cell"], shapes)
     status = payload.get("status")
     if status not in ("in_progress", "complete"):
         raise RuntimeError(f"unsupported checkpoint status {status!r}")
-    if status == "complete" and len(rows) != len(_OFFICIAL_SHAPES):
-        raise RuntimeError("complete checkpoint does not contain every official shape")
+    if status == "complete" and len(rows) != len(shapes):
+        raise RuntimeError("complete checkpoint does not contain every requested shape")
     if status == "complete":
-        _validate_summary(payload.get("summary"), _summarize(rows))
+        _validate_summary(payload.get("summary"), _summarize(rows, shapes))
     elif "summary" in payload:
         raise RuntimeError("in-progress checkpoint unexpectedly contains a summary")
     return rows, status == "complete"
@@ -571,6 +595,7 @@ def _benchmark_payload(*, status, identity, measurement_config, rows, summary=No
 
 def _run_paired_benchmark(args):
     cupti_version, target = _require_gpu_and_cupti(allow_b300=True)
+    shapes = _PAIRED_SHAPE_SETS[args.shapes]
     repo_root = Path(__file__).resolve().parents[1]
     output_path = Path(args.output_json).resolve()
     try:
@@ -633,9 +658,15 @@ def _run_paired_benchmark(args):
         "order": list(_ABBA_ORDER),
         "dry_run_iters": args.dry_run_iters,
         "repeat_iters_per_cell": args.repeat_iters,
+        "shapes": args.shapes,
+        "state_dtype": args.state_dtype,
+        "state_indices_mode": "positive_unique",
     }
     rows, complete = _load_checkpoint(
-        output_path, identity=identity, measurement_config=measurement_config
+        output_path,
+        identity=identity,
+        measurement_config=measurement_config,
+        shapes=shapes,
     )
     if complete:
         print(f"checkpoint is already complete: {output_path}", flush=True)
@@ -646,7 +677,7 @@ def _run_paired_benchmark(args):
     ) as temporary_directory:
         temporary_path = Path(temporary_directory)
         for shape_index, (num_heads, num_rows) in enumerate(
-            _OFFICIAL_SHAPES[len(rows) :], start=len(rows)
+            shapes[len(rows) :], start=len(rows)
         ):
             backend_samples = {"baseline": [], "candidate": []}
             measurements = []
@@ -663,6 +694,7 @@ def _run_paired_benchmark(args):
                     worker_measurement.get("backend") != backend
                     or worker_measurement.get("num_heads") != num_heads
                     or worker_measurement.get("num_rows") != num_rows
+                    or worker_measurement.get("state_dtype") != args.state_dtype
                 ):
                     raise RuntimeError("worker result does not match its request")
                 variant_name = worker_measurement.get("variant_name")
@@ -701,7 +733,7 @@ def _run_paired_benchmark(args):
                     "measurements": measurements,
                 }
             )
-            _validate_row(rows[-1], shape_index, args.repeat_iters)
+            _validate_row(rows[-1], shape_index, args.repeat_iters, shapes)
             _write_json_atomic(
                 output_path,
                 _benchmark_payload(
@@ -718,7 +750,7 @@ def _run_paired_benchmark(args):
                 flush=True,
             )
 
-    summary = _summarize(rows)
+    summary = _summarize(rows, shapes)
     _write_json_atomic(
         output_path,
         _benchmark_payload(
@@ -729,6 +761,7 @@ def _run_paired_benchmark(args):
             summary=summary,
         ),
     )
+    print(json.dumps(summary, indent=2), flush=True)
 
 
 def _canonical_json_sha256(payload):
@@ -1388,7 +1421,10 @@ def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json")
     parser.add_argument(
-        "--shapes", choices=("official21", "full-domain"), default="official21"
+        "--shapes", choices=("official21", "h8", "full-domain"), default="official21"
+    )
+    parser.add_argument(
+        "--state-dtype", choices=tuple(_STATE_DTYPES), default="float32"
     )
     parser.add_argument(
         "--baseline", choices=("public-fallback",), default="public-fallback"
@@ -1405,6 +1441,9 @@ def _parse_args():
     parser.add_argument("--worker-backend", choices=("baseline", "candidate"))
     parser.add_argument("--worker-heads", type=int)
     parser.add_argument("--worker-rows", type=int)
+    parser.add_argument(
+        "--worker-state-dtype", choices=tuple(_STATE_DTYPES), default="float32"
+    )
     parser.add_argument("--worker-json")
     args = parser.parse_args()
     if args.dry_run_iters < 1 or args.repeat_iters < 1:
@@ -1427,6 +1466,8 @@ def _parse_args():
             parser.error(
                 "full-domain requires 5 warmups and 16 timed replays per ABBA cell"
             )
+        if args.shapes != "h8" and args.state_dtype != "float32":
+            parser.error("only --shapes h8 supports a non-FP32 recurrent state")
     return args
 
 

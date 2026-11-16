@@ -16,7 +16,7 @@ VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
 PYTORCH_INDEX_PATTERN = re.compile(r"^(?:nightly/)?cu[0-9]+$")
 IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9._-]*$")
 CUDNN_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
-ARCH_LIST_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[a-z]?(?: [0-9]+\.[0-9]+[a-z]?)*$")
+ARCHITECTURE_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[af]?$")
 DEPENDENCY_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEPENDENCY_VERSION_PATTERN = re.compile(
     r"^(?P<release>[0-9]+(?:\.[0-9]+)*)(?:(?P<phase>a|b|rc)(?P<serial>[0-9]+))?$"
@@ -56,6 +56,68 @@ def _entries(config: dict[str, Any], section: str) -> list[dict[str, Any]]:
     ]
 
 
+def _architecture_array(entry: dict[str, Any], field: str, context: str) -> list[str]:
+    value = entry.get(field)
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(architecture, str)
+            or ARCHITECTURE_PATTERN.fullmatch(architecture) is None
+            for architecture in value
+        )
+    ):
+        raise ConfigError(f"{context}.{field} has an invalid value: {value!r}")
+    if len(value) != len(set(value)):
+        raise ConfigError(f"{context}.{field} contains duplicate architectures")
+    return value
+
+
+def _provider_tag(architecture: str) -> str:
+    return f"sm{architecture.replace('.', '')}"
+
+
+def build_jit_cache_provider_matrix(config: dict[str, Any]) -> list[dict[str, str]]:
+    matrix = []
+    for entry in config["jit_cache"]:
+        for cpu_architecture in ("x86_64", "aarch64"):
+            field = f"{cpu_architecture}_provider_architectures"
+            for provider_architecture in entry[field]:
+                matrix.append(
+                    {
+                        "cuda_label": entry["label"],
+                        "cuda_version": entry["version"],
+                        "pytorch_index": entry["pytorch_index"],
+                        "cpu_architecture": cpu_architecture,
+                        "provider_architecture": provider_architecture,
+                        "provider_tag": _provider_tag(provider_architecture),
+                    }
+                )
+    return matrix
+
+
+def build_jit_cache_shim_matrix(config: dict[str, Any]) -> list[dict[str, str]]:
+    matrix = []
+    for entry in config["jit_cache"]:
+        for cpu_architecture in ("x86_64", "aarch64"):
+            field = f"{cpu_architecture}_provider_architectures"
+            provider_architectures = entry[field]
+            matrix.append(
+                {
+                    "cuda_label": entry["label"],
+                    "cuda_version": entry["version"],
+                    "pytorch_index": entry["pytorch_index"],
+                    "cpu_architecture": cpu_architecture,
+                    "provider_architectures": " ".join(provider_architectures),
+                    "provider_tags": " ".join(
+                        _provider_tag(architecture)
+                        for architecture in provider_architectures
+                    ),
+                }
+            )
+    return matrix
+
+
 def _version_key(version: str) -> tuple[int, ...]:
     match = DEPENDENCY_VERSION_PATTERN.fullmatch(version)
     if match is None:
@@ -72,7 +134,7 @@ def _toml_string_arrays(path: Path, section: str) -> dict[str, list[str]]:
     """Read the simple string arrays used by a pyproject table."""
     values: dict[str, list[str]] = {}
     in_section = False
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.startswith("["):
             if in_section:
@@ -123,7 +185,7 @@ def _validate_dependency_policy(
     requirements_path = repo_root / "requirements.txt"
     requirements = {
         line.strip()
-        for line in requirements_path.read_text().splitlines()
+        for line in requirements_path.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
     optional_dependencies = _toml_string_arrays(
@@ -245,7 +307,7 @@ def _validate_devcontainer(
         raise ConfigError(f"missing development container for {label}: {path}")
 
     try:
-        devcontainer = _mapping(json.loads(path.read_text()), str(path))
+        devcontainer = _mapping(json.loads(path.read_text(encoding="utf-8")), str(path))
     except json.JSONDecodeError as error:
         raise ConfigError(f"invalid JSON in {path}: {error}") from error
 
@@ -298,8 +360,8 @@ def validate_cuda_config(config: Any, repo_root: Path) -> None:
         label, _, _ = _validate_identity(entry, context)
         if label in jit_by_label:
             raise ConfigError(f"duplicate JIT-cache label: {label}")
-        _string(entry, "x86_64_arch_list", context, ARCH_LIST_PATTERN)
-        _string(entry, "aarch64_arch_list", context, ARCH_LIST_PATTERN)
+        _architecture_array(entry, "x86_64_provider_architectures", context)
+        _architecture_array(entry, "aarch64_provider_architectures", context)
         jit_by_label[label] = entry
 
     missing_jit = sorted(runtime_by_label.keys() - jit_by_label.keys())
@@ -333,20 +395,32 @@ def main() -> int:
         default=default_root / "ci" / "cuda-versions.json",
     )
     parser.add_argument("--repo-root", type=Path, default=default_root)
+    parser.add_argument(
+        "--matrix",
+        choices=("providers", "shims"),
+        help="Print a compact GitHub Actions matrix after validation",
+    )
     args = parser.parse_args()
 
     try:
-        config = json.loads(args.config.read_text())
+        config = json.loads(args.config.read_text(encoding="utf-8"))
         validate_cuda_config(config, args.repo_root)
     except (ConfigError, OSError, json.JSONDecodeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
 
-    print(
-        "Validated CUDA configuration: "
-        f"{len(config['runtime'])} runtime images, "
-        f"{len(config['jit_cache'])} JIT-cache targets"
-    )
+    if args.matrix == "providers":
+        print(
+            json.dumps(build_jit_cache_provider_matrix(config), separators=(",", ":"))
+        )
+    elif args.matrix == "shims":
+        print(json.dumps(build_jit_cache_shim_matrix(config), separators=(",", ":")))
+    else:
+        print(
+            "Validated CUDA configuration: "
+            f"{len(config['runtime'])} runtime images, "
+            f"{len(config['jit_cache'])} JIT-cache targets"
+        )
     return 0
 
 

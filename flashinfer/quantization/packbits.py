@@ -132,6 +132,7 @@ def segment_packbits(
     output_nnzs = indptr_new[-1].item()
 
     device = x.device
+    x = x.to(torch.bool)
     indptr = indptr.to(torch.int32)
     indptr_new = indptr_new.to(torch.int32)
     y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)

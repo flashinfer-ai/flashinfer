@@ -519,7 +519,7 @@ def test_gvr2_workspace_override():
 # ---------------------------------------------------------------------------
 
 
-def _assert_family(rows, msl_c, top_k, next_n, cr, want):
+def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
     """The varlen launcher must admit the same family the free route picks."""
     key = (
         rows,
@@ -528,6 +528,8 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want):
         msl_c,
         next_n,
         cr,
+        hint_free,
+        None,  # page_shift: unpaged output
         _host._arch_token(),
         _host._sm_count(),
     )
@@ -541,6 +543,25 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want):
     "rows,msl_c,top_k,next_n,cr,family",
     [
         (8, 131072, 1024, 4, 4, "reg_clus"),  # clustered register-resident
+        (8, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC admitted (local), CS=4
+        (64, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC, CS=2, one wave
+        (
+            4,
+            65536,
+            2048,
+            2,
+            1,
+            "reg_clus",
+        ),  # K > BLKC above 32K, CS=8, next_n rows (one wave on every part)
+        (
+            100,
+            65536,
+            512,
+            1,
+            1,
+            "main",
+        ),  # unsplit 75-148 row slab: two-CTA (512, 8, 2) regime (local)
+        (148, 32768, 2048, 1, 1, "main"),  # same regime, K > 1024 (KPT 4)
         (8, 6144, 512, 1, 4, "reg"),  # register-resident (local VPT=2 rung)
         (8, 8192, 512, 1, 1, "reg"),  # local VPT=2 rung, top of its band
         (256, 8192, 512, 1, 1, "reg"),  # local b > 148 BLK=512 rung (upstream: main)
@@ -1063,6 +1084,78 @@ def test_gvr2_sequential_warmup_populates_exact_launchers():
 
 
 @requires_gvr2
+@pytest.mark.parametrize("page_size", [None, 64], ids=["unpaged", "paged64"])
+def test_gvr2_warmup_launches_both_staged_output_variants(page_size):
+    """The register family's staged-output emit is a compile dimension picked
+    by the row count (one wave, rows <= SMs, stages; deeper grids emit
+    directly), so one register band holds two kernel objects. warmup_varlen's
+    band key did not include it: for a band spanning the SM count (N = 2048,
+    K = 512 covers every row count) only the one-wave variant got an eager
+    launch, and the many-wave variant was compiled by the final launcher
+    population without ever being called, leaving its first-call gate cold
+    for the capture that follows. next_n = 3 gives this test compile keys no
+    other test warms, so the objects are cold beforehand."""
+    top_k, msl, nn = 512, 2048, 3
+    sms = _host._sm_count()
+    rows = nn * sms  # past the SM count: the many-wave (direct-emit) variant
+    npad = _round64(msl)
+    page_shift = None if page_size is None else page_size.bit_length() - 1
+    modes = [(False, None), (True, None)]  # (hint_free, page_shift)
+    if page_shift is not None:
+        modes.append((True, page_shift))
+
+    def launcher(r, hf, ps):
+        hits = [
+            lc
+            for key, lc in _host._VARLEN_CACHE.items()
+            if key[:5] == (r, npad, top_k, msl, nn) and key[6:8] == (hf, ps)
+        ]
+        assert len(hits) == 1, (
+            f"{len(hits)} launchers: rows={r} hint_free={hf} page_shift={ps}"
+        )
+        return hits[0]
+
+    _host.warmup_varlen(
+        top_k, msl, next_n=nn, num_rows_list=(rows,), page_size=page_size
+    )
+    torch.cuda.synchronize()
+    for hf, ps in modes:
+        many = launcher(rows, hf, ps)  # the requested geometry (many waves)
+        one = launcher(nn, hf, ps)  # the band's first-row representative (one wave)
+        assert many[0] == one[0] == "reg", (many[0], one[0])
+        assert many[1] is not one[1], "the two row counts must compile distinct objects"
+        assert _host._first_call_done(one[1]), (
+            f"one-wave variant cold: hint_free={hf} page_shift={ps}"
+        )
+        assert _host._first_call_done(many[1]), (
+            f"many-wave variant cold: hint_free={hf} page_shift={ps}"
+        )
+    # the capture the warmup is for, at the requested geometry (hint-free, and
+    # paged through an identity table so slots are columns)
+    gen = torch.Generator(device=_DEV).manual_seed(31)
+    logits = torch.randn(rows, npad, generator=gen, device=_DEV) - 2.0
+    batch = rows // nn
+    seq_lens = torch.full((batch,), msl, dtype=torch.int32, device=_DEV)
+    out = torch.empty(rows, top_k, dtype=torch.int32, device=_DEV)
+    kw = {}
+    if page_size is not None:
+        pt = torch.arange(npad // page_size, dtype=torch.int32, device=_DEV)
+        kw = dict(page_table=pt.repeat(batch, 1).contiguous(), page_size=page_size)
+    s = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out, next_n=nn, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(
+        logits, out, _row_valid_lens([msl] * batch, rows, nn, 1, msl), top_k
+    )
+
+
+@requires_gvr2
 def test_gvr2_rejects_overlapping_rows():
     """stride(0) < shape[1] (an expand view) is not a row-major layout the
     kernel can address; the checker used to derive npad = 0 from it and
@@ -1199,6 +1292,12 @@ def test_gvr2_route_pure_and_total():
         ([8192, 5000, 300, 1], 1, 1, 512),  # reg VPT=2 rung + short rows
         ([8192 * 4, 6000 * 4, 2048 * 4], 2, 4, 512),  # MTP rows, cr=4
         ([65536, 40000, 1000], 1, 1, 1024),  # reg_clus band
+        (
+            [32768, 20000, 2049, 2048, 1500, 1],
+            1,
+            1,
+            2048,
+        ),  # reg_clus, K > BLKC: short rows stride the identity write
         ([262144, 100000, 2047], 1, 1, 2048),  # main/clus band, K=2048
         ([8192] * 200 + [100] * 56, 1, 1, 512),  # b > sms BLK=512/VPT=4 rung
     ],
@@ -1226,10 +1325,46 @@ def test_gvr2_hint_free_exact(kv, next_n, cr, top_k):
 
 
 @requires_gvr2
+@pytest.mark.parametrize("hinted", [True, False], ids=["hinted", "hint_free"])
+@pytest.mark.parametrize("n", [4160, 8192])
+@pytest.mark.parametrize("rows", [600, 1024])
+def test_gvr2_k2048_register_rung_oracle(rows, n, hinted):
+    """GPU oracle for the FlashInfer-local K = 2048 register rung (BLK=512,
+    VPT=4, MINB=2), admitted through 1024 rows over the whole 4K < n <= 8K
+    band (upstream: 592 rows); the route tests pin only the selection. Mixed
+    lengths (short rows, rows at K and K + 1, full rows), hinted and
+    hint-free, at the newly admitted 600 / 1024 row counts and both band
+    edges."""
+    from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
+
+    top_k = 2048
+    gen = torch.Generator(device=_DEV).manual_seed(rows + n)
+    kv = torch.randint(1, n + 1, (rows,), generator=gen, device=_DEV).tolist()
+    kv[0] = n  # pin the envelope so route sees the full width
+    kv[1], kv[2], kv[3] = (
+        top_k,
+        top_k + 1,
+        1,
+    )  # identity edge, first real row, 1-token row
+    logits, seq_lens, pre_idx, n_r, msl_c = _make_varlen_case(
+        kv, 1, 1, top_k, seed=rows, msl_c=_round64(n)
+    )
+    plan = _host.route(rows, msl_c, msl_c, top_k, sms=_host._sm_count())
+    assert plan["kernel"] == "reg" and plan["tpl"][:3] == (512, 4, 2), plan["tpl"]
+    indices, values = _run_gvr2(
+        logits, seq_lens, top_k, pre_idx if hinted else None, return_values=True
+    )
+    _check_varlen_rows(logits, indices, n_r, top_k, values)
+
+
+@requires_gvr2
 def test_gvr2_hint_free_cuda_graph_replay():
-    """Hint-free calls replay under CUDA graphs: the arange table is a stable
-    per-(device, k) address, growth happens only eagerly (refused under
-    capture), and seq_lens contents may change between replays."""
+    """Hint-free calls replay under CUDA graphs: the hint-free engines are
+    distinct compiled objects (hint-gather sites compiled out, TRT-LLM #18410),
+    so hint mode IS a warm-up dimension — a hinted eager call does not warm a
+    hint-free capture of the same geometry (raises loudly under capture), an
+    eager hint-free call or ``warmup_varlen`` does; seq_lens contents may
+    change between replays."""
     from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
 
     top_k, n = 512, 8192
@@ -1239,7 +1374,7 @@ def test_gvr2_hint_free_cuda_graph_replay():
     )
     out = torch.empty(len(kv_a), top_k, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()  # every eager warm-up below runs on the capturing stream
-    # eager call: compiles the launcher and sizes the table
+    # eager hint-free call: compiles the hint-free launcher
     with torch.cuda.stream(s):
         _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
     torch.cuda.synchronize()
@@ -1261,11 +1396,10 @@ def test_gvr2_hint_free_cuda_graph_replay():
     g.replay()
     torch.cuda.synchronize()
     _check_varlen_rows(logits, out, n_r_b, top_k)
-    # hint mode is not a warm-up dimension: a HINTED eager call at a larger
-    # batch also sizes the anchor table, so a hint-free capture of the same
-    # geometry succeeds without any hint-free eager call
-    cap0 = _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0]
-    big = 4 * len(kv_a) + cap0
+    # hint mode IS a warm-up dimension: a HINTED eager call at a new batch
+    # compiles only the hinted launcher, so a hint-free capture of the same
+    # geometry is refused; one eager hint-free call then makes it succeed
+    big = 4 * len(kv_a) + 3
     logits_b = torch.randn(big, n, device=_DEV)
     seq_b = torch.full((big,), n, dtype=torch.int32, device=_DEV)
     hint = torch.zeros(big, top_k, dtype=torch.int32, device=_DEV)
@@ -1273,7 +1407,18 @@ def test_gvr2_hint_free_cuda_graph_replay():
     with torch.cuda.stream(s):  # hinted eager warm-up, on the capturing stream
         _run_gvr2(logits_b, seq_b, top_k, hint, out_indices=out_b)
     torch.cuda.synchronize()
-    assert _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0] >= big
+    g2 = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with (
+        pytest.raises(RuntimeError, match="varlen launcher not compiled"),
+        torch.cuda.stream(s),
+        torch.cuda.graph(g2, stream=s),
+    ):
+        _run_gvr2(logits_b, seq_b, top_k, None, out_indices=out_b)
+    torch.cuda.synchronize()
+    with torch.cuda.stream(s):
+        _run_gvr2(logits_b, seq_b, top_k, None, out_indices=out_b)
+    torch.cuda.synchronize()
     g2 = torch.cuda.CUDAGraph()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s), torch.cuda.graph(g2, stream=s):
@@ -1282,27 +1427,22 @@ def test_gvr2_hint_free_cuda_graph_replay():
     g2.replay()
     torch.cuda.synchronize()
     _check_varlen_rows(logits_b, out_b, [n] * big, top_k)
-    # table growth under capture is refused: a batch no eager call has seen
-    huge = 2 * _host._HINT_FREE[(torch.cuda.current_device(), top_k)].shape[0] + 8
+    # a batch no eager call has seen is refused under capture ...
+    huge = 4 * big + 8
     logits_h = torch.randn(huge, n, device=_DEV)
     seq_h = torch.full((huge,), n, dtype=torch.int32, device=_DEV)
     out_h = torch.empty(huge, top_k, dtype=torch.int32, device=_DEV)
-    # compile the launcher for this row count on the capturing stream, but
-    # with a hint from a table-free path: legacy warmup_varlen cannot help here
-    # since it would size the table too, so capture straight away
     g3 = torch.cuda.CUDAGraph()
     s.wait_stream(torch.cuda.current_stream())
     with (
-        pytest.raises(
-            RuntimeError, match="hint-free gvr_2|varlen launcher not compiled"
-        ),
+        pytest.raises(RuntimeError, match="varlen launcher not compiled"),
         torch.cuda.stream(s),
         torch.cuda.graph(g3, stream=s),
     ):
         _run_gvr2(logits_h, seq_h, top_k, None, out_indices=out_h)
     torch.cuda.synchronize()
-    # warmup_varlen sizes the table for its largest batch, so the same
-    # capture then succeeds
+    # ... and warmup_varlen compiles BOTH hint modes for its row counts, so
+    # the same capture then succeeds
     with torch.cuda.stream(s):
         _host.warmup_varlen(top_k, n, num_rows_list=(huge,))
     torch.cuda.synchronize()
@@ -1331,10 +1471,11 @@ def test_gvr2_hint_free_host_requires_top_k():
 
 
 def test_gvr2_route_local_rungs():
-    """The two FlashInfer-local rungs (4K < n <= 8K): VPT=2 for b <= 148,
+    """The FlashInfer-local rungs (4K < n <= 8K): VPT=2 for b <= 148,
     BLK=512/VPT=4/MINB=2 for 148 < b <= 296 (one wave) — with NBH == IMGOFF
-    (asserted at launch) — the main slab beyond one wave, and the upstream
-    VPT=4 rung untouched above 8K."""
+    (asserted at launch) — a second wave (b <= 592) for n >= 6144, the same
+    kernel up to 1024 rows for K = 2048 at every n of the band, the main slab
+    beyond, and the upstream VPT=4 rung untouched above 8K."""
     from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
 
     for k in (512, 1024, 2048):
@@ -1354,12 +1495,19 @@ def test_gvr2_route_local_rungs():
             )
             assert p["rt"]["IMGOFF"] == p["tpl"][7] == _host.NB
             assert _host.route(296, n, _round64(n), k)["tpl"][:3] == (512, 4, 2)
-            # second wave only for the upper half of the band (n4 >= 1536)
-            second = "reg" if n >= 6144 else "main"
+            # second wave only for the upper half of the band (n4 >= 1536);
+            # K = 2048 keeps the register kernel up to 1024 rows at every n
+            second = "reg" if (n >= 6144 or k == 2048) else "main"
+            beyond = "reg" if k == 2048 else "main"
             assert _host.route(297, n, _round64(n), k)["kernel"] == second
             assert _host.route(512, n, _round64(n), k)["kernel"] == second
             assert _host.route(592, n, _round64(n), k)["kernel"] == second
-            assert _host.route(593, n, _round64(n), k)["kernel"] == "main"
+            assert _host.route(593, n, _round64(n), k)["kernel"] == beyond
+            p = _host.route(1024, n, _round64(n), k)
+            assert p["kernel"] == beyond
+            if k == 2048:
+                assert p["tpl"][:3] == (512, 4, 2) and p["rt"]["IMGOFF"] == _host.NB
+            assert _host.route(1025, n, _round64(n), k)["kernel"] == "main"
         p = _host.route(8, 12288, 12288, k)
         assert p["kernel"] == "reg" and p["tpl"][:3] == (1024, 4, 1)
         p = _host.route(256, 12288, 12288, k)
@@ -1399,14 +1547,17 @@ def test_gvr2_route_sm_count_aware():
                 _host.route(sms, 12288, 12288, k)["kernel"] == "main"
             )  # default 148: slab
             # wave cutoffs of the BLK=512 rung scale with sms: one wave for the
-            # whole band, a second wave (<= 4*sms) only from n=6144 up
+            # whole band, a second wave (<= 4*sms) only from n=6144 up; K=2048
+            # keeps the register kernel up to 1024 rows regardless of sms
+            beyond = "reg" if k == 2048 else "main"
             for n_, b_, want in (
                 (8192, 2 * sms, "reg"),
                 (6140, 2 * sms, "reg"),
                 (8192, 4 * sms, "reg"),
                 (6144, 4 * sms, "reg"),
-                (8192, 4 * sms + 1, "main"),
-                (6140, 2 * sms + 1, "main"),
+                (8192, 4 * sms + 1, beyond if 4 * sms + 1 <= 1024 else "main"),
+                (6140, 2 * sms + 1, beyond),
+                (8192, 1025, "main"),
             ):
                 p = _host.route(b_, n_, n_, k, sms=sms)
                 assert p["kernel"] == want, (k, sms, n_, b_, p["kernel"])
@@ -1433,54 +1584,126 @@ def test_gvr2_route_sm_count_aware():
 
 
 @requires_gvr2
-def test_gvr2_hint_free_table_growth_is_serialized_and_stream_ordered():
-    """Concurrent cold-start / growth of the hint-free anchor table from several
-    threads on several streams: the published capacity is the maximum ever
-    requested (never a smaller table overwriting a larger one), every row of
-    the published table reads arange(k) from any stream, and hint-free calls
-    on every stream are exact afterwards."""
+def test_gvr2_hint_free_concurrent_first_calls_on_many_streams_are_exact():
+    """Hint-free cold start from several threads on several streams at several
+    batches: the hint-free engines hold no per-batch host state (no anchor
+    table since TRT-LLM #18410 was ported), so every call is exact and no
+    thread sees an error."""
     import threading
 
     top_k, n = 1024, 8192
-    key = (torch.cuda.current_device(), top_k)
-    with _host._HINT_FREE_LOCK:
-        _host._HINT_FREE.pop(key, None)  # cold start for this k
     batches = [8, 200, 64, 512, 16, 300, 128, 40]
     streams = [torch.cuda.Stream() for _ in batches]
+    logits = torch.randn(max(batches), n, device=_DEV)
+    seq = torch.full((max(batches),), n, dtype=torch.int32, device=_DEV)
+    outs = [torch.full((b, top_k), -7, dtype=torch.int32, device=_DEV) for b in batches]
+    torch.cuda.synchronize()
     errors = []
-    barrier = threading.Barrier(len(batches))
+    barrier = threading.Barrier(len(batches), timeout=120)
 
-    def grow(i, b):
+    def run(i, b):
         try:
             with torch.cuda.stream(streams[i]):
                 barrier.wait()
-                t = _host._hint_free_pre_idx(b, top_k, torch.device("cuda"))
-                assert t.shape == (b, top_k)
+                _run_gvr2(logits[:b], seq[:b], top_k, None, out_indices=outs[i])
+                streams[i].synchronize()
         except Exception as e:  # noqa: BLE001
             errors.append(e)
 
-    threads = [
-        threading.Thread(target=grow, args=(i, b)) for i, b in enumerate(batches)
-    ]
+    threads = [threading.Thread(target=run, args=(i, b)) for i, b in enumerate(batches)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
     assert not errors, errors
-    table = _host._HINT_FREE[key]
-    assert table.shape[0] >= max(batches), table.shape
-    ref = torch.arange(top_k, dtype=torch.int32, device=_DEV)
-    for s in streams:  # complete contents visible from every stream
-        with torch.cuda.stream(s):
-            assert bool((table == ref).all())
-    torch.cuda.synchronize()
-    logits = torch.randn(max(batches), n, device=_DEV)
-    seq = torch.full((max(batches),), n, dtype=torch.int32, device=_DEV)
-    for s, b in zip(streams, batches, strict=True):
-        with torch.cuda.stream(s):
-            idx, _ = _run_gvr2(logits[:b], seq[:b], top_k, None)
-        torch.cuda.synchronize()
-        _check_varlen_rows(logits[:b], idx, [n] * b, top_k)
+    for b, out in zip(batches, outs, strict=True):
+        _check_varlen_rows(logits[:b], out, [n] * b, top_k)
+
+
+def test_gvr2_route_reg_clus_k2048():
+    """K = 2048 is admitted to the clustered register family (FlashInfer-local;
+    upstream gates it at k <= BLKC): every admitted row count up to 32K, and
+    above 32K only while the cluster grid fits one GPC wave (b * cs <= 7/8 of
+    the SM count: 129 on B200, 182 on Rubin)."""
+    r = _host.route
+    for n in (20480, 32768):
+        assert r(1, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        assert (
+            r(37, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        )  # 148 CTAs, still beats the slab here
+        assert r(64, n, _round64(n), 2048)["tpl"] == (1024, 4, 2)
+        assert (
+            r(75, n, _round64(n), 2048)["kernel"] == "main"
+        )  # no cluster fits (av == 1)
+    for n in (49152, 65536):
+        assert r(1, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        assert r(32, n, _round64(n), 2048)["tpl"] == (
+            1024,
+            4,
+            4,
+        )  # 128 CTAs: one wave on B200
+        assert (
+            r(37, n, _round64(n), 2048)["kernel"] == "main"
+        )  # 148 CTAs of 4-clusters: two waves on B200
+        assert r(44, n, _round64(n), 2048, sms=208)["tpl"] == (
+            1024,
+            4,
+            4,
+        )  # Rubin: 176 CTAs fit
+        assert (
+            r(52, n, _round64(n), 2048, sms=208)["kernel"] == "main"
+        )  # Rubin: 208 CTAs do not
+    # K <= BLKC admission unchanged by the wave gate
+    assert r(37, 65536, 65536, 1024)["kernel"] == "reg_clus"
+    assert (
+        r(1, 16384, 16384, 2048)["kernel"] == "reg"
+    )  # below the band: register rung as before
+
+
+def test_gvr2_route_unsplit_slab_regime():
+    """Unsplit slab rows (R == 1) in the 75-148 row band with rows of <= 64K
+    columns take the b > 148 configuration ((512, 8, 2): 512 threads, two CTAs
+    per SM) instead of upstream's one-wave 1024-thread slab; the split slab
+    (R > 1), 33-74 rows and rows above 64K keep the big regime (FlashInfer-
+    local, see _big_regime)."""
+    r = _host.route
+    for k in (512, 1024, 2048):
+        for b in (75, 104, 148):
+            for n in (32768, 49152, 65536):
+                p = r(b, n, _round64(n), k)
+                # tpl = (BLK, U, MINB, ...)
+                assert p["kernel"] == "main" and p["tpl"][:3] == (512, 8, 2), (
+                    k,
+                    b,
+                    n,
+                    p["tpl"],
+                )
+                assert p["rt"]["R"] == 1 and p["rt"]["SCAP_"] == (
+                    8192 if k > 1024 else 4096
+                )
+            # above 64K the band keeps the 1024-thread configuration
+            p = r(b, 65540, _round64(65540), k)
+            assert p["kernel"] == "main" and (p["tpl"][0], p["tpl"][2]) == (1024, 1)
+            assert p["rt"]["SCAP_"] == 16384
+    # 33-74 unsplit rows (K = 2048 above 32K) keep the big configuration
+    p = r(37, 65536, 65536, 2048)
+    assert p["kernel"] == "main" and p["tpl"][0] == 1024 and p["rt"]["R"] == 1
+    # split slab at <= 74 rows keeps the 1024-thread big configuration
+    p = r(16, 262144, 262144, 2048)
+    assert p["kernel"] == "main" and (p["tpl"][0], p["tpl"][2]) == (1024, 1)
+    assert p["rt"]["R"] > 1 and p["rt"]["SCAP_"] == 8192
+    p = r(1, 1 << 20, 1 << 20, 1024)
+    assert p["kernel"] == "main" and p["tpl"][0] == 1024 and p["rt"]["R"] == 148
+    # b > 148 unchanged
+    assert r(200, 65536, 65536, 512)["tpl"][:3] == (512, 8, 2)
+    assert r(304, 65536, 65536, 1024)["tpl"][:3] == (256, 8, 4)
+    assert _host._big_regime(148, 1, 16384) is False
+    assert _host._big_regime(148, 1, 16385) is True
+    assert (
+        _host._big_regime(74, 1, 16384) is True
+        and _host._big_regime(74, 2, 8192) is True
+    )
+    assert _host._big_regime(149, 1, 8192) is False  # b > 148: never big
 
 
 def test_gvr2_route_reg_clus_sm_count_aware():
@@ -1549,11 +1772,11 @@ def test_gvr2_route_bands_follow_sm_count():
 @requires_gvr2
 def test_gvr2_release_cached_resources():
     """flashinfer.topk_varlen.release_gvr2_resources(): drops every default
-    workspace slab and hint-free anchor table of the device, returns the bytes
-    released (at least one slab + the tables), and the allocator's footprint
-    falls by that much; the next eager launch recreates its stream's slab and
-    the table, and a slab-using capture right after a release (no warm-up on
-    that stream) raises the documented error instead of allocating."""
+    workspace slab of the device, returns the bytes released (at least one
+    slab), and the allocator's footprint falls by that much; the next eager
+    launch recreates its stream's slab, and a slab-using capture right after a
+    release (no warm-up on that stream) raises the documented error instead of
+    allocating — hinted or hint-free."""
     from flashinfer.topk_varlen import release_gvr2_resources
 
     rows, n, k = 16, 131072, 512
@@ -1568,29 +1791,23 @@ def test_gvr2_release_cached_resources():
     )
     out = torch.empty(rows, k, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
-    with torch.cuda.stream(
-        s
-    ):  # creates s's slab and the k=512 anchor table (hint-free)
+    with torch.cuda.stream(s):  # creates s's slab (hint-free launch)
         _run_gvr2(logits, seq, k, None, out_indices=out)
     torch.cuda.synchronize()
-    assert (dev, s.cuda_stream) in _host._ws_keep and (dev, k) in _host._HINT_FREE
+    assert (dev, s.cuda_stream) in _host._ws_keep
     slab_bytes = _host.workspace_bytes()
-    table_bytes = _host._HINT_FREE[(dev, k)].numel() * 4
     before = torch.cuda.memory_allocated(dev)
     freed = release_gvr2_resources()
-    assert freed >= slab_bytes + table_bytes, (freed, slab_bytes, table_bytes)
+    assert freed >= slab_bytes, (freed, slab_bytes)
     assert not any(key[0] == dev for key in _host._ws_keep)
-    assert not any(key[0] == dev for key in _host._HINT_FREE)
-    assert not any(t.device.index == dev for t in _host._HINT_FREE_KEEP)
     assert before - torch.cuda.memory_allocated(dev) >= freed - 1024, (
         before,
         torch.cuda.memory_allocated(dev),
         freed,
     )
     # capture without a fresh warm-up on s: loud, not a silent allocation.
-    # Hinted capture (a valid pre_idx, so the anchor-table check cannot fire):
-    # the WORKSPACE guard must be the one that raises, and it must not have
-    # allocated a slab from the graph pool.
+    # Hinted capture: the WORKSPACE guard must be the one that raises, and it
+    # must not have allocated a slab from the graph pool.
     pre = (
         torch.arange(k, dtype=torch.int32, device=_DEV)
         .unsqueeze(0)
@@ -1606,21 +1823,22 @@ def test_gvr2_release_cached_resources():
         _run_gvr2(logits, seq, k, pre, out_indices=out)
     torch.cuda.synchronize()
     assert not any(key[0] == dev for key in _host._ws_keep), "capture allocated a slab"
-    # hint-free capture after release: the anchor-table guard fires first
+    # hint-free capture after release: the same workspace guard (the launcher
+    # itself is still compiled; only the slab was released)
     g = torch.cuda.CUDAGraph()
     with (
-        pytest.raises(RuntimeError, match="hint-free gvr_2: no pre_idx table"),
+        pytest.raises(RuntimeError, match="no slab for this stream"),
         torch.cuda.stream(s),
         torch.cuda.graph(g, stream=s),
     ):
         _run_gvr2(logits, seq, k, None, out_indices=out)
     torch.cuda.synchronize()
-    assert not any(key[0] == dev for key in _host._HINT_FREE)
-    # eager launch recreates both, and the result is exact
+    assert not any(key[0] == dev for key in _host._ws_keep), "capture allocated a slab"
+    # eager launch recreates the slab, and the result is exact
     with torch.cuda.stream(s):
         _run_gvr2(logits, seq, k, None, out_indices=out)
     torch.cuda.synchronize()
-    assert (dev, s.cuda_stream) in _host._ws_keep and (dev, k) in _host._HINT_FREE
+    assert (dev, s.cuda_stream) in _host._ws_keep
     _check_varlen_rows(logits, out, seq.tolist(), k)
     # releasing when nothing is cached is a no-op returning 0; int / device /
     # string spellings of the same CUDA device are all accepted
@@ -1689,51 +1907,38 @@ def test_gvr2_release_rejects_non_cuda_device():
     _run_gvr2(logits, seq, k, None, out_indices=out)
     torch.cuda.synchronize()
     slabs = sum(1 for key in _host._ws_keep if key[0] == dev)
-    tables = sum(1 for key in _host._HINT_FREE if key[0] == dev)
-    assert slabs and tables
+    assert slabs
     for bad in ("cpu", "cpu:1", torch.device("cpu"), torch.device("cpu", 1)):
         with pytest.raises(ValueError, match="expected a CUDA device"):
             release_gvr2_resources(bad)
         assert sum(1 for key in _host._ws_keep if key[0] == dev) == slabs
-        assert sum(1 for key in _host._HINT_FREE if key[0] == dev) == tables
 
 
 @requires_gvr2
-def test_gvr2_release_partitions_kept_tables_without_tensor_equality():
-    """The superseded-table list is partitioned by device index. Tensor
-    equality (`in` / `list.remove`) would compare contents and raise on
-    entries of different shapes or devices; this interleaves superseded tables
-    of two shapes (and, with two GPUs, of two devices) and releases one device
-    at a time."""
+def test_gvr2_release_is_per_device():
+    """Releasing one device leaves the other device's slabs untouched (two
+    GPUs; on one GPU the test only checks the single-device path)."""
     from flashinfer.topk_varlen import release_gvr2_resources
 
     dev = torch.cuda.current_device()
     devices = [dev]
     if torch.cuda.device_count() > 1:
         devices.append((dev + 1) % torch.cuda.device_count())
-    with _host._HINT_FREE_LOCK:
-        for d in devices:
-            _host._HINT_FREE.pop((d, 512), None)
-            _host._HINT_FREE.pop((d, 1024), None)
     for d in devices:
-        for k in (512, 1024):
-            # capacities 8 -> 64 -> 128 -> 256: two superseded tables per k per
-            # device, of different shapes, interleaved across k and devices
-            for b in (8, 100, 200):
-                _host._hint_free_pre_idx(b, k, torch.device("cuda", d))
-    before = {
-        d: sum(1 for t in _host._HINT_FREE_KEEP if t.device.index == d) for d in devices
-    }
-    assert all(v >= 4 for v in before.values()), before
+        with torch.device("cuda", d):
+            _host.default_workspace(
+                torch.empty(0, dtype=torch.uint8, device=f"cuda:{d}")
+            )
+    torch.cuda.synchronize()
+    before = {d: sum(1 for key in _host._ws_keep if key[0] == d) for d in devices}
+    assert all(v >= 1 for v in before.values()), before
     freed = release_gvr2_resources(torch.device("cuda", dev))
-    assert freed > 0
-    assert not any(t.device.index == dev for t in _host._HINT_FREE_KEEP)
-    assert not any(key[0] == dev for key in _host._HINT_FREE)
+    assert freed >= _host.workspace_bytes()
+    assert not any(key[0] == dev for key in _host._ws_keep)
     for d in devices[1:]:  # the other device's entries are untouched
-        assert sum(1 for t in _host._HINT_FREE_KEEP if t.device.index == d) == before[d]
-        assert (d, 512) in _host._HINT_FREE and (d, 1024) in _host._HINT_FREE
+        assert sum(1 for key in _host._ws_keep if key[0] == d) == before[d]
         release_gvr2_resources(d)
-        assert not any(t.device.index == d for t in _host._HINT_FREE_KEEP)
+        assert not any(key[0] == d for key in _host._ws_keep)
 
 
 def test_gvr2_first_call_gate_serializes_only_the_first_call():

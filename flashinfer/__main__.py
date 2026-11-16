@@ -15,15 +15,27 @@ limitations under the License.
 """
 
 import copy
+from email.parser import BytesParser
+from importlib.util import find_spec
 import os
+from pathlib import Path
 import re
-from packaging.version import InvalidVersion, Version
+from shutil import which
 import subprocess
 import sys
+import tempfile
+import zipfile
 
 import click
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 from tabulate import tabulate  # type: ignore[import-untyped]
 import torch
+
+from .jit._cuda_architecture import (
+    select_compatible_cuda_architecture,
+)
 
 from .artifacts import (
     ArtifactPath,
@@ -161,8 +173,8 @@ def _normalize_jit_cache_provider_tag(cuda_architecture: str) -> str:
     return f"sm{normalized}"
 
 
-def _detect_jit_cache_provider_tags() -> tuple[str, ...]:
-    provider_tags = tuple(
+def _detect_jit_cache_target_tags() -> tuple[str, ...]:
+    target_tags = tuple(
         sorted(
             {
                 _normalize_jit_cache_provider_tag(f"{major}{minor}")
@@ -170,12 +182,122 @@ def _detect_jit_cache_provider_tags() -> tuple[str, ...]:
             }
         )
     )
-    if not provider_tags:
+    if not target_tags:
         raise click.ClickException(
             "No CUDA architecture could be detected. Pass --sm explicitly when "
             "installing minimal jit-cache providers on a host without a visible GPU."
         )
-    return provider_tags
+    return target_tags
+
+
+def _read_jit_cache_provider_tags(
+    shim_wheel: Path, expected_version: str
+) -> tuple[str, ...]:
+    """Read the provider inventory from an exact shim wheel."""
+    try:
+        with zipfile.ZipFile(shim_wheel) as archive:
+            metadata_paths = [
+                path
+                for path in archive.namelist()
+                if path.endswith(".dist-info/METADATA")
+            ]
+            if len(metadata_paths) != 1:
+                raise ValueError(
+                    f"expected one METADATA file, found {len(metadata_paths)}"
+                )
+            metadata = BytesParser().parsebytes(archive.read(metadata_paths[0]))
+
+        if canonicalize_name(metadata["Name"] or "") != "flashinfer-jit-cache":
+            raise ValueError(f"unexpected distribution {metadata['Name']!r}")
+        if Version(metadata["Version"] or "") != Version(expected_version):
+            raise ValueError(
+                f"shim version {metadata['Version']!r} does not match {expected_version}"
+            )
+
+        provider_tags = []
+        for requirement_text in metadata.get_all("Requires-Dist", []):
+            requirement = Requirement(requirement_text)
+            name = canonicalize_name(requirement.name)
+            match = re.fullmatch(r"flashinfer-jit-cache-(sm[0-9]{2,3}[af]?)", name)
+            if match is None:
+                raise ValueError(f"unexpected shim dependency {requirement_text!r}")
+            if str(requirement.specifier) != f"=={expected_version}":
+                raise ValueError(
+                    f"provider dependency is not pinned to {expected_version}: "
+                    f"{requirement_text!r}"
+                )
+            provider_tags.append(match.group(1))
+    except (
+        InvalidRequirement,
+        InvalidVersion,
+        OSError,
+        ValueError,
+        zipfile.BadZipFile,
+    ) as error:
+        raise click.ClickException(
+            f"Could not read provider inventory from {shim_wheel.name}: {error}"
+        ) from error
+
+    if not provider_tags:
+        raise click.ClickException(
+            f"The flashinfer-jit-cache {expected_version} shim has no providers."
+        )
+    return tuple(sorted(set(provider_tags)))
+
+
+def _get_available_jit_cache_provider_tags(
+    shim_requirement: str,
+    expected_version: str,
+    index_url: str,
+    nightly: bool,
+) -> tuple[str, ...]:
+    """Download the small shim wheel and return its published provider set."""
+    with tempfile.TemporaryDirectory(prefix="flashinfer-jit-cache-shim-") as temp_dir:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "download",
+            "--disable-pip-version-check",
+            "--no-deps",
+            "--only-binary=:all:",
+            "--dest",
+            temp_dir,
+        ]
+        if nightly:
+            cmd.append("--pre")
+        cmd.extend(["--index-url", index_url, shim_requirement])
+        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise click.ClickException(
+                "Could not resolve the flashinfer-jit-cache shim needed to select "
+                f"a minimal provider (pip download exited with {result.returncode})."
+            )
+
+        shim_wheels = sorted(Path(temp_dir).glob("*.whl"))
+        if len(shim_wheels) != 1:
+            raise click.ClickException(
+                f"Expected one downloaded flashinfer-jit-cache shim, found "
+                f"{len(shim_wheels)}."
+            )
+        return _read_jit_cache_provider_tags(shim_wheels[0], expected_version)
+
+
+def _select_jit_cache_provider_tags(
+    target_tags: tuple[str, ...], available_provider_tags: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Select the best published provider for every requested CUDA target."""
+    selected = set()
+    for target in target_tags:
+        provider = select_compatible_cuda_architecture(target, available_provider_tags)
+        if provider is None:
+            available = ", ".join(available_provider_tags)
+            raise click.ClickException(
+                f"No published jit-cache provider is compatible with {target}. "
+                f"Available providers: {available}."
+            )
+        selected.add(provider)
+    return tuple(sorted(selected))
 
 
 def _build_jit_cache_provider_requirement(
@@ -201,6 +323,21 @@ def _build_jit_cache_index_url(cuda_index_label: str, nightly: bool) -> str:
     return f"{base_url}/{cuda_index_label}"
 
 
+def _get_pip_install_cmd() -> list[str]:
+    uv = which("uv")
+    if uv is not None:
+        try:
+            config = (Path(sys.prefix) / "pyvenv.cfg").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            config = ""
+        created_by_uv = any(
+            line.partition("=")[0].strip() == "uv" for line in config.splitlines()
+        )
+        if created_by_uv or find_spec("pip") is None:
+            return [uv, "pip", "install", "--python", sys.executable]
+    return [sys.executable, "-m", "pip", "install"]
+
+
 def _build_pip_install_cmd(
     requirements: str | list[str],
     index_url: str,
@@ -209,13 +346,7 @@ def _build_pip_install_cmd(
 ) -> list[str]:
     if isinstance(requirements, str):
         requirements = [requirements]
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--upgrade",
-    ]
+    cmd = [*_get_pip_install_cmd(), "--upgrade"]
     if no_deps:
         cmd.append("--no-deps")
     if nightly:
@@ -268,9 +399,14 @@ def _install_jit_cache_wheel(
     index_url: str | None,
     nightly: bool,
     dry_run: bool,
-    mode: str = "all",
+    mode: str | None = None,
     sm_architectures: tuple[str, ...] = (),
 ) -> None:
+    if mode is None:
+        mode = "minimal" if sm_architectures else "all"
+    elif sm_architectures and mode != "minimal":
+        raise click.ClickException("--sm cannot be combined with --mode all.")
+
     detected_cuda_version = _parse_cuda_version(cuda_version)
     wheel_cuda_version = _resolve_jit_cache_cuda_version(detected_cuda_version)
     cuda_index_label = _cuda_version_to_index_label(wheel_cuda_version)
@@ -281,13 +417,11 @@ def _install_jit_cache_wheel(
     resolved_index_url = index_url or _build_jit_cache_index_url(
         cuda_index_label, nightly
     )
-    if sm_architectures and mode != "minimal":
-        raise click.ClickException("--sm can only be used with --mode minimal.")
 
     provider_tags: tuple[str, ...] = ()
     requirements = [shim_requirement]
     if mode == "minimal":
-        provider_tags = tuple(
+        target_tags = tuple(
             sorted(
                 {
                     _normalize_jit_cache_provider_tag(architecture)
@@ -295,8 +429,21 @@ def _install_jit_cache_wheel(
                 }
             )
         )
-        if not provider_tags:
-            provider_tags = _detect_jit_cache_provider_tags()
+        if not target_tags:
+            target_tags = _detect_jit_cache_target_tags()
+        expected_version = (
+            f"{_get_public_flashinfer_version(resolved_flashinfer_version)}"
+            f"+{cuda_index_label}"
+        )
+        available_provider_tags = _get_available_jit_cache_provider_tags(
+            shim_requirement,
+            expected_version,
+            resolved_index_url,
+            nightly,
+        )
+        provider_tags = _select_jit_cache_provider_tags(
+            target_tags, available_provider_tags
+        )
         requirements.extend(
             _build_jit_cache_provider_requirement(
                 resolved_flashinfer_version, cuda_index_label, provider_tag
@@ -339,7 +486,23 @@ def _install_kernel_wheels(
     jit_cache_index_url: str | None,
     nightly: bool,
     dry_run: bool,
+    sm_architectures: tuple[str, ...] = (),
+    mode: str | None = None,
 ) -> None:
+    # Reject invalid jit-cache selections before installing the cubin wheel, so a
+    # bad flag does not first spend a multi-GB download and then fail.
+    if mode is None:
+        mode = "minimal" if sm_architectures else "all"
+    elif sm_architectures and mode != "minimal":
+        raise click.ClickException("--sm cannot be combined with --mode all.")
+    for architecture in sm_architectures:
+        _normalize_jit_cache_provider_tag(architecture)
+    # Only an explicit --cuda-version is checked here: auto-detection may fail on
+    # a host without CUDA, which must not block the architecture-independent
+    # cubin wheel.
+    if cuda_version is not None:
+        _resolve_jit_cache_cuda_version(_parse_cuda_version(cuda_version))
+
     failures = []
     installers = [
         (
@@ -351,7 +514,13 @@ def _install_kernel_wheels(
         (
             "flashinfer-jit-cache",
             lambda: _install_jit_cache_wheel(
-                cuda_version, flashinfer_version, jit_cache_index_url, nightly, dry_run
+                cuda_version,
+                flashinfer_version,
+                jit_cache_index_url,
+                nightly,
+                dry_run,
+                mode=mode,
+                sm_architectures=sm_architectures,
             ),
         ),
     ]
@@ -529,27 +698,79 @@ def download_cubin_cmd():
     _download_cubin()
 
 
-@cli.command("install-cubin-wheel")
-@click.option(
+# Options shared by the kernel-wheel install commands (install-cubin-wheel,
+# install-jit-cache-wheel, download-kernels). Defining each option once keeps
+# their names, help text and order identical across the commands.
+_CUDA_VERSION_OPTION = click.option(
+    "--cuda-version",
+    default=None,
+    help=(
+        "Override CUDA version detection for the jit-cache wheel, e.g. '12.9' "
+        "or 'cu129'. Defaults to the CUDA version of the installed PyTorch."
+    ),
+)
+_FLASHINFER_VERSION_OPTION = click.option(
     "--flashinfer-version",
     default=None,
-    help="Override the FlashInfer version to install a matching cubin wheel for.",
+    help=(
+        "Override the FlashInfer version to install matching wheels for. "
+        "Defaults to the installed flashinfer-python version."
+    ),
 )
-@click.option(
-    "--index-url",
+_MODE_OPTION = click.option(
+    "--mode",
+    type=click.Choice(("all", "minimal")),
     default=None,
-    help="Explicit wheel index URL (overrides the auto-generated FlashInfer index URL).",
+    help=(
+        "jit-cache providers to install: 'all' installs every provider "
+        "declared by the shim; 'minimal' installs only the best compatible "
+        "provider for each --sm target or, without --sm, each visible GPU (no "
+        "baseline provider is added). Defaults to minimal when --sm is given, "
+        "otherwise all."
+    ),
 )
-@click.option(
+_SM_OPTION = click.option(
+    "--sm",
+    "sm_architectures",
+    multiple=True,
+    help=(
+        "CUDA architecture to install a jit-cache provider for, such as sm80, "
+        "sm90a, or sm120f; the best compatible published provider is "
+        "selected. Implies --mode minimal. May be repeated."
+    ),
+)
+_CUBIN_INDEX_URL_HELP = (
+    "Explicit flashinfer-cubin wheel index URL (overrides the FlashInfer index URL)."
+)
+_JIT_CACHE_INDEX_URL_HELP = (
+    "Explicit flashinfer-jit-cache wheel index URL (overrides the CUDA-specific "
+    "FlashInfer index URL)."
+)
+_NIGHTLY_OPTION = click.option(
     "--nightly",
     is_flag=True,
-    help="Install from the nightly wheel index instead of the release index.",
+    help="Install from the nightly wheel indexes instead of the release indexes.",
 )
-@click.option(
+_DRY_RUN_OPTION = click.option(
     "--dry-run",
     is_flag=True,
-    help="Print the pip command without executing it.",
+    help="Print the pip commands without executing them.",
 )
+
+
+@cli.command("install-cubin-wheel")
+@_FLASHINFER_VERSION_OPTION
+# --cubin-index-url matches the download-kernels spelling; --index-url is kept
+# for existing callers.
+@click.option(
+    "--index-url",
+    "--cubin-index-url",
+    "index_url",
+    default=None,
+    help=_CUBIN_INDEX_URL_HELP,
+)
+@_NIGHTLY_OPTION
+@_DRY_RUN_OPTION
 def install_cubin_wheel_cmd(flashinfer_version, index_url, nightly, dry_run):
     """Install the matching flashinfer-cubin wheel."""
     _install_cubin_wheel(flashinfer_version, index_url, nightly, dry_run)
@@ -576,51 +797,21 @@ def clear_cubin_cmd():
 
 
 @cli.command("install-jit-cache-wheel")
-@click.option(
-    "--cuda-version",
-    default=None,
-    help="Override CUDA version detection, e.g. '12.9' or 'cu129'.",
-)
-@click.option(
-    "--flashinfer-version",
-    default=None,
-    help="Override the FlashInfer version to install a matching jit-cache wheel for.",
-)
-@click.option(
-    "--mode",
-    type=click.Choice(("all", "minimal")),
-    default="all",
-    show_default=True,
-    help=(
-        "Install all provider dependencies declared by the shim, or only the "
-        "providers selected by --sm or the visible GPUs. Minimal mode does not "
-        "add a baseline provider."
-    ),
-)
-@click.option(
-    "--sm",
-    "sm_architectures",
-    multiple=True,
-    help=(
-        "CUDA architecture to install in minimal mode, such as sm80, sm90a, "
-        "or sm120f. May be repeated."
-    ),
-)
+@_CUDA_VERSION_OPTION
+@_FLASHINFER_VERSION_OPTION
+@_MODE_OPTION
+@_SM_OPTION
+# --jit-cache-index-url matches the download-kernels spelling; --index-url is
+# kept for existing callers.
 @click.option(
     "--index-url",
+    "--jit-cache-index-url",
+    "index_url",
     default=None,
-    help="Explicit wheel index URL (overrides the auto-generated FlashInfer index URL).",
+    help=_JIT_CACHE_INDEX_URL_HELP,
 )
-@click.option(
-    "--nightly",
-    is_flag=True,
-    help="Install from the nightly wheel index instead of the release index.",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Print the pip command without executing it.",
-)
+@_NIGHTLY_OPTION
+@_DRY_RUN_OPTION
 def install_jit_cache_wheel_cmd(
     cuda_version,
     flashinfer_version,
@@ -648,45 +839,29 @@ cli.add_command(download_jit_cache_cmd, "download-jit-cache")
 
 
 @cli.command("download-kernels")
-@click.option(
-    "--cuda-version",
-    default=None,
-    help="Override CUDA version detection for the jit-cache wheel, e.g. '12.9' or 'cu129'.",
-)
-@click.option(
-    "--flashinfer-version",
-    default=None,
-    help="Override the FlashInfer version to install matching kernel wheels for.",
-)
-@click.option(
-    "--cubin-index-url",
-    default=None,
-    help="Explicit flashinfer-cubin wheel index URL.",
-)
-@click.option(
-    "--jit-cache-index-url",
-    default=None,
-    help="Explicit flashinfer-jit-cache wheel index URL.",
-)
-@click.option(
-    "--nightly",
-    is_flag=True,
-    help="Install from nightly wheel indexes instead of release indexes.",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Print the pip commands without executing them.",
-)
+@_CUDA_VERSION_OPTION
+@_FLASHINFER_VERSION_OPTION
+@_MODE_OPTION
+@_SM_OPTION
+@click.option("--cubin-index-url", default=None, help=_CUBIN_INDEX_URL_HELP)
+@click.option("--jit-cache-index-url", default=None, help=_JIT_CACHE_INDEX_URL_HELP)
+@_NIGHTLY_OPTION
+@_DRY_RUN_OPTION
 def download_kernels_cmd(
     cuda_version,
     flashinfer_version,
+    mode,
+    sm_architectures,
     cubin_index_url,
     jit_cache_index_url,
     nightly,
     dry_run,
 ):
-    """Install matching flashinfer-cubin and flashinfer-jit-cache wheels."""
+    """Install matching flashinfer-cubin and flashinfer-jit-cache wheels.
+
+    The flashinfer-cubin wheel covers every architecture; --mode and --sm only
+    select which jit-cache providers are installed.
+    """
     _install_kernel_wheels(
         cuda_version,
         flashinfer_version,
@@ -694,6 +869,8 @@ def download_kernels_cmd(
         jit_cache_index_url,
         nightly,
         dry_run,
+        sm_architectures,
+        mode,
     )
 
 

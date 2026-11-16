@@ -24,6 +24,7 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAPagedAttentionFaBackendBase):
         kv_layouts=frozenset({"combined", "adjacent-split", "independent-split"}),
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default", "kv-per-tensor"}),
+        supports_cuda_graph_replan=True,
     )
 
     def __init__(

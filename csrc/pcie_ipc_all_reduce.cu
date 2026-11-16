@@ -30,7 +30,20 @@ using tvm::ffi::Array;
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
 
+// Local eligibility sizes this rank's optional region; the group still decides
+// whether the SM120 protocol may be enabled.
+bool pcie_ipc_memop_supported();
+
 namespace {
+
+// The SM120 region: the single-piece ring's binary flags, then the pipelined
+// ring's flags and landing slots.
+size_t memop_workspace_bytes(int world_size, const fi::WorkspaceLayout& layout) {
+  return (world_size == 4 || world_size == 8) && pcie_ipc_memop_supported()
+             ? fi::ce_binary_flag_bytes(world_size) +
+                   fi::ce_piped_region_bytes(layout.max_payload_bytes, world_size)
+             : 0;
+}
 
 // Everything the launcher needs that does not change between calls. The
 // workspace itself is owned by the caller (see pcie_ipc_all_reduce.cuh).
@@ -39,6 +52,9 @@ struct PcieIpcHandle {
   fi::WorkspaceLayout layout;
   fi::CeResources ce;
   bool ce_ready;
+  bool launched;
+  bool memop_configured;
+  bool hops_configured;
   int rank;
   int world_size;
   int max_blocks;
@@ -51,6 +67,14 @@ struct PcieIpcHandle {
 template <typename T>
 cudaError_t dispatch_one(const PcieIpcHandle* h, const T* in, T* out, int64_t numel, int blocks,
                          int threads, fi::Variant algo, bool use_pdl, cudaStream_t stream) {
+  if (algo == fi::Variant::kCopyEngineRingPiped) {
+    return fi::ce_ring_all_reduce_piped<T>(in, out, numel, h->rank, h->world_size, h->ce, blocks,
+                                           threads, stream);
+  }
+  if (algo == fi::Variant::kCopyEngineRingMemop) {
+    return fi::ce_ring_all_reduce_flat<T, true>(in, out, numel, h->views, h->rank, h->world_size,
+                                                h->layout, h->ce, blocks, threads, stream);
+  }
   if (algo == fi::Variant::kCopyEngineRing) {
     return fi::ce_ring_all_reduce_flat<T>(in, out, numel, h->views, h->rank, h->world_size,
                                           h->layout, h->ce, blocks, threads, stream);
@@ -113,8 +137,11 @@ int64_t pcie_ipc_workspace_size(int64_t world_size, int64_t max_numel, int64_t e
   TVM_FFI_ICHECK_EQ(elem_size, 2)
       << "only 2-byte dtypes (bfloat16, float16) are supported, got elem_size " << elem_size;
   TVM_FFI_ICHECK_GT(max_blocks, 0) << "max_blocks must be positive";
-  return fi::workspace_size(static_cast<int>(world_size), max_numel, static_cast<int>(elem_size),
-                            static_cast<int>(max_blocks));
+  const fi::WorkspaceLayout layout =
+      fi::compute_workspace_layout(static_cast<int>(world_size), max_numel,
+                                   static_cast<int>(elem_size), static_cast<int>(max_blocks));
+  return static_cast<int64_t>(layout.total_bytes +
+                              memop_workspace_bytes(static_cast<int>(world_size), layout));
 }
 
 /*!
@@ -151,13 +178,27 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
   handle->layout = fi::compute_workspace_layout(world_size, max_numel, static_cast<int>(elem_size),
                                                 static_cast<int>(max_blocks));
   handle->views = fi::make_peer_views(ptrs, world_size, static_cast<int>(rank), handle->layout);
+  const size_t memop_bytes = memop_workspace_bytes(world_size, handle->layout);
+  if (memop_bytes != 0) {
+    const size_t piped_flags = handle->layout.total_bytes + fi::ce_binary_flag_bytes(world_size);
+    const size_t piped_scratch = piped_flags + fi::ce_piped_flag_bytes(world_size);
+    for (int peer = 0; peer < world_size; ++peer) {
+      char* base = reinterpret_cast<char*>(ptrs[peer]);
+      handle->ce.binary_flags[peer] = reinterpret_cast<int32_t*>(base + handle->layout.total_bytes);
+      handle->ce.piped_flags[peer] = reinterpret_cast<int32_t*>(base + piped_flags);
+      handle->ce.piped_scratch[peer] = base + piped_scratch;
+    }
+    handle->ce.piped_slot_bytes =
+        fi::ce_piped_slot_bytes(handle->layout.max_payload_bytes, world_size);
+  }
   handle->rank = static_cast<int>(rank);
   handle->world_size = world_size;
   handle->max_blocks = static_cast<int>(max_blocks);
   handle->max_numel = max_numel;
   handle->elem_size = static_cast<int>(elem_size);
 
-  cudaError_t err = cudaMemset(reinterpret_cast<void*>(ptrs[rank]), 0, handle->layout.total_bytes);
+  cudaError_t err =
+      cudaMemset(reinterpret_cast<void*>(ptrs[rank]), 0, handle->layout.total_bytes + memop_bytes);
   if (err != cudaSuccess) {
     delete handle;
     TVM_FFI_LOG_AND_THROW(RuntimeError)
@@ -174,6 +215,50 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
   }
   handle->ce_ready = true;
   return reinterpret_cast<fptr_t>(handle);
+}
+
+// Query before group agreement; a rank-local decision must never select a wire protocol.
+bool pcie_ipc_memop_supported() {
+  int ordinal = 0, major = 0, minor = 0;
+  CUdevice device;
+  if (cudaGetDevice(&ordinal) != cudaSuccess || cuDeviceGet(&device, ordinal) != CUDA_SUCCESS) {
+    return false;
+  }
+  if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device) !=
+          CUDA_SUCCESS ||
+      cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device) !=
+          CUDA_SUCCESS) {
+    return false;
+  }
+  // cuStreamWriteValue32 uses the v2 API, whose 32-bit writes are available by
+  // default. The deprecated v1 capability can be disabled independently.
+  return major == 12 && minor == 0;
+}
+
+// Called once after communicator-wide capability agreement and before any launch.
+void pcie_ipc_set_memop_enabled(fptr_t handle, bool enabled) {
+  auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
+  TVM_FFI_ICHECK(!h->launched && !h->memop_configured)
+      << "memory-operation protocol must be configured once before the first launch";
+  TVM_FFI_ICHECK(!enabled || (h->ce.binary_flags[h->rank] != nullptr && pcie_ipc_memop_supported()))
+      << "memory-operation protocol requires SM120 and stream memory operation support";
+  h->ce.memop_enabled = enabled;
+  h->memop_configured = true;
+}
+
+// Which ring hops cross the CPU interconnect: bit h is the hop from rank h to
+// rank h+1. Shapes the pipelined ring's chunks (ce_piped_geometry), so every
+// rank must pass the same mask; the caller derives it from the gathered
+// topology. Called at most once, before any launch. Zero -- the default --
+// means an even split.
+void pcie_ipc_set_ce_slow_hops(fptr_t handle, int64_t mask) {
+  auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
+  TVM_FFI_ICHECK(!h->launched && !h->hops_configured)
+      << "the ring's slow hops must be configured once before the first launch";
+  TVM_FFI_ICHECK(mask >= 0 && mask < (int64_t{1} << h->world_size))
+      << "slow-hop mask " << mask << " names a hop outside world_size " << h->world_size;
+  h->ce.slow_hops = static_cast<uint32_t>(mask);
+  h->hops_configured = true;
 }
 
 void pcie_ipc_dispose(fptr_t handle) {
@@ -194,6 +279,7 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
   auto* h = reinterpret_cast<PcieIpcHandle*>(handle);
   ffi::CUDADeviceGuard device_guard(inp.device().device_id);
   auto stream = get_stream(inp.device());
+  if (h->ce.binary_flags[h->rank] != nullptr) h->launched = true;
 
   TVM_FFI_ICHECK(inp.IsContiguous() && out.IsContiguous()) << "input and output must be contiguous";
   TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(inp.dtype()), encode_dlpack_dtype(out.dtype()))
@@ -244,7 +330,8 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
     TVM_FFI_ICHECK_EQ(blocks % 4, 0)
         << "the TP8 topology kernel requires blocks divisible by 4, got " << blocks;
   }
-  if (algo == fi::Variant::kCopyEngineRing || algo == fi::Variant::kCopyEngineIsland) {
+  if (algo == fi::Variant::kCopyEngineRing || algo == fi::Variant::kCopyEngineIsland ||
+      algo == fi::Variant::kCopyEngineRingMemop || algo == fi::Variant::kCopyEngineRingPiped) {
     // `blocks` carries the sub-chunk depth here, not a grid size; see
     // IpcVariant.COPY_ENGINE_RING in pcie_ipc_policy.py, and kCeAddThreads for
     // why the thread count is fixed rather than searched. The candidate grid
@@ -272,6 +359,15 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
     TVM_FFI_ICHECK(!(algo == fi::Variant::kCopyEngineIsland && h->world_size != 8))
         << "the island schedule is a 4+4 decomposition and is world_size 8 only, got "
         << h->world_size;
+    if (algo == fi::Variant::kCopyEngineRingPiped) {
+      TVM_FFI_ICHECK(h->ce.memop_enabled)
+          << "the pipelined copy-engine ring requires the SM120 stream-publication protocol";
+      fi::CePipedGeometry geometry;
+      TVM_FFI_ICHECK(fi::ce_piped_geometry(numel / pack_elems, h->world_size, h->ce.slow_hops,
+                                           static_cast<int>(blocks), &geometry))
+          << "the pipelined copy-engine ring cannot cut " << numel << " elements into depth "
+          << blocks << " pieces of whole 16-byte packs";
+    }
   }
 
   cudaError_t err = cudaSuccess;
@@ -299,6 +395,9 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
   }
 }
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_memop_supported, pcie_ipc_memop_supported);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_set_memop_enabled, pcie_ipc_set_memop_enabled);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_set_ce_slow_hops, pcie_ipc_set_ce_slow_hops);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_workspace_size, pcie_ipc_workspace_size);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_init, pcie_ipc_init);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(pcie_ipc_dispose, pcie_ipc_dispose);
