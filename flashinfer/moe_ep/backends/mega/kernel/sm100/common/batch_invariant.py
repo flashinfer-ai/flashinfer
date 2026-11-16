@@ -31,7 +31,6 @@ _FIXED_FIELDS = {
     "num_sched_stages": None,
     "enable_in_kernel_fc2_reduce": False,
     "in_kernel_fc2_reduce": False,
-    "use_custom_finalize": False,
     "enable_iket": False,
     "group_hint": None,
     "flag_batch": 1,
@@ -64,6 +63,12 @@ _CONTRACT_FIELDS = frozenset(
         "fast_math",
         "knobs",
         "finalize_mode",
+        "use_custom_finalize",
+        "activation",
+        "swiglu_alpha",
+        "swiglu_beta",
+        "situ_beta",
+        "situ_linear_beta",
     }
 )
 
@@ -207,6 +212,17 @@ def validate_bf16_batch_invariant(
     """Reject unsupported effective knobs when the session enables invariance."""
     if not getattr(config, "batch_invariant", False):
         return
+    from .activation_batch_invariant import batch_invariant_activation
+
+    batch_invariant_activation(config, family="bf16")
+    from .activation_batch_invariant import validate_batch_invariant_output
+
+    validate_batch_invariant_output(
+        config,
+        implementation="legacy",
+        arch=arch or bf16_batch_invariant_arch(),
+        kind="bf16",
+    )
     knobs = {} if knobs is None else knobs
     unknown = set(knobs) - _TUNABLE_FIELDS
     if unknown:
@@ -315,6 +331,8 @@ def bf16_batch_invariant_fingerprint(
     admission tests use the SM100 class; a public receipt without a CUDA
     device must supply its architecture explicitly through the public API.
     """
+    from .activation_batch_invariant import batch_invariant_fingerprint_kwargs
+
     from flashinfer.moe_ep.batch_invariant.spec import spec_fingerprint
 
     if arch is None:
@@ -341,4 +359,5 @@ def bf16_batch_invariant_fingerprint(
             else getattr(config, "activation_clamp", None)
         ),
         arch=arch,
+        **batch_invariant_fingerprint_kwargs(config),
     )

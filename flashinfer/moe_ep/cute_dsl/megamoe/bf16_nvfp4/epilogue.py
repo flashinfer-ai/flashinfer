@@ -65,7 +65,24 @@ class W4A16Epilogue:
         swiglu_beta=None,
         situ_beta=None,
         situ_linear_beta=None,
+        batch_invariant=False,
     ):
+        self.batch_invariant = batch_invariant
+        self.batch_invariant_activation = None
+        if batch_invariant:
+            from flashinfer.moe_ep.batch_invariant.activation_variants import (
+                ActivationVariant,
+            )
+
+            self.batch_invariant_activation = ActivationVariant(
+                "w4a16",
+                "situ" if situ_beta is not None else "swiglu",
+                swiglu_alpha,
+                swiglu_beta,
+                situ_beta,
+                situ_linear_beta,
+                gate_up_clamp,
+            )
         self.token_back_by_dispatch = token_back_by_dispatch
         self.in_kernel_fc2_reduce = in_kernel_fc2_reduce
         self.apply_routing_weights_before_fc2 = apply_routing_weights_before_fc2
@@ -432,6 +449,20 @@ class W4A16Fc1Epilogue(EpilogueContext):
     def _swiglu_act(self, t_swiglu, t_up, t_gate):
         # Match the local W4A16 kernel's up * (gate * sigmoid(gate))
         # association before the BF16 FC1 handoff.
+        if cutlass.const_expr(self.batch_invariant):
+            from flashinfer.moe_ep.batch_invariant.activation_variants import (
+                activation_accumulator,
+            )
+            from flashinfer.moe_ep.batch_invariant.device import PackedF32
+
+            for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
+                t_swiglu[i], t_swiglu[i + 1] = activation_accumulator(
+                    PackedF32,
+                    (t_gate[i], t_gate[i + 1]),
+                    (t_up[i], t_up[i + 1]),
+                    variant=self.batch_invariant_activation,
+                )
+            return
         for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
             gate = (t_gate[i], t_gate[i + 1])
             if cutlass.const_expr(self.swiglu_alpha is not None):
@@ -654,7 +685,9 @@ class W4A16Fc1Epilogue(EpilogueContext):
             up.store(up.load() * weight_alpha)
             # Preserve the prior W4A16 sequence: post-alpha gate upper clamp,
             # symmetric up clamp, then up * (gate * sigmoid(gate)).
-            if cutlass.const_expr(self.gate_up_clamp is not None):
+            if cutlass.const_expr(
+                self.gate_up_clamp is not None and not self.batch_invariant
+            ):
                 for i in cutlass.range_constexpr(cute.size(up)):
                     gate[i] = fmin(gate[i], self.gate_up_clamp)
                     up[i] = fmin(up[i], self.gate_up_clamp)
