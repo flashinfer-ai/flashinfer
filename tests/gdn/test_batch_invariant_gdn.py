@@ -816,6 +816,25 @@ def test_views_of_the_pool_share_its_state():
 
 
 @needs_device
+def test_pending_tail_survives_a_shorter_view():
+    """A call through a view that cannot address a pending slot leaves that slot's tail to a later call."""
+    HQ, HV = 4, 8
+    x, s0 = _inputs(110, HQ, HV, 11)
+    y, _ = _inputs(2, HQ, HV, 12)
+    ref, _ = _reference(x, s0)
+    pool = _pool(HV, 2)
+    pool[1] = s0
+    assert torch.equal(_bi(pool, [1], _cut(x, 0, 100)), ref[:100])
+    gp = get_pool(pool, HQ)
+    _bi(pool[:1], [0], _cut(y, 0, 1), prefix=[0])
+    _bi(pool[:1], [0], _cut(y, 1, 2))
+    assert gp.pending == {1: 36}
+    assert torch.equal(_bi(pool, [1], _cut(x, 100, 101)), ref[100:101])
+    assert not gp.pending
+    assert torch.equal(_bi(pool, [1], _cut(x, 101, 110), prefix=[101]), ref[101:110])
+
+
+@needs_device
 def test_slot_outside_the_pool_returns_nan():
     HQ, HV = 4, 8
     x, _ = _inputs(2, HQ, HV, 4)

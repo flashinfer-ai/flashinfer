@@ -177,17 +177,20 @@ class GdnPool:
                 self.pending.pop(slot, None)
 
     def rebuild(self, pool: torch.Tensor) -> None:
-        """Build the cached rows of every pending tail: one span launch over the kept rows, which skips a slot whose
-        count cell no longer marks it (a later call restarted it)."""
-        if not self.pending:
+        """Build the cached rows of every pending tail ``pool`` can address (a shorter view leaves the others pending):
+        one span launch over the kept rows, which skips a slot whose count cell no longer marks it (a later call
+        restarted it)."""
+        limit = int(pool.shape[0])
+        work = [(s, n) for s, n in self.pending.items() if s < limit]
+        if not work:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "a slot of this pool holds a prefill's open tail: run the first call after the prefill outside the"
                 " CUDA graph capture"
             )
-        work = list(self.pending.items())
-        self.pending.clear()
+        for s, _ in work:
+            del self.pending[s]
         m = self._idx(
             [
                 [s for s, _ in work],
