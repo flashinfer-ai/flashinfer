@@ -1392,7 +1392,7 @@ def test_determinism_graph_replay_and_pdl():
 
 
 @needs_device
-def test_preallocated_outputs():
+def test_preallocated_outputs(monkeypatch):
     """Caller-owned output buffers on the public entries (``out=``, ``logprob_out=``): written in place and returned as
     given, bit for bit the allocating call; an int64 buffer with int64 indices is filled by a cast (the operator's dtype
     contract), an int32 one is the kernel's own output; the contract refused rather than copied; the default path refuses
@@ -1513,9 +1513,14 @@ def test_preallocated_outputs():
                 logprob_out=arena[:M],
             )
     # the scratch behind the kernel's validity word: a buffer a CUDA graph captured must survive the cache's growth (the
-    # replay keeps writing to its address), and so must one a pending kernel on another stream still writes
+    # replay keeps writing to its address), and so must one a pending kernel on another stream still writes. The block
+    # works on its own cache (restored by monkeypatch): the growth draw below is then 1025 rows whatever the earlier
+    # tests grew the process-wide cache to (after a 2^20-row test it was a 2^20 x 4096 logits tensor), and the
+    # clear() further down touches nothing the later tests see
     from flashinfer.batch_invariant import support as bi_support
 
+    monkeypatch.setattr(bi_support, "_scratch", {})
+    monkeypatch.setattr(bi_support, "_scratch_keep", [])
     xs = logits(512, N, torch.bfloat16, seed=3)
     ss, os_ = keys(512, 31)
     flashinfer.sampling.sampling_from_logits(
@@ -1560,7 +1565,7 @@ def test_preallocated_outputs():
     # a capture the cache cannot serve takes its buffer from the graph's private pool: neither cached nor retained (the
     # pool holds it for the graph's lifetime and returns it when the graph is freed; retaining it kept 2 MiB of pool per
     # capture reserved in review), and the replay is right
-    bi_support._scratch.clear()  # the next call cannot be served from the cache
+    bi_support._scratch.clear()  # the next call cannot be served from the cache (the test's own dict)
     n_keep = len(bi_support._scratch_keep)
     tb3 = torch.empty(512, dtype=torch.int32, device="cuda")
     g3 = torch.cuda.CUDAGraph()
