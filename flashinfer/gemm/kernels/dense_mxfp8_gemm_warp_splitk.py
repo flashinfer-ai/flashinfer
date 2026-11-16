@@ -953,8 +953,20 @@ def _from_dlpack_1d(tensor: _torch.Tensor, *, dynamic: bool):
     return tensor
 
 
-@functools.cache
-def _compile(
+def _disk_kernel_name(out_dtype, n: int, k: int, tactic, use_pdl: bool) -> str:
+    """Symbol-safe on-disk name encoding every warp split-K codegen parameter."""
+    dtype = str(out_dtype).removeprefix("torch.")
+    tactic_part = "x".join(str(int(v)) for v in dataclasses.astuple(tactic))
+    return f"{dtype}_n{n}_k{k}_t{tactic_part}_pdl{int(use_pdl)}"
+
+
+def _disk_key_files() -> tuple:
+    from . import dense_bf16_gemm_warp_splitk
+
+    return (__file__, dense_bf16_gemm_warp_splitk.__file__)
+
+
+def _compile_kernel(
     device_index: int,
     out_dtype,
     n: int,
@@ -962,8 +974,6 @@ def _compile(
     tactic: MxFp8WarpSplitKTactic,
     use_pdl: bool,
 ):
-    # M is a runtime value: only the tactic, N, K, and dtypes specialize the kernel
-    # (the activation rows and its scale length are dynamic below).
     with _torch.cuda.device(device_index):
         weight_sf_len = _swizzled_scale_len(n, k)
         act_sf_len = _swizzled_scale_len(_MAX_M, k)
@@ -987,6 +997,32 @@ def _compile(
                 dynamic_m=True,
             ),
             _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+        )
+
+
+@functools.cache
+def _compile(
+    device_index: int,
+    out_dtype,
+    n: int,
+    k: int,
+    tactic: MxFp8WarpSplitKTactic,
+    use_pdl: bool,
+):
+    # M is a runtime value: only the tactic, N, K, and dtypes specialize the kernel
+    # (the activation rows and its scale length are dynamic below).
+    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    # Persist as a plain object file (no TVM-FFI): the kernel is launched with
+    # dlpack/CuTe arguments, which the reloaded function accepts unchanged. A
+    # failed export or reload is non-fatal and falls back to recompiling.
+    with _torch.cuda.device(device_index):
+        return build_and_load_cute_dsl_kernel(
+            "mm_mxfp8_warp_splitk",
+            _disk_kernel_name(out_dtype, n, k, tactic, use_pdl),
+            lambda: _compile_kernel(device_index, out_dtype, n, k, tactic, use_pdl),
+            _disk_key_files(),
+            enable_tvm_ffi=False,
         )
 
 

@@ -365,6 +365,12 @@ from flashinfer.gemm.gemm_mm_fp4_cute_dsl import (  # noqa: E402
     _blockscaled_kernel_disk_name,
     _compile_block_scaled_gemm,
     _mxfp8_blockscaled_kernel_disk_name,
+    _mm_mxfp8_sm107_cache_key,
+    _mxfp8_sm107_kernel_disk_name,
+    _mm_mxfp8_sm120_cache_key,
+    _mxfp8_sm120_kernel_disk_name,
+    _blockscaled_mxfp8_sm120_cache_key_files,
+    _blockscaled_mxfp8_sm107_cache_key_files,
     _mm_fp4_cache_key,
     _mm_mxfp8_cache_key,
 )
@@ -723,6 +729,186 @@ def test_mm_mxfp8_runner_routes_to_disk_cache(monkeypatch, m, n, k, tactic):
     assert kwargs["cache_module_name"] == "mm_mxfp8"
     assert kwargs["disk_kernel_name_fn"] is _mxfp8_blockscaled_kernel_disk_name
     assert kwargs["cache_key_files_fn"] is _blockscaled_mxfp8_gemm_cache_key_files
+
+
+MM_MXFP8_SM107_NAME_BASELINE = {
+    "mma_tiler_mn": (128, 128),
+    "cluster_shape_mn": (1, 1),
+    "swap_ab": False,
+    "mma_inst_shape_m": 128,
+    "out_dtype": torch.bfloat16,
+    "batch_size": 1,
+    "max_active_clusters": 148,
+}
+MM_MXFP8_SM107_NAME_PERTURBED = {
+    "mma_tiler_mn": (256, 128),
+    "cluster_shape_mn": (2, 1),
+    "swap_ab": True,
+    "mma_inst_shape_m": 64,
+    "out_dtype": torch.float16,
+    "batch_size": 2,
+    "max_active_clusters": 74,
+}
+
+
+def _mm_mxfp8_sm107_name(**kwargs):
+    cache_key = _mm_mxfp8_sm107_cache_key(
+        kwargs["mma_tiler_mn"],
+        kwargs["cluster_shape_mn"],
+        kwargs["swap_ab"],
+        kwargs["mma_inst_shape_m"],
+        kwargs["out_dtype"],
+    )
+    return _mxfp8_sm107_kernel_disk_name(
+        cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
+    )
+
+
+def test_mm_mxfp8_sm107_cache_key_schema_is_fully_exercised():
+    name_only_params = {"batch_size", "max_active_clusters"}
+    assert set(inspect.signature(_mm_mxfp8_sm107_cache_key).parameters) == (
+        set(MM_MXFP8_SM107_NAME_BASELINE) - name_only_params
+    )
+
+
+@pytest.mark.parametrize("param", sorted(MM_MXFP8_SM107_NAME_BASELINE))
+def test_mm_mxfp8_sm107_kernel_name_varies_with_every_argument(param):
+    baseline_name = _mm_mxfp8_sm107_name(**MM_MXFP8_SM107_NAME_BASELINE)
+    kwargs = dict(MM_MXFP8_SM107_NAME_BASELINE)
+    kwargs[param] = MM_MXFP8_SM107_NAME_PERTURBED[param]
+    perturbed_name = _mm_mxfp8_sm107_name(**kwargs)
+    assert perturbed_name != baseline_name, (
+        f"_mxfp8_sm107_kernel_disk_name ignores argument {param!r}: two "
+        "different kernel specializations would collide on one cache artifact."
+    )
+    for name in (baseline_name, perturbed_name):
+        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+def test_mm_mxfp8_sm107_source_fingerprint_covers_kernel():
+    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm107
+
+    assert (
+        dense_blockscaled_gemm_sm107.__file__
+        in _blockscaled_mxfp8_sm107_cache_key_files()
+    )
+
+
+MM_MXFP8_SM120_NAME_BASELINE = {
+    "sf_vec_size": 32,
+    "mma_tiler_mn": (128, 128),
+    "cluster_shape_mn": (1, 1),
+    "swap_ab": False,
+    "use_prefetch": False,
+    "kernel_type": "sm120",
+    "use_tma_store": None,
+    "enable_pdl": False,
+    "out_dtype": torch.bfloat16,
+    "batch_size": 1,
+    "max_active_clusters": 1,
+}
+MM_MXFP8_SM120_NAME_PERTURBED = {
+    "sf_vec_size": 16,
+    "mma_tiler_mn": (128, 64),
+    "cluster_shape_mn": (2, 1),
+    "swap_ab": True,
+    "use_prefetch": True,
+    "kernel_type": "sm120x",
+    "use_tma_store": True,
+    "enable_pdl": True,
+    "out_dtype": torch.float16,
+    "batch_size": 2,
+    "max_active_clusters": 2,
+}
+
+
+def _mm_mxfp8_sm120_name(**kwargs):
+    key_params = inspect.signature(_mm_mxfp8_sm120_cache_key).parameters
+    cache_key = _mm_mxfp8_sm120_cache_key(*(kwargs[p] for p in key_params))
+    return _mxfp8_sm120_kernel_disk_name(
+        cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
+    )
+
+
+def test_mm_mxfp8_sm120_cache_key_schema_is_fully_exercised():
+    name_only_params = {"batch_size", "max_active_clusters"}
+    assert set(inspect.signature(_mm_mxfp8_sm120_cache_key).parameters) == (
+        set(MM_MXFP8_SM120_NAME_BASELINE) - name_only_params
+    )
+
+
+@pytest.mark.parametrize("param", sorted(MM_MXFP8_SM120_NAME_BASELINE))
+def test_mm_mxfp8_sm120_kernel_name_varies_with_every_argument(param):
+    baseline_name = _mm_mxfp8_sm120_name(**MM_MXFP8_SM120_NAME_BASELINE)
+    kwargs = dict(MM_MXFP8_SM120_NAME_BASELINE)
+    kwargs[param] = MM_MXFP8_SM120_NAME_PERTURBED[param]
+    perturbed_name = _mm_mxfp8_sm120_name(**kwargs)
+    assert perturbed_name != baseline_name, (
+        f"_mxfp8_sm120_kernel_disk_name ignores argument {param!r}: two "
+        "different kernel specializations would collide on one cache artifact."
+    )
+    for name in (baseline_name, perturbed_name):
+        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+def test_mm_mxfp8_sm120_source_fingerprint_covers_kernel():
+    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm120_b12x
+
+    assert (
+        dense_blockscaled_gemm_sm120_b12x.__file__
+        in _blockscaled_mxfp8_sm120_cache_key_files()
+    )
+
+
+WARP_SPLITK_NAME_BASELINE = {
+    "out_dtype": torch.bfloat16,
+    "n": 4096,
+    "k": 2048,
+    "tactic": (32, 8, 256, 4, 1),
+    "use_pdl": False,
+}
+WARP_SPLITK_NAME_PERTURBED = {
+    "out_dtype": torch.float16,
+    "n": 2048,
+    "k": 4096,
+    "tactic": (16, 16, 512, 3, 2),
+    "use_pdl": True,
+}
+
+
+def _warp_splitk_name(**kwargs):
+    from flashinfer.gemm.kernels.dense_mxfp8_gemm_warp_splitk import (
+        MxFp8WarpSplitKTactic,
+        _disk_kernel_name,
+    )
+
+    kwargs = dict(kwargs)
+    kwargs["tactic"] = MxFp8WarpSplitKTactic(*kwargs["tactic"])
+    return _disk_kernel_name(**kwargs)
+
+
+@pytest.mark.parametrize("param", sorted(WARP_SPLITK_NAME_BASELINE))
+def test_mxfp8_warp_splitk_kernel_name_varies_with_every_argument(param):
+    baseline_name = _warp_splitk_name(**WARP_SPLITK_NAME_BASELINE)
+    kwargs = dict(WARP_SPLITK_NAME_BASELINE)
+    kwargs[param] = WARP_SPLITK_NAME_PERTURBED[param]
+    perturbed_name = _warp_splitk_name(**kwargs)
+    assert perturbed_name != baseline_name, param
+    for name in (baseline_name, perturbed_name):
+        assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+def test_mxfp8_warp_splitk_tactic_fields_are_all_in_the_name():
+    """A new tactic field must change the name, or tactics would collide."""
+    import dataclasses
+
+    from flashinfer.gemm.kernels.dense_mxfp8_gemm_warp_splitk import (
+        MxFp8WarpSplitKTactic,
+    )
+
+    assert len(dataclasses.fields(MxFp8WarpSplitKTactic)) == len(
+        WARP_SPLITK_NAME_BASELINE["tactic"]
+    )
 
 
 # ---------------------------------------------------------------------------
