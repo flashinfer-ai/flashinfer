@@ -27,6 +27,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
+from flashinfer.moe_ep.batch_invariant.nvfp4_device import PackedF32
+
 from cutlass.cutlass_dsl import Float32, Int32, T
 from cutlass._mlir.dialects import llvm
 
@@ -237,6 +239,7 @@ class TopkReduce:
         num_topk: int,
         combine_format: CombineFormat,
         *,
+        batch_invariant: bool = False,
         sm_arch: Optional[str] = None,
         num_experts: Optional[int] = None,
         vector_bytes: Optional[int] = None,
@@ -247,6 +250,7 @@ class TopkReduce:
         max_fetch: int = 8,
         fetch_rounds: int = 4,
     ) -> None:
+        self.batch_invariant = bool(batch_invariant)
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.num_experts = None if num_experts is None else int(num_experts)
@@ -679,7 +683,7 @@ class TopkReduce:
                 # takes the same add and a -0.0 first term yields +0.0, exactly
                 # like fma(v, score, +0.0) on the other paths (main's +0 seed).
                 mixed_add = topk_score is None and not self.use_scalar_math and self._bf16_mixed_add
-                if cutlass.const_expr(mixed_add):
+                if cutlass.const_expr(mixed_add or self.batch_invariant):
                     for i in cutlass.range_constexpr(hidden_per_thread):
                         acc[i] = Float32(0.0)
                 # Note on load scheduling: ptxas sinks the last one or two of the
@@ -714,7 +718,14 @@ class TopkReduce:
                             score_reg[k] = score_dtype(0)
                     score = Float32(score_reg[k])
 
-                    if cutlass.const_expr(self.use_scalar_math):
+                    if cutlass.const_expr(self.batch_invariant):
+                        for i in cutlass.range_constexpr(0, hidden_per_thread, 2):
+                            value_pair = (Float32(term[i]), Float32(term[i + 1]))
+                            if cutlass.const_expr(topk_score is None):
+                                acc[i], acc[i + 1] = PackedF32.add((acc[i], acc[i + 1]), value_pair)
+                            else:
+                                acc[i], acc[i + 1] = PackedF32.fma(value_pair, (score, score), (acc[i], acc[i + 1]))
+                    elif cutlass.const_expr(self.use_scalar_math):
                         for i in cutlass.range_constexpr(hidden_per_thread):
                             value = Float32(term[i])
                             if cutlass.const_expr(k != 0):
@@ -732,6 +743,18 @@ class TopkReduce:
                             else:
                                 # +0 seed: a -0.0 first term yields +0.0 (main's semantics).
                                 acc[i], acc[i + 1] = self._fma(value_pair, score, (Float32(0.0), Float32(0.0)))
+            elif cutlass.const_expr(self.batch_invariant):
+                from flashinfer.moe_ep.batch_invariant.quantized_combine_device import ordered_quantized_slot_fold
+
+                sf = cute.zipped_divide(combine_sf[token_idx, None, None], (num_topk, hidden_per_thread))[
+                    (None, None), (0, hidden_tile_idx)
+                ]
+                acc = ordered_quantized_slot_fold(
+                    codes, sf, topk_score, topk_indices, token_idx,
+                    num_experts=self.num_experts,
+                    hidden_per_thread=hidden_per_thread, num_topk=num_topk,
+                    act_dtype=fmt.act_dtype, decode_fp4=cvt_e2m1_to_fp32_cvt_ptx,
+                )
             else:
                 sf = cute.zipped_divide(combine_sf[token_idx, None, None], (num_topk, hidden_per_thread))[
                     (None, None), (0, hidden_tile_idx)
