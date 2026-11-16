@@ -3176,6 +3176,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_total_num_rows: Optional[int] = None,
         *,
         batch_invariant: bool = False,
+        prewiden_fp8_kv: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -3281,7 +3282,34 @@ class BatchPrefillWithPagedKVCacheWrapper:
             the first :meth:`plan` fixes the capacity. Only valid with
             ``use_cuda_graph=True``. Every plan must stay within this capacity;
             each captured graph still requires compatible query/output buffers.
+
+        prewiden_fp8_kv : bool
+            Opt-in fast path for FP8 K/V caches on the FA2 paged-prefill kernel.
+            The referenced pages are gathered and widened to the query's 16-bit
+            dtype once per :meth:`run` into wrapper-owned compact caches, and the
+            regular BF16/FP16 kernel runs on them. This avoids re-converting every
+            KV tile in every query CTA, which dominates long-context prefill at
+            large head dimensions. Requires ``backend="fa2"`` (or ``"auto"``,
+            which is pinned to FA2), an FP8 (e4m3/e5m2) K/V cache, matching
+            16-bit query/output dtypes, and contiguous ``(k_cache, v_cache)``
+            page caches. The compact caches cost
+            ``2 * sum(page_elems) * sizeof(query dtype)`` bytes on top of the
+            caller's FP8 cache and are allocated in :meth:`plan`. The
+            planned page count is fixed; the page ids are read at :meth:`run`
+            from the plan-time index tensor (or its int32 copy), so in CUDA-graph
+            mode keep that tensor fixed or update it in place without changing
+            the planned page count. Unsupported combinations raise; the option
+            never silently falls back. Defaults to ``False``.
         """
+        if batch_invariant and prewiden_fp8_kv:
+            raise ValueError(
+                "batch_invariant and prewiden_fp8_kv are mutually exclusive"
+            )
+        if prewiden_fp8_kv and backend not in ("auto", "fa2"):
+            raise ValueError(
+                "prewiden_fp8_kv is only supported with backend='fa2' or 'auto', "
+                f"got backend={backend!r}"
+            )
         if max_total_num_rows is not None:
             if not use_cuda_graph:
                 raise ValueError("max_total_num_rows requires use_cuda_graph=True")
@@ -3417,6 +3445,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._plan_info = None
         self._cuda_graph_backend: Optional[str] = None
         self._cached_module = None
+        # Opt-in FP8-KV pre-widen state (see the constructor docstring).
+        self._prewiden_fp8_kv = prewiden_fp8_kv
+        self._pw_active = False
+        self._pw_src_dtype: Optional[torch.dtype] = None
+        self._pw_src_indices: Optional[torch.Tensor] = None
+        self._pw_k_shadow: Optional[torch.Tensor] = None
+        self._pw_v_shadow: Optional[torch.Tensor] = None
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
@@ -4298,6 +4333,86 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
         self._num_kv_heads = num_kv_heads
+
+        self._pw_active = False
+        if self._prewiden_fp8_kv:
+            if self._jit_module is not None:
+                raise ValueError(
+                    "prewiden_fp8_kv does not support custom JIT modules; build the "
+                    "wrapper without jit_args"
+                )
+            if self._variant_owns_mask:
+                raise ValueError("prewiden_fp8_kv does not support variant_owns_mask")
+            if use_token_head_sf:
+                raise ValueError("prewiden_fp8_kv does not support use_token_head_sf")
+            if max_sequence_kv is not None:
+                raise ValueError(
+                    "prewiden_fp8_kv requires paged KV metadata (max_sequence_kv "
+                    "must be None)"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"prewiden_fp8_kv requires a fp16/bf16 query, got {q_data_type}"
+                )
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    "prewiden_fp8_kv requires an fp8 (e4m3/e5m2) KV cache, got "
+                    f"{kv_data_type}"
+                )
+            if o_data_type != q_data_type:
+                raise ValueError(
+                    "prewiden_fp8_kv requires the output dtype to match the query "
+                    f"dtype, got q={q_data_type} o={o_data_type}"
+                )
+            if head_dim_qk % 16 or head_dim_vo % 16:
+                raise ValueError(
+                    "prewiden_fp8_kv requires head dimensions that are multiples "
+                    f"of 16, got {head_dim_qk}/{head_dim_vo}"
+                )
+            if (
+                custom_mask is not None
+                or packed_custom_mask is not None
+                or logits_soft_cap != 0.0
+                or prefix_len_ptr is not None
+                or token_pos_in_items_ptr is not None
+                or max_item_len_ptr is not None
+                or getattr(self, "_sinks", None) is not None
+            ):
+                raise ValueError(
+                    "prewiden_fp8_kv supports only plain paged prefill (no custom "
+                    "mask, soft cap, sinks, prefix lengths or item positions)"
+                )
+            num_ref_pages = int(paged_kv_indptr_host[-1])
+            if self._kv_layout == "HND":
+                shape_k = (num_ref_pages, num_kv_heads, page_size, head_dim_qk)
+                shape_v = (num_ref_pages, num_kv_heads, page_size, head_dim_vo)
+            else:
+                shape_k = (num_ref_pages, page_size, num_kv_heads, head_dim_qk)
+                shape_v = (num_ref_pages, page_size, num_kv_heads, head_dim_vo)
+            self._pw_src_dtype = kv_data_type
+            self._pw_src_indices = paged_kv_indices.to(
+                device=self.device, dtype=torch.int32, non_blocking=non_blocking
+            ).contiguous()
+            self._pw_k_shadow = torch.empty(
+                shape_k, dtype=q_data_type, device=self.device
+            )
+            self._pw_v_shadow = torch.empty(
+                shape_v, dtype=q_data_type, device=self.device
+            )
+            # The planned module reads the compact cache; run() fills it by
+            # gathering the caller's pages through _pw_src_indices.
+            paged_kv_indices = torch.arange(
+                num_ref_pages, dtype=paged_kv_indices.dtype, device=self.device
+            )
+            kv_data_type = q_data_type
+            planned_backend = "fa2"
+            self._pw_active = True
+        else:
+            self._pw_src_dtype = None
+            self._pw_src_indices = None
+            self._pw_k_shadow = None
+            self._pw_v_shadow = None
+
         if custom_mask is not None or packed_custom_mask is not None:
             mask_indptr = _compute_page_mask_indptr(
                 qo_indptr,
@@ -4698,7 +4813,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 *args,
             )
-            if self._backend == "fa2":
+            if self._backend == "fa2" and not self._pw_active:
                 # specialized SM90 fp8-KV verify kernel: eligibility, JIT
                 # build and workspace are settled here, outside the hot path
                 # The kernel route needs the caller's promise to hold on the
@@ -5184,6 +5299,47 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._pw_active:
+            if (
+                sinks is not None
+                or kv_cache_sf is not None
+                or skip_softmax_threshold_scale_factor is not None
+            ):
+                raise ValueError(
+                    "prewiden_fp8_kv does not support sinks, FP4 KV scales or "
+                    "skip-softmax"
+                )
+            if tuple(k_cache.shape[1:]) != tuple(self._pw_k_shadow.shape[1:]) or tuple(
+                v_cache.shape[1:]
+            ) != tuple(self._pw_v_shadow.shape[1:]):
+                raise ValueError(
+                    "prewiden_fp8_kv: the KV cache shape does not match the plan; "
+                    f"got K{tuple(k_cache.shape)} V{tuple(v_cache.shape)}, expected "
+                    f"per-page K{tuple(self._pw_k_shadow.shape[1:])} "
+                    f"V{tuple(self._pw_v_shadow.shape[1:])}"
+                )
+            if (
+                k_cache.dtype != self._pw_src_dtype
+                or v_cache.dtype != self._pw_src_dtype
+            ):
+                raise ValueError(
+                    "prewiden_fp8_kv: the KV caches must stay "
+                    f"{self._pw_src_dtype}, got K={k_cache.dtype} V={v_cache.dtype}"
+                )
+            if not k_cache.is_contiguous() or not v_cache.is_contiguous():
+                raise ValueError(
+                    "prewiden_fp8_kv requires contiguous K and V page caches"
+                )
+            from .jit.fp8_kv_widen import get_fp8_kv_widen_module
+
+            get_fp8_kv_widen_module().gather_widen_fp8_kv(
+                k_cache,
+                v_cache,
+                self._pw_k_shadow,
+                self._pw_v_shadow,
+                self._pw_src_indices,
+            )
+            k_cache, v_cache = self._pw_k_shadow, self._pw_v_shadow
         check_lse_base(lse_base)
         check_lse_layout(lse_layout)
         if self._batch_invariant is not None:
