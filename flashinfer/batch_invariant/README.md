@@ -257,7 +257,8 @@ Megatron-Core's `batch_invariant_kernels.py` registration of `aten::_log_softmax
 `softmax(..., out=)`, `log_softmax(..., out=)`, `log_probs(..., out=, lse_out=)`, `sampling_from_probs(..., out=)`,
 `sampling_from_logits(..., out=, logprob_out=)` -- written in place and returned as given, so a step allocates nothing
 (the kernels' validity word, which the draws do not return unless asked, goes to a per-device scratch grown to the largest
-batch seen, never cached from inside a CUDA-graph capture): CUDA graphs captured on the caller's buffers replay into them, and a framework's persistent structures (a decode step's
+batch seen and never freed once handed out: a graph that captured it, or a kernel still pending on another stream, keeps
+writing to its address after the cache has grown): CUDA graphs captured on the caller's buffers replay into them, and a framework's persistent structures (a decode step's
 token and log-probability buffers, a trainer's chunk buffer for the batch x vocabulary log-softmax row) take the kernel's
 stores directly. A buffer must have the output dtype and shape, be contiguous and (the row outputs) 16-byte aligned; one
 that does not fit is refused with `ValueError`, never copied. The row output may be the logits tensor itself

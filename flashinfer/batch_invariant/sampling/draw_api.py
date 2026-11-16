@@ -215,12 +215,6 @@ def draw(
                 f"config {config.describe()} issues {loads} loads per thread per pass; the enumerated space bounds a "
                 f"re-read or staged member at {LOADS_PER_THREAD_MAX} (such a kernel compiles for minutes)"
             )
-        loads = config.elems_per_thread(N) // config.vec_elems
-        if config.stage != "regs" and loads > LOADS_PER_THREAD_MAX:
-            raise ValueError(
-                f"config {config.describe()} issues {loads} loads per thread per pass; the enumerated space bounds a "
-                f"re-read or staged member at {LOADS_PER_THREAD_MAX} (such a kernel compiles for minutes)"
-            )
     if indices is not None and config.rows_per_cta != 1:
         raise ValueError("an index gather needs a config with one row per CTA")
     if config.vec_elems > max_vec_elems(N, elem_bytes):
@@ -339,7 +333,7 @@ def _entry(
             None,
         )
         check_no_overlap(
-            [("out", out64)],
+            [("out", out64), ("logprob_out", logprob_out)],
             [
                 ("x", x),
                 ("seed", seeds),

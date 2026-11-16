@@ -272,18 +272,13 @@ def lse_row(
             "logp_out is the token log-probabilities' buffer: this mode writes none"
         )
     # an output may not overlap another output or an input, except the row output aliasing the logits exactly (in
-    # place: every thread writes the elements it read, after reading them)
+    # place: every thread writes the elements it read, after reading them). Not with a token gather in the same launch:
+    # the token's logit may lie in a peer CTA's share, already overwritten by its row output (the public entries never
+    # combine a row output with the gather; the generic entry refuses the alias then)
     check_no_overlap(
         [("out", yb), ("lse_out", lb), ("logp_out", pb)],
         [("logits", logits), ("temperature", temp_t), ("token_ids", token_ids)],
-        in_place=(("out", "logits"),),
-    )
-    # an output may not overlap another output or an input, except the row output aliasing the logits exactly (in
-    # place: every thread writes the elements it read, after reading them)
-    check_no_overlap(
-        [("out", yb), ("lse_out", lb), ("logp_out", pb)],
-        [("logits", logits), ("temperature", temp_t), ("token_ids", token_ids)],
-        in_place=(("out", "logits"),),
+        in_place=() if mode.logp else (("out", "logits"),),
     )
     temp_arg = temp_t if temp_t is not None else _dummy(dev, torch.float32)
     if M == 0:  # no rows: nothing to launch; the outputs keep their documented shapes

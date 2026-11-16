@@ -1498,6 +1498,65 @@ def test_preallocated_outputs():
         flashinfer.sampling.sampling_from_logits(
             x, seed=s, offset=o, batch_invariant=True, out=o.view(torch.int32)[:M]
         )
+    if DS.draw_config(N, M, 2, sm).rows_per_cta == 1:
+        # an int64 samples buffer (the gather's dtype contract) overlapping the log-probability buffer
+        idx = torch.tensor([0, 2, 2, 4, 1], device="cuda")
+        arena = torch.empty(2 * M, dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError, match="overlap"):
+            flashinfer.sampling.sampling_from_logits(
+                x,
+                indices=idx,
+                seed=s,
+                offset=o,
+                batch_invariant=True,
+                out=arena.view(torch.int64),
+                logprob_out=arena[:M],
+            )
+    # the scratch behind the kernel's validity word: a buffer a CUDA graph captured must survive the cache's growth (the
+    # replay keeps writing to its address), and so must one a pending kernel on another stream still writes
+    from flashinfer.batch_invariant import support as bi_support
+
+    xs = logits(512, N, torch.bfloat16, seed=3)
+    ss, os_ = keys(512, 31)
+    flashinfer.sampling.sampling_from_logits(
+        xs, seed=ss, offset=os_, batch_invariant=True
+    )
+    captured = bi_support.scratch(xs.device, torch.int32, 512).data_ptr()
+    tb2 = torch.empty(512, dtype=torch.int32, device="cuda")
+    st2 = torch.cuda.Stream()
+    with torch.cuda.stream(st2):
+        flashinfer.sampling.sampling_from_logits(
+            xs, seed=ss, offset=os_, batch_invariant=True, out=tb2
+        )
+        torch.cuda.current_stream().synchronize()
+        g2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2, stream=st2):
+            flashinfer.sampling.sampling_from_logits(
+                xs, seed=ss, offset=os_, batch_invariant=True, out=tb2
+            )
+    torch.cuda.synchronize()
+    cur = bi_support.scratch(xs.device, torch.int32, 1)
+    assert cur.data_ptr() == captured  # the cache still serves the captured buffer
+    xl = logits(
+        cur.numel() + 1, N, torch.bfloat16, seed=4
+    )  # one row more than the cache holds: it grows
+    sl, ol = keys(cur.numel() + 1, 32)
+    flashinfer.sampling.sampling_from_logits(
+        xl, seed=sl, offset=ol, batch_invariant=True
+    )
+    grown = bi_support.scratch(xs.device, torch.int32, 1)
+    assert grown.data_ptr() != captured and grown.numel() >= 2 * cur.numel()
+    assert any(t.data_ptr() == captured for t in bi_support._scratch_keep), (
+        "the buffer the graph captured was released"
+    )
+    g2.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        tb2,
+        flashinfer.sampling.sampling_from_logits(
+            xs, seed=ss, offset=os_, batch_invariant=True
+        ),
+    )
     # a CUDA graph on caller-owned buffers: new logits and new keys through the captured addresses
     xin, sin, oin = x.clone(), s.clone(), o.clone()
     tb = torch.empty(M, dtype=torch.int32, device="cuda")

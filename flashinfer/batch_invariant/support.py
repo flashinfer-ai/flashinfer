@@ -183,20 +183,27 @@ def check_no_overlap(outputs, inputs, in_place=()):
 
 
 _scratch: dict = {}
+#: Every scratch buffer ever handed out, kept alive for the process: a kernel captured into a CUDA graph, or still
+#: pending on another stream, writes into the buffer it was given, so a replaced buffer must never return to the
+#: allocator (its address would be reused by an unrelated tensor). The growth is geometric, so the retained total stays
+#: under twice the largest cached buffer plus one buffer per capture that outgrew the cache.
+_scratch_keep: list = []
 
 
 def scratch(device: torch.device, dtype: torch.dtype, n: int) -> torch.Tensor:
     """A per-device scratch of at least ``n`` elements for a kernel output nobody reads (the draws' validity word, the
-    truncated draw's kept mass when not requested): grown to the largest size seen and kept, so a call allocates nothing
-    in steady state. Its contents are dead writes, so calls on different streams may share it. Inside a CUDA-graph
-    capture a fresh buffer is used and not cached (a capture-time allocation belongs to the graph's pool and would
-    dangle after the graph is freed)."""
+    truncated draw's kept mass when not requested): grown to the largest size seen, so a call allocates nothing in
+    steady state. Its contents are dead writes. A buffer is never freed once handed out (``_scratch_keep``): a CUDA graph
+    that captured it, or a kernel still running on another stream, keeps writing to its address after the cache has
+    moved on. Inside a CUDA-graph capture a buffer the cache cannot serve is allocated for that capture and retained,
+    not cached (it belongs to the graph's pool)."""
     key = (device, dtype)
     t = _scratch.get(key)
     if t is not None and t.numel() >= n:
         return t
     size = max(n, 2 * (t.numel() if t is not None else 0), 1024)
     fresh = torch.empty(size, dtype=dtype, device=device)
+    _scratch_keep.append(fresh)
     if not torch.cuda.is_current_stream_capturing():
         _scratch[key] = fresh
     return fresh

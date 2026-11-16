@@ -819,6 +819,16 @@ def test_in_place_row_output_at_a_large_shape():
     big[:512] = xb
     with pytest.raises(ValueError, match="overlap"):
         flashinfer.sampling.softmax(big[:512], batch_invariant=True, out=big[1:])
+    # no in-place alias when a token gather shares the launch (the generic entry only): the token's logit may lie in a
+    # peer CTA's share that its row output already overwrote
+    x4 = logits(5, 4096, torch.bfloat16)
+    with pytest.raises(ValueError, match="overlap"):
+        lse_row(
+            S.Mode(probs=True, logp=True),
+            x4,
+            token_ids=ids_for(x4),
+            out=x4,
+        )
 
 
 def test_space_members_are_bounded_in_loads_per_thread():
