@@ -1484,6 +1484,7 @@ _ATTENTION_TS_DECODE_TRACES = {
         out_dtype=out_dtype,
         q_mode=q_mode,
         encoded_page_size=encoded_page_size,
+        store_softmax_stats=False,
     )
     for combined in (False, True)
     for out_dtype in (None, "float16", "bfloat16")
@@ -2021,7 +2022,10 @@ def _make_prims_ts_decode_mla_one_shot_trace(
 
 _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
     (rank4_cache, packed_query): _make_prims_ts_decode_mla_one_shot_trace(
-        rank4_cache=rank4_cache, packed_query=packed_query
+        rank4_cache=rank4_cache,
+        packed_query=packed_query,
+        store_softmax_stats=False,
+        use_kv_bounds=False,
     )
     for rank4_cache in (False, True)
     for packed_query in (False, True)
