@@ -25,14 +25,91 @@ follow the standard SM100-family CuTe-DSL/Cake policy. SM120a uses a CuTe-DSL
 backend of its own. These prefill routes leave decode and speculative-decode
 dispatch unchanged.
 
+Automatic prefill policy on GB200 and GB300
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For one packed sequence, BF16 activations, head dimension 128 and an existing
+BF16 or FP32 state, ``auto`` uses these coarse performance regions:
+
+* Few heads: 1--16 local heads; moderate: 17--64; wide: 65--96.
+* Short: 1K to below 4K tokens; medium: 4K to below 8K;
+  long: 8K through 64K. Here K means 1024.
+
+The policy prefers cuDNN when its measured GPU time is within 10% of the
+fastest valid backend, except wide-head BF16 calls on GB300, which prefer
+cuDNN despite its measured 14--15% overhead against Cake. This is an offline
+tuning target, not a runtime benchmark or a guarantee for unmeasured shapes.
+The measurements used 8, 12, 64 and 96 local heads on GB200/GB300 at
+FlashInfer ``fd14b3056d0c``.
+
+.. list-table:: Preferred backend
+   :header-rows: 1
+
+   * - Local heads / state
+     - Short
+     - Medium
+     - Long
+   * - 1--8 / BF16
+     - small-bh
+     - cuDNN
+     - cuDNN
+   * - 9--16 / BF16
+     - small-bh
+     - small-bh
+     - cuDNN
+   * - 1--16 / FP32
+     - cute-dsl
+     - cuDNN
+     - cuDNN
+   * - 17--64 / BF16
+     - small-bh
+     - small-bh
+     - small-bh
+   * - 17--64 / FP32
+     - cute-dsl-persistent
+     - cuDNN
+     - cuDNN [1]_
+   * - 65--96 / BF16, GB200
+     - cuDNN
+     - cuDNN
+     - cuDNN
+   * - 65--96 / BF16, GB300
+     - cuDNN
+     - cuDNN
+     - cuDNN
+   * - 65--96 / FP32
+     - cute-dsl-persistent
+     - cute-dsl-persistent
+     - cute-dsl-persistent
+
+.. [1] GB300 uses persistent for FP32 moderate-head calls from 8K to below
+   16K: cuDNN exceeded the 10% margin against PTX at the measured 8K point.
+   PTX remains explicit because it requires bounded state values.
+
+Numerical and layout eligibility checks still apply. Persistent selection
+requires heads divisible by eight and no more than the device SM count,
+so this single-sequence route never uses inter-CTA state handoffs. An
+unavailable cuDNN frontend falls back to a compatible native backend.
+Unbounded gates, state pools, checkpoints, strided Q/K, multiple sequences,
+and sizes outside these regions retain the existing policy. Auto-selected
+cuDNN leaves a supplied ``prefill_workspace`` unused and manages its own
+scratch buffers, including private storage during CUDA Graph capture.
+Native fallback uses the supplied workspace. Warm the selected backend with
+the same arguments and stream before capture.
+
 Input layout
 ~~~~~~~~~~~~
 
-Ordinary prefill with ``auto``, ``cute-dsl``, ``cake`` or ``small-bh`` accepts
-strided Q/K and packs them before selecting dense-only kernels. ``cudnn``
-retains supported strides. V, gates, state and output keep their existing
-layout requirements. Output alias checks use the original Q/K storage,
-and decode retains its existing layout contract.
+Ordinary prefill with ``auto``, ``cake`` or ``small-bh`` packs strided Q/K
+before backend selection. ``auto`` can select CuTe prefill with supported
+token-strided V. Explicit ``cute-dsl`` consumes supported Q/K/V token-strided
+views directly on SM100/SM103/SM107 and SM120, and packs Q/K layouts the kernel
+cannot read directly. ``cute-dsl-persistent`` requires supported Q/K/V
+token-strided views on SM100/SM103. V is never packed automatically and must
+meet the selected backend's layout requirements. ``cudnn`` retains its supported
+strides. Gates, state and output keep their existing layout requirements.
+Output alias checks use the original Q/K storage, and decode retains its
+existing layout contract.
 
 .. currentmodule:: flashinfer.kda
 
@@ -42,25 +119,39 @@ and decode retains its existing layout contract.
     recurrent_kda
 
 Static PTX prefill on B300
-~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects four
-retained PTX programs from `NVlabs/kda (260927-kda-for-kda)
+``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects retained PTX
+programs originally imported from `NVlabs/kda (260927-kda-for-kda)
 <https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67/ptx>`_.
 The programs target SM103a (B300) and use persistent recurrence scheduling
 with exact FP32 state handoff between pieces. The default backend selection
 is unchanged.
 
-Install ``nvidia-cuda-nvcc>=13.2`` and ``apache-tvm-ffi>=0.1.12`` in addition
-to FlashInfer's regular dependencies. The retained PTX uses ISA 9.2. It is
-assembled once with ptxas >= 13.2 and embedded as a cubin, allowing execution
-with a CUDA 13 driver that cannot JIT PTX 9.2 directly. A C++17 host compiler
-and CUDA driver headers (provided by Triton) are needed for the FFI shims.
+Install ``apache-tvm-ffi>=0.1.12`` in addition to FlashInfer's regular
+dependencies. The retained PTX uses ISA 9.2. Drivers supporting CUDA 13.2 or
+newer JIT the PTX directly. Older CUDA 13 drivers use a cubin assembled with
+ptxas >= 13.2; install ``nvidia-cuda-nvcc>=13.2`` for this fallback. A C++17
+host compiler and CUDA driver headers (provided by Triton) are needed for
+the FFI shims.
 ``FLASHINFER_KDA_PTXAS`` selects the assembler;
 ``FLASHINFER_KDA_PTX_CACHE_DIR`` overrides the default FlashInfer JIT cubin
 cache directory. No build output is written into the installed package. This backend is
 JIT-only and is unavailable with ``FLASHINFER_DISABLE_JIT=1`` in a fresh
 process.
+
+The optimized schedules currently require a 148-SM B300, 8192 total tokens,
+64 or 96 heads, and exactly one of these sequence-length layouts:
+``[8192]``, ``[1300, 547, 2048, 963, 271, 3063]``, or ``[1024] * 8``.
+Other supported layouts use the original scheduler, including nearby layouts
+that differ by only one token or an additional sequence.
+
+The fixed-sequence split retains the full recurrence through affine state
+composition. State handoff buffers and final-state storage are FP32. The
+correction uses TF32 products with FP32 accumulation for state composition,
+and BF16 state operands with FP32 accumulation for tail-output correction.
+Its numerical contract is the validated reference tolerance; FP32 storage does
+not imply bitwise FP32 arithmetic throughout the composition.
 
 Supported inputs are contiguous CUDA BF16 ``q/k/v/g [1, T, H, 128]`` with
 ``T >= 32`` and ``H`` equal to 64 or 96, BF16 beta logits ``[1, T, H]``, FP32
@@ -133,6 +224,11 @@ The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
 
+The CuTe DSL decode kernels accept a BF16 or FP32 ``initial_state`` pool and read and
+write it in its own dtype. Any other dtype raises ``TypeError``. ``backend="cake"``
+and ``packed_kda_decode`` still require a BF16 state; the fused decode ops already
+accept BF16 or FP32.
+
 ``fused_kda_decode`` combines width-four causal convolution, one KDA update,
 and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same
 pipeline to packed ragged speculative decode, retaining one recurrent
@@ -145,19 +241,19 @@ behavior or performance is changed by this optimization.
 
 Pass ``backend="cake"`` to select the exported Cake backend. On SM100-family
 SM100a (B200/GB200) and SM103a (B300/GB300) devices, its D128 ``T=1..6``
-family with in-kernel QK normalization exports 25 frozen CUDA bodies:
+family with in-kernel QK normalization exports 21 frozen CUDA bodies:
 
 * ``T=3`` with raw gates, ``use_gate_in_kernel=True``, a negative
   ``lower_bound``, float32 ``A_log`` and ``dt_bias``, ``H=HV=16``, and
   ``N`` in ``{1, 2, 4, 8, 16}``;
-* four value-row splits for each ``T`` in ``{1, 2, 4, 5, 6}`` with
-  precomputed gates, ``use_gate_in_kernel=False``, and no ``A_log``,
-  ``dt_bias``, or ``lower_bound``;
-* two additional one-warp direct-state ``T=1`` schedules with value-row
-  splits 16 and 8. ``T=1`` keeps the standard decode API and is normalized
+* two splits (4, 8) for ``T=2`` and four (1, 2, 4, 8) for each ``T`` in
+  ``{4, 5, 6}`` with precomputed gates, ``use_gate_in_kernel=False``, and
+  no ``A_log``, ``dt_bias``, or ``lower_bound``;
+* two one-warp direct-state ``T=1`` schedules with precomputed gates and
+  value-row splits 16 and 8. ``T=1`` keeps the standard decode API and is normalized
   to the packed frozen ABI with zero-copy views and cached identity metadata;
   explicit ``T=1`` ``cu_seqlens`` metadata is outside the Cake contract.
-* two Kimi-Linear ``T=1`` equal-head direct-state schedules for
+* four Kimi-Linear ``T=1`` equal-head direct-state schedules for
   ``lower_bound=None``. They accept any positive runtime head count, including
   production per-rank ``H=HV=32/16/8/4`` for TP1/2/4/8, and evaluate
   ``-exp(A_log) * softplus(g + dt_bias)`` and beta sigmoid in-kernel. Q, K,
@@ -182,18 +278,18 @@ split-1 island at ``3S/4<W<=S``. T6 selects split 8 through ``W<=3S/8``, split
 2 through ``W<=S/2``, and split 1 above it. T3 uses its sole exact lower-bound
 split-4 specialization on both architectures.
 
-With CUDA 12.9 or newer, JIT and AOT compile all 25 checked-in bodies once for
-the ``sm_100f`` family target. The family module URI and cubin artifact can run
+With CUDA 12.9 or newer, JIT compiles selected bodies on demand and AOT builds all
+21 checked-in bodies for the ``sm_100f`` family target. The family module URI and cubin artifact can run
 on both CC 10.0 and CC 10.3; build workspaces may still materialize separate
 cache directories for their local architecture context. Runtime split
 selection remains device-specific. A cold-L2 CUPTI A/B against exact-target
 cubins measured no aggregate change on B200 (``1.0000x`` exact/family) and
 ``0.9987x`` on GB300. The GB300 direct-T1 path was the repeatable exception
-(``0.9790x``), so its two public direct variants retain exact ``sm_103a``
-cubins while every other GB300 route uses ``sm_100f``.
+(``0.9790x``), so its two precomputed direct variants retain exact ``sm_103a``
+cubins; four Kimi-Linear direct variants also use ``sm_103a``. All others use ``sm_100f``.
 
 CUDA 12.8 cannot compile ``sm_100f``. On B200 it therefore retains exact
-``sm_100a`` modules for all 25 bodies. SM103a requires CUDA 12.9 or newer.
+``sm_100a`` modules for all 21 bodies. SM103a requires CUDA 12.9 or newer.
 Every binding validates its family or exact-device contract before launch, and
 the frozen generated body bytes are identical across all physical targets.
 
@@ -303,8 +399,14 @@ unsupported contracts. Decode retains the existing KDA decode routing.
 raise when its contract is unsupported.
 
 For multi-token prefill, ``backend="cute-dsl"`` selects a BT=16 CuTe DSL kernel.
-It supports contiguous BF16 Q, K, V, G, and beta with one shared head count and
-head dimension 128, the in-kernel lower-bound gate, fixed or packed-varlen
+It supports BF16 Q, K, V, G, and beta with one shared head count and
+head dimension 128. Q/K/V may use independent,
+non-overlapping token-row strides with contiguous head/features, 16-byte-aligned
+base pointers and token strides divisible by eight BF16 elements. Fixed batches
+must flatten without a copy (batch stride equals token count times token stride).
+Explicit ``backend="cute-dsl"`` consumes these views directly, including views
+into packed QKV storage; G, beta and output retain their contiguous layouts.
+It supports the in-kernel lower-bound gate, fixed or packed-varlen
 layout, BF16 recurrent state, explicit ``seq_order``, and the same checkpoint
 contract as Cake. ``checkpoint_cu_starts`` must always be int64. Packed
 ``cu_seqlens`` must be int64 during CUDA graph capture. The CuTe DSL schedule
@@ -474,11 +576,11 @@ The frozen kernel uses restricted output and auxiliary storage. A preallocated
 ``output`` and checkpoint buffers must not overlap Q, K, V, G, beta, state,
 metadata, or descriptor storage.
 
-Eager calls without ``prefill_workspace`` use an internal serialized workspace
+Native eager calls without ``prefill_workspace`` use an internal serialized workspace
 for the current CUDA stream. This default workspace is eager-only and cannot
 be used during CUDA graph capture.
 
-CUDA graph capture requires a caller-owned
+Native CUDA graph capture requires a caller-owned
 ``RecurrentKDAPrefillWorkspace(device)`` and a preallocated ``output``. The
 workspace owns optional final-state scratch for calls without an initial
 state, beta padding, separate TMA descriptor blocks, and the small-BH compact
@@ -488,8 +590,8 @@ diagonal factors, and independent prepare/chain descriptor storage. The
 workspace binds to the device and CUDA stream of its first ``recurrent_kda``
 call.
 Warm it eagerly on the intended capture stream with the exact Q, K, V, G,
-beta, and output tensors, then synchronize that stream before capture. Packed
-graphs must also pass preallocated int64 ``cu_seqlens`` and int32
+beta, and output tensors, then synchronize that stream before capture. For SM100-family Cake,
+packed graphs must also pass preallocated int64 ``cu_seqlens`` and int32
 ``seq_order``. The warm call prepares descriptors; capture accepts only the
 exact warmed pointer, shape, stride, and dtype signature and performs no
 descriptor preparation. Warm the largest intended small-BH shape before
@@ -540,11 +642,12 @@ refused rather than silently executed by another backend.
   against architecture-specific instructions;
 * input is ordinary multi-token prefill: fixed ``T > 1``, or packed input
   whose total token count exceeds its number of sequences;
-* Q, K, V and G are contiguous BF16 ``[B,T,H,128]`` tensors sharing one head
-  count, and beta is contiguous BF16 ``[B,T,H]``. GQA and ``V != K`` are not
-  supported;
-* the output fits an INT32 extent: ``T_total * H * 128 <= 2**31 - 1``, which is
-  16383 tokens at H=1024 and no constraint at ordinary head counts. Larger is
+* Q, K, V and G are BF16 ``[B,T,H,128]`` tensors sharing one head count.
+  Q/K/V support the token-strided layout described above for ``cute-dsl``;
+  G and beta remain contiguous. Beta has shape ``[B,T,H]``.
+  GQA and ``V != K`` are not supported;
+* the output fits an INT32 extent: ``T_total * H * 128 <= 2**31 - 1``, which permits up to
+  16,383 tokens at H=1024 and imposes no practical constraint at ordinary head counts. Larger is
   refused with the backend's own error, because the two things that stop there
   — a device index built in INT32, and the DSL packing a memref extent as one —
   otherwise fail as a silent negative offset and as a compile-time overflow
@@ -643,11 +746,11 @@ should rotate fewer buffer sets, or call
 which releases all of it.
 
 Persistent CuTe DSL prefill with FP32 state
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``recurrent_kda(..., backend="cute-dsl-persistent")`` selects the persistent
-M128/BT32 kernel adapted from
-`humanfia/kda-for-kda-release <https://github.com/humanfia/kda-for-kda-release>`_.
+M128/BT32 kernel adapted from humanfia/kda-for-kda-release, now
+`vendored in FlashInfer <https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/kda_kernels/persistent>`_.
 It fuses Q/K L2 normalization, the bounded K3 gate, beta sigmoid, preparation,
 triangular solves and recurrence. A continuous five-stage preparation pipeline
 is shared across each CTA's sequence/head chains. Recurrent state and
@@ -672,11 +775,12 @@ uses the source contract: relative L2 error at most 3%, with each element's
 error bounded by the larger of 0.5 times reference RMS and 5% of its magnitude.
 Short-sequence tests additionally compare with an independent FP64 recurrence.
 
-This backend is explicitly selected and requires SM100 or SM103 with
+This backend requires SM100 or SM103 with
 ``nvidia-cutlass-dsl>=4.7.0``. Its supported contract is:
 
-* contiguous, 16-byte-aligned BF16 Q/K/V/G ``[B,T,H,128]`` and beta
-  ``[B,T,H]``, with ``T > 1``, positive H divisible by eight and
+* BF16 Q/K/V ``[B,T,H,128]`` with the token-strided layout described above
+  for ``cute-dsl``; contiguous, 16-byte-aligned BF16 G ``[B,T,H,128]`` and
+  beta ``[B,T,H]``; ``T > 1``, positive H divisible by eight and
   ``B*T*H*128 < 2**31``;
 * contiguous FP32 ``A_log[H]`` and ``dt_bias[H*128]`` or ``dt_bias[H,128]``;
 * ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,

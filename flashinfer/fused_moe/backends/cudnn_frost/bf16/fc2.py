@@ -7,8 +7,6 @@ belong to the surrounding MoE pipeline. No cuDNN Frost compiler is imported here
 
 from __future__ import annotations
 
-import functools
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,10 +15,15 @@ import torch
 
 from .runtime import (
     _arch_for,
+    bind_kernel,
+    cache_discovery,
+    discovery_binding,
+    source_binding,
     _artifact_roots,
     _current_custream,
     _dimension_matches,
     _load_kernel,
+    _read_manifest,
     _read_source,
     _validate_abi,
     _tactic_digest,
@@ -36,6 +39,9 @@ class Fc2Kernel:
     workspace_bytes: int
     contract: dict[str, Any]
     tactic_metadata: dict[str, Any]
+    source_parameters: dict | None = None
+    template_path: Path | None = None
+    source_identity: str = ""
 
     @property
     def swap_ab(self) -> bool:
@@ -46,22 +52,18 @@ class Fc2Kernel:
         return (
             "cudnn_frost-grouped-fc2-v2",
             self.artifact_id,
-            _tactic_digest(self.source_sha256),
+            _tactic_digest(self.source_identity or self.source_sha256),
         )
 
 
-@functools.lru_cache(maxsize=8)
+@cache_discovery
 def discover(roots: tuple[Path, ...] | None = None) -> tuple[Fc2Kernel, ...]:
     """Read and verify sealed FC2 artifacts, separately from the FC1 pool."""
     result = []
     seen = set()
     for root in _artifact_roots() if roots is None else roots:
         path = root / "cudnn_frost_selected_kernels.json"
-        payload = json.loads(path.read_text())
-        if payload.get("schema_version") != 2 or not isinstance(
-            payload.get("kernels"), list
-        ):
-            raise RuntimeError(f"invalid cuDNN Frost manifest: {path}")
+        payload = _read_manifest(path)
         for raw in payload["kernels"]:
             if raw.get("op") != "grouped_gemm2":
                 continue
@@ -98,9 +100,10 @@ def discover(roots: tuple[Path, ...] | None = None) -> tuple[Fc2Kernel, ...]:
                     size,
                     contract,
                     raw["tactic"],
+                    **source_binding(root, raw, digest),
                 )
             )
-    return tuple(result)
+    return tuple(bound for k in result if (bound := discovery_binding(k)) is not None)
 
 
 def matching_kernels(
@@ -138,6 +141,7 @@ class PreparedFc2:
     ):
         if x.device.type != "cuda":
             raise ValueError("FC2 requires CUDA tensors")
+        kernel = bind_kernel(kernel, x.device)
         with torch.cuda.device(x.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("prepare FC2 outside CUDA Graph capture")

@@ -88,8 +88,6 @@ union MmaSmemDesc {
 #include "cake_device_helpers/cake_tcgen05_mma_f16_03fde8c1cbf058c8.cuh"
 #include "cake_device_helpers/cake_add_f32x2_74578aa6314ab32b.cuh"
 #include "cake_device_helpers/cake_fma_f32x2_rn_ftz_abada39162909eda.cuh"
-#include "cake_device_helpers/cake_fma_f32x2_35fce702230b2007.cuh"
-#include "cake_device_helpers/cake_tmem_st_x8_u32_dc3bd531d058988e.cuh"
 #include "cake_device_helpers/cake_tma_store_4d_fe168f8f1026468a.cuh"
 #include "cake_device_helpers/cake_fma_f32x2_rn_noftz_e5a5b765e454e524.cuh"
 template <int Stages>
@@ -108,5 +106,7 @@ cake_pipeline_state_at(CakePipelineState<Stages> state) {
     return state;
 }
 #include "cake_device_helpers/cake_mbarrier_wait_cluster_hint_bdb29a0e36dedbee.cuh"
+#include "cake_device_helpers/cake_fma_f32x2_35fce702230b2007.cuh"
 #include "cake_device_helpers/cake_tma_2d_gmem2smem_f2637c69284c470a.cuh"
 #include "cake_device_helpers/cake_tmem_ld_x8_38cb8e5e57da80f2.cuh"
+#include "cake_device_helpers/cake_tmem_st_x8_u32_dc3bd531d058988e.cuh"

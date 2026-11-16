@@ -21,15 +21,30 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   const int smem_bytes = plan.shared_bytes;
   const int block_threads = plan.block_threads;
   auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS>;
-  if constexpr (MT == ModelType::DSV4_1) {
+  if constexpr (MT == ModelType::DSV4 || is_dsv41(MT)) {
+    if (p.mega.output)
+      kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Fp8DecodeGatherSchedule, true>;
+  }
+  // Inline-scale rows are addressed flat: the stride arguments carry the main
+  // and extra row pitches.
+  size_t main_stride = p.page_stride_bytes, extra_stride = p.extra_page_stride_bytes;
+  if constexpr (KV::SCALE_INLINE && is_dsv41(MT)) {
+    main_stride = size_t(plan.metadata.row_stride_bytes);
+    extra_stride = plan.metadata.extra_row_stride_bytes;
+  }
+  if constexpr (is_dsv41(MT)) {
     if (plan.implementation == Implementation::MixedCache) {
-      kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Dsv41MixedCacheDecodeSchedule>;
+      kernel =
+          p.mega.output
+              ? sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Dsv41MixedCacheDecodeSchedule<MT>,
+                                              true>
+              : sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Dsv41MixedCacheDecodeSchedule<MT>>;
       cudaError_t result = validate_mixed_smem(kernel, smem_bytes);
       if (result != cudaSuccess) return result;
     }
     if (plan.implementation == Implementation::FullBF16) {
-      kernel = plan.metadata.extra_fp4 ? sparse_mla_decode_dsv41_bf16_kernel<NUM_HEADS, true>
-                                       : sparse_mla_decode_dsv41_bf16_kernel<NUM_HEADS, false>;
+      kernel = plan.metadata.extra_fp4 ? sparse_mla_decode_dsv41_bf16_kernel<NUM_HEADS, true, MT>
+                                       : sparse_mla_decode_dsv41_bf16_kernel<NUM_HEADS, false, MT>;
     }
   }
   cudaError_t result =
@@ -48,18 +63,23 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   kernel<<<dim3(p.num_tokens, h_blocks, p.allocated_splits), dim3(block_threads), smem_bytes,
            stream>>>(p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.extra_kv,
                      p.extra_indices, p.extra_topk_length, p.extra_topk, p.extra_page_size,
-                     p.extra_page_stride_bytes, p.num_tokens, q_heads, p.topk, p.allocated_splits,
-                     cpb, p.sm_scale, p.page_stride_bytes, p.indices_stride_elems,
-                     p.extra_indices_stride_elems, pages);
+                     extra_stride, p.num_tokens, q_heads, p.topk, p.allocated_splits, cpb,
+                     p.sm_scale, main_stride, p.indices_stride_elems, p.extra_indices_stride_elems,
+                     pages, p.mega);
   result = cudaGetLastError();
   if (result != cudaSuccess) return result;
   constexpr int MERGE_THREADS = 64;
   auto merge = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_THREADS,
                                                    KV::D_V / MERGE_THREADS>;
-  merge<<<dim3(p.num_tokens, q_heads), dim3(MERGE_THREADS),
-          size_t(p.allocated_splits) * sizeof(float), stream>>>(
+  size_t merge_smem = size_t(p.allocated_splits) * sizeof(float);
+  if (p.mega.output && p.allocated_splits <= 32) {
+    merge = sparse_mla_decode_dsv4_merge_kernel<NUM_HEADS, KV::D_V, MERGE_THREADS,
+                                                KV::D_V / MERGE_THREADS, true>;
+    merge_smem = 0;
+  }
+  merge<<<dim3(p.num_tokens, q_heads), dim3(MERGE_THREADS), merge_smem, stream>>>(
       p.mid_out, p.mid_lse, p.output, p.out_lse, p.attn_sink, p.num_tokens, p.allocated_splits,
-      q_heads, h_blocks * HPB, p.out_lse_stride_elems, p.lse_scale);
+      q_heads, h_blocks * HPB, p.out_lse_stride_elems, p.lse_scale, p.mega);
   return cudaGetLastError();
 }
 

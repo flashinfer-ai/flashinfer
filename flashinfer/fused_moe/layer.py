@@ -40,6 +40,7 @@ from .api import (
     CudnnFrostMxfp8Mxfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CakeStepFunConfig,
     CakeWarpDecodeConfig,
     CudnnGroupedGemmBf16Config,
     CudnnGroupedGemmFp8PerTensorConfig,
@@ -65,6 +66,9 @@ from .api import (
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
+    BatchInvariantBf16Config,
+    BatchInvariantFp8PerTensorConfig,
+    FrostLowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -72,6 +76,7 @@ from .api import (
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -81,6 +86,7 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeStepFunRunner,
     CakeWarpDecodeRunner,
     CudnnGroupedGemmBf16Runner,
     CudnnGroupedGemmFp8PerTensorRunner,
@@ -110,6 +116,7 @@ from .runners import (
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -120,10 +127,17 @@ from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
 from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
+from .backends.frost_low_latency.runner import FrostLowLatencyRunner
+from .batch_invariant.runner import BatchInvariantMoeRunner
+from .batch_invariant.runner_fp8 import BatchInvariantFp8PerTensorRunner
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    BatchInvariantMoeRunner,
+    BatchInvariantFp8PerTensorRunner,
+    FrostLowLatencyRunner,
+    CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8MoeRunner,
     CudnnFrostNvfp4MoeRunner,
@@ -157,6 +171,7 @@ _RunnerT = Union[
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -168,6 +183,9 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    BatchInvariantBf16Config: BatchInvariantMoeRunner,
+    FrostLowLatencyConfig: FrostLowLatencyRunner,
+    CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8Config: CudnnFrostMxfp8MoeRunner,
     CudnnFrostNvfp4Config: CudnnFrostNvfp4MoeRunner,
@@ -201,6 +219,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     SM12xFp8Config: SM12xFp8Runner,
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
     SM12xNvfp4Bf16Config: SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Config: SM12xNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
     TrtllmFp8BlockConfig: TrtllmFp8BlockRunner,
@@ -208,7 +227,12 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     TrtllmMxInt4Config: TrtllmMxInt4RoutedRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
+    BatchInvariantFp8PerTensorConfig: BatchInvariantFp8PerTensorRunner,
 }
+
+
+class NoEligibleBackend(RuntimeError):
+    """No configured backend supports the requested MoE configuration."""
 
 
 class MoELayer:
@@ -230,8 +254,8 @@ class MoELayer:
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
         """Build the layer and the set of backend runners it will autotune over.
 
-        Every backend in ``config.backend`` whose hardware preconditions the
-        target device satisfies gets a runner; the rest are skipped here rather
+        Every backend in ``config.backend`` whose hardware preconditions are
+        satisfied by the target device gets a runner; the rest are skipped here rather
         than at call time, so an unsupported backend costs nothing per call.
 
         Parameters
@@ -258,10 +282,11 @@ class MoELayer:
 
         # Build one runner per compatible backend
         self.runners: List[_RunnerT] = []
+        self._tuning_runner_ids: list[int] = []
         # check_support() raises a precise reason; keep it instead of letting
         # the filter swallow it, or every rejection reads "no usable backend".
         rejected: List[str] = []
-        for backend_cfg in config.backend:
+        for backend_index, backend_cfg in enumerate(config.backend):
             if not backend_cfg.supported(arch):
                 continue
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
@@ -285,6 +310,7 @@ class MoELayer:
                 continue
             runner.build()
             self.runners.append(runner)
+            self._tuning_runner_ids.append(backend_index)
 
         if not self.runners:
             mvp = ", ".join(c.__name__ for c in _BACKEND_RUNNERS)
@@ -348,7 +374,7 @@ class MoELayer:
                 reasons = " Backends rejected this configuration: " + "; ".join(
                     rejected
                 )
-            raise RuntimeError(
+            raise NoEligibleBackend(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
                 f"arch sm{arch} for this configuration. Registered unified "
@@ -378,6 +404,8 @@ class MoELayer:
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
         per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+        Candidate pools containing Frost low-latency use exact token counts
+        because their bounded tactics need not cover every row in a bucket.
 
         Parameters
         ----------
@@ -405,6 +433,41 @@ class MoELayer:
         NotImplementedError
             If no usable backend supports this pack's ``routing_input_mode``.
         """
+        eligible = self._eligible_runners(act_pack, weight_pack)
+        ceiling = self.config.execution.tune_max_num_tokens
+        mode = act_pack.routing_input_mode
+
+        bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
+        # Frost's bounded decode tactics can require exactly T=4 or T=8.
+        # Sharing their winner with T=3 or T=5..7 is not a valid specialization.
+        # Other candidate pools retain hybrid bucketing; Frost admits at most
+        # eight token counts, so exact keys remain bounded.
+        if any(
+            isinstance(self.runners[index], FrostLowLatencyRunner) for index in eligible
+        ):
+            bucket = act_pack.num_tokens
+        # Candidate positions distinguish different options for the same backend
+        # and prevent changing weight views or shape eligibility from reusing a winner.
+        winner_key = (bucket, mode, eligible)
+        winner = self._winners.get(winner_key)
+        if winner is None:
+            runners = [self.runners[index] for index in eligible]
+            winner = self._select_winner(act_pack, weight_pack, runners)
+            self._winners[winner_key] = winner
+            if len(self._winners) > 128:
+                self._winners.popitem(last=False)
+        else:
+            self._winners.move_to_end(winner_key)
+        runner, tactic = winner
+        self._last_winner_backend = runner.backend_key
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        return runner.forward(
+            inputs,
+            tactic=tactic,
+            **runner.launch_kwargs_for(inputs),
+        )
+
+    def _eligible_runners(self, act_pack, weight_pack) -> tuple[int, ...]:
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(
@@ -432,27 +495,74 @@ class MoELayer:
                 f"routing_input_mode={mode!r} with these input/weight packs."
             )
 
-        bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
-        # Candidate positions distinguish different options for the same backend
-        # and prevent changing weight views or shape eligibility from reusing a winner.
-        winner_key = (bucket, mode, eligible)
-        winner = self._winners.get(winner_key)
-        if winner is None:
-            runners = [self.runners[index] for index in eligible]
-            winner = self._select_winner(act_pack, weight_pack, runners)
-            self._winners[winner_key] = winner
-            if len(self._winners) > 128:
-                self._winners.popitem(last=False)
-        else:
-            self._winners.move_to_end(winner_key)
-        runner, tactic = winner
-        self._last_winner_backend = runner.backend_key
-        inputs = runner.pack_inputs(act_pack, weight_pack)
-        return runner.forward(
-            inputs,
-            tactic=tactic,
-            **runner.launch_kwargs_for(inputs),
+        return eligible
+
+    def _tuning_candidates(self, act_pack, weight_pack):
+        """Enumerate tactics on the actual inputs without compute-only selection."""
+        from ..autotuner.autotuner import (
+            OptimizationProfile,
+            StaticDim,
+            _tactic_to_json_hashable,
         )
+
+        candidates = []
+        eligible = self._eligible_runners(act_pack, weight_pack)
+        for index in eligible:
+            runner = self.runners[index]
+            inputs = runner.pack_inputs(act_pack, weight_pack)
+            profile = OptimizationProfile(
+                [
+                    [StaticDim(d) for d in t.shape]
+                    if isinstance(t, torch.Tensor)
+                    else [StaticDim(0)]
+                    for t in inputs
+                ],
+                [None] * len(inputs),
+            )
+            tactics = [
+                _tactic_to_json_hashable(tactic)
+                for tactic in self.tuner._blocklist.filter(
+                    f"moe_{runner.backend_key}",
+                    runner,
+                    runner.get_valid_tactics(inputs, profile),
+                )
+            ]
+            candidates.append(
+                {
+                    "runner": self._tuning_runner_ids[index],
+                    "backend": runner.backend_key,
+                    "implementation": type(runner).__name__,
+                    "extras": runner.get_cache_key_extras(inputs),
+                    "tactics": tactics,
+                }
+            )
+        return candidates
+
+    def _prepare_tactic(self, act_pack, weight_pack, selection):
+        from ..autotuner.autotuner import OptimizationProfile, StaticDim
+
+        backend_index, tactic = selection
+        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        profile = OptimizationProfile(
+            [
+                [StaticDim(d) for d in t.shape]
+                if isinstance(t, torch.Tensor)
+                else [StaticDim(0)]
+                for t in inputs
+            ],
+            [None] * len(inputs),
+        )
+        kwargs = runner.launch_kwargs_for(inputs)
+        if not runner.precompile_tactics(inputs, [tactic], profile, **kwargs):
+            runner.forward(inputs, tactic=tactic, do_preparation=True, **kwargs)
+
+    def _run_tactic(self, act_pack, weight_pack, selection):
+        """Pack and execute an already selected runner/tactic."""
+        backend_index, tactic = selection
+        runner = self.runners[self._tuning_runner_ids.index(backend_index)]
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        return runner.forward(inputs, tactic=tactic, **runner.launch_kwargs_for(inputs))
 
     def _select_winner(
         self,

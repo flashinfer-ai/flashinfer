@@ -115,7 +115,7 @@ def issue_dynamic_bf16_mma_tile(
     reach this function, and valid_tokens must not exceed the allocated N.
     """
     umma_m, allocated_n, tile_k = mma_tiler_mnk
-    if allocated_n not in (64, 128, 256) or tile_k % 16:
+    if allocated_n not in (32, 64, 128, 256) or tile_k % 16:
         raise ValueError("Unsupported BF16 N/K geometry.")
     if (
         cute.size(a_frag_tile, mode=[1]) != 1

@@ -49,6 +49,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
+from . import _softplus
+from ._softplus import softplus_fp32
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
 
@@ -76,6 +78,58 @@ def _mark_index_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 32):
     return from_dlpack(
         torch_t, assumed_align=assumed_align, enable_tvm_ffi=True
     ).mark_compact_shape_dynamic(mode=0, stride_order=stride_order, divisibility=1)
+
+
+def _flatten_intermediate_cache_view(
+    buffer: torch.Tensor,
+    *,
+    batch_size: int,
+    num_tokens: int,
+    num_v_heads: int,
+    v_dim: int,
+    k_dim: int,
+) -> tuple[torch.Tensor, int]:
+    """Return a zero-copy flat alias and its physical per-batch capacity.
+
+    ``buffer`` is ``[B, S, HV, V, K]`` with ``S >= num_tokens``: either a
+    padded allocation passed directly or a leading view ``cache[:, :T]`` of
+    one. Only steps ``[0, num_tokens)`` are written; the physical capacity
+    comes from ``stride(0)`` in both forms.
+    """
+    assert (
+        buffer.dim() == 5
+        and buffer.shape[0] == batch_size
+        and buffer.shape[1] >= num_tokens
+        and tuple(buffer.shape[2:]) == (num_v_heads, v_dim, k_dim)
+    ), (
+        "intermediate_states_buffer must have logical shape "
+        f"[{batch_size}, >={num_tokens}, {num_v_heads}, {v_dim}, {k_dim}], "
+        f"got {tuple(buffer.shape)}"
+    )
+    cache_step_stride = num_v_heads * v_dim * k_dim
+    expected_inner_strides = (cache_step_stride, v_dim * k_dim, k_dim, 1)
+    assert tuple(buffer.stride()[1:]) == expected_inner_strides, (
+        "intermediate_states_buffer must be contiguous within each batch; "
+        f"expected inner strides {expected_inner_strides}, got "
+        f"{tuple(buffer.stride()[1:])}"
+    )
+    cache_batch_stride = buffer.stride(0)
+    assert cache_batch_stride % cache_step_stride == 0, (
+        "intermediate_states_buffer batch stride must be a whole number of "
+        f"cache steps; got stride(0)={cache_batch_stride} and "
+        f"step size={cache_step_stride}"
+    )
+    cache_steps = cache_batch_stride // cache_step_stride
+    assert cache_steps >= num_tokens, (
+        f"intermediate_states_buffer batch stride encodes {cache_steps} cache "
+        f"steps, fewer than logical T={num_tokens}"
+    )
+    flat = buffer.as_strided(
+        size=(batch_size * cache_steps * num_v_heads, v_dim, k_dim),
+        stride=(v_dim * k_dim, k_dim, 1),
+        storage_offset=buffer.storage_offset(),
+    )
+    return flat, cache_steps
 
 
 # ==============================================================================
@@ -139,7 +193,7 @@ MTP_ILP4_ROWS = 4
 @cute.kernel
 def gdn_decode_bf16state_mtp_ilp4_kernel(
     h0_source: cute.Tensor,  # [pool_size, HV, V, K] as BF16
-    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] as BF16 (or dummy)
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] as BF16 (or dummy)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -160,6 +214,7 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -348,21 +403,8 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
                         r_b_pre = cutlass.Float32(b[i_n, i_t_pre, i_hv])
                         x_pre = r_a_pre + r_dt_bias
-                        beta_x_pre = softplus_beta * x_pre
-                        exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
-                        softplus_val_pre = (
-                            cutlass.Float32(1.0) / softplus_beta
-                        ) * cute.log(
-                            cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
-                        )
-                        use_softplus_pre = (
-                            cutlass.Float32(1.0)
-                            if beta_x_pre <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
-                        softplus_x_pre = (
-                            use_softplus_pre * softplus_val_pre
-                            + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
+                        softplus_x_pre = softplus_fp32(
+                            x_pre, softplus_beta, softplus_threshold
                         )
                         r_g_value_pre = (
                             -cute.exp(r_A_log, fastmath=True) * softplus_x_pre
@@ -458,21 +500,8 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
                         r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
                         x_val = r_a_val + r_dt_bias
-                        beta_x_val = softplus_beta * x_val
-                        exp_beta_x_val = cute.exp(beta_x_val, fastmath=True)
-                        softplus_val_v = (
-                            cutlass.Float32(1.0) / softplus_beta
-                        ) * cute.log(
-                            cutlass.Float32(1.0) + exp_beta_x_val, fastmath=True
-                        )
-                        use_softplus_v = (
-                            cutlass.Float32(1.0)
-                            if beta_x_val <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
-                        softplus_x_v = (
-                            use_softplus_v * softplus_val_v
-                            + (cutlass.Float32(1.0) - use_softplus_v) * x_val
+                        softplus_x_v = softplus_fp32(
+                            x_val, softplus_beta, softplus_threshold
                         )
                         r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
                         r_beta = cutlass.Float32(1.0) / (
@@ -517,19 +546,8 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
                     r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
                     x_val = r_a_val + r_dt_bias
-                    beta_x_val = softplus_beta * x_val
-                    exp_beta_x_val = cute.exp(beta_x_val, fastmath=True)
-                    softplus_val_v = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + exp_beta_x_val, fastmath=True
-                    )
-                    use_softplus_v = (
-                        cutlass.Float32(1.0)
-                        if beta_x_val <= softplus_threshold
-                        else cutlass.Float32(0.0)
-                    )
-                    softplus_x_v = (
-                        use_softplus_v * softplus_val_v
-                        + (cutlass.Float32(1.0) - use_softplus_v) * x_val
+                    softplus_x_v = softplus_fp32(
+                        x_val, softplus_beta, softplus_threshold
                     )
                     r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
                     r_beta = cutlass.Float32(1.0) / (
@@ -774,11 +792,12 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     # initial_state_indices points at slots >= B (i.e. any
                     # realistic pool_size > B serving config). Fix mirrors
                     # upstream PR #3145.
-                    # Int64: intermediate_states is reshaped to [B*T*HV, V, K]
+                    # Int64: intermediate_states is reshaped to
+                    # [B*cache_steps*HV, V, K]
                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
                     # >= 256). PR #3230.
-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
                     ita = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec_size),
@@ -882,6 +901,7 @@ def gdn_wide_vec_kernel(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1174,20 +1194,7 @@ def gdn_wide_vec_kernel(
                 r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
                 r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
                 x_pre = r_a_pre + r_dt_bias
-                beta_x_pre = softplus_beta * x_pre
-                exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
-                softplus_val_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
-                )
-                use_softplus_pre = (
-                    cutlass.Float32(1.0)
-                    if beta_x_pre <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x_pre = (
-                    use_softplus_pre * softplus_val_pre
-                    + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
-                )
+                softplus_x_pre = softplus_fp32(x_pre, softplus_beta, softplus_threshold)
                 r_g_pre = cute.exp(
                     -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
                 )
@@ -1310,7 +1317,7 @@ def gdn_wide_vec_kernel(
             o1 = cutlass.Float32(0.0)
             o2 = cutlass.Float32(0.0)
             o3 = cutlass.Float32(0.0)
-            flat_idx = cutlass.Int32(0)
+            flat_idx = cutlass.Int64(0)
             # FLA-flat predeclaration: Int64 so the Phase B loop's
             # reassignment via Int64(pool_slot)*HV+i_hv keeps a consistent
             # type. cute-DSL rejects type changes inside a dynamic for.
@@ -1554,11 +1561,12 @@ def gdn_wide_vec_kernel(
                     # initial_state_indices points at slots >= B (i.e. any
                     # realistic pool_size > B serving config). Fix mirrors
                     # upstream PR #3145.
-                    # Int64: intermediate_states is reshaped to [B*T*HV, V, K]
+                    # Int64: intermediate_states is reshaped to
+                    # [B*cache_steps*HV, V, K]
                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
                     # >= 256). PR #3230.
-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -1867,11 +1875,12 @@ def gdn_wide_vec_kernel(
                     cute.autovec_copy(r_hb2, it2)
                     cute.autovec_copy(r_hb3, it3)
                 elif cutlass.const_expr(cache_intermediate_states):
-                    # Int64: intermediate_states is reshaped to [B*T*HV, V, K]
+                    # Int64: intermediate_states is reshaped to
+                    # [B*cache_steps*HV, V, K]
                     # (BF16) with stride[0] = V*K = 16384 elements. flat_idx *
                     # 16384 hits 2**31 at flat_idx >= 131072 (HV=64+T=8: i_n
                     # >= 256). PR #3230.
-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -1958,6 +1967,7 @@ def gdn_wide_vec_kernel_t1(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2137,20 +2147,7 @@ def gdn_wide_vec_kernel_t1(
                 r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
                 r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
                 x_pre = r_a_pre + r_dt_bias
-                beta_x_pre = softplus_beta * x_pre
-                exp_beta_x_pre = cute.exp(beta_x_pre, fastmath=True)
-                softplus_val_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x_pre, fastmath=True
-                )
-                use_softplus_pre = (
-                    cutlass.Float32(1.0)
-                    if beta_x_pre <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x_pre = (
-                    use_softplus_pre * softplus_val_pre
-                    + (cutlass.Float32(1.0) - use_softplus_pre) * x_pre
-                )
+                softplus_x_pre = softplus_fp32(x_pre, softplus_beta, softplus_threshold)
                 r_g_pre = cute.exp(
                     -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
                 )
@@ -2366,14 +2363,15 @@ def gdn_wide_vec_kernel_t1(
                         r_hb1[i] = cutlass.BFloat16(r_h[1, i])
                         r_hb2[i] = cutlass.BFloat16(r_h[2, i])
                         r_hb3[i] = cutlass.BFloat16(r_h[3, i])
-                    # The intermediate_states buffer is sized [B, T, HV, V, K]
+                    # The intermediate_states buffer is sized
+                    # [B, cache_steps, HV, V, K]
                     # (batch-scoped, NOT pool-scoped), so this index uses i_n
                     # (the per-call batch index) and not cache_idx (the pool
                     # slot). Using cache_idx here writes OOB whenever
                     # initial_state_indices points at slots >= B (i.e. any
                     # realistic pool_size > B serving config). Fix mirrors
                     # upstream PR #3145. Int64 widening per PR #3230.
-                    flat_idx = i_n * T * HV + i_t * HV + i_hv
+                    flat_idx = cutlass.Int64(i_n) * cache_steps * HV + i_t * HV + i_hv
                     it0 = cute.local_tile(
                         intermediate_states,
                         (1, 1, vec),
@@ -2428,7 +2426,7 @@ def gdn_wide_vec_kernel_t1(
 @cute.jit
 def run_gdn_decode_bf16state_mtp_ilp4(
     h0_source: cute.Tensor,  # [pool_size, HV, V, K] BF16
-    intermediate_states: cute.Tensor,  # [B * T * HV, V, K] BF16 (or dummy)
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] BF16 (or dummy)
     A_log: cute.Tensor,
     a: cute.Tensor,
     dt_bias: cute.Tensor,
@@ -2446,6 +2444,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2503,6 +2502,7 @@ def run_gdn_decode_bf16state_mtp_ilp4(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -2549,6 +2549,7 @@ def _run_wide_vec(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2596,6 +2597,7 @@ def _run_wide_vec(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -2643,6 +2645,7 @@ def _run_wide_vec_t1(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2681,6 +2684,7 @@ def _run_wide_vec_t1(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -3058,24 +3062,17 @@ def gated_delta_rule_mtp_wide_vec(
     )
 
     cache_intermediate_states = intermediate_states_buffer is not None
+    cache_steps = T_val
     if cache_intermediate_states:
-        # The cache buffer is BATCH-scoped: shape [B, T, HV, V, K]. The kernel
-        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
-        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
-        # mirrors upstream PR #3145.
-        buffer_size = intermediate_states_buffer.shape[0]
-        cache_steps = intermediate_states_buffer.shape[1]
-        assert buffer_size == B_val, (
-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
-            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
-        )
-        assert cache_steps >= T_val
         assert intermediate_states_buffer.dtype == torch.bfloat16
-        intermediate_states = intermediate_states_buffer.reshape(
-            B_val * cache_steps * HV_val, V_val, K_val
+        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
+            intermediate_states_buffer,
+            batch_size=B_val,
+            num_tokens=T_val,
+            num_v_heads=HV_val,
+            v_dim=V_val,
+            k_dim=K_val,
         )
-        if not intermediate_states.is_contiguous():
-            intermediate_states = intermediate_states.contiguous()
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
     elif per_token_pool_scatter_flat:
@@ -3175,6 +3172,7 @@ def gated_delta_rule_mtp_wide_vec(
     cache_key = (
         "v3_mtp_bf16_tiled_dynB",
         T_val,
+        cache_steps,
         H_val,
         HV_val,
         K_val,
@@ -3225,8 +3223,8 @@ def gated_delta_rule_mtp_wide_vec(
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
-        a_ = _mark_batch_dynamic(a)
-        b_ = _mark_batch_dynamic(b)
+        a_ = _mark_batch_dynamic(a, assumed_align=a.element_size())
+        b_ = _mark_batch_dynamic(b, assumed_align=b.element_size())
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
@@ -3274,6 +3272,7 @@ def gated_delta_rule_mtp_wide_vec(
                     scale,
                     HV_val,
                     T_val,
+                    cache_steps,
                     H_val,
                     K_val,
                     V_val,
@@ -3290,7 +3289,7 @@ def gated_delta_rule_mtp_wide_vec(
                     per_token_pool_scatter_flat,
                     stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             ),
             # Per-B default tensors (B-dependent shapes; can't be shared
             # across batch sizes — see #L bug at cache_key without B).
@@ -3424,26 +3423,19 @@ def gated_delta_rule_t1_wide_vec(
 
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
-        # The cache buffer is BATCH-scoped: shape [B, T, HV, V, K]. The kernel
-        # indexes it by i_n (the per-call batch index), NOT by cache_idx (the
-        # pool slot), so a pool_size-sized buffer would be OOB-prone. Fix
-        # mirrors upstream PR #3145.
-        buffer_size = intermediate_states_buffer.shape[0]
-        cache_steps = intermediate_states_buffer.shape[1]
-        assert buffer_size == B_val, (
-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
-            f"batch size B={B_val}; the buffer is batch-scoped, not pool-scoped"
-        )
-        assert cache_steps >= T_val
         assert intermediate_states_buffer.dtype == torch.bfloat16
-        intermediate_states = intermediate_states_buffer.reshape(
-            B_val * cache_steps * HV_val, V_val, K_val
+        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
+            intermediate_states_buffer,
+            batch_size=B_val,
+            num_tokens=T_val,
+            num_v_heads=HV_val,
+            v_dim=V_val,
+            k_dim=K_val,
         )
-        if not intermediate_states.is_contiguous():
-            intermediate_states = intermediate_states.contiguous()
         # Skip the redundant final writeback when caching is on.
         effective_disable_final = True
     else:
+        cache_steps = T_val
         intermediate_states = h0_source[:1, :1, :1]
         effective_disable_final = disable_state_update
 
@@ -3470,6 +3462,7 @@ def gated_delta_rule_t1_wide_vec(
     cache_key = (
         "v3_mtp_bf16_tiled_dynB",
         T_val,
+        cache_steps,
         H_val,
         HV_val,
         K_val,
@@ -3512,8 +3505,8 @@ def gated_delta_rule_t1_wide_vec(
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
-        a_ = _mark_batch_dynamic(a)
-        b_ = _mark_batch_dynamic(b)
+        a_ = _mark_batch_dynamic(a, assumed_align=a.element_size())
+        b_ = _mark_batch_dynamic(b, assumed_align=b.element_size())
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
@@ -3549,6 +3542,7 @@ def gated_delta_rule_t1_wide_vec(
                     scale,
                     HV_val,
                     T_val,
+                    cache_steps,
                     H_val,
                     K_val,
                     V_val,
@@ -3560,7 +3554,7 @@ def gated_delta_rule_t1_wide_vec(
                     same_pool,
                     stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).
@@ -3645,11 +3639,13 @@ def gated_delta_rule_mtp(
         initial_state_indices: [B] int32 - indices into state pool (read)
         output_state_indices: Optional [B] int32 - indices for writing updated state.
             Defaults to initial_state_indices when None.
-        intermediate_states_buffer: Optional [B, T, HV, V, K] bf16. Note: this
-            buffer is BATCH-scoped, not pool-scoped — the kernel indexes it by
-            the per-call batch index (i_n), not by the pool slot. Sizing it
-            larger than B silently wastes memory; sizing it smaller than B
-            triggers an assertion (see the OOB fix mirroring upstream PR #3145).
+        intermediate_states_buffer: Optional
+            [B, S, HV, V, K] bf16 with S >= T; only the first T steps of each
+            batch row are written. This buffer is BATCH-scoped, not
+            pool-scoped — the kernel indexes it by the per-call batch index
+            (i_n), not by the pool slot. A leading slice of a larger cache,
+            for example ``cache[:, :T]``, is also supported; in both forms
+            the batch stride determines the physical cache capacity.
         disable_state_update: bool - if True, don't update initial state
         scale: Optional, default 1/sqrt(K)
         output: Optional pre-allocated output tensor [B, T, HV, V] bf16
@@ -3690,27 +3686,21 @@ def gated_delta_rule_mtp(
     # padded pool) work without a silent .contiguous() clone. See PR #3268.
     h0_source = initial_state_source
 
-    # Handle intermediate states. The cache buffer is BATCH-scoped: shape
-    # [B, T, HV, V, K]. The kernel indexes it by i_n (per-call batch index),
-    # NOT by cache_idx (pool slot), so a pool_size-sized buffer would be
-    # OOB-prone. Fix mirrors upstream PR #3145.
+    # The public cache shape is [B, S, HV, V, K] with S >= T (padded buffer
+    # or its leading view `cache[:, :T]`); stride(0) carries the physical
+    # per-batch capacity in either form.
     cache_intermediate_states = intermediate_states_buffer is not None
+    cache_steps = T
     if cache_intermediate_states:
-        buffer_size = intermediate_states_buffer.shape[0]
-        cache_steps = intermediate_states_buffer.shape[1]
-        assert buffer_size == B, (
-            f"intermediate_states_buffer dim 0 ({buffer_size}) must equal "
-            f"batch size B={B}; the buffer is batch-scoped, not pool-scoped"
-        )
-        assert cache_steps >= T, (
-            f"intermediate_states_buffer dim 1 ({cache_steps}) must be >= T={T}"
-        )
         assert intermediate_states_buffer.dtype == torch.bfloat16
-        intermediate_states = intermediate_states_buffer.reshape(
-            B * cache_steps * HV, V, K
+        intermediate_states, cache_steps = _flatten_intermediate_cache_view(
+            intermediate_states_buffer,
+            batch_size=B,
+            num_tokens=T,
+            num_v_heads=HV,
+            v_dim=V,
+            k_dim=K,
         )
-        if not intermediate_states.is_contiguous():
-            intermediate_states = intermediate_states.contiguous()
         per_token_pool_scatter_flat = False
     elif ssm_state_indices is not None and tuple(
         int(s) for s in h0_source.stride()
@@ -3851,6 +3841,7 @@ def gated_delta_rule_mtp(
     cache_key = (
         "mtp_bf16_dynB",
         T,
+        cache_steps,
         H,
         HV,
         K,
@@ -3901,8 +3892,8 @@ def gated_delta_rule_mtp(
         q_ = _mark_batch_dynamic(q)
         k_ = _mark_batch_dynamic(k)
         v_ = _mark_batch_dynamic(v)
-        a_ = _mark_batch_dynamic(a)
-        b_ = _mark_batch_dynamic(b)
+        a_ = _mark_batch_dynamic(a, assumed_align=a.element_size())
+        b_ = _mark_batch_dynamic(b, assumed_align=b.element_size())
         A_log_ = from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True)
         dt_bias_ = from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True)
         o_ = _mark_batch_dynamic(output if output is not None else _placeholder_output)
@@ -3950,6 +3941,7 @@ def gated_delta_rule_mtp(
                     scale,
                     HV,
                     T,
+                    cache_steps,
                     H,
                     K,
                     V,
@@ -3965,7 +3957,7 @@ def gated_delta_rule_mtp(
                     per_token_pool_scatter_flat,
                     stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).

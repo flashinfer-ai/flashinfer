@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Provider-owned Q/K packing must preserve routing and caller storage contracts."""
+"""KDA input layouts preserve numerical results and caller storage contracts."""
 
 import importlib
 
@@ -21,7 +21,12 @@ import torch
 
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.kda_prefill import packed_prefill_inputs
+from tests.kda.test_helpers.kda_prefill import (
+    _make_inputs,
+    _strict_prefill_kwargs,
+    _strided_qkv,
+    packed_prefill_inputs,
+)
 
 kda = importlib.import_module("flashinfer.kda")
 
@@ -151,11 +156,53 @@ def test_prefill_fallback_preserves_decode_qk_layout(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_auto_prefill_strided_qk_capture_reads_changed_inputs():
+@pytest.mark.parametrize(
+    ("backend", "heads", "state_dtype", "layout"),
+    [
+        ("auto", 4, torch.bfloat16, "token-strided"),
+        ("cute-dsl", 12, torch.bfloat16, "token-strided"),
+        ("cute-dsl", 96, torch.float32, "token-strided"),
+        ("cute-dsl-persistent", 96, torch.float32, "token-strided"),
+        ("cute-dsl", 12, torch.bfloat16, "transposed"),
+        ("cute-dsl", 12, torch.bfloat16, "misaligned"),
+    ],
+)
+@pytest.mark.parametrize("packed", [False, True])
+def test_prefill_strided_qkv_capture_reads_changed_inputs(
+    backend, heads, state_dtype, layout, packed
+):
     device = torch.device("cuda")
-    if get_compute_capability(device) not in ((10, 0), (10, 3)):
+    capability = get_compute_capability(device)
+    if capability not in ((10, 0), (10, 3)):
         pytest.skip("requires SM100/SM103 KDA prefill")
-    values = _inputs(device)
+    values = _strict_prefill_kwargs(
+        _make_inputs(
+            seq_lens=(33, 65) if packed else (33, 33),
+            num_heads=heads,
+            packed=packed,
+            initial_state=True,
+            state_dtype=state_dtype,
+            seed=31,
+        )
+    )
+    if layout == "token-strided":
+        values.update(_strided_qkv(values, independent=not packed))
+    else:
+        for name in ("q", "k"):
+            tensor = values[name]
+            if layout == "transposed":
+                values[name] = tensor.transpose(1, 2).contiguous().transpose(1, 2)
+            else:
+                batch, tokens, heads, dim = tensor.shape
+                width = heads * dim
+                carrier = torch.empty(
+                    (batch, tokens, width + 8), dtype=tensor.dtype, device=device
+                )
+                values[name] = carrier[..., 1 : width + 1].view_as(tensor).copy_(tensor)
+    values["output"] = torch.empty(
+        values["q"].shape, dtype=values["q"].dtype, device=device
+    )
+    values["output_final_state"] = True
     state_seed = values["initial_state"].clone()
     reference_state = state_seed.clone()
     reference_output = torch.empty_like(values["output"])
@@ -164,29 +211,30 @@ def test_auto_prefill_strided_qk_capture_reads_changed_inputs():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        kda.recurrent_kda(**values, prefill_workspace=workspace, backend="auto")
+        kda.recurrent_kda(**values, prefill_workspace=workspace, backend=backend)
         stream.synchronize()
         values["initial_state"].copy_(state_seed)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             result = kda.recurrent_kda(
-                **values, prefill_workspace=workspace, backend="auto"
+                **values, prefill_workspace=workspace, backend=backend
             )
-        # The facade's packed Q/K temporaries have no Python owner now. Replay
-        # must retain their captured storage and recopy the current input views.
+        # Replay must read the current views, including auto's captured Q/K copies.
         for delta in (0.0, 0.125):
             values["q"].add_(delta)
             values["k"].sub_(delta)
+            values["v"].add_(delta)
             reference_state.copy_(state_seed)
             reference = dict(
                 values,
                 q=values["q"].contiguous(),
                 k=values["k"].contiguous(),
+                v=values["v"].contiguous(),
                 initial_state=reference_state,
                 output=reference_output,
             )
             expected = kda.recurrent_kda(
-                **reference, prefill_workspace=reference_workspace, backend="auto"
+                **reference, prefill_workspace=reference_workspace, backend=backend
             )
             churn = [
                 torch.empty_like(reference["q"]).fill_(float("nan")) for _ in range(4)
@@ -197,5 +245,51 @@ def test_auto_prefill_strided_qk_capture_reads_changed_inputs():
             stream.synchronize()
             for actual, target in zip(result, expected, strict=True):
                 assert torch.isfinite(actual).all()
-                torch.testing.assert_close(actual, target, rtol=1e-2, atol=1e-2)
+                tolerance = 1e-2 if backend == "auto" else 0
+                torch.testing.assert_close(
+                    actual, target, rtol=tolerance, atol=tolerance
+                )
             del churn
+
+
+@pytest.mark.parametrize("backend", ["cute-dsl", "cute-dsl-persistent"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cute_prefill_qkv_token_pitch_above_int32_bytes(backend):
+    device = torch.device("cuda")
+    if get_compute_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/SM103 KDA prefill")
+    inputs = _make_inputs(
+        seq_lens=(2,),
+        num_heads=8,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32
+        if backend == "cute-dsl-persistent"
+        else torch.bfloat16,
+        seed=61,
+    )
+    pitch = 2**30 + 8
+    qkv = {
+        name: torch.empty_strided(
+            inputs[name].shape,
+            (1, pitch, 128, 1),
+            dtype=inputs[name].dtype,
+            device=device,
+        ).copy_(inputs[name])
+        for name in ("q", "k", "v")
+    }
+    expected = kda.recurrent_kda(
+        **_strict_prefill_kwargs(
+            dict(inputs, initial_state=inputs["initial_state"].clone())
+        ),
+        output_final_state=True,
+        backend=backend,
+    )
+    actual = kda.recurrent_kda(
+        **_strict_prefill_kwargs(dict(inputs, **qkv)),
+        output_final_state=True,
+        backend=backend,
+    )
+    torch.cuda.synchronize()
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)

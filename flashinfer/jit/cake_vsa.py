@@ -18,10 +18,12 @@ limitations under the License.
 #
 # ``csrc/cake_vsa`` holds one device source per kernel profile
 # (``cake_vsa_<profile>.cu``, compiled for both ``sm_100a`` and ``sm_103a``) and
-# one shared tvm-ffi launcher (``cake_vsa_binding.cu``).  Each ``(profile, arch)``
-# pair is one ``JitSpec`` named ``cake_vsa_<profile>_<arch>``: the launcher is
-# compiled with the profile's route defines and the profile cubin is embedded
-# through FlashInfer's ``embedded_cubin_factory`` path.
+# one shared tvm-ffi launcher (``cake_vsa_binding.cu``).  ``blk128_fp16_compact``
+# shares ``cake_vsa_blk128_compact.cu`` and selects its float16 lines through
+# ``CAKE_VSA_FP16``.  Each ``(profile, arch)`` pair is one ``JitSpec`` named
+# ``cake_vsa_<profile>_<arch>``: the launcher and the profile cubin are compiled
+# with the profile's route defines and the cubin is embedded through
+# FlashInfer's ``embedded_cubin_factory`` path.
 
 from __future__ import annotations
 
@@ -83,7 +85,7 @@ PROFILES: dict[str, Profile] = {
         defines=_BLOCK_MASK_D128,
     ),
     "blk128_fp16_compact": Profile(
-        source="cake_vsa_blk128_fp16_compact.cu",
+        source="cake_vsa_blk128_compact.cu",
         kernel="kernel_flashinfer_blackwell_vsa_blk128_fp16_compact_sm100",
         threads=512,
         smem_bytes=134784,
@@ -246,11 +248,14 @@ def prepare_cake_vsa_cubin(
 ) -> Mapping[str, Path]:
     """Compile the profile cubin for ``arch`` into ``build_dir`` for Ninja embedding.
 
+    The device source gets the profile's route defines (the launcher's ``-D``
+    list), so profiles that share one source select their lines from them.
     The cubin is rebuilt when it is missing or older than its device source;
     the module's Ninja graph depends on the cubin path, so a rebuilt cubin is
     re-embedded on the next build.
     """
     _check_arch(arch)
+    record = _check_profile(profile)
     source = device_source(profile)
     build_dir.mkdir(parents=True, exist_ok=True)
     cubin_path = build_dir / f"cake_vsa_{profile}_{arch}.cubin"
@@ -264,6 +269,7 @@ def prepare_cake_vsa_cubin(
                 str(_nvcc()),
                 *_CUBIN_OPTIONS,
                 f"-arch={arch}",
+                *(f"-D{define}" for define in record.defines),
                 str(source),
                 "-o",
                 str(temporary),

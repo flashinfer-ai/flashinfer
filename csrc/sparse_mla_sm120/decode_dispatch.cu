@@ -19,6 +19,7 @@ cudaError_t dispatch_decode(const execution::AttentionParams& params,
   MODEL(DSV4)
   MODEL(DOTS3_SWA)
   MODEL(DSV4_1)
+  MODEL(DSV4_1_INLINE)
 #undef MODEL
   return cudaErrorInvalidValue;
 }

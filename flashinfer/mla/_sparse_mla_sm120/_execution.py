@@ -1,8 +1,10 @@
 from tvm_ffi import Module as ExecutionPlan
-from typing import NamedTuple, TypeVar, TypedDict, cast
+from typing import NamedTuple, Optional, TypeVar, TypedDict, cast
 from collections.abc import Iterator, Mapping
 from types import MappingProxyType
 import functools
+
+import torch
 
 from ...jit.mla import (
     gen_sparse_mla_dsv4_nvfp4_cache_ops_module,
@@ -31,6 +33,7 @@ MODEL_FAMILIES = {
     3: "glm53_nope",
     4: "dots3_swa",
     5: "dsv4_1",
+    6: "dsv4_1_inline",
 }
 
 
@@ -63,7 +66,18 @@ def query(name: str, *args, is_dsv4_nvfp4: bool = False):
     return getattr(get_sparse_mla_sm120_module(), name)(*args)
 
 
-KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32", "ue8m0_g32"})
+KV_SCALE_FORMATS = frozenset(
+    {"auto", "pow2_fp32", "arbitrary_fp32", "ue8m0_g32", "ue8m0_g32_inline"}
+)
+
+# DeepSeek-V4.1 inline-scale records: each token's data bytes are followed by
+# its own scale bytes, so the records are rows of the whole cache (FlashMLA's
+# V4.1 ABI as of its 2026.09.30 release). The footer form keeps
+# ``page_size * data`` bytes ahead of ``page_size * scales`` bytes per page.
+# The attention kernels and the cache writers address these records natively.
+_INLINE_SCALE_SUFFIX = "_inline"
+DSV41_INLINE_ROW_BYTES = 528
+DSV41_INLINE_FP4_ROW_BYTES = 288
 
 _PRECISION_CODES = {"fp8": 0, "default": 1, "bf16": 2}
 
@@ -85,9 +99,87 @@ def normalize_kv_scale_format(kv_scale_format: str) -> str:
     return fmt
 
 
+def split_inline_scale_format(kv_scale_format: str) -> tuple[str, bool]:
+    """Return ``(footer_scale_format, inline)`` for a scale format."""
+    fmt = normalize_kv_scale_format(kv_scale_format)
+    if fmt.endswith(_INLINE_SCALE_SUFFIX):
+        return fmt[: -len(_INLINE_SCALE_SUFFIX)], True
+    return fmt, False
+
+
 @functools.cache
 def resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
     return query("resolve_format", d_qk, normalize_kv_scale_format(kv_scale_format))
+
+
+def check_inline_scale_cache(cache: torch.Tensor, row_bytes: int, name: str) -> None:
+    """Check that an inline-scale DSv4.1 cache holds rows of the whole cache.
+
+    Accepts a 2D ``[num_rows, row_bytes]`` cache (one-row pages), a 3D
+    ``[num_pages, page_size, row_bytes]`` cache, or the 4D HND / NHD forms with
+    a singleton head axis. Records sit at a uniform row pitch: the token-axis
+    stride of multi-row pages, the page stride of one-row pages. The pitch is a
+    16-byte multiple of at least ``row_bytes`` and the page stride a whole
+    number of rows, so row ``page * (page_stride // pitch) + slot`` is slot
+    ``slot`` of page ``page``; the kernels and writers address records as
+    ``row * pitch``.
+    """
+    if cache.dtype != torch.uint8:
+        raise ValueError(f"{name} must be a uint8 cache, got {cache.dtype}")
+    if cache.size(-1) != row_bytes or cache.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must end in a contiguous {row_bytes}-byte record axis, got "
+            f"shape {tuple(cache.shape)} and strides {tuple(cache.stride())}"
+        )
+    if cache.ndim == 2:
+        num_pages, page_size = cache.shape[0], 1
+        page_stride = row_stride = cache.stride(0)
+    elif cache.ndim == 3:
+        num_pages, page_size = cache.shape[0], cache.shape[1]
+        page_stride, row_stride = cache.stride(0), cache.stride(1)
+    elif cache.ndim == 4 and cache.shape[1] == 1:
+        num_pages, page_size = cache.shape[0], cache.shape[2]
+        page_stride, row_stride = cache.stride(0), cache.stride(2)
+    elif cache.ndim == 4 and cache.shape[2] == 1:
+        num_pages, page_size = cache.shape[0], cache.shape[1]
+        page_stride, row_stride = cache.stride(0), cache.stride(1)
+    else:
+        raise ValueError(
+            f"{name} must be [num_rows, {row_bytes}], [num_pages, page_size, "
+            f"{row_bytes}] or a 4D HND/NHD form, got shape {tuple(cache.shape)}"
+        )
+    if num_pages * page_size <= 1:
+        return  # a single record has no pitch
+    pitch = page_stride if page_size == 1 else row_stride
+    if pitch < row_bytes or pitch % 16:
+        raise ValueError(
+            f"{name}: the inline-scale row pitch must be a 16-byte multiple of at "
+            f"least {row_bytes} bytes, got {pitch}"
+        )
+    if page_size != 1 and num_pages > 1 and page_stride % pitch:
+        raise ValueError(
+            f"{name}: inline-scale records are rows of the whole cache, so the page "
+            f"stride must be a whole number of rows; got row pitch {pitch} and "
+            f"page stride {page_stride}"
+        )
+
+
+def check_inline_scale_caches(
+    kv_scale_format: str,
+    cache: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    extra_fp4: bool,
+) -> None:
+    """Check the caches of an inline-scale call; footer formats pass."""
+    if not normalize_kv_scale_format(kv_scale_format).endswith(_INLINE_SCALE_SUFFIX):
+        return
+    check_inline_scale_cache(cache, DSV41_INLINE_ROW_BYTES, "kv_cache")
+    if extra is not None:
+        check_inline_scale_cache(
+            extra,
+            DSV41_INLINE_FP4_ROW_BYTES if extra_fp4 else DSV41_INLINE_ROW_BYTES,
+            "extra_kv_cache",
+        )
 
 
 @functools.cache
@@ -150,6 +242,8 @@ class AttentionMetadata(NamedTuple):
     has_sink: bool
     extra_fp4: bool
     variant: int
+    # Extra-cache row advance (the inline-scale row pitch); 0 without one.
+    extra_row_stride_bytes: int = 0
 
 
 @functools.cache
@@ -229,6 +323,7 @@ def resolve_attention(
     cpb: int,
     sm_count: int,
     max_shared_bytes: int,
+    extra_row_stride_bytes: int = 0,
 ) -> ExecutionPlan:
     metadata = (
         model,
@@ -249,6 +344,7 @@ def resolve_attention(
         int(has_sink),
         int(extra_fp4),
         variant,
+        extra_row_stride_bytes,
     )
     requested = _precision_code(precision)
     return get_sparse_mla_sm120_module().resolve_attention(

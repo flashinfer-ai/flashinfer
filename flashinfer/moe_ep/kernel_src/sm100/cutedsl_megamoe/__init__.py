@@ -35,7 +35,10 @@ from .shim import (
     COMBINE_FORMAT_NAMES,
     CORRECTNESS_KNOBS,
     MegaMoEBf16Mxfp8Config,
+    MegaMoEBf16Mxfp8Inputs,
     MegaMoEBf16Mxfp8SymmBuffer,
+    MegaMoEMxfp8Inputs,
+    MegaMoEMxfp8Config,
     MegaMoEMxfp8SymmBuffer,
     MegaMoEBf16Inputs,
     MegaMoEBf16SymmBuffer,
@@ -64,6 +67,7 @@ from .shim import (
     ensure_not_capturing,
     finalize_dist,
     forget_staged_tokens,
+    fused_bf16_stage,
     fused_quant_stage,
     fused_quant_stage_supported,
     get_symm_buffer_for_mega_moe,
@@ -119,8 +123,23 @@ _LAZY_HELPERS = (
     "compute_megamoe_reference_bf16_mxfp8",
 )
 
+# The next/ export owns a different top-level namespace. Bootstrap it only
+# when the caller explicitly selects GenPhase, preserving legacy imports.
+_GENPHASE_EXPORTS = (
+    "Sm100GenphaseMoeConfig",
+    "Sm100GenphaseSymmBuffer",
+    "preprocess_genphase_weights",
+    "quantize_genphase_mxfp8",
+    "sm100_genphase_mega_launch_thunk",
+    "sm100_genphase_mega_moe",
+)
+
 
 def __getattr__(name):  # PEP 562
+    if name in _GENPHASE_EXPORTS:
+        from .. import next_cutedsl_megamoe
+
+        return getattr(next_cutedsl_megamoe, name)
     if name in _LAZY_HELPERS:
         from .shim import kernel_helpers
 
@@ -132,6 +151,7 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
+    "MegaMoEMxfp8Config",
     "_CompiledMega",
     "_compute_peer_offsets",
     "_resolve_per_expert_epilogue",
@@ -144,7 +164,9 @@ __all__ = [
     "MegaMoEBf16Inputs",
     "MegaMoEBf16SymmBuffer",
     "MegaMoEBf16Mxfp8Config",
+    "MegaMoEBf16Mxfp8Inputs",
     "MegaMoEBf16Mxfp8SymmBuffer",
+    "MegaMoEMxfp8Inputs",
     "MegaMoEMxfp8SymmBuffer",
     "MegaMoENvfp4Config",
     "MegaMoENvfp4Inputs",
@@ -174,6 +196,7 @@ __all__ = [
     "finalize_dist",
     "forget_staged_tokens",
     "fused_quant_stage",
+    "fused_bf16_stage",
     "fused_quant_stage_supported",
     "bf16_mxfp8_candidates",
     "get_symm_buffer_for_mega_moe",
@@ -213,3 +236,4 @@ __all__ = [
     "_stack_byte_reinterpretable_tensors",
 ]
 __all__ += [name for name in _kernel_helpers.__all__ if name not in __all__]
+__all__ += _GENPHASE_EXPORTS

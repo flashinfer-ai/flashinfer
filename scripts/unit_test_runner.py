@@ -10,6 +10,7 @@ import shlex
 import sys
 import time
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -37,6 +38,7 @@ from scripts.test_sharding.runner import (
     visible_devices,
 )
 from scripts.test_sharding.planner import capacity_metrics
+from scripts.test_sharding.resource_monitor import monitor_from_env
 from scripts.test_sharding.state import (
     AttemptSettings,
     RunnerStateError,
@@ -299,11 +301,17 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
             "SAMPLE_OFFSET (defaults: SAMPLE_RATE=5, SAMPLE_OFFSET=0)"
         ),
     )
-    parser.add_argument(
+    worker_options = parser.add_mutually_exclusive_group()
+    worker_options.add_argument(
         "--workers",
         type=_positive,
-        default=os.environ.get("UNIT_TEST_WORKERS", max(1, len(visible_devices()))),
-        help="local workers, at most visible GPU count (UNIT_TEST_WORKERS)",
+        default=os.environ.get("UNIT_TEST_WORKERS"),
+        help="total local workers, assigned to visible GPUs round-robin (UNIT_TEST_WORKERS)",
+    )
+    worker_options.add_argument(
+        "--workers-per-gpu",
+        type=_positive,
+        help="workers per visible GPU; defaults to one",
     )
     parser.add_argument(
         "--unit-timeout-seconds",
@@ -384,11 +392,18 @@ def _shell_settings(argv: list[str]) -> int:
             raise ValueError("SAMPLE_OFFSET must be in [0, SAMPLE_RATE)")
         _pytest_command_prefix()
         _env_positive_float("MEMORY_MONITOR_INTERVAL", 2)
+        _env_positive_float("RESOURCE_MONITOR_INTERVAL", 5)
     except (RunnerStateError, ValueError) as error:
         parser.error(str(error))
     print(operation)
     print(" ".join(str(path) for path in args.test_path))
     return 0
+
+
+def _worker_count(args: argparse.Namespace) -> int:
+    if args.workers_per_gpu is not None:
+        return args.workers_per_gpu * max(1, len(visible_devices()))
+    return args.workers if args.workers is not None else max(1, len(visible_devices()))
 
 
 def _load_frozen_plan(junit_dir: Path) -> Plan:
@@ -417,6 +432,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             "UNIT_TEST_TIMEOUT_GRACE_SECONDS or --timeout-grace-seconds"
         )
 
+    args.workers = _worker_count(args)
     _report_collection_jit_parallelism(args.workers)
     pytest_command_prefix = _pytest_command_prefix()
     planning = PlanningOptions(
@@ -557,7 +573,18 @@ def main(argv: list[str] | None = None) -> int:
             started_at=operation_started_at,
             limit_seconds=getattr(args, "deadline_seconds", 0),
         )
-        result = _execute_command(args, operation_started_at)
+        monitor = (
+            monitor_from_env(args.junit_dir)
+            if args.command in {"run", "plan"}
+            else None
+        )
+        try:
+            with monitor if monitor is not None else nullcontext():
+                result = _execute_command(args, operation_started_at)
+        finally:
+            if monitor is not None:
+                os.environ.pop("FLASHINFER_RESOURCE_SNAPSHOT", None)
+                os.environ.pop("FLASHINFER_RESOURCE_MONITOR_PID", None)
     except CollectionTimeoutError as error:
         pending = "unknown" if error.pending_nodes is None else str(error.pending_nodes)
         deadline_fields = (

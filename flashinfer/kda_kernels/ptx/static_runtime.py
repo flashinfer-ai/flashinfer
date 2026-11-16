@@ -1,21 +1,21 @@
+# Copyright 2026 Co-developed by KDA (Kernel Design Agents)
 # Copyright (c) 2026 KDA Team
 # SPDX-License-Identifier: MIT
 # See LICENSE.kda-for-kda.txt for the full license.
 
-"""Load retained PTX kernels through one shared CUDA host shim.
+"""Load retained PTX kernels through the shared CUDA host shim.
 
-The retained PTX is ``.version 9.2`` / ``.target sm_103a``. Drivers older than
-CUDA 13.2 cannot JIT it, so each file is assembled once with ptxas >= 13.2 and
-the cubin is embedded instead. The cubins are cached in ``FLASHINFER_KDA_PTX_CACHE_DIR``
-(default: the FlashInfer JIT cache); ``FLASHINFER_KDA_PTXAS`` selects a specific ptxas.
+Drivers supporting CUDA 13.2 can JIT PTX ISA 9.2 directly. Prefer that compiler
+for the retained SM103a programs; older drivers use cubins assembled with
+ptxas >= 13.2. Assembled cubins are cached in ``FLASHINFER_KDA_PTX_CACHE_DIR``
+(default: the FlashInfer JIT cache); ``FLASHINFER_KDA_PTXAS`` selects ptxas.
 
-``csrc/kda/ptx/programs.json`` holds the one argument plan shared by the four
-programs and the per-program launch parameters; ``csrc/kda/ptx/shim.cc`` is
-compiled once per program with those parameters prepended as ``#define`` lines.
+``programs.json`` supplies the shared argument plan and launch parameters.
 """
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -82,14 +82,18 @@ def _ptxas() -> tuple[str, tuple[int, int]]:
     )
 
 
-def _cubin(name: str) -> bytes:
-    """Assemble one retained PTX file for sm_103a, cached by content."""
-
+def _validate_device() -> None:
+    """Require the retained SM103a target before loading either image format."""
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) != (10, 3):
         raise RuntimeError(
             f"the retained PTX targets {PTX_ARCH} (B300); this GPU is sm_{major}{minor}"
         )
+
+
+def _cubin(name: str) -> bytes:
+    """Assemble one retained PTX file for sm_103a, cached by content."""
+
     source = SHIMS / f"{name}.ptx"
     ptxas, version = _ptxas()
     digest = hashlib.sha256(source.read_bytes() + Path(ptxas).read_bytes()).hexdigest()[
@@ -116,6 +120,27 @@ def _cubin(name: str) -> bytes:
 
 
 @cache
+def _image_kind() -> str:
+    """Choose driver JIT when PTX ISA 9.2 is supported, otherwise ptxas."""
+    driver = ctypes.CDLL("libcuda.so.1")
+    version = ctypes.c_int()
+    get_version = driver.cuDriverGetVersion
+    get_version.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    get_version.restype = ctypes.c_int
+    if get_version(ctypes.byref(version)) != 0:
+        raise RuntimeError("cannot query the CUDA driver version")
+    return "driver_ptx" if version.value >= 13020 else "assembled_cubin"
+
+
+def _kernel_image(name: str) -> bytes:
+    """Validate the launch device and return its PTX or assembled cubin image."""
+    _validate_device()
+    if _image_kind() == "driver_ptx":
+        return (SHIMS / f"{name}.ptx").read_bytes() + b"\0"
+    return _cubin(name)
+
+
+@cache
 def _program_table() -> dict:
     return json.loads((SHIMS / "programs.json").read_text())
 
@@ -138,6 +163,7 @@ def _shim_source(program: dict) -> str:
 
 @cache
 def _load(name: str):
+    """Compile and cache one shared FFI shim with its validated PTX or cubin image."""
     from tvm_ffi import cpp
     from ...jit.core import MissingJITCacheError
 
@@ -150,7 +176,7 @@ def _load(name: str):
     module = cpp.load_inline(
         f"flashinfer_ptx_{program['module_ident']}",
         cpp_sources=_shim_source(program),
-        embed_cubin={program["module_ident"]: _cubin(name)},
+        embed_cubin={program["module_ident"]: _kernel_image(name)},
         extra_include_paths=[_cuda_include()],
         extra_ldflags=["-lcuda"],
     )
@@ -226,33 +252,23 @@ class StaticPTXModule:
             entry(*args, *grid)
 
 
-def compiled_stream_m64_fixed_final(*, split_major=False, **_):
+def compiled_stream_m64_fixed_final(*, split_major=False):
     return StaticPTXModule("fixed_h64") if split_major else None
 
 
-def compiled_stream_m64_fixed():
-    return None
-
-
-def compiled_stream_m128_fixed_h96_final(**_):
+def compiled_stream_m128_fixed_h96_final():
     return StaticPTXModule("fixed_h96")
 
 
-def compiled_stream_m128_cluster8(**_):
-    return None
-
-
 def compiled_stream_m128_cluster2(
-    *, full_chunks=False, store_final_state=True, handoff=False, **_
+    *, full_chunks=False, store_final_state=True, handoff=False
 ):
     if not full_chunks and store_final_state and handoff:
         return StaticPTXModule("varlen_mixed_h64")
     return None
 
 
-def compiled_stream_m128(
-    *, full_chunks=False, store_final_state=True, handoff=False, **_
-):
+def compiled_stream_m128(*, full_chunks=False, store_final_state=True, handoff=False):
     if full_chunks and store_final_state:
         return StaticPTXModule("varlen_uniform_h64")
     if not full_chunks and store_final_state:
@@ -262,10 +278,8 @@ def compiled_stream_m128(
 
 __all__ = [
     "StaticPTXModule",
-    "compiled_stream_m64_fixed",
     "compiled_stream_m64_fixed_final",
     "compiled_stream_m128",
     "compiled_stream_m128_cluster2",
-    "compiled_stream_m128_cluster8",
     "compiled_stream_m128_fixed_h96_final",
 ]

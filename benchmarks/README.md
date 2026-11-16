@@ -18,6 +18,17 @@ the sample count to stay within the rotating-state capacity and set
 iterations fit. `--dry-run-iters` and `--repeat-iters` request fixed iteration
 counts; they are not duration targets.
 
+`diag_cake_dsa_indexer_det_train_sampling.py` replays the sampled first threshold of the
+experimental Cake DSA indexer top-k backend on the host: for one call's inputs
+(a saved rank's tensors, a row of `bench_cake_dsa_indexer_det_train.py`, or a synthetic
+16-way context-parallel rank) it reports how many work units would fail their
+verdict and be streamed twice under the plan the backend picks. The console
+prints totals, per-segment counts and a per-CTA summary (CTAs with a failure,
+the most failures on one CTA and a histogram); `--json` adds the count for
+each persistent CTA (`cta.fails_per_cta`) and one record per work unit
+(`units`), which `--csv` also writes. With `--time` it measures the
+kernel with the default plan against `sample_tiles_max=0` on the same inputs.
+
 ## Overview
 
 This framework provides tools to:
@@ -47,6 +58,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
+    - Batch-invariant mode: `--backends batch_invariant` runs on supported APIs with `batch_invariant=True` [Batch-invariant mode](#batch-invariant-mode).
 - MOE:
     - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
@@ -54,8 +66,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
     - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
     - `unified_moe` - Unified MoE API comparison between the CUTLASS, cuTile, b12x and cuDNN grouped-GEMM backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
-- MOE Communication:
-    - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
+- MOE Communication: no routine yet; standalone scripts cover it. `benchmarks/moe_ep/bench_moe_ep_comm.py` times dispatch + combine of the `flashinfer.moe_ep` communication backends (launched with `torchrun`), `benchmarks/moe_ep/bench_moe_ep.py` times one MoE layer (quantize + dispatch + expert computation + combine) per stage over the same backends, and `benchmarks/moe_ep/bench_moe_ep_fleet.py` times the layer over the Fleet/Handle transports (`nccl_ep`, `nixl_ep`), including the NCCL-EP `ep_bench` reference cases.
 - AllReduce Communication:
     - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
 - Norm:
@@ -72,8 +83,12 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mxfp4_quantize` - Quantize tensor to MxFP4 format (Blackwell SM10.0+).
     - `nvfp4_quantize` - Quantize tensor to NVFP4 format with configurable scale factor layout (Blackwell SM10.0+).
     - `nvfp4_batched_quantize` - Batched NVFP4 quantization (Blackwell SM10.0+).
+    - Batch-invariant mode: `--backends batch_invariant` runs `mxfp8_quantize`, `mxfp4_quantize` and `nvfp4_quantize` with `batch_invariant=True` (SM100 / SM103 / SM107). See [Batch-invariant mode](#batch-invariant-mode).
 - Sampling:
     - `softmax` - Softmax with optional temperature scaling.
+    - `log_softmax` - Row-wise log-softmax in fp32 with optional temperature scaling (`flashinfer.sampling.log_softmax`; SM100 / SM103 / SM107).
+    - `log_probs` - The log-probability of one token id per row in fp32 (`flashinfer.sampling.log_probs`; SM100 / SM103 / SM107).
+    - Batch-invariant mode: `--backends batch_invariant` runs `softmax`, `log_softmax` and `log_probs` with `batch_invariant=True` (SM100 / SM103 / SM107). See [Batch-invariant mode](#batch-invariant-mode).
     - `sampling_from_probs` - Sample token indices from probability distributions.
     - `sampling_from_logits` - Sample token indices from logits (fused softmax + sampling).
     - `top_k_sampling_from_probs` - Top-K sampling from probabilities.
@@ -100,7 +115,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 - Mamba (Selective State Space Models):
     - `selective_state_update` - Selective state update for Mamba layers (generation phase). Supports both single-token prediction (STP) and multi-token prediction (MTP) via `--cache_steps`. Backends: `flashinfer` (CUDA, architecture-specific kernels for base/SM90/SM100+) and `triton` (reference).
 - GDN (Gated Delta Net linear attention, SM90+):
-    - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL) and `triton` (reference).
+    - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (the public API with its default `backend="auto"`: whatever FlashInfer dispatches to on this GPU), `cute` (`backend="flashinfer"`: the generic CuTe-DSL kernels), `cake_gdn` (`backend="cake_gdn"`: the Cake GDN kernels; SM100/SM103/SM107, bf16 inputs), `triton` (reference), `rubin` (`backend="rubin"`: the Rubin-tuned T=1 bf16-state kernel; SM107 only) and `rubin_ugpu` (`rubin` with uGPU localization: a `ugpu_state_pool`, each die updates the half of every state in its own memory).
     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
     - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
 - KDA (SM120a):
@@ -261,7 +276,23 @@ The output CSV will contain detailed metrics including:
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
 | `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
 | `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
-| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, prims-ts, cute-dsl, cute-dsl-prims, cublas, trtllm_low_latency. (`prims_ts` aliases `prims-ts`; `auto` support is routine-dependent.)|
+| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, prims-ts, cute-dsl, cute-dsl-prims, cublas, trtllm_low_latency, batch_invariant. (`prims_ts` aliases `prims-ts`; `auto` support is routine-dependent; `batch_invariant` is described below.)|
+
+### Batch-invariant mode
+`--backends batch_invariant` runs the routine's operator with `batch_invariant=True` (and `backend="auto"`): the
+batch-invariant classes of `flashinfer.batch_invariant`, whose output bits for a row depend only on that row's inputs,
+never on the batch size, the row's position in the batch or the kernel configuration (see
+`flashinfer/batch_invariant/README.md`). It can be listed next to a routine's other backends, so one run compares it with them.
+
+- `--refcheck` applies the routine's usual check against the torch reference and, for this backend, a bitwise check:
+  the same rows computed alone, in a sub-batch and under a permutation of the batch must give the same bits as the whole
+  batch (run-to-run too). A mismatch is an error regardless of `--allow_output_mismatch`. For `nvfp4_quantize`, whose
+  refcheck compares the backends' codes and scales bit for bit, set `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1` so the
+  `cuda` / `cute-dsl` backends take the exact path the class computes.
+- `--autotune` makes the GEMM classes profile their top configurations through FlashInfer's autotuner (reported as
+  `batch_invariant_autotune`); without it the class's dispatcher picks the configuration.
+- `log_softmax` and `log_probs` have the batch-invariant class as their only kernel, so `batch_invariant` is their
+  only backend and their default.
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
@@ -276,6 +307,7 @@ The output CSV will contain detailed metrics including:
 | `--head_dim_vo`          | Head dimension for V/O. Usually equals head_dim_qk.                                                        |
 | `--head_dim_ckv`         | Head dimension for C/K/V (MLA attention).                                                                  |
 | `--head_dim_kpe`         | Head dimension for KPE (MLA attention).                                                                    |
+| `--mla_softmax_rescale_threshold_log2` | MLA prims-ts only: `plan(tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=...))`. A positive value skips the O rescale while a K tile raises a row maximum by at most this many binades (bound 8 for FP8, 32 for BF16). FP8 P is then quantized at `448 * 2**-T` instead of 448, which loses E4M3 precision for probabilities far below the row anchor. Default 0 keeps the exact rescale. |
 | `--q_dtype`              | Data type for the query tensor. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
 | `--kv_dtype`             | Data type for the key and value tensors. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
 | `--v_dtype`              | Data type for the value tensor. Default: same as kv_dtype. Only the prims-ts backend accepts a V dtype different from kv_dtype, and only as `--kv_dtype bfloat16 --v_dtype fp8_e4m3` (QK-BF16/PV-FP8); other backends then read the FP8-rounded V in kv_dtype. |
@@ -303,7 +335,7 @@ The output CSV will contain detailed metrics including:
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines) |
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines; the `batch_invariant` backend of those and of `gemm_fp8_nt_groupwise`) |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags
@@ -349,57 +381,6 @@ Notes:
 - Different MOE kernel implementations have different `top_k` constraints. FP8 MOE kernels (both Block Scale and Per-Tensor) have stricter limits than FP4 for non-DeepSeekV3 routing methods.
 - FP8 MOE kernels require integer values for group parameters, while FP4 MOE kernels accept optional values.
 - CUTLASS fused MoE (`cutlass_fused_moe`) ignores `--routing_method`, `--n_group`, and `--topk_group`; it computes routing via softmax+top-k internally from the provided logits.
-
-### MoE Communication Flags (moe_a2a_dispatch_combine)
-The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication for multi-GPU expert-parallel inference. It must be launched with `mpirun`.
-
-| Flag                     | Description                                                                                                 |
-|--------------------------|-------------------------------------------------------------------------------------------------------------|
-| `--num_tokens`           | Number of tokens per rank (local batch size)                                                               |
-| `--hidden_size`          | Hidden dimension size                                                                                      |
-| `--num_experts`          | Total number of experts across all ranks                                                                   |
-| `--top_k`                | Number of experts to route each token to                                                                   |
-| `--input_dtype`          | Data type for hidden states payload: `bfloat16` (default) or `float16`                                     |
-| `--quant_dtype`          | Quantization format: `fp8` (per-tensor), `nvfp4` (block-scale FP4), `fp8_block_scale` (block-scale FP8)    |
-| `--real_math`            | Run actual MoE kernels instead of fake computation. Requires `--intermediate_size` and `--quant_dtype` to be `nvfp4` or `fp8_block_scale` |
-| `--intermediate_size`    | Intermediate FFN size. Required if `--real_math` is set                                                    |
-| `--max_num_tokens`       | Max tokens per rank for workspace allocation. Defaults to `--num_tokens`                                   |
-| `--validate`             | Run correctness validation before benchmarking using deterministic fake MoE                                |
-| `--per_phase_timing`     | Enable per-phase timing (dispatch/combine/moe_kernel). Adds slight overhead from CUDA events               |
-| `--nvtx`                 | Enable NVTX markers for Nsight Systems profiling                                                           |
-| `--use_lora`             | Carry a per-token int32 LoRA adapter ID through dispatch as an extra payload.                                                                                                                  |
-
-**Launch Examples:**
-```bash
-# Basic (no quantization)
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8
-
-# With FP8 quantization
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --quant_dtype fp8
-
-# With NVFP4 quantization and real MoE kernel
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --quant_dtype nvfp4 --real_math --intermediate_size 18432
-
-# With validation and per-phase timing
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --validate --per_phase_timing
-
-# Multi-tenant LoRA: carry per-token adapter ID through dispatch
-mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
-    --routine moe_a2a_dispatch_combine \
-    --num_tokens 2048 --hidden_size 7168 --num_experts 256 --top_k 8 \
-    --use_lora --validate
-```
 
 ### AllReduce Communication Flags (allreduce_fusion)
 The `allreduce_fusion` routine benchmarks AllReduce fusion operations for multi-GPU inference. It must be launched with `mpirun`. Both oneshot and twoshot strategies are benchmarked automatically and reported side by side.
@@ -469,7 +450,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--sf_layout`            | Scale factor layout for FP4 quantization: `128x4` (default), `8x4`, or `linear`                             |
 | `--do_shuffle`           | Shuffle scale factors for TRTLLM backend (`nvfp4_quantize` only)                                           |
 | `--sf_vec_size`          | Scale factor vector size for NVFP4 quantization. Default: 16                                               |
-| `--backends`             | Backend to test. Default: `cuda`                                                                           |
+| `--backends`             | Backend to test: `cuda` (default), `cute-dsl`, `batch_invariant` (`mxfp8_quantize`, `mxfp4_quantize`, `nvfp4_quantize`; see [Batch-invariant mode](#batch-invariant-mode)) |
 
 ### Sampling Flags
 | Flag                     | Description                                                                                                 |
@@ -485,7 +466,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--num_speculate_tokens` | Number of speculative tokens for chain speculative sampling. Default: 5                                    |
 | `--max_len`              | Max sequence length for `top_k_page_table_transform` and `top_k_ragged_transform`. Default: 4096           |
 | `--num_rows`             | Number of rows for `top_k_page_table_transform` and `top_k_ragged_transform`. Defaults to batch_size       |
-| `--backends`             | Backend to test: `cuda` (default)                                                                          |
+| `--backends`             | Backend to test: `cuda` (default) or `batch_invariant` for `softmax`; `batch_invariant` only (and the default) for `log_softmax` and `log_probs`. See [Batch-invariant mode](#batch-invariant-mode) |
 
 ### RoPE Flags
 | Flag                     | Description                                                                                                 |
@@ -544,7 +525,7 @@ Applies to `gated_delta_rule_decode`, `gated_delta_rule_mtp`, and `chunk_gated_d
 | `--update_state`              | MTP only: write the final state back (`disable_state_update=False`). BF16 state always updates in-place    |
 | `--cache_intermediate_states` | MTP with `float32` state only: cache per-token intermediate states                                         |
 | `--no_qk_l2norm`              | Decode/MTP: disable in-kernel Q/K L2 normalization                                                         |
-| `--backends`                  | Decode/MTP: `flashinfer` (default), `triton`. Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
+| `--backends`                  | Decode/MTP: `flashinfer` (default, `backend="auto"`), `triton`; decode also `cute` (generic CuTe-DSL kernels), `cake_gdn` (SM100/SM103/SM107, bf16 inputs) and, with `--state_dtype bfloat16`, `rubin` and `rubin_ugpu` (SM107). Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
 
 Notes:
 - Refcheck compares against the torch reference in `tests/gdn/reference_delta_rule.py`.
@@ -575,12 +556,13 @@ Legend:
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
 | **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |
-| **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
+| **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass, batch_invariant | cutlass, batch_invariant |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
-| **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |
+| **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass, batch_invariant | cudnn, cublas, cutlass, batch_invariant | cudnn, cublas |
 | **mm_fp8** |  |  |  |  |  | trtllm_low_latency | trtllm_low_latency |  |
-| **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn |
-| **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv | cudnn, cutlass, tgv |  |
+| **mm_mxfp8** |  |  |  |  |  | cutlass, cute-dsl, trtllm, cudnn, batch_invariant | cutlass, cute-dsl, trtllm, cudnn, batch_invariant | cutlass, cudnn |
+| **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass, batch_invariant | cudnn, trtllm, cutlass, batch_invariant | cudnn |
+| **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv, batch_invariant | cudnn, cutlass, tgv, batch_invariant |  |
 | **bmm_bf16** |  |  |  |  |  | cudnn, cutlass | cudnn, cutlass |  |
 | **trtllm_fp4_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
@@ -588,7 +570,6 @@ Legend:
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
 | **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |
 | **unified_moe** |  | cudnn (BF16) | cudnn (BF16) | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16), cudnn (BF16, FP8) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16), cudnn (BF16, FP8) | cutlass, cudnn | cutlass, cudnn | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16), b12x (NVFP4 W4A4/W4A16), cudnn |
-| **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
 | **fused_add_rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
@@ -598,11 +579,13 @@ Legend:
 | **fused_add_rmsnorm_quant** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |
 | **rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl |  |
 | **add_rmsnorm_fp4quant** |  |  |  |  |  | cute-dsl | cute-dsl |  |
-| **mxfp8_quantize** |  |  |  |  |  | cuda | cuda |  |
-| **mxfp4_quantize** |  |  |  |  |  | cuda | cuda |  |
-| **nvfp4_quantize** |  |  |  |  |  | cuda | cuda |  |
+| **mxfp8_quantize** |  |  |  |  |  | cuda, cute-dsl, batch_invariant | cuda, cute-dsl, batch_invariant | cuda, cute-dsl |
+| **mxfp4_quantize** |  |  |  |  |  | cuda, cute-dsl, batch_invariant | cuda, cute-dsl, batch_invariant | cuda, cute-dsl |
+| **nvfp4_quantize** |  |  |  |  |  | cuda, cute-dsl, batch_invariant | cuda, cute-dsl, batch_invariant | cuda, cute-dsl |
 | **nvfp4_batched_quantize** |  |  |  |  |  | cuda | cuda |  |
-| **softmax** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
+| **softmax** | cuda | cuda | cuda | cuda | cuda | cuda, batch_invariant | cuda, batch_invariant | cuda |
+| **log_softmax** |  |  |  |  |  | batch_invariant | batch_invariant |  |
+| **log_probs** |  |  |  |  |  | batch_invariant | batch_invariant |  |
 | **sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **sampling_from_logits** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
 | **top_k_sampling_from_probs** | cuda | cuda | cuda | cuda | cuda | cuda | cuda | cuda |
@@ -626,7 +609,7 @@ Legend:
 | **rope_quantize_fp8** |  |  |  | cuda | cuda | cuda | cuda | cuda |
 | **rope_quantize_fp8_append_paged_kv_cache** |  |  |  | cuda | cuda | cuda | cuda | cuda |
 | **selective_state_update** | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton | flashinfer, triton |
-| **gated_delta_rule_decode** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
+| **gated_delta_rule_decode** |  |  |  |  | flashinfer, cute, triton | flashinfer, cute, cake_gdn, triton | flashinfer, cute, cake_gdn, triton | triton |
 | **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **chunk_gated_delta_rule** |  |  |  |  | flashinfer, fla | flashinfer, fla | flashinfer, fla |  |
 | **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
@@ -646,6 +629,9 @@ Backend Legend:
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Hopper SM90; Blackwell SM100+)
+- batch_invariant: FlashInfer's batch-invariant kernels (`batch_invariant=True`: a row's bits depend only on its own
+  inputs, never on the batch size, its position or the configuration; Blackwell SM100 / SM103 / SM107; see
+  `flashinfer/batch_invariant/README.md` and [Batch-invariant mode](#batch-invariant-mode))
 - cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use
   packed NHD storage, while paged K/V uses HND storage. Paged attention accepts
   the standard combined cache or separate K/V pools without copying. The

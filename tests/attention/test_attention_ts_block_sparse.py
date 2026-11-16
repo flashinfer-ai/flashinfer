@@ -1321,7 +1321,6 @@ def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
     reason="fatal device assertions require explicit isolated-test opt-in",
 )
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 def test_reusable_paged_invalid_seq_len_triggers_one_device_assert(
     tmp_path: Path,
 ) -> None:
@@ -2001,7 +2000,6 @@ def test_q8_b8_parallel_load_tasks_partition_resources() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("q_block_size", "dtype", "route_size"),
     (
@@ -2125,7 +2123,6 @@ def test_block_sparse_keeps_rescale_threshold_gpu_edges(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_q8_sparse_p_discards_dead_paired_instance() -> None:
     """The straight-line Q8 P helper must discard a dead paired instance."""
@@ -2828,6 +2825,8 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
         row_route_offsets=torch.zeros(2, dtype=torch.int32),
         route_workspace=torch.zeros(4, dtype=torch.int32),
         page_size=None,
+        sm_scale=1.0 / math.sqrt(_HEAD_DIM),
+        output_scale=1.0,
     )
     q = torch.empty((1, 8, 8, _HEAD_DIM), dtype=torch.float16)
     k = torch.empty((1, 64, 1, _HEAD_DIM), dtype=torch.float16)
@@ -2953,6 +2952,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             None,  # v_scale
             None,  # v_mean
             1.25,
+            1.0,
         )
     ]
 
@@ -3024,6 +3024,7 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
             19,
             23,
             1.25,
+            1.0,
         )
     ]
 
@@ -3570,7 +3571,6 @@ def _fail_if_planned(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("case", "message"),
     (
@@ -3605,7 +3605,6 @@ def test_paged_one_shot_rejects_invalid_live_metadata_before_plan(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "case",
     (
@@ -3713,21 +3712,21 @@ def _paged_one_shot_metadata_abi_cases() -> list[object]:
             "seq_lens_kv",
             lambda: torch.tensor([[64]], **cuda_i32),
             ValueError,
-            "seq_lens must be one-dimensional",
+            "seq_lens_kv must be one-dimensional",
             id="seq_lens_kv-rank",
         ),
         pytest.param(
             "seq_lens_kv",
             lambda: torch.tensor([64], device="cuda", dtype=torch.int64),
             TypeError,
-            "seq_lens must have dtype torch.int32",
+            "seq_lens_kv must have dtype torch.int32",
             id="seq_lens_kv-dtype",
         ),
         pytest.param(
             "seq_lens_kv",
             lambda: torch.tensor([64], dtype=torch.int32),
             ValueError,
-            "seq_lens must be a CUDA tensor",
+            "seq_lens_kv must be a CUDA tensor",
             id="seq_lens_kv-device",
         ),
         pytest.param(
@@ -3741,7 +3740,6 @@ def _paged_one_shot_metadata_abi_cases() -> list[object]:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("field", "make_tensor", "error_type", "message"),
     _paged_one_shot_metadata_abi_cases(),
@@ -3764,7 +3762,6 @@ def test_paged_one_shot_rejects_invalid_metadata_abi_before_plan(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 def test_paged_one_shot_rejects_batch_mismatch_before_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3976,7 +3973,6 @@ def test_metadata_inspection_scan_positions_use_int64() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     ("indptr", "indices", "message"),
     (
@@ -4018,7 +4014,6 @@ def test_one_shot_rejects_noncanonical_bsr(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_one_shot_all_empty_bsr_returns_finite_zero() -> None:
     q = torch.randn((1, 64, 1, _HEAD_DIM), device="cuda", dtype=torch.float16)
@@ -4043,7 +4038,6 @@ def test_one_shot_all_empty_bsr_returns_finite_zero() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 def test_plan_owns_uniform_route_storage_for_skewed_rows() -> None:
     """Every row receives the declared maximum route capacity."""
 
@@ -4082,7 +4076,6 @@ def test_plan_owns_uniform_route_storage_for_skewed_rows() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_public_block_sparse_correctness(
@@ -4196,7 +4189,6 @@ def test_public_block_sparse_correctness(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "case",
     _PROXY_ROUTE_CASES,
@@ -4324,7 +4316,6 @@ def test_public_proxy_bsr_and_bitmask_match_reference_for_tail(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_public_bitmask_rows_spanning_word_batches_match_reference() -> None:
     """Bitmask rows wider than one prepare batch keep their semantic blocks.
@@ -4416,7 +4407,6 @@ def test_public_bitmask_rows_spanning_word_batches_match_reference() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _GQA_CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_public_block_sparse_gqa_correctness(
@@ -4538,7 +4528,6 @@ def test_public_block_sparse_gqa_correctness(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_one_block_sparse_plan_runs_distinct_layer_routes() -> None:
     """One capacity plan accepts distinct eager and captured route storage."""
@@ -4686,7 +4675,6 @@ def _make_lifecycle_problem() -> tuple[
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_failed_replan_preserves_runnable_plan() -> None:
     wrapper, q, k, v, block_indptr, block_indices = _make_lifecycle_problem()
@@ -4708,7 +4696,6 @@ def test_failed_replan_preserves_runnable_plan() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_run_uses_callers_current_stream() -> None:
     wrapper, q, k, v, block_indptr, block_indices = _make_lifecycle_problem()
@@ -4727,7 +4714,6 @@ def test_run_uses_callers_current_stream() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_cuda_graph_keeps_captured_plan_after_replan() -> None:
     wrapper, q, k, v, old_indptr, old_indices = _make_lifecycle_problem()
@@ -4756,7 +4742,6 @@ def test_cuda_graph_keeps_captured_plan_after_replan() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
     """A captured run observes in-place metadata updates without replanning."""
@@ -4871,7 +4856,6 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
     """One plan accepts changing indptr rows inside a declared BSR envelope."""
@@ -4958,7 +4942,6 @@ def test_runtime_routes_repartition_rows_with_declared_capacity() -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 @pytest.mark.parametrize(
     ("live_seq_len_kv", "physical_page_ids", "patterns"),
@@ -5070,7 +5053,6 @@ def test_public_paged_one_shot_q64_kv256_gqa_matches_reference(
         pytest.param(4, 2, 8, id="q4-gqa2"),
     ),
 )
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_public_paged_gqa_small_q_blocks_match_reference(
     q_block_size: int,
@@ -5243,7 +5225,6 @@ def test_public_paged_gqa_small_q_blocks_match_reference(
     ),
     ids=("q32-kv128-page64-fp16", "q64-kv256-page128-bf16"),
 )
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_public_paged_gqa_graph_reloads_routes_and_pages(
     kv_block_size: int,
@@ -5437,7 +5418,6 @@ def test_public_paged_gqa_graph_reloads_routes_and_pages(
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @torch.no_grad()
 def test_public_paged_varlen_gqa_q64_kv256_graph_reloads_live_pages_bits_and_sparse_routes() -> (
     None
@@ -5955,7 +5935,6 @@ def test_dense_contiguous_run_rejects_routing_inputs(argument: str) -> None:
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _DENSE_CONTIGUOUS_CASES, ids=lambda case: case.name)
 @torch.no_grad()
 def test_dense_contiguous_run_matches_reference(case: _Case) -> None:
@@ -6001,3 +5980,144 @@ def test_dense_contiguous_run_matches_reference(case: _Case) -> None:
     assert torch.equal(actual, one_shot)
     tolerance = 2e-2 if case.dtype is torch.bfloat16 else 1e-2
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def _global_scale_case(kind, sm_scale, output_scale):
+    torch.manual_seed(911)
+    q = torch.randn((1, 16, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 128, 1, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indptr = torch.tensor([[[0, 1, 2]]], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    plan_args = dict(
+        device=q.device,
+        q_data_type=q.dtype,
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+    )
+    if kind == "paged":
+        wrapper = block_sparse_module.BlockSparsePagedTSWrapper()
+        wrapper.plan(
+            1,
+            16,
+            128,
+            1,
+            1,
+            128,
+            8,
+            64,
+            64,
+            max_blocks_per_row=1,
+            use_kv_valid_bits=False,
+            **plan_args,
+        )
+        # Allocate canonical HND strides, including the singleton head axis.
+        k_cache = torch.empty((2, 1, 64, 128), device=k.device, dtype=k.dtype)
+        v_cache = torch.empty_like(k_cache)
+        k_cache.copy_(k.view(2, 64, 1, 128).transpose(1, 2))
+        v_cache.copy_(v.view(2, 64, 1, 128).transpose(1, 2))
+        tables = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
+        run_args = (q, (k_cache, v_cache), tables, lengths, indptr, indices)
+    else:
+        wrapper = block_sparse_module.BlockSparseTSWrapper()
+        wrapper.plan(
+            1,
+            16,
+            128,
+            1,
+            1,
+            128,
+            8,
+            64,
+            max_blocks_per_row=1,
+            **plan_args,
+        )
+        run_args = (q, k, v, indptr, indices)
+    return wrapper, run_args, (q, k, v)
+
+
+def _global_scale_reference(inputs, sm_scale, output_scale):
+    q, k, v = (x[0, :, 0].float() for x in inputs)
+    logits = q @ k.T * sm_scale
+    allowed = torch.arange(16, device=q.device)[:, None] // 8 == (
+        torch.arange(128, device=q.device)[None, :] // 64
+    )
+    logits.masked_fill_(~allowed, -torch.inf)
+    return (logits.softmax(-1) @ v * output_scale)[None, :, None]
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("kind", ("sparse", "paged"))
+@torch.no_grad()
+def test_block_sparse_global_scales_graph_replay(kind):
+    sm_scale = torch.tensor(0.0625, device="cuda") if kind == "sparse" else 0.0625
+    output_scale = 1.75 if kind == "sparse" else torch.tensor(1.75, device="cuda")
+    wrapper, args, inputs = _global_scale_case(kind, sm_scale, output_scale)
+    out = wrapper.run(*args)
+    expected = _global_scale_reference(inputs, 0.0625, 1.75)
+    torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(*args, out=out, validate=False)
+    if kind == "sparse":
+        sm_scale.fill_(0.09375)
+        changed = (0.09375, 1.75)
+    else:
+        output_scale.fill_(0.75)
+        changed = (0.0625, 0.75)
+    graph.replay()
+    expected = _global_scale_reference(inputs, *changed)
+    torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
+    kwargs = dict(
+        q_block_size=8, kv_block_size=64, sm_scale=sm_scale, output_scale=output_scale
+    )
+    if kind == "paged":
+        eager = prims_ts.block_sparse_attention_with_paged_kv_cache(
+            *args, max_seq_len_kv=128, **kwargs
+        )
+    else:
+        eager = prims_ts.block_sparse_attention(
+            *args,
+            **kwargs,
+        )
+    torch.testing.assert_close(eager.float(), expected, atol=5e-3, rtol=5e-3)
+
+
+@_REQUIRES_PRIMTS_GPU
+@torch.no_grad()
+def test_sage_global_scales_include_restored_mean():
+    from tests.attention.test_attention_ts_sage import _SageCase, _random_inputs
+
+    case = _SageCase(
+        "global_mean",
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=256,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_tile=256,
+        sage=prims_ts.SageAttentionConfig(v_mean=True),
+    )
+    q, k, v, params, _ = _random_inputs(case)
+    # Dequantized V is exactly its channel mean, independent of P rounding.
+    v = torch.zeros(v.shape, device=v.device).to(v.dtype)
+    output_scale = torch.tensor(1.75, device="cuda")
+    result = prims_ts.block_sparse_attention(
+        q,
+        k,
+        v,
+        None,
+        None,
+        use_block_sparse=False,
+        q_block_size=64,
+        kv_block_size=64,
+        sm_scale=0.0625,
+        output_scale=output_scale,
+        sage=params,
+        sage_config=case.sage,
+    )
+    expected = (params.v_mean[:, None] * 1.75).expand_as(result).to(result.dtype)
+    torch.testing.assert_close(result, expected, atol=2e-3, rtol=8e-3)

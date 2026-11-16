@@ -1,6 +1,8 @@
 import hashlib
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier, local
 
 from flashinfer.artifacts import (
     ArtifactPath,
@@ -13,9 +15,76 @@ import pytest
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
+from flashinfer.jit import cubin_loader
+
+
+@pytest.mark.parametrize("cached_content", [None, b"stale header"])
+@pytest.mark.parametrize(
+    "content", [b"", b"#pragma once\nenum class Layout { Linear };\n"]
+)
+def test_concurrent_get_artifact_downloads_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cached_content: bytes | None,
+    content: bytes,
+) -> None:
+    """Concurrent cache misses must not replace an already verified artifact."""
+    checksum = hashlib.sha256(content).hexdigest()
+    destination = tmp_path / "header.h"
+    if cached_content is not None:
+        destination.write_bytes(cached_content)
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path)
+    monkeypatch.setattr(
+        cubin_loader, "FLASHINFER_CUBINS_REPOSITORY", "https://example.test/"
+    )
+    monkeypatch.delenv("FLASHINFER_NO_DOWNLOAD", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED", raising=False)
+
+    workers = 4
+    first_reads = Barrier(workers, timeout=10)
+    state = local()
+    load_cubin = cubin_loader.load_cubin
+
+    def synchronized_first_read(path: str, sha256: str) -> bytes | None:
+        """Wait for every worker's initial cache read before allowing downloads."""
+        data = load_cubin(path, sha256)
+        if not getattr(state, "read_once", False):
+            state.read_once = True
+            # Every worker sees a miss before any worker can start downloading.
+            first_reads.wait()
+        return data
+
+    monkeypatch.setattr(cubin_loader, "load_cubin", synchronized_first_read)
+    with responses.RequestsMock() as http:
+        http.add(
+            responses.GET, "https://example.test/header.h", body=content, status=200
+        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(cubin_loader.get_artifact, "header.h", checksum)
+                for _ in range(workers)
+            ]
+            assert [future.result(timeout=15) for future in futures] == [
+                content
+            ] * workers
+        assert len(http.calls) == 1
+    assert destination.read_bytes() == content
+
+
+def test_get_artifact_reuses_empty_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checksum-valid empty file is a cache hit even when downloads are disabled."""
+    (tmp_path / "empty.h").write_bytes(b"")
+    monkeypatch.setattr(cubin_loader, "FLASHINFER_CUBIN_DIR", tmp_path)
+    monkeypatch.setenv("FLASHINFER_NO_DOWNLOAD", "1")
+    monkeypatch.delenv("FLASHINFER_CUBIN_CHECKSUM_DISABLED", raising=False)
+
+    assert cubin_loader.get_artifact("empty.h", hashlib.sha256(b"").hexdigest()) == b""
 
 
 def test_sanity_check_urllib_behavior():
+    """Check directory and absolute-path handling when joining artifact URLs."""
     # We use safe_urljoin which ensures the base is always treated as a directory
     # by adding a trailing slash if needed before calling urljoin.
     base_with_trailing_slash = "https://example.com/some/path/"

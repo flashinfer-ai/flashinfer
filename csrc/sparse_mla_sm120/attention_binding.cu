@@ -13,7 +13,7 @@
 
 #include "attention_descriptor.h"
 #include "attention_dispatch.h"
-#include "attention_validation.h"
+#include "input_validation.h"
 
 using tvm::ffi::Optional;
 
@@ -183,24 +183,26 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                            q.device().device_id),
                     cudaSuccess);
-  const execution::AttentionMetadata metadata{int(mt),
-                                              num_tokens,
-                                              num_heads,
-                                              topk,
-                                              extra_topk_arg,
-                                              page_block_size,
-                                              pbs_extra_arg,
-                                              kv_layout.stride_kv_block,
-                                              stride_extra_kv_block,
-                                              bpt,
-                                              stride_indices_token,
-                                              stride_extra_indices_token,
-                                              stride_out_lse,
-                                              topk_length.has_value(),
-                                              extra_topk_length.has_value(),
-                                              attn_sink.has_value(),
-                                              extra_fp4,
-                                              0};
+  const execution::AttentionMetadata metadata{
+      int(mt),
+      num_tokens,
+      num_heads,
+      topk,
+      extra_topk_arg,
+      page_block_size,
+      pbs_extra_arg,
+      kv_layout.stride_kv_block,
+      stride_extra_kv_block,
+      bpt,
+      stride_indices_token,
+      stride_extra_indices_token,
+      stride_out_lse,
+      topk_length.has_value(),
+      extra_topk_length.has_value(),
+      attn_sink.has_value(),
+      extra_fp4,
+      0,
+      extra_kv_cache.has_value() ? size_t(extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bpt) : 0};
   // The override narrows to resolve_attention's int requested_cpb; reject
   // values that would wrap instead of silently selecting a different chunking.
   TVM_FFI_ICHECK(chunks_per_block_override >= INT_MIN && chunks_per_block_override <= INT_MAX)
@@ -366,12 +368,13 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "decode-dsv3_2: " << cudaGetErrorString(status);
 }
 
-void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache,
-                          TensorView indices, TensorView mid, TensorView mlse, TensorView output,
-                          TensorView lse, double scale, Optional<TensorView> lengths,
-                          Optional<TensorView> sink, Optional<TensorView> extra_cache,
-                          Optional<TensorView> extra_indices, Optional<TensorView> extra_lengths,
-                          double lse_scale) {
+void ExecuteAttentionPlanImpl(ffi::Module descriptor, TensorView q, TensorView cache,
+                              TensorView indices, TensorView mid, TensorView mlse,
+                              TensorView output, TensorView lse, double scale,
+                              Optional<TensorView> lengths, Optional<TensorView> sink,
+                              Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
+                              Optional<TensorView> extra_lengths, double lse_scale,
+                              SparseMlaMegaParams mega) {
   const auto& plan = execution::unpack_plan(descriptor, false);
   const auto& m = plan.metadata;
   const auto format = cache_format_info(static_cast<ModelType>(m.model));
@@ -391,7 +394,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                  layout.stride_kv_block == m.page_stride_bytes &&
                  layout.stride_kv_row == size_t(m.row_stride_bytes))
       << "execution plan cache metadata mismatch";
-  TVM_FFI_ICHECK(m.variant == 0 || !inline_scale ||
+  TVM_FFI_ICHECK(m.variant == 0 || !inline_scale || mt == ModelType::DSV4_1_INLINE ||
                  m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes)
       << "execution plan inline prefill stride mismatch";
   TVM_FFI_ICHECK(lengths.has_value() == m.has_lengths && sink.has_value() == m.has_sink &&
@@ -403,6 +406,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   check_attention_vector(q, sink, m.heads, dl_float32, "attn_sink");
   check_attention_vector(q, extra_lengths, m.tokens, dl_int32, "extra_topk_length");
   execution::AttentionParams p{};
+  p.mega = mega;
   p.num_heads = m.heads;
   p.topk = m.topk;
   p.num_tokens = m.tokens;
@@ -418,6 +422,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   p.output = static_cast<bf16*>(output.data_ptr());
   p.out_lse = static_cast<float*>(lse.data_ptr());
   p.page_stride_bytes = m.page_stride_bytes;
+  p.row_stride_bytes = size_t(m.row_stride_bytes);
   p.page_size = m.page_size;
   p.indices_stride_elems = m.indices_stride;
   p.out_lse_stride_elems = m.lse_stride;
@@ -435,16 +440,18 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                    ix.stride(0) == int64_t(m.extra_indices_stride) && ix.stride(1) == 1)
         << "execution plan extra indices mismatch";
     const auto el = parse_paged_kv_layout(
-        ex, m.extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bytes_per_token(mt), false,
+        ex, m.extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bytes_per_token(mt), inline_scale,
         "extra_kv_cache");
     TVM_FFI_ICHECK(el.page_block_size == m.extra_page_size &&
-                   el.stride_kv_block == m.extra_page_stride_bytes)
+                   el.stride_kv_block == m.extra_page_stride_bytes &&
+                   size_t(el.stride_kv_row) == m.extra_row_stride_bytes)
         << "execution plan extra cache mismatch";
     p.extra_kv = static_cast<const uint8_t*>(ex.data_ptr());
     p.extra_indices = static_cast<const int32_t*>(ix.data_ptr());
     p.extra_topk = m.extra_topk;
     p.extra_page_size = m.extra_page_size;
     p.extra_page_stride_bytes = m.extra_page_stride_bytes;
+    p.extra_row_stride_bytes = m.extra_row_stride_bytes;
     p.extra_indices_stride_elems = m.extra_indices_stride;
     p.extra_topk_length = extra_lengths.has_value()
                               ? static_cast<const int*>(extra_lengths.value().data_ptr())
@@ -463,7 +470,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
         << "execute_attention " << result.operation << ": " << cudaGetErrorString(result.error);
     return;
   }
-  if (inline_scale) {
+  if (inline_scale && !is_dsv41(mt)) {
     TVM_FFI_ICHECK_EQ(layout.stride_kv_row, m.row_stride_bytes)
         << "execution plan row stride mismatch";
     const auto status = dispatch_dsv32(p, plan, get_stream(q.device()));
@@ -473,6 +480,35 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   }
   const auto status = dispatch_decode(p, plan, get_stream(q.device()));
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "execute_attention: " << cudaGetErrorString(status);
+}
+
+void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache,
+                          TensorView indices, TensorView mid, TensorView mlse, TensorView output,
+                          TensorView lse, double scale, Optional<TensorView> lengths,
+                          Optional<TensorView> sink, Optional<TensorView> extra_cache,
+                          Optional<TensorView> extra_indices, Optional<TensorView> extra_lengths,
+                          double lse_scale) {
+  ExecuteAttentionPlanImpl(descriptor, q, cache, indices, mid, mlse, output, lse, scale, lengths,
+                           sink, extra_cache, extra_indices, extra_lengths, lse_scale, {});
+}
+
+void ExecuteAttentionRopeFp8Plan(
+    ffi::Module descriptor, TensorView q, TensorView cache, TensorView indices, TensorView mid,
+    TensorView mlse, TensorView output, TensorView lse, double scale, Optional<TensorView> lengths,
+    Optional<TensorView> sink, Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
+    Optional<TensorView> extra_lengths, double lse_scale, TensorView positions, TensorView cos_sin,
+    TensorView fp8_output, TensorView output_scales) {
+  const auto& plan = execution::unpack_plan(descriptor, false);
+  const auto mt = static_cast<ModelType>(plan.metadata.model);
+  TVM_FFI_ICHECK(mt == ModelType::DSV4 || is_dsv41(mt))
+      << "mega requires a 512-dimensional V4/V4.1 model";
+  TVM_FFI_ICHECK(plan.numeric != execution::NumericRoute::FullBF16 &&
+                 plan.implementation != execution::Implementation::SwapAB)
+      << "mega does not support full-BF16 or swapAB plans";
+  const auto mega =
+      check_attention_rope_fp8_inputs(q, positions, cos_sin, fp8_output, output_scales);
+  ExecuteAttentionPlanImpl(descriptor, q, cache, indices, mid, mlse, output, lse, scale, lengths,
+                           sink, extra_cache, extra_indices, extra_lengths, lse_scale, mega);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120
@@ -487,3 +523,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv4,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv3_2,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv3_2);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(execute_attention_rope_fp8,
+                              flashinfer::sparse_mla_sm120::ExecuteAttentionRopeFp8Plan);

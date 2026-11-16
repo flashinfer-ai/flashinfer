@@ -5,13 +5,13 @@ import torch
 
 from .....fused_moe.api import QuantFormat, RoutingInputMode
 from ..activations import activation_name
-from ..support import quantized_moe_geometry
+from ..support import SUPPORTED_ARCH_NUMBERS, moe_geometry
 
 
 def is_eligible(config, act, arch):
     x = act.hidden_states_q
     if not (
-        arch == 107
+        arch in SUPPORTED_ARCH_NUMBERS
         and config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
         and config.quant.output == QuantFormat.BF16
         and act.routing_input_mode == RoutingInputMode.PackedPrecomputed
@@ -23,4 +23,4 @@ def is_eligible(config, act, arch):
         activation_name(config.activation)
     except NotImplementedError:
         return False
-    return quantized_moe_geometry(config, act)
+    return moe_geometry(config, act)

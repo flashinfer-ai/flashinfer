@@ -1421,6 +1421,18 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
     )
 
 
+def _pt_xf(pre_idx, req, v, ps: int):
+    """Paged output: physical KV slot of a VALID (>= 0) column index ``v`` of request
+    ``req`` — the paged compiles carry the page table [batch, max_pages] in the pre_idx
+    slot (dead in hint-free mode) — as ``page_table[req, v >> ps] * 2**ps + v % 2**ps``.
+    ``-1`` pads never pass through here (their writes are separate)."""
+    if ps == 0:
+        return pre_idx[req, v]
+    return (pre_idx[req, v >> cutlass.Int32(ps)] << cutlass.Int32(ps)) | (
+        v & cutlass.Int32((1 << ps) - 1)
+    )
+
+
 class GvrMainKernel:
     """gvr_main<BLK, U, MINB, NBS, KPT, SPLIT> — streaming self-sampling GVR."""
 
@@ -1440,6 +1452,10 @@ class GvrMainKernel:
         hint_free: bool = False,
         prefill: bool = False,
         prefill_abs: bool = False,
+        paged: bool = False,
+        page_shift: int = 0,
+        pt_smem: int = 0,
+        pdl: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1450,9 +1466,25 @@ class GvrMainKernel:
         self.nbs = nbs
         self.kpt = kpt
         self.split = bool(split)
+        # programmatic dependent launch: griddepcontrol.wait is the first
+        # instruction (before any global read), so the preceding kernel's
+        # outputs are complete; only the launch processing overlaps its tail
+        self.pdl = bool(pdl)
         # hint-free: gather_hint sites compiled out (sentinel pass-through);
         # upstream PR NVIDIA/TensorRT-LLM#18410
         self.hint_free = bool(hint_free)
+        # paged output: valid emitted indices become physical KV slots through the
+        # page table carried in the pre_idx slot (hint-free varlen compiles only)
+        self.paged = bool(paged)
+        self.page_shift = int(page_shift)
+        if self.paged:
+            assert varlen and hint_free and not prefill, 'paged output needs a hint-free varlen compile'
+            assert 0 <= self.page_shift <= 30
+        # paged: page-table entries staged in smem per CTA (0 = global read at
+        # every emit); staged in the prologue so the emit transform is an smem
+        # read instead of a dependent L2 load at the kernel tail
+        self.pt_smem = int(pt_smem)
+        assert self.pt_smem == 0 or (self.paged and self.pt_smem & (self.pt_smem - 1) == 0)
         # ---- per-row varlen mode (production heuristicTopKDecode contract) --
         # n and the sampling-ladder scalars are re-derived PER ROW inside the
         # kernel from a device kv_lens tensor (route_dynamic formula mirror);
@@ -1557,7 +1589,9 @@ class GvrMainKernel:
     # p<cap2. s_scal[1]=s_o1, s_scal[2]=s_o2.
     # ------------------------------------------------------------------
     @cute.jit
-    def _ballot_pair_emit(self, p1, p2, idv, base1, cap1, base2, cap2, out_row, s_scal, lane):
+    def _ballot_pair_emit(
+        self, p1, p2, idv, base1, cap1, base2, cap2, out_row, s_scal, lane, pre_idx, s_pt
+    ):
         n1 = C.ballot(p1 != cutlass.Int32(0))
         n2 = C.ballot(p2 != cutlass.Int32(0))
         b1 = cutlass.Int32(0)
@@ -1573,15 +1607,39 @@ class GvrMainKernel:
         if p1 != cutlass.Int32(0):
             p = b1 + cutlass.Int32(C.popc(n1 & lm))
             if p < cap1:
-                out_row[base1 + p] = idv
+                out_row[base1 + p] = self._ox(pre_idx, s_pt, idv)
         if p2 != cutlass.Int32(0):
             p = b2 + cutlass.Int32(C.popc(n2 & lm))
             if p < cap2:
-                out_row[base2 + p] = idv
+                out_row[base2 + p] = self._ox(pre_idx, s_pt, idv)
 
     # ------------------------------------------------------------------
     # kernel
     # ------------------------------------------------------------------
+
+    # ---- paged output (page table in the pre_idx slot of a hint-free compile) ----
+    def _pt_req(self):
+        # request of this CTA's row, re-derived from the block index (no live register)
+        bx, by, _ = cute.arch.block_idx()
+        return by // cutlass.Int32(self.next_n)
+
+    def _ox_g(self, pre_idx, v):
+        """Output transform of a valid emitted index (global page-table read)."""
+        if self.paged:
+            return _pt_xf(pre_idx, self._pt_req(), v, self.page_shift)
+        return v
+
+    def _ox(self, pre_idx, s_pt, v):
+        """Output transform at the emit sites: smem-staged page table when compiled
+        with pt_smem, else the global read."""
+        if self.paged and self.pt_smem > 0:
+            ps = self.page_shift
+            if ps == 0:
+                return s_pt[v]
+            return (s_pt[v >> cutlass.Int32(ps)] << cutlass.Int32(ps)) | (
+                v & cutlass.Int32((1 << ps) - 1)
+            )
+        return self._ox_g(pre_idx, v)
     @cute.kernel
     def kern(
         self,
@@ -1616,6 +1674,9 @@ class GvrMainKernel:
         PFD = self.pfd
         NATT = self.natt
         NW = BLK // 32
+
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
 
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # 2-D grid (part, row)
@@ -1787,6 +1848,24 @@ class GvrMainKernel:
             cutlass.Int8, cute.make_ordered_layout((self.dyn_bytes,), order=(0,)), byte_alignment=16
         )
         sbase = blob.iterator.toint()
+        s_pt = blob  # placeholder view when the page table is read from global
+        # ---- paged: stage this request's page-table row in smem (consumed by the
+        # emit sites after the barriers below) ----
+        if cutlass.const_expr(self.paged and self.pt_smem > 0):
+            s_pt = smem.allocate_tensor(
+                cutlass.Int32,
+                cute.make_ordered_layout((self.pt_smem,), order=(0,)),
+                byte_alignment=16,
+            )
+            npg = cutlass.Int32(pre_idx.shape[1])
+            req_pt = self._pt_req()
+            jp = tidx
+            while jp < cutlass.Int32(self.pt_smem):
+                ent = cutlass.Int32(-1)
+                if jp < npg:
+                    ent = pre_idx[req_pt, jp]
+                s_pt[jp] = ent
+                jp = jp + cutlass.Int32(BLK)
         s_cbuf = cute.make_tensor(
             cute.make_ptr(cutlass.Int32, sbase, cute.AddressSpace.smem, assumed_align=16),
             cute.make_layout((SCPB + 4,)),
@@ -2715,9 +2794,9 @@ class GvrMainKernel:
                                     # prefill: staged idx are in the col0 frame; the
                                     # local output frame is relative to ks = col0+lead.
                                     if cutlass.const_expr(self.prefill):
-                                        out_row[p] = idv + s_ofs[0]
+                                        out_row[p] = self._ox(pre_idx, s_pt, idv + s_ofs[0])
                                     else:
-                                        out_row[p] = idv
+                                        out_row[p] = self._ox(pre_idx, s_pt, idv)
                                 else:
                                     if whole == cutlass.Int32(0):
                                         q2 = p - above
@@ -2756,9 +2835,9 @@ class GvrMainKernel:
                                         p = C.atomic_add_cta(s_hist.iterator + bq, cutlass.Int32(1))
                                         if p < lim1:
                                             if cutlass.const_expr(self.prefill):
-                                                out_row[p] = i_ + s_ofs[0]
+                                                out_row[p] = self._ox(pre_idx, s_pt, i_ + s_ofs[0])
                                             else:
-                                                out_row[p] = i_
+                                                out_row[p] = self._ox(pre_idx, s_pt, i_)
                                         else:
                                             if whole == cutlass.Int32(0):
                                                 q2 = p - above
@@ -2801,7 +2880,7 @@ class GvrMainKernel:
                                     )
                                     if cutlass.const_expr(self.prefill):
                                         idv6 = idv6 + s_ofs[0]
-                                    out_row[above + r_] = idv6
+                                    out_row[above + r_] = self._ox(pre_idx, s_pt, idv6)
                                 i = i + cutlass.Int32(BLK)
                         else:
                             # key-space narrowing over ck64
@@ -2919,6 +2998,8 @@ class GvrMainKernel:
                                     out_row,
                                     s_scal,
                                     lane,
+                                    pre_idx,
+                                    s_pt,
                                 )
                                 it = it + cutlass.Int32(1)
                 else:
@@ -3076,7 +3157,7 @@ class GvrMainKernel:
                             if cutlass.const_expr(self.prefill):
                                 idv = idv + s_ofs[0]
                             self._ballot_pair_emit(
-                                p1, p2, idv, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
+                                p1, p2, idv, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane, pre_idx, s_pt
                             )
                             it = it + cutlass.Int32(1)
                     else:
@@ -3182,7 +3263,7 @@ class GvrMainKernel:
                                         if iu == ethr:
                                             p2 = cutlass.Int32(1)
                             self._ballot_pair_emit(
-                                p1, p2, i + ofs_db, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
+                                p1, p2, i + ofs_db, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane, pre_idx, s_pt
                             )
                             it = it + cutlass.Int32(1)
 
@@ -3204,7 +3285,7 @@ class GvrMainKernel:
                             ofs_id = cutlass.Int32(0)
                     i = tidx
                     while i < n_row:
-                        out_row[i] = i + ofs_id
+                        out_row[i] = self._ox_g(pre_idx, i + ofs_id)
                         i = i + cutlass.Int32(BLK)
                     j = n_row + tidx
                     while j < k:
@@ -3263,7 +3344,13 @@ class GvrMainKernel:
             amin,
             sd_en,
             tsh_en,
-        ).launch(grid=(R, b, 1), block=(self.blk, 1, 1), stream=stream, min_blocks_per_mp=self.minb)
+        ).launch(
+            grid=(R, b, 1),
+            block=(self.blk, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3278,6 +3365,10 @@ def get_compiled(
     hint_free: bool = False,
     prefill: bool = False,
     prefill_abs: bool = False,
+    paged: bool = False,
+    page_shift: int = 0,
+    pt_smem: int = 0,
+    pdl: bool = False,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3293,12 +3384,19 @@ def get_compiled(
     kv_lens slot carries the window lengths and ke = ks + len is formed on
     device)."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
+    paged = bool(paged)
+    if paged and not (hint_free and len(tpl) == 10 and not prefill):
+        raise RuntimeError("paged compile requires the hint-free varlen (decode) tuple")
     key = (
         tuple(tpl),
         options_extra,
         bool(hint_free),
         bool(prefill),
         prefill_abs,
+        paged,
+        int(page_shift) if paged else 0,
+        int(pt_smem) if paged else 0,
+        bool(pdl),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3309,7 +3407,7 @@ def get_compiled(
     if len(tpl) == 7:
         blk, u, minb, nbs, kpt, split, tshg = tpl
         kern = GvrMainKernel(
-            blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free)
+            blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free), pdl=bool(pdl)
         )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
@@ -3328,6 +3426,10 @@ def get_compiled(
             hint_free=bool(hint_free),
             prefill=bool(prefill),
             prefill_abs=prefill_abs,
+            paged=paged,
+            page_shift=int(page_shift) if paged else 0,
+            pt_smem=int(pt_smem) if paged else 0,
+            pdl=bool(pdl),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3341,6 +3443,11 @@ def get_compiled(
         # pre_idx slot carries row_starts [rows] int32 (4B-aligned per-slab slices).
         pre_fake = _crt.make_fake_compact_tensor(
             cutlass.Int32, (r1,), stride_order=(0,), assumed_align=4
+        )
+    elif paged:
+        # pre_idx slot carries the page table [batch, max_pages] int32 (any row width)
+        pre_fake = _crt.make_fake_compact_tensor(
+            cutlass.Int32, (r1, c1), stride_order=(1, 0), assumed_align=4
         )
     else:
         pre_fake = _crt.make_fake_compact_tensor(
@@ -3380,6 +3487,12 @@ def get_compiled(
         name += "_pf"
         if prefill_abs:
             name += "_abs"
+    if paged:
+        name += f"_pg{int(page_shift)}"
+        if pt_smem:
+            name += f"_pts{int(pt_smem)}"
+    if pdl:
+        name += "_pdl1"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -3672,6 +3785,10 @@ class GvrTopkRegKernel:
         hint_free: bool = False,
         prefill: bool = False,
         prefill_abs: bool = False,
+        paged: bool = False,
+        page_shift: int = 0,
+        pt_smem: int = 0,
+        stage_out: bool = True,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -3701,6 +3818,24 @@ class GvrTopkRegKernel:
         # (already in registers); the hint-gather bracket arms are forced off
         # (upstream PR NVIDIA/TensorRT-LLM#18410)
         self.hint_free = bool(hint_free)
+        # paged output: valid emitted indices become physical KV slots through the
+        # page table carried in the pre_idx slot (hint-free varlen compiles only)
+        self.paged = bool(paged)
+        self.page_shift = int(page_shift)
+        if self.paged:
+            assert varlen and hint_free and not prefill, 'paged output needs a hint-free varlen compile'
+            assert 0 <= self.page_shift <= 30
+        # paged: page-table entries staged in smem per CTA (0 = read the table
+        # from global at every emit). Staged in the prologue, overlapped with the
+        # row load, so the emit's transform is an smem read instead of a
+        # dependent L2 load at the kernel tail (measured 5-22% of the decode
+        # kernel on this family without it).
+        self.pt_smem = int(pt_smem)
+        assert self.pt_smem == 0 or (self.paged and self.pt_smem & (self.pt_smem - 1) == 0)
+        # staged coalesced output (k-word smem region + one copy pass): a win when
+        # the launch is one wave (latency-bound), a 3-4% loss when it is
+        # throughput-bound over several waves -- the host picks per launch
+        self.stage_out = bool(stage_out)
         self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1 and (not hint_free)
         self.use_img = img and vpt == 1 and (not hint_free)
         # hint-free bracket policy (FlashInfer-local refinement of TRT-LLM
@@ -3726,6 +3861,30 @@ class GvrTopkRegKernel:
             assert not (self.use_img or self.use_bm)
 
     # ------------------------------------------------------------------
+
+    # ---- paged output (page table in the pre_idx slot of a hint-free compile) ----
+    def _pt_req(self):
+        # request of this CTA's row, re-derived from the block index (no live register)
+        bx, by, _ = cute.arch.block_idx()
+        return bx // cutlass.Int32(self.next_n)
+
+    def _ox_g(self, pre_idx, v):
+        """Output transform of a valid emitted index (global page-table read)."""
+        if self.paged:
+            return _pt_xf(pre_idx, self._pt_req(), v, self.page_shift)
+        return v
+
+    def _ox(self, pre_idx, s_pt, v):
+        """Output transform at the emit sites: smem-staged page table when compiled
+        with pt_smem, else the global read."""
+        if self.paged and self.pt_smem > 0:
+            ps = self.page_shift
+            if ps == 0:
+                return s_pt[v]
+            return (s_pt[v >> cutlass.Int32(ps)] << cutlass.Int32(ps)) | (
+                v & cutlass.Int32((1 << ps) - 1)
+            )
+        return self._ox_g(pre_idx, v)
     @cute.kernel
     def kern(
         self,
@@ -3752,6 +3911,25 @@ class GvrTopkRegKernel:
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         lane = tid & cutlass.Int32(31)
+
+        # ---- early row load (decode): the float4 batch is bounded by the launch
+        # envelope `n` (<= the row width, so memory-safe), issued BEFORE the per-row
+        # length read below so the two global latencies overlap instead of
+        # serializing (measured ~0.3 us of a 3.5 us kernel at N=4096). Lanes at or
+        # beyond the row's own float4 count are -inf-filled in the body. Prefill
+        # keeps its in-body load: its base depends on the row_starts read.
+        n4e = n >> cutlass.Int32(2)
+        atom128 = g2r_atom_f32(128, invariant=True)
+        frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
+        if cutlass.const_expr(not self.prefill):
+            x_addr0 = logits[row, None].iterator.toint()
+            for u in cutlass.range_constexpr(VPT):
+                ie = tid + cutlass.Int32(u * self.blk)
+                if ie < n4e:
+                    ld_g_f32x4(atom128, x_addr0, ie, frags[u])
+                else:
+                    for q in cutlass.range_constexpr(4):
+                        frags[u][q] = cutlass.Float32(_NEG_INF__reg)
 
         # ================= per-row varlen prologue (varlen mode only) =========
         # Production heuristicTopKDecode contract (GvrMainKernel /
@@ -3799,6 +3977,8 @@ class GvrTopkRegKernel:
                     ofs_i = ks
             else:
                 kq = cutlass.Int32(pre_idx.shape[1])
+                if cutlass.const_expr(self.paged):
+                    kq = cutlass.Int32(out.shape[1])  # pre_idx slot = page table
                 req = row // cutlass.Int32(self.next_n)
                 rr = row % cutlass.Int32(self.next_n)
                 prow = req
@@ -3832,7 +4012,7 @@ class GvrTopkRegKernel:
                 while i < kq:
                     ov = cutlass.Int32(-1)
                     if i < nv:
-                        ov = i + ofs_i
+                        ov = self._ox_g(pre_idx, i + ofs_i)
                     out[row, i] = ov
                     i = i + cutlass.Int32(BLK)
 
@@ -3938,6 +4118,8 @@ class GvrTopkRegKernel:
                 p_addr = pre_idx.iterator.toint()
             else:
                 k = cutlass.Int32(pre_idx.shape[1])
+                if cutlass.const_expr(self.paged):
+                    k = cutlass.Int32(out.shape[1])  # pre_idx slot = page table
                 p_addr = pre_idx[prow, None].iterator.toint()  # request-level under varlen
             out_row = out[row, None]
             # prefill: base shifted to the float4-rounded window start
@@ -3984,6 +4166,43 @@ class GvrTopkRegKernel:
                 cute.make_layout((65536,)),
             )
 
+            # ---- paged: stage this request's page-table row (tail of the dynamic
+            # smem window; visible to the emit sites after the first barrier) ----
+            s_pt = ck  # placeholder view when the page table is read from global
+            if cutlass.const_expr(self.paged and self.pt_smem > 0):
+                pt_base = sbase + smem_bytes - cutlass.Int32(self.pt_smem * 4)
+                s_pt = cute.make_tensor(
+                    cute.make_ptr(cutlass.Int32, pt_base, cute.AddressSpace.smem, assumed_align=16),
+                    cute.make_layout((self.pt_smem,)),
+                )
+                npg = cutlass.Int32(pre_idx.shape[1])
+                req_pt = self._pt_req()
+                jp = tid
+                while jp < cutlass.Int32(self.pt_smem):
+                    ent = cutlass.Int32(-1)
+                    if jp < npg:
+                        ent = pre_idx[req_pt, jp]
+                    s_pt[jp] = ent
+                    jp = jp + cutlass.Int32(BLK)
+            # ---- output staging: the emit positions of a warp are scattered (per-bin
+            # cursors), so direct global stores cost one L1 sector per index (5x the
+            # sectors of a coalesced write, ~1 us at k=2048 on B200). Stage the k
+            # outputs in smem and write them coalesced at the end (see the tail).
+            s_out = ck  # placeholder view when the output is written directly
+            if cutlass.const_expr(self.stage_out):
+                s_out = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Int32,
+                        sbase + smem_bytes - cutlass.Int32(self.pt_smem * 4) - k * cutlass.Int32(4),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((65536,)),
+                )  # typed view, no bound (k live entries)
+                io = tid
+                while io < k:
+                    s_out[io] = cutlass.Int32(-1)  # unwritten slots surface as pads
+                    io = io + cutlass.Int32(BLK)
             n4 = n >> cutlass.Int32(2)
             ntail = n - (n4 << cutlass.Int32(2))
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
@@ -4002,20 +4221,27 @@ class GvrTopkRegKernel:
                             pv = ld_g_i32(p_addr, j)
                     pvs.append(pv)
 
-            # ---- row load: exact-fit peel + float4[VPT] register batch
-            atom128 = g2r_atom_f32(128, invariant=True)
-            frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
-            if n4 >= cutlass.Int32(self.blk * self.vpt):  # block-uniform peel
-                for u in cutlass.range_constexpr(VPT):
-                    ld_g_f32x4(atom128, x_addr, tid + cutlass.Int32(u * self.blk), frags[u])
-            else:  # predicated flat batch
+            # ---- row load: prefill loads here (window base from row_starts); the
+            # decode path loaded the envelope at kernel start and only masks the
+            # lanes beyond this row's float4 count
+            if cutlass.const_expr(self.prefill):
+                if n4 >= cutlass.Int32(self.blk * self.vpt):  # block-uniform peel
+                    for u in cutlass.range_constexpr(VPT):
+                        ld_g_f32x4(atom128, x_addr, tid + cutlass.Int32(u * self.blk), frags[u])
+                else:  # predicated flat batch
+                    for u in cutlass.range_constexpr(VPT):
+                        i = tid + cutlass.Int32(u * self.blk)
+                        if i < n4:
+                            ld_g_f32x4(atom128, x_addr, i, frags[u])
+                    for u in cutlass.range_constexpr(VPT):
+                        i = tid + cutlass.Int32(u * self.blk)
+                        if i >= n4:  # -INFINITY fill
+                            for q in cutlass.range_constexpr(4):
+                                frags[u][q] = cutlass.Float32(_NEG_INF__reg)
+            else:
                 for u in cutlass.range_constexpr(VPT):
                     i = tid + cutlass.Int32(u * self.blk)
-                    if i < n4:
-                        ld_g_f32x4(atom128, x_addr, i, frags[u])
-                for u in cutlass.range_constexpr(VPT):
-                    i = tid + cutlass.Int32(u * self.blk)
-                    if i >= n4:  # -INFINITY fill
+                    if i >= n4:  # beyond this row's length: -INFINITY fill
                         for q in cutlass.range_constexpr(4):
                             frags[u][q] = cutlass.Float32(_NEG_INF__reg)
 
@@ -4429,10 +4655,16 @@ class GvrTopkRegKernel:
                     p2e = b2 + popc(n2 & lml)
                     if q1e == cutlass.Int32(1):
                         if p1e < nA:
-                            out_row[p1e] = ixv + ofs_e
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p1e] = ixv + ofs_e
+                            else:
+                                out_row[p1e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
                     if q2e == cutlass.Int32(1):
                         if p2e < nT:
-                            out_row[nA + p2e] = ixv + ofs_e
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[nA + p2e] = ixv + ofs_e
+                            else:
+                                out_row[nA + p2e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
                 # tail element
                 u64 = cutlass.Int64(-1)
                 if tid < ntail:
@@ -4458,10 +4690,16 @@ class GvrTopkRegKernel:
                 p2e = b2 + popc(n2 & lml)
                 if q1e == cutlass.Int32(1):
                     if p1e < nA:
-                        out_row[p1e] = tix + ofs_e
+                        if cutlass.const_expr(self.stage_out):
+                            s_out[p1e] = tix + ofs_e
+                        else:
+                            out_row[p1e] = self._ox(pre_idx, s_pt, tix + ofs_e)
                 if q2e == cutlass.Int32(1):
                     if p2e < nT:
-                        out_row[nA + p2e] = tix + ofs_e
+                        if cutlass.const_expr(self.stage_out):
+                            s_out[nA + p2e] = tix + ofs_e
+                        else:
+                            out_row[nA + p2e] = self._ox(pre_idx, s_pt, tix + ofs_e)
                 # (CUDA returns here — everything below is the else-arm)
             else:
                 # ---- emit
@@ -4498,7 +4736,10 @@ class GvrTopkRegKernel:
                                     s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
                                 )
                                 if p < lim1:
-                                    out_row[p] = idx + ofs_e
+                                    if cutlass.const_expr(self.stage_out):
+                                        s_out[p] = idx + ofs_e
+                                    else:
+                                        out_row[p] = self._ox(pre_idx, s_pt, idx + ofs_e)
                                 else:
                                     if whole == cutlass.Int32(0):
                                         q2i = p - above
@@ -4515,7 +4756,10 @@ class GvrTopkRegKernel:
                         bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
                         p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                         if p < lim1:
-                            out_row[p] = tix + ofs_e
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p] = tix + ofs_e
+                            else:
+                                out_row[p] = self._ox(pre_idx, s_pt, tix + ofs_e)
                         else:
                             if whole == cutlass.Int32(0):
                                 q2i = p - above
@@ -4591,12 +4835,18 @@ class GvrTopkRegKernel:
                             << cutlass.Int32(2)
                         ) + (sdyn & cutlass.Int32(3))
                         if p1 < lim1:
-                            out_row[p1] = idx + ofs_e
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p1] = idx + ofs_e
+                            else:
+                                out_row[p1] = self._ox(pre_idx, s_pt, idx + ofs_e)
                         p1 = p1 + cutlass.Int32(1)
                         wm = wm & (wm - cutlass.Int32(1))
                     if t1 == cutlass.Int32(1):
                         if p1 < lim1:
-                            out_row[p1] = tix + ofs_e
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p1] = tix + ofs_e
+                            else:
+                                out_row[p1] = self._ox(pre_idx, s_pt, tix + ofs_e)
                         p1 = p1 + cutlass.Int32(1)
                     if m2 != cutlass.Int32(0):  # static-unrolled
                         for s in cutlass.range_constexpr(S):
@@ -4647,7 +4897,10 @@ class GvrTopkRegKernel:
                                 r = r + tinc
                                 j = j + cutlass.Int32(1)
                             if r < need:
-                                out_row[above + r] = ci[i]
+                                if cutlass.const_expr(self.stage_out):
+                                    s_out[above + r] = ci[i]
+                                else:
+                                    out_row[above + r] = self._ox(pre_idx, s_pt, ci[i])
                             i = i + cutlass.Int32(BLK)
                     else:
                         # ---- fallback: exact key-space narrowing
@@ -4763,11 +5016,27 @@ class GvrTopkRegKernel:
                             p2e = b2 + popc(n2 & lml)
                             if q1f == cutlass.Int32(1):
                                 if p1e < aboveC:
-                                    out_row[above + p1e] = idv
+                                    if cutlass.const_expr(self.stage_out):
+                                        s_out[above + p1e] = idv
+                                    else:
+                                        out_row[above + p1e] = self._ox(pre_idx, s_pt, idv)
                             if q2f == cutlass.Int32(1):
                                 if p2e < needC:
-                                    out_row[above + aboveC + p2e] = idv
+                                    if cutlass.const_expr(self.stage_out):
+                                        s_out[above + aboveC + p2e] = idv
+                                    else:
+                                        out_row[above + aboveC + p2e] = self._ox(pre_idx, s_pt, idv)
                             it = it + cutlass.Int32(1)
+            # ---- coalesced output write (all emit paths converge here) ----
+            if cutlass.const_expr(self.stage_out):
+                cute.arch.barrier()  # staged outputs complete
+                io = tid
+                while io < k:
+                    vo = cutlass.Int32(s_out[io])
+                    if vo >= cutlass.Int32(0):
+                        vo = self._ox(pre_idx, s_pt, vo)
+                    out_row[io] = vo
+                    io = io + cutlass.Int32(BLK)
 
     # ------------------------------------------------------------------
     @cute.jit
@@ -4810,6 +5079,10 @@ def get_compiled__reg(
     hint_free=False,
     prefill=False,
     prefill_abs=False,
+    paged=False,
+    page_shift=0,
+    pt_smem=0,
+    stage_out=True,
 ):
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
@@ -4818,10 +5091,13 @@ def get_compiled__reg(
     kernel never reads the hint (no prefetch, no gather arm), so the hinted and
     hint-free launchers share one compiled object instead of two byte-identical
     ones."""
+    paged = bool(paged)
+    if paged and not (varlen and hint_free and not prefill):
+        raise RuntimeError("reg paged compile requires varlen + hint_free (decode)")
     if prefill:
         if not (varlen and hint_free and int(next_n) == 1 and int(cr_shift) == 0):
             raise RuntimeError("reg prefill requires varlen, hint_free, next_n == 1, cr_shift == 0")
-    elif bool(tpl[5]):  # DEG (hinted / hint-free share one object; prefill keys its own)
+    elif bool(tpl[5]) and not paged:  # DEG shares one object for both hint modes
         hint_free = False
     key = (
         tuple(tpl),
@@ -4832,6 +5108,10 @@ def get_compiled__reg(
         bool(hint_free),
         bool(prefill),
         bool(prefill_abs and prefill),
+        paged,
+        int(page_shift) if paged else 0,
+        int(pt_smem) if paged else 0,
+        bool(stage_out),
         C._compile_arch_token(),
     )
     compiled = _COMPILE_CACHE__reg.get(key)
@@ -4855,6 +5135,10 @@ def get_compiled__reg(
             hint_free=hint_free,
             prefill=prefill,
             prefill_abs=prefill_abs,
+            paged=paged,
+            page_shift=int(page_shift) if paged else 0,
+            pt_smem=int(pt_smem) if paged else 0,
+            stage_out=bool(stage_out),
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -4866,6 +5150,11 @@ def get_compiled__reg(
             # 1-D row_starts in the pre_idx slot (4B aligned: it is sliced per slab)
             pi_fake = _crt.make_fake_compact_tensor(
                 cutlass.Int32, (nb2_,), stride_order=(0,), assumed_align=4
+            )
+        elif paged:
+            # page table [batch, max_pages] int32 in the pre_idx slot (any row width)
+            pi_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (nb2_, nc2_), stride_order=(1, 0), assumed_align=4
             )
         else:
             pi_fake = _crt.make_fake_compact_tensor(
@@ -4909,6 +5198,9 @@ def get_compiled__reg(
                 + ("_hf" if hint_free else "")
                 + ("_pf" if prefill else "")
                 + ("_abs" if (prefill and prefill_abs) else "")
+                + (f"_pg{int(page_shift)}" if paged else "")
+                + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
+                + ("" if stage_out else "_ds")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__reg[key] = compiled
@@ -4932,7 +5224,7 @@ def reg_topk(logits, pre_idx, n, out, rd=None):
     rt = rd["rt"]
     assert rt["IMGOFF"] == tpl[7], (rt["IMGOFF"], tpl[7])  # IMGOFF == NBH
     compiled = get_compiled__reg(tpl)
-    smem = STATIC_BYTES + rd["smem"]
+    smem = STATIC_BYTES + rd["smem"] + 4 * pre_idx.shape[1]  # + output staging
     try:
         from .gvr2_topk_host import _dummy_kv
     except ImportError:
@@ -5025,11 +5317,17 @@ class GvrClusKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
+        paged: bool = False,
+        page_shift: int = 0,
+        pt_smem: int = 0,
+        pdl: bool = False,
     ):
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         assert nbs == 256, "SNB must stay 256"
         assert u in (1, 2, 4, 8) and cs in (2, 4, 8)
+        # programmatic dependent launch (griddepcontrol.wait first, see GvrMainKernel)
+        self.pdl = bool(pdl)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel / GvrRegClusKernel): n and the sampling-
         # ladder scalars are re-derived PER ROW in-kernel from a device
@@ -5041,6 +5339,18 @@ class GvrClusKernel:
         if self.varlen:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
         self.hint_free = bool(hint_free)  # hint-free: gather_hint sites compiled out
+        # paged output: valid emitted indices become physical KV slots through the
+        # page table carried in the pre_idx slot (hint-free varlen compiles only)
+        self.paged = bool(paged)
+        self.page_shift = int(page_shift)
+        if self.paged:
+            assert varlen and hint_free, 'paged output needs a hint-free varlen compile'
+            assert 0 <= self.page_shift <= 30
+        # paged: page-table entries staged in smem per CTA (0 = global read at
+        # every emit); staged in the prologue so the emit transform is an smem
+        # read instead of a dependent L2 load at the kernel tail
+        self.pt_smem = int(pt_smem)
+        assert self.pt_smem == 0 or (self.paged and self.pt_smem & (self.pt_smem - 1) == 0)
         self.lcs = cs.bit_length() - 1  # log2(CS) for the per-row Q shift
         self.blk = blk
         self.u = u
@@ -5088,7 +5398,9 @@ class GvrClusKernel:
     # DSMEM store to rank-0 ck64c (never split into 4B stores).
     # ------------------------------------------------------------------
     @cute.jit
-    def _p5_emit(self, xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64):
+    def _p5_emit(
+        self, xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64, pre_idx, s_pt
+    ):
         NBS = self.nbs
         bn = C.f2s_rz((xv - TF) * SC)
         if bn > cutlass.Int32(NBS - 1):
@@ -5096,7 +5408,7 @@ class GvrClusKernel:
         if bn >= B:
             p = C.atomic_add_cta(s_mrg.iterator + bn, cutlass.Int32(1))
             if p < lim1:
-                out_row[p] = idv
+                out_row[p] = self._ox(pre_idx, s_pt, idv)
             else:
                 if whole == cutlass.Int32(0):
                     q2 = p - above
@@ -5185,7 +5497,9 @@ class GvrClusKernel:
     # same helper as the main family. s_scal[1]=s_o1, s_scal[2]=s_o2.
     # ------------------------------------------------------------------
     @cute.jit
-    def _ballot_pair_emit(self, p1, p2, idv, base1, cap1, base2, cap2, out_row, s_scal, lane):
+    def _ballot_pair_emit(
+        self, p1, p2, idv, base1, cap1, base2, cap2, out_row, s_scal, lane, pre_idx, s_pt
+    ):
         n1 = C.ballot(p1 != cutlass.Int32(0))
         n2 = C.ballot(p2 != cutlass.Int32(0))
         b1 = cutlass.Int32(0)
@@ -5201,15 +5515,39 @@ class GvrClusKernel:
         if p1 != cutlass.Int32(0):
             p = b1 + cutlass.Int32(C.popc(n1 & lm))
             if p < cap1:
-                out_row[base1 + p] = idv
+                out_row[base1 + p] = self._ox(pre_idx, s_pt, idv)
         if p2 != cutlass.Int32(0):
             p = b2 + cutlass.Int32(C.popc(n2 & lm))
             if p < cap2:
-                out_row[base2 + p] = idv
+                out_row[base2 + p] = self._ox(pre_idx, s_pt, idv)
 
     # ------------------------------------------------------------------
     # kernel
     # ------------------------------------------------------------------
+
+    # ---- paged output (page table in the pre_idx slot of a hint-free compile) ----
+    def _pt_req(self):
+        # request of this CTA's row, re-derived from the block index (no live register)
+        bx, by, _ = cute.arch.block_idx()
+        return by // cutlass.Int32(self.next_n)
+
+    def _ox_g(self, pre_idx, v):
+        """Output transform of a valid emitted index (global page-table read)."""
+        if self.paged:
+            return _pt_xf(pre_idx, self._pt_req(), v, self.page_shift)
+        return v
+
+    def _ox(self, pre_idx, s_pt, v):
+        """Output transform at the emit sites: smem-staged page table when compiled
+        with pt_smem, else the global read."""
+        if self.paged and self.pt_smem > 0:
+            ps = self.page_shift
+            if ps == 0:
+                return s_pt[v]
+            return (s_pt[v >> cutlass.Int32(ps)] << cutlass.Int32(ps)) | (
+                v & cutlass.Int32((1 << ps) - 1)
+            )
+        return self._ox_g(pre_idx, v)
     @cute.kernel
     def kern(
         self,
@@ -5237,6 +5575,9 @@ class GvrClusKernel:
         STEPC = self.stepc
         NW = BLK // 32
 
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
+
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # (rank, row)
         rank = bx
@@ -5256,6 +5597,8 @@ class GvrClusKernel:
         prow = row
         if cutlass.const_expr(self.varlen):
             kq = cutlass.Int32(pre_idx.shape[1])
+            if cutlass.const_expr(self.paged):
+                kq = cutlass.Int32(out.shape[1])  # pre_idx slot = page table
             req = row // cutlass.Int32(self.next_n)
             rr = row % cutlass.Int32(self.next_n)
             prow = req
@@ -5360,7 +5703,7 @@ class GvrClusKernel:
                     if tidx < kq:
                         ov = cutlass.Int32(-1)
                         if tidx < nv:
-                            ov = tidx
+                            ov = self._ox_g(pre_idx, tidx)
                         out[row, tidx] = ov
 
         # ---- shared memory (CUDA dynamic map order, then static allocs) ----
@@ -5402,6 +5745,24 @@ class GvrClusKernel:
             cutlass.Uint32, cute.make_ordered_layout((2,), order=(0,)), byte_alignment=8
         )
         sbase = blob.iterator.toint()
+        s_pt = blob  # placeholder view when the page table is read from global
+        # ---- paged: stage this request's page-table row in smem (consumed by the
+        # emit sites after the barriers below) ----
+        if cutlass.const_expr(self.paged and self.pt_smem > 0):
+            s_pt = smem.allocate_tensor(
+                cutlass.Int32,
+                cute.make_ordered_layout((self.pt_smem,), order=(0,)),
+                byte_alignment=16,
+            )
+            npg = cutlass.Int32(pre_idx.shape[1])
+            req_pt = self._pt_req()
+            jp = tidx
+            while jp < cutlass.Int32(self.pt_smem):
+                ent = cutlass.Int32(-1)
+                if jp < npg:
+                    ent = pre_idx[req_pt, jp]
+                s_pt[jp] = ent
+                jp = jp + cutlass.Int32(BLK)
         s_cbuf2 = cute.make_tensor(  # int2 staged as u64
             cute.make_ptr(cutlass.Uint64, sbase, cute.AddressSpace.smem, assumed_align=16),
             cute.make_layout((self.scap + 4,)),
@@ -5888,7 +6249,7 @@ class GvrClusKernel:
                         idv = cutlass.Int32(pk64 >> cutlass.Uint64(32))
                         xv = C.f32_of_i32(vx)
                         self._p5_emit(
-                            xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
+                            xv, idv, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64, pre_idx, s_pt
                         )
                         i = i + cutlass.Int32(BLK)
                 else:
@@ -5905,7 +6266,7 @@ class GvrClusKernel:
                             x = C.ldg_f32(x_addr, i)
                             if x >= TF:
                                 self._p5_emit(
-                                    x, i, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
+                                    x, i, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64, pre_idx, s_pt
                                 )
                             i = i + cutlass.Int32(BLK)
                         g = g + cutlass.Int32(CS)
@@ -5915,7 +6276,7 @@ class GvrClusKernel:
                         x = C.ldg_f32(x_addr, ii)
                         if x >= TF:
                             self._p5_emit(
-                                x, ii, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64
+                                x, ii, TF, SC, B, above, lim1, whole, CMP, s_mrg, out_row, rk64, pre_idx, s_pt
                             )
                         t2 = t2 + cutlass.Int32(BLK)
 
@@ -5951,10 +6312,14 @@ class GvrClusKernel:
                                         cutlass.Uint64(s_ck64[mc2]) > cutlass.Uint64(u64v)
                                     )
                                 if r_ < need:
-                                    out_row[above + r_] = cutlass.Int32(
-                                        cutlass.Uint32(
-                                            cutlass.Uint64(u64v) & cutlass.Uint64(0xFFFFFFFF)
-                                        )
+                                    out_row[above + r_] = self._ox(
+                                        pre_idx,
+                                        s_pt,
+                                        cutlass.Int32(
+                                            cutlass.Uint32(
+                                                cutlass.Uint64(u64v) & cutlass.Uint64(0xFFFFFFFF)
+                                            )
+                                        ),
                                     )
                                 i = i + cutlass.Int32(BLK)
                         else:
@@ -6070,6 +6435,8 @@ class GvrClusKernel:
                                     out_row,
                                     s_scal,
                                     lane,
+                                    pre_idx,
+                                    s_pt,
                                 )
                                 it = it + cutlass.Int32(1)
                 else:
@@ -6169,7 +6536,7 @@ class GvrClusKernel:
                                 if iu == ethr:
                                     p2 = cutlass.Int32(1)
                         self._ballot_pair_emit(
-                            p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane
+                            p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane, pre_idx, s_pt
                         )
                         it = it + cutlass.Int32(1)
 
@@ -6211,6 +6578,7 @@ class GvrClusKernel:
             cluster=(self.cs, 1, 1),
             stream=stream,
             min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
         )
 
 
@@ -6229,6 +6597,10 @@ def get_compiled__clus(
     next_n: int = 1,
     cr_shift: int = 0,
     hint_free: bool = False,
+    paged: bool = False,
+    page_shift: int = 0,
+    pt_smem: int = 0,
+    pdl: bool = False,
 ):
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
@@ -6242,8 +6614,14 @@ def get_compiled__clus(
         int(next_n),
         int(cr_shift),
         bool(hint_free),
+        bool(paged),
+        int(page_shift) if paged else 0,
+        int(pt_smem) if paged else 0,
+        bool(pdl),
         C._compile_arch_token(),
     )
+    if paged and not (varlen and hint_free):
+        raise RuntimeError("clus paged compile requires varlen + hint_free")
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
         return hit
@@ -6260,6 +6638,10 @@ def get_compiled__clus(
         next_n=next_n,
         cr_shift=cr_shift,
         hint_free=hint_free,
+        paged=bool(paged),
+        page_shift=int(page_shift) if paged else 0,
+        pt_smem=int(pt_smem) if paged else 0,
+        pdl=bool(pdl),
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -6268,7 +6650,7 @@ def get_compiled__clus(
         cutlass.Float32, (r0, c0), stride_order=(1, 0), assumed_align=16
     )
     pre_fake = _crt.make_fake_compact_tensor(
-        cutlass.Int32, (r1, c1), stride_order=(1, 0), assumed_align=16
+        cutlass.Int32, (r1, c1), stride_order=(1, 0), assumed_align=4 if paged else 16
     )
     out_fake = _crt.make_fake_compact_tensor(
         cutlass.Int32, (r2, c2), stride_order=(1, 0), assumed_align=16
@@ -6295,6 +6677,9 @@ def get_compiled__clus(
         "clus_" + "_".join(str(x) for x in tuple(tpl))
         + f"_scap{int(scap)}_cmp{int(cmp_)}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
         + ("_hf" if hint_free else "")
+        + (f"_pg{int(page_shift)}" if paged else "")
+        + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
+        + ("_pdl1" if pdl else "")
     )
     if options_extra:
         name += "_opt_" + options_extra
@@ -6489,6 +6874,10 @@ class GvrRegClusKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
+        paged: bool = False,
+        page_shift: int = 0,
+        pt_smem: int = 0,
+        stage_out: bool = False,
     ):
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
@@ -6496,6 +6885,13 @@ class GvrRegClusKernel:
         self.vpt = vpt
         self.cs = cs
         self.pdl = bool(pdl)
+        # staged coalesced output: every rank writes its winners into rank 0's
+        # k-word staging region (DSMEM stores, tail of the dynamic window after
+        # the page-table row) and rank 0 writes the row in one coalesced pass
+        # after the final cluster rendezvous, applying the paged transform
+        # there. Replaces the per-winner scattered global stores (one L1 store
+        # sector each, with the page-table read inline when paged).
+        self.stage_out = bool(stage_out)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel): n is re-derived PER ROW in-kernel from
         # a device kv_lens tensor; the scalar n launch arg becomes the
@@ -6507,10 +6903,58 @@ class GvrRegClusKernel:
             assert self.next_n >= 1 and self.cr_shift in (0, 2)
         # hint-free: P0 samples the first k row elements (coalesced) instead of the hint
         self.hint_free = bool(hint_free)
+        # paged output: valid emitted indices become physical KV slots through the
+        # page table carried in the pre_idx slot (hint-free varlen compiles only)
+        self.paged = bool(paged)
+        self.page_shift = int(page_shift)
+        if self.paged:
+            assert varlen and hint_free, 'paged output needs a hint-free varlen compile'
+            assert 0 <= self.page_shift <= 30
+        # paged: page-table entries staged in smem per CTA (0 = global read at
+        # every emit); staged in the prologue so the emit transform is an smem
+        # read instead of a dependent L2 load at the kernel tail
+        self.pt_smem = int(pt_smem)
+        assert self.pt_smem == 0 or (self.paged and self.pt_smem & (self.pt_smem - 1) == 0)
         self.S = vpt * 4
         self.span = blk * vpt  # float4 per CTA
 
     # ------------------------------------------------------------------
+
+    # ---- paged output (page table in the pre_idx slot of a hint-free compile) ----
+    def _pt_req(self):
+        # request of this CTA's row, re-derived from the block index (no live register)
+        bx, by, _ = cute.arch.block_idx()
+        return by // cutlass.Int32(self.next_n)
+
+    def _ox_g(self, pre_idx, v):
+        """Output transform of a valid emitted index (global page-table read)."""
+        if self.paged:
+            return _pt_xf(pre_idx, self._pt_req(), v, self.page_shift)
+        return v
+
+    def _ox(self, pre_idx, s_pt, v):
+        """Output transform at the emit sites: smem-staged page table when compiled
+        with pt_smem, else the global read."""
+        if self.paged and self.pt_smem > 0:
+            ps = self.page_shift
+            if ps == 0:
+                return s_pt[v]
+            return (s_pt[v >> cutlass.Int32(ps)] << cutlass.Int32(ps)) | (
+                v & cutlass.Int32((1 << ps) - 1)
+            )
+        return self._ox_g(pre_idx, v)
+
+    def _emit(self, out_row, pos, v, pre_idx, s_pt, stage_addr):
+        """Winner store at position `pos`: into rank 0's staging region (stage_out;
+        the transform is applied by the epilogue) or straight to the row."""
+        if self.stage_out:
+            _st_shared_cluster_i32(
+                _mapa_shared_cluster_addr(stage_addr + (pos << cutlass.Int32(2)), cutlass.Int32(0)),
+                v,
+            )
+        else:
+            out_row[pos] = self._ox(pre_idx, s_pt, v)
+
     @cute.kernel
     def kern(
         self,
@@ -6544,6 +6988,8 @@ class GvrRegClusKernel:
         prow = row
         if cutlass.const_expr(self.varlen):
             kq = cutlass.Int32(pre_idx.shape[1])
+            if cutlass.const_expr(self.paged):
+                kq = cutlass.Int32(out.shape[1])  # pre_idx slot = page table
             req = row // cutlass.Int32(self.next_n)
             rr = row % cutlass.Int32(self.next_n)
             prow = req
@@ -6561,11 +7007,15 @@ class GvrRegClusKernel:
                 n = nv
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
-                    if tid < kq:
+                    # k may exceed BLK (K = 2048 rows are admitted to this
+                    # family): stride the identity write
+                    jq = tid
+                    while jq < kq:
                         ov = cutlass.Int32(-1)
-                        if tid < nv:
-                            ov = tid
-                        out[row, tid] = ov
+                        if jq < nv:
+                            ov = self._ox_g(pre_idx, jq)
+                        out[row, jq] = ov
+                        jq = jq + cutlass.Int32(BLK)
 
         # ------------------------------------------------------------------
         # Predeclarations (DSL AST rule: every scalar (re)assigned under a
@@ -6626,10 +7076,14 @@ class GvrRegClusKernel:
         tval = cutlass.Float32(_NEG_INF__regclus)
         LOQ = cutlass.Float32(0.0)
         qv = cutlass.Float32(0.0)
+        jo = cutlass.Int32(0)
+        vo = cutlass.Int32(0)
 
         if short == cutlass.Int32(0):
             npad = cutlass.Int32(logits.shape[1])  # noqa: F841
             k = cutlass.Int32(pre_idx.shape[1])
+            if cutlass.const_expr(self.paged):
+                k = cutlass.Int32(out.shape[1])  # pre_idx slot = page table
             out_row = out[row, None]
             x_addr = logits[row, None].iterator.toint()  # Int64 gmem byte base
             p_addr = pre_idx[prow, None].iterator.toint()  # request-level under varlen
@@ -6653,17 +7107,56 @@ class GvrRegClusKernel:
             hist_addr = sbase + cutlass.Int32(W_HIST * 4)
             ck_addr = sbase + cutlass.Int32(W_CK * 4)
             ci_addr = sbase + cutlass.Int32(W_CI * 4)
+            s_pt = s_ci  # placeholder view when the page table is read from global
+            # ---- paged: stage this request's page-table row in smem (consumed by the
+            # emit sites after the barriers below) ----
+            if cutlass.const_expr(self.paged and self.pt_smem > 0):
+                s_pt = cute.make_tensor(  # tail of the dynamic window (SMEM_BYTES + 4 * pt_smem launched)
+                    cute.make_ptr(
+                        cutlass.Int32,
+                        sbase + cutlass.Int32(SMEM_BYTES),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((self.pt_smem,)),
+                )
+                npg = cutlass.Int32(pre_idx.shape[1])
+                req_pt = self._pt_req()
+                jp = tid
+                while jp < cutlass.Int32(self.pt_smem):
+                    ent = cutlass.Int32(-1)
+                    if jp < npg:
+                        ent = pre_idx[req_pt, jp]
+                    s_pt[jp] = ent
+                    jp = jp + cutlass.Int32(BLK)
+            # ---- staged output: k words after the page-table row, in rank 0's
+            # window (peers reach it through mapa); rank 0 clears it before the
+            # first cluster rendezvous, so every remote winner store lands later
+            stage_addr = sbase + cutlass.Int32(SMEM_BYTES + 4 * self.pt_smem)
+            s_out = s_ci  # placeholder view when the output is not staged
+            if cutlass.const_expr(self.stage_out):
+                s_out = cute.make_tensor(
+                    cute.make_ptr(cutlass.Int32, stage_addr, cute.AddressSpace.smem, assumed_align=16),
+                    cute.make_layout((k,)),
+                )
+                if rank == cutlass.Int32(0):
+                    jo = tid
+                    while jo < k:
+                        s_out[jo] = cutlass.Int32(-1)
+                        jo = jo + cutlass.Int32(BLK)
 
             n4 = n >> cutlass.Int32(2)
             ntail = n - (n4 << cutlass.Int32(2))
             base4 = rank * cutlass.Int32(self.span)
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
 
-            # ---- P0: redundant hint gather, EVERY CTA (k<=BLK by dispatch
-            # gate). One coalesced word per thread, NO cluster barrier —
-            # GMIN/GMAX identical everywhere by construction. hint-free: the
-            # first k row positions stand in for the hint (identity sample),
-            # no pre_idx load (upstream PR NVIDIA/TensorRT-LLM#18410).
+            # ---- P0: redundant hint gather, EVERY CTA. One coalesced word per
+            # thread (the first min(k, BLK) hint / row positions; K = 2048 rows
+            # sample the first BLK, a looser bracket with the same exact
+            # result), NO cluster barrier — GMIN/GMAX identical everywhere by
+            # construction. hint-free: the first row positions stand in for the
+            # hint (identity sample), no pre_idx load (upstream PR
+            # NVIDIA/TensorRT-LLM#18410).
             if cutlass.const_expr(self.hint_free):
                 if tid < k:
                     pv0 = tid
@@ -6814,7 +7307,7 @@ class GvrRegClusKernel:
                             (base4 + tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                         ) + cutlass.Int32(s % 4)
                         if p < lim1:
-                            out_row[p] = idx
+                            self._emit(out_row, p, idx, pre_idx, s_pt, stage_addr)
                         else:
                             if whole == cutlass.Int32(0):
                                 # crossing overflow -> striped DSMEM slabs; TWO
@@ -6835,7 +7328,7 @@ class GvrRegClusKernel:
                     bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
                     p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                     if p < lim1:
-                        out_row[p] = tix
+                        self._emit(out_row, p, tix, pre_idx, s_pt, stage_addr)
                     else:
                         if whole == cutlass.Int32(0):
                             q2i = p - above
@@ -6876,7 +7369,7 @@ class GvrRegClusKernel:
                                     rnk = rnk + tinc
                                     j = j + cutlass.Int32(1)
                                 if rnk < need:
-                                    out_row[above + rnk] = s_ci[i]
+                                    self._emit(out_row, above + rnk, s_ci[i], pre_idx, s_pt, stage_addr)
                                 i = i + cutlass.Int32(BLK)
                         else:
                             # (2) key-space narrowing over striped DSMEM slabs:
@@ -7027,10 +7520,10 @@ class GvrRegClusKernel:
                                 p2e = b2 + popc(n2 & lml)
                                 if q1f == cutlass.Int32(1):
                                     if p1e < aboveC:
-                                        out_row[above + p1e] = idv
+                                        self._emit(out_row, above + p1e, idv, pre_idx, s_pt, stage_addr)
                                 if q2f == cutlass.Int32(1):
                                     if p2e < needC:
-                                        out_row[above + aboveC + p2e] = idv
+                                        self._emit(out_row, above + aboveC + p2e, idv, pre_idx, s_pt, stage_addr)
                                 it = it + cutlass.Int32(1)
                     else:
                         # (3) degen safety net: crossing bin larger than the
@@ -7141,15 +7634,27 @@ class GvrRegClusKernel:
                             p2e = b2 + popc(n2 & lml)
                             if q1f == cutlass.Int32(1):
                                 if p1e < nA:
-                                    out_row[p1e] = i
+                                    self._emit(out_row, p1e, i, pre_idx, s_pt, stage_addr)
                             if q2f == cutlass.Int32(1):
                                 if p2e < nT:
-                                    out_row[nA + p2e] = i
+                                    self._emit(out_row, nA + p2e, i, pre_idx, s_pt, stage_addr)
                             it = it + cutlass.Int32(1)
 
             # ---- P10: FINAL cluster rendezvous — ALL ranks reach it;
-            # keeps peers resident until rank 0 has read their ck/ci.
+            # keeps peers resident until rank 0 has read their ck/ci, and
+            # publishes every rank's staged winner stores to rank 0.
             _cluster_sync_aligned()
+            if cutlass.const_expr(self.stage_out):
+                # coalesced epilogue: rank 0 alone, one pass over the k staged
+                # winners, paged transform applied here
+                if rank == cutlass.Int32(0):
+                    jo = tid
+                    while jo < k:
+                        vo = s_out[jo]
+                        if vo >= cutlass.Int32(0):
+                            vo = self._ox(pre_idx, s_pt, vo)
+                        out_row[jo] = vo
+                        jo = jo + cutlass.Int32(BLK)
 
     # ------------------------------------------------------------------
     @cute.jit
@@ -7163,12 +7668,15 @@ class GvrRegClusKernel:
         stream,
     ):
         b = out.shape[0]
+        smem = SMEM_BYTES + 4 * self.pt_smem
+        if self.stage_out:
+            smem = smem + out.shape[1] * 4  # k-word staging region (rank 0 reads it)
         self.kern(logits, pre_idx, kv_lens, out, n).launch(
             grid=(self.cs, b, 1),
             block=(self.blk, 1, 1),
             cluster=(self.cs, 1, 1),
             stream=stream,
-            smem=SMEM_BYTES,
+            smem=smem,
             min_blocks_per_mp=1,
             use_pdl=self.pdl,
         )
@@ -7181,7 +7689,17 @@ _COMPILE_CACHE__regclus: dict = {}
 
 
 def get_compiled__regclus(
-    tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, hint_free=False
+    tpl,
+    dump_dir=None,
+    pdl=False,
+    varlen=False,
+    next_n=1,
+    cr_shift=0,
+    hint_free=False,
+    paged=False,
+    page_shift=0,
+    pt_smem=0,
+    stage_out=False,
 ):
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
     key = (
@@ -7191,8 +7709,14 @@ def get_compiled__regclus(
         int(next_n),
         int(cr_shift),
         bool(hint_free),
+        bool(paged),
+        int(page_shift) if paged else 0,
+        int(pt_smem) if paged else 0,
+        bool(stage_out),
         C._compile_arch_token(),
     )
+    if paged and not (varlen and hint_free):
+        raise RuntimeError("regclus paged compile requires varlen + hint_free")
     compiled = _COMPILE_CACHE__regclus.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
@@ -7207,6 +7731,10 @@ def get_compiled__regclus(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=hint_free,
+            paged=bool(paged),
+            page_shift=int(page_shift) if paged else 0,
+            pt_smem=int(pt_smem) if paged else 0,
+            stage_out=bool(stage_out),
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -7215,7 +7743,7 @@ def get_compiled__regclus(
             cutlass.Float32, (nb_, nc_), stride_order=(1, 0), assumed_align=16
         )
         pi_fake = _crt.make_fake_compact_tensor(
-            cutlass.Int32, (nb2_, nc2_), stride_order=(1, 0), assumed_align=16
+            cutlass.Int32, (nb2_, nc2_), stride_order=(1, 0), assumed_align=4 if paged else 16
         )
         out_fake = _crt.make_fake_compact_tensor(
             cutlass.Int32, (nb3_, nc3_), stride_order=(1, 0), assumed_align=16
@@ -7249,6 +7777,9 @@ def get_compiled__regclus(
                 "regclus_" + "_".join(str(x) for x in tuple(tpl))
                 + f"_pdl{int(bool(pdl))}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
                 + ("_hf" if hint_free else "")
+                + (f"_pg{int(page_shift)}" if paged else "")
+                + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
+                + ("_ds" if stage_out else "")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__regclus[key] = compiled

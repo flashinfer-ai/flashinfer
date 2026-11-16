@@ -34,6 +34,9 @@
 #ifndef CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4
 #error "CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 must describe auxiliary alignment"
 #endif
+#ifndef CAKE_KDA_PACKED_T1_PAIR_PUBLISH
+#error "CAKE_KDA_PACKED_T1_PAIR_PUBLISH must describe the output store width"
+#endif
 #ifndef FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND
 #error "FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND must identify the target"
 #endif
@@ -100,6 +103,8 @@ static_assert(CAKE_KDA_PACKED_T1_VALUE_TILES == 1 || CAKE_KDA_PACKED_T1_VALUE_TI
               "packed KDA T=1 has an unsupported value tiling");
 static_assert(CAKE_KDA_PACKED_T1_THREADS == 32 || CAKE_KDA_PACKED_T1_THREADS == 128,
               "packed KDA T=1 has an unsupported thread count");
+static_assert(CAKE_KDA_PACKED_T1_PAIR_PUBLISH == 0 || CAKE_KDA_PACKED_T1_PAIR_PUBLISH == 1,
+              "CAKE_KDA_PACKED_T1_PAIR_PUBLISH must be 0 or 1");
 static_assert(CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 0 ||
                   CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 1,
               "packed KDA T=1 auxiliary alignment must be boolean");
@@ -260,6 +265,13 @@ void Run(TensorView mixed_qkv, TensorView raw_gate, TensorView raw_beta, TensorV
                  out.size(2) == kHeadDim)
       << "output must have shape [B, " << kHeads << ", " << kHeadDim << "]";
   CHECK_CONTIGUOUS(out);
+  if constexpr (CAKE_KDA_PACKED_T1_PAIR_PUBLISH != 0) {
+    // The body publishes the two output rows a thread group owns as one 32-bit
+    // BF16x2 store; rows are 256 bytes apart, so the base must be 4-byte aligned.
+    TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 4 == 0)
+        << "this packed KDA variant stores output rows as BF16x2 pairs and "
+           "requires a 4-byte-aligned output";
+  }
 
   if constexpr (CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 != 0) {
     const uintptr_t mixed_base = reinterpret_cast<uintptr_t>(mixed_qkv.data_ptr());

@@ -6,12 +6,13 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import bf16_cutedsl_runtime_requirements
 from ......core.validation.common import validate_mega_arch, validate_mega_fleet_params
 from ......weights import MoEWeightPack
+from ..ep_tuning import BlackwellEpTuningMixin
 from ..common.bf16_staging import (
     stage_mega_moe_inputs,
     validate_bf16_forward_inputs,
@@ -21,6 +22,12 @@ from .weights import (
     TransformedMegaWeights,
     preprocess_mega_weights,
     validate_transformed_mega_weights,
+)
+
+from ..common.activation_batch_invariant import batch_invariant_numerical_metadata
+
+from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+    batch_invariant_variant_kwargs,
 )
 
 if TYPE_CHECKING:
@@ -38,7 +45,7 @@ def _clamp(config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
 @register_mega_kernel(
     "sm100_bf16_bf16_bf16_cutedsl", deprecated_aliases=("bf16_cutedsl",)
 )
-class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
+class Bf16CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBackend):
     supports_output_view = True
 
     @classmethod
@@ -46,9 +53,13 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         return "sm100_bf16_bf16_bf16_cutedsl"
 
     def __init__(self, config: Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        # Configs are mutable: also validate a caller-edited instance before
+        # any collective setup or workspace allocation.
+        config.__post_init__()
         super().__init__(config)
         self._kernel_config = config
-        self.supports_unfinalized_output = not config.do_finalize
+        self._arithmetic_arch: str | None = None
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._autotune_pending = config.knobs == "auto"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
@@ -57,6 +68,14 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     def validate_init(
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
+        if self._kernel_config.batch_invariant:
+            from ..common.batch_invariant import (
+                bf16_batch_invariant_arch,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            self._arithmetic_arch = bf16_batch_invariant_arch()
         validate_mega_arch()
         validate_mega_fleet_params(
             fleet_params,
@@ -103,6 +122,10 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
     )
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        from ..common.batch_invariant import (
+            BF16_BATCH_INVARIANT_VERSION,
+        )
+
         k = self._kernel_config
         return dict(
             dtype="bf16",
@@ -113,6 +136,27 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=(
+                BF16_BATCH_INVARIANT_VERSION if k.batch_invariant else None
+            ),
+            gate_up_clamp=_clamp(k),
+            **(batch_invariant_variant_kwargs(k) if k.batch_invariant else {}),
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params: FleetParams) -> str | None:
+        """Return this layer's arithmetic receipt without creating a workspace."""
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ..common.batch_invariant import bf16_batch_invariant_fingerprint
+
+        return bf16_batch_invariant_fingerprint(
+            self._kernel_config,
+            hidden=fleet_params.token_hidden_size,
+            num_experts=fleet_params.num_experts,
+            arch=self._arithmetic_arch,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -130,20 +174,27 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_clamp(config),
+            apply_routing_weights_before_fc2=config.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
+            batch_invariant=config.batch_invariant,
+            **batch_invariant_numerical_metadata(config),
             knobs=self._workspace_knobs(fleet_params),
         )
-        if not config.do_finalize:
+        if config.finalize_mode is FinalizeMode.NONE:
             workspace._unfinalized_route_map = torch.arange(
                 fleet_params.max_tokens_per_rank * config.top_k,
                 dtype=torch.int32,
                 device=workspace.topk_idx.device,
             ).view(fleet_params.max_tokens_per_rank, config.top_k)
-            # Default BF16 folds routing into FC1; respect pinned frontend knobs.
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if workspace._frontend.config.apply_topk_in_fc1
-                else workspace.topk_weights
+                if config.apply_routing_weights_before_fc2
+                else (
+                    torch.empty_like(workspace.topk_weights)
+                    if config.batch_invariant
+                    else workspace.topk_weights
+                )
             )
         return workspace
 
@@ -190,7 +241,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         from ......kernel_src.sm100.cutedsl_megamoe import bf16_mega_moe, staged_tokens
 
         if self.supports_unfinalized_output:
-            raise ValueError("do_finalize=False requires compute_unfinalized()")
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -210,7 +261,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         if self._autotune_pending:
             from ......kernel_src.sm100.cutedsl_megamoe import autotune_bf16_mega_moe
 
-            autotune_bf16_mega_moe(
+            self._autotune_winner = autotune_bf16_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
@@ -242,7 +293,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
         if not self.supports_unfinalized_output:
-            raise ValueError("compute_unfinalized() requires do_finalize=False")
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
         num_tokens = staged_tokens(workspace.topk_idx)
         if num_tokens is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")
@@ -250,19 +301,33 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         if clamp is not None:
             workspace._frontend.set_gate_up_clamp(clamp)
         # Launch at full capacity even when this rank has no live tokens.
-        partials = workspace._frontend.run(
+        workspace._frontend.run(
             MegaMoEBf16Inputs(
                 workspace.x,
                 workspace.topk_idx,
                 workspace.topk_weights,
                 transformed_weights[0][0],
                 transformed_weights[1][0],
-                workspace.combine_output,
+                workspace.output_activation,
             ),
             num_tokens=num_tokens,
         )
+        partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        if self._kernel_config.batch_invariant:
+            weights = workspace._unfinalized_weights[:num_tokens]
+            if self._kernel_config.apply_routing_weights_before_fc2:
+                weights.fill_(1.0)
+            else:
+                weights.copy_(workspace.topk_weights[:num_tokens])
+            weights.masked_fill_(
+                (workspace.topk_idx[:num_tokens] < 0)
+                | (workspace.topk_idx[:num_tokens] >= workspace.num_total_experts),
+                0,
+            )
         return (
-            partials.view(num_tokens * self._kernel_config.top_k, workspace.hidden),
+            partials[:num_tokens].view(
+                num_tokens * self._kernel_config.top_k, workspace.hidden
+            ),
             workspace._unfinalized_weights[:num_tokens],
             workspace._unfinalized_route_map[:num_tokens],
         )
@@ -286,8 +351,11 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             config.intermediate_size,
             _clamp(config),
+            config.apply_routing_weights_before_fc2,
+            config.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             config.enable_in_kernel_fc2_reduce,
-            config.do_finalize,
+            config.finalize_mode,
             knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 

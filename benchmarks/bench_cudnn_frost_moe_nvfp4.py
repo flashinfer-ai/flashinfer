@@ -57,21 +57,25 @@ from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
 
 if __package__:
     from .bench_cudnn_frost_common import (
+        BF16_INPUT_BACKENDS,
         activation_reference,
         capture,
         check_idle_gpu,
         emit,
         error,
         measure,
+        prepare_original_view,
     )
 else:
     from bench_cudnn_frost_common import (
+        BF16_INPUT_BACKENDS,
         activation_reference,
         capture,
         check_idle_gpu,
         emit,
         error,
         measure,
+        prepare_original_view,
     )
 
 
@@ -516,7 +520,7 @@ def relative_l2(actual, expected):
     ).item()
 
 
-def discover_original(arch, quant, activation):
+def discover_original(arch, quant, activation, exclude=()):
     from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
     from flashinfer.fused_moe.api import SwiGLU, SiTU
 
@@ -534,6 +538,10 @@ def discover_original(arch, quant, activation):
             arch=cfg_cls.supported(arch),
             quant=runner_cls.supports_quant(quant),
             activation=isinstance(activation, supported_acts),
+            # Frost's pre-quantized activation pack cannot reach a runner that
+            # quantizes BF16 hidden states itself.
+            activation_pack=runner_cls.backend_key not in BF16_INPUT_BACKENDS,
+            requested=runner_cls.backend_key not in exclude,
         )
         # The generic registry also covers Blackwell. Rubin's CuTe kernels
         # implement default SwiGLU only; its pinned TRTLLM BMM rejects SiTU.
@@ -564,7 +572,6 @@ def prepare_problem(args, activation_name, geometry):
     from flashinfer.fused_moe import (
         BackendOptions,
         CutlassNvfp4Config,
-        CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
         MoEConfig,
@@ -572,20 +579,15 @@ def prepare_problem(args, activation_name, geometry):
         QuantConfig,
         QuantFormat,
         RoutingConfig,
-        TrtllmFp4Config,
     )
 
     e, h, i, top_k = geometry
     activation = ACTIVATIONS[activation_name]()
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
     major, minor = torch.cuda.get_device_capability()
-    eligible, audit = discover_original(major * 10 + minor, quant, activation)
-    unsupported = set(eligible) - {CutlassNvfp4Config, TrtllmFp4Config, CuteDslConfig}
-    if unsupported:
-        raise RuntimeError(
-            "Missing preparation for applicable backends: "
-            + ", ".join(sorted(cls.__name__ for cls in unsupported))
-        )
+    eligible, audit = discover_original(
+        major * 10 + minor, quant, activation, args.exclude_backend
+    )
     if not eligible:
         raise RuntimeError("No original NVFP4 backend applies")
     config = MoEConfig(
@@ -613,12 +615,11 @@ def prepare_problem(args, activation_name, geometry):
     )
     # The Frost runner shares this canonical CUTLASS weight view, byte for byte.
     views = {"cutlass_nvfp4": CutlassNvfp4Config.prepare_weights(w1, w2, **kwargs)}
-    if TrtllmFp4Config in eligible:
-        views["trtllm_fp4_routed"] = TrtllmFp4Config.prepare_weights(
-            w1, w2, quant=quant, **kwargs
-        )
-    if CuteDslConfig in eligible:
-        views["cute_dsl"] = CuteDslConfig.prepare_weights(w1, w2, quant=quant, **kwargs)
+    for cfg_cls, runner_cls in eligible.items():
+        if runner_cls.backend_key not in views:
+            views[runner_cls.backend_key] = prepare_original_view(
+                cfg_cls, w1, w2, quant=quant, **kwargs
+            )
     del w1, w2
     return (
         config,
@@ -662,6 +663,7 @@ def benchmark_case(args, config, weights, activation, geometry, routing, tokens,
             + torch.cuda.get_device_capability()[1],
             config.quant,
             config.activation,
+            args.exclude_backend,
         )[0].values()
     )
     expected_keys = {runner.backend_key for runner in expected}
@@ -878,9 +880,23 @@ def benchmark_case(args, config, weights, activation, geometry, routing, tokens,
         telemetry=telemetry,
     )
     if not args.baseline_only:
+        # Pools run back to back within each rotated round, so per-round ratios
+        # also cancel clock drift across rounds (e.g. power capping when SM
+        # clocks are not locked), which the medians of whole runs retain.
+        paired = {
+            label: statistics.median(
+                original / other
+                for original, other in zip(
+                    samples["original"], samples[label], strict=True
+                )
+            )
+            for label in ("with_cudnn_frost", "cudnn_frost_only")
+        }
         record.update(
             speedup=medians["original"] / medians["with_cudnn_frost"],
             frost_speedup=medians["original"] / medians["cudnn_frost_only"],
+            paired_speedup=paired["with_cudnn_frost"],
+            paired_frost_speedup=paired["cudnn_frost_only"],
         )
     emit_e2e(record, file)
     del graphs, layers, packed_keepalive
@@ -941,6 +957,13 @@ def parse_e2e_args(argv=None):
     parser.add_argument("--reference-l2", type=float, default=0.12)
     parser.add_argument("--reference-tokens", type=int, default=8)
     parser.add_argument("--baseline-only", action="store_true")
+    parser.add_argument(
+        "--exclude-backend",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Drop an original backend by key; the audit records the exclusion",
+    )
     parser.add_argument(
         "--artifacts",
         type=Path,

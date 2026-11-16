@@ -59,6 +59,10 @@ echo "Verifying installation..."
 cp -a "${SOURCE_WORKSPACE}/tests" "${TEST_RUN_DIR}/"
 cp -a "${SOURCE_WORKSPACE}/benchmarks" "${TEST_RUN_DIR}/"
 cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
+mkdir -p "${TEST_RUN_DIR}/scripts"
+cp -a "${SOURCE_WORKSPACE}/scripts/__init__.py" "${TEST_RUN_DIR}/scripts/"
+cp -a "${SOURCE_WORKSPACE}/scripts/test_sharding" \
+  "${TEST_RUN_DIR}/scripts/"
 
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."

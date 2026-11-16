@@ -572,6 +572,15 @@ def _run_raw_oracle(routing_pattern, *, tactic=None, capture_graph=False):
         second_repeat = layer.forward(tensors(launches[1])).clone()
         torch.cuda.synchronize()
         torch.testing.assert_close(second_repeat, second, atol=0.0, rtol=0.0)
+        if tactic is not None:
+            # The pull fields do not change outputs: check that the requested
+            # ones reached the kernel instead of the serial, unrotated pull.
+            token_comm = layer._staged_workspace._frontend._mega.kernel.token_comm
+            assert token_comm.pull_batch == tactic.get("dispatch_pull_batch", 1)
+            assert token_comm.pull_rotate == tactic.get("dispatch_pull_rotate", False)
+            assert token_comm.compact_pull_buffer == tactic.get(
+                "compact_pull_buffer", False
+            )
         if capture_graph:
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
@@ -630,6 +639,67 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
     routing_pattern,
 ):
     _run_raw_oracle(routing_pattern)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "tile_n,tail_pairs,pull,tokens",
+    [
+        (64, False, {}, 129),
+        (64, True, {}, 129),
+        (72, False, {}, 129),
+        (72, False, {}, 200),
+        (80, False, {}, 129),
+        (80, False, {}, 200),
+        (80, True, {}, 129),
+        (64, False, {"dispatch_pull_batch": 2, "dispatch_pull_rotate": True}, 200),
+        (64, False, {"dispatch_pull_batch": 3, "dispatch_pull_rotate": True}, 200),
+        (64, False, {"compact_pull_buffer": True, "dispatch_pull_rotate": True}, 129),
+    ],
+    ids=(
+        "n64",
+        "n64-tail",
+        "n72",
+        "n72-multitile",
+        "n80",
+        "n80-multitile",
+        "n80-tail",
+        "n64-pull2-rotate",
+        "n64-pull3-rotate",
+        "n64-compact-rotate",
+    ),
+)
+def test_moe_ep_sm90_pull_mxfp4_m256_k128_independent_oracle(
+    monkeypatch, tile_n, tail_pairs, pull, tokens
+):
+    """Folded K128 tiles (N64 across a tile boundary, partial and multi-tile N72/N80)
+    and the pull-buffer variants match raw math."""
+    import sys
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "HIDDEN", 2560)
+    monkeypatch.setattr(module, "INTERMEDIATE", 640)
+    # With 129 tokens EP2 routes 64/65 rows per expert: across an N64 tile
+    # boundary, and into one partial N72/N80 tile. With 200 tokens (about 100
+    # rows per expert) N72/N80 run a full tile and a partial one, and a batched
+    # pull has more rows per rank than one pass of its 132 * batch slots.
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", tokens)
+    tactic = dict(
+        _fused_tactic(),
+        mma_tiler_mnk=(256, tile_n, 128),
+        cluster_shape_mnk=(1, 2, 1) if tail_pairs else (1, 1, 1),
+        group_hint=132 if tail_pairs else 330,
+        num_sched_stages=1,
+        load_balance_mode="atomic_counter",
+        fc1_store_offload=False,
+        fc1_early_done_publish=True,
+        tail_split_pairs=tail_pairs,
+    )
+    # Rows in flight per dispatch warp, the rotated row assignment, and the
+    # serial rotated loop on the compact buffer.
+    tactic.update(pull)
+    _run_raw_oracle("cross_rank", tactic=tactic)
 
 
 @pytest.mark.gpu_4
@@ -858,16 +928,20 @@ def test_moe_ep_sm90_pull_mxfp4_offset_m_boundary(
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "hidden,tile,dedup,tail,routing_pattern",
+    "hidden,tile,dedup,tail,routing_pattern,tokens,pairs",
     [
-        (256, (128, 32, 256), False, False, "cross_rank"),
-        (256, (256, 64, 256), True, False, "sparse_owner"),
-        (7168, (256, 64, 256), False, False, "cross_rank"),
-        (7168, (256, 64, 256), False, True, "cross_rank"),
+        (256, (128, 32, 256), False, False, "cross_rank", 8, False),
+        (256, (256, 64, 256), True, False, "sparse_owner", 8, False),
+        (7168, (256, 64, 256), False, False, "cross_rank", 8, False),
+        (7168, (256, 64, 256), False, True, "cross_rank", 8, False),
+        # K256 N72/N80 token tiles: 100 rows per expert fill one tile and part of
+        # a second; N80 also runs tail-split pairs on a (1, 2, 1) cluster.
+        (7168, (256, 72, 256), False, False, "cross_rank", 100, False),
+        (7168, (256, 80, 256), False, False, "cross_rank", 100, True),
     ],
 )
 def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
-    monkeypatch, hidden, tile, dedup, tail, routing_pattern
+    monkeypatch, hidden, tile, dedup, tail, routing_pattern, tokens, pairs
 ):
     """Small expert/I fixture, independent raw math; never a perf substitute."""
     import sys
@@ -875,6 +949,8 @@ def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "HIDDEN", hidden)
     monkeypatch.setattr(module, "INTERMEDIATE", 256)
+    # cross_rank routes TOKENS_PER_RANK rows to each expert at EP4.
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", tokens)
     tactic = dict(
         _fused_tactic(),
         mma_tiler_mnk=tile,
@@ -882,6 +958,8 @@ def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
         fc2_tail_n8=tail,
         fc1_ready_mode="tile",
     )
+    if pairs:
+        tactic.update(cluster_shape_mnk=(1, 2, 1), tail_split_pairs=True)
     _run_raw_oracle(
         routing_pattern,
         tactic=tactic,

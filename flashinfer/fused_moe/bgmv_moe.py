@@ -317,8 +317,9 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
 
     Runs the generated Cake programs (one owner per output token, no output
     atomics, bitwise-reproducible replays). ``backend_used`` is ``"cake"``;
-    ``variant`` is ``"specialized"`` for the hidden 2688/3072 x rank 32 bodies (up to 2048 tokens)
-    and ``"generic"`` for the runtime-hidden rank 8/16/32/64 bundles.
+    ``variant`` is ``"specialized"`` for the hidden 2688/3072 x rank 32 bodies at
+    32 to 1024 tokens on SM100, SM103 and SM107 (SM90 always takes the generic
+    bundles) and ``"generic"`` for the runtime-hidden rank 8/16/32/64 bundles.
     """
 
     backend_used: BGMVMoEBackendUsed = "cake"
@@ -347,7 +348,8 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         self.variant: CakeBGMVMoEVariant = variant
         # Generic variant only: (shrink form, hidden splits) chosen at prepare
         # time by ``select_cake_bgmv_moe_generic_shrink`` (form 0 two-stage
-        # prefill ring, 1 decode, 2 three-stage prefill ring for small grids).
+        # prefill ring, 2 three-stage prefill ring for small grids; form 1, the
+        # retired four-pair decode kernel, is rejected).
         self.shrink_launch: Optional[Tuple[int, int]] = shrink_launch
         # Generic variant only: pair-grouped pipeline (each unique (LoRA, expert)
         # pair's weights streamed once per tile of routes, deterministic per-token
@@ -368,16 +370,68 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         self.lora_indices = lora_indices
         self.topk_weights = topk_weights
         self.schedule_id: Optional[int] = schedule_id
-        from ..jit.cake_bgmv_moe import cake_bgmv_moe_route_index_numel
+        from ..jit.cake_bgmv_moe import (
+            CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS,
+            CAKE_BGMV_MOE_PDL_MODES,
+            CAKE_BGMV_MOE_SCHEDULE_IDS,
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL,
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3,
+            cake_bgmv_moe_arch_for_capability,
+            cake_bgmv_moe_route_index_numel,
+        )
+
+        # Reject the removed kernels before any workspace is allocated (the
+        # bindings reject them again): specialized schedule 0 was the 64-lane
+        # expand, generic shrink form 1 the four-pair decode shrink.
+        valid_schedule_ids = (
+            CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS.values()
+            if variant == "generic"
+            else CAKE_BGMV_MOE_SCHEDULE_IDS.values()
+        )
+        if int(schedule_id) not in valid_schedule_ids:
+            raise ValueError(
+                f"schedule_id {schedule_id} is not a {variant} Cake BGMV MoE expand "
+                f"schedule; valid ids are {sorted(valid_schedule_ids)}"
+            )
+        shrink_forms = (
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL,
+            CAKE_BGMV_MOE_SHRINK_FORM_PREFILL_S3,
+        )
+        if variant == "generic" and (
+            shrink_launch is None or int(shrink_launch[0]) not in shrink_forms
+        ):
+            raise ValueError(
+                "generic Cake BGMV MoE plans take shrink_launch=(form, splits) with "
+                "form 0 (two-stage prefill) or 2 (three-stage prefill), got "
+                f"{shrink_launch}"
+            )
+        # The plain launch (pdl_mode 0) is an sm_90a form: the generic bundles of
+        # the other targets render the PDL kernel forms only (the host policy never
+        # selects mode 0 there), so a direct construction asking for it fails here,
+        # before the binding rejects it.
+        if variant == "generic" and x.device.type == "cuda":
+            arch = cake_bgmv_moe_arch_for_capability(
+                torch.cuda.get_device_capability(x.device)
+            )
+            if arch is not None and self.pdl_mode not in CAKE_BGMV_MOE_PDL_MODES[arch]:
+                raise ValueError(
+                    f"pdl_mode {self.pdl_mode} is not a launch mode of the generic "
+                    f"Cake BGMV MoE bundle for {arch}; valid modes are "
+                    f"{list(CAKE_BGMV_MOE_PDL_MODES[arch])}"
+                )
 
         # Token->pair route index: published by the shrink kernels and read by
-        # the expand kernels (arbitrary pair order in O(1) per CTA), followed by
-        # the generic shrink's hidden-split partials and arrival counters.
-        # Pointer-stable and zero-initialized once; counts are monotonic with
-        # launch-parity bases and the split counters are reset by their last
-        # arrival, so graph replays never need a memset node.
+        # the expand kernels (arbitrary pair order in O(1) per CTA), followed,
+        # for the per-route generic pipeline only, by the shrink's hidden-split
+        # partials and arrival counters (the specialized kernels and the grouped
+        # pipeline never read them). Pointer-stable and zero-initialized once;
+        # counts are monotonic with launch-parity bases and the split counters
+        # are reset by their last arrival, so graph replays never need a memset
+        # node.
         self.route_index = torch.zeros(
-            cake_bgmv_moe_route_index_numel(int(x.shape[0])),
+            cake_bgmv_moe_route_index_numel(
+                int(x.shape[0]), variant=self.variant, grouped=self.grouped
+            ),
             dtype=torch.int32,
             device=x.device,
         )
@@ -562,10 +616,18 @@ class BGMVMoEPortablePlan(_BGMVMoEGraphPlan):
         )
 
 
-# Compatible alias for the name exported by the first release of this backend.
-BGMVMoEBlackwellPlan = BGMVMoECakePlan
-
 BGMVMoEPlan = Union[BGMVMoECakePlan, BGMVMoEPortablePlan]
+
+
+def __getattr__(name: str):
+    if name == "BGMVMoEBlackwellPlan":
+        warnings.warn(
+            "BGMVMoEBlackwellPlan is deprecated; use BGMVMoECakePlan instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return BGMVMoECakePlan
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _cake_unsupported_reason(
@@ -632,8 +694,8 @@ def prepare_bgmv_moe(
     topk_weights: torch.Tensor,
     num_experts: int,
     *,
-    backend: Literal["cake"] = "cake",
-    fallback: bool = True,
+    backend: Literal["cake", "blackwell"] = "cake",
+    fallback: Optional[bool] = None,
     shrink_out: Optional[torch.Tensor] = None,
     y_accum: Optional[torch.Tensor] = None,
     grouped: Optional[bool] = None,
@@ -645,10 +707,10 @@ def prepare_bgmv_moe(
     64, any hidden size that is a positive multiple of 8 (LoRA-B feat_out equal
     to it), BF16/FP16 inputs, and exact SM90 (H100/H200), SM100 (B200/GB200),
     SM103 (B300/GB300) or SM107 (Rubin R200) devices; each target runs its own
-    cubin. Hidden sizes
-    2688 and 3072 at rank 32 use the specialized measured bodies at up to 2048
-    tokens (``plan.variant == "specialized"``); everything else, including those
-    shapes at larger token counts, uses the runtime-hidden generic bundles
+    cubin. Hidden sizes 2688 and 3072 at rank 32 use the specialized measured
+    bodies at 32 to 1024 tokens on SM100, SM103 and SM107
+    (``plan.variant == "specialized"``); everything else, including those shapes
+    at other token counts and on SM90, uses the runtime-hidden generic bundles
     (``plan.variant == "generic"``). Routing may be arbitrary; each output has one owner that accumulates
     routes in fixed input order, so identical prepared replays are bitwise
     reproducible. The contiguous top-k=2 layout takes the optimized fast path;
@@ -665,9 +727,9 @@ def prepare_bgmv_moe(
     Inputs outside that support set (other device capabilities, ranks, hidden
     sizes that are not multiples of 8, multiple slices) are served by a
     :class:`BGMVMoEPortablePlan` running the portable ``bgmv_moe_shrink`` +
-    ``bgmv_moe_expand`` kernels when ``fallback=True`` (default); one
-    ``RuntimeWarning`` is emitted per distinct reason per process. With
-    ``fallback=False`` such inputs raise ``ValueError`` as before. Invalid
+    ``bgmv_moe_expand`` kernels when ``fallback`` is true (the default for
+    ``backend="cake"``); one ``RuntimeWarning`` is emitted per distinct reason
+    per process. With ``fallback=False`` such inputs raise ``ValueError``. Invalid
     inputs (shape mismatches, wrong index dtypes, out-of-range routing indices,
     non-contiguous or CPU tensors) always raise.
 
@@ -682,10 +744,14 @@ def prepare_bgmv_moe(
         lora_indices: LoRA index for each input token.
         topk_weights: FP32 routing weight for each routed pair.
         num_experts: Number of experts in the LoRA tensors.
-        backend: Backend selector; only ``"cake"`` (the generated Cake
-            programs) is supported.
+        backend: Backend selector: ``"cake"`` (the generated Cake programs).
+            ``"blackwell"`` is a deprecated alias of ``"cake"`` that emits a
+            ``DeprecationWarning`` and defaults ``fallback`` to ``False``, so
+            unsupported inputs raise ``ValueError`` as they did when it was the
+            only backend.
         fallback: Serve unsupported inputs with the portable path instead of
-            raising.
+            raising. ``None`` (default) means ``True`` for ``"cake"`` and
+            ``False`` for ``"blackwell"``.
         grouped: Generic Cake variant only. ``None`` (default) lets the plan
             choose the pair-grouped pipeline when the routes clearly outnumber
             the ``num_loras * num_experts`` (LoRA, expert) pairs (each pair's
@@ -715,10 +781,22 @@ def prepare_bgmv_moe(
         ``"portable"``.
     """
 
-    if backend != "cake":
+    if backend == "blackwell":
+        warnings.warn(
+            'prepare_bgmv_moe: backend="blackwell" is a deprecated alias of '
+            '"cake"; pass backend="cake" (unsupported inputs then fall back to '
+            "the portable path unless fallback=False).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if fallback is None:
+            fallback = False
+    elif backend != "cake":
         raise ValueError(
             f"prepare_bgmv_moe only supports backend='cake', got {backend}"
         )
+    if fallback is None:
+        fallback = True
     from ..jit.cake_bgmv_moe import cake_bgmv_moe_arch_for_capability
 
     capability: Optional[Tuple[int, int]] = None

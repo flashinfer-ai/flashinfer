@@ -61,6 +61,7 @@ from .helpers_common import (
     _q_physical_output_row,
     _q_physical_output_row_from_logical,
     _q_row_is_valid_for_seq,
+    _q_logical_output_row_is_valid_for_seq,
     _q_tile_output_row_base,
     _q_tile_valid_rows_for_seq,
     _masked_weighted_sum,
@@ -83,13 +84,16 @@ from .helpers_output import (
     _store_transposed_smem8b,
 )
 from .helpers_softmax import (
-    _attention_sink_for_local_head,
-    _attention_sink_for_scale_idx,
+    _final_output_lse,
     _pack_float4_to_fp8_e4m3,
 )
 from .sage_scales import SageVScalesResource
 from .smem_p import SmemPResource
 from .tmem_softmax_stats import TmemSoftmaxLocalResource
+
+# Swaps loop correction keeps at most this many FP32 O values live per lane;
+# wider O stages (H512 TileQ32) are rescaled in streamed chunk groups.
+SWAPS_RESCALE_MAX_LIVE_F32_REGS = 64
 
 _KV_TILE_256_CORRECTION_THREADS = 128
 _KV_TILE_256_LOGICAL_OUTPUT_ROWS = 64
@@ -121,12 +125,15 @@ class TmemCorrResource(DecodeGenResourceBase):
     partial_stats_ptr: cute.Pointer = None
     split_kv_counter_ptr: cute.Pointer = None
     attention_sinks_ptr: cute.Pointer = None
+    lse_ptr: cute.Pointer | None = None
     # The ``sfV`` / ``v_mean`` block the correction task stages per work tile;
     # the schedule waits and releases it, the epilogue only reads it. ``None``
     # without Sage attention.
     sage_v_scales_ref: Constexpr[SageVScalesResource | None] = None
     seqlens_kv: cute.Pointer = None
-    max_seq_len_kv: Constexpr[int] = 0
+    max_seq_len_kv: Int32 = 0
+    # Launch bound in Q tokens; h_r separately carries partial-output row capacity.
+    max_q_len: Int32 = 1
     seq_len_q: Int32 = None
     q_token_offset: Int32 = None
     num_heads_kv: Int32 = None
@@ -135,6 +142,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     b_idx: Int32 = None
     q_group_idx: Int32 = None
     active_splits_kv: Int32 = None
+    # Runtime launch fanout used as the GMEM partial split stride; None keeps
+    # the configured capacity stride.
+    partial_split_stride: Int32 = None
     static_full_split_prefix: Constexpr[bool] = False
     smem_p0_ref: Constexpr[SmemPResource] = None
     smem_p1_ref: Constexpr[SmemPResource] = None
@@ -187,7 +197,10 @@ class TmemCorrResource(DecodeGenResourceBase):
         """Create placeholder SMEM views for correction and split reduction."""
         o_stage_dtype_bytes = self.get_o_stage_dtype_bytes()
         o_entries = max(
-            self.cfg.tile_size_q * self.cfg.headdim * o_stage_dtype_bytes // 4,
+            self.cfg.tile_size_q
+            * self.cfg.swaps_output_staging_head_dim
+            * o_stage_dtype_bytes
+            // 4,
             1,
         )
         # Keeps reduces each row's denominator in registers (plus the q64
@@ -251,6 +264,9 @@ class TmemCorrResource(DecodeGenResourceBase):
             seq_len_kv,
             self.seq_len_q,
             _q_group_token_base(cfg, logical_q_group_idx),
+            requested_splits=_decode_gen_task_cache(stage_info)[10]
+            if cfg.runtime_split_kv
+            else None,
         )
 
     def _can_alias_o_smem(self) -> bool:
@@ -259,7 +275,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         # draining the final O staging path. Keep O staging separate from SmemP
         # there so the next tile's P producer cannot overwrite the copy source.
         o_stage_dtype_bytes = self.get_o_stage_dtype_bytes()
-        required_o_bytes = self.cfg.tile_size_q * self.cfg.headdim * o_stage_dtype_bytes
+        required_o_bytes = (
+            self.cfg.tile_size_q
+            * self.cfg.swaps_output_staging_head_dim
+            * o_stage_dtype_bytes
+        )
         available_p_bytes = 2 * self.cfg.smem_p_tile_bytes
         return (
             self.smem_p0_ref is not None
@@ -280,7 +300,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
                 size_bytes=self.cfg.tile_size_q
-                * self.cfg.headdim
+                * self.cfg.swaps_output_staging_head_dim
                 * o_stage_dtype_bytes,
                 alignment=self.cfg.stensor_align,
             )
@@ -381,20 +401,19 @@ class TmemCorrResource(DecodeGenResourceBase):
 
     @cute.jit
     def _multi_cta_counter_q_groups(self, h_r: Int32) -> Int32:
-        """Return the number of split-KV counter groups in the output tile."""
+        """Index counters by the launch Q bound, independent of partial-O capacity."""
         cfg = self.cfg
+        seq_len_q = self.max_q_len if not cfg.fixed_seqlen else Int32(cfg.max_seq_len_q)
         if cutlass.const_expr(cfg.groups_tokens_heads_q):
-            return Int32(
-                (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
-            )
+            return Int32((seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta)
         if cutlass.const_expr(
-            cfg.max_seq_len_q > 1
+            cfg.is_multi_token_q
             and not cfg.groups_tokens_heads_q
             and cfg.heads_q_per_kv != 0
         ):
             return Int32(
                 ((cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q)
-                * cfg.max_seq_len_q
+                * seq_len_q
             )
         return (h_r + Int32(cfg.tile_size_q - 1)) // Int32(cfg.tile_size_q)
 
@@ -407,9 +426,12 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> Int64:
         """Return a split/row workspace offset using 64-bit arithmetic."""
 
-        return (
-            Int64(logical_kv_idx) * Int64(self.cfg.max_splits_kv) + Int64(cta_idx_kv)
-        ) * Int64(self.h_r) + Int64(row_idx)
+        split_stride = Int64(self.cfg.max_splits_kv)
+        if cutlass.const_expr(self.partial_split_stride is not None):
+            split_stride = Int64(self.partial_split_stride)
+        return (Int64(logical_kv_idx) * split_stride + Int64(cta_idx_kv)) * Int64(
+            self.h_r
+        ) + Int64(row_idx)
 
     @cute.jit
     def _cluster_reduction_rows_per_cta(self, splits_kv: Int32) -> Int32:
@@ -757,52 +779,9 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> None:
         """Store one scaled Swaps O chunk back to TMEM."""
         cfg = self.cfg
-        if cutlass.const_expr(q_repeats == 4):
-            scaled_vec = cutlass.Vector.from_elements(
-                (
-                    chunk_scaled[0],
-                    chunk_scaled[1],
-                    chunk_scaled[2],
-                    chunk_scaled[3],
-                    chunk_scaled[4],
-                    chunk_scaled[5],
-                    chunk_scaled[6],
-                    chunk_scaled[7],
-                    chunk_scaled[8],
-                    chunk_scaled[9],
-                    chunk_scaled[10],
-                    chunk_scaled[11],
-                    chunk_scaled[12],
-                    chunk_scaled[13],
-                    chunk_scaled[14],
-                    chunk_scaled[15],
-                ),
-                Float32,
-            )
-        elif cutlass.const_expr(q_repeats == 2):
-            scaled_vec = cutlass.Vector.from_elements(
-                (
-                    chunk_scaled[0],
-                    chunk_scaled[1],
-                    chunk_scaled[2],
-                    chunk_scaled[3],
-                    chunk_scaled[4],
-                    chunk_scaled[5],
-                    chunk_scaled[6],
-                    chunk_scaled[7],
-                ),
-                Float32,
-            )
-        else:
-            scaled_vec = cutlass.Vector.from_elements(
-                (
-                    chunk_scaled[0],
-                    chunk_scaled[1],
-                    chunk_scaled[2],
-                    chunk_scaled[3],
-                ),
-                Float32,
-            )
+        scaled_vec = cutlass.Vector.from_elements(
+            tuple(chunk_scaled[idx] for idx in range(4 * q_repeats)), Float32
+        )
         prims.tcgen05_st(
             "16x256b",
             prims.make_tmem_ptr(
@@ -817,49 +796,146 @@ class TmemCorrResource(DecodeGenResourceBase):
         self,
         base_addr: Int32,
         scale_vals: cutlass.Array,
-        skip_correction: cutlass.Boolean,
         *,
         q_repeats: Constexpr[int],
         num_o_chunks: Constexpr[int],
         output_f32_regs: Constexpr[int],
     ) -> None:
         """Apply online-softmax correction scales to one Swaps O stage."""
-        if not skip_correction:
-            o_vals = self._swaps_load_o_stage_chunks(
-                base_addr,
-                q_repeats=q_repeats,
-                num_o_chunks=num_o_chunks,
-                output_f32_regs=output_f32_regs,
-            )
+        if cutlass.const_expr(self.cfg.tile_size_q >= 48):
+            # Stream one D64 fragment and a query band that divides the tile.
+            # Q48 needs 16-row bands; other wide tiles use 32-row bands.
+            # This keeps fragment coverage independent of CTA occupancy.
+            fragment_repeats = 4 if q_repeats % 4 == 0 else 2
+            fragment_regs = fragment_repeats * 4
             for chunk_idx in cutlass.range_constexpr(num_o_chunks):
-                chunk_scaled = cutlass.Array(
-                    Float32, 4 * q_repeats, space=cutlass.AddressSpace.rmem
-                )
-                for reg_pair_idx in cutlass.range_constexpr(2 * q_repeats):
-                    global_pair_idx = chunk_idx * (2 * q_repeats) + reg_pair_idx
-                    scale_base = (reg_pair_idx // 2) * 2
-                    reg_base = global_pair_idx * 2
-                    scaled_pair = fmul2(
-                        (
-                            scale_vals[scale_base],
-                            scale_vals[scale_base + 1],
-                        ),
-                        (o_vals[reg_base], o_vals[reg_base + 1]),
+                for q_slice in cutlass.range_constexpr(q_repeats // fragment_repeats):
+                    addr = base_addr + Int32(
+                        self.cfg.swaps_o_chunk_tmem_offset(chunk_idx)
+                        + q_slice * fragment_repeats * 8
                     )
-                    chunk_scaled[reg_pair_idx * 2] = scaled_pair[0]
-                    chunk_scaled[reg_pair_idx * 2 + 1] = scaled_pair[1]
-                self._swaps_store_scaled_o_chunk(
-                    base_addr,
-                    chunk_idx,
-                    chunk_scaled,
-                    q_repeats=q_repeats,
-                )
-        # Keep the correction task's TMEM ordering point on the no-op path.
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-        if not skip_correction:
-            # FlashInfer's established TMEM path keeps this view fence after
-            # real stores. Avoid emitting its duplicate wait on a no-op path.
+                    loaded = prims.tcgen05_ld(
+                        "16x256b",
+                        prims.make_tmem_ptr(addr, Float32),
+                        num=fragment_repeats,
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                    scaled = cutlass.Array(
+                        Float32, fragment_regs, space=cutlass.AddressSpace.rmem
+                    )
+                    for pair_idx in cutlass.range_constexpr(fragment_regs // 2):
+                        scale_base = (
+                            q_slice * fragment_repeats * 2 + (pair_idx // 2) * 2
+                        )
+                        pair = fmul2(
+                            (scale_vals[scale_base], scale_vals[scale_base + 1]),
+                            (loaded[pair_idx * 2], loaded[pair_idx * 2 + 1]),
+                        )
+                        scaled[pair_idx * 2] = pair[0]
+                        scaled[pair_idx * 2 + 1] = pair[1]
+                    prims.tcgen05_st(
+                        "16x256b",
+                        prims.make_tmem_ptr(addr, Float32),
+                        cutlass.Vector.from_elements(
+                            tuple(scaled[idx] for idx in range(fragment_regs)),
+                            Float32,
+                        ),
+                    )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             cute.arch.fence_view_async_tmem_store()
+            return
+        if cutlass.const_expr(
+            num_o_chunks * 4 * q_repeats > SWAPS_RESCALE_MAX_LIVE_F32_REGS
+        ):
+            # H512 TileQ32 holds 8 chunks x 16 = 128 FP32 O values per lane,
+            # above correction's 88-register grant, so the load-all form
+            # spills on every K/V tile. Stream groups of chunks instead:
+            # load, scale and store each group before loading the next. The
+            # arithmetic per element is unchanged (bitwise-identical O).
+            group_chunks = max(
+                SWAPS_RESCALE_MAX_LIVE_F32_REGS // 2 // (4 * q_repeats), 1
+            )
+            for group_base in cutlass.range_constexpr(0, num_o_chunks, group_chunks):
+                group_end = min(group_base + group_chunks, num_o_chunks)
+                group_vals = cutlass.Array(
+                    Float32,
+                    (group_end - group_base) * 4 * q_repeats,
+                    space=cutlass.AddressSpace.rmem,
+                )
+                for chunk_idx in cutlass.range_constexpr(group_base, group_end):
+                    loaded = prims.tcgen05_ld(
+                        "16x256b",
+                        prims.make_tmem_ptr(
+                            base_addr
+                            + Int32(self.cfg.swaps_o_chunk_tmem_offset(chunk_idx)),
+                            Float32,
+                        ),
+                        num=q_repeats,
+                    )
+                    for reg_idx in cutlass.range_constexpr(4 * q_repeats):
+                        group_vals[
+                            (chunk_idx - group_base) * 4 * q_repeats + reg_idx
+                        ] = loaded[reg_idx]
+                cute.arch.fence_view_async_tmem_load()
+                for chunk_idx in cutlass.range_constexpr(group_base, group_end):
+                    chunk_scaled = cutlass.Array(
+                        Float32, 4 * q_repeats, space=cutlass.AddressSpace.rmem
+                    )
+                    for reg_pair_idx in cutlass.range_constexpr(2 * q_repeats):
+                        scale_base = (reg_pair_idx // 2) * 2
+                        reg_base = (chunk_idx - group_base) * 4 * q_repeats + (
+                            reg_pair_idx * 2
+                        )
+                        scaled_pair = fmul2(
+                            (
+                                scale_vals[scale_base],
+                                scale_vals[scale_base + 1],
+                            ),
+                            (group_vals[reg_base], group_vals[reg_base + 1]),
+                        )
+                        chunk_scaled[reg_pair_idx * 2] = scaled_pair[0]
+                        chunk_scaled[reg_pair_idx * 2 + 1] = scaled_pair[1]
+                    self._swaps_store_scaled_o_chunk(
+                        base_addr,
+                        chunk_idx,
+                        chunk_scaled,
+                        q_repeats=q_repeats,
+                    )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            cute.arch.fence_view_async_tmem_store()
+            return
+        o_vals = self._swaps_load_o_stage_chunks(
+            base_addr,
+            q_repeats=q_repeats,
+            num_o_chunks=num_o_chunks,
+            output_f32_regs=output_f32_regs,
+        )
+        for chunk_idx in cutlass.range_constexpr(num_o_chunks):
+            chunk_scaled = cutlass.Array(
+                Float32, 4 * q_repeats, space=cutlass.AddressSpace.rmem
+            )
+            for reg_pair_idx in cutlass.range_constexpr(2 * q_repeats):
+                global_pair_idx = chunk_idx * (2 * q_repeats) + reg_pair_idx
+                scale_base = (reg_pair_idx // 2) * 2
+                reg_base = global_pair_idx * 2
+                scaled_pair = fmul2(
+                    (
+                        scale_vals[scale_base],
+                        scale_vals[scale_base + 1],
+                    ),
+                    (o_vals[reg_base], o_vals[reg_base + 1]),
+                )
+                chunk_scaled[reg_pair_idx * 2] = scaled_pair[0]
+                chunk_scaled[reg_pair_idx * 2 + 1] = scaled_pair[1]
+            self._swaps_store_scaled_o_chunk(
+                base_addr,
+                chunk_idx,
+                chunk_scaled,
+                q_repeats=q_repeats,
+            )
+        # Complete correction stores before publishing the O stage.
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
     def _zero_o_vec8(self) -> cutlass.Array:
@@ -950,7 +1026,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     ) -> Float32 | None:
         """Dequantize ``count`` output columns per V channel in place.
 
-        Column ``c`` becomes ``value * norm_scale * sfV[c] + v_mean[c]``, read
+        Column ``c`` becomes ``value * norm_scale * sfV[c] + output_scale * v_mean[c]``, read
         from the work tile's staged ``SageVScalesResource`` block, so the
         normalization is consumed here and the caller continues with the unit
         scale. A row without mass has no V contribution and keeps a zero
@@ -965,6 +1041,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             self._sage_v_scales, first_col=first_col, count=count
         )
         if cutlass.const_expr(cfg.sage_v_mean):
+            for value_idx in cutlass.range_constexpr(count):
+                v_means[value_idx] *= self.output_scale
             if not row_has_mass:
                 for value_idx in cutlass.range_constexpr(count):
                     v_means[value_idx] = Float32(0.0)
@@ -1109,6 +1187,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             reduce_row_idx,
             sum_val,
             max_val,
+            lse_writer=reduce_col_idx == Int32(0),
         )
         dst_offset = dst_row_base + reduce_col_idx * Int32(self.cfg.o_dtype_bytes)
         final_o_dst = cutlass.inttoptr(
@@ -1125,6 +1204,43 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
 
     @cute.jit
+    def _final_row_weight(self, head_kv, batch, row, row_sum, row_max, writer):
+        cfg = self.cfg
+        weight = Float32(1.0)
+        if cutlass.const_expr(cfg.use_attention_sinks or cfg.lse_mode != "none"):
+            local_head = _local_head_from_q_output_row(cfg, self.h_r, row)
+            head_stride = _attention_sink_head_stride(cfg, self.h_r)
+            physical_row = _q_physical_output_row_from_logical(
+                cfg,
+                self.h_r,
+                self.num_heads_kv,
+                batch,
+                head_kv,
+                row,
+                self.q_token_offset,
+            )
+            # This compact-row check excludes tail queries. Direct scale-group
+            # callers also mask CTA-local padding, which can alias the next tile.
+            valid = _q_logical_output_row_is_valid_for_seq(
+                cfg, self.h_r, row, self.seq_len_q
+            )
+            mass_lse = Float32(-Float32.inf)
+            if row_sum > Float32(0.0):
+                mass_lse = self.scale_softmax_log2 * row_max + cute.math.log2(
+                    row_sum, fastmath=True
+                )
+            weight = _final_output_lse(
+                cfg,
+                self.attention_sinks_ptr,
+                self.lse_ptr,
+                mass_lse,
+                physical_row,
+                head_kv * head_stride + local_head,
+                writer and valid,
+            )
+        return weight
+
+    @cute.jit
     def _softmax_output_row_state(
         self,
         logical_h_k_idx: Int32,
@@ -1132,6 +1248,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         reduce_row_idx: Int32,
         sum_val: Float32,
         max_val: Float32,
+        lse_writer: cutlass.Boolean = False,
     ) -> tuple[Int64, Float32]:
         """Resolve one logical row's output address and normalization once.
 
@@ -1139,24 +1256,13 @@ class TmemCorrResource(DecodeGenResourceBase):
         (``fp8_p_quant_scale``), which cancels in a direct tail.
         """
         cfg = self.cfg
-        attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
-        attention_sink_head_idx = _local_head_from_q_output_row(
-            cfg, self.h_r, reduce_row_idx
-        )
-        sum_val += _attention_sink_for_local_head(
-            cfg,
-            self.attention_sinks_ptr,
-            self.scale_softmax_log2,
-            max_val,
-            logical_h_k_idx,
-            attention_sink_h_r,
-            self.num_heads_kv,
-            attention_sink_head_idx,
+        final_weight = self._final_row_weight(
+            logical_h_k_idx, logical_b_idx, reduce_row_idx, sum_val, max_val, lse_writer
         )
         # ``output_scale`` is the public bmm2_scale. Fold it into the final
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
-        norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
+        norm_scale = self.output_scale * self._safe_norm_rcp(sum_val) * final_weight
         if cutlass.const_expr(cfg.use_fp8_pv and cfg.use_split_kv):
             # Fused split partials carry O divided by the FP8 P scale (see
             # ``_split_partial_scale``); restore it after the FP32 reduction.
@@ -1247,7 +1353,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                 + (alias_offset if alias_offset is not None else self._alloc.offset),
                 dtype=Int32,
                 shape=(
-                    self.cfg.tile_size_q * self.cfg.headdim * o_stage_dtype_bytes // 4,
+                    self.cfg.tile_size_q
+                    * self.cfg.swaps_output_staging_head_dim
+                    * o_stage_dtype_bytes
+                    // 4,
                 ),
                 addrspace=3,
             )
@@ -1428,16 +1537,16 @@ class TmemCorrResource(DecodeGenResourceBase):
         partial_max = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         partial_sum = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         partial_regs = cutlass.Array(Int32, 16, space=cutlass.AddressSpace.rmem)
-        for split_base_i in cutlass.range_constexpr(0, cfg.max_splits_kv, 4):
+        for split_base_i in cutlass.range(
+            0, reduction_splits_kv, 4, unroll_full=full_prefix
+        ):
             split_base = Int32(split_base_i)
             # Load up to four split partials first. Keeping the stats and O
             # loads grouped lets the fold loop below operate on registers only.
             for jj in cutlass.range_constexpr(4):
                 if cutlass.const_expr(full_prefix):
                     split_idx = Int32(split_base_i + jj)
-                    valid_split_idx = cutlass.const_expr(
-                        split_base_i + jj < cfg.splits_kv
-                    )
+                    valid_split_idx = split_idx < Int32(cfg.splits_kv)
                 else:
                     split_idx = split_base + Int32(jj)
                     valid_split_idx = split_idx < reduction_splits_kv
@@ -1478,8 +1587,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             for jj in cutlass.range_constexpr(4):
                 valid_split_for_apply = split_base + Int32(jj) < reduction_splits_kv
                 if cutlass.const_expr(full_prefix):
-                    valid_split_for_apply = cutlass.const_expr(
-                        split_base_i + jj < cfg.splits_kv
+                    valid_split_for_apply = split_base + Int32(jj) < Int32(
+                        cfg.splits_kv
                     )
                 if valid_split_for_apply and valid_reduce_row:
                     regs_base = jj * 4
@@ -1991,7 +2100,11 @@ class TmemCorrResource(DecodeGenResourceBase):
                     dst_row_idx,
                     self.seq_len_q,
                 )
-                if valid_partial_row:
+                # Only padded STSM head bands need a runtime column check.
+                if valid_partial_row and (
+                    cfg.swaps_output_head_dim == cfg.headdim
+                    or dst_col_offset < Int32(cfg.headdim * 2)
+                ):
                     smem_src = self._smem_base_o_i32.subview(
                         load_smem_offset >> Int32(2)
                     ).data_ptr()
@@ -2049,6 +2162,9 @@ class TmemCorrResource(DecodeGenResourceBase):
                     logical_q_group_idx,
                     dst_row_idx,
                     self.seq_len_q,
+                ) and (
+                    cfg.swaps_output_head_dim == cfg.headdim
+                    or dst_col_offset < Int32(cfg.headdim * cfg.o_dtype_bytes)
                 ):
                     smem_src = self._smem_base_o_i32.subview(
                         load_smem_offset >> Int32(2)
@@ -2213,6 +2329,47 @@ class TmemCorrResource(DecodeGenResourceBase):
         publication_splits_kv = splits_kv
         if cutlass.const_expr(enable_cluster and full_prefix):
             publication_splits_kv = Int32(cfg.splits_kv)
+        if cutlass.const_expr(cfg.tile_size_q >= 48):
+            # Four lanes publish one stat from each scale group. Enumerating
+            # groups avoids truncating Q64/Q128 to the first warp's 32 rows,
+            # and keeps register-array indices compile-time constants.
+            if warp_idx == Int32(0) and lane_idx < Int32(4):
+                for scale_idx in cutlass.range_constexpr(num_scale_groups):
+                    row = lane_idx * Int32(2) + Int32(
+                        (scale_idx // 2) * 8 + scale_idx % 2
+                    )
+                    if _q_row_is_valid_for_seq(
+                        cfg, self.h_r, logical_q_group_idx, row, self.seq_len_q
+                    ):
+                        stats_row = self._gmem_partial_row_offset(
+                            logical_kv_idx, cta_idx_kv, row_offset + row
+                        )
+                        if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+                            ptr = cutlass.inttoptr(
+                                self.partial_stats_ptr.toint() + stats_row * Int64(4),
+                                mem_space=1,
+                                dtype=Float32,
+                            )
+                            ptr.store(
+                                self._separate_partial_lse(
+                                    final_max[scale_idx], reduced_sum[scale_idx]
+                                ),
+                                alignment=4,
+                            )
+                        else:
+                            ptr = cutlass.inttoptr(
+                                self.partial_stats_ptr.toint() + stats_row * Int64(8),
+                                mem_space=1,
+                                dtype=Float32,
+                            )
+                            ptr.store(
+                                cutlass.Vector.from_elements(
+                                    (final_max[scale_idx], reduced_sum[scale_idx]),
+                                    Float32,
+                                ),
+                                alignment=8,
+                            )
+            return
         # Only one warp publishes per-row state. The lane mapping keeps each
         # record next to the matching partial-O row.
         if warp_idx == Int32(0) and lane_idx < Int32(4 * num_scale_groups):
@@ -2604,6 +2761,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx: Int32,
         denominator: Float32,
         global_max: Float32,
+        lse_writer: cutlass.Boolean,
     ) -> tuple[cutlass.Boolean, Int64, Float32]:
         """Return ``(valid_output_row, row_base, row_scale)`` of a lane's output row.
 
@@ -2637,6 +2795,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     logical_output_row_idx,
                     denominator,
                     global_max,
+                    lse_writer=lse_writer and valid_output_row,
                 )
         return valid_output_row, row_base, row_scale
 
@@ -2679,6 +2838,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx = q_row_offset + exchange_row_idx
         valid_output_row, row_base, row_scale = self._kv_tile_256_output_row_state(
             resolves=output_lane,
+            lse_writer=output_lane,
             logical_h_k_idx=logical_h_k_idx,
             logical_b_idx=logical_b_idx,
             logical_kv_idx=logical_kv_idx,
@@ -3013,6 +3173,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx = q_row_offset + exchange_row_idx
         valid_output_row, row_base, row_scale = self._kv_tile_256_output_row_state(
             resolves=cutlass.Boolean(True),
+            lse_writer=owned_col_base == Int32(0),
             logical_h_k_idx=logical_h_k_idx,
             logical_b_idx=logical_b_idx,
             logical_kv_idx=logical_kv_idx,
@@ -3153,6 +3314,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             and cfg.tile_size_q == 128
             and cfg.headdim == 128
             and cfg.num_insts_kv == 2
+            and cfg.fixed_seqlen
             and cfg.max_seq_len_q == 1
             and cfg.has_static_dense_full_kv_tiles
         ):
@@ -3223,32 +3385,42 @@ class TmemCorrResource(DecodeGenResourceBase):
                 base_addr1 = base_addr0
             partial_dst_col_offset = col_base * Int32(2)
             partial_norm_scale = self._split_partial_scale(reduced_sum_0)
-            regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+            # Retain the narrow fallback for low-level pointers whose base
+            # does not satisfy the public workspace's 32-byte alignment.
+            partial_misalignment = self.partial_o_ptr.toint() & Int64(31)
+            store_sectors = valid_output_row & (partial_misalignment == Int64(0))
+            store_halves = valid_output_row & (partial_misalignment != Int64(0))
+            chunk_cols = min(16, output_pair_regs * 2)
+            regs_o_chunk = cutlass.Array(
+                Int32, chunk_cols // 2, space=cutlass.AddressSpace.rmem
+            )
             partial_o_row_base = self._gmem_partial_row_offset(
                 logical_kv_idx,
                 cta_idx_kv,
                 logical_output_row_idx,
             ) * Int64(cfg.headdim * 2)
-            for store_idx in cutlass.range_constexpr(output_pair_regs // 4):
-                chunk_col = store_idx * 8
+            for store_idx in cutlass.range_constexpr(
+                output_pair_regs * 2 // chunk_cols
+            ):
+                chunk_col = store_idx * chunk_cols
                 # Load O0/O1 from the tail TMEM slots, combine with
                 # max-correction scales, then store normalized 16-bit O for
                 # standalone reduction or unnormalized O for fused reduction.
                 o0_vals = _keeps_tcgen05_ld(
                     cfg,
                     prims.make_tmem_ptr(base_addr0 + Int32(chunk_col), Float32),
-                    num=8,
+                    num=chunk_cols,
                     offset=keeps_o_ldst_offset,
                 )
                 if cutlass.const_expr(cfg.num_insts_kv != 1):
                     o1_vals = _keeps_tcgen05_ld(
                         cfg,
                         prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
-                        num=8,
+                        num=chunk_cols,
                         offset=keeps_o_ldst_offset,
                     )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                for chunk_idx in cutlass.range_constexpr(4):
+                for chunk_idx in cutlass.range_constexpr(chunk_cols // 2):
                     reg_base = chunk_idx * 2
                     if cutlass.const_expr(cfg.num_insts_kv == 1):
                         partial_pair = fmul2(
@@ -3292,15 +3464,25 @@ class TmemCorrResource(DecodeGenResourceBase):
                     self.partial_o_ptr.toint()
                     + partial_o_row_base
                     + Int64(partial_dst_col_offset)
-                    + Int64(store_idx * 16),
+                    + Int64(store_idx * chunk_cols * 2),
                     mem_space=1,
                     dtype=Int32,
                 )
-                if valid_output_row:
-                    partial_o_dst.store(
-                        regs_o_chunk.data_ptr().load(count=4, alignment=4),
-                        alignment=16,
-                    )
+                if cutlass.const_expr(chunk_cols == 16):
+                    if store_sectors:
+                        partial_o_dst.store(
+                            regs_o_chunk.data_ptr().load(count=8, alignment=4),
+                            alignment=32,
+                        )
+                    if store_halves:
+                        self._store_16bit_output_chunks(
+                            partial_o_dst, regs_o_chunk, chunk_cols
+                        )
+                else:
+                    if valid_output_row:
+                        self._store_16bit_output_chunks(
+                            partial_o_dst, regs_o_chunk, chunk_cols
+                        )
 
             if col_base == Int32(0) and valid_output_row:
                 # One state record per output row accompanies all partial-O
@@ -3359,24 +3541,20 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
-        attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
-        attention_sink_head_idx = _local_head_from_q_output_row(
-            cfg, self.h_r, logical_output_row_idx
-        )
-        reduced_sum_0 += _attention_sink_for_local_head(
-            cfg,
-            self.attention_sinks_ptr,
-            self.scale_softmax_log2,
-            final_max_0,
+        final_weight = self._final_row_weight(
             logical_h_k_idx,
-            attention_sink_h_r,
-            self.num_heads_kv,
-            attention_sink_head_idx,
+            logical_b_idx,
+            logical_output_row_idx,
+            reduced_sum_0,
+            final_max_0,
+            col_base == Int32(0) and valid_output_row,
         )
         # Apply public bmm2_scale in the final direct-output normalization.
         # The split-KV branch above returns before reaching this point, so its
         # partial O remains unscaled for the selected reducer.
-        norm_scale_0 = self.output_scale * self._safe_norm_rcp(reduced_sum_0)
+        norm_scale_0 = (
+            self.output_scale * self._safe_norm_rcp(reduced_sum_0) * final_weight
+        )
         # Direct-output path: fold attention sinks into the denominator, then
         # bake normalization and per-instance max correction into the O scales.
         final_scale0_0 = norm_scale_0 * exp_scale0_0
@@ -3616,6 +3794,224 @@ class TmemCorrResource(DecodeGenResourceBase):
         return
 
     @cute.jit
+    def copy_swaps_o_band(
+        self, stage_info: StageInfo, head_band: Constexpr[int]
+    ) -> None:
+        """Drain one swizzled D128 band, then let the next band reuse SMEM."""
+        cfg = self.cfg
+        task_cache = _decode_gen_task_cache(stage_info)
+        thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        logical_h_k_idx, logical_b_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        q_group = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
+        logical_kv_idx = logical_b_idx * self.num_heads_kv + logical_h_k_idx
+        cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
+        row_offset = _q_tile_output_row_base(cfg, q_group)
+        prims.barrier_cta_sync(
+            self.store_barrier_id, thread_count=cfg.correction_barrier_threads
+        )
+        for segment in cutlass.range_constexpr(cfg.tile_size_q // 8):
+            offset = thread_idx * Int32(16) + Int32(segment * 2048)
+            smem_row = offset // Int32(128)
+            row = smem_row % Int32(cfg.tile_size_q)
+            col_bytes = (
+                (smem_row // Int32(cfg.tile_size_q)) * Int32(128)
+                + offset % Int32(128)
+                + Int32(head_band * 256)
+            )
+            if _q_row_is_valid_for_seq(
+                cfg, self.h_r, q_group, row, self.seq_len_q
+            ) and col_bytes < Int32(cfg.headdim * 2):
+                src = self._smem_base_o_i32.subview(
+                    (offset ^ ((smem_row & Int32(7)) * Int32(16))) >> Int32(2)
+                ).data_ptr()
+                if cutlass.const_expr(cfg.use_split_kv):
+                    dst_row = self._gmem_partial_row_offset(
+                        logical_kv_idx, cta_idx_kv, row_offset + row
+                    )
+                    dst_base = self.partial_o_ptr.toint()
+                else:
+                    dst_row = Int64(
+                        _q_physical_output_row(
+                            cfg,
+                            self.h_r,
+                            self.num_heads_kv,
+                            logical_b_idx,
+                            logical_h_k_idx,
+                            q_group,
+                            row,
+                            self.q_token_offset,
+                        )
+                    )
+                    dst_base = self.o_ptr.toint()
+                dst = cutlass.inttoptr(
+                    dst_base + dst_row * Int64(cfg.headdim * 2) + Int64(col_bytes),
+                    mem_space=1,
+                    dtype=Int32,
+                )
+                dst.store(src.load(count=4, alignment=16), alignment=16)
+        # Every lane must finish reading this band before any warp overwrites it.
+        prims.barrier_cta_sync(
+            self.store_barrier_id, thread_count=cfg.correction_barrier_threads
+        )
+
+    @cute.jit
+    def stream_swaps_tail_o(
+        self,
+        stage_info: StageInfo,
+        base_addr: Int32,
+        final_max: cutlass.Array,
+        reduced_sum: cutlass.Array,
+        exp_scale: cutlass.Array,
+    ) -> None:
+        """Normalize Q48+ one-instance O in sixteen-row, D64 fragments.
+
+        Q48+ accumulators exceed the correction task's register grant when
+        loaded together. Convert and stage each bounded fragment before the
+        next load, using the same STSM offsets as the compact epilogue.
+        """
+        cfg = self.cfg
+        task_cache = _decode_gen_task_cache(stage_info)
+        thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        q_slices = cfg.tile_size_q // 16
+        for head_band in cutlass.range_constexpr(
+            (cfg.swaps_output_head_dim + 127) // 128
+        ):
+            for chunk_in_band in cutlass.range_constexpr(2):
+                chunk_idx = head_band * 2 + chunk_in_band
+                for q_slice in cutlass.range_constexpr(q_slices):
+                    loaded = prims.tcgen05_ld(
+                        "16x256b",
+                        prims.make_tmem_ptr(
+                            base_addr
+                            + Int32(
+                                cfg.swaps_o_chunk_tmem_offset(chunk_idx) + q_slice * 16
+                            ),
+                            Float32,
+                        ),
+                        num=2,
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                    packed = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)
+                    for pair_idx in cutlass.range_constexpr(4):
+                        scale_base = q_slice * 4 + (pair_idx // 2) * 2
+                        scale0 = exp_scale[scale_base]
+                        scale1 = exp_scale[scale_base + 1]
+                        if cutlass.const_expr(not cfg.use_split_kv):
+                            scale0 *= self.output_scale * self._safe_norm_rcp(
+                                reduced_sum[scale_base]
+                            )
+                            scale1 *= self.output_scale * self._safe_norm_rcp(
+                                reduced_sum[scale_base + 1]
+                            )
+                        elif cutlass.const_expr(
+                            cfg.use_separate_reduction_kernel or cfg.use_fp8_pv
+                        ):
+                            scale0 *= self._split_partial_scale(reduced_sum[scale_base])
+                            scale1 *= self._split_partial_scale(
+                                reduced_sum[scale_base + 1]
+                            )
+                        value0 = loaded[pair_idx * 2] * scale0
+                        value1 = loaded[pair_idx * 2 + 1] * scale1
+                        if cutlass.const_expr(cfg.use_separate_reduction_kernel):
+                            packed[pair_idx] = self._pack_separate_partial_o_pair(
+                                value0, value1
+                            )
+                        elif cutlass.const_expr(cfg.use_bf16_output):
+                            packed[pair_idx] = _pack_float2_to_bf16(value0, value1)
+                        else:
+                            packed[pair_idx] = _pack_float2_to_fp16(value0, value1)
+                    smem_offset, _, _, _ = _fp16_o_reorg_offsets(
+                        cfg,
+                        thread_idx,
+                        warp_idx,
+                        lane_idx,
+                        chunk_in_band * q_slices + q_slice,
+                        0,
+                    )
+                    prims.stmatrix(
+                        self._smem_base_o_i32.subview(
+                            smem_offset >> Int32(2)
+                        ).data_ptr(),
+                        packed.data_ptr().load(count=4, alignment=4),
+                        prims.MMALayout.COL,
+                        shape=prims.StoreShape.M8N8,
+                    )
+            cute.arch.fence_view_async_shared()
+            self.copy_swaps_o_band(stage_info, head_band)
+        cute.arch.fence_view_async_shared()
+        logical_h_k_idx, logical_b_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
+        if cutlass.const_expr(not cfg.use_split_kv):
+            if cutlass.const_expr(cfg.lse_mode != "none"):
+                # Four lanes in warp zero own the logical rows represented by
+                # each scale pair; exclude padded queries before publishing LSE.
+                col_group_idx = thread_idx & Int32(3)
+                row_offset = _q_tile_output_row_base(cfg, logical_q_group_idx)
+                for scale_idx in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
+                    row_in_tile = (
+                        Int32((scale_idx // 2) * 8)
+                        + col_group_idx * Int32(2)
+                        + Int32(scale_idx % 2)
+                    )
+                    self._final_row_weight(
+                        logical_h_k_idx,
+                        logical_b_idx,
+                        row_offset + row_in_tile,
+                        reduced_sum[scale_idx],
+                        final_max[scale_idx],
+                        warp_idx == Int32(0)
+                        and lane_idx < Int32(4)
+                        and _q_row_is_valid_for_seq(
+                            cfg,
+                            self.h_r,
+                            logical_q_group_idx,
+                            row_in_tile,
+                            self.seq_len_q,
+                        ),
+                    )
+            return
+        logical_kv_idx = logical_b_idx * self.num_heads_kv + logical_h_k_idx
+        cta_idx_kv = _logical_cta_kv_idx(cfg, stage_info)
+        splits_kv = self._runtime_splits_kv(stage_info)
+        row_offset = _q_tile_output_row_base(cfg, logical_q_group_idx)
+        self._store_split_stats_from_scale_arrays(
+            cfg,
+            logical_kv_idx,
+            cta_idx_kv,
+            splits_kv,
+            row_offset,
+            logical_q_group_idx,
+            warp_idx,
+            lane_idx,
+            final_max,
+            reduced_sum,
+            num_scale_groups=cfg.num_softmax_scale_groups,
+            enable_cluster=False,
+            full_prefix=False,
+        )
+        if cutlass.const_expr(not cfg.use_separate_reduction_kernel):
+            counter_group_idx = (
+                logical_kv_idx * self._multi_cta_counter_q_groups(self.h_r)
+                + logical_q_group_idx
+            )
+            self._reduce_fused_gmem_partials(
+                logical_h_k_idx,
+                logical_b_idx,
+                logical_kv_idx,
+                row_offset,
+                logical_q_group_idx,
+                counter_group_idx,
+                splits_kv,
+                thread_idx,
+            )
+
+    @cute.jit
     def _swaps_wide_tail_epilogue(
         self,
         stage_info: StageInfo,
@@ -3722,32 +4118,13 @@ class TmemCorrResource(DecodeGenResourceBase):
             # Store one warp partial per column group. The following CTA
             # barrier and reload combine the four correction warps for the
             # final denominator.
-            if cutlass.const_expr(num_scale_groups == 8):
-                self._sum_scratch.store(
-                    (
-                        final_sum[0],
-                        final_sum[1],
-                        final_sum[2],
-                        final_sum[3],
-                        final_sum[4],
-                        final_sum[5],
-                        final_sum[6],
-                        final_sum[7],
-                    ),
-                    warp_store_base,
-                    alignment=16,
-                )
-            else:
-                self._sum_scratch.store(
-                    (
-                        final_sum[0],
-                        final_sum[1],
-                        final_sum[2],
-                        final_sum[3],
-                    ),
-                    warp_store_base,
-                    alignment=16,
-                )
+            self._sum_scratch.store(
+                cutlass.Vector.from_elements(
+                    tuple(final_sum[idx] for idx in range(num_scale_groups)), Float32
+                ),
+                warp_store_base,
+                alignment=16,
+            )
         prims.barrier_cta_sync(
             self.sum_barrier_id,
             thread_count=cfg.correction_barrier_threads,
@@ -3778,28 +4155,6 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
                 reduced_sum[scale_base] = reduced_pair[0]
                 reduced_sum[scale_base + 1] = reduced_pair[1]
-        if cutlass.const_expr(not cfg.use_split_kv):
-            logical_h_k_idx, _ = _logical_head_batch(
-                stage_info, self.h_k_idx, self.b_idx
-            )
-            logical_q_group_idx = _logical_q_group_idx(
-                cfg, stage_info, self.q_group_idx
-            )
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                # Attention sinks add to the denominator before the
-                # final normalization scale is computed.
-                reduced_sum[scale_idx] += _attention_sink_for_scale_idx(
-                    cfg,
-                    self.attention_sinks_ptr,
-                    self.scale_softmax_log2,
-                    final_max[scale_idx],
-                    logical_h_k_idx,
-                    self.h_r,
-                    self.num_heads_kv,
-                    logical_q_group_idx,
-                    col_group_idx,
-                    scale_idx,
-                )
 
         base_addr0 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_0
@@ -3807,6 +4162,11 @@ class TmemCorrResource(DecodeGenResourceBase):
         base_addr1 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_1
         )
+        if cutlass.const_expr(cfg.tile_size_q >= 48):
+            self.stream_swaps_tail_o(
+                stage_info, base_addr0, final_max, reduced_sum, exp_scale0
+            )
+            return
         if cutlass.const_expr(cfg.num_insts_kv == 1):
             o0_vals = self._swaps_load_o_stage_chunks(
                 base_addr0,
@@ -3975,11 +4335,43 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
+        logical_h_k_idx, logical_b_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Direct final-output scales include both the reciprocal softmax
             # denominator and public bmm2_scale. Split partials returned above
             # use only the unnormalized ``exp_scale*`` arrays.
-            norm_scale = self.output_scale * self._safe_norm_rcp(reduced_sum[scale_idx])
+            row_in_tile = (
+                Int32((scale_idx // 2) * 8)
+                + col_group_idx * Int32(2)
+                + Int32(scale_idx % 2)
+            )
+            output_row = _q_tile_output_row_base(cfg, logical_q_group_idx) + row_in_tile
+            final_weight = self._final_row_weight(
+                logical_h_k_idx,
+                logical_b_idx,
+                output_row,
+                reduced_sum[scale_idx],
+                final_max[scale_idx],
+                (
+                    warp_idx == Int32(0)
+                    and lane_idx < Int32(4)
+                    and _q_row_is_valid_for_seq(
+                        cfg,
+                        self.h_r,
+                        logical_q_group_idx,
+                        row_in_tile,
+                        self.seq_len_q,
+                    )
+                ),
+            )
+            norm_scale = (
+                self.output_scale
+                * self._safe_norm_rcp(reduced_sum[scale_idx])
+                * final_weight
+            )
             final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
             final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 
@@ -4087,7 +4479,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
                 warp_grp_thread_idx,
                 cfg.tile_size_q,
-                cfg.headdim,
+                cfg.swaps_output_head_dim,
                 cfg.num_fp8_output_regs,
             )
             cute.arch.fence_view_async_shared()
@@ -4283,27 +4675,6 @@ class TmemCorrResource(DecodeGenResourceBase):
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
                 reduced_sum[scale_idx] = reduced_pair[scale_idx]
 
-        if cutlass.const_expr(not cfg.use_split_kv):
-            logical_h_k_idx, _ = _logical_head_batch(
-                stage_info, self.h_k_idx, self.b_idx
-            )
-            logical_q_group_idx = _logical_q_group_idx(
-                cfg, stage_info, self.q_group_idx
-            )
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                reduced_sum[scale_idx] += _attention_sink_for_scale_idx(
-                    cfg,
-                    self.attention_sinks_ptr,
-                    self.scale_softmax_log2,
-                    final_max[scale_idx],
-                    logical_h_k_idx,
-                    self.h_r,
-                    self.num_heads_kv,
-                    logical_q_group_idx,
-                    col_group_idx,
-                    scale_idx,
-                )
-
         base_addr0 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_0
         )
@@ -4314,7 +4685,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
         output_pair_regs = cfg.num_fp16_output_regs
         output_f32_regs = output_pair_regs * 2
-        num_o_chunks = cfg.headdim // 64
+        num_o_chunks = cfg.swaps_output_head_dim // 64
         if cutlass.const_expr(cfg.num_insts_kv == 1):
             o0_vals = self._swaps_load_o_stage_chunks(
                 base_addr0,
@@ -4482,11 +4853,43 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
+        logical_h_k_idx, logical_b_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Direct final-output scales include both the reciprocal softmax
             # denominator and public bmm2_scale. Split partials returned above
             # use only the unnormalized ``exp_scale*`` arrays.
-            norm_scale = self.output_scale * self._safe_norm_rcp(reduced_sum[scale_idx])
+            row_in_tile = (
+                Int32((scale_idx // 2) * 8)
+                + col_group_idx * Int32(2)
+                + Int32(scale_idx % 2)
+            )
+            output_row = _q_tile_output_row_base(cfg, logical_q_group_idx) + row_in_tile
+            final_weight = self._final_row_weight(
+                logical_h_k_idx,
+                logical_b_idx,
+                output_row,
+                reduced_sum[scale_idx],
+                final_max[scale_idx],
+                (
+                    warp_idx == Int32(0)
+                    and lane_idx < Int32(4)
+                    and _q_row_is_valid_for_seq(
+                        cfg,
+                        self.h_r,
+                        logical_q_group_idx,
+                        row_in_tile,
+                        self.seq_len_q,
+                    )
+                ),
+            )
+            norm_scale = (
+                self.output_scale
+                * self._safe_norm_rcp(reduced_sum[scale_idx])
+                * final_weight
+            )
             final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
             final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 
@@ -4572,7 +4975,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 ),
                 warp_grp_thread_idx,
                 cfg.tile_size_q,
-                cfg.headdim,
+                cfg.swaps_output_head_dim,
                 cfg.num_fp8_output_regs,
             )
             cute.arch.fence_view_async_shared()
@@ -4641,6 +5044,66 @@ class TmemCorrResource(DecodeGenResourceBase):
                     self.store_barrier_id,
                     thread_count=cfg.correction_barrier_threads,
                 )
+
+    @cute.jit
+    def rescale_swaps_o_stage(
+        self,
+        tmem_row_base: Int32,
+        o_base_col: Constexpr[int],
+        o_stage_idx: Int32,
+        old_max_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        *,
+        skip_identity: Constexpr[bool],
+    ) -> None:
+        """Prepare scales only after the optional exact identity vote, then rescale O."""
+        cfg = self.cfg
+        skip_correction = cutlass.Boolean(False)
+        if cutlass.const_expr(skip_identity):
+            lane_identity = cutlass.Boolean(True)
+            for i in cutlass.range_constexpr(cfg.num_softmax_scale_groups):
+                lane_identity = lane_identity & (old_max_arr[i] == new_max_arr[i])
+            skip_correction = self._warp_can_skip_o_correction(lane_identity)
+        if not skip_correction:
+            scales = cutlass.Array(
+                Float32, cfg.num_softmax_scale_groups, space=cutlass.AddressSpace.rmem
+            )
+            # Wide profiles prepare scales straight-line after the warp vote;
+            # narrow profiles retain their per-row neutral-scale guards.
+            for i in cutlass.range_constexpr(0, cfg.num_softmax_scale_groups, 2):
+                diff = fadd2(
+                    (old_max_arr[i], old_max_arr[i + 1]),
+                    (-new_max_arr[i], -new_max_arr[i + 1]),
+                )
+                scaled = fmul2((self.scale_softmax_log2, self.scale_softmax_log2), diff)
+                scale0 = Float32(1.0)
+                scale1 = Float32(1.0)
+                if (
+                    cutlass.const_expr(
+                        not skip_identity or cfg.skips_unchanged_max_work
+                    )
+                    or old_max_arr[i] != new_max_arr[i]
+                ):
+                    scale0 = cute.math.exp2(scaled[0], fastmath=True)
+                if (
+                    cutlass.const_expr(
+                        not skip_identity or cfg.skips_unchanged_max_work
+                    )
+                    or old_max_arr[i + 1] != new_max_arr[i + 1]
+                ):
+                    scale1 = cute.math.exp2(scaled[1], fastmath=True)
+                scales[i] = scale0
+                scales[i + 1] = scale1
+            self._swaps_rescale_o_stage_in_tmem(
+                self._swaps_o_stage_base_addr(tmem_row_base, o_base_col, o_stage_idx),
+                scales,
+                q_repeats=max(cfg.tile_size_q // 8, 1),
+                num_o_chunks=cfg.swaps_output_head_dim // 64,
+                output_f32_regs=cfg.num_fp16_output_regs * 2,
+            )
+        else:
+            # The O-stage handoff retains its TMEM ordering even without stores.
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
 
     @producer_work
     @cute.jit
@@ -4734,137 +5197,18 @@ class TmemCorrResource(DecodeGenResourceBase):
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             return
 
-        if cutlass.const_expr(cfg.tile_size_q == 16):
-            q_repeats = max(cfg.tile_size_q // 8, 1)
-            num_scale_groups = cfg.num_softmax_scale_groups
-            output_pair_regs = cfg.num_fp16_output_regs
-            output_f32_regs = output_pair_regs * 2
-            num_o_chunks = cfg.headdim // 64
-            scale_vals = cutlass.Array(
-                Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
-            )
-            lane_scales_are_identity = cutlass.Boolean(True)
-            for scale_base in cutlass.range_constexpr(0, num_scale_groups, 2):
-                old_max_0 = old_max_arr[scale_base]
-                old_max_1 = old_max_arr[scale_base + 1]
-                new_max_0 = new_max_arr[scale_base]
-                new_max_1 = new_max_arr[scale_base + 1]
-                scale_0_is_identity = old_max_0 == new_max_0
-                scale_1_is_identity = old_max_1 == new_max_1
-                scale_0 = Float32(1.0)
-                scale_1 = Float32(1.0)
-                # Preserve the packed arithmetic used by the original path;
-                # only the exponentials and TMEM transaction are conditional.
-                max_diff_pair = fadd2(
-                    (old_max_0, old_max_1),
-                    (-new_max_0, -new_max_1),
-                )
-                scale_pair = fmul2(
-                    (self.scale_softmax_log2, self.scale_softmax_log2),
-                    max_diff_pair,
-                )
-                if not scale_0_is_identity:
-                    scale_0 = cute.math.exp2(scale_pair[0], fastmath=True)
-                if not scale_1_is_identity:
-                    scale_1 = cute.math.exp2(scale_pair[1], fastmath=True)
-                scale_vals[scale_base] = scale_0
-                scale_vals[scale_base + 1] = scale_1
-                lane_scales_are_identity = (
-                    lane_scales_are_identity & scale_0_is_identity & scale_1_is_identity
-                )
-
-            skip_correction = self._warp_can_skip_o_correction(lane_scales_are_identity)
-
-            base_addr = self._swaps_o_stage_base_addr(
-                tmem_row_base, o_base_col, o_stage_idx
-            )
-            self._swaps_rescale_o_stage_in_tmem(
-                base_addr,
-                scale_vals,
-                skip_correction,
-                q_repeats=q_repeats,
-                num_o_chunks=num_o_chunks,
-                output_f32_regs=output_f32_regs,
-            )
-            return
-
-        if cutlass.const_expr(cfg.tile_size_q == 32):
-            # FlashInfer keeps Q32 straight-line: the warp vote and dynamic
-            # TMEM gate regress the wider Swaps pipeline on B200.
-            q_repeats = max(cfg.tile_size_q // 8, 1)
-            num_scale_groups = cfg.num_softmax_scale_groups
-            output_pair_regs = cfg.num_fp16_output_regs
-            output_f32_regs = output_pair_regs * 2
-            num_o_chunks = cfg.headdim // 64
-            scale_vals = cutlass.Array(
-                Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
-            )
-            for scale_base in cutlass.range_constexpr(0, num_scale_groups, 2):
-                old_max_0 = old_max_arr[scale_base]
-                old_max_1 = old_max_arr[scale_base + 1]
-                new_max_0 = new_max_arr[scale_base]
-                new_max_1 = new_max_arr[scale_base + 1]
-                max_diff_pair = fadd2((old_max_0, old_max_1), (-new_max_0, -new_max_1))
-                scale_pair = fmul2(
-                    (self.scale_softmax_log2, self.scale_softmax_log2),
-                    max_diff_pair,
-                )
-                scale_vals[scale_base] = cute.math.exp2(scale_pair[0], fastmath=True)
-                scale_vals[scale_base + 1] = cute.math.exp2(
-                    scale_pair[1], fastmath=True
-                )
-
-            base_addr = self._swaps_o_stage_base_addr(
-                tmem_row_base, o_base_col, o_stage_idx
-            )
-            self._swaps_rescale_o_stage_in_tmem(
-                base_addr,
-                scale_vals,
-                cutlass.Boolean(False),
-                q_repeats=q_repeats,
-                num_o_chunks=num_o_chunks,
-                output_f32_regs=output_f32_regs,
-            )
-            return
-
-        # Tile-Q=8 loop ProdWork: rescale the current O stage in place when
-        # the row max changes.
-        old_max_0 = old_max_arr[0]
-        old_max_1 = old_max_arr[1]
-        new_max_0 = new_max_arr[0]
-        new_max_1 = new_max_arr[1]
-        scale_0_is_identity = old_max_0 == new_max_0
-        scale_1_is_identity = old_max_1 == new_max_1
-        scale_0 = Float32(1.0)
-        scale_1 = Float32(1.0)
-        max_diff_pair = fadd2((old_max_0, old_max_1), (-new_max_0, -new_max_1))
-        scale_pair = fmul2(
-            (self.scale_softmax_log2, self.scale_softmax_log2), max_diff_pair
-        )
-        if not scale_0_is_identity:
-            scale_0 = cute.math.exp2(scale_pair[0], fastmath=True)
-        if not scale_1_is_identity:
-            scale_1 = cute.math.exp2(scale_pair[1], fastmath=True)
-        skip_correction = self._warp_can_skip_o_correction(
-            scale_0_is_identity & scale_1_is_identity
-        )
-
-        scale_vals = cutlass.Array(Float32, 2, space=cutlass.AddressSpace.rmem)
-        scale_vals[0] = scale_0
-        scale_vals[1] = scale_1
-        base_addr = self._swaps_o_stage_base_addr(
-            tmem_row_base, o_base_col, o_stage_idx
-        )
-        output_pair_regs = cfg.num_fp16_output_regs
-        output_f32_regs = output_pair_regs * 2
-        num_o_chunks = cfg.headdim // 64
-        self._swaps_rescale_o_stage_in_tmem(
-            base_addr,
-            scale_vals,
-            skip_correction,
-            q_repeats=1,
-            num_o_chunks=num_o_chunks,
-            output_f32_regs=output_f32_regs,
+        # Preserve the straight-line Q32 and streamed D128/Q128 profiles.
+        self.rescale_swaps_o_stage(
+            tmem_row_base,
+            o_base_col,
+            o_stage_idx,
+            old_max_arr,
+            new_max_arr,
+            skip_identity=(
+                cfg.tile_size_q < 32
+                or cfg.skips_unchanged_max_work
+                or (cfg.tile_size_q >= 48 and cfg.headdim >= 256)
+            ),
         )
 
     @cute.jit
@@ -4953,14 +5297,14 @@ class TmemCorrResource(DecodeGenResourceBase):
             # Swaps is finalized directly by its sole correction instance.
             return
 
-        if cutlass.const_expr(cfg.tile_size_q in (16, 32)):
+        if cutlass.const_expr(cfg.tile_size_q >= 16):
             # Wide tile-Q Swaps path has multiple softmax scale groups and may
             # span several 64-column O chunks.
             q_repeats = max(cfg.tile_size_q // 8, 1)
             num_scale_groups = cfg.num_softmax_scale_groups
             output_pair_regs = cfg.num_fp16_output_regs
             output_f32_regs = output_pair_regs * 2
-            num_o_chunks = cfg.headdim // 64
+            num_o_chunks = cfg.swaps_output_head_dim // 64
             self._swaps_wide_tail_epilogue(
                 stage_info,
                 tail_o_stage_idx_0=tail_o_stage_idx_0,

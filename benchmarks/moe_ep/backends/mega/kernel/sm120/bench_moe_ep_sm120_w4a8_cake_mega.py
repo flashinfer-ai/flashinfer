@@ -44,6 +44,7 @@ import torch.distributed as dist
 SHAPES = {
     # name: (hidden, intermediate, experts, top_k, swiglu_limit)
     "v4flash": (4096, 2048, 256, 6, 10),
+    "v41flash": (5120, 2304, 384, 6, 10),
     "dsv3": (7168, 2048, 256, 8, 0),
     "qwen3_235b": (4096, 1536, 128, 8, 0),
     "qwen3_30b": (2048, 768, 128, 8, 0),
@@ -182,7 +183,9 @@ def main() -> None:
                 transport_table=_table_spec(args.table, world),
                 swiglu_limit=limit,
             )
-            layer.warmup(random_inputs(256, geometry, seed=args.seed + rank))
+            layer.warmup(
+                random_inputs(min(256, capacity), geometry, seed=args.seed + rank)
+            )
             ws = layer._workspace
             timer = _KernelTimer(ws.module)
             ws.module = timer

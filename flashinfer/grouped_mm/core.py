@@ -18,7 +18,7 @@ from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
+from ..api_logging import flashinfer_api, warn_experimental_backend_once
 from ..utils import (
     backend_requirement,
     get_compute_capability,
@@ -119,8 +119,9 @@ def grouped_mm_bf16(
         Output data type.  ``torch.bfloat16`` (default) or ``torch.float16``, ``torch.float32``.
     backend : str
         Backend selector.  ``"cudnn"`` (default), or the experimental
-        ``"cake"`` backend (:mod:`flashinfer.experimental.cake_moe_grouped_gemm`,
-        SM100 / SM103 / SM107): generated ragged BF16 programs that read
+        ``"cake"`` backend (the deterministic forward programs of
+        :mod:`flashinfer.cake_moe_grouped_gemm_det_train`, SM100 / SM103 /
+        SM107): generated ragged BF16 programs that read
         ``m_indptr`` on the device, need no padding, produce bfloat16 outputs
         only and require ``n % 256 == 0`` and ``k % 64 == 0``.  Naming it is the
         opt-in and emits an ``ExperimentalWarning`` once.
@@ -145,11 +146,12 @@ def grouped_mm_bf16(
     >>> out_cake = flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")
     """
     if backend == "cake":
-        from ..experimental.cake_moe_grouped_gemm.cake_backend import (
-            grouped_mm_bf16_cake,
+        warn_experimental_backend_once("grouped_mm_bf16", "cake")
+        from ..experimental.cake.cake_moe_grouped_gemm_det_train.cake_backend import (
+            grouped_det_mm_bf16_cake,
         )
 
-        return grouped_mm_bf16_cake(
+        return grouped_det_mm_bf16_cake(
             a, b, m_indptr, out=out, out_dtype=out_dtype, tactic=tactic
         )
 

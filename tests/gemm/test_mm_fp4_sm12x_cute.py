@@ -157,7 +157,7 @@ def test_public_rejects_cached_raw_for_ragged_actual_m(monkeypatch):
     _, aligned = make_inputs(8192, n, k, 42)
     alpha = torch.tensor(-0.75, dtype=torch.float32, device="cuda")
     out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device="cuda")
-    workspace = gemm_base._get_cache_buf(
+    workspace = gemm_base._get_stream_cache_buf(
         "mm_fp4_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, operands[0].device
     )
     runner, tuner = get_runner(), AutoTuner.get()
@@ -459,7 +459,7 @@ def test_public_default_graph_and_cached_choice(m, n, k, monkeypatch):
     expected = mm_fp4(*operands, alpha, backend="cutlass")
     out = torch.empty_like(expected)
     runner, tuner = get_runner(), AutoTuner.get()
-    workspace = gemm_base._get_cache_buf(
+    workspace = gemm_base._get_stream_cache_buf(
         "mm_fp4_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, operands[0].device
     )
     inputs = [*operands, alpha, out.dtype, out, 16, True, workspace]

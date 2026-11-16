@@ -9,8 +9,6 @@ cuDNN is needed only by the exporter, never by this runtime.
 
 from __future__ import annotations
 
-import functools
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +44,9 @@ class Nvfp4Kernel:
     tactic_metadata: dict
     launch_tail: tuple[str, ...]
     op: str
+    source_parameters: dict | None = None
+    template_path: Path | None = None
+    source_identity: str = ""
 
     @property
     def gated(self):
@@ -54,6 +55,14 @@ class Nvfp4Kernel:
     @property
     def fc1(self):
         return self.op != _FC2
+
+    @property
+    def combines_output(self):
+        return self.contract.get("moe_mode") == "combine"
+
+    @property
+    def gathers_input(self):
+        return self.contract.get("moe_mode") == "gather"
 
     @property
     def activation(self):
@@ -72,22 +81,22 @@ class Nvfp4Kernel:
         return (
             "cudnn_frost-nvfp4-v1",
             self.artifact_id,
-            runtime._tactic_digest(self.source_sha256),
+            runtime._tactic_digest(self.source_identity or self.source_sha256),
         )
 
 
-@functools.lru_cache(maxsize=8)
+@runtime.cache_discovery
 def discover(
-    root: Path | None = None, *, quantized_output: bool = False
+    root: Path | None = None,
+    *,
+    quantized_output: bool = False,
+    include_combine: bool = False,
+    include_gather: bool = False,
 ) -> tuple[Nvfp4Kernel, ...]:
     """Load BF16 grouped kernels or FC1 kernels with fused output quantization."""
     root = runtime.artifact_root("nvfp4") if root is None else Path(root)
     path = root / runtime._MANIFEST
-    payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 2 or not isinstance(
-        payload.get("kernels"), list
-    ):
-        raise RuntimeError(f"invalid NVFP4 manifest: {path}")
+    payload = runtime._read_manifest(path)
     result, seen = [], set()
     for raw in payload["kernels"]:
         op, identity = raw.get("op"), raw.get("id")
@@ -98,7 +107,34 @@ def discover(
         seen.add(identity)
         contract = raw.get("contract", {})
         fused = contract.get("output_dtype") == "float4_e2m1fn_x2"
-        runtime._validate_abi(raw, f"{op}_quantized" if fused else op)
+        combine = contract.get("moe_mode") == "combine"
+        gather = contract.get("moe_mode") == "gather"
+        runtime._validate_abi(
+            raw,
+            (
+                f"{op}_combine"
+                if combine
+                else f"{op}{'_gather' if gather else ''}{'_quantized' if fused else ''}"
+            ),
+        )
+        if contract.get("moe_mode", "none") not in ("none", "combine", "gather"):
+            raise RuntimeError(f"unsupported NVFP4 grouped output mode: {identity}")
+        if combine and (
+            op != _FC2
+            or fused
+            or raw["arch"] != "sm_107a"
+            or raw["tactic"].get("cta_group")
+            != (2 if raw["tactic"].get("swap_ab") else 1)
+            or raw["launch"].get("prefix")
+            != ["top_k_scores", "token_ks", "token_index"]
+        ):
+            raise RuntimeError(f"invalid NVFP4 COMBINE contract: {identity}")
+        if gather and (
+            op == _FC2
+            or raw["arch"] != "sm_107a"
+            or raw.get("launch", {}).get("prefix") != ["token_index"]
+        ):
+            raise RuntimeError(f"invalid GATHER contract: {identity}")
         expected = dict(
             token_dtype="float4_e2m1fn_x2",
             weight_dtype="float4_e2m1fn_x2",
@@ -108,9 +144,11 @@ def discover(
             elements_per_byte=2,
             global_scale_dtype="float32",
             global_scale_layout="per_group",
-            global_scale_position="gemm_output_before_activation",
+            global_scale_position=(
+                "top_k_score" if combine else "gemm_output_before_activation"
+            ),
             scale_layout="F8_128x4",
-            token_scale_layout="segmented_F8_128x4",
+            token_scale_layout="linear" if gather else "segmented_F8_128x4",
             activation=(
                 "identity"
                 if op == _FC2
@@ -132,6 +170,8 @@ def discover(
         expected_tail = (
             {"output", "alpha"} if op == _FC2 else {"output", "gate_alpha", "scale"}
         )
+        if combine:
+            expected_tail = {"output"}
         if op != _FC2 and is_gated(expected["activation"]):
             expected_tail.add("up_alpha")
         if expected["activation"] == "situ":
@@ -151,7 +191,11 @@ def discover(
         size = raw.get("workspace_bytes")
         if type(size) is not int or size <= 0 or size % 128:
             raise RuntimeError("NVFP4 workspace must be a positive multiple of 128")
-        if fused != quantized_output:
+        if (
+            fused != quantized_output
+            or (combine and not include_combine)
+            or (gather and not include_gather)
+        ):
             continue
         source, digest = runtime._read_source(root, raw)
         result.append(
@@ -165,9 +209,12 @@ def discover(
                 raw["tactic"],
                 tail,
                 op,
+                **runtime.source_binding(root, raw, digest),
             )
         )
-    return tuple(result)
+    return tuple(
+        bound for k in result if (bound := runtime.discovery_binding(k)) is not None
+    )
 
 
 def clear_artifact_cache() -> None:
@@ -351,10 +398,17 @@ class PreparedNvfp4GroupedGemm:
         gemm_scales: tuple[torch.Tensor, ...] | None = None,
         workspace: torch.Tensor | None = None,
     ):
+        if kernel.combines_output:
+            raise ValueError(
+                "COMBINE kernels require the MoELayer routing/reduction ABI"
+            )
+        if kernel.gathers_input:
+            raise ValueError("GATHER kernels require the MoELayer token-index ABI")
         if kernel.quantizes_output:
             raise ValueError("quantized FC1 kernels are launched by the MoE runner")
         if tokens.device.type != "cuda":
             raise ValueError("NVFP4 grouped GEMM requires CUDA tensors")
+        kernel = runtime.bind_kernel(kernel, tokens.device)
         with torch.cuda.device(tokens.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("prepare NVFP4 grouped GEMM outside capture")

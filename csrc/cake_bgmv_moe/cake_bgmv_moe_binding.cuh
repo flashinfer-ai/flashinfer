@@ -37,9 +37,6 @@
 #ifndef CAKE_BGMV_MOE_SHRINK_PREFILL
 #error "CAKE_BGMV_MOE_SHRINK_PREFILL must name the generated kernel symbol"
 #endif
-#ifndef CAKE_BGMV_MOE_EXPAND_TOKEN_T64
-#error "CAKE_BGMV_MOE_EXPAND_TOKEN_T64 must name the generated kernel symbol"
-#endif
 #ifndef CAKE_BGMV_MOE_EXPAND_TOKEN
 #error "CAKE_BGMV_MOE_EXPAND_TOKEN must name the generated kernel symbol"
 #endif
@@ -69,7 +66,6 @@ constexpr int32_t kShrinkDecodePairsPerBlock = 4;
 // the shrink kernels, routed activations plus the route list for expand).
 constexpr int32_t kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_DECODE;
 constexpr int32_t kShrinkPrefillSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_PREFILL;
-constexpr int32_t kExpandT64SmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_T64;
 constexpr int32_t kExpandTokenSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN;
 constexpr int32_t kExpandDualSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_DUAL;
 static_assert(kShrinkDecodeSmemBytes == 221696, "decode shrink smem layout changed");
@@ -83,8 +79,9 @@ constexpr int32_t kRouteIndexMaxRoutes = 16;
 constexpr int32_t kRouteIndexHeaderWords = 4;
 constexpr int32_t kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes;
 
+// Schedule id 0 was the 64-lane token-owned expand: the selector never picked it inside the
+// specialized token window, so the kernel was removed and the id is rejected below.
 enum class Schedule : int32_t {
-  kTokenOwnedT64 = 0,
   kTokenOwned = 1,
   kTokenOwnedDualCol = 2,
 };
@@ -94,8 +91,9 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
 }
 
 // Each module is compiled for exactly one target (sm_90a for H100/H200,
-// sm_100a for B200/GB200, sm_103a for B300/GB300). The device must match it;
-// anything else fails closed instead of silently running another cubin.
+// sm_100a for B200/GB200, sm_103a for B300/GB300, sm_107a for Rubin R200).
+// The device must match it; anything else fails closed instead of silently
+// running another cubin.
 inline void CheckCompiledArch(int32_t device_id) {
   int major = 0;
   int minor = 0;
@@ -236,9 +234,10 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
       << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
       << kRouteIndexWordsPerToken << " int32 words";
 
-  TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
+  TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwned) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwnedDualCol))
-      << "invalid Cake BGMV MoE schedule id: " << schedule_value;
+      << "invalid Cake BGMV MoE schedule id (1 token_owned, 2 token_owned_dual_col): "
+      << schedule_value;
   const auto schedule = static_cast<Schedule>(schedule_value);
   const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   auto* y_ptr = static_cast<float*>(y_accum.data_ptr());
@@ -282,15 +281,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   config.attrs = attrs;
   config.numAttrs = 1;
   cudaError_t expand_status;
-  if (schedule == Schedule::kTokenOwnedT64) {
-    config.gridDim = dim3(num_tokens, (kHidden + 63) / 64, 1);
-    config.blockDim = dim3(64, 1, 1);
-    config.dynamicSmemBytes = kExpandT64SmemBytes;
-    expand_status = cudaLaunchKernelEx(&config, CAKE_BGMV_MOE_EXPAND_TOKEN_T64, y_ptr, shrink_ptr,
-                                       b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
-                                       num_pairs, num_experts, num_tokens, output_stride,
-                                       output_offset, route_ptr, kRouteLookup, kRouteAdvance);
-  } else if (schedule == Schedule::kTokenOwned) {
+  if (schedule == Schedule::kTokenOwned) {
     config.gridDim = dim3(num_tokens, (kHidden + 127) / 128, 1);
     config.blockDim = dim3(128, 1, 1);
     config.dynamicSmemBytes = kExpandTokenSmemBytes;

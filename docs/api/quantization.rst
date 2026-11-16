@@ -123,7 +123,7 @@ three cases, but only one public type:
         that default rather than picking up the environment's value.
 
 The four ``FLASHINFER_NVFP4_4OVER6*`` variables are documented in the
-repository's ``CLAUDE.md``. They remain supported as a compatibility shim but
+repository's ``AGENTS.md``. They remain supported as a compatibility shim but
 are deprecated: being process-wide, they cannot express two models served in
 one process under different recipes. When the shim is retired the default of
 ``nvfp4_4over6=`` becomes ``None`` and no signature changes.
@@ -203,62 +203,92 @@ linear (non-swizzled) block-scale layout.
     nvfp4_kv_dequantize_paged
     nvfp4_quantize_paged_kv_cache
 
+NVFP4 KV Cache Materialization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Materialize the active pages of a paged NVFP4 KV cache as FP8 for attention
+kernels that do not read NVFP4 K/V directly.
+
+.. currentmodule:: flashinfer.quantization.kernels.nvfp4_kv_materialize
+
+.. autosummary::
+    :toctree: ../generated
+
+    nvfp4_kv_materialize_fp8
+
+.. autoclass:: NVFP4KVMaterializer
+    :members: run
+
+CSF Block Scales
+----------------
+
+Block-scale matrices compressed per 16-row slab (CSF), such as NVFP4 MoE expert
+scales kept compressed on the GPU and expanded into the fused MoE scale layout
+before each call.
+
+.. currentmodule:: flashinfer.quantization
+
+.. autosummary::
+    :toctree: ../generated
+
+    encode_csf_scales
+    expand_csf_scales
+
 FP8 Quantization
 ----------------
+
+.. currentmodule:: flashinfer.quantization
 
 .. autosummary::
     :toctree: ../generated
 
     mxfp8_quantize
     mxfp8_grouped_quantize
+    silu_and_mul_mxfp8_experts_quantize
     mxfp8_dequantize_host
     per_token_group_quant_8bit
 
-Fused gated-activation MXFP8 quantization
------------------------------------------
-
-.. currentmodule:: flashinfer.gated_act_mxfp8
-
-.. autosummary::
-    :toctree: ../generated
-
-    silu_and_mul_mxfp8_quantize
-    silu_and_mul_mxfp8_quantize_backward
-
 .. note::
 
-    ``mxfp8_grouped_quantize`` uses a cuTile backend and requires SM100+ and
-    ``cuda.tile`` (a ``requirements.txt`` dependency). ``K`` must be divisible
-    by 32 and is padded internally to 128-column tiles.
+    ``mxfp8_grouped_quantize`` and ``silu_and_mul_mxfp8_experts_quantize``
+    require SM100+. The default ``"cutile"`` backend of
+    ``mxfp8_grouped_quantize`` requires ``cuda.tile`` (a ``requirements.txt``
+    dependency) and ``"cake"`` requires compute capability 10.0 or 10.3.
+    ``K`` must be divisible by 32 and is padded internally to 128-column tiles.
 
-CuTe-DSL Quantization Kernels (experimental)
---------------------------------------------
+Fused gated-activation MXFP8 quantization (Cake, deterministic)
+----------------------------------------------------------------
 
-The CuTe-DSL backends are conditionally available when the
-``nvidia-cutlass-dsl`` package is installed. At runtime they are also
-re-exported as ``flashinfer.quantization.{nvfp4,mxfp4,mxfp8}_quantize_cute_dsl``
-when available; documenting them here via their canonical submodule
-path keeps the docs build from depending on the CuTe-DSL stack being
-importable.
-
-.. currentmodule:: flashinfer.quantization.kernels.nvfp4_quantize
+.. currentmodule:: flashinfer.cake_gated_act_mxfp8_det_train
 
 .. autosummary::
     :toctree: ../generated
 
-    nvfp4_quantize_cute_dsl
-    nvfp4_quantize_per_token_cute_dsl
+    cake_gated_act_mxfp8_det_train_forward
+    cake_gated_act_mxfp8_det_train_backward
+    is_cake_gated_act_mxfp8_det_train_supported
 
-.. currentmodule:: flashinfer.quantization.kernels.mxfp4_quantize
+Every output (the E4M3 values and E8M0 scales of both orientations, forward
+and backward) repeats bit for bit for identical inputs. The backend package is
+``flashinfer.experimental.cake.cake_gated_act_mxfp8_det_train``. The former
+names are removed, with no alias:
 
-.. autosummary::
-    :toctree: ../generated
+.. list-table::
+    :header-rows: 1
 
-    mxfp4_quantize_cute_dsl
-
-.. currentmodule:: flashinfer.quantization.kernels.mxfp8_quantize
-
-.. autosummary::
-    :toctree: ../generated
-
-    mxfp8_quantize_cute_dsl
+    * - Former name
+      - New name
+    * - ``flashinfer.gated_act_mxfp8`` (module)
+      - ``flashinfer.cake_gated_act_mxfp8_det_train``
+    * - ``silu_and_mul_mxfp8_quantize``
+      - ``cake_gated_act_mxfp8_det_train_forward``
+    * - ``silu_and_mul_mxfp8_quantize_backward``
+      - ``cake_gated_act_mxfp8_det_train_backward``
+    * - ``get_gated_act_mxfp8_module``
+      - ``cake_gated_act_mxfp8_det_train_register_custom_ops``
+    * - ``GatedActMxfp8Outputs``
+      - ``CakeGatedActMXFP8DetOutputs``
+    * - ``torch.ops.flashinfer.silu_and_mul_mxfp8_quantize`` / ``_backward``
+      - ``torch.ops.flashinfer.cake_gated_act_mxfp8_det_train_forward`` / ``_backward``
+    * - ``flashinfer/cake_gated_act_mxfp8_backend/`` (backend directory)
+      - ``flashinfer/experimental/cake/cake_gated_act_mxfp8_det_train/``

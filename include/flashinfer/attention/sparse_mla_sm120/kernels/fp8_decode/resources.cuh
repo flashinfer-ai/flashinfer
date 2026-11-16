@@ -99,19 +99,28 @@ template <ModelType MT, bool MIXED_PIPELINE = false>
 struct Fp8DecodeSharedLayout {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT, MIXED_PIPELINE>;
-  // This layout assumes footer scales (a separate kv_sc buffer) and a KV smem
-  // region holding nope only. DSV4, DOTS3_SWA, and DSV4_1 satisfy that; the
-  // inline-scale models (DSV3_2 / GLM_NSA) bulk-copy their scales inside the
-  // KV region and use kernels/dsv32_fp8/resources.cuh instead.
-  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || MT == ModelType::DSV4_1);
-  static_assert(!KV::SCALE_IN_KV_SMEM, "this smem layout keeps scales in a separate buffer");
+  // This layout serves the UE8M0-scaled models. The footer-scale ones (DSV4,
+  // DOTS3_SWA, DSV4_1) keep a KV smem region holding nope only and gather
+  // their scales into a separate kv_sc buffer; DSV4_1_INLINE bulk-copies each
+  // record's scales into the pad after its nope row instead, so its kv_sc
+  // buffer is empty and kv_scales() points into the KV row. The FP32-scaled
+  // inline models (DSV3_2 / GLM_NSA / GLM53_NOPE) use
+  // kernels/dsv32_fp8/resources.cuh.
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || is_dsv41(MT));
+  static_assert(!KV::SCALE_IN_KV_SMEM ||
+                    KV::KV_SMEM_COPY_BYTES == KV::D_NOPE + KV::SCALE_BYTES_PER_TOKEN,
+                "inline scales must land right after the nope row");
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_Q_FP8 = HPB * KV::Q_NOPE_STRIDE;
   static constexpr size_t SMEM_Q_SC = HPB * KV::NUM_SCALES * sizeof(float);
   static constexpr size_t SMEM_KV_FP8_BUF = Cfg::BI * KV::KV_SMEM_STRIDE;
-  static constexpr size_t SMEM_KV_SC_BUF = Cfg::BI * KV::SCALE_BYTES_PER_TOKEN;
+  static constexpr size_t SMEM_KV_SC_BUF =
+      KV::SCALE_IN_KV_SMEM ? 0 : Cfg::BI * KV::SCALE_BYTES_PER_TOKEN;
+  // Byte distance between consecutive candidates' scale rows in kv_scales().
+  static constexpr int SCALE_STRIDE =
+      KV::SCALE_IN_KV_SMEM ? KV::KV_SMEM_STRIDE : KV::SCALE_BYTES_PER_TOKEN;
   static constexpr size_t SMEM_KV_ROPE_BUF = Cfg::BI * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_MBAR_PAIR = 2 * sizeof(uint64_t);
   static constexpr size_t SMEM_REDUCE = 2 * Cfg::N_WARPS * HPB * sizeof(float);
@@ -155,6 +164,14 @@ struct Fp8DecodeSharedLayout {
   }
   __device__ __forceinline__ uint8_t* kv_sc(int i) const {
     return reinterpret_cast<uint8_t*>(base + OFF_KV_SC + i * SMEM_KV_SC_BUF);
+  }
+  // Candidate 0's scale row; candidate c's is SCALE_STRIDE * c bytes later.
+  __device__ __forceinline__ uint8_t* kv_scales(int i) const {
+    if constexpr (KV::SCALE_IN_KV_SMEM) {
+      return kv_fp8(i) + KV::D_NOPE;
+    } else {
+      return kv_sc(i);
+    }
   }
   __device__ __forceinline__ bf16* kv_rope(int i) const {
     return reinterpret_cast<bf16*>(base + OFF_KV_ROPE + i * SMEM_KV_ROPE_BUF);

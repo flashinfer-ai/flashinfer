@@ -114,3 +114,36 @@ def test_tinygemm_bf16_pdl_back_to_back(num_launches, batch_size):
         assert cos_sim > 0.99, (
             f"Launch {i}/{num_launches}: cosine similarity {cos_sim:.6f} < 0.99"
         )
+
+
+@pytest.mark.parametrize("use_pdl", [False, True])
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_tinygemm2_output_past_int32_index(has_bias, use_pdl):
+    """batch_size * output_features > 2^31: the last rows lie past the int32
+    index range and must still be stored in place (an lm_head autotuned at
+    16k tokens hit an illegal memory access here)."""
+    _skip_if_not_sm90()
+    from flashinfer.gemm.routergemm import get_tinygemm2_module
+
+    batch_size, output_features, input_features = 2**14 + 8, 2**17, 128
+    if torch.cuda.mem_get_info()[0] < 3 * batch_size * output_features:
+        pytest.skip("needs a 4.3 GB output")
+    input = torch.randn(batch_size, input_features, device="cuda").bfloat16() / 8
+    weight = torch.randn(output_features, input_features, device="cuda").bfloat16() / 8
+    bias = torch.randn(output_features, device="cuda").bfloat16() if has_bias else None
+    out = torch.full(
+        (batch_size, output_features), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+
+    module = get_tinygemm2_module()
+    if has_bias:
+        module.tinygemm2_op(input, weight, bias, out, use_pdl)
+    else:
+        module.tinygemm2_nobias_op(input, weight, out, use_pdl)
+    torch.cuda.synchronize()
+
+    rows = [0, 1] + list(range(batch_size - 8, batch_size))
+    ref = F.linear(
+        input[rows].float(), weight.float(), bias.float() if has_bias else None
+    )
+    torch.testing.assert_close(out[rows].float(), ref, atol=1e-2, rtol=1e-2)

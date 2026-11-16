@@ -31,6 +31,14 @@ from .gemm_base import (
     group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .gemm_bf16_fp8 import mm_bf16_fp8 as mm_bf16_fp8
+from .gemm_bf16_fp8 import (
+    mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes,
+)
+from .gemm_bf16_fp8 import mm_fp16_fp8 as mm_fp16_fp8
+from .gemm_bf16_fp8 import (
+    mm_fp16_fp8_workspace_bytes as mm_fp16_fp8_workspace_bytes,
+)
 from .cake_grouped_fp8_gemm import (
     PreparedGroupGemmFp8NtGroupwiseContiguous as PreparedGroupGemmFp8NtGroupwiseContiguous,
 )
@@ -72,6 +80,13 @@ from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
     svdquant_linear as svdquant_linear,
+)
+from .cake_quant_lora_gemm import (
+    PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter,
+    StaleAdapterError as StaleAdapterError,
+    mm_fp8_lora as mm_fp8_lora,
+    mm_nvfp4_lora as mm_nvfp4_lora,
+    prepare_nvfp4_lora_adapter as prepare_nvfp4_lora_adapter,
 )
 
 # Dense PrimsTS FP8/NVFP4 GEMMs are imported lazily enough that installations
@@ -199,6 +214,11 @@ __all__ = (
         "prepare_kimi_k3_fp8_projection",
         "prepare_kimi_k3_fp8_projection_weights",
         "fp8_blockscale_gemm_sm90",
+        "PreparedNvFp4LoraAdapter",
+        "StaleAdapterError",
+        "mm_fp8_lora",
+        "mm_nvfp4_lora",
+        "prepare_nvfp4_lora_adapter",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
         "fp8_linear",
@@ -216,6 +236,10 @@ __all__ = (
         "mm_M1_16_K7168_N896",
         "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
+        "mm_bf16_fp8",
+        "mm_bf16_fp8_workspace_bytes",
+        "mm_fp16_fp8",
+        "mm_fp16_fp8_workspace_bytes",
     ]
     + _cute_dsl_kernels
     + _cuda_tile_kernels

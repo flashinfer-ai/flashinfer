@@ -202,6 +202,7 @@ class GenphaseTokenComm(KernelComponent):
     refine_work_counter_region: ClassVar[str] = "genphase.token_comm.refine_work_counter"
 
     # SMEM regions, grouped into mutually exclusive role lifetimes.
+    exchange_active_routes_region: ClassVar[str] = "genphase.token_comm.smem.exchange_active_routes"
     exchange_mbarrier_region: ClassVar[str] = "genphase.token_comm.smem.exchange_mbarrier"
     pusher_mbarrier_region: ClassVar[str] = "genphase.token_comm.smem.pusher_mbarrier"
     exchange_topk_stage_region: ClassVar[str] = "genphase.token_comm.smem.exchange_topk"
@@ -767,6 +768,7 @@ class GenphaseTokenComm(KernelComponent):
         # `max_tokens_per_rank * topk` is not, and the staging buffer has to cover
         # what the transfer reads.
         exchange = overlay.add_lifetime("exchange")
+        exchange.register_tensor(self.exchange_active_routes_region, cutlass.Int32, (warp_count,))
         exchange.register_tensor(
             self.exchange_topk_stage_region, self.topk_index_dtype, (self.topk_slab_elements,), byte_alignment=16
         )
@@ -1144,9 +1146,11 @@ class GenphaseTokenComm(KernelComponent):
                 tma_load_1d(score_stage.iterator, topk_scores.iterator, load_mbarrier, Int32(score_plane_bytes))
         cute.arch.mbarrier_wait(load_mbarrier, 0)
 
-        self._canonicalize_wire_indices(index_stage, thread_idx)
-        # Every thread rewrote its own share of the staged plane; the single thread
-        # that copies the plane out reads all of it.
+        active_routes = self._canonicalize_sparse_wire_indices(index_stage, thread_idx, smem_base)
+        wire_bytes = ((active_routes + Int32(3)) // Int32(4)) * Int32(16)
+        # Every writer must publish its rewritten indices to the async proxy
+        # before the elected thread issues the TMA bulk read of shared memory.
+        cute.arch.fence_proxy(kind="async.shared", space="cta")
         cute.arch.sync_threads()
 
         # The peer's slab address is this rank's slab address shifted by the
@@ -1158,27 +1162,28 @@ class GenphaseTokenComm(KernelComponent):
         wire_indices = self._wire_index_view(index_stage)
 
         if thread_idx == Int32(0):
-            cp_async_bulk_s2g(
-                cute.make_ptr(
-                    cutlass.Int32, own_index_slab.iterator.toint() + peer_offset, AddressSpace.gmem, assumed_align=16
-                ),
-                wire_indices.iterator,
-                Int32(self.topk_slab_elements * 4),
-            )
-            if cutlass.const_expr(self.apply_topk_at_fc1):
-                score_inbox = device_workspace.tensor(self.topk_score_inbox_region)
-                own_score_slab = score_inbox[local_rank, None, None]
+            if wire_bytes > Int32(0):
                 cp_async_bulk_s2g(
                     cute.make_ptr(
-                        cutlass.Float32,
-                        own_score_slab.iterator.toint() + peer_offset,
-                        AddressSpace.gmem,
-                        assumed_align=16,
+                        cutlass.Int32, own_index_slab.iterator.toint() + peer_offset, AddressSpace.gmem, assumed_align=16
                     ),
-                    self._smem_workspace.tensor(self.exchange_score_stage_region, smem_base).iterator,
-                    Int32(self.topk_slab_elements * 4),
+                    wire_indices.iterator,
+                    wire_bytes,
                 )
-            cute.arch.cp_async_bulk_commit_group()
+                if cutlass.const_expr(self.apply_topk_at_fc1):
+                    score_inbox = device_workspace.tensor(self.topk_score_inbox_region)
+                    own_score_slab = score_inbox[local_rank, None, None]
+                    cp_async_bulk_s2g(
+                        cute.make_ptr(
+                            cutlass.Float32,
+                            own_score_slab.iterator.toint() + peer_offset,
+                            AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        self._smem_workspace.tensor(self.exchange_score_stage_region, smem_base).iterator,
+                        wire_bytes,
+                    )
+                cute.arch.cp_async_bulk_commit_group()
 
         # The copy and the flag both belong to this one thread, so the wait belongs
         # to it too: no other thread committed a group.
@@ -1187,7 +1192,11 @@ class GenphaseTokenComm(KernelComponent):
             # Each destination's `topk_ready[source]` slot has exactly one
             # producer, so the consumer can wait on an exact value.
             own_ready_slot = device_workspace.ptr(self.topk_ready_region) + local_rank
-            red_async_add_release_sys_u32(own_ready_slot.toint() + peer_offset, Int32(1))
+            # Exactly one producer owns this slot. Zero remains not-ready;
+            # one publishes an empty source, and larger values carry its
+            # last valid flat route plus one. The existing tail resets it.
+            publication = active_routes + Int32(1)
+            red_async_add_release_sys_u32(own_ready_slot.toint() + peer_offset, publication)
         cute.arch.sync_threads()
         iket.range_pop()
 
@@ -1203,6 +1212,39 @@ class GenphaseTokenComm(KernelComponent):
         return cute.make_tensor(
             cute.recast_ptr(index_stage.iterator, dtype=cutlass.Int32), cute.make_layout((self.topk_slab_elements,))
         )
+
+    @cute.jit
+    def _canonicalize_sparse_wire_indices(self, index_stage: cute.Tensor, thread_idx: Int32, smem_base: cute.Pointer) -> Int32:
+        """Find the last valid route, preserving holes and original route IDs."""
+        wire_indices = self._wire_index_view(index_stage)
+        rounds = ceil_div(self.routes_per_rank, self.threads_per_cta)
+        narrowed = cute.make_rmem_tensor((rounds,), cutlass.Int32)
+        lane_extent = Int32(0)
+        for step in cutlass.range_constexpr(rounds):
+            route = Int32(step * self.threads_per_cta) + thread_idx
+            narrowed[step] = Int32(self.invalid_expert_marker)
+            if route < Int32(self.routes_per_rank):
+                raw_index = index_stage[route]
+                if not self._is_unowned_expert(raw_index):
+                    narrowed[step] = Int32(raw_index)
+                    lane_extent = route + Int32(1)
+        warp_extent = Int32(cute.arch.warp_redux_sync(lane_extent, "max"))
+        warp_extents = self._smem_workspace.tensor(self.exchange_active_routes_region, smem_base)
+        if thread_idx % Int32(32) == Int32(0):
+            warp_extents[thread_idx // Int32(32)] = warp_extent
+        # Also protects narrowing Int64 in place before any lane rewrites it.
+        cute.arch.sync_threads()
+        active_routes = Int32(0)
+        for warp in cutlass.range_constexpr(self.threads_per_cta // 32):
+            extent = warp_extents[warp]
+            if extent > active_routes:
+                active_routes = extent
+        for step in cutlass.range_constexpr(rounds):
+            route = Int32(step * self.threads_per_cta) + thread_idx
+            if route < Int32(self.routes_per_rank):
+                wire_indices[route] = narrowed[step]
+        return active_routes
+
 
     @cute.jit
     def _canonicalize_wire_indices(self, index_stage: cute.Tensor, thread_idx: Int32) -> None:
@@ -1481,6 +1523,39 @@ class GenphaseTokenComm(KernelComponent):
         source_rank: Int32,
         thread_idx: Int32,
     ) -> None:
+        # Wait for the existing single-producer release before deciding
+        # which code path every lane of this CTA will execute. Extent is
+        # last-valid-route+1, not the count of nonempty slots.
+        iket.range_push("sort.wait_extent")
+        if thread_idx == Int32(0):
+            spin_wait(
+                device_workspace.ptr(self.topk_ready_region) + source_rank,
+                lambda value: value != Int32(0),
+                scope="sys",
+            )
+        cute.arch.sync_threads()
+        active_routes = Int32(cute.arch.load(
+            device_workspace.ptr(self.topk_ready_region) + source_rank,
+            Int32, sem="acquire", scope="sys"
+        )) - Int32(1)
+        iket.range_pop()
+        if active_routes <= Int32(self.threads_per_cta):
+            self._run_sort_impl(device_workspace, local_rank, smem_base, source_rank, thread_idx, active_routes, 1)
+        else:
+            self._run_sort_impl(device_workspace, local_rank, smem_base, source_rank, thread_idx, active_routes,
+                                ceil_div(self.routes_per_rank, self.threads_per_cta))
+
+    @cute.jit
+    def _run_sort_impl(
+        self,
+        device_workspace: DeviceWorkspace,
+        local_rank: Int32,
+        smem_base: cute.Pointer,
+        source_rank: Int32,
+        thread_idx: Int32,
+        active_routes: Int32,
+        sort_round_limit: cutlass.Constexpr[int],
+    ) -> None:
         """Bucket one source rank's routes by local expert, then place them.
 
         Waiting on one source's slot rather than on all of them means an
@@ -1498,20 +1573,15 @@ class GenphaseTokenComm(KernelComponent):
             if bucket < Int32(self.histogram_bucket_count):
                 histogram[bucket] = Int32(0)
 
-        # Spans the release, not just the poll: what matters is when the whole CTA
-        # is let through, and the same holds for every other wait range below.
+        # _run_sort already acquired this source's publication and extent.
+        # Keep the CTA join: histogram initialization must finish before any
+        # lane increments another lane's bucket. Keep its existing IKET range.
         iket.range_push("sort.wait_topk")
-        if thread_idx == Int32(0):
-            spin_wait(
-                device_workspace.ptr(self.topk_ready_region) + source_rank,
-                lambda value: value == Int32(self.topk_ready_target),
-                scope="sys",
-            )
         cute.arch.sync_threads()
         iket.range_pop()
 
         iket.range_push("sort.count")
-        route_rounds = ceil_div(self.routes_per_rank, self.threads_per_cta)
+        route_rounds = sort_round_limit
         buckets = cute.make_rmem_tensor((route_rounds,), cutlass.Int32)
         offsets = cute.make_rmem_tensor((route_rounds,), cutlass.Int32)
 
@@ -1525,7 +1595,7 @@ class GenphaseTokenComm(KernelComponent):
         for route_round in cutlass.range_constexpr(route_rounds):
             route = Int32(route_round * self.threads_per_cta) + thread_idx
             buckets[route_round] = Int32(self.trash_bucket_index)
-            if route < Int32(self.routes_per_rank):
+            if route < active_routes:
                 # One unsigned compare covers "not this rank's" and "invalid":
                 # the wire marker and any wild value both land outside the window.
                 local_expert = index_slab[route // Int32(self.topk), route % Int32(self.topk)] - local_expert_begin
@@ -1533,9 +1603,14 @@ class GenphaseTokenComm(KernelComponent):
                     buckets[route_round] = local_expert
 
         for route_round in cutlass.range_constexpr(route_rounds):
-            offsets[route_round] = Int32(
-                cute.arch.atomic_add(histogram.iterator + buckets[route_round], Int32(1), sem="relaxed", scope="cta")
-            )
+            # Only real expert buckets are published, and scatter never
+            # reads the offset of an unowned/invalid route. Do not serialize
+            # all of those lanes on a single unused shared-memory counter.
+            offsets[route_round] = Int32(0)
+            if buckets[route_round] != Int32(self.trash_bucket_index):
+                offsets[route_round] = Int32(
+                    cute.arch.atomic_add(histogram.iterator + buckets[route_round], Int32(1), sem="relaxed", scope="cta")
+                )
         cute.arch.sync_threads()
 
         expert_counts = device_workspace.tensor(self.expert_counts_by_rank_region)
@@ -1587,6 +1662,7 @@ class GenphaseTokenComm(KernelComponent):
         if thread_idx == Int32(0):
             red_async_add_release_gpu_s32(device_workspace.ptr(self.metadata_ready_region), Int32(1))
         iket.range_pop()
+
 
     @cute.jit
     def _run_helper(
@@ -1917,25 +1993,19 @@ class GenphaseTokenComm(KernelComponent):
         through the experts in the order the main kernel processes them, so the
         scale factors of the expert scheduled first are also refined first.
         """
+        # The caller has just published the SF-row prefix in this same
+        # scan order. Each padded row count is a multiple of sf_padding_block,
+        # so converting that prefix to blocks replaces another CTA-wide scan.
         bucket_rounds = ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
-        for bucket_round in cutlass.range_constexpr(bucket_rounds):
-            scan_entry = Int32(bucket_round * self.threads_per_cta) + thread_idx
-            if scan_entry < Int32(self.local_expert_bucket_count):
-                scan_input[scan_entry] = ceil_div(loads_in_scan_order[scan_entry], Int32(self.sf_padding_block))
-        cute.arch.sync_threads()
-
-        block_total = smem_exclusive_prefix(
-            scan_input, prefix, warp_totals, self.threads_per_cta, thread_idx, lane_idx, warp_idx
-        )
-        cute.arch.sync_threads()
-
         destination = device_workspace.tensor(self.refine_block_base_region)
         for bucket_round in cutlass.range_constexpr(bucket_rounds):
             scan_entry = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if scan_entry < Int32(self.local_expert_bucket_count):
-                destination[scan_order_experts[scan_entry]] = prefix[scan_entry]
+                destination[scan_order_experts[scan_entry]] = prefix[scan_entry] // Int32(self.sf_padding_block)
         if thread_idx == Int32(0):
-            device_workspace.tensor(self.refine_block_total_region)[0] = block_total
+            last = Int32(self.local_expert_bucket_count - 1)
+            total_rows = prefix[last] + padded_expert_rows(loads_in_scan_order[last], Int32(self.sf_padding_block))
+            device_workspace.tensor(self.refine_block_total_region)[0] = total_rows // Int32(self.sf_padding_block)
         cute.arch.sync_threads()
 
     @cute.jit

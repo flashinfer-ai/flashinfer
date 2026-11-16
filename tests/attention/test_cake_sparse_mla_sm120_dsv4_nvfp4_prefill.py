@@ -21,10 +21,8 @@ atol=rtol=5e-2, LSE atol=rtol=2e-2); every valid head-tile count is
 exercised.
 """
 
-import importlib
 import itertools
 import math
-import os
 
 import pytest
 import torch
@@ -59,8 +57,6 @@ from tests.attention.test_cake_sparse_mla_sm120_dsv4_nvfp4 import (
     _require_sm120,
 )
 
-# Dotted name of the generating prefill kernel module (planner parity test); unset -> skipped.
-_KERNEL_MODULE_ENV = "CAKE_SPARSE_MLA_SM120_DSV4_PREFILL_KERNEL_MODULE"
 _PREFILL_HEADS = (16, 32, 48, 64, 80, 96, 112, 128)
 
 
@@ -140,6 +136,83 @@ def test_cake_plan_prefill_rules() -> None:
         plan(num_tokens=128, num_heads=128, topk=512, num_sms=0)
 
 
+# Dense planner sweep: every input ``plan_prefill`` reads (token count, head count,
+# ``topk + extra_topk``, SM count) crosses every ``_PREFILL_POLICY`` threshold (two-tile
+# token limits 96 / 128, candidate band 512 .. 639, ``large_sms`` 180) on the GB10 (48),
+# RTX 5090 (170) and RTX PRO 6000 (188) SM counts.
+_SWEEP_TOKENS = (*range(1, 133), 255, 256, 511, 512, 513, 2048, 8192, 65536)
+_SWEEP_CANDIDATES = tuple(
+    (topk, extra_topk)
+    for topk in (64, 128, 256, 448, 511, 512, 513, 576, 639, 640, 768, 1024)
+    for extra_topk in (0, 64, 128, 512)
+    if topk + extra_topk <= 1024
+)
+_SWEEP_SMS = (48, 170, 180, 188)
+
+
+def test_cake_plan_prefill_never_plans_single_tile_for_wide_heads() -> None:
+    """The planner never selects one head tile for 32 / 64 / 96 / 128 heads.
+
+    Over the dense sweep ``plan_prefill`` returns 2 or 4 for every head count with a
+    two-tile instance, so the planned launch never asks for their one-tile kernels nor
+    for the three-stage ring (exported for one tile only).  Those instances are reached
+    there only through the explicit ``head_tiles`` override of the prefill entry.
+    """
+
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    plan = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill
+    stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages
+    two_tile_heads = tuple(
+        h for h in info["prefill_heads"] if 2 in info["prefill_head_tiles"][h]
+    )
+    assert two_tile_heads == (32, 64, 96, 128)
+    planned = {num_heads: set() for num_heads in two_tile_heads}
+    for num_heads, num_sms, (topk, extra_topk), num_tokens in itertools.product(
+        two_tile_heads, _SWEEP_SMS, _SWEEP_CANDIDATES, _SWEEP_TOKENS
+    ):
+        tiles = info["prefill_head_tiles"][num_heads]
+        head_tiles = plan(
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            num_sms=num_sms,
+        )
+        case = (num_heads, num_sms, topk, extra_topk, num_tokens)
+        assert head_tiles in tiles, case
+        assert head_tiles != 1, case
+        # the planned launch keeps two ring stages (three exist for one tile only)
+        assert (
+            stages(
+                head_tiles=head_tiles,
+                topk=topk,
+                extra_topk=extra_topk,
+                dual=extra_topk > 0,
+                num_tokens=num_tokens,
+            )
+            == 2
+        ), case
+        planned[num_heads].add(head_tiles)
+    # Every multi-tile instance is planned somewhere in the sweep.
+    assert planned == {32: {2}, 64: {2, 4}, 96: {2}, 128: {2, 4}}
+    # One tile is planned only for the head counts whose single instance it is.
+    for num_heads, num_sms, (topk, extra_topk) in itertools.product(
+        (16, 48, 80, 112), _SWEEP_SMS, _SWEEP_CANDIDATES
+    ):
+        assert cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(num_heads) == (1,)
+        for num_tokens in (1, 96, 97, 128, 129, 8192):
+            assert (
+                plan(
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    topk=topk,
+                    extra_topk=extra_topk,
+                    num_sms=num_sms,
+                )
+                == 1
+            )
+
+
 def test_cake_plan_prefill_stages_rules() -> None:
     stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages
     # three cp.async stages only for the one-tile instance from 8 chunks (512 candidates) per token
@@ -164,6 +237,37 @@ def test_cake_plan_prefill_stages_rules() -> None:
     assert (
         stages(head_tiles=1, topk=512, extra_topk=128, dual=False, num_tokens=128) == 3
     )
+
+
+def test_cake_plan_prefill_stages_three_only_for_single_tile() -> None:
+    """Three ring stages are planned for the one-tile instance only.
+
+    The manifest exports a three-stage form for one head tile alone; the planner asks
+    for it from 8 chunks per token, except dual-cache lists below 16 chunks and below
+    512 tokens.  Two- and four-tile launches keep two stages at every chunk and token
+    count.
+    """
+
+    ring = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()["prefill_ring_stages"]
+    assert [ht for ht in ring if 3 in ring[ht]] == [1]
+    stages = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages
+    for head_tiles, (topk, extra_topk), dual, num_tokens in itertools.product(
+        (1, 2, 4), _SWEEP_CANDIDATES, (False, True), (1, 128, 511, 512, 513, 8192)
+    ):
+        chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+        expected = 3 if head_tiles == 1 and chunks >= 8 else 2
+        if dual and chunks < 16 and num_tokens < 512:
+            expected = 2
+        assert (
+            stages(
+                head_tiles=head_tiles,
+                topk=topk,
+                extra_topk=extra_topk,
+                dual=dual,
+                num_tokens=num_tokens,
+            )
+            == expected
+        ), (head_tiles, topk, extra_topk, dual, num_tokens)
 
 
 def test_cake_plan_prefill_grid_order_rules() -> None:
@@ -252,140 +356,6 @@ def test_cake_select_kernel_rules() -> None:
             )
             assert isinstance(head_tiles, int)
             assert head_tiles in _valid_tiles(num_heads)
-
-
-def test_cake_prefill_planner_parity_with_kernel_module() -> None:
-    """The Python prefill facts mirror the generating kernel module exactly.
-
-    Set ``CAKE_SPARSE_MLA_SM120_DSV4_PREFILL_KERNEL_MODULE`` to the module's dotted name to run it.
-    """
-
-    name = os.environ.get(_KERNEL_MODULE_ENV)
-    if not name:
-        pytest.skip(f"{_KERNEL_MODULE_ENV} not set")
-    try:
-        mod = importlib.import_module(name)
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        pytest.skip(f"kernel module {name} unavailable: {exc}")
-    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
-    assert info["heads_per_block"] == mod.HPB
-    assert info["prefill_max_chunks"] == mod.MAX_CPB
-    assert tuple(mod.SUPPORTED_HEAD_COUNTS) == info["prefill_heads"]
-    for num_heads in info["prefill_heads"]:
-        tiles = cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(num_heads)
-        # The module's default is the largest instance; every exported tile count traces.
-        assert mod.plan_head_tiles(num_heads) == max(tiles)
-        assert tiles == tuple(ht for ht in (1, 2, 4) if num_heads % (mod.HPB * ht) == 0)
-        for num_tokens in (128, 2048):
-            head_tiles = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
-                num_tokens=num_tokens, num_heads=num_heads, topk=512, num_sms=188
-            )
-            assert head_tiles in tiles
-    for topk, extra_topk in ((64, 0), (128, 128), (512, 512), (130, 1), (1024, 0)):
-        assert cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(
-            topk, extra_topk
-        ) == mod.max_chunks(topk, extra_topk)
-    # Ring depth and query L2 policy mirror the module's planner over the measured grid.
-    assert mod.PLAN_NUM_STAGES_MIN_CHUNKS == 8
-    assert mod.PLAN_NUM_STAGES_DUAL_MIN_CHUNKS == 16
-    assert mod.PLAN_NUM_STAGES_DUAL_MIN_TOKENS == 512
-    assert mod.PLAN_Q_EVICT_MIN_TOKENS == 512
-    assert mod.PLAN_GRID_HB_FIRST_MAX_CHUNKS == 4
-    assert mod.PLAN_GRID_HB_FIRST_MAX_TOKENS == 65535
-    for num_tokens in (1, 128, 511, 512, 2048, 8192, 65535, 65536):
-        assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_q_evict_first(
-            num_tokens=num_tokens
-        ) == mod.plan_q_evict_first(num_tokens)
-        for head_tiles in (1, 2, 4):
-            for topk, extra_topk, dual in (
-                (128, 0, False),
-                (448, 0, False),
-                (512, 0, False),
-                (512, 128, True),
-                (512, 512, True),
-                (1024, 0, False),
-            ):
-                assert cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_stages(
-                    head_tiles=head_tiles,
-                    topk=topk,
-                    extra_topk=extra_topk,
-                    dual=dual,
-                    num_tokens=num_tokens,
-                ) == mod.plan_num_stages(
-                    head_tiles,
-                    mod.max_chunks(topk, extra_topk),
-                    dual=dual,
-                    num_tokens=num_tokens,
-                ), (num_tokens, head_tiles, topk, extra_topk, dual)
-                assert (
-                    cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill_grid_head_blocks_first(
-                        head_tiles=head_tiles,
-                        topk=topk,
-                        extra_topk=extra_topk,
-                        num_tokens=num_tokens,
-                    )
-                    == mod.plan_grid_head_blocks_first(
-                        head_tiles, mod.max_chunks(topk, extra_topk), num_tokens
-                    )
-                ), (num_tokens, head_tiles, topk, extra_topk)
-    # The decode / prefill crossover and the tile choice mirror the module's planner on both
-    # sm_120a SKUs (188 / 170 SMs) over the measured token, head and candidate grid.
-    for num_sms in (188, 170):
-        for num_tokens in (
-            1,
-            4,
-            8,
-            9,
-            16,
-            17,
-            24,
-            32,
-            33,
-            48,
-            64,
-            96,
-            97,
-            128,
-            129,
-            512,
-            2048,
-        ):
-            for num_heads in info["prefill_heads"]:
-                for topk, extra_topk in (
-                    (128, 0),
-                    (256, 0),
-                    (512, 0),
-                    (256, 256),
-                    (512, 512),
-                ):
-                    plan = mod.plan_prefill(
-                        num_tokens, num_heads, topk, extra_topk, num_sms=num_sms
-                    )
-                    form = cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
-                        num_tokens=num_tokens,
-                        num_heads=num_heads,
-                        topk=topk,
-                        extra_topk=extra_topk,
-                        num_sms=num_sms,
-                    )
-                    assert form == plan["form"], (
-                        num_sms,
-                        num_tokens,
-                        num_heads,
-                        topk,
-                        extra_topk,
-                    )
-                    if form == "prefill":
-                        assert (
-                            cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
-                                num_tokens=num_tokens,
-                                num_heads=num_heads,
-                                topk=topk,
-                                extra_topk=extra_topk,
-                                num_sms=num_sms,
-                            )
-                            == plan["head_tiles"]
-                        ), (num_sms, num_tokens, num_heads, topk, extra_topk)
 
 
 # ----------------------------------------------------------------------------- GPU: attention cases

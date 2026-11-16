@@ -14,6 +14,7 @@ from .moe_w4a16_activations import (
 
 
 _W4A16_ALLOWED_ROUTED_SIZES = (8, 16, 32, 48, 64)
+_W4A16_MAX_DIRECT_ROUTE_TOKENS = 8
 _ROUTED_SIZE_TARGET_FILL = 0.9
 _SUPPORTED_ACTIVATIONS = SUPPORTED_MOE_ACTIVATIONS
 
@@ -201,6 +202,15 @@ def packed_gemm_scratch_elements(
     return max(elements, 1)
 
 
+def max_w4a16_scratch_route_slots(
+    routed_rows: int, topk: int, block_size: int, packed_slots: int
+) -> int:
+    # Direct routing reserves a full block per route, even when several routes
+    # select the same expert. Packed-route capacity alone can be smaller.
+    direct_rows = min(int(routed_rows), _W4A16_MAX_DIRECT_ROUTE_TOKENS * int(topk))
+    return max(int(packed_slots), direct_rows * int(block_size))
+
+
 def plan_w4a16_buffers(
     prepared,
     *,
@@ -221,6 +231,9 @@ def plan_w4a16_buffers(
     block_size_m = select_route_block_size_m(m, topk, route_num_experts)
     route_slots = max_packed_route_slots(routed_rows, block_size_m, route_num_experts)
     route_blocks = (route_slots + block_size_m - 1) // block_size_m
+    scratch_slots = max_w4a16_scratch_route_slots(
+        routed_rows, topk, block_size_m, route_slots
+    )
     scratch_sms = int(sms)
     return W4A16BufferPlan(
         routed_rows=routed_rows,
@@ -229,13 +242,13 @@ def plan_w4a16_buffers(
         route_blocks=route_blocks,
         fc1_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=fc1_cols,
-            route_slots=route_slots,
+            route_slots=scratch_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
         fc2_c_tmp_elements=packed_gemm_scratch_elements(
             size_n=hidden_size,
-            route_slots=route_slots,
+            route_slots=scratch_slots,
             moe_block_size=block_size_m,
             sms=scratch_sms,
         ),
