@@ -126,28 +126,72 @@ def test_noncontiguous_input():
             assert torch.equal(x, y)
 
 
-@pytest.mark.parametrize("kind", ["typical", "random"])
-def test_chunking_is_invisible(monkeypatch, kind):
+def _set_slab_rows(monkeypatch, slab: int, cols: int) -> None:
+    per_row = (
+        x4t_encode._HISTOGRAM_BYTES_PER_ROW + cols * x4t_encode._TEMP_BYTES_PER_SCALE
+    )
+    monkeypatch.setattr(x4t_encode, "_SLAB_BUDGET_BYTES", slab * per_row)
+    assert x4t_encode._slab_rows(48, cols) == slab
+
+
+def _assert_same(got, want) -> None:
+    for a, b in zip(got, want, strict=True):
+        assert len(a) == len(b)
+        for x, y in zip(a, b, strict=True):
+            assert torch.equal(x, y)
+
+
+@pytest.mark.parametrize("kind", ["typical", "random", "extreme"])
+@pytest.mark.parametrize("slab", [16, 32, 64, 144])
+def test_slabbing_is_invisible(monkeypatch, kind, slab):
+    # rows=48: slab 16 aligns to tiles, 32 splits inside experts and straddles
+    # expert boundaries, 64 and 144 cover several experts per slab.
     scales = _data(kind, 5, 48, 9)
     want = encode_x4t_scales(scales)
-    # One expert per chunk, then two experts per chunk (uneven final chunk).
-    for experts_per_chunk in (1, 2):
-        monkeypatch.setattr(
-            x4t_encode,
-            "_CHUNK_BUDGET_BYTES",
-            experts_per_chunk * 48 * (256 * 4 + 9 * x4t_encode._TEMP_BYTES_PER_SCALE),
+    _set_slab_rows(monkeypatch, slab, 9)
+    got = encode_x4t_scales(scales)
+    _assert_same(got, want)
+    _check_planes(scales, got)
+    for plane in got[0] + got[1]:
+        assert plane.untyped_storage().nbytes() == plane.numel() * plane.element_size()
+
+
+def _check_planes(scales, planes) -> None:
+    raw = scales.view(torch.uint8).numpy()
+    for e in range(scales.shape[0]):
+        ref_fixed, ref_words = _reference(raw[e])
+        np.testing.assert_array_equal(planes[0][e].numpy(), ref_fixed)
+        np.testing.assert_array_equal(
+            planes[1][e].to(torch.int64).numpy(), ref_words.astype(np.int64)
         )
-        assert x4t_encode._chunk_experts(48, 9) == experts_per_chunk
-        got = encode_x4t_scales(scales)
-        for a, b in zip(got, want, strict=True):
-            assert len(a) == len(b)
-            for x, y in zip(a, b, strict=True):
-                assert torch.equal(x, y)
 
 
-def test_planes_own_their_storage(monkeypatch):
-    monkeypatch.setattr(x4t_encode, "_CHUNK_BUDGET_BYTES", 1 << 30)
-    assert x4t_encode._chunk_experts(48, 9) >= 4
+def test_tall_expert_is_processed_in_slabs(monkeypatch):
+    # A 2**20-row expert at the position limit exceeds the default slab.
+    assert x4t_encode._slab_rows(2**20, 16) < 2**20
+    assert x4t_encode._slab_rows(2**24, 1) < 2**24
+    scales = _data("typical", 1, 4096, 3)
+    want = encode_x4t_scales(scales)
+    _set_slab_rows(monkeypatch, 16, 3)
+    calls = []
+    original = x4t_encode._encode_slab
+    monkeypatch.setattr(
+        x4t_encode,
+        "_encode_slab",
+        lambda *args: calls.append(args[1]) or original(*args),
+    )
+    got = encode_x4t_scales(scales)
+    assert len(calls) == 4096 // 16
+    _assert_same(got, want)
+    _check_planes(scales, got)
+
+
+def test_histogram_counted_in_row_estimate():
+    assert x4t_encode._HISTOGRAM_BYTES_PER_ROW == (256 + 255) * 4
+    assert x4t_encode._slab_rows(16, 1) % 16 == 0
+
+
+def test_planes_own_their_storage():
     fixed, exceptions = encode_x4t_scales(_data("random", 4, 48, 9))
     for plane in fixed + exceptions:
         assert plane.untyped_storage().nbytes() == plane.numel() * plane.element_size()
