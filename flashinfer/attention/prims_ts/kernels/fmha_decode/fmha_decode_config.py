@@ -304,8 +304,6 @@ _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES = {
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 256, 128, 1, 1),
-    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
-    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 128, 0, 2, 2),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
     (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, BFloat16, 256, 128, 1, 1),
 }
@@ -5106,8 +5104,8 @@ def _resolve_grouped_q_launch_candidates(
         return ()
     cost_kv_width = _grouped_q_cost_kv_width(probe)
     fills_wave = batch_size * num_heads_kv * candidate.q_tiles >= service_capacity
-    # A full grid can still waste a partial final wave, so these profiles
-    # also score multi-wave splits instead of forcing every full grid direct.
+    # Qualified NVFP4 profiles may split to reduce a partial final wave.
+    # Other storage precisions retain their established candidate scope.
     transformed_multi_wave = probe.use_nvfp4_kv and probe.use_fp8_pv
     sm107_smem_transform = (
         is_sm107_compile_target()
@@ -5115,9 +5113,7 @@ def _resolve_grouped_q_launch_candidates(
         and probe.out_dtype == BFloat16
         and probe.uses_fast_smem_nvfp4_transform
     )
-    multi_wave = (
-        transformed_multi_wave and (candidate.tile_size_q >= 48 or fills_wave)
-    ) or (probe.use_fp8_qkv and fills_wave)
+    multi_wave = transformed_multi_wave and (candidate.tile_size_q >= 48 or fills_wave)
     min_loop_iters_per_split = MIN_LOOP_ITERS_PER_SPLIT
     if transformed_multi_wave and candidate.tile_size_q < 48 and fills_wave:
         # Narrow transformed tiles split a full grid only to trim its final
@@ -5358,20 +5354,12 @@ def _apply_auto_grouped_q_mma_config(
         and cfg.use_fp8_pv
         and any(recipe.mma.tile_size_q >= 48 for recipe in supported)
     )
-    has_full_grid_fp8_split_recipe = cfg.use_fp8_qkv and any(
-        recipe.splits_kv > 1 for recipe in supported
-    )
-    if (
-        has_underfilled_q_grid
-        or has_large_q_tile_transformed_recipe
-        or has_full_grid_fp8_split_recipe
-    ):
+    if has_underfilled_q_grid or has_large_q_tile_transformed_recipe:
         selected = select_grouped_q_launch_candidate(supported)
     else:
-        # Every legal Q grid already fills the machine, so splitting cannot
-        # expose otherwise-idle SMs. Compare direct recipes with the same
-        # mainloop-aware score instead of rewarding narrow tiles that reread
-        # the complete KV sequence for each additional Q tile.
+        # Outside the qualified transformed recipes above, retain direct-only
+        # selection when every legal Q grid fills a wave. Compare complete
+        # direct recipes with the existing mainloop-aware score.
         direct = tuple(recipe for recipe in supported if recipe.splits_kv == 1)
         selected = (
             select_grouped_q_direct_wave_candidate(direct)
