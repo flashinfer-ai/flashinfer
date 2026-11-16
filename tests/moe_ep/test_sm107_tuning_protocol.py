@@ -364,6 +364,7 @@ def test_execution_storage_allocation_preserves_staged_state(
     workspace.bind_scalars({"fc1_alpha": scalar})
     storage = Mock()
     storage.data_ptr.return_value = 128
+    storage.device = workspace.device
     scratch = Mock()
     scratch.data_ptr.return_value = 256
     allocate_scratch = Mock(return_value=scratch)

@@ -83,6 +83,12 @@ from .genphase_tail import GenphaseTail
 
 
 @cute.jit
+def _stride_mismatch_trap() -> None:
+    """Stop the launch: a plane's runtime row stride differs from the padded stride the kernel addresses."""
+    llvm.inline_asm(None, [], "trap;", "", has_side_effects=True, is_align_stack=False, asm_dialect=0)
+
+
+@cute.jit
 def st_relaxed_sys_b64(address: Int64, value: Int64) -> None:
     """Single-copy-atomic 8-byte store: one LL word (value in the low half, call tag in the high half)."""
     llvm.inline_asm(
@@ -268,6 +274,8 @@ class GenphaseTokenComm(KernelComponent):
     token_data_ready_region: ClassVar[str] = "genphase.token_comm.token_data_ready"
     token_sf_plain_ready_region: ClassVar[str] = "genphase.token_comm.token_sf_plain_ready"
     count_ll_inbox_region: ClassVar[str] = "genphase.token_comm.count_ll_inbox"
+    ll_reset_ready_region: ClassVar[str] = "genphase.token_comm.ll_reset_ready"
+    ll_reset_done_region: ClassVar[str] = "genphase.token_comm.ll_reset_done"
     plain_sf_ll_region: ClassVar[str] = "genphase.token_comm.plain_sf_ll"
     refine_row_source_ll_region: ClassVar[str] = "genphase.token_comm.refine_row_source_ll"
 
@@ -381,6 +389,9 @@ class GenphaseTokenComm(KernelComponent):
         self.token_padding_block = impl_desc["token_padding_block"]
         self.sf_padding_block = impl_desc["sf_padding_block"]
         self.pusher_cta_count = impl_desc["pusher_cta_count"]
+        if self.pusher_cta_count <= self.sf_pusher_cta_count:
+            # The first sf_pusher_cta_count pushers carry the scale factors; at least one more pushes data.
+            raise ValueError(f"pusher_cta_count must exceed {self.sf_pusher_cta_count}, got {self.pusher_cta_count}.")
         self.refine_participant_groups = impl_desc["refine_participant_groups"]
         self.refine_output_stages = impl_desc["refine_output_stages"]
         self.smem_limit_bytes = impl_desc.get("smem_limit_bytes", self.default_smem_limit_bytes)
@@ -550,9 +561,11 @@ class GenphaseTokenComm(KernelComponent):
     def hidden_sf(self) -> int:
         return self.hidden_size // self.quant_kind.sf_vec_size
 
+    def _row_alignment_elements(self, dtype: type) -> int:
+        return self.plain_row_byte_alignment * 8 // int(dtype.width)
+
     def _padded_row_elements(self, elements: int, dtype: type) -> int:
-        elements_per_alignment = self.plain_row_byte_alignment * 8 // int(dtype.width)
-        return int(round_up(elements, elements_per_alignment))
+        return int(round_up(elements, self._row_alignment_elements(dtype)))
 
     @property
     def plain_activation_row_elements(self) -> int:
@@ -787,13 +800,16 @@ class GenphaseTokenComm(KernelComponent):
         # LL inboxes: one 8-byte word per route, value in the low half and the call
         # tag (epoch + 1) in the high half, written with single-copy-atomic stores so a
         # word is its own readiness flag. Zeroed once at allocation and never reset:
-        # the per-call tag already tells this call's words from any earlier one.
+        # the per-call tag already tells this call's words from any earlier one. Every
+        # LL plane has two halves selected by the call's parity (``_ll_parity``), so a
+        # call writes only the half the previous call did not read.
+        routes_plane = self.world_size * self.routes_per_rank
         workspace.register(
             self.topk_index_inbox_region,
             cutlass.Int64,
-            (self.world_size, self.routes_per_rank),
+            (2, self.world_size, self.routes_per_rank),
             buffer_space="shared",
-            stride=(self.routes_per_rank, 1),
+            stride=(routes_plane, self.routes_per_rank, 1),
             byte_alignment=16,
             reset="zero_on_first_allocate",
         )
@@ -801,9 +817,9 @@ class GenphaseTokenComm(KernelComponent):
             workspace.register(
                 self.topk_score_inbox_region,
                 cutlass.Int64,
-                (self.world_size, self.routes_per_rank),
+                (2, self.world_size, self.routes_per_rank),
                 buffer_space="shared",
-                stride=(self.routes_per_rank, 1),
+                stride=(routes_plane, self.routes_per_rank, 1),
                 byte_alignment=16,
                 reset="zero_on_first_allocate",
             )
@@ -832,12 +848,13 @@ class GenphaseTokenComm(KernelComponent):
             workspace.register(region_name, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
         # Scale-factor rows as LL words, indexed like the plain planes.
         if not self.sf_plain_transport:
+            sf_ll_rank_words = self.max_tokens_per_rank * self.sf_ll_row_words
             workspace.register(
                 self.plain_sf_ll_region,
                 cutlass.Int64,
-                (self.world_size, self.max_tokens_per_rank, self.sf_ll_row_words),
+                (2, self.world_size, self.max_tokens_per_rank, self.sf_ll_row_words),
                 buffer_space="shared",
-                stride=(self.max_tokens_per_rank * self.sf_ll_row_words, self.sf_ll_row_words, 1),
+                stride=(self.world_size * sf_ll_rank_words, sf_ll_rank_words, self.sf_ll_row_words, 1),
                 byte_alignment=128,
                 reset="zero_on_first_allocate",
             )
@@ -845,12 +862,16 @@ class GenphaseTokenComm(KernelComponent):
         workspace.register(
             self.count_ll_inbox_region,
             cutlass.Int64,
-            (self.world_size, self.local_expert_bucket_count),
+            (2, self.world_size, self.local_expert_bucket_count),
             buffer_space="shared",
-            stride=(self.local_expert_bucket_count, 1),
+            stride=(self.world_size * self.local_expert_bucket_count, self.local_expert_bucket_count, 1),
             byte_alignment=16,
             reset="zero_on_first_allocate",
         )
+        if not self.sf_plain_transport:
+            workspace.register(
+                self.ll_reset_ready_region, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset"
+            )
 
     def _register_local_regions(self, workspace: DeviceWorkspace) -> None:
         workspace.register(
@@ -918,8 +939,9 @@ class GenphaseTokenComm(KernelComponent):
             workspace.register(
                 self.refine_row_source_ll_region,
                 cutlass.Int64,
-                (self.worst_case_data_rows,),
+                (2, self.worst_case_data_rows),
                 buffer_space="local",
+                stride=(self.worst_case_data_rows, 1),
                 byte_alignment=16,
                 reset="zero_on_first_allocate",
             )
@@ -946,14 +968,15 @@ class GenphaseTokenComm(KernelComponent):
             self.pushers_done_region,
         ):
             workspace.register(region_name, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset")
-        # Owned by the helper, not the tail reset: a refine group's last (losing) claim is ordered
-        # after nothing the main kernel waits for, so a tail-time reset could race it; the helper
-        # zeroes it before publishing prefix_ready, which every claim acquires first. This leaves
-        # one whole call of margin for the previous call's stragglers (see the TODO at the
-        # exchange's LL write for the assumption behind that margin).
+        # Each call resets its own half before publishing prefix_ready. The other
+        # half stays intact until the previous call's final refine claims retire.
         workspace.register(
-            self.refine_work_counter_region, cutlass.Int32, (1,), buffer_space="local", reset="zero_on_first_allocate"
+            self.refine_work_counter_region, cutlass.Int32, (2,), buffer_space="local", reset="zero_on_first_allocate"
         )
+        if not self.sf_plain_transport:
+            workspace.register(
+                self.ll_reset_done_region, cutlass.Int32, (1,), buffer_space="local", reset="zero_on_first_allocate"
+            )
         # One slot per local expert
         workspace.register(
             self.fc1_sf_ready_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
@@ -1149,8 +1172,16 @@ class GenphaseTokenComm(KernelComponent):
         return self._payload_plane_by_dense_row(device_workspace, self.plain_activation_sf_region)
 
     @cute.jit
-    def dense_sf_ll_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
-        return self._payload_plane_by_dense_row(device_workspace, self.plain_sf_ll_region)
+    def dense_sf_ll_tensor(self, device_workspace: DeviceWorkspace, call_tag: Int32) -> cute.Tensor:
+        """``(world * tokens, words)`` view of the call's half of the SF LL plane, merged as in
+        ``_payload_plane_by_dense_row``."""
+        _, _, _, columns = device_workspace.region(self.plain_sf_ll_region).shape
+        row_elements = device_workspace.stride(self.plain_sf_ll_region)[2]
+        return cute.make_tensor(
+            device_workspace.ptr(self.plain_sf_ll_region)
+            + self._ll_parity(call_tag) * Int32(device_workspace.stride(self.plain_sf_ll_region)[0]),
+            cute.make_layout((self.world_size * self.max_tokens_per_rank, columns), stride=(row_elements, 1)),
+        )
 
     @cute.jit
     def canonical_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
@@ -1227,17 +1258,23 @@ class GenphaseTokenComm(KernelComponent):
         if cutlass.const_expr(args.activation_sf.element_type is not self.activation_sf_dtype):
             raise TypeError(f"activation_sf must be {self.activation_sf_dtype}, got {args.activation_sf.element_type}.")
         # Row addressing uses each plane's own layout, so the padded stride is a
-        # requirement rather than something this component can paper over: a whole
+        # floor rather than something this component can paper over: a whole
         # padded row is bulk-copied, and a tighter caller stride would be read past
-        # its last row. `from_dlpack` unpacks sub-byte tensors, so both strides are
-        # already in logical elements and comparable.
-        for plane_name, plane, row_elements in (
-            ("activation", args.activation, self.plain_activation_row_elements),
-            ("activation_sf", args.activation_sf, self.plain_activation_sf_row_elements),
+        # its last row. A wider stride works if it keeps rows aligned. `from_dlpack`
+        # unpacks sub-byte tensors, so both strides are already in logical elements
+        # and comparable.
+        for plane_name, plane, row_elements, alignment in (
+            ("activation", args.activation, self.plain_activation_row_elements,
+             self._row_alignment_elements(self.activation_dtype)),
+            ("activation_sf", args.activation_sf, self.plain_activation_sf_row_elements,
+             self._row_alignment_elements(self.activation_sf_dtype)),
         ):
             if cutlass.const_expr(isinstance(plane.stride[0], int)):
-                if cutlass.const_expr(plane.stride[0] != row_elements):
-                    raise ValueError(f"{plane_name} needs the padded row stride {row_elements}, got {plane.stride[0]}.")
+                if cutlass.const_expr(plane.stride[0] < row_elements or plane.stride[0] % alignment != 0):
+                    raise ValueError(
+                        f"{plane_name} needs a row stride of at least {row_elements}, a multiple of {alignment}, "
+                        f"got {plane.stride[0]}."
+                    )
 
         self._kernel(
             args.topk_indices,
@@ -1283,6 +1320,22 @@ class GenphaseTokenComm(KernelComponent):
         linear_cta_idx = cluster_idx * Int32(self.launch_cluster_width) + cta_idx_in_cluster
         thread_idx, _, _ = cute.arch.thread_idx()
 
+        # launch() checks the row strides only when they are static; a dynamic layout is
+        # checked here, since every row access below needs at least the padded stride and
+        # aligned rows (aligned 8-byte LL loads, whole-row bulk copies).
+        if linear_cta_idx == Int32(0):
+            if thread_idx == Int32(0):
+                activation_stride = Int64(activation.layout.stride[0])
+                if activation_stride < Int64(self.plain_activation_row_elements):
+                    _stride_mismatch_trap()
+                if activation_stride % Int64(self._row_alignment_elements(self.activation_dtype)) != Int64(0):
+                    _stride_mismatch_trap()
+                activation_sf_stride = Int64(activation_sf.layout.stride[0])
+                if activation_sf_stride < Int64(self.plain_activation_sf_row_elements):
+                    _stride_mismatch_trap()
+                if activation_sf_stride % Int64(self._row_alignment_elements(self.activation_sf_dtype)) != Int64(0):
+                    _stride_mismatch_trap()
+
         # Cluster padding: these CTAs hold no role and are counted by no readiness
         # target, so they leave before allocating anything rather than falling
         # through the whole body. The predicate is CTA-uniform and no barrier here
@@ -1314,6 +1367,12 @@ class GenphaseTokenComm(KernelComponent):
                 sleep_cycles=64,
             )
         cute.arch.sync_threads()
+        if cutlass.const_expr(not self.sf_plain_transport):
+            epoch = self._tail.read_epoch(device_workspace)
+            if (epoch >= Int32(-1)) & (epoch <= Int32(1)):
+                self._reset_sparse_ll_history(
+                    device_workspace, peer_rank_ptr_mapper, linear_cta_idx, thread_idx
+                )
         cute.arch.griddepcontrol_launch_dependents()
 
         if linear_cta_idx < Int32(self.world_size):
@@ -1367,6 +1426,59 @@ class GenphaseTokenComm(KernelComponent):
                 cute.arch.store(sync + Int32(1), Int32(0), sem="relaxed", scope="gpu")
                 calls_done = cute.arch.load(sync, Int32, sem="relaxed", scope="gpu")
                 cute.arch.store(sync, calls_done + Int32(1), sem="relaxed", scope="gpu")
+
+    @cute.jit
+    def _reset_sparse_ll_history(
+        self,
+        workspace: DeviceWorkspace,
+        peer_rank_ptr_mapper: SymmetricBufferDevice,
+        cta_idx: Int32,
+        thread_idx: Int32,
+    ) -> None:
+        """Retire sparse words before a counter cycle reuses their tags."""
+        call_tag = self._call_tag(workspace)
+        if cta_idx == Int32(0):
+            if thread_idx == Int32(0):
+                observed = self._tail.previous_done_observation(workspace)
+                self._tail.wait_previous_done(workspace, observed)
+            cute.arch.sync_threads()
+            # Other calls need not touch inactive words. Clear each half at wrap,
+            # including the half that receives the special nonzero wrap tag.
+            self._clear_sparse_ll_half(workspace, self.plain_sf_ll_region, call_tag, thread_idx)
+            self._clear_sparse_ll_half(workspace, self.refine_row_source_ll_region, call_tag, thread_idx)
+            cute.arch.sync_threads()
+            if thread_idx == Int32(0):
+                cute.arch.fence_acq_rel_sys()
+                address = workspace.ptr(self.ll_reset_ready_region).toint()
+                for peer in cutlass.range_constexpr(self.world_size):
+                    red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(address, Int32(peer), Int64(0)), Int32(1))
+                spin_wait(
+                    workspace.ptr(self.ll_reset_ready_region),
+                    lambda value: value == Int32(self.world_size),
+                    scope="sys",
+                    sleep_cycles=64,
+                )
+                # The tail can finish before idle communication CTAs leave. Keep
+                # this tag outside its reset span until every CTA has seen it.
+                cute.arch.store(workspace.ptr(self.ll_reset_done_region), call_tag, sem="release", scope="gpu")
+        if thread_idx == Int32(0):
+            spin_wait(
+                workspace.ptr(self.ll_reset_done_region),
+                lambda value: value == call_tag,
+                scope="gpu",
+                sleep_cycles=64,
+            )
+        cute.arch.sync_threads()
+
+    @cute.jit
+    def _clear_sparse_ll_half(
+        self, workspace: DeviceWorkspace, region: str, call_tag: Int32, thread_idx: Int32
+    ) -> None:
+        words = workspace.nbytes(region) // 16
+        address = self._ll_half_address(workspace, region, call_tag)
+        pointer = cute.make_ptr(Int64, address, AddressSpace.gmem, assumed_align=8)
+        for word in cutlass.range(thread_idx, words, self.threads_per_cta):
+            cute.arch.store(pointer + word, Int64(0), sem="relaxed", scope="gpu")
 
     # ------------------------------------------------------------------
     # Roles
@@ -1481,28 +1593,26 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
 
         # Every word carries this call's tag, so nothing needs a fence or a ready flag.
-        # TODO(risk, documented not fixed): these words go out at kernel entry with no wait
-        # for the peer to have consumed the previous call's words. If this rank routed to the
-        # peer in the previous call, the previous reduce already waited for the peer's FC2,
-        # which came after the peer's sort read the words. If it routed nothing there, the only
-        # ordering is that the peer's sort CTA reads them a few instructions after sending its
-        # own words, which this rank needs before it can finish the previous call. That is a
-        # forward-progress assumption on a resident CTA, not a data dependency: it holds while
-        # each GPU of the EP group runs this process alone (a resident CTA is never descheduled
-        # for the length of a whole call); time-slicing the GPU with another process could stall
-        # the peer long enough for these words to be overwritten with the next tag, and the
-        # peer's sort would then poll forever (deadlock, not corruption). The same assumption
-        # covers the previous call's last refine claims finishing before this call's helper
-        # resets the work counter. Parity double-buffered inboxes (index by epoch & 1) would
-        # close both without a wait; not done because exclusive deployment makes it unreachable.
+        # These words go out at kernel entry with no wait for the peer, into the half of its
+        # inboxes this call's parity selects; the peer may still be reading the other half for
+        # the previous call. Call k reuses the half of call k-2, whose words the peer read in
+        # its call k-2 communication kernel. That kernel has left before the peer's call k-1
+        # kernel passes entry (the premise the entry wait's ``calls_done`` already relies on);
+        # the call k-1 kernel always sends this rank its counts, zero or not, and this rank's
+        # call k-1 helper waits for them, so this rank's call k kernel, which in turn starts
+        # after its call k-1 kernel has left, writes only after the peer's reads. The same chain
+        # covers the SF rows; the rank-local halves (row sources, refine counter) need only its
+        # first link.
         call_tag = self._call_tag(device_workspace)
+        parity = self._ll_parity(call_tag)
         tag_high = Int64(call_tag) << Int64(32)
         peer_offset = peer_rank_ptr_mapper.map(Int64(0), destination_rank, Int64(0))
         index_slab_address = (
-            device_workspace.tensor(self.topk_index_inbox_region)[local_rank, None].iterator.toint() + peer_offset
+            device_workspace.tensor(self.topk_index_inbox_region)[parity, local_rank, None].iterator.toint()
+            + peer_offset
         )
         count_slab_address = (
-            device_workspace.tensor(self.count_ll_inbox_region)[local_rank, None].iterator.toint() + peer_offset
+            device_workspace.tensor(self.count_ll_inbox_region)[parity, local_rank, None].iterator.toint() + peer_offset
         )
         if cutlass.const_expr(self.apply_topk_at_fc1):
             if cutlass.const_expr(self.exchange_stages_topk_scores):
@@ -1518,7 +1628,8 @@ class GenphaseTokenComm(KernelComponent):
                     cute.recast_ptr(topk_scores.iterator, dtype=cutlass.Int32), cute.make_layout((self.routes_per_rank,))
                 )
             score_slab_address = (
-                device_workspace.tensor(self.topk_score_inbox_region)[local_rank, None].iterator.toint() + peer_offset
+                device_workspace.tensor(self.topk_score_inbox_region)[parity, local_rank, None].iterator.toint()
+                + peer_offset
             )
         for bucket_round in cutlass.range_constexpr(ceil_div(self.local_expert_bucket_count, self.threads_per_cta)):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
@@ -1547,12 +1658,25 @@ class GenphaseTokenComm(KernelComponent):
         epoch = cute.arch.load(device_workspace.ptr(GenphaseTail.epoch_region), Int32, sem="relaxed", scope="gpu")
         tag = epoch + Int32(1)
         # A zero tag would make a never-written (zero-initialized) word look present. The 32-bit
-        # epoch wraps after 2^32 calls (about two weeks of continuous decode), so map that one
-        # call's tag to 2: it differs from both neighbours (-1 before, 1 after), which is all the
-        # protocol needs since only the previous call's words can still sit in an inbox.
+        # epoch wraps after 2^32 calls (about two weeks of continuous decode), and the call at
+        # the wrap needs another nonzero tag. Some inboxes (plain_sf_ll, refine_row_source_ll)
+        # are only rewritten for routed tokens / live rows, so a word may survive many calls:
+        # reuse the tag of the call 2^31 calls back (0x80000000), not one of a nearby call.
         if tag == Int32(0):
-            tag = Int32(2)
+            tag = Int32(-(1 << 31))
         return tag
+
+    @cute.jit
+    def _ll_parity(self, call_tag: Int32) -> Int32:
+        """The LL half a call uses: ``epoch & 1``, read off its tag. The wrap tag 0x80000000
+        gives 1 like the epoch 0xFFFFFFFF it stands for, so the halves keep alternating."""
+        return (call_tag - Int32(1)) & Int32(1)
+
+    @cute.jit
+    def _ll_half_address(self, device_workspace: DeviceWorkspace, region_name: str, call_tag: Int32) -> Int64:
+        """Address of the call's half of an Int64 LL region whose leading mode is the parity."""
+        half_bytes = device_workspace.stride(region_name)[0] * 8
+        return device_workspace.ptr(region_name).toint() + Int64(self._ll_parity(call_tag)) * Int64(half_bytes)
 
     @cute.jit
     def _wire_index_view(self, index_stage: cute.Tensor) -> cute.Tensor:
@@ -1815,8 +1939,9 @@ class GenphaseTokenComm(KernelComponent):
         fence, and the refine is gated by the routing metadata alone.
         """
         pairs = self.sf_ll_live_pairs
-        tag_high = Int64(self._call_tag(device_workspace)) << Int64(32)
-        own_plane_address = device_workspace.ptr(self.plain_sf_ll_region).toint()
+        call_tag = self._call_tag(device_workspace)
+        tag_high = Int64(call_tag) << Int64(32)
+        own_plane_address = self._ll_half_address(device_workspace, self.plain_sf_ll_region, call_tag)
         values = cute.make_rmem_tensor((self.sf_ll_pairs_per_lane,), cutlass.Int64)
 
         for token_round in cutlass.range_constexpr(int(ceil_div(self.max_tokens_per_rank, role_warp_count))):
@@ -1826,8 +1951,9 @@ class GenphaseTokenComm(KernelComponent):
                 any_destination = any_destination | destination_masks[token_round, word]
 
             if any_destination != cutlass.Uint32(0):
-                # The caller's row stride is the padded one `launch` checks, a
-                # multiple of sixteen bytes, so every word read is aligned.
+                # The caller's row stride is the padded one, a multiple of sixteen
+                # bytes, so every word read is aligned: `launch` checks a static
+                # stride, the kernel entry a dynamic one.
                 source_row_address = activation_sf[token, None].iterator.toint()
                 for pair_round in cutlass.range_constexpr(self.sf_ll_pairs_per_lane):
                     pair_idx = Int32(pair_round * 32) + lane_idx
@@ -1993,7 +2119,9 @@ class GenphaseTokenComm(KernelComponent):
             # reset them for the previous call before this call's increments land.
             self._tail.wait_previous_done(device_workspace, previous_done)
             counter_address = device_workspace.ptr(self.token_data_ready_region).toint()
-            red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, lane_idx, Int64(0)), Int32(1))
+            # Lane l signals peers l, l + 32, ...: every rank gets its flag for any world size.
+            for peer in cutlass.range(lane_idx, self.world_size, 32):
+                red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, peer, Int64(0)), Int32(1))
 
     @cute.jit
     def _publish_payload_flags(
@@ -2066,7 +2194,10 @@ class GenphaseTokenComm(KernelComponent):
         # single integer coordinate into a rank-2 layout walks it leftmost-mode
         # fastest, which would classify one route while labelling another; the pair
         # is both the address and the route identity, so the two cannot drift.
-        index_slab_address = device_workspace.tensor(self.topk_index_inbox_region)[source_rank, None].iterator.toint()
+        parity = self._ll_parity(call_tag)
+        index_slab_address = (
+            device_workspace.tensor(self.topk_index_inbox_region)[parity, source_rank, None].iterator.toint()
+        )
         local_expert_begin = local_rank * Int32(self.experts_per_rank)
 
         # All of a chunk's route words are loaded before any tag is tested: polling them
@@ -2113,11 +2244,13 @@ class GenphaseTokenComm(KernelComponent):
 
         gather_index = device_workspace.tensor(self.gather_index_region)
         if cutlass.const_expr(not self.sf_plain_transport):
-            row_source_ll_address = device_workspace.ptr(self.refine_row_source_ll_region).toint()
+            row_source_ll_address = self._ll_half_address(device_workspace, self.refine_row_source_ll_region, call_tag)
         token_metadata = device_workspace.tensor(self.token_src_metadata_region)
         routed_scores = self.fc1_topk_scores_tensor(device_workspace)
         if cutlass.const_expr(self.apply_topk_at_fc1):
-            score_slab_address = device_workspace.tensor(self.topk_score_inbox_region)[source_rank, None].iterator.toint()
+            score_slab_address = (
+                device_workspace.tensor(self.topk_score_inbox_region)[parity, source_rank, None].iterator.toint()
+            )
         dense_row_begin = source_rank * Int32(self.max_tokens_per_rank)
 
         present_zero = Int64(call_tag) << Int64(32)
@@ -2187,7 +2320,7 @@ class GenphaseTokenComm(KernelComponent):
 
         iket.range_push("helper.wait_counts")
         call_tag = self._call_tag(device_workspace)
-        count_inbox_address = device_workspace.ptr(self.count_ll_inbox_region).toint()
+        count_inbox_address = self._ll_half_address(device_workspace, self.count_ll_inbox_region, call_tag)
         iket.range_pop()
 
         iket.range_push("helper.fold")
@@ -2270,7 +2403,12 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
             # This call's refine claims start at zero; the release below publishes the store.
-            cute.arch.store(device_workspace.ptr(self.refine_work_counter_region), Int32(0), sem="relaxed", scope="gpu")
+            cute.arch.store(
+                device_workspace.ptr(self.refine_work_counter_region) + self._ll_parity(call_tag),
+                Int32(0),
+                sem="relaxed",
+                scope="gpu",
+            )
             red_async_add_release_gpu_s32(device_workspace.ptr(self.prefix_ready_region), Int32(1))
         iket.range_pop()
 
@@ -2580,7 +2718,7 @@ class GenphaseTokenComm(KernelComponent):
         expert_table = self._stage_refine_expert_table(device_workspace, smem_base, thread_idx)
         iket.range_pop()
         claim = self._smem_workspace.tensor(self.refine_claim_region, smem_base)
-        work_counter = device_workspace.ptr(self.refine_work_counter_region)
+        work_counter = device_workspace.ptr(self.refine_work_counter_region) + self._ll_parity(sf_tag)
         # Work items are (block, column part), block-major, so the claim field
         # that used to hold the block holds the item.
         parts = self.refine_parts_per_block
@@ -2687,7 +2825,7 @@ class GenphaseTokenComm(KernelComponent):
         source_row = Int32(-1)
         if thread_in_group < live_rows:
             source_row = poll_ll_word(
-                device_workspace.ptr(self.refine_row_source_ll_region).toint()
+                self._ll_half_address(device_workspace, self.refine_row_source_ll_region, sf_tag)
                 + Int64(data_row_begin + thread_in_group) * Int64(8),
                 sf_tag,
             )
@@ -2816,6 +2954,7 @@ class GenphaseTokenComm(KernelComponent):
             source_row,
             live_rows,
             part,
+            sf_tag,
             group_idx,
             thread_in_group,
             group_barrier,
@@ -2877,6 +3016,7 @@ class GenphaseTokenComm(KernelComponent):
         source_row: Int32,
         live_rows: Int32,
         part: Int32,
+        sf_tag: Int32,
         group_idx: Int32,
         thread_in_group: Int32,
         group_barrier: Int32,
@@ -2896,7 +3036,7 @@ class GenphaseTokenComm(KernelComponent):
         block put there. They land in atoms the MMA does read, but only in N
         columns its dynamic instruction extent excludes.
         """
-        ll_sf = self.dense_sf_ll_tensor(device_workspace)
+        ll_sf = self.dense_sf_ll_tensor(device_workspace, sf_tag)
         staging = self._smem_workspace.tensor(self.refine_staging_region, smem_base)
         row_sources = self._smem_workspace.tensor(self.refine_row_source_region, smem_base)
         mbarrier = self._smem_workspace.ptr(self.refine_mbarrier_region, smem_base) + group_idx
@@ -2987,7 +3127,7 @@ class GenphaseTokenComm(KernelComponent):
                 if Int32(w) < live_words:
                     stale = stale | Int32(Int32(words[w] >> Int64(32)) != sf_tag)
             if stale != Int32(0):
-                ll_sf = self.dense_sf_ll_tensor(device_workspace)
+                ll_sf = self.dense_sf_ll_tensor(device_workspace, sf_tag)
                 row_address = ll_sf[row_sources[group_idx, thread_in_group], None].iterator.toint() + Int64(
                     part_word
                 ) * Int64(8)

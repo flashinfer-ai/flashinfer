@@ -17,10 +17,10 @@ next_cutedsl_megamoe/
 
 - Source revision: `70a6878de7852ed837d6a4dfc1572728226fbbc4`.
 - Shared-runtime revision: `1695115c1fb703f4f1d2ad9076944e4876a3ae01`.
-- Source with retained patches: `7a08e1825194461fd17a60adc2fb47ba26af7eb7`,
+- Source with retained patches: `882c348ed290a4186509df57cb89eba6cd3925e9`,
   recorded as `patch_revision` in `export_manifest.json`.
-- Exporter: `export_src.py` at the shared-runtime revision above,
-  SHA-256 `3bda4e9bfd5184d9051f3eda17bbbdc0203675e9959459bbc9e2d2629b48d2af`.
+- Exporter: `export_src.py` at the retained-patch revision above,
+  SHA-256 `d71f28ed0d4028758e8024e831c049726923f112d30d33447be2db74149e89b5`.
 - Entry points: `RubinInferenceMegaMoE` and `RubinInferenceGenphaseMegaMoE`.
 - Exported Python files: 69, including 11 generated package initializers.
 
@@ -112,5 +112,31 @@ require 32 bytes.
 settings have distinct compiled names, split-CTA FC1 scores follow the selected
 routing-weight position, and deduplicated reduction uses 128-bit output stores.
 Inference rejects CLC work IDs because its communication and reset protocol
-requires a fixed persistent CTA set. The default kernel names are unchanged;
-deduplicated reduction has a new output-store cache suffix.
+requires a fixed persistent CTA set. Ordinary kernel names are unchanged.
+Deduplicated reduction has a distinct output-store cache suffix. GenPhase
+names include `_llparity` because its LL workspace layout changed.
+
+
+## Communication lifetime and batch-invariant paths
+
+GenPhase alternates two halves of its LL inboxes and refine counter. This
+keeps a new call from overwriting words a peer still reads from the preceding
+call. Call tags avoid zero at epoch wrap, and payload-ready notifications
+cover every peer above 32 ranks as well. Workspace sizing includes both halves;
+they are zeroed on allocation and remain outside the per-call reset spans.
+
+Sparse LL words are cleared in the selected half at counter rollover, with
+an all-rank barrier before publication. This prevents an inactive word from
+matching a tag reused by the next counter cycle. The SF-plain path needs no
+rollover clear.
+
+The export retains FlashInfer's opt-in batch-invariant activation, quantization
+and ordered-reduction recipes for NVFP4, MXFP4 and MXFP8. Their fixed instruction
+N, two-CTA split, activation signature and compiled identity are preserved.
+GenPhase uses the ordinary BF16 combine wire for these ordered reductions.
+The standard temporary buffer is prepared with the other local allocations
+before any rank enters the symmetric heap.
+
+These compatibility branches import `flashinfer.moe_ep.batch_invariant`.
+The composed exporter's external-module allowlist includes `flashinfer`;
+those modules stay in FlashInfer and are not copied into `src/`.

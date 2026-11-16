@@ -139,6 +139,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         self._validate_desc_inputs(problem_desc, impl_desc)
 
         self.quant_kind = QuantKind(problem_desc["quant_kind"])
+        self.batch_invariant = bool(problem_desc.get("batch_invariant", False))
         self.a_dtype = self.quant_kind.weight_dtype
         self.b_dtype = self.quant_kind.activation_dtype
         self.sf_dtype = self.quant_kind.sf_dtype
@@ -1373,10 +1374,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
         thread_mma_sfb = tiled_mma_sfb.get_slice(self.mma_cta_index)
         real_b, _ = kernel_extension.get_gmem_tensor("b", template_b_tensor, work_tile)
         real_sfb, _ = kernel_extension.get_gmem_tensor("sfb", template_sfb_tensor, work_tile)
-        if cutlass.const_expr(self.use_2cta_instrs):
+        if cutlass.const_expr(self.use_2cta_instrs and not self.batch_invariant):
             if not self.is_leader_cta:
                 load_shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
-                    valid_tokens_in_tile=work_tile.valid_tokens_in_cta_tile, mma_tiler_n=self.mma_tiler_mnk[1]
+                    valid_tokens_in_tile=(Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile), mma_tiler_n=self.mma_tiler_mnk[1]
                 )
                 real_b = cute.domain_offset((load_shift, 0, 0), real_b)
         global_b = cute.local_tile(real_b, cute.slice_(mma_tiler_mnk, (0, None, None)), (None, None, None))
@@ -1707,7 +1708,10 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
                 # `compute_non_leader_cta_load_shift` does for the tiled TMA legs.
                 # Rounding to sixteen keeps that midpoint a multiple of eight, so
                 # every run stays aligned to its 256-bit index load.
-                cta_row_base = self.mma_cta_index * (round_up(work_tile.valid_tokens_in_cta_tile, 16) // Int32(2))
+                if cutlass.const_expr(self.batch_invariant):
+                    cta_row_base = self.mma_cta_index * Int32(self.cta_tile_n // self.mma_cta_count)
+                else:
+                    cta_row_base = self.mma_cta_index * (round_up(work_tile.valid_tokens_in_cta_tile, 16) // Int32(2))
                 cta_valid_rows = work_tile.valid_tokens_in_cta_tile - cta_row_base
                 index_runs = cute.zipped_divide(
                     cute.domain_offset((tile_pool_base + cta_row_base,), gather_index), (self.gather_index_load_rows,)
@@ -1831,7 +1835,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             partitioned_tmem_sfb,
         ) = views
         use_n128_sfb_mapping = self._mma_use_n128_sfb_mapping(quant_kind, work_tile)
-        valid_tokens_in_cta_tile = work_tile.valid_tokens_in_cta_tile
+        valid_tokens_in_cta_tile = (Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile)
         if use_n128_sfb_mapping:
             next_ab_pipeline_state = ab_pipeline_state.clone()
             next_ab_pipeline_state.advance()
@@ -1946,7 +1950,7 @@ class BlockScaledSwapAbFc12MainloopGenSpecialized(SharedKindMainloopMixin, Kerne
             partitioned_tmem_sfb,
         ) = views
         use_n128_sfb_mapping = self._mma_use_n128_sfb_mapping(quant_kind, work_tile)
-        valid_tokens_in_cta_tile = work_tile.valid_tokens_in_cta_tile
+        valid_tokens_in_cta_tile = (Int32(self.cta_tile_n) if cutlass.const_expr(self.batch_invariant) else work_tile.valid_tokens_in_cta_tile)
         for k_tile_idx in cutlass.range(k_tile_count, unroll=1):
             weight_pipeline.consumer_wait(weight_pipeline_state)
             token_pipeline.consumer_wait(token_pipeline_state)

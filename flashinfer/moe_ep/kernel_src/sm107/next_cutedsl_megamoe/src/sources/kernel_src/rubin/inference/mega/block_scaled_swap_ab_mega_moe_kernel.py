@@ -439,7 +439,8 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
         else:
             self._topk_reduce = TopkReduce(
                 self.hidden_size, self.topk, self.combine_format,
-                num_experts=self.expert_count, shared_term=self.reduce_shared_output
+                num_experts=self.expert_count, shared_term=self.reduce_shared_output,
+                batch_invariant=bool(problem_desc.get("batch_invariant", False))
             )
 
     def _validate_cta_partition(self) -> None:
@@ -800,6 +801,14 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             else "x".join(str(dimension) for dimension in self.fallback_cluster_shape_mn)
         )
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        bi_enabled = bool(getattr(self.epilogue, "batch_invariant", False))
+        bi_variant = getattr(self.epilogue, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             f"sm107_block_scaled_swap_ab_mega_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
@@ -814,7 +823,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
             f"fallbackclusters{self.fallback_cluster_count}_"
             f"sched{self.schedule_mode}_hint{self.hint}_pad{self.token_padding_block}x{self.sf_padding_block}_"
             f"work{self.work_id_mode}_"
-            f"singlectareset{int(self.token_comm.tail_reset_single_cta)}_"
+            f"singlectareset{int(False if self.combine_dedup else self.token_comm.tail_reset_single_cta)}_"
             f"fc2store{'tma' if self.epilogue.fc2_use_tma else 'ublk' if self.epilogue.fc2_use_ublk else 'stg'}_"
             f"fc2tmastages{self.epilogue.fc2_tma_stages}_"
             f"epiflag{epi_flags}_clusters{self.launch_cluster_count}_ctas{self.mixed_cga_config.total_cta_cnt}_"
@@ -849,6 +858,7 @@ class BlockScaledSwapAbMegaMoeKernel(SharedExpertKernelMixin, KernelClass):
                 ) else ""
             )
             + ("_dedupout128" if self.combine_dedup else "")
+            + bi_suffix
             + self._shared_name_suffix()
             # The tmp buffer is a third pointer operand, an ABI change: it keys the compiled kernel and its AOT symbol.
             + ("_tmpbuf_v1" if self.separate_tmp_buffer else "")

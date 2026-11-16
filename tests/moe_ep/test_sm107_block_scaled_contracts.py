@@ -923,3 +923,57 @@ def test_native_inference_rejects_clc_before_launch(monkeypatch):
         ValueError, match="inference requires grid_stride or atomic_counter"
     ):
         _native_inference_kernel(monkeypatch, work_id_mode="cluster_launch_control")
+
+
+def test_native_dedup_build_has_its_own_compiled_identity(monkeypatch):
+    ordinary = _native_inference_kernel(
+        monkeypatch, token_back_mode="reuse_dispatch_warps"
+    )
+    dedup = _native_inference_kernel(
+        monkeypatch, token_back_mode="reuse_dispatch_warps", combine_dedup=True
+    )
+    assert ordinary.name() != dedup.name()
+    assert ordinary._aot_symbol_name() != dedup._aot_symbol_name()
+
+
+@pytest.mark.parametrize("world", [1, 4, 16, 32, 64])
+@pytest.mark.parametrize("early", [False, True])
+def test_genphase_ll_halves_have_disjoint_storage(monkeypatch, world, early):
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda size: 128 // size)
+    cfg = _config(
+        num_total_experts=world * 4,
+        world_size=world,
+        hidden=512,
+        intermediate=256,
+        max_tokens_per_rank=17,
+        num_topk=3,
+        quant_kind="mxfp8_e4m3",
+        kernel_variant="genphase",
+        cluster_shape_mn=(4, 1),
+        fc2_use_bulk=True,
+        apply_routing_weights_before_fc2=early,
+    )
+    kernel = Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    workspace, communication = kernel._device_workspace, kernel.token_comm
+    regions = [
+        communication.topk_index_inbox_region,
+        communication.count_ll_inbox_region,
+        communication.plain_sf_ll_region,
+        communication.refine_row_source_ll_region,
+    ]
+    if early:
+        regions.append(communication.topk_score_inbox_region)
+    for name in regions:
+        region = workspace.region(name)
+        assert region.shape[0] == 2
+        assert region.reset == "zero_on_first_allocate"
+        half_bytes = workspace.stride(name)[0] * 8
+        assert workspace.nbytes(name) == 2 * half_bytes
+        assert workspace.offset(name) >= workspace.tail_reset_bytes(region.buffer_space)
+    assert workspace.region(communication.refine_work_counter_region).shape == (2,)
+    ready = workspace.region(communication.ll_reset_ready_region)
+    done = workspace.region(communication.ll_reset_done_region)
+    assert ready.reset == "tail_reset"
+    assert done.reset == "zero_on_first_allocate"
+    assert workspace.offset(done.name) >= workspace.tail_reset_bytes("local")
+    assert "_llparity" in kernel.name()

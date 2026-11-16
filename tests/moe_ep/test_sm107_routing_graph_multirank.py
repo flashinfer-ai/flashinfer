@@ -78,6 +78,8 @@ def _check_sparse_to_dense_graph_multirank(
     *,
     topk_override=None,
     remote_experts_only=False,
+    initial_epoch=None,
+    graph_replays=65,
 ):
     """Check graph replay against the oracle after poisoning combine and output.
 
@@ -188,6 +190,24 @@ def _check_sparse_to_dense_graph_multirank(
             launch()
         _barrier()
 
+        if initial_epoch is not None:
+            workspace = ws.kernel._device_workspace
+            tail = ws.kernel.tail
+            offset = workspace.offset(tail.epoch_region)
+            ws.local_workspace[offset : offset + 4].view(torch.int32).fill_(
+                initial_epoch
+            )
+            offset = workspace.offset(ws.kernel.token_comm.call_sync_region)
+            calls = ws.local_workspace[offset : offset + 8].view(torch.int32)
+            calls[0] = initial_epoch
+            calls[1] = 0
+            phase = initial_epoch & 3
+            offset = workspace.offset(tail.signal_region)
+            signals = ws.shared_workspace[offset : offset + 8].view(torch.int32)
+            signals[0] = world if phase in (1, 2) else 0
+            signals[1] = world if phase in (2, 3) else 0
+            _barrier()
+
         states = ("dense129", "empty", "tail", "holes", "asymmetric", "restore")
         for step, state in enumerate(states):
             ids = (base_ids + 5 * step) % experts
@@ -231,10 +251,32 @@ def _check_sparse_to_dense_graph_multirank(
             # Peers write the poisoned buffers. Finish poisoning on EVERY rank
             # before any peer starts, or the diagnostic itself introduces a race.
             _barrier()
+            if initial_epoch is not None:
+                region = ws.kernel.token_comm.count_ll_inbox_region
+                offset = workspace.offset(region)
+                counts = (
+                    ws.shared_workspace[offset : offset + workspace.nbytes(region)]
+                    .view(torch.int64)
+                    .view(2, world, -1)
+                )
+                parity = (initial_epoch + step) & 1
+                previous_half = counts[1 - parity].clone()
             graph.replay()
             torch.cuda.synchronize()
             first = output.clone()
-            for _ in range(64):
+            if initial_epoch is not None:
+                tag = ((initial_epoch + step + 1 + (1 << 31)) % (1 << 32)) - (1 << 31)
+                tag = -(1 << 31) if tag == 0 else tag
+                valid = torch.tensor(
+                    int(torch.all((counts[parity] >> 32) == tag).item())
+                    & int(torch.equal(counts[1 - parity], previous_half)),
+                    device="cuda",
+                )
+                dist.all_reduce(valid, op=dist.ReduceOp.MIN)
+                assert valid.item(), (
+                    "LL publication changed the wrong half or used a stale tag"
+                )
+            for _ in range(graph_replays - 1):
                 graph.replay()
             torch.cuda.synchronize()
             inactive = ~((ids >= 0) & (ids < experts)).any(dim=1)
@@ -306,4 +348,19 @@ def test_genphase_large_topk_remote_graph(ep_runtime, topk, early):
         early,
         topk_override=topk,
         remote_experts_only=True,
+    )
+
+
+@pytest.mark.parametrize("initial_epoch", [-2, (1 << 31) - 2])
+@pytest.mark.parametrize("early", [False, True])
+def test_genphase_graph_crosses_epoch_boundaries(ep_runtime, initial_epoch, early):
+    _check_sparse_to_dense_graph_multirank(
+        ep_runtime,
+        "genphase",
+        "mxfp8_e4m3",
+        4,
+        129,
+        early,
+        initial_epoch=initial_epoch,
+        graph_replays=1,
     )

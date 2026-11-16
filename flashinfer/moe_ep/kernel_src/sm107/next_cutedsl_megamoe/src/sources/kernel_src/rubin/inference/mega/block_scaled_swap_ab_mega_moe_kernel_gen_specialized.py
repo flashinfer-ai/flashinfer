@@ -384,7 +384,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 # bulk reduce-add.
                 "token_back_push_data": False,
                 # The standalone reduce below polls the self-validating combine plane.
-                "combine_ll_encoded": not self.reduce_topk_in_kernel and self.topk <= 31,
+                "combine_ll_encoded": not self.reduce_topk_in_kernel and self.topk <= 31 and not bool(problem_desc.get("batch_invariant", False)),
                 "fc1_epi_flag_batch": self.epi_flag_batches[0],
                 "fc2_epi_flag_batch": self.epi_flag_batches[1],
                 **({"die_aware": self.die_aware} if self.die_aware != "off" else {}),
@@ -420,7 +420,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         self._device_workspace = self._build_device_workspace()
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
         self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel
-        if self.epilogue.combine_ll_encoded != (not self.reduce_topk_in_kernel and self.topk <= 31):
+        if self.epilogue.combine_ll_encoded != (not self.reduce_topk_in_kernel and self.topk <= 31 and not bool(problem_desc.get("batch_invariant", False))):
             raise ValueError("The standalone top-k reduce expects the self-validating bf16 combine plane.")
         self._check_shared_tile_k()
         self._topk_reduce = (
@@ -432,6 +432,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 self.combine_format,
                 ll_encoded=self.epilogue.combine_ll_encoded,
                 num_experts=self.expert_count,
+                batch_invariant=bool(problem_desc.get("batch_invariant", False)),
                 shared_term=self.reduce_shared_output,
                 outlive_producer=self.shared_expert,
             )
@@ -706,6 +707,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
         tile = "x".join(str(dimension) for dimension in self.mma_tiler_mnk)
         cluster = "x".join(str(dimension) for dimension in self.cluster_shape_mn)
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        bi_enabled = bool(getattr(self.epilogue, "batch_invariant", False))
+        bi_variant = getattr(self.epilogue, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         # grouped / phase_interleave names (and so their AOT symbols) carry no decode or die tag.
         schedule = (
             f"scheddecode_lead{self.decode_lead}"
@@ -734,6 +743,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
             f"claimgate{int(self.claim_gate_on_tma_a)}_sfplain{int(self.token_comm.sf_plain_transport)}_"
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
             + ("_dlb_v1" if self.helper_expert_count > 0 else "")
+            + "_llparity"
+            + bi_suffix
             + self._shared_name_suffix()
             # The shared epilogue bakes the SiTU betas and the tanh sigmoid in at codegen time, so they must key the
             # compiled kernel; only non-default values change the name, so SwiGLU kernels keep their keys.
