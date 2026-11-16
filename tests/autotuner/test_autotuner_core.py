@@ -1813,17 +1813,15 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
         use_cold_l2_cache=True,
         cuda_graph_profile_replays=2,
     )
-    allocations = []
-    original_empty = torch.empty
+    flushes = []
+    original_make_l2_flush = autotuner_module.make_l2_flush
 
-    def tracked_empty(*args, **kwargs):
-        result = original_empty(*args, **kwargs)
-        if kwargs.get("dtype") == torch.int8:
-            allocations.append((result.numel(), result.device))
-        return result
+    def tracked_make_l2_flush(num_bytes, device):
+        flushes.append((num_bytes, device))
+        return original_make_l2_flush(num_bytes, device)
 
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
-    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(autotuner_module, "make_l2_flush", tracked_make_l2_flush)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
@@ -1831,7 +1829,7 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
     latency = tuner._profile_single_kernel(runner, inputs, 0, config)
 
     assert latency >= 0
-    assert allocations == [(8192, inputs[0].device)]
+    assert flushes == [(8192, inputs[0].device)]
 
 
 class _CudaAddRunner(DummyRunner):
@@ -1945,7 +1943,7 @@ def test_cold_chain_profiling_policy_labels():
     assert l2_policy(replace(chain, profile_arena_input_indices=())) == "cold"
     assert l2_policy(replace(chain, use_cold_l2_cache=False)) == "hot"
     assert l2_policy(gemm_base._BF16_GEMM_SM100_TUNING_CONFIG) == "cold-chain:8"
-    assert l2_policy(gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG) == "cold"
+    assert l2_policy(gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG) == "cold-chain:16"
 
 
 def test_tuning_overrides_keep_cold_chain():

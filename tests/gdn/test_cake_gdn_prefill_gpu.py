@@ -288,7 +288,20 @@ def _launch_raw_indexed_prefill(case):
     major, minor = torch.cuda.get_device_capability(case["q"].device)
     arch = cake_gdn.arch_for_compute_capability(major, minor)
     route = _public_route(case)
-    entry = cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+    empty_state = torch.empty(1, dtype=case["state_dtype"], device=case["q"].device)
+    checkpoints = case["state_checkpoints"] if case["checkpoint_every"] else empty_state
+    # The flavor the public launch would pick for these buffers: a padded pool whose
+    # slot stride is not a 16-byte multiple runs the guarded flavor.
+    aligned = prefill_mod._cake_gdn_state_vec_aligned(
+        (
+            (case["initial_state"], int(case["initial_state"].stride(0))),
+            (case["output_state"], int(case["output_state"].stride(0))),
+        ),
+        checkpoints,
+    )
+    entry = cake_gdn.load_cake_gdn_kernel(
+        route.variant_name, arch, **({} if aligned else {"state_vec_aligned": False})
+    )
     num_o_heads = max(case["num_q_heads"], case["num_v_heads"])
     dvsplit = route.route_id.endswith(".dvsplit")
     total_tiles = len(case["seq_lens"]) * num_o_heads * (2 if dvsplit else 1)
@@ -300,7 +313,6 @@ def _launch_raw_indexed_prefill(case):
         total_tiles, active_clusters, dvsplit, max(case["seq_lens"])
     )
     empty_i32 = torch.empty(1, dtype=torch.int32, device=case["q"].device)
-    empty_state = torch.empty(1, dtype=case["state_dtype"], device=case["q"].device)
     workspace = torch.empty(grid_x * 512, dtype=torch.uint8, device=case["q"].device)
     entry(
         case["q"],
@@ -313,7 +325,7 @@ def _launch_raw_indexed_prefill(case):
         case["state_indices"],
         case["initial_state"],
         case["output_state"],
-        case["state_checkpoints"] if case["checkpoint_every"] else empty_state,
+        checkpoints,
         case["checkpoint_cu_starts"] if case["checkpoint_every"] else empty_i32,
         workspace,
         int(case["initial_state"].stride(0)),
@@ -1291,6 +1303,106 @@ def test_public_cake_gdn_prefill_raw_ffi_bf16_indexed_checkpoint_b7_t421_noncomp
             atol=0,
             rtol=0,
         )
+
+
+@pytest.mark.parametrize("layout", ("unused_output_off_by_one", "padded_pool"))
+def test_public_cake_gdn_prefill_state_flavor_is_decided_on_the_launched_buffers(
+    monkeypatch, layout
+):
+    """The prefill state flavor is decided on the buffers and slot strides the entry gets.
+
+    A stateless call (no initial state, ``output_final_state=False``) ignores its
+    ``output_state`` and launches the sentinel, so a misaligned ``output_state`` keeps
+    the aligned flavor and the same output bits as a call without it; an indexed pool
+    whose slot stride is not a 16-byte multiple takes the guarded flavor.
+    """
+
+    if layout == "padded_pool":
+        case = _make_case(
+            seq_lens=(64, 37),
+            indexed=True,
+            state_dtype=torch.bfloat16,
+            state_pool_padding=257,
+        )
+        stateful, expect_aligned = True, False
+        initial_state = case["initial_state"].clone()
+        expected_out, _, _ = _reference(case, initial_state)
+    else:
+        # The shipped stateless single-chunk key (see the absent-gates test).
+        case = _make_case(
+            seq_lens=(64,) * 4, num_q_heads=4, num_k_heads=4, num_v_heads=8
+        )
+        case["initial_state"] = None
+        dense = case["output_state"]
+        backing = torch.empty(dense.numel() + 4, dtype=dense.dtype, device="cuda")
+        case["output_state"] = backing[1 : 1 + dense.numel()].view(dense.shape)
+        assert case["output_state"].data_ptr() % 16 != 0
+        stateful, expect_aligned = False, True
+
+    def launch(output_state):
+        return chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=case["g"],
+            beta=case["beta"],
+            scale=case["scale"],
+            initial_state=case["initial_state"],
+            output_final_state=stateful,
+            cu_seqlens=case["cu_seqlens"],
+            cu_seqlens_cpu=_host_cu_seqlens(case["seq_lens"]),
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            output_state=output_state,
+            use_cp=False,
+            state_indices=case["state_indices"],
+            backend="cake_gdn",
+        )
+
+    if not stateful:
+        launch(None)
+        torch.cuda.synchronize()
+        expected_out = case["output"].clone()
+        case["output"].fill_(float("nan"))
+    decisions, launches = [], []
+    rule = prefill_mod._cake_gdn_state_vec_aligned
+    load = cake_gdn.load_cake_gdn_kernel
+
+    def deciding(slot_states, checkpoints):
+        aligned = rule(slot_states, checkpoints)
+        decisions.append((slot_states, checkpoints, aligned))
+        return aligned
+
+    def loading(name, arch, **kwargs):
+        entry = load(name, arch, **kwargs)
+
+        def launching(*args):
+            launches.append((kwargs.get("state_vec_aligned", True), args))
+            return entry(*args)
+
+        return launching
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_state_vec_aligned", deciding)
+    monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", loading)
+    launch(case["output_state"])
+    torch.cuda.synchronize()
+    ((slot_states, checkpoints, aligned),) = decisions
+    ((flavor, args),) = launches
+    assert aligned is expect_aligned and flavor is expect_aligned, (aligned, flavor)
+    (initial, initial_stride), (output, output_stride) = slot_states
+    # Entry ABI: initial state, output state, checkpoints at 8..10, slot strides at 13, 14.
+    assert args[8] is initial and args[9] is output and args[10] is checkpoints
+    assert (args[13], args[14]) == (initial_stride, output_stride)
+    if stateful:
+        assert initial is case["initial_state"] and output is case["output_state"]
+        torch.testing.assert_close(
+            case["output"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+    else:
+        # Both state buffers are the one-element sentinel.
+        assert output is not case["output_state"] and output.numel() == 1
+        assert initial.numel() == 1
+        assert torch.equal(case["output"], expected_out)
 
 
 def test_public_cake_gdn_prefill_api_bf16_indexed_checkpoint_b5_t4296_live_matches_independent_recurrence():

@@ -1,13 +1,18 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The sampling class's entries of the mode's registry (:data:`flashinfer.batch_invariant.CLASSES`): the class name and
+"""The sampling classes' entries of the mode's registry (:data:`flashinfer.batch_invariant.CLASSES`): the class name and
 the fingerprint behind ``fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])``, ``fingerprint("log_softmax",
-...)`` and ``fingerprint("log_probs", ...)``.
+...)``, ``fingerprint("log_probs", ...)``, ``fingerprint("sampling_from_probs", N=, dtype=)`` and
+``fingerprint("sampling_from_logits", N=, dtype=)``.
 
-The three APIs run one class, ``lse.row``, whose specification is a function of the vocabulary ``N`` (the two row
+The first three APIs run one class, ``lse.row``, whose specification is a function of the vocabulary ``N`` (the two row
 trees), the input dtype (the output conversion of the probabilities; the leaves of a 16-bit input are its exact
 widenings, so ``softmax`` with ``out_dtype=torch.float32`` is the fp32 input's specification) and whether a temperature
-enters the scale (``c = LOG2E`` or ``div(LOG2E, T)``)."""
+enters the scale (``c = LOG2E`` or ``div(LOG2E, T)``). The two samplers run the draw class ``sample.icdf.v1``
+(``draw_spec.py``): its specification is a function of the vocabulary (the sum tree and the prefix nodes read from it)
+and of whether the weights are the given probabilities or the ``lse.row`` weights of the logits; the input dtype is a
+validated dimension that enters nothing (the leaves of a 16-bit input are its exact widenings and the draw converts no
+output)."""
 
 from __future__ import annotations
 
@@ -51,13 +56,37 @@ def _lse_row_fingerprint(N: int, dtype, temperature, out_dtype=None) -> str:
     return spec_fingerprint(int(N), in_fmt, bool(temperature))
 
 
+def _draw_fingerprint(N: int, dtype, from_logits: bool = False) -> str:
+    from .draw_spec import spec_fingerprint
+
+    in_fmt = _in_fmt(dtype)
+    return spec_fingerprint(int(N), bool(from_logits), in_fmt)
+
+
+def _draw_probs_fingerprint(N: int, dtype) -> str:
+    return _draw_fingerprint(N, dtype, False)
+
+
+def _draw_logits_fingerprint(N: int, dtype) -> str:
+    return _draw_fingerprint(N, dtype, True)
+
+
 def register(classes: Dict[str, Any], class_info: Any) -> None:
-    """Add the sampling class to the mode's registry (called by ``flashinfer.batch_invariant`` at import): ``softmax``,
+    """Add the sampling classes to the mode's registry (called by ``flashinfer.batch_invariant`` at import): ``softmax``,
     ``log_softmax`` and ``log_probs`` take the vocabulary ``N``, the input ``dtype`` and whether a ``temperature`` is
-    given; ``softmax`` optionally ``out_dtype`` (f32: the probabilities before the output conversion)."""
+    given; ``softmax`` optionally ``out_dtype`` (f32: the probabilities before the output conversion);
+    ``sampling_from_probs`` and ``sampling_from_logits`` (the draw class) take ``N`` and the input ``dtype``."""
     dims = ("N", "dtype", "temperature")
     classes["softmax"] = class_info(
         "lse.row", dims, _lse_row_fingerprint, ("out_dtype",)
     )
     classes["log_softmax"] = class_info("lse.row", dims, _lse_row_fingerprint)
     classes["log_probs"] = class_info("lse.row", dims, _lse_row_fingerprint)
+    # the inverse-CDF draw (draw_api.py): one class with two weight forms (the given probabilities / the lse.row weights
+    # of the logits), hence two fingerprints per vocabulary; the input dtype enters nothing
+    classes["sampling_from_probs"] = class_info(
+        "sample.icdf.v1", ("N", "dtype"), _draw_probs_fingerprint
+    )
+    classes["sampling_from_logits"] = class_info(
+        "sample.icdf.v1", ("N", "dtype"), _draw_logits_fingerprint
+    )

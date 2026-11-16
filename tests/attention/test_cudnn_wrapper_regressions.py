@@ -1215,9 +1215,7 @@ def test_decode_rebinds_sinks_without_repreparing(monkeypatch, strided):
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize(
     "kind,unsupported",
-    # Ragged cuDNN prefill supports windows; the paged wrapper still rejects them.
-    [("paged", dict(window_left=4))]
-    + [
+    [
         (kind, unsupported)
         for kind in ("paged", "ragged")
         for unsupported in (
