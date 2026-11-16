@@ -278,7 +278,7 @@ copy. A step is one launch that reads its count on the device, so it needs no ho
 CUDA graph. A prefill takes the slot's state as a chunk boundary (any open rows are discarded), runs the sequence's whole
 chunks through the chunked prefill kernel, which writes the state at the last boundary to the slot, and its tail through the
 step kernel, which leaves the tail's rows cached. A slot whose state the caller replaced since the class last wrote it (a
-new request) is seen by the stamp and starts a new chunk; a caller that resets a slot after a request shorter than 16 tokens
+new request) is seen by the stamp and starts a new chunk; a caller that loads a state with the same first eight values per head into a slot with open rows (a reset after a request shorter than 16 tokens, a saved boundary state loaded back)
 must prefill the new request with more than one token, since a one-token call is a decode step and that slot's stamp has not
 moved, or call `flashinfer.batch_invariant.kda.api.recurrent_kda_batch_invariant_reset(pool, slots)`, the explicit reset. The
 call shape decides for every sequence of a call: in a prefill call a sequence with a single token also starts from its slot's

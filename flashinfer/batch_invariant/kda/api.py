@@ -22,9 +22,10 @@ pool (:mod:`.pool`). Call shapes:
 
 A prefill into a slot discards whatever open rows the slot had (its state is taken as a chunk boundary), which is why
 a chunked prefill cuts at multiples of 16. A slot whose state the caller replaced since the class last wrote it (a new
-request loaded into the slot) is recognised by a stamp of its first values and starts a new chunk; the one case the
-stamp cannot see is a slot reset after a request shorter than 16 tokens, which never moved its boundary state: such a
-slot's next request must be prefilled with more than one token, since a one-token call is a decode step.
+request loaded into the slot) is recognised by a stamp of its first values and starts a new chunk; what the stamp
+cannot see is a state replaced by one with the same first eight values per head while the slot has open rows (a slot
+reset after a request shorter than 16 tokens, which never moved its boundary state, or a saved boundary state loaded
+back): such a slot's next request must be prefilled with more than one token, since a one-token call is a decode step.
 Every slot index must be unique and in range: a prefill checks it, a decode step (which reads nothing back to the
 host) does not, as for the operator's other state-pool routes, and its ``cu_seqlens`` are taken to be
 ``arange(N + 1)``. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
