@@ -1518,6 +1518,7 @@ def top_p_sampling_from_probs(
     return_valid: bool = False,
     *,
     batch_invariant: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-p (nucleus) sampling from probabilities.
     This operator implements GPU-based rejection sampling without explicit sorting.
@@ -1600,6 +1601,11 @@ def top_p_sampling_from_probs(
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
+        (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
+        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
 
     Returns
     -------
@@ -1651,7 +1657,11 @@ def top_p_sampling_from_probs(
         )
 
         return top_p_sampling_from_probs_batch_invariant(
-            probs, top_p, indices, generator, seed, offset, return_valid
+            probs, top_p, indices, generator, seed, offset, return_valid, out=out
+        )
+    if out is not None:
+        raise ValueError(
+            "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
     return get_sampling_module().top_p_sampling_from_probs(
         probs,
@@ -1678,6 +1688,7 @@ def top_k_sampling_from_probs(
     return_valid: bool = False,
     *,
     batch_invariant: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k sampling from probabilities.
     This operator implements GPU-based rejection sampling without explicit sorting.
@@ -1760,6 +1771,11 @@ def top_k_sampling_from_probs(
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
+        (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
+        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
 
     Returns
     -------
@@ -1810,7 +1826,11 @@ def top_k_sampling_from_probs(
         )
 
         return top_k_sampling_from_probs_batch_invariant(
-            probs, top_k, indices, generator, seed, offset, return_valid
+            probs, top_k, indices, generator, seed, offset, return_valid, out=out
+        )
+    if out is not None:
+        raise ValueError(
+            "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
     return get_sampling_module().top_k_sampling_from_probs(
         probs,
@@ -1837,6 +1857,7 @@ def min_p_sampling_from_probs(
     return_valid: bool = False,
     *,
     batch_invariant: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities.
 
@@ -1920,6 +1941,11 @@ def min_p_sampling_from_probs(
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
+        (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
+        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
 
     Returns
     -------
@@ -1965,7 +1991,11 @@ def min_p_sampling_from_probs(
         )
 
         return min_p_sampling_from_probs_batch_invariant(
-            probs, min_p, indices, generator, seed, offset, return_valid
+            probs, min_p, indices, generator, seed, offset, return_valid, out=out
+        )
+    if out is not None:
+        raise ValueError(
+            "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
     return get_sampling_module().min_p_sampling_from_probs(
         probs,
@@ -2117,6 +2147,9 @@ def top_k_top_p_sampling_from_logits(
     temperature: Optional[Union[torch.Tensor, float]] = None,
     return_logprob: bool = False,
     return_kept_logprob: bool = False,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
+    kept_logprob_out: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits.
 
@@ -2228,6 +2261,17 @@ def top_k_top_p_sampling_from_logits(
         Only with ``batch_invariant=True``. Also return the drawn token's natural log-probability renormalised over the
         kept set, ``ln(e_t / mass)`` (fp32, the samples' shape, NaN for an invalid row): the probability the token was
         actually drawn with (the processed log-probability of the engines' filtered modes).
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
+        (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
+        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
+    logprob_out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned float32 buffer of shape ``(batch_size,)`` for the
+        full-distribution log-probability (it implies ``return_logprob=True``), written in place and returned.
+    kept_logprob_out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: the same for the kept set's log-probability (it implies
+        ``return_kept_logprob=True``).
 
     Returns
     -------
@@ -2293,11 +2337,21 @@ def top_k_top_p_sampling_from_logits(
             temperature=temperature,
             return_logprob=return_logprob,
             return_kept_logprob=return_kept_logprob,
+            out=out,
+            logprob_out=logprob_out,
+            kept_logprob_out=kept_logprob_out,
         )
-    if temperature is not None or return_logprob or return_kept_logprob:
+    if (
+        temperature is not None
+        or return_logprob
+        or return_kept_logprob
+        or out is not None
+        or logprob_out is not None
+        or kept_logprob_out is not None
+    ):
         raise ValueError(
-            "temperature, return_logprob and return_kept_logprob are available under batch_invariant=True only "
-            "(the operator's kernel takes none of them)"
+            "temperature, return_logprob, return_kept_logprob and the out buffers are available under "
+            "batch_invariant=True only (the operator's kernel takes none of them and allocates its output)"
         )
     if filter_apply_order == "top_k_first":
         if _top_k_first_fast_path_applicable(logits, top_k, indices, top_k_max):
@@ -2361,6 +2415,7 @@ def top_k_top_p_sampling_from_probs(
     top_k_max: Optional[int] = None,
     *,
     batch_invariant: bool = False,
+    out: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities.
 
@@ -2459,6 +2514,11 @@ def top_k_top_p_sampling_from_probs(
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction), and so is ``top_k_max`` (one kernel, no fast path). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
+    out : Optional[torch.Tensor]
+        Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
+        (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
+        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
 
     Returns
     -------
@@ -2520,6 +2580,11 @@ def top_k_top_p_sampling_from_probs(
             seed,
             offset,
             return_valid,
+            out=out,
+        )
+    if out is not None:
+        raise ValueError(
+            "out is available under batch_invariant=True only (the operator's kernel allocates its output)"
         )
     if filter_apply_order == "top_k_first":
         if _top_k_first_fast_path_applicable(probs, top_k, indices, top_k_max):

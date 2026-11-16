@@ -1189,6 +1189,82 @@ def test_determinism_graph_replay_and_pdl():
 
 
 @needs_device
+def test_preallocated_outputs():
+    """Caller-owned output buffers on the public entries (``out=`` on every truncated sampler; ``logprob_out=`` /
+    ``kept_logprob_out=`` on the logits one, implying their ``return_*``): written in place and returned as given, bit
+    for bit the allocating call; the contract (dtype, shape) refused rather than copied; a log-probability buffer on
+    weights refused; the default paths refuse the buffers."""
+    N, M = 1000, 6
+    w = weights(M, N, torch.float32)
+    s, o = keys(M, 4)
+    ks = torch.tensor([1, 5, 0, N, 50, 7], dtype=torch.int32, device="cuda")
+    ref = flashinfer.sampling.top_k_sampling_from_probs(
+        w, ks, seed=s, offset=o, batch_invariant=True
+    )
+    ob = torch.empty(M, dtype=torch.int32, device="cuda")
+    r = flashinfer.sampling.top_k_sampling_from_probs(
+        w, ks, seed=s, offset=o, batch_invariant=True, out=ob
+    )
+    assert r is ob and torch.equal(ob, ref)
+    r2, v2 = flashinfer.sampling.top_k_sampling_from_probs(
+        w, ks, seed=s, offset=o, return_valid=True, batch_invariant=True, out=ob
+    )
+    assert r2 is ob and v2.dtype == torch.bool and torch.equal(ob, ref)
+    ps = torch.tensor([0.9, 0.5, 0.0, 1.0, 0.3, 0.99], device="cuda")
+    x = tied_logits(M, N, torch.bfloat16, seed=2)
+    ref_t, ref_lp, ref_lpk = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        x,
+        ks,
+        ps,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        return_logprob=True,
+        return_kept_logprob=True,
+    )
+    tb = torch.empty(M, dtype=torch.int32, device="cuda")
+    lb = torch.empty(M, dtype=torch.float32, device="cuda")
+    kb = torch.empty(M, dtype=torch.float32, device="cuda")
+    t2, l2, k2 = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        x,
+        ks,
+        ps,
+        seed=s,
+        offset=o,
+        batch_invariant=True,
+        out=tb,
+        logprob_out=lb,
+        kept_logprob_out=kb,
+    )
+    assert t2 is tb and l2 is lb and k2 is kb and torch.equal(tb, ref_t)
+    _same_nan(lb, ref_lp, "logprob_out")
+    _same_nan(kb, ref_lpk, "kept_logprob_out")
+    # the contract: refused, never copied; a log-probability buffer on weights; the default paths
+    with pytest.raises(ValueError, match="dtype"):
+        flashinfer.sampling.top_k_sampling_from_probs(
+            w, ks, seed=s, offset=o, batch_invariant=True, out=lb
+        )
+    with pytest.raises(ValueError, match="shape"):
+        flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x,
+            ks,
+            ps,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=torch.empty(M + 1, dtype=torch.int32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="log-probability"):
+        probs_draw(w, s, o, top_k=5, logprob_out=lb)
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.top_k_sampling_from_probs(w, 7, seed=s, offset=o, out=ob)
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x, ks, ps, seed=s, offset=o, out=tb
+        )
+
+
+@needs_device
 def test_default_path_is_the_operator_kernel(monkeypatch):
     """``batch_invariant=False`` (the default) never enters the classes and is byte for byte the operator's own kernel
     (the registered custom op the unmodified entries called), for every entry."""

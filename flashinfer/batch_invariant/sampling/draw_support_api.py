@@ -28,7 +28,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from ..support import unsupported
+from ..support import out_buffer, unsupported
 from .api import (
     _DTYPE_STR,
     _aligned_rows,
@@ -74,8 +74,13 @@ def draw_support(
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
     early_finish: str = "mass",
+    return_valid: bool = True,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
+    kept_logprob_out: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
-    """One launch of the composition: ``{"samples"`` (int32, ``-1`` for an invalid row), ``"valid"`` (bool), ``"mass"``
+    """One launch of the composition: ``{"samples"`` (int32, ``-1`` for an invalid row), ``"valid"`` (bool, with
+    ``return_valid``), ``"mass"``
     (fp32: the kept weights' canonical tree), with ``return_logprob`` (logits only) ``"logp"`` (fp32: the drawn token's
     natural log-probability under the FULL distribution at the given temperature, ``mul(add(z, neg(lg2(S))), LN2)`` with
     ``S`` the row's sum tree -- ``lse.row``'s ``log_probs`` at the token, bit for bit; never renormalised over the kept set;
@@ -88,7 +93,8 @@ def draw_support(
     number (nothing kept: ``k <= 0``, no positive weight; a non-finite row) is invalid, and so is an output whose index
     lies outside the source rows. Bitwise identical for every ``config`` of the support kernel's space (one row per CTA,
     the staged share within the budget), every batch composition and every ``sm_count``; ``early_finish`` is the
-    selection's placement (the support kernel's)."""
+    selection's placement (the support kernel's). ``out`` (int32), ``logprob_out`` and ``kept_logprob_out`` (fp32; each
+    implies its ``return_*``) are caller-owned buffers of the output shape, written in place and returned as given."""
     from .draw_support_kernel import get_compiled_kernel
 
     name = "logits" if from_logits else "probs"
@@ -99,6 +105,10 @@ def draw_support(
         raise ValueError(
             "at least one of top_k / top_p / min_p (the plain draw is sampling_from_probs / sampling_from_logits)"
         )
+    if logprob_out is not None:
+        return_logprob = True
+    if kept_logprob_out is not None:
+        return_kept_logprob = True
     if (return_logprob or return_kept_logprob) and not from_logits:
         raise ValueError("the drawn token's log-probability is defined for logits")
     if early_finish not in ("", "mass", "all"):
@@ -148,19 +158,29 @@ def draw_support(
         if config.vec_elems > max_vec_elems(N, elem_bytes):
             raise ValueError("config vector width exceeds the row alignment")
     x2 = _aligned_rows(x2, config.vec_elems * elem_bytes)
-    tok = torch.empty(M, dtype=torch.int32, device=dev)
+    ob = out_buffer(out, "out", lead, torch.int32, x, 4)
+    tok = (
+        ob.view(-1) if ob is not None else torch.empty(M, dtype=torch.int32, device=dev)
+    )
     valid = torch.empty(M, dtype=torch.int32, device=dev)
     mass = torch.empty(M, dtype=torch.float32, device=dev)
-    lp = (
-        torch.empty(M, dtype=torch.float32, device=dev)
-        if return_logprob
-        else _dummy(dev, torch.float32)
-    )
-    lpk = (
-        torch.empty(M, dtype=torch.float32, device=dev)
-        if return_kept_logprob
-        else _dummy(dev, torch.float32)
-    )
+    lb = kb = None
+    lp = _dummy(dev, torch.float32)
+    if return_logprob:
+        lb = out_buffer(logprob_out, "logprob_out", lead, torch.float32, x, 4)
+        lp = (
+            lb.view(-1)
+            if lb is not None
+            else torch.empty(M, dtype=torch.float32, device=dev)
+        )
+    lpk = _dummy(dev, torch.float32)
+    if return_kept_logprob:
+        kb = out_buffer(kept_logprob_out, "kept_logprob_out", lead, torch.float32, x, 4)
+        lpk = (
+            kb.view(-1)
+            if kb is not None
+            else torch.empty(M, dtype=torch.float32, device=dev)
+        )
     if M > 0 and (indices is None or Msrc > 0):
         kernel = get_compiled_kernel(
             _DTYPE_STR[x.dtype],
@@ -204,16 +224,17 @@ def draw_support(
             lp.fill_(float("nan"))
         if return_kept_logprob:
             lpk.fill_(float("nan"))
-    out = {
-        "samples": tok.view(lead),
-        "valid": valid.to(torch.bool).view(lead),
+    res = {
+        "samples": ob if ob is not None else tok.view(lead),
         "mass": mass.view(lead),
     }
+    if return_valid:  # the bool form is a cast kernel: formed only when asked for
+        res["valid"] = valid.to(torch.bool).view(lead)
     if return_logprob:
-        out["logp"] = lp.view(lead)
+        res["logp"] = lb if lb is not None else lp.view(lead)
     if return_kept_logprob:
-        out["kept_logp"] = lpk.view(lead)
-    return out
+        res["kept_logp"] = kb if kb is not None else lpk.view(lead)
+    return res
 
 
 def _entry(
@@ -232,9 +253,15 @@ def _entry(
     temperature=None,
     return_logprob: bool = False,
     return_kept_logprob: bool = False,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
+    kept_logprob_out: Optional[torch.Tensor] = None,
 ):
     """The public entries' common body: the operator's key resolution and validation, the draw, the output dtype rule
-    (the indices' dtype with ``indices``), the outputs in the flags' order: ``samples[, logp][, kept_logp][, valid]``."""
+    (the indices' dtype with ``indices``), the outputs in the flags' order: ``samples[, logp][, kept_logp][, valid]``.
+    ``out`` takes the samples: an int32 buffer is the kernel's own output; with int64 ``indices`` an int64 buffer is
+    filled by a cast from the kernel's int32 tokens (the operator's dtype contract). The two log-probability buffers
+    imply their ``return_*`` flags."""
     name = "logits" if from_logits else "probs"
     N = _check_input(x, name)
     if indices is not None:
@@ -246,6 +273,23 @@ def _entry(
     else:
         M = int(x.numel() // N) if N else 0
     seeds, offs = _resolve_keys(seed, offset, generator, M * per_row, M, x.device)
+    out64 = None
+    if (
+        out is not None
+        and indices is not None
+        and indices.dtype == torch.int64
+        and out.dtype == torch.int64
+    ):
+        # the operator's contract gives int64 samples with int64 indices: the kernel's int32 tokens are cast into the
+        # caller's int64 buffer (an int32 buffer is written directly)
+        out64, out = (
+            out_buffer(out, "out", tuple(indices.shape), torch.int64, x, 8),
+            None,
+        )
+    if logprob_out is not None:
+        return_logprob = True
+    if kept_logprob_out is not None:
+        return_kept_logprob = True
     res = draw_support(
         x,
         seeds,
@@ -258,10 +302,16 @@ def _entry(
         enable_pdl=_pdl(enable_pdl, x.device),
         config=config,
         sm_count=sm_count,
+        return_valid=return_valid,
+        out=out,
+        logprob_out=logprob_out,
+        kept_logprob_out=kept_logprob_out,
         **filters,
     )
     samples = res["samples"]
-    if indices is not None and indices.dtype != samples.dtype:
+    if out64 is not None:
+        samples = out64.copy_(samples)
+    elif out is None and indices is not None and indices.dtype != samples.dtype:
         samples = samples.to(
             indices.dtype
         )  # the operator's contract: the output takes the indices' dtype
@@ -284,6 +334,7 @@ def top_k_sampling_from_probs_batch_invariant(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
     *,
+    out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
@@ -316,6 +367,7 @@ def top_k_sampling_from_probs_batch_invariant(
         enable_pdl,
         config,
         sm_count,
+        out=out,
     )
 
 
@@ -328,6 +380,7 @@ def top_p_sampling_from_probs_batch_invariant(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
     *,
+    out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
@@ -350,6 +403,7 @@ def top_p_sampling_from_probs_batch_invariant(
         enable_pdl,
         config,
         sm_count,
+        out=out,
     )
 
 
@@ -362,6 +416,7 @@ def min_p_sampling_from_probs_batch_invariant(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
     *,
+    out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
@@ -383,6 +438,7 @@ def min_p_sampling_from_probs_batch_invariant(
         enable_pdl,
         config,
         sm_count,
+        out=out,
     )
 
 
@@ -397,6 +453,7 @@ def top_k_top_p_sampling_from_probs_batch_invariant(
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
     *,
+    out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
@@ -421,6 +478,7 @@ def top_k_top_p_sampling_from_probs_batch_invariant(
         enable_pdl,
         config,
         sm_count,
+        out=out,
     )
 
 
@@ -437,6 +495,9 @@ def top_k_top_p_sampling_from_logits_batch_invariant(
     temperature: Optional[Union[float, torch.Tensor]] = None,
     return_logprob: bool = False,
     return_kept_logprob: bool = False,
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
+    kept_logprob_out: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
@@ -452,7 +513,9 @@ def top_k_top_p_sampling_from_logits_batch_invariant(
     temperature -- ``lse.row``'s ``log_probs(logits, samples, temperature)`` bit for bit, never renormalised over the kept
     set (what a trainer re-scores); ``return_kept_logprob`` adds the one renormalised over the kept set (the probability
     the token was drawn with); both fp32 of the samples' shape, NaN for an invalid row. Returns the samples alone, or the
-    tuple ``(samples[, logp][, kept_logp])``."""
+    tuple ``(samples[, logp][, kept_logp])``. ``out`` (int32 of the output shape, or int64 with int64 ``indices``),
+    ``logprob_out`` and ``kept_logprob_out`` (fp32; each implies its ``return_*``) are caller-owned buffers, written in
+    place and returned."""
     if filter_apply_order not in ORDERS:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
     return _entry(
@@ -471,4 +534,7 @@ def top_k_top_p_sampling_from_logits_batch_invariant(
         temperature=temperature,
         return_logprob=return_logprob,
         return_kept_logprob=return_kept_logprob,
+        out=out,
+        logprob_out=logprob_out,
+        kept_logprob_out=kept_logprob_out,
     )
