@@ -1187,7 +1187,7 @@ def gen_all_modules(
         ]
         if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
-        if has_sm100 or has_sm103:
+        if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_kda_batch_invariant_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
