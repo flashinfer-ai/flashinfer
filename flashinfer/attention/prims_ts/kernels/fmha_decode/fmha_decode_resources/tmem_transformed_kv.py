@@ -73,9 +73,9 @@ def _mul_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
     byte i scales by byte i of ``packed_sf`` and the products round to E4M3.
     Both paths ignore the high nibble of every input byte: the packed
     ``e2m1p4`` operand defines it as padding (checked exhaustively on SM103
-    for all byte and scale values), and the f16x2 fallback extracts nibbles
-    itself. Callers may therefore pass packed payload bytes, or the same word
-    shifted right by four, without masking.
+    for all byte and scale values), and the f16x2 fallback masks it off.
+    Callers may therefore pass packed payload bytes, or the same word shifted
+    right by four, without masking.
     """
     if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
         return cute.arch.inline_ptx(
@@ -84,16 +84,17 @@ def _mul_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
             read_only_args=[packed_fp4, packed_sf],
         )
     else:
-        # LDSM leaves one FP4 nibble per byte. OR with a four-bit shift
-        # packs adjacent values into bytes 0 and 2 without scalar extraction.
+        # Keep each byte's low nibble, then OR with a four-bit shift to pack
+        # adjacent values into bytes 0 and 2 without scalar extraction.
         return cute.arch.inline_ptx(
             """
             {
                 .reg .b8 fp4_01, fp4_23, unused0, unused1;
                 .reg .b16 sf_01, sf_23, e4m3_01, e4m3_23;
-                .reg .b32 tmp, h_01, h_23, sf_h_01, sf_h_23;
-                shr.u32 tmp, {$r0}, 4;
-                or.b32 tmp, tmp, {$r0};
+                .reg .b32 lo, tmp, h_01, h_23, sf_h_01, sf_h_23;
+                and.b32 lo, {$r0}, 0x0F0F0F0F;
+                shr.u32 tmp, lo, 4;
+                or.b32 tmp, tmp, lo;
                 mov.b32 {fp4_01, unused0, fp4_23, unused1}, tmp;
                 mov.b32 {sf_01, sf_23}, {$r1};
                 cvt.rn.f16x2.e2m1x2 h_01, fp4_01;

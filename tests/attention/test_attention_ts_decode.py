@@ -4783,6 +4783,39 @@ def test_attention_ts_decode_mixed_precision(
 
 
 @_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "head_dim,page_size,qkv_dtype",
+    [
+        (128, 4, "fp8q-nvfp4kv-bf16o"),
+        (128, 8, "fp8q-nvfp4kv-bf16o"),
+        (256, 4, "fp8q-nvfp4kv-bf16o"),
+        (256, 4, "fp8q-nvfp4kv"),
+        (256, 4, "bf16q-nvfp4kv"),
+    ],
+    ids=lambda value: str(value),
+)
+def test_attention_ts_decode_nvfp4_small_page_scale_fragments(
+    head_dim: int, page_size: int, qkv_dtype: str
+):
+    """Scale fragments below 128 bytes occupy padded SMEM slots.
+
+    Every converter, including the row-per-thread Keeps FP8 converter that
+    FP8 Q with BF16 output selects here, must skip that padding.
+    """
+    assert page_size * head_dim // 16 < 128
+    test_attention_ts_decode_mixed_precision(
+        batch_size=8,
+        seq_len_kv=2048,
+        seq_len_q=8,
+        num_qo_heads=32,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        page_size=page_size,
+        qkv_dtype=qkv_dtype,
+    )
+
+
+@_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("out_dtype", (torch.bfloat16, torch.float16))
 def test_attention_ts_decode_nvfp4_padded_scale_page_stride(out_dtype):
     """Consume zero-copy scale views embedded in a larger physical page."""

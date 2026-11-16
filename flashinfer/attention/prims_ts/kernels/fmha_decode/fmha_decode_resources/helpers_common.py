@@ -962,15 +962,19 @@ def gather_byte_of_words(
 
 @cute.jit
 def load_nvfp4_row_scale_words(
+    cfg: Constexpr[FmhaDecodeConfig],
     src_sf_base: cutlass.Array,
     row: Int32,
     head_dim_stage_idx: Int32 | int,
     *,
-    sf_bytes_per_token: Constexpr[int],
-    sf_tile_bytes: Constexpr[int],
     is_v: Constexpr[bool],
 ) -> tuple[Int32, Int32]:
-    """Load eight E4M3 scales for one 128-value row slice as two words."""
+    """Load eight E4M3 scales for one 128-value row slice as two words.
+
+    Scale rows sit at ``cfg.smem_kv_sf_row_offset``, which skips the padding
+    of page fragments below 128 bytes.
+    """
+    sf_tile_bytes = cfg.smem_kv_sf_tile_bytes
     if cutlass.const_expr(not is_v):
         scales = cutlass.Array(
             src_sf_base.data_ptr(),
@@ -978,7 +982,10 @@ def load_nvfp4_row_scale_words(
             shape=(sf_tile_bytes // 8,),
             addrspace=3,
         )
-        pair = scales[row * Int32(sf_bytes_per_token // 8) + Int32(head_dim_stage_idx)]
+        # Scale rows of D128+ are whole 8-byte words.
+        pair = scales[
+            (cfg.smem_kv_sf_row_offset(row) >> Int32(3)) + Int32(head_dim_stage_idx)
+        ]
         return Int32(pair), Int32(pair >> Int64(32))
     else:
         # V interleaves four tokens: each lane gathers its byte from eight words.
@@ -988,7 +995,7 @@ def load_nvfp4_row_scale_words(
             shape=(sf_tile_bytes // 4,),
             addrspace=3,
         )
-        base = (row >> Int32(2)) * Int32(sf_bytes_per_token) + Int32(
+        base = (cfg.smem_kv_sf_row_offset(row & Int32(~3)) >> Int32(2)) + Int32(
             head_dim_stage_idx * 8
         )
         words = [scales[base + Int32(i)] for i in range(8)]

@@ -516,12 +516,7 @@ class SmemTransformedKvResource(DecodeGenResourceBase):
             addrspace=3,
         )
         scale_words = load_nvfp4_row_scale_words(
-            src_sf_base,
-            row,
-            head_dim_stage_idx,
-            sf_bytes_per_token=cfg.smem_kv_sf_bytes_per_token,
-            sf_tile_bytes=cfg.smem_kv_sf_tile_bytes,
-            is_v=is_v,
+            cfg, src_sf_base, row, head_dim_stage_idx, is_v=is_v
         )
         src_swizzle = (row >> Int32(1)) & Int32(3)
         # Stream each chunk through SM107's fallback conversion when the

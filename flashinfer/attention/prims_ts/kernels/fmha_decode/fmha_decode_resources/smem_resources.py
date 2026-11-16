@@ -1610,12 +1610,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
             addrspace=3,
         )
         scale_words = load_nvfp4_row_scale_words(
-            src_sf_base,
-            row,
-            head_dim_stage_idx,
-            sf_bytes_per_token=cfg.smem_kv_sf_bytes_per_token,
-            sf_tile_bytes=cfg.smem_kv_sf_tile_bytes,
-            is_v=is_v,
+            cfg, src_sf_base, row, head_dim_stage_idx, is_v=is_v
         )
         src_swizzle = (row >> Int32(1)) & Int32(3)
         # Sixteen packed words and two four-scale words survive raw-slot release.
@@ -3326,9 +3321,15 @@ class SmemKvResource(DecodeGenResourceBase):
                     # locator-read-and-issue loop on one elected lane.
                     lane = cute.arch.lane_idx()
                     issue = lane < Int32(pages_per_warp)
+                    share_rank = load_warp_rank
                     if cutlass.const_expr(active_load_warps < cfg.load_num_warps):
                         issue = issue & (load_warp_rank < Int32(active_load_warps))
-                    page_frag = load_warp_rank * Int32(pages_per_warp) + (
+                        # Idle warps take the last active warp's share, so their
+                        # discarded locator reads stay inside this tile.
+                        share_rank = cutlass.min(
+                            load_warp_rank, Int32(active_load_warps - 1)
+                        )
+                    page_frag = share_rank * Int32(pages_per_warp) + (
                         lane % Int32(pages_per_warp)
                     )
                     locator = self.page_offsets_kv.page_id(
