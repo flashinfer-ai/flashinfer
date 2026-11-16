@@ -7,18 +7,9 @@ __forceinline__ __device__ void register_fragment_softmax(
   const int m0 = fragment_m0(warp_in_group, lane);
   const int m1 = m0 + 8;
   static_assert(T::BLOCK_M == 8);
-  int lane_q_pos = 0;
-  int lane_left = 0;
-  int lane_row_valid = 0;
-  if (lane < T::BLOCK_M) {
-    const int lane_global_row = m_block_idx * T::BLOCK_M + lane;
-    lane_row_valid = physical_page >= 0 && lane_global_row < total_rows;
-    if (lane_row_valid) {
-      const int query_idx = lane_global_row / num_heads;
-      lane_q_pos = cache_len - s_q + query_idx;
-      lane_left = max(lane_q_pos - window_size + 1, 0);
-    }
-  }
+  // Public contract Hq=64 and M8 keeps the CTA inside one query token.
+  const int q_pos = cache_len - s_q + m_block_idx / 8;
+  const int left = max(q_pos - window_size + 1, 0);
 #pragma unroll
   for (int group = 0; group < T::BLOCK_M / 8; ++group) {
     const int n0 = group * 8 + (lane % 4) * 2;
@@ -28,16 +19,12 @@ __forceinline__ __device__ void register_fragment_softmax(
     const int token1 = page_idx * T::BLOCK_N + m1;
     const int global_row0 = m_block_idx * T::BLOCK_M + n0;
     const int global_row1 = global_row0 + 1;
-    const int row0_valid = __shfl_sync(0xffffffff, lane_row_valid, n0);
-    const int row1_valid = __shfl_sync(0xffffffff, lane_row_valid, n1);
-    const int q_pos0 = __shfl_sync(0xffffffff, lane_q_pos, n0);
-    const int q_pos1 = __shfl_sync(0xffffffff, lane_q_pos, n1);
-    const int left0 = __shfl_sync(0xffffffff, lane_left, n0);
-    const int left1 = __shfl_sync(0xffffffff, lane_left, n1);
-    const bool valid00 = row0_valid && token0 >= left0 && token0 <= q_pos0;
-    const bool valid01 = row1_valid && token0 >= left1 && token0 <= q_pos1;
-    const bool valid10 = row0_valid && token1 >= left0 && token1 <= q_pos0;
-    const bool valid11 = row1_valid && token1 >= left1 && token1 <= q_pos1;
+    const bool row0_valid = physical_page >= 0 && global_row0 < total_rows;
+    const bool row1_valid = physical_page >= 0 && global_row1 < total_rows;
+    const bool valid00 = row0_valid && token0 >= left && token0 <= q_pos;
+    const bool valid01 = row1_valid && token0 >= left && token0 <= q_pos;
+    const bool valid10 = row0_valid && token1 >= left && token1 <= q_pos;
+    const bool valid11 = row1_valid && token1 >= left && token1 <= q_pos;
     const float scale = softmax_scale * 1.4426950408889634f;
     score(base + 0) = valid00 ? score(base + 0) * scale : -CUDART_INF_F;
     score(base + 1) = valid01 ? score(base + 1) * scale : -CUDART_INF_F;
@@ -56,7 +43,10 @@ __forceinline__ __device__ void register_fragment_softmax(
       plan.reduction[warp_in_group * T::BLOCK_M + n1] = max1;
     }
   }
-  role_barrier();
+  if constexpr (T::Config::S == 9)
+    role_barrier();
+  else
+    qk_warpgroup_barrier();
   if (idx_in_warpgroup < T::BLOCK_M) {
     const int row = idx_in_warpgroup;
     float tile_max = -CUDART_INF_F;
@@ -69,7 +59,10 @@ __forceinline__ __device__ void register_fragment_softmax(
     plan.row_scale[row] = isfinite(old_max) ? exp2f(old_max - new_max) : 0.0f;
     plan.row_max[row] = new_max;
   }
-  role_barrier();
+  if constexpr (T::Config::S == 9)
+    role_barrier();
+  else
+    qk_warpgroup_barrier();
 #pragma unroll
   for (int group = 0; group < T::BLOCK_M / 8; ++group) {
     const int n0 = group * 8 + (lane % 4) * 2;
@@ -102,7 +95,10 @@ __forceinline__ __device__ void register_fragment_softmax(
   }
   // Publish generic P stores to the WGMMA async proxy before the handoff.
   cutlass::arch::fence_view_async_shared();
-  role_barrier();
+  if constexpr (T::Config::S == 9)
+    role_barrier();
+  else
+    qk_warpgroup_barrier();
   if (idx_in_warpgroup < T::BLOCK_M) {
     const int row = idx_in_warpgroup;
     float tile_sum = 0.0f;
