@@ -538,8 +538,7 @@ def test_wrapper_cudnn_single_token_gqa_lse(paged, lse_layout):
 def test_ragged_wrapper_cudnn_return_lse(causal):
     """``BatchPrefillWithRaggedKVCacheWrapper(backend="cudnn").run(...,
     return_lse=True)`` returns the ``[qo_len, num_qo_heads]`` LSE the wrapper
-    documents (it allocates that shape and hands it to the cuDNN path), matching
-    the default backend's."""
+    documents, checked against independent Torch O and LSE references."""
     _skip_unless_cudnn()
     device = "cuda:0"
     batch_size, s_qo, s_kv, h_qo, h_kv, d = 4, 87, 512, 8, 4, 128
@@ -569,23 +568,24 @@ def test_ragged_wrapper_cudnn_return_lse(causal):
     )
     out, lse = w_cudnn.run(q, k, v, return_lse=True)
 
-    w_ref = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        ws.clone(), kv_layout="NHD"
-    )
-    w_ref.plan(
-        qo_indptr,
-        kv_indptr,
-        h_qo,
-        h_kv,
-        d,
-        head_dim_vo=d,
-        causal=causal,
-        sm_scale=scale,
-        q_data_type=torch.bfloat16,
-        kv_data_type=torch.bfloat16,
-    )
-    out_ref, lse_ref = w_ref.run(q, k, v, return_lse=True)
+    # A default wrapper may also select cuDNN. Use an independent reference
+    # so a dispatch change cannot turn this into a comparison with itself.
+    ref_lse = _reference_lse(q, k, q_lens, kv_lens, qo_indptr, kv_indptr, scale, causal)
+    ref_out = torch.empty_like(out, dtype=torch.float32)
+    for batch in range(batch_size):
+        qs = slice(int(qo_indptr[batch]), int(qo_indptr[batch + 1]))
+        ks = slice(int(kv_indptr[batch]), int(kv_indptr[batch + 1]))
+        qi = q[qs].float().transpose(0, 1)
+        ki = k[ks].float().repeat_interleave(h_qo // h_kv, dim=1).transpose(0, 1)
+        vi = v[ks].float().repeat_interleave(h_qo // h_kv, dim=1).transpose(0, 1)
+        scores = qi @ ki.transpose(-1, -2) * scale
+        if causal:
+            lq, lkv = qi.size(1), ki.size(1)
+            row = torch.arange(lq, device=q.device)[:, None]
+            col = torch.arange(lkv, device=q.device)[None, :]
+            scores.masked_fill_(col > row + lkv - lq, -torch.inf)
+        ref_out[qs] = (scores.softmax(-1) @ vi).transpose(0, 1)
 
-    assert lse.shape == (q.shape[0], h_qo) == lse_ref.shape
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-2)
+    assert lse.shape == (q.shape[0], h_qo) == ref_lse.shape
+    torch.testing.assert_close(out.float(), ref_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=1e-2)

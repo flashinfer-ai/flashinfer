@@ -1,5 +1,19 @@
 #pragma once
 
+__forceinline__ __device__ void zero_shared128(uint32_t address) {
+  asm volatile("st.shared.v4.b32 [%0], {0,0,0,0};" ::"r"(address) : "memory");
+}
+
+template <class Layout>
+__forceinline__ __device__ uint32_t swizzled_shared_bf16_address(Layout const& layout,
+                                                                 uint32_t base, int token,
+                                                                 int feature) {
+  // GMMA's smem_ptr_flag carries a BYTE-address swizzle. make_tensor
+  // applies it after pointer addition, not to the BF16 element offset.
+  const uint32_t address = base + uint32_t(layout.layout_b()(make_coord(token, feature))) * 2;
+  return uint32_t(layout.layout_a()(address));
+}
+
 __forceinline__ __device__ void fragment_store4(float* ptr, float a, float b, float c, float d) {
   const uint32_t address = cute::cast_smem_ptr_to_uint(ptr);
   asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" ::"r"(address), "f"(a), "f"(b), "f"(c),
@@ -51,40 +65,54 @@ __forceinline__ __device__ void write_output_slices(
     const float inv_sum1 = plan.row_sum[n1] > 0.0f ? 1.0f / plan.row_sum[n1] : 0.0f;
 #pragma unroll
     for (int slice = 0; slice < MaxSlices; ++slice) {
-      if (slice_begin + slice >= slice_end) {
+      constexpr int slice_stride = mla_swa::PVOwnership<typename T::Config>::Stride;
+      if (slice_begin + slice * slice_stride >= slice_end) {
         continue;
       }
       Tensor output_fragment_flat = output_fragment_all(_, output_slice_offset + slice, _0{});
       Tensor output_fragment =
           make_tensor(output_fragment_flat.data(), typename T::OutputSliceFragmentLayout{});
-      const int global_slice = slice_begin + slice;
+      const int global_slice = slice_begin + slice * slice_stride;
       const int dim0 = global_slice * T::TILE_K + m0;
       const int dim1 = global_slice * T::TILE_K + m1;
       const float value00 = output_fragment(base + 0) * inv_sum0;
       const float value01 = output_fragment(base + 1) * inv_sum1;
       const float value10 = output_fragment(base + 2) * inv_sum0;
       const float value11 = output_fragment(base + 3) * inv_sum1;
-      const float peer00 = __shfl_down_sync(0xffffffff, value00, 4);
-      const float peer01 = __shfl_down_sync(0xffffffff, value01, 4);
-      const float peer10 = __shfl_down_sync(0xffffffff, value10, 4);
-      const float peer11 = __shfl_down_sync(0xffffffff, value11, 4);
-      if ((lane & 4) == 0) {
-        cutlass::Array<typename T::InputT, 2> pair;
+      if constexpr (std::is_same_v<typename T::InputT, float>) {
+        // FP32 already fills a 32-byte sector with eight adjacent Dv
+        // lanes per row. Unlike BF16, it needs no cross-lane packing.
         if (row0 != nullptr) {
-          pair[0] = static_cast<typename T::InputT>(value00);
-          pair[1] = static_cast<typename T::InputT>(peer00);
-          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row0 + dim0) = pair;
-          pair[0] = static_cast<typename T::InputT>(value10);
-          pair[1] = static_cast<typename T::InputT>(peer10);
-          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row0 + dim1) = pair;
+          row0[dim0] = value00;
+          row0[dim1] = value10;
         }
         if (row1 != nullptr) {
-          pair[0] = static_cast<typename T::InputT>(value01);
-          pair[1] = static_cast<typename T::InputT>(peer01);
-          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row1 + dim0) = pair;
-          pair[0] = static_cast<typename T::InputT>(value11);
-          pair[1] = static_cast<typename T::InputT>(peer11);
-          *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row1 + dim1) = pair;
+          row1[dim0] = value01;
+          row1[dim1] = value11;
+        }
+      } else {
+        const float peer00 = __shfl_down_sync(0xffffffff, value00, 4);
+        const float peer01 = __shfl_down_sync(0xffffffff, value01, 4);
+        const float peer10 = __shfl_down_sync(0xffffffff, value10, 4);
+        const float peer11 = __shfl_down_sync(0xffffffff, value11, 4);
+        if ((lane & 4) == 0) {
+          cutlass::Array<typename T::InputT, 2> pair;
+          if (row0 != nullptr) {
+            pair[0] = static_cast<typename T::InputT>(value00);
+            pair[1] = static_cast<typename T::InputT>(peer00);
+            *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row0 + dim0) = pair;
+            pair[0] = static_cast<typename T::InputT>(value10);
+            pair[1] = static_cast<typename T::InputT>(peer10);
+            *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row0 + dim1) = pair;
+          }
+          if (row1 != nullptr) {
+            pair[0] = static_cast<typename T::InputT>(value01);
+            pair[1] = static_cast<typename T::InputT>(peer01);
+            *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row1 + dim0) = pair;
+            pair[0] = static_cast<typename T::InputT>(value11);
+            pair[1] = static_cast<typename T::InputT>(peer11);
+            *reinterpret_cast<cutlass::Array<typename T::InputT, 2>*>(row1 + dim1) = pair;
+          }
         }
       }
     }

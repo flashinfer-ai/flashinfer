@@ -171,14 +171,34 @@ class MegaKernelBackend(ABC):
         from flashinfer.autotuner.autotuner import _json_to_tactic
         from .registry import create_mega_kernel
 
-        config = dataclasses.replace(
-            self._config,
-            kernel_variant=selection["kernel_variant"],
-            knobs={k: _json_to_tactic(v) for k, v in selection["knobs"].items()},
+        expected = (
+            {"kernel_variant", "knobs"}
+            if hasattr(self._config, "kernel_variant")
+            else {"knobs"}
         )
+        if set(selection) != expected:
+            raise ValueError(
+                "cached MegaMoE selection fields do not match its configuration"
+            )
+        fields = {
+            "knobs": {k: _json_to_tactic(v) for k, v in selection["knobs"].items()}
+        }
+        if "kernel_variant" in selection:
+            if not hasattr(self._config, "kernel_variant"):
+                raise ValueError("this MegaMoE configuration has no kernel_variant")
+            fields["kernel_variant"] = selection["kernel_variant"]
+        config = dataclasses.replace(self._config, **fields)
         kernel = create_mega_kernel(config)
         kernel.bind_ep_bootstrap(self._ep_bootstrap)
         kernel.validate_init(self._ep_bootstrap, fleet_params)
+        if getattr(self._config, "batch_invariant", False):
+            self.validate_init(self._ep_bootstrap, fleet_params)
+            if kernel.batch_invariant_fingerprint(
+                fleet_params
+            ) != self.batch_invariant_fingerprint(fleet_params):
+                raise ValueError(
+                    "cached MegaMoE selection changes the arithmetic fingerprint"
+                )
 
     def ep_force_tune(self, workspace, tensors, weights, output):
         """Run a fresh inner search for an explicitly forced outer search."""
