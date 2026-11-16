@@ -282,8 +282,8 @@ new request) is seen by the stamp and starts a new chunk; a caller that resets a
 must prefill the new request with more than one token, since a one-token call is a decode step and that slot's stamp has not
 moved, or call `flashinfer.batch_invariant.kda.api.recurrent_kda_batch_invariant_reset(pool, slots)`, the explicit reset. The
 call shape decides for every sequence of a call: in a prefill call a sequence with a single token also starts from its slot's
-state as a boundary. The side state is keyed by the pool's storage, so any alias of the buffer (a view, a `detach()`) is the
-same pool; the first call on a pool must be eager (a pool first used inside a graph capture is refused). A multi-token decode step (several tokens appended to an open chunk) has no spelling in `recurrent_kda`'s arguments
+state as a boundary. The side state is keyed by the pool's storage, offset and shape, so any alias of the same extent (a full view, a `detach()`) is the
+same pool, and a view of another extent that overlaps a pool in use (`pool[:n]`) is refused; the first call on a pool must be eager (a pool first used inside a graph capture is refused). A multi-token decode step (several tokens appended to an open chunk) has no spelling in `recurrent_kda`'s arguments
 yet: `flashinfer.batch_invariant.kda.api.recurrent_kda_batch_invariant_extend` appends `[N, T]` tokens: fewer than 32 per sequence in one launch of the step kernel, which loops over the rows and commits the chunks it completes; longer calls with the rows that form whole chunks from a boundary through the prefill kernel and every other row through the step kernel, a split that is a function of the slot's row count and the call's shape alone. Besides the pool the class holds per slot `HV * (32 KB + 21 KB)`
 (the bf16 state copy and the cached rows).
 

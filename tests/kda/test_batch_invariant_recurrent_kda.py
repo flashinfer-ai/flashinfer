@@ -718,6 +718,27 @@ def test_misaligned_buffers_are_refused():
 
 
 @needs_device
+def test_overlapping_pool_extent_is_refused():
+    """A view of another extent of a pool in use has no open rows of its own: refused, the pool itself keeps working."""
+    h = 16
+    p = params(h)
+    s = make_seq(40, h, SEED + 88, GATES["steep"])
+    ref, _ = one_shot(s, p)
+    big = torch.zeros(3, 2, h, D, D, dtype=torch.float32, device="cuda")
+    pool = big[1]
+    pool[0].copy_(s["s0"])
+    rows = [bi_decode(token(s, pos), pool, [0], p) for pos in range(5)]
+    for view in (pool[:1], big.view(6, h, D, D)):
+        with pytest.raises(BatchInvariantUnsupportedError, match="overlaps"):
+            bi_decode(token(s, 5), view, [0], p)
+    bi_decode(
+        token(s, 0), big[2], [0], p
+    )  # a disjoint extent of the same buffer is a pool of its own
+    rows += [bi_decode(token(s, pos), pool, [0], p) for pos in range(5, 20)]
+    assert torch.equal(torch.cat(rows, 0), ref[:20])
+
+
+@needs_device
 def test_first_use_inside_a_graph_capture_is_refused():
     h = 16
     p = params(h)

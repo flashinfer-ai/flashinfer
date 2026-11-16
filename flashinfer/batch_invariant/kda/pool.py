@@ -22,6 +22,7 @@ several rows per slot in one launch.
 from __future__ import annotations
 
 import functools
+import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -41,8 +42,8 @@ def _module():
 
 
 def pool_key(pool: torch.Tensor) -> Tuple[int, int, Tuple[int, ...]]:
-    """The identity of a pool: its storage, its offset in it and its shape, so every alias of one buffer (a view, a
-    ``detach()``) is the same pool."""
+    """The identity of a pool: its storage, its offset in it and its shape, so every alias of the same extent of one
+    buffer (a full view, a ``detach()``) is the same pool."""
     return (pool.untyped_storage()._cdata, pool.storage_offset(), tuple(pool.shape))
 
 
@@ -68,6 +69,15 @@ def get_pool(pool: torch.Tensor) -> "ExactPool":
             "a state pool that does not start at a 16-byte boundary",
             "a pool whose first element is 16-byte aligned (the kernels load 16 bytes at a time)",
         )
+    first, last = key[1], key[1] + pool.numel()
+    for storage, offset, shape in _POOLS:
+        # another extent of a tracked buffer would start with empty rows: its history is under the other key
+        if storage == key[0] and offset < last and first < offset + math.prod(shape):
+            raise unsupported(
+                CLASS,
+                "a state pool that overlaps a pool of another shape or offset on the same buffer",
+                "the same pool extent on every call (its open rows are kept per extent)",
+            )
     ep = ExactPool(pool)
     _POOLS[key] = (ep, StorageWeakRef(pool.untyped_storage()))
     return ep
