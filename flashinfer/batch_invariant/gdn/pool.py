@@ -181,6 +181,8 @@ class GdnPool:
         """Build the cached rows of every pending tail ``pool`` can address (a shorter view leaves the others pending):
         one span launch over the kept rows, which skips a slot whose count cell no longer marks it (a later call
         restarted it)."""
+        if not self.pending:
+            return
         limit = int(pool.shape[0])
         work = [(s, n) for s, n in self.pending.items() if s < limit]
         if not work:
