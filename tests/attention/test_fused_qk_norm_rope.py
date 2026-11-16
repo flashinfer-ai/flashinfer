@@ -415,21 +415,48 @@ def test_fused_qk_norm_rope_neox_non_power_of_2_partial():
         )
 
 
-def test_fused_qk_norm_rope_interleave_accepts_partial():
+@pytest.mark.parametrize(
+    "head_dim, rotary_dim", [(128, 24), (256, 40), (64, 6)]
+)
+def test_fused_qk_norm_rope_interleave_accepts_partial(head_dim, rotary_dim):
     """Interleave=True has no power-of-2 constraint on partial rope; any even
-    rotary_dim <= head_dim should work."""
+    rotary_dim <= head_dim should work and match the reference, with the tail
+    past rotary_dim only normalized, not rotated."""
     _skip_if_unsupported()
-    q, k, q_weight, k_weight, pos_ids = _make_inputs(head_dim=128)
-    # rotary_dim = 24 would fail in neox mode, but is allowed in interleave mode.
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    q, k, q_weight, k_weight, pos_ids = _make_inputs(head_dim=head_dim, dtype=dtype)
+    eps, rope_theta = 1e-6, 1e4
+    q_ref, k_ref = ref_fused_qk_norm_rope(
+        q.clone(),
+        k.clone(),
+        q_weight,
+        k_weight,
+        pos_ids,
+        rotary_dim,
+        eps,
+        rope_theta,
+        True,
+        True,
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+    )
     flashinfer.fused_qk_norm_rope(
         q,
         k,
         q_weight,
         k_weight,
         pos_ids,
-        rotary_dim=24,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        rope_theta=rope_theta,
         interleave=True,
     )
+    rtol, atol = _tolerances(dtype)
+    torch.testing.assert_close(q, q_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(k, k_ref, rtol=rtol, atol=atol)
 
 
 def test_fused_qk_norm_rope_misaligned_stride():

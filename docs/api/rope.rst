@@ -23,3 +23,13 @@ Kernels for applying rotary embeddings.
     rope_quantize_fp8
     rope_quantize_fp8_append_paged_kv_cache
     mla_rope_quantize_fp8
+
+Fused QK RMSNorm and RoPE
+-------------------------
+
+.. currentmodule:: flashinfer.fused_qk_norm_rope
+
+.. autosummary::
+    :toctree: ../generated
+
+    fused_qk_norm_rope
