@@ -26,7 +26,11 @@ head, also a PDL build).  Two more PDL builds serve small rows: the one-launch
 TMA-ring quantizer (``quantize_qkv_tma_x4``, ``quantize_qkv_tma_x8``: 4-CTA
 clusters, ``vsplit`` clusters per batch and KV head, each holding a slice of
 ``128 / vsplit`` V channels, plus clusters that take only Q/K tiles up to the
-clusters the device holds at once).  Twenty programs serve
+clusters the device holds at once).  More attention builds, each with its PDL
+build, serve rows with more selected blocks: ``attention_qs`` (SM100),
+``attention_per_tile`` (SM103), ``attention_sd`` (two S buffers per softmax
+group) and its tail-split build ``attention_sd_tsplit`` (2-CTA clusters, grid
+rule ``tail_split_clusters``).  Twenty programs serve
 SM120 (RTX PRO 6000 / RTX 5090): the ``mma.sync`` INT8-QK / FP8-PV kernel, one
 per dispatched specialization of the five metadata flags (``sm120_module_key``
 derives them from a call; the record's ``select_rule`` fixes them).  The SM120
@@ -2304,6 +2308,7 @@ LOGICAL_SCALARS = (
     "passes",
     "batch",
     "v_boxes",
+    "split_from",
 )
 
 
@@ -2521,7 +2526,10 @@ def launch_grid(
     ``grid_heads``.  ``vsplit_clusters`` (the TMA-ring quantizer): clusters of
     ``launch.cluster[0]`` CTAs, ``vsplit`` per batch and ``num_kv_heads``,
     raised to the clusters the device holds at once (:func:`resident_clusters`;
-    the extra clusters take Q/K tiles only).  ``q_blocks_heads_batch`` (SM120): the 3-D grid
+    the extra clusters take Q/K tiles only).  ``tail_split_clusters`` (the tail-split
+    attention): clusters of ``launch.cluster[0]`` CTAs, one CTA per item of the
+    ``total_tiles`` item stream, capped at the clusters the device holds at once (the
+    kernel walks the remaining items).  ``q_blocks_heads_batch`` (SM120): the 3-D grid
     ``(q_blocks, num_heads, batch)``.  Every input is a host scalar the caller
     already holds; nothing is read from a tensor.
     """
@@ -2550,6 +2558,14 @@ def launch_grid(
         )
         clusters = max(clusters, resident_clusters(record, device_index))
         return (max(1, clusters * int(record["launch"]["cluster"][0])), 1, 1)
+    if kind == "tail_split_clusters":
+        # ``total_tiles`` is the item count: a split tile is two items.
+        clusters = min(
+            _ceil_div(int(values["total_tiles"]), 2),
+            sm_count(device_index) // 2,
+            resident_clusters(record, device_index) or sm_count(device_index) // 2,
+        )
+        return (max(1, clusters) * int(record["launch"]["cluster"][0]), 1, 1)
     if kind == "q_blocks_heads_batch":
         return (
             max(1, int(values["q_blocks"])),
