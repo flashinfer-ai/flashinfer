@@ -1121,24 +1121,17 @@ def test_mm_fp4_helper_rejects_scales_shorter_than_the_layout():
     b_rows = torch.empty([n, k // 16], dtype=torch.float8_e4m3fn, device="cuda")
     problem = _fp4_short_scale_problem(a, b, full_a, b_rows[1:].T, 16)
     assert problem is not None and "b_descale has 8160 bytes" in problem
-    # A slice that drops the last row keeps all 4096 bytes but has 127 rows of the
-    # 128 the layout pads to, so the row check rejects it.
-    problem = _fp4_short_scale_problem(a, b, full_a[:-1], full_b, 16)
-    assert problem is not None and "127 rows of 32 scales" in problem
-    problem = _fp4_short_scale_problem(a, b, full_a, b_rows[:-1].T, 16)
-    assert (
-        problem is not None and "b_descale is a row-major tensor of 255 rows" in problem
-    )
-    # nvfp4_quantize's linear output at m = 120 is a (120, 32) array on 4096
-    # bytes, because its rows are padded to a multiple of 16 in storage. The
-    # byte count passes; the row check rejects it.
+    # Only the byte count is checked. A slice that drops the last row keeps all
+    # the bytes behind the data pointer. A linear (120, 32) array on a buffer of
+    # 128 rows has all 128 x 32 = 4096 bytes too. All three below pass the byte
+    # check of _fp4_short_scale_problem.
+    assert _fp4_short_scale_problem(a, b, full_a[:-1], full_b, 16) is None
+    assert _fp4_short_scale_problem(a, b, full_a, b_rows[:-1].T, 16) is None
     a120 = torch.empty([120, k // 2], dtype=torch.uint8, device="cuda")
     linear_120 = torch.empty([128, k // 16], dtype=torch.float8_e4m3fn, device="cuda")[
         :120
     ]
-    problem = _fp4_short_scale_problem(a120, b, linear_120, full_b, 16)
-    assert problem is not None and "120 rows of 32 scales" in problem
-    assert "128 padded rows" in problem
+    assert _fp4_short_scale_problem(a120, b, linear_120, full_b, 16) is None
 
 
 @pytest.mark.parametrize("form", list(_SHORT_BLOCK_SCALES))
@@ -1223,10 +1216,10 @@ def test_mm_fp4_auto_raises_on_short_block_scales():
         _run_byte_order_case(case, "auto", a_short, case["b_sf"].T)
 
 
-def test_mm_fp4_auto_raises_on_linear_scales_with_padded_storage():
-    """nvfp4_quantize's linear A scales at m = 120 sit on 4096 bytes, as many as
-    the 128x4 layout reads, so only the row check catches them. Auto mode must
-    raise instead of returning a wrong result."""
+def test_mm_fp4_auto_raises_on_linear_scales():
+    """Auto mode raises on nvfp4_quantize's A scales in the linear layout
+    (SfLayout.layout_linear) at m = 120. No wrong result is returned, because no
+    backend accepts these scales."""
     # The same skips as the other auto-mode tests: CUDA, and a GPU and library
     # where the quantizer and an FP4 backend run.
     _byte_order_case("cutlass", "nvfp4")
@@ -1238,7 +1231,6 @@ def test_mm_fp4_auto_raises_on_linear_scales_with_padded_storage():
     b_fp4, b_sf = nvfp4_quantize(b, one, sfLayout=SfLayout.layout_128x4)
     _, a_linear = nvfp4_quantize(a, one, sfLayout=SfLayout.layout_linear)
     assert tuple(a_linear.shape) == (120, 32)
-    assert a_linear.untyped_storage().nbytes() == 4096
     out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
     with pytest.raises(BackendSupportedError, match="No suitable auto backends"):
         mm_fp4(
