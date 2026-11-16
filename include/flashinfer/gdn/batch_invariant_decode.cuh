@@ -155,8 +155,7 @@ __device__ __forceinline__ Acc4 mma128(const AReg& A, const BReg& B) {
              B.b[2 * ks + 1]);
   return d;
 }
-// A fragments A[v][j] of a 16-value group over the tokens, from a [token][value] tile through
-// transposing loads.
+// A fragments A[v][j] of a 16-value group over the tokens, from a [token][value] tile.
 __device__ __forceinline__ void load_at(TReg& r, const uint16_t* tile, int v16, int lane, int nks) {
   const uint16_t* pa =
       tile + (size_t)((lane & 7) + 8 * (lane >> 4)) * SD + v16 + 8 * ((lane >> 3) & 1);
@@ -188,8 +187,7 @@ __device__ __forceinline__ uint4 norm_row(uint4 raw) {
   return o;
 }
 
-// Hillis-Steele inclusive scan of the log2 gates over 64 positions (lane owns positions lane and
-// lane + 32).
+// Hillis-Steele inclusive scan of the log2 gates over 64 positions, two per lane.
 __device__ __forceinline__ void gate_scan(float& g0, float& g1, int lane) {
   for (int off = 1; off < 32; off <<= 1) {
     const float n0 = __shfl_up_sync(0xffffffffu, g0, off),
@@ -466,8 +464,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
     }
     __syncthreads();
     if (!SPAN) {
-      // the K tile is consumed: X rows of the earlier blocks and the M rows of p's block take its
-      // place
+      // the K tile is consumed: earlier blocks' X rows and the M rows of p's block take its place
       for (int u = tid; u < xhi * 8; u += NTHR)
         cp_async16(Xsm + (u >> 3) * XS + (u & 7) * 8, Xpool + (size_t)u * 8);
       for (int u = tid + mlo * 8; u < p * 8; u += NTHR)
@@ -497,8 +494,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
     cp_async_wait_all();
     __syncthreads();
 
-    // ---- row p of the blocked unit-lower-triangular inverse (warp 0): 8x8 Gauss-Jordan, then the
-    // 16 / 32 / 64 stages
+    // ---- row p of the blocked unit-lower-triangular inverse (warp 0): 8x8, then 16 / 32 / 64
     if (warp == 0) {
       {
         const int b8 = p & ~7, r = lane & 7, ri = b8 + r;
@@ -522,6 +518,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
           for (int i = 0; i < 8; ++i)
             if (i <= r) xrow[b8 + i] = (uint16_t)f2bf(row[i]);
         }
+        __syncwarp();
       }
       if ((p & 15) >= 8) {
         const int b16 = p & ~15, r0 = b16 + 8 + 2 * t4;
@@ -536,6 +533,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
         Acc4 e = {{0.f, 0.f, 0.f, 0.f}};
         mma_k8(e, a0, 0u, b0);
         if (g == 0) *reinterpret_cast<uint32_t*>(xrow + b16 + 2 * t4) = f2bf_x2(e.c[0], e.c[1]);
+        __syncwarp();
       }
       if ((p & 31) >= 16) {
         const int b32 = p & ~31, db = b32 + 16;
@@ -572,6 +570,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
           if (g == 0)
             *reinterpret_cast<uint32_t*>(xrow + b32 + 8 * nt + 2 * t4) = f2bf_x2(e.c[0], e.c[1]);
         }
+        __syncwarp();
       }
       if (p >= 32) {
         uint32_t aa[4];
@@ -614,6 +613,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
           if (g == 0)
             *reinterpret_cast<uint32_t*>(xrow + 8 * nt + 2 * t4) = f2bf_x2(e.c[0], e.c[1]);
         }
+        __syncwarp();
       }
       // A_inv row p = bf16(f32(X[p][j]) * beta[j]); X row p to the pool
 #pragma unroll
@@ -686,8 +686,7 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
       continue;
     }
 
-    // ---- chunk completion: NV refolded from the VKS rows and A_inv, then the state update S' =
-    // S_decayed + decayV^T K
+    // ---- chunk completion: NV refolded from VKS and A_inv, then S' = S_decayed + decayV^T K
     __syncthreads();
     TReg AV;
     load_at(AV, Vsm, 16 * warp, lane, 4);
@@ -701,7 +700,6 @@ __global__ void __launch_bounds__(NTHR, SPAN ? 2 : MINB)
       }
     }
     __syncthreads();
-    // the pool may not hold this launch's K rows yet (another head's CTA writes them)
     float* const blk = reinterpret_cast<float*>(warp < 4 ? Ssm : (SPAN ? Vsm : Ksm)) +
                        (size_t)(warp & 3) * 16 * FS;
     const uint16_t* const Kb = SPAN ? Ksm : Nsm;
