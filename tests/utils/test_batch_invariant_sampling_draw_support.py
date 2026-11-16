@@ -1262,6 +1262,32 @@ def test_preallocated_outputs():
         flashinfer.sampling.top_k_top_p_sampling_from_logits(
             x, ks, ps, seed=s, offset=o, out=tb
         )
+    # overlap: an output may not overlap the input's storage, nor another output (a dtype view included)
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x,
+            ks,
+            ps,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=x.view(-1)[: 2 * M].view(torch.int32),
+        )
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x,
+            ks,
+            ps,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=lb.view(torch.int32),
+            logprob_out=lb,
+        )
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.top_k_sampling_from_probs(
+            w, ks, seed=s, offset=o, batch_invariant=True, out=ks
+        )
 
 
 @needs_device

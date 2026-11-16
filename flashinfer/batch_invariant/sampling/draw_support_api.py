@@ -28,7 +28,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from ..support import out_buffer, unsupported
+from ..support import check_no_overlap, out_buffer, scratch, unsupported
 from .api import (
     _DTYPE_STR,
     _aligned_rows,
@@ -75,12 +75,13 @@ def draw_support(
     sm_count: Optional[int] = None,
     early_finish: str = "mass",
     return_valid: bool = True,
+    return_mass: bool = True,
     out: Optional[torch.Tensor] = None,
     logprob_out: Optional[torch.Tensor] = None,
     kept_logprob_out: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """One launch of the composition: ``{"samples"`` (int32, ``-1`` for an invalid row), ``"valid"`` (bool, with
-    ``return_valid``), ``"mass"``
+    ``return_valid``), ``"mass"`` (with ``return_mass``)
     (fp32: the kept weights' canonical tree), with ``return_logprob`` (logits only) ``"logp"`` (fp32: the drawn token's
     natural log-probability under the FULL distribution at the given temperature, ``mul(add(z, neg(lg2(S))), LN2)`` with
     ``S`` the row's sum tree -- ``lse.row``'s ``log_probs`` at the token, bit for bit; never renormalised over the kept set;
@@ -162,8 +163,14 @@ def draw_support(
     tok = (
         ob.view(-1) if ob is not None else torch.empty(M, dtype=torch.int32, device=dev)
     )
-    valid = torch.empty(M, dtype=torch.int32, device=dev)
-    mass = torch.empty(M, dtype=torch.float32, device=dev)
+    # the kernel's validity word is never read (validity is the token's sign: an invalid row draws -1) and the kept mass
+    # only when asked for: the two go to a per-device scratch otherwise, and the call allocates nothing it does not return
+    valid = scratch(dev, torch.int32, M)
+    mass = (
+        torch.empty(M, dtype=torch.float32, device=dev)
+        if return_mass
+        else scratch(dev, torch.float32, M)
+    )
     lb = kb = None
     lp = _dummy(dev, torch.float32)
     if return_logprob:
@@ -181,6 +188,19 @@ def draw_support(
             if kb is not None
             else torch.empty(M, dtype=torch.float32, device=dev)
         )
+    check_no_overlap(
+        [("out", ob), ("logprob_out", lb), ("kept_logprob_out", kb)],
+        [
+            ("x", x),
+            ("seed", seeds),
+            ("offset", offs),
+            ("indices", indices),
+            ("temperature", temp_t),
+            ("top_k", k_t if use_k else None),
+            ("top_p", p_t if use_p else None),
+            ("min_p", m_t if use_m else None),
+        ],
+    )
     if M > 0 and (indices is None or Msrc > 0):
         kernel = get_compiled_kernel(
             _DTYPE_STR[x.dtype],
@@ -218,18 +238,17 @@ def draw_support(
     elif M > 0:
         # a gather from an empty source: every index lies outside the source rows, nothing is read or kept
         tok.fill_(-1)
-        valid.zero_()
-        mass.zero_()
+        if return_mass:
+            mass.zero_()
         if return_logprob:
             lp.fill_(float("nan"))
         if return_kept_logprob:
             lpk.fill_(float("nan"))
-    res = {
-        "samples": ob if ob is not None else tok.view(lead),
-        "mass": mass.view(lead),
-    }
-    if return_valid:  # the bool form is a cast kernel: formed only when asked for
-        res["valid"] = valid.to(torch.bool).view(lead)
+    res = {"samples": ob if ob is not None else tok.view(lead)}
+    if return_mass:
+        res["mass"] = mass.view(lead)
+    if return_valid:  # a comparison kernel: formed only when asked for
+        res["valid"] = (tok != -1).view(lead)
     if return_logprob:
         res["logp"] = lb if lb is not None else lp.view(lead)
     if return_kept_logprob:
@@ -286,6 +305,19 @@ def _entry(
             out_buffer(out, "out", tuple(indices.shape), torch.int64, x, 8),
             None,
         )
+        check_no_overlap(
+            [("out", out64)],
+            [
+                ("x", x),
+                ("seed", seeds),
+                ("offset", offs),
+                ("indices", indices),
+                (
+                    "temperature",
+                    temperature if isinstance(temperature, torch.Tensor) else None,
+                ),
+            ],
+        )
     if logprob_out is not None:
         return_logprob = True
     if kept_logprob_out is not None:
@@ -303,6 +335,7 @@ def _entry(
         config=config,
         sm_count=sm_count,
         return_valid=return_valid,
+        return_mass=False,
         out=out,
         logprob_out=logprob_out,
         kept_logprob_out=kept_logprob_out,

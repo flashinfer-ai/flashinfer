@@ -140,3 +140,63 @@ def out_buffer(
             f"{name} must be {align}-byte aligned (its storage offset is not)"
         )
     return t
+
+
+def byte_range(t: torch.Tensor) -> Tuple[int, int]:
+    """The half-open byte range ``[start, end)`` a tensor's elements occupy, for any strides (the extent is the largest
+    element offset plus one, times the element size); an empty tensor spans nothing."""
+    start = t.data_ptr()
+    if t.numel() == 0:
+        return (start, start)
+    extent = 1 + sum(
+        (n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True) if n > 1
+    )
+    return (start, start + extent * t.element_size())
+
+
+def check_no_overlap(outputs, inputs, in_place=()):
+    """An output buffer may overlap neither another output nor any input -- a partial overlap is a corruption (a row's
+    values read after another row's store) -- except an output that IS the input it is allowed to replace in place:
+    ``in_place`` lists the ``(output name, input name)`` pairs whose byte ranges must then coincide exactly (the kernel
+    writes every element after the thread that owns it read it). ``outputs`` / ``inputs`` are ``(name, tensor | None)``
+    pairs; a violation raises ``ValueError``."""
+    outs = [(n, byte_range(t)) for n, t in outputs if t is not None]
+    ins = [(n, byte_range(t)) for n, t in inputs if t is not None]
+
+    def overlap(a, b):
+        return a[0] < b[1] and b[0] < a[1]
+
+    for i, (n, r) in enumerate(outs):
+        for m, q in outs[i + 1 :]:
+            if overlap(r, q):
+                raise ValueError(
+                    f"{n} and {m} overlap in memory: the outputs need distinct buffers"
+                )
+        for m, q in ins:
+            if overlap(r, q):
+                if (n, m) in in_place and r == q:
+                    continue
+                how = " without aliasing it exactly" if (n, m) in in_place else ""
+                raise ValueError(
+                    f"{n} overlaps {m} in memory{how}: an output buffer may not overlap an input"
+                )
+
+
+_scratch: dict = {}
+
+
+def scratch(device: torch.device, dtype: torch.dtype, n: int) -> torch.Tensor:
+    """A per-device scratch of at least ``n`` elements for a kernel output nobody reads (the draws' validity word, the
+    truncated draw's kept mass when not requested): grown to the largest size seen and kept, so a call allocates nothing
+    in steady state. Its contents are dead writes, so calls on different streams may share it. Inside a CUDA-graph
+    capture a fresh buffer is used and not cached (a capture-time allocation belongs to the graph's pool and would
+    dangle after the graph is freed)."""
+    key = (device, dtype)
+    t = _scratch.get(key)
+    if t is not None and t.numel() >= n:
+        return t
+    size = max(n, 2 * (t.numel() if t is not None else 0), 1024)
+    fresh = torch.empty(size, dtype=dtype, device=device)
+    if not torch.cuda.is_current_stream_capturing():
+        _scratch[key] = fresh
+    return fresh
