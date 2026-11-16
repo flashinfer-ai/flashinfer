@@ -4184,8 +4184,12 @@ def _build_w_ptr_table(weights, num_experts):
     ],
 )
 @pytest.mark.parametrize(
-    "activation_type",
-    [pytest.param(ActivationType.Swiglu, id="Swiglu")],
+    "activation_type,alpha_value,beta_value",
+    [
+        pytest.param(ActivationType.Swiglu, None, None, id="Swiglu"),
+        pytest.param(ActivationType.Situ, None, None, id="Situ"),
+        pytest.param(ActivationType.Situ, 4.0, 25.0, id="Situ_kimi-k3"),
+    ],
 )
 @pytest.mark.parametrize(
     "delta_mode",
@@ -4203,6 +4207,8 @@ def test_moe_lora_delta(
     routing_config,
     weight_processing,
     activation_type,
+    alpha_value,
+    beta_value,
     delta_mode,
     moe_gemm_backend,
     cache_permute_indices,
@@ -4212,6 +4218,11 @@ def test_moe_lora_delta(
       * "fake": zero vs constant delta, so the test fails if LoRA is silently dropped;
       * "real": regular 2-slice delta built by bgmv_moe_gemm1_lora_delta inside run_moe_test;
       * "performant": shared-A + horizontally-fused-B delta via 1D [E] w_ptr tables."""
+    if activation_type == ActivationType.Situ and (
+        not isinstance(moe_impl, FP4Moe)
+        or moe_impl.quant_mode != QuantMode.FP4_MXFP4_MXFP8
+    ):
+        pytest.skip("SiTU LoRA coverage targets MXFP4 x MXFP8")
     if delta_mode == "performant" and not (
         num_tokens == 128
         and weight_processing["layout"] == WeightLayout.BlockMajorK
@@ -4220,6 +4231,13 @@ def test_moe_lora_delta(
         pytest.skip("performant LoRA is covered on a reduced matrix")
 
     top_k = routing_config["top_k"]
+    activation_kwargs = {
+        name: torch.full(
+            (routing_config["num_experts"],), value, device="cuda", dtype=torch.float32
+        )
+        for name, value in (("gemm1_alpha", alpha_value), ("gemm1_beta", beta_value))
+        if value is not None
+    }
     zero_delta = torch.zeros(
         num_tokens, top_k, 2 * intermediate_size, dtype=torch.bfloat16, device="cuda"
     )
@@ -4236,6 +4254,7 @@ def test_moe_lora_delta(
         cache_permute_indices,
         gemm1_lora_delta=zero_delta,
         moe_gemm_backend=moe_gemm_backend,
+        **activation_kwargs,
     )
 
     if delta_mode == "fake":
@@ -4251,6 +4270,7 @@ def test_moe_lora_delta(
             cache_permute_indices,
             gemm1_lora_delta=delta,
             moe_gemm_backend=moe_gemm_backend,
+            **activation_kwargs,
         )
         torch.testing.assert_close(delta_args_dequant.gemm1_lora_delta, delta)
         assert (delta_reference - zero_reference).abs().max().item() > 0.05
@@ -4258,7 +4278,9 @@ def test_moe_lora_delta(
 
     # Real / performant delta: built inside run_moe_test from the generated hidden + routing.
     num_experts = routing_config["num_experts"]
-    rank, num_loras, lora_scale = 16, 4, 0.5
+    rank, num_loras = 16, 4
+    # Default SiTU attenuates the adapter effect; keep the nontrivial-output check.
+    lora_scale = 2.0 if activation_type == ActivationType.Situ else 0.5
     torch.manual_seed(1234)
     lora_ids = torch.randint(
         0, num_loras, (num_tokens,), dtype=torch.int64, device="cuda"
@@ -4341,6 +4363,7 @@ def test_moe_lora_delta(
             "scale": lora_scale,
         },
         moe_gemm_backend=moe_gemm_backend,
+        **activation_kwargs,
     )
 
     # Sanity: delta is non-trivial and changes the output vs no LoRA.
@@ -4348,3 +4371,41 @@ def test_moe_lora_delta(
     assert (real_reference - zero_reference).abs().max().item() > 0.05
     # Kernel matches the dequant reference (delta injected on both sides).
     check_accuracy(real_reference, real_actual, **moe_impl.get_tolerances())
+
+
+@pytest.mark.parametrize(
+    "activation_type", [ActivationType.Swiglu, ActivationType.Situ]
+)
+def test_moe_situ_lora_large_token_bucket(cache_permute_indices, activation_type):
+    # Exercise the throughput tiles against the independent dequantized reference.
+    test_moe_lora_delta(
+        num_tokens=4096,
+        hidden_size=1024,
+        intermediate_size=1024,
+        moe_impl=FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
+        routing_config={
+            "num_experts": 128,
+            "top_k": 8,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [1024],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_gemm_backends": [MoeGemmBackend.TRTLLM],
+        },
+        activation_type=activation_type,
+        alpha_value=4.0 if activation_type == ActivationType.Situ else None,
+        beta_value=25.0 if activation_type == ActivationType.Situ else None,
+        delta_mode="fake",
+        moe_gemm_backend=MoeGemmBackend.TRTLLM,
+        cache_permute_indices=cache_permute_indices,
+    )
