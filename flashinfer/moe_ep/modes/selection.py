@@ -24,9 +24,12 @@ def numerical_contract(config, prototype, fleet):
                 "EP selection currently requires canonical BF16 inputs and weights"
             )
         k = config.megakernel
-        if getattr(k, "input_norm_const", 1.0) != 1.0 or any(
-            getattr(k, name, None) is not None
-            for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+        if not getattr(k, "batch_invariant", False) and (
+            getattr(k, "input_norm_const", 1.0) != 1.0
+            or any(
+                getattr(k, name, None) is not None
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+            )
         ):
             raise ValueError(
                 "EP selection does not support Mega-only scaling overrides"
@@ -110,6 +113,12 @@ class MegaPlan:
             kernel = dataclasses.replace(kernel, **tuples(selected))
         elif fallback and kernel.knobs == "auto":
             kernel = prototype._kernel.ep_tuning_fallback()
+        elif kernel.knobs == "auto" and not prototype._kernel.supports_auto_workspaces:
+            from flashinfer.autotuner import AutoTuner
+            from ..core.selection import NAMESPACE
+
+            if not AutoTuner.get().protocol_context(NAMESPACE).tuning_enabled:
+                kernel = prototype._kernel.ep_tuning_fallback()
         self.layer = MoEEpMegaLayer(
             dataclasses.replace(prototype._bootstrap, auto_bootstrap=False),
             fleet,
@@ -174,7 +183,10 @@ class MegaPlan:
     def selection(self):
         layer = self.layer
         cfg = layer._kernel.ep_selected_config(layer._ensure_workspace())
-        return {"kernel_variant": cfg.kernel_variant, "knobs": plain(cfg.knobs)}
+        result = {"knobs": plain(cfg.knobs)}
+        if hasattr(cfg, "kernel_variant"):
+            result["kernel_variant"] = cfg.kernel_variant
+        return result
 
     def warmup(self, tensors):
         layer = self.layer
