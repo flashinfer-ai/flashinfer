@@ -43,7 +43,7 @@ def host(monkeypatch):
     state = SimpleNamespace(
         device=H100_SXM,
         aot_modules=set(),
-        tools={"/usr/local/cuda/bin/nvcc", "ninja"},
+        tools={"/usr/local/cuda/bin/nvcc", "ninja", "c++"},
         probes=0,
     )
 
@@ -75,6 +75,7 @@ def host(monkeypatch):
     monkeypatch.setattr(fused_moe, "gen_cutlass_fused_moe_module", gen_module)
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
     monkeypatch.delenv("FLASHINFER_NVCC", raising=False)
+    monkeypatch.delenv("CXX", raising=False)
     return state
 
 
@@ -114,19 +115,23 @@ def test_other_devices_keep_generic_module(host, device):
     ("aot_modules", "tools", "nvcc_env", "expected"),
     [
         pytest.param(
-            set(), {"/usr/local/cuda/bin/nvcc"}, None, GENERIC_MODULE, id="no-ninja"
+            set(),
+            {"/usr/local/cuda/bin/nvcc", "c++"},
+            None,
+            GENERIC_MODULE,
+            id="no-ninja",
         ),
-        pytest.param(set(), {"ninja"}, None, GENERIC_MODULE, id="no-nvcc"),
+        pytest.param(set(), {"ninja", "c++"}, None, GENERIC_MODULE, id="no-nvcc"),
         pytest.param(
             set(),
-            {"/opt/nvcc", "ninja"},
+            {"/opt/nvcc", "ninja", "c++"},
             "/opt/nvcc",
             H100_MODULE,
             id="flashinfer-nvcc",
         ),
         pytest.param(
             set(),
-            {"/usr/local/cuda/bin/nvcc", "ninja"},
+            {"/usr/local/cuda/bin/nvcc", "ninja", "c++"},
             "/opt/nvcc",
             GENERIC_MODULE,
             id="flashinfer-nvcc-missing",
@@ -149,6 +154,33 @@ def test_h100_requires_aot_artifact_or_compiler(
     if nvcc_env is not None:
         monkeypatch.setenv("FLASHINFER_NVCC", nvcc_env)
     assert _select()[0] == expected
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("cxx", "compilers", "expected"),
+    [
+        pytest.param(None, set(), GENERIC_MODULE, id="missing-default-cxx"),
+        pytest.param(
+            "/missing/c++", {"c++"}, GENERIC_MODULE, id="invalid-cxx-override"
+        ),
+        pytest.param("", {"c++"}, GENERIC_MODULE, id="empty-cxx-override"),
+        pytest.param("/opt/clang++", {"/opt/clang++"}, H100_MODULE, id="custom-cxx"),
+        pytest.param(
+            "/opt/clang++ -fPIC",
+            {"/opt/clang++"},
+            H100_MODULE,
+            id="cxx-with-arguments",
+        ),
+    ],
+)
+def test_h100_requires_host_compiler(monkeypatch, host, cxx, compilers, expected):
+    host.aot_modules = {GENERIC_MODULE}
+    host.tools = {"/usr/local/cuda/bin/nvcc", "ninja"} | compilers
+    if cxx is not None:
+        monkeypatch.setenv("CXX", cxx)
+    expected_flags = {H100_FLAG} if expected == H100_MODULE else set()
+    assert _select() == (expected, expected_flags)
 
 
 @pytest.mark.cpu_only
@@ -178,7 +210,7 @@ def test_h20_selects_its_prebuilt_d_module(host):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("has_aot", [False, True], ids=["jit", "aot"])
 def test_nvcc_override_without_cuda_toolkit(monkeypatch, host, has_aot):
-    host.tools = {"/opt/nvcc", "ninja"}
+    host.tools = {"/opt/nvcc", "ninja", "c++"}
     host.aot_modules = {H100_MODULE} if has_aot else set()
     monkeypatch.setenv("FLASHINFER_NVCC", "/opt/nvcc")
     monkeypatch.setattr(

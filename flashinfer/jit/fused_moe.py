@@ -16,6 +16,7 @@ limitations under the License.
 
 import os
 import platform
+import shlex
 import shutil
 from pathlib import Path
 from typing import List, Optional, Union
@@ -67,9 +68,9 @@ def _should_enable_sm90_moe_h100_prebuilt_d_descriptor() -> bool:
     """Return whether to use the H100-specific prebuilt-D JIT variant.
 
     Only the measured H100 SXM 80GB (HBM3, 132 SMs) qualifies; other H100
-    variants keep the generic module. The variant is selected only when it can
-    be loaded, from an installed AOT artifact or by compiling it with nvcc and
-    ninja, so generic AOT-only deployments keep working.
+    variants keep the generic module. Select the variant when its AOT artifact
+    is installed or the required JIT commands can be found; otherwise keep
+    the generic module available to AOT-only deployments.
     """
     if os.environ.get("FLASHINFER_DISABLE_JIT"):
         return False
@@ -86,6 +87,10 @@ def _should_enable_sm90_moe_h100_prebuilt_d_descriptor() -> bool:
             return False
         if jit_env.get_aot_artifacts(_SM90_MOE_H100_PREBUILT_D_MODULE):
             return True
+        # Ninja uses CXX (or c++) for the host sources and link step.
+        cxx = shlex.split(os.environ.get("CXX", "c++"))
+        if not cxx or shutil.which(cxx[0]) is None:
+            return False
         # Ninja also needs the CUDA toolkit root for headers and libraries,
         # even when the compiler executable is overridden separately.
         cuda_path = get_cuda_path()
