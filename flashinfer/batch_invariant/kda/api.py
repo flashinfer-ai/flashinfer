@@ -41,7 +41,15 @@ import torch
 
 from ..support import check_device, unsupported
 from .pool import ExactPool, get_pool
-from .spec import CHUNK, CLASS, HEAD_DIM, KDA_ARCHS, ROUTE, append_split
+from .spec import (
+    CHUNK,
+    CLASS,
+    HEAD_DIM,
+    KDA_ARCHS,
+    ROUTE,
+    append_split,
+    heads_supported,
+)
 
 _IO = torch.bfloat16
 
@@ -101,9 +109,11 @@ def _check_inputs(q, k, v, g, beta) -> Tuple[int, int]:
         )
     if HV != H:
         raise unsupported(CLASS, f"GQA with H={H}, HV={HV}", "HV == H")
-    if HV % 8 and HV > 14:
+    if not heads_supported(HV):
         raise unsupported(
-            CLASS, f"{HV} heads", "a multiple of 8 heads, or at most 14 heads"
+            CLASS,
+            f"{HV} heads",
+            "a multiple of 8 heads, or 1 to 10 or 12 heads (what the pinned prefill route carries)",
         )
     return H, HV
 

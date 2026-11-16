@@ -39,6 +39,20 @@ STAMP = 8
 GATE_LOG2_E = 1.4426950408889634
 
 
+#: The bf16 elements one stage of the prefill kernel's beta transport holds (its ``BETA_TILE_STAGE_ELEMS``).
+BETA_STAGE_ELEMS = 256
+
+
+def heads_supported(heads: int) -> bool:
+    """Whether the pinned prefill route carries ``heads`` heads: a multiple of 8 travels as 8-head boxes, any other
+    count as packed rows that must fit one stage (1 to 10, and 12)."""
+    if heads < 1:
+        return False
+    if heads % 8 == 0:
+        return True
+    return heads * (CHUNK + 8 // (heads & -heads)) <= BETA_STAGE_ELEMS
+
+
 def boundary(p: int) -> int:
     """The chunk boundary at or before position ``p``: the fp32 state the replay of row ``p`` starts from."""
     return CHUNK * (p // CHUNK)

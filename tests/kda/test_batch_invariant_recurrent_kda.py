@@ -20,7 +20,12 @@ import flashinfer.batch_invariant as bi
 from flashinfer import kda_prefill_cute
 from flashinfer.batch_invariant import BatchInvariantUnsupportedError
 from flashinfer.batch_invariant.kda import pool as bi_pool
-from flashinfer.batch_invariant.kda.spec import CHUNK, KDA_ARCHS, ROUTE
+from flashinfer.batch_invariant.kda.spec import (
+    CHUNK,
+    KDA_ARCHS,
+    ROUTE,
+    heads_supported,
+)
 from flashinfer.kda import recurrent_kda
 
 needs_device = pytest.mark.skipif(
@@ -227,6 +232,17 @@ def test_class_is_registered():
     assert fp.startswith("kda-bf16-c16-engine-") and fp == bi.fingerprint(
         "recurrent_kda"
     )
+
+
+def test_supported_head_counts():
+    assert [h for h in range(0, 34) if heads_supported(h)] == [
+        *range(1, 11),
+        12,
+        16,
+        24,
+        32,
+    ]
+    assert heads_supported(96) and not heads_supported(20)
 
 
 def test_unsupported_device_raises_before_any_kernel():
@@ -1030,3 +1046,29 @@ def test_rows_do_not_depend_on_the_head_count(h, n0):
         assert same_bits(got, ref[:, :h])
         assert same_bits(state, ref_state[:h])
     _check_hash(f"head_count_h{h}_n{n0}", got)
+
+
+@needs_device
+@pytest.mark.parametrize("h", range(1, 16))
+def test_head_count_rule_is_the_prefill_route_rule(h):
+    """Every head count the class accepts runs prefill, tail and decode; every other one is refused by the class and
+    by the pinned route alike."""
+    p = params(h)
+    s = make_seq(72, h, SEED + 950 + h, GATES["steep"])
+    if heads_supported(h):
+        got, state = _prefill_and_decode(s, p, 23, 72)
+        assert same_bits(got, one_shot(s, p)[0])
+        assert same_bits(state, one_shot(s, p, 64)[1])
+        a = h - 1
+        one = {
+            key: s[key][:, a : a + 1].clone() for key in ("q", "k", "v", "g", "beta")
+        }
+        one["s0"] = s["s0"][a : a + 1].clone()
+        par = dict(p, A_log=p["A_log"][a:].clone(), dt_bias=p["dt_bias"][a:].clone())
+        ref, ref_state = _prefill_and_decode(one, par, 23, 72)
+        assert same_bits(got[:, a:], ref) and same_bits(state[a:], ref_state)
+    else:
+        with pytest.raises(BatchInvariantUnsupportedError, match="heads"):
+            bi_decode(token(s, 0), new_pool([s], [0]), [0], p)
+        with pytest.raises(ValueError):
+            one_shot(s, p)

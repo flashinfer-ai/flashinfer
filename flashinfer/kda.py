@@ -477,7 +477,7 @@ def recurrent_kda(
             caller replaced starts a new chunk; a slot reset after a request
             shorter than 16 tokens must be prefilled with more than one token.
             Requires ``backend="auto"``, bf16 activations, head dim 128,
-            ``HV == H`` (a multiple of 8, or at most 14), ``A_log`` / ``dt_bias`` with
+            ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
             ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
             ``beta_is_logit``, a finite negative ``lower_bound``; speculative
             decode, checkpoints, ``initial_state_source``, ``seq_order``,
