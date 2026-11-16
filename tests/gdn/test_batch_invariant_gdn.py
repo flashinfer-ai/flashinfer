@@ -835,6 +835,17 @@ def test_pending_tail_survives_a_shorter_view():
 
 
 @needs_device
+def test_slot_outside_a_view_raises_on_the_host_checked_path():
+    HQ, HV = 4, 8
+    x, _ = _inputs(100, HQ, HV, 3)
+    buf = _pool(HV, 4)
+    before = buf.clone()
+    with pytest.raises(BatchInvariantUnsupportedError):
+        _bi(buf[:2], [3], x)
+    assert torch.equal(buf, before) and not get_pool(buf, HQ).pending
+
+
+@needs_device
 def test_slot_outside_the_pool_returns_nan():
     HQ, HV = 4, 8
     x, _ = _inputs(2, HQ, HV, 4)

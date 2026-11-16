@@ -65,7 +65,7 @@ def _check_inputs(q, k, v, g, beta) -> Tuple[int, int, int]:
         )
     if T == 0:
         raise unsupported(CLASS, "an empty call", "at least one token")
-    if HQ == 0 or HV % HQ:
+    if HQ == 0 or HV == 0 or HV % HQ:
         raise unsupported(
             CLASS,
             f"{HQ} q heads with {HV} v heads",
@@ -301,7 +301,11 @@ def chunk_gated_delta_rule_batch_invariant(
     ):
         return (out, pool) if output_final_state else out
     slot_list = slots.tolist()
-    if len(set(slot_list)) != N or min(slot_list) < 0 or max(slot_list) >= gp.slots:
+    if (
+        len(set(slot_list)) != N
+        or min(slot_list) < 0
+        or max(slot_list) >= int(pool.shape[0])
+    ):
         raise unsupported(
             CLASS,
             "state_indices that repeat a slot or leave the pool",

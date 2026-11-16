@@ -44,7 +44,7 @@ void launch(TensorView q, TensorView k, TensorView v, TensorView g, TensorView b
   const int64_t tokens = q.size(0), num_q_heads = q.size(1), num_v_heads = v.size(1);
   const int64_t batch = slots.numel();
   TVM_FFI_ICHECK(q.size(2) == bi::D && v.size(2) == bi::D) << "head dim must be 128";
-  TVM_FFI_ICHECK(num_q_heads > 0 && num_v_heads % num_q_heads == 0)
+  TVM_FFI_ICHECK(num_q_heads > 0 && num_v_heads > 0 && num_v_heads % num_q_heads == 0)
       << "the v-head count must be a multiple of the q-head count";
   // a span launch without an output only builds the slots' cached rows
   TVM_FFI_ICHECK(k.numel() == q.numel() && v.size(0) == tokens);
@@ -137,7 +137,7 @@ void gdn_batch_invariant_stash(TensorView k, TensorView v, TensorView g, TensorV
   CHECK_DIM(4, state);
   const int64_t tokens = k.size(0), num_q_heads = k.size(1), num_v_heads = v.size(1);
   TVM_FFI_ICHECK(k.size(2) == bi::D && v.size(2) == bi::D) << "head dim must be 128";
-  TVM_FFI_ICHECK(num_q_heads > 0 && num_v_heads % num_q_heads == 0)
+  TVM_FFI_ICHECK(num_q_heads > 0 && num_v_heads > 0 && num_v_heads % num_q_heads == 0)
       << "the v-head count must be a multiple of the q-head count";
   TVM_FFI_ICHECK(v.size(0) == tokens);
   TVM_FFI_ICHECK(g.numel() == tokens * num_v_heads && beta.numel() == g.numel());
