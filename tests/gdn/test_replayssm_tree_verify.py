@@ -200,7 +200,7 @@ def test_validation_flag_accepts_trees_and_rejects_a_forward_parent():
         for marker in (
             "device-side assert",
             "CUDA error",
-            "CUDA Error Code",
+            "CUDA Error Code: 710",
             "_assert_async_cuda_kernel",
         )
     ), combined
