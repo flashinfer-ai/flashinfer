@@ -8,7 +8,7 @@ frameworks a deterministic value to include in their compiled-kernel cache.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import os
 from typing import Any, Dict, Optional
 
@@ -34,6 +34,12 @@ def _read_optional_int(name: str) -> Optional[int]:
 class Sm120JitConfig:
     """All non-shape options that specialize generated SM120 device code."""
 
+    # None selects the evidence-qualified production policy; explicit booleans
+    # remain available for controlled ablation and rollback. Compile specs
+    # always resolve this to a bool before creating a cache key.
+    fc1_utility_postprocess: Optional[bool] = None
+    weight_eviction_policy: Optional[str] = field(default=None, kw_only=True)
+    activation_eviction_policy: Optional[str] = field(default=None, kw_only=True)
     k1_ready_major: bool = True
     k2_token_stripe: int = 2
     fc2_ready_bundle_k_tiles: int = 12
@@ -43,6 +49,12 @@ class Sm120JitConfig:
     enable_k2_tile_trace: bool = False
 
     def __post_init__(self) -> None:
+        if self.weight_eviction_policy not in (None, "default", "evict_first"):
+            raise ValueError("weight_eviction_policy must be auto/default/evict_first")
+        if self.activation_eviction_policy not in (None, "default", "evict_last"):
+            raise ValueError("activation_eviction_policy must be auto/default/evict_last")
+        if self.fc1_utility_postprocess is not None and type(self.fc1_utility_postprocess) is not bool:
+            raise ValueError("fc1_utility_postprocess must be None (auto), True or False")
         if self.k2_token_stripe <= 0:
             raise ValueError("k2_token_stripe must be positive")
         if self.fc2_ready_bundle_k_tiles <= 0:
@@ -59,6 +71,10 @@ class Sm120JitConfig:
 
         enable_k2_tile_trace = _read_bool("MEGA_SPLIT_K2_TILE_TRACE", False)
         return cls(
+            weight_eviction_policy=os.environ.get("MEGA_WEIGHT_EVICTION_POLICY"),
+            activation_eviction_policy=os.environ.get("MEGA_ACTIVATION_EVICTION_POLICY"),
+            fc1_utility_postprocess=(_read_bool("MEGA_FC1_UTILITY_POSTPROCESS", False)
+                                     if "MEGA_FC1_UTILITY_POSTPROCESS" in os.environ else None),
             k1_ready_major=_read_bool("MEGA_K1_READY_MAJOR", True),
             k2_token_stripe=int(os.environ.get("MEGA_K2_TOKEN_STRIPE", "2")),
             fc2_ready_bundle_k_tiles=int(

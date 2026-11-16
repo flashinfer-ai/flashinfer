@@ -2,9 +2,13 @@
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-nvfp4-split`, commit
-`d0762b1a361c69640885f64e6529e5fec4fa7ef4` (ABI 2812).
-This revision includes qualified compact compute policies and the NCCL-only
-memory/transport runtime. The private `moe_sm120_nvfp4_split/support/common/` and `support/src/`
+`f6f6b5ae0f7d16fc7856d1af1d633d421590f44d`. The FlashInfer
+delivery uses ABI `2814542011115` (standalone source ABI `281454201`).
+This revision includes continuous decode policies, M128 workers, utility
+defaults, DATA TMA eviction hints and the NCCL memory/transport runtime.
+The FlashInfer-specific EP8 GIN adapter and graph integration are retained
+alongside the standalone source; this is not a byte-identical standalone drop.
+See [DECODE_DEFAULTS.md](DECODE_DEFAULTS.md) for activation ranges and validation limits. The private `moe_sm120_nvfp4_split/support/common/` and `support/src/`
 directories retain the PR's framework adaptations without exposing generic
 `common` or `src` packages that could shadow other backends. `runtime/green_context.py` and its tests retain
 the graph-aware FlashInfer adapter rather than the standalone runner wrapper.
@@ -18,9 +22,15 @@ contract is packed E2M1 NVFP4 x NVFP4 with one E4M3 scale per 16 K elements,
 FP32 accumulation, and BF16 output. FlashInfer imports only this package's
 `shim`; backend code does not import benchmark runners.
 
-The initial integration supports the production same-NUMA `p2p_direct` path.
-The cross-NUMA GIN transport is present in the vendored source but is not exposed
-by this same-NUMA framework adapter.
+The adapter supports same-NUMA `p2p_direct` and cross-NUMA `gin` transport.
+At host selection, FlashInfer `gin` maps to the native policy name
+`gin_hybrid`, then maps back for execution. Local peers use P2P; remote
+peers use NCCL GIN. EP8 retains disjoint K1/TX/RX/K2 Green Contexts.
+The CUDA 13.0 driver path splits equal SM units once and assembles the
+requested disjoint resources; newer drivers use the structured split API.
+Dynamic GIN window registration preserves live device signal-shadow state.
+The host bridge and its pinned build manifest are shipped together;
+the existing GIN device bitcode is unchanged.
 
 Multi-rank execution requires the pinned NCCL 2.32.3 runtime, selected through
 `MEGAMOE_NCCL_ROOT` or `nvidia-nccl-cu13==2.32.3`. Keep `NCCL_CUMEM_ENABLE=1` set before initializing the communicator;
@@ -28,8 +38,11 @@ frameworks such as SGLang may otherwise override this setting to zero, which is
 incompatible with the NCCL device communicator used here. The backend requests
 only Torch distributed bootstrap. It allocates one NCCL-registered arena per workspace
 and derives direct-P2P pointers through LSA. It does not initialize NVSHMEM.
-The runtime rejects processes that already load NVSHMEM, including incompatible
-PyTorch builds; use a clean compatible PyTorch build. Single-rank execution can set `MEGA_NO_DIST=1`. The backend
+By default the runtime rejects processes that load NVSHMEM. The explicit
+`MEGAMOE_ALLOW_TORCH_NVSHMEM_LOAD=1` compatibility option permits only
+the two recognized Torch-linked library paths, with a warning. MegaMoE
+allocation and transport still use NCCL; the process is not NVSHMEM-free.
+Other NVSHMEM modules/libraries remain rejected. Single-rank execution can set `MEGA_NO_DIST=1`. The backend
 must be warmed up collectively before an outer CUDA Graph capture begins.
 
 Layers with identical geometry share activation, routing, K1/K2 scratch, and

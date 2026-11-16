@@ -142,35 +142,57 @@ class NativeGreenContextResources:
                 f"got {requested_counts[:-1]}."
             )
 
-        # The driver accepts the heterogeneous split in K1, TX, RX, K2 order.
-        # A catch-all K2 group avoids imposing an invalid 38-SM co-schedule
-        # constraint on Blackwell while still consuming the full remainder.
-        options = SMResourceOptions(
-            count=[k1_sm_count, comm_tx_sm_count, comm_rx_sm_count, None],
-            coscheduled_sm_count=[alignment, alignment, alignment, 2],
-            backfill=True,
-        )
-        groups, remainder = sm_resource.split(options)
-        if int(remainder.sm_count) != 0 or len(groups) != 4:
-            raise RuntimeError("CUDA did not produce the requested K1/TX/RX/K2 split.")
-        actual_counts = tuple(int(group.sm_count) for group in groups)
-        if min(actual_counts) <= 0:
-            raise RuntimeError(f"CUDA produced an empty SM partition: {actual_counts}.")
-        if actual_counts != requested_counts:
-            raise RuntimeError(
-                f"CUDA produced {actual_counts}, requested {requested_counts}."
+        (driver_version,) = _check_cuda(cuda.cuDriverGetVersion(), "cuDriverGetVersion")
+        if driver_version < 13010:
+            # CUDA 13.0 cannot split a remainder again. Partition once into
+            # equal disjoint units, then merge units in resource descriptors.
+            # The unstructured remainder supplies the exact K2 allocation.
+            unit = alignment
+            n_units = sum(requested_counts[:-1]) // unit
+            (raw_resource,) = _check_cuda(
+                cuda.cuDeviceGetDevResource(cuda_device, cuda.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM),
+                "cuDeviceGetDevResource",
             )
-
-        driver_resources = tuple(cuda.CUdevResource(group.handle) for group in groups)
+            units, count, remainder = _check_cuda(
+                cuda.cuDevSmResourceSplitByCount(n_units, raw_resource, 0, unit),
+                "cuDevSmResourceSplitByCount",
+            )
+            if int(count) != n_units or any(int(x.sm.smCount) != unit for x in units[:n_units]):
+                raise RuntimeError("CUDA cannot supply the requested disjoint SM units")
+            resource_sets = []
+            cursor = 0
+            for requested in requested_counts[:-1]:
+                stop = cursor + requested // unit
+                resource_sets.append(tuple(units[cursor:stop]))
+                cursor = stop
+            resource_sets.append((remainder,))
+            actual_counts = tuple(sum(int(x.sm.smCount) for x in part) for part in resource_sets)
+            groups = ()
+            driver_resources = tuple(units[:n_units]) + (remainder,)
+        else:
+            # Structured API creates heterogeneous partitions in one call.
+            options = SMResourceOptions(
+                count=[k1_sm_count, comm_tx_sm_count, comm_rx_sm_count, None],
+                coscheduled_sm_count=[alignment, alignment, alignment, 2],
+                backfill=True,
+            )
+            groups, remainder = sm_resource.split(options)
+            if int(remainder.sm_count) != 0 or len(groups) != 4:
+                raise RuntimeError("CUDA did not produce the requested K1/TX/RX/K2 split.")
+            actual_counts = tuple(int(group.sm_count) for group in groups)
+            driver_resources = tuple(cuda.CUdevResource(group.handle) for group in groups)
+            resource_sets = [(resource,) for resource in driver_resources]
+        if actual_counts != requested_counts:
+            raise RuntimeError(f"CUDA produced {actual_counts}, requested {requested_counts}.")
         contexts = []
         execution_contexts = []
         raw_streams = []
         try:
             for label, resource in zip(
-                ("K1", "COMM_TX", "COMM_RX", "K2"), driver_resources
+                ("K1", "COMM_TX", "COMM_RX", "K2"), resource_sets
             ):
                 (descriptor,) = _check_cuda(
-                    cuda.cuDevResourceGenerateDesc([resource], 1),
+                    cuda.cuDevResourceGenerateDesc(list(resource), len(resource)),
                     f"cuDevResourceGenerateDesc({label})",
                 )
                 (green_context,) = _check_cuda(
@@ -430,6 +452,7 @@ class NativeGreenContextGraph:
         launch_k2_finalizer: Optional[Callable[[], None]],
         launch_k3: Optional[Callable[[], None]],
         launch_reset: Optional[Callable[[], None]] = None,
+        launch_transport_end: Optional[Callable[[], None]] = None,
         k1_sm_count: int,
         k1_grid_clusters: Optional[int] = None,
         k2_grid_clusters: Optional[int] = None,
@@ -491,6 +514,9 @@ class NativeGreenContextGraph:
             k2_done.record(k2_stream)
             root_stream.wait_event(k1_done)
             root_stream.wait_event(k2_done)
+            if launch_transport_end is not None:
+                with torch.cuda.stream(root_stream):
+                    launch_transport_end()
             # Primary-context finalizer and K3 run after this mixed-context
             # graph. Embedding the finalizer here can stall a pooled Green
             # Context launch (reproduced at the N16/dual-N8 decode bucket).
@@ -554,6 +580,11 @@ class NativeGreenContextGraph:
                 green_resources.execution_contexts[0],
                 green_resources.execution_contexts[-1],
             ]
+        if compiled_role_owners is not None and any(role >= 2 for role in compiled_role_owners):
+            if not isinstance(green_resources, NativeGreenContextResources):
+                raise ValueError("Transport graph roles require four Green partitions")
+            execution_contexts.extend((green_resources.execution_contexts[1],
+                                       green_resources.execution_contexts[2]))
         try:
             library_kernels = cls._library_kernels(compiled_kernels)
             role_functions = {}
@@ -597,7 +628,7 @@ class NativeGreenContextGraph:
                 cuda.cuGraphGetNodes(graph, num_nodes),
                 "cuGraphGetNodes",
             )
-            rebound = [0, 0]
+            rebound = [0] * len(execution_contexts)
             for node in nodes:
                 (node_type,) = _check_cuda(
                     cuda.cuGraphNodeGetType(node),

@@ -42,8 +42,10 @@ class ImplDesc:
     def __post_init__(self) -> None:
         m, n, _k = self.mma_tiler_mnk
 
-        if m != 64:
-            raise ValueError(f"SM120 swap-AB requires mma_tiler_m=64, got {m}.")
+        if m not in (64, 128):
+            raise ValueError(f"SM120 swap-AB requires mma_tiler_m in (64,128), got {m}.")
+        if m == 128 and (n, _k) not in ((16, 128), (32, 128)):
+            raise ValueError("experimental M128 requires N32 K128")
         if n not in (16, 32, 64, 128):
             raise ValueError(
                 f"mma_tiler_n must be 16, 32, 64, or 128, got {n}."

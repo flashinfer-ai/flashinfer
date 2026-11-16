@@ -39,7 +39,7 @@ from .jit_config import Sm120JitConfig
 # Rank-local combine now reserves a source-generated contributor-plan plane.
 # Version 22 refreshes generated code for whole-warp rank-local reduction;
 # the workspace layout and completion protocol are unchanged.
-KERNEL_CACHE_ABI = 2812
+KERNEL_CACHE_ABI = 2814542011115  # isolated K2 M128 serial-N8 experiment
 
 
 @dataclass(frozen=True)
@@ -132,6 +132,58 @@ class MegaMoECompileSpec:
     def __post_init__(self) -> None:
         self.problem.validate()
         self.build.validate()
+        object.__setattr__(self, "jit", replace(self.jit,
+            weight_eviction_policy=self.jit.weight_eviction_policy or "default",
+            activation_eviction_policy=self.jit.activation_eviction_policy or "default"))
+        if self.kernel.k1_tile[0] == 128 or self.kernel.k2_tile[0] == 128:
+            k, p = self.kernel, self.problem
+            ep4_k1_only = (1 <= p.tokens_per_rank <= 32768 and p.expert_parallel_size == 4
+                    and p.hidden == p.intermediate == 4096
+                    and (p.num_total_experts, p.num_topk) in ((256, 6), (288, 8))
+                    and k.k1_tile == (128, 16, 128) and k.k2_tile == (64, 16, 128)
+                    and k.k2_warps == 12 and k.dispatch_warps == 1
+                    and k.k2_tail_reclaim and not k.rank_local_combine
+                    and (k.k1_sms, k.k2_sms, k.tx_sms, k.rx_sms) == (80, 30, 0, 0)
+                    and k.comm_backend == k.kernel_comm_backend == "p2p_direct"
+                    and not k.k1_compact_tokens and not k.k2_compact_tokens
+                    and k.token_back_mode == "epi_warps"
+                    and not k.dispatch_compute_overlap and k.dispatch_rank_cache
+                    and k.k1_ready_queue and k.k2_ready_queue
+                    and k.k2_natural_regs and k.k2_min_blocks_per_sm == 2
+                    and k.k1_stages == 3 and k.k2_stages == 2)
+            ep4_k2_m128 = (1 <= p.tokens_per_rank <= 32768 and p.expert_parallel_size == 4
+                    and p.hidden == p.intermediate == 4096
+                    and (p.num_total_experts, p.num_topk) in ((256, 6), (288, 8))
+                    and k.k1_tile == (128, 16, 128) and k.k2_tile == (128, 16, 128)
+                    and k.k2_warps == 12 and k.dispatch_warps == 1
+                    and k.k2_tail_reclaim and not k.rank_local_combine
+                    and (k.k1_sms, k.k2_sms, k.tx_sms, k.rx_sms) == (80, 30, 0, 0)
+                    and k.comm_backend == k.kernel_comm_backend == "p2p_direct"
+                    and not k.k1_compact_tokens and not k.k2_compact_tokens
+                    and k.token_back_mode == "epi_warps"
+                    and not k.dispatch_compute_overlap and k.dispatch_rank_cache
+                    and k.k1_ready_queue and k.k2_ready_queue
+                    and k.k2_natural_regs and k.k2_min_blocks_per_sm == 2
+                    and k.k1_stages == 3 and k.k2_stages == 2
+                    and k.ready_queue_bundle == 1
+                    and p.gate_up_clamp == 10.0
+                    and p.tensor_parallel_size == p.data_parallel_size == 1
+                    and self.jit.fc1_utility_postprocess == (p.num_total_experts == 256)
+                    and self.jit.num_ab_stages_override in (None, 3)
+                    and self.build.k1_active_clusters in (None, 80)
+                    and self.build.k2_active_clusters in (None, 30))
+            if not ep4_k1_only and not ep4_k2_m128 and not (1 <= p.tokens_per_rank <= 32768 and p.expert_parallel_size == 8
+                    and p.hidden % 128 == 0 and p.intermediate % 128 == 0
+                    and k.k1_tile == k.k2_tile == (128, 32, 128)
+                    and k.k2_warps == 12 and k.dispatch_warps == 4
+                    and not k.k2_tail_reclaim and not k.rank_local_combine
+                    and not k.k1_compact_tokens and not k.k2_compact_tokens
+                    and k.token_back_mode == "reuse_dispatch_warps"
+                    and not k.dispatch_compute_overlap and not k.dispatch_rank_cache
+                    and k.k1_ready_queue and k.k2_ready_queue
+                    and k.k2_natural_regs and k.k2_min_blocks_per_sm == 2
+                    and k.k1_stages == k.k2_stages == 2):
+                raise ValueError("M128 requires the experimental model/topology/geometry contract")
         if self.kernel.k2_tail_reclaim and not self.build.concurrent_k1_k2:
             raise ValueError("K2 tail reclaim requires concurrent green execution")
         # Explicit JIT stage override wins and is reflected in the canonical
@@ -139,6 +191,14 @@ class MegaMoECompileSpec:
         if self.jit.num_ab_stages_override is not None:
             object.__setattr__(self, "kernel", replace(
                 self.kernel, k1_stages=self.jit.num_ab_stages_override))
+        # Direct construction has no topology/contract qualification context.
+        # Automatic selection is resolved by select_compile_spec below.
+        if self.jit.fc1_utility_postprocess is None:
+            object.__setattr__(self, "jit", replace(self.jit, fc1_utility_postprocess=False))
+        if self.jit.fc1_utility_postprocess and (
+            self.kernel.k1_tile[1] not in (16, 32) or self.kernel.k1_compact_tokens
+        ):
+            raise ValueError("FC1 utility requires noncompact N16/N32")
         if self.kernel.total_sms <= 0:
             raise ValueError("kernel SM partition must be non-empty")
 
@@ -204,7 +264,7 @@ def is_calibrated_execution(
         dual_k2_ctas_per_sm == 2 and complete_pipeline
         and
         (build is None or build == SplitKernelBuildOptions())
-        and (jit is None or jit == Sm120JitConfig())
+        and (jit is None or replace(jit, fc1_utility_postprocess=None, weight_eviction_policy=None, activation_eviction_policy=None) == Sm120JitConfig())
     )
 
 
@@ -258,10 +318,32 @@ def select_compile_spec(
             numerical_contract=numerical_contract, host_expert_counts=host_expert_counts,
             tuning_config=tuning_config, hardware=hardware)
     )
+    from .ep8_resource_policy import select_ep8_resources
+    selected = select_ep8_resources(
+        heuristic_input, selected, overrides, numerical_contract, host_expert_counts,
+        eligible=is_calibrated_execution(build=build, jit=jit),
+        gate_up_clamp=problem.gate_up_clamp, tuning_config=tuning_config,
+    )
+    resolved_jit = jit or Sm120JitConfig()
+    from .decode_policy import select_decode_defaults
+    selected, resolved_jit = select_decode_defaults(
+        heuristic_input, selected, overrides, resolved_jit, numerical_contract,
+        host_expert_counts, eligible=is_calibrated_execution(build=build, jit=resolved_jit),
+        clamp=problem.gate_up_clamp, tuning=tuning_config,
+    )
+    if resolved_jit.fc1_utility_postprocess is None:
+        from .utility_policy import select_utility
+        enabled = select_utility(
+            heuristic_input, selected, numerical_contract,
+            eligible=(is_calibrated_execution(build=build, jit=resolved_jit)
+                      and host_expert_counts is None and tuning_config is None
+                      and problem.gate_up_clamp == 10.0),
+        )
+        resolved_jit = replace(resolved_jit, fc1_utility_postprocess=enabled)
     return MegaMoECompileSpec(
         problem=problem,
         kernel=selected,
-        jit=jit or Sm120JitConfig(),
+        jit=resolved_jit,
         build=build or SplitKernelBuildOptions(),
     )
 
@@ -286,7 +368,8 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     cluster_size = 1
     k1_clusters = options.k1_active_clusters or config.k1_sms // cluster_size
     k2_clusters = options.k2_active_clusters or config.k2_sms // cluster_size
-    k2_ctas_per_sm = 2 if config.k2_warps == 12 else 1
+    dual_n16 = config.k2_warps == 12 and config.k2_tile[1] == 16
+    k2_ctas_per_sm = 2 if dual_n16 else 1
     k2_launch_clusters = k2_clusters * k2_ctas_per_sm
     k1_group_hint = options.group_hint or k1_clusters
     k2_group_hint = options.group_hint or k2_launch_clusters
@@ -294,7 +377,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     k1_token_n = config.k1_tile[1]
     k2_token_n = config.k2_tile[1]
     ready_token_n = max(k1_token_n, k2_token_n)
-    if config.k2_warps == 12 and k2_token_n == 16:
+    if dual_n16 and k2_token_n == 16:
         # K2 stages one N128 SFB slab even though each consumer owns N16.
         # Do not publish any child tile while K1 can still update sibling
         # scale rows covered by the same TMA transaction.
@@ -314,6 +397,8 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         sf_padding_block=SfPaddingBlock,
         fc1_ready_tile_tokens=k1_token_n,
         fc1_producer_tile_tokens=k1_token_n,
+        fc1_channel_tile=config.k1_tile[0],
+        fc2_channel_tile=config.k2_tile[0],
         k2_token_tile_tokens=k2_token_n,
         k2_ready_tile_tokens=ready_token_n,
         static_expert_shape=(
@@ -370,7 +455,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         compact_k2=(config.k2_warps in (8, 12) or config.k2_tile[1] == 256),
         load_balance_mode=k2_load_balance,
         k2_tail_reclaim=config.k2_tail_reclaim,
-        skip_global_tail=(config.k2_tail_reclaim or config.k2_warps == 12),
+        skip_global_tail=(config.k2_tail_reclaim or dual_n16),
         producer_sm_count=(
             k1_clusters * cluster_size if options.concurrent_k1_k2 else 0
         ),
@@ -378,7 +463,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     )
     k2_kernel_cls = (
         Sm120Fc2CombineN16DualGroupKernel
-        if config.k2_warps == 12
+        if dual_n16
         else Sm120Fc2CombineKernel
     )
     k2 = k2_kernel_cls(**k2_common, **common_kwargs)
@@ -398,7 +483,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         k2_drain = k2_kernel_cls(**drain_common, **common_kwargs)
         k2_drain.compact_token_rows = config.k2_compact_tokens
 
-    if config.k2_tail_reclaim or config.k2_warps == 12:
+    if config.k2_tail_reclaim or dual_n16:
         finalizer_common = dict(k2_common)
         finalizer_common.update(
             group_hint=1,
@@ -412,7 +497,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
             **finalizer_common, **common_kwargs
         )
 
-    expected_threads = 32 * (11 if config.k2_warps == 12 else config.k2_warps)
+    expected_threads = 32 * (11 if dual_n16 else config.k2_warps)
     if k2.threads_per_cta != expected_threads:
         raise RuntimeError(
             f"K2 requested {expected_threads} threads, got {k2.threads_per_cta}"

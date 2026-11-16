@@ -24,12 +24,30 @@ def require_nccl_only_process():
     modules = [name for name in sys.modules
                if name == 'nvshmem' or name.startswith('nvshmem.')]
     libraries = []
+    framework_libraries = []
+    allow_torch = os.environ.get("MEGAMOE_ALLOW_TORCH_NVSHMEM_LOAD") == "1"
+    if allow_torch:
+        import torch
+        torch_root = Path(torch.__file__).resolve().parent
+        framework_paths = {
+            (torch_root / "lib/libtorch_nvshmem.so").resolve(),
+            (torch_root.parent / "nvidia/nvshmem/lib/libnvshmem_host.so.3").resolve(),
+        }
     for line in Path('/proc/self/maps').read_text().splitlines():
         fields = line.split()
         if len(fields) >= 6:
             name = Path(fields[-1]).name.lower()
             if name.startswith('lib') and 'nvshmem' in name:
-                libraries.append(name)
+                path = Path(fields[-1]).resolve()
+                if allow_torch and path in framework_paths:
+                    framework_libraries.append(name)
+                else:
+                    libraries.append(name)
+    if framework_libraries:
+        import warnings
+        warnings.warn("Torch-linked NVSHMEM libraries are loaded by the framework; "
+                      "MegaMoE allocation and transport remain NCCL-only. "
+                      "This process is not NVSHMEM-free.", RuntimeWarning)
     if modules or libraries:
         raise RuntimeError(
             'The NCCL-only MegaMoE runtime cannot use a process that already '

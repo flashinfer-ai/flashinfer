@@ -201,6 +201,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         rank_local_combine: bool = False,
         fc1_ready_tile_tokens: Optional[int] = None,
         fc1_producer_tile_tokens: Optional[int] = None,
+        fc1_channel_tile: Optional[int] = None,
+        fc2_channel_tile: Optional[int] = None,
         k2_token_tile_tokens: Optional[int] = None,
         k2_ready_tile_tokens: Optional[int] = None,
         split_role: Literal["k1", "k2"],
@@ -327,6 +329,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             jit_config=jit_config,
         )
 
+        self.fc1_channel_tile = fc1_channel_tile or mma_tiler_mnk[0]
+        self.fc2_channel_tile = fc2_channel_tile or mma_tiler_mnk[0]
         self.split_role = split_role
         self.comm_backend = comm_backend
         self.producer_sm_count = producer_sm_count
@@ -336,6 +340,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             split_role in ("k1", "k2")
             and k2_ready_queue
         )
+        self.diag_inputs_ready = False
         self.k1_ready_queue_workspace = (
             split_role in ("k1", "k2")
             and k1_ready_queue_workspace
@@ -403,9 +408,9 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             split_role == "k2" and k2_n16_dual_group
         )
         if self.k2_n16_dual_group:
-            if mma_tiler_mnk != (64, 16, 128):
+            if mma_tiler_mnk not in ((64, 16, 128), (128, 16, 128)):
                 raise ValueError(
-                    "K2 dual-group mapping requires tile (64,16,128)"
+                    "K2 N16 mapping requires tile M64 or M128, N16 K128"
                 )
             self.compute_warp_id = tuple(range(8))
             self.tma_a_warp_id = 8
@@ -532,8 +537,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             fc2_k_tiles + self.fc2_ready_bundle_k_tiles - 1
         ) // self.fc2_ready_bundle_k_tiles
         fc2_hidden_tiles = (
-            self.hidden + self.mma_tiler_mnk[0] - 1
-        ) // self.mma_tiler_mnk[0]
+            self.hidden + self.fc2_channel_tile - 1
+        ) // self.fc2_channel_tile
         queue_bundles_per_token_block = (
             fc2_hidden_tiles + self.k2_ready_queue_bundle - 1
         ) // self.k2_ready_queue_bundle
@@ -546,8 +551,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             * k2_token_tiles_per_ready_block
         ) + 256
         self.k1_ready_queue_m_tiles = (
-            self.intermediate_gateup + self.mma_tiler_mnk[0] - 1
-        ) // self.mma_tiler_mnk[0]
+            self.intermediate_gateup + self.fc1_channel_tile - 1
+        ) // self.fc1_channel_tile
         self.k1_ready_queue_capacity = (
             (
                 self.pool_task_tile_capacity
@@ -574,12 +579,12 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             # Keep the physical 4-warp setmaxnreg group intact. Warps beyond
             # dispatch_warps are idle for dispatch, but still participate in
             # the kernel-tail rendezvous as cohabitants.
-            num_other_warps = 4 + 1 + 1 + 1 + 1 + (4 - dispatch_warps)
+            num_other_warps = len(self.compute_warp_id) + 1 + 1 + 1 + 1 + (4 - dispatch_warps)
             token_comm_num_dispatch_warps = dispatch_warps
         # fc2 epi publishes once per CTA per work tile; edge hidden tiles
         # still publish (no in-bound gating), so ceil_div on the hidden axis.
         cluster_fc2_tile_hidden = (
-            self.mma_tiler[0] * self.cluster_shape_mn[0]
+            self.fc2_channel_tile * self.cluster_shape_mn[0]
             // (2 if self.use_2cta_instrs else 1)
         )
         fc2_publishes_per_token_cluster_tile = (
@@ -799,8 +804,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             fc2_k_tiles + self.fc2_ready_bundle_k_tiles - 1
         ) // self.fc2_ready_bundle_k_tiles
         fc2_hidden_tiles = (
-            self.hidden + self.mma_tiler_mnk[0] - 1
-        ) // self.mma_tiler_mnk[0]
+            self.hidden + self.fc2_channel_tile - 1
+        ) // self.fc2_channel_tile
         queue_bundles_per_token_block = (
             fc2_hidden_tiles + self.k2_ready_queue_bundle - 1
         ) // self.k2_ready_queue_bundle
@@ -1610,7 +1615,15 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         lane_idx,
         tidx,
     ):
-        if cutlass.const_expr(self.split_role != "k2"):
+        if cutlass.const_expr(self.diag_inputs_ready):
+            # Diagnostic only: real dispatched payload and immutable queue are
+            # restored and stream-ordered BEFORE this launch. Preserve the
+            # scheduler admission barrier and the all-warp completion hook.
+            pipeline.NamedBarrier(
+                barrier_id=self.token_comm.dispatch_to_sched_named_barrier_id,
+                num_threads=self.token_comm.dispatch_to_sched_threads,
+            ).arrive()
+        elif cutlass.const_expr(self.split_role != "k2"):
             self.token_comm.dispatch_warp_body(
                 token_comm_args,
                 token_comm_storage,

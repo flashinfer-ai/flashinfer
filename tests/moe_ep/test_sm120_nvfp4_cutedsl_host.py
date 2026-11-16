@@ -275,7 +275,9 @@ def test_execution_allocation_synchronizes_only_new_storage(
     frontend.workspace = workspace
     frontend.compile_bucket = 32
     frontend.config = SimpleNamespace(num_topk=1, hidden=1, world_size=4)
-    spec = SimpleNamespace(kernel=SimpleNamespace(rank_local_combine=False))
+    spec = SimpleNamespace(
+        kernel=SimpleNamespace(rank_local_combine=False, comm_backend="p2p_direct")
+    )
     bundle = SimpleNamespace(local_workspace_bytes=4, shared_workspace_bytes=4)
     monkeypatch.setattr(frontend, "_ensure_plan", lambda bucket: (spec, bundle))
     monkeypatch.setattr(runtime, "ensure_not_capturing", lambda op: None)
@@ -370,7 +372,7 @@ def test_frontend_passes_contract_and_gate_up_width(monkeypatch, contract):
 
     def select(**kwargs):
         seen.update(kwargs)
-        return Spec(SimpleNamespace(k1_sms=80, k2_sms=30))
+        return Spec(SimpleNamespace(k1_sms=80, k2_sms=30, comm_backend="p2p_direct"))
 
     monkeypatch.setattr(api, "select_compile_spec", select)
     monkeypatch.setattr(green_context, "query_sm_resource_info", lambda: (110, 8, 8))
@@ -380,6 +382,9 @@ def test_frontend_passes_contract_and_gate_up_width(monkeypatch, contract):
     frontend = object.__new__(runtime.MegaMoESm120Nvfp4Frontend)
     frontend.config = runtime.MegaMoESm120Nvfp4Config(
         0, 4, 64, 6, 256, 4096, 2048, numerical_contract=contract
+    )
+    frontend.workspace = SimpleNamespace(
+        _topology=SimpleNamespace(same_numa_peer_count=3, cross_numa_peer_count=0)
     )
     frontend._select_spec(64)
     assert seen["numerical_contract"] == contract

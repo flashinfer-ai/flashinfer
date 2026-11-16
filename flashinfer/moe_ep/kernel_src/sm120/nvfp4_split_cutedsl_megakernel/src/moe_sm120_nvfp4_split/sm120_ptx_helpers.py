@@ -206,3 +206,14 @@ def red_add_relaxed_sys_v2_bf16x2_raw(
         loc=loc,
         ip=ip,
     )
+
+
+@dsl_user_op
+def utility_load_f32x4(ptr, *, loc=None, ip=None):
+    """Ordered handoff read after FULL; prevent compiler motion across barrier."""
+    value = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4), [ptr.toint().ir_value()],
+        'ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];',
+        '=f,=f,=f,=f,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return tuple(Float32(llvm.extractvalue(T.f32(), value, [i], loc=loc, ip=ip)) for i in range(4))

@@ -53,6 +53,7 @@ def _sfb_atom_layout_tv() -> cute.Layout:
 
 def make_swapab_m64n8k128_tiled_mma(
     *,
+    channel_tile: int = 64,
     a_dtype: Type[cutlass.Numeric],
     b_dtype: Type[cutlass.Numeric],
     acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
@@ -72,15 +73,17 @@ def make_swapab_m64n8k128_tiled_mma(
         raise ValueError("native NVFP4 requires E2M1 x E2M1 operands")
     if sf_dtype is not cutlass.Float8E4M3FN:
         raise ValueError("native NVFP4 requires E4M3 block scales")
+    if channel_tile not in (64, 128):
+        raise ValueError("channel_tile must be 64 or 128")
     op = warp_mma.MmaMXF4NVF4Op(a_dtype, acc_dtype, sf_dtype)
     permutation_mnk = sm120_utils.get_permutation_mnk(
-        (64, 64, 128),
+        (channel_tile, 64, 128),
         NVFP4_BLOCK,
         False,
     )
     return cute.make_tiled_mma(
         op,
-        cute.make_layout((4, 1, 1)),
+        cute.make_layout((channel_tile // 16, 1, 1)),
         permutation_mnk=permutation_mnk,
     )
 

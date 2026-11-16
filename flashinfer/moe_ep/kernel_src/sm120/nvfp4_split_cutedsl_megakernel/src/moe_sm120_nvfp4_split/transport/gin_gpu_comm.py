@@ -59,8 +59,12 @@ class GinGpuOwnerPlanPush:
         count_tx: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
         """Publish the small count record before either data-plane starts."""
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         peer, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         _prepare_hybrid_peer(
@@ -151,8 +155,12 @@ class GinGpuOwnerPlanPush:
         route_bases: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
         """Publish expert-major route blocks with one commit per expert."""
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         peer, expert, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         _prepare_hybrid_peer(
@@ -307,6 +315,7 @@ class GinGpuOwnerPlanPush:
         own_rank: Int32,
         epoch: Int32,
         stream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.count_kernel(
             count_rx,
@@ -315,6 +324,7 @@ class GinGpuOwnerPlanPush:
             count_tx,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.world_size, 1, 1],
             block=[128, 1, 1],
@@ -333,6 +343,7 @@ class GinGpuOwnerPlanPush:
         own_rank: Int32,
         epoch: Int32,
         stream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.route_kernel(
             count_tx,
@@ -343,6 +354,7 @@ class GinGpuOwnerPlanPush:
             route_bases,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.world_size, self.num_experts_per_rank, 1],
             block=[128, 1, 1],

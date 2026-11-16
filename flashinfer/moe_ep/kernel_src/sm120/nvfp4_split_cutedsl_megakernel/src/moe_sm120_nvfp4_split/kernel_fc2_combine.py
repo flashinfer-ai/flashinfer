@@ -748,7 +748,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         peek_ab_empty_status = a_producer.try_acquire()
                         iket.range_pop()
                     iket.range_push('tma_weight_fc2_issue')
-                    cute.copy(tma_atom_fc2_weight, tAgA_slice[None, handle.count], tAsA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_a, mcast_mask=a_full_mcast_mask)
+                    cute.copy(tma_atom_fc2_weight, tAgA_slice[None, handle.count], tAsA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_a, mcast_mask=a_full_mcast_mask, cache_policy=cutlass.Int64(0x12F0000000000000 if self.weight_eviction_policy == "evict_first" else 0))
                     if cutlass.const_expr(UseScaleTma):
                         cute.copy(tma_atom_fc2_weight_sf, tAgSFA_slice[None, handle.count], tAsSFA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_sfa, mcast_mask=sfa_full_mcast_mask)
                     iket.range_pop()
@@ -856,7 +856,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if handle.count + 1 < k_tile_cnt:
                         peek_ab_empty_status = b_producer.try_acquire()
-                    cute.copy(tma_atom_fc1_output_as_fc2_input, tBgB_slice[None, handle.count], tBsB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_b, mcast_mask=b_full_mcast_mask)
+                    cute.copy(tma_atom_fc1_output_as_fc2_input, tBgB_slice[None, handle.count], tBsB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_b, mcast_mask=b_full_mcast_mask, cache_policy=cutlass.Int64(0x14F0000000000000 if self.activation_eviction_policy == "evict_last" else 0))
                     if cutlass.const_expr(UseScaleTma):
                         cute.copy(tma_atom_fc1_output_sf_as_fc2_input, tBgSFB_slice[None, handle.count], tBsSFB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_sfb, mcast_mask=sfb_full_mcast_mask)
                 iket.range_pop()

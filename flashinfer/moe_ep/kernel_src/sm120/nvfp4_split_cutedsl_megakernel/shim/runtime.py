@@ -142,6 +142,7 @@ class _ExecutionStorage:
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     rank_combine_ready: torch.Tensor | None = None
     green_trace: torch.Tensor | None = None
+    network: Any = None
 
 
 @dataclass
@@ -154,6 +155,7 @@ class _ExecutionBuffers:
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     rank_combine_ready: torch.Tensor | None = None
     green_trace: torch.Tensor | None = None
+    network: Any = None
 
 
 @dataclass
@@ -186,6 +188,7 @@ class MegaMoESm120Nvfp4Workspace:
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _comm_session: Any = None
     _control_group: Any = None
+    _topology: Any = None
     _storages: dict[int, _ExecutionStorage] = field(default_factory=dict)
     _execution_plans: dict[int, tuple[Any, Any]] = field(default_factory=dict)
     _compiled_k12: dict[int, tuple[Any, Any]] = field(default_factory=dict)
@@ -196,6 +199,8 @@ class MegaMoESm120Nvfp4Workspace:
         default_factory=dict
     )
     _green_resources: dict[tuple[int, int], Any] = field(default_factory=dict)
+    _capture_streams: Any = None
+    _transport_streams: dict[str, Any] = field(default_factory=dict)
     _staged_tokens: int = 0
     _destroyed: bool = False
 
@@ -307,11 +312,14 @@ class MegaMoESm120Nvfp4Frontend:
         unknown = sorted(set(values) - fields)
         if unknown:
             raise ValueError(f"unknown SM120 NVFP4 tuning knobs: {unknown}")
-        if values.get("comm_backend", "p2p_direct") != "p2p_direct":
-            raise NotImplementedError(
-                "the initial FlashInfer NVFP4 backend supports p2p_direct only"
+        backend = (
+            "gin" if self.workspace._topology.cross_numa_peer_count else "p2p_direct"
+        )
+        if values.get("comm_backend", backend) != backend:
+            raise ValueError(
+                "Communication override conflicts with discovered EP topology"
             )
-        values["comm_backend"] = "p2p_direct"
+        values["comm_backend"] = backend
         return MegaMoEHeuristicOverrides(**values)
 
     def _select_spec(self, tokens_per_rank: int):
@@ -330,6 +338,7 @@ class MegaMoESm120Nvfp4Frontend:
         if (
             os.environ.get("MEGA_SPLIT_GLOBALTIMER") == "1"
             or os.environ.get("MEGA_SPLIT_K2_TILE_TRACE") == "1"
+            or "MEGA_FC1_UTILITY_POSTPROCESS" in os.environ
         ):
             from moe_sm120_nvfp4_split.jit_config import Sm120JitConfig
 
@@ -347,20 +356,33 @@ class MegaMoESm120Nvfp4Frontend:
             tensor_parallel_size=cfg.tensor_parallel_size,
             gate_up_clamp=cfg.gate_up_clamp,
         )
+        # The native policy calls local P2P + cross-NUMA GIN gin_hybrid;
+        # FlashInfer's topology-owned transport calls the same mode gin.
+        overrides = self._heuristic_overrides()
+        if overrides.comm_backend == "gin":
+            overrides = dataclasses.replace(overrides, comm_backend="gin_hybrid")
         spec = select_compile_spec(
             problem=problem,
-            ep_same_numa_peer_count=cfg.world_size - 1,
-            ep_cross_numa_peer_count=0,
+            ep_same_numa_peer_count=self.workspace._topology.same_numa_peer_count,
+            ep_cross_numa_peer_count=self.workspace._topology.cross_numa_peer_count,
             num_sms=num_sms,
             sm_min_partition=minimum,
             sm_partition_alignment=alignment,
-            overrides=self._heuristic_overrides(),
+            overrides=overrides,
             numerical_contract=cfg.numerical_contract,
             jit=jit,
         )
-        actual_k1, actual_k2 = query_green_context_sm_counts(
-            k1_sm_count=spec.kernel.k1_sms
-        )
+        if spec.kernel.comm_backend == "gin_hybrid":
+            spec = dataclasses.replace(
+                spec, kernel=dataclasses.replace(spec.kernel, comm_backend="gin")
+            )
+        if spec.kernel.comm_backend == "gin":
+            resources = self._green_resources_for(spec)
+            actual_k1, actual_k2 = resources.k1_sm_count, resources.k2_sm_count
+        else:
+            actual_k1, actual_k2 = query_green_context_sm_counts(
+                k1_sm_count=spec.kernel.k1_sms
+            )
         if (actual_k1, actual_k2) != (spec.kernel.k1_sms, spec.kernel.k2_sms):
             raise RuntimeError(
                 "Green Context partition differs from the heuristic: "
@@ -376,6 +398,38 @@ class MegaMoESm120Nvfp4Frontend:
             ),
         )
 
+    def _green_resources_for(self, spec):
+        from moe_sm120_nvfp4_split.runtime.green_context import (
+            NativeGreenContextPair,
+            NativeGreenContextResources,
+        )
+
+        k = spec.kernel
+        network = k.comm_backend == "gin"
+        key = (
+            torch.cuda.current_device(),
+            k.k1_sms,
+            k.k2_sms,
+            k.tx_sms if network else 0,
+            k.rx_sms if network else 0,
+        )
+        resources = self.workspace._green_resources.get(key)
+        if resources is None:
+            if network:
+                resources = NativeGreenContextResources.create(
+                    device=key[0],
+                    k1_sm_count=k.k1_sms,
+                    k2_sm_count=k.k2_sms,
+                    comm_tx_sm_count=k.tx_sms,
+                    comm_rx_sm_count=k.rx_sms,
+                )
+            else:
+                resources = NativeGreenContextPair.create(
+                    device=key[0], k1_sm_count=k.k1_sms
+                )
+            self.workspace._green_resources[key] = resources
+        return resources
+
     def _runtime_tensors(
         self,
         inputs: MegaMoESm120Nvfp4Inputs,
@@ -389,15 +443,31 @@ class MegaMoESm120Nvfp4Frontend:
     ) -> dict[str, Any]:
         from moe_sm120_nvfp4_split.support.src.sym_buffer import SymBufferHost
 
-        base, offsets = compute_peer_offsets(shared_workspace, self.config.world_size)
+        network = self.workspace._executions[self.compile_bucket].network
+        if network is None:
+            base, offsets = compute_peer_offsets(
+                shared_workspace, self.config.world_size
+            )
+            activation, activation_sf, topk_weights = (
+                inputs.activation,
+                inputs.activation_scale,
+                inputs.topk_weights,
+            )
+        else:
+            base, offsets = network.symmetric_base, network.peer_offsets_list
+            activation, activation_sf, topk_weights = (
+                network._transport.activation_rx,
+                network._transport.sf_rx,
+                network._transport.topk_weight_rx,
+            )
         fc1_alpha, fc2_alpha, fc1_norm_const = epilogue_args
         return dict(
             # Dispatch addresses packed bytes; the GEMM builds its logical
             # Float4 view from the dispatched local buffer.
-            activation=self._to_cute(inputs.activation.view(torch.uint8)),
-            activation_sf=self._to_cute(inputs.activation_scale),
+            activation=self._to_cute(activation.view(torch.uint8)),
+            activation_sf=self._to_cute(activation_sf),
             topk_idx=self._to_cute(inputs.topk_ids),
-            topk_weights=self._to_cute(inputs.topk_weights),
+            topk_weights=self._to_cute(topk_weights),
             fc1_weight=self._to_cute(inputs.fc1_weight),
             fc1_weight_sf=self._to_cute(inputs.fc1_weight_scale),
             fc2_weight=self._to_cute(inputs.fc2_weight),
@@ -467,35 +537,45 @@ class MegaMoESm120Nvfp4Frontend:
             # NCCL workspace allocation is not ordered on every peer caller
             # stream. Drain in-flight peer-dependent graphs before entering it.
             torch.cuda.synchronize()
-            local_workspace = torch.zeros(
-                (bundle.local_workspace_bytes,),
-                dtype=torch.uint8,
-                device="cuda",
-            )
-            shared_workspace = sym_zeros(
-                (bundle.shared_workspace_bytes,),
-                torch.uint8,
-                session=self.workspace._comm_session,
-            )
-            self.workspace._sym_roots.append(shared_workspace)
             combine_output, root = sym_byte_view(
-                (
-                    self.compile_bucket,
-                    self.config.num_topk,
-                    self.config.hidden,
-                ),
+                (self.compile_bucket, self.config.num_topk, self.config.hidden),
                 torch.bfloat16,
                 session=self.workspace._comm_session,
             )
             self.workspace._sym_roots.append(root)
-            rank_combine_ready = None
-            if spec.kernel.rank_local_combine:
-                rank_combine_ready = sym_zeros(
-                    (self.compile_bucket + 1, self.config.world_size),
-                    torch.int32,
+            network = None
+            if spec.kernel.comm_backend == "gin":
+                from .network_runtime import create_network_runtime
+
+                network = create_network_runtime(
+                    self.workspace, self.compile_bucket, spec, bundle, combine_output
+                )
+                local_workspace, shared_workspace = (
+                    network.local_workspace,
+                    network.shared_workspace,
+                )
+                rank_combine_ready = network.rank_combine_ready
+                self.workspace._sym_roots.append(shared_workspace)
+                if rank_combine_ready is not None:
+                    self.workspace._sym_roots.append(rank_combine_ready)
+            else:
+                local_workspace = torch.zeros(
+                    (bundle.local_workspace_bytes,), dtype=torch.uint8, device="cuda"
+                )
+                shared_workspace = sym_zeros(
+                    (bundle.shared_workspace_bytes,),
+                    torch.uint8,
                     session=self.workspace._comm_session,
                 )
-                self.workspace._sym_roots.append(rank_combine_ready)
+                self.workspace._sym_roots.append(shared_workspace)
+                rank_combine_ready = None
+                if spec.kernel.rank_local_combine:
+                    rank_combine_ready = sym_zeros(
+                        (self.compile_bucket + 1, self.config.world_size),
+                        torch.int32,
+                        session=self.workspace._comm_session,
+                    )
+                    self.workspace._sym_roots.append(rank_combine_ready)
             epilogue_args = (
                 self.workspace.fc1_alpha,
                 self.workspace.fc2_alpha,
@@ -524,6 +604,7 @@ class MegaMoESm120Nvfp4Frontend:
                 epilogue_args=epilogue_args,
                 rank_combine_ready=rank_combine_ready,
                 green_trace=green_trace,
+                network=network,
             )
             self.workspace._storages[self.compile_bucket] = storage
         execution = _ExecutionBuffers(
@@ -535,6 +616,7 @@ class MegaMoESm120Nvfp4Frontend:
             epilogue_args=storage.epilogue_args,
             rank_combine_ready=storage.rank_combine_ready,
             green_trace=storage.green_trace,
+            network=storage.network,
         )
         self.workspace._executions[self.compile_bucket] = execution
         return execution
@@ -552,7 +634,6 @@ class MegaMoESm120Nvfp4Frontend:
         )
         from moe_sm120_nvfp4_split.runtime.green_context import (
             NativeGreenContextGraph,
-            NativeGreenContextPair,
         )
 
         profile_start = time.monotonic()
@@ -565,9 +646,16 @@ class MegaMoESm120Nvfp4Frontend:
         epilogue_args = execution.epilogue_args
         green_trace = execution.green_trace
 
-        root_stream = torch.cuda.Stream(priority=0)
-        k1_stream = torch.cuda.Stream(priority=-1)
-        k2_stream = torch.cuda.Stream(priority=0)
+        # Layers sharing this workspace execute serially. Reuse capture
+        # streams instead of allocating three persistent streams per layer.
+        # Excess streams can alias hardware queues used by persistent waiters.
+        if self.workspace._capture_streams is None:
+            self.workspace._capture_streams = (
+                torch.cuda.Stream(priority=0),
+                torch.cuda.Stream(priority=-1),
+                torch.cuda.Stream(priority=0),
+            )
+        root_stream, k1_stream, k2_stream = self.workspace._capture_streams
         root_cuda = cuda.CUstream(root_stream.cuda_stream)
         k1_cuda = cuda.CUstream(k1_stream.cuda_stream)
         k2_cuda = cuda.CUstream(k2_stream.cuda_stream)
@@ -584,7 +672,9 @@ class MegaMoESm120Nvfp4Frontend:
         runtime_k1 = dict(base_runtime, stream=k1_cuda)
         runtime_k2 = dict(base_runtime, stream=k2_cuda)
         compile_k1 = dict(runtime_k1, max_active_clusters=spec.kernel.k1_sms)
-        k2_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
+        k2_ctas_per_sm = (
+            2 if (spec.kernel.k2_warps == 12 and spec.kernel.k2_tile[1] == 16) else 1
+        )
         k2_launch_clusters = spec.kernel.k2_sms * k2_ctas_per_sm
         compile_k2 = dict(
             runtime_k2,
@@ -615,7 +705,11 @@ class MegaMoESm120Nvfp4Frontend:
             runtime_drain = dict(base_runtime, stream=k1_cuda)
             # The dual-N8 specialization is verified at two resident CTAs/SM.
             # Use both slots on the SMs released by K1 during the drain phase.
-            drain_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
+            drain_ctas_per_sm = (
+                2
+                if (spec.kernel.k2_warps == 12 and spec.kernel.k2_tile[1] == 16)
+                else 1
+            )
             k2_drain_launch_clusters = spec.kernel.k1_sms * drain_ctas_per_sm
             if compiled_aux is None:
                 compiled_drain = cute.compile(
@@ -677,13 +771,14 @@ class MegaMoESm120Nvfp4Frontend:
         all_kernels_ready = time.monotonic()
         # Preserve per-layer graph/weight bindings; only the device/SM partition
         # is shared by sequential calls on this pooled workspace.
-        resource_key = (torch.cuda.current_device(), spec.kernel.k1_sms)
-        green_resources = self.workspace._green_resources.get(resource_key)
-        if green_resources is None:
-            green_resources = NativeGreenContextPair.create(
-                device=resource_key[0], k1_sm_count=resource_key[1]
-            )
-            self.workspace._green_resources[resource_key] = green_resources
+        green_resources = self._green_resources_for(spec)
+        network = execution.network
+        transport_roles = network.compiled_roles() if network is not None else {}
+        transport_kernels = tuple(
+            k for group in transport_roles.values() for k in group
+        )
+        if network is not None:
+            transport_kernels += (network._transport.compiled_dispatch_route_builder,)
         graph = NativeGreenContextGraph.capture(
             green_resources=green_resources,
             root_stream=root_stream,
@@ -694,7 +789,8 @@ class MegaMoESm120Nvfp4Frontend:
             k2_drain_executor=drain_executor,
             k2_finalizer_executor=finalizer_executor,
             k3_executor=k3_executor,
-            compiled_kernels=tuple(
+            compiled_kernels=transport_kernels
+            + tuple(
                 k
                 for k in (
                     compiled_k1,
@@ -708,7 +804,10 @@ class MegaMoESm120Nvfp4Frontend:
             compiled_role_owners={
                 0: (compiled_k1, compiled_drain),
                 1: (compiled_k2,),
+                **transport_roles,
             },
+            launch_reset=network.begin if network is not None else None,
+            launch_transport_end=network.end if network is not None else None,
             launch_k1=lambda: k1_executor(**runtime_k1),
             launch_k2=lambda: k2_executor(**runtime_k2),
             launch_k2_drain=(
@@ -805,7 +904,8 @@ class MegaMoESm120Nvfp4Frontend:
         compiled = self._ensure_compiled(inputs)
         # Caller reset -> launch_ready -> Green K1/K2/K3 -> launch_done. Keep
         # cache admission outside the Green graph's kernel-node rebinding.
-        self._reset_execution(compiled.execution)
+        if compiled.execution.network is None:
+            self._reset_execution(compiled.execution)
         compiled.graph.launch(torch.cuda.current_stream())
         return inputs.output
 
@@ -840,7 +940,24 @@ def allocate_workspace(
     # or allocation during graph capture. Layers share this workspace.
     from types import SimpleNamespace
 
-    planned = SimpleNamespace(config=config, _execution_plans={})
+    from moe_sm120_nvfp4_split.runtime.gpu_topology import (
+        discover_gpu_topology,
+        gather_ep_transport_topology,
+    )
+
+    if _no_dist():
+        topology = SimpleNamespace(
+            same_numa_peer_count=0, cross_numa_peer_count=0, force_ibgda_peer_mask=0
+        )
+    else:
+        topology = gather_ep_transport_topology(
+            discover_gpu_topology(torch.cuda.current_device(), config.rank),
+            ep_rank=config.rank,
+            ep_control_group=control_group,
+        )
+    planned = SimpleNamespace(
+        config=config, _execution_plans={}, _topology=topology, _green_resources={}
+    )
     buckets = sorted(
         {
             config.max_tokens_per_rank,
@@ -875,7 +992,13 @@ def allocate_workspace(
     session = (
         None
         if _no_dist()
-        else PeerMemorySession(config.rank, config.world_size, capacity, control_group)
+        else PeerMemorySession(
+            config.rank,
+            config.world_size,
+            capacity,
+            control_group,
+            network_peer_mask=topology.force_ibgda_peer_mask,
+        )
     )
     roots: list[torch.Tensor] = []
     x, root = sym_byte_view(
@@ -919,6 +1042,8 @@ def allocate_workspace(
         _sym_roots=roots,
         _comm_session=session,
         _execution_plans=planned._execution_plans,
+        _green_resources=planned._green_resources,
+        _topology=topology,
         _control_group=control_group,
         _compile_bucket=config.max_tokens_per_rank,
     )

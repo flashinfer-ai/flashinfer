@@ -143,7 +143,11 @@ class GinGpuRingCombineSender:
         tx_handoff: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         peer, channel_index, _ = cute.arch.block_idx()
         lane_idx, _, _ = cute.arch.thread_idx()
 
@@ -414,6 +418,7 @@ class GinGpuRingCombineSender:
         own_rank,
         epoch,
         lane_idx,
+        epoch_ptr: cute.Tensor = None,
     ):
         """Submit one already-ready combine chunk without waiting."""
         row_base = chunk_idx * Int32(self.chunk_rows)
@@ -617,6 +622,7 @@ class GinGpuRingCombineSender:
         own_rank: Int32,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         # One CTA has exclusive lifetime ownership of one (peer, channel).
         # Its four warps select ready chunks within that channel; no global
@@ -638,6 +644,7 @@ class GinGpuRingCombineSender:
             tx_handoff,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.world_size, self.channels, 1],
             block=[128, 1, 1],
@@ -652,6 +659,7 @@ class GinGpuRingCombineSender:
         send_counts: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
         """Retire terminal credits after combine data submission.
 
@@ -659,6 +667,9 @@ class GinGpuRingCombineSender:
         recovery in the ordered TX stream preserves replay safety without
         putting the final network ACK on the current replay's critical path.
         """
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         tidx, _, _ = cute.arch.thread_idx()
         ack_i32 = cute.recast_tensor(ack_signals, cutlass.Int32)
         epoch_base = epoch * Int32(self.signal_stride)
@@ -719,12 +730,14 @@ class GinGpuRingCombineSender:
         own_rank: Int32,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.ack_kernel(
             ack_signals,
             send_counts,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[1, 1, 1],
             block=[128, 1, 1],
@@ -813,6 +826,7 @@ class GinGpuRingCombineReceiver:
         own_rank,
         epoch,
         lane_idx,
+        epoch_ptr: cute.Tensor = None,
     ):
         """Scatter one arrived combine chunk and return its slot credit."""
         epoch_base = epoch * Int32(self.signal_stride)
@@ -911,8 +925,12 @@ class GinGpuRingCombineReceiver:
         combine_output: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
         """Receive exactly one peer/channel with deterministic CTA ownership."""
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         task, _, _ = cute.arch.block_idx()
         lane_idx, _, _ = cute.arch.thread_idx()
         peer = task // Int32(self.channels)
@@ -1019,6 +1037,7 @@ class GinGpuRingCombineReceiver:
         own_rank: Int32,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.owned_channel_kernel(
             rx_slots,
@@ -1029,6 +1048,7 @@ class GinGpuRingCombineReceiver:
             combine_output,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.worker_ctas, 1, 1],
             block=[128, 1, 1],
@@ -1119,7 +1139,11 @@ class GinGpuRingDispatchSender:
         work_queue: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         worker_index, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         # Use the same fixed strided ownership as dispatch RX.  Matching the
@@ -1426,6 +1450,7 @@ class GinGpuRingDispatchSender:
         send_counts: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
         """Wait for terminal slot ownership after payload submission.
 
@@ -1434,6 +1459,9 @@ class GinGpuRingDispatchSender:
         lightweight waiter still prevents the next replay from recycling a
         slot before its peer has consumed it.
         """
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         tidx, _, _ = cute.arch.thread_idx()
         ack_i32 = cute.recast_tensor(ack_payload, cutlass.Int32)
         epoch_base = epoch * Int32(self.signal_stride)
@@ -1497,6 +1525,7 @@ class GinGpuRingDispatchSender:
         own_rank: Int32,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.kernel(
             rx_slots,
@@ -1513,6 +1542,7 @@ class GinGpuRingDispatchSender:
             work_queue,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.worker_ctas, 1, 1],
             block=[128, 1, 1],
@@ -1528,12 +1558,14 @@ class GinGpuRingDispatchSender:
         own_rank: Int32,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.ack_kernel(
             ack_payload,
             send_counts,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[1, 1, 1],
             block=[128, 1, 1],
@@ -1593,7 +1625,11 @@ class GinGpuRingDispatchReceiver:
         dispatch_ready: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         worker_index, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         # Keep TX/RX channel ownership identical across the resident waves.
@@ -1825,6 +1861,7 @@ class GinGpuRingDispatchReceiver:
         own_rank: Int32,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.kernel(
             rx_slots,
@@ -1838,6 +1875,7 @@ class GinGpuRingDispatchReceiver:
             dispatch_ready,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.worker_ctas, 1, 1],
             block=[128, 1, 1],

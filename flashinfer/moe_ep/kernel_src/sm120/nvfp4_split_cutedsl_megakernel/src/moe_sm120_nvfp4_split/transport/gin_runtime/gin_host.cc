@@ -82,8 +82,14 @@ extern "C" int eq_register(void* handle,unsigned long long address,unsigned long
   // Every rank registers the identical logical allocation in the same order.
   // VA signals must be STRICT_ORDERING; no ordinary stores while active.
   EQ_CALL(ncclCommWindowRegister,h->comm,(void*)address,bytes,&w.window,NCCL_WIN_STRICT_ORDERING);
+  // Other buckets may already have completed replays. Their shadow values
+  // track the cumulative VA signals and are device-owned: publishing the
+  // zero-initialized host snapshot would corrupt the next signal delta.
+  // Registration runs outside capture with prior users drained. Publish only
+  // the new window, then make it visible in the registry count.
+  cuda_check(cudaMemcpy(&h->device->windows[i],&w,sizeof(EqWindow),cudaMemcpyHostToDevice),"window publication");
   ++h->state.count;
-  cuda_check(cudaMemcpy(h->device,&h->state,sizeof(EqState),cudaMemcpyHostToDevice),"window publication");
+  cuda_check(cudaMemcpy(&h->device->count,&h->state.count,sizeof(int),cudaMemcpyHostToDevice),"window count publication");
   EQ_END
 }
 extern "C" int eq_destroy(void* handle) {

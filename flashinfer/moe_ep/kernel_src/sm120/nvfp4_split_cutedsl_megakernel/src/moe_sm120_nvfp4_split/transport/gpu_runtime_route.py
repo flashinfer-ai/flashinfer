@@ -54,7 +54,11 @@ class GpuDispatchRouteBuilder:
         owner_expert_counts: cute.Tensor,
         owner_token_counts: cute.Tensor,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         block, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         token = block * Int32(256) + tid
@@ -130,7 +134,11 @@ class GpuDispatchRouteBuilder:
         owner_token_cursors: cute.Tensor,
         send_counts: cute.Tensor,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         owner, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         if tid == Int32(0):
@@ -235,7 +243,11 @@ class GpuDispatchRouteBuilder:
         owner_routes: cute.Tensor,
         combine_recv_output_rows: cute.Tensor,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         block, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         route = block * Int32(256) + tid
@@ -299,12 +311,14 @@ class GpuDispatchRouteBuilder:
         combine_recv_output_rows: cute.Tensor,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.kernel(
             topk_idx,
             owner_expert_counts,
             owner_token_counts,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[(self.num_tokens + 255) // 256, 1, 1],
             block=[256, 1, 1],
@@ -320,6 +334,7 @@ class GpuDispatchRouteBuilder:
             owner_token_cursors,
             send_counts,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.world_size, 1, 1],
             block=[128, 1, 1],
@@ -343,6 +358,7 @@ class GpuDispatchRouteBuilder:
             owner_routes,
             combine_recv_output_rows,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[
                 (self.num_tokens * self.num_topk + 255) // 256,
@@ -415,7 +431,11 @@ class GpuChunkedOwnerRoutePlanBuilder:
         source_expert_route_bases: cute.Tensor,
         own_rank: Int32,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         tid, _, _ = cute.arch.thread_idx()
         plan_slot = epoch % Int32(self.plan_slots)
         count_slot_base = plan_slot * Int32(
@@ -526,7 +546,11 @@ class GpuChunkedOwnerRoutePlanBuilder:
         combine_pool_to_stage_rows: cute.Tensor,
         owner_plan_ready: cute.Tensor,
         epoch: Int32,
+        epoch_ptr: cute.Tensor = None,
     ):
+        # Serving graph replays advance the workspace epoch on the GPU.
+        if cutlass.const_expr(epoch_ptr is not None):
+            epoch = Int32(epoch_ptr[0])
         source, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         plan_slot = epoch % Int32(self.plan_slots)
@@ -673,6 +697,7 @@ class GpuChunkedOwnerRoutePlanBuilder:
         own_rank: Int32,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.install_counts_kernel(
             count_records,
@@ -685,6 +710,7 @@ class GpuChunkedOwnerRoutePlanBuilder:
             source_expert_route_bases,
             own_rank,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(grid=[1, 1, 1], block=[128, 1, 1], stream=stream)
 
     @cute.jit
@@ -706,6 +732,7 @@ class GpuChunkedOwnerRoutePlanBuilder:
         owner_plan_ready: cute.Tensor,
         epoch: Int32,
         stream: cuda.CUstream,
+        epoch_ptr: cute.Tensor = None,
     ):
         self.install_metadata_kernel(
             route_records,
@@ -723,6 +750,7 @@ class GpuChunkedOwnerRoutePlanBuilder:
             combine_pool_to_stage_rows,
             owner_plan_ready,
             epoch,
+            epoch_ptr=epoch_ptr,
         ).launch(
             grid=[self.world_size, 1, 1],
             block=[128, 1, 1],

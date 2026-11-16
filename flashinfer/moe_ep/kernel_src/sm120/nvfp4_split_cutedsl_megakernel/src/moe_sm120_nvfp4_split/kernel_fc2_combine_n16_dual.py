@@ -81,7 +81,7 @@ UseScaleTma = True
 
 
 class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
-    """N16 K2 with two N8 compute groups sharing each A-weight stage."""
+    """N16 K2: M64 dual N8 or M128 eight M-warps with serial N8."""
 
     def __init__(
         self,
@@ -112,12 +112,12 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
         sfa_smem_layout = cute.slice_(sfa_smem_layout_staged, (None, None, 0))
         sfb_smem_layout = cute.slice_(sfb_smem_layout_staged, (None, None, 0))
-        fc1_tiles_per_fc2_k_tile = self.mma_tiler[2] // (self.mma_tiler[0] // 2)
+        fc1_tiles_per_fc2_k_tile = self.mma_tiler[2] // (self.fc1_channel_tile // 2)
         ext_fc2_spin_threshold = (
             (fc2_weight_gemm.shape[1] + self.mma_tiler[2] - 1)
             // self.mma_tiler[2]
             * fc1_tiles_per_fc2_k_tile
-            * (self.mma_tiler[0] // 16)
+            * (self.fc1_channel_tile // 16)
         )
         ext = Sm120SwapABNvfp4Fc12SchedExtension(sf_vec_size=self.sf_vec_size, fc1_done_counter_ptr=fc1_done_counter.iterator, fc2_spin_threshold=ext_fc2_spin_threshold, fc1_ready_counter_ptr=self.token_comm_hook_fc1_ready_counter_ptr(token_comm_args))
         warp_idx = cute.arch.warp_idx()
@@ -423,7 +423,7 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
                         peek_ab_empty_status = a_producer.try_acquire()
                         iket.range_pop()
                     iket.range_push('tma_weight_fc2_issue')
-                    cute.copy(tma_atom_fc2_weight, tAgA_slice[None, handle.count], tAsA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_a, mcast_mask=a_full_mcast_mask)
+                    cute.copy(tma_atom_fc2_weight, tAgA_slice[None, handle.count], tAsA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_a, mcast_mask=a_full_mcast_mask, cache_policy=cutlass.Int64(0x12F0000000000000 if self.weight_eviction_policy == "evict_first" else 0))
                     if cutlass.const_expr(UseScaleTma):
                         cute.copy(tma_atom_fc2_weight_sf, tAgSFA_slice[None, handle.count], tAsSFA[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_sfa, mcast_mask=sfa_full_mcast_mask)
                     iket.range_pop()
@@ -534,7 +534,7 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if handle.count + 1 < k_tile_cnt:
                         peek_ab_empty_status = b_producer.try_acquire()
-                    cute.copy(tma_atom_fc1_output_as_fc2_input, tBgB_slice[None, handle.count], tBsB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_b, mcast_mask=b_full_mcast_mask)
+                    cute.copy(tma_atom_fc1_output_as_fc2_input, tBgB_slice[None, handle.count], tBsB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_b, mcast_mask=b_full_mcast_mask, cache_policy=cutlass.Int64(0x14F0000000000000 if self.activation_eviction_policy == "evict_last" else 0))
                     if cutlass.const_expr(UseScaleTma):
                         cute.copy(tma_atom_fc1_output_sf_as_fc2_input, tBgSFB_slice[None, handle.count], tBsSFB[None, handle.index], tma_bar_ptr=handle.barrier, tma_desc_ptr=desc_ptr_sfb, mcast_mask=sfb_full_mcast_mask)
                 iket.range_pop()
@@ -552,26 +552,30 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
             lane_idx = cute.arch.lane_idx()
             lane_g = lane_idx >> cutlass.Int32(2)
             lane_t = lane_idx & cutlass.Int32(3)
-            compute_m_warp = compute_warp % cutlass.Int32(4)
-            compute_n_warp = compute_warp // cutlass.Int32(4)
-            n_groups = 1
-            mma_tidx = tidx % cutlass.Int32(128)
+            # M128 assigns every warp a different M16 atom. Its two N8
+            # results have independent accumulators and identical K order.
+            n_groups = 2 if self.mma_tiler[0] == 128 else 1
+            compute_m_warp = compute_warp % cutlass.Int32(self.mma_tiler[0] // 16)
+            compute_n_warp = compute_warp // cutlass.Int32(self.mma_tiler[0] // 16)
+            mma_tidx = tidx % cutlass.Int32(self.mma_tiler[0] * 2)
             compute_tiled_mma = make_swapab_m64n8k128_tiled_mma(
+                channel_tile=self.mma_tiler[0],
                 a_dtype=self.a_dtype,
                 b_dtype=self.b_dtype,
                 acc_dtype=self.acc_dtype,
                 sf_dtype=self.sf_dtype,
             )
-            sB_compute = cute.local_tile(
-                sB,
-                (8, None, None),
-                (compute_n_warp, 0, None),
-            )
-            sB_compute = cute.group_modes(sB_compute, 2, 4)
-            compute_tile_n = 8
+            if cutlass.const_expr(self.mma_tiler[0] == 128):
+                sB_compute = sB
+            else:
+                sB_compute = cute.local_tile(
+                    sB, (8, None, None), (compute_n_warp, 0, None),
+                )
+                sB_compute = cute.group_modes(sB_compute, 2, 4)
+            compute_tile_n = 8 * n_groups
             rFc2Store = cute.make_rmem_tensor((4,), self.fc2_output_dtype)
             rFc2StoreI32 = cute.recast_tensor(rFc2Store, cutlass.Int32)
-            rSFBCompact = cute.make_rmem_tensor((8,), self.sf_dtype)
+            rSFBCompact = cute.make_rmem_tensor((8 * n_groups,), self.sf_dtype)
             rSFBCompactI32 = cute.recast_tensor(
                 rSFBCompact, cutlass.Int32
             )
@@ -825,14 +829,14 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoENvfp4SwapABKernel):
                         + handle_b.index
                         * cutlass.Int32(cute.cosize(sfb_smem_layout))
                     )
-                    rSFBCompactI32[0] = lds_b32_raw(
-                        sSFB.iterator + sfb_stage_byte_offset
-                    )
-                    rSFBCompactI32[1] = lds_b32_raw(
-                        sSFB.iterator
-                        + sfb_stage_byte_offset
-                        + cutlass.Int32(512)
-                    )
+                    for ng in cutlass.range_constexpr(0, n_groups):
+                        rSFBCompactI32[ng * 2] = lds_b32_raw(
+                            sSFB.iterator + sfb_stage_byte_offset + cutlass.Int32(ng * 128)
+                        )
+                        rSFBCompactI32[ng * 2 + 1] = lds_b32_raw(
+                            sSFB.iterator + sfb_stage_byte_offset
+                            + cutlass.Int32(ng * 128 + 512)
+                        )
                     tile_compute_start = cutlass.Int64(0)
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None

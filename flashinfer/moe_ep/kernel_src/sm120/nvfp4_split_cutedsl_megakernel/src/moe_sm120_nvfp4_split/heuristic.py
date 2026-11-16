@@ -173,14 +173,14 @@ def derive_features(shape, c, host_expert_counts=None):
     t1, t2 = _tiles(shape, n1, host_expert_counts), _tiles(
         shape, n2, host_expert_counts
     )
-    ready = max(n1, n2, 128 if c.k2_warps == 12 else 0)
+    ready = max(n1, n2, 128 if (c.k2_warps == 12 and c.k2_tile[1] == 16) else 0)
     blocks = _tiles(shape, ready, host_expert_counts)
-    htiles = (shape.hidden + 63) // 64
+    htiles = (shape.hidden + c.k2_tile[0] - 1) // c.k2_tile[0]
     ksteps = (shape.intermediate // 2 + 127) // 128
     descriptors = t2 * ((htiles + c.ready_queue_bundle - 1) // c.ready_queue_bundle)
     fanout = descriptors / max(blocks, 1e-30)
     c1 = c.k1_sms
-    c2 = c.k2_sms * (2 if c.k2_warps == 12 else 1)
+    c2 = c.k2_sms * (2 if (c.k2_warps == 12 and c.k2_tile[1] == 16) else 1)
     rows = shape.tokens_per_rank * shape.num_topk
     h, i = shape.hidden, shape.intermediate
     owner_p = 1 - shape.probability_one_owner_is_untouched
@@ -200,15 +200,17 @@ def derive_features(shape, c, host_expert_counts=None):
     # SM120 TMA layouts have128-row scale padding and128-byte data granularity.
     # These are conservative screening estimates; actual layouts remain authoritative.
     def smem(n, stage, dispatch):
-        stage_bytes = 64 * 128 // 2 + n * 128 // 2 + 2 * 128 * 128 // 16
+        m = c.k1_tile[0] if dispatch else c.k2_tile[0]
+        stage_bytes = m * 128 // 2 + n * 128 // 2 + 2 * 128 * 128 // 16
         # Match kernel budget: base1024, four packed activation pull rows,
         # aligned barriers32+128, and FC1 reduction/packed-store epilogue.
         fixed = 1024 + (
             32
             + ((4 * ((shape.hidden + 1) // 2) + 127) // 128) * 128
             + 128
-            + 2048
-            + n * 16
+            + 16 * (m // 2) * 4
+            + n * (m // 4)
+            + (n * (m // 2) * 4 if m == 128 else 0)
             if dispatch
             else 0
         )
@@ -235,7 +237,7 @@ def derive_features(shape, c, host_expert_counts=None):
         t2,
         c1,
         c2,
-        t1 * ((i + 63) // 64) / c1,
+        t1 * ((i + c.k1_tile[0] - 1) // c.k1_tile[0]) / c1,
         t2 * htiles / c2,
         ready,
         blocks,
@@ -250,8 +252,8 @@ def derive_features(shape, c, host_expert_counts=None):
         owner_p,
         smem(n1, c.k1_stages or 2, True),
         smem(n2, c.k2_stages, False),
-        384,
-        352 if c.k2_warps == 12 else 256,
+        512 if c.k1_tile[0] == 128 else 384,
+        352 if (c.k2_warps == 12 and c.k2_tile[1] == 16) else 384 if c.k2_tile[0] == 128 else 256,
         (
             "owner_vector"
             if c.rank_local_combine and h % 2048 == 0 and shape.num_topk <= 8
@@ -274,15 +276,50 @@ def legality_errors(shape, c):
     if shape.hidden % 32 or shape.intermediate % 64:
         errors.append("NVFP4 alignment requires H%32=0,I%64=0")
     for name, tile in (("K1", c.k1_tile), ("K2", c.k2_tile)):
-        if tile[0] != 64 or tile[1] not in (16, 32, 64, 128) or tile[2] != 128:
+        if (tile[0] != 64 or tile[1] not in (16, 32, 64, 128) or tile[2] != 128) and tile not in ((128, 16, 128), (128, 32, 128)):
             errors.append(name + " tile outside implemented candidate catalog")
+    if c.k1_tile[0] == 128 or c.k2_tile[0] == 128:
+        ep4_k1_only = (1 <= shape.tokens_per_rank <= 32768 and shape.expert_parallel_size == 4
+                    and shape.hidden == shape.intermediate == 4096
+                    and (shape.num_total_experts, shape.num_topk) in ((256, 6), (288, 8))
+                    and c.k1_tile == (128, 16, 128) and c.k2_tile == (64, 16, 128)
+                    and c.k2_warps == 12 and c.dispatch_warps == 1
+                    and c.k2_tail_reclaim and not c.rank_local_combine
+                    and (c.k1_sms, c.k2_sms, c.tx_sms, c.rx_sms) == (80, 30, 0, 0)
+                    and c.comm_backend == c.kernel_comm_backend == "p2p_direct"
+                    and not c.k1_compact_tokens and not c.k2_compact_tokens
+                    and c.token_back_mode == "epi_warps"
+                    and not c.dispatch_compute_overlap and c.dispatch_rank_cache
+                    and c.k1_ready_queue and c.k2_ready_queue
+                    and c.k2_natural_regs and c.k2_min_blocks_per_sm == 2
+                    and c.k1_stages == 3 and c.k2_stages == 2)
+        ep4_k2_m128 = (1 <= shape.tokens_per_rank <= 32768 and shape.expert_parallel_size == 4
+                    and shape.hidden == shape.intermediate == 4096
+                    and (shape.num_total_experts, shape.num_topk) in ((256, 6), (288, 8))
+                    and c.k1_tile == (128, 16, 128) and c.k2_tile == (128, 16, 128)
+                    and c.k2_warps == 12 and c.dispatch_warps == 1
+                    and c.k2_tail_reclaim and not c.rank_local_combine
+                    and (c.k1_sms, c.k2_sms, c.tx_sms, c.rx_sms) == (80, 30, 0, 0)
+                    and c.comm_backend == c.kernel_comm_backend == "p2p_direct"
+                    and not c.k1_compact_tokens and not c.k2_compact_tokens
+                    and c.token_back_mode == "epi_warps"
+                    and not c.dispatch_compute_overlap and c.dispatch_rank_cache
+                    and c.k1_ready_queue and c.k2_ready_queue
+                    and c.k2_natural_regs and c.k2_min_blocks_per_sm == 2
+                    and c.k1_stages == 3 and c.k2_stages == 2
+                    and c.ready_queue_bundle == 1)
+        if not ep4_k1_only and not ep4_k2_m128 and not (1 <= shape.tokens_per_rank <= 32768 and shape.expert_parallel_size == 8
+                and shape.hidden % 128 == shape.intermediate % 128 == 0
+                and c.k1_tile == c.k2_tile == (128, 32, 128)
+                and c.k2_warps == 12 and not c.k2_tail_reclaim):
+            errors.append("experimental M128 requires supported model/topology and paired geometry")
     if c.k1_stages not in (None, 1, 2, 3, 4, 5):
         errors.append("K1 stage count exceeds implemented1..5 bound")
     if c.k2_stages not in (1, 2, 3, 4, 5):
         errors.append("K2 stage count exceeds implemented1..5 bound")
     if c.k2_warps not in (8, 12):
         errors.append("K2 warp mode unsupported")
-    if c.k2_warps == 12 and c.k2_tile[1] != 16:
+    if (c.k2_warps == 12 and c.k2_tile[0] == 64) and c.k2_tile[1] != 16:
         errors.append("dual group requires K2N16")
     if c.k2_tail_reclaim and c.k2_warps != 12:
         errors.append("tail catalog requires dual group")
@@ -321,7 +358,7 @@ def legality_errors(shape, c):
             or c.token_back_mode != "epi_warps"
             or shape.tensor_parallel_size != 1
             or shape.expert_parallel_size > shape.num_topk
-            or c.k2_warps == 12
+            or (c.k2_warps == 12 and c.k2_tile[1] == 16)
             or c.k2_tail_reclaim
         ):
             errors.append("RLC layout/protocol incompatibility")
@@ -352,6 +389,8 @@ def semantic_errors(c, numerical_contract):
     """Caller permission for BF16 association; never a speed threshold."""
     if numerical_contract not in NUMERICAL_CONTRACTS:
         return ("unknown numerical contract",)
+    if (c.k1_tile[0] == 128 or c.k2_tile[0] == 128) and numerical_contract != "owner_bf16":
+        return ("experimental M128 requires owner_bf16",)
     if c.rank_local_combine and numerical_contract != "owner_bf16":
         return ("RLC requires explicit owner_bf16 numerical permission",)
     return ()
