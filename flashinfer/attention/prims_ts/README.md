@@ -240,6 +240,11 @@ partitions can be merged using weights `exp(m_i - max_j(m_j)) * s_i`; a sink
 must belong to only one partition. Empty rows, where supported by the existing
 attention API, produce `(-inf, 0)`.
 
+Handle an all-empty query/head row before evaluating weights or division:
+if every partition has `(-inf, 0)`, return zero output and `(-inf, 0)`
+statistics (and `-inf` LSE when requested). Otherwise, empty partitions have
+zero weight. This avoids evaluating `exp(-inf - -inf)` for an all-empty row.
+
 The optional base-2 `lse` output and its return-value semantics are unchanged;
 LSE and merge statistics may be enabled together. Context statistics support
 plain attention, not VC/Sage recipes, MXFP8 Q/K, or context attention sinks. Contiguous

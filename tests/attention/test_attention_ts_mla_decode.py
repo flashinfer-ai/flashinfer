@@ -1728,6 +1728,40 @@ def test_attention_ts_mla_build_advisories_are_opt_in(monkeypatch, capsys):
         manager.print_and_verify()
 
 
+def test_attention_ts_mla_cluster_statistics_smem_budget(monkeypatch):
+    """Statistics must affect both explicit and automatic cluster admission."""
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+        config,
+    )
+
+    kwargs = dict(
+        batch_size=1,
+        num_heads_q=8,
+        seq_len_q=1,
+        seq_len_kv=4096,
+        tile_size_q=8,
+        explicit_split_kv=2,
+        max_active_clusters=148,
+    )
+    cfg = make_throughput_latency_mla_config(**kwargs, reduction_mode="cluster")
+    without_stats = config.estimated_throughput_latency_smem_data_bytes(cfg)
+    with_stats = config.estimated_throughput_latency_smem_data_bytes(
+        cfg, store_softmax_stats=True
+    )
+    assert with_stats > without_stats
+    monkeypatch.setattr(config, "MAX_CLUSTER_SMEM_DATA_BYTES", without_stats)
+    assert make_throughput_latency_mla_config(
+        **kwargs, reduction_mode="cluster"
+    ).use_cluster_reduction
+    with pytest.raises(ValueError, match="shared-memory budget"):
+        make_throughput_latency_mla_config(
+            **kwargs, reduction_mode="cluster", store_softmax_stats=True
+        )
+    assert not make_throughput_latency_mla_config(
+        **kwargs, store_softmax_stats=True
+    ).use_cluster_reduction
+
+
 def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
     """Keep partial flat-row tails on the predicated standalone reducer."""
 
