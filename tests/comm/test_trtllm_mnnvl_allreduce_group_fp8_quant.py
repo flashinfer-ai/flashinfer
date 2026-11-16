@@ -52,8 +52,9 @@ def _init_distributed_and_device() -> tuple[int, int, torch.device]:
     # Global rank modulo visible GPUs is wrong when ranks do not fill each node.
     # Select the local device before NCCL binds the process group to a GPU.
     torch.cuda.set_device(local_rank % device_count)
-    init_torch_distributed_from_mpi()
-    return rank, world_size, torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.cuda.current_device())
+    init_torch_distributed_from_mpi(device_id=device)
+    return rank, world_size, device
 
 
 def _scale_storage_size(token_num: int, groups_per_row: int) -> int:
@@ -433,6 +434,8 @@ def test_group_fp8_uses_launcher_device_before_nccl(
     )
     for key, value in zip(keys, (rank, world_size, local_rank), strict=True):
         monkeypatch.setenv(key, str(value))
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
     monkeypatch.setattr(f"{__name__}._prefer_mpi_launcher_env", lambda: None)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: device_count)
     selected = []
@@ -440,17 +443,21 @@ def test_group_fp8_uses_launcher_device_before_nccl(
     monkeypatch.setattr(torch.cuda, "current_device", lambda: selected[-1])
     initialized = []
 
-    def init_nccl():
+    def init_nccl(*, backend, init_method, rank, world_size, device_id):
         assert selected == [expected_device]
-        initialized.append(True)
+        assert backend == "nccl"
+        assert init_method == "tcp://127.0.0.1:29500"
+        assert device_id == torch.device("cuda", expected_device)
+        initialized.append((rank, world_size))
 
-    monkeypatch.setattr(f"{__name__}.init_torch_distributed_from_mpi", init_nccl)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_nccl)
     assert _init_distributed_and_device() == (
         rank,
         world_size,
         torch.device("cuda", expected_device),
     )
-    assert initialized == [True]
+    assert initialized == [(rank, world_size)]
     assert selected == [expected_device]
 
 
