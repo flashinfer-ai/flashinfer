@@ -753,6 +753,36 @@ def test_preallocated_outputs():
         flashinfer.sampling.log_probs(x, ids, temps, lse_out=lseb)
     with pytest.raises(ValueError, match="batch_invariant=True"):
         flashinfer.sampling.softmax(x, temps, batch_invariant=False, out=buf)
+    # overlap: an output may not overlap an input (other than the row output aliasing the logits exactly) or another
+    # output -- a partial overlap would read another row's values after a store
+    xf = torch.randn(M, N, device="cuda")
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.log_probs(xf, ids, return_lse=True, lse_out=xf.view(-1)[:M])
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.log_probs(xf, ids, return_lse=True, out=lpb, lse_out=lpb)
+    big = torch.empty(M + 1, N, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.softmax(big[:M], batch_invariant=True, out=big[1:])
+    # in place: the row output may be the logits themselves -- every configuration kind gives the out-of-place bits
+    # (each thread writes the elements it read, after reading them)
+    xb = logits(37, 4097, torch.bfloat16)
+    tb = torch.rand(37, device="cuda") * 1.5 + 0.25
+    ref_in = flashinfer.sampling.softmax(xb, tb, batch_invariant=True)
+    for cfg in _config_sample(4097, torch.bfloat16):
+        xc = xb.clone()
+        r = softmax_batch_invariant(xc, tb, config=cfg, out=xc)
+        assert r is xc and same(xc, ref_in), f"in place differs: {cfg.describe()}"
+    xc = xb.clone()
+    assert same(
+        flashinfer.sampling.log_softmax(xc, tb, out_dtype=torch.bfloat16, out=xc),
+        flashinfer.sampling.log_softmax(xb, tb, out_dtype=torch.bfloat16),
+    )
+    xf2 = xb.float()
+    xc = xf2.clone()
+    assert same(
+        flashinfer.sampling.log_softmax(xc, tb, out=xc),
+        flashinfer.sampling.log_softmax(xf2, tb),
+    )
     # a CUDA graph on caller-owned buffers: the replay writes the new inputs' values into them
     xin = x.clone()
     outb = torch.empty_like(x)
@@ -769,6 +799,26 @@ def test_preallocated_outputs():
     g.replay()
     torch.cuda.synchronize()
     assert same(outb, flashinfer.sampling.softmax(x2, temps, batch_invariant=True))
+
+
+@needs_device
+def test_in_place_row_output_at_a_large_shape():
+    """The in-place promise where a partially overlapping buffer corrupted rows in review (570 of 600 at this vocabulary,
+    by scheduling): the row output aliasing the logits exactly gives the out-of-place bits at 512 x 152064 for the softmax
+    and the 16-bit log-softmax, and the one-row-shifted buffer is refused before any launch."""
+    xb = logits(512, N_BIG, torch.bfloat16, seed=2)
+    ref = flashinfer.sampling.softmax(xb, batch_invariant=True)
+    xc = xb.clone()
+    assert flashinfer.sampling.softmax(xc, batch_invariant=True, out=xc) is xc
+    assert same(xc, ref)
+    ref16 = flashinfer.sampling.log_softmax(xb, out_dtype=torch.bfloat16)
+    xc = xb.clone()
+    assert flashinfer.sampling.log_softmax(xc, out_dtype=torch.bfloat16, out=xc) is xc
+    assert same(xc, ref16)
+    big = torch.empty(513, N_BIG, dtype=torch.bfloat16, device="cuda")
+    big[:512] = xb
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.softmax(big[:512], batch_invariant=True, out=big[1:])
 
 
 def test_space_members_are_bounded_in_loads_per_thread():

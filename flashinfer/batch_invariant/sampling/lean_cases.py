@@ -331,9 +331,6 @@ def render() -> str:
             f'theorem {tag}_logp0c : osexpr (Sampling.specLogpCvt "bf16" {N} {kb} lseRow ({T}) 0) = {_with_refs(c["logp0c"], refs)} := by decide +kernel'
         )
         L.append(
-            f'theorem {tag}_logp0c : osexpr (Sampling.specLogpCvt "bf16" {N} {kb} lseRow ({T}) 0) = {_with_refs(c["logp0c"], refs)} := by decide +kernel'
-        )
-        L.append(
             f'theorem {tag}_lse : osexpr (Sampling.specLse "bf16" {N} {kb} lseRow ({T})) = {_with_refs(c["lse"], refs)} := by decide +kernel'
         )
     L.append(

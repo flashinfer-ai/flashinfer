@@ -235,9 +235,10 @@ padded lm_head's rows must be sliced to the vocabulary, or padded with `-inf` on
 the value is fp32 (or its one conversion to the input's 16-bit dtype), and two callers agree bit for bit exactly when both
 pass the same logits bits with the same temperature (or identically pre-scaled logits and `temperature=None`) on the same
 architecture (the two MUFU tables are identical on SM100 and SM107, measured over every input); a greedy row's temperature
-of 0 is replaced by `1.0` or `None` before the call. The draw's `return_logprob` and the truncated samplers'
-`return_logprob` are this value -- the full distribution's, never renormalised over a filtered support (the engines'
-`processed_logprobs` of a filtered mode is the truncated samplers' `return_kept_logprob`, a separate named output) -- so
+of 0 is replaced by `1.0` or `None` before the call. The draw's `return_logprob` is this value -- the full
+distribution's, never renormalised over a filtered support (the truncated samplers' companion PR, `bi/09-sampling-support`,
+gives `top_k_top_p_sampling_from_logits` the same `return_logprob`, and the renormalised value the engines' `processed_logprobs`
+of a filtered mode report as a separate named output, `return_kept_logprob`) -- so
 the engine's returned log-probability and the trainer's `log_probs` / `log_softmax` of the same row are one definition.
 Nothing is stored and no RNG state crosses to the trainer: the draw is a function of the row, its `(seed, offset)` key
 and the temperature, and the trainer never re-draws.
@@ -254,16 +255,22 @@ Megatron-Core's `batch_invariant_kernels.py` registration of `aten::_log_softmax
 
 **Caller-owned outputs.** Every sampling entry under the flag takes its outputs as optional caller-owned buffers --
 `softmax(..., out=)`, `log_softmax(..., out=)`, `log_probs(..., out=, lse_out=)`, `sampling_from_probs(..., out=)`,
-`sampling_from_logits(..., out=, logprob_out=)` -- written in place and returned as given, so a step allocates nothing:
-CUDA graphs captured on the caller's buffers replay into them, and a framework's persistent structures (a decode step's
+`sampling_from_logits(..., out=, logprob_out=)` -- written in place and returned as given, so a step allocates nothing
+(the kernels' validity word, which the draws do not return unless asked, goes to a per-device scratch grown to the largest
+batch seen, never cached from inside a CUDA-graph capture): CUDA graphs captured on the caller's buffers replay into them, and a framework's persistent structures (a decode step's
 token and log-probability buffers, a trainer's chunk buffer for the batch x vocabulary log-softmax row) take the kernel's
 stores directly. A buffer must have the output dtype and shape, be contiguous and (the row outputs) 16-byte aligned; one
-that does not fit is refused with `ValueError`, never copied. The samples buffer is int32 (the kernel's output), or int64
+that does not fit is refused with `ValueError`, never copied. The row output may be the logits tensor itself
+(`softmax(x, out=x)`, `log_softmax(x, out_dtype=x.dtype, out=x)`: every thread writes the elements it read, after reading
+them, so the in-place call gives the out-of-place bits -- tested over the register, re-read and staged members); any other
+overlap between an output and an input, or between two outputs (a dtype view included), is refused. The samples buffer is int32 (the kernel's output), or int64
 with int64 `indices` (filled by a cast from the kernel's int32 tokens, the operator's dtype contract). Without the buffers
 the entries allocate their outputs as the operator's own kernels do (graph-safe through torch's private pools). The
 inputs are read in place when they are in the kernels' form -- int64 or uint64 keys, an fp32 per-row temperature, int64
 indices, contiguous rows -- and conditioned (a cast or a copy) otherwise; the validity mask is formed only when asked
-for (`return_valid`). The default path (`batch_invariant=False`) refuses the buffers rather than copying into them.
+for (`return_valid`). `softmax`, `sampling_from_probs` and `sampling_from_logits` refuse the buffers on their default path
+(`batch_invariant=False`: the operator's kernels allocate their own outputs) rather than copying into them; `log_softmax`
+and `log_probs` run the class under either flag value and take them.
 
 `ex2.approx.ftz.f32` and `lg2.approx.ftz.f32` are the class's two opaque primitives: deterministic per architecture,
 pinned as inline PTX in the kernel, and tabulated on the device for the exact CPU model (`sampling/mufu_device.py`).

@@ -1366,7 +1366,9 @@ def sampling_from_logits(
         float64, the last rounded to float32) of shape ``(batch_size,)``, applied inside the class's chain
         (``c = log2(e) / temperature``) exactly as :func:`softmax` and :func:`log_probs` apply it, so the draw is from
         ``softmax(logits / temperature)`` and the returned log-probability is that distribution's. A scalar is
-        validated on the host; a tensor's values are not (a ``0`` yields an invalid row).
+        validated on the host; a tensor's values are not (a ``0`` yields an invalid row). ``temperature=1.0`` forms the
+        same scale bits as ``None`` (``div.rn(log2(e), 1)``), so the tokens agree, but the receipt differs: whether a
+        temperature enters the scale is a dimension of the fingerprint, as for :func:`softmax`.
     return_logprob : bool
         Only with ``batch_invariant=True``. Also return the drawn token's natural log-probability under the full
         distribution at the given temperature (fp32, shape ``(batch_size,)``, NaN for an invalid row): bit for bit

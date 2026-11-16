@@ -25,7 +25,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from ..support import check_device, out_buffer, unsupported
+from ..support import check_device, check_no_overlap, out_buffer, unsupported
 from .schedule import (
     VOCAB_COVERED,
     LSEConfig,
@@ -192,6 +192,7 @@ def lse_row(
     x2 = _aligned_rows(x2, config.vec_elems * elem_bytes)
     dev = logits.device
     res: Dict[str, torch.Tensor] = {}
+    yb = lb = pb = None  # the caller-owned buffers, when given
     y = _dummy(dev, torch.float32).view(1, 8)
     if mode.row_output:
         row_dtype = (
@@ -270,6 +271,20 @@ def lse_row(
         raise ValueError(
             "logp_out is the token log-probabilities' buffer: this mode writes none"
         )
+    # an output may not overlap another output or an input, except the row output aliasing the logits exactly (in
+    # place: every thread writes the elements it read, after reading them)
+    check_no_overlap(
+        [("out", yb), ("lse_out", lb), ("logp_out", pb)],
+        [("logits", logits), ("temperature", temp_t), ("token_ids", token_ids)],
+        in_place=(("out", "logits"),),
+    )
+    # an output may not overlap another output or an input, except the row output aliasing the logits exactly (in
+    # place: every thread writes the elements it read, after reading them)
+    check_no_overlap(
+        [("out", yb), ("lse_out", lb), ("logp_out", pb)],
+        [("logits", logits), ("temperature", temp_t), ("token_ids", token_ids)],
+        in_place=(("out", "logits"),),
+    )
     temp_arg = temp_t if temp_t is not None else _dummy(dev, torch.float32)
     if M == 0:  # no rows: nothing to launch; the outputs keep their documented shapes
         return res

@@ -25,7 +25,13 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch
 
-from ..support import check_device, out_buffer, unsupported
+from ..support import (
+    check_device,
+    check_no_overlap,
+    out_buffer,
+    scratch,
+    unsupported,
+)
 from .api import (
     _DTYPE_STR,
     MAX_VOCAB,
@@ -224,7 +230,9 @@ def draw(
     tok = (
         ob.view(-1) if ob is not None else torch.empty(M, dtype=torch.int32, device=dev)
     )
-    valid = torch.empty(M, dtype=torch.int32, device=dev)
+    # the kernel's validity word is never read: validity is the token's sign (an invalid row draws -1), so the word
+    # goes to a per-device scratch and the call allocates nothing it does not return
+    valid = scratch(dev, torch.int32, M)
     if return_logprob:
         lb = out_buffer(logprob_out, "logprob_out", lead, torch.float32, x, 4)
         lp = (
@@ -234,6 +242,16 @@ def draw(
         )
     else:
         lb, lp = None, _dummy(dev, torch.float32)
+    check_no_overlap(
+        [("out", ob), ("logprob_out", lb)],
+        [
+            ("x", x),
+            ("seed", seeds),
+            ("offset", offs),
+            ("indices", indices),
+            ("temperature", temp_t),
+        ],
+    )
     temp_arg = temp_t if temp_t is not None else _dummy(dev, torch.float32)
     if M > 0 and (indices is None or Msrc > 0):
         kernel = get_compiled_kernel(
@@ -265,12 +283,11 @@ def draw(
         M > 0
     ):  # a gather from an empty source: every index lies outside the source rows, nothing is read
         tok.fill_(-1)
-        valid.zero_()
         if return_logprob:
             lp.fill_(float("nan"))
     res = {"samples": ob if ob is not None else tok.view(lead)}
-    if return_valid:  # the bool form is a cast kernel: formed only when asked for
-        res["valid"] = valid.to(torch.bool).view(lead)
+    if return_valid:  # a comparison kernel: formed only when asked for
+        res["valid"] = (tok != -1).view(lead)
     if return_logprob:
         res["logp"] = lb if lb is not None else lp.view(lead)
     return res
@@ -320,6 +337,19 @@ def _entry(
         out64, out = (
             out_buffer(out, "out", tuple(indices.shape), torch.int64, x, 8),
             None,
+        )
+        check_no_overlap(
+            [("out", out64)],
+            [
+                ("x", x),
+                ("seed", seeds),
+                ("offset", offs),
+                ("indices", indices),
+                (
+                    "temperature",
+                    temperature if isinstance(temperature, torch.Tensor) else None,
+                ),
+            ],
         )
     if logprob_out is not None:
         return_logprob = True

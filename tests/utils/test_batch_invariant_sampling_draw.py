@@ -1476,6 +1476,28 @@ def test_preallocated_outputs():
         flashinfer.sampling.sampling_from_logits(x, seed=s, offset=o, out=ob)
     with pytest.raises(ValueError, match="batch_invariant=True"):
         flashinfer.sampling.sampling_from_probs(w, seed=s, offset=o, out=ob2)
+    # overlap: an output may not overlap the input's storage, nor another output (a dtype view included)
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.sampling_from_logits(
+            x,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=x.view(-1)[: 2 * M].view(torch.int32),
+        )
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.sampling_from_logits(
+            x,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=lb.view(torch.int32),
+            logprob_out=lb,
+        )
+    with pytest.raises(ValueError, match="overlap"):  # a key tensor's storage
+        flashinfer.sampling.sampling_from_logits(
+            x, seed=s, offset=o, batch_invariant=True, out=o.view(torch.int32)[:M]
+        )
     # a CUDA graph on caller-owned buffers: new logits and new keys through the captured addresses
     xin, sin, oin = x.clone(), s.clone(), o.clone()
     tb = torch.empty(M, dtype=torch.int32, device="cuda")
