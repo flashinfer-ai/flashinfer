@@ -119,3 +119,16 @@ def test_second_process_reloads_recurrent_kda_without_compiling(tmp_path):
     subprocess.run([sys.executable, script, "compile"], env=env, check=True)
     assert list((tmp_path / "ws").rglob("recurrent_kda_*/*.o")), "nothing exported"
     subprocess.run([sys.executable, script, "forbid_compile"], env=env, check=True)
+
+
+@pytest.mark.parametrize(
+    "module", ["gdn_replay_mtp_umma", "gdn_replay_mtp_umma_rubin"]
+)
+def test_umma_key_files_cover_compile_options(module):
+    """gdn_compile_options feeds the compile, so editing device_target.py must invalidate."""
+    import importlib
+
+    from flashinfer.gdn_kernels import device_target
+
+    mod = importlib.import_module(f"flashinfer.gdn_kernels.{module}")
+    assert device_target.__file__ in mod._KEY_FILES

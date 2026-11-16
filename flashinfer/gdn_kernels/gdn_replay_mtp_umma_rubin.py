@@ -101,6 +101,7 @@ from cutlass.cute.nvgpu import cpasync
 
 try:
     from . import _umma_helpers_rubin as U
+    from . import device_target as _device_target
     from .cute_dsl_cache_naming import make_kernel_name
     from .device_target import gdn_compile_options, gdn_device_target, target_arch
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
@@ -108,6 +109,7 @@ except (
     ImportError
 ):  # tests and benchmarks may load this file by path, outside the package
     from flashinfer.gdn_kernels import _umma_helpers_rubin as U
+    from flashinfer.gdn_kernels import device_target as _device_target
     from flashinfer.gdn_kernels.cute_dsl_cache_naming import make_kernel_name
     from flashinfer.gdn_kernels.device_target import (
         gdn_compile_options,
@@ -4357,7 +4359,7 @@ class GdnReplayMtpUmmaRubin:
 
 _KERNELS: dict = {}
 _CUTE_DSL_MODULE = "gdn_replay_mtp_umma_rubin"
-_KEY_FILES = (__file__, U.__file__)
+_KEY_FILES = (__file__, U.__file__, _device_target.__file__)
 
 
 def _get_kernel(
