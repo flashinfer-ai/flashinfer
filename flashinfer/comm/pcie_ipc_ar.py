@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 import hashlib
 import os
 import warnings
@@ -73,12 +74,31 @@ def _spin_timeout_ns() -> int:
         raise ValueError(
             f"FLASHINFER_PCIE_IPC_TIMEOUT_S must be a number of seconds, got {raw!r}"
         ) from e
-    return max(0, int(seconds * 1e9))
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(
+            "FLASHINFER_PCIE_IPC_TIMEOUT_S must be a finite number of seconds >= 0, "
+            f"got {raw!r}"
+        )
+    # Round up, so a tiny positive value never turns the guard off.
+    ns = math.ceil(seconds * 1e9)
+    if ns >= 2**64:
+        raise ValueError(
+            f"FLASHINFER_PCIE_IPC_TIMEOUT_S={raw!r} does not fit in 64-bit nanoseconds"
+        )
+    return ns
 
 
 @functools.cache
 def get_pcie_ipc_comm_module():
-    module = gen_pcie_ipc_comm_module(_spin_timeout_ns()).build_and_load()
+    timeout_ns = _spin_timeout_ns()
+    # Without a timeout, call the generator with no argument: benchmarks and
+    # tests swap it for zero-argument debug generators.
+    spec = (
+        gen_pcie_ipc_comm_module(timeout_ns)
+        if timeout_ns
+        else gen_pcie_ipc_comm_module()
+    )
+    module = spec.build_and_load()
 
     @register_custom_op("flashinfer::pcie_ipc_workspace_size", mutates_args=[])
     def workspace_size(
