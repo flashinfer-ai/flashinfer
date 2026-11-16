@@ -932,7 +932,8 @@ def sweep(args, file):
                 dtype=torch.float32,
                 device=device,
             )
-            pools = moe._kernels(rows, h, i, e, device, activation)
+            first, second = moe._kernels(rows, h, i, e, device, activation)
+            pools = (tuple(k for k in first if not k.gathers_input), second)
             selected = []
             for stage, pool in enumerate(pools):
                 if args.stage_only and args.stage_only != stage + 1:

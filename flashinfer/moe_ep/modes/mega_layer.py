@@ -171,6 +171,18 @@ class MoEEpMegaLayer(nn.Module):
         elif backend.preprocess_weights:
             self._preprocess_weights()
 
+    @property
+    def batch_invariant_fingerprint(self) -> str | None:
+        """The arithmetic receipt of a batch-invariant layer; None in ordinary mode.
+
+        Its scope additionally fixes the architecture, compiler/software stack,
+        EP topology and expert placement. Batch and workspace capacity do not
+        enter it. Routing IDs and weights are supplied by the caller.
+        """
+        if not getattr(self._megakernel_config, "batch_invariant", False):
+            return None
+        return self._kernel.batch_invariant_fingerprint(self._fleet_params)
+
     def _preprocess_weights(self) -> None:
         if self._transformed is not None:
             return
@@ -517,6 +529,21 @@ class MoEEpMegaLayer(nn.Module):
             backend_workspace, kernel = self._workspace, self._kernel
         return kernel.get_tuned_knobs(backend_workspace)
 
+    def get_tuned_config(self, *, workspace: MoEEpMegaWorkspace | None = None) -> Any:
+        """Return a fixed kernel config, including the selected variant and knobs.
+
+        Pass it as ``MegaConfig(megakernel=...)`` when reconstructing a layer
+        with the same geometry and weights. This call does not allocate or tune.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError("MegaMoE layer has been destroyed")
+        handle = workspace if workspace is not None else self._default_workspace_handle
+        if handle is not None:
+            _, backend_workspace, kernel = self._resolve_workspace(handle)
+        else:
+            backend_workspace, kernel = self._workspace, self._kernel
+        return kernel.get_tuned_config(backend_workspace)
+
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:
             return False
@@ -766,7 +793,9 @@ class MoEEpMegaLayer(nn.Module):
         self._staged_kernel = kernel
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
-        return self.compute_staged(output=output)
+        return kernel._compute_prepared(
+            backend_workspace, transformed_weights, output=output
+        )
 
     def forward_unfinalized(
         self,

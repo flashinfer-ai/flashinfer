@@ -16,9 +16,8 @@ bias) on tcgen05, bit for bit the output of the mma.sync tinygemm2 kernel: nine 
 (PACKED_NARROW, PACKED_NARROW_U4, PACKED_NARROW_FULL_STAGES, PACKED_M64_N16,
 PACKED_M64_N4, PACKED, PACKED_BOX8, PACKED_M64_N8, ACCUMULATORS), each with and without
 the bias and with and without programmatic dependent launch, for sm_100a, sm_103a and
-sm_107a (PACKED_M64_N8 for sm_107a only). The host module ``flashinfer.gemm.routergemm``
-selects the program from the batch, the output features and the bias, computes the grid
-and launches it.
+sm_107a. The host module ``flashinfer.gemm.routergemm`` selects the program from the
+batch, the output features and the bias, computes the grid and launches it.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -709,8 +708,12 @@ PACKED_M64_N8 = cake_program.CakeProgram(
         "cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2_kernel.cu",
         "cake_tinygemm2_tcgen05_3b3d21550960b5b6b8b2_binding.cu",
     ),
-    targets=("sm_107a",),
-    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
     tensors=("W", "X", "out", "bias"),
     block=(256, 1, 1),
@@ -729,8 +732,12 @@ PACKED_M64_N8_NOBIAS = cake_program.CakeProgram(
         "cake_tinygemm2_tcgen05_53e595e7d938f773c823_kernel.cu",
         "cake_tinygemm2_tcgen05_53e595e7d938f773c823_binding.cu",
     ),
-    targets=("sm_107a",),
-    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
     tensors=("W", "X", "out", "bias"),
     block=(256, 1, 1),
@@ -749,8 +756,12 @@ PACKED_M64_N8_PDL = cake_program.CakeProgram(
         "cake_tinygemm2_tcgen05_8e89c0a937878adae26b_kernel.cu",
         "cake_tinygemm2_tcgen05_8e89c0a937878adae26b_binding.cu",
     ),
-    targets=("sm_107a",),
-    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
     tensors=("W", "X", "out", "bias"),
     block=(256, 1, 1),
@@ -769,8 +780,12 @@ PACKED_M64_N8_NOBIAS_PDL = cake_program.CakeProgram(
         "cake_tinygemm2_tcgen05_e7244c463ed684737af3_kernel.cu",
         "cake_tinygemm2_tcgen05_e7244c463ed684737af3_binding.cu",
     ),
-    targets=("sm_107a",),
-    compile_options=(("sm_107a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a", "sm_107a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+        ("sm_107a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=("W", "X", "out", "bias", "M", "N", "K", "grid_x", "grid_y", "grid_z"),
     tensors=("W", "X", "out", "bias"),
     block=(256, 1, 1),

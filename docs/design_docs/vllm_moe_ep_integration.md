@@ -304,7 +304,7 @@ Validate the **LL** path first (§5) — it maps cleanly and has no such open po
 # per-rank wrapper; file:// rendezvous on a shared mount
 EP_SYNC=/shared/ep_sync srun --ntasks-per-node=8 \
     benchmarks/moe_ep/core/comm/run_ep_matrix_one.sh <bench_ep_matrix.py args>
-# or the single-process driver:
+# or the nccl_ep / nixl_ep layer benchmark (one process per GPU):
 torchrun --nproc_per_node=8 benchmarks/moe_ep/bench_moe_ep_fleet.py \
     --tokens 8192 --backend nccl_ep --quant bf16
 ```

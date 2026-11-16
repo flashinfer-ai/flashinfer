@@ -1008,7 +1008,7 @@ kernel_cake_kimi_k3_fused_router_49a2f49970db28d2d0b3(float* __restrict__ logits
             pass0_local += pass0_word_count_7;
         }
         int group_total = 0;
-        group_total += plan_counts[tid * 4 + 0] + BLOCK_MASK & ~BLOCK_MASK;
+        group_total += plan_counts[tid * 4] + BLOCK_MASK & ~BLOCK_MASK;
         group_total += plan_counts[tid * 4 + 1] + BLOCK_MASK & ~BLOCK_MASK;
         group_total += plan_counts[tid * 4 + 2] + BLOCK_MASK & ~BLOCK_MASK;
         group_total += plan_counts[tid * 4 + 3] + BLOCK_MASK & ~BLOCK_MASK;
@@ -1018,9 +1018,9 @@ kernel_cake_kimi_k3_fused_router_49a2f49970db28d2d0b3(float* __restrict__ logits
         int warp_expert = own_expert_base + warp;
         int below_part = 0;
         int all_part = 0;
-        all_part += plan_offsets[lane + 0];
-        if (lane + 0 < first_group) {
-            below_part += plan_offsets[lane + 0];
+        all_part += plan_offsets[lane];
+        if (lane < first_group) {
+            below_part += plan_offsets[lane];
         }
         all_part += plan_offsets[lane + 32];
         if (lane + 32 < first_group) {

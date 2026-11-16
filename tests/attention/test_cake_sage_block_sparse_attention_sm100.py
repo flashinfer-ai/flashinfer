@@ -18,7 +18,7 @@ attention package: the Sage-FP8 block-sparse attention forward against an
 exact-P dequantized reference, the fused quantizer against the torch recipe,
 the one-launch and CUDA-Graph contract of the host path, and the package's
 ``build.json`` contract.  It imports the package only through
-``tests.test_helpers.cake_package`` and nothing else from flashinfer; the
+``tests.cake.test_helpers.cake_package`` and nothing else from flashinfer; the
 flashinfer public routes are covered by
 ``test_cake_sage_block_sparse_attention_sm100_api.py``.
 """
@@ -31,8 +31,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
-from tests.test_helpers.cake_profiler import cuda_kernel_names
+from tests.cake.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_profiler import cuda_kernel_names
 
 pkg = cake_package("cake_sage_block_sparse_attention")
 cake_build = cake_package("cake_sage_block_sparse_attention", "cake_build")
@@ -138,7 +138,7 @@ def _reference(
 ):
     """Reference of the kernel's arithmetic over the selected tokens (per (b, h, q-block)).
 
-    FP32 scores of the dequantized operands in log2 units; the online softmax of the kernel's
+    FP32 log2 scores (E4M3 products, scaled after the sum); the online softmax of the kernel's
     two consumer groups (group ``g`` takes every other pair of selected blocks starting at pair
     ``g``; the 128 columns of a pair share one max update).  The row max follows the kernel's
     rule: a pair takes it when the row had none, and later only when the pair's max exceeds
@@ -195,7 +195,13 @@ def _reference(
                     )
                 if not any(len(tok) for tok in blocks):
                     continue
-                qq = q[b, h, q0:q1] * q_scale[b, h, q0:q1, None]
+                # The products take the E4M3 operands as they are (exact in FP32, TF32 and
+                # BF16 inputs) and apply the scales after the sum, as the kernel does; a
+                # product of dequantized FP32 operands would round them to TF32 wherever
+                # TF32 matmuls are on (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 in NGC-based
+                # images), which moves P by far more than _P_ROUNDING_SLACK.
+                qq = q[b, h, q0:q1]
+                q_log2 = q_scale[b, h, q0:q1, None] * (scale * _LOG2E)
                 rows = q1 - q0
                 merged = []  # (m, l, acc, bud) of the two consumer groups
                 for g in range(2):
@@ -207,9 +213,9 @@ def _reference(
                         tok = torch.cat(blocks[2 * pair : 2 * pair + 2])
                         if not len(tok):
                             continue
-                        kk = k[b, kh, tok] * k_tok_scale[b, kh, tok, None]
-                        vv = v[b, kh, tok] * v_scale[b, kh][None, :]
-                        s = (qq @ kk.T) * (scale * _LOG2E)
+                        kk = k[b, kh, tok]
+                        vv = v[b, kh, tok]
+                        s = (qq @ kk.T) * (q_log2 * k_tok_scale[b, kh, tok][None, :])
                         tile_max = s.amax(dim=-1)
                         fresh = torch.isinf(m)  # the row had no column yet
                         bump = ~fresh & (tile_max - m > _MAX_STEP_LOG2)
@@ -233,8 +239,9 @@ def _reference(
                     l_all = l_all + w * l_sum
                     acc_all = acc_all + w[:, None] * acc
                     bud_all = bud_all + w[:, None] * bud
-                out[b, h, q0:q1] = acc_all / l_all[:, None]
-                budget[b, h, q0:q1] = bud_all / l_all[:, None]
+                vs = v_scale[b, kh][None, :]
+                out[b, h, q0:q1] = acc_all * vs / l_all[:, None]
+                budget[b, h, q0:q1] = bud_all * vs / l_all[:, None]
                 lse[b, h, q0:q1] = (m_all + torch.log2(l_all) - _P_BIAS_LOG2) * _LN2
     return (
         out.transpose(1, 2).contiguous(),
@@ -403,12 +410,13 @@ def test_cake_sage_sm100_v_scale_without_batch_axis():
 @requires_sm100
 def test_cake_sage_sm100_launches_one_kernel_per_call():
     """The attention call is one kernel: the TMA descriptors travel by value in the
-    kernel parameters, so no upload kernel precedes the attention kernel.  The
-    quantizer is its two kernels behind the zero-fill of its V amax scratch
-    (``torch.zeros``: a torch fill kernel, or a memset on torch builds that zero
-    a fresh tensor that way).  The launch records come from
-    ``tests.test_helpers.cake_profiler``, which retries a profiler session that
-    lost its CUDA records."""
+    kernel parameters, so no upload kernel precedes the attention kernel.  It is the
+    PDL build (``attention_pdl``) by default on SM100/SM103 and the plain one with
+    ``enable_pdl=False``.  The two-launch quantizer is its two kernels behind the
+    zero-fill of its V amax scratch (``zero_``: a torch fill kernel, or a memset on
+    torch builds that zero that way); the one-launch quantizer is one kernel.  The
+    launch records come from ``tests.cake.test_helpers.cake_profiler``, which
+    retries a profiler session that lost its CUDA records."""
     device = torch.device("cuda")
     c = _make_case(
         ("one_launch_b2_h4", 2, 4, 2, 257, 1000, 6, True, True, 2, 40, True, 1.0),
@@ -417,8 +425,9 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
     out = torch.empty_like(c["q8"], dtype=torch.bfloat16)
     lse = torch.empty(c["q_scale"].shape, dtype=torch.float32, device=device)
     names = cuda_kernel_names(lambda: _run(c, out=out, lse=lse))
-    symbol = loader.MODULES["attention"]["kernel_symbol"]
-    assert names == [symbol], names
+    assert names == [loader.MODULES["attention_pdl"]["kernel_symbol"]], names
+    names = cuda_kernel_names(lambda: _run(c, out=out, lse=lse, enable_pdl=False))
+    assert names == [loader.MODULES["attention"]["kernel_symbol"]], names
     g = torch.Generator(device=device).manual_seed(11)
     q, k, v = (
         torch.randn(s, device=device, generator=g).bfloat16()
@@ -429,12 +438,24 @@ def test_cake_sage_sm100_launches_one_kernel_per_call():
         )
     )
     names = cuda_kernel_names(
-        lambda: sage_fp8_quantize_sm100(q, k, v), exclude=("Memcpy",)
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="one_launch"),
+        exclude=("Memcpy",),
+    )
+    assert names == [loader.MODULES["quantize_qkv_c8w16"]["kernel_symbol"]], names
+    # The TMA-ring quantizer is one kernel too: vsplit=8 where its V clusters fit one wave.
+    names = cuda_kernel_names(
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="tma"),
+        exclude=("Memcpy",),
+    )
+    assert names == [loader.MODULES["quantize_qkv_tma_x8"]["kernel_symbol"]], names
+    names = cuda_kernel_names(
+        lambda: sage_fp8_quantize_sm100(q, k, v, impl="two_launch"),
+        exclude=("Memcpy",),
     )
     kernels = [name for name in names if name.startswith("kernel_")]
     assert kernels == [
-        loader.MODULES["quantize_qk_vamax"]["kernel_symbol"],
-        loader.MODULES["quantize_v"]["kernel_symbol"],
+        loader.MODULES["quantize_qk_vamax_pdl"]["kernel_symbol"],
+        loader.MODULES["quantize_v_pdl"]["kernel_symbol"],
     ], names
     fills = [name for name in names if not name.startswith("kernel_")]
     assert fills == [names[0]] and (
@@ -570,6 +591,210 @@ def test_sage_fp8_quantize_sm100_matches_torch(shape):
         )
 
 
+def _quantizer_inputs(batch, heads, kv_heads, sq, sk, device, seed):
+    g = torch.Generator(device=device).manual_seed(seed)
+    q = torch.randn((batch, sq, heads, _HEAD_DIM), device=device, generator=g)
+    k = torch.randn((batch, sk, kv_heads, _HEAD_DIM), device=device, generator=g)
+    v = torch.randn((batch, sk, kv_heads, _HEAD_DIM), device=device, generator=g)
+    v[..., 3] = 0  # a zero V channel: its scale is the amax floor
+    return q.bfloat16(), k.bfloat16(), (v * 3).bfloat16()
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 8, 8, 4096, 4096),  # vsplit=4, the longest sequence
+        (1, 2, 2, 4096, 4096),  # vsplit=8
+        (1, 32, 8, 4096, 4096),  # GQA, vsplit=4
+        (2, 4, 4, 1000, 1500),  # ragged tails
+        (1, 8, 2, 65, 257),  # tails shorter than a unit and a V box
+        (1, 1, 1, 16384, 2048),  # long Q, short K/V: Q/K units on every cluster
+        (3, 2, 2, 300, 17),
+        (8, 8, 8, 512, 512),  # more V clusters than one wave (impl="tma" only)
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_tma_quantizer_matches_two_launches(shape, enable_pdl):
+    """The TMA-ring quantizer writes the bits of the two-launch quantizer."""
+    device = torch.device("cuda")
+    batch, heads, kv_heads, sq, sk = shape
+    q, k, v = _quantizer_inputs(batch, heads, kv_heads, sq, sk, device, sq * 7 + sk)
+    ref = sage_fp8_quantize_sm100(q, k, v, impl="two_launch", enable_pdl=False)
+    for _ in range(2):
+        got = sage_fp8_quantize_sm100(q, k, v, impl="tma", enable_pdl=enable_pdl)
+        torch.cuda.synchronize()
+        for name, a, b in zip(
+            ("q8", "k8", "v8", "q_scale", "k_scale", "v_scale"), got, ref, strict=True
+        ):
+            assert a.shape == b.shape, name
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
+
+
+@requires_sm100
+def test_tma_quantizer_refuses_sequences_beyond_its_v_boxes():
+    device = torch.device("cuda")
+    q, k, v = _quantizer_inputs(1, 2, 2, 64, 4097, device, 5)
+    with pytest.raises(ValueError, match='impl="tma"'):
+        sage_fp8_quantize_sm100(q, k, v, impl="tma")
+
+
+@requires_sm100
+def test_tma_quantizer_refuses_partitions_beyond_32_bits():
+    """The TMA kernel multiplies its CTA count by its Q/K tile count in 32-bit integers:
+    ``impl="tma"`` refuses a shape whose product reaches ``2**31``, and ``"auto"`` takes
+    another quantizer for it."""
+    route = ("quantize_qkv_tma_x4", 4, 37)
+    assert pkg._tma_partition_fits(1, 8, 8, 4096, 4096, route)
+    assert not pkg._tma_partition_fits(64, 128, 128, 64, 64, route)
+    assert not pkg._tma_partition_fits(1, 8, 8, 1 << 27, 4096, route)
+    q, k, v = _quantizer_inputs(64, 128, 128, 64, 64, torch.device("cuda"), 5)
+    with pytest.raises(ValueError, match="32-bit"):
+        sage_fp8_quantize_sm100(q, k, v, impl="tma")
+
+
+@requires_sm100
+def test_auto_quantizer_capture_without_an_eager_call_takes_two_launches():
+    """The TMA route's occupancy query cannot run inside a CUDA-graph capture: a capture
+    of a row no eager call has routed takes the two-launch quantizer (same bits), the
+    next eager call queries the occupancy, and a later capture takes the TMA quantizer;
+    ``impl="tma"`` in that first capture raises before anything is captured."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.device_arch(index)
+    q, k, v = _quantizer_inputs(1, 8, 8, 4096, 4096, device, 5)
+    ref = sage_fp8_quantize_sm100(q, k, v, impl="two_launch", enable_pdl=False)
+    sage_fp8_quantize_sm100(q, k, v, impl="two_launch")  # load the two-launch kernels
+    torch.cuda.synchronize()
+
+    def capture(fn):
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            calls, _ = pkg._quantize_calls(q, k, v, "auto", None)
+            got = fn()
+        for t in got:
+            t.view(torch.uint8).fill_(255)
+        graph.replay()
+        torch.cuda.synchronize()
+        return [run for run, _ in calls], got
+
+    pkg._TMA_RESIDENT.clear()
+    runs, got = capture(lambda: sage_fp8_quantize_sm100(q, k, v))
+    assert loader.entry("quantize_qkv_tma_x4", arch) not in runs
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="needs one eager call first"),
+        torch.cuda.stream(stream),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        sage_fp8_quantize_sm100(q, k, v, impl="tma")
+    torch.cuda.synchronize()
+    sage_fp8_quantize_sm100(q, k, v)  # eager: the cluster quantizer, and the query
+    assert ("quantize_qkv_tma_x4", index) in pkg._TMA_RESIDENT
+    runs, got = capture(lambda: sage_fp8_quantize_sm100(q, k, v))
+    assert runs == [loader.entry("quantize_qkv_tma_x4", arch)]
+    for a, b in zip(got, ref, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@requires_sm100
+def test_auto_quantizer_routes_captured_small_rows_to_the_tma_quantizer():
+    """``impl="auto"``: eager small rows take the cluster quantizer; inside a CUDA-graph
+    capture the rows whose TMA V clusters fit one wave take the TMA quantizer (one kernel
+    node, no zero-fill), ``vsplit=8`` where that fits, and the replay writes the
+    two-launch bits."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    x8 = loader.resident_clusters(loader.MODULES["quantize_qkv_tma_x8"], index)
+    x4 = loader.resident_clusters(loader.MODULES["quantize_qkv_tma_x4"], index)
+    assert x8 >= 16 and x4 >= 16, (x8, x4)
+    route = pkg._tma_route
+    assert route(1, 2, 4096, 4096, index, one_wave=True)[:2] == (
+        "quantize_qkv_tma_x8",
+        8,
+    )
+    assert route(1, 8, 4096, 4096, index, one_wave=True)[:2] == (
+        "quantize_qkv_tma_x4",
+        4,
+    )
+    assert route(1, 8, 4096, 4097, index, one_wave=True) is None
+    assert route(8, 8, 4096, 4096, index, one_wave=True) is None
+    assert route(8, 8, 4096, 4096, index, one_wave=False)[:2] == (
+        "quantize_qkv_tma_x4",
+        4,
+    )
+    for shape, record in (
+        ((1, 2, 2, 4096, 4096), "quantize_qkv_tma_x8"),
+        ((1, 8, 8, 4096, 4096), "quantize_qkv_tma_x4"),
+    ):
+        q, k, v = _quantizer_inputs(*shape, device, 3)
+        ref = sage_fp8_quantize_sm100(q, k, v, impl="two_launch", enable_pdl=False)
+        calls, _ = pkg._quantize_calls(q, k, v, "auto", None)
+        assert [run for run, _ in calls] == [
+            loader.entry("quantize_qkv_c8w16", loader.device_arch(index))
+        ]
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            sage_fp8_quantize_sm100(q, k, v)  # warm-up on the capture stream
+            stream.synchronize()
+            with torch.cuda.graph(graph, stream=stream):
+                calls, _ = pkg._quantize_calls(q, k, v, "auto", None)
+                got = sage_fp8_quantize_sm100(q, k, v)
+        assert [run for run, _ in calls] == [
+            loader.entry(record, loader.device_arch(index))
+        ]
+        graph.replay()
+        torch.cuda.synchronize()
+        for name, a, b in zip(
+            ("q8", "k8", "v8", "q_scale", "k_scale", "v_scale"), got, ref, strict=True
+        ):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
+
+
+@requires_sm100
+def test_run_module_launches_the_tma_quantizer_like_the_host_api():
+    """``run_module`` grids a ``vsplit_clusters`` record as the host API does."""
+    device = torch.device("cuda")
+    batch, heads, kv_heads, sq, sk = 1, 4, 2, 300, 2000
+    q, k, v = _quantizer_inputs(batch, heads, kv_heads, sq, sk, device, 9)
+    ref = sage_fp8_quantize_sm100(q, k, v, impl="tma")
+    out = [torch.empty_like(t) for t in ref]
+    values = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "q_out": out[0],
+        "k_out": out[1],
+        "v_out": out[2],
+        "q_scale": out[3],
+        "k_scale": out[4],
+        "v_scale": out[5],
+        "batch": batch,
+        "seqlen_q": sq,
+        "seqlen_k": sk,
+        "num_heads": heads,
+        "num_kv_heads": kv_heads,
+        "k_scale_groups": _ceil_div(sk, _K_GROUP),
+        "q_chunks": _ceil_div(sq, 64),
+        "k_chunks": _ceil_div(sk, 64),
+        "v_boxes": _ceil_div(_ceil_div(sk, 4), 256),
+        "enable_pdl": True,
+    }
+    index = torch.cuda.current_device()
+    for name in ("quantize_qkv_tma_x4", "quantize_qkv_tma_x8"):
+        for t in out:
+            t.view(torch.uint8).fill_(255)
+        loader.run_module(name, values, device_index=index)
+        torch.cuda.synchronize()
+        for a, b in zip(out, ref, strict=True):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
+
+
 # Flag macros of the shared SM120 kernel source, in ``SM120_FLAGS`` order.
 _SM120_FLAG_MACROS = (
     "CAKE_SAGE_HAS_BLOCK_NUMS",
@@ -609,7 +834,11 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert set(record["arches"]) <= set(manifest["arch_flags"]), name
         plan = [tuple(pair) for pair in record["arg_plan"]]
         assert plan[-3:] == [("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z")]
-        for kind, key in plan[:-3]:
+        # A PDL record takes the per-call ``enable_pdl`` argument right before the grid.
+        pdl = record["launch"]["use_pdl"] == "runtime"
+        assert record["launch"]["use_pdl"] in (False, "runtime"), name
+        assert (plan[-4] == ("launch", "enable_pdl")) == pdl, name
+        for kind, key in plan[: -4 if pdl else -3]:
             assert kind in ("buffer", "parameter"), (name, kind, key)
             assert record["logical"][key] in (
                 loader.LOGICAL_TENSORS + loader.LOGICAL_SCALARS
@@ -660,6 +889,16 @@ def test_registry_records_reference_the_build_manifest() -> None:
         == 20
     )
     assert all(loader.MODULES[name]["arches"] == ["sm_120a"] for name in sm120)
-    assert [
-        loader.MODULES[name]["arches"] for name in loader.records_of_role("attention")
-    ] == [["sm_100a", "sm_103a"]]
+    # The default attention build (and its PDL build) ships on both architectures; the
+    # second build of each architecture (split QK on SM100, per tile on SM103) on its own.
+    assert {
+        name: loader.MODULES[name]["arches"]
+        for name in loader.records_of_role("attention")
+    } == {
+        "attention": ["sm_100a", "sm_103a"],
+        "attention_pdl": ["sm_100a", "sm_103a"],
+        "attention_qs": ["sm_100a"],
+        "attention_qs_pdl": ["sm_100a"],
+        "attention_per_tile": ["sm_103a"],
+        "attention_per_tile_pdl": ["sm_103a"],
+    }

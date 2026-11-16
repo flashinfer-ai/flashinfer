@@ -213,5 +213,6 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     graph.replay()
     torch.cuda.synchronize()
     assert ws._launch_key[-1] == stream.cuda_stream
+    assert ws._tuning_state.graph_captured
     assert (ws.output_activation == 3).all()
     del graph

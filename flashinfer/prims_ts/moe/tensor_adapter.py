@@ -60,13 +60,13 @@ def _validate_swap_ab_cluster_span(cfg, out_hidden: int) -> None:
     validated by the launch-capacity path.
     """
 
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _validate_swap_ab_out_hidden,
+    )
+
     if not cfg.is_swap_ab:
         return
-    if out_hidden % cfg.tile_m:
-        raise ValueError(
-            f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
-            f"got {out_hidden}"
-        )
+    _validate_swap_ab_out_hidden(cfg, out_hidden)
     cluster_dim_x = int(cfg.preferred_cluster_shape[0])
     if cluster_dim_x <= int(cfg.umma_cta_count):
         return
@@ -609,16 +609,24 @@ def build_bf16_launch_io(
         raise ValueError(
             f"tile_idx/mn_limit capacity mismatch: {tile_idx.numel()} vs {mn_limit.numel()}"
         )
-    if not tile_idx.is_contiguous():
-        raise ValueError("tile_idx must be contiguous")
-    if not mn_limit.is_contiguous():
-        raise ValueError("mn_limit must be contiguous")
-    if not route_map.is_contiguous():
-        raise ValueError("route_map must be contiguous")
-    if not num_non_exiting_ctas.is_contiguous():
-        raise ValueError("num_non_exiting_ctas must be contiguous")
-    if not total_num_padded_tokens.is_contiguous():
-        raise ValueError("total_num_padded_tokens must be contiguous")
+    for name, tensor in (
+        ("hidden_states", hidden_states),
+        ("gemm1_weights", gemm1_weights),
+        ("gemm2_weights", gemm2_weights),
+        ("gemm1_output", gemm1_output),
+        ("gemm2_output", gemm2_output),
+        ("tile_idx", tile_idx),
+        ("mn_limit", mn_limit),
+        ("route_map", route_map),
+        ("num_non_exiting_ctas", num_non_exiting_ctas),
+        ("total_num_padded_tokens", total_num_padded_tokens),
+    ):
+        # A strided C view (partitioned column slice) is checked against
+        # c_row_stride by _validate_c_output_layout instead.
+        if c_row_stride and tensor is output_buf:
+            continue
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     if num_non_exiting_ctas.numel() < 1:
         raise ValueError("num_non_exiting_ctas must contain the GPU active CGA count")
 

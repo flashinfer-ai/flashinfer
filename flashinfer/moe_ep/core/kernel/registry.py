@@ -93,7 +93,7 @@ def create_mega_kernel(config: object) -> MegaKernelBackend:
         available = _available_mega_kernels()
         raise KeyError(f"unknown mega kernel {name!r}; available: {available}")
     _warn_if_deprecated_mega_name(name)
-    return _MEGA_KERNEL_REGISTRY[name](config)
+    return _MEGA_KERNEL_REGISTRY[name].create(config)
 
 
 def kernel_requires_weights(config: object) -> bool:

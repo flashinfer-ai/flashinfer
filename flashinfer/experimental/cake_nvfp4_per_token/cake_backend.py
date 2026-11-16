@@ -295,6 +295,16 @@ QUANT_ALONE_CLUSTER_SPLIT: dict[str, dict[int, tuple[tuple[int, int, int], ...]]
         28672: ((1, 8, 8), (130, 130, 4)),
     },
 }
+# The quantizer alone, row-strided bf16 rows (M >= 2, row stride != K): per architecture and
+# row width, the token-count ranges ``(low, high, fold)`` that keep one CTA per padded row
+# with the entry read instead of the plan of their contiguous copy, at the SM counts of
+# :data:`MEASURED_SM_COUNT` (paired timings of the row-strided view: at 32 tokens the split
+# ties one CTA per row on GB300, as the contiguous folded rows do above 17 tokens).
+STRIDED_ALONE_ONE_CTA: dict[str, dict[int, tuple[tuple[int, int, bool], ...]]] = {
+    "sm_103a": {
+        8192: ((18, 32, False),),
+    },
+}
 # 16-byte chunks of the last scale tile's padding one padding-cluster CTA zeroes.
 CLUSTER_SPLIT_PAD_CHUNKS = 1024
 # The quantizer alone (the quantize + GEMM chain keeps one CTA per padded row): per
@@ -476,6 +486,22 @@ def quant_alone_cluster_split(
     return quant_cluster_split(m, k, is_bf16, fold, arch)
 
 
+def strided_alone_one_cta(
+    m: int, k: int, is_bf16: bool, fold: bool, arch: str, sm_count: int
+) -> bool:
+    """True when the quantizer alone runs a row-strided bf16 view of ``(M, K)`` on ``arch``
+    one CTA per padded row with the entry read: ``M`` in a range of
+    :data:`STRIDED_ALONE_ONE_CTA` for ``K`` and the fold, at the measured SM count."""
+    return (
+        is_bf16
+        and MEASURED_SM_COUNT.get(arch) == int(sm_count)
+        and any(
+            low <= int(m) <= high and bool(fold) == folded
+            for low, high, folded in STRIDED_ALONE_ONE_CTA.get(arch, {}).get(int(k), ())
+        )
+    )
+
+
 def quant_alone_pad_chunked(
     m: int, k: int, is_bf16: bool, k_static: Optional[int], arch: str, sm_count: int
 ) -> bool:
@@ -537,8 +563,9 @@ def quant_plan(
     static-K instance for contiguous row sets of fewer than :data:`STATIC_M_LIMIT` tokens
     at a row width in :data:`STATIC_K`, one CTA per padded row (the CTAs past ``M`` zero
     the padding rows of the scale tiles).  ``x_row_stride`` (elements; ``None`` =
-    contiguous) decides between the static-K and the runtime-geometry instance, and
-    row-strided rows keep the entry out_scale read;
+    contiguous) decides between the static-K and the runtime-geometry instance; the
+    quantizer alone plans row-strided rows like their contiguous copy, and the chain's
+    quantizer runs them one CTA per padded row;
     ``alone`` selects the cluster split of the quantizer alone
     (:func:`quant_alone_cluster_split`) instead of the chain's (:func:`chain_cluster_split`,
     of the chain GEMM's weight rows ``n`` when given).
@@ -562,11 +589,20 @@ def quant_plan(
     k_static = static_k_for(k, m, x_row_stride)
     pm, cols = padded_rows(m), padded_sf_cols(k)
     grid = pm
-    split = (
-        quant_alone_cluster_split(m, k, is_bf16, fold, arch, sm_count)
-        if alone
-        else chain_cluster_split(m, k, is_bf16, fold, arch, sm_count, n)
-    )
+    # Every runtime-geometry binding takes ``x`` through its row stride (the entry
+    # functions keep rows on 32-byte boundaries).  Row-strided rows of the quantizer
+    # alone keep the cluster split, the pad-chunked program and the late out_scale read
+    # of their contiguous copy, except the rows of STRIDED_ALONE_ONE_CTA; those and the
+    # chain's quantizer run them one CTA per padded row with the entry read.
+    contiguous = m == 1 or x_row_stride is None or x_row_stride == k
+    if alone and not contiguous:
+        alone = not strided_alone_one_cta(m, k, is_bf16, fold, arch, sm_count)
+    if alone:
+        split = quant_alone_cluster_split(m, k, is_bf16, fold, arch, sm_count)
+    elif contiguous:
+        split = chain_cluster_split(m, k, is_bf16, fold, arch, sm_count, n)
+    else:
+        split = 1
     if split > 1:
         share = (k // SF_VEC + split - 1) // split * SF_VEC
         threads, min_blocks = cta_config(share, m)
@@ -585,9 +621,6 @@ def quant_plan(
         min_blocks = 1
         store_hint = default_store_hint(k, threads, min_blocks)
         grid = m + (-(-8 * cols // CLUSTER_SPLIT_PAD_CHUNKS) if m % ROW_TILE else 0)
-    # The ``_ru`` program's binding requires contiguous rows: row-strided activations keep
-    # the entry read.
-    contiguous = m == 1 or x_row_stride is None or x_row_stride == k
     out_scale_read = (
         quant_alone_out_scale_read(
             m,
@@ -598,7 +631,7 @@ def quant_plan(
             arch,
             sm_count,
         )
-        if alone and split == 1 and not pad_chunked and contiguous
+        if alone and split == 1 and not pad_chunked
         else "entry"
     )
     plan = QuantizePlan(
@@ -2061,11 +2094,19 @@ def row_stride_of(x: torch.Tensor) -> int:
     return stride
 
 
+def rows_aligned(x: torch.Tensor) -> bool:
+    """Whether every row of ``x[M, K]`` starts on a 32-byte boundary.  The quantizer
+    programs load ``x`` 32 bytes at a time from ``x + row * row_stride``."""
+    stride_bytes = row_stride_of(x) * x.element_size()
+    return x.data_ptr() % 32 == 0 and stride_bytes % 32 == 0
+
+
 def validate_quantize_inputs(
     x: torch.Tensor, outputs: PerTokenQuantizeOutputs
 ) -> tuple[int, int]:
-    """Shape / dtype validation of one quantizer call; returns ``(M, K)``.  ``x`` may be a
-    row-strided view (unit stride along the row)."""
+    """Shape / dtype validation of one quantizer call; returns ``(M, K)``.  ``x`` may be
+    a row-strided view (unit stride along the row) whose rows start on 32-byte
+    boundaries."""
     if x.dim() != 2 or x.device.type != "cuda":
         raise ValueError("x must be a 2-D CUDA tensor")
     if x.dtype not in (torch.bfloat16, torch.float16):
@@ -2073,7 +2114,11 @@ def validate_quantize_inputs(
     m, k = (int(v) for v in x.shape)
     if k <= 0 or k % SF_VEC:
         raise ValueError(f"K={k} must be a positive multiple of {SF_VEC}")
-    row_stride_of(x)
+    if not rows_aligned(x):
+        raise ValueError(
+            "x rows must start on 32-byte boundaries (data_ptr % 32 == 0 and a row "
+            "stride that is a multiple of 16 elements); quantize a copy (x.clone())"
+        )
     fp4, sf, scale = outputs
     if (
         tuple(fp4.shape) != (m, k // 2)
@@ -2181,8 +2226,8 @@ def _quant_prepared(
     m: int, k: int, is_bf16: bool, fold: bool, device_index: int, x_row_stride: int
 ) -> tuple[QuantizePlan, Callable[..., Any], tuple[tuple[str, str], ...]]:
     """Plan, loaded FFI entry and argument plan of the quantizer launch of one shape on one device
-    (``x_row_stride`` selects the static-K or the runtime-geometry instance and keeps
-    row-strided rows on the entry out_scale read)."""
+    (``x_row_stride`` selects the static-K or the runtime-geometry instance; row-strided
+    rows keep the plan of their contiguous copy)."""
     device = torch.device("cuda", device_index)
     arch = _device_arch(device)
     plan = quant_plan(
@@ -2233,6 +2278,9 @@ def nvfp4_quantize_per_token(
     m, k = (int(v) for v in x.shape)
     if k <= 0 or k % SF_VEC:
         raise ValueError(f"K={k} must be a positive multiple of {SF_VEC}")
+    if not rows_aligned(x):
+        # Rows that start off 32-byte boundaries are quantized from an aligned copy.
+        x = x.clone(memory_format=torch.contiguous_format)
     outputs = allocate_nvfp4_per_token_quantize_outputs(m, k, device)
     fold = out_scale is not None
     plan, entry, arg_plan = _quant_prepared(

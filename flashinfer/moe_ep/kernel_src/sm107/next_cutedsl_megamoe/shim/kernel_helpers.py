@@ -280,7 +280,7 @@ def preprocess_block_scaled_weights(
     if quant_kind == "nvfp4":
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e4m3fn, Nvfp4BlockSize, 2
-    elif quant_kind == "mxfp4_mxfp8":
+    elif quant_kind in ("mxfp4", "mxfp4_mxfp8"):
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e8m0fnu, Mxfp8BlockSize, 2
     elif quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2"):
@@ -302,7 +302,9 @@ def preprocess_block_scaled_weights(
         intermediate_size,
     ):
         raise ValueError("canonical weight shapes must be [E, 2I, H] and [E, H, I].")
-    intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
+    intermediate_alignment = (
+        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+    )
     if hidden % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the SM107 scale-vector alignment."
@@ -338,7 +340,7 @@ def preprocess_block_scaled_weights(
                 block = source[begin:end].to(torch.float32).contiguous()
                 if quant_kind == "nvfp4":
                     q, sf = quantize_nvfp4_block16(block)
-                elif quant_kind == "mxfp4_mxfp8":
+                elif quant_kind in ("mxfp4", "mxfp4_mxfp8"):
                     q, sf = quantize_mxfp4_block32(block)
                 else:
                     q, sf = quantize_mxfp8_block32(block, data_dtype)
@@ -373,7 +375,7 @@ def preprocess_prequantized_block_scaled_weights(
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e4m3fn, Nvfp4BlockSize, 2
         allowed_data = (data_dtype, torch.uint8)
-    elif quant_kind == "mxfp4_mxfp8":
+    elif quant_kind in ("mxfp4", "mxfp4_mxfp8"):
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e8m0fnu, Mxfp8BlockSize, 2
         allowed_data = (data_dtype, torch.uint8)
@@ -390,7 +392,9 @@ def preprocess_prequantized_block_scaled_weights(
     experts = w13.shape[0]
     if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
-    intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
+    intermediate_alignment = (
+        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+    )
     if hidden_size % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the SM107 scale-vector alignment."
@@ -456,9 +460,9 @@ def _dequant_activation(
     hidden: int,
 ) -> torch.Tensor:
     """Staged activation payload + raw per-token SF plane -> fp32 (tokens, hidden)."""
-    if quant_kind == "nvfp4":
+    if quant_kind in ("nvfp4", "mxfp4"):
         data = unpack_fp4_to_f32(x_data[:num_tokens])[:, :hidden]
-        vec = Nvfp4BlockSize
+        vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
     else:
         data = x_data[:num_tokens, :hidden].to(torch.float32)
         vec = Mxfp8BlockSize
@@ -470,7 +474,7 @@ def _dequant_weight_k_major(
     quant_kind: str, weight: torch.Tensor, sf_raw: torch.Tensor
 ) -> torch.Tensor:
     """K-major weight (N, K[packed]) + raw SF (N, K/vec) -> fp32 (N, K)."""
-    if quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+    if quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
         data = unpack_fp4_to_f32(weight)
         vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
     else:
@@ -485,6 +489,8 @@ def _quantize_fc2_wire(
     """Emulate the in-kernel FC1->FC2 wire quantization for one expert."""
     if quant_kind == "nvfp4":
         return quantize_nvfp4_block16(act, norm_const)
+    if quant_kind == "mxfp4":
+        return quantize_mxfp4_block32(act)
     data_dtype = (
         torch.float8_e5m2 if quant_kind == "mxfp8_e5m2" else torch.float8_e4m3fn
     )
@@ -534,6 +540,8 @@ def compute_megamoe_reference_sm107_block_scaled(
     fc1_alpha: Optional[torch.Tensor] = None,
     fc2_alpha: Optional[torch.Tensor] = None,
     fc1_norm_const: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
 ) -> torch.Tensor:
     """Pure-torch single-rank oracle for the SM107 block-scaled inference kernel.
 
@@ -548,8 +556,10 @@ def compute_megamoe_reference_sm107_block_scaled(
     ``(E, 2I, hidden/vec)``; ``fc2_weight_k_major (E, hidden, I[packed])`` with
     raw SF ``(E, hidden, I/vec)``.
     """
-    if (situ_beta is None) != (situ_linear_beta is None):
-        raise ValueError("SiTU requires both beta parameters.")
+    if situ_beta is None and situ_linear_beta is not None:
+        raise ValueError("situ_linear_beta requires situ_beta.")
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
     device = topk_idx.device
     tokens = x_data.shape[0] if num_tokens is None else num_tokens
     num_local_experts, fc1_out, _ = fc1_weight_k_major.shape
@@ -582,8 +592,13 @@ def compute_megamoe_reference_sm107_block_scaled(
             up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
         if situ_beta is not None:
             gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            if situ_linear_beta is not None:
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
             act = (up * gate).reshape(-1, intermediate)
+        elif swiglu_alpha is not None:
+            act = (
+                (up + swiglu_beta) * gate * torch.sigmoid(swiglu_alpha * gate)
+            ).reshape(-1, intermediate)
         else:
             act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
         if apply_routing_weights_before_fc2:
@@ -592,7 +607,7 @@ def compute_megamoe_reference_sm107_block_scaled(
         norm_const = 1.0 if fc1_norm_const is None else fc1_norm_const[local_e]
         act_q, act_sf = _quantize_fc2_wire(quant_kind, act, norm_const)
         vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
-        if quant_kind == "nvfp4":
+        if quant_kind in ("nvfp4", "mxfp4"):
             act = unpack_fp4_to_f32(act_q)
         else:
             act = act_q.to(torch.float32)
