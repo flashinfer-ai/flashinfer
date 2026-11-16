@@ -3325,8 +3325,6 @@ def testUnifiedNvfp4Moe(args):
     # experts <= local). For EP=1 (local == global) this is unchanged.
     routing_num_experts = local_num_experts
     routing_top_k = min(top_k, local_num_experts)
-    # Activation/routing only: the expert weights were already built above, so
-    # do not allocate (and quantize) another full expert-weight set here.
     cute_dsl_data = create_moe_activation_tensors(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
@@ -3399,8 +3397,6 @@ def testUnifiedNvfp4Moe(args):
     if args.refcheck:
         ref_output = compute_reference_moe_fp4(
             hidden_states=cute_dsl_data["x_bf16"].float().to(device),
-            # Pass bf16 weights directly: the reference converts one expert
-            # slice at a time, so no full fp32 copy of the weights is made.
             gemm1_weights=w1_bf16,
             gemm2_weights=w2_bf16,
             token_selected_experts=local_topk_ids,
@@ -3410,7 +3406,6 @@ def testUnifiedNvfp4Moe(args):
             top_k=routing_top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            # Unit FC2 input scale, matching create_moe_tensors.
             fc2_input_scale=torch.ones(1, dtype=torch.float32, device=device),
         )
 

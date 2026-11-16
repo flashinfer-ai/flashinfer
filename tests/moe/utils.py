@@ -679,12 +679,6 @@ def compute_reference_moe_fp4(
 
     hidden_states = hidden_states.float()
 
-    # Convert expert weights to fp32 lazily, one expert slice at a time, instead
-    # of materializing a full fp32 copy of every expert's weights. For large
-    # expert counts (e.g. 384 x 7168 x 3072 x 3 = 94.5 GiB in fp32) the eager
-    # copy alone exceeds device memory. Converted slices are cached only while
-    # the cache stays under a fixed budget, so small shapes keep the old
-    # convert-once behaviour and large shapes convert on the fly.
     fp32_cache_budget_bytes = 8 * 1024**3
     fp32_cache: dict[tuple[int, int], torch.Tensor] = {}
     fp32_cache_bytes = 0
@@ -846,14 +840,7 @@ def create_moe_activation_tensors(
     seed: int = 42,
     use_per_token_activation: bool = False,
 ):
-    """Create the NVFP4 activation and routing tensors for MoE tests.
-
-    This is the activation/routing half of :func:`create_moe_tensors`. It does
-    not allocate any expert weights, so callers that supply their own weights
-    (e.g. memory-bound benchmarks) can avoid a second full expert-weight set.
-    It seeds the RNG with ``seed`` and draws in the same order as
-    :func:`create_moe_tensors`, so both produce identical activations/routing.
-    """
+    """Create the NVFP4 activation and routing tensors for MoE tests."""
     from flashinfer.fp4_quantization import fp4_quantize
     from flashinfer.quantization import (
         SfLayout,
@@ -961,8 +948,6 @@ def create_moe_tensors(
 
     sf_vec_size = 16
 
-    # Activations + routing (seeds the RNG; weights below draw from the same
-    # stream, so results match the pre-split implementation exactly).
     activation_tensors = create_moe_activation_tensors(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
