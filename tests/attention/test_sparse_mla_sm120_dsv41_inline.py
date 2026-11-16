@@ -413,13 +413,7 @@ def test_inline_attention_matches_footer(
     )
     torch.cuda.synchronize()
     assert torch.isfinite(ref_out).all()
-    if (
-        tokens <= 64
-        and precision != "bf16"
-        and extra != "fp4"
-        and main_span_pad == 0
-        and extra_span_pad == 0
-    ):
+    if tokens <= 64 and precision != "bf16" and extra != "fp4":
         _assert_inline_and_footer_decode_accuracy(
             out, ref_out, q, footer, indices, extra_footer, extra_indices
         )
@@ -462,8 +456,9 @@ def test_inline_padded_row_pitches_match_footer(
     )
     fp4 = extra == "fp4"
 
-    def run(scale_format, cache, extra_cache, idx, extra_idx):
+    def run(scale_format, cache, extra_cache, idx, extra_idx, impl="auto"):
         wrapper = flashinfer.mla.SparseMLASm120Wrapper(
+            backend="sparse",
             kv_scale_format=scale_format,
             extra_kv_fp4=fp4,
             compute_precision=precision,
@@ -479,11 +474,25 @@ def test_inline_padded_row_pitches_match_footer(
             extra_kv_cache=extra_cache,
             extra_indices=extra_idx,
             return_lse=True,
+            impl=impl,
         )
         return out, lse
 
     main_span, extra_span = main_bs + 3, extra_bs + 2
-    ref_out, ref_lse = run("ue8m0_g32", footer, extra_footer, indices, extra_indices)
+    # Auto may intentionally select different algorithms for footer and
+    # inline caches. Test pitch invariance within the same format and policy.
+    if precision == "default" and not fp4:
+        ref_out, ref_lse = run(
+            "ue8m0_g32_inline",
+            _footer_to_inline(footer, *_FP8),
+            _footer_to_inline(extra_footer, *_FP8),
+            indices,
+            extra_indices,
+        )
+    else:
+        ref_out, ref_lse = run(
+            "ue8m0_g32", footer, extra_footer, indices, extra_indices
+        )
     out, lse = run(
         "ue8m0_g32_inline",
         _inline_view(footer, _FP8, main_span, main_pitch),
@@ -494,6 +503,29 @@ def test_inline_padded_row_pitches_match_footer(
     torch.cuda.synchronize()
     assert torch.equal(out, ref_out)
     assert torch.equal(lse, ref_lse)
+
+    # Pin both CuTe schedules to retain exact cross-format checks, including
+    # page gaps and independent main/extra row pitches.
+    if precision == "default" and not fp4:
+        for impl in ("decode-splitkv", "decode"):
+            ref_out, ref_lse = run(
+                "ue8m0_g32",
+                footer,
+                extra_footer,
+                indices,
+                extra_indices,
+                impl,
+            )
+            out, lse = run(
+                "ue8m0_g32_inline",
+                _inline_view(footer, _FP8, main_span, main_pitch),
+                _inline_view(extra_footer, _FP8, extra_span, extra_pitch),
+                _row_indices(indices, main_bs, main_span),
+                _row_indices(extra_indices, extra_bs, extra_span),
+                impl,
+            )
+            assert torch.equal(out, ref_out)
+            assert torch.equal(lse, ref_lse)
 
 
 def _metadata(scale_format, cache, extra_cache, indices, extra_indices, fp4):

@@ -29,9 +29,8 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
       (m.heads % 32 == 0 || plan.implementation == execution::Implementation::Dsv4Fp8Decode) &&
       plan.numeric == execution::NumericRoute::FP8 &&
       (mt == ModelType::DSV4_1 ||
-       (m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes &&
-        (!m.extra_topk ||
-         m.extra_page_stride_bytes == size_t(m.extra_page_size) * m.extra_row_stride_bytes))) &&
+       (m.page_stride_bytes % m.row_stride_bytes == 0 &&
+        (!m.extra_topk || m.extra_page_stride_bytes % m.extra_row_stride_bytes == 0))) &&
       m.indices_stride == size_t(m.topk) &&
       (!m.extra_topk || m.extra_indices_stride == size_t(m.extra_topk))) {
     using namespace cute_prefill::integrated;

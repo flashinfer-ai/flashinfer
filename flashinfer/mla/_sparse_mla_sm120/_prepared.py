@@ -106,7 +106,7 @@ def resolve_execution(
         and m.heads in (8, 16, 32, 64)
         and (
             m.model == policy._MODEL_TYPE_DSV4_1
-            or m.page_stride_bytes == m.page_size * m.row_stride_bytes
+            or m.page_stride_bytes % m.row_stride_bytes == 0
         )
         and m.indices_stride == m.topk
         and (
@@ -114,8 +114,7 @@ def resolve_execution(
             or (
                 (
                     m.model == policy._MODEL_TYPE_DSV4_1
-                    or m.extra_page_stride_bytes
-                    == m.extra_page_size * m.extra_row_stride_bytes
+                    or m.extra_page_stride_bytes % m.extra_row_stride_bytes == 0
                 )
                 and m.extra_indices_stride == m.extra_topk
             )

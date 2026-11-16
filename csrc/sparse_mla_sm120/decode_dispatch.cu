@@ -147,10 +147,9 @@ ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t mode, int64_t
   TVM_FFI_ICHECK(
       is_dsv41(static_cast<ModelType>(m.model)) && !m.extra_fp4 &&
       (m.heads == 8 || m.heads == 16 || m.heads == 32 || m.heads == 64) &&
-      (footer || m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes) &&
+      (footer || m.page_stride_bytes % m.row_stride_bytes == 0) &&
       m.indices_stride == size_t(m.topk) &&
-      (!m.extra_topk || ((footer || m.extra_page_stride_bytes ==
-                                        size_t(m.extra_page_size) * m.extra_row_stride_bytes) &&
+      (!m.extra_topk || ((footer || m.extra_page_stride_bytes % m.extra_row_stride_bytes == 0) &&
                          m.extra_indices_stride == size_t(m.extra_topk))))
       << "DSv4 FP8 decode requires footer pages or flat inline FP8 KV, contiguous indices and "
          "H=8/16/32/64";
