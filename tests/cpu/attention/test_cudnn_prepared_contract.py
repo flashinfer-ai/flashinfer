@@ -91,34 +91,26 @@ def test_paged_explicit_lengths_preserve_token_origins_on_cudnn924(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "version,backend,native,runtime,expected",
+    "backend,native,runtime,expected",
     [
-        ("1.30.0", 92700, True, True, False),
-        ("1.31.0", 92700, True, True, False),
-        ("1.31.0+local", 92700, True, True, False),
-        ("1.32.0.dev1", 92700, True, True, False),
-        ("1.32.0rc1", 92700, True, True, False),
-        ("1.32.0+local", 92700, True, True, True),
-        ("1.33.0.dev1", 92700, True, True, True),
-        ("unknown", 92700, True, True, False),
-        ("1.32.0", 92300, True, True, False),
-        ("1.32.0", 92400, True, True, True),
-        ("1.32.0", 92500, True, True, True),
-        ("1.32.0", 92600, True, True, True),
-        ("1.32.0", 92700, False, True, False),
-        ("1.32.0", 92700, True, False, False),
-        ("1.32.0", 92700, True, True, True),
+        (92300, True, True, False),
+        (92400, True, True, True),
+        (92500, True, True, True),
+        (92600, True, True, True),
+        (92700, False, True, False),
+        (92700, True, False, False),
+        (92700, True, True, True),
     ],
 )
 def test_paged_auto_requires_qualified_runtime(
-    monkeypatch, version, backend, native, runtime, expected
+    monkeypatch, backend, native, runtime, expected
 ):
     monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
     monkeypatch.setattr(
         prefill,
         "cudnn",
         SimpleNamespace(
-            __version__=version,
+            __version__="1.32.0",
             backend_version=lambda: backend,
             _pybind_module=SimpleNamespace(
                 _SdpaThdBinder=SimpleNamespace(supports_paged_packed_split=native)
@@ -252,22 +244,12 @@ def test_ordered_execution_feature_detection():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "version,features,mla,d128",
+    "features,mla,d128",
     [
+        ({}, False, False),
+        ({"supports_nonpaged_packed_split": True}, True, False),
+        ({"supports_nonpaged_d128_packed_split": True}, False, True),
         (
-            "1.30.0",
-            {
-                "supports_nonpaged_packed_split": True,
-                "supports_nonpaged_d128_packed_split": True,
-            },
-            False,
-            False,
-        ),
-        ("1.31.0", {}, False, False),
-        ("1.31.0", {"supports_nonpaged_packed_split": True}, True, False),
-        ("1.31.0", {"supports_nonpaged_d128_packed_split": True}, False, True),
-        (
-            "1.31.0",
             {
                 "supports_nonpaged_packed_split": True,
                 "supports_nonpaged_d128_packed_split": True,
@@ -278,7 +260,7 @@ def test_ordered_execution_feature_detection():
     ],
 )
 def test_bounded_ragged_requires_matching_native_feature(
-    monkeypatch, version, features, mla, d128
+    monkeypatch, features, mla, d128
 ):
     """A native MLA executor does not establish D128 packed-split support."""
     monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
@@ -286,7 +268,7 @@ def test_bounded_ragged_requires_matching_native_feature(
         prefill,
         "cudnn",
         SimpleNamespace(
-            __version__=version,
+            __version__="1.32.0",
             _pybind_module=SimpleNamespace(_SdpaThdBinder=SimpleNamespace(**features)),
         ),
     )

@@ -494,6 +494,9 @@ from .page import (
     nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
 )
 from .page import (
+    fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping as fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping,
+)
+from .page import (
     nvfp4_quantize_append_paged_mla_kv_cache as nvfp4_quantize_append_paged_mla_kv_cache,
 )
 from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
@@ -562,6 +565,7 @@ from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )
+from .sparse import qsa_sparse_paged_attention as qsa_sparse_paged_attention
 from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
