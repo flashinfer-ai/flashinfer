@@ -1288,6 +1288,21 @@ def test_preallocated_outputs():
         flashinfer.sampling.top_k_sampling_from_probs(
             w, ks, seed=s, offset=o, batch_invariant=True, out=ks
         )
+    # an int64 samples buffer (the gather's dtype contract) overlapping a log-probability buffer
+    idx = torch.arange(M, device="cuda")
+    arena = torch.empty(2 * M, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x,
+            ks,
+            ps,
+            indices=idx,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=arena.view(torch.int64),
+            kept_logprob_out=arena[:M],
+        )
 
 
 @needs_device

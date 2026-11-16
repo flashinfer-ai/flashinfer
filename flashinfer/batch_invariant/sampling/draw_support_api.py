@@ -306,7 +306,11 @@ def _entry(
             None,
         )
         check_no_overlap(
-            [("out", out64)],
+            [
+                ("out", out64),
+                ("logprob_out", logprob_out),
+                ("kept_logprob_out", kept_logprob_out),
+            ],
             [
                 ("x", x),
                 ("seed", seeds),
