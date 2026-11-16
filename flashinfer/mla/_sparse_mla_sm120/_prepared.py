@@ -90,6 +90,7 @@ def resolve_execution(
     preference: int,
     decode_only: bool = False,
     impl: str = "auto",
+    use_decode_policy: bool = True,
 ) -> ExecutionPlan:
     m = metadata
     selected = (
@@ -125,7 +126,8 @@ def resolve_execution(
             "impl requires DSv4.1 FP8 KV, FP8 compute, contiguous indices and H=8/16/32/64"
         )
     if (
-        eligible
+        use_decode_policy
+        and eligible
         and preference == 0
         and not decode_only
         and (impl != "auto" or selected is None)
@@ -310,9 +312,17 @@ def prepare(
     current=None,
     decode_only=False,
     impl="auto",
+    use_decode_policy=True,
 ):
     plan = resolve_execution(
-        metadata, device, precision, is_dsv4_nvfp4, preference, decode_only, impl
+        metadata,
+        device,
+        precision,
+        is_dsv4_nvfp4,
+        preference,
+        decode_only,
+        impl,
+        use_decode_policy,
     )
     workspace = tuple(
         (tuple(shape), getattr(torch, str(dtype)), int(size), int(alignment))
@@ -568,6 +578,8 @@ def _functional_plan(
     preference=0,
     value_dim=0,
     decode_only=False,
+    *,
+    use_decode_policy=True,
 ):
     q = tensors[0]
     key = (
@@ -577,6 +589,7 @@ def _functional_plan(
         preference,
         value_dim,
         decode_only,
+        use_decode_policy,
         tuple(tensor_signature(x) for x in tensors),
     )
     capturing = torch.cuda.is_current_stream_capturing()
@@ -612,6 +625,7 @@ def _functional_plan(
             caller_lse=True,
             current=current,
             decode_only=decode_only,
+            use_decode_policy=use_decode_policy,
         )
         _functional_plans[key] = current
     return current
@@ -662,7 +676,16 @@ def caller_run(
         None,
     )
     current = _functional_plan(
-        tensors, model, False, extra_fp4, preference, value_dim, decode_only
+        tensors,
+        model,
+        False,
+        extra_fp4,
+        preference,
+        value_dim,
+        decode_only,
+        # This API's caller sizes scratch from the legacy decode/prefill plan.
+        # Preserve that contract; the wrapper owns buffers for the new policy.
+        use_decode_policy=False,
     )
     if current.workspace[0][2]:
         from ._api import _decode_scratch_views

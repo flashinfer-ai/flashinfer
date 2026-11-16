@@ -101,6 +101,45 @@ def test_decode_explicit_selection(inline):
             assert facts[0]["partial_bytes"] == 0
 
 
+@pytest.mark.parametrize("first", [False, True])
+def test_caller_and_workspace_scheduling_cache_isolation(first, monkeypatch):
+    from flashinfer.mla._sparse_mla_sm120 import _prepared
+
+    monkeypatch.setattr(_prepared, "device_caps", lambda device: (188, 101376))
+    f = fixture(65, 16, "v41_fp8", inline=False)
+    tensors = (
+        f["q"],
+        f["caches"][0],
+        f["indices"][0],
+        f["context"],
+        f["lengths"][0],
+        f["sink"],
+        f["caches"][1],
+        f["indices"][1],
+        f["lengths"][1],
+        None,
+        None,
+        None,
+    )
+    plans = {}
+    for use_decode_policy in (first, not first, first):
+        prepared = _prepared._functional_plan(
+            tensors,
+            5,
+            False,
+            False,
+            value_dim=512,
+            use_decode_policy=use_decode_policy,
+        )
+        if use_decode_policy in plans:
+            assert prepared is plans[use_decode_policy]
+        plans[use_decode_policy] = prepared
+    assert plans[False].plan.inspect()["variant"] == 1
+    assert plans[False].workspace[0][2] == 0
+    assert plans[True].plan.inspect()["implementation"] == "dsv4_fp8_splitkv_decode"
+    assert plans[True].workspace[0][2] > 0
+
+
 def test_footer_auto_keeps_small_workloads_on_legacy_decode():
     f = fixture(1, 8, "v41_fp8", inline=False, extra_topk=0)
     call(f, "auto")
