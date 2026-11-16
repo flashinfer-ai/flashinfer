@@ -404,6 +404,20 @@ def test_decode_takes_strided_activations():
 
 
 @needs_device
+def test_pool_first_used_under_another_default_dtype():
+    h = 16
+    p = params(h)
+    s = make_seq(4, h, SEED + 32, GATES["steep"])
+    ref = bi_decode(token(s, 0), new_pool([s], [0]), [0], p)
+    torch.set_default_dtype(torch.float64)
+    try:
+        got = bi_decode(token(s, 0), new_pool([s], [0]), [0], p)
+    finally:
+        torch.set_default_dtype(torch.float32)
+    assert torch.equal(got, ref)
+
+
+@needs_device
 @pytest.mark.parametrize("h", HEADS)
 def test_graph_replay_equals_eager(h):
     p = params(h)

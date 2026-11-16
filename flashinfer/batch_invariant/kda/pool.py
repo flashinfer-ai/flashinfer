@@ -78,7 +78,9 @@ class ExactPool:
 
         self.cnt = zeros(S, HV, dtype=torch.int32)
         # NaN matches no state: every (slot, head) builds its bf16 copy at its first step
-        self.stamp = torch.full((S, HV, STAMP), float("nan"), device=dev)
+        self.stamp = torch.full(
+            (S, HV, STAMP), float("nan"), dtype=torch.float32, device=dev
+        )
         self.state_bf16 = zeros(S, HV, HEAD_DIM, HEAD_DIM)
         self.prefix = zeros(S, HV, HEAD_DIM, dtype=torch.float32)
         self.k_inv_rows = zeros(S, HV, CHUNK, HEAD_DIM)
