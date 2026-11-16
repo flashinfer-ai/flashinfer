@@ -1311,6 +1311,7 @@ def chunk_gated_delta_rule(
     output_state_indices: Optional[torch.Tensor] = None,
     checkpoint_state_indices: Optional[torch.Tensor] = None,
     prefix_lens: Optional[torch.Tensor] = None,
+    batch_invariant: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -1603,6 +1604,48 @@ def chunk_gated_delta_rule(
         SM100/SM103/SM107 and SM120 (``backend="auto"`` or
         ``"flashinfer"``); ``use_cp=True``, ``backend="cake_gdn"`` and
         ``backend="cudnn"`` reject them.
+    batch_invariant : bool
+        Keyword-only. ``True`` runs the batch-invariant class ``gdn.bf16.s16``
+        (``flashinfer.batch_invariant``) in place of the backends: one term
+        with 16-token chunks, evaluated by a prefill kernel and a decode
+        kernel, so decode row ``p`` of a request is bit for bit the row a
+        prefill of the whole sequence gives at ``p``, whatever the batch, the
+        neighbours or the slot. The state is a bf16 pool ``initial_state``
+        ``[slots, HV, 128, 128]`` addressed by ``state_indices`` (int32,
+        ``arange`` when omitted) and updated in place; a slot holds the state
+        at the sequence's last 16-token boundary and the class keeps the open
+        chunk next to the pool. ``g`` and ``beta`` are the raw bf16 gate
+        inputs ``[T, HV]``: the call requires ``use_gate_in_kernel=True``,
+        ``beta_is_logit=True``, fp32 ``A_log`` and ``dt_bias`` ``[HV]`` and
+        ``use_qk_l2norm_in_kernel=True``, since the gate and the norm are
+        part of the term (the sigmoid is not rounded to bf16 here). A call
+        with one token per sequence is a decode step and continues the slot's
+        open chunk. A call with more tokens than sequences is a prefill from
+        the slot's state as a chunk boundary (the slot's open rows are
+        dropped). With ``prefix_lens`` (here without checkpoints: the tokens
+        of each sequence consumed before the call) a sequence at a multiple of
+        16 starts from its slot's state and any other sequence continues its
+        open chunk, which is the form for multi-token decode steps and for
+        prefill pieces cut anywhere; a sequence whose ``prefix_lens`` is not
+        where its slot's open chunk ends, or whose slot is outside the pool,
+        gets NaN rows. A new sequence in a slot must start with a prefill call
+        or carry ``prefix_lens``; a call with one token per sequence and no
+        ``prefix_lens`` is a decode step for every sequence in it, so a batch
+        of new one-token sequences passes ``prefix_lens`` of zeros. Every call
+        is one launch that reads nothing on the host; it can be captured in a
+        CUDA graph once the pool was used eagerly, with int32 device
+        ``state_indices`` / ``cu_seqlens`` / ``prefix_lens``.
+        ``output_final_state=True`` returns the pool (the states
+        at the last chunk boundaries, not the states after the last token);
+        ``max_seqlen`` and ``gate_domain`` are not used. Requires
+        ``backend="auto"``, ``use_cp="auto"``, bf16 ``q`` / ``k`` / ``v`` of
+        head size 128 and a v-head count that is a multiple of the q-head
+        count; checkpoints, ``output_state_indices`` and an fp32 state are not
+        in the class. Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back.
+        ``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")``
+        names the class; see ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -1642,6 +1685,40 @@ def chunk_gated_delta_rule(
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if batch_invariant:
+        from .batch_invariant.gdn_s16.api import chunk_gated_delta_rule_batch_invariant
+
+        return chunk_gated_delta_rule_batch_invariant(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_indices=state_indices,
+            prefix_lens=prefix_lens,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            beta_is_logit=beta_is_logit,
+            backend=backend,
+            use_cp=use_cp,
+            refused=dict(
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                _cp_chunk_len=_cp_chunk_len,
+                output_state_indices=output_state_indices,
+                checkpoint_state_indices=checkpoint_state_indices,
+            ),
+        )
     if backend == "sm120_cute":
         from .api_logging import warn_experimental_backend_once
         from .experimental.gdn_sm120_cute import run
