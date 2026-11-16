@@ -402,8 +402,10 @@ class Sm100SwigluMxfp8Fc12Kernel:
             use_stg_fc1=self.use_stg_fc1,
             combine_format=getattr(self, "combine_format", None),
             act_func=self.act_func,
+            batch_invariant=getattr(self, "batch_invariant", False),
         )
         self.epilogue = GluMxfp8Epilogue(**_epi_common)
+        self.epilogue.batch_invariant_activation = getattr(self, "batch_invariant_activation", None)
 
         if self.num_sched_stages is None:
             self.num_sched_stages = 2
