@@ -3,7 +3,8 @@
 Decode: one token per request over an fp32 state pool, replayed as a CUDA graph, against
 ``gated_delta_rule_decode_pretranspose`` over a bf16 pool. The class's chunk phase advances with every replay, so its
 figure is the mean over whole 64-step chunks (the chunk-completing step included); the median is the mid-chunk step.
-Prefill: sequences of whole chunks against today's dispatch. CUPTI GPU time with a cold L2.
+Prefill: sequences of whole chunks against today's dispatch. CUPTI GPU time with a cold L2. ``--reverse`` measures the
+regular path first: run both orders in fresh processes to cancel an order effect.
 
     python benchmarks/bench_batch_invariant_gdn.py --heads 16x48 --batches 8 16 64 128 256
 """
@@ -29,7 +30,7 @@ def _tokens(n, HQ, HV, gen):
     return q, k, v, g, torch.sigmoid(randn(n, HV))
 
 
-def bench_decode(HQ, HV, B, chunks):
+def bench_decode(HQ, HV, B, chunks, reverse=False):
     gen = torch.Generator(device="cuda").manual_seed(B)
     q, k, v, g, beta = _tokens(B, HQ, HV, gen)
     pool = 0.05 * torch.randn(B, HV, D, D, device="cuda", generator=gen)
@@ -54,17 +55,19 @@ def bench_decode(HQ, HV, B, chunks):
             batch_invariant=True,
         )
 
-    step(torch.zeros(B, dtype=torch.int32, device="cuda"))
-    for _ in range(CHUNK - 1):
-        step()
-    times = bench_gpu_time(
-        step,
-        dry_run_iters=CHUNK,
-        repeat_iters=CHUNK * chunks,
-        enable_cupti=True,
-        use_cuda_graph=True,
-        cold_l2_cache=True,
-    )
+    def time_step():
+        step(torch.zeros(B, dtype=torch.int32, device="cuda"))
+        for _ in range(CHUNK - 1):
+            step()
+        return bench_gpu_time(
+            step,
+            dry_run_iters=CHUNK,
+            repeat_iters=CHUNK * chunks,
+            enable_cupti=True,
+            use_cuda_graph=True,
+            cold_l2_cache=True,
+        )
+
     bf16_pool = pool.to(torch.bfloat16)
     A_log, dt_bias = (
         0.1 * torch.randn(HV, device="cuda", generator=gen) for _ in range(2)
@@ -93,15 +96,21 @@ def bench_decode(HQ, HV, B, chunks):
             backend="auto",
         )
 
-    base()
-    base_times = bench_gpu_time(
-        base,
-        dry_run_iters=5,
-        repeat_iters=30,
-        enable_cupti=True,
-        use_cuda_graph=True,
-        cold_l2_cache=True,
-    )
+    def time_base():
+        base()
+        return bench_gpu_time(
+            base,
+            dry_run_iters=5,
+            repeat_iters=30,
+            enable_cupti=True,
+            use_cuda_graph=True,
+            cold_l2_cache=True,
+        )
+
+    if reverse:
+        base_times, times = time_base(), time_step()
+    else:
+        times, base_times = time_step(), time_base()
     return (
         statistics.mean(times),
         statistics.median(times),
@@ -109,7 +118,7 @@ def bench_decode(HQ, HV, B, chunks):
     )
 
 
-def bench_prefill(HQ, HV, L, nseq):
+def bench_prefill(HQ, HV, L, nseq, reverse=False):
     gen = torch.Generator(device="cuda").manual_seed(L)
     q, k, v, g, beta = _tokens(L * nseq, HQ, HV, gen)
     s0 = 0.05 * torch.randn(nseq, HV, D, D, device="cuda", generator=gen)
@@ -142,21 +151,19 @@ def bench_prefill(HQ, HV, L, nseq):
             q, k, v, g, beta, initial_state=s0, output_final_state=True, **common
         )
 
-    res = []
-    for fn in (ours, auto):
+    res = {}
+    for fn in (auto, ours) if reverse else (ours, auto):
         fn()
-        res.append(
-            statistics.median(
-                bench_gpu_time(
-                    fn,
-                    dry_run_iters=3,
-                    repeat_iters=20,
-                    enable_cupti=True,
-                    cold_l2_cache=True,
-                )
+        res[fn] = statistics.median(
+            bench_gpu_time(
+                fn,
+                dry_run_iters=3,
+                repeat_iters=20,
+                enable_cupti=True,
+                cold_l2_cache=True,
             )
         )
-    return res
+    return res[ours], res[auto]
 
 
 def main():
@@ -165,23 +172,25 @@ def main():
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 8, 16, 64, 128, 256])
     ap.add_argument("--lengths", type=int, nargs="+", default=[1024, 4096, 32768])
     ap.add_argument("--chunks", type=int, default=5)
+    ap.add_argument("--reverse", action="store_true")
     args = ap.parse_args()
     HQ, HV = (int(x) for x in args.heads.split("x"))
     print(
-        f"{torch.cuda.get_device_name(0)}, heads {args.heads}, torch {torch.__version__}"
+        f"{torch.cuda.get_device_name(0)}, heads {args.heads}, torch {torch.__version__}, "
+        f"{'regular' if args.reverse else 'batch_invariant'} measured first"
     )
     print(
         "decode, microseconds per step: batch | batch_invariant mean over a chunk | mid-chunk | regular | ratio"
     )
     for B in args.batches:
-        mean, mid, base = bench_decode(HQ, HV, B, args.chunks)
+        mean, mid, base = bench_decode(HQ, HV, B, args.chunks, args.reverse)
         print(
             f"{B:5d} | {mean * 1e3:8.1f} | {mid * 1e3:8.1f} | {base * 1e3:8.1f} | {base / mean:.2f}"
         )
     print("prefill, microseconds: sequences | L | batch_invariant | auto | ratio")
     for nseq in (1, 4):
         for L in args.lengths:
-            ours, auto = bench_prefill(HQ, HV, L, nseq)
+            ours, auto = bench_prefill(HQ, HV, L, nseq, args.reverse)
             print(
                 f"{nseq:3d} | {L:6d} | {ours * 1e3:9.1f} | {auto * 1e3:9.1f} | {auto / ours:.2f}"
             )
