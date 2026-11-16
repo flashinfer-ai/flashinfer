@@ -461,10 +461,6 @@ def _moe_core_impl(
             ActivationType.ClampedRelu2 (``relu(L * tanh(x / L)) ** 2`` on the
             alpha-scaled FC1 output), a one-element float32 CUDA tensor read
             at runtime; required with it and rejected otherwise.
-        routing_weights_before_fc2: Apply routing weights to BF16-rounded
-            ClampedRelu2 activations before NVFP4 quantization for GEMM2.
-            Requires W4A4, BF16 output, and the single-CTA 128x128 path.
-            Per-token scales, swap-AB and localized weights are unsupported.
         nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
             - omitted (the default): read FLASHINFER_NVFP4_4OVER6* on every
               call.
@@ -540,7 +536,7 @@ def _moe_core_impl(
         per_token_scale=per_token_scale is not None,
         localized_weights=localized_weights is not None,
     )
-    if routing_weights_before_fc2:
+    if routing_weights_before_fc2 and not swap_ab:
         if (
             tile_size != PRE_FC2_TILE_SIZE
             or gemm1_mma_tiler_mn != PRE_FC2_MMA_SHAPE
@@ -766,7 +762,7 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
-    if routing_weights_before_fc2:
+    if routing_weights_before_fc2 and not swap_ab:
         return _nvfp4_moe_with_pre_fc2_routing_weights(
             x,
             x_sf,
@@ -789,6 +785,12 @@ def _moe_core_impl(
             use_fused_finalize,
             enable_pdl,
         )
+
+    if routing_weights_before_fc2:
+        # Swap-AB weights the FP32 activation in FC1's existing epilogue.
+        # Preserve the original route weights for FC1; FC2 combines with unity.
+        gemm1_options["routing_weights"] = token_final_scales.reshape(-1).float()
+        token_final_scales = torch.ones_like(token_final_scales, dtype=torch.float32)
 
     if use_localized_path:
         # Allocate once: both domains fill disjoint columns of this buffer.
@@ -1264,11 +1266,7 @@ class CuteDslMoEWrapper:
             and rejected for every other activation. Not supported by
             ``"w4a16"`` or on SM107.
         routing_weights_before_fc2 : bool
-            Apply routing weights before GEMM2-input NVFP4 quantization,
-            preserving BF16 rounding after GEMM1, clamping, squaring and
-            weighting. Requires W4A4, ClampedRelu2, BF16 output,
-            ``tile_size=128``, ``sf_vec_size=16`` and ``swap_ab=False``.
-            Per-token scales are unsupported. See :func:`cute_dsl_fused_moe`.
+            Apply routing weights before GEMM2; see :func:`cute_dsl_fused_moe`.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = _canonicalize_quant_mode(quant_mode)
@@ -1278,11 +1276,15 @@ class CuteDslMoEWrapper:
         validate_pre_fc2_routing(
             routing_weights_before_fc2, quant_mode, activation, output_dtype, swap_ab
         )
-        if routing_weights_before_fc2 and (
-            tile_size != PRE_FC2_TILE_SIZE or sf_vec_size != NVFP4_BLOCK_SIZE
+        if (
+            routing_weights_before_fc2
+            and not swap_ab
+            and quant_mode != "w4a16"
+            and (tile_size != PRE_FC2_TILE_SIZE or sf_vec_size != NVFP4_BLOCK_SIZE)
         ):
             raise ValueError(
-                "Pre-FC2 routing weighting requires tile_size=128 and sf_vec_size=16"
+                "Pre-FC2 routing weighting requires sf_vec_size=16 and, "
+                "without swap-AB, tile_size=128"
             )
         self.routing_weights_before_fc2 = routing_weights_before_fc2
         self.num_experts = num_experts
@@ -1380,7 +1382,7 @@ class CuteDslMoEWrapper:
                 quant_mode=quant_mode,
                 swap_ab=swap_ab,
             )
-            if quant_mode == "w4a4" and not routing_weights_before_fc2:
+            if quant_mode == "w4a4" and (not routing_weights_before_fc2 or swap_ab):
                 self._per_token_runner = CuteDslFusedMoERunner(
                     forward_impl=_forward_with_tactic_weak,
                     num_experts=num_experts,
@@ -1398,11 +1400,12 @@ class CuteDslMoEWrapper:
                     situ_linear_beta=situ_linear_beta,
                     clamped_relu2_limit=clamped_relu2_limit,
                     use_per_token_activation=True,
+                    routing_weights_before_fc2=routing_weights_before_fc2,
                     quant_mode=quant_mode,
                     swap_ab=swap_ab,
                 )
 
-            if use_cuda_graph and not routing_weights_before_fc2:
+            if use_cuda_graph and (not routing_weights_before_fc2 or swap_ab):
                 self._aux_stream = torch.cuda.Stream(device=self.device)
                 self._main_event = torch.cuda.Event()
                 self._memset_event = torch.cuda.Event()
@@ -1422,6 +1425,7 @@ class CuteDslMoEWrapper:
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 swap_ab=swap_ab,
+                routing_weights_before_fc2=routing_weights_before_fc2,
             )
         else:
             raise ValueError(
@@ -1592,7 +1596,7 @@ class CuteDslMoEWrapper:
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         validate_pre_fc2_options(
-            self.routing_weights_before_fc2,
+            self.routing_weights_before_fc2 and not self.swap_ab,
             per_token_scale=per_token_scale is not None,
         )
         num_tokens = token_selected_experts.size(0)
@@ -1703,7 +1707,11 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
-        if self.routing_weights_before_fc2:
+        if (
+            self.routing_weights_before_fc2
+            and not self.swap_ab
+            and self.quant_mode != "w4a16"
+        ):
             return [DEFAULT_BLACKWELL_MOE_TACTIC]
         if self.swap_ab and self.quant_mode != "w4a16":
             from .blackwell.moe_swap_ab_tuner import ALL_SWAP_AB_MOE_TACTICS
@@ -2084,12 +2092,9 @@ def cute_dsl_fused_moe(
         Profile tactics through CUDA Graph replay.
 
     routing_weights_before_fc2 : bool
-        Apply routing weights after ClampedRelu2 and before NVFP4
-        quantization of the GEMM2 input. Rounds to BF16 after GEMM1,
-        soft clamping, squaring, and routing-weight multiplication.
-        Requires W4A4, BF16 output and ``swap_ab=False`` on SM100/SM103.
-        Per-token scales and localized weights are unsupported. This path
-        uses a single-CTA 128x128 tactic on one stream without PDL.
+        Multiply FP32 post-activation values before FC2-input quantization or
+        conversion for swap-AB and W4A16. Non-swap block-scaled execution keeps
+        its BF16-rounded ClampedRelu2 W4A4 contract and 128x128 tactic.
 
     Returns
     -------
@@ -2251,6 +2256,7 @@ def cute_dsl_fused_moe(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             swap_ab=swap_ab,
+            routing_weights_before_fc2=routing_weights_before_fc2,
         )
         runners = [runner]
         inputs = [

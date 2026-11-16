@@ -128,7 +128,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
+            apply_routing_weights_before_fc2=k.routing_weights_before_fc2,
             use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
             batch_invariant=k.batch_invariant,
             batch_invariant_version=(1 if k.batch_invariant else None),
@@ -169,7 +169,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             self.ep_world_size,
             gate_up_clamp=config.gate_up_clamp,
             activation_clamp=config.activation_clamp,
-            apply_routing_weights_before_fc2=(config.apply_routing_weights_before_fc2),
+            routing_weights_before_fc2=config.routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
             fc1_alpha=config.fc1_alpha,
@@ -192,7 +192,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             ).view(fleet_params.max_tokens_per_rank, config.top_k)
             workspace._unfinalized_weights = (
                 torch.ones_like(workspace.topk_weights)
-                if config.apply_routing_weights_before_fc2
+                if config.routing_weights_before_fc2
                 else workspace.topk_weights
             )
             if config.batch_invariant:
@@ -219,7 +219,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
             config.intermediate_size,
             config.top_k,
             _resolve_gate_up_clamp(config),
-            config.apply_routing_weights_before_fc2,
+            config.routing_weights_before_fc2,
             config.enable_in_kernel_fc2_reduce,
             config.finalize_mode,
             config.batch_invariant,
@@ -449,7 +449,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(BlackwellEpTuningMixin, MegaKernelBacken
                 valid = (ids >= 0) & (ids < workspace.num_total_experts)
                 scores = (
                     torch.ones_like(workspace.topk_weights[:num_tokens])
-                    if self._kernel_config.apply_routing_weights_before_fc2
+                    if self._kernel_config.routing_weights_before_fc2
                     else workspace.topk_weights[:num_tokens]
                 )
                 workspace._unfinalized_weights[:num_tokens].copy_(

@@ -607,6 +607,7 @@ def split_w4a16_reference_from_tensors(
     token_final_scales=None,
     wrong_formula=False,
     swap_ab=False,
+    routing_weights_before_fc2=False,
 ):
     """Adapt split test tensors to the shared deterministic W4A16 oracle.
 
@@ -666,5 +667,6 @@ def split_w4a16_reference_from_tensors(
         ),
         fc1_alpha=tensors["w1_alpha"],
         fc2_alpha=tensors["w2_alpha"],
+        apply_routing_weights_before_fc2=routing_weights_before_fc2,
         local_expert_offset=local_expert_offset,
     )

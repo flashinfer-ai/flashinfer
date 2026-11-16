@@ -4998,8 +4998,30 @@ class CuteDslRunner(MoERunner):
             raise ValueError("CuteDslRunner requires one bound CuteDslConfig")
         return candidates[0].swap_ab
 
+    @property
+    def routing_weights_before_fc2(self) -> bool:
+        candidates = [
+            backend
+            for backend in self.config.backend
+            if isinstance(backend, CuteDslConfig)
+        ]
+        if not candidates:
+            return False
+        if len(candidates) != 1:
+            raise ValueError("CuteDslRunner requires one bound CuteDslConfig")
+        return candidates[0].routing_weights_before_fc2
+
     def _check_support(self) -> None:
         super()._check_support()
+        if (
+            self.routing_weights_before_fc2
+            and not self.swap_ab
+            and self.config.quant.pair != (QuantFormat.NVFP4, QuantFormat.BF16)
+        ):
+            raise NotImplementedError(
+                "CuteDslConfig routing_weights_before_fc2 requires swap_ab=True "
+                "for block-scaled activation formats."
+            )
         if self.swap_ab and hasattr(self, "device"):
             from .prepare import _cute_dsl_gated_weight_group_size
 
@@ -5170,6 +5192,7 @@ class CuteDslRunner(MoERunner):
                     (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8",
                 }[self.config.quant.pair],
                 swap_ab=self.swap_ab,
+                routing_weights_before_fc2=self.routing_weights_before_fc2,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -5181,6 +5204,7 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 swap_ab=self.swap_ab,
+                routing_weights_before_fc2=self.routing_weights_before_fc2,
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         else:
@@ -5211,6 +5235,8 @@ class CuteDslRunner(MoERunner):
         )
         if self.swap_ab:
             extras += ("swap_ab",)
+        if self.routing_weights_before_fc2:
+            extras += ("routing_weights_before_fc2",)
         return extras
 
     def forward(

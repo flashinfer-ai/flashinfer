@@ -2842,7 +2842,9 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
 
 @cute_dsl_sm100_required
 @pytest.mark.usefixtures("observe_swap_ab_mma_plans")
-@pytest.mark.parametrize("swap_ab", [False, True])
+@pytest.mark.parametrize(
+    "swap_ab,routing_weights_before_fc2", [(False, False), (True, False), (True, True)]
+)
 @pytest.mark.parametrize(
     "quant",
     (
@@ -2859,7 +2861,9 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
         ReLU2(),
     ),
 )
-def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swap_ab):
+def test_cute_dsl_typed_activation_matches_flat_reference(
+    quant, activation, swap_ab, routing_weights_before_fc2
+):
     if swap_ab and get_compute_capability(torch.device("cuda")) == (10, 7):
         pytest.skip("swap_ab requires SM100 or SM103")
     if (
@@ -2896,7 +2900,14 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
         raise ValueError(f"Unsupported test quantization pair {quant.pair!r}")
     config = dataclasses.replace(
         config,
-        backend=BackendOptions(candidates=(CuteDslConfig(swap_ab=swap_ab),)),
+        backend=BackendOptions(
+            candidates=(
+                CuteDslConfig(
+                    swap_ab=swap_ab,
+                    routing_weights_before_fc2=routing_weights_before_fc2,
+                ),
+            )
+        ),
     )
     layer = MoELayer(config)
     runner = layer.runners[0]
@@ -2939,6 +2950,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
             w2_alpha=tensors["w2_alpha"],
             local_expert_offset=config.experts.local_expert_offset,
             swap_ab=True,
+            routing_weights_before_fc2=routing_weights_before_fc2,
             **activation_options,
         )
         assert_cute_dsl_moe_bits(actual, reference)
@@ -2973,6 +2985,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swa
                 local_expert_offset=config.experts.local_expert_offset,
                 wrong_formula=wrong_formula,
                 swap_ab=swap_ab,
+                routing_weights_before_fc2=routing_weights_before_fc2,
                 **activation_options,
             )
 

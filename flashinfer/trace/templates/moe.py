@@ -2657,6 +2657,7 @@ def _moe_bf16_run_experts(
     situ_linear_beta=None,
     clamped_relu2_limit=None,
     use_shuffled_weight=True,
+    routing_weights_before_fc2=False,
 ):
     """Un-quantized (bf16) MoE expert computation."""
     # Keep enum values local so the serialized reference needs only PyTorch.
@@ -2747,11 +2748,14 @@ def _moe_bf16_run_experts(
                 up = torch.clamp(X1, min=-limit, max=limit)
                 gate = torch.clamp(X2, max=limit)
                 act = gate * torch.sigmoid(alpha * gate) * (up + beta)
-        expert_out = act.matmul(W2[le].t())
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
         w_e = (w_tok * match).sum(dim=1)
-        output.index_add_(0, token_idx, expert_out * w_e.unsqueeze(1))
+        if routing_weights_before_fc2:
+            expert_out = (act * w_e.unsqueeze(1)).matmul(W2[le].t())
+        else:
+            expert_out = act.matmul(W2[le].t()) * w_e.unsqueeze(1)
+        output.index_add_(0, token_idx, expert_out)
     return output.to(torch.bfloat16)
 
 
@@ -5108,19 +5112,25 @@ def _cute_dsl_fused_moe_reference(
 ):
     """Reference for block-scaled MoE, including pre-FC2 weighted quantization."""
     # Keep enum values local so the serialized reference has no enum dependency.
-    swiglu, swiglu_step, geglu_tanh, clamped_relu2 = 3, 7, 8, 12
+    swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2 = 3, 7, 8, 6, 12
     fp4_values_per_byte = 2
     nvfp4_block_size = 16
-    if routing_weights_before_fc2:
+    if routing_weights_before_fc2 and (
+        (not swap_ab and quant_mode.lower() != "w4a16")
+        or (quant_mode.lower() in ("w4a4", "nvfp4") and per_token_scale is None)
+    ):
         clamp = clamped_relu2_limit
         if (
             quant_mode.lower() not in ("w4a4", "nvfp4")
-            or int(activation_type) != clamped_relu2
-            or clamp is None
+            or int(activation_type) not in (swiglu, geglu_tanh, relu2, clamped_relu2)
+            or (not swap_ab and int(activation_type) != clamped_relu2)
+            or (int(activation_type) == clamped_relu2 and clamp is None)
             or per_token_scale is not None
-            or swap_ab
         ):
-            raise ValueError("Pre-FC2 weighting reference requires soft-clamped W4A4")
+            raise ValueError(
+                "Pre-FC2 weighting reference requires W4A4 and a supported activation; "
+                "without swap-AB it requires ClampedRelu2"
+            )
         if x.shape[0] == 0:
             return torch.empty(
                 (0, w2_weight.shape[1]), dtype=torch.bfloat16, device=x.device
@@ -5153,6 +5163,13 @@ def _cute_dsl_fused_moe_reference(
             logical_scales(w2_weight_sf, w2_weight).view(torch.float8_e4m3fn),
             False,
         )
+        if int(activation_type) in (swiglu, geglu_tanh):
+            # Swap-AB FC1 stores up16/gate16 rows and matching block scales.
+            W1 = (
+                W1.reshape(w1_weight.shape[0], -1, 2, 16, W1.shape[-1])
+                .transpose(1, 2)
+                .reshape(w1_weight.shape[0], -1, W1.shape[-1])
+            )
         output = torch.zeros_like(
             activations, dtype=torch.float64 if use_fused_finalize else torch.float32
         )
@@ -5178,12 +5195,34 @@ def _cute_dsl_fused_moe_reference(
             )
             if token.numel() == 0:
                 continue
-            raw = (activations[token] @ W1[expert].T * w1_alpha[expert]).bfloat16()
-            intermediate = (clamp * torch.tanh(raw.float() / clamp)).bfloat16()
-            intermediate = intermediate.float().relu().square().bfloat16()
+            raw = activations[token] @ W1[expert].T * w1_alpha[expert]
+            if not swap_ab:
+                raw = raw.bfloat16().float()
+                intermediate = (clamp * torch.tanh(raw / clamp)).bfloat16()
+                intermediate = intermediate.float().relu().square().bfloat16()
+            elif int(activation_type) == clamped_relu2:
+                intermediate = (clamp * torch.tanh(raw / clamp)).relu().square()
+            elif int(activation_type) == relu2:
+                intermediate = raw.relu().square()
+            else:
+                up, gate = raw.chunk(2, dim=-1)
+                if situ_beta is not None:
+                    gate = situ_beta * torch.tanh(gate / situ_beta) * gate.sigmoid()
+                    if situ_linear_beta is not None:
+                        up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+                elif int(activation_type) == geglu_tanh:
+                    gate = torch.nn.functional.gelu(gate, approximate="tanh")
+                else:
+                    limit = swiglu_limit or torch.finfo(torch.float32).max
+                    up = up.clamp(-limit, limit) + swiglu_beta
+                    gate = gate.clamp(max=limit)
+                    gate = gate * torch.sigmoid(swiglu_alpha * gate)
+                intermediate = up * gate
             intermediate = (
-                intermediate.float() * token_final_scales[token, slot, None]
-            ).bfloat16()
+                intermediate.float() * token_final_scales[token, slot, None].float()
+            )
+            if not swap_ab:
+                intermediate = intermediate.bfloat16()
             scale = fc2_input_scale.reshape(-1)
             scale = scale[expert : expert + 1] if scale.numel() > 1 else scale
             quantized = _pre_fc2_nvfp4_qdq(intermediate, scale)
@@ -5288,6 +5327,7 @@ def _cute_dsl_fused_moe_reference(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         clamped_relu2_limit=clamped_relu2_limit,
+        routing_weights_before_fc2=routing_weights_before_fc2,
     )
 
 

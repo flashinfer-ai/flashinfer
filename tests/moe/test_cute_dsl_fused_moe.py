@@ -262,7 +262,9 @@ def _prepare_moe_quant_mode_inputs(
         raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
 
-def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwargs):
+def _compute_moe_quant_mode_reference(
+    tensors, quant_mode, swap_ab=False, routing_weights_before_fc2=False, **kwargs
+):
     reference_keys = (
         "activation_type",
         "local_expert_offset",
@@ -280,6 +282,7 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
         return split_w4a16_reference_from_tensors(
             tensors,
             swap_ab=swap_ab,
+            routing_weights_before_fc2=routing_weights_before_fc2,
             **{key: kwargs[key] for key in reference_keys if key in kwargs},
         )
     elif quant_mode in ("w4a4", "w4a8", "mxfp8"):
@@ -327,7 +330,10 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
             else:
                 raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
             return swap_ab_reference.cute_dsl_moe_reference(
-                **inputs, swap_ab=True, **reference_config
+                **inputs,
+                swap_ab=True,
+                routing_weights_before_fc2=routing_weights_before_fc2,
+                **reference_config,
             )
         if quant_mode == "w4a4":
             return compute_reference_moe_fp4(**kwargs)
@@ -1983,7 +1989,10 @@ class TestCuteDslMoeW4A16:
 
     @pytest.mark.parametrize("use_wrapper", [False, True])
     @pytest.mark.parametrize("swap_ab", [False, True])
-    def test_weight_scale_update(self, use_wrapper: bool, swap_ab: bool):
+    @pytest.mark.parametrize("routing_weights_before_fc2", [False, True])
+    def test_weight_scale_update(
+        self, use_wrapper: bool, swap_ab: bool, routing_weights_before_fc2: bool
+    ):
         if swap_ab and is_sm107():
             pytest.skip("swap_ab requires Blackwell SM100 or SM103")
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
@@ -2024,6 +2033,7 @@ class TestCuteDslMoeW4A16:
                 use_cuda_graph=False,
                 quant_mode="w4a16",
                 swap_ab=swap_ab,
+                routing_weights_before_fc2=routing_weights_before_fc2,
                 use_fused_finalize=False,
             )
         else:
@@ -2038,6 +2048,7 @@ class TestCuteDslMoeW4A16:
                 top_k=top_k,
                 quant_mode="w4a16",
                 swap_ab=swap_ab,
+                routing_weights_before_fc2=routing_weights_before_fc2,
                 use_fused_finalize=False,
             )
 
@@ -2045,7 +2056,12 @@ class TestCuteDslMoeW4A16:
         # Reuse the same allocation to ensure W4A16 reads the current contents.
         result = run()
         assert_w4a16_bits(
-            result, split_w4a16_reference_from_tensors(tensors, swap_ab=swap_ab)
+            result,
+            split_w4a16_reference_from_tensors(
+                tensors,
+                swap_ab=swap_ab,
+                routing_weights_before_fc2=routing_weights_before_fc2,
+            ),
         )
         assert torch.count_nonzero(result).item() > 0
         tensors["w1_weight_sf"].zero_()
@@ -2356,7 +2372,7 @@ class TestCuteDslFusedMoeFunctional:
         )
 
     @pytest.mark.parametrize(
-        "quant_mode,activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation,swap_ab,tactic,situ_beta,situ_linear_beta",
+        "quant_mode,activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation,swap_ab,tactic,situ_beta,situ_linear_beta,routing_weights_before_fc2",
         [
             pytest.param(
                 "w4a4",
@@ -2371,9 +2387,11 @@ class TestCuteDslFusedMoeFunctional:
                 None,
                 None,
                 None,
-                id=f"{name}-swap-ab-{swap_ab}",
+                routing_weights_before_fc2,
+                id=f"{name}-swap-ab-{swap_ab}-pre-fc2-{routing_weights_before_fc2}",
             )
             for swap_ab in (False, True)
+            for routing_weights_before_fc2 in ((False, True) if swap_ab else (False,))
             for name, activation_type, num_tokens, top_k, hidden_size, intermediate_size, num_experts, use_per_token_activation in (
                 (
                     "swiglu-per-tensor",
@@ -2411,10 +2429,12 @@ class TestCuteDslFusedMoeFunctional:
                 tactic,
                 situ_beta,
                 situ_linear_beta,
-                id=f"{quant_mode}-{activation}-{tile}",
+                routing_weights_before_fc2,
+                id=f"{quant_mode}-{activation}-{tile}-pre-fc2-{routing_weights_before_fc2}",
                 marks=mxfp8_required,
             )
             for quant_mode in ("w4a8", "mxfp8")
+            for routing_weights_before_fc2 in (False, True)
             for activation, activation_type, situ_beta, situ_linear_beta in (
                 ("swiglu", ActivationType.Swiglu, None, None),
                 ("situ-gate", ActivationType.Swiglu, 1.75, None),
@@ -2459,6 +2479,7 @@ class TestCuteDslFusedMoeFunctional:
         tactic,
         situ_beta,
         situ_linear_beta,
+        routing_weights_before_fc2: bool,
     ):
         if swap_ab and is_sm107():
             pytest.skip("swap_ab requires Blackwell SM100 or SM103")
@@ -2473,6 +2494,7 @@ class TestCuteDslFusedMoeFunctional:
             use_per_token_activation,
             use_fused_finalize=False,
             swap_ab=swap_ab,
+            routing_weights_before_fc2=routing_weights_before_fc2,
             tactic=tactic,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
@@ -2556,6 +2578,7 @@ class TestCuteDslFusedMoeFunctional:
         situ_beta=None,
         situ_linear_beta=None,
         clamped_relu2_limit=None,
+        routing_weights_before_fc2: bool = False,
     ):
         from flashinfer import cute_dsl_fused_moe
 
@@ -2644,6 +2667,8 @@ class TestCuteDslFusedMoeFunctional:
             )
         else:
             raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
+        if swap_ab and top_k == 1:
+            tensors["token_final_scales"].fill_(0.7)
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(
             tensors, quant_mode
         )
@@ -2667,6 +2692,7 @@ class TestCuteDslFusedMoeFunctional:
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
             swap_ab=swap_ab,
+            routing_weights_before_fc2=routing_weights_before_fc2,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             clamped_relu2_limit=clamped_relu2_limit,
@@ -2682,6 +2708,7 @@ class TestCuteDslFusedMoeFunctional:
             tensors,
             quant_mode,
             swap_ab=swap_ab,
+            routing_weights_before_fc2=routing_weights_before_fc2,
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             num_tokens=num_tokens,
@@ -2711,7 +2738,10 @@ class TestCuteDslFusedMoeFunctional:
             _assert_moe_quant_mode_reference(wrapped, ref_output, quant_mode, swap_ab)
             if situ_beta is not None:
                 swiglu_reference = _compute_moe_quant_mode_reference(
-                    tensors, quant_mode, swap_ab=swap_ab
+                    tensors,
+                    quant_mode,
+                    swap_ab=swap_ab,
+                    routing_weights_before_fc2=routing_weights_before_fc2,
                 )
                 assert not torch.equal(ref_output, swiglu_reference)
 
@@ -5869,11 +5899,20 @@ def test_cute_dsl_pinned_4over6_requires_w4a4_per_token():
 @sm100_required
 @cute_dsl_available
 @pytest.mark.parametrize(
-    "swap_ab,use_fused_finalize,disable_fp4_quant_fast_math",
+    "swap_ab,use_fused_finalize,disable_fp4_quant_fast_math,routing_weights_before_fc2",
     [
-        pytest.param(False, True, False, id="legacy-fused"),
-        pytest.param(True, False, False, id="swap-ab-fast"),
-        pytest.param(True, False, True, id="swap-ab-strict"),
+        pytest.param(False, True, False, False, id="legacy-fused"),
+    ]
+    + [
+        pytest.param(
+            True,
+            False,
+            strict,
+            pre_fc2,
+            id=f"swap-ab-strict-{strict}-pre-fc2-{pre_fc2}",
+        )
+        for strict in (False, True)
+        for pre_fc2 in (False, True)
     ],
 )
 @pytest.mark.parametrize(
@@ -5884,7 +5923,12 @@ def test_cute_dsl_pinned_4over6_requires_w4a4_per_token():
     ],
 )
 def test_cute_dsl_pinned_recipe_matches_env(
-    recipe, swap_ab, use_fused_finalize, disable_fp4_quant_fast_math, monkeypatch
+    recipe,
+    swap_ab,
+    use_fused_finalize,
+    disable_fp4_quant_fast_math,
+    routing_weights_before_fc2,
+    monkeypatch,
 ):
     """``nvfp4_4over6=`` selects, bit for bit, the per-token GEMM2-input
     quantizer the environment selects, through both public entry points."""
@@ -5947,6 +5991,7 @@ def test_cute_dsl_pinned_recipe_matches_env(
         intermediate_size=intermediate_size,
         quant_mode="w4a4",
         swap_ab=swap_ab,
+        routing_weights_before_fc2=routing_weights_before_fc2,
         use_fused_finalize=use_fused_finalize,
     )
 
@@ -5956,6 +6001,7 @@ def test_cute_dsl_pinned_recipe_matches_env(
             num_experts=num_experts,
             top_k=top_k,
             swap_ab=swap_ab,
+            routing_weights_before_fc2=routing_weights_before_fc2,
             use_fused_finalize=use_fused_finalize,
             **extra,
         )
@@ -5970,6 +6016,7 @@ def test_cute_dsl_pinned_recipe_matches_env(
             expected = swap_ab_reference.cute_dsl_moe_reference(
                 **common,
                 swap_ab=True,
+                routing_weights_before_fc2=routing_weights_before_fc2,
                 nvfp4_4over6_config=effective_recipe,
                 disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
             )

@@ -124,6 +124,7 @@ def _get_compiled_kernel(
     raster_along_m: bool,
     gated_weight_group_size: int,
     gather_input: bool,
+    pre_fc2_routing: bool,
 ):
     mma_tiler_m, route_tile, mma_tiler_k = mma_tiler_mnk
     use_2cta_instrs = mma_tiler_m == 256
@@ -156,6 +157,7 @@ def _get_compiled_kernel(
         m_cluster_aligned,
         gated_weight_group_size,
         gather_input,
+        pre_fc2_routing,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
@@ -182,6 +184,7 @@ def _get_compiled_kernel(
             gated_weight_group_size=gated_weight_group_size,
             gather_input=gather_input,
             gather_top_k=top_k if gather_input else 1,
+            pre_fc2_routing=pre_fc2_routing,
         )
         compiled = cute.compile(
             kernel.wrapper,
@@ -232,6 +235,7 @@ def _run_grouped_gemm(
     swap_ab: bool,
     gather_input: bool = False,
     gather_top_k: int = 1,
+    pre_fc2_routing: bool = False,
 ) -> None:
     from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
 
@@ -370,6 +374,7 @@ def _run_grouped_gemm(
         raster_along_m,
         gated_weight_group_size,
         gather_input,
+        pre_fc2_routing,
     )
     compiled(
         weight_ptr,
@@ -412,6 +417,7 @@ def launch_w4a16_moe(
     situ_linear_beta: Optional[float] = None,
     tactic: Optional[W4A16MoeTactic] = None,
     swap_ab: bool = False,
+    routing_weights_before_fc2: bool = False,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
@@ -461,6 +467,11 @@ def launch_w4a16_moe(
     )
     hidden_workspace = workspace.hidden_workspace
     intermediate = workspace.intermediate
+    final_scales = (
+        torch.ones_like(token_final_scales)
+        if routing_weights_before_fc2
+        else token_final_scales
+    )
     _run_grouped_gemm(
         weight=w1_weight,
         weight_sf=w1_weight_sf,
@@ -479,12 +490,13 @@ def launch_w4a16_moe(
         situ_linear_beta=situ_linear_beta,
         use_fused_finalize=False,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-        token_final_scales=None,
+        token_final_scales=(token_final_scales if routing_weights_before_fc2 else None),
         enable_pdl=enable_pdl,
         tactic=gemm1_tactic,
         swap_ab=swap_ab,
         gather_input=True,
         gather_top_k=top_k,
+        pre_fc2_routing=routing_weights_before_fc2,
     )
     gemm2_output = moe_output if use_fused_finalize else hidden_workspace
     if use_fused_finalize:
@@ -509,7 +521,7 @@ def launch_w4a16_moe(
         permuted_idx_to_expanded_idx=(
             permuted_idx_to_expanded_idx if use_fused_finalize else None
         ),
-        token_final_scales=token_final_scales if use_fused_finalize else None,
+        token_final_scales=final_scales if use_fused_finalize else None,
         enable_pdl=enable_pdl,
         tactic=gemm2_tactic,
         swap_ab=swap_ab,
@@ -521,7 +533,7 @@ def launch_w4a16_moe(
             permuted_input=gemm2_output,
             output=moe_output,
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            topk_scales=token_final_scales,
+            topk_scales=final_scales,
             num_tokens=int(x.size(0)),
             top_k=top_k,
             enable_pdl=enable_pdl,

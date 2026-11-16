@@ -86,10 +86,12 @@ def _standalone_inputs(scale_dtype=torch.uint8):
 
 
 @pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e4m3fn])
-def test_pre_fc2_exported_reference_runs_standalone(scale_dtype):
+@pytest.mark.parametrize("swap_ab", [False, True])
+def test_pre_fc2_exported_reference_runs_standalone(scale_dtype, swap_ab):
     from flashinfer import cute_dsl_fused_moe
 
     inputs = _standalone_inputs(scale_dtype)
+    inputs["swap_ab"] = swap_ab
     definition = cute_dsl_fused_moe.fi_trace(**inputs)
     namespace = {}
     exec(compile(definition["reference"], "<exported-reference>", "exec"), namespace)
