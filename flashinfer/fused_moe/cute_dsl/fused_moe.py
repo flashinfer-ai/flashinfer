@@ -154,9 +154,8 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
 def _check_clamped_relu2_supported(
     activation: ActivationType, quant_mode: str, device: Union[str, torch.device]
 ) -> None:
-    """ClampedRelu2 needs the SM100/SM103 gather GEMM1 epilogue: W4A16, the
-    Rubin (SM107) kernels and the CUTLASS MoE kernels run below SM100 do not
-    implement it."""
+    """ClampedRelu2 needs the SM100/SM103 gather GEMM1 epilogue: W4A16 and the
+    Rubin (SM107) kernels do not implement it."""
     if activation != ActivationType.ClampedRelu2:
         return
     if quant_mode == "w4a16":
@@ -1128,9 +1127,9 @@ class CuteDslMoEWrapper:
     overlap during capture and replay. Auto-tuning is supported via the `tactic`
     parameter or `autotune()` context.
 
-    Supported architectures: SM80 to SM90 (on the SM80 kernels, without
-    tactics), SM100, SM103, and SM107. W8A8 is limited to SM100 and SM103,
-    and W4A8 is not supported on SM107.
+    Supported architectures: SM80 to SM90 (on the SM80 kernels, without tactics), SM100, SM103,
+    and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
+    SM100 and SM103.
 
     Attributes:
         num_experts: Total number of experts.
@@ -1890,9 +1889,8 @@ def _w4a16_sm80_module():
 
 
 def _w4a16_moe_sm80(runner, inputs, tactic):
-    """Runs W4A16 ``inputs`` holding records (``cute_dsl_w4a16_sm80_weights``) as routing into
-    row blocks, GEMM1 with the activation, GEMM2 and the top-k weighted sum, with ``tactic`` from
-    ``W4A16_SM80_TACTICS``."""
+    """Runs W4A16 on records: routing into row blocks, GEMM1 with the activation, GEMM2 and the
+    top-k weighted sum, with ``tactic`` from ``W4A16_SM80_TACTICS``."""
     from ..prepare import _w4a16_records_bytes, _w4a16_records_geometry
 
     if not _w4a16_records_runnable(runner):
@@ -1949,9 +1947,8 @@ def _w4a16_moe_sm80(runner, inputs, tactic):
 
 
 def _cute_dsl_fused_moe_below_sm100(op_name, runner, inputs, tactic, **recipe_kwargs):
-    """``_cute_dsl_fused_moe_sm80`` for the functional and wrapper APIs: W4A16 runs on records
-    where they run, converted from the CuTe-DSL weights' MMA-layout block scales, tuned among
-    their tactics under ``op_name`` unless given ``tactic``."""
+    """``_cute_dsl_fused_moe_sm80`` for the public APIs: W4A16 converts MMA-layout scales to
+    records where they run, tuned under ``op_name`` unless given ``tactic``."""
     if isinstance(runner, CuteDslFusedMoEW4A16Runner):
         if inputs[4].dim() == 6 and _w4a16_records_runnable(runner):
             from ..prepare import cute_dsl_w4a16_sm80_weights
@@ -1967,10 +1964,9 @@ def _cute_dsl_fused_moe_below_sm100(op_name, runner, inputs, tactic, **recipe_kw
 
 
 def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
-    """Runs the tuner's ``runner`` on ``inputs`` on the CUTLASS SM80 kernels (W4A8 as W4A16, with
-    MXFP8 activations; on SM90 on the FP8 mixed-input GEMM), converting the weights unless already
-    their operands (scales in the output dtype, or SM90's int32). As from SM100 the GEMM2 input is
-    standard NVFP4, or per token with the pinned 4over6 recipe, else the environment's."""
+    """Runs ``runner`` on the CUTLASS SM80 kernels (W4A8 as W4A16 with MXFP8 activations, on SM90
+    the FP8 mixed-input GEMM), converting weights unless given operands. As from SM100 the GEMM2
+    input is standard NVFP4, or per token the pinned 4over6 recipe, else the environment's."""
     from ..core import get_cutlass_fused_moe_module
     from ..prepare import cutlass_nvfp4_sm80_weights
 
@@ -1992,8 +1988,7 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, nvfp4_4over6=_UNSET):
     out = inputs[-1]
     major, minor = torch.cuda.get_device_capability(x.device)
     if s1.dtype not in (out.dtype, torch.int32):  # int32: SM90 W4A8's operands
-        # The MMA-layout scales in byte order are the 128x4 swizzled scales.
-        mma_bytes = (5, 2, 4, 0, 1, 3)
+        mma_bytes = (5, 2, 4, 0, 1, 3)  # MMA-layout scale bytes are 128x4 swizzled
         _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
         w1, s1, w2, s2 = cutlass_nvfp4_sm80_weights(
             w1, s1.permute(mma_bytes), w2, s2.permute(mma_bytes), out.dtype, gated, mx=w4a8,
@@ -2088,10 +2083,9 @@ def cute_dsl_fused_moe(
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
-    Supported architectures: SM80 to SM90 (on the SM80 kernels, without
-    tactics), SM100, SM103, and SM107. W8A8 is limited to SM100 and SM103,
-    and W4A8 is not supported on SM107. This is the simple functional API;
-    for CUDA-graph support
+    Supported architectures: SM80 to SM90 (on the SM80 kernels, without tactics), SM100, SM103,
+    and SM107. W4A8 is not supported on SM107, and W8A8 is limited to
+    SM100 and SM103. This is the simple functional API; for CUDA-graph support
     use :class:`CuteDslMoEWrapper` instead.
 
     Auto-tuning is controlled by the :func:`autotune` context manager::
@@ -2115,10 +2109,9 @@ def cute_dsl_fused_moe(
         GEMM1 weights (gate + up fused for gated activations, or a single
         projection for non-gated activations).
     w1_weight_sf : torch.Tensor
-        Scale factors for ``w1_weight``. Below SM100, W4A16 also takes here
-        (and in ``w2_weight_sf``) the records of ``cute_dsl_w4a16_sm80_weights``
-        where ``cute_dsl_w4a16_sm80_supported``; ``w1_weight`` and
-        ``w2_weight`` then give only their shapes.
+        Scale factors for ``w1_weight``.
+        Below SM100 W4A16 also takes ``cute_dsl_w4a16_sm80_weights`` records here and in
+        ``w2_weight_sf`` where ``cute_dsl_w4a16_sm80_supported``; the weights give only shapes.
     w1_alpha : torch.Tensor
         Per-expert global scale for GEMM1.
     fc2_input_scale : Optional[torch.Tensor]

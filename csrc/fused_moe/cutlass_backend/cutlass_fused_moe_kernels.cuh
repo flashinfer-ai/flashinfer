@@ -411,9 +411,10 @@ void buildMinLatencyActiveExpertMaps(
 
 #if defined(FLASHINFER_FP4_SW_CVT)
 constexpr static int SMALL_PROLOGUE_THREADS = 256;
+template <class T>
+__device__ inline int64_t findTotalEltsLessThanTarget(T const*, int64_t, T);
 
-// One CTA sorts the expanded rows by expert, a thread per row: a row's permuted row counts the rows
-// ahead of it by (expert, row), and an expert's first row is searched in the sorted experts.
+// One CTA, a thread per expanded row: its permuted row counts the (expert, row) keys below its own.
 __global__ void smallBuildExpertMapsSortFirstTokenKernel(
     int const* token_selected_experts, int* permuted_token_selected_experts,
     int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
@@ -460,17 +461,7 @@ __global__ void smallBuildExpertMapsSortFirstTokenKernel(
   }
   int const num_local = __syncthreads_count(expert < num_experts_per_node);
   for (int64_t e = threadIdx.x; e <= num_experts_per_node; e += SMALL_PROLOGUE_THREADS) {
-    int first = 0;
-    for (int count = num_local; count > 0;) {  // the first sorted expert at least e
-      int const half = count / 2;
-      if (sorted[first + half] < e) {
-        first += half + 1;
-        count -= half + 1;
-      } else {
-        count = half;
-      }
-    }
-    expert_first_token_offset[e] = first;
+    expert_first_token_offset[e] = findTotalEltsLessThanTarget<int>(sorted, num_local, e);
   }
 }
 #endif
@@ -1345,8 +1336,7 @@ __device__ void writeSF(int64_t num_tokens_before_expert, int64_t expert_id,
   }
 }
 
-// Below SM100 the GEMMs take the NVFP4 activations restored to FP16/BF16: eight codes times their
-// E4M3 block scale, exact (at most 2 and 4 significant bits).
+// Eight NVFP4 codes times their E4M3 block scale in FP16/BF16, exact (2 and 4 significant bits).
 template <class T>
 __device__ inline void restoreNvfp4x8(uint32_t codes, uint8_t sf, uint32_t* out) {
   using T2 = std::conditional_t<std::is_same_v<T, half>, half2, __nv_bfloat162>;
@@ -1362,10 +1352,10 @@ __device__ inline void restoreNvfp4x8(uint32_t codes, uint8_t sf, uint32_t* out)
 }
 
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
-// One warp per row, restored rows K padded as the GEMMs take them. Restore (NVFP4): codes times
-// their 128x4 block scales, permuted rows with per-expert scales given expert_first_token_offset,
-// else num_rows token rows. Pack: restored NVFP4 or MXFP8 permuted rows back to codes, each value
-// over its per-expert block scale (NVFP4) or twice over its E8M0 scale (MXFP8), exact.
+// A warp per row, restored rows K padded. Restore (NVFP4): codes times their 128x4 block scales,
+// permuted rows (per-expert scales) given expert_first_token_offset, else num_rows token rows.
+// Pack: permuted rows back to codes, over their block scale (NVFP4) or twice over their E8M0 scale
+// (MXFP8), exact.
 template <class T, bool Pack, bool IsMX>
 __global__ void restoredRowsKernel(T* values, void* codes,
                                    TmaWarpSpecializedGroupedGemmInput::ElementSF const* sf,
@@ -1444,13 +1434,12 @@ void restoredRows(T* values, void* codes, TmaWarpSpecializedGroupedGemmInput::El
       values, codes, sf, expert_first_token_offset, num_experts_per_node, num_rows, cols);
 }
 
-// Token rows restored to 16 bits into their local (k, token) permuted rows (K padded as the GEMMs
-// take it), a CTA per token row (columns split over more CTAs when rows are few), with the GEMM row
-// scales: GEMM1's alpha (times the token's scale, per-token NVFP4) and GEMM2's. NVFP4 codes with
-// their scales, 16-bit rows (W4A16, no scales) as they are, or MXFP8 (cols a multiple of 128): the
-// values times 8, a row flagged when a finite E8M0 is 244 or more (values to 448 x 2^130, out of
-// BF16's range; GEMM1 recomputes its rows, completeWideMxfp8RowsKernel), GEMM2's alpha x 16 (its
-// inputs restored halved), the SM80 MXFP4 weight scales being over 8 (cutlass_nvfp4_sm80_weights).
+// Token rows restored to 16 bits (K padded) into their local (k, token) permuted rows, a CTA a row
+// (its columns split over gridDim.y CTAs when rows are few), with GEMM1's row scale (alpha, times
+// the token's per-token NVFP4 scale) and GEMM2's. NVFP4 codes times their scales; W4A16 rows as
+// they are; MXFP8 (cols % 128 == 0) times 8 for the SM80 MXFP4 weight scales over 8, GEMM2's alpha
+// x 16 (its inputs restored halved), a finite E8M0 >= 244 (to 448 x 2^130, past BF16) flagging the
+// row for completeWideMxfp8RowsKernel to recompute in GEMM1.
 template <class T, bool IsMX>
 __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t const* sf,
                                        bool const swizzled_sf, int64_t const num_rows,
@@ -1468,8 +1457,7 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
         std::nullopt, row, block, std::nullopt, blocks, const_cast<uint8_t*>(sf),
         swizzled_sf ? QuantizationSFLayout::SWIZZLED_128x4 : QuantizationSFLayout::LINEAR);
   };
-  // The words of 8 values v (codes and their block scale; zeros in the K padding), read ahead of
-  // the stores that need them, and the values restored to 16 bits from them.
+  // Words of 8 values v (codes, block scale; zeros in the K padding), read ahead of their stores.
   struct Words {
     uint4 q;
     uint8_t e;
@@ -1499,7 +1487,6 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
     return out;
   };
   extern __shared__ int permuted_rows[];  // the chunk's, -1 for another node's expert
-  // The row's columns, split over gridDim.y CTAs when there are few rows.
   int64_t const first_v = blockIdx.y * blockDim.x + threadIdx.x, stride = blockDim.x * gridDim.y;
   for (int64_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
     // A thread per k, the row restored once per chunk of blockDim.x k.
@@ -1545,12 +1532,12 @@ __global__ void restoreTokenRowsKernel(T* output, void const* input, uint8_t con
   }
 }
 
-// GEMM1's rows restoreTokenRowsKernel flagged, recomputed from the MXFP8 codes: an expert's flagged
-// rows 32 at a time (mma m16n8k16, codes and weights in BF16, exact), each 32-wide block's sum (two
-// mma steps from zero) times 2^(ea + ew - 254), ea the input's E8M0, ew the weights' (BF16 scales
-// 2^(ew - 130)), in two steps (exact for a normal product), times the row's GEMM1 scale; NaN with a
-// NaN scale or code. A CTA takes an expert's rows and 128 columns, a warp 32, the warps sharing the
-// rows' codes in BF16, 4 blocks at a time (the next 4 loading meanwhile; cols a multiple of 128).
+// GEMM1's flagged rows recomputed from the MXFP8 codes, an expert's 32 at a time (mma m16n8k16,
+// codes and weights in BF16, exact): each 32-wide block's sum (two mma steps from zero) times
+// 2^(ea + ew - 254) in two steps (exact for a normal product), ea the input's E8M0, ew the weights'
+// (BF16 scales 2^(ew - 130)), times the row's GEMM1 scale; NaN with a NaN scale or code. A CTA
+// takes an expert's rows and 128 columns, a warp 32, the warps sharing the rows' codes in BF16,
+// 4 blocks at a time, the next 4 loading meanwhile (cols % 128 == 0).
 template <class OutT>
 __global__ void __launch_bounds__(128)
     completeWideMxfp8RowsKernel(OutT* output, QuantParams::RestoredMxfp8Inputs const input,
@@ -1578,8 +1565,8 @@ __global__ void __launch_bounds__(128)
   __shared__ alignas(16) uint16_t tile_a[32][ABlocks * 32 + 8];
   __shared__ alignas(16) float tile_sf[ABlocks][8][4];  // as 2^(ea - 127): row 8i + g at [g][i]
   static_assert(32 * ABlocks == 128);
-  // Each warp's B words for two chunks: its 8 column quads (4 words more so quads 2j and 2j + 1
-  // hit other banks), and its scale words.
+  // A warp's B words for two chunks (8 column quads, 4 words padded: 2j, 2j + 1 in other banks)
+  // and its scale words.
   __shared__ alignas(16) uint32_t tile_w[2][4][8][ABlocks / 2 * 32 + 4];
   __shared__ alignas(16) uint32_t tile_u[2][4][ABlocks][16];
   // The chunk's tile_u as 2^(ew - 127) in BF16, column col0 + 8j + g's in both halves of [8j + g].
@@ -1704,8 +1691,7 @@ __global__ void __launch_bounds__(128)
         bool const split =
             __all_sync(~0u, ew) &
             __syncthreads_and(int(threadIdx.x / ABlocks) >= count || unsigned(sf_now - 1) < 254);
-        // Block block0 + block of the tile's first hs halves, of a half's 4 results a thread and j
-        // the first rs (2: row g's).
+        // Block block0 + block of hs halves, the first rs of a thread's 4 results (2: row g's).
         auto const block_step = [&](unsigned const block, bool const fast, int const hs,
                                     int const rs = 4) {
           // A: rows 16h + g, + 8, K 2t, 2t + 1 and 8 more, then 16 more (ldmatrix: lane's row 16h +
@@ -1743,9 +1729,8 @@ __global__ void __launch_bounds__(128)
             uint32_t b[4];
             flashinfer::e2m1x8_to_bf16x8(w, b);
             if (fast && hs == 2) {
-              // Times column col0 + 8j + g's 2^(ew - 127), exact; so is the mma sum then, its
-              // products all at least 2^-116 if not 0 and the sums below 2^114. With one half, the
-              // sums times it instead (fewer multiplies).
+              // Times column col0 + 8j + g's 2^(ew - 127), exact, as is the sum (products 0 or
+              // >= 2^-116, sums below 2^114). One half scales the sums instead (fewer multiplies).
               uint32_t const sw = tile_sw[warp][block][8 * j + g];
 #pragma unroll
               for (int k = 0; k < 4; ++k) {
@@ -2678,8 +2663,7 @@ __global__ void finalizeMoeRoutingKernel(
 #endif
 
 #if defined(FLASHINFER_FP4_SW_CVT)
-  // Per k: the permuted row (-1 to skip), expert and scale, read once into shared memory for the
-  // first FINALIZE_CACHED_K k (padded with skipped rows to whole batches), else where they're used.
+  // Per k: permuted row (-1 to skip), expert and scale, the first padded_k in shared memory.
   struct Entry {
     int row, expert;
     float scale;
@@ -3267,8 +3251,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, float* fp8_token_dequant_scale,
     float const* fp8_expert_residual_scale, ActivationParams activation_params) {
 #ifdef ENABLE_FP4
-  // FP16/BF16 output with NVFP4 scaling: the NVFP4 values, written restored (code x scale), with
-  // K padded, for a GEMM that takes 16-bit activations.
+  // FP16/BF16 output of the NVFP4 values restored (code x scale), K padded, for 16-bit GEMMs.
   constexpr bool IsRestoredNVFP4 =
       (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>) &&
       std::is_same_v<GemmOutputType, T> &&
@@ -3362,7 +3345,6 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
     assert(reinterpret_cast<std::uintptr_t>(bias_ptr_vec) % sizeof(BiasElem) == 0);
 
 #if defined(FLASHINFER_FP4_SW_CVT)
-    // The row's columns, split over gridDim.y CTAs when there are few rows.
     int64_t const start_offset = tid + blockIdx.y * blockDim.x;
     int64_t const stride = blockDim.x * gridDim.y;
 #else
@@ -3963,8 +3945,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
           ? num_moe_inputs
           : std::min(num_moe_inputs, static_cast<size_t>(num_rows * num_experts_per_node));
 #if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100 threeStepBuildExpertMapsSortFirstToken's one-CTA sort keeps every expanded row,
-  // including an expert a token picks twice, which the three-step sort keeps once.
+  // Below SM100 the one-CTA sort keeps every expanded row, even an expert a token picks twice
+  // (the three-step sort keeps it once).
   if (!min_latency_mode && num_moe_inputs <= SMALL_PROLOGUE_THREADS) {
     act_sf_rows = num_moe_inputs;
   }
@@ -4084,8 +4066,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
   ADD_NAME(act_fp8_token_scale,
            (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0)
                ? num_moe_inputs * sizeof(float)
-           // Below SM100 the GEMM row scales, GEMM1's and GEMM2's (MXFP8: then the rows' wide
-           // flags), each padded by a GEMM tile.
+           // Below SM100 GEMM1's and GEMM2's row scales (MXFP8: and wide flags), each tile-padded.
            : use_restored_fp4 ? (num_moe_inputs + 128) * (use_restored_mx ? 3 : 2) * sizeof(float)
                               : 0);
   ADD(fused_fc2_fp4_act_scale);
@@ -4525,8 +4506,7 @@ void CutlassMoeFCRunner<
     TLLM_CHECK(!config.is_tma_warp_specialized);
     TLLM_CHECK(!use_block_scaling || use_restored_fp4);
 
-    // Restored rows with row scales carry their expert's global scale in them; with the token rows
-    // the small-M kernel takes the global scales themselves.
+    // Row scales carry the experts' global scales; with token rows the small-M kernel takes them.
     alpha_scale_ptr_array =
         use_restored_fp4 && (act_fp8_token_scale || w4a16TokenRows(quant_params))
             ? nullptr
@@ -4576,8 +4556,7 @@ void CutlassMoeFCRunner<
 
     bool use_per_expert_act_scale = use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale : false;
     if (use_restored_fp4) use_per_expert_act_scale = quant_params.fp4.fc2.use_per_expert_act_scale;
-    // FC2 activations stay 16-bit without FC2 scales (per-token, quantized per row after GEMM1) or
-    // W4A16 (no FC2 activation global scale).
+    // FC2 activations stay 16-bit without FC2 scales: per-token (quantized after GEMM1) or W4A16.
     bool const fc2_scales = use_restored_mx || quant_params.fp4.fc2.act_global_scale;
     auto* const act_sf = use_restored_fp4 && fc2_scales ? fc2_fp4_act_flat : nullptr;
     doActivation<GemmInputType, UnfusedGemmOutputType, ScaleBiasType,
@@ -5316,8 +5295,7 @@ void CutlassMoeFCRunner<
     bool fused_prologue_result = false;
     bool try_fused_prologue = true;
 #if defined(FLASHINFER_FP4_SW_CVT)
-    // Rows at most the experts sort faster in threeStepBuildExpertMapsSortFirstToken's one CTA (its
-    // scan growing with the rows) than in the fused radix rank (its scan growing with the experts).
+    // Rows <= experts sort faster in one CTA (scan over rows) than the fused radix rank (experts).
     try_fused_prologue = num_rows * experts_per_token >
                          std::min<int64_t>(SMALL_PROLOGUE_THREADS, num_experts_per_node);
 #endif
@@ -5360,9 +5338,9 @@ void CutlassMoeFCRunner<
 
     // Only NVFP4xNVFP4 supports FC1 per-expert act scale
     bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc1.use_per_expert_act_scale : false;
-    // Below SM100 the GEMMs take the activations restored to 16 bits: each input token is
-    // quantized (16-bit input) and restored once, then expanded; with per-expert FC1 activation
-    // scales the expanded rows are quantized, as from SM100, and restored.
+    // Below SM100 the GEMMs take 16-bit restored activations: each token quantized (16-bit input)
+    // and restored once, then expanded; with per-expert FC1 activation scales the expanded rows
+    // are quantized, as from SM100, and restored.
     bool const restore_tokens = use_restored_fp4 && !use_per_expert_act_scale;
     float* row_scales = nullptr;
     float* fc2_row_scales = nullptr;
@@ -5398,9 +5376,8 @@ void CutlassMoeFCRunner<
 #if defined(ENABLE_FP4) && defined(FLASHINFER_FP4_SW_CVT)
     if constexpr (use_restored_fp4) {
       auto* scratch = reinterpret_cast<BackBoneType*>(glu_inter_result_);
-      // BF16 W4A16 with both GEMMs on the small-M kernel restores nothing: GEMM1 reads the token
-      // rows in place (so its K is checked unpadded: hidden_size is their pitch) and both GEMMs
-      // scale by their experts' global scales.
+      // BF16 W4A16 with both GEMMs small-M restores nothing: GEMM1 reads the token rows in place
+      // (K checked unpadded: hidden_size is their pitch); both use the experts' global scales.
       if (std::is_same_v<InputType, __nv_bfloat16> && std::is_same_v<BackBoneType, __nv_bfloat16> &&
           restore_tokens && !quant_params.fp4.fc1.act_global_scale && !use_lora &&
           gemm1_config_->enableCudaKernel && gemm2_config_->enableCudaKernel &&

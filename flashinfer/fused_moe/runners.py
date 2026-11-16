@@ -2593,7 +2593,6 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
             (w1, w2, a1_gs, w1_scale, fc1_dequant, a2_gs, w2_scale, fc2_dequant)
         )
         if self._device_arch < 100 and "sm80_fc1_expert_weights" in view:
-            # Below SM100 the GEMMs read the SM80 operands prepared with the view, if any.
             w1, w1_scale, w2, w2_scale = _sm80_view_operands(view, w1, w2, self.device)
         # Flat NVFP4 CUTLASS selects the kernel from weight dtype int64.
         return [
@@ -2831,7 +2830,6 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
             )  # fmt: skip
             return [w1, w2, w1_scale, w2_scale, a1_scale, a2_scale]
         if self._device_arch < 100 and "sm80_fc1_expert_weights" in view:
-            # Below SM100 the GEMMs read the SM80 operands prepared with the view, if any.
             w1, w1_scale, w2, w2_scale = _sm80_view_operands(view, w1, w2, self.device)
         return [
             w1.view(torch.int64),
@@ -5241,8 +5239,7 @@ class CuteDslRunner(MoERunner):
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
-        # Below SM100 the CUTLASS SM80 kernels choose their own tactics; W4A16 records
-        # have theirs.
+        # Below SM100 only W4A16 records have tactics; the CUTLASS SM80 kernels pick their own.
         if self._below_sm100():
             from .cute_dsl.tuner import CuteDslFusedMoEW4A16Runner
 
@@ -5332,14 +5329,12 @@ class CuteDslRunner(MoERunner):
             sm90 = map(v.get, _CUTLASS_MXFP4_SM90_KEYS)
             v = {**v, **dict(zip(keys, sm90, strict=True))}
         elif self._below_sm100() and "sm80_fc1_expert_weights" in v:
-            # Below SM100 the GEMMs read the SM80 operands prepared with the view, if any.
             sm80 = _sm80_view_operands(
                 v, v["w1_weight"], v["w2_weight"], act.hidden_states_q.device
             )
             v = {**v, **dict(zip(keys, sm80, strict=True))}
         elif self._below_sm100() and "sm80_fc1_records" in v:
-            # W4A16 reads the records prepared with the view over all experts; an
-            # expert-parallel shard converts the weights on every call.
+            # W4A16 reads the view's records, but an expert-parallel shard converts per call.
             experts = self.config.experts
             whole = (None, self.config.routing.num_experts)
             if experts.local_expert_offset == 0 and experts.local_num_experts in whole:
@@ -6133,13 +6128,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
 
             mx = self._pair[0] is QuantFormat.MXFP4
             device = act.hidden_states_q.device
-            # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
             sm90 = get_compute_capability(device)[0] == 9 and self._pair == (
                 QuantFormat.MXFP4, QuantFormat.MXFP8,
             )  # fmt: skip
             keys = _CUTLASS_MXFP4_SM90_KEYS if sm90 else _CUTLASS_NVFP4_SM80_KEYS
             w1, w2 = v["gemm1_weights"], v["gemm2_weights"]
-            # The operands prepared with the view, else converted on every call.
             static_kwargs["sm80_weights"] = sm80 = (
                 tuple(v[key] for key in keys)
                 if keys[0] in v

@@ -548,7 +548,7 @@ _TRTLLM_ROUTED_FP8_ARCHS = (100, 103, 107)
 _PRIMS_TS_ARCHS = (100, 103)
 
 # Dense BF16 follows the architecture dispatch already exposed by the flat
-# CUTLASS API (SM80 to SM87 on the SM80 module).
+# CUTLASS API.
 _CUTLASS_BF16_ARCHS = (80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121)
 
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
@@ -612,8 +612,7 @@ class TrtllmFp4Config:
     ``supported(arch)`` reflects the routed-MoE cubin manifest. Variant-specific
     restrictions are applied by ``TrtllmFp4RoutedRunner.check_support()``:
     NVFP4/MXFP4 support SM100/SM103/SM107, while W4A16 supports SM100/SM107
-    and remains disabled on SM103. Below SM100 all of them run on the CUTLASS
-    SM80 kernels.
+    and remains disabled on SM103. Below SM100 all run on the CUTLASS SM80 kernels.
     """
 
     @classmethod

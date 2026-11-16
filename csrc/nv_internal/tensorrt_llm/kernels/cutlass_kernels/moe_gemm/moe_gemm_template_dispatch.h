@@ -150,8 +150,7 @@ struct genericMoeGemmKernelLauncher {
       }
 #endif
 #if defined(ENABLE_FP4)
-      // NVFP4 weights: each expert's global scale, already in the row scales when there are any.
-      // The occupancy query carries no scale pointers.
+      // NVFP4: each expert's global scale, in the row scales if any (none for the occupancy query).
       if constexpr (std::is_same_v<WeightType, Fp4Type>) {
         TLLM_CHECK_WITH_INFO(inputs.occupancy || inputs.alpha_scales || inputs.row_scales,
                              "FP4 weights take alpha_scale_ptr_array or row scales.");

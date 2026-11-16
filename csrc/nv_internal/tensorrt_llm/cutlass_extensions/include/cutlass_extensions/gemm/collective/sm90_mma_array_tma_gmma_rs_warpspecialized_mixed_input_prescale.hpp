@@ -1209,8 +1209,7 @@ struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixed
         constexpr int BLK_N = size<1>(TileShape{});
         int const warp_group = canonical_warp_group_idx() - 1;
         if constexpr (k_block == 0) {
-          // Each consumer warpgroup expands this stage's activation atoms to FP32 [kb][n], one tile
-          // column of each atom per thread; the K tile's four blocks then read it.
+          // Each warpgroup expands the stage's activation atoms to FP32 [kb][n], a column a thread.
           act_factor_parity ^= 1;
           act_factor_buffer = (warp_group * 2 + act_factor_parity) * RawActScaleChunksPerTileK;
           int const row = thread_idx % NumThreadsPerWarpGroup;

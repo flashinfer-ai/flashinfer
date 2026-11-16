@@ -933,8 +933,8 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type, CVT_ELTS_PER_THREAD>& ve
 #endif
 }
 
-// cvt_warp_fp16_to_mxfp8's scaling: writes the E8M0 SF to SFout and SFlocal (each if given) and
-// leaves the values over it, saturated to +/-448, in fp2Vals.
+// cvt_warp_fp16_to_mxfp8's scaling: E8M0 SF to SFout/SFlocal if given, fp2Vals = values / SF
+// saturated to +/-448.
 template <class Type, int SF_VEC_SIZE, int CVT_ELTS_PER_THREAD>
 __device__ void scale_warp_fp16_for_mxfp8(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, uint8_t* SFout,
                                           uint8_t* SFlocal,

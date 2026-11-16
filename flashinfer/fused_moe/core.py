@@ -1949,8 +1949,7 @@ def cutlass_fused_moe(
     elif (
         major < 10 and use_mxfp8_act_scaling and fc1_expert_weights.dtype == torch.int64
     ):
-        # MXFP8 x MXFP4 likewise; it computes in BF16, biases included, for either output.
-        # Its SM90 operands run on the FP8 mixed-input GEMM instead.
+        # MXFP8 x MXFP4 likewise, in BF16 with BF16 biases; SM90 on the FP8 mixed-input GEMM.
         sm90 = major == 9 and quant_scales[0].dtype == torch.int32
         if quant_scales[0].dtype == torch.int32:
             fc1_expert_weights, s1, fc2_expert_weights, s2 = cutlass_nvfp4_sm80_weights(
@@ -7094,9 +7093,8 @@ def trtllm_fp4_block_scale_moe(
         ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
         ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated ones (``6`` Relu2, ``9`` Identity).
-        Below SM100 the four weight and scale tensors may be the operands
-        :func:`~flashinfer.fused_moe.trtllm_nvfp4_sm80_weights` prepares once;
-        others are converted on every call.
+        Below SM100 the four weight and scale tensors may be operands prepared by
+        :func:`~flashinfer.fused_moe.trtllm_nvfp4_sm80_weights`, else converted per call.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, M, hidden_size // (32 if mxfp4 else 16)]`` FC1 weight
         block scales, dtype float8, with the same ``M`` as ``gemm1_weights``.
@@ -7449,9 +7447,8 @@ def trtllm_fp4_block_scale_routed_moe(
     gemm1_weights : torch.Tensor
         ``[num_experts, 2 * intermediate_size, hidden_size // 2]`` packed
         FP4 FC1 weights, ``uint8``.
-        Below SM100 the four weight and scale tensors may be the operands
-        :func:`~flashinfer.fused_moe.trtllm_nvfp4_sm80_weights` prepares once;
-        others are converted on every call.
+        Below SM100 the four weight and scale tensors may be operands prepared by
+        :func:`~flashinfer.fused_moe.trtllm_nvfp4_sm80_weights`, else converted per call.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]``
         FC1 weight block scales, float8.
@@ -7639,8 +7636,7 @@ def trtllm_fp4_block_scale_routed_moe(
 
     # The kernel folds dequantScaleAb into scaleC and applies it to the bias
     # when the input is Fp8 or NvFp4 and DeepSeekFp8 is not used (see trtllm-gen
-    # getDoesScaleAb()); pre-divide lora_delta to compensate. Below SM100 the
-    # kernels add the biases dequantized.
+    # getDoesScaleAb()); pre-divide lora_delta to compensate.
     sm80 = (
         hidden_states.is_cuda and get_compute_capability(hidden_states.device)[0] < 10
     )
@@ -7648,7 +7644,7 @@ def trtllm_fp4_block_scale_routed_moe(
         gemm1_lora_delta is not None
         and output1_scale_gate_scalar is not None
         and hidden_states.dtype == torch.uint8
-        and not sm80
+        and not sm80  # the SM80 kernels add the biases dequantized
     ):
         if routing_mode == RoutingInputMode.UnpackedPrecomputed:
             # topk_ids_tensor: [num_tokens, top_k] int32 of plain expert IDs.
@@ -7665,10 +7661,9 @@ def trtllm_fp4_block_scale_routed_moe(
         ).to(gemm1_lora_delta.dtype)
 
     if sm80:
-        # The SM100 launchers' checks, with their errors: NVFP4 (16-element blocks) or MXFP4
-        # (32) weights by their scale count, and with fused shared experts each expert-major
-        # tensor's extent. Operands from trtllm_nvfp4_sm80_weights (BF16 scales, int32 on SM90's
-        # GEMM) are checked and used as they are.
+        # The SM100 launchers' checks and errors: NVFP4 (16-element blocks) or MXFP4 (32) by
+        # scale count, and with fused shared experts each expert-major tensor's extent. Prepared
+        # operands (BF16 scales, SM90's int32) are checked and used as they are.
         device = hidden_states.device
         experts, dtype = local_num_experts + _nfse, hidden_states.dtype
         hidden_size = hidden_states.shape[1] * (2 if dtype == torch.uint8 else 1)
@@ -7721,8 +7716,7 @@ def trtllm_fp4_block_scale_routed_moe(
             _check_sm80_nvfp4_operands, _trtllm_fc1_rows, trtllm_nvfp4_sm80_weights,
         )  # fmt: skip
 
-        # Padded sizes as above SM100: GEMM1's K is roundUp(valid_hidden_size, 128), the FC2
-        # rows, and the intermediate size roundUp(valid_intermediate_size, 128) at most.
+        # As above SM100, GEMM1's K (the FC2 rows) is roundUp(valid_hidden_size, 128).
         num_tokens = hidden_states.shape[0]
         output_hidden_size = _infer_trtllm_moe_output_hidden_size(
             hidden_size, valid_hidden_size
@@ -7747,7 +7741,6 @@ def trtllm_fp4_block_scale_routed_moe(
             _check_trtllm_moe_output(
                 output, num_tokens, hidden_size, valid_hidden_size, device
             )
-        # SM90 runs MXFP4 x MXFP8 on the FP8 mixed-input GEMM, as CUTLASS MoE does.
         sm90 = dtype == torch.float8_e4m3fn and get_compute_capability(device)[0] == 9
         weights = gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale
         if prepared:
@@ -7827,8 +7820,8 @@ def _trtllm_routing_sm80(
     routing_logits, routing_bias, routing_method_type, top_k, n_group, topk_group,
     routed_scaling_factor, norm_topk_prob, enable_pdl, num_fused_shared_experts=0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
-    """Below SM100 the TRT-LLM launchers' routing runs on its own, over every expert: global ids
-    (other ranks' dropped by the CUTLASS kernels) and BF16 weights, fused shared experts last."""
+    """TRT-LLM routing over all experts: global ids (other ranks' dropped by the CUTLASS kernels),
+    BF16 weights, fused shared experts last."""
     from .trtllm_gen_routing import trtllm_gen_routing
 
     routing = trtllm_gen_routing(
@@ -7849,15 +7842,13 @@ def _trtllm_fp4_routed_moe_sm80(
     tune_max_num_tokens, gemm1_bias=None, gemm2_bias=None, fc1_rows=None, do_finalize=True,
     fc1_deltas=None, nvfp4_4over6=_UNSET,
 ) -> List[torch.Tensor]:  # fmt: skip
-    """Runs TRT-LLM FP4 MoE on the CUTLASS SM80 kernels with ``sm80_weights``, its weights' SM80
-    operands (for MXFP4 x MXFP8 on SM90, the FP8 mixed-input GEMM's), cut to ``fc1_rows`` (biases
-    too) for a padded intermediate size. The gate scalar dequantizes GEMM1; the FC1 output scalar
-    is the GEMM2-input scale (NVFP4's FC2 activation global scale, or per token a GEMM2
-    dequantization factor), over the gate scalar for gated activations but SiTU; MXFP4 reads no
-    output scalar. As above SM100, unfinalized it returns GEMM2's rows with the FC2 biases, the
-    routing weights and each (token, k)'s row (-1 on other ranks' experts); LoRA's ``fc1_deltas``
-    (GEMM1's dequantized row biases) add each (token, k)'s row and GEMM2's inputs (NVFP4 or MXFP8
-    codes, else BF16)."""
+    """TRT-LLM FP4 MoE on the CUTLASS SM80 kernels with SM80 operands ``sm80_weights`` cut to
+    ``fc1_rows`` (biases too). The gate scalar dequantizes GEMM1; the FC1 output scalar is the
+    GEMM2-input scale (NVFP4's FC2 activation global scale, or per token a GEMM2 dequantization
+    factor), over the gate scalar for gated activations but SiTU; MXFP4 reads no output scalar.
+    As above SM100, unfinalized it returns GEMM2's rows with FC2 biases, the routing weights and
+    each (token, k)'s row (-1 on other ranks' experts); LoRA's ``fc1_deltas`` (GEMM1's dequantized
+    row biases) add each (token, k)'s row and GEMM2's inputs (NVFP4/MXFP8 codes, else BF16)."""
     act = ActivationType(activation_type)
     if topk_weights is None:  # (expert id << 16) | bf16 weight
         pairs = topk_ids.view(torch.int16).view(*topk_ids.shape, 2)

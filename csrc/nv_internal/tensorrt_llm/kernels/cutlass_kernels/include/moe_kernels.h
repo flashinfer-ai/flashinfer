@@ -351,8 +351,7 @@ struct QuantParams {
   } fp8_block_scaling;
 
 #if defined(FLASHINFER_FP4_SW_CVT)
-  // Below SM100, MXFP8 x MXFP4: the MXFP8 input, and per GEMM1 row (permuted) whether its token has
-  // an E8M0 scale of 244 to 254 (restored BF16 out of range), GEMM1 recomputing it from the codes.
+  // Below SM100 MXFP8 x MXFP4: the MXFP8 input, and permuted GEMM1 rows' wide flags (E8M0 244-254).
   struct RestoredMxfp8Inputs {
     void const* codes = nullptr;
     uint8_t const* sf = nullptr;
@@ -361,8 +360,7 @@ struct QuantParams {
     int const* permuted_row_to_unpermuted_row = nullptr;
   } restored_mxfp8;
 
-  // Below SM100, BF16 W4A16 on the small-M kernel: nothing restored, GEMM1 reading the token rows
-  // (row r: token w4a16_token_rows[r] % the tokens), both GEMMs scaling by experts' global scales.
+  // Below SM100 BF16 W4A16 on small-M: GEMM1 row r reads token w4a16_token_rows[r] % the tokens.
   int const* w4a16_token_rows = nullptr;
 #endif
 

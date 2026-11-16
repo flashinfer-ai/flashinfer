@@ -671,8 +671,7 @@ class DqMmaMultistage<Shape_, IteratorA_, SmemIteratorA_, CacheOpA, IteratorB_, 
       load_scales();
     }
 
-    // E2M1 weights drain too: the prologue zero-fills unconditionally, and the epilogue reuses this
-    // shared memory.
+    // E2M1 weights drain too: the prologue zero-fills unconditionally; the epilogue reuses smem.
     if (SharedMemoryClear == SharedMemoryClearOption::kZfill ||
         platform::is_same<ElementB, float_e2m1_t>::value) {
       // commit and drain all pending and predicated LDGSTS pnz from the GEMM mainloop

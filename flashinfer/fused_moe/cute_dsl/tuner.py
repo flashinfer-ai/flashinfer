@@ -1191,11 +1191,10 @@ def get_w4a16_moe_valid_tactics() -> List[Tuple]:
 W4A16_MOE_TACTICS = tuple(get_w4a16_moe_valid_tactics())
 
 
-# Below SM100 W4A16 runs on records (csrc/w4a16_moe_sm80.cu) with these tactics: row tile, then
-# the GEMM1 and GEMM2 variants: 0 the row tile's own; at row tile 64, 1 GEMM1 at 2 stages (GEMM2
-# as 0), 2 GEMM2 at 2 stages, 3 GEMM1 and 4 GEMM2 over two 128-column records per CTA, 5 GEMM2
-# as 4 with vector scale loads; at row tile 96, 6 and 7 the 2-stage paths, 7 with 12 row parts.
-# Untuned calls take row tile 64.
+# Below SM100 W4A16 records' (csrc/w4a16_moe_sm80.cu) tactics: row tile, GEMM1 and GEMM2 variant.
+# Variants: 0 the row tile's own; at row tile 64, 1 GEMM1 at 2 stages (GEMM2 as 0), 2 GEMM2 at 2
+# stages, 3 GEMM1 and 4 GEMM2 over two 128-column records per CTA, 5 GEMM2 as 4 with vector scale
+# loads; at row tile 96, 6 and 7 the 2-stage paths, 7 with 12 row parts. Untuned: row tile 64.
 W4A16_SM80_TACTICS = (
     (8, 0, 0), (16, 0, 0), (32, 0, 0), (64, 0, 0), (96, 0, 0), (64, 1, 1), (64, 1, 2),
     (64, 3, 2), (64, 3, 4), (64, 1, 4), (64, 3, 5), (64, 1, 5), (96, 6, 6), (96, 7, 7),

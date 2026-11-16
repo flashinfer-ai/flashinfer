@@ -38,8 +38,7 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
-// Below SM100 NVFP4, and MXFP8 x MXFP4 with MXFP8 input, run on the SM80 16-bit x E2M1 GEMMs
-// with the activations restored.
+// Below SM100 NVFP4, and MXFP8 x MXFP4 with MXFP8 input, run restored on the SM80 E2M1 GEMMs.
 #if defined(FLASHINFER_FP4_SW_CVT)
 constexpr bool kRestoredFp4 = true;
 #else

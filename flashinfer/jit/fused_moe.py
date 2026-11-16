@@ -207,10 +207,7 @@ def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_w4a16_moe_sm80_module() -> JitSpec:
-    """BF16 x NVFP4 MoE records kernels for SM80 to SM90.
-
-    SM86, SM87 and SM89 run the sm_80 code; SM90 gets its own sm_90 build.
-    """
+    """BF16 x NVFP4 MoE records kernels: sm_80 code for SM80 to SM89, sm_90 for SM90."""
     majors = {major for major, _ in current_compilation_context.TARGET_CUDA_ARCHS}
     nvcc_flags = [
         f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors

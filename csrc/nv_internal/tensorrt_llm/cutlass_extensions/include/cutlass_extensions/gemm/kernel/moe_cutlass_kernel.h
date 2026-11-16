@@ -596,9 +596,8 @@ struct MoeFCGemm {
                 params.group_size);
 
         if constexpr (kE2m1B && Mma::Operator::MmaIterations::kRow >= 4) {
-          // Run only the warp tile's mma rows that cover problem rows, in a mainloop specialized
-          // per count (no per-mma branch); the lane-0 broadcast keeps the count warp-uniform. One
-          // or two mma rows keep the single mainloop: one has nothing to skip, two measured slower.
+          // Only mma rows covering problem rows run, a mainloop per warp-uniform count (no per-mma
+          // branch). One or two rows keep one mainloop: one skips nothing, two measured slower.
           using WarpMma = typename Mma::Operator;
           int const warp_m =
               warp_idx % (Mma::WarpCount::kM * Mma::WarpCount::kN) % Mma::WarpCount::kM;

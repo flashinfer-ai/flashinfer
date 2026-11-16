@@ -394,8 +394,7 @@ struct FastInterleavedAndBiasedNumericArrayConverter<bfloat16_t, uint4b_t, N> {
   result_type operator()(source_type const& s) { return convert(s); }
 };
 
-// E2M1 (NVFP4) codes to FP16 or BF16 exactly, in their natural order (element i from nibble i),
-// with no bias: FlashInfer's e2m1x8_to_16bx8.
+// E2M1 (NVFP4) codes to FP16/BF16 exactly, element i from nibble i: FlashInfer's e2m1x8_to_16bx8.
 template <typename T, int N>
 struct FastE2M1NumericArrayConverter {
   static_assert(!(N % 8), "N must be multiple of 8.");
