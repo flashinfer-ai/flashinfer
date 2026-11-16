@@ -2119,7 +2119,13 @@ class TokenCommDedup(KernelComponent):
                             destination_sf_vectors[None, sf_vector_idx],
                         )
 
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                # The FC1 GEMM TMA-loads a row once a flag covering it is visible. .read only means the
+                # bulk store has read the stage, so a row whose accumulate() publishes waits for the
+                # stores to complete, which also completes the batch's earlier rows.
+                if flag_tracker.publishes_on_accumulate(Int32(0), self.token_in_flag_batch):
+                    cute.arch.cp_async_bulk_wait_group(0)
+                else:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.sync_warp()
                 ready_address = (fc1_ready_counter + ready_slot_idx).toint()
                 flag_tracker = flag_tracker.accumulate(Int32(0), self.token_in_flag_batch, ready_address)
@@ -2137,6 +2143,10 @@ class TokenCommDedup(KernelComponent):
             )
             local_expert = local_expert + Int32(1)
 
+        # The tail flush publishes a batch that never filled.
+        if cutlass.const_expr(self.token_in_flag_batch > 1):
+            cute.arch.cp_async_bulk_wait_group(0)
+            cute.arch.sync_warp()
         flag_tracker.fire()
         cute.arch.sync_warp()
         iket.range_pop()

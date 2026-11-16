@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional, Tuple
 
 from flashinfer.moe_ep._compat import deprecated_aliases
+from ..shared_expert import Sm107SharedExpertConfig, validate_feature_config
 
 
 @deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
@@ -59,8 +60,11 @@ class Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig:
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
     use_tanh_sigmoid: bool = False
     epilogue_warpgroups: int = 1
+    shared_expert: Sm107SharedExpertConfig | None = None
+    combine_dedup: bool = False
 
     def __post_init__(self):
+        validate_feature_config(self)
         if not self.batch_invariant and (
             self.swiglu_alpha is not None or self.swiglu_beta is not None
         ):

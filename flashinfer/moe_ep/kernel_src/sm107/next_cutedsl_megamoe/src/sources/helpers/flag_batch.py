@@ -6,9 +6,17 @@ from typing import Any, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
 from ...common.ptx_helpers import red_add_release_gpu_s32, red_add_release_sys_s32, red_async_add_release_gpu_s32
+
+
+@cute.jit
+def _publishes(accumulated_flags: Int32, phase: Int32, next_phase: Any, flush_threshold: int) -> Boolean:
+    """Predict whether the next accumulation releases its batch."""
+    if cutlass.const_expr(flush_threshold == 1):
+        return Boolean(True)
+    return (accumulated_flags + Int32(1) == Int32(flush_threshold)) | (next_phase != phase)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -36,6 +44,11 @@ class GpuReleaseFlagBatchTracker:
     def drained(self) -> "GpuReleaseFlagBatchTracker":
         """The tracker after an explicit ``fire()``: nothing held, so a later flush cannot publish it again."""
         return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=self.phase)
+
+    @cute.jit
+    def publishes_on_accumulate(self, next_phase: Any, flush_threshold: int) -> Boolean:
+        """Covered writes must complete before an accumulation that publishes."""
+        return _publishes(self.accumulated_flags, self.phase, next_phase, flush_threshold)
 
     @cute.jit
     def accumulate(
@@ -106,6 +119,11 @@ class GpuAsyncReleaseFlagBatchTracker:
     def drained(self) -> "GpuAsyncReleaseFlagBatchTracker":
         """The tracker after an explicit ``fire()``: nothing held, so a later flush cannot publish it again."""
         return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=self.phase)
+
+    @cute.jit
+    def publishes_on_accumulate(self, next_phase: Any, flush_threshold: int) -> Boolean:
+        """Covered writes must complete before an accumulation that publishes."""
+        return _publishes(self.accumulated_flags, self.phase, next_phase, flush_threshold)
 
     @cute.jit
     def accumulate(

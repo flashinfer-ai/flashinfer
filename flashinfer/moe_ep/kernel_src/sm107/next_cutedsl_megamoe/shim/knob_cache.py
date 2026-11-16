@@ -18,6 +18,7 @@ the smallest larger bucket, then the largest smaller bucket.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import datetime
 import json
 import os
@@ -26,6 +27,7 @@ import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 from flashinfer.moe_ep._compat import deprecated_aliases
+from .shared_expert import Sm107SharedExpertConfig
 
 # Bump when kernel or knob semantics invalidate previous tuning results.
 BACKEND_REVISION = "sm107-block-scaled-70a6878d-runtime-v1"
@@ -51,6 +53,8 @@ _KEY_FIELDS = (
     "batch_invariant_fingerprint",
     "use_tanh_sigmoid",
     "epilogue_warpgroups",
+    "shared_expert",
+    "combine_dedup",
 )
 
 
@@ -309,6 +313,8 @@ def _matching_entries(
     per_token_scale: bool = False,
     use_tanh_sigmoid: bool = False,
     epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return records with a compatible numerical and execution contract."""
     if entries is None:
@@ -345,6 +351,10 @@ def _matching_entries(
         gate_up_clamp=gate_up_clamp,
         use_tanh_sigmoid=use_tanh_sigmoid,
         epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -358,7 +368,8 @@ def _matching_entries(
         e
         for e in entries
         if all(
-            e.get(f, False if f == "batch_invariant" else None) == key[f]
+            e.get(f, False if f in ("batch_invariant", "combine_dedup") else None)
+            == key[f]
             for f in _KEY_FIELDS
         )
         and isinstance(e.get("knobs"), dict)
@@ -416,6 +427,8 @@ def lookup_record(
     per_token_scale: bool = False,
     use_tanh_sigmoid: bool = False,
     epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
 
@@ -445,6 +458,10 @@ def lookup_record(
         per_token_scale=per_token_scale,
         use_tanh_sigmoid=use_tanh_sigmoid,
         epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
@@ -494,6 +511,8 @@ def make_record(
     per_token_scale: bool = False,
     use_tanh_sigmoid: bool = False,
     epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> Dict[str, Any]:
     """Build a tuning record shared by FlashInfer and the MegaMoE file."""
     if batch_invariant and not _bi_plan_valid(
@@ -544,6 +563,10 @@ def make_record(
         gate_up_clamp=gate_up_clamp,
         use_tanh_sigmoid=use_tanh_sigmoid,
         epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -576,7 +599,10 @@ def write_record(entry: Dict[str, Any]) -> Optional[str]:
             for e in entries
             if not (
                 all(
-                    e.get(f, False if f == "batch_invariant" else None) == entry[f]
+                    e.get(
+                        f, False if f in ("batch_invariant", "combine_dedup") else None
+                    )
+                    == entry[f]
                     for f in _KEY_FIELDS
                 )
                 and e.get("max_tokens") == max_tokens
@@ -694,6 +720,8 @@ def resolve_knobs(
     per_token_scale: bool = False,
     use_tanh_sigmoid: bool = False,
     epilogue_warpgroups: int = 1,
+    shared_expert=None,
+    combine_dedup: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -724,6 +752,10 @@ def resolve_knobs(
         per_token_scale=per_token_scale,
         use_tanh_sigmoid=use_tanh_sigmoid,
         epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=dataclasses.asdict(shared_expert)
+        if isinstance(shared_expert, Sm107SharedExpertConfig)
+        else shared_expert,
+        combine_dedup=combine_dedup,
     )
     if cached is not None:
         return cached, "cache"
@@ -738,12 +770,19 @@ def resolve_knobs(
             "genphase" if kernel_variant == "genphase" else "standard",
             arch="sm_107",
         ), "heuristic"
-    return default_knobs(
+    selected = default_knobs(
         max_tokens,
         quant_kind=dtype,
         kernel_variant=kernel_variant,
         combine_dtype=combine_dtype,
-    ), "heuristic"
+    )
+    if combine_dedup:
+        selected.update(
+            fc2_use_bulk=True,
+            token_back_mode="reuse_dispatch_warps",
+            reduce_topk_in_kernel=False,
+        )
+    return selected, "heuristic"
 
 
 __all__ = [

@@ -14,6 +14,31 @@ Two epilogue warpgroups require standard inference with BF16 bulk combine and
 separate cache identities. To compare their combinations, tune a separate
 configuration for each combination and retain its best valid tactic.
 
+Shared-expert fusion is opt-in on standard and GenPhase. Set
+`shared_expert=Sm107SharedExpertConfig(intermediate_size=..., kind="mxfp8_e4m3")`
+on the backend config. Supply the routed pack as usual, with
+`shared_expert=MoEWeightPack(shared_w13, shared_w2)` on that pack. The shared
+weights have shapes `[1, 2 * shared_intermediate, hidden]` and
+`[1, hidden, shared_intermediate]` on every rank. Canonical BF16 and
+prequantized MXFP8 weights use the existing MXFP8 preparation. Prepared weights
+use `Sm107SharedExpertWeights(routed, shared)` with two FC1/FC2 pairs.
+
+The shared branch uses MXFP8 E4M3 or E5M2, the routed input/output hidden size,
+and its own intermediate width. Its output is added in separate reduction.
+BF16 inputs are staged for both branches. With prequantized routed inputs in
+a different format, provide `MoEEpTensors.shared_hidden_states`; this accepts
+BF16 or shared-format MXFP8 with row-major E8M0 `shared_scales`. Workspace-owned
+shared inputs, scale padding and outputs remain valid across graph replay.
+Shared fusion does not implement the batch-invariant contract.
+
+Set `combine_dedup=True` for standard inference with early routing weights,
+BF16 combine, `fc2_use_bulk=True`, separate reduction, one epilogue warpgroup,
+and `token_back_mode="reuse_dispatch_warps"` or `"standalone_warps"`.
+The native protocol admits at most 32 ranks. It reduces expert outputs on their
+owner before returning a rank-major row; this differs from selecting routes
+or reusing input activation rows. Shared fusion and dedup have separate
+workspace and tuning identities. Neither is enabled by default.
+
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
 NVFP4, MXFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python

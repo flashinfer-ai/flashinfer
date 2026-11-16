@@ -17,7 +17,7 @@ next_cutedsl_megamoe/
 
 - Source revision: `70a6878de7852ed837d6a4dfc1572728226fbbc4`.
 - Shared-runtime revision: `1695115c1fb703f4f1d2ad9076944e4876a3ae01`.
-- Source with retained patches: `882c348ed290a4186509df57cb89eba6cd3925e9`,
+- Source with retained patches: `9bcb9455ad0ec296f6b13b948251db0527e84a97`,
   recorded as `patch_revision` in `export_manifest.json`.
 - Exporter: `export_src.py` at the retained-patch revision above,
   SHA-256 `d71f28ed0d4028758e8024e831c049726923f112d30d33447be2db74149e89b5`.
@@ -100,9 +100,15 @@ their existing locations. See [TUNING.md](TUNING.md) for the measurement protoco
 
 Standard inference uses a caller-owned temporary buffer, retained by the
 adapter across launches and graph replay. GenPhase retains its local-workspace
-interface. Shared-expert execution remains disabled by default.
-Its provider implementation is included as a dependency of the standard
-kernel; FlashInfer does not expose shared-expert parameters in this drop.
+interface. Shared-expert execution remains disabled by default. Set
+`shared_expert=Sm107SharedExpertConfig(...)` and supply replicated shared
+weights through `MoEWeightPack.shared_expert` to add the shared FFN output.
+Standard inference also exposes `combine_dedup` for early-weighted BF16 bulk
+return. See [TUNING.md](TUNING.md) for the supported combinations.
+
+The communication components complete FC1-row bulk stores before publishing
+their READY counters, including partial batches. Reading a staging buffer is
+not sufficient to establish completion of those destination writes.
 
 Local corrections initialize FC1 scale padding through the last valid writer
 and retain 16-byte routed-output alignment. Optional shared-term loads still

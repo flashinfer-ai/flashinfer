@@ -27,9 +27,9 @@
     "sources/communication/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "sources/communication/nvlink_domain/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "sources/communication/nvlink_domain/symmetric_buffer.py": "315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa",
-    "sources/communication/nvlink_domain/token_comm.py": "caa2f1cb6352c75337e60c6b53e24f07670e1fd1ec7176457698512137ce988f",
+    "sources/communication/nvlink_domain/token_comm.py": "a9f496c663f0a80f44d62d2cf6244d2d1c6301f1d34f68fd97e675ff4379b337",
     "sources/communication/nvlink_domain/token_comm_cta_mainloop.py": "a92aad16499c0d6bc39f3145579c74d044d00b85e23b6d7037986ab31c033e99",
-    "sources/communication/nvlink_domain/token_comm_dedup.py": "046bd13f6486a0206f2d455e7e7e88c1091a71b16d33129fe4960413cfa51032",
+    "sources/communication/nvlink_domain/token_comm_dedup.py": "5c4195d5ba5e3d949250692af563f2f46cdad36a6cf2b9d6d7fdaf065bdb3264",
     "sources/communication/token_protocol.py": "f67e609c3f38ef3458df5031bb412905afd1486cc1d3aa388074e244767fc0bc",
     "sources/helpers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "sources/helpers/cute_py_helpers.py": "affa55be8de866169283ecaa6a1550f863ca986ef7d73a964b418dd19c9e1b9f",
@@ -37,7 +37,7 @@
     "sources/helpers/dlb_expert_count.py": "8450a03a98b6015726edc10773ad4af8f678e830e919f13e66c74345df2977f8",
     "sources/helpers/dsl_helpers.py": "4c713ddfdb0d648b42d8dd2808592749371aae509aeed529fcbcab8b75fef127",
     "sources/helpers/fc2_ready_geometry.py": "64a894bf6b76e8fa0d40f1970edb8cd395926bec19555648cc0ed1a4dfd35123",
-    "sources/helpers/flag_batch.py": "06538d4f7291174d89065a1dbabd7f65a766a5e7b3093b86ce9b4cbc419bec91",
+    "sources/helpers/flag_batch.py": "78bf4b328a414ee061ed25989f8079c33772f57d1e1f29e30a9456596057bc14",
     "sources/helpers/helper_weight_ready_gate.py": "14d2646fb0b7ef23b8f361bfb29fe35c026c6988f95d8b6e6cd19125c3089227",
     "sources/helpers/iket_compat.py": "4b8a3c3e231793f87d6b1bcd5dffee8b5c19c384c3a719fbb4ed895d9929ba29",
     "sources/helpers/megamoe_aot.py": "3e48f772d12d8458a9e091c1e8a3059833eb0543b1379bbadb15521a551a6d09",
@@ -77,5 +77,5 @@
     "sources/quant_def.py": "020da2ed98414726f992553c2d9a0c5a1e151864322617a68c850ce9d0783afd"
   },
   "cleanup_patch_sha256": "610b475ad3dd741903715606a055bae0e82eadbdcc93b0bf1fb16b2bb74059ff",
-  "patch_revision": "882c348ed290a4186509df57cb89eba6cd3925e9"
+  "patch_revision": "9bcb9455ad0ec296f6b13b948251db0527e84a97"
 }

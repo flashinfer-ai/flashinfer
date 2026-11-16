@@ -43,6 +43,7 @@ SUITES = {
     "multi": [
         "tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py",
         "tests/moe_ep/test_sm107_routing_graph_multirank.py",
+        "tests/moe_ep/test_sm107_shared_expert.py",
     ],
 }
 

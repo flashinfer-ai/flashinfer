@@ -268,6 +268,8 @@ from .weights import (
 )
 
 __all__ = [
+    "Sm107SharedExpertConfig",
+    "Sm107SharedExpertWeights",
     "AutoConfig",
     "MoEEpAutoLayer",
     "MoEEpAutoWorkspace",
@@ -540,4 +542,9 @@ from .backends.split.comm.cake.communication import (  # noqa: E402
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
     NVLinkTwoSidedAlltoAll,
+)
+
+from .backends.mega.kernel.sm107.shared_expert import (
+    Sm107SharedExpertConfig,
+    Sm107SharedExpertWeights,
 )
