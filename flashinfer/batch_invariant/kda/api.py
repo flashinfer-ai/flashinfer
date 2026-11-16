@@ -260,6 +260,13 @@ def recurrent_kda_batch_invariant(
             raise unsupported(
                 CLASS, "an output on another device", "the inputs' device"
             )
+        lo, hi = output.data_ptr(), initial_state.data_ptr()
+        if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
+            raise unsupported(
+                CLASS,
+                "an output that shares memory with the state pool",
+                "an output buffer of its own",
+            )
     ep = get_pool(initial_state)
 
     if decode:
@@ -517,7 +524,8 @@ def recurrent_kda_batch_invariant_reset(
     """Take the pool states of the listed slots as chunk boundaries and drop their open rows: the explicit form of
     what the stamp detects, for a caller that recycles a slot (required after a request shorter than 16 tokens)."""
     check_device(initial_state.device, CLASS, KDA_ARCHS)
-    _check_pool(initial_state, int(initial_state.shape[1]), initial_state.device)
+    heads = int(initial_state.shape[1]) if initial_state.ndim == 4 else 0
+    _check_pool(initial_state, heads, initial_state.device)
     S = int(initial_state.shape[0])
     slot_ids = _slot_ids(
         ssm_state_indices, ssm_state_indices.numel(), initial_state.device, S

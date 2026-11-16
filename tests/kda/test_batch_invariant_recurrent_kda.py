@@ -739,6 +739,22 @@ def test_overlapping_pool_extent_is_refused():
 
 
 @needs_device
+def test_output_inside_the_pool_is_refused():
+    h = 16
+    p = params(h)
+    s = make_seq(4, h, SEED + 89, GATES["steep"])
+    pool = new_pool([s], [0])
+    before = pool.clone()
+    alias = pool.view(torch.bfloat16).flatten()[: 2 * h * D].view(1, 2, h, D)
+    args = [s[key][None, :2] for key in ("q", "k", "v", "g", "beta")]
+    with pytest.raises(BatchInvariantUnsupportedError, match="shares memory"):
+        recurrent_kda(
+            *args, initial_state=pool, output=alias, batch_invariant=True, **_fused(p)
+        )
+    assert torch.equal(pool, before)
+
+
+@needs_device
 def test_first_use_inside_a_graph_capture_is_refused():
     h = 16
     p = params(h)
