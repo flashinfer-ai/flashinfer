@@ -1,9 +1,8 @@
 # Colonels fused MoE
 
-This backend ports `poolside/colonels/fused_moe_up_down` into FlashInfer. All
-kernel headers, launch templates, and configuration enumeration live in this
+This backend contains fused MoE kernels for SM90 and SM103.
+All kernel headers, launch templates, and configuration enumeration live in this
 repository. Compilation uses FlashInfer's NVCC JIT/cache and AOT infrastructure.
-The runtime does not import Colonels or vLLM.
 
 | GPU | Weights × activations | Kernel families | Activations |
 | --- | --- | --- | --- |
@@ -52,10 +51,6 @@ with autotune(True):
 
 Preparation converts canonical `[up, gate]` weights into the kernels' interleaved
 `[gate, up]` layout. Ungated activations use `w1: [E_local + S, I, H]`.
-`ClampedReLU2(limit)` computes `(limit*tanh(relu(x)/limit))**2`.
-SwiGLU supports the default alpha, beta, and limit. These are the shared
-activation configs from `flashinfer.fused_moe.api`; unsupported activations
-or parameters are rejected explicitly.
 
 For FP8, use `ColonelsFp8BlockConfig`, the `colonels_fp8_block` weight-view key,
 and `QuantConfig(QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8)`.
@@ -66,7 +61,8 @@ and canonical FP32 scales shaped `[H/128, M]`.
 ## Routing and expert parallelism
 
 Both `PackedPrecomputed` and `UnpackedPrecomputed` packs supply logical int32
-expert IDs and final weights (FP32, or BF16 for UnpackedPrecomputed). FlashInfer's CUDA `moe_sort` groups and pads routes
+expert IDs and final weights (FP32, or BF16 for UnpackedPrecomputed).
+FlashInfer's CUDA `moe_sort` groups and pads routes
 by expert; GEMV consumes the IDs directly. IDs must be distinct within each
 token's selected experts. Negative, out-of-range, and nonlocal IDs contribute
 zero. The output is this rank's local contribution; communication is caller-owned.
@@ -80,7 +76,8 @@ Shared experts occupy the last `S` weight rows. A pack may include the shared
 slots (global IDs `E` through `E+S-1`), as in the existing precomputed API, or
 supply just the routed slots; the latter appends unit-weight shared routes.
 Precomputed weights are final, including any routed scaling; the runner consumes
-them exactly as supplied. The direct launch API also exposes `scaling_factor`. Use Colonels-only candidates for precomputed shared experts;
+them exactly as supplied. The direct launch API also exposes `scaling_factor`.
+Use Colonels-only candidates for precomputed shared experts;
 other backends retain their existing DeepSeekV3 shared-expert contract.
 The sorter supports at most 32 combined routes per token and 2048 local plus
 shared experts. FromLogits routing, PDL, and unfinalized output are rejected.
