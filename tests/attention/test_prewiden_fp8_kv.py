@@ -460,6 +460,98 @@ def test_gather_widen_special_value_convention(src_dtype):
 
 
 @needs_cuda
+def test_prewiden_int64_indptr():
+    """The compact table must carry the indptr dtype (the FA2 module's IdType)."""
+    q_len, kv_len, hq, hkv, d, page = 128, 1024, 8, 2, 256, 16
+    q, k, v, idx = _make_problem("HND", q_len, kv_len, hq, hkv, d, page)
+    idx64 = idx.long()
+    n_pages = idx.numel()
+    k16 = k.index_select(0, idx64).to(torch.bfloat16)
+    v16 = v.index_select(0, idx64).to(torch.bfloat16)
+    compact64 = torch.arange(n_pages, dtype=torch.int64, device="cuda")
+
+    def mk(prewiden, kv_dt, table):
+        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.zeros(128 << 20, dtype=torch.uint8, device="cuda"),
+            "HND",
+            backend="fa2",
+            prewiden_fp8_kv=prewiden,
+        )
+        w.plan(
+            torch.tensor([0, q_len], dtype=torch.int64, device="cuda"),
+            torch.tensor([0, n_pages], dtype=torch.int64, device="cuda"),
+            table,
+            torch.tensor(
+                [kv_len - (n_pages - 1) * page], dtype=torch.int64, device="cuda"
+            ),
+            hq,
+            hkv,
+            d,
+            page,
+            causal=True,
+            sm_scale=1.0 / d**0.5,
+            q_data_type=torch.bfloat16,
+            kv_data_type=kv_dt,
+            o_data_type=torch.bfloat16,
+            fixed_split_size=-1,
+            disable_split_kv=False,
+        )
+        return w
+
+    w_pw = mk(True, torch.float8_e4m3fn, idx64)
+    w_bf = mk(False, torch.bfloat16, compact64)
+    o1 = torch.empty(q_len, hq, d, dtype=torch.bfloat16, device="cuda")
+    o2 = torch.empty_like(o1)
+    w_pw.run(q, (k, v), k_scale=1.125, v_scale=0.875, out=o1)
+    w_bf.run(q, (k16, v16), k_scale=1.125, v_scale=0.875, out=o2)
+    torch.cuda.synchronize()
+    assert torch.equal(o1, o2)
+
+
+@needs_cuda
+def test_prewiden_rejected_replan_keeps_previous_plan():
+    q_len, kv_len, hq, hkv, d, page = 128, 1024, 8, 2, 256, 16
+    q, k, v, idx = _make_problem("HND", q_len, kv_len, hq, hkv, d, page)
+    n_pages = idx.numel()
+    w = _graph_wrapper(n_pages, hq, hkv, d, page)
+    args = _plan_args(q_len, kv_len, n_pages, hq, hkv, d, page)
+    w.plan(paged_kv_indices=idx, kv_data_type=torch.float8_e4m3fn, **args)
+    out = torch.empty(q_len, hq, d, dtype=torch.bfloat16, device="cuda")
+    _run(w, q, k, v, out)
+    ref = out.clone()
+    with pytest.raises(ValueError, match="replan"):
+        w.plan(
+            paged_kv_indices=idx[:32].contiguous(),
+            kv_data_type=torch.float8_e4m3fn,
+            **_plan_args(q_len, 512, 32, hq, hkv, d, page),
+        )
+    # the rejected plan must leave the previously accepted plan runnable
+    assert w._pw_active
+    out.zero_()
+    _run(w, q, k, v, out)
+    assert torch.equal(out, ref)
+
+
+@needs_cuda
+def test_prewiden_plan_loads_module_for_cold_capture():
+    q_len, kv_len, hq, hkv, d, page = 128, 1024, 8, 2, 256, 16
+    q, k, v, idx = _make_problem("HND", q_len, kv_len, hq, hkv, d, page)
+    ref = _ref_run(q, k, v, idx, q_len, kv_len, hq, hkv, d, page)
+    get_fp8_kv_widen_module.cache_clear()
+    w = _wrapper("HND", torch.float8_e4m3fn, True, q_len, kv_len, hq, hkv, d, page, idx)
+    assert w._pw_widen_module is not None  # loaded at plan, not at run
+    out = torch.empty(q_len, hq, d, dtype=torch.bfloat16, device="cuda")
+    # capture the very first run of this wrapper, with no eager warmup
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(q, (k, v), k_scale=1.125, v_scale=0.875, out=out)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+@needs_cuda
 def test_prewiden_rejects_unsupported_inputs():
     q_len, kv_len, hq, hkv, d, page = 64, 512, 8, 2, 256, 16
     q, k, v, idx = _make_problem(
