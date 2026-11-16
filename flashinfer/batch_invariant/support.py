@@ -5,6 +5,7 @@ Light imports only: the operators import this module on every call with ``batch_
 
 from __future__ import annotations
 
+import functools
 from typing import Iterable, Tuple
 
 import torch
@@ -61,8 +62,20 @@ def check_device(
     device: torch.device, class_name: str, archs: Iterable[Tuple[int, int]]
 ) -> Tuple[int, int]:
     """The compute capability of ``device``, or :class:`BatchInvariantUnsupportedError` naming the limit; ``archs`` are
-    the compute capabilities the class ``class_name`` supports."""
-    archs = tuple(archs)
+    the compute capabilities the class ``class_name`` supports.
+
+    Runs on every call with ``batch_invariant=True``; a successful check is cached per (device, class, archs), since
+    neither the device's compute capability nor the installed CuTe DSL changes within a process (a failing check is
+    not cached and raises again on the next call)."""
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _check_device_cached(device, class_name, tuple(archs))
+
+
+@functools.lru_cache(maxsize=None)
+def _check_device_cached(
+    device: torch.device, class_name: str, archs: Tuple[Tuple[int, int], ...]
+) -> Tuple[int, int]:
     if device.type != "cuda":
         raise unsupported(
             class_name,

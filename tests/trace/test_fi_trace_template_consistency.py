@@ -697,30 +697,38 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         for template in prims_ts_block_sparse_trace_dispatch.templates
     }
     assert set(one_shot_traces) == {
-        "prims_ts_block_sparse",
-        "prims_ts_block_sparse_bitmask",
-        "prims_ts_block_sparse_bsr_proxy",
-        "prims_ts_block_sparse_bitmask_proxy",
-        "prims_ts_block_sparse_shared",
-        "prims_ts_block_sparse_bitmask_shared",
-        "prims_ts_block_sparse_bsr_proxy_shared",
-        "prims_ts_block_sparse_bitmask_proxy_shared",
-        "prims_ts_block_sparse_dense",
+        name + suffix
+        for name in {
+            "prims_ts_block_sparse",
+            "prims_ts_block_sparse_bitmask",
+            "prims_ts_block_sparse_bsr_proxy",
+            "prims_ts_block_sparse_bitmask_proxy",
+            "prims_ts_block_sparse_shared",
+            "prims_ts_block_sparse_bitmask_shared",
+            "prims_ts_block_sparse_bsr_proxy_shared",
+            "prims_ts_block_sparse_bitmask_proxy_shared",
+            "prims_ts_block_sparse_dense",
+        }
+        for suffix in ("", "_scales_ft", "_scales_tf", "_scales_tt")
     }
     contiguous_wrapper_traces = {
         template.name_prefix: template
         for template in prims_ts_block_sparse_wrapper_trace_dispatch.templates
     }
     assert set(contiguous_wrapper_traces) == {
-        "prims_ts_block_sparse_wrapper",
-        "prims_ts_block_sparse_wrapper_bitmask",
-        "prims_ts_block_sparse_wrapper_bsr_proxy",
-        "prims_ts_block_sparse_wrapper_bitmask_proxy",
-        "prims_ts_block_sparse_wrapper_shared",
-        "prims_ts_block_sparse_wrapper_bitmask_shared",
-        "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
-        "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
-        "prims_ts_block_sparse_wrapper_dense",
+        name + suffix
+        for name in {
+            "prims_ts_block_sparse_wrapper",
+            "prims_ts_block_sparse_wrapper_bitmask",
+            "prims_ts_block_sparse_wrapper_bsr_proxy",
+            "prims_ts_block_sparse_wrapper_bitmask_proxy",
+            "prims_ts_block_sparse_wrapper_shared",
+            "prims_ts_block_sparse_wrapper_bitmask_shared",
+            "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
+            "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
+            "prims_ts_block_sparse_wrapper_dense",
+        }
+        for suffix in ("", "_scales_ft", "_scales_tf", "_scales_tt")
     }
     route_modes = {
         ("bsr", False): ("", {"block_indptr", "block_indices"}),
@@ -892,10 +900,14 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         for template in prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates
     }
     assert set(wrapper_paged_templates) == {
-        "prims_ts_paged_block_sparse_wrapper_tuple",
-        "prims_ts_paged_block_sparse_wrapper_combined",
-        "prims_ts_paged_block_sparse_wrapper_tuple_shared",
-        "prims_ts_paged_block_sparse_wrapper_combined_shared",
+        name + suffix
+        for name in {
+            "prims_ts_paged_block_sparse_wrapper_tuple",
+            "prims_ts_paged_block_sparse_wrapper_combined",
+            "prims_ts_paged_block_sparse_wrapper_tuple_shared",
+            "prims_ts_paged_block_sparse_wrapper_combined_shared",
+        }
+        for suffix in ("", "_scales_ft", "_scales_tf", "_scales_tt")
     }
     for template in (
         contiguous_wrapper_trace,

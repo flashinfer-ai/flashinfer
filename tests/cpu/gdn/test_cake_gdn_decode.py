@@ -1024,12 +1024,12 @@ def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_ban
 
 @pytest.mark.cpu_only
 def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
-    # One table (sm_107a only): the `mid4_rc_kq128` twin below 21 rows, the TMA-state
-    # `hqsplit_tma3` twin from 21 rows on (the upper small band 21 <= B < 32 and the whole
+    # One table (sm_107a only): the `mid4_rc_kq128` twin below 10 rows, the TMA-state
+    # `hqsplit_tma3` twin from 10 rows on (the upper small band 10 <= B < 32 and the whole
     # large band B >= 32, wave-fit range 32 <= B < 37 included), the shipped small / large
     # bodies everywhere else; B200 / B300 keep the shipped bodies.
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD == 32
-    assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START == 21
+    assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_UPPER_BATCH_START == 10
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT == 37
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES == {
         "small": "gdn_decode_nontranspose_fp32_t1_small",
@@ -1069,7 +1069,9 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
     rule_band = cake_gdn.cake_gdn_nontranspose_fp32_t1_rule_band
     for batch_size, expected in (
         (1, "small"),
-        (20, "small"),
+        (9, "small"),
+        (10, "small_upper"),
+        (20, "small_upper"),
         (21, "small_upper"),
         (31, "small_upper"),
         (32, "large_wavefit"),
@@ -1105,11 +1107,11 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
             assert rule(batch_size, arch) == small
         for batch_size in (32, 33, 34, 35, 36, 37, 64, 128, 512):
             assert rule(batch_size, arch) == large
-    # the public nontranspose rows (HV=32) on sm_107a: b1 .. b20 take mid4_rc_kq128, b21 .. b31
+    # the public nontranspose rows (HV=32) on sm_107a: b1 .. b9 take mid4_rc_kq128, b10 .. b31
     # (the upper small band) and b32 .. (the wave-fit range b32 .. b36 included) take hqsplit_tma3
-    for batch_size in (1, 4, 8, 16, 20):
+    for batch_size in (1, 4, 8, 9):
         assert rule(batch_size, "sm_107a") == mid4
-    for batch_size in (21, 22, 24, 28, 31):
+    for batch_size in (10, 11, 16, 20, 21, 22, 24, 28, 31):
         assert rule(batch_size, "sm_107a") == small_tma3
     for batch_size in (32, 33, 34, 35, 36, 37, 38, 63, 64, 65, 128, 512, 4096):
         assert rule(batch_size, "sm_107a") == tma3
@@ -1120,9 +1122,9 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
 def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
     arch,
 ) -> None:
-    # The K-major fp32-state T=1 rows run the `mid4_rc_kq128` twin on Rubin (sm_107a) below 21
+    # The K-major fp32-state T=1 rows run the `mid4_rc_kq128` twin on Rubin (sm_107a) below 10
     # batch rows (four CTAs per state head instead of eight) and the TMA-state
-    # `hqsplit_tma3` twin from 21 on (one CTA per state head): bitwise-identical output
+    # `hqsplit_tma3` twin from 10 on (one CTA per state head): bitwise-identical output
     # and state; the TMA-state twin takes the state as a tensor map (its record's tma_abi
     # is grid_constant).  The route id names the twin and the host takes the grid from the
     # resolved record, not from a fixed eight / one.
@@ -1130,6 +1132,8 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
         1,
         4,
         8,
+        9,
+        10,
         16,
         20,
         21,
@@ -1149,8 +1153,8 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
     ):
         route = _decode(arch=arch, layout="nontranspose", batch_size=batch_size)
         band = "small" if batch_size < 32 else "large"
-        mid4 = arch == "sm_107a" and batch_size < 21
-        tma3 = arch == "sm_107a" and batch_size >= 21
+        mid4 = arch == "sm_107a" and batch_size < 10
+        tma3 = arch == "sm_107a" and batch_size >= 10
         suffix = "_mid4_rc_kq128" if mid4 else "_hqsplit_tma3" if tma3 else ""
         assert (
             route.route_id
@@ -1185,9 +1189,9 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
             route.variant_name
         ) == (4 if mid4 else 1 if tma3 else 8 if band == "small" else 1)
     # the H4 / HV8 trace geometry ships a small record of its own and follows the rule;
-    # the TMA-state twin ships no H4 / HV8 record, so its upper small band (B 21 .. 31)
+    # the TMA-state twin ships no H4 / HV8 record, so its upper small band (B 10 .. 31)
     # keeps the small band's body (mid4_rc_kq128 on sm_107a)
-    for batch_size in (4, 20, 21, 24, 31):
+    for batch_size in (4, 9, 10, 20, 21, 24, 31):
         trace = _decode(
             arch=arch,
             layout="nontranspose",
@@ -1230,8 +1234,8 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
 @pytest.mark.cpu_only
 def test_tma_state_decode_records_spell_their_abi_and_encode_the_state_map() -> None:
     # The TMA-state decode records (sm_107a only) spell tma_abi grid_constant and launch
-    # through the TMA-state host template, which encodes the state's 4D tensor map on
-    # every call and opts in to the kernel's dynamic shared memory; every other decode
+    # through the TMA-state host template, which encodes the state's 4D tensor map (reused
+    # for the same state per host thread) and opts in to the kernel's dynamic shared memory; every other decode
     # record derives the pointer ABI.
     variants = cake_gdn._manifest()["variants"]
     tma = [
@@ -1249,12 +1253,16 @@ def test_tma_state_decode_records_spell_their_abi_and_encode_the_state_map() -> 
         assert host["params"]["DYNAMIC_SMEM_BYTES"] == 51328
         text = cake_gdn.render_cake_gdn_host_shim(record)
         assert "cuTensorMapEncodeTiled(" in text
+        # the encoded map is reused per host thread for the same (device, address, B,
+        # HV) and re-encoded on a miss
+        assert "thread_local StateTmaCacheEntry cache[kStateTmaCacheSlots]" in text
+        assert "StateTma4D(arg_state, (int)dev.device_id)" in text
         assert "CU_TENSOR_MAP_SWIZZLE_128B" in text
         assert "&p_state_tma," in text and "p_state =" not in text
         assert "CakeGDNSetMaxDynamicSmem(kernel, (int)dev.device_id, 51328," in text
         assert "kernel.Launch(kargs, grid, block, stream, 51328u)" in text
         # the kernel takes any batch (one CTA per state head): no batch floor in the
-        # shim, the rule routes the record from 21 rows on
+        # shim, the rule routes the record from 10 rows on
         assert "arg_q.size(0) > 0 && grid_y == 1" in text
     assert {record["specializations"]["SCALE"] for record in tma} == {128**-0.5, 1.0}
     for record in variants:
@@ -1835,12 +1843,13 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
     """Cake rule mirror (``gate_stream_flat_default``, exporter ``_prefill_plan``): the full-DV stateful bodies take
     their ``_gatestream_full`` twin on every architecture when a CTA owns at least two work tiles under the grid rule
     and the mean sequence length is at most 512 tokens; every other key stays on its base.  On sm_107a the seq twin
-    rule applies on top: the gate-stream twin's own ``_sm107a_i64meta`` twin (no sm_107a record is a base body)."""
+    rule applies on top: the gate-stream twin's own ``_sm107a_i64meta`` twin (no sm_107a record is a base body),
+    its prefetch twin ``_gatestream_full_pf`` where the launch grid gives some CTA a second tile."""
     base = "flashinfer_blackwell_gdn_prefill_initial"
     key = _HQ16_HV32_BF16_STATEFUL_32X256
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
         twin, specs, route = _requested_prefill_source(monkeypatch, arch=arch, **key)
-        seq_twin = "_sm107a_i64meta" if arch == "sm_107a" else ""
+        seq_twin = "_pf_sm107a_i64meta" if arch == "sm_107a" else ""
         assert twin == f"{base}_gatestream_full{seq_twin}", arch
         assert route == "flashinfer.gdn_prefill.noncp.full_dv"
         assert (
@@ -1886,9 +1895,16 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
             monkeypatch, arch="sm_103a", **{**key, **change}
         )
         assert attr == expected, (change, attr)
+    # The f16-I/O body asks for its twin as well (shipped on sm_107a only; elsewhere the real catalog has no twin
+    # record and the key runs its base, see test_f16io_keys_without_a_shipped_gate_stream_twin_keep_their_base).
+    attr, _, _ = _requested_prefill_source(
+        monkeypatch, arch="sm_100a", **{**key, "io_dtype": "float16"}
+    )
+    assert attr == f"{base}_f16io_gatestream_full", attr
     # Off: 8 x 1024 (256 tiles, two per CTA, but a 1024-token mean), 16 x 513 (mean above 512), 16 x 512 Hq4/Hv8
     # (128 tiles, one CTA per tile), 4 x 256 Hq4/Hv8 (DV-split: one CTA per tile; sm_100a takes the L2 twin), f16
-    # I/O and the stateless body (no gate-stream twin), indexed state (the ``_indexed`` body, no twin).
+    # I/O with long sequences, the stateless body (no gate-stream twin), indexed state (the ``_indexed`` body, no
+    # twin).
     for change, expected in (
         (dict(num_seqs=8, total_seq_len=8 * 1024, max_seq_len=1024), base),
         (dict(num_seqs=16, total_seq_len=16 * 513, max_seq_len=513), base),
@@ -1913,7 +1929,15 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
             ),
             "flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm100a_state_inp_late",
         ),
-        (dict(io_dtype="float16"), f"{base}_f16io"),
+        (
+            dict(
+                io_dtype="float16",
+                num_seqs=8,
+                total_seq_len=8 * 1024,
+                max_seq_len=1024,
+            ),
+            f"{base}_f16io",
+        ),
         (
             dict(use_initial_state=False, store_final_state=False),
             "flashinfer_blackwell_gdn_prefill",
@@ -1965,8 +1989,8 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
             "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full"
         ), twin
     # CC 10.7 ships the gate-stream twin for the TP4 key: its `i64meta` record (the sm_107a
-    # default body: the same schedule reading int32 or int64 metadata directly); the base
-    # record lists the other architectures only.
+    # default body: the same schedule reading int32 or int64 metadata directly), here its
+    # prefetch twin (1024 tiles on 212 CTAs); the base record lists the other architectures only.
     seven = _prefill(
         arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape
     )
@@ -1975,7 +1999,7 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
     assert seven.metadata_i64 is True and base.metadata_i64 is False
     seven_record = cake_gdn._kernel_record(seven.variant_name)
     assert seven_record["source_schedule"].endswith(
-        ":flashinfer_blackwell_gdn_prefill_initial_gatestream_full_sm107a_i64meta"
+        ":flashinfer_blackwell_gdn_prefill_initial_gatestream_full_pf_sm107a_i64meta"
     )
     assert seven_record["architectures"] == ["sm_107a"]
     assert seven_record["specializations"] == record["specializations"]

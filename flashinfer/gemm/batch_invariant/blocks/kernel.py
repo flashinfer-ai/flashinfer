@@ -1,10 +1,17 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """The kernel body: scaffolding (smem, pipelines, barriers, TMEM), the role dispatch and the composition of
-the blocks. ``BlockGemm`` is the bf16 body: the engine's fold in the mainloop, ``cvt.rn`` in the epilogue.
+the blocks. ``BlockGemm`` is the unscaled body (the engine's fold in the mainloop, ``cvt.rn`` in the epilogue; bf16
+inputs, or fp8 inputs storing the fp32 partials of the workspace split); ``ScaledBlockGemm`` the fp8 body with the
+per-tensor chain (``mul.rn alpha`` then ``cvt.rn``), ``alpha = mul.rn(a_scale, b_scale)`` formed once per CTA on the
+device from the two per-tensor scales.
+``BiasBlockGemm`` is the bf16 body with the biased chain (``add.rn bias`` of the output column's bias before the
+``cvt.rn``; ``spec.BIAS_NOTE``), which takes the (N,) bias as one more operand.
 """
 
 from __future__ import annotations
+
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -19,7 +26,9 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
 
+from ....batch_invariant.fp_interface.cute import CuteF32
 from ..generator import Knobs, MainloopBlock
+from ..spec import EpilogueChain
 from .epilogue import epilogue_loop
 from .mainloop import mma_loop
 from .operands import (
@@ -41,14 +50,27 @@ from .producer import tma_producer_loop
 class BlockGemm:
     """``C[m, n, l] = cvt(sum_k A[m, k, l] B[n, k, l])`` for the knobs; M, N, K (and L) dynamic. ``chunks > 1`` with
     ``knobs.cta_chunks``: the in-CTA chunk fold of the split class (A and B as the split class's ``(rows, Kc, C)`` views,
-    C with ``L = 1``; the chunk partials folded in order through the TMEM running sum)."""
+    C with ``L = 1``; the chunk partials folded in order through the TMEM running sum). ``in_fmt`` is the operand format
+    (``bf16`` / ``e4m3`` / ``e5m2``); the chain is the specification's object for the output format (unscaled and
+    unbiased here; the subclasses set ``scaled`` / ``biased``)."""
 
-    def __init__(self, knobs: Knobs, out_fmt: str, chunks: int = 1):
+    scaled = False
+    biased = False
+
+    def __init__(self, knobs: Knobs, in_fmt: str, out_fmt: str, chunks: int = 1):
         self.knobs = knobs
+        self.in_fmt = in_fmt
         self.chunks = chunks if knobs.cta_chunks else 1
         assert self.chunks == 1 or chunks > 1, (knobs, chunks)
         self.cluster_shape_mn = knobs.cluster_shape_mn
         self.out_fmt = out_fmt
+        # the chain is the spec's object; the epilogue block applies it (the fp32 ops, then the vector cvt)
+        self.chain = EpilogueChain.for_class(out_fmt, self.scaled, self.biased)
+        assert self.chain.scaled == self.scaled and self.chain.out_fmt == out_fmt
+        assert self.chain.biased == self.biased
+        assert not self.biased or out_fmt != "f32", (
+            "the split's partials are bias-free: the fixup adds the bias"
+        )
 
     @cute.jit
     def __call__(
@@ -59,10 +81,10 @@ class BlockGemm:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        self._launch(a, b, c, max_active_clusters, stream)
+        self._launch(a, b, c, max_active_clusters, stream, None, None, None)
 
     # host side (trace time)
-    def _launch(self, a, b, c, max_active_clusters, stream):
+    def _launch(self, a, b, c, max_active_clusters, stream, a_scale, b_scale, bias):
         if cutlass.const_expr(a.element_type != b.element_type):
             raise TypeError(
                 f"A and B must have one type: {a.element_type} != {b.element_type}"
@@ -76,12 +98,14 @@ class BlockGemm:
             LayoutEnum.from_tensor(b).mma_major_mode(),
             LayoutEnum.from_tensor(c),
             chunks=self.chunks,
+            in_fmt=self.in_fmt,
         )
         self.st = st
         assert OUT_DT[self.out_fmt] is c.element_type, (self.out_fmt, c.element_type)
-        assert a.element_type is IN_DT["bf16"], a.element_type
-        # the generator's mainloop block: its lowering is what mma_loop executes, and one smem stage holds exactly one block of it
-        self.block = MainloopBlock()
+        assert a.element_type is IN_DT[self.in_fmt], (self.in_fmt, a.element_type)
+        # the generator's mainloop block for this format: its lowering is what mma_loop executes, and one smem stage holds
+        # exactly one block of it
+        self.block = MainloopBlock(self.in_fmt)
         self.lowering = self.block.lowering()
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         tma = TmaSetup(st, a, b, c)
@@ -101,6 +125,9 @@ class BlockGemm:
             st.c_smem_layout_staged,
             st.epi_tile,
             params,
+            a_scale,
+            b_scale,
+            bias,
         ).launch(
             grid=grid,
             block=[THREADS, 1, 1],
@@ -125,9 +152,17 @@ class BlockGemm:
         c_smem_layout_staged,
         epi_tile: cute.Tile,
         tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
+        a_scale: Optional[cute.Tensor],
+        b_scale: Optional[cute.Tensor],
+        mBias: Optional[cute.Tensor],
     ):
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        alpha = None
+        if cutlass.const_expr(self.scaled):
+            alpha = CuteF32.mul(
+                a_scale[0], b_scale[0]
+            )  # the chain's alpha: one .rn multiply per CTA on the device
         if warp_idx == TMA_WARP:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -224,6 +259,16 @@ class BlockGemm:
         tCgA = thr_mma.partition_A(gA_mkl)
         tCgB = thr_mma.partition_B(gB_nkl)
         tCgC = thr_mma.partition_C(gC_mnl)
+        tCcC = None
+        if cutlass.const_expr(self.biased):
+            # the output coordinates, tiled and partitioned exactly like C: the epilogue reads the bias of each
+            # element's column through them (and skips the columns of a partial tile that the store clips)
+            cC_mnl = cute.local_tile(
+                cute.make_identity_tensor(mC_mnl.shape),
+                cute.slice_(st.mma_tiler, (None, None, 0)),
+                (None, None, None),
+            )
+            tCcC = thr_mma.partition_C(cC_mnl)
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
@@ -309,6 +354,7 @@ class BlockGemm:
             )
             epilogue_loop(
                 st,
+                self.chain,
                 atom_thr_size,
                 tidx,
                 warp_idx,
@@ -319,7 +365,49 @@ class BlockGemm:
                 tCgC,
                 epi_tile,
                 acc_pipeline,
+                alpha,
                 st.cta_chunks,
+                mBias,
+                tCcC,
             )
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+
+
+class ScaledBlockGemm(BlockGemm):
+    """``C = cvt(mul.rn(sum_k A B, mul.rn(a_scale, b_scale)))``: the fp8 classes' body; the scales are 1-element fp32
+    tensors."""
+
+    scaled = True
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        a_scale: cute.Tensor,
+        b_scale: cute.Tensor,
+    ):
+        self._launch(a, b, c, max_active_clusters, stream, a_scale, b_scale, None)
+
+
+class BiasBlockGemm(BlockGemm):
+    """``C = cvt(add(sum_k A B, bias[n]))``: the bf16 body with the biased chain; ``bias`` is the (N,) bf16 vector, read
+    in the epilogue (the unsplit class and the in-CTA chunk fold; the split's partial kernel never takes it)."""
+
+    biased = True
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        c: cute.Tensor,
+        bias: cute.Tensor,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        self._launch(a, b, c, max_active_clusters, stream, None, None, bias)

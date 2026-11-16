@@ -291,7 +291,7 @@ __device__ __forceinline__ void tma_4d_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -338,7 +338,7 @@ kernel_cake_vsa_balanced_058db78861db239ba714(const __grid_constant__ CUtensorMa
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_smem_addr = smem + 1024;
     __nv_bfloat16* kv_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -354,8 +354,7 @@ kernel_cake_vsa_balanced_058db78861db239ba714(const __grid_constant__ CUtensorMa
     unsigned int* hist_smem = reinterpret_cast<unsigned int*>(smem_raw + 232064);
     const int hist_smem_addr = smem + 232064;
 
-    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 27 barriers)
-    // Mbarriers at smem_raw[0..216)
+    // Mbarrier init (27 barriers at smem_raw[0..216))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -424,12 +423,12 @@ kernel_cake_vsa_balanced_058db78861db239ba714(const __grid_constant__ CUtensorMa
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_scores = taddr;
+    const unsigned int tmem_probabilities = taddr + 256;
+    const unsigned int tmem_output = taddr + 128;
 
     // Kernel post-init ops
-    const int tmem_scores = taddr;
-    const int tmem_probabilities = taddr + 256;
-    const int tmem_output = taddr + 128;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -1551,7 +1550,7 @@ kernel_cake_vsa_balanced_058db78861db239ba714(const __grid_constant__ CUtensorMa
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output), "r"(_mma_b_lo_2), "r"(tmem_probabilities), "r"(((first_pv) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output), "r"(_mma_b_lo_2), "r"(tmem_probabilities + 0), "r"(((first_pv) ? 0 : 1)) : "memory");
                     mbarrier_wait(p_lastsplit_addr, _phase_p_lastsplit_0);
                     _phase_p_lastsplit_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1584,7 +1583,7 @@ kernel_cake_vsa_balanced_058db78861db239ba714(const __grid_constant__ CUtensorMa
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output), "r"(_mma_b_lo_3), "r"(tmem_probabilities), "r"(1) : "memory");
+                    :: "r"(tmem_output), "r"(_mma_b_lo_3), "r"(tmem_probabilities + 0), "r"(1) : "memory");
                     first_pv = 0;
                     elect_commit(p_empty_addr);
                     elect_commit(kv_empty_addr + (kv_stage) * 8);
@@ -1625,7 +1624,7 @@ kernel_cake_vsa_balanced_058db78861db239ba714(const __grid_constant__ CUtensorMa
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output), "r"(_mma_b_lo_4), "r"(tmem_probabilities), "r"(((first_pv) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output), "r"(_mma_b_lo_4), "r"(tmem_probabilities + 0), "r"(((first_pv) ? 0 : 1)) : "memory");
                 mbarrier_wait(p_lastsplit_addr, _phase_p_lastsplit_0);
                 _phase_p_lastsplit_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1658,7 +1657,7 @@ kernel_cake_vsa_balanced_058db78861db239ba714(const __grid_constant__ CUtensorMa
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output), "r"(_mma_b_lo_5), "r"(tmem_probabilities), "r"(1) : "memory");
+                    :: "r"(tmem_output), "r"(_mma_b_lo_5), "r"(tmem_probabilities + 0), "r"(1) : "memory");
                 elect_commit2(o_full_addr, p_empty_addr);
                 elect_commit(kv_empty_addr + (kv_stage) * 8);
                 kv_stage += 1;

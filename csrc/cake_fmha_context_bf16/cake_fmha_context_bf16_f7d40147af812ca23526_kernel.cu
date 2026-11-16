@@ -377,7 +377,7 @@ __device__ __forceinline__ void tma_5d_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -423,7 +423,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* sScale = reinterpret_cast<float*>(smem_raw + 1024);
     const int sScale_addr = smem + 1024;
     __nv_bfloat16* smem_q0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
@@ -438,12 +438,13 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
     const int smem_pages_addr = smem + 200704;
     unsigned int* work_id_slot = reinterpret_cast<unsigned int*>(smem_raw + 201088);
     const int work_id_slot_addr = smem + 201088;
+
+    // Kernel setup ops
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory"); }
 
-    // Mbarrier init (16 pipeline groups, 0 ordered-sequence groups, 39 barriers)
-    // Mbarriers at smem_raw[0..312)
+    // Mbarrier init (39 barriers at smem_raw[0..312))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -524,15 +525,15 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_scores_0 = taddr;
+    const unsigned int tmem_softmax_0 = taddr + 64;
+    const unsigned int tmem_scores_1 = taddr + 128;
+    const unsigned int tmem_softmax_1 = taddr + 192;
+    const unsigned int tmem_output_0 = taddr + 256;
+    const unsigned int tmem_output_1 = taddr + 384;
 
     // Kernel post-init ops
-    const int tmem_scores_0 = taddr;
-    const int tmem_softmax_0 = taddr + 64;
-    const int tmem_scores_1 = taddr + 128;
-    const int tmem_softmax_1 = taddr + 192;
-    const int tmem_output_0 = taddr + 256;
-    const int tmem_output_1 = taddr + 384;
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
     }
@@ -569,12 +570,18 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 {
                     uint32_t rt_section = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx >> 3), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(tile_idx >> 3);
                     uint32_t rt_sw_m = (uint32_t)(tile_idx >> 3) - rt_section * (uint32_t)(m_blocks.divisor);
-                    if (rt_section >= full_sections) {
+                    if (rt_section >= (full_sections & 2147483647)) {
                         unsigned int rt_tail = tile_idx - rt_section * 8 * ((uint32_t)(m_blocks.divisor));
-                        uint32_t rt_tail_unit = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail);
-                        uint32_t rt_tail_m = (uint32_t)(rt_tail) - rt_tail_unit * (uint32_t)(m_blocks.divisor);
-                        m_block = rt_tail_m;
-                        bh = rt_section * 8 + rt_tail_unit;
+                        if (full_sections >> 31 != 0) {
+                            unsigned int rt_tail_n = (unsigned int)total_bh - rt_section * 8;
+                            m_block = rt_tail / rt_tail_n;
+                            bh = rt_section * 8 + rt_tail % rt_tail_n;
+                        } else {
+                            uint32_t rt_tail_unit = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail);
+                            uint32_t rt_tail_m = (uint32_t)(rt_tail) - rt_tail_unit * (uint32_t)(m_blocks.divisor);
+                            m_block = rt_tail_m;
+                            bh = rt_section * 8 + rt_tail_unit;
+                        }
                     } else {
                         m_block = rt_sw_m;
                         bh = rt_section * 8 + (tile_idx & 7);
@@ -1823,12 +1830,18 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 {
                     uint32_t rt_section_1 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_1 >> 3), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(tile_idx_1 >> 3);
                     uint32_t rt_sw_m_1 = (uint32_t)(tile_idx_1 >> 3) - rt_section_1 * (uint32_t)(m_blocks.divisor);
-                    if (rt_section_1 >= full_sections) {
+                    if (rt_section_1 >= (full_sections & 2147483647)) {
                         unsigned int rt_tail_1 = tile_idx_1 - rt_section_1 * 8 * ((uint32_t)(m_blocks.divisor));
-                        uint32_t rt_tail_unit_1 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_1), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_1);
-                        uint32_t rt_tail_m_1 = (uint32_t)(rt_tail_1) - rt_tail_unit_1 * (uint32_t)(m_blocks.divisor);
-                        m_block_1 = rt_tail_m_1;
-                        bh_1 = rt_section_1 * 8 + rt_tail_unit_1;
+                        if (full_sections >> 31 != 0) {
+                            unsigned int rt_tail_n_1 = (unsigned int)total_bh - rt_section_1 * 8;
+                            m_block_1 = rt_tail_1 / rt_tail_n_1;
+                            bh_1 = rt_section_1 * 8 + rt_tail_1 % rt_tail_n_1;
+                        } else {
+                            uint32_t rt_tail_unit_1 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_1), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_1);
+                            uint32_t rt_tail_m_1 = (uint32_t)(rt_tail_1) - rt_tail_unit_1 * (uint32_t)(m_blocks.divisor);
+                            m_block_1 = rt_tail_m_1;
+                            bh_1 = rt_section_1 * 8 + rt_tail_unit_1;
+                        }
                     } else {
                         m_block_1 = rt_sw_m_1;
                         bh_1 = rt_section_1 * 8 + (tile_idx_1 & 7);
@@ -1926,7 +1939,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 float final_max_1 = sScale[warp % 4 * 32 + lane + BLOCK_M + 4 * BLOCK_M];
                 mbarrier_arrive(corr_done_addr);
                 mbarrier_arrive(corr_done_addr + 8);
-                bool o_wide = ((unsigned long long)O_ptr & 31) == 0;
+                bool o_wide = ((unsigned long long)O_ptr & 31ull) == 0ull;
                 #pragma unroll
                 for (int stage_1 = 0; stage_1 < 2; stage_1++) {
                     if (stage_1 == 0) {
@@ -2050,7 +2063,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                                         o_bf16[_lp + 15] = *(uint32_t*)&_bf2;
                                     }
                                     asm volatile("st.global.L1::no_allocate.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(O_ptr + o_elem), "r"(o_bf16[(0) + 0]), "r"(o_bf16[(0) + 1]), "r"(o_bf16[(0) + 2]), "r"(o_bf16[(0) + 3]), "r"(o_bf16[(0) + 4]), "r"(o_bf16[(0) + 5]), "r"(o_bf16[(0) + 6]), "r"(o_bf16[(0) + 7]) : "memory");
-                                    asm volatile("st.global.L1::no_allocate.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(O_ptr + (o_elem + 16)), "r"(o_bf16[(8) + 0]), "r"(o_bf16[(8) + 1]), "r"(o_bf16[(8) + 2]), "r"(o_bf16[(8) + 3]), "r"(o_bf16[(8) + 4]), "r"(o_bf16[(8) + 5]), "r"(o_bf16[(8) + 6]), "r"(o_bf16[(8) + 7]) : "memory");
+                                    asm volatile("st.global.L1::no_allocate.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};" :: "l"(O_ptr + (o_elem + 16ll)), "r"(o_bf16[(8) + 0]), "r"(o_bf16[(8) + 1]), "r"(o_bf16[(8) + 2]), "r"(o_bf16[(8) + 3]), "r"(o_bf16[(8) + 4]), "r"(o_bf16[(8) + 5]), "r"(o_bf16[(8) + 6]), "r"(o_bf16[(8) + 7]) : "memory");
                                 } else {
                                     unsigned int o_bf16_1[16];
                                     #pragma unroll
@@ -2134,9 +2147,9 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                                         o_bf16_1[_lp + 15] = *(uint32_t*)&_bf2;
                                     }
                                     reinterpret_cast<int4*>(O_ptr + o_elem)[0] = reinterpret_cast<int4*>(o_bf16_1)[0];
-                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 8))[0] = reinterpret_cast<int4*>(o_bf16_1 + (4))[0];
-                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 16))[0] = reinterpret_cast<int4*>(o_bf16_1 + (8))[0];
-                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 24))[0] = reinterpret_cast<int4*>(o_bf16_1 + (12))[0];
+                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 8ll))[0] = reinterpret_cast<int4*>(o_bf16_1 + (4))[0];
+                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 16ll))[0] = reinterpret_cast<int4*>(o_bf16_1 + (8))[0];
+                                    reinterpret_cast<int4*>(O_ptr + (o_elem + 24ll))[0] = reinterpret_cast<int4*>(o_bf16_1 + (12))[0];
                                 }
                             }
                         }
@@ -2181,12 +2194,18 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 {
                     uint32_t rt_section_2 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_2 >> 3), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(tile_idx_2 >> 3);
                     uint32_t rt_sw_m_2 = (uint32_t)(tile_idx_2 >> 3) - rt_section_2 * (uint32_t)(m_blocks.divisor);
-                    if (rt_section_2 >= full_sections) {
+                    if (rt_section_2 >= (full_sections & 2147483647)) {
                         unsigned int rt_tail_2 = tile_idx_2 - rt_section_2 * 8 * ((uint32_t)(m_blocks.divisor));
-                        uint32_t rt_tail_unit_2 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_2), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_2);
-                        uint32_t rt_tail_m_2 = (uint32_t)(rt_tail_2) - rt_tail_unit_2 * (uint32_t)(m_blocks.divisor);
-                        m_block_2 = rt_tail_m_2;
-                        bh_2 = rt_section_2 * 8 + rt_tail_unit_2;
+                        if (full_sections >> 31 != 0) {
+                            unsigned int rt_tail_n_2 = (unsigned int)total_bh - rt_section_2 * 8;
+                            m_block_2 = rt_tail_2 / rt_tail_n_2;
+                            bh_2 = rt_section_2 * 8 + rt_tail_2 % rt_tail_n_2;
+                        } else {
+                            uint32_t rt_tail_unit_2 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_2), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_2);
+                            uint32_t rt_tail_m_2 = (uint32_t)(rt_tail_2) - rt_tail_unit_2 * (uint32_t)(m_blocks.divisor);
+                            m_block_2 = rt_tail_m_2;
+                            bh_2 = rt_section_2 * 8 + rt_tail_unit_2;
+                        }
                     } else {
                         m_block_2 = rt_sw_m_2;
                         bh_2 = rt_section_2 * 8 + (tile_idx_2 & 7);
@@ -2209,6 +2228,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 }
                 unsigned int _max_0_2 = ((num_n_blocks_2) > (1) ? (num_n_blocks_2) : (1));
                 num_n_blocks_2 = _max_0_2;
+                int v_valid = seqlen_kv_bh_2 - (int)(num_n_blocks_2 - 1) * BLOCK_N;
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
@@ -2308,6 +2328,20 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
                 mma_kv_stage += 1;
                 if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
+                if (v_valid < BLOCK_N) {
+                    mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, _phase_kv_full);
+                    unsigned int vz_stage = mma_kv_stage;
+                    uint32_t vz_lane;
+                    asm volatile("mov.u32 %0, %%laneid;" : "=r"(vz_lane));
+                    unsigned int vz_base = smem_kv_addr + vz_stage * 32768;
+                    #pragma unroll 1
+                    for (unsigned int vz_addr = vz_base + ((unsigned int)v_valid * 8 + vz_lane) * 16; vz_addr < vz_base + 16384; vz_addr += 512) {
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(vz_addr), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(vz_addr + 16384), "r"(0), "r"(0), "r"(0), "r"(0) : "memory");
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    __syncwarp();
+                }
                 unsigned int first_pv = 1;
                 #pragma unroll 1
                 for (unsigned int n_iter_3 = 0; n_iter_3 < num_n_blocks_2 - 1; n_iter_3++) {
@@ -2356,7 +2390,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(mma_b_lo_1), "r"(tmem_softmax_0), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_0), "r"(mma_b_lo_1), "r"(tmem_softmax_0 + 0), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
                     mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
                     _phase_p_full_2_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -2381,7 +2415,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(mma_b_lo_2), "r"(tmem_softmax_0), "r"(1) : "memory");
+                    :: "r"(tmem_output_0), "r"(mma_b_lo_2), "r"(tmem_softmax_0 + 0), "r"(1) : "memory");
                     mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, _phase_kv_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int k_stage = mma_kv_stage;
@@ -2470,7 +2504,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(mma_b_lo_4), "r"(tmem_softmax_1), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_1), "r"(mma_b_lo_4), "r"(tmem_softmax_1 + 0), "r"(((first_pv_flag) ? 0 : 1)) : "memory");
                     mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
                     _phase_p_full_2_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -2495,7 +2529,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(mma_b_lo_5), "r"(tmem_softmax_1), "r"(1) : "memory");
+                    :: "r"(tmem_output_1), "r"(mma_b_lo_5), "r"(tmem_softmax_1 + 0), "r"(1) : "memory");
                     elect_commit(kv_empty_addr + (((mma_kv_stage + 3 >= 4) ? mma_kv_stage + 3 - 4 : mma_kv_stage + 3)) * 8);
                     int mma_a_lo_2 = make_warp_uniform(((smem_q1_addr) >> 4) & 0x3FFF);
                     int mma_b_lo_6 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
@@ -2590,7 +2624,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(mma_b_lo_7), "r"(tmem_softmax_0), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_0), "r"(mma_b_lo_7), "r"(tmem_softmax_0 + 0), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
                 mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
                 _phase_p_full_2_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -2615,7 +2649,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_0), "r"(mma_b_lo_8), "r"(tmem_softmax_0), "r"(1) : "memory");
+                    :: "r"(tmem_output_0), "r"(mma_b_lo_8), "r"(tmem_softmax_0 + 0), "r"(1) : "memory");
                 elect_commit(o_full_addr);
                 mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
                 _phase_p_full_1 ^= 1;
@@ -2657,7 +2691,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(mma_b_lo_9), "r"(tmem_softmax_1), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
+                    :: "r"(tmem_output_1), "r"(mma_b_lo_9), "r"(tmem_softmax_1 + 0), "r"(((first_pv_flag_1) ? 0 : 1)) : "memory");
                 mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
                 _phase_p_full_2_1 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -2682,7 +2716,7 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_output_1), "r"(mma_b_lo_10), "r"(tmem_softmax_1), "r"(1) : "memory");
+                    :: "r"(tmem_output_1), "r"(mma_b_lo_10), "r"(tmem_softmax_1 + 0), "r"(1) : "memory");
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
                 mma_kv_stage += 1;
                 if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
@@ -2715,12 +2749,18 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 {
                     uint32_t rt_section_3 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_3 >> 3), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(tile_idx_3 >> 3);
                     uint32_t rt_sw_m_3 = (uint32_t)(tile_idx_3 >> 3) - rt_section_3 * (uint32_t)(m_blocks.divisor);
-                    if (rt_section_3 >= full_sections) {
+                    if (rt_section_3 >= (full_sections & 2147483647)) {
                         unsigned int rt_tail_3 = tile_idx_3 - rt_section_3 * 8 * ((uint32_t)(m_blocks.divisor));
-                        uint32_t rt_tail_unit_3 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_3), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_3);
-                        uint32_t rt_tail_m_3 = (uint32_t)(rt_tail_3) - rt_tail_unit_3 * (uint32_t)(m_blocks.divisor);
-                        m_block_3 = rt_tail_m_3;
-                        bh_3 = rt_section_3 * 8 + rt_tail_unit_3;
+                        if (full_sections >> 31 != 0) {
+                            unsigned int rt_tail_n_3 = (unsigned int)total_bh - rt_section_3 * 8;
+                            m_block_3 = rt_tail_3 / rt_tail_n_3;
+                            bh_3 = rt_section_3 * 8 + rt_tail_3 % rt_tail_n_3;
+                        } else {
+                            uint32_t rt_tail_unit_3 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_3), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_3);
+                            uint32_t rt_tail_m_3 = (uint32_t)(rt_tail_3) - rt_tail_unit_3 * (uint32_t)(m_blocks.divisor);
+                            m_block_3 = rt_tail_m_3;
+                            bh_3 = rt_section_3 * 8 + rt_tail_unit_3;
+                        }
                     } else {
                         m_block_3 = rt_sw_m_3;
                         bh_3 = rt_section_3 * 8 + (tile_idx_3 & 7);
@@ -2849,12 +2889,18 @@ kernel_cake_fmha_context_bf16_f7d40147af812ca23526(const __grid_constant__ CUten
                 {
                     uint32_t rt_section_4 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_4 >> 3), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(tile_idx_4 >> 3);
                     uint32_t rt_sw_m_4 = (uint32_t)(tile_idx_4 >> 3) - rt_section_4 * (uint32_t)(m_blocks.divisor);
-                    if (rt_section_4 >= full_sections) {
+                    if (rt_section_4 >= (full_sections & 2147483647)) {
                         unsigned int rt_tail_4 = tile_idx_4 - rt_section_4 * 8 * ((uint32_t)(m_blocks.divisor));
-                        uint32_t rt_tail_unit_4 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_4), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_4);
-                        uint32_t rt_tail_m_4 = (uint32_t)(rt_tail_4) - rt_tail_unit_4 * (uint32_t)(m_blocks.divisor);
-                        m_block_4 = rt_tail_m_4;
-                        bh_4 = rt_section_4 * 8 + rt_tail_unit_4;
+                        if (full_sections >> 31 != 0) {
+                            unsigned int rt_tail_n_4 = (unsigned int)total_bh - rt_section_4 * 8;
+                            m_block_4 = rt_tail_4 / rt_tail_n_4;
+                            bh_4 = rt_section_4 * 8 + rt_tail_4 % rt_tail_n_4;
+                        } else {
+                            uint32_t rt_tail_unit_4 = (m_blocks.divisor != 1) ? (__umulhi((uint32_t)(rt_tail_4), m_blocks.multiplier) >> m_blocks.shift_right) : (uint32_t)(rt_tail_4);
+                            uint32_t rt_tail_m_4 = (uint32_t)(rt_tail_4) - rt_tail_unit_4 * (uint32_t)(m_blocks.divisor);
+                            m_block_4 = rt_tail_m_4;
+                            bh_4 = rt_section_4 * 8 + rt_tail_unit_4;
+                        }
                     } else {
                         m_block_4 = rt_sw_m_4;
                         bh_4 = rt_section_4 * 8 + (tile_idx_4 & 7);

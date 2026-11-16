@@ -96,11 +96,18 @@ once at session construction.
 Both implementations synchronize before session construction returns. Each
 forward then uses exactly two kernels: the first publishes and dispatches BF16
 rows, executes FC1 and FC2, and returns one contribution per route; the second
-reduces the eight route contributions in a fixed order. The CUDA kernel stores
-each rank's routes into that rank's slot on every rank, and each BF16 row into
-that rank's slot on the ranks that own the row's experts, so dispatch reads rows
-and routes from local memory. Neither implementation allocates device storage in
-the forward path. CUDA Graph capture is not supported.
+reduces the eight route contributions in a fixed order. Both fused kernels
+store each rank's routes into that rank's slot on every rank, and each BF16 row
+into that rank's slot on the ranks that own the row's experts, so dispatch reads
+rows and routes from local memory. Both use the same workspace layout. The
+reducer waits until no route-term word it reads is all ones. The CUDA fused
+kernel sets its rank's route terms to all ones on the first forward, and the
+CUDA reducer sets the words it read back to all ones for the next forward. The
+CuTe-DSL fused kernel instead sets its rank's route terms to all ones on every
+forward, before its publication barrier, and the CuTe-DSL reducer leaves them
+as it read them. A session runs one implementation's fused kernel and reducer.
+Neither implementation allocates device storage in the forward path. CUDA Graph
+capture is not supported.
 Calls on one session must be serialized on a single CUDA stream. Recreate the
 session after 14,913,080 forwards (10,324,440 for both SM107 backends),
 before its signed grid-counter epoch would overflow.

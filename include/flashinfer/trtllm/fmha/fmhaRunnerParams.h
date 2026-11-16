@@ -203,6 +203,8 @@ struct TllmGenFmhaRunnerParams {
   TileScheduler mTileScheduler;
   // The multiCtasKvMode (i.e. multiBlockMode).
   bool mMultiCtasKvMode;
+  // Keep the initial grouped query tile instead of applying generation occupancy tuning.
+  bool mKeepGqaGenerationQueryTile;
 
   // Input QKV buffers.
   void const* qPtr;

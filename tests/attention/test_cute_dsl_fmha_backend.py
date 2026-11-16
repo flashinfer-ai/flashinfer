@@ -303,7 +303,8 @@ def _blockscaled_dequant(x_bshd, qk_mode):
 @pytest.mark.parametrize("qk_mode", ["mxfp8", "nvfp4"])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
+@pytest.mark.parametrize("p_exp_mode", ["exp2", "expcast"])
+def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype, p_exp_mode):
     """End-to-end block-scaled path: fused quantizer -> SF -> FMHA kernel."""
     from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
     from flashinfer.attention.cute_dsl.fmha_blockscaled import (
@@ -331,6 +332,7 @@ def test_blockscaled_quantize_and_prefill(qk_mode, causal, out_dtype):
         v_store,
         o,
         qk_mode=qk_mode,
+        p_exp_mode=p_exp_mode,
         is_causal=causal,
         sm_scale=sm,
         scale_q=q_scale,

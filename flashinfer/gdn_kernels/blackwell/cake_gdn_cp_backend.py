@@ -269,18 +269,68 @@ def _default_physical_chunk_len(
     )
 
 
-def _choose_sm107_fixup_kind(
-    num_parallel_states: int, num_sms: int, *, all_sequences_equal: bool
-) -> str:
-    """The sm_107a SIMT fixup build: 3 CTAs per SM for a grid of more than 2.
+# The sm_107a row-split fixup builds, by parallel-state count: (logical kernel,
+# row CTAs per state, CTAs per SM the grid must fit in, minimum CP chunks per
+# sequence).  A build gives each CTA 3, 5, 7, 8 or 10 state rows instead of 4
+# (43, 26, 19, 16 or 13 row CTAs per state); every element keeps its FMA
+# chain, so the outputs are bitwise those of the 4-row builds.
+_SM107_ROW_SPLIT_FIXUPS = {
+    4: ("state_fixup_simt_row3_sb2", 43, 1, 6),
+    8: ("state_fixup_simt_row3_sb2", 43, 2, 1),
+    14: ("state_fixup_simt_row5_mb3", 26, 2, 1),
+    16: ("state_fixup_simt_row5_mb3", 26, 2, 1),
+    22: ("state_fixup_simt_row7_sb2_mb3", 19, 2, 1),
+    24: ("state_fixup_simt_row8_sb2_mb3", 16, 2, 1),
+    26: ("state_fixup_simt_row8_mb3", 16, 2, 1),
+    32: ("state_fixup_simt_row10_sb2", 13, 2, 1),
+    36: ("state_fixup_simt_row8_sb2_mb3", 16, 3, 1),
+    48: ("state_fixup_simt_row10_mb3", 13, 3, 1),
+}
+_FIXUP_ROW_CTAS = {
+    "state_fixup_simt_row3_sb2": 43,
+    "state_fixup_simt_row4": 32,
+    "state_fixup_simt_row4_mb3": 32,
+    "state_fixup_simt_row5_mb3": 26,
+    "state_fixup_simt_row7_sb2_mb3": 19,
+    "state_fixup_simt_row8_mb3": 16,
+    "state_fixup_simt_row8_sb2_mb3": 16,
+    "state_fixup_simt_row10_mb3": 13,
+    "state_fixup_simt_row10_sb2": 13,
+    "state_fixup_utcmma64": 2,
+    "state_fixup_utcmma128": 1,
+}
 
-    The ``_mb3`` build (``__launch_bounds__(128, 3)``) computes the same
-    outputs bit for bit.  It is faster once the 32 row CTAs per (sequence,
-    head) exceed the 2 CTAs per SM of the default build, but only when every
-    sequence has the same number of CP chunks: unequal sequences leave the
-    longer ones' CTAs to finish alone, where the default build runs them
-    faster.  Equal lengths are the host-provable form of that condition.
+
+def _choose_sm107_fixup_kind(
+    num_parallel_states: int,
+    num_sms: int,
+    *,
+    all_sequences_equal: bool,
+    cp_chunks_per_seq: int,
+) -> str:
+    """The sm_107a SIMT fixup build.
+
+    Over sequences of one length with a parallel-state count of
+    ``_SM107_ROW_SPLIT_FIXUPS``, its row-split build when its grid fits the
+    listed CTAs per SM and each sequence has at least the listed CP chunks:
+    its grid fills the SMs evenly where the 32 row CTAs per state do not.
+
+    Otherwise the ``_mb3`` build (``__launch_bounds__(128, 3)``) once the 32
+    row CTAs per (sequence, head) exceed the 2 CTAs per SM of the default
+    build, but only when every sequence has the same number of CP chunks:
+    unequal sequences leave the longer ones' CTAs to finish alone, where the
+    default build runs them faster.  Equal lengths are the host-provable form
+    of that condition.  Every build computes the same outputs bit for bit.
     """
+    split = _SM107_ROW_SPLIT_FIXUPS.get(num_parallel_states)
+    if (
+        all_sequences_equal
+        and split is not None
+        and num_parallel_states * split[1] <= split[2] * num_sms
+        and cp_chunks_per_seq >= split[3]
+        and has_gdn_cp_kernel(split[0], "sm_107a")
+    ):
+        return split[0]
     rows = num_parallel_states * (_HEAD_DIM // 4)
     if (
         all_sequences_equal
@@ -439,12 +489,7 @@ class GDNCPPrefillPlan:
 
     @property
     def fixup_grid(self) -> tuple[int, int, int]:
-        row_ctas = {
-            "state_fixup_simt_row4": 32,
-            "state_fixup_simt_row4_mb3": 32,
-            "state_fixup_utcmma64": 2,
-            "state_fixup_utcmma128": 1,
-        }[self.fixup_kernel]
+        row_ctas = _FIXUP_ROW_CTAS[self.fixup_kernel]
         return (self.num_seqs * self.num_sab_heads * row_ctas, 1, 1)
 
 
@@ -656,6 +701,7 @@ def _build_plan(
                 num_seqs * num_sab_heads,
                 num_sms,
                 all_sequences_equal=all_sequences_equal,
+                cp_chunks_per_seq=_ceil_div(max_seqlen, cp_chunk_len),
             )
             if arch == "sm_107a"
             else "state_fixup_simt_row4"

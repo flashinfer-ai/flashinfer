@@ -76,7 +76,7 @@ ROW_TILES = (16, 32, 48)  # packed (token, head) rows per CTA
 WIDE_MIN_ROWS = 48
 WIDE_BLOCK_M = 128
 WIDE_CLUSTER = 2  # CTAs per cluster
-WIDE_LSE_BIAS = 6.0  # the wide kernel's P = 2^6 exp2(s - m) (uniform V shift; no lazy-ratchet slack in the bias)
+WIDE_LSE_BIAS = 6.0  # the wide kernel's P = 2^6 exp2(s - m) (per-token V shift compensated in P after the row sums; no lazy-ratchet slack in the bias)
 REDUCE_WARPS = 8  # warp reducer CTA: 256 threads
 REDUCE_CTA_MIN_SPLITS = 33  # above the warp reducer's lane-per-split range
 REDUCE_DIM_CHUNKS = 4  # CTA reducer: 128 latent dims per CTA

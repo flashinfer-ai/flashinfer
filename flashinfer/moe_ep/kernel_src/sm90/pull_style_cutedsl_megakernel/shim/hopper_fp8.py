@@ -46,6 +46,7 @@ from .comm import (
     resolve_gate_up_clamp,
     sym_zeros,
 )
+from .tuner import PULL_KNOB_DEFAULTS, validate_dispatch_pull
 
 _KIND_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.float8_e4m3fn,
@@ -74,6 +75,8 @@ _NONSWAP_TILE_M_CHOICES = (64,)
 _NONSWAP_TILE_N_CHOICES = (128, 256)
 _SWAPAB_TILE_M_CHOICES = (128, 256)
 _SWAPAB_TILE_N_CHOICES = (8, 16, 32, 64, 128)
+# Blockwise also takes N72/N80 with M=256: one task for an expert's 65-80 rows.
+_SWAPAB_BLOCKWISE_TILE_N_CHOICES = (8, 16, 32, 64, 72, 80, 128)
 
 # CGA shapes accepted by the drop's _validate_mma_tiler_and_cluster_shape
 # (both geometries).  Cluster K must stay 1; peers only cooperate through
@@ -178,6 +181,15 @@ class MegaMoEHopperFp8Config:
     # idle warps' slots otherwise cost 3 * hidden bytes of AB-stage SMEM per
     # CTA).  Output-invariant; False restores the 4-slot buffer for A/B.
     compact_pull_buffer: bool = True
+    # Dispatch-pull rows in flight per active dispatch warp (1 = the serial
+    # pull) and the per-pass rotation of the warp -> row assignment.
+    # Output-invariant tactic fields.  A batch > 1 keeps its rows in the idle
+    # slots of the 4-slot buffer (compact_pull_buffer=False) and needs
+    # epi_warps token-back without dedup_dispatch / grouped_token_back, with
+    # dispatch_pull_batch * active_dispatch_warps <= 4; rotation needs
+    # epi_warps token-back (see tuner.validate_dispatch_pull).
+    dispatch_pull_batch: int = 1
+    dispatch_pull_rotate: bool = False
     # FC1 store offload to the empty warp (S2G + fc1_done publish leave the
     # epilogue warps).  Self-gating: active only for non-swap non-ping-pong
     # kernels with register headroom for the store server; elsewhere it
@@ -358,11 +370,26 @@ class MegaMoEHopperFp8Config:
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
                 )
         if self.swap_ab:
-            if m not in _SWAPAB_TILE_M_CHOICES or n not in _SWAPAB_TILE_N_CHOICES:
+            n_choices = (
+                _SWAPAB_BLOCKWISE_TILE_N_CHOICES
+                if self.blockwise
+                else _SWAPAB_TILE_N_CHOICES
+            )
+            if m not in _SWAPAB_TILE_M_CHOICES or n not in n_choices:
                 raise ValueError(
                     "swap-AB Hopper FP8 requires mma_tiler M in "
-                    f"{_SWAPAB_TILE_M_CHOICES} and N in {_SWAPAB_TILE_N_CHOICES}; "
+                    f"{_SWAPAB_TILE_M_CHOICES} and N in {n_choices}; "
                     f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+                )
+            if n in (72, 80) and m != 256:
+                raise ValueError(
+                    "swap-AB Hopper FP8 token tiles N72/N80 require M=256; "
+                    f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+                )
+            if self.blockwise and n in (72, 80) and self.generate_c:
+                raise ValueError(
+                    "blockwise swap-AB Hopper FP8 token tiles N72/N80 require "
+                    "generate_c=False."
                 )
         else:
             if m not in _NONSWAP_TILE_M_CHOICES or n not in _NONSWAP_TILE_N_CHOICES:
@@ -409,6 +436,15 @@ class MegaMoEHopperFp8Config:
                 raise ValueError(
                     f"epi_flag_batch[{leg}] must be in [1, 32], got {val}."
                 )
+        validate_dispatch_pull(
+            compact_pull_buffer=self.compact_pull_buffer,
+            dispatch_pull_batch=self.dispatch_pull_batch,
+            dispatch_pull_rotate=self.dispatch_pull_rotate,
+            token_back_mode=self.resolved_token_back_mode,
+            dedup_dispatch=self.dedup_dispatch,
+            grouped_token_back=self.grouped_token_back,
+            active_dispatch_warps=self.active_dispatch_warps,
+        )
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -501,11 +537,17 @@ class MegaMoEHopperFp8Frontend:
     def apply_knobs(self, knobs: Optional[dict]) -> None:
         """Apply tuner knobs (see :mod:`.tuner`) to the session config.
 
+        The dispatch-pull fields are tactic fields: a knob dict that omits
+        them selects ``PULL_KNOB_DEFAULTS``, so a tactic never inherits the
+        previous tactic's pull buffer, batch or rotation.
+
         Invalidates the compile cache when the effective config changes; the
         next ``run()``/``warmup()`` recompiles.  Used by :mod:`.autotune`.
         """
         from .tuner import with_knobs
 
+        if knobs is not None:
+            knobs = {**PULL_KNOB_DEFAULTS, **knobs}
         new_config = with_knobs(self.config, knobs)
         if new_config == self._config:
             return
@@ -718,9 +760,13 @@ class MegaMoEHopperFp8Frontend:
             c.grouped_token_back,
             c.combine_format,
             c.active_dispatch_warps,
+            c.compact_pull_buffer,
+            c.dispatch_pull_batch,
+            c.dispatch_pull_rotate,
             c.fc1_store_offload,
             c.fc1_early_done_publish,
             c.fold_producer_warps,
+            c.generate_c,
             self._gate_up_clamp,
             c.enable_iket,
         )
@@ -806,7 +852,10 @@ class MegaMoEHopperFp8Frontend:
             use_2cta_instrs=c.use_2cta_instrs,
             group_hint=group_hint,
             token_padding_block=token_padding_block,
-            sf_padding_block=SfPaddingBlock,
+            # The activation-SF TMA addresses token tile t of an expert as
+            # (expert SF base + t * N) // N: pad each expert to a multiple of
+            # the token tile (128 for every power-of-two tile, as before).
+            sf_padding_block=_round_up(SfPaddingBlock, token_padding_block),
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=c.force_static_sched,
@@ -838,6 +887,8 @@ class MegaMoEHopperFp8Frontend:
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
             tail_split_pairs=c.tail_split_pairs,
+            dispatch_pull_batch=c.dispatch_pull_batch,
+            dispatch_pull_rotate=c.dispatch_pull_rotate,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1412,6 +1463,8 @@ def resolve_hopper_fp8_mega_moe_config(
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
     compact_pull_buffer: bool = True,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
@@ -1532,6 +1585,35 @@ def resolve_hopper_fp8_mega_moe_config(
         # silently switch it.
         knob_overrides.pop("grouped_token_back", None)
         knob_overrides.pop("combine_format", None)
+        # Dispatch pull: an explicit caller value wins over the tactic's.  When
+        # the caller's own layout rules out the tactic's batch or rotation
+        # (dispatch-side token-back, dedup_dispatch, more dispatch warps),
+        # the rest of the tactic applies with the serial, unrotated pull;
+        # the pull schedule never changes outputs.
+        if dispatch_pull_batch is not None:
+            knob_overrides.pop("dispatch_pull_batch", None)
+        if dispatch_pull_rotate is not None:
+            knob_overrides.pop("dispatch_pull_rotate", None)
+        if token_back_mode is not None:
+            caller_dispatch_token_back = token_back_mode != "epi_warps"
+        else:
+            caller_dispatch_token_back = token_back_by_dispatch
+        tactic_batch = knob_overrides.get("dispatch_pull_batch", 1)
+        if tactic_batch > 1 and (
+            caller_dispatch_token_back
+            or (dedup_dispatch and "dedup_dispatch" not in knob_overrides)
+            or (
+                "active_dispatch_warps" not in knob_overrides
+                and tactic_batch * active_dispatch_warps > 4
+            )
+        ):
+            knob_overrides["dispatch_pull_batch"] = 1
+        if caller_dispatch_token_back and knob_overrides.get("dispatch_pull_rotate"):
+            knob_overrides["dispatch_pull_rotate"] = False
+    if dispatch_pull_batch is not None and dispatch_pull_batch > 1:
+        # An explicit batch keeps its rows in the 4-slot pull buffer.
+        compact_pull_buffer = False
+        knob_overrides.pop("compact_pull_buffer", None)
 
     cfg = MegaMoEHopperFp8Config(
         rank=rank,
@@ -1557,6 +1639,8 @@ def resolve_hopper_fp8_mega_moe_config(
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=1,
+        dispatch_pull_rotate=False,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
@@ -1570,6 +1654,11 @@ def resolve_hopper_fp8_mega_moe_config(
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
     )
+    # Validate explicit pull settings together with the tactic's final layout.
+    if dispatch_pull_batch is not None:
+        knob_overrides["dispatch_pull_batch"] = dispatch_pull_batch
+    if dispatch_pull_rotate is not None:
+        knob_overrides["dispatch_pull_rotate"] = dispatch_pull_rotate
     if knob_overrides:
         # Non-geometry knobs from the cache/dict (token_back_mode,
         # load_balance_mode, flag_batch, epi_flag_batch, group_hint, ...).
@@ -1614,6 +1703,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
     compact_pull_buffer: bool = True,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
     fc1_store_offload: bool = True,
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
@@ -1649,6 +1740,10 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     a deprecated alias for ``gate_up_clamp``.
     ``intermediate`` is the post-SwiGLU width, matching the SM100 frontends
     and SGLang (the kernel's gate+up width is ``2 * intermediate``).
+    ``dispatch_pull_batch`` / ``dispatch_pull_rotate`` (output-invariant)
+    default to the resolved tactic's values, else the serial, unrotated pull;
+    an explicit value wins, and an explicit batch > 1 uses the 4-slot pull
+    buffer whatever ``compact_pull_buffer`` says.
 
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, weight_sf, activation_dequant_scale, weight_dequant_scale)``
@@ -1680,6 +1775,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=dispatch_pull_batch,
+        dispatch_pull_rotate=dispatch_pull_rotate,
         fc1_store_offload=fc1_store_offload,
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,

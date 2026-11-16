@@ -49,16 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_PREFIX_OFF 0
-#define SMEM_PREFIX_STAGE_BYTES 16384
-#define SMEM_PREFIX_STRIDE 16384
-#define SMEM_WARP_SUMS_OFF 16384
-#define SMEM_WARP_SUMS_STAGE_BYTES 128
-#define SMEM_WARP_SUMS_STRIDE 128
-#define SMEM_TOTAL 16512
-#define THREADS 1024
-
 #include <math_constants.h>
 
 extern "C" {
@@ -79,7 +69,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_2870f0f230889249addf(int* __restrict
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* prefix = reinterpret_cast<int*>(smem_raw + 0);
     const int prefix_addr = smem + 0;
     int* warp_sums = reinterpret_cast<int*>(smem_raw + 16384);
@@ -131,14 +121,14 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_2870f0f230889249addf(int* __restrict
     int sentinel = batch_size * num_next_n_atoms;
     int slots = dyn_slots * num_sms;
     int walk_rows = num_sms + slots;
-    long long per_item = (long long)dyn_seg * 100;
-    long long want = ((long long)total * (long long)dyn_pct + per_item - 1) / per_item;
-    long long cap = ((long long)total + (long long)dyn_seg - 1) / (long long)dyn_seg;
+    long long per_item = (long long)dyn_seg * 100ll;
+    long long want = ((long long)total * (long long)dyn_pct + per_item - 1ll) / per_item;
+    long long cap = ((long long)total + (long long)dyn_seg - 1ll) / (long long)dyn_seg;
     long long _min_2 = (((long long)slots) < (want) ? ((long long)slots) : (want));
     long long _min_1 = ((_min_2) < (cap) ? (_min_2) : (cap));
-    long long _max_0 = ((0) > (_min_1) ? (0) : (_min_1));
+    long long _max_0 = ((0ll) > (_min_1) ? (0ll) : (_min_1));
     int n = (int)_max_0;
-    long long _max_3 = ((0) > ((long long)total - (long long)n * (long long)dyn_seg) ? (0) : ((long long)total - (long long)n * (long long)dyn_seg));
+    long long _max_3 = ((0ll) > ((long long)total - (long long)n * (long long)dyn_seg) ? (0ll) : ((long long)total - (long long)n * (long long)dyn_seg));
     int static_segs = (int)_max_3;
     int qd = static_segs / num_sms;
     int rd = static_segs % num_sms;
@@ -176,11 +166,11 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_2870f0f230889249addf(int* __restrict
             q_atom_idx = q_idx * num_next_n_atoms + atom_idx;
             kv_split_idx = ((num_segs_q > 0) ? offset_in_q % num_segs_q : 0);
         }
-        *(reinterpret_cast<int*>(schedule_meta + (row * 2)) + (0)) = q_atom_idx;
+        *(reinterpret_cast<int*>(schedule_meta + row * 2) + (0)) = q_atom_idx;
         *(reinterpret_cast<int*>(schedule_meta + (row * 2 + 1)) + (0)) = kv_split_idx;
     }
     if (tid_1 == 0) {
-        *(reinterpret_cast<int*>(schedule_meta + (walk_rows * 2)) + (0)) = sentinel;
+        *(reinterpret_cast<int*>(schedule_meta + walk_rows * 2) + (0)) = sentinel;
         *(reinterpret_cast<int*>(schedule_meta + (walk_rows * 2 + 1)) + (0)) = 0;
         *(reinterpret_cast<int*>(schedule_meta + (walk_rows * 2 + 2)) + (0)) = 0;
         *(reinterpret_cast<int*>(schedule_meta + (walk_rows * 2 + 3)) + (0)) = n;

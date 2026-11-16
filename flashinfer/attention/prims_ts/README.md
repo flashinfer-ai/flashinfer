@@ -72,7 +72,12 @@ by planning with `initialize_workspace=False`.
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
 capture. Zero caller-owned FMHA scratch before its first trusted standalone
 launch and re-zero it when workspace-layout inputs change; wrappers
-initialize control storage by default. Scratch and output must not
+initialize control storage by default. Alternatively, FMHA plans for one
+device may share one buffer of at least the largest size returned for them:
+zero the whole buffer once, bind the same full tensor to every plan (not
+slices), and plan and launch them on one stream. FMHA may use any byte of the
+passed buffer; its control state sits at the buffer end and launches leave it
+zero. Scratch and output must not
 overlap any live input or each other; each concurrent launch/graph needs its
 own scratch. Warm up the exact topology before capture, retain stable storage,
 and update metadata only between completed replays. Validation is enabled by
@@ -259,6 +264,13 @@ kernel. Nonpositive KV lengths mark inactive requests; positive lengths must
 cover all query tokens. Packed Q and arbitrary mappings continue to accept
 explicit per-token metadata.
 
+After a successful validated `run()`, `run(..., validate=False)` skips repeated
+host tensor-metadata checks. Preserve shapes, strides, dtypes, devices and
+alignment; K/V and `qo_indptr` must retain their prepared storage. Other input
+and output tensors may use replacement storage with the same ABI, and device
+contents remain live during graph replay. Scale overrides are still validated.
+Run with the default `validate=True` after `plan()` or any binding change.
+
 Packed Q uses a bounded `[D, Hq, total_q_tokens]` TensorMap. Per-route masks
 handle tiles crossing a request boundary, and the physical token extent
 bounds the final tile. FP8 queries need no extra tail allocation or staging copy.
@@ -280,7 +292,7 @@ no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
 
-Eligible prepared FP8 G2–G8/page-4 Keeps routes store query-oriented membership
+Eligible prepared G2–G8/page-4 Keeps routes store query-oriented membership
 words internally, with eight query slots and complete tail tiles reserved in
 the workspace. Unused slots and tail bits are zero. Standalone metadata outputs
 retain four membership bytes per Int32 word; the public plan/run API is unchanged.
@@ -302,7 +314,22 @@ Equal Q/K/V D192 uses the same sparse dtype contract, with native
 head-dimension staging. FP8 uses 128-wide K/V stages; Q staging rounds to
 256 elements internally, with the last 64 supplied by TMA zero fill. The D192
 BF16/FP8 paths and bounded packed-Q loads are additionally tested on GB300/SM103
-with CUDA graphs and allocation-boundary checks. Decode's
+with CUDA graphs and allocation-boundary checks.
+
+D256 also accepts packed NVFP4 K/V (`torch.uint8`) with BF16 or FP8 E4M3 Q
+and BF16 output, in two layouts: interleaved rows `[pages, Hkv, page_size,
+D/2 + D/16]` (each token's E2M1 payload, then its E4M3 block scales), or
+`[.., D/2]` payloads with `kv_scale_factors=(K_SF, V_SF)` (decode's
+`PagedKVScaleFactors`). Q's dtype selects the MMA: BF16 Q runs exact BF16
+operands, FP8 Q runs FP8 MMA on K/V rounded to E4M3. NVFP4 is a transform-KV
+storage dtype: a task converts it into Q's dtype, in TMEM for the SwapsMmaAb
+recipe (BF16 Q with interleaved rows needs a CUDA 13.2+ toolkit) or into SMEM
+K/V tiles for the KeepsMmaAb recipe, one D256 stage per KV128 tile. The shared
+sparse policy takes Keeps for BF16 Q, for groups of more than 32 Q rows per KV
+head and for FP8-Q groups of G >= 5. Its
+raw ring loads four interleaved page fragments per TMA gather4 copy from flat
+compact caches, and one tiled copy per fragment otherwise (including separate
+scale tensors and strided views). Decode's
 native logical HND cache views can use strided NHD/interleaved physical storage.
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
@@ -323,8 +350,10 @@ The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
-Metadata releases at entry so the attention prologue can overlap it; the
-attention dependency wait still covers all metadata stores.
+Each metadata CTA releases attention after its last output store, so the
+attention prologue overlaps the metadata tail without leaving attention CTAs
+resident for the whole metadata grid; the attention dependency wait covers all
+metadata stores.
 Attention initializes its independent resources before acquiring immediately
 ahead of the first metadata-dependent read. Split-KV attention releases its
 reducer only after producer completion and TMEM teardown; the reducer
@@ -751,8 +780,8 @@ whenever supplied to an enabled plan, even if the return flag is false.
 LSE excludes output scaling and removes internal FP8 probability amplification.
 Keep output and LSE buffers disjoint from live inputs and workspace.
 Sparse MLA retains its existing `return_lse` contract: natural-log QK LSE
-before the attention-sink contribution. Its scale arguments also accept scalar
-CUDA FP32 tensors, while dense wrappers use host scalar scale operands.
+before the attention-sink contribution. Global scale operands follow the same
+float-or-device contract across dense and sparse attention.
 
 Context and dense FMHA decode plans additionally support
 `use_attention_sinks=True`, binding `attention_sinks` on every run. This FP32
@@ -770,13 +799,69 @@ Dense context, FMHA decode and MLA decode use `softmax_scale` / `output_scale`.
 Where applicable, their public interfaces use `q_dtype` / `k_dtype` / `v_dtype` /
 `kv_dtype` / `out_dtype`, `packed_query`, `num_qo_heads`, `seq_lens_kv`, and
 `max_kv_len`. Sparse MLA uses `attention_sinks` and `use_attention_sinks`.
-The QK scale is in natural-exponential units; context converts it to base two
-internally. Context planning sets defaults that `run()` may override. Context
-and FMHA decode default to `1 / sqrt(D)`; MLA retains its default of 1.
-Context scales are host FP32 scalar operands; device scale tensors are not
-supported. Captured graphs retain the scalar values used during capture;
-changing them requires recapture. Scalar values are validated on the host and do not specialize JIT. Packed NVFP4 block
-scales remain a separate input contract.
+
+### Global scale operands
+
+Each global scale independently accepts a positive finite Python number or a
+contiguous CUDA FP32 tensor of shape `()` or `(1,)` on the attention device. Tensor
+contents must be positive and finite; metadata validation never reads those
+contents back to the host. Callers maintain that value contract. QK scales use
+natural-exponential units for both types; conversion to base two is internal.
+
+| Public family | Global operands |
+| --- | --- |
+| Contiguous and paged context | `softmax_scale`, `output_scale` |
+| Paged decode, including prepared and one-shot execution | `softmax_scale`, `output_scale` |
+| QToken-KV-block sparse attention | `sm_scale`, `v_scale` |
+| Contiguous and paged block-sparse attention | `sm_scale`, `output_scale` |
+| Dense MLA | `softmax_scale`, `output_scale` |
+| Sparse MLA | `softmax_scale`, `output_scale`; `kv_cache_scale` for a per-tensor FP8 primary pool |
+
+Pass defaults to `plan()` (or the prepared-plan constructor). Their types select
+the kernel argument signature independently: float/float, float/tensor,
+tensor/float, and tensor/tensor. `run()` with `None` inherits the corresponding
+planned operand; an override must keep that operand's planned type. One-shot
+calls infer types directly from the supplied operands. Replan to change a type.
+Only types specialize compiled code: values and tensor addresses are runtime
+arguments, excluded from compilation keys. Warm up the required signature before
+CUDA graph capture.
+
+Context, FMHA decode, and block-sparse attention default their QK multiplier to
+`1 / sqrt(D)`; dense MLA defaults to 1, and sparse MLA to `1 / sqrt(query_width)`.
+Output multipliers and sparse storage descales default to 1. The output multiplier
+scales the complete attention result, including any restored Sage V mean, and
+never changes LSE. Structured Sage/VC block and channel scales, NVFP4 block
+scales, and the fused MLA output-quantization buffer `out_scale` remain separate
+contracts.
+
+For dynamic per-tensor FP8 inputs, GPU preparation can write
+`attention_scale * q_descale * k_descale` and `v_descale` into the global scale
+buffers. Attention consumes them in stream order without a device-to-host
+readback. Float operands remain runtime FP32 kernel parameters; their numeric
+values are not compiled into the kernel.
+
+A captured graph retains float values and device-buffer addresses from capture.
+Update tensor contents in place before replay, while keeping their storage alive
+and avoiding concurrent writes during attention. Replacing a tensor object or
+changing a Python float only affects later eager launches or new captures; it
+does not update an existing graph. The plan retains references to its default
+scale tensors; callers retain any tensors supplied as run-time overrides.
+
+```python
+# Continue from a planned decode configuration, selecting only a device V scale.
+v_descale = torch.ones(1, dtype=torch.float32, device=device)
+wrapper.plan(
+    device, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
+    max_kv_len, max_q_len=max_q_len, q_dtype=dtype, packed_query=True,
+    mask_type="causal", workspace_buffer=workspace,
+    softmax_scale=head_dim**-0.5, output_scale=v_descale,
+)
+# The attention run inherits v_descale. A preceding GPU quantizer can update
+# its contents for each input, including inside the captured graph.
+out = wrapper.run(
+    q, (k_cache, v_cache), seq_lens_kv, block_tables, qo_indptr=qo_indptr,
+)
+```
 
 ### Runtime split-KV policy
 
@@ -788,9 +873,10 @@ No count, ceiling, or count tensor is exposed to users. Reduction selection chec
 cluster residency with the rounded capacity and falls back to the standalone
 reducer when that physical cluster grid no longer fits one resident wave.
 
-Producers and reducers receive typed runtime counts. Scratch strides and
-cluster/barrier participation retain prepared capacity; inactive slots/ranks
-contribute neutral state and preserve teardown. Count changes within a capacity
+Producers and reducers receive typed runtime counts. FMHA compact GMEM
+partials are packed by the runtime fanout; capacity only bounds it. Other
+scratch strides and cluster/barrier participation retain prepared capacity;
+inactive slots/ranks contribute neutral state and preserve teardown. Count changes within a capacity
 reuse the compiled callables, including reduction. Static internal kernel
 recipes remain available for comparison.
 

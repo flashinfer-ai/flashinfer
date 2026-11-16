@@ -31,6 +31,14 @@ from .gemm_base import (
     group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .gemm_bf16_fp8 import mm_bf16_fp8 as mm_bf16_fp8
+from .gemm_bf16_fp8 import (
+    mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes,
+)
+from .gemm_bf16_fp8 import mm_fp16_fp8 as mm_fp16_fp8
+from .gemm_bf16_fp8 import (
+    mm_fp16_fp8_workspace_bytes as mm_fp16_fp8_workspace_bytes,
+)
 from .cake_grouped_fp8_gemm import (
     PreparedGroupGemmFp8NtGroupwiseContiguous as PreparedGroupGemmFp8NtGroupwiseContiguous,
 )
@@ -271,6 +279,10 @@ __all__ = (
         "prepare_activations",
         "prepare_weight_pack",
         "supported_backends",
+        "mm_bf16_fp8",
+        "mm_bf16_fp8_workspace_bytes",
+        "mm_fp16_fp8",
+        "mm_fp16_fp8_workspace_bytes",
     ]
     + _cute_dsl_kernels
     + _cuda_tile_kernels

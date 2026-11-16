@@ -24,7 +24,7 @@ from flashinfer.comm.ulysses_topology import (
     probe_ulysses_rank_topology,
     resolve_ulysses_backend,
 )
-from tests.test_helpers.ulysses import forbid_ipc_and_jit, full_mesh
+from tests.comm.test_helpers.ulysses import forbid_ipc_and_jit, full_mesh
 
 
 def _pcie_mesh(rank_order=None, world_size=8):
