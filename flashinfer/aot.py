@@ -207,6 +207,7 @@ from .jit.cake_vsa_sm120 import (
 )
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
+from .jit.fp8_kv_widen import gen_fp8_kv_widen_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
     gen_rmsnorm_silu_module,
@@ -1181,6 +1182,7 @@ def gen_all_modules(
         jit_specs += [
             gen_api_log_stats_module(),
             gen_cascade_module(),
+            gen_fp8_kv_widen_module(),
             gen_mhc_module(),
             gen_norm_module(),
             gen_page_module(),
