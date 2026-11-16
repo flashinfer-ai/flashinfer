@@ -101,8 +101,10 @@ def _check_inputs(q, k, v, g, beta) -> Tuple[int, int]:
         )
     if HV != H:
         raise unsupported(CLASS, f"GQA with H={H}, HV={HV}", "HV == H")
-    if HV & (HV - 1) or HV == 0:
-        raise unsupported(CLASS, f"{HV} heads", "a power-of-two head count")
+    if HV % 8 and HV > 14:
+        raise unsupported(
+            CLASS, f"{HV} heads", "a multiple of 8 heads, or at most 14 heads"
+        )
     return H, HV
 
 

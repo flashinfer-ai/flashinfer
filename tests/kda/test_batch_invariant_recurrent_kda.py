@@ -34,7 +34,7 @@ D = 128
 L = 4096
 SEED = 1234
 LB = -5.0
-HEADS = [16, 32]
+HEADS = [int(x) for x in os.environ.get("FLASHINFER_KDA_BI_HEADS", "16,32").split(",")]
 GATES = {
     "steep": 0.0,
     "long": -6.0,
@@ -843,7 +843,6 @@ def test_unsupported_inputs_raise_and_nothing_runs():
         full = {**_fused(p), **base, "cu_seqlens": cu, **kw}
         with pytest.raises(BatchInvariantUnsupportedError):
             recurrent_kda(*args, **full)
-    g16 = make_seq(8, 16, SEED + 2, 0.0)
     with pytest.raises(BatchInvariantUnsupportedError):  # GQA
         recurrent_kda(
             torch.cat([tok["q"], tok["q"]], 1)[None],
@@ -855,19 +854,21 @@ def test_unsupported_inputs_raise_and_nothing_runs():
             **_fused(p),
             **base,
         )
-    with pytest.raises(BatchInvariantUnsupportedError):  # 12 heads
-        t12 = {key: g16[key][:1, :12] for key in ("q", "k", "v", "g", "beta")}
+    with pytest.raises(BatchInvariantUnsupportedError):  # 20 heads
+        g20 = make_seq(8, 20, SEED + 3, 0.0)
+        p20 = params(20)
+        t20 = {key: g20[key][:1] for key in ("q", "k", "v", "g", "beta")}
         recurrent_kda(
-            t12["q"][None],
-            t12["k"][None],
-            t12["v"][None],
-            t12["g"][None],
-            t12["beta"][None],
-            initial_state=pool[:, :12].contiguous(),
+            t20["q"][None],
+            t20["k"][None],
+            t20["v"][None],
+            t20["g"][None],
+            t20["beta"][None],
+            initial_state=new_pool([g20], [0]),
             batch_invariant=True,
             cu_seqlens=cu,
-            A_log=p["A_log"][:12],
-            dt_bias=p["dt_bias"][:12],
+            A_log=p20["A_log"],
+            dt_bias=p20["dt_bias"],
             lower_bound=LB,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
@@ -884,3 +885,46 @@ def test_unsupported_inputs_raise_and_nothing_runs():
         bi_pool.pool_key(pool) not in bi_pool._POOLS
         or bi_pool._POOLS[bi_pool.pool_key(pool)][0].cnt.sum().item() == 0
     )
+
+
+def _heads(s, p, a, b):
+    """Heads ``[a, b)`` of a sequence and of its parameters, as a sequence of ``b - a`` heads."""
+    seq = {key: s[key][:, a:b].contiguous() for key in ("q", "k", "v", "g", "beta")}
+    seq["s0"] = s["s0"][a:b].contiguous()
+    par = dict(
+        A_log=p["A_log"][a:b].contiguous(),
+        dt_bias=p["dt_bias"][a:b].contiguous(),
+        lower_bound=p["lower_bound"],
+    )
+    return seq, par
+
+
+def _prefill_and_decode(s, p, n0, stop):
+    pool = new_pool([s], [1])
+    rows0 = bi_prefill([sub(s, 0, n0)], pool, [1], p)
+    rows = decode_all(s, pool, 1, p, n0, stop)
+    return torch.cat([rows0, rows], 0), pool[1].clone()
+
+
+@needs_device
+@pytest.mark.parametrize("h", [6, 12, 24, 48, 96])
+@pytest.mark.parametrize("n0", [1, 23, 200])
+def test_rows_do_not_depend_on_the_head_count(h, n0):
+    """A head's rows and state in a call of ``h`` heads are its rows and state in a call of 16 heads."""
+    wide = max(h, 16)
+    stop = 264
+    p = params(wide)
+    s = make_seq(stop, wide, SEED + 900 + h + n0, GATES["steep"])
+    if h >= 16:
+        got, state = _prefill_and_decode(s, p, n0, stop)
+        assert torch.equal(got, one_shot(s, p)[0])
+        for a in sorted({*range(0, h - 15, 16), h - 16}):
+            ref, ref_state = _prefill_and_decode(*_heads(s, p, a, a + 16), n0, stop)
+            assert torch.equal(got[:, a : a + 16], ref)
+            assert torch.equal(state[a : a + 16], ref_state)
+    else:
+        ref, ref_state = _prefill_and_decode(s, p, n0, stop)
+        got, state = _prefill_and_decode(*_heads(s, p, 0, h), n0, stop)
+        assert torch.equal(got, ref[:, :h])
+        assert torch.equal(state, ref_state[:h])
+    _check_hash(f"head_count_h{h}_n{n0}", got)
