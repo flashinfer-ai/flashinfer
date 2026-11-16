@@ -46,7 +46,6 @@ from flashinfer.attention.prims_ts import (
 )
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
-    build_context_task_manager,
     build_fmha_task_manager,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
@@ -822,7 +821,6 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "uniform_packed_lengths",
         "has_q_offset",
         "paged_v_tail_is_zero",
-        "store_softmax_stats",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -840,7 +838,6 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "max_q_len",
         "max_kv_len",
         "out",
-        "softmax_stats",
         "lse",
         "return_lse",
         "attention_sinks",
@@ -853,8 +850,6 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert plan_parameters["uniform_packed_lengths"].default is False
     assert plan_parameters["has_q_offset"].default is True
     assert plan_parameters["paged_v_tail_is_zero"].default is False
-    assert plan_parameters["store_softmax_stats"].default is False
-    assert run_parameters["softmax_stats"].default is None
     assert not hasattr(BatchPrefillPagedTSWrapper, "plan_live")
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
@@ -909,7 +904,6 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "v_dtype",
         "out_dtype",
         "packed_query",
-        "store_softmax_stats",
         "mask_type",
         "window_left",
         "softmax_scale",
@@ -939,7 +933,6 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "max_q_len",
         "max_kv_len",
         "out",
-        "softmax_stats",
         "lse",
         "return_lse",
         "attention_sinks",
@@ -950,9 +943,6 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "validate",
     )
     assert plan_parameters["head_dim_vo"].default is None
-    assert plan_parameters["store_softmax_stats"].default is False
-    assert run_parameters["softmax_stats"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert run_parameters["softmax_stats"].default is None
     assert plan_parameters["sage"].default is None
     assert run_parameters["sage"].default is None
     assert run_parameters["qo_indptr"].default is None
@@ -1073,8 +1063,6 @@ def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> N
         "output_scale": 1.0,
         "out_dtype": None,
         "out": None,
-        "store_softmax_stats": False,
-        "softmax_stats": None,
         "lse": None,
         "return_lse": False,
         "attention_sinks": None,
@@ -1125,10 +1113,8 @@ def test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture(
         )
 
 
-@pytest.mark.parametrize("store_softmax_stats", [False, True])
 def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     monkeypatch,
-    store_softmax_stats,
 ) -> None:
     """The convenience API preserves caller-owned fixed metadata tensors."""
 
@@ -1181,7 +1167,6 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     block_tables = torch.tensor(((3, 1, -1), (7, 0, 2)), dtype=torch.int32)
     seq_lens_kv = torch.tensor((33, 65), dtype=torch.int32)
     out = torch.empty_like(q)
-    stats = torch.empty((*q.shape[:-1], 2)) if store_softmax_stats else None
 
     returned = batch_prefill_with_paged_kv_cache(
         q,
@@ -1191,8 +1176,6 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         block_tables,
         seq_lens_kv,
         out=out,
-        store_softmax_stats=store_softmax_stats,
-        softmax_stats=stats,
     )
 
     assert returned is out
@@ -1205,7 +1188,6 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert calls["plan"]["uniform_packed_lengths"] is False
     assert calls["plan"]["has_q_offset"] is False
     assert calls["plan"]["paged_v_tail_is_zero"] is False
-    assert calls["plan"]["store_softmax_stats"] is store_softmax_stats
     assert "max_num_pages_per_seq_kv" not in calls["plan"]
     run_args, run_kwargs = calls["run"]
     assert run_args[3] is qo_indptr
@@ -1215,7 +1197,6 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         "max_q_len",
         "max_kv_len",
         "out",
-        "softmax_stats",
         "lse",
         "return_lse",
         "attention_sinks",
@@ -1224,7 +1205,6 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert run_kwargs["return_lse"] is False
     assert run_kwargs["attention_sinks"] is None
     assert run_kwargs["out"] is out
-    assert run_kwargs["softmax_stats"] is stats
 
 
 def _enable_paged_one_shot_cpu_validation(monkeypatch) -> None:
@@ -1247,30 +1227,6 @@ def _enable_paged_one_shot_cpu_validation(monkeypatch) -> None:
     monkeypatch.setattr(
         context_module, "_validate_paged_runtime_inputs", lambda *_a, **_k: None
     )
-
-
-@pytest.mark.parametrize(
-    "skip,threshold,expected",
-    [(False, None, 0.0), (True, None, 8.0), (True, 0.0, 0.0), (False, 2.0, 2.0)],
-)
-def test_attention_ts_context_correction_and_anchor_policies_are_independent(
-    skip, threshold, expected
-):
-    kernel = FmhaTs(enable_skip_correction=skip, corr_skip_threshold_log2=threshold)
-    assert kernel.cfg.enable_skip_correction is skip
-    assert kernel.cfg.corr_skip_threshold_log2 == expected
-    if expected > 0:
-        # Both low-level builders must reject lazy anchors before constructing
-        # resources, including callers bypassing the outer plan/run API.
-        for builder in (build_fmha_task_manager, build_context_task_manager):
-            arguments = {
-                name: None
-                for name, parameter in inspect.signature(builder).parameters.items()
-                if parameter.default is inspect.Parameter.empty
-            }
-            arguments.update(cfg=kernel.cfg, num_kv_tiles=2, softmax_stats=object())
-            with pytest.raises(ValueError, match="corr_skip_threshold_log2=0"):
-                builder(**arguments)
 
 
 def test_attention_ts_context_paged_one_shot_validates_fixed_table(
@@ -1429,11 +1385,7 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
         geometry=SimpleNamespace(
-            packed_query=False,
-            mask_type="dense",
-            vc=None,
-            qk_dtype=torch.bfloat16,
-            store_softmax_stats=False,
+            packed_query=False, mask_type="dense", vc=None, qk_dtype=torch.bfloat16
         ),
         softmax_scale=torch.empty(1),
         output_scale=torch.empty(1),
@@ -1522,7 +1474,6 @@ def _validate_paged_metadata_on_cpu(
         mask_type="causal",
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
-        store_softmax_stats=False,
     )
     compact_block_tables = torch.tensor(block_tables, dtype=torch.int32)
     if row_stride_extra:
@@ -5196,20 +5147,20 @@ def test_attention_ts_context_mla_chunk_merge(heads):
             k_dtype=dtype,
             out_dtype=torch.bfloat16,
             mask_type=mask,
-            store_softmax_stats=True,
+            lse_mode="base2",
         )
-        stats = torch.empty((*q.shape[:-1], 2), device="cuda")
+        stats = torch.empty(q.shape[:-1], device="cuda")
         out = wrapper.run(
             q,
             k[0, start:end].unsqueeze(0),
             v[0, start:end].unsqueeze(0),
-            softmax_stats=stats,
+            lse=stats,
         )
         pieces.append((out.float(), stats))
     (o0, s0), (o1, s1) = pieces
-    maximum = torch.maximum(s0[..., 0], s1[..., 0])
-    w0 = s0[..., 1] * (s0[..., 0] - maximum).exp()
-    w1 = s1[..., 1] * (s1[..., 0] - maximum).exp()
+    maximum = torch.maximum(s0, s1)
+    w0 = (s0 - maximum).exp2()
+    w1 = (s1 - maximum).exp2()
     merged = (o0 * w0[..., None] + o1 * w1[..., None]) / (w0 + w1)[..., None]
     scores = torch.einsum("bqhd,bkhd->bqhk", q.float(), k.float()) / math.sqrt(192)
     mask = torch.arange(385, device="cuda")[None, :] > (
@@ -5220,138 +5171,6 @@ def test_attention_ts_context_mla_chunk_merge(heads):
     torch.testing.assert_close(merged, expected, atol=0.01, rtol=0.02)
     relative_rms = (merged - expected).square().mean() / expected.square().mean()
     assert relative_rms.sqrt() < 0.01
-
-
-@_REQUIRES_CONTEXT_STATS_GPU
-def test_attention_ts_context_mla_exact_stats_merge():
-    """BF16 prefill and FP8 MLA must agree on the original-scale maximum."""
-    from flashinfer.attention.prims_ts import BatchMLADecodePagedTSWrapper
-
-    heads, length, scale = 96, 128, 0.37
-    q = torch.zeros(1, 1, heads, 192, device="cuda", dtype=torch.bfloat16)
-    k = torch.zeros(1, length, heads, 192, device="cuda", dtype=q.dtype)
-    v = torch.ones(1, length, heads, 128, device="cuda", dtype=q.dtype)
-    q[..., 0] = k[..., 0] = 4096
-    context = BatchPrefillTSWrapper()
-    context.plan(
-        device="cuda",
-        batch_size=1,
-        max_q_len=1,
-        max_kv_len=length,
-        num_qo_heads=heads,
-        num_kv_heads=heads,
-        head_dim=192,
-        head_dim_vo=128,
-        q_dtype=q.dtype,
-        k_dtype=k.dtype,
-        mask_type="dense",
-        store_softmax_stats=True,
-        softmax_scale=scale,
-    )
-    context_stats = torch.empty(1, 1, heads, 2, device="cuda")
-    context_out = context.run(q, k, v, softmax_stats=context_stats)
-
-    query = torch.zeros(1, 1, heads, 576, device="cuda", dtype=_FP8)
-    cache = torch.zeros(1, length, 576, device="cuda", dtype=_FP8)
-    query[..., :256] = cache[..., :256] = 256
-    query[..., 512], cache[..., 512] = 1, 2
-    pages = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
-    lengths = torch.full((1,), length, device="cuda", dtype=torch.int32)
-    mla = BatchMLADecodePagedTSWrapper()
-    mla.plan(
-        device="cuda",
-        batch_size=1,
-        num_qo_heads=heads,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        page_size=length,
-        max_q_len=1,
-        max_kv_len=length,
-        q_dtype=_FP8,
-        kv_dtype=_FP8,
-        packed_query=False,
-        out_dtype=torch.bfloat16,
-        mask_type="dense",
-        store_softmax_stats=True,
-        softmax_scale=scale,
-    )
-    mla_stats = torch.empty_like(context_stats)
-    mla_out = mla.run(query, cache, pages, lengths, softmax_stats=mla_stats)
-    maxima = (
-        torch.tensor([2**24, 2**24 + 2], device="cuda", dtype=torch.float32) * scale
-    )
-    for stats, maximum in ((context_stats, maxima[0]), (mla_stats, maxima[1])):
-        torch.testing.assert_close(
-            stats[..., 0], maximum.expand_as(stats[..., 0]), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            stats[..., 1], torch.full_like(stats[..., 1], length), rtol=1e-6, atol=1e-4
-        )
-    torch.testing.assert_close(
-        context_out, torch.ones_like(context_out), rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        mla_out[..., 0], torch.full_like(mla_out[..., 0], 256), rtol=0, atol=0
-    )
-    weight = (context_stats[..., 0] - mla_stats[..., 0]).exp()
-    merged = (context_out[..., 0].float() * weight + mla_out[..., 0].float()) / (
-        weight + 1
-    )
-    expected = ((maxima[0] - maxima[1]).exp() + 256) / (
-        (maxima[0] - maxima[1]).exp() + 1
-    )
-    torch.testing.assert_close(merged, expected.expand_as(merged), rtol=0, atol=1e-6)
-
-
-@_REQUIRES_CONTEXT_STATS_GPU
-def test_attention_ts_context_stats_tracks_small_maximum_increases():
-    dtype = torch.bfloat16
-    q = torch.zeros((1, 1, 6, 192), device="cuda", dtype=dtype)
-    k = torch.zeros((1, 256, 6, 192), device="cuda", dtype=dtype)
-    v = torch.zeros((1, 256, 6, 128), device="cuda", dtype=dtype)
-    q[..., 0] = 1
-    k[:, 128:, :, 0] = 1
-    v[:, 128:, :, :] = 1
-    wrapper = BatchPrefillTSWrapper()
-    wrapper.plan(
-        device=q.device,
-        batch_size=1,
-        max_q_len=1,
-        max_kv_len=256,
-        num_qo_heads=6,
-        num_kv_heads=6,
-        head_dim=192,
-        head_dim_vo=128,
-        q_dtype=dtype,
-        k_dtype=dtype,
-        out_dtype=torch.bfloat16,
-        mask_type="dense",
-        softmax_scale=1.0,
-        store_softmax_stats=True,
-        lse_mode="base2",
-    )
-    args = (q, k, v)
-    stats = torch.empty((*q.shape[:-1], 2), device="cuda")
-    lse = torch.empty(q.shape[:-1], device="cuda")
-    out = wrapper.run(*args, softmax_stats=stats, lse=lse)
-    torch.testing.assert_close(
-        stats[..., 0], torch.ones_like(stats[..., 0]), rtol=2e-5, atol=2e-5
-    )
-    torch.testing.assert_close(
-        stats[..., 1],
-        torch.full_like(stats[..., 1], 128 * (1 + math.exp(-1))),
-        rtol=2e-5,
-        atol=2e-5,
-    )
-    torch.testing.assert_close(
-        lse, torch.full_like(lse, math.log2(128 * (1 + math.e))), rtol=2e-5, atol=2e-5
-    )
-    torch.testing.assert_close(
-        out.float(),
-        torch.full_like(out.float(), 1 / (1 + math.exp(-1))),
-        rtol=0.02,
-        atol=0.02,
-    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])

@@ -42,7 +42,7 @@ the backend column indicates which kernel the API wraps.
 
 from functools import lru_cache
 import math
-from typing import Dict, Union, cast
+from typing import Dict, Union
 
 import torch
 
@@ -1308,28 +1308,6 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
     return isinstance(kwargs.get(cache_param), torch.Tensor), out_dtype, q_mode
 
 
-# fi_trace retains builders by template identity, so repeated traces must reuse
-# their templates, including each supported encoded fragment size.
-def _with_prims_ts_softmax_stats(
-    template: TraceTemplate, *, enabled: bool, one_shot: bool = False
-) -> TraceTemplate:
-    """Add the caller-owned statistics output only to enabled specializations."""
-    if enabled:
-        template.name_prefix += "_softmax_stats"
-        template.axes["softmax_stats_width"] = Const(abbrev="", value=2)
-        template.axes["store_softmax_stats"] = Const(abbrev="", value=1)
-        output = cast(Tensor, template.outputs["output"])
-        template.outputs["softmax_stats"] = Tensor(
-            [*output.dim_names[:-1], "softmax_stats_width"],
-            dtype="float32",
-            param="softmax_stats",
-            description="Scaled natural-log token maximum and unscaled denominator.",
-        )
-        if one_shot:
-            template.inputs["store_softmax_stats"] = Scalar("bool")
-    return template
-
-
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
     *,
@@ -1337,7 +1315,6 @@ def _make_attention_ts_decode_trace(
     out_dtype: str | None,
     q_mode: str,
     encoded_page_size: int = 0,
-    store_softmax_stats: bool = False,
 ):
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
@@ -1466,9 +1443,7 @@ def _make_attention_ts_decode_trace(
         constraints=constraints,
         tags=["stage:decode", "backend:prims-ts", "status:experimental"],
     )
-    return _with_prims_ts_softmax_stats(
-        template, enabled=store_softmax_stats, one_shot=True
-    )
+    return template
 
 
 # Representative native/encoded layouts suffice for discovery. Other supported
@@ -1484,7 +1459,6 @@ _ATTENTION_TS_DECODE_TRACES = {
         out_dtype=out_dtype,
         q_mode=q_mode,
         encoded_page_size=encoded_page_size,
-        store_softmax_stats=False,
     )
     for combined in (False, True)
     for out_dtype in (None, "float16", "bfloat16")
@@ -1504,7 +1478,6 @@ def attention_ts_decode_trace_dispatch(**kwargs):
         out_dtype=out_dtype,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
-        store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
     )
     return _prims_ts_scale_trace(base, kwargs)
 
@@ -1528,7 +1501,6 @@ def _make_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
-    store_softmax_stats: bool = False,
 ):
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
@@ -1719,7 +1691,7 @@ def _make_prims_ts_decode_wrapper_trace(
             f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}",
         ],
     )
-    return _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats)
+    return template
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1769,7 +1741,6 @@ def _get_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
-    store_softmax_stats: bool = False,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen FMHA plan identity."""
 
@@ -1786,7 +1757,6 @@ def _get_prims_ts_decode_wrapper_trace(
         plan_owns_seq_lens=plan_owns_seq_lens,
         encoded_page_size=encoded_page_size,
         split_kv=split_kv,
-        store_softmax_stats=store_softmax_stats,
     )
 
 
@@ -1873,9 +1843,6 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         encoded_page_size=encoded_page_size,
         # Preserve caller permission, not whether this shape actually splits.
         split_kv=bool(dict(getattr(state, "policy", ())).get("split_kv_allowed", True)),
-        store_softmax_stats=bool(
-            getattr(getattr(state, "config", None), "store_softmax_stats", False)
-        ),
     )
     return _prims_ts_scale_trace(base, kwargs, bound=True)
 
@@ -1928,7 +1895,7 @@ def _with_prims_ts_mla_kv_bounds(
         template.tags.append("mask:kv_prefix")
         template.description += " Explicit kv_bounds replaces dense/causal visibility."
         template.description += (
-            " Zero prefixes produce zero output and, when requested, softmax stats (-inf, 0)."
+            " Zero prefixes produce zero output and, when requested, base-2 LSE -inf."
             if zero_empty_rows
             else " Empty-row results are unspecified; initialize them or exclude them from merging."
         )
@@ -1940,7 +1907,6 @@ def _make_prims_ts_decode_mla_one_shot_trace(
     *,
     rank4_cache: bool,
     packed_query: bool,
-    store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
     zero_empty_rows: bool = True,
 ):
@@ -2025,9 +1991,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(
         tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
     return _with_prims_ts_mla_kv_bounds(
-        _with_prims_ts_softmax_stats(
-            template, enabled=store_softmax_stats, one_shot=True
-        ),
+        template,
         enabled=use_kv_bounds,
         packed_query=packed_query,
         zero_empty_rows=zero_empty_rows,
@@ -2039,7 +2003,6 @@ _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
     (rank4_cache, packed_query): _make_prims_ts_decode_mla_one_shot_trace(
         rank4_cache=rank4_cache,
         packed_query=packed_query,
-        store_softmax_stats=False,
         use_kv_bounds=False,
         zero_empty_rows=True,
     )
@@ -2053,7 +2016,6 @@ def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
     base = _make_prims_ts_decode_mla_one_shot_trace(
         rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         packed_query=kwargs.get("qo_indptr") is not None,
-        store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
         use_kv_bounds=kwargs.get("kv_bounds") is not None,
         zero_empty_rows=(
             bool(kwargs.get("zero_empty_rows", True))
@@ -2079,7 +2041,6 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
-    store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
     zero_empty_rows: bool = True,
 ):
@@ -2231,7 +2192,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         ],
     )
     return _with_prims_ts_mla_kv_bounds(
-        _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats),
+        template,
         enabled=use_kv_bounds,
         packed_query=packed_query,
         zero_empty_rows=zero_empty_rows,
@@ -2268,7 +2229,6 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
-    store_softmax_stats: bool = False,
     use_kv_bounds: bool = False,
     zero_empty_rows: bool = True,
 ) -> TraceTemplate:
@@ -2283,7 +2243,6 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
-        store_softmax_stats=store_softmax_stats,
         use_kv_bounds=use_kv_bounds,
         zero_empty_rows=zero_empty_rows,
     )
@@ -2328,7 +2287,6 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         softmax_rescale_threshold_log2=float(
             getattr(state, "softmax_rescale_threshold_log2", 0.0)
         ),
-        store_softmax_stats=bool(getattr(state, "store_softmax_stats", False)),
         use_kv_bounds=use_kv_bounds,
         zero_empty_rows=(
             bool(getattr(state, "zero_empty_rows", True)) if use_kv_bounds else True

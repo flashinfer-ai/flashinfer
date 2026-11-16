@@ -1662,11 +1662,8 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
         "kv_cache": torch.empty((2, 1, 128, 576), dtype=torch.float8_e4m3fn),
         "block_tables": torch.tensor(((-1, -1), (0, 1)), dtype=torch.int32),
         "seq_lens_kv": torch.tensor((0, 65), dtype=torch.int32),
-        "softmax_stats": torch.empty((*query.shape[:-1], 2)),
     }
-    default_template = prims_ts_decode_mla_one_shot_trace_dispatch(
-        **{name: value for name, value in kwargs.items() if name != "softmax_stats"}
-    )
+    default_template = prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs)
     assert any(
         default_template is registered
         for registered in prims_ts_decode_mla_one_shot_trace_dispatch.templates
@@ -1683,7 +1680,6 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
         max_kv_len=128,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
-        store_softmax_stats=True,
         use_kv_bounds=False,
     )
     ordinary = fi_trace(wrapper.run, **kwargs)
@@ -1702,7 +1698,7 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
     assert "mask:causal" not in bounded["tags"]
     assert "kv_bounds" not in ordinary["inputs"]
 
-    one_shot_kwargs = {**kwargs, "store_softmax_stats": True}
+    one_shot_kwargs = dict(kwargs)
     ordinary_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs)
     bounded_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
         **one_shot_kwargs, kv_bounds=bounds
@@ -1743,9 +1739,7 @@ def test_prims_ts_mla_kv_bounds_trace_contract() -> None:
     # Ignored flags must not break canonical template identity without bounds.
     assert (
         prims_ts_decode_mla_one_shot_trace_dispatch(
-            **{
-                name: value for name, value in kwargs.items() if name != "softmax_stats"
-            },
+            **kwargs,
             zero_empty_rows=False,
         )
         is default_template

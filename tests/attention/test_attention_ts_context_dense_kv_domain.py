@@ -39,8 +39,7 @@ def _reference(q, k, v, k_lengths, scale):
     for nq, nk in zip(_Q_LENGTHS, k_lengths, strict=True):
         if nk == 0:
             output = torch.zeros(nq, _HEADS, 128, device=q.device)
-            stats = torch.zeros(nq, _HEADS, 2, device=q.device)
-            stats[..., 0] = -torch.inf
+            stats = torch.full((nq, _HEADS), -torch.inf, device=q.device)
         else:
             scores = (
                 torch.einsum(
@@ -50,9 +49,7 @@ def _reference(q, k, v, k_lengths, scale):
                 )
                 * scale
             )
-            maximum = scores.amax(-1)
-            denominator = (scores - maximum[..., None]).exp().sum(-1)
-            stats = torch.stack((maximum, denominator), -1)
+            stats = scores.logsumexp(-1)
             output = (
                 torch.einsum(
                     "qhk,khd->qhd",
@@ -87,18 +84,16 @@ def _check(output, stats, expected, expected_stats, k_lengths) -> None:
             assert error / norm < 0.02
         if nk == 0:
             assert (actual == 0).all()
-            assert torch.isneginf(stats[begin : begin + nq, :, 0]).all()
-            assert (stats[begin : begin + nq, :, 1] == 0).all()
+            assert torch.isneginf(stats[begin : begin + nq]).all()
         else:
             state, reference = (
                 stats[begin : begin + nq],
                 expected_stats[begin : begin + nq],
             )
-            assert torch.isfinite(state).all() and (state[..., 1] > 0).all()
-            torch.testing.assert_close(state, reference, atol=0.002, rtol=0.002)
+            assert torch.isfinite(state).all()
             torch.testing.assert_close(
-                state[..., 0] + state[..., 1].log(),
-                reference[..., 0] + reference[..., 1].log(),
+                state * math.log(2),
+                reference,
                 atol=0.002,
                 rtol=0.002,
             )
@@ -147,7 +142,7 @@ def test_runtime_dense_kv_domain_graph_replay() -> None:
         device="cuda",
         dtype=dtype,
     )
-    stats = torch.empty(sum(_Q_LENGTHS), _HEADS, 2, device="cuda")
+    stats = torch.empty(sum(_Q_LENGTHS), _HEADS, device="cuda")
     scale = 0.75 / math.sqrt(head_dim)
     wrapper = BatchPrefillTSWrapper()
     wrapper.plan(
@@ -165,7 +160,7 @@ def test_runtime_dense_kv_domain_graph_replay() -> None:
         out_dtype=output.dtype,
         packed_query=True,
         mask_type="dense",
-        store_softmax_stats=True,
+        lse_mode="base2",
         softmax_scale=scale,
         output_scale=0.625,
     )
@@ -176,9 +171,7 @@ def test_runtime_dense_kv_domain_graph_replay() -> None:
     assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
     def run(validate=False):
-        return wrapper.run(
-            q, k, v, qo, ko, out=output, softmax_stats=stats, validate=validate
-        )
+        return wrapper.run(q, k, v, qo, ko, out=output, lse=stats, validate=validate)
 
     run(validate=True)
     torch.cuda.synchronize()

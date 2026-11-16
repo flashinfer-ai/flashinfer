@@ -11,11 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native Prims-TS MLA per-query local-KV prefix bounds and merge statistics."""
+"""Native Prims-TS MLA per-query local-KV prefix bounds and merge-compatible LSE."""
 
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 
 import pytest
 import torch
@@ -80,7 +81,6 @@ def _plan_bounds(
     max_q_len: int,
     packed_query: bool = False,
     use_kv_bounds: bool = True,
-    store_softmax_stats: bool = True,
     zero_empty_rows: bool = True,
 ) -> BatchMLADecodePagedTSWrapper:
     wrapper = BatchMLADecodePagedTSWrapper()
@@ -99,7 +99,7 @@ def _plan_bounds(
         out_dtype=case.out_dtype,
         mask_type=case.mask_type,
         use_kv_bounds=use_kv_bounds,
-        store_softmax_stats=store_softmax_stats,
+        lse_mode="base2",
         zero_empty_rows=zero_empty_rows,
     )
     assert wrapper._plan_state is not None
@@ -124,7 +124,7 @@ def _run_bounds(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if stats is None:
         stats = torch.full(
-            (*case.query.shape[:-1], 2),
+            case.query.shape[:-1],
             float("nan"),
             dtype=torch.float32,
             device=case.query.device,
@@ -139,7 +139,7 @@ def _run_bounds(
         softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
         out=out,
-        softmax_stats=stats,
+        lse=stats,
         validate=validate,
     )
     return output, stats
@@ -154,16 +154,15 @@ def _bounded_reference(
     policy: dict[str, object] | None = None,
     bf16_single_tile: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute FP32 stats and model the selected low-precision PV operands."""
+    """Compute base-2 LSE and model the selected low-precision PV operands."""
 
     query = case.query.reshape(-1, case.query.shape[-2], case.query.shape[-1])
     output = torch.zeros(
         (*query.shape[:-1], _LATENT_DIM), dtype=torch.float32, device=query.device
     )
-    stats = torch.zeros(
-        (*query.shape[:-1], 2), dtype=torch.float32, device=query.device
+    stats = torch.full(
+        query.shape[:-1], -torch.inf, dtype=torch.float32, device=query.device
     )
-    stats[..., 0] = -torch.inf
     offsets = (
         qo_indptr.tolist()
         if qo_indptr is not None
@@ -210,11 +209,10 @@ def _bounded_reference(
                     / denominator[:, None]
                     * case.output_scale
                 )
-            stats[query_idx, :, 0] = maximum
-            stats[query_idx, :, 1] = denominator
+            stats[query_idx] = logits.logsumexp(-1) / math.log(2)
     return (
         output.reshape(*case.query.shape[:-1], _LATENT_DIM),
-        stats.reshape(*case.query.shape[:-1], 2),
+        stats.reshape(case.query.shape[:-1]),
     )
 
 
@@ -238,11 +236,11 @@ def _assert_output_reference(
 def _merge_reference(
     output: torch.Tensor, stats: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    maximum = stats[..., 0].max(dim=0).values
-    mass = torch.exp(stats[..., 0] - maximum) * stats[..., 1]
+    maximum = stats.max(dim=0).values
+    mass = torch.exp2(stats - maximum)
     denominator = mass.sum(dim=0)
     merged = (output.float() * mass[..., None]).sum(dim=0) / denominator[..., None]
-    return merged, torch.stack((maximum, denominator), dim=-1)
+    return merged, maximum + denominator.log2()
 
 
 def _assert_bounded_result(
@@ -276,10 +274,9 @@ def _assert_bounded_result(
     torch.testing.assert_close(stats, expected_stats, rtol=2e-3, atol=2e-4)
     empty = bounds == 0
     flat_output = output.reshape(-1, output.shape[-2], _LATENT_DIM)
-    flat_stats = stats.reshape(-1, stats.shape[-2], 2)
+    flat_stats = stats.reshape(-1, stats.shape[-1])
     assert torch.count_nonzero(flat_output[empty]) == 0
-    assert torch.isneginf(flat_stats[empty, :, 0]).all()
-    assert torch.count_nonzero(flat_stats[empty, :, 1]) == 0
+    assert torch.isneginf(flat_stats[empty]).all()
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -302,7 +299,7 @@ def test_attention_ts_mla_kv_bounds_split_reduction() -> None:
 
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_kv_bounds_helix_page_boundary() -> None:
-    """BF16 PV rounding on short local prefixes must not corrupt merge statistics."""
+    """BF16 PV rounding on short local prefixes must not corrupt LSE merging."""
 
     case = _make_bounded_case(
         seq_len_q=6, kv_lengths=(64, 5, 0), qkv_dtype=torch.bfloat16
@@ -332,7 +329,7 @@ def test_attention_ts_mla_kv_bounds_helix_page_boundary() -> None:
             / denominator[:, None]
             * case.output_scale
         )
-        expected_stats.append(torch.stack((maximum, denominator), dim=-1))
+        expected_stats.append(logits.logsumexp(-1) / math.log(2))
     # Keep an independent mathematical-attention gate for the merged output.
     rtol, atol = _mla_tolerances(case.query.dtype)
     torch.testing.assert_close(merged, torch.stack(expected_rows), rtol=rtol, atol=atol)
@@ -415,7 +412,7 @@ def test_attention_ts_mla_kv_bounds_cp8_page128(first_position: int) -> None:
         expected_rows.append(
             weights @ visible[:, :_LATENT_DIM] / row_sum[:, None] * case.output_scale
         )
-        expected_stats.append(torch.stack((row_maximum, row_sum), dim=-1))
+        expected_stats.append(logits.logsumexp(-1) / math.log(2))
     _assert_output_reference(
         merged, quantized_merged, torch.stack(expected_rows), dtype=qkv_dtype
     )
@@ -531,8 +528,8 @@ def _exercise_bounds_graph(
             atol=0,
         )
         torch.testing.assert_close(
-            stats.flatten(0, -3)[active],
-            graph_stats.flatten(0, -3)[active],
+            stats.reshape(-1, stats.shape[-1])[active],
+            graph_stats.reshape(-1, graph_stats.shape[-1])[active],
             rtol=0,
             atol=0,
         )

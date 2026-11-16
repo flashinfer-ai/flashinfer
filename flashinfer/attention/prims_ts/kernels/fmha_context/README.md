@@ -71,7 +71,6 @@ Validation can read metadata values on the host. Trusted/captured execution uses
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state; INT8 Q/K accumulate INT32 scores that the softmax reads as FP32 |
 | Sage attention | Contiguous dense fixed-length plans with `head_dim=128`, `torch.float8_e4m3fn` or `torch.int8` (SM100a only) Q/K, `torch.float8_e4m3fn` V and a 16-bit output: `plan(sage=SageAttentionConfig(...))`, `run(sage=SageAttentionParams(...))`; see [Sage attention](../../README.md#sage-attention) |
-| Softmax statistics | Optional caller-owned FP32 maximum/denominator output for plain attention; not combined with Sage/VC, MXFP8 Q/K, or attention sinks |
 
 See the shared [validation scope](../../README.md#validation-scope) for the
 measured hardware and DSL versions, including SM103/GB300 coverage of the
@@ -111,40 +110,17 @@ below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
 or active wrapper-owned scratch. This is an unchecked caller
 precondition in both validation modes. The default API returns O; an enabled
 LSE plan can also return final FP32 LSE, as described below. Intermediate
-softmax state remains internal unless explicitly requested.
+softmax state remains internal.
 
-Set `plan(store_softmax_stats=True)` and supply `run(..., softmax_stats=stats)`
-to export compact FP32 `[*out.shape[:-1], 2]` statistics. The pair is the
-maximum scaled token logit `m` in natural-log units and
-`s = sum(exp(logit - m))`, with internal FP8 probability scaling removed.
-`output_scale` does not affect it. The buffer must be disjoint from inputs,
-outputs, LSE, metadata, and plan-owned storage. Its presence is checked even
-with `validate=False`; CUDA graphs retain the captured address. One-shot APIs
-accept the same flag and buffer, and the LSE API/return value remain unchanged.
-No additional statistics scratch is required for prefill.
-The existing `lse_mode="base2"` / `return_lse` interface is independent and
-can be used at the same time. For a nonempty row its value is
-`(m + ln(s)) / ln(2)`. The pair directly serves maximum/sum consumers; it is
-not needed to implement a merge that already accepts LSE.
-Statistics-enabled softmax centers raw scores before scaling and retains FP32
-probability sums instead of the optional packed-FP16 exponent/sum path. The
-statistics-disabled exponent policy is unchanged.
-Statistics retain the exact running maximum while skipping O rescaling only
-when the maximum is unchanged or there is no prior contribution. Low-level
-`FmhaTs` callers must select `corr_skip_threshold_log2=0` before exporting
-statistics; positive lazy-update thresholds are rejected. The independent
-`enable_skip_correction` switch does not change the statistics contract.
-
-Dense contiguous statistics retain valid-query empty-KV chunks and write zero
-output with `(-inf, 0)` statistics. Physical packed K/V storage must contain at
-least one token. Paged context statistics require positive per-request KV lengths.
-Statistics-disabled empty-request skipping is unchanged.
+With LSE enabled, ordinary dense contiguous requests with empty local K/V
+write zero output and negative-infinity LSE. Physical packed K/V storage must
+contain at least one token; equal adjacent offsets represent logical empties.
 
 Packed dense contiguous context uses each request's live KV extent for every
 task's loop domain, including during graph replay. This applies to homogeneous
 FP16, BF16, and E4M3 inputs with FP16/BF16 output and paired QK/V dimensions
-128/128 or 192/128 on supported architectures. Empty statistics rows retain
-one masked tile so the epilogue still writes zero O and `(-inf, 0)` statistics.
+128/128 or 192/128 on supported architectures. Empty rows with LSE enabled retain
+one masked tile so the epilogue writes zero O and negative-infinity LSE.
 Fixed/uniform-packed inputs, single-instance and two-CTA schedules, causal and
 windowed attention, paged KV, mixed-precision inputs, and VC/Sage/MXFP8 recipes
 retain their existing domain policies.

@@ -1237,7 +1237,6 @@ def test_attention_ts_mla_trusted_workspace_size(monkeypatch):
         max_q_len=8,
         max_kv_len=8192,
         q_dtype=_FP8,
-        store_softmax_stats=True,
         use_kv_bounds=True,
         device="cuda:0",
     )
@@ -1344,7 +1343,6 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "softmax_scale",
         "output_scale",
         "lse_mode",
-        "store_softmax_stats",
         "use_kv_bounds",
         "zero_empty_rows",
         "workspace_buffer",
@@ -1385,7 +1383,6 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "out",
         "lse",
         "return_lse",
-        "softmax_stats",
         "validate",
     )
     assert run_parameters["block_tables"].default is inspect.Parameter.empty
@@ -1393,10 +1390,8 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["qo_indptr"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
-    assert plan_parameters["store_softmax_stats"].default is False
     assert plan_parameters["use_kv_bounds"].default is False
     assert plan_parameters["zero_empty_rows"].default is True
-    assert run_parameters["softmax_stats"].default is None
     assert run_parameters["kv_bounds"].default is None
     assert run_parameters["kv_bounds"].kind is inspect.Parameter.KEYWORD_ONLY
 
@@ -1579,11 +1574,9 @@ def test_attention_ts_mla_run_requires_plan():
         wrapper.run(None, None, None, None)
 
 
-@pytest.mark.parametrize("store_softmax_stats", (False, True))
 @pytest.mark.parametrize("use_kv_bounds", (False, True))
 def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     monkeypatch,
-    store_softmax_stats,
     use_kv_bounds,
 ):
     """Leave validation outside compiled and captured MLA run regions."""
@@ -1607,12 +1600,10 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         lse_mode="none",
         softmax_scale=1.0,
         output_scale=1.0,
-        store_softmax_stats=store_softmax_stats,
         use_kv_bounds=use_kv_bounds,
     )
     runtime = _empty_mla_runtime()
     sentinel = torch.empty(1)
-    stats = torch.empty((1, 1, 8, 2)) if store_softmax_stats else None
     bounds = torch.ones(1, dtype=torch.int32) if use_kv_bounds else None
 
     def fail_validation(*args, **kwargs):
@@ -1623,7 +1614,6 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         return runtime
 
     def launch(*args, **kwargs):
-        assert kwargs["softmax_stats"] is stats
         assert kwargs["kv_bounds"] is bounds
         return sentinel
 
@@ -1642,7 +1632,6 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
             tensor,
             tensor,
             validate=False,
-            softmax_stats=stats,
             kv_bounds=bounds,
         )
         is sentinel
@@ -1728,40 +1717,6 @@ def test_attention_ts_mla_build_advisories_are_opt_in(monkeypatch, capsys):
     manager.tasks[0].num_registers = 512
     with pytest.raises(ValueError), mla_build_diagnostics():
         manager.print_and_verify()
-
-
-def test_attention_ts_mla_cluster_statistics_smem_budget(monkeypatch):
-    """Statistics must affect both explicit and automatic cluster admission."""
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
-        config,
-    )
-
-    kwargs = dict(
-        batch_size=1,
-        num_heads_q=8,
-        seq_len_q=1,
-        seq_len_kv=4096,
-        tile_size_q=8,
-        explicit_split_kv=2,
-        max_active_clusters=148,
-    )
-    cfg = make_throughput_latency_mla_config(**kwargs, reduction_mode="cluster")
-    without_stats = config.estimated_throughput_latency_smem_data_bytes(cfg)
-    with_stats = config.estimated_throughput_latency_smem_data_bytes(
-        cfg, store_softmax_stats=True
-    )
-    assert with_stats > without_stats
-    monkeypatch.setattr(config, "MAX_CLUSTER_SMEM_DATA_BYTES", without_stats)
-    assert make_throughput_latency_mla_config(
-        **kwargs, reduction_mode="cluster"
-    ).use_cluster_reduction
-    with pytest.raises(ValueError, match="shared-memory budget"):
-        make_throughput_latency_mla_config(
-            **kwargs, reduction_mode="cluster", store_softmax_stats=True
-        )
-    assert not make_throughput_latency_mla_config(
-        **kwargs, store_softmax_stats=True
-    ).use_cluster_reduction
 
 
 def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
