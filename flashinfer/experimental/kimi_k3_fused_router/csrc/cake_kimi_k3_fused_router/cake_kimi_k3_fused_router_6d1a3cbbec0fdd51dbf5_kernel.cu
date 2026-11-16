@@ -269,11 +269,16 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
     int expert_base = group_tid * ITEMS_PER_THREAD;
     float _vec_load_0[4];
     {
-        float4 _v4 = *reinterpret_cast<const float4*>(bias + expert_base);
-        _vec_load_0[0 + 0] = _v4.x;
-        _vec_load_0[0 + 1] = _v4.y;
-        _vec_load_0[0 + 2] = _v4.z;
-        _vec_load_0[0 + 3] = _v4.w;
+        unsigned _v4_0_0;
+        unsigned _v4_0_1;
+        unsigned _v4_0_2;
+        unsigned _v4_0_3;
+        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(_v4_0_0), "=r"(_v4_0_1), "=r"(_v4_0_2), "=r"(_v4_0_3) : "l"((const void*)(bias + (expert_base))) : "memory");
+        _vec_load_0[0 + 0] = __uint_as_float(_v4_0_0);
+        _vec_load_0[0 + 1] = __uint_as_float(_v4_0_1);
+        _vec_load_0[0 + 2] = __uint_as_float(_v4_0_2);
+        _vec_load_0[0 + 3] = __uint_as_float(_v4_0_3);
     }
     int load_row = group_row;
     if (load_row >= M) {
@@ -281,11 +286,16 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
     }
     float _vec_load_1[4];
     {
-        float4 _v4 = *reinterpret_cast<const float4*>(logits + (unsigned long long)load_row * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base);
-        _vec_load_1[0 + 0] = _v4.x;
-        _vec_load_1[0 + 1] = _v4.y;
-        _vec_load_1[0 + 2] = _v4.z;
-        _vec_load_1[0 + 3] = _v4.w;
+        unsigned _v4_1_0;
+        unsigned _v4_1_1;
+        unsigned _v4_1_2;
+        unsigned _v4_1_3;
+        asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(_v4_1_0), "=r"(_v4_1_1), "=r"(_v4_1_2), "=r"(_v4_1_3) : "l"((const void*)(logits + ((unsigned long long)load_row * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base))) : "memory");
+        _vec_load_1[0 + 0] = __uint_as_float(_v4_1_0);
+        _vec_load_1[0 + 1] = __uint_as_float(_v4_1_1);
+        _vec_load_1[0 + 2] = __uint_as_float(_v4_1_2);
+        _vec_load_1[0 + 3] = __uint_as_float(_v4_1_3);
     }
     if (warp == 0) {
         if (elect_sync()) {
@@ -349,36 +359,36 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
             }
         }
         unsigned int published = 0;
-        unsigned int warp_top0;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+        unsigned int warp_top0_1_0;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
         if (lane == 0) {
-            published = warp_top0;
+            published = warp_top0_1_0;
         }
-        if (lane_bound == warp_top0) {
+        if (lane_bound == warp_top0_1_0) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top1;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+        unsigned int warp_top0_1_1;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
         if (lane == 1) {
-            published = warp_top1;
+            published = warp_top0_1_1;
         }
-        if (lane_bound == warp_top1) {
+        if (lane_bound == warp_top0_1_1) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top2;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+        unsigned int warp_top0_1_2;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
         if (lane == 2) {
-            published = warp_top2;
+            published = warp_top0_1_2;
         }
-        if (lane_bound == warp_top2) {
+        if (lane_bound == warp_top0_1_2) {
             lane_bound = (unsigned int)0;
         }
-        unsigned int warp_top3;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+        unsigned int warp_top0_1_3;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
         if (lane == 3) {
-            published = warp_top3;
+            published = warp_top0_1_3;
         }
-        if (lane_bound == warp_top3) {
+        if (lane_bound == warp_top0_1_3) {
             lane_bound = (unsigned int)0;
         }
         if (lane < 4) {
@@ -417,24 +427,24 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
         }
         cand_slot += ((keys[0] >= cand_floor) ? 1 : 0);
         if (keys[1] >= cand_floor && cand_slot < 32) {
-            int cand_index1 = cand_region + cand_slot;
-            cand_keys[cand_index1] = keys[1];
-            cand_ids[cand_index1] = expert_base + 1;
-            cand_scores[cand_index1] = unbiased[1];
+            int cand_index_0 = cand_region + cand_slot;
+            cand_keys[cand_index_0] = keys[1];
+            cand_ids[cand_index_0] = expert_base + 1;
+            cand_scores[cand_index_0] = unbiased[1];
         }
         cand_slot += ((keys[1] >= cand_floor) ? 1 : 0);
         if (keys[2] >= cand_floor && cand_slot < 32) {
-            int cand_index2 = cand_region + cand_slot;
-            cand_keys[cand_index2] = keys[2];
-            cand_ids[cand_index2] = expert_base + 2;
-            cand_scores[cand_index2] = unbiased[2];
+            int cand_index_1 = cand_region + cand_slot;
+            cand_keys[cand_index_1] = keys[2];
+            cand_ids[cand_index_1] = expert_base + 2;
+            cand_scores[cand_index_1] = unbiased[2];
         }
         cand_slot += ((keys[2] >= cand_floor) ? 1 : 0);
         if (keys[3] >= cand_floor && cand_slot < 32) {
-            int cand_index3 = cand_region + cand_slot;
-            cand_keys[cand_index3] = keys[3];
-            cand_ids[cand_index3] = expert_base + 3;
-            cand_scores[cand_index3] = unbiased[3];
+            int cand_index_2 = cand_region + cand_slot;
+            cand_keys[cand_index_2] = keys[3];
+            cand_ids[cand_index_2] = expert_base + 3;
+            cand_scores[cand_index_2] = unbiased[3];
         }
         if (lane == 0) {
             cand_counts[sums_base + group_warp] = cand_warp;
@@ -906,178 +916,178 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_4) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(0));
-            uint32_t _cluster_mapa_5;
-            asm volatile(
+            uint32_t _mbar_peer_5;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_5) : "r"(ids_full_addr), "r"(0));
+                : "=r"(_mbar_peer_5) : "r"(ids_full_addr), "r"(0));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_4), "r"(early_id), "r"(_cluster_mapa_5) : "memory");
+                :: "r"(_cluster_mapa_4), "r"(early_id), "r"(_mbar_peer_5) : "memory");
             uint32_t _cluster_mapa_6;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_6) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(1));
-            uint32_t _cluster_mapa_7;
-            asm volatile(
+            uint32_t _mbar_peer_7;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_7) : "r"(ids_full_addr), "r"(1));
+                : "=r"(_mbar_peer_7) : "r"(ids_full_addr), "r"(1));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_6), "r"(early_id), "r"(_cluster_mapa_7) : "memory");
+                :: "r"(_cluster_mapa_6), "r"(early_id), "r"(_mbar_peer_7) : "memory");
             uint32_t _cluster_mapa_8;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_8) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(2));
-            uint32_t _cluster_mapa_9;
-            asm volatile(
+            uint32_t _mbar_peer_9;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_9) : "r"(ids_full_addr), "r"(2));
+                : "=r"(_mbar_peer_9) : "r"(ids_full_addr), "r"(2));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_8), "r"(early_id), "r"(_cluster_mapa_9) : "memory");
+                :: "r"(_cluster_mapa_8), "r"(early_id), "r"(_mbar_peer_9) : "memory");
             uint32_t _cluster_mapa_10;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_10) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(3));
-            uint32_t _cluster_mapa_11;
-            asm volatile(
+            uint32_t _mbar_peer_11;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_11) : "r"(ids_full_addr), "r"(3));
+                : "=r"(_mbar_peer_11) : "r"(ids_full_addr), "r"(3));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_10), "r"(early_id), "r"(_cluster_mapa_11) : "memory");
+                :: "r"(_cluster_mapa_10), "r"(early_id), "r"(_mbar_peer_11) : "memory");
             uint32_t _cluster_mapa_12;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_12) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(4));
-            uint32_t _cluster_mapa_13;
-            asm volatile(
+            uint32_t _mbar_peer_13;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_13) : "r"(ids_full_addr), "r"(4));
+                : "=r"(_mbar_peer_13) : "r"(ids_full_addr), "r"(4));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_12), "r"(early_id), "r"(_cluster_mapa_13) : "memory");
+                :: "r"(_cluster_mapa_12), "r"(early_id), "r"(_mbar_peer_13) : "memory");
             uint32_t _cluster_mapa_14;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_14) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(5));
-            uint32_t _cluster_mapa_15;
-            asm volatile(
+            uint32_t _mbar_peer_15;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_15) : "r"(ids_full_addr), "r"(5));
+                : "=r"(_mbar_peer_15) : "r"(ids_full_addr), "r"(5));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_14), "r"(early_id), "r"(_cluster_mapa_15) : "memory");
+                :: "r"(_cluster_mapa_14), "r"(early_id), "r"(_mbar_peer_15) : "memory");
             uint32_t _cluster_mapa_16;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_16) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(6));
-            uint32_t _cluster_mapa_17;
-            asm volatile(
+            uint32_t _mbar_peer_17;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_17) : "r"(ids_full_addr), "r"(6));
+                : "=r"(_mbar_peer_17) : "r"(ids_full_addr), "r"(6));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_16), "r"(early_id), "r"(_cluster_mapa_17) : "memory");
+                :: "r"(_cluster_mapa_16), "r"(early_id), "r"(_mbar_peer_17) : "memory");
             uint32_t _cluster_mapa_18;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_18) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(7));
-            uint32_t _cluster_mapa_19;
-            asm volatile(
+            uint32_t _mbar_peer_19;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_19) : "r"(ids_full_addr), "r"(7));
+                : "=r"(_mbar_peer_19) : "r"(ids_full_addr), "r"(7));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_18), "r"(early_id), "r"(_cluster_mapa_19) : "memory");
+                :: "r"(_cluster_mapa_18), "r"(early_id), "r"(_mbar_peer_19) : "memory");
             uint32_t _cluster_mapa_20;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_20) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(8));
-            uint32_t _cluster_mapa_21;
-            asm volatile(
+            uint32_t _mbar_peer_21;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_21) : "r"(ids_full_addr), "r"(8));
+                : "=r"(_mbar_peer_21) : "r"(ids_full_addr), "r"(8));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_20), "r"(early_id), "r"(_cluster_mapa_21) : "memory");
+                :: "r"(_cluster_mapa_20), "r"(early_id), "r"(_mbar_peer_21) : "memory");
             uint32_t _cluster_mapa_22;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_22) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(9));
-            uint32_t _cluster_mapa_23;
-            asm volatile(
+            uint32_t _mbar_peer_23;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_23) : "r"(ids_full_addr), "r"(9));
+                : "=r"(_mbar_peer_23) : "r"(ids_full_addr), "r"(9));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_22), "r"(early_id), "r"(_cluster_mapa_23) : "memory");
+                :: "r"(_cluster_mapa_22), "r"(early_id), "r"(_mbar_peer_23) : "memory");
             uint32_t _cluster_mapa_24;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_24) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(10));
-            uint32_t _cluster_mapa_25;
-            asm volatile(
+            uint32_t _mbar_peer_25;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_25) : "r"(ids_full_addr), "r"(10));
+                : "=r"(_mbar_peer_25) : "r"(ids_full_addr), "r"(10));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_24), "r"(early_id), "r"(_cluster_mapa_25) : "memory");
+                :: "r"(_cluster_mapa_24), "r"(early_id), "r"(_mbar_peer_25) : "memory");
             uint32_t _cluster_mapa_26;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_26) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(11));
-            uint32_t _cluster_mapa_27;
-            asm volatile(
+            uint32_t _mbar_peer_27;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_27) : "r"(ids_full_addr), "r"(11));
+                : "=r"(_mbar_peer_27) : "r"(ids_full_addr), "r"(11));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_26), "r"(early_id), "r"(_cluster_mapa_27) : "memory");
+                :: "r"(_cluster_mapa_26), "r"(early_id), "r"(_mbar_peer_27) : "memory");
             uint32_t _cluster_mapa_28;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_28) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(12));
-            uint32_t _cluster_mapa_29;
-            asm volatile(
+            uint32_t _mbar_peer_29;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_29) : "r"(ids_full_addr), "r"(12));
+                : "=r"(_mbar_peer_29) : "r"(ids_full_addr), "r"(12));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_28), "r"(early_id), "r"(_cluster_mapa_29) : "memory");
+                :: "r"(_cluster_mapa_28), "r"(early_id), "r"(_mbar_peer_29) : "memory");
             uint32_t _cluster_mapa_30;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_30) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(13));
-            uint32_t _cluster_mapa_31;
-            asm volatile(
+            uint32_t _mbar_peer_31;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_31) : "r"(ids_full_addr), "r"(13));
+                : "=r"(_mbar_peer_31) : "r"(ids_full_addr), "r"(13));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_30), "r"(early_id), "r"(_cluster_mapa_31) : "memory");
+                :: "r"(_cluster_mapa_30), "r"(early_id), "r"(_mbar_peer_31) : "memory");
             uint32_t _cluster_mapa_32;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_32) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(14));
-            uint32_t _cluster_mapa_33;
-            asm volatile(
+            uint32_t _mbar_peer_33;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_33) : "r"(ids_full_addr), "r"(14));
+                : "=r"(_mbar_peer_33) : "r"(ids_full_addr), "r"(14));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_32), "r"(early_id), "r"(_cluster_mapa_33) : "memory");
+                :: "r"(_cluster_mapa_32), "r"(early_id), "r"(_mbar_peer_33) : "memory");
             uint32_t _cluster_mapa_34;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
                 : "=r"(_cluster_mapa_34) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(15));
-            uint32_t _cluster_mapa_35;
-            asm volatile(
+            uint32_t _mbar_peer_35;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_35) : "r"(ids_full_addr), "r"(15));
+                : "=r"(_mbar_peer_35) : "r"(ids_full_addr), "r"(15));
             asm volatile(
                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_34), "r"(early_id), "r"(_cluster_mapa_35) : "memory");
+                :: "r"(_cluster_mapa_34), "r"(early_id), "r"(_mbar_peer_35) : "memory");
             float selected_sum = 0.0f;
             #pragma unroll
             for (int route_sum = 0; route_sum < TOP_K; route_sum++) {
@@ -1099,178 +1109,178 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_37) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(0));
-        uint32_t _cluster_mapa_38;
-        asm volatile(
+        uint32_t _mbar_peer_38;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_38) : "r"(ids_full_addr), "r"(0));
+            : "=r"(_mbar_peer_38) : "r"(ids_full_addr), "r"(0));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_37), "r"(filler_pair), "r"(_cluster_mapa_38) : "memory");
+            :: "r"(_cluster_mapa_37), "r"(filler_pair), "r"(_mbar_peer_38) : "memory");
         uint32_t _cluster_mapa_39;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_39) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(1));
-        uint32_t _cluster_mapa_40;
-        asm volatile(
+        uint32_t _mbar_peer_40;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_40) : "r"(ids_full_addr), "r"(1));
+            : "=r"(_mbar_peer_40) : "r"(ids_full_addr), "r"(1));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_39), "r"(filler_pair), "r"(_cluster_mapa_40) : "memory");
+            :: "r"(_cluster_mapa_39), "r"(filler_pair), "r"(_mbar_peer_40) : "memory");
         uint32_t _cluster_mapa_41;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_41) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(2));
-        uint32_t _cluster_mapa_42;
-        asm volatile(
+        uint32_t _mbar_peer_42;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_42) : "r"(ids_full_addr), "r"(2));
+            : "=r"(_mbar_peer_42) : "r"(ids_full_addr), "r"(2));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_41), "r"(filler_pair), "r"(_cluster_mapa_42) : "memory");
+            :: "r"(_cluster_mapa_41), "r"(filler_pair), "r"(_mbar_peer_42) : "memory");
         uint32_t _cluster_mapa_43;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_43) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(3));
-        uint32_t _cluster_mapa_44;
-        asm volatile(
+        uint32_t _mbar_peer_44;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_44) : "r"(ids_full_addr), "r"(3));
+            : "=r"(_mbar_peer_44) : "r"(ids_full_addr), "r"(3));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_43), "r"(filler_pair), "r"(_cluster_mapa_44) : "memory");
+            :: "r"(_cluster_mapa_43), "r"(filler_pair), "r"(_mbar_peer_44) : "memory");
         uint32_t _cluster_mapa_45;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_45) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(4));
-        uint32_t _cluster_mapa_46;
-        asm volatile(
+        uint32_t _mbar_peer_46;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_46) : "r"(ids_full_addr), "r"(4));
+            : "=r"(_mbar_peer_46) : "r"(ids_full_addr), "r"(4));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_45), "r"(filler_pair), "r"(_cluster_mapa_46) : "memory");
+            :: "r"(_cluster_mapa_45), "r"(filler_pair), "r"(_mbar_peer_46) : "memory");
         uint32_t _cluster_mapa_47;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_47) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(5));
-        uint32_t _cluster_mapa_48;
-        asm volatile(
+        uint32_t _mbar_peer_48;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_48) : "r"(ids_full_addr), "r"(5));
+            : "=r"(_mbar_peer_48) : "r"(ids_full_addr), "r"(5));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_47), "r"(filler_pair), "r"(_cluster_mapa_48) : "memory");
+            :: "r"(_cluster_mapa_47), "r"(filler_pair), "r"(_mbar_peer_48) : "memory");
         uint32_t _cluster_mapa_49;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_49) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(6));
-        uint32_t _cluster_mapa_50;
-        asm volatile(
+        uint32_t _mbar_peer_50;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_50) : "r"(ids_full_addr), "r"(6));
+            : "=r"(_mbar_peer_50) : "r"(ids_full_addr), "r"(6));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_49), "r"(filler_pair), "r"(_cluster_mapa_50) : "memory");
+            :: "r"(_cluster_mapa_49), "r"(filler_pair), "r"(_mbar_peer_50) : "memory");
         uint32_t _cluster_mapa_51;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_51) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(7));
-        uint32_t _cluster_mapa_52;
-        asm volatile(
+        uint32_t _mbar_peer_52;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_52) : "r"(ids_full_addr), "r"(7));
+            : "=r"(_mbar_peer_52) : "r"(ids_full_addr), "r"(7));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_51), "r"(filler_pair), "r"(_cluster_mapa_52) : "memory");
+            :: "r"(_cluster_mapa_51), "r"(filler_pair), "r"(_mbar_peer_52) : "memory");
         uint32_t _cluster_mapa_53;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_53) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(8));
-        uint32_t _cluster_mapa_54;
-        asm volatile(
+        uint32_t _mbar_peer_54;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_54) : "r"(ids_full_addr), "r"(8));
+            : "=r"(_mbar_peer_54) : "r"(ids_full_addr), "r"(8));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_53), "r"(filler_pair), "r"(_cluster_mapa_54) : "memory");
+            :: "r"(_cluster_mapa_53), "r"(filler_pair), "r"(_mbar_peer_54) : "memory");
         uint32_t _cluster_mapa_55;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_55) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(9));
-        uint32_t _cluster_mapa_56;
-        asm volatile(
+        uint32_t _mbar_peer_56;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_56) : "r"(ids_full_addr), "r"(9));
+            : "=r"(_mbar_peer_56) : "r"(ids_full_addr), "r"(9));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_55), "r"(filler_pair), "r"(_cluster_mapa_56) : "memory");
+            :: "r"(_cluster_mapa_55), "r"(filler_pair), "r"(_mbar_peer_56) : "memory");
         uint32_t _cluster_mapa_57;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_57) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(10));
-        uint32_t _cluster_mapa_58;
-        asm volatile(
+        uint32_t _mbar_peer_58;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_58) : "r"(ids_full_addr), "r"(10));
+            : "=r"(_mbar_peer_58) : "r"(ids_full_addr), "r"(10));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_57), "r"(filler_pair), "r"(_cluster_mapa_58) : "memory");
+            :: "r"(_cluster_mapa_57), "r"(filler_pair), "r"(_mbar_peer_58) : "memory");
         uint32_t _cluster_mapa_59;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_59) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(11));
-        uint32_t _cluster_mapa_60;
-        asm volatile(
+        uint32_t _mbar_peer_60;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_60) : "r"(ids_full_addr), "r"(11));
+            : "=r"(_mbar_peer_60) : "r"(ids_full_addr), "r"(11));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_59), "r"(filler_pair), "r"(_cluster_mapa_60) : "memory");
+            :: "r"(_cluster_mapa_59), "r"(filler_pair), "r"(_mbar_peer_60) : "memory");
         uint32_t _cluster_mapa_61;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_61) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(12));
-        uint32_t _cluster_mapa_62;
-        asm volatile(
+        uint32_t _mbar_peer_62;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_62) : "r"(ids_full_addr), "r"(12));
+            : "=r"(_mbar_peer_62) : "r"(ids_full_addr), "r"(12));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_61), "r"(filler_pair), "r"(_cluster_mapa_62) : "memory");
+            :: "r"(_cluster_mapa_61), "r"(filler_pair), "r"(_mbar_peer_62) : "memory");
         uint32_t _cluster_mapa_63;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_63) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(13));
-        uint32_t _cluster_mapa_64;
-        asm volatile(
+        uint32_t _mbar_peer_64;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_64) : "r"(ids_full_addr), "r"(13));
+            : "=r"(_mbar_peer_64) : "r"(ids_full_addr), "r"(13));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_63), "r"(filler_pair), "r"(_cluster_mapa_64) : "memory");
+            :: "r"(_cluster_mapa_63), "r"(filler_pair), "r"(_mbar_peer_64) : "memory");
         uint32_t _cluster_mapa_65;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_65) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(14));
-        uint32_t _cluster_mapa_66;
-        asm volatile(
+        uint32_t _mbar_peer_66;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_66) : "r"(ids_full_addr), "r"(14));
+            : "=r"(_mbar_peer_66) : "r"(ids_full_addr), "r"(14));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_65), "r"(filler_pair), "r"(_cluster_mapa_66) : "memory");
+            :: "r"(_cluster_mapa_65), "r"(filler_pair), "r"(_mbar_peer_66) : "memory");
         uint32_t _cluster_mapa_67;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_67) : "r"(selected_ids_addr + (unsigned int)(filler_pair * 4)), "r"(15));
-        uint32_t _cluster_mapa_68;
-        asm volatile(
+        uint32_t _mbar_peer_68;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_68) : "r"(ids_full_addr), "r"(15));
+            : "=r"(_mbar_peer_68) : "r"(ids_full_addr), "r"(15));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_67), "r"(filler_pair), "r"(_cluster_mapa_68) : "memory");
+            :: "r"(_cluster_mapa_67), "r"(filler_pair), "r"(_mbar_peer_68) : "memory");
     }
     __syncthreads();
     mbarrier_wait(ids_full_addr, 0);
@@ -1285,110 +1295,141 @@ kernel_cake_kimi_k3_fused_router_6d1a3cbbec0fdd51dbf5(float* __restrict__ logits
         }
     }
     #pragma unroll
-    for (int bit_slot = 0; bit_slot < 2; bit_slot++) {
+    for (int bit_slot = 0; bit_slot < 1; bit_slot++) {
         int bit_pair = bit_slot * 448 + tid;
+        unsigned int bit_value = (unsigned int)0;
+        int bit_index = lane;
         if (bit_pair < pair_bound) {
-            unsigned int bit_old = atomicAdd(&row_bits[gathered[bit_slot]], (unsigned int)1 << (unsigned int)(bit_pair >> 4));
-            int bit_level = (int)(unsigned int)__popc(bit_old);
-            if ((bit_level & BLOCK_MASK) == 0) {
-                atomicAdd(&level_masks[(bit_level >> BLOCK_SHIFT) * 28 + (gathered[bit_slot] >> 5)], (unsigned int)1 << (unsigned int)(gathered[bit_slot] & 31));
+            bit_value = (unsigned int)1 << (unsigned int)(bit_pair >> 4);
+            bit_index = gathered[bit_slot];
+        }
+        unsigned int bit_old = atomicAdd(&row_bits[bit_index], bit_value);
+        int bit_level = (int)(unsigned int)__popc(bit_old);
+        unsigned int level_value = (unsigned int)0;
+        int level_index = lane;
+        if (bit_pair < pair_bound && (bit_level & BLOCK_MASK) == 0) {
+            level_value = (unsigned int)1 << (unsigned int)(bit_index & 31);
+            level_index = (bit_level >> BLOCK_SHIFT) * 28 + (bit_index >> 5);
+        }
+        atomicAdd(&level_masks[level_index], level_value);
+    }
+    if (448 < pair_bound) {
+        #pragma unroll
+        for (int tail_slot = 1; tail_slot < 2; tail_slot++) {
+            int tail_pair = tail_slot * 448 + tid;
+            unsigned int tail_value = (unsigned int)0;
+            int tail_index = lane;
+            if (tail_pair < pair_bound) {
+                tail_value = (unsigned int)1 << (unsigned int)(tail_pair >> 4);
+                tail_index = gathered[tail_slot];
             }
+            unsigned int tail_old = atomicAdd(&row_bits[tail_index], tail_value);
+            int tail_level = (int)(unsigned int)__popc(tail_old);
+            unsigned int tail_level_value = (unsigned int)0;
+            int tail_level_index = lane;
+            if (tail_pair < pair_bound && (tail_level & BLOCK_MASK) == 0) {
+                tail_level_value = (unsigned int)1 << (unsigned int)(tail_index & 31);
+                tail_level_index = (tail_level >> BLOCK_SHIFT) * 28 + (tail_index >> 5);
+            }
+            atomicAdd(&level_masks[tail_level_index], tail_level_value);
         }
     }
     __syncthreads();
-    int emit_local = tid & 31;
-    int emit_slot = emit_local & TOP_K - 1;
-    int emit_sub = tid >> 5;
-    int emit_row = cta_rank + (emit_local >> 4) * 16;
-    int emit_src_row = emit_row;
-    if (emit_row >= M) {
-        emit_src_row = cta_rank;
-    }
-    int emit_expert = selected_ids[emit_src_row * TOP_K + emit_slot];
-    unsigned int emit_bits = row_bits[emit_expert];
-    unsigned int emit_below = ((unsigned int)1 << (unsigned int)emit_src_row) - (unsigned int)1;
-    int emit_rank = (int)(unsigned int)__popc(emit_bits & emit_below);
-    int emit_count = (int)(unsigned int)__popc(emit_bits);
-    unsigned int level_words[4];
-    int mask_lane_blocks = 0;
-    #pragma unroll
-    for (int level_load = 0; level_load < MASK_LEVELS; level_load++) {
-        level_words[level_load] = (unsigned int)0;
-        if (lane < 28) {
-            level_words[level_load] = level_masks[level_load * 28 + lane];
+    if (warp < 4) {
+        int emit_local = tid & 31;
+        int emit_slot = emit_local & TOP_K - 1;
+        int emit_sub = tid >> 5;
+        int emit_row = cta_rank + (emit_local >> 4) * 16;
+        int emit_src_row = emit_row;
+        if (emit_row >= M) {
+            emit_src_row = cta_rank;
         }
-        mask_lane_blocks += (int)(unsigned int)__popc(level_words[level_load]);
-    }
-    int mask_inclusive = mask_lane_blocks;
-    int mask_peer = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
-    if (lane >= 1) {
-        mask_inclusive += mask_peer;
-    }
-    int mask_peer_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
-    if (lane >= 2) {
-        mask_inclusive += mask_peer_0;
-    }
-    int mask_peer_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
-    if (lane >= 4) {
-        mask_inclusive += mask_peer_1;
-    }
-    int mask_peer_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
-    if (lane >= 8) {
-        mask_inclusive += mask_peer_2;
-    }
-    int mask_peer_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
-    if (lane >= 16) {
-        mask_inclusive += mask_peer_3;
-    }
-    int mask_exclusive = mask_inclusive - mask_lane_blocks;
-    int mask_total = __shfl_sync(0xFFFFFFFF, mask_inclusive, 31);
-    int emit_word = emit_expert >> 5;
-    unsigned int emit_low = ((unsigned int)1 << (unsigned int)(emit_expert & 31)) - (unsigned int)1;
-    int emit_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, emit_word);
-    #pragma unroll
-    for (int level_emit = 0; level_emit < MASK_LEVELS; level_emit++) {
-        unsigned int _shfl_sync_69 = __shfl_sync(0xFFFFFFFF, level_words[level_emit], emit_word);
-        emit_blocks += (int)(unsigned int)__popc(_shfl_sync_69 & emit_low);
-    }
-    int emit_start = emit_blocks << BLOCK_SHIFT;
-    if (emit_row < M) {
-        if (emit_sub == 0) {
-            int emit_grouped = emit_start + emit_rank;
-            sorted_token_ids[emit_grouped] = emit_row * TOP_K + emit_slot;
-            if ((emit_rank & BLOCK_MASK) == 0) {
-                expert_ids[emit_grouped >> BLOCK_SHIFT] = emit_expert;
+        int emit_expert = selected_ids[emit_src_row * TOP_K + emit_slot];
+        unsigned int emit_bits = row_bits[emit_expert];
+        unsigned int emit_below = ((unsigned int)1 << (unsigned int)emit_src_row) - (unsigned int)1;
+        int emit_rank = (int)(unsigned int)__popc(emit_bits & emit_below);
+        int emit_count = (int)(unsigned int)__popc(emit_bits);
+        unsigned int level_words[4];
+        int mask_lane_blocks = 0;
+        #pragma unroll
+        for (int level_load = 0; level_load < MASK_LEVELS; level_load++) {
+            level_words[level_load] = (unsigned int)0;
+            if (lane < 28) {
+                level_words[level_load] = level_masks[level_load * 28 + lane];
+            }
+            mask_lane_blocks += (int)(unsigned int)__popc(level_words[level_load]);
+        }
+        int mask_inclusive = mask_lane_blocks;
+        int mask_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 1, 32);
+        if (lane >= 1) {
+            mask_inclusive += mask_peer_4_0;
+        }
+        int mask_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 2, 32);
+        if (lane >= 2) {
+            mask_inclusive += mask_peer_4_1;
+        }
+        int mask_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 4, 32);
+        if (lane >= 4) {
+            mask_inclusive += mask_peer_4_2;
+        }
+        int mask_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 8, 32);
+        if (lane >= 8) {
+            mask_inclusive += mask_peer_4_3;
+        }
+        int mask_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, mask_inclusive, 16, 32);
+        if (lane >= 16) {
+            mask_inclusive += mask_peer_4_4;
+        }
+        int mask_exclusive = mask_inclusive - mask_lane_blocks;
+        int mask_total = __shfl_sync(0xFFFFFFFF, mask_inclusive, 31);
+        int emit_word = emit_expert >> 5;
+        unsigned int emit_low = ((unsigned int)1 << (unsigned int)(emit_expert & 31)) - (unsigned int)1;
+        int emit_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, emit_word);
+        #pragma unroll
+        for (int level_emit = 0; level_emit < MASK_LEVELS; level_emit++) {
+            unsigned int _shfl_sync_69 = __shfl_sync(0xFFFFFFFF, level_words[level_emit], emit_word);
+            emit_blocks += (int)(unsigned int)__popc(_shfl_sync_69 & emit_low);
+        }
+        int emit_start = emit_blocks << BLOCK_SHIFT;
+        if (emit_row < M) {
+            if (emit_sub == 0) {
+                int emit_grouped = emit_start + emit_rank;
+                sorted_token_ids[emit_grouped] = emit_row * TOP_K + emit_slot;
+                if ((emit_rank & BLOCK_MASK) == 0) {
+                    expert_ids[emit_grouped >> BLOCK_SHIFT] = emit_expert;
+                }
+            }
+            if (emit_rank == 0) {
+                int emit_padded = emit_count + BLOCK_MASK & ~BLOCK_MASK;
+                #pragma unroll 1
+                for (int emit_pad = emit_count + emit_sub; emit_pad < emit_padded; emit_pad += 4) {
+                    sorted_token_ids[emit_start + emit_pad] = M * TOP_K;
+                }
             }
         }
-        if (emit_rank == 0) {
-            int emit_padded = emit_count + BLOCK_MASK & ~BLOCK_MASK;
-            #pragma unroll 1
-            for (int emit_pad = emit_count + emit_sub; emit_pad < emit_padded; emit_pad += 14) {
-                sorted_token_ids[emit_start + emit_pad] = M * TOP_K;
-            }
+        int slice_expert = cta_rank * 56;
+        if (tid < 56) {
+            slice_expert += tid;
         }
-    }
-    int slice_expert = cta_rank * 56;
-    if (tid < 56) {
-        slice_expert += tid;
-    }
-    int slice_word = slice_expert >> 5;
-    unsigned int slice_low = ((unsigned int)1 << (unsigned int)(slice_expert & 31)) - (unsigned int)1;
-    int slice_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word);
-    #pragma unroll
-    for (int level_slice = 0; level_slice < MASK_LEVELS; level_slice++) {
-        unsigned int _shfl_sync_70 = __shfl_sync(0xFFFFFFFF, level_words[level_slice], slice_word);
-        slice_blocks += (int)(unsigned int)__popc(_shfl_sync_70 & slice_low);
-    }
-    if (tid < 56) {
-        int slice_count = (int)(unsigned int)__popc(row_bits[slice_expert]);
-        expert_counts[slice_expert] = slice_count;
-        expert_scatter_offsets[slice_expert] = slice_count;
-        expert_offsets[slice_expert] = slice_blocks << BLOCK_SHIFT;
-    }
-    if (cta_rank == 0) {
-        if (tid == 447) {
-            expert_offsets[NUM_EXPERTS] = mask_total << BLOCK_SHIFT;
-            num_tokens_post_padded[0] = mask_total << BLOCK_SHIFT;
+        int slice_word = slice_expert >> 5;
+        unsigned int slice_low = ((unsigned int)1 << (unsigned int)(slice_expert & 31)) - (unsigned int)1;
+        int slice_blocks = __shfl_sync(0xFFFFFFFF, mask_exclusive, slice_word);
+        #pragma unroll
+        for (int level_slice = 0; level_slice < MASK_LEVELS; level_slice++) {
+            unsigned int _shfl_sync_70 = __shfl_sync(0xFFFFFFFF, level_words[level_slice], slice_word);
+            slice_blocks += (int)(unsigned int)__popc(_shfl_sync_70 & slice_low);
+        }
+        if (tid < 56) {
+            int slice_count = (int)(unsigned int)__popc(row_bits[slice_expert]);
+            expert_counts[slice_expert] = slice_count;
+            expert_scatter_offsets[slice_expert] = slice_count;
+            expert_offsets[slice_expert] = slice_blocks << BLOCK_SHIFT;
+        }
+        if (cta_rank == 0) {
+            if (tid == 127) {
+                expert_offsets[NUM_EXPERTS] = mask_total << BLOCK_SHIFT;
+                num_tokens_post_padded[0] = mask_total << BLOCK_SHIFT;
+            }
         }
     }
 }

@@ -30,11 +30,9 @@ with 96 to 256 (batch x KV heads) CTAs, where the d256 decode tile measures at
 takes cuDNN only with a caller-owned ``block_tables`` (the auto-built table cannot
 grow once captured), and the resolution is frozen after the first plan. The
 performance-driven choice also requires that the frontend's FROST engines can run
-on the install. FlashInfer's base requirements and cudnn-frontend's dependency
-metadata permit ``nvidia-cutlass-dsl`` 4.6.2, but FROST's own runtime check
-currently requires 4.7.0 or newer. An install can therefore satisfy the package
-dependencies while still being unable to use FROST; in that case the backend
-engine would serve the graph and ``auto`` keeps fa2. Callers passing
+on the install: its own CuTe-DSL check (``nvidia-cutlass-dsl`` 4.7.0 or newer,
+satisfied by FlashInfer's package minimum of 4.8.0) must pass, otherwise the
+backend engine would serve the graph and fa2 is kept. Callers passing
 ``fixed_split_size`` or ``disable_split_kv`` (fa2's batch-invariance controls)
 keep fa2 wherever fa2 can serve the rows. A CUDA-graph wrapper also tells
 cudnn-frontend 1.31+ that the graph is replayed
@@ -98,11 +96,19 @@ GQA1/2/4/8/16, Q64–1024, and KV2K–32K at least four times Q. Small workloads
 with ``total_query_tokens * Hq * max_KV < 8 * 1024 * 1024`` retain FA2 to
 avoid paged setup and split/combine overhead. This admission
 requires stable cuDNN Frontend 1.32 or newer, its matching native paged
-capability, a compatible FROST runtime, and cuDNN 9.27 or newer. Older stacks
+capability, a compatible FROST runtime, and cuDNN 9.24 or newer. Bounded
+paged plans use explicit per-request Q/KV lengths with token-unit physical
+origins; mixed cumulative-Q/per-request-KV lengths and FP8 retain their
+cuDNN 9.25 floor. Older stacks
 and unsupported attention options retain their existing auto route.
 The wrapper reuses bounded plans and refreshes metadata in ``plan()``;
 first use of a new bucket still requires prewarming. GPU replay gains do not
 imply lower eager submission cost or higher serving throughput.
+
+Explicit paged ``backend="cudnn"`` also reuses prepared plans on cuDNN 9.24
+when both per-request Q and KV lengths are available. This does not require
+bounded auto dispatch. The single-token GQA Stats workaround retains its
+cuDNN 9.27 guard.
 
 For FP16/BF16 cuDNN prefill, runtime ``q_scale`` and ``k_scale`` multiply the
 attention score scale, and ``v_scale`` multiplies the output without changing

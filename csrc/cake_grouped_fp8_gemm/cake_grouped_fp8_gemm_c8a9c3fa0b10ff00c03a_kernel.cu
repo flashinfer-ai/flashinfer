@@ -371,7 +371,6 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
                 asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
             }
             unsigned int partial_pair_stage = 0;
-            unsigned int partial_full_phase = 0;
             const int acc_wg = warp / 4;
             const int acc_warp_in_wg = warp % 4;
             int wg_col_base = acc_wg * 64;
@@ -385,6 +384,7 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
             int dm_tile = num_bids / n_tiles;
             int dn_tile = num_bids % n_tiles;
             unsigned int _phase_scale_full = 0;
+            unsigned int _phase_partial_full = 0;
             #pragma unroll 1
             for (int tile_id = bid; tile_id < total_tiles; tile_id += num_bids) {
                 int tile_rows = 128;
@@ -512,8 +512,8 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
                         _phase_scale_full ^= 1;
                         #pragma unroll
                         for (int pair_inner = 0; pair_inner < 2; pair_inner++) {
-                            mbarrier_wait(partial_full_addr + (partial_pair_stage) * 8, partial_full_phase);
-                            unsigned int partial_stage0 = partial_pair_stage * 2;
+                            mbarrier_wait(partial_full_addr + (partial_pair_stage) * 8, _phase_partial_full);
+                            unsigned int partial_stage0 = partial_pair_stage * 2 % 4;
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             float combined0 = scale_products[pair_inner * 2];
                             tmem_ld_x16(&partial_fragment_a[0], (unsigned int)tmem_partials + (partial_stage0 * 128 + (unsigned int)wg_col_base) + (unsigned int)(row_base << 16));
@@ -523,9 +523,9 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             if (elect_sync()) {
-                                mbarrier_arrive(partial_free_addr + (partial_pair_stage * 2) * 8);
+                                mbarrier_arrive(partial_free_addr + (partial_stage0) * 8);
                             }
-                            unsigned int partial_stage1 = partial_pair_stage * 2 + 1;
+                            unsigned int partial_stage1 = (partial_pair_stage * 2 + 1) % 4;
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             float combined1 = scale_products[pair_inner * 2 + 1];
                             tmem_ld_x16(&next_fragment_a[0], (unsigned int)tmem_partials + (partial_stage1 * 128 + (unsigned int)wg_col_base) + (unsigned int)(row_base << 16));
@@ -631,10 +631,10 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
                             }
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             if (elect_sync()) {
-                                mbarrier_arrive(partial_free_addr + (partial_pair_stage * 2 + 1) * 8);
+                                mbarrier_arrive(partial_free_addr + (partial_stage1) * 8);
                             }
                             partial_pair_stage += 1;
-                            if (partial_pair_stage == 2) { partial_pair_stage = 0; partial_full_phase ^= 1; }
+                            if (partial_pair_stage == 2) { partial_pair_stage = 0; _phase_partial_full ^= 1; }
                         }
                     }
                     int homogeneous = 0;
@@ -759,17 +759,17 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
                     m_tile += 1;
                 }
             }
+            asm volatile("barrier.sync 9, 288;" ::: "memory");
+            asm volatile("tcgen05.fence::after_thread_sync;");
+            if (warp == 0) {
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
+            }
             if (warp == 0) {
                 if (elect_sync()) {
                     asm volatile("cp.async.bulk.wait_group.read 0;");
                 }
             }
             asm volatile("barrier.sync 8, 256;" ::: "memory");
-            asm volatile("barrier.sync 9, 288;" ::: "memory");
-            asm volatile("tcgen05.fence::after_thread_sync;");
-            if (warp == 0) {
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
-            }
         }
     }
     // ---- Role: mma_role ----
@@ -779,13 +779,13 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
             taddr = tmem_addr_storage[0];
             tmem_partials = taddr;
             unsigned int ab_stage = 0;
-            unsigned int ab_full_phase = 0;
             unsigned int partial_pair_stage_1 = 0;
             unsigned int partial_free_stage = 0;
-            unsigned int partial_free_phase = 1;
             int m_tiles_1 = (M + 128 - 1) / 128;
             int n_tiles_1 = N / 128;
             int total_tiles_1 = m_tiles_1 * n_tiles_1;
+            unsigned int _phase_ab_full = 0;
+            unsigned int _phase_partial_free = 1;
             #pragma unroll 1
             for (int _tile_id = bid; _tile_id < total_tiles_1; _tile_id += num_bids) {
                 int m_tile_1 = _tile_id / n_tiles_1;
@@ -823,15 +823,15 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
                     int _shfl_sync_1_1 = __shfl_sync(0xFFFFFFFF, group_1, 0);
                     group_1 = _shfl_sync_1_1;
                     int k_blocks_1 = K / 128;
-                    uint32_t _mbar_token_0 = mbarrier_try_wait(ab_full_addr + (ab_stage) * 8, ab_full_phase);
+                    uint32_t _mbar_token_0 = mbarrier_try_wait(ab_full_addr + (ab_stage) * 8, _phase_ab_full);
                     unsigned int ab_full_token = _mbar_token_0;
                     int k_pairs = k_blocks_1 / 2;
                     #pragma unroll 1
                     for (int pair_k = 0; pair_k < k_pairs; pair_k++) {
                         #pragma unroll
                         for (int pair_half = 0; pair_half < 2; pair_half++) {
-                            mbarrier_wait(partial_free_addr + (partial_free_stage) * 8, partial_free_phase);
-                            mbarrier_wait_token(ab_full_addr + (ab_stage) * 8, ab_full_phase, ab_full_token);
+                            mbarrier_wait(partial_free_addr + (partial_free_stage) * 8, _phase_partial_free);
+                            mbarrier_wait_token(ab_full_addr + (ab_stage) * 8, _phase_ab_full, ab_full_token);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (ab_stage) * 1024);
                             int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (ab_stage) * 1024);
@@ -858,17 +858,17 @@ kernel_cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a(const __grid_constant__ CUtens
                                 }
                             }
                             partial_free_stage += 1;
-                            if (partial_free_stage == 4) { partial_free_stage = 0; partial_free_phase ^= 1; }
+                            if (partial_free_stage == 4) { partial_free_stage = 0; _phase_partial_free ^= 1; }
                             elect_commit(ab_free_addr + (ab_stage) * 8);
                             ab_stage += 1;
-                            if (ab_stage == 6) { ab_stage = 0; ab_full_phase ^= 1; }
+                            if (ab_stage == 6) { ab_stage = 0; _phase_ab_full ^= 1; }
                             if (pair_half == 0) {
-                                uint32_t _mbar_token_1 = mbarrier_try_wait(ab_full_addr + (ab_stage) * 8, ab_full_phase);
+                                uint32_t _mbar_token_1 = mbarrier_try_wait(ab_full_addr + (ab_stage) * 8, _phase_ab_full);
                                 ab_full_token = _mbar_token_1;
                             } else {
                                 ab_full_token = 1;
                                 if (k_pairs > pair_k + 1) {
-                                    uint32_t _mbar_token_2 = mbarrier_try_wait(ab_full_addr + (ab_stage) * 8, ab_full_phase);
+                                    uint32_t _mbar_token_2 = mbarrier_try_wait(ab_full_addr + (ab_stage) * 8, _phase_ab_full);
                                     ab_full_token = _mbar_token_2;
                                 }
                             }

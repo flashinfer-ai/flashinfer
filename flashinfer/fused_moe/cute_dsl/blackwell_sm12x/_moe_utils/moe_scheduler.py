@@ -294,7 +294,9 @@ class MoeSchedProducer:
             empty + sched_stage, ((self.sched_iter // self.stages) & 1) ^ 1
         )
         with cute.arch.elect_one():
-            work[sched_stage, MoeWorkTile.FIELDS - 1] = Int32(0)
+            MoeWorkTile(
+                Int32(0), Int32(0), Int32(0), Int32(0), Int32(0), Int32(0)
+            ).store(work, sched_stage)
             cute.arch.mbarrier_arrive(full + sched_stage)
 
 

@@ -65,15 +65,27 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_STATE_STAGE_BYTES 512
 #define SMEM_STATE_STRIDE 512
 #define SMEM_CAND_OFF 67072
+#if __CUDA_ARCH__ == 1030
+#define CAND_PAD 65
+#define HIST_PAD 17
+#define SMEM_CAND_STAGE_BYTES 8320
+#define SMEM_CAND_STRIDE 8320
+#define SMEM_CAND_CNT_OFF 75392
+#define SMEM_FLAGS_OFF 75584
+#define SMEM_TOTAL 75648
+#else
+#define CAND_PAD 64
+#define HIST_PAD 16
 #define SMEM_CAND_STAGE_BYTES 8192
 #define SMEM_CAND_STRIDE 8192
 #define SMEM_CAND_CNT_OFF 75264
+#define SMEM_FLAGS_OFF 75456
+#define SMEM_TOTAL 75520
+#endif
 #define SMEM_CAND_CNT_STAGE_BYTES 64
 #define SMEM_CAND_CNT_STRIDE 64
-#define SMEM_FLAGS_OFF 75456
 #define SMEM_FLAGS_STAGE_BYTES 64
 #define SMEM_FLAGS_STRIDE 64
-#define SMEM_TOTAL 75520
 #define THREADS 256
 
 #include <math_constants.h>
@@ -130,10 +142,10 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
     const int state_addr = smem + 66560;
     unsigned long long* cand = reinterpret_cast<unsigned long long*>(smem_raw + 67072);
     const int cand_addr = smem + 67072;
-    unsigned int* cand_cnt = reinterpret_cast<unsigned int*>(smem_raw + 75264);
-    const int cand_cnt_addr = smem + 75264;
-    unsigned int* flags = reinterpret_cast<unsigned int*>(smem_raw + 75456);
-    const int flags_addr = smem + 75456;
+    unsigned int* cand_cnt = reinterpret_cast<unsigned int*>(smem_raw + SMEM_CAND_CNT_OFF);
+    const int cand_cnt_addr = smem + SMEM_CAND_CNT_OFF;
+    unsigned int* flags = reinterpret_cast<unsigned int*>(smem_raw + SMEM_FLAGS_OFF);
+    const int flags_addr = smem + SMEM_FLAGS_OFF;
 
     // === Task calls (declaration order) ===
     int tid_0 = tid;
@@ -1239,7 +1251,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_1 == 0 && comp >= cthr_me) {
                                 unsigned int slot = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot < 64) {
-                                    cand[q_local * 64 + (int)slot] = comp;
+                                    cand[q_local * CAND_PAD + (int)slot] = comp;
                                 }
                             }
                             unsigned int raw_62 = __as_u32(xs[1]);
@@ -1253,7 +1265,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_64 == 0 && comp_69 >= cthr_me) {
                                 unsigned int slot_1 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_1 < 64) {
-                                    cand[q_local * 64 + (int)slot_1] = comp_69;
+                                    cand[q_local * CAND_PAD + (int)slot_1] = comp_69;
                                 }
                             }
                             unsigned int raw_70 = __as_u32(xs[2]);
@@ -1267,7 +1279,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_72 == 0 && comp_77 >= cthr_me) {
                                 unsigned int slot_2 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_2 < 64) {
-                                    cand[q_local * 64 + (int)slot_2] = comp_77;
+                                    cand[q_local * CAND_PAD + (int)slot_2] = comp_77;
                                 }
                             }
                             unsigned int raw_78 = __as_u32(xs[3]);
@@ -1281,7 +1293,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_80 == 0 && comp_85 >= cthr_me) {
                                 unsigned int slot_3 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_3 < 64) {
-                                    cand[q_local * 64 + (int)slot_3] = comp_85;
+                                    cand[q_local * CAND_PAD + (int)slot_3] = comp_85;
                                 }
                             }
                             unsigned int raw_86 = __as_u32(xs[4]);
@@ -1295,7 +1307,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_88 == 0 && comp_93 >= cthr_me) {
                                 unsigned int slot_4 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_4 < 64) {
-                                    cand[q_local * 64 + (int)slot_4] = comp_93;
+                                    cand[q_local * CAND_PAD + (int)slot_4] = comp_93;
                                 }
                             }
                             unsigned int raw_94 = __as_u32(xs[5]);
@@ -1309,7 +1321,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_96 == 0 && comp_101 >= cthr_me) {
                                 unsigned int slot_5 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_5 < 64) {
-                                    cand[q_local * 64 + (int)slot_5] = comp_101;
+                                    cand[q_local * CAND_PAD + (int)slot_5] = comp_101;
                                 }
                             }
                             unsigned int raw_102 = __as_u32(xs[6]);
@@ -1323,7 +1335,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_104 == 0 && comp_109 >= cthr_me) {
                                 unsigned int slot_6 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_6 < 64) {
-                                    cand[q_local * 64 + (int)slot_6] = comp_109;
+                                    cand[q_local * CAND_PAD + (int)slot_6] = comp_109;
                                 }
                             }
                             unsigned int raw_110 = __as_u32(xs[7]);
@@ -1337,7 +1349,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_112 == 0 && comp_117 >= cthr_me) {
                                 unsigned int slot_7 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_7 < 64) {
-                                    cand[q_local * 64 + (int)slot_7] = comp_117;
+                                    cand[q_local * CAND_PAD + (int)slot_7] = comp_117;
                                 }
                             }
                             if (i1_1 < n_it) {
@@ -1352,7 +1364,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_2 == 0 && comp_7 >= cthr_me) {
                                     unsigned int slot_8 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_8 < 64) {
-                                        cand[q_local * 64 + (int)slot_8] = comp_7;
+                                        cand[q_local * CAND_PAD + (int)slot_8] = comp_7;
                                     }
                                 }
                                 unsigned int raw_8 = __as_u32(xs[9]);
@@ -1366,7 +1378,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_10 == 0 && comp_15 >= cthr_me) {
                                     unsigned int slot_9 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_9 < 64) {
-                                        cand[q_local * 64 + (int)slot_9] = comp_15;
+                                        cand[q_local * CAND_PAD + (int)slot_9] = comp_15;
                                     }
                                 }
                                 unsigned int raw_16 = __as_u32(xs[10]);
@@ -1380,7 +1392,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_18 == 0 && comp_23 >= cthr_me) {
                                     unsigned int slot_10 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_10 < 64) {
-                                        cand[q_local * 64 + (int)slot_10] = comp_23;
+                                        cand[q_local * CAND_PAD + (int)slot_10] = comp_23;
                                     }
                                 }
                                 unsigned int raw_24_1 = __as_u32(xs[11]);
@@ -1394,7 +1406,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_26 == 0 && comp_31 >= cthr_me) {
                                     unsigned int slot_11 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_11 < 64) {
-                                        cand[q_local * 64 + (int)slot_11] = comp_31;
+                                        cand[q_local * CAND_PAD + (int)slot_11] = comp_31;
                                     }
                                 }
                                 unsigned int raw_32 = __as_u32(xs[12]);
@@ -1408,7 +1420,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_34 == 0 && comp_39 >= cthr_me) {
                                     unsigned int slot_12 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_12 < 64) {
-                                        cand[q_local * 64 + (int)slot_12] = comp_39;
+                                        cand[q_local * CAND_PAD + (int)slot_12] = comp_39;
                                     }
                                 }
                                 unsigned int raw_40_1 = __as_u32(xs[13]);
@@ -1422,7 +1434,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_42_1 == 0 && comp_47 >= cthr_me) {
                                     unsigned int slot_13 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_13 < 64) {
-                                        cand[q_local * 64 + (int)slot_13] = comp_47;
+                                        cand[q_local * CAND_PAD + (int)slot_13] = comp_47;
                                     }
                                 }
                                 unsigned int raw_48 = __as_u32(xs[14]);
@@ -1436,7 +1448,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_50 == 0 && comp_55 >= cthr_me) {
                                     unsigned int slot_14 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_14 < 64) {
-                                        cand[q_local * 64 + (int)slot_14] = comp_55;
+                                        cand[q_local * CAND_PAD + (int)slot_14] = comp_55;
                                     }
                                 }
                                 unsigned int raw_56 = __as_u32(xs[15]);
@@ -1450,7 +1462,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                                 if (is_stage != 0 && nan_58 == 0 && comp_63 >= cthr_me) {
                                     unsigned int slot_15 = atomicAdd(&cand_cnt[q_local], 1);
                                     if (slot_15 < 64) {
-                                        cand[q_local * 64 + (int)slot_15] = comp_63;
+                                        cand[q_local * CAND_PAD + (int)slot_15] = comp_63;
                                     }
                                 }
                             }
@@ -1600,7 +1612,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_4 == 0 && comp_1 >= cthr_me) {
                             unsigned int slot_16 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_16 < 64) {
-                                cand[q_local * 64 + (int)slot_16] = comp_1;
+                                cand[q_local * CAND_PAD + (int)slot_16] = comp_1;
                             }
                         }
                         unsigned int raw_30_1 = __as_u32(xs[1]);
@@ -1614,7 +1626,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_32 == 0 && comp_37 >= cthr_me) {
                             unsigned int slot_17 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_17 < 64) {
-                                cand[q_local * 64 + (int)slot_17] = comp_37;
+                                cand[q_local * CAND_PAD + (int)slot_17] = comp_37;
                             }
                         }
                         unsigned int raw_38 = __as_u32(xs[2]);
@@ -1628,7 +1640,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_40 == 0 && comp_45 >= cthr_me) {
                             unsigned int slot_18 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_18 < 64) {
-                                cand[q_local * 64 + (int)slot_18] = comp_45;
+                                cand[q_local * CAND_PAD + (int)slot_18] = comp_45;
                             }
                         }
                         unsigned int raw_46_1 = __as_u32(xs[3]);
@@ -1642,7 +1654,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_48_1 == 0 && comp_53 >= cthr_me) {
                             unsigned int slot_19 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_19 < 64) {
-                                cand[q_local * 64 + (int)slot_19] = comp_53;
+                                cand[q_local * CAND_PAD + (int)slot_19] = comp_53;
                             }
                         }
                         unsigned int raw_54_1 = __as_u32(xs[4]);
@@ -1656,7 +1668,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_56 == 0 && comp_61 >= cthr_me) {
                             unsigned int slot_20 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_20 < 64) {
-                                cand[q_local * 64 + (int)slot_20] = comp_61;
+                                cand[q_local * CAND_PAD + (int)slot_20] = comp_61;
                             }
                         }
                         unsigned int raw_62_1 = __as_u32(xs[5]);
@@ -1670,7 +1682,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_64_1 == 0 && comp_69_1 >= cthr_me) {
                             unsigned int slot_21 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_21 < 64) {
-                                cand[q_local * 64 + (int)slot_21] = comp_69_1;
+                                cand[q_local * CAND_PAD + (int)slot_21] = comp_69_1;
                             }
                         }
                         unsigned int raw_70_1 = __as_u32(xs[6]);
@@ -1684,7 +1696,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_72_1 == 0 && comp_77_1 >= cthr_me) {
                             unsigned int slot_22 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_22 < 64) {
-                                cand[q_local * 64 + (int)slot_22] = comp_77_1;
+                                cand[q_local * CAND_PAD + (int)slot_22] = comp_77_1;
                             }
                         }
                         unsigned int raw_78_1 = __as_u32(xs[7]);
@@ -1698,7 +1710,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_80_1 == 0 && comp_85_1 >= cthr_me) {
                             unsigned int slot_23 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_23 < 64) {
-                                cand[q_local * 64 + (int)slot_23] = comp_85_1;
+                                cand[q_local * CAND_PAD + (int)slot_23] = comp_85_1;
                             }
                         }
                         if (i1_2 < iters) {
@@ -1713,7 +1725,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_2_1 == 0 && comp_7_1 >= cthr_me) {
                                 unsigned int slot_24 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_24 < 64) {
-                                    cand[q_local * 64 + (int)slot_24] = comp_7_1;
+                                    cand[q_local * CAND_PAD + (int)slot_24] = comp_7_1;
                                 }
                             }
                             unsigned int raw_8_1 = __as_u32(xs[9]);
@@ -1727,7 +1739,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_10_1 == 0 && comp_15_1 >= cthr_me) {
                                 unsigned int slot_25 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_25 < 64) {
-                                    cand[q_local * 64 + (int)slot_25] = comp_15_1;
+                                    cand[q_local * CAND_PAD + (int)slot_25] = comp_15_1;
                                 }
                             }
                             unsigned int raw_16_1 = __as_u32(xs[10]);
@@ -1741,7 +1753,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_18_1 == 0 && comp_23_1 >= cthr_me) {
                                 unsigned int slot_26 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_26 < 64) {
-                                    cand[q_local * 64 + (int)slot_26] = comp_23_1;
+                                    cand[q_local * CAND_PAD + (int)slot_26] = comp_23_1;
                                 }
                             }
                             unsigned int raw_24_2 = __as_u32(xs[11]);
@@ -1755,7 +1767,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_26_1 == 0 && comp_31_1 >= cthr_me) {
                                 unsigned int slot_27 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_27 < 64) {
-                                    cand[q_local * 64 + (int)slot_27] = comp_31_1;
+                                    cand[q_local * CAND_PAD + (int)slot_27] = comp_31_1;
                                 }
                             }
                             unsigned int raw_32_1 = __as_u32(xs[12]);
@@ -1769,7 +1781,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_34_1 == 0 && comp_39_1 >= cthr_me) {
                                 unsigned int slot_28 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_28 < 64) {
-                                    cand[q_local * 64 + (int)slot_28] = comp_39_1;
+                                    cand[q_local * CAND_PAD + (int)slot_28] = comp_39_1;
                                 }
                             }
                             unsigned int raw_40_2 = __as_u32(xs[13]);
@@ -1783,7 +1795,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_42_2 == 0 && comp_47_1 >= cthr_me) {
                                 unsigned int slot_29 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_29 < 64) {
-                                    cand[q_local * 64 + (int)slot_29] = comp_47_1;
+                                    cand[q_local * CAND_PAD + (int)slot_29] = comp_47_1;
                                 }
                             }
                             unsigned int raw_48_1 = __as_u32(xs[14]);
@@ -1797,7 +1809,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_50_1 == 0 && comp_55_1 >= cthr_me) {
                                 unsigned int slot_30 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_30 < 64) {
-                                    cand[q_local * 64 + (int)slot_30] = comp_55_1;
+                                    cand[q_local * CAND_PAD + (int)slot_30] = comp_55_1;
                                 }
                             }
                             unsigned int raw_56_1 = __as_u32(xs[15]);
@@ -1811,7 +1823,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                             if (is_stage != 0 && nan_58_1 == 0 && comp_63_1 >= cthr_me) {
                                 unsigned int slot_31 = atomicAdd(&cand_cnt[q_local], 1);
                                 if (slot_31 < 64) {
-                                    cand[q_local * 64 + (int)slot_31] = comp_63_1;
+                                    cand[q_local * CAND_PAD + (int)slot_31] = comp_63_1;
                                 }
                             }
                         }
@@ -1974,7 +1986,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_5 == 0 && comp_2 >= cthr_me) {
                         unsigned int slot_32 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_32 < 64) {
-                            cand[q_local * 64 + (int)slot_32] = comp_2;
+                            cand[q_local * CAND_PAD + (int)slot_32] = comp_2;
                         }
                     }
                     unsigned int raw_32_2 = __as_u32(xs[1]);
@@ -2001,7 +2013,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_34_2 == 0 && comp_50 >= cthr_me) {
                         unsigned int slot_33 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_33 < 64) {
-                            cand[q_local * 64 + (int)slot_33] = comp_50;
+                            cand[q_local * CAND_PAD + (int)slot_33] = comp_50;
                         }
                     }
                     unsigned int raw_51_1 = __as_u32(xs[2]);
@@ -2028,7 +2040,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_53 == 0 && comp_69_2 >= cthr_me) {
                         unsigned int slot_34 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_34 < 64) {
-                            cand[q_local * 64 + (int)slot_34] = comp_69_2;
+                            cand[q_local * CAND_PAD + (int)slot_34] = comp_69_2;
                         }
                     }
                     unsigned int raw_70_2 = __as_u32(xs[3]);
@@ -2055,7 +2067,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_72_2 == 0 && comp_88 >= cthr_me) {
                         unsigned int slot_35 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_35 < 64) {
-                            cand[q_local * 64 + (int)slot_35] = comp_88;
+                            cand[q_local * CAND_PAD + (int)slot_35] = comp_88;
                         }
                     }
                     unsigned int raw_89 = __as_u32(xs[4]);
@@ -2082,7 +2094,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_91 == 0 && comp_107 >= cthr_me) {
                         unsigned int slot_36 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_36 < 64) {
-                            cand[q_local * 64 + (int)slot_36] = comp_107;
+                            cand[q_local * CAND_PAD + (int)slot_36] = comp_107;
                         }
                     }
                     unsigned int raw_108 = __as_u32(xs[5]);
@@ -2109,7 +2121,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_110 == 0 && comp_126 >= cthr_me) {
                         unsigned int slot_37 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_37 < 64) {
-                            cand[q_local * 64 + (int)slot_37] = comp_126;
+                            cand[q_local * CAND_PAD + (int)slot_37] = comp_126;
                         }
                     }
                     unsigned int raw_127 = __as_u32(xs[6]);
@@ -2136,7 +2148,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_129 == 0 && comp_145 >= cthr_me) {
                         unsigned int slot_38 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_38 < 64) {
-                            cand[q_local * 64 + (int)slot_38] = comp_145;
+                            cand[q_local * CAND_PAD + (int)slot_38] = comp_145;
                         }
                     }
                     unsigned int raw_146 = __as_u32(xs[7]);
@@ -2163,7 +2175,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                     if (is_stage != 0 && nan_148 == 0 && comp_164 >= cthr_me) {
                         unsigned int slot_39 = atomicAdd(&cand_cnt[q_local], 1);
                         if (slot_39 < 64) {
-                            cand[q_local * 64 + (int)slot_39] = comp_164;
+                            cand[q_local * CAND_PAD + (int)slot_39] = comp_164;
                         }
                     }
                     if (i1_3 < iters) {
@@ -2191,7 +2203,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_2_2 == 0 && comp_19 >= cthr_me) {
                             unsigned int slot_40 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_40 < 64) {
-                                cand[q_local * 64 + (int)slot_40] = comp_19;
+                                cand[q_local * CAND_PAD + (int)slot_40] = comp_19;
                             }
                         }
                         unsigned int raw_20 = __as_u32(xs[9]);
@@ -2218,7 +2230,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_22 == 0 && comp_38 >= cthr_me) {
                             unsigned int slot_41 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_41 < 64) {
-                                cand[q_local * 64 + (int)slot_41] = comp_38;
+                                cand[q_local * CAND_PAD + (int)slot_41] = comp_38;
                             }
                         }
                         unsigned int raw_39 = __as_u32(xs[10]);
@@ -2245,7 +2257,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_41 == 0 && comp_57 >= cthr_me) {
                             unsigned int slot_42 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_42 < 64) {
-                                cand[q_local * 64 + (int)slot_42] = comp_57;
+                                cand[q_local * CAND_PAD + (int)slot_42] = comp_57;
                             }
                         }
                         unsigned int raw_58_1 = __as_u32(xs[11]);
@@ -2272,7 +2284,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_60_1 == 0 && comp_76 >= cthr_me) {
                             unsigned int slot_43 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_43 < 64) {
-                                cand[q_local * 64 + (int)slot_43] = comp_76;
+                                cand[q_local * CAND_PAD + (int)slot_43] = comp_76;
                             }
                         }
                         unsigned int raw_77 = __as_u32(xs[12]);
@@ -2299,7 +2311,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_79 == 0 && comp_95 >= cthr_me) {
                             unsigned int slot_44 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_44 < 64) {
-                                cand[q_local * 64 + (int)slot_44] = comp_95;
+                                cand[q_local * CAND_PAD + (int)slot_44] = comp_95;
                             }
                         }
                         unsigned int raw_96 = __as_u32(xs[13]);
@@ -2326,7 +2338,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_98 == 0 && comp_114 >= cthr_me) {
                             unsigned int slot_45 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_45 < 64) {
-                                cand[q_local * 64 + (int)slot_45] = comp_114;
+                                cand[q_local * CAND_PAD + (int)slot_45] = comp_114;
                             }
                         }
                         unsigned int raw_115 = __as_u32(xs[14]);
@@ -2353,7 +2365,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_117 == 0 && comp_133 >= cthr_me) {
                             unsigned int slot_46 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_46 < 64) {
-                                cand[q_local * 64 + (int)slot_46] = comp_133;
+                                cand[q_local * CAND_PAD + (int)slot_46] = comp_133;
                             }
                         }
                         unsigned int raw_134 = __as_u32(xs[15]);
@@ -2380,7 +2392,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                         if (is_stage != 0 && nan_136 == 0 && comp_152 >= cthr_me) {
                             unsigned int slot_47 = atomicAdd(&cand_cnt[q_local], 1);
                             if (slot_47 < 64) {
-                                cand[q_local * 64 + (int)slot_47] = comp_152;
+                                cand[q_local * CAND_PAD + (int)slot_47] = comp_152;
                             }
                         }
                     }
@@ -2855,29 +2867,29 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
     int i = j;
     cs[0] = 0;
     if (i < n_me) {
-        cs[0] = cand[q_local * 64 + i];
+        cs[0] = cand[q_local * CAND_PAD + i];
     }
     ranks[0] = 0;
     int i_4 = j + 16;
     cs[1] = 0;
     if (i_4 < n_me) {
-        cs[1] = cand[q_local * 64 + i_4];
+        cs[1] = cand[q_local * CAND_PAD + i_4];
     }
     ranks[1] = 0;
     int i_5 = j + 32;
     cs[2] = 0;
     if (i_5 < n_me) {
-        cs[2] = cand[q_local * 64 + i_5];
+        cs[2] = cand[q_local * CAND_PAD + i_5];
     }
     ranks[2] = 0;
     int i_6 = j + 48;
     cs[3] = 0;
     if (i_6 < n_me) {
-        cs[3] = cand[q_local * 64 + i_6];
+        cs[3] = cand[q_local * CAND_PAD + i_6];
     }
     ranks[3] = 0;
     for (int m_1 = 0; m_1 < n_me; m_1++) {
-        unsigned long long cm = cand[q_local * 64 + m_1];
+        unsigned long long cm = cand[q_local * CAND_PAD + m_1];
         ranks[0] = ranks[0] + (int)(cm > cs[0]);
         ranks[1] = ranks[1] + (int)(cm > cs[1]);
         ranks[2] = ranks[2] + (int)(cm > cs[2]);
@@ -2886,25 +2898,25 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
     int i2 = j;
     int live = (int)(i2 < n_me) & (int)(ranks[0] < r);
     if (live != 0) {
-        hist64[q_local * 16 + ranks[0]] = cs[0];
+        hist64[q_local * HIST_PAD + ranks[0]] = cs[0];
     }
     int i2_7 = j + 16;
     int live_8 = (int)(i2_7 < n_me) & (int)(ranks[1] < r);
     if (live_8 != 0) {
-        hist64[q_local * 16 + ranks[1]] = cs[1];
+        hist64[q_local * HIST_PAD + ranks[1]] = cs[1];
     }
     int i2_9 = j + 32;
     int live_10 = (int)(i2_9 < n_me) & (int)(ranks[2] < r);
     if (live_10 != 0) {
-        hist64[q_local * 16 + ranks[2]] = cs[2];
+        hist64[q_local * HIST_PAD + ranks[2]] = cs[2];
     }
     int i2_11 = j + 48;
     int live_12 = (int)(i2_11 < n_me) & (int)(ranks[3] < r);
     if (live_12 != 0) {
-        hist64[q_local * 16 + ranks[3]] = cs[3];
+        hist64[q_local * HIST_PAD + ranks[3]] = cs[3];
     }
     if (j >= n_me && j < r) {
-        hist64[q_local * 16 + j] = 0;
+        hist64[q_local * HIST_PAD + j] = 0;
     }
     __syncthreads();
     int is_last = 0;
@@ -2913,7 +2925,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
         int jm = lane_1 & 15;
         unsigned long long pv = 0;
         if (jm < r) {
-            pv = hist64[qm * 16 + jm];
+            pv = hist64[qm * HIST_PAD + jm];
         }
         unsigned int cnt_m = cand_cnt[qm];
         unsigned int mode_m = state[qm * 8];
@@ -2970,7 +2982,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
                 cur = ((gt_8 == take_max_7) ? cur : vp_6);
                 vm = cur;
             }
-            hist64[qm * 16 + jm] = vm;
+            hist64[qm * HIST_PAD + jm] = vm;
             __syncthreads();
         }
     }
@@ -2981,7 +2993,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
         int qo = qtile * 16 + qo_local;
         unsigned int cnt_o = cand_cnt[qo_local];
         unsigned int mode_o = state[qo_local * 8];
-        unsigned long long top_o = hist64[qo_local * 16];
+        unsigned long long top_o = hist64[qo_local * HIST_PAD];
         int ovf_o = (int)(r > 0) & ((int)(cnt_o > 64) | (int)(mode_o != 2) | (int)(top_o == ovf_c));
         int value = max_k_tiles;
         if (k_1 < fb) {
@@ -2989,7 +3001,7 @@ kernel_cake_blackwell_msa_dce0ec63212385c16c81(float* __restrict__ max_score, in
         } else if (k_1 < fb + fe) {
             value = num_valid_pages - fe + (k_1 - fb);
         } else {
-            unsigned long long comp_o = hist64[qo_local * 16 + (k_1 - fb - fe)];
+            unsigned long long comp_o = hist64[qo_local * HIST_PAD + (k_1 - fb - fe)];
             if (comp_o != 0) {
                 value = (int)~(unsigned int)comp_o;
             }

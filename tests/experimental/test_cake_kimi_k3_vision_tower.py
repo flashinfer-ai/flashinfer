@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import dataclasses
 import math
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -68,6 +71,8 @@ ATOL = RTOL = 1e-2
 # Persistent-grid capacity of B200 / B300 in 2-CTA clusters (148 SMs).
 GRID_CLUSTERS = 74
 SM_COUNT = 148
+# Encoder layers of the evaluation contract's rows.
+CONTRACT_LAYERS = 27
 
 # grid_thws batches: single images, a ragged multi-segment batch and a t = 3 video group.
 SMALL_GRIDS = [
@@ -377,7 +382,7 @@ def test_select_tile_config_buckets():
     # column-first twin windows) plus the rule boundaries and the window edges on M.
     assert cb.GEMM_CENSUS_LIMIT == 153088 + GEMM_BLOCK_M
     counts = cb.gemm_census_counts("gelu_erf")
-    assert counts[:3] == (1, 129, 143) and {
+    assert counts[:5] == (1, 64, 65, 129, 143) and {
         143,
         144,
         638,
@@ -616,6 +621,147 @@ def test_pdl_early_window_and_exclusions():
 
 
 @pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_small_m_twins_route_per_arch(arch):
+    # The pre-wait weight prefetch twins (``*_wpl``: the PDL_EARLY QKV / FC0 / FC1 forms up to TINY_M_LIMIT rows)
+    # and the 64-row A-box twins (``*_ab``: the merger GEMMs up to A_BOX_MAX_M rows, outside the PDL_EARLY window)
+    # replace their base tile only on the arches of their scope; the twin keeps the base TileConfig.
+    wpl, ab = arch in cb.WEIGHT_PF_LEAD_ARCHES, arch in cb.A_BOX_ARCHES
+    for variant, base, twin in (
+        ("norm_qkv_rope", "xs_cs_pf", "xs_cs_pf_wpl"),
+        ("norm_gelu", "xs", "xs_wpl"),
+        ("residual_fc1", "xs_k4_pf", "xs_k4_pf_wpl"),
+        ("residual_fc1_sqxw", "xs_k4_pf", "xs_k4_pf_wpl"),
+    ):
+        for m in (1, 256):
+            assert cb.gemm_stage_key(variant, m, arch=arch) == (
+                f"gemm:{variant}:{twin if wpl else base}:pdle"
+            )
+        assert cb.gemm_stage_key(variant, 1) == f"gemm:{variant}:{base}:pdle"
+    assert cb.gemm_stage_key("norm_qkv_rope", 257, arch=arch) == (
+        "gemm:norm_qkv_rope:xs_cs_pf:pdle"
+    )
+    assert cb.gemm_stage_key("residual_wo_sqxw", 256, arch=arch) == (
+        "gemm:residual_wo_sqxw:xs_pf:pdle"
+    )
+    for variant, base, twin in (("gelu_erf", "xs", "xs_ab"), ("rmsnorm", "s", "s_ab")):
+        for m in (1, 64):
+            assert cb.gemm_stage_key(variant, m, arch=arch) == (
+                f"gemm:{variant}:{twin if ab else base}"
+            )
+        assert cb.gemm_stage_key(variant, 65, arch=arch) == f"gemm:{variant}:{base}"
+        assert cb.gemm_stage_key(variant, 64) == f"gemm:{variant}:{base}"
+    for base, twin in (
+        *cb.WEIGHT_PF_LEAD_TWINS.items(),
+        *((name, t) for (_v, name), t in cb.A_BOX_TWINS.items()),
+    ):
+        assert dataclasses.replace(TILE_CONFIGS[twin], name=base) == TILE_CONFIGS[base]
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_qkv_576_token_twin_routes_per_arch(arch):
+    # The QKV GEMM's same-tile pre-wait weight prefetch twin (``s_cs_h_wpl``) replaces its
+    # PDL_EARLY half-N tile at exactly QKV_T576_M rows, on the arches of QKV_T576_ARCHES only;
+    # every other token count and variant keeps its tile, and the twin keeps the base TileConfig.
+    on = arch in cb.QKV_T576_ARCHES
+    assert sorted(cb.QKV_T576_ARCHES) == ["sm_103a"] and cb.QKV_T576_M == 576
+    assert cb.QKV_T576_TWINS == {("norm_qkv_rope", "s_cs_h"): "s_cs_h_wpl"}
+    m = cb.QKV_T576_M
+    assert cb.gemm_stage_key("norm_qkv_rope", m) == "gemm:norm_qkv_rope:s_cs_h:pdle"
+    assert cb.gemm_stage_key("norm_qkv_rope", m, arch=arch) == (
+        f"gemm:norm_qkv_rope:{'s_cs_h_wpl' if on else 's_cs_h'}:pdle"
+    )
+    for other in (m - 1, m + 1):
+        assert cb.gemm_stage_key("norm_qkv_rope", other, arch=arch) == (
+            cb.gemm_stage_key("norm_qkv_rope", other)
+        )
+    for variant in cb.GEMM_VARIANTS:
+        if variant != "norm_qkv_rope":
+            for c in (m - 1, m, m + 1):
+                assert "s_cs_h_wpl" not in cb.gemm_stage_key(variant, c, arch=arch)
+    assert (
+        dataclasses.replace(TILE_CONFIGS["s_cs_h_wpl"], name="s_cs_h")
+        == TILE_CONFIGS["s_cs_h"]
+    )
+    assert {m - 1, m, m + 1} <= set(cb.gemm_census_counts("norm_qkv_rope"))
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
+def test_ready_counter_key_contract(arch):
+    """The ready counters gate batch8_448 (8192 tokens) on sm_103a at 148 SMs on all three edges: its plan lists the
+    five twin keys after its GEMM keys, the twins are required and registered there (on no other arch), the counter
+    words are the plan's last zeroed u32 workspace, and every encoder launch takes its twin and wait target; a plan
+    of one layer, another token count or another arch keeps the base launches and allocates no counter words."""
+    on = arch in cb.READY_COUNTER_ARCHES
+    plan = build_kimi_k3_vision_plan(
+        CONTRACT_GRIDS["batch8_448"],
+        "cpu",
+        num_layers=CONTRACT_LAYERS,
+        sm_count=SM_COUNT,
+        arch=arch,
+    )
+    assert plan.total_tokens == 8192
+    assert plan.ready_counters == (("E1", "E2", "E3") if on else ())
+    for edge in cb.READY_COUNTER_EDGES:
+        early = cb.ready_counter_early_clusters(edge, 8192, SM_COUNT, plan.gemm_configs)
+        assert early > 0, edge
+    twins = list(cb.READY_COUNTER_KEYS)
+    gemm = list(dict.fromkeys(plan.gemm_kernel_keys.values()))
+    keys = list(cb.plan_kernel_keys(plan))
+    assert keys[: len(gemm)] == gemm
+    if on:
+        assert keys[len(gemm) : len(gemm) + len(twins)] == twins
+    else:
+        assert not set(twins) & set(keys)
+    assert (set(twins) <= set(cb.REQUIRED_KERNEL_KEYS[arch])) is on
+    assert (set(twins) <= set(cb.REGISTERED_KERNEL_KEYS[arch])) is on
+    if cake_jit.route_available(arch):
+        assert cake_jit.route_available(arch, tuple(twins)) is on
+    for variant, (base, twin) in cb.READY_COUNTER_TILES.items():
+        assert plan.gemm_kernel_keys[variant] == f"gemm:{variant}:{base}:pdle"
+        assert cb.READY_COUNTER_KEYS[list(cb.READY_COUNTER_TILES).index(variant)] == (
+            f"gemm:{variant}:{twin}:pdle"
+        )
+    if on:
+        assert list(plan.workspace)[-1] == "ready_counters"
+        words = plan.workspace["ready_counters"]
+        assert words.shape == (cb.READY_COUNTER_SLOTS * cb.READY_COUNTER_STRIDE,)
+        assert words.dtype == torch.uint32
+        assert int(words.view(torch.int32).count_nonzero()) == 0
+    else:
+        assert "ready_counters" not in plan.workspace
+    for layer in range(CONTRACT_LAYERS - 1):
+        expected = {
+            "norm_qkv_rope": None if layer == 0 else ("l_e8_cs_rcw", 4 * layer),
+            "residual_wo_sqxw": ("l_e8_tma1x_rcp", 0),
+            "norm_gelu": ("l_e8_rcwp", 4 * (layer + 1)),
+            "residual_fc1_sqxw": ("l_e8_pf_rcwp", 16 * (layer + 1)),
+        }
+        for variant, want in expected.items():
+            if want is not None and on:
+                want = (f"gemm:{variant}:{want[0]}:pdle", want[1])
+            else:
+                want = None
+            got = cb.ready_counter_launch(plan, variant, layer)
+            assert got == want, (variant, layer)
+    last = cb.ready_counter_launch(plan, "residual_fc1", CONTRACT_LAYERS - 1)
+    assert last == (("gemm:residual_fc1:l_e8_pf_rcc:pdle", 0) if on else None)
+    if on:
+        with pytest.raises(RuntimeError, match="below the last layer"):
+            cb.ready_counter_launch(plan, "residual_fc1_sqxw", CONTRACT_LAYERS - 1)
+    assert cb.ready_counter_launch(plan, "pos_sqxw", 0) is None
+    for grids, layers in (
+        (CONTRACT_GRIDS["batch8_448"], 1),
+        ([(1, 32, 32)] * 7, CONTRACT_LAYERS),
+        (CONTRACT_GRIDS["img_1920x1080"], CONTRACT_LAYERS),
+    ):
+        other = build_kimi_k3_vision_plan(
+            grids, "cpu", num_layers=layers, sm_count=SM_COUNT, arch=arch
+        )
+        assert other.ready_counters == () and "ready_counters" not in other.workspace
+        assert not set(twins) & set(cb.plan_kernel_keys(other))
+
+
+@pytest.mark.parametrize("arch", sorted(SUPPORTED_COMPUTE_CAPABILITIES.values()))
 def test_export_rows_plan_onto_registered_programs(arch):
     """Every grid batch of the export's rows (the contract rows and the coverage rows) plans on the
     CPU, with the census device's SM count, onto kernels this checkout registers for ``arch``, and the
@@ -624,7 +770,7 @@ def test_export_rows_plan_onto_registered_programs(arch):
         pytest.skip(f"no generated Kimi-K3 vision tower program registered for {arch}")
     for label, grids in {**cb.CONTRACT_ROW_GRIDS, **cb.COVERAGE_ROW_GRIDS}.items():
         plan = build_kimi_k3_vision_plan(
-            grids, "cpu", num_layers=1, sm_count=SM_COUNT, arch=arch
+            grids, "cpu", num_layers=CONTRACT_LAYERS, sm_count=SM_COUNT, arch=arch
         )
         keys = cb.plan_kernel_keys(plan)
         missing = [k for k in keys if not cake_jit.route_available(arch, (k,))]
@@ -927,6 +1073,42 @@ def test_attention_plan_layout_rule():
         )
     with pytest.raises(ValueError):
         cake_jit.parse_attention_kernel_key("attention:ring3:split:wide")
+
+
+def test_forced_kv_split_never_launches_the_split_build_idle(monkeypatch):
+    """The forced four-way tail split of the 4096 x 4096 image on sm_103a (``FORCED_KV_SPLIT``) cuts 18 tail units
+    on 74 clusters; on a grid whose rounds its 1572 two-tile units fill exactly (12 or 131 clusters) it cuts none,
+    and the plan is the automatic one: whole units, no idle partial-output build."""
+    cu = cu_seqlens_of(CONTRACT_GRIDS["img_max_4096sq"])
+    cpu = torch.device("cpu")
+    forced = build_attention_plan(
+        cu, cpu, HEADS, grid_clusters=GRID_CLUSTERS, arch="sm_103a"
+    )
+    assert (
+        forced.kernel_key,
+        forced.kv_split,
+        forced.split_units,
+        forced.num_merge_units,
+    ) == ("attention:tiles2:split", 4, 18, 18)
+    idle = {
+        clusters: build_attention_plan(
+            cu, cpu, HEADS, grid_clusters=clusters, arch="sm_103a"
+        )
+        for clusters in (12, 131)
+    }
+    monkeypatch.setattr(cb, "FORCED_KV_SPLIT", {})
+    for clusters, plan in idle.items():
+        auto = build_attention_plan(
+            cu, cpu, HEADS, grid_clusters=clusters, arch="sm_103a"
+        )
+        assert plan.total_units % clusters == 0
+        assert (plan.kernel_key, plan.kv_split, plan.num_merge_units) == (
+            "attention:tiles2",
+            None,
+            0,
+        )
+        assert auto.kernel_key == plan.kernel_key and auto.kv_split is None
+        assert torch.equal(auto.unit_table, plan.unit_table)
 
 
 def test_attention_plan_drops_empty_segments():
@@ -1489,7 +1671,10 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     runner = prepare_kimi_k3_vision_tower(
         pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
     )
-    merge = int(plan.attention.num_merge_units > 0)
+    # The merge launch follows a split plan's attention, except where the split builds merge in the kernel.
+    merge = int(
+        plan.attention.num_merge_units > 0 and not cb.in_kernel_merge(plan.arch)
+    )
     assert runner.plan is plan and runner.launch_count == 1 + 2 * (5 + merge) + 4
     expected_stages = set(cb.STAGE_NAMES) - (
         set() if merge else {"layer_attention_merge"}
@@ -1528,6 +1713,222 @@ def test_prepared_runner_graph_replay_and_no_allocation():
     assert metadata["attention_kernel_key"] == plan.attention.kernel_key
     assert metadata["attention_merge"] is bool(merge)
     assert metadata["attention_kernel_key"] in cb.REGISTERED_KERNEL_KEYS[plan.arch]
+
+
+def test_ready_counters_match_the_base_launches():
+    """batch8_448 on a GPU whose plan the ready counters gate (sm_103a): the counter-gated forward equals the plan's
+    base launches bitwise, after a first forward, after five back-to-back forwards without a host synchronization and
+    through CUDA-graph replay (also with new pixel values); the counters are zero again after every forward."""
+    arch = _require_program()
+    grids = CONTRACT_GRIDS["batch8_448"]
+    layers = 3
+    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers, seed=9)
+    prepared = prepare_kimi_k3_vision_weights(weights)
+    plan = build_kimi_k3_vision_plan(grids, device, num_layers=layers)
+    if not plan.ready_counters:
+        pytest.skip(
+            f"no ready-counter plan for this batch on {arch} ({plan.sm_count} SMs)"
+        )
+    runner = prepare_kimi_k3_vision_tower(
+        pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
+    )
+    torch.cuda.synchronize()
+    metadata = runner.route_metadata
+    assert metadata["ready_counter_edges"] == ["E1", "E2", "E3"]
+    assert set(metadata["ready_counter_keys"].values()) == set(cb.READY_COUNTER_KEYS)
+    # every layer's out-proj, fc0 and fc1 but the first layer's QKV: 4 per layer, less one
+    assert metadata["ready_counter_launches"] == 4 * layers - 1
+    assert runner.launch_count == len(runner.stage_launches)
+    reference = torch.full_like(out, float("nan"))
+    base = dataclasses.replace(
+        runner,
+        out=reference,
+        launches=cb._launch_sequence(
+            plan, prepared, pixels, pos_rows, reference, ready_counters=False
+        ),
+        stage_launches=(),
+    )
+    words = plan.workspace["ready_counters"]
+
+    def cleared() -> bool:
+        return int(words.view(torch.int32).count_nonzero()) == 0
+
+    base.launch()
+    torch.cuda.synchronize()
+    expected = reference.clone()
+    assert torch.isfinite(expected.float()).all()
+    runner.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected) and cleared()
+    out.fill_(float("nan"))
+    for _ in range(5):
+        runner.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected) and cleared()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        runner.launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+    pixels.mul_(-1.0)
+    base.launch()
+    torch.cuda.synchronize()
+    flipped = reference.clone()
+    assert not torch.equal(flipped, expected)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, flipped) and cleared()
+
+
+class _Interrupt(BaseException):
+    """A host-side abort between two launches (like KeyboardInterrupt, not an Exception)."""
+
+
+def test_ready_counters_clear_after_an_interrupted_forward():
+    """batch8_448 on a GPU whose plan the ready counters gate (sm_103a): a forward cut short on the host (an entry that
+    raises between two launches: after layer 0's out-proj, after layer 1's FC0, and before the last FC1, which clears
+    the counters) leaves the counters zero once the stream drains, and the next forward with new pixel values equals
+    the plan's base launches bitwise, eager and through CUDA-graph replay after replays of the same graph."""
+    arch = _require_program()
+    grids = CONTRACT_GRIDS["batch8_448"]
+    layers = 3
+    device, weights, pixels, cos, sin, pos_rows, out = _inputs(grids, layers, seed=11)
+    prepared = prepare_kimi_k3_vision_weights(weights)
+    plan = build_kimi_k3_vision_plan(grids, device, num_layers=layers)
+    if not plan.ready_counters:
+        pytest.skip(
+            f"no ready-counter plan for this batch on {arch} ({plan.sm_count} SMs)"
+        )
+    runner = prepare_kimi_k3_vision_tower(
+        pixels, grids, prepared, out, plan=plan, pos_rows=pos_rows
+    )
+    torch.cuda.synchronize()
+    reference = torch.full_like(out, float("nan"))
+    base = dataclasses.replace(
+        runner,
+        out=reference,
+        launches=cb._launch_sequence(
+            plan, prepared, pixels, pos_rows, reference, ready_counters=False
+        ),
+        stage_launches=(),
+    )
+    words = plan.workspace["ready_counters"]
+
+    def cleared() -> bool:
+        return int(words.view(torch.int32).count_nonzero()) == 0
+
+    aborted = pixels.clone()
+    pixels.mul_(-1.0)
+    following = pixels.clone()
+    base.launch()
+    torch.cuda.synchronize()
+    expected = reference.clone()
+    assert torch.isfinite(expected.float()).all()
+
+    def at(stage, layer):
+        return next(
+            index
+            for index, item in enumerate(runner.launches)
+            if item.stage == stage and item.layer == layer
+        )
+
+    cuts = (
+        at("layer_out_proj", 0) + 1,
+        at("layer_norm_fc0_gelu", 1) + 1,
+        at("layer_fc1_last", layers - 1),
+    )
+
+    def stop(*arguments):
+        raise _Interrupt
+
+    def interrupt(cut):
+        launches = list(runner.launches)
+        launches.insert(cut, dataclasses.replace(launches[cut], entry=stop))
+        pixels.copy_(aborted)
+        with pytest.raises(_Interrupt):
+            dataclasses.replace(runner, launches=tuple(launches)).launch()
+        torch.cuda.synchronize()
+        assert cleared()
+        pixels.copy_(following)
+        out.fill_(float("nan"))
+
+    for cut in cuts:
+        interrupt(cut)
+        runner.launch()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        runner.launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    for cut in cuts:
+        for _ in range(2):
+            graph.replay()
+        interrupt(cut)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected) and cleared()
+
+
+class _ClearFailed(RuntimeError):
+    """The zeroing of the ready counters failing in its turn (e.g. on a broken stream)."""
+
+
+@pytest.mark.parametrize("clear_fails", [False, True])
+def test_an_interrupted_launch_reraises_its_own_exception(monkeypatch, clear_fails):
+    """Host only: launch() of a counter-gated plan cut short between two launches enqueues one zeroing of the counters
+    and re-raises the original exception, also when the zeroing raises in its turn (on Python 3.11+ a note on the
+    original then names that failure); a plan without ready counters leaves its workspace alone."""
+    monkeypatch.setattr(
+        cb, "tvm_ffi", types.SimpleNamespace(use_torch_stream=contextlib.nullcontext)
+    )
+    events = []
+
+    class Words:
+        def zero_(self):
+            events.append("zero")
+            if clear_fails:
+                raise _ClearFailed("the stream is broken")
+
+    def ran(*arguments):
+        events.append("ran")
+
+    def stop(*arguments):
+        raise _Interrupt
+
+    def runner(ready_counters):
+        plan = types.SimpleNamespace(
+            ready_counters=ready_counters, workspace={"ready_counters": Words()}
+        )
+        launches = tuple(
+            cb._Launch("layer_out_proj", 0, "", {}, entry, ())
+            for entry in (ran, stop, ran)
+        )
+        return cb.KimiK3VisionTowerRunner(plan, None, None, None, None, launches)
+
+    with pytest.raises(_Interrupt) as raised:
+        runner(("E1", "E2", "E3")).launch()
+    assert events == ["ran", "zero"]
+    notes = getattr(raised.value, "__notes__", [])
+    if clear_fails and sys.version_info >= (3, 11):
+        assert len(notes) == 1 and "_ClearFailed" in notes[0]
+    else:
+        assert notes == []
+    events.clear()
+    with pytest.raises(_Interrupt):
+        runner(()).launch()
+    assert events == ["ran"]
 
 
 def test_one_shot_api():

@@ -19,13 +19,19 @@ import math
 import numpy
 import pytest
 import torch
-from tests.test_helpers.jit_utils import gen_prefill_attention_modules
-from tests.test_helpers.paged_kv import make_padded_paged_kv_view
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.jit.test_helpers.jit_utils import gen_prefill_attention_modules
+from tests.attention.test_helpers.paged_kv import make_padded_paged_kv_view
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 import flashinfer
-from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
-from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.attention.test_helpers.test_helpers import (
+    assert_close_chunked,
+    ref_single_prefill,
+)
+from tests.quantization.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
@@ -1548,7 +1554,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_with_paged_kv_cache_nvfp4(
@@ -2304,7 +2310,7 @@ def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len
 @pytest.mark.parametrize("qo_len", [64, 128])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("num_qo_heads", [1])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_with_ragged_kv_cache_nvfp4(

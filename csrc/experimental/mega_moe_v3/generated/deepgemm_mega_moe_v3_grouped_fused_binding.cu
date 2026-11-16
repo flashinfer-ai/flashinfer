@@ -14,7 +14,7 @@
 #include <cstring>
 
 struct DeepgemmTensorMap;
-extern "C" __global__ void kernel_deepgemm_mega_moe_v3_grouped_fused(DeepgemmTensorMap const* A, DeepgemmTensorMap const* B1, uint8_t* __restrict__ SFA1, uint8_t* __restrict__ SFB1, float* __restrict__ routing_weights, uint8_t* __restrict__ I_fp8_w, uint8_t* __restrict__ SF_I_w, DeepgemmTensorMap const* A2, DeepgemmTensorMap const* B2, unsigned int* __restrict__ SFA2, unsigned int* __restrict__ SFB2, __nv_bfloat16* __restrict__ Out, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, unsigned int* __restrict__ l1_arrival, int M_total, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles);
+extern "C" __global__ void kernel_deepgemm_mega_moe_v3_grouped_fused(DeepgemmTensorMap const* A, DeepgemmTensorMap const* B1, uint8_t* __restrict__ SFA1, uint8_t* __restrict__ SFB1, float* __restrict__ routing_weights, uint8_t* __restrict__ I_fp8_w, uint8_t* SF_I_w, DeepgemmTensorMap const* A2, DeepgemmTensorMap const* B2, unsigned int* SFA2, unsigned int* __restrict__ SFB2, __nv_bfloat16* __restrict__ Out, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, unsigned int* __restrict__ l1_arrival, int M_total, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles);
 
 
 namespace deepgemm_host_shim_grouped_fused {

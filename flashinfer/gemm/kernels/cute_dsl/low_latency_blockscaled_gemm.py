@@ -59,6 +59,7 @@ Warp assignment (384 threads, 12 warps):
 """
 
 import argparse
+import functools
 from typing import NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -159,6 +160,14 @@ def autotune_tactics(
     CTA-K covers every MMA-K multiple that divides K, AB stages cover the full
     supported range, and ``can_implement`` applies the TMEM/SMEM limits.
     """
+    # Memoized: the dispatch path enumerates the tactics on every launch.
+    key = (tuple(problem_sizes_mnkl), a_dtype, b_dtype, sf_dtype, sf_vec_size, c_dtype)
+    return list(_autotune_tactics(key))
+
+
+@functools.lru_cache(maxsize=1024)
+def _autotune_tactics(key: tuple) -> tuple[tuple[int, int, int, int], ...]:
+    problem_sizes_mnkl, a_dtype, b_dtype, sf_dtype, sf_vec_size, c_dtype = key
     _, _, k, _ = problem_sizes_mnkl
     mma_k = 64 if a_dtype.width == b_dtype.width == 4 else 32
     tactics = []
@@ -183,8 +192,7 @@ def autotune_tactics(
                     tactics.append(tactic)
 
     default_cta_k = 4 * mma_k
-    return sorted(
-        tactics,
+    tactics.sort(
         key=lambda tactic: (
             tactic != (default_cta_k, 8, 1, 1),
             abs(tactic[0] - default_cta_k),
@@ -194,6 +202,7 @@ def autotune_tactics(
             tactic[1],
         ),
     )
+    return tuple(tactics)
 
 
 class LowLatencyBlockscaledGemmKernel:

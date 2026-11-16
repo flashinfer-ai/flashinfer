@@ -1,44 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm100 GEMM kernel: persistent + double-TMEM + CLC dynamic scheduler (2-stage ring).
-
-Serves both MMA modes; ``cta_group`` is an injected tile constant.
-
-  cta_group=1  single-CTA MMA — every CTA runs its own MMA on its own
-               SMEM/TMEM, no leader-follower pair.
-  cta_group=2  2-CTA MMA cluster pair — the leader CTA issues the MMA while the
-               follower CLC-consumes only; both CTAs load their operand slice.
-
-The CTA tile may span several MMA instructions along M (``mma_size_m``, each
-``mma_inst_shape_mnk``): TMA fills the whole tile using boxes of at most 256
-rows for K-major A (swizzle groups for M-major A), the MMA
-warp issues one instruction per (M, N) sub-block into its own TMEM column
-region, and the epilogue drains one MMA-M block per pass.
-
-Warp layout (8 warps × 32 = 256 threads/CTA):
-  warps 0–3 : epilogue (warp 0 also allocates TMEM)  — setmaxnreg.inc 216
-  warp  4   : MMA driver (cta_group=2: leader runs the MMA, follower
-              CLC-consumes only)  — setmaxnreg.dec 40
-  warp  5   : TMA producer (cta_group=2: both CTAs load their slice)  — setmaxnreg.dec 40
-  warp  6   : CLC scheduler (leader CTA issues queries; every CTA waits + reads + arrives empty)  — setmaxnreg.dec 40
-  warp  7   : unused donor — setmaxnreg.dec 40
-
-FORKED BY ``sdpa/bwd/kernels/bprop_matmul_blackwell.py``
-----------------------------------------------------
-The SDPA backward's stage-3 gradient GEMMs need a 2-D ``(batch, head)`` batch:
-their operands are BSHD ``[B, S, H, D]``, so the batch element is the PAIR
-``(b, h)`` at offset ``b*(S*H*D) + h*D`` -- a two-level stride that the single
-uniform batch stride here cannot express, and that cannot be normalised
-host-side without copying a multi-GiB workspace per chunk.  That fork takes a
-rendered dense-bf16 expansion of this template and widens the TMA descriptors
-to 4-D ``[k, m, h, b]``.  It is otherwise identical: same mainloop, same CLC
-scheduler, same TMEM pipeline, same epilogue.
-
-**Any correctness fix or performance improvement here should be applied there
-too, and vice versa.**  The fork carries the matching note and a list of the
-points where the two intentionally differ.
-"""
+"""sm100 GEMM kernel: persistent + double-TMEM + CLC dynamic scheduler (2-stage ring)."""
 
 from __future__ import annotations
 
@@ -47,6 +10,7 @@ from typing import Callable
 
 import cutlass.experimental.primitives as nvvm
 from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.tile_helpers import (
+    cluster_split_k_reduce,
     epi_subtile_spans as _epi_subtile_spans,
     l2_swizzle_tile as _l2_swizzle_tile,
     tcgen05_alloc as _tcgen05_alloc,
@@ -65,17 +29,11 @@ from cutlass.cute.arch import clc as cute_clc
 
 # @@INJECT_TILE_CONSTANTS@@
 
-# Rank decomposition below uses shifts and masks instead of runtime integer
-# division.  The catalog satisfies this; keep synthesized configs from silently
-# taking the fast path with a non-power-of-two cluster dimension.
 if any(_d <= 0 or (_d & (_d - 1)) != 0 for _d in cluster_shape_mnk[:2]):
     raise NotImplementedError(f"{__name__}: cluster M/N dimensions must be powers of two")
 if fallback_cluster_shape_mnk is not None and any(_d <= 0 or (_d & (_d - 1)) != 0 for _d in fallback_cluster_shape_mnk[:2]):
     raise NotImplementedError(f"{__name__}: fallback cluster M/N dimensions must be powers of two")
 
-# Keep the two launch alternatives as host constants and spell the preferred /
-# fallback operations at each use site. This exposes constant masks and shift
-# alternatives before backend canonicalization.
 _preferred_cluster_m_shift = cluster_shape_mnk[0].bit_length() - 1
 _preferred_cluster_n_shift = cluster_shape_mnk[1].bit_length() - 1
 _fallback_cluster_m_shift = _preferred_cluster_m_shift if fallback_cluster_shape_mnk is None else fallback_cluster_shape_mnk[0].bit_length() - 1
@@ -102,14 +60,7 @@ TMEM_ALLOC_BARRIER_ID = 2
 
 @cute.jit
 def _auto_swizzle_w(m, n, k, nt_n):
-    """N-super-block width for the tile rasterization, resolved per launch.
-
-    ``tile_swizzle_n > 0`` pins it. Otherwise: the walk keeps one operand slice
-    resident and re-reads the other every super-block, so block along the SHORTER
-    problem side. Once that side outgrows what L2 can hold onto while C streams
-    through it, keeping it is no longer free -- fall back to the widest N block the
-    budget does cover.
-    """
+    """N-super-block width for the tile rasterization, resolved per launch."""
     if cutlass.const_expr(tile_swizzle_n > 0):
         return tile_swizzle_n
     budget = cutlass.Int64(swizzle_l2_budget_bytes)
@@ -132,7 +83,7 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.kernel_templ
 
 @cute.jit
 def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, aux):
-    """epilogue function for split-K reduction"""
+    """Apply the split-K reducer epilogue."""
     # @@INJECT_SPLITK_EPILOGUE_BINDINGS@@
     # @@INJECT_REDUCE_AUX_VIEWS@@
 
@@ -167,16 +118,17 @@ def _kernel(
     m: cutlass.Int64,
     n: cutlass.Int64,
     k: cutlass.Int64,
+    swizzle_w: cutlass.Int32,
     # @@INJECT_KERNEL_AB_DESC_PARAMS@@
     # @@INJECT_KERNEL_TAP_PARAMS@@
-    # @@SPLITK_ONLY:BEGIN@@
-    mSplitK_partials: cute.Tensor,
-    # @@SPLITK_ONLY:END@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
     # @@INJECT_KERNEL_TMA_C_PARAMS@@
     # @@TMA_STORE_ONLY:END@@
+    # @@SPLITK_ONLY:BEGIN@@
+    mSplitK_partials: cute.Tensor,
+    # @@SPLITK_ONLY:END@@
 ) -> None:
     # @@INJECT_AB_DESC_LISTS@@
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -202,11 +154,6 @@ def _kernel(
     gridx = cute.arch.grid_dim()[0]
     gridy = cute.arch.grid_dim()[1]
 
-    # Mixed CGA: the launch carries a preferred (wide) cluster plus a smaller
-    # fallback one, and the device picks per cluster — a CTA can only tell which
-    # by reading the hardware cluster dims. Everything cluster-shaped below then
-    # follows from those, so the two kinds share one body; only the multicast bit
-    # patterns are loop-built and come in precomputed per shape.
     a_mcast_pattern = mixed_a_pattern_pref
     if cutlass.const_expr(cta_group == 2):
         b_mcast_pattern = mixed_b_pattern_pref
@@ -220,8 +167,6 @@ def _kernel(
         a_mcast_pattern = cutlass.Int32(mixed_a_pattern_pref)
         if cutlass.const_expr(cta_group == 2):
             b_mcast_pattern = cutlass.Int32(mixed_b_pattern_pref)
-        # Bitwise, not `or`: both operands are runtime Booleans (this is the form
-        # cutlass.cute.experimental.is_preferred_cluster uses).
         if (cdim_x != cluster_shape_mnk[0]) | (cdim_y != cluster_shape_mnk[1]):
             a_mcast_pattern = cutlass.Int32(mixed_a_pattern_fb)
             if cutlass.const_expr(cta_group == 2):
@@ -229,21 +174,25 @@ def _kernel(
     cluster_size = cluster_m * cluster_n * cluster_shape_mnk[2]
 
     cta_rank_in_cluster = cute.arch.block_idx_in_cluster()
-    # Every catalog cluster dimension is a power of two.  Mixed-CGA makes the
-    # divisor runtime-visible, so spelling rank decomposition as div/mod would
-    # otherwise lower to reciprocal-based integer division in every warp.
     m_rank = cta_rank_in_cluster & (cluster_shape_mnk[0] - 1)
-    n_rank = cta_rank_in_cluster >> _preferred_cluster_m_shift
+    n_rank = (cta_rank_in_cluster >> _preferred_cluster_m_shift) & (cluster_shape_mnk[1] - 1)
     if cutlass.const_expr(fallback_cluster_shape_mnk is not None):
         if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
             m_rank = cta_rank_in_cluster & (fallback_cluster_shape_mnk[0] - 1)
             n_rank = cta_rank_in_cluster >> _fallback_cluster_m_shift
 
+    k_rank = cutlass.Int32(0)
+    k_root_rank = cta_rank_in_cluster
+    if cutlass.const_expr(cluster_k_reduce):
+        plane_ctas = cluster_shape_mnk[0] * cluster_shape_mnk[1]
+        k_rank = cta_rank_in_cluster // plane_ctas
+        k_root_rank = cta_rank_in_cluster % plane_ctas
+
     if cutlass.const_expr(cta_group == 2):
         pair_member = m_rank % cta_group
         pair_m_idx = m_rank // cta_group
         is_pair_leader = pair_member == 0
-        pair_leader_rank = pair_m_idx * cta_group + n_rank * cluster_m
+        pair_leader_rank = pair_m_idx * cta_group + n_rank * cluster_m + k_rank * (cluster_shape_mnk[0] * cluster_shape_mnk[1])
     else:
         pair_member = 0
         pair_m_idx = m_rank
@@ -273,7 +222,6 @@ def _kernel(
             init_raw_n = bidy >> _fallback_cluster_n_shift
             init_nt_m = gridx >> _fallback_cluster_m_shift
             init_nt_n = gridy >> _fallback_cluster_n_shift
-    swizzle_w = _auto_swizzle_w(m, n, k, init_nt_n)
     init_tile_m, init_tile_n = _l2_swizzle_tile(
         init_raw_m,
         init_raw_n,
@@ -308,6 +256,13 @@ def _kernel(
             tma_mcast_mask_b = cutlass.Int16((b_mcast_pattern << pair_member) << (n_rank * cluster_m))
         else:
             tma_mcast_mask_b = cutlass.Int16(1 << cta_rank_in_cluster)
+
+    if cutlass.const_expr(cluster_k_reduce):
+        k_plane_shift = k_rank * (cluster_shape_mnk[0] * cluster_shape_mnk[1])
+        if cutlass.const_expr(multicast_a):
+            tma_mcast_mask_a = tma_mcast_mask_a << k_plane_shift
+        if cutlass.const_expr(multicast_b):
+            tma_mcast_mask_b = tma_mcast_mask_b << k_plane_shift
 
     _smem_sys_reserved = cutlass.Array(cutlass.Int8, 1024, space=cutlass.AddressSpace.smem, alignment=1)
 
@@ -356,9 +311,6 @@ def _kernel(
     ]
 
     # @@TMA_STORE_ONLY:BEGIN@@
-    # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
-    # The ring slot is indexed by `tidx`, so its row count is the EPILOGUE THREAD
-    # count -- which is epi_tile_mn[0] only when the MMA M block is 128.
     epi_subtile_elems = epi_stage_rows * epi_row_elems * epi_slot_widen
     smem_d_ptr = cutlass.Array(
         epi_store_dtype,
@@ -368,12 +320,17 @@ def _kernel(
     )
     # @@TMA_STORE_ONLY:END@@
 
+    if cutlass.const_expr(cluster_k_reduce):
+        cluster_mailbox = cutlass.Array(cutlass.Float32, split_k_slices * cluster_reduce_elems, space=cutlass.AddressSpace.smem, alignment=16)
+        cluster_ready_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+        cluster_free_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
+
     acc_empty_count = num_epilogue_warps * cta_group
     if cutlass.const_expr(ab_empty_full_mask):
         if cutlass.const_expr(cta_group == 1):
-            ab_empty_count = cluster_size
+            ab_empty_count = cluster_m * cluster_n
         else:
-            ab_empty_count = cluster_size // cta_group
+            ab_empty_count = (cluster_m * cluster_n) // cta_group
     else:
         if cutlass.const_expr(cta_group == 1):
             ab_empty_count = cluster_m + cluster_n - 1
@@ -382,6 +339,10 @@ def _kernel(
     num_consumer_warps_per_cta = 7
     clc_empty_count = num_consumer_warps_per_cta * cluster_size
     if warp_idx == 0:
+        if cutlass.const_expr(cluster_k_reduce):
+            if elect_one:
+                nvvm.mbarrier_init(cluster_ready_mbar_ptr, split_k_slices - 1)
+                nvvm.mbarrier_init(cluster_free_mbar_ptr, 1)
         if cutlass.const_expr(cta_group == 2):
             if elect_one:
                 nvvm.mbarrier_init(tmem_dealloc_mbar_ptr, 32)
@@ -403,7 +364,7 @@ def _kernel(
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cta_group == 1):
 
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             nvvm.barrier_cluster_arrive_relaxed()
             nvvm.barrier_cluster_wait()
         else:
@@ -418,8 +379,6 @@ def _kernel(
     else:
         num_tma_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * 2
 
-    # One descriptor for every MMA instruction of the tile — the CTA tile spans
-    # mma_size_m of them, all the same shape.
     idesc = cutlass.experimental.primitives.Tcgen05InstrDesc.build(
         a_dtype=mma_a_dtype,
         b_dtype=mma_b_dtype,
@@ -431,18 +390,10 @@ def _kernel(
         k_dim=mma_k_dim,
     )
 
-    # Per-CTA logical tile — the cluster cancels out, so these stay compile-time
-    # constants even when the cluster shape is only known at runtime.
     logical_cta_tile_m = cgrp_tile_mnk[0] // cluster_shape_mnk[0]
     logical_cta_tile_n = cgrp_tile_mnk[1] // cluster_shape_mnk[1]
     pair_n_size = logical_cta_tile_n
-    # Per-CTA output rows one MMA-M block covers. A 2-CTA pair splits M, so this
-    # is the per-CTA mma_inst_m — half the instruction's hardware M.
     epi_rows_per_mma_m = cta_tile_mnk[0] // mma_size_m
-    # TMEM accumulator layout, per acc stage: gemm g, M block mi -> columns
-    # [g*cols_per_acc_stage + mi*epi_cols_per_mma_m, +epi_cols_per_mma_m), all at
-    # TMEM lane base 0. N is NOT split across instructions, so the epilogue drains
-    # a whole M block as one contiguous span.
     if cutlass.const_expr(epi_dp22):
         # cluster-MMA m=128: the pair also splits N, so each CTA drains N/2.
         epi_cols_per_mma_m = pair_n_size // 2
@@ -467,9 +418,6 @@ def _kernel(
     M = m
     N = n
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
-    # The tile this cluster owns spans its OWN cluster shape; both shapes walk
-    # the grid as the identity map (tile == blockIdx), so they tile the problem
-    # identically and every output tile is still covered exactly once.
     cgrp_tile_m_cur = logical_cta_tile_m * cluster_m
     cgrp_tile_n_cur = logical_cta_tile_n * cluster_n
     num_k_blocks = cta_tile_mnk[2] // mma_inst_shape_mnk[2]
@@ -517,7 +465,7 @@ def _kernel(
 
             sched_iter += 1
 
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             if is_cluster_leader_cta:
                 for _ in range(CLC_SCHED_STAGES):
                     stage = sched_iter % CLC_SCHED_STAGES
@@ -552,7 +500,10 @@ def _kernel(
             # Split-K: grid z carries batch*S
             if cutlass.const_expr(split_k_slices > 1):
                 batch_tile_l = tile_l // split_k_slices
-                split_idx = cutlass.Int64(tile_l % split_k_slices)
+                if cutlass.const_expr(cluster_k_reduce):
+                    split_idx = cutlass.Int64(k_rank)
+                else:
+                    split_idx = cutlass.Int64(tile_l % split_k_slices)
                 k_tiles_per_split = num_k_tiles // split_k_slices
                 k_tiles_remainder = num_k_tiles % split_k_slices
                 k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
@@ -809,7 +760,7 @@ def _kernel(
         tail_phase = ab_empty_phase_bit
         if tail_stage == 0 and ab_iter != 0:
             tail_phase = tail_phase ^ 1
-        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
+        if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] * cluster_shape_mnk[2] > 1):
             for _ in range(ab_stages):
                 while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
                     pass
@@ -827,7 +778,7 @@ def _kernel(
         a_part = a_part | (a_part << 1)
     b_part = b_arrive_pattern << (n_rank * cluster_m)
     if cutlass.const_expr(ab_empty_full_mask):
-        ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
+        ab_empty_arrive_mask = cutlass.Int16((1 << (cluster_m * cluster_n)) - 1)
     else:
         ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
     if cutlass.const_expr(cta_group == 2):
@@ -860,8 +811,6 @@ def _kernel(
             acc_stage = cutlass.Int32(0)
             if cutlass.const_expr(split_k_slices > 1):
                 tile_l = bidz  # this tile's z coord
-            # Descriptor metadata and the SMEM allocation base are invariant
-            # across persistent tiles.  Only the encoded start address advances.
             desc_a_roots = [
                 cutlass.experimental.primitives.Tcgen05SmemDesc.build(
                     start_address=smem_a_list[i],
@@ -893,8 +842,6 @@ def _kernel(
                     pass
 
                 acc_base_col = base_col_id_root + acc_stage * acc_region_cols
-                # One accumulator per (gemm, M block). Column arithmetic stays on
-                # the encoded (row << 16) | col integer.
                 tmem_addr_mmas = [
                     [
                         cutlass.inttoptr(
@@ -908,7 +855,10 @@ def _kernel(
                 ]
 
                 if cutlass.const_expr(split_k_slices > 1):
-                    split_idx = cutlass.Int64(tile_l % split_k_slices)
+                    if cutlass.const_expr(cluster_k_reduce):
+                        split_idx = cutlass.Int64(k_rank)
+                    else:
+                        split_idx = cutlass.Int64(tile_l % split_k_slices)
                     k_tiles_per_split = num_k_tiles // split_k_slices
                     k_tiles_remainder = num_k_tiles % split_k_slices
                     k_begin = split_idx * k_tiles_per_split + cutlass.min(split_idx, k_tiles_remainder)
@@ -934,9 +884,6 @@ def _kernel(
                             desc_a_k = desc_a_roots[gemm_a_idx[g]].advance_start_address(sA_bytes * stage + a_smem_k_step_bytes * k_block_idx)
                             desc_b = desc_b_roots[gemm_b_idx[g]].advance_start_address(sB_bytes * stage + b_smem_k_step_bytes * k_block_idx)
                             for mi in cutlass.range_constexpr(mma_size_m):
-                                # The M sub-block offset is a whole SMEM swizzle atom
-                                # (mma_inst_m x cta_tile_k_bytes), so the descriptor's
-                                # swizzle phase is preserved. B is shared by every M block.
                                 desc_a = desc_a_k.advance_start_address(a_smem_m_step_bytes * mi)
                                 if elect_one:
                                     _tcgen05_mma(
@@ -950,14 +897,12 @@ def _kernel(
                                         collector_op=_a_collector_op(g),
                                         b_collector_op=_b_collector_op(mi),
                                     )
-                        # Every accumulator sees scale_d=False on exactly the first
-                        # k_block of the tile, so the flip stays outside mi.
                         scale_d = cutlass.Boolean(True)
 
                     if elect_one:
                         nvvm.tcgen05_commit(
                             ab_empty_mbar_ptr.subview(stage),
-                            multicast_mask=ab_empty_arrive_mask,
+                            multicast_mask=ab_empty_arrive_mask << (k_rank * (cluster_shape_mnk[0] * cluster_shape_mnk[1])),
                             group=_CTA_GROUP,
                         )
                     ab_iter += 1
@@ -989,8 +934,6 @@ def _kernel(
                     nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                 tile_iter += 1
 
-            # Dense only: an early-launched reducer would pile its many small CTAs
-            # onto the few idle SMs, so split-K leaves the trigger to grid exit.
             if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
 
@@ -1073,9 +1016,14 @@ def _kernel(
         acc_full_phase_bit = cutlass.Int32(0)
         tile_m = init_tile_m
         tile_n = init_tile_n
-        tile_l = init_tile_l
+        tile_l = init_tile_l // cluster_shape_mnk[2]
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
+
+        write_epilogue = True
+        if cutlass.const_expr(cluster_k_reduce):
+            write_epilogue = k_rank == 0
+            cluster_reduce_iter = cutlass.Int32(0)
 
         # @@EPILOGUE_SETUP:BEGIN@@
         if cutlass.const_expr(epi_packed_lanes):
@@ -1146,6 +1094,22 @@ def _kernel(
                         c_rmem_vecs.append(_cv)
                     c_rmem_vec = c_rmem_vecs[0]
 
+                    if cutlass.const_expr(cluster_k_reduce):
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                        c_rmem_vec = cluster_split_k_reduce(
+                            c_rmem_vec,
+                            cluster_mailbox,
+                            cluster_ready_mbar_ptr,
+                            cluster_free_mbar_ptr,
+                            cluster_reduce_iter,
+                            k_rank,
+                            k_root_rank,
+                            cluster_shape_mnk[0] * cluster_shape_mnk[1],
+                            split_k_slices,
+                            num_epilogue_warps * 32,
+                        )
+                        cluster_reduce_iter += 1
+
                     if mi == mma_size_m - 1 and subtile_idx == subtile_cnt - 1:
                         nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
                         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -1162,17 +1126,17 @@ def _kernel(
                     col = coord_n_c + subtile_col_offset
 
                     # @@TMA_STORE_ONLY:BEGIN@@
-                    vec_f32 = c_rmem_vec
-                    col_j = col
-                    linear_idx = tile_l * out_stride_l_0 + row * out_stride_m_0 + col_j * out_stride_n_0
+                    if write_epilogue:
+                        vec_f32 = c_rmem_vec
+                        col_j = col
 
-                    # @@INJECT_EPILOGUE@@
+                        # @@INJECT_EPILOGUE@@
 
-                    # @@INJECT_TMA_STORE_SEQUENCE@@
+                        # @@INJECT_TMA_STORE_SEQUENCE@@
                     # @@TMA_STORE_ONLY:END@@
 
                     # @@STG_ONLY:BEGIN@@
-                    if row_active and row < M:
+                    if write_epilogue and row_active and row < M:
                         for j in cutlass.range_constexpr(subtile_w // vsize):
                             col_j = col + j * vsize
                             if col_j + vsize <= N:
@@ -1214,7 +1178,7 @@ def _kernel(
                 swizzle_w,
                 identity=tile_swizzle_n == 1,
             )
-            tile_l = l_idx
+            tile_l = l_idx // cluster_shape_mnk[2]
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1229,6 +1193,11 @@ def _kernel(
 
     if warp_idx == unused_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+
+    if cutlass.const_expr(cluster_k_reduce):
+        # DSMEM slots must outlive every peer's final load and acknowledgement.
+        nvvm.barrier_cluster_arrive()
+        nvvm.barrier_cluster_wait()
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
@@ -1362,25 +1331,24 @@ def _host(
     grid_x = num_tile_m_host * cluster_m
     grid_y = num_tile_n_host * cluster_n
     grid_shape = (grid_x, grid_y, batch * split_k_slices)
+    # Resolve shape-only rasterization once per launch on the host.
+    swizzle_w_host = _auto_swizzle_w(m, n, k_sym, num_tile_n_host)
     launch = _kernel(
         problem_size[0],
         problem_size[1],
         problem_size[2],
+        swizzle_w_host,
         # @@INJECT_HOST_KERNEL_DESC_PASS@@
         # @@INJECT_HOST_TAP_PASS@@
-        # @@SPLITK_ONLY:BEGIN@@
-        splitk_partials,
-        # @@SPLITK_ONLY:END@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
         # @@TMA_STORE_ONLY:BEGIN@@
         # @@INJECT_HOST_TMA_C_PASS@@
         # @@TMA_STORE_ONLY:END@@
+        # @@SPLITK_ONLY:BEGIN@@
+        splitk_partials,
+        # @@SPLITK_ONLY:END@@
     )
-    # Mixed CGA: `cluster` is the preferred (wide) shape and `fallback_cluster`
-    # the regular one the device groups blocks into when a preferred cluster does
-    # not fit. The grid is already a multiple of the preferred shape, which the
-    # driver requires.
     if cutlass.const_expr(fallback_cluster_shape_mnk is None):
         launch.launch(
             grid=grid_shape,
@@ -1437,9 +1405,6 @@ def compile() -> Callable:
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
     sym_n = cute.sym_int64(divisibility=out_vec_elems)
-    # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
-    # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
-    # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     sym_l = cute.sym_int64()
     if matmul_a_batch == 1:

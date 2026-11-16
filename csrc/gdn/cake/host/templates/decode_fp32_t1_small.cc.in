@@ -129,9 +129,9 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_st
 
   static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(@MODULE_IDENT@, "@CUDA_SYMBOL@");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
-  tvm::ffi::dim3 block(128u, 1u, 1u);
+  tvm::ffi::dim3 block(@BLOCK_THREADS@u, 1u, 1u);
 
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 11392u));
+  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, @DYNAMIC_SMEM_BYTES@u));
 }
 
 }  // namespace cake_gdn_host_shim_@SHIM_NAMESPACE@

@@ -21,8 +21,8 @@ import torch
 from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry points; the workspace, route selection (one-launch
-# program / one-shot / two-shot K1, K3-ESS / persistent tail, grouped / pinned
-# poll schedule), launch binding and JIT registration live in
+# program / one-shot / two-shot K1, K3-ESS / reduce / persistent tail, grouped /
+# pinned poll schedule), launch binding and JIT registration live in
 # flashinfer.experimental.kimi_k3_tp12_tail.
 
 _FEATURE = "Kimi-K3 TP12 fused LatentMoE tail"
@@ -54,6 +54,19 @@ def create_kimi_k3_tp12_tail_workspace(
     for up to ``max_tokens`` tokens plus the normalised-latent and
     up-projection slice buffers of this rank.  Reuse the workspace for every
     call of the layer and ``destroy()`` it before the process group.
+
+    The workspace is collective state, like an NCCL communicator: the calls
+    that share it run one at a time and in the same order on every rank, and
+    a call from another stream than the previous one waits for it (outside
+    CUDA Graph capture; concurrent graph replays and several host threads
+    must not share a workspace).  For ``M <= 8`` a call is one cooperative
+    grid of ``M + 80`` CTAs (``M + 64`` on ranks 8-11) that must be resident
+    at once on every rank: under a green context or MPS partition with fewer
+    SMs (88 covers every ``M <= 8``) the launch raises instead of spinning.
+    Do not overlap two ``M <= 8`` calls, or one and another cooperative
+    peer-waiting kernel, on one GPU, even with separate workspaces.  Every
+    rank must be able to run the call: a co-runner that never frees those
+    SMs stalls the whole group.
 
     Parameters
     ----------
@@ -114,9 +127,10 @@ def prepare_kimi_k3_tp12_tail(
     ``shared_partial`` columns fused with the add of the slice, one BF16
     rounding and the multicast all-gather of ``out`` (one CTA per eight output
     columns for ``M <= 8``, in the same grid as the all-reduce's one CTA per
-    token; one CTA per token below 961 tokens, a persistent token pipeline
-    above).  ``out`` is bitwise identical on every rank.  Every rank must
-    prepare and launch the same ``M``.
+    token; one CTA per token below 320 tokens, a persistent grid that reduces
+    and gathers from 320 to 960 tokens, a persistent token pipeline above).
+    ``out`` is bitwise identical on every rank.  Every rank must prepare and
+    launch the same ``M``.
 
     Parameters
     ----------
@@ -141,8 +155,9 @@ def prepare_kimi_k3_tp12_tail(
     KimiK3Tp12TailRunner
         Calling it launches the generated kernels (one for ``M <= 8``; two and
         cuBLAS above) on the current stream with no CUDA allocation or host
-        synchronization and returns ``out``.  CUDA Graph capture of the runner
-        is supported; prepare outside capture.
+        synchronization and returns ``out``; a launch from another stream than
+        the previous launch on the workspace first waits for it.  CUDA Graph
+        capture of the runner is supported; prepare outside capture.
     """
     return _backend(backend).prepare_kimi_k3_tp12_tail(
         routed_partial, shared_partial, norm_weight, up_weight, out, workspace=workspace

@@ -76,7 +76,8 @@
   "MMA_TILE_K": 1006,
   "CTA_GROUP": 1007,
   "WARPS_M": 1008,
-  "WARPS_N": 1009
+  "WARPS_N": 1009,
+  "CLUSTER_K_REDUCE": 1010
  },
  "behavior_note": {
   "RUNTIME_COMPILATION": 1,
@@ -146,18 +147,33 @@
   "_SdpaDenseBinder": {
    "supports_combine_q_lens": true,
    "supports_epilogue_gate": true,
-   "supports_paged_epilogue_gate": true
+   "supports_mixed_fp8_kv": true,
+   "supports_native_d576": true,
+   "supports_paged_epilogue_gate": true,
+   "supports_quantized_split_sink": true,
+   "supports_ragged_q_lens": true
   },
   "_SdpaThdBinder": {
    "supports_epilogue_gate": true,
+   "supports_initial_wave_geometry": true,
+   "supports_initial_waves": true,
+   "supports_mixed_fp8_kv": true,
+   "supports_native_d576": true,
+   "supports_native_d576_packed_split": true,
    "supports_nonpaged_d128_packed_split": true,
+   "supports_nonpaged_d128_split_physical_origins": true,
    "supports_nonpaged_d256_packed_split": true,
    "supports_nonpaged_packed_split": true,
    "supports_paged_d256_packed_split": true,
    "supports_paged_d64_packed_split": true,
    "supports_paged_epilogue_gate": true,
+   "supports_paged_fp8_physical_origins": true,
    "supports_paged_packed_split": true,
+   "supports_paged_physical_origins": true,
+   "supports_paged_split_physical_origins": true,
    "supports_paged_split_sink": true,
+   "supports_physical_origin_caps": true,
+   "supports_physical_origins": true,
    "supports_stats_stride_override": true
   }
  },

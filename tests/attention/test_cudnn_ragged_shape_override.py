@@ -79,6 +79,105 @@ def _cudnn_override_available():
     )
 
 
+@pytest.mark.parametrize("initial_lengths", ["q", "kv", "both", "neither"])
+@pytest.mark.parametrize("length_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("causal", [False, True])
+def test_ragged_mask_lengths_survive_replan(
+    initial_lengths, length_device, length_dtype, causal
+):
+    """Fresh length tensors and explicit/inferred transitions update old captures."""
+    if not _cudnn_override_available():
+        pytest.skip("requires cuDNN ragged CUDA Graph support")
+    torch.manual_seed(7438)
+    q = torch.randn(8, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(16, 2, 128, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device="cuda", dtype=torch.float32)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+        backend="cudnn",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+        kv_indptr_buf=torch.empty(3, device="cuda", dtype=torch.int32),
+    )
+
+    def plan(mode, qslots, kslots, qlens, klens):
+        lengths = {}
+        for key, include, values in (
+            ("seq_lens_q", mode in ("q", "both"), qlens),
+            ("seq_lens", mode in ("kv", "both"), klens),
+        ):
+            if include:
+                lengths[key] = torch.tensor(
+                    values, device=length_device, dtype=length_dtype
+                )
+        wrapper.plan(
+            _indptr(qslots),
+            _indptr(kslots),
+            8,
+            2,
+            128,
+            q_data_type=q.dtype,
+            causal=causal,
+            max_token_per_sequence=4,
+            max_sequence_kv=8,
+            **lengths,
+        )
+        return (
+            qlens if mode in ("q", "both") else qslots,
+            klens if mode in ("kv", "both") else kslots,
+        )
+
+    def run():
+        return wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, lse_base="ln")
+
+    plan(initial_lengths, [4, 4], [8, 8], [4, 4], [8, 8])
+    run()
+    capture = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(capture):
+            run()
+        for mode, qslots, kslots, qlens, klens in (
+            (initial_lengths, [3, 3], [6, 6], [3, 3], [6, 6]),
+            ("q", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("kv", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("both", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("neither", [3, 3], [6, 6], [2, 1], [4, 3]),
+            ("both", [4, 4], [8, 8], [4, 4], [8, 8]),
+        ):
+            qlens, klens = plan(mode, qslots, kslots, qlens, klens)
+            out.fill_(float("nan"))
+            lse.fill_(float("nan"))
+            capture.replay()
+            qstart = kstart = 0
+            for qslot, kslot, nq, nk in zip(qslots, kslots, qlens, klens, strict=True):
+                qq = q[qstart : qstart + nq].double().transpose(0, 1)
+                kk = k[kstart : kstart + nk].double().repeat_interleave(4, 1)
+                vv = v[kstart : kstart + nk].double().repeat_interleave(4, 1)
+                scores = qq @ kk.permute(1, 2, 0) * (128**-0.5)
+                if causal:
+                    mask = torch.arange(nk, device="cuda")[None, :] > (
+                        torch.arange(nq, device="cuda")[:, None] + nk - nq
+                    )
+                    scores.masked_fill_(mask, -torch.inf)
+                expected = (scores.softmax(-1) @ vv.transpose(0, 1)).transpose(0, 1)
+                torch.testing.assert_close(
+                    out[qstart : qstart + nq].double(), expected, atol=0.004, rtol=0.004
+                )
+                torch.testing.assert_close(
+                    lse[qstart : qstart + nq].double(),
+                    scores.logsumexp(-1).T,
+                    atol=4e-4,
+                    rtol=0,
+                )
+                qstart += qslot
+                kstart += kslot
+    finally:
+        capture.reset()
+
+
 requires_override = pytest.mark.skipif(
     not _cudnn_override_available(),
     reason="needs SM100, cuDNN>=9.24 and cudnn-frontend>=1.29",
@@ -760,7 +859,7 @@ def test_small_workspace_selection_reuse_and_capture(
             with monkeypatch.context() as m:
                 m.setattr(
                     prefill_module,
-                    "prepare_cudnn_batch_prefill",
+                    "_reuse_cudnn_prefill_preparation",
                     lambda *a, **kw: pytest.fail("warm run prepared again"),
                 )
                 capture = torch.cuda.CUDAGraph()

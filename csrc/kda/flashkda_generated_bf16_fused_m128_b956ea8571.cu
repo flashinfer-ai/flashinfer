@@ -813,8 +813,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
         // gate_raw_full: 5 barriers, init_count=1
         // qk_raw_full: 5 barriers, init_count=1
         // v_full: 5 barriers, init_count=1
-        // v_free: 5 barriers, init_count=4
-        // smem_free: 5 barriers, init_count=4
+        // v_free: 5 barriers, init_count=128
+        // smem_free: 5 barriers, init_count=128
         // raw_inputs_free: 5 barriers, init_count=1
         // state_inp_ready: 5 barriers, init_count=4
         // state_inp_left_ready: 5 barriers, init_count=4
@@ -843,7 +843,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
             mbarrier_init(smem + 0 + _bar * 8, 1);
         }
         for (int _bar = lane; _bar < 10; _bar += 32) {
-            mbarrier_init(smem + 160 + _bar * 8, 4);
+            mbarrier_init(smem + 160 + _bar * 8, 128);
         }
         for (int _bar = lane; _bar < 5; _bar += 32) {
             mbarrier_init(smem + 240 + _bar * 8, 1);
@@ -1312,8 +1312,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     }
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                mbarrier_arrive(v_free_addr + (compute_stage) * 8);
                 if (elect_sync()) {
-                    mbarrier_arrive(v_free_addr + (compute_stage) * 8);
                     mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_u2_acc_ready);
@@ -1347,9 +1347,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
                 }
                 mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
-                if (elect_sync()) {
-                    mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
-                }
+                mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
                 int checkpoint_token = (chunk_idx + 1) * 16;
                 compute_stage += 1;
                 if (compute_stage == 5) { compute_stage = 0; _phase_qk_full ^= 1; _phase_v_full ^= 1; _phase_old_out_ready ^= 1; _phase_u2_acc_ready ^= 1; _phase_final_ready ^= 1; }
