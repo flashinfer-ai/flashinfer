@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.parser import BytesParser
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 _CUDA_ARCHITECTURE_PATH = (
     Path(__file__).resolve().parents[1] / "flashinfer/jit/_cuda_architecture.py"
@@ -70,6 +70,20 @@ class Wheel:
             contents=contents,
             metadata_path=metadata_path,
         )
+
+
+def linux_library_name(module: str) -> str:
+    """Provider library file name on Linux: ``<module>/<module>.so``."""
+    return f"{module}.so"
+
+
+def windows_library_name(module: str) -> str:
+    """Provider library file name on Windows: ``<module>/module.dll``.
+
+    Matches ``flashinfer.jit.env.jit_library_name`` from the Windows build port,
+    which shortens the file name to stay under MAX_PATH.
+    """
+    return "module.dll"
 
 
 def require(condition: bool, message: str) -> None:
@@ -139,7 +153,9 @@ def validate_provider(
     provider: str,
     expected_version: str,
     expected_platform_tag: str | None = None,
+    library_name: Callable[[str], str] = linux_library_name,
 ) -> tuple[dict[str, Any], dict[str, str]]:
+    """Check one provider wheel; ``library_name`` maps a module to its file name."""
     expected_distribution = f"flashinfer-jit-cache-{provider}"
     require(
         canonicalize_distribution(wheel.distribution) == expected_distribution,
@@ -172,13 +188,14 @@ def validate_provider(
 
     module_paths: dict[str, str] = {}
     so_prefix = f"{package_prefix}/jit_cache/"
+    library_suffix = Path(library_name("module")).suffix
     for path in wheel.contents:
-        if not path.startswith(so_prefix) or not path.endswith(".so"):
+        if not path.startswith(so_prefix) or not path.endswith(library_suffix):
             continue
         relative = path.removeprefix(so_prefix)
         parts = relative.split("/")
         require(
-            len(parts) == 2 and parts[1] == f"{parts[0]}.so",
+            len(parts) == 2 and parts[1] == library_name(parts[0]),
             f"Unexpected provider shared-library path: {path}",
         )
         module_paths[parts[0]] = path
@@ -223,7 +240,7 @@ def validate_shim(
         f"Shim version {wheel.version} does not match {expected_version}",
     )
     require(
-        not any(path.endswith(".so") for path in wheel.contents),
+        not any(path.endswith((".so", ".dll")) for path in wheel.contents),
         "Shim wheel must not contain shared libraries",
     )
     if expected_platform_tag:
