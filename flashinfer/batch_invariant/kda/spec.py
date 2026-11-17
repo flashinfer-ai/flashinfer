@@ -30,9 +30,11 @@ ROUTE = "engine"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300) and SM107 (Rubin), which
 #: give one set of bits for the same inputs.
 KDA_ARCHS = ((10, 0), (10, 3), (10, 7))
-#: The source files that define the term: relative to the ``flashinfer`` package, and to its C++ include directory.
-TERM_SOURCES = ("kda_kernels/kda_chunked_bt16.py",)
+#: The source files that define the term: relative to the ``flashinfer`` package (the prefill kernel and the step's
+#: build flags), to its C++ include directory (the step kernel) and to its ``csrc`` directory (the step's launcher).
+TERM_SOURCES = ("kda_kernels/kda_chunked_bt16.py", "jit/kda_batch_invariant.py")
 TERM_INCLUDES = ("flashinfer/kda/batch_invariant_decode.cuh",)
+TERM_CSRC = ("kda_batch_invariant.cu",)
 #: The first fp32 values of a (slot, head) state compared by the decode step to notice a state the caller replaced.
 STAMP = 8
 #: ``log2(e)`` as the prefill kernel spells it (its gate scale is ``lower_bound * log2(e)``).
@@ -100,6 +102,9 @@ def source_digest() -> str:
         (rel, os.path.join(str(jit_env.FLASHINFER_INCLUDE_DIR), rel))
         for rel in TERM_INCLUDES
     ]
+    paths += [
+        (rel, os.path.join(str(jit_env.FLASHINFER_CSRC_DIR), rel)) for rel in TERM_CSRC
+    ]
     for rel, path in paths:
         with open(path, "rb") as f:
             h.update(rel.encode())
@@ -119,8 +124,10 @@ def _dsl_version() -> str:
 
 @functools.lru_cache(maxsize=None)
 def spec_fingerprint() -> str:
-    """Identifier of the class: the class constants and the digest of the kernel sources that are the term (the kernels
-    are hand-written, so their source is the dataflow; an edit to them renames the class)."""
+    """Identifier of the class: the class constants, the digest of the sources that are the term (both kernels, the
+    step's launcher and its build flags; the kernels are hand-written, so their source is the dataflow and an edit
+    renames the class) and the installed ``nvidia-cutlass-dsl`` version, which compiles the prefill kernel: the
+    identifier therefore differs between environments with different DSL builds."""
     parts = [
         f"class={CLASS}",
         f"chunk={CHUNK}",
@@ -131,7 +138,6 @@ def spec_fingerprint() -> str:
         "gate=lower_bound*sigmoid(exp(A_log)*(g+dt_bias))",
         "norm=qk_l2",
         "beta=sigmoid",
-        "step_flags=-fmad=false,no-fast-math",
         f"cute_dsl={_dsl_version()}",
         f"sources={source_digest()}",
     ]
