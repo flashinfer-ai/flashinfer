@@ -26,8 +26,11 @@ the first step after a prefill eagerly). A new sequence loaded into a slot must 
 call without it always continues what the slot holds. As for the operator's other state-pool routes, every slot index
 must be unique and in range, and ``cu_seqlens_cpu`` must agree with ``cu_seqlens``; a decode call's ``cu_seqlens`` are
 taken to be ``arange(N + 1)``. Only the calls that bring whole chunks together with open chunks or tails read the
-slots on the host and check them there. ``output_final_state=True`` returns the pool, whose slots hold the states at
-the last chunk boundaries.
+slots on the host and check them there; a prefill of whole chunks from chunk boundaries trusts them, and an
+out-of-range slot there writes outside the pool. A call of fewer than 64 tokens without
+``cu_seqlens_cpu`` does not check a device ``cu_seqlens``: rows that no sequence covers are left unwritten.
+``output`` must not partly overlap an input (not checked). ``output_final_state=True`` returns the pool, whose slots
+hold the states at the last chunk boundaries.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -129,7 +132,7 @@ def _slot_ids(
         raise unsupported(
             CLASS,
             f"state_indices of shape {tuple(indices.shape)} {indices.dtype}",
-            f"int32 [{N}] (one slot per sequence)",
+            f"int32 [{N}] (one slot per sequence; a decode batch passes cu_seqlens = arange(N + 1))",
         )
     if indices.device != device:
         raise unsupported(
@@ -264,6 +267,12 @@ def chunk_gated_delta_rule_batch_invariant(
             CLASS,
             f"{HQ} q heads on a pool first used with {gp.HQ}",
             "one head geometry per pool",
+        )
+    if gp.slots < N:
+        raise unsupported(
+            CLASS,
+            f"{N} sequences on a pool of {gp.slots} slots",
+            "one distinct slot per sequence",
         )
     out = output if output is not None else torch.empty_like(v)
 

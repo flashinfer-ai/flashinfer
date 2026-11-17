@@ -60,6 +60,11 @@ def get_pool(pool: torch.Tensor, num_q_heads: int) -> "GdnPool":
     key = pool_key(pool)
     gp = _POOLS.get(key)
     if gp is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "the first call on a pool allocates the class's state next to it: run it outside the CUDA graph"
+                " capture"
+            )
         storage = pool.untyped_storage()
         slot_bytes = 4 * int(pool.shape[1]) * HEAD_DIM * HEAD_DIM
         capacity = (storage.nbytes() - 4 * pool.storage_offset()) // slot_bytes
@@ -67,6 +72,15 @@ def get_pool(pool: torch.Tensor, num_q_heads: int) -> "GdnPool":
         _POOLS[key] = gp
         weakref.finalize(storage, _POOLS.pop, key, None)
     return gp
+
+
+def _raise_if_misaligned(e: Exception) -> None:
+    if "% 16 == 0" in str(e) or "Misaligned Tensor data" in str(e):
+        raise unsupported(
+            CLASS,
+            "a buffer that is not 16-byte aligned",
+            "16-byte aligned inputs, output and pool",
+        ) from e
 
 
 def _pinned(
@@ -93,27 +107,31 @@ def _pinned(
             checkpoint_state_indices=checkpoints[0],
             checkpoint_cu_starts=checkpoints[1],
         )
-    out, _ = chunk_gated_delta_rule(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale=scale,
-        initial_state=pool,
-        output_state=pool,
-        output_final_state=True,
-        cu_seqlens=cu,
-        cu_seqlens_cpu=cu_cpu,
-        state_indices=read_slots,
-        output_state_indices=write_slots,
-        output=output,
-        use_qk_l2norm_in_kernel=True,
-        backend="flashinfer",
-        use_cp=False,
-        gate_domain="log",
-        **extra,
-    )
+    try:
+        out, _ = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state=pool,
+            output_state=pool,
+            output_final_state=True,
+            cu_seqlens=cu,
+            cu_seqlens_cpu=cu_cpu,
+            state_indices=read_slots,
+            output_state_indices=write_slots,
+            output=output,
+            use_qk_l2norm_in_kernel=True,
+            backend="flashinfer",
+            use_cp=False,
+            gate_domain="log",
+            **extra,
+        )
+    except (RuntimeError, ValueError) as e:
+        _raise_if_misaligned(e)
+        raise
     return out
 
 
@@ -192,8 +210,6 @@ class GdnPool:
                 "a slot of this pool holds a prefill's open tail: run the first call after the prefill outside the"
                 " CUDA graph capture"
             )
-        for s, _ in work:
-            del self.pending[s]
         m = self._idx(
             [
                 [s for s, _ in work],
@@ -212,13 +228,19 @@ class GdnPool:
             1.0,
             self._no_out,
         )
+        for s, _ in work:
+            del self.pending[s]
 
     def step(self, pool, slots, q, k, v, g, beta, scale, out) -> None:
         """One token per slot: ``out[i]`` is the row of ``slots[i]``'s sequence at its position."""
         self.rebuild(pool)
-        _module().gdn_batch_invariant_decode_step(
-            q, k, v, g, beta, slots, out, pool, *self._side(), scale
-        )
+        try:
+            _module().gdn_batch_invariant_decode_step(
+                q, k, v, g, beta, slots, out, pool, *self._side(), scale
+            )
+        except RuntimeError as e:
+            _raise_if_misaligned(e)
+            raise
 
     def span(self, pool, slots, starts, ends, prefix, packed, scale, out) -> None:
         """Rows ``[starts[i], ends[i])`` of ``packed`` appended to ``slots[i]`` in one launch (int32 device tensors).
@@ -226,31 +248,39 @@ class GdnPool:
         the rows of a slot that holds another count are NaN and the slot is left as it was. An empty run at a boundary
         only marks the bf16 state copy for a refresh."""
         q, k, v, g, beta = packed
-        _module().gdn_batch_invariant_decode_span(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            slots,
-            starts,
-            ends,
-            prefix,
-            out,
-            pool,
-            *self._side(),
-            scale,
-        )
+        try:
+            _module().gdn_batch_invariant_decode_span(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                slots,
+                starts,
+                ends,
+                prefix,
+                out,
+                pool,
+                *self._side(),
+                scale,
+            )
+        except RuntimeError as e:
+            _raise_if_misaligned(e)
+            raise
 
     def extend_whole_chunks(self, pool, slots, offs, cu, packed, scale, out) -> bool:
         """A prefill of whole chunks from the slots' states: the caller's tensors as they are, nothing read back before
-        the kernel and the bookkeeping after it. False (nothing done) when a sequence leaves an open tail."""
+        the kernel and the bookkeeping after it (the slots are read only to drop the tails a pool still has pending).
+        False (nothing done) when a sequence leaves an open tail."""
         if any((b - a) % CHUNK for a, b in zip(offs, offs[1:], strict=False)):
             return False
         if cu is None:
             cu = self._idx(offs)
         _pinned(packed, cu, list(offs), pool, slots, slots, scale, output=out)
         self.cnt.index_fill_(0, slots.long(), STALE)
+        if self.pending and not torch.cuda.is_current_stream_capturing():
+            for s in slots.tolist():
+                self.pending.pop(s, None)
         return True
 
     def extend(

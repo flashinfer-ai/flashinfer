@@ -10,6 +10,8 @@ boundary states of the one-call prefill kernel without context parallelism, what
 import hashlib
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -54,7 +56,10 @@ def _hash_file():
     if os.path.exists(path):
         with open(path) as f:
             saved = json.load(f)
-        diff = {k for k in _HASHES if k in saved and saved[k] != _HASHES[k]}
+        assert set(saved) == set(_HASHES), (
+            f"the two processes recorded other cases: {sorted(set(saved) ^ set(_HASHES))}"
+        )
+        diff = {k for k in _HASHES if saved[k] != _HASHES[k]}
         assert not diff, (
             f"output hashes differ from the recorded process: {sorted(diff)}"
         )
@@ -856,3 +861,128 @@ def test_slot_outside_the_pool_returns_nan():
     y, _ = _inputs(6, HQ, HV, 5)
     out = _bi(pool, [9, 0], y, cu=[0, 3, 6], prefix=[0, 1])
     assert torch.isnan(out[:3].float()).all() and not torch.isnan(out[3:].float()).any()
+
+
+@needs_device
+def test_output_hashes_repeat_in_a_fresh_process(tmp_path):
+    """Two fresh processes run the same cases; the second asserts the hashes and the case set of the first."""
+    if os.environ.get("FLASHINFER_GDN_BI_HASH_DIR"):
+        pytest.skip("this process is one of a recorded pair")
+    env = dict(os.environ, FLASHINFER_GDN_BI_HASH_DIR=str(tmp_path))
+    cases = "test_multi_token_steps or test_batch_and_slots or test_ragged_prefill_then_decode"
+    cmd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", __file__]
+    for _ in range(2):
+        run = subprocess.run(
+            cmd + ["-k", cases], env=env, capture_output=True, text=True
+        )
+        assert run.returncode == 0, run.stdout[-3000:]
+    with open(tmp_path / "gdn_bi_hashes.json") as f:
+        assert len(json.load(f)) >= 10
+
+
+@needs_device
+def test_first_call_on_a_pool_inside_a_capture_raises():
+    """The class's state next to a pool is allocated on its first call, which a capture would replay."""
+    HQ, HV = 4, 8
+    x, s0 = _inputs(70, HQ, HV, 41)
+    ref, _ = _reference(x, s0)
+    pool = _pool(HV, 2)
+    pool[0] = s0
+    bufs = tuple(t.clone() for t in _cut(x, 0, 1))
+    out = torch.empty(1, HV, D, dtype=torch.bfloat16, device="cuda")
+    slots, cu = _i32([0]), _i32([0, 1])
+
+    def step():
+        flashinfer.chunk_gated_delta_rule(
+            *bufs,
+            initial_state=pool,
+            state_indices=slots,
+            cu_seqlens=cu,
+            use_qk_l2norm_in_kernel=True,
+            gate_domain="log",
+            output=out,
+            batch_invariant=True,
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="first call on a pool"),
+        torch.cuda.graph(graph),
+    ):
+        step()
+    torch.cuda.synchronize()
+    step()
+    assert torch.equal(out, ref[0:1])
+    graph = torch.cuda.CUDAGraph()
+    for b, n in zip(bufs, _cut(x, 1, 2), strict=True):
+        b.copy_(n)
+    with torch.cuda.graph(graph):
+        step()
+    for p in range(1, 70):
+        for b, n in zip(bufs, _cut(x, p, p + 1), strict=True):
+            b.copy_(n)
+        graph.replay()
+        assert torch.equal(out, ref[p : p + 1]), p
+
+
+@needs_device
+def test_restarted_slot_drops_its_pending_tail():
+    """A whole-chunk prefill that restarts a slot ends the wait of the tail an earlier prefill left there."""
+    HQ, HV = 4, 8
+    x, s0 = _inputs(100, HQ, HV, 51)
+    y, s1 = _inputs(70, HQ, HV, 52)
+    ref, _ = _reference(y, s1)
+    pool = _pool(HV, 2)
+    pool[1] = s0
+    _bi(pool, [1], x)
+    gp = get_pool(pool, HQ)
+    assert gp.pending == {1: 36}
+    pool[1] = s1
+    assert torch.equal(_bi(pool, [1], _cut(y, 0, 64)), ref[:64])
+    assert not gp.pending
+    graph = torch.cuda.CUDAGraph()
+    bufs = tuple(t.clone() for t in _cut(y, 64, 65))
+    out = torch.empty(1, HV, D, dtype=torch.bfloat16, device="cuda")
+    slots, cu = _i32([1]), _i32([0, 1])
+    with torch.cuda.graph(graph):
+        flashinfer.chunk_gated_delta_rule(
+            *bufs,
+            initial_state=pool,
+            state_indices=slots,
+            cu_seqlens=cu,
+            use_qk_l2norm_in_kernel=True,
+            gate_domain="log",
+            output=out,
+            batch_invariant=True,
+        )
+    for p in range(64, 70):
+        for b, n in zip(bufs, _cut(y, p, p + 1), strict=True):
+            b.copy_(n)
+        graph.replay()
+        assert torch.equal(out, ref[p : p + 1]), p
+
+
+def _misaligned(t):
+    flat = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+    flat[1:] = t.flatten()
+    return flat[1:].view(t.shape)
+
+
+@needs_device
+@pytest.mark.parametrize("L", [1, 5, 100])
+def test_misaligned_buffer_raises_the_typed_error(L):
+    HQ, HV = 4, 8
+    (q, k, v, g, beta), _ = _inputs(L, HQ, HV, 61)
+    pool = _pool(HV, 1)
+    _bi(pool, [0], (q, k, v, g, beta), prefix=[0])
+    with pytest.raises(BatchInvariantUnsupportedError, match="16-byte aligned"):
+        _bi(pool, [0], (q, k, _misaligned(v), g, beta), prefix=[0])
+
+
+@needs_device
+def test_more_sequences_than_slots_raises():
+    HQ, HV = 4, 8
+    x, _ = _inputs(6, HQ, HV, 62)
+    pool = _pool(HV, 2)
+    with pytest.raises(BatchInvariantUnsupportedError, match="3 sequences"):
+        _bi(pool, [0, 1, 0], x, cu=[0, 2, 4, 6], prefix=[0, 0, 0])
