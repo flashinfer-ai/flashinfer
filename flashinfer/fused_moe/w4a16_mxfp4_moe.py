@@ -100,7 +100,7 @@ _SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 BACKENDS = ("auto", "specialized", "reference")
 _DISPATCH_FILE = "w4a16_mxfp4_latent_moe_sm90_dispatch.json"
 
-_stats = {
+_stats: dict = {
     "calls": 0,
     "backend_dispatches": {"specialized": 0, "reference": 0},
     "fallback_reasons": {},
@@ -417,6 +417,7 @@ def w4a16_mxfp4_latent_routed_moe(
             "out",
         ),
         tensors,
+        strict=True,
     ):
         _check(t.is_contiguous(), f"{name} must be contiguous")
         _check(t.device == x.device, f"{name} must be on the same device as x")
