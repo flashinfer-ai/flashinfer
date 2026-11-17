@@ -204,8 +204,9 @@ def test_allowlist_rejects_large_batches_and_flags():
     c["token_selected_experts"] = torch.zeros((5000, K), dtype=torch.int32)
     c["token_final_scales"] = torch.zeros((5000, K), dtype=torch.float32)
     assert "num_tokens=5000" in _eligibility(**c)
-    assert "min_latency_mode" == _eligibility(
-        **_elig_args(flags={"min_latency_mode": True})
+    assert (
+        _eligibility(**_elig_args(flags={"min_latency_mode": True}))
+        == "min_latency_mode"
     )
     bad = _elig_args()
     bad["output_dtype"] = torch.float16
