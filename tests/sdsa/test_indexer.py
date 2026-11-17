@@ -21,6 +21,7 @@ from flashinfer.sdsa import (
 )
 
 SM10X = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+FP8 = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 sm10x_only = pytest.mark.skipif(not SM10X, reason="requires SM10x")
 
@@ -94,6 +95,8 @@ def dequantize(values: torch.Tensor, scales: torch.Tensor | None) -> torch.Tenso
         "bf16_triton",
         "fp8",
         "fp8_scaled",
+        "fp8_triton",
+        "fp8_triton_scaled",
         "nvfp4",
         "nvfp4_packed",
     ],
@@ -108,9 +111,9 @@ def test_indexer_scores_match_reference_and_replay(
     then their scales. fp8 *_scaled: the scores are times a power-of-two
     score_scale, given a new value before the replay."""
     if keys.startswith("nvfp4") and not SM10X:
-        pytest.skip("Off SM10x, keys are BF16 (scored by Triton)")
-    if keys.startswith("fp8") and not SM10X:
-        pytest.skip("FP8 needs SM10x")
+        pytest.skip("Off SM10x, keys are BF16 or FP8 (scored by Triton)")
+    if keys.startswith("fp8") and not FP8:
+        pytest.skip("FP8 needs SM89 or newer")
     if "_triton" in keys:  # the path off SM10x, also on SM10x
         monkeypatch.setattr(indexer, "get_compute_capability", lambda _: (9, 0))
     scaled = keys.endswith("_scaled")
@@ -830,8 +833,8 @@ def test_indexer_scores_off_sm10x_rejects_bad_layouts(
         run(query, key_cache, table, context.repeat(2)[::2], scores=scores)
     fp8_query = torch.zeros(4, 128, dtype=torch.float8_e4m3fn, device="cuda")
     fp8_keys = torch.zeros(4, 64, 128, dtype=torch.float8_e4m3fn, device="cuda")
-    with pytest.raises(ValueError, match="as does FP8"):
-        run(fp8_query, fp8_keys, table, context, scores=scores)
+    with pytest.raises(ValueError, match="both BF16 or both FP8"):
+        run(fp8_query, key_cache, table, context, scores=scores)
     with pytest.raises(ValueError, match="NVFP4 needs SM10x"):
         run(
             torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
@@ -843,6 +846,13 @@ def test_indexer_scores_off_sm10x_rejects_bad_layouts(
     one = torch.ones(1, device="cuda")
     with pytest.raises(ValueError, match="applies only to FP8"):
         run(query, key_cache, table, context, scores=scores, score_scale=one)
+    with pytest.raises(ValueError, match="score_scale must be a float32"):
+        run(fp8_query, fp8_keys, table, context, scores=scores, score_scale=one.half())
+    with pytest.raises(ValueError, match="Keys must be"):
+        run(fp8_query[:, :64], fp8_keys[..., :64], table, context, scores=scores)
+    monkeypatch.setattr(indexer, "get_compute_capability", lambda _: (8, 0))
+    with pytest.raises(ValueError, match="SM89 or newer"):
+        run(fp8_query, fp8_keys, table, context, scores=scores)
 
 
 @sm10x_only

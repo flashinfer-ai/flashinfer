@@ -45,7 +45,7 @@ def indexer_scores(
     It runs as one launch without host synchronization, so it can be captured in a
     CUDA graph (run it once before capture to compile it). Queries, keys, pages and lengths can change between replays.
     On SM10x it runs a CuTe DSL kernel; on other GPUs (e.g. Hopper) it scores BF16
-    keys with a Triton kernel, and FP8 and NVFP4 keys are not supported.
+    or FP8 keys with a Triton kernel, and NVFP4 keys are not supported.
 
     Parameters
     ----------
@@ -94,14 +94,23 @@ def indexer_scores(
         raise ValueError("Mismatched query rows, scores, lengths or requests")
     if max_context > PAGE * width:
         raise ValueError("The block table must cover the context capacity")
-    if get_compute_capability(query.device)[0] != 10:
+    capability = get_compute_capability(query.device)
+    if capability[0] != 10:
         # The CuTe scorer needs SM10x (tcgen05); elsewhere, a Triton kernel scores
-        # BF16 keys: one program per request group and 64-key page.
-        if key_scales is not None or {query.dtype, key_cache.dtype} != {torch.bfloat16}:
+        # BF16 or FP8 keys: one program per request group and 64-key page.
+        if (
+            key_scales is not None
+            or query.dtype != key_cache.dtype
+            or key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        ):
             raise ValueError(
-                "Off SM10x, queries and keys must be BF16 (NVFP4 needs SM10x, as does FP8)"
+                "Off SM10x, queries and keys must be both BF16 or both FP8 "
+                "(NVFP4 needs SM10x)"
             )
-        _check_score_scale(score_scale, False, query)
+        fp8 = key_cache.dtype == torch.float8_e4m3fn
+        if fp8 and capability < (8, 9):
+            raise ValueError("FP8 queries and keys need SM89 or newer")
+        _check_score_scale(score_scale, fp8, query)
         # The kernel reads DIM-value keys PAGE to a page and contiguous rows.
         if query.shape[1] != DIM or key_cache.shape[1:] != (PAGE, DIM):
             raise ValueError(
@@ -134,7 +143,9 @@ def indexer_scores(
             requests,
             scores,
             scores.stride(0),
+            scores if score_scale is None else score_scale,  # unread if None
             ROWS=rows,
+            SCALED=score_scale is not None,
         )
         return
     if not is_cute_dsl_experimental_available():

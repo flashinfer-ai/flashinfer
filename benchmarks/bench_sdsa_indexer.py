@@ -21,8 +21,8 @@ On SM10x it times, with BF16, FP8 and NVFP4 keys and queries:
 * ``indexer_threshold_select``: ``--select-rows`` causal query rows of one
   request at the end of its context, with ``--top-k`` tie slots and the repair.
 
-Off SM10x (Hopper), only BF16 decode scoring runs (the Triton kernel), so it
-times that. FP8 calls pass a ``score_scale`` of 1, as a model does.
+Off SM10x (Hopper), only decode scoring runs, so it times BF16 and FP8 decode
+(the Triton kernel). FP8 calls pass a ``score_scale`` of 1, as a model does.
 
 Keys and queries are random. The select's thresholds are each row's
 ``top_k * (1 + --slack)``-th largest score estimated from a key sample, so a
@@ -182,7 +182,7 @@ def main() -> None:
     torch.manual_seed(0)
     major, minor = torch.cuda.get_device_capability()
     sm10x = major == 10
-    formats = [f for f in args.formats if sm10x or f == "bf16"]
+    formats = [f for f in args.formats if sm10x or f != "nvfp4"]
     print(f"{torch.cuda.get_device_name()} (SM{major}{minor})")
     print(f"{'op':<8} {'format':<6} {'rows':>5} {'context':>8} {'us':>10} {'GB/s':>8}")
 

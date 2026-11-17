@@ -138,7 +138,7 @@ runs without host synchronization. CTAs after the length of their group exit
 at once. The groups share two CTAs for each SM. A group gets more CTAs when it
 needs them, so that the pages of each CTA run fit in its shared memory.
 
-On other GPUs, such as Hopper, a Triton kernel scores BF16 keys. FP8 and NVFP4
+On other GPUs, such as Hopper, a Triton kernel scores BF16 or FP8 keys. NVFP4
 keys need SM10x.
 
 #### Selection
@@ -210,6 +210,9 @@ score = fp32(sum_d query[d] * key[d]) * score_scale    # score_scale = query sca
   with K = 32: four MMAs for each 128-value tile. Decode keeps the shape of
   BF16, M = 128 keys and N = 8 query rows, which `kind::f8f6f4` allows when the
   query (B) is K-major. The accumulator is FP32.
+- On Hopper, the Triton kernel calls `tl.dot` on E4M3 operands, with FP32
+  accumulation. Triton 3.8 runs it as an FP16 `mma.sync` on the converted
+  values, so its scores match an FP64 reference to FP32 rounding.
 - `score_scale` is an FP32 tensor of one element on the device, or None for 1.
   The kernels read it once, and multiply each FP32 dot product by it before
   they store it or compare it with a threshold: on SM10x, right after each
@@ -232,8 +235,10 @@ score = fp32(sum_d query[d] * key[d]) * score_scale    # score_scale = query sca
 - The block table must cover `max_context`.
 - The CuTe-DSL kernels need CuTe DSL 4.7 or newer. The scorer and the select
   need SM10x. Off SM10x, `indexer_scores` runs the Triton kernel,
-  which takes only BF16 queries and keys, with contiguous rows.
-- FP8 scoring, selection and sampling need SM10x.
+  which takes only BF16 or FP8 queries and keys, with contiguous rows.
+- FP8 runs on SM10x (decode scores, selection and sampling) and on SM90 (decode
+  scores only, as for BF16: the selection, sampling, thresholds and Top-K
+  kernels need SM10x for every format). FP8 off SM10x needs SM89 or newer.
 - Queries and keys have the same format. `score_scale` takes FP8 only.
 - `gather_key_sample` takes sample rows of whole 128-key tiles.
 - `top_k_from_candidates` takes `top_k` below 65536.
@@ -253,8 +258,8 @@ Each API records a trace template, with the op type `sdsa_<api>`.
 
 `tests/sdsa/test_indexer.py` covers:
 
-- decode scores: BF16, BF16 through the Triton kernel, FP8 (with and without
-  `score_scale`), NVFP4, and NVFP4 keys and
+- decode scores: BF16, BF16 through the Triton kernel, FP8 and FP8 through the
+  Triton kernel (each with and without `score_scale`), NVFP4, and NVFP4 keys and
   scales in one cache; 1, 3 and 8 rows for each request; lengths that end on a
   page, in a key tile, at 0, and in runs of several CTAs. The values are exact in
   FP32, so the scores must equal an FP64 reference bit for bit. FP8 values are
@@ -282,7 +287,7 @@ Each API records a trace template, with the op type `sdsa_<api>`.
 - the checks that reject bad shapes, bad layouts off SM10x, bad counters, and
   CuTe DSL older than 4.7; FP8 queries with BF16 keys, FP8 keys of the wrong
   shape or with scales, `score_scale` with BF16 or NVFP4, a `score_scale` that
-  is not one float32 on the device, and FP8 and NVFP4 off SM10x.
+  is not one float32 on the device, NVFP4 off SM10x, and FP8 below SM89.
 
 ## Token-sparse attention
 
