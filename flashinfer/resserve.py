@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental ResServe quantization and folded GEMM APIs.
+"""Experimental ResServe quantization, folded GEMM and paged decode APIs.
 
 Import public entry points from this module. Each call explicitly opts into
 an experimental API and lazily imports its backend. Implementation modules
@@ -17,6 +17,7 @@ __all__ = [
     "nvfp4_quantize_residue",
     "nvfp4_quantize_kext",
     "mm_nvfp4_residue",
+    "paged_decode_residue",
 ]
 
 
@@ -230,4 +231,159 @@ def mm_nvfp4_residue(
             out_dtype=out_dtype,
             mma_tiler_mn=tiler,
             cluster_shape_mn=cluster,
+        )
+
+
+@flashinfer_experimental_api
+def paged_decode_residue(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    sm_scale: float | None = None,
+    key_scale: float = 1.0,
+    value_scale: float = 1.0,
+    max_seq_len: int | None = None,
+    num_splits: int | None = None,
+    out: torch.Tensor | None = None,
+):
+    """Single-token page32 NVFP4 attention with Q residue and BF16 output.
+
+    SM100; original BF16 ``q[B, H_q, D]``, D128/D256 and GQA4/6/8.
+    K/V are packed uint8 ``[pages, H_kv, 32, D/2]``. K scales are E4M3
+    (or uint8 bytes) ``[pages, H_kv, 32, D/16]``. V scales are four-token
+    interleaved ``[pages, H_kv, 8, D/16, 4]``; prepare this layout when
+    writing KV. K/V data may use HND or NHD storage, exposed as the HND-shaped
+    views above. Scales have contiguous inner page contents; page strides may
+    include other cache buffers. No KV data or scale repacking is performed.
+
+    ``block_tables`` is int32 ``[B, max_pages]`` with unit column stride;
+    padded row strides are accepted. ``seq_lens`` is contiguous int32 ``[B]``.
+    Lengths must be nonnegative and at most 32*max_pages; used page IDs must
+    be valid. Zero-length rows are Graph padding and their outputs are ignored.
+    These device values are caller preconditions, not synchronized to the CPU.
+    Q must be finite; key/value scales are positive finite reconstruction
+    multipliers prepared before launch.
+
+    ``max_seq_len`` is an optional host upper bound for static split selection;
+    the default is the table capacity. ``num_splits=None`` uses ResServe's
+    existing static policy; a power of two through 64 requests deterministic
+    FP32-partial reduction (one split needs no reducer). No timing/autotuning
+    is performed. ``out`` may supply a contiguous BF16 tensor shaped like Q.
+    Scratch is invocation-local, including under CUDA Graph capture.
+
+    FP4 QK folds base/residue before softmax. QMUL4 converts V to E4M3;
+    unnormalized probabilities are rounded to E4M3 for PV with an FP32
+    denominator. This is not full BF16 attention. Requires CUTLASS DSL 4.8
+    with CUDA 13.4 PTX support; warm up outside graph capture.
+    """
+    import math
+
+    _check_sm100(q)
+    device, q_shape, q_stride = q.device, q.shape, q.stride()
+    _check_tensor(q, "q", device, (torch.bfloat16,), 32, contiguous=False)
+    if len(q_shape) != 3 or min(q_shape) <= 0 or q_shape[-1] not in (128, 256):
+        raise ValueError("q must be positive [batch, query_heads, 128 or 256]")
+    b, hq, d = q_shape
+    if q_stride[2] != 1 or q_stride[1] != d or q_stride[0] < hq * d:
+        raise ValueError("q requires nonoverlapping rows with contiguous heads")
+    k_shape = k.shape
+    if len(k_shape) != 4 or min(k_shape) <= 0:
+        raise ValueError("k must be positive [pages, kv_heads, 32, D/2]")
+    pages, h = k_shape[:2]
+    if hq % h or hq // h not in (4, 6, 8):
+        raise ValueError("ResAttn requires GQA4, GQA6 or GQA8")
+    data_dim, scale_dim = d // 2, d // 16
+    data_strides = ((32 * data_dim, data_dim, 1), (data_dim, h * data_dim, 1))
+    for tensor, name, shape, layouts, dtype in (
+        (k, "k", (pages, h, 32, data_dim), data_strides, (torch.uint8,)),
+        (v, "v", (pages, h, 32, data_dim), data_strides, (torch.uint8,)),
+        (
+            k_scale,
+            "k_scale",
+            (pages, h, 32, scale_dim),
+            ((32 * scale_dim, scale_dim, 1),),
+            (torch.uint8, torch.float8_e4m3fn),
+        ),
+        (
+            v_scale,
+            "v_scale",
+            (pages, h, 8, scale_dim, 4),
+            ((32 * scale_dim, 4 * scale_dim, 4, 1),),
+            (torch.uint8, torch.float8_e4m3fn),
+        ),
+    ):
+        _check_tensor(tensor, name, device, dtype, contiguous=False)
+        if tensor.shape != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}; V scales are four-token interleaved"
+            )
+        strides = tensor.stride()
+        # Singleton head strides are immaterial in both HND and NHD views.
+        inner = strides[1:] if h > 1 else strides[2:]
+        if inner not in (layouts if h > 1 else tuple(layout[1:] for layout in layouts)):
+            raise ValueError(f"{name} requires contiguous inner page contents")
+        page_bytes = h * 32 * (data_dim if name in ("k", "v") else scale_dim)
+        if strides[0] < page_bytes or strides[0] % 16:
+            raise ValueError(f"{name} requires nonoverlapping, 16-byte-aligned pages")
+    _check_tensor(
+        block_tables, "block_tables", device, (torch.int32,), 4, contiguous=False
+    )
+    _check_tensor(seq_lens, "seq_lens", device, (torch.int32,), 4)
+    table_shape, table_stride = block_tables.shape, block_tables.stride()
+    if (
+        len(table_shape) != 2
+        or table_shape[0] != b
+        or table_shape[1] <= 0
+        or table_stride[1] != 1
+        or table_stride[0] < table_shape[1]
+    ):
+        raise ValueError(
+            "block_tables requires nonoverlapping rows and unit column stride"
+        )
+    if tuple(seq_lens.shape) != (b,):
+        raise ValueError("seq_lens must be [batch]")
+    if num_splits is not None and (
+        type(num_splits) is not int
+        or num_splits < 1
+        or num_splits > 64
+        or num_splits & (num_splits - 1)
+    ):
+        raise ValueError("num_splits must be a power of two from 1 through 64")
+    capacity = 32 * table_shape[1]
+    max_seq_len = capacity if max_seq_len is None else max_seq_len
+    if type(max_seq_len) is not int or not 0 < max_seq_len <= capacity:
+        raise ValueError(
+            "max_seq_len must be a positive host bound within table capacity"
+        )
+    sm_scale = d**-0.5 if sm_scale is None else float(sm_scale)
+    if not all(math.isfinite(x) and x > 0 for x in (sm_scale, key_scale, value_scale)):
+        raise ValueError(
+            "attention and reconstruction scales must be positive finite scalars"
+        )
+    if out is not None:
+        _check_tensor(out, "out", device, (torch.bfloat16,))
+        if out.shape != q_shape:
+            raise ValueError("out must have Q's shape")
+    from .experimental.resserve_resattn.host import decode
+
+    with torch.cuda.device(device.index):
+        return decode(
+            q,
+            k,
+            v,
+            k_scale,
+            v_scale,
+            block_tables,
+            seq_lens,
+            sm_scale,
+            key_scale,
+            value_scale,
+            num_splits,
+            max_seq_len,
+            out,
         )
