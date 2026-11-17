@@ -306,6 +306,13 @@ def _validate_mxfp4_inputs(
     """Check the ``quant_mode="mxfp4"`` tensor contract before any GPU work."""
     if x.dtype is not torch.uint8:
         raise TypeError("quant_mode='mxfp4' requires packed uint8 (E2M1) input")
+    # GEMM1 gathers the row-major x_sf four E8M0 scales (128 elements) at a
+    # time, so a partial final group would read past the end of each row.
+    hidden_size = x.shape[-1] * 2
+    if hidden_size % 128:
+        raise ValueError(
+            f"CuTe-DSL MXFP4 requires hidden size divisible by 128, got {hidden_size}"
+        )
     if w1_weight.dtype is not torch.uint8 or w2_weight.dtype is not torch.uint8:
         raise TypeError("quant_mode='mxfp4' requires packed uint8 (E2M1) weights")
     if per_token_scale is not None:

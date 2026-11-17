@@ -504,6 +504,59 @@ def test_mxfp4_mode_rejects_invalid_inputs():
         cute_dsl_fused_moe(**kwargs, output_dtype=torch.float16)
 
 
+def test_mxfp4_rejects_hidden_size_not_divisible_by_128(monkeypatch):
+    """GEMM1 gathers x_sf four scales at a time, so hidden_size=160 (five
+    scales per row) is rejected before any routing."""
+    import importlib
+
+    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
+
+    api = importlib.import_module("flashinfer.fused_moe.cute_dsl.fused_moe")
+
+    def forbidden_sort(*args, **kwargs):
+        raise AssertionError("MXFP4 with hidden_size=160 reached GPU routing")
+
+    num_tokens, hidden, inter, num_experts, top_k = 8, 160, 256, 4, 2
+    u8 = dict(dtype=torch.uint8, device="cuda")
+
+    def mma_sf(rows, cols):
+        # Zero E8M0 weight scales in the MMA layout validate_w4a8_inputs expects.
+        m, k = (rows + 127) // 128, (cols + 127) // 128
+        sf = torch.zeros(num_experts, m, k, 32, 4, 4, **u8)
+        return sf.permute(3, 4, 1, 5, 2, 0)
+
+    tensors = dict(
+        x=torch.zeros(num_tokens, hidden // 2, **u8),
+        x_sf=torch.zeros(num_tokens, hidden // MX_BLOCK, **u8),
+        token_selected_experts=torch.zeros(
+            num_tokens, top_k, dtype=torch.int32, device="cuda"
+        ),
+        token_final_scales=torch.full((num_tokens, top_k), 0.5, device="cuda"),
+        w1_weight=torch.zeros(num_experts, 2 * inter, hidden // 2, **u8),
+        w1_weight_sf=mma_sf(2 * inter, hidden),
+        w1_alpha=torch.ones(num_experts, device="cuda"),
+        fc2_input_scale=None,
+        w2_weight=torch.zeros(num_experts, hidden, inter // 2, **u8),
+        w2_weight_sf=mma_sf(hidden, inter),
+        w2_alpha=torch.ones(num_experts, device="cuda"),
+    )
+    monkeypatch.setattr(api, "moe_sort", forbidden_sort)
+    match = "hidden size divisible by 128, got 160"
+    with pytest.raises(ValueError, match=match):
+        cute_dsl_fused_moe(
+            **tensors, num_experts=num_experts, top_k=top_k, quant_mode="mxfp4"
+        )
+    moe = CuteDslMoEWrapper(
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        quant_mode="mxfp4",
+    )
+    with pytest.raises(ValueError, match=match):
+        moe.run(**tensors)
+
+
 def test_mx_gemm1_output_rejects_global_scale():
     """MXFP4 output has no global scale; passing one is an error, not ignored."""
     from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
