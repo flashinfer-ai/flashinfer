@@ -127,14 +127,14 @@ from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
 from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
-from .backends.colonels.runner import ColonelsBf16Runner, ColonelsFp8BlockRunner
+from .backends.colonels.runner import ColonelsRunnerBF16, ColonelsRunnerFP8
 from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
-    ColonelsBf16Runner,
-    ColonelsFp8BlockRunner,
+    ColonelsRunnerBF16,
+    ColonelsRunnerFP8,
     FrostLowLatencyRunner,
     CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,
@@ -184,8 +184,8 @@ _RunnerT = Union[
 
 
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
-    ColonelsBf16Config: ColonelsBf16Runner,
-    ColonelsFp8BlockConfig: ColonelsFp8BlockRunner,
+    ColonelsBf16Config: ColonelsRunnerBF16,
+    ColonelsFp8BlockConfig: ColonelsRunnerFP8,
     FrostLowLatencyConfig: FrostLowLatencyRunner,
     CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,

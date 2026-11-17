@@ -4739,8 +4739,8 @@ class TestFusedSharedExpertsBackendGating:
             if r.supports_fused_shared_experts
         }
         assert supporting == {
-            "ColonelsBf16Runner",
-            "ColonelsFp8BlockRunner",
+            "ColonelsRunnerBF16",
+            "ColonelsRunnerFP8",
             "TrtllmFp4RoutedRunner",
             "TrtllmFp8BlockRunner",
         }, (

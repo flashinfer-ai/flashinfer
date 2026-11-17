@@ -29,20 +29,16 @@ class _Inputs(list):
         self.tuning_config = tuning_config
 
 
-class ColonelsBf16Runner(MoERunner):
-    backend_key = "colonels_bf16"
+class ColonelsRunner(MoERunner):
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     )
-    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
-    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
-        SwiGLU,
-        ReLU2,
-        ClampedReLU2,
-    )
     supports_fused_shared_experts = True
-    fp8 = False
+    _backend_config: ClassVar[type]
+    _dtype: ClassVar[torch.dtype]
+    _tuning_input_idx: ClassVar[tuple[int, ...]] = (0, 1, 2, 3)
+    _tuning_dim_idx: ClassVar[tuple[int, ...]] = (0, 0, 0, 0)
 
     def __init__(self, config, device):
         super().__init__()
@@ -64,15 +60,27 @@ class ColonelsBf16Runner(MoERunner):
         self.top_k = config.routing.top_k + self.shared_experts
         backend = config.backend.candidates[0]
         self.automatic_tactics = not backend.tactics
-        self.tactics = backend.tactics or get_colonels_tactics(self.arch, fp8=self.fp8)
+        self.tactics = backend.tactics or self._get_tactics()
         self._workspaces = {}
         self._scratch = {}
         self._valid = {}
 
+    def _get_tactics(self):
+        raise NotImplementedError
+
+    @property
+    def _blocked_weights(self):
+        return False
+
+    def _pack_scales(self, act, view):
+        raise NotImplementedError
+
+    def _launch_scales(self, x_scale, w1_scale, w2_scale):
+        raise NotImplementedError
+
     def _check_support(self):
         super()._check_support()
-        backend_type = ColonelsFp8BlockConfig if self.fp8 else ColonelsBf16Config
-        if not backend_type.supported(self.arch):
+        if not self._backend_config.supported(self.arch):
             raise NotImplementedError(
                 f"{self.backend_key} does not support SM{self.arch}"
             )
@@ -111,7 +119,7 @@ class ColonelsBf16Runner(MoERunner):
             )
         ):
             raise ValueError("Invalid local expert shard")
-        allowed = set(get_colonels_tactics(self.arch, fp8=self.fp8))
+        allowed = set(self._get_tactics())
         if any(t not in allowed for t in self.tactics):
             raise ValueError(
                 "Colonels tactic is outside the architecture's kernel catalogue"
@@ -200,7 +208,7 @@ class ColonelsBf16Runner(MoERunner):
             raise ValueError(
                 "Expected contiguous CUDA activations on the runner device"
             )
-        if x.dtype != (torch.float8_e4m3fn if self.fp8 else torch.bfloat16):
+        if x.dtype != self._dtype:
             raise ValueError("Unexpected Colonels activation dtype")
         m, h = x.shape
         if m > self.config.execution.tune_max_num_tokens:
@@ -226,7 +234,7 @@ class ColonelsBf16Runner(MoERunner):
         if v.get("activation") != self.config.activation:
             raise ValueError("Prepared weights and layer activation must match")
         i = self.config.experts.intermediate_size
-        if v.get("blocked_weights", False) != (not self.fp8 and self.arch == 103):
+        if v.get("blocked_weights", False) != self._blocked_weights:
             raise ValueError("Prepare Colonels weights on the layer's target device")
         expected = (
             (self.total_experts, i * (2 if self.config.activation.is_gated else 1), h),
@@ -256,34 +264,19 @@ class ColonelsBf16Runner(MoERunner):
                 raise ValueError(
                     "Use local_expert_offset=0 with an explicit expert_map"
                 )
-        scale = act.hidden_states_scale
-        if self.fp8:
-            if (
-                scale is None
-                or tuple(scale.shape) != (h // 128, m)
-                or scale.dtype != torch.float32
-                or scale.device != self.device
-            ):
-                raise ValueError(
-                    "Expected canonical FP8 scales float32 [hidden/128, tokens]"
-                )
-        elif scale is not None:
-            raise ValueError("BF16 activations must not have a scale tensor")
+        scales = self._pack_scales(act, v)
         self._workspace(m, h)
         bucket = map_to_hybrid_bucket(m, self.config.execution.tune_max_num_tokens)
         specs = [
             DynamicTensorSpec(
-                input_idx=(0, 1, 2, 3),
-                dim_idx=(0, 0, 0, 0),
+                input_idx=self._tuning_input_idx,
+                dim_idx=self._tuning_dim_idx,
                 gen_tuning_buckets=(bucket,),
                 map_to_tuning_buckets=make_hybrid_bucket_mapper(
                     self.config.execution.tune_max_num_tokens
                 ),
             )
         ]
-        if self.fp8:
-            specs[0].input_idx += (6,)
-            specs[0].dim_idx += (1,)
         tuning = TuningConfig(
             dynamic_tensor_specs=tuple(specs),
             use_cuda_graph=True,
@@ -297,9 +290,7 @@ class ColonelsBf16Runner(MoERunner):
                 act.topk_weights.float(),
                 v["w1"],
                 v["w2"],
-                scale if self.fp8 else self._empty,
-                v["w1_scale"] if self.fp8 else self._empty,
-                v["w2_scale"] if self.fp8 else self._empty,
+                *scales,
                 expert_map if expert_map is not None else self._empty,
             ],
             tuning,
@@ -353,6 +344,7 @@ class ColonelsBf16Runner(MoERunner):
             if tactic.variant == "bf16_gemv"
             else workspace.sort(ids, weights, self.total_experts, tactic.block_m)
         )
+        xs, s1, s2 = self._launch_scales(xs, s1, s2)
         return self.runtime.launch(
             tactic,
             self.kind,
@@ -363,9 +355,9 @@ class ColonelsBf16Runner(MoERunner):
             weights,
             out,
             scratch=workspace.scratch if "gmem" in tactic.variant else None,
-            x_scale=xs.T.contiguous() if self.fp8 else None,
-            w1_scale=s1 if self.fp8 else None,
-            w2_scale=s2 if self.fp8 else None,
+            x_scale=xs,
+            w1_scale=s1,
+            w2_scale=s2,
             clamp=self.config.activation.limit
             if isinstance(self.config.activation, ClampedReLU2)
             else 0.5,
@@ -418,8 +410,58 @@ class ColonelsBf16Runner(MoERunner):
         return inputs[0]
 
 
-class ColonelsFp8BlockRunner(ColonelsBf16Runner):
+class ColonelsRunnerBF16(ColonelsRunner):
+    backend_key = "colonels_bf16"
+    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        ReLU2,
+        ClampedReLU2,
+    )
+    _backend_config = ColonelsBf16Config
+    _dtype = torch.bfloat16
+
+    def _get_tactics(self):
+        return get_colonels_tactics(self.arch)
+
+    @property
+    def _blocked_weights(self):
+        return self.arch == 103
+
+    def _pack_scales(self, act, view):
+        if act.hidden_states_scale is not None:
+            raise ValueError("BF16 activations must not have a scale tensor")
+        return self._empty, self._empty, self._empty
+
+    def _launch_scales(self, x_scale, w1_scale, w2_scale):
+        return None, None, None
+
+
+class ColonelsRunnerFP8(ColonelsRunner):
     backend_key = "colonels_fp8_block"
     supported_quant_variants = ((QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),)
     supported_activation_classes = (SwiGLU,)
-    fp8 = True
+    _backend_config = ColonelsFp8BlockConfig
+    _dtype = torch.float8_e4m3fn
+    _tuning_input_idx = (0, 1, 2, 3, 6)
+    _tuning_dim_idx = (0, 0, 0, 0, 1)
+
+    def _get_tactics(self):
+        return get_colonels_tactics(self.arch, fp8=True)
+
+    def _pack_scales(self, act, view):
+        m, h = act.hidden_states_q.shape
+        scale = act.hidden_states_scale
+        if (
+            scale is None
+            or tuple(scale.shape) != (h // 128, m)
+            or scale.dtype != torch.float32
+            or scale.device != self.device
+        ):
+            raise ValueError(
+                "Expected canonical FP8 scales float32 [hidden/128, tokens]"
+            )
+        return scale, view["w1_scale"], view["w2_scale"]
+
+    def _launch_scales(self, x_scale, w1_scale, w2_scale):
+        return x_scale.T.contiguous(), w1_scale, w2_scale
