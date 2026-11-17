@@ -284,19 +284,12 @@ def recurrent_kda_batch_invariant(
             raise unsupported(
                 CLASS, "an output on another device", "the inputs' device"
             )
-        lo, hi = output.data_ptr(), initial_state.data_ptr()
-        if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
-            raise unsupported(
-                CLASS,
-                "an output that shares memory with the state pool",
-                "an output buffer of its own",
-            )
     ep = get_pool(initial_state)
 
     if decode:
         out = output
         if out is None:
-            out = torch.empty(v.shape, dtype=_IO, device=dev)
+            out = torch.empty_like(v, memory_format=torch.contiguous_format)
         rows = out.view(N, HV, HEAD_DIM)
         ep.step(
             initial_state,
@@ -314,6 +307,15 @@ def recurrent_kda_batch_invariant(
         )
         return out, (initial_state if output_final_state else None)
 
+    if output is not None:
+        # a prefill writes its rows after the kernels: an output inside the pool would overwrite boundary states
+        lo, hi = output.data_ptr(), initial_state.data_ptr()
+        if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
+            raise unsupported(
+                CLASS,
+                "a prefill output that shares memory with the state pool",
+                "an output buffer of its own",
+            )
     if cu_seqlens is not None:
         cu = [int(x) for x in cu_seqlens.tolist()]
         lens = [cu[i + 1] - cu[i] for i in range(N)]
