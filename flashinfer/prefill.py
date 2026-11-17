@@ -2878,9 +2878,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
         if reason is None:
             # chunked-prefill host contract: kv_len >= q_len per request, and
             # the kv-length envelope the kernel was measured on
-            q_lens = (
-                qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
-            )
+            q_lens = qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
             kv_lens = kv_lens_arr_host[:batch_size]
             if int(qo_indptr_host[batch_size]) != total_num_rows:
                 reason = "qo_indptr/total_num_rows mismatch"
@@ -2999,7 +2997,12 @@ def _gqa_ctx_fp8q_sm90_prepare(
         )
     nb = max(nb, 1)
     bt = bufs.get("block_table")
-    if bt is None or bt.shape[0] < batch_size or bt.shape[1] != nb or bt.device != device:
+    if (
+        bt is None
+        or bt.shape[0] < batch_size
+        or bt.shape[1] != nb
+        or bt.device != device
+    ):
         bt = torch.empty((batch_size, nb), dtype=torch.int32, device=device)
         bufs["block_table"] = bt
         counters["workspace_allocs"] += 1
@@ -3129,8 +3132,7 @@ def _gqa_ctx_fp8q_sm90_run_eligibility(
             return f"{name} strides {tuple(cache.stride())}"
     if v_cache.shape[0] < state.vt_pages:
         return (
-            f"v_cache pages {v_cache.shape[0]} < planned V^T coverage "
-            f"{state.vt_pages}"
+            f"v_cache pages {v_cache.shape[0]} < planned V^T coverage {state.vt_pages}"
         )
     buf = wrapper._qo_indptr_buf
     if (
