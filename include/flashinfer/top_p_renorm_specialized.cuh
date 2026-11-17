@@ -19,29 +19,38 @@
 // Top-p renormalisation of float32 probability rows with one thread-block cluster (8 or 16 CTAs)
 // per row: one read of the row and one write of the output, in a single launch.
 //
-// Semantics (identical to top_p_renorm_probs): keep {p >= threshold}, where threshold is the
-// smallest value of the shortest descending prefix whose mass reaches top_p (ties at the
-// threshold are kept); the kept entries are divided by their sum, every other entry is 0.
+// Semantics (identical to the AIR path of top_p_renorm_probs): keep {p >= threshold}, where
+// threshold is the smallest value of the shortest descending prefix whose mass reaches
+// top_p * M, M being the row's positive mass (AIR's target is blockSum * p); ties at the
+// threshold are kept; the kept entries are divided by their sum, every other entry is 0. The
+// target is relative to the row's own mass, so a row that does not sum to 1 (scaled, vanishing or
+// unnormalised) keeps the same entries as on the AIR path.
 //
 // Fast path: every CTA streams its slice of the row once, writes zeros to the matching output
-// slice and collects the entries >= 2^-8 (at most 256 per row, since a row sums to 1). If their
-// mass reaches top_p, the nucleus lies entirely inside that set: the cluster gathers these head
-// entries through distributed shared memory, resolves the exact threshold with 2^-56
-// fixed-point prefix sums (exact for every float >= 2^-8, so the kept set does not depend on the
-// summation order) and each CTA scatters its kept entries. Serving rows are peaked (nucleus of
-// 1-2 tokens at top_p 0.95), so this path serves almost every row; up to 32 head entries are
-// resolved by one warp with shuffles, and a single head entry that reaches top_p on its own exits
-// right after the gather (its output is exactly 1).
+// slice, adds the slice up in float32 and collects the entries >= 2^-8 (at most 256 per row when
+// the row sums to 1; a row with more takes the radix path). The float32 row mass bounds M within
+// its rounding error, and so bounds the target. If the head entries' mass reaches the target's
+// upper bound, the nucleus lies entirely inside that set: the cluster gathers these head entries
+// through distributed shared memory, resolves the exact threshold with 2^-56 fixed-point prefix
+// sums (exact for every float >= 2^-8, so the kept set does not depend on the summation order)
+// and each CTA scatters its kept entries. A head prefix sum inside the target's bounds (the kept
+// set would depend on M's last bits) sends the row to the radix path. Serving rows are peaked
+// (nucleus of 1-2 tokens at top_p 0.95), so this path serves almost every row; up to 32 head
+// entries are resolved by one warp with shuffles, and a single head entry that reaches the target
+// on its own exits right after the gather (its output is exactly 1).
 // Otherwise an exact radix select over the float bits (12/11/9-bit levels, 64-bit fixed-point
 // bin masses) reduced across the cluster through distributed shared memory finds the threshold,
-// and a masked pass rewrites the slice.
+// and a masked pass rewrites the slice. Its first level also sums the entries below the level's
+// range, which gives the exact fixed-point M, and so the exact target, before any decision.
 //
 // Compared with the AIR radix top-p (air_top_p.cuh: five kernels, one 1024-thread CTA per row in
 // the apply pass), this keeps the whole GPU busy for small batches (16 CTAs per row) and reads
 // the row once on the fast path. Accumulation is 64-bit fixed point (2^-56): each entry is
 // rounded to 2^-57 at most, so for rows that sum to ~1 it is at least as precise as the float32
 // accumulation it replaces; the one discontinuous decision on the mass (a kept mass <= 1e-8 is
-// left unnormalised) is re-checked in float64 near its cutoff. No fast-math is used (the JIT
+// left unnormalised) is re-checked in float64 near its cutoff. A row of mass 64 or more (never a
+// probability row; the 2^-56 accumulator overflows at 256) takes the radix path in a coarser
+// power-of-two fixed point that keeps its mass below 2^61 units. No fast-math is used (the JIT
 // module is built without -use_fast_math, so the renormalising division is the IEEE division).
 //
 // Requires sm_90+ (thread-block clusters, distributed shared memory).
@@ -60,10 +69,47 @@ constexpr int NBINS = 2048;
 constexpr int LBITS = 0x37800000;  // bits of 2^-16: fallback level-0 filter
 constexpr int CBITS = 0x3B800000;  // bits of 2^-8: fast-path head-entry cutoff
 constexpr int CAP = 256;           // head entries per row (mass <= 1 => at most 256)
+constexpr float FIX_SCALE = 72057594037927936.0f;  // 2^56
+constexpr float BIG_MASS = 64.0f;  // a row this heavy is selected in a coarser fixed point
 
 typedef unsigned long long u64;
 
-__device__ __forceinline__ u64 to_fix(float p) { return __float2ull_rn(p * 72057594037927936.0f); }
+// Fixed-point mass of p; 0 for p <= 0 and NaN (the conversion saturates at 0).
+__device__ __forceinline__ u64 to_fix(float p, float scale = FIX_SCALE) {
+  return __float2ull_rn(p * scale);
+}
+
+// max(1, round(top_p * mass)) in exact integer arithmetic: AIR's target blockSum * p for a
+// fixed-point row mass (top_p >= 1 gives the whole mass). The minimum of one unit (top_p <= 0 or
+// NaN, or a product below half a unit) keeps the row maximum, as AIR does: the nucleus always
+// holds at least one entry.
+__device__ __forceinline__ u64 row_target(float tp, u64 mass) {
+  u64 r = 0;
+  if (tp >= 1.f) {
+    r = mass;
+  } else if (tp > 0.f) {
+    const unsigned b = __float_as_uint(tp);
+    const int e = (int)(b >> 23);  // biased exponent, <= 126 since tp < 1
+    const int sh = 150 - e;        // tp = m * 2^-sh, sh >= 24
+    const u64 m = (b & 0x7FFFFFu) | 0x800000u;
+    const u64 lo = mass * m, hi = __umul64hi(mass, m);  // the 88-bit product
+    if (e == 0 || sh >= 128) {
+      r = 0;  // below 2^-126 * 2^64 units
+    } else if (sh < 64) {
+      r = ((lo >> sh) | (hi << (64 - sh))) + ((lo >> (sh - 1)) & 1ULL);
+    } else {
+      r = (hi >> (sh - 64)) + ((sh == 64) ? (lo >> 63) : ((hi >> (sh - 65)) & 1ULL));
+    }
+  }
+  return r ? r : 1ULL;
+}
+
+template <typename T>
+__device__ __forceinline__ T warp_sum(T x) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) x += __shfl_xor_sync(0xffffffffu, x, off);
+  return x;
+}
 __device__ __forceinline__ void cl_arrive() {
   asm volatile("barrier.cluster.arrive.release.aligned;\n" ::: "memory");
 }
@@ -73,7 +119,7 @@ __device__ __forceinline__ void cl_wait() {
 
 // mode 0: p >= 2^-16, key bits>>20      mode 1: 0 < p < 2^-16, key bits>>20
 // mode 2: bits>>20 == prefix, key (bits>>9)&0x7FF     mode 3: bits>>9 == prefix, key bits&0x1FF
-__device__ __forceinline__ void hist_add(float x, int mode, int prefix, u64* lmass,
+__device__ __forceinline__ void hist_add(float x, int mode, int prefix, float scale, u64* lmass,
                                          unsigned* lcnt) {
   int bits = __float_as_int(x);
   if (bits <= 0) return;
@@ -93,7 +139,7 @@ __device__ __forceinline__ void hist_add(float x, int mode, int prefix, u64* lma
     key = bits & 0x1FF;
   }
   if (f) {
-    atomicAdd(&lmass[key], to_fix(x));
+    atomicAdd(&lmass[key], to_fix(x, scale));
     atomicAdd(&lcnt[key], 1u);
   }
 }
@@ -102,6 +148,11 @@ __device__ __forceinline__ void hist_add(float x, int mode, int prefix, u64* lma
 __device__ __forceinline__ double kept_f64(float x, int kshift, int kprefix) {
   const int bits = __float_as_int(x);
   return (bits > 0 && bits < 0x7f800000 && (bits >> kshift) >= kprefix) ? (double)x : 0.0;
+}
+
+// Fixed-point mass of an entry below the fallback's level-0 range (0 for p >= 2^-16 and p <= 0).
+__device__ __forceinline__ u64 tail_fix(float x, float scale) {
+  return (__float_as_int(x) < LBITS) ? to_fix(x, scale) : 0ULL;
 }
 
 __device__ __forceinline__ void cand_add(float x, int gi, int* s_n, float* s_cv, int* s_ci) {
@@ -131,6 +182,13 @@ __global__ void __launch_bounds__(NT, MINB)
   __shared__ int s_n;
   __shared__ int s_off[C + 1];
   __shared__ u64 s_wsum[NT / 32];
+  __shared__ float s_wmass[NT / 32];  // per-warp float32 slice mass
+  __shared__ float s_rmass;           // this CTA's float32 slice mass (read by the cluster)
+  __shared__ float s_fmass;           // the row's float32 mass
+  __shared__ u64 s_tlo, s_thi;        // bounds of the row's target (head paths)
+  __shared__ int s_big;               // the row's mass is >= BIG_MASS
+  __shared__ int s_amb;               // a head prefix sum lies within the target's bounds
+  __shared__ u64 s_rsum, s_tail;      // fallback level 0: this CTA's / the row's tail mass
   __shared__ int s_best;
   __shared__ u64 s_above, s_bmass;
   __shared__ unsigned s_bcnt;
@@ -151,15 +209,12 @@ __global__ void __launch_bounds__(NT, MINB)
 
   if (t == 0) s_n = 0;
   const float tp = top_p[row];
-  // A top_p whose fixed-point target is zero (<= 0, NaN, or below 2^-56) keeps the row maximum, as
-  // the reference does (the nucleus always holds at least one entry).
-  const u64 target_raw = (tp <= 0.f) ? 0ULL : __float2ull_rn(tp * 72057594037927936.0f);
-  const u64 target = target_raw ? target_raw : 1ULL;
   __syncthreads();
 
-  // ---- single streaming pass: collect head entries and zero the output slice ----
+  // ---- single streaming pass: collect head entries, add up the slice and zero the output slice
   // The output is a fresh (uninitialised) buffer: every element is written here, the kept
   // entries are overwritten by the scatter below (ordered by the barriers in between).
+  float fsum = 0.f;  // positive mass (NaN and p <= 0 add 0, as in to_fix)
   if (VEC) {
     const float4* p4 = reinterpret_cast<const float4*>(psrc);
     float4* o4 = reinterpret_cast<float4*>(odst);
@@ -181,9 +236,13 @@ __global__ void __launch_bounds__(NT, MINB)
       for (int u = 0; u < UNR; ++u) {
         const int gi = cstart + 4 * (base + u * NT + t);
         cand_add(x[u].x, gi + 0, &s_n, s_cv, s_ci);
+        fsum += fmaxf(x[u].x, 0.f);
         cand_add(x[u].y, gi + 1, &s_n, s_cv, s_ci);
+        fsum += fmaxf(x[u].y, 0.f);
         cand_add(x[u].z, gi + 2, &s_n, s_cv, s_ci);
+        fsum += fmaxf(x[u].z, 0.f);
         cand_add(x[u].w, gi + 3, &s_n, s_cv, s_ci);
+        fsum += fmaxf(x[u].w, 0.f);
       }
     }
   } else {
@@ -191,13 +250,24 @@ __global__ void __launch_bounds__(NT, MINB)
       float x = __ldg(psrc + i);
       odst[i] = 0.f;
       cand_add(x, cstart + i, &s_n, s_cv, s_ci);
+      fsum += fmaxf(x, 0.f);
     }
+  }
+  fsum = warp_sum(fsum);
+  if (lane == 0) s_wmass[w] = fsum;
+  __syncthreads();
+  if (t < 32) {
+    const float f = warp_sum((t < NT / 32) ? s_wmass[t] : 0.f);
+    if (t == 0) s_rmass = f;
   }
   cluster.sync();
 
-  // ---- gather the row's head entries (one DSMEM exchange for the counts, one for the values) ----
+  // ---- gather the row's head entries (one DSMEM exchange for the counts and slice masses, one
+  // for the values) and bound the target ----
   if (t < 32) {
     int n = (t < C) ? *cluster.map_shared_rank(&s_n, t) : 0;
+    // the same values in the same order in every CTA: the row's float32 mass is uniform
+    const float f = warp_sum((t < C) ? *cluster.map_shared_rank(&s_rmass, t) : 0.f);
     int incl = n;
 #pragma unroll
     for (int off = 1; off < 32; off <<= 1) {
@@ -206,11 +276,39 @@ __global__ void __launch_bounds__(NT, MINB)
     }
     if (t < C) s_off[t] = incl - n;
     if (t == C - 1) s_off[C] = incl;
+    const bool heavy = !(f < BIG_MASS);  // also an inf entry
+    if (t == 0) {
+      s_fmass = f;
+      s_big = heavy;
+    }
+    if (t < 2) {
+      u64 tg = ~0ULL;  // a heavy row never takes the head paths
+      if (!heavy) {
+        // f is a sum tree of positive terms of height <= per_thread + 15, so it is within
+        // (per_thread + 24) * 2^-24 of the exact sum of the entries; to_fix rounds each entry by
+        // at most half a unit. M (the fixed-point mass the radix path sums) lies in
+        // [mlo - V, mhi + V]; lane 0 bounds the target from below, lane 1 from above.
+        const int per_thread = VEC ? 4 * ((chunk / 4 + NT - 1) / NT) : (chunk + NT - 1) / NT;
+        const float d = (float)(per_thread + 24) * 5.9604645e-8f;
+        const u64 mlo = __float2ull_rd(__fmul_rd(__fmul_rd(f, __fsub_rd(1.f, d)), FIX_SCALE));
+        const u64 mhi = __float2ull_ru(__fmul_ru(__fmul_ru(f, __fadd_ru(1.f, d)), FIX_SCALE));
+        tg = row_target(tp, t == 0 ? (mlo > (u64)V ? mlo - (u64)V : 0ULL) : mhi + (u64)V);
+      }
+      if (t == 0) {
+        s_tlo = tg;
+      } else {
+        s_thi = tg;
+      }
+    }
   }
   __syncthreads();
   const int ntot = s_off[C];
-  bool fast = ntot <= CAP;
-  if (ntot <= 32) {
+  const bool big = s_big;  // uniform across the cluster, like every decision derived from f
+  // The exact target lies in [tlo, thi]: an entry whose prefix sum is below tlo is in the
+  // nucleus, one at or above thi is out, one in between makes the row ambiguous on the head path.
+  const u64 tlo = s_tlo, thi = s_thi;
+  bool fast = !big && ntot <= CAP;
+  if (!big && ntot <= 32) {
     // Small head set (serving rows hold 1-4): warp 0 gathers and resolves it with shuffles
     // while the rest of the block waits at the barrier below.
     if (t < 32) {
@@ -232,14 +330,15 @@ __global__ void __launch_bounds__(NT, MINB)
           const u64 fy = __shfl_sync(0xffffffffu, fv, j);
           if (y > v || (y == v && j < t)) excl += fy;
         }
-        const int cb = (t < ntot && excl < target) ? __float_as_int(v) : 0x7fffffff;
+        const int cb = (t < ntot && excl < tlo) ? __float_as_int(v) : 0x7fffffff;
         const int bst = __reduce_min_sync(0xffffffffu, cb);
         const float thr = __int_as_float(bst);
+        const bool amb = __any_sync(0xffffffffu, t < ntot && excl >= tlo && excl < thi);
         u64 ks = (t < ntot && v >= thr) ? fv : 0ULL;
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) ks += __shfl_xor_sync(0xffffffffu, ks, off);
         if (t == 0) {
-          s_small = (wtot >= target) ? 1 : 0;
+          s_small = (wtot >= thi && !amb) ? 1 : 0;
           s_thr = thr;
           s_ksum = ks;
         }
@@ -256,7 +355,7 @@ __global__ void __launch_bounds__(NT, MINB)
 
   // One-entry nucleus (the common serving case): every CTA holds the same sole head entry,
   // so its exact fixed-point mass decides without further block reductions or atomics.
-  if (ntot == 1 && target > 0 && to_fix(s_all[0]) >= target) {
+  if (!big && ntot == 1 && to_fix(s_all[0]) >= thi) {
     if (s_n == 1 && t == 0) {
       const float x = s_cv[0];
       out[(long long)row * V + s_ci[0]] = x / x;
@@ -264,9 +363,9 @@ __global__ void __launch_bounds__(NT, MINB)
     cl_wait();
     return;
   }
-  if (ntot >= 2 && ntot <= 32 && s_small) {
+  if (!big && ntot >= 2 && ntot <= 32 && s_small) {
     const float thr = s_thr;
-    const float sumf = __ull2float_rn(s_ksum) * (1.0f / 72057594037927936.0f);
+    const float sumf = __ull2float_rn(s_ksum) * (1.0f / FIX_SCALE);
     const int n = min(s_n, CAP);
     for (int i = t; i < n; i += NT) {
       const float x = s_cv[i];
@@ -276,16 +375,15 @@ __global__ void __launch_bounds__(NT, MINB)
     return;
   }
 
-  // ---- exact resolve: element e is in the prefix iff (sum of strictly-earlier entries) < top_p
-  // ----
+  // ---- exact resolve: element e is in the prefix iff (sum of strictly-earlier entries) < target
   u64 tot = 0;
   if (fast) {
     float v = 0.f;
     u64 excl = 0;
-    bool in = false;
     if (t == 0) {
       s_ksum = 0;
       s_best = 0x7fffffff;
+      s_amb = 0;
     }
     __syncthreads();
     if (t < ntot) {
@@ -296,8 +394,11 @@ __global__ void __launch_bounds__(NT, MINB)
         tot += fy;
         if (y > v || (y == v && j < t)) excl += fy;
       }
-      in = excl < target;
-      if (in) atomicMin(&s_best, __float_as_int(v));
+      if (excl < tlo) {
+        atomicMin(&s_best, __float_as_int(v));
+      } else if (excl < thi) {
+        s_amb = 1;
+      }
     }
     __syncthreads();
     // total mass of the head entries (identical in every thread that computed it; thread 0 always
@@ -305,13 +406,13 @@ __global__ void __launch_bounds__(NT, MINB)
     if (t == 0) s_above = tot;
     __syncthreads();
     tot = s_above;
-    fast = (ntot > 0) && (tot >= target);
+    fast = (ntot > 0) && (tot >= thi) && !s_amb;
     if (fast) {
       // Positive float bit patterns are monotonically ordered, including threshold ties.
       const float thr = __int_as_float(s_best);
       if (t < ntot && v >= thr) atomicAdd(&s_ksum, to_fix(v));
       __syncthreads();
-      const float sumf = __ull2float_rn(s_ksum) * (1.0f / 72057594037927936.0f);
+      const float sumf = __ull2float_rn(s_ksum) * (1.0f / FIX_SCALE);
       const int n = min(s_n, CAP);
       for (int i = t; i < n; i += NT) {
         const float x = s_cv[i];
@@ -338,6 +439,16 @@ __global__ void __launch_bounds__(NT, MINB)
   int mode = 0, prefix = 0, kshift = 0, kprefix = 0;
   const float4* sd4 = reinterpret_cast<const float4*>(psrc);
   const int len4 = len >> 2;
+  // The fixed point: 2^-56, or for a heavy row 2^-q with q chosen from its float32 mass f so that
+  // the mass stays below 2^61 units (it is below 2^(e+2) allowing for f's rounding).
+  float scale = FIX_SCALE, inv_scale = 1.0f / FIX_SCALE;
+  if (big) {
+    const int e = min(max(ilogbf(s_fmass), 6), 185);
+    const int q = 59 - e;  // in [-126, 53]
+    scale = __int_as_float((q + 127) << 23);
+    inv_scale = __int_as_float((127 - q) << 23);
+  }
+  u64 target = 1;  // the exact target, set on level 0
   for (int lvl = 0; lvl < 4; ++lvl) {
     if (lvl > 0) {
       for (int i = t; i < NBINS; i += NT) {
@@ -346,18 +457,37 @@ __global__ void __launch_bounds__(NT, MINB)
       }
     }
     __syncthreads();
+    // Level 0 bins the entries >= 2^-16 and also sums the rest: the row's exact mass is then the
+    // level's bin total plus that tail.
+    u64 tail = 0;
     if (VEC) {
       for (int i = t; i < len4; i += NT) {
         float4 x = sd4[i];
-        hist_add(x.x, mode, prefix, lmass, lcnt);
-        hist_add(x.y, mode, prefix, lmass, lcnt);
-        hist_add(x.z, mode, prefix, lmass, lcnt);
-        hist_add(x.w, mode, prefix, lmass, lcnt);
+        hist_add(x.x, mode, prefix, scale, lmass, lcnt);
+        hist_add(x.y, mode, prefix, scale, lmass, lcnt);
+        hist_add(x.z, mode, prefix, scale, lmass, lcnt);
+        hist_add(x.w, mode, prefix, scale, lmass, lcnt);
+        if (lvl == 0) {
+          tail += tail_fix(x.x, scale) + tail_fix(x.y, scale) + tail_fix(x.z, scale) +
+                  tail_fix(x.w, scale);
+        }
       }
     } else {
-      for (int i = t; i < len; i += NT) hist_add(psrc[i], mode, prefix, lmass, lcnt);
+      for (int i = t; i < len; i += NT) {
+        const float x = psrc[i];
+        hist_add(x, mode, prefix, scale, lmass, lcnt);
+        if (lvl == 0) tail += tail_fix(x, scale);
+      }
+    }
+    if (lvl == 0) {
+      tail = warp_sum(tail);
+      if (lane == 0) s_wsum[w] = tail;
     }
     __syncthreads();
+    if (lvl == 0 && t < 32) {
+      const u64 m = warp_sum((t < NT / 32) ? s_wsum[t] : 0ULL);
+      if (t == 0) s_rsum = m;  // read by the cluster after the cluster barrier below
+    }
     u64* gm = gmass + lvl * S;
     unsigned* gc = gcnt + lvl * S;
     for (int b = t; b < NBINS; b += NT) {
@@ -395,6 +525,10 @@ __global__ void __launch_bounds__(NT, MINB)
     }
     if (lane == 0) s_wsum[w] = incl;
     if (t == 0) s_best = -1;
+    if (lvl == 0 && t < 32) {
+      const u64 m = warp_sum((t < C) ? *cluster.map_shared_rank(&s_rsum, t) : 0ULL);
+      if (t == 0) s_tail = m;
+    }
     __syncthreads();
     u64 wabove = 0, ftot = 0;
 #pragma unroll
@@ -403,6 +537,7 @@ __global__ void __launch_bounds__(NT, MINB)
       ftot += x;
       if (ww > (int)w) wabove += x;
     }
+    if (lvl == 0) target = row_target(tp, ftot + s_tail);
     u64 cum = above + wabove + (incl - tsum);
     int mybest = -1;
     u64 myabove = 0, mym = 0;
@@ -435,7 +570,7 @@ __global__ void __launch_bounds__(NT, MINB)
       }
       kshift = 0;
       kprefix = 0;
-      sumfix = above + ftot;  // whole positive mass < top_p: keep all
+      sumfix = above + ftot;  // whole positive mass < target: keep all
       break;
     }
     above = s_above;
@@ -458,12 +593,13 @@ __global__ void __launch_bounds__(NT, MINB)
   // per kept entry (at most V of them), so a sum within V units of the cutoff can land on the
   // wrong side of it: such a row re-sums its kept entries in float64 (relative error below
   // V * 2^-53, in a fixed order) and decides on that. A probability row never gets here (its kept
-  // mass is at least its maximum, >= 1/V), so the served rows pay one integer comparison.
+  // mass is at least its maximum, >= 1/V), so the served rows pay one integer comparison; nor
+  // does a heavy row (its kept mass is at least its maximum, >= 64/V).
   constexpr u64 KEEP_CUT = 720575936ULL;
-  bool scale = sumfix > KEEP_CUT;
-  float sumf = __ull2float_rn(sumfix) * (1.0f / 72057594037927936.0f);
+  bool normalise = big || sumfix > KEEP_CUT;
+  float sumf = __ull2float_rn(sumfix) * inv_scale;
   // sumfix is identical in every CTA of the cluster, so this branch (and its barrier) is uniform.
-  if ((sumfix > KEEP_CUT ? sumfix - KEEP_CUT : KEEP_CUT - sumfix) < (u64)V) {
+  if (!big && (sumfix > KEEP_CUT ? sumfix - KEEP_CUT : KEEP_CUT - sumfix) < (u64)V) {
     double part = 0.0;
     if (VEC) {
       for (int i = t; i < len4; i += NT) {
@@ -491,11 +627,11 @@ __global__ void __launch_bounds__(NT, MINB)
     }
     __syncthreads();
     const double row_sum = s_dsum[NT / 32 + 1];
-    scale = row_sum > (double)1e-8f;
+    normalise = row_sum > (double)1e-8f;
     sumf = (float)row_sum;
   }
   cl_arrive();  // all DSMEM traffic of this CTA is done
-  if (!scale) sumf = 1.0f;
+  if (!normalise) sumf = 1.0f;
   if (VEC) {
     float4* o4 = reinterpret_cast<float4*>(odst);
     for (int i = t; i < len4; i += NT) {

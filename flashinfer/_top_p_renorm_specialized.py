@@ -24,8 +24,10 @@ first and keeps its stock path whenever that returns ``None``.
 are served by a single-launch thread-block-cluster kernel
 (``include/flashinfer/top_p_renorm_specialized.cuh``) for the exact ``(batch_size, vocab_size)``
 rows of ``top_p_renorm_probs_specialized_workloads.json``. Every other call keeps the stock AIR
-top-p kernels. Same semantics as the stock path: keep the entries ``>=`` the nucleus threshold
-(ties kept) and renormalise them to sum to 1.
+top-p kernels. Same semantics as the stock path: the nucleus is the shortest descending prefix
+whose mass reaches ``top_p`` times the row's own mass (AIR's target, so a row that does not sum to
+1 keeps the same entries), the entries ``>=`` its threshold are kept (ties kept) and renormalised
+to sum to 1 (a kept mass ``<= 1e-8`` is left as it is).
 
 The decision is made at call time, in this order (semantics, then shape/layout, device last, so
 the correctness gates are exercisable without a GPU):

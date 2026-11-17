@@ -2512,36 +2512,52 @@ def top_p_specialized_enabled(monkeypatch):
     monkeypatch.delenv(_TOP_P_SPECIALIZED_KILL_SWITCH, raising=False)
 
 
+def _top_p_specialized_target(probs, top_p):
+    """The nucleus target of each row, as on the AIR path (blockSum * p): top_p times the row's
+    mass (float64), so a row that does not sum to 1 keeps the same entries."""
+    p = probs.double()
+    return top_p.double().reshape(-1, 1).to(p.device) * p.clamp(min=0).sum(
+        dim=-1, keepdim=True
+    )
+
+
 def _top_p_specialized_reference(probs, top_p):
     """Exact semantics in float64: keep p >= threshold, where threshold is the smallest value of
-    the shortest descending prefix whose mass reaches top_p (ties kept), renormalise."""
+    the shortest descending prefix whose mass reaches top_p times the row's mass (ties kept);
+    renormalise, unless the kept mass is <= 1e-8 (that row is left as it is, like on AIR)."""
     p = probs.double()
     sp, _ = torch.sort(p, dim=-1, descending=True)
     excl = torch.cumsum(sp, dim=-1) - sp
-    k = (excl < top_p.double().reshape(-1, 1)).sum(dim=-1, keepdim=True).clamp(min=1)
+    target = _top_p_specialized_target(p, top_p)
+    k = (excl < target).sum(dim=-1, keepdim=True).clamp(min=1)
     thr = sp.gather(-1, k - 1)
     kept = torch.where(p >= thr, p, torch.zeros_like(p))
-    return (kept / kept.sum(dim=-1, keepdim=True)).float()
+    mass = kept.sum(dim=-1, keepdim=True)
+    cut = float(torch.tensor(1e-8, dtype=torch.float32))
+    return torch.where(mass > cut, kept / mass, kept).float()
 
 
 def _top_p_specialized_edge_margin(probs, top_p):
-    """Distance of each row's nucleus edge from top_p (float64); rows whose edge entry is at
-    most 1e-6 are exempt (flipping it moves no output beyond the tolerance)."""
+    """Distance of each row's nucleus edge from its target, relative to the row's mass
+    (float64); rows whose edge entry is at most 1e-6 of the mass are exempt (flipping it moves
+    no output beyond the tolerance)."""
     sp, _ = torch.sort(probs.double(), dim=-1, descending=True)
     cum = torch.cumsum(sp, dim=-1)
     excl = cum - sp
-    tp = top_p.double().reshape(-1, 1)
+    tp = _top_p_specialized_target(probs, top_p)
+    mass = sp.clamp(min=0).sum(dim=-1, keepdim=True).clamp(min=1e-300)
     k = (excl < tp).sum(dim=-1, keepdim=True).clamp(min=1)
     inc = cum.gather(-1, k - 1)
     exc = excl.gather(-1, k - 1)
     edge = sp.gather(-1, k - 1)
-    m = torch.minimum((inc - tp).abs(), (exc - tp).abs())
-    return torch.where(edge > 1e-6, m, torch.ones_like(m)).reshape(-1)
+    m = torch.minimum((inc - tp).abs(), (exc - tp).abs()) / mass
+    return torch.where(edge > 1e-6 * mass, m, torch.ones_like(m)).reshape(-1)
 
 
 def _top_p_specialized_robust_top_p(probs, top_p):
-    """Lower top_p (2e-4 steps) on rows whose nucleus edge lies within 1e-5 of it, so the kept
-    set does not depend on the float32 summation order of the path under test."""
+    """Lower top_p (2e-4 steps) on rows whose nucleus edge lies within 1e-5 of the row's mass
+    from the target, so the kept set does not depend on the float32 summation order of the path
+    under test."""
     tp = top_p.clone()
     for _ in range(50):
         bad = _top_p_specialized_edge_margin(probs, tp) < 1e-5
@@ -3124,11 +3140,15 @@ def test_top_p_renorm_probs_specialized_zero_mass_rows(
     top_p_value, top_p_specialized_enabled, monkeypatch
 ):
     # A row whose kept mass is <= 1e-8 (all zeros, or vanishing values) is left unnormalised,
-    # exactly like the AIR path (norm 1.0), never 0/0 = NaN or x/0 = inf.
+    # exactly like the AIR path (norm 1.0), never 0/0 = NaN or x/0 = inf. The nucleus target is
+    # relative to the row's mass there too: of the different vanishing values in row 2, top_p 0.5
+    # keeps 2^-28 alone, like AIR (an absolute target would keep both).
     _skip_unless_sm103()
     batch_size, vocab_size = 4, 248320
     probs = torch.zeros(batch_size, vocab_size, device="cuda")
     probs[1] = 1e-14  # every entry vanishing: total mass 2.5e-9
+    probs[2, 7] = 2.0**-28
+    probs[2, vocab_size // 2] = 2.0**-29
     probs[3, ::7] = 1e-13
     tp = torch.full((batch_size,), top_p_value, device="cuda")
     out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
@@ -3136,6 +3156,7 @@ def test_top_p_renorm_probs_specialized_zero_mass_rows(
     stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, stock, atol=0.0, rtol=0.0)
+    assert int((out[2] > 0).sum()) == (1 if top_p_value <= 0.5 else 2)
 
 
 def test_top_p_renorm_probs_specialized_unnormalised_cutoff_is_exact(
@@ -3168,7 +3189,11 @@ def test_top_p_renorm_probs_specialized_unnormalised_cutoff_is_exact(
     p = probs.double().cpu()
     sp, _ = torch.sort(p, dim=-1, descending=True)
     excl = torch.cumsum(sp, dim=-1) - sp
-    k = (excl < tp.double().cpu().reshape(-1, 1)).sum(dim=-1, keepdim=True).clamp(min=1)
+    k = (
+        (excl < _top_p_specialized_target(p, tp.cpu()))
+        .sum(dim=-1, keepdim=True)
+        .clamp(min=1)
+    )
     kept = torch.where(p >= sp.gather(-1, k - 1), p, torch.zeros_like(p))
     mass = kept.sum(dim=-1, keepdim=True)
     cut = float(torch.tensor(1e-8, dtype=torch.float32))
@@ -3182,6 +3207,68 @@ def test_top_p_renorm_probs_specialized_unnormalised_cutoff_is_exact(
     monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
     stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
     torch.testing.assert_close(out[[0, 2]], stock[[0, 2]], atol=0.0, rtol=0.0)
+
+
+def _top_p_specialized_non_unit_rows(vocab_size, g):
+    """Rows that do not sum to 1, with their top_p (float64)."""
+    v = vocab_size
+    rows, top_ps = [], []
+    # the review's row: AIR's target is 0.5 * 0.5 = 0.25, so 0.375 alone is kept (output 1)
+    row = torch.zeros(v, dtype=torch.float64)
+    row[0], row[1] = 0.375, 0.125
+    rows.append(row)
+    top_ps.append(0.5)
+    # vanishing, different values: 2^-28 alone is kept, left unnormalised (kept mass <= 1e-8)
+    row = torch.zeros(v, dtype=torch.float64)
+    row[7], row[v // 2] = 2.0**-28, 2.0**-29
+    rows.append(row)
+    top_ps.append(0.5)
+    # vanishing everywhere (mass 7e-4): the 2^-28 half is kept and renormalised
+    rows.append(
+        torch.where(torch.arange(v) % 2 == 0, 2.0**-28, 2.0**-29).to(torch.float64)
+    )
+    top_ps.append(0.5)
+    # a serving row at half mass (one-entry nucleus) and at mass 3.7 (block-wide head resolve)
+    rows.append(_top_p_specialized_row(1, v, g) * 0.5)
+    top_ps.append(0.95)
+    rows.append(_top_p_specialized_row(4, v, g) * 3.7)
+    top_ps.append(0.9)
+    # an unnormalised uniform row (mass ~v/2): too heavy for the 2^-56 fixed point
+    rows.append(torch.rand(v, generator=g, dtype=torch.float64))
+    top_ps.append(0.5)
+    # a wide nucleus at mass 1e-3 (exact radix path)
+    rows.append(_top_p_specialized_row(2, v, g) * 1e-3)
+    top_ps.append(0.8)
+    return torch.stack(rows).float(), torch.tensor(top_ps, dtype=torch.float32)
+
+
+def test_top_p_renorm_probs_specialized_non_unit_mass_rows_match_air(
+    top_p_specialized_enabled, monkeypatch
+):
+    # The nucleus target is top_p times the row's own mass, as on the AIR path (blockSum * p),
+    # so rows that do not sum to 1 keep the same entries as there.
+    _skip_unless_sm103()
+    batch_size, vocab_size = 7, 248320
+    probs, tp = _top_p_specialized_non_unit_rows(
+        vocab_size, torch.Generator().manual_seed(12)
+    )
+    assert probs.shape[0] == batch_size
+    tp = _top_p_specialized_robust_top_p(probs, tp)
+    probs, tp = probs.cuda(), tp.cuda()
+    before = _top_p_specialized_stats()["dispatch_count"]
+    out = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    assert _top_p_specialized_stats()["dispatch_count"] == before + 1
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    stock = flashinfer.sampling.top_p_renorm_probs(probs, tp)
+    assert torch.isfinite(out).all()
+    # the same entries as the AIR path, the same values up to its float32 sums
+    assert torch.equal(out > 0, stock > 0)
+    torch.testing.assert_close(out, stock, atol=1e-6, rtol=1e-4)
+    _assert_top_p_specialized_contract(out, _top_p_specialized_reference(probs, tp))
+    # the review's rows, exactly
+    assert out[0, 0].item() == 1.0 and int((out[0] > 0).sum()) == 1
+    assert out[1, 7].item() == 2.0**-28 and int((out[1] > 0).sum()) == 1
+    assert int((out[2] > 0).sum()) == vocab_size // 2
 
 
 def test_top_p_renorm_probs_specialized_launch_plan_matches_the_kernel(
