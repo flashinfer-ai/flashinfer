@@ -89,6 +89,7 @@ from .api import (  # noqa: F401
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
+    W4A16MxFp4LatentConfig,
 )
 from .layer import MoELayer  # noqa: F401
 from .da_runtime import (  # noqa: F401
@@ -135,6 +136,7 @@ from .runners import (  # noqa: F401
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
+    W4A16MxFp4LatentRunner,
 )
 
 # Legacy flat-argument Prims-TS APIs are imported on first use. Keeping them
@@ -394,6 +396,8 @@ __all__ = [
     "CutlassNvfp4Runner",
     "CutlassW4A16Config",
     "CutlassW4A16Runner",
+    "W4A16MxFp4LatentConfig",
+    "W4A16MxFp4LatentRunner",
     "CutlassW4A8Config",
     "CutlassW4A8Runner",
     "CuTileBf16Config",

@@ -230,3 +230,357 @@ def test_kill_switch_forces_the_reference_path(env, val, monkeypatch):
     stats = _w4a16_mxfp4_latent_moe_stats()
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert stats["backend_dispatches"]["reference"] == 1, stats
+
+
+# ---------------------------------------------------------------------------
+# Unified MoELayer backend (W4A16MxFp4LatentConfig / W4A16MxFp4LatentRunner)
+# ---------------------------------------------------------------------------
+
+from flashinfer.fused_moe import (  # noqa: E402
+    BackendOptions,
+    ExpertConfig,
+    MoEActivationPack,
+    MoEConfig,
+    MoEWeightPack,
+    QuantConfig,
+    QuantFormat,
+    RoutingConfig,
+    SiTU,
+    W4A16MxFp4LatentConfig,
+    W4A16MxFp4LatentRunner,
+)
+from flashinfer.fused_moe import api as moe_api  # noqa: E402
+from flashinfer.fused_moe import layer as moe_layer  # noqa: E402
+from flashinfer.fused_moe import runners as moe_runners  # noqa: E402
+from flashinfer.fused_moe.layer import (  # noqa: E402
+    _BACKEND_RUNNERS,
+    MoELayer,
+    NoEligibleBackend,
+)
+from flashinfer.tllm_enums import RoutingInputMode  # noqa: E402
+
+
+def _unified_config(experts=None, backend=None):
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=EL, top_k=K),
+        quant=QuantConfig(weight=QuantFormat.MXFP4),
+        experts=experts or ExpertConfig(intermediate_size=I),
+        activation=SiTU(),
+        backend=backend or BackendOptions(candidates=(W4A16MxFp4LatentConfig(),)),
+    )
+
+
+def _weight_pack(w13p, w13s, w2p, w2s):
+    pack = MoEWeightPack()
+    pack.prepare_for(
+        "w4a16_mxfp4_latent",
+        W4A16MxFp4LatentConfig.prepare_weights(w13p, w13s, w2p, w2s),
+    )
+    return pack
+
+
+def _act_pack(x, ids, w):
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        topk_ids=ids,
+        topk_weights=w,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+
+
+def _fake_sm90(monkeypatch):
+    monkeypatch.setattr(moe_runners, "get_compute_capability", lambda dev: (9, 0))
+    monkeypatch.setattr(moe_layer, "get_compute_capability", lambda dev: (9, 0))
+
+
+def _cpu_case(T=4, el=EL, l=L, i=I, k=K, seed=11):
+    return _case(T=T, el=el, l=l, i=i, k=k, seed=seed, device="cpu")
+
+
+def test_unified_config_supported_arch_gating():
+    assert W4A16MxFp4LatentConfig.supported(90)
+    for arch in (80, 86, 89, 100, 103, 110, 120, 121):
+        assert not W4A16MxFp4LatentConfig.supported(arch), arch
+
+
+def test_unified_config_registered_but_not_default():
+    assert _BACKEND_RUNNERS[W4A16MxFp4LatentConfig] is W4A16MxFp4LatentRunner
+    # Opt-in only: specialized fixed-geometry backends stay out of the
+    # default candidate tuple (the SM12x / B12x precedent).
+    assert not any(
+        isinstance(c, W4A16MxFp4LatentConfig) for c in moe_api._DEFAULT_BACKEND
+    )
+    assert W4A16MxFp4LatentConfig in moe_api.ALL_BACKEND_CONFIGS
+
+
+def test_unified_prepare_weights_validation():
+    x, w13p, w13s, w2p, w2s, ids, w = _cpu_case(T=2)
+    view = W4A16MxFp4LatentConfig.prepare_weights(w13p, w13s, w2p, w2s)
+    assert set(view) == {"w13_packed", "w13_scale", "w2_packed", "w2_scale"}
+    assert all(v.is_contiguous() for v in view.values())
+    with pytest.raises(TypeError, match="uint8"):
+        W4A16MxFp4LatentConfig.prepare_weights(w13p.to(torch.int32), w13s, w2p, w2s)
+    with pytest.raises(ValueError, match="3D"):
+        W4A16MxFp4LatentConfig.prepare_weights(w13p[0], w13s, w2p, w2s)
+
+
+def test_unified_runner_ep_rejected_cpu():
+    config = _unified_config(
+        experts=ExpertConfig(intermediate_size=I, local_num_experts=28)
+    )
+    runner = W4A16MxFp4LatentRunner(config, device=torch.device("cpu"))
+    with pytest.raises(NotImplementedError, match="expert parallelism"):
+        runner.check_support()
+    config = _unified_config(
+        experts=ExpertConfig(intermediate_size=I, local_expert_offset=8)
+    )
+    runner = W4A16MxFp4LatentRunner(config, device=torch.device("cpu"))
+    with pytest.raises(NotImplementedError, match="expert parallelism"):
+        runner.check_support()
+
+
+def test_unified_runner_fixed_geometry_rejected_cpu(monkeypatch):
+    _fake_sm90(monkeypatch)
+    cpu = torch.device("cpu")
+    runner = W4A16MxFp4LatentRunner(
+        MoEConfig(
+            routing=RoutingConfig(num_experts=64, top_k=K),
+            quant=QuantConfig(weight=QuantFormat.MXFP4),
+            experts=ExpertConfig(intermediate_size=I),
+            activation=SiTU(),
+        ),
+        device=cpu,
+    )
+    with pytest.raises(NotImplementedError, match="num_experts=56"):
+        runner.check_support()
+    runner = W4A16MxFp4LatentRunner(
+        MoEConfig(
+            routing=RoutingConfig(num_experts=EL, top_k=8),
+            quant=QuantConfig(weight=QuantFormat.MXFP4),
+            experts=ExpertConfig(intermediate_size=I),
+            activation=SiTU(),
+        ),
+        device=cpu,
+    )
+    with pytest.raises(NotImplementedError, match="top_k=16"):
+        runner.check_support()
+    runner = W4A16MxFp4LatentRunner(
+        _unified_config(experts=ExpertConfig(intermediate_size=4096)), device=cpu
+    )
+    with pytest.raises(NotImplementedError, match="intermediate_size=3072"):
+        runner.check_support()
+    # non-canonical SiTU scalars are rejected, not silently re-scaled
+    runner = W4A16MxFp4LatentRunner(
+        MoEConfig(
+            routing=RoutingConfig(num_experts=EL, top_k=K),
+            quant=QuantConfig(weight=QuantFormat.MXFP4),
+            experts=ExpertConfig(intermediate_size=I),
+            activation=SiTU(gate_scale=2.0),
+        ),
+        device=cpu,
+    )
+    with pytest.raises(NotImplementedError, match="canonical SiTU"):
+        runner.check_support()
+
+
+def test_unified_runner_quant_gating():
+    assert W4A16MxFp4LatentRunner.supports_quant(QuantConfig(weight=QuantFormat.MXFP4))
+    assert not W4A16MxFp4LatentRunner.supports_quant(QuantConfig())
+    assert not W4A16MxFp4LatentRunner.supports_quant(
+        QuantConfig(weight=QuantFormat.NVFP4)
+    )
+    assert not W4A16MxFp4LatentRunner.supports_quant(
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    )
+    assert W4A16MxFp4LatentRunner.supports_expert_parallelism is False
+
+
+def test_unified_layer_construction_reaches_runner_cpu(monkeypatch):
+    _fake_sm90(monkeypatch)
+    layer = MoELayer(_unified_config(), device=torch.device("cpu"))
+    assert len(layer.runners) == 1
+    assert isinstance(layer.runners[0], W4A16MxFp4LatentRunner)
+    assert layer.runners[0].backend_key == "w4a16_mxfp4_latent"
+
+
+def test_unified_layer_ep_rejected_cpu(monkeypatch):
+    _fake_sm90(monkeypatch)
+    config = _unified_config(
+        experts=ExpertConfig(intermediate_size=I, local_num_experts=28)
+    )
+    with pytest.raises(NoEligibleBackend, match="expert parallelism"):
+        MoELayer(config, device=torch.device("cpu"))
+
+
+def test_unified_runner_dispatch_monkeypatched_launch(monkeypatch):
+    """CPU dispatch logic: the runner forwards to the flat entry with
+    backend="specialized", passes the pack/view tensors through unchanged,
+    and suspends autotune tuning mode only for the duration of the call."""
+    from flashinfer.autotuner import AutoTuner
+
+    _fake_sm90(monkeypatch)
+    layer = MoELayer(_unified_config(), device=torch.device("cpu"))
+    runner = layer.runners[0]
+    x, w13p, w13s, w2p, w2s, ids, w = _cpu_case(T=4)
+    weight_pack = _weight_pack(w13p, w13s, w2p, w2s)
+    act = _act_pack(x, ids, w)
+
+    seen = {}
+
+    def _fake_flat(x_, w13p_, w13s_, w2p_, w2s_, ids_, w_, *, out=None, backend):
+        seen["backend"] = backend
+        seen["tensors_ok"] = (
+            x_ is x
+            and w13p_ is weight_pack.get_view("w4a16_mxfp4_latent")["w13_packed"]
+            and ids_ is ids
+            and w_ is w
+        )
+        seen["tuning_mode_inside"] = AutoTuner.get().is_tuning_mode
+        return torch.zeros_like(x_)
+
+    monkeypatch.setattr(runner._flat, "w4a16_mxfp4_latent_routed_moe", _fake_flat)
+    tuner = AutoTuner.get()
+    monkeypatch.setattr(tuner, "is_tuning_mode", True)
+    inputs = runner.pack_inputs(act, weight_pack)
+    out = runner.forward(inputs, tactic=-1)
+    assert seen["backend"] == "specialized"
+    assert seen["tensors_ok"]
+    assert seen["tuning_mode_inside"] is False
+    assert tuner.is_tuning_mode is True  # restored
+    assert out.shape == x.shape
+
+
+def test_unified_runner_pack_rejections(monkeypatch):
+    _fake_sm90(monkeypatch)
+    layer = MoELayer(_unified_config(), device=torch.device("cpu"))
+    runner = layer.runners[0]
+    x, w13p, w13s, w2p, w2s, ids, w = _cpu_case(T=4)
+    weight_pack = _weight_pack(w13p, w13s, w2p, w2s)
+    # bf16 topk_weights: the kernel consumes float32 combine weights as-is
+    act = _act_pack(x, ids, w.to(torch.bfloat16))
+    with pytest.raises(TypeError, match="float32"):
+        runner.pack_inputs(act, weight_pack)
+    # off-geometry weight view: a precise error, never another kernel
+    bad = _weight_pack(w13p[:, : 2 * I - 64], w13s, w2p, w2s)
+    with pytest.raises(ValueError, match="fixed"):
+        runner.pack_inputs(_act_pack(x, ids, w), bad)
+    # non-bf16 activations
+    act = _act_pack(x.float(), ids, w)
+    with pytest.raises(TypeError, match="BF16"):
+        runner.pack_inputs(act, weight_pack)
+    # routing from logits is not supported (no in-kernel router)
+    logits_pack = MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=torch.randn(x.shape[0], EL),
+    )
+    with pytest.raises(NotImplementedError, match="routing_input_mode"):
+        runner.pack_inputs(logits_pack, weight_pack)
+    # off-envelope / off-hidden packs are filtered by accepts(), not crashed on
+    assert runner._accepts_shape(_act_pack(x, ids, w))
+    wide = torch.zeros((2, 4096), dtype=torch.bfloat16)
+    wide_ids = torch.zeros((2, K), dtype=torch.int32)
+    wide_w = torch.zeros((2, K), dtype=torch.float32)
+    assert not runner._accepts_shape(_act_pack(wide, wide_ids, wide_w))
+
+
+# ---- GPU (SM90) tests ------------------------------------------------------
+
+
+def test_unified_layer_ep_rejected_sm90():
+    _sm90_or_skip()
+    config = _unified_config(
+        experts=ExpertConfig(intermediate_size=I, local_num_experts=28)
+    )
+    with pytest.raises(NoEligibleBackend, match="expert parallelism"):
+        MoELayer(config)
+
+
+def test_unified_layer_matches_flat_specialized():
+    """Numerics parity through MoELayer vs the flat entry on the allowlisted
+    geometry (decode launch path, T <= 64)."""
+    _sm90_or_skip()
+    x, w13p, w13s, w2p, w2s, ids_global, w = _case(T=8, seed=21)
+    # the unified layer exposes the op as a complete 56-expert MoE: ids in [0, EL)
+    g = torch.Generator(device="cuda").manual_seed(22)
+    ids = torch.stack(
+        [torch.randperm(EL, generator=g, device="cuda")[:K] for _ in range(x.shape[0])]
+    ).to(torch.int32)
+    y_flat = w4a16_mxfp4_latent_routed_moe(
+        x, w13p, w13s, w2p, w2s, ids, w, backend="specialized"
+    )
+    stats = _w4a16_mxfp4_latent_moe_stats()
+    assert stats["backend_dispatches"]["specialized"] == 1, stats
+
+    layer = MoELayer(_unified_config())
+    _reset_w4a16_mxfp4_latent_moe_stats()
+    y_layer = layer(_act_pack(x, ids, w), _weight_pack(w13p, w13s, w2p, w2s))
+    stats = _w4a16_mxfp4_latent_moe_stats()
+    assert stats["backend_dispatches"]["specialized"] >= 1, stats
+    assert stats["backend_dispatches"]["reference"] == 0, stats
+    assert layer.winner_backend == "w4a16_mxfp4_latent"
+    assert y_layer.shape == y_flat.shape and y_layer.dtype == y_flat.dtype
+    # The kernel's bf16 atomic combine order is disclosed nondeterministic
+    # (see the flat rerun hedge above), so two dispatches of the same kernel
+    # live in a tolerance band, not at bitwise equality.
+    assert _matched(y_layer, y_flat) >= 0.99
+    # Accuracy vs the exact-math reference is a property of the kernel, not
+    # of this adapter (this routing keeps all 16 slots local — denser
+    # accumulation than the flat suite's half-local cases, so its absolute
+    # 0.99 band does not transfer): the layer path must match the reference
+    # as well as the flat path does, within the atomic-order noise.
+    y_ref = w4a16_mxfp4_latent_routed_moe(
+        x, w13p, w13s, w2p, w2s, ids, w, backend="reference"
+    )
+    m_layer, m_flat = _matched(y_layer, y_ref), _matched(y_flat, y_ref)
+    assert m_layer >= m_flat - 5e-3, (m_layer, m_flat)
+
+
+def test_unified_layer_prefill_path_matches_flat():
+    _sm90_or_skip()
+    x, w13p, w13s, w2p, w2s, _ids, w = _case(T=128, seed=23)
+    g = torch.Generator(device="cuda").manual_seed(24)
+    ids = torch.stack(
+        [torch.randperm(EL, generator=g, device="cuda")[:K] for _ in range(x.shape[0])]
+    ).to(torch.int32)
+    layer = MoELayer(_unified_config())
+    y_layer = layer(_act_pack(x, ids, w), _weight_pack(w13p, w13s, w2p, w2s))
+    y_flat = w4a16_mxfp4_latent_routed_moe(
+        x, w13p, w13s, w2p, w2s, ids, w, backend="specialized"
+    )
+    y_ref = w4a16_mxfp4_latent_routed_moe(
+        x, w13p, w13s, w2p, w2s, ids, w, backend="reference"
+    )
+    # The prefill path's bf16 atomic combine order is disclosed
+    # nondeterministic; gate layer-vs-flat within that band and the
+    # reference comparison relative to the flat path (see the decode test
+    # for why the absolute 0.99 reference band does not transfer here).
+    assert _matched(y_layer, y_flat) >= 0.99
+    m_layer, m_flat = _matched(y_layer, y_ref), _matched(y_flat, y_ref)
+    assert m_layer >= m_flat - 5e-3, (m_layer, m_flat)
+
+
+def test_unified_layer_kill_switch_serves_reference(monkeypatch):
+    """The flat op's kill switch is honored identically through the layer:
+    the dispatch lands on the composable reference path."""
+    _sm90_or_skip()
+    x, w13p, w13s, w2p, w2s, _ids, w = _case(T=4, seed=25)
+    g = torch.Generator(device="cuda").manual_seed(26)
+    ids = torch.stack(
+        [torch.randperm(EL, generator=g, device="cuda")[:K] for _ in range(x.shape[0])]
+    ).to(torch.int32)
+    layer = MoELayer(_unified_config())
+    weight_pack = _weight_pack(w13p, w13s, w2p, w2s)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    _reset_w4a16_mxfp4_latent_moe_stats()
+    y_layer = layer(_act_pack(x, ids, w), weight_pack)
+    stats = _w4a16_mxfp4_latent_moe_stats()
+    assert stats["backend_dispatches"]["specialized"] == 0, stats
+    assert stats["backend_dispatches"]["reference"] >= 1, stats
+    assert any("kill switch" in r for r in stats["fallback_reasons"]), stats
+    y_ref = w4a16_mxfp4_latent_routed_moe(
+        x, w13p, w13s, w2p, w2s, ids, w, backend="reference"
+    )
+    assert torch.equal(y_layer, y_ref)
