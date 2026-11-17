@@ -335,6 +335,8 @@ class SwapsKernel:
                     mDesc[(u, F_KVHEAD)],
                     mDesc[(u, F_TILE_LO)],
                     mDesc[(u, F_TILE_HI)],
+                    storage.kv_mbar.data_ptr(),
+                    u == bidx,
                 )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
