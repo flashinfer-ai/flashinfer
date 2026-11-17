@@ -1,7 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public scheduling choices, fused split finalization and graph replay."""
+"""DSv4.1 FP8 decode implementation selection and mega-fusion contracts.
+
+Implementation and fusion are independent axes: ``decode-splitkv`` selects the
+cooperative split-KV kernel, ``decode`` selects the prefill-derived backbone,
+and ``auto`` selects between them. Exercise the public wrapper with inline and
+footer caches, single/dual caches, supported head counts, and ragged/empty rows.
+
+Check attention against independent references, then require exact agreement
+between mega and separate RoPE/attention/output-quantization composition. The
+latter checks fusion boundaries, not an independent attention implementation.
+Graph tests verify that mega captures one kernel and replays correctly after
+inputs change, including pitched caches and poisoned output buffers.
+
+Also cover caller/workspace plan-cache isolation, caller-managed reduction with
+more than 32 splits, and multi-tile score-buffer reuse under racecheck. Routing
+assertions protect intended dispatch decisions; they do not measure performance
+or establish that the split-count heuristic is optimal.
+"""
 
 import pytest
 import torch

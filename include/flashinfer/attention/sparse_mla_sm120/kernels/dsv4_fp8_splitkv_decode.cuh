@@ -420,7 +420,19 @@ __global__ __launch_bounds__((HeadGroups * 4 + 1) * 32, 1) void decode(Params p)
                     blockIdx.z] = row_l > 0.f ? row_m + log2f(row_l) : -INFINITY;
     if constexpr (PartialOnly) return;
     asm volatile("barrier.cluster.arrive.release; barrier.cluster.wait.acquire;" ::: "memory");
-    // Phase 6b: all cluster CTAs share the final merge and fused epilogue.
+    // Phase 6b: the same CTAs divide final output vectors after publishing all
+    // partials to global scratch. Each vector owner reads every split; the loader
+    // warp exits after the rendezvous above. Ownership changes, for example,
+    // for a 16-head task with four splits (256 compute threads per CTA):
+    //
+    //              Before barrier                 After barrier
+    //   CTA 0: KV subset 0 -> all 16 heads    merge + epilogue for heads  0-3
+    //   CTA 1: KV subset 1 -> all 16 heads    merge + epilogue for heads  4-7
+    //   CTA 2: KV subset 2 -> all 16 heads    merge + epilogue for heads  8-11
+    //   CTA 3: KV subset 3 -> all 16 heads    merge + epilogue for heads 12-15
+    //
+    // The loop below statically partitions flattened [head, feature/8] vectors;
+    // other head-group/split counts use the same rule, not these fixed ranges.
     int head_base = blockIdx.y * (HeadGroups * 8);
     for (int vec = (int(threadIdx.x) - 32) + int(blockIdx.z) * HeadGroups * WarpsPerGroup * 32;
          vec < HeadGroups * 8 * 64; vec += HeadGroups * WarpsPerGroup * 32 * splits) {

@@ -78,6 +78,8 @@ class AttentionPlanObj : public ffi::ModuleObj {
     if (name == "inspect")
       return ffi::Function::FromTyped([this]() {
         const char* numeric[] = {"fp8", "hybrid", "bf16", "nvfp4"};
+        // These names identify execution::Implementation kernel families; mega
+        // fusion is selected separately and does not introduce another family.
         const char* implementation[] = {"ordinary",
                                         "mixed",
                                         "full_bf16",
