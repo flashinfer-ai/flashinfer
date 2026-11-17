@@ -341,6 +341,120 @@ def test_alphamoe_fused_router_routed_512_nan_and_neg_inf_logits(
 
 
 @requires_router_gpu
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,top_k,block_m,has_shared_expert",
+    [
+        (4, 512, 6, 8, False),
+        (4, 257, 9, 5, True),
+        (64, 256, 8, 16, False),
+        (64, 257, 9, 8, True),
+        (300, 512, 6, 5, False),
+        (300, 300, 8, 8, True),
+        (4096, 256, 8, 16, False),
+        (16384, 512, 2, 8, False),
+        (16384, 512, 6, 5, False),
+        (16384, 512, 10, 8, True),
+    ],
+)
+def test_alphamoe_fused_router_nan_rows(
+    num_tokens, num_experts, top_k, block_m, has_shared_expert
+):
+    # The calls outside the cake_ entries (shared expert, other expert counts,
+    # top_k below 8) skip NaN logits. A row holding a NaN still selects routed
+    # experts only and keeps the plan in bounds: its logits that are neither
+    # NaN nor -inf come first in descending order. When they run out, a route
+    # can repeat an expert already selected in the row (the -inf tie), so the
+    # IDs are not checked for being distinct there. An all-NaN row selects
+    # experts 0 to top_k - 1 with NaN weights.
+    torch.manual_seed(29015 + num_tokens + num_experts + top_k)
+    logits = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+    routed_experts = num_experts - int(has_shared_expert)
+    routed_top_k = top_k - int(has_shared_expert)
+    nan, inf = float("nan"), float("inf")
+    for row in range(1, num_tokens):
+        pattern = row % 7 if num_tokens > 7 else row
+        if pattern == 1:  # every routed logit NaN
+            logits[row, :routed_experts] = nan
+        elif pattern == 2:  # three NaN logits
+            logits[row, [routed_experts - 1, routed_experts // 2, 5]] = nan
+        elif pattern == 3:  # -inf in the first half, NaN at the last routed expert
+            logits[row, : routed_experts // 2] = -inf
+            logits[row, routed_experts - 1] = nan
+        elif pattern == 4:  # -inf except routed_top_k NaN logits
+            logits[row, :routed_experts] = -inf
+            spread = torch.arange(routed_top_k, device="cuda") * 7 + 2
+            logits[row, spread % routed_experts] = nan
+        elif pattern == 5:  # one finite logit, NaN everywhere else
+            logits[row, :routed_experts] = nan
+            logits[row, 7] = 1.0
+    base = allocate_alphamoe_route_plan(logits, top_k=top_k, block_m=block_m)
+    guard = -1234567
+    buffers = {}
+    for name in (
+        "sorted_token_ids",
+        "expert_ids",
+        "expert_counts",
+        "expert_offsets",
+        "expert_scatter_offsets",
+    ):
+        tensor = getattr(base, name)
+        buffers[name] = torch.full(
+            (tensor.numel() + 1,), guard, device="cuda", dtype=tensor.dtype
+        )
+        buffers[name][:-1].copy_(tensor)
+    plan = base._replace(**{name: buffer[:-1] for name, buffer in buffers.items()})
+    first_ids = None
+    for _ in range(2):
+        alphamoe_fused_router(
+            logits,
+            top_k=top_k,
+            block_m=block_m,
+            has_shared_expert=has_shared_expert,
+            plan=plan,
+        )
+        for buffer in buffers.values():
+            assert int(buffer[-1]) == guard
+        if first_ids is None:
+            first_ids = plan.topk_ids.clone()
+        torch.testing.assert_close(plan.topk_ids, first_ids, rtol=0, atol=0)
+
+    nan_rows = torch.isnan(logits[:, :routed_experts]).any(dim=-1)
+    ref_weights, ref_ids = _reference_topk(logits, top_k, has_shared_expert)
+    torch.testing.assert_close(
+        plan.topk_ids[~nan_rows], ref_ids[~nan_rows], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        plan.topk_weights[~nan_rows], ref_weights[~nan_rows], rtol=3e-4, atol=3e-4
+    )
+    ids = plan.topk_ids[:, :routed_top_k].cpu().to(torch.int64)
+    weights = plan.topk_weights.cpu()
+    host_logits = logits.cpu()
+    assert int(ids.min()) >= 0 and int(ids.max()) < routed_experts
+    for row in torch.nonzero(nan_rows.cpu()).flatten().tolist():
+        values = host_logits[row, :routed_experts]
+        if torch.isnan(values).all():
+            assert ids[row].tolist() == list(range(routed_top_k))
+            assert torch.isnan(weights[row, :routed_top_k]).all()
+            continue
+        live = torch.nonzero(~torch.isnan(values) & (values > -inf)).flatten()
+        order = live[torch.argsort(values[live], descending=True, stable=True)]
+        count = min(routed_top_k, order.numel())
+        assert ids[row, :count].tolist() == order[:count].tolist()
+        if count:
+            selected = torch.full((top_k,), -inf)
+            selected[:count] = values[order[:count]]
+            if has_shared_expert:
+                selected[-1] = host_logits[row, -1]
+            torch.testing.assert_close(
+                weights[row, :count],
+                torch.softmax(selected, dim=-1)[:count],
+                rtol=3e-4,
+                atol=3e-4,
+            )
+    _assert_aligned_plan(plan, plan.topk_ids, num_experts=num_experts, block_m=block_m)
+
+
+@requires_router_gpu
 @pytest.mark.parametrize("num_tokens", [8, 32, 128, 512, 1024])
 def test_alphamoe_fused_router_routed_512_cuda_graph_replay(num_tokens):
     # One case per routed 512-expert entry at top_k 8: one CTA, the 4- and

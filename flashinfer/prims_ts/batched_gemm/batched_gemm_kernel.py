@@ -168,6 +168,44 @@ def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
             smem_allocator.add_resource(resource)
 
 
+def _registered_smem_bytes(smem_allocator) -> int | None:
+    """Data + barrier SMEM bytes registered so far, before ``compute_layout()``.
+
+    Mirrors the allocator's bump layout (standalone allocations plus the
+    largest phase of every alias group) without alignment padding, so the
+    result is a lower bound of the final total.  Returns ``None`` when the
+    allocator does not expose its registrations.
+    """
+    allocations = getattr(smem_allocator, "_allocations", None)
+    alias_groups = getattr(smem_allocator, "_alias_groups", None)
+    aliased_ids = getattr(smem_allocator, "_aliased_ids", None)
+    if allocations is None or alias_groups is None or aliased_ids is None:
+        return None
+    total = sum(a.size_bytes for a in allocations if id(a) not in aliased_ids)
+    for group in alias_groups:
+        total += max((sum(a.size_bytes for a in phase) for phase in group), default=0)
+    return total + int(getattr(smem_allocator, "barrier_smem_bytes", 0))
+
+
+def _add_single_cta_smem_floor(smem_allocator, cfg) -> int:
+    """Pad the dynamic SMEM up to :attr:`BatchedGemmConfig.smem_single_cta_floor_bytes`.
+
+    Must run after every data allocation has been registered and before
+    ``compute_layout()``.  Returns the padding added (0 when none is needed).
+    """
+    floor_bytes = cfg.smem_single_cta_floor_bytes
+    if floor_bytes <= 0:
+        return 0
+    used = _registered_smem_bytes(smem_allocator)
+    if used is None or used >= floor_bytes:
+        return 0
+    pad_bytes = floor_bytes - used
+    smem_allocator.add(
+        SmemAllocation("single_cta_smem_floor", size_bytes=pad_bytes, alignment=16)
+    )
+    return pad_bytes
+
+
 def _make_tmem_ptr_smem_allocation() -> SmemAllocation:
     """Create the typed TMEM-pointer slot with explicit barrier alignment.
 
@@ -1415,6 +1453,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 alignment=16,
             )
         )
+    _add_single_cta_smem_floor(smem_allocator, cfg)
     smem_allocator.compute_layout()
 
     # TMEM allocator
@@ -2065,6 +2104,9 @@ def _batched_gemm_kernel_bf16_body(
                     alignment=8,
                 )
             )
+    # Keep the hardware block scheduler at one CTA per SM when TMEM already
+    # forbids a second one (see BatchedGemmConfig.smem_single_cta_floor_bytes).
+    _add_single_cta_smem_floor(smem_allocator, cfg)
     smem_allocator.compute_layout()
 
     clc_response_ptr = None
@@ -2829,10 +2871,17 @@ def gemm(
 
     # TMA route (gather4) reads compact (K, num_tokens) input storage.
     # GEMM M/N include routing padding and must not define its source bounds.
+    # An LDGSTS-gathered activation operand is never read through its
+    # TensorMap, which describes the same compact storage. As a padded
+    # (K, M or N, L) tensor its expert stride would be M*K or N*K elements,
+    # which the TensorMap encoding overflows (it scales strides to bits in
+    # 32-bit arithmetic) from 2**28 FP8 elements on: 8192 tokens at top-6
+    # over 48 experts with K=5120 and tile_n=128 already reach it.
     # TmaOobOpt: non-routed activations use a 4D out-of-bounds TMA descriptor.
     # Non-swapAB: A=activations (routed 2D), B=weights (3D).
     # SwapAB:     A=weights (3D), B=activations (routed 2D).
     # No route:   activation operand may be 4D OOB; weights stay 3D.
+    routed_act_is_compact = cfg.has_tma_route or cfg.has_gather
     if cutlass.const_expr(cfg.uses_block_major_k_weight_a):
         a_block_k = cfg.block_major_k_elems
         a_layout = cute.make_layout(
@@ -2845,7 +2894,7 @@ def gemm(
             ),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
-    elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
+    elif cutlass.const_expr(routed_act_is_compact and not cfg.is_swap_ab):
         a_layout = cute.make_layout(
             (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
@@ -2880,7 +2929,7 @@ def gemm(
                 cute.assume(n * k, 32),
             ),
         )
-    elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
+    elif cutlass.const_expr(routed_act_is_compact and cfg.is_swap_ab):
         b_layout = cute.make_layout(
             (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
@@ -2924,7 +2973,7 @@ def gemm(
             swizzle=a_tma_swizzle,
             tma_format=tma_format_a,
         )
-    elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
+    elif cutlass.const_expr(routed_act_is_compact and not cfg.is_swap_ab):
         tma_a_desc = cuda.create_tensor_map_tiled_from_tensor(
             tensor=a_tensor,
             box_dims=(a_box_k, 1),
@@ -2957,7 +3006,7 @@ def gemm(
             tma_format=tma_format_a,
         )
 
-    if cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
+    if cutlass.const_expr(routed_act_is_compact and cfg.is_swap_ab):
         tma_b_desc = cuda.create_tensor_map_tiled_from_tensor(
             tensor=b_tensor,
             box_dims=(b_box_k, 1),
@@ -3407,7 +3456,8 @@ def gemm(
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))
     elif cutlass.const_expr(cfg.has_deepseek_fp8_c_scale):
         if cutlass.const_expr(cfg.is_swap_ab):
-            sf_c_elems = ((output_m_for_sf + Int32(127)) // Int32(128)) * n
+            sf_c_block = Int32(cfg.deepseek_fp8_block_size)
+            sf_c_elems = ((output_m_for_sf + sf_c_block - Int32(1)) // sf_c_block) * n
         else:
             sf_c_elems = ((n + Int32(127)) // Int32(128)) * output_m_for_sf
         sf_c_layout = cute.make_layout((sf_c_elems,), stride=(1,))

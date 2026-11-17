@@ -3,7 +3,7 @@ import pytest
 import torch
 
 import flashinfer
-from tests.test_helpers.sampling import required_num_trials
+from tests.utils.test_helpers.sampling import required_num_trials
 from flashinfer.logits_processor import (
     LogitsPipe,
     MinP,

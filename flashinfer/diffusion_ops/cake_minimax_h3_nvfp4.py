@@ -18,15 +18,17 @@ output, one GEMM schedule per target and one program per output format:
 
 The token count ``M`` and the destination geometry are launch parameters, so
 every destination partition count ``P`` of one format routes to the same GEMM
-program of its target, except that on ``sm_103a`` eight destinations
-(``P == 8``) of ``out_format="nvfp4"`` take a second GEMM program that keeps
-the block scales on a five-stage ring of their own; both write the same bytes.
-The norm stage is one program for both targets, except
-that on ``sm_103a`` four destinations (``P == 4``), and eight destinations
-(``P == 8``) of ``out_format="nvfp4"`` from ``M = 6096`` tokens on, take a
-second norm program that stages each row's activation in shared memory; both
-write the same bytes.  Tensor maps are passed by value; no descriptor workspace
-exists.
+program of its target, except that on ``sm_103a`` ``out_format="nvfp4"``
+takes a second GEMM program that keeps the block scales on a five-stage ring of
+their own for eight destinations (``P == 8``), for two destinations
+(``P == 2``) from ``M = 16736`` tokens on and for one destination (``P == 1``)
+from ``M = 32640`` tokens on; both write the same bytes.  The norm stage is one
+program for both targets, except that on ``sm_103a`` four destinations
+(``P == 4``) take a second norm program that stages each row's activation in
+shared memory, and so does ``out_format="nvfp4"`` for eight destinations from
+``M = 6096``, two destinations from ``M = 16736`` and one destination from
+``M = 32640`` tokens on; both write the same bytes.  Tensor maps are passed by
+value; no descriptor workspace exists.
 """
 
 from __future__ import annotations
@@ -93,6 +95,16 @@ _GEMM_PROGRAMS_BY_P: dict[tuple[str, str, int], cake_program.CakeProgram] = {
     ("nvfp4", "sm_103a", 8): FUSED_PACK_K96_SFR5,
 }
 
+# The fused GEMM program of an (output format, exact target, P) triple that
+# takes a program of its own from a token count ``M`` on:
+# ``(minimum M, program)``.
+_GEMM_PROGRAMS_FROM_M: dict[
+    tuple[str, str, int], tuple[int, cake_program.CakeProgram]
+] = {
+    ("nvfp4", "sm_103a", 1): (32640, FUSED_PACK_K96_SFR5),
+    ("nvfp4", "sm_103a", 2): (16736, FUSED_PACK_K96_SFR5),
+}
+
 
 # The norm program of an (exact target, P) pair that does not take ``NORM``.
 _NORM_PROGRAMS: dict[tuple[str, int], cake_program.CakeProgram] = {
@@ -104,6 +116,8 @@ _NORM_PROGRAMS: dict[tuple[str, int], cake_program.CakeProgram] = {
 _NORM_PROGRAMS_FROM_M: dict[
     tuple[str, str, int], tuple[int, cake_program.CakeProgram]
 ] = {
+    ("nvfp4", "sm_103a", 1): (32640, NORM_V5),
+    ("nvfp4", "sm_103a", 2): (16736, NORM_V5),
     ("nvfp4", "sm_103a", 8): (6096, NORM_V5),
 }
 
@@ -169,7 +183,7 @@ def minimax_h3_nvfp4_programs(
     """``(norm, gemm)``: the two generated programs of ``out_format``, ``P``
     destinations and ``M`` tokens on the device's exact target (``P=None``: the
     programs of every ``P`` but the ones with a program of their own;
-    ``M=None``: the norm program of every ``M`` but the ones with a program of
+    ``M=None``: the programs of every ``M`` but the ones with a program of
     their own)."""
     if out_format not in _SUPPORTED_FORMATS:
         raise ValueError(
@@ -183,6 +197,9 @@ def minimax_h3_nvfp4_programs(
     gemm = _GEMM_PROGRAMS[(out_format, target)]
     if P is not None:
         gemm = _GEMM_PROGRAMS_BY_P.get((out_format, target, P), gemm)
+    gemm_from_m = _GEMM_PROGRAMS_FROM_M.get((out_format, target, P))
+    if gemm_from_m is not None and M is not None and gemm_from_m[0] <= M:
+        gemm = gemm_from_m[1]
     return norm, gemm
 
 

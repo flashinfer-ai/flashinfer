@@ -26,6 +26,21 @@ Kernels for block sparse flashattention.
     .. automethod:: __init__
 
 
+QSA Sparse Paged Attention
+--------------------------
+
+Gated sparse paged GQA attention of the Qwen QSA layer over an NVFP4, FP8 or
+BF16 paged KV cache, with the argument order of vLLM's
+``qsa_sparse_paged_attention``. The default implementation runs on SM80
+through SM90. NVFP4 on compute capability 10.0, 10.3, 10.7 and 12.0 is served by
+the experimental Cake backend (``backend="cake"``).
+
+.. autosummary::
+    :toctree: ../generated
+
+    qsa_sparse_paged_attention
+
+
 Cake VSA
 --------
 
@@ -44,13 +59,33 @@ Token-Sparse Attention Inputs
 Build cache-slot lists for token-sparse attention.
 Build grouped key unions and masks for masked dense attention.
 
-.. currentmodule:: flashinfer.token_sparse
+.. currentmodule:: flashinfer.sdsa.token_sparse
 
 .. autosummary::
     :toctree: ../generated
 
     token_sparse_kv_indices
     group_union_masks
+    union_key_limit
+
+
+SDSA Indexer
+------------
+
+Score, select and quantize the keys of the SDSA (Simplified DSA) indexer, which
+has one query head and no head weights.
+
+.. currentmodule:: flashinfer.sdsa
+
+.. autosummary::
+    :toctree: ../generated
+
+    indexer_scores
+    indexer_threshold_select
+    top_k_from_candidates
+    gather_key_sample
+    thresholds_from_sample
+    quantize_write_index_qk_nvfp4
 
 
 .. currentmodule:: flashinfer.sparse
@@ -172,6 +207,17 @@ exchange and before CUDA Graph capture: it loads every kernel into the device's
 context, so that no first launch waits on module loading while a peer's merge
 spins.
 
+``msa_icp_prefill_score_select`` fuses the prefill score and local Top16 steps
+of one query window: a list scorer keeps per-work-item Top16 lists in a
+caller-owned uint8 ``pool`` (``msa_icp_prefill_pool_bytes``) and a list merger
+writes the same carrier rows as ``msa_icp_index_score_sharded`` followed by
+``msa_icp_topk_select_prefill``, without the score scratch. The plan's
+``prefill_local`` runs it when given a ``pool``; ``prefill_pool_shape()`` and
+``prefill_window_tokens()`` size the pool for windows of at most
+``min(8192, max_num_batched_tokens)`` tokens. ``fused_prefill`` on the plan is
+the serving default per layout (``cake_backend.FUSED_PREFILL``); it is ``False``
+on every layout in this version, so the fused path runs only on request.
+
 .. autosummary::
     :toctree: ../generated
 
@@ -180,6 +226,7 @@ spins.
     msa_icp_index_score_sharded_plan_device
     msa_icp_index_score_sharded
     msa_icp_topk_select_prefill
+    msa_icp_prefill_score_select
     msa_icp_decode_index_score_sharded
     msa_icp_topk_select_publish
     msa_icp_decode_score_publish
@@ -188,4 +235,5 @@ spins.
     msa_icp_index_score_columns
     msa_icp_decode_score_columns
     msa_icp_decode_pool_bytes
+    msa_icp_prefill_pool_bytes
     msa_icp_comm_layout

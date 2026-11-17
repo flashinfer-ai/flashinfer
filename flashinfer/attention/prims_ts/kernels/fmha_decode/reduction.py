@@ -92,10 +92,18 @@ def _separate_workspace_row_offset(
     row_idx: Int32,
     rows_per_split: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
+    requested_splits=None,
 ) -> Int64:
-    """Return a split/row offset without overflowing 32-bit products."""
+    """Return a split/row offset without overflowing 32-bit products.
 
-    return (logical_kv_idx * Int64(cfg.max_splits_kv) + Int64(split_idx)) * Int64(
+    Compact runtime splits pack partials by the launch fanout, matching the
+    producer's ``TmemCorrResource._gmem_partial_row_offset``.
+    """
+
+    split_stride = Int64(cfg.max_splits_kv)
+    if cutlass.const_expr(cfg.uses_compact_split_grid and requested_splits is not None):
+        split_stride = Int64(requested_splits)
+    return (logical_kv_idx * split_stride + Int64(split_idx)) * Int64(
         rows_per_split
     ) + Int64(row_idx)
 
@@ -264,6 +272,7 @@ def _reduce_exact_splits_body(
                     reduce_row_idx,
                     g_q_output_rows,
                     cfg,
+                    requested_splits=requested_splits,
                 )
                 stats_offset = workspace_row * Int64(
                     SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES
@@ -662,6 +671,7 @@ def decode_gen_parallel_separate_reduction_kernel(
                     reduce_row_idx,
                     g_q_output_rows,
                     cfg,
+                    requested_splits=requested_splits,
                 )
                 stats_offset = workspace_row * Int64(
                     SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES
@@ -958,8 +968,6 @@ def fmha_decode_separate_reduction_launch(
     partial_o_iter: cute.Pointer,
     partial_stats_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    softmax_scale: Float32,
-    output_scale: Float32,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
@@ -971,9 +979,9 @@ def fmha_decode_separate_reduction_launch(
 
     The serial reference grid is ``(slice, kv_head, batch)`` with 8 KiB slices.
     The production reducer keeps that geometry for compact S2-S4 and otherwise
-    maps cluster ranks into grid.x for each 2 KiB slice. ``softmax_scale`` and
-    ``output_scale`` remain parameters for launch-ABI compatibility; producer
-    CTAs already applied them to log2-LSE and normalized partial O, respectively.
+    maps cluster ranks into grid.x for each 2 KiB slice. Producer CTAs already
+    apply the QK scale to log2-LSE and the output scale to normalized partial O;
+    the reducer only merges these scaled states.
     ``seqlens_kv_iter`` is internal reducer metadata used only to
     bound the runtime split prefix; the decode launch ABI remains unchanged.
     """

@@ -36,6 +36,11 @@ SAMPLERS = [
     "top_k_top_p_logits_sequential",
 ]
 RNG_SHAPES = [(4, 4), (1, 4), (4, 1)]
+# These widths reach SM90 split-row dispatch with scalar/broadcast RNG.
+SPLIT_ROW_SAMPLERS = ["top_k", "top_p", "top_k_top_p"]
+SAMPLER_VOCAB_SIZES = [(name, 257) for name in SAMPLERS] + [
+    (name, vocab_size) for name in SPLIT_ROW_SAMPLERS for vocab_size in [32000, 151936]
+]
 
 
 def _sampler(name, indexed, vocab_size=257):
@@ -132,13 +137,15 @@ def _assert_rng_reference(sample, actual, seed, offset):
             torch.testing.assert_close(output[rows], reordered, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("name", SAMPLERS)
+@pytest.mark.parametrize("name,vocab_size", SAMPLER_VOCAB_SIZES)
 @pytest.mark.parametrize("indexed", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("seed_size,offset_size", RNG_SHAPES)
-def test_sampling_row_seed_offset(name, indexed, dtype, seed_size, offset_size):
+def test_sampling_row_seed_offset(
+    name, vocab_size, indexed, dtype, seed_size, offset_size
+):
     """Tensor RNG keys must follow requests independently of batch layout."""
-    sample = _sampler(name, indexed)
+    sample = _sampler(name, indexed, vocab_size)
     seed, offset = _rng_tensors(seed_size, offset_size, dtype)
     actual = sample(seed=seed, offset=offset)
     _assert_rng_reference(sample, actual, seed, offset)
@@ -174,11 +181,11 @@ def test_chain_sampling_row_seed_offset(reject_at, dtype, seed_size, offset_size
     _assert_rng_reference(sample, actual, seed, offset)
 
 
-@pytest.mark.parametrize("name", [*SAMPLERS, "chain"])
+@pytest.mark.parametrize("name,vocab_size", [*SAMPLER_VOCAB_SIZES, ("chain", 257)])
 @pytest.mark.parametrize("seed_size,offset_size", [(4, 4), (1, 1)])
-def test_sampling_rng_tensor_cuda_graph(name, seed_size, offset_size):
+def test_sampling_rng_tensor_cuda_graph(name, vocab_size, seed_size, offset_size):
     """Graph replay must preserve per-row keys and legacy broadcast draws."""
-    sample = _chain_sampler(1) if name == "chain" else _sampler(name, True)
+    sample = _chain_sampler(1) if name == "chain" else _sampler(name, True, vocab_size)
     seed, offset = _rng_tensors(seed_size, offset_size, torch.int64)
     sample(seed=seed, offset=offset)
     graph = torch.cuda.CUDAGraph()
@@ -196,15 +203,23 @@ def test_sampling_rng_tensor_cuda_graph(name, seed_size, offset_size):
 
 
 @pytest.mark.parametrize(
-    "name,indexed",
-    [(name, indexed) for name in SAMPLERS for indexed in (False, True)]
-    + [("chain", False)],
+    "name,indexed,vocab_size",
+    [
+        (name, indexed, vocab_size)
+        for name, vocab_size in SAMPLER_VOCAB_SIZES
+        for indexed in (False, True)
+    ]
+    + [("chain", False, 257)],
 )
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("repeat_distribution", [False, True])
-def test_broadcast_rng_matches_scalar(name, indexed, dtype, repeat_distribution):
+def test_broadcast_rng_matches_scalar(
+    name, indexed, vocab_size, dtype, repeat_distribution
+):
     """Broadcast tensors must preserve scalar draws for every output row."""
-    sample = _chain_sampler(1) if name == "chain" else _sampler(name, indexed)
+    sample = (
+        _chain_sampler(1) if name == "chain" else _sampler(name, indexed, vocab_size)
+    )
     # Cover identical distributions (the original collapse to one token) and
     # distinct distributions (the same-quantile correlation hidden by that test).
     rows = [2] * 64 if repeat_distribution else list(range(4)) * 16
@@ -216,6 +231,19 @@ def test_broadcast_rng_matches_scalar(name, indexed, dtype, repeat_distribution)
         offset=torch.tensor([offset], device="cuda", dtype=dtype),
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("name", SPLIT_ROW_SAMPLERS)
+@pytest.mark.parametrize("vocab_size", [32000, 151936])
+@pytest.mark.parametrize("batch_size", [64, 512])
+def test_request_rng_across_split_row_dispatch_boundary(name, vocab_size, batch_size):
+    """Changing the batch-dependent cluster layout must not change a request's draw."""
+    sample = _sampler(name, False, vocab_size)
+    seed, offset = _rng_tensors(4, 4, torch.int64)
+    expected = sample(seed=seed, offset=offset)
+    rows = torch.arange(batch_size, device="cuda") % 4
+    actual = _select_rows(sample, rows)(seed=seed[rows], offset=offset[rows])
+    torch.testing.assert_close(actual, expected[rows], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("name", ["seed", "offset"])

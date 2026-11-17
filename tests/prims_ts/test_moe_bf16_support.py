@@ -287,14 +287,43 @@ def test_config_mapper_mxfp4_mxfp8_supports_geglu():
     assert pair.fc2.cfg.kwargs["act_kind"] == 0
 
 
-@pytest.mark.parametrize("num_tokens", [1024, 8192])
-def test_kimi_k3_tile_selection_keeps_128_and_adds_192(num_tokens):
-    assert _selected_tile_ns(
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,expected_tiles",
+    [
+        (1024, None, (128, 192, 256)),
+        (8192, None, (128, 192, 256)),
+        # Expert parallel (56 of 896 local): ~37 rows per local expert at
+        # 2048 tokens centres the window on 64 and drops the half-empty tiles.
+        (2048, 896, (32, 64, 128)),
+    ],
+)
+def test_kimi_k3_tile_selection_keeps_128_and_adds_192(
+    num_tokens, num_experts, expected_tiles
+):
+    kwargs = dict(
         num_tokens=num_tokens,
         top_k=16,
         num_local_experts=56,
         supported_tiles=SUPPORTED_MXFP4_MXFP8_TILE_N,
-    ) == (128, 192, 256)
+    )
+    assert _selected_tile_ns(num_experts=num_experts, **kwargs) == expected_tiles
+    if num_experts is not None and num_experts > 56:
+        # The untuned EP default must be a persistent-scheduler pair (a static
+        # grid is sized for every routed row, 16x the local work here).
+        pair = map_trtllm_mxfp4_mxfp8_moe_tactic(
+            [-1, -1],
+            sm_arch=100,
+            activation_type=int(ActivationType.Situ),
+            num_tokens=num_tokens,
+            top_k=16,
+            num_local_experts=56,
+            num_experts=num_experts,
+            has_gemm1_alpha=True,
+            has_gemm1_beta=True,
+        )
+        assert pair.tile_n == 64
+        assert pair.fc1.cfg.build().tile_scheduler == int(TileScheduler.PERSISTENT)
+        assert pair.fc2.cfg.build().tile_scheduler == int(TileScheduler.PERSISTENT)
 
 
 @pytest.mark.parametrize("sm_arch", (100, 107))
@@ -1109,3 +1138,60 @@ def test_support_rejects_unshuffled_major_k(monkeypatch):
 
     assert not ok
     assert "shuffled weights" in reason
+
+
+def _deepseek_block32_call(**overrides):
+    hidden_size = overrides.pop("hidden_size", 256)
+    intermediate_size = overrides.pop("intermediate_size", 160)
+    num_local_experts = overrides.pop("num_local_experts", 4)
+    weight_layout = overrides.pop("weight_layout", WeightLayout.MajorK)
+    runner = _runner(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
+        weight_layout=weight_layout,
+    )
+    inputs = _inputs(
+        hidden_states=torch.empty((4, hidden_size), dtype=torch.float8_e4m3fn),
+        hidden_states_scale=torch.empty((hidden_size // 32, 4), dtype=torch.float32),
+    )
+    kwargs = dict(
+        weight_layout=weight_layout,
+        gemm1_weights_scale=torch.empty(
+            (num_local_experts, 2 * intermediate_size // 32, hidden_size // 32),
+            dtype=torch.float32,
+        ),
+        gemm2_weights_scale=torch.empty(
+            (num_local_experts, hidden_size // 32, intermediate_size // 32),
+            dtype=torch.float32,
+        ),
+    )
+    kwargs.update(overrides)
+    return runner, inputs, kwargs
+
+
+def test_deepseek_scale_block_accepts_block32_major_k():
+    ok, reason, block = support._deepseek_fp8_scale_block(*_deepseek_block32_call())
+    assert ok, reason
+    assert block == 32
+
+
+def test_deepseek_scale_block_rejects_block_major_k_hidden_not_128():
+    # FC1's K is hidden_size; BlockMajorK stores it in 128-element blocks.
+    ok, reason, _ = support._deepseek_fp8_scale_block(
+        *_deepseek_block32_call(
+            hidden_size=160,
+            intermediate_size=256,
+            weight_layout=WeightLayout.BlockMajorK,
+        )
+    )
+    assert not ok
+    assert "BlockMajorK" in reason and "hidden_size=160" in reason
+
+
+def test_deepseek_scale_block_rejects_wrong_expert_dim():
+    runner, inputs, kwargs = _deepseek_block32_call()
+    kwargs["gemm1_weights_scale"] = kwargs["gemm1_weights_scale"][:2]
+    ok, reason, _ = support._deepseek_fp8_scale_block(runner, inputs, kwargs)
+    assert not ok
+    assert "gemm1_weights_scale" in reason and "num_local_experts=4" in reason

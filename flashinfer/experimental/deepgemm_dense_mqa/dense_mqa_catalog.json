@@ -598,6 +598,9 @@
         ],
         "fp8:q1:short": [
           "pre_issue"
+        ],
+        "fp8:qle2048:short": [
+          "source_consumer_release"
         ]
       }
     },
@@ -2254,6 +2257,113 @@
       ],
       "standalone": true
     },
+    "cake_deepgemm_dense_mqa_0813c2bb0e98b02fba62": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0813c2bb0e98b02fba62_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0813c2bb0e98b02fba62_binding.cu"
+      ],
+      "standalone": true
+    },
     "cake_deepgemm_dense_mqa_09b0415542de2fbca39a": {
       "arches": [
         "sm_100a"
@@ -2706,6 +2816,113 @@
       ],
       "standalone": true
     },
+    "cake_deepgemm_dense_mqa_0cd97f50abee6a4a7af8": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0cd97f50abee6a4a7af8_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0cd97f50abee6a4a7af8_binding.cu"
+      ],
+      "standalone": true
+    },
     "cake_deepgemm_dense_mqa_0d5696ee5c439684ea28": {
       "arches": [
         "sm_100a",
@@ -2786,6 +3003,113 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_0d5696ee5c439684ea28_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_13be94a0007bc79b8ba9": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_13be94a0007bc79b8ba9_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_13be94a0007bc79b8ba9_binding.cu"
       ],
       "standalone": true
     },
@@ -3346,6 +3670,113 @@
       ],
       "standalone": true
     },
+    "cake_deepgemm_dense_mqa_2862d4b787d7b6fbaff0": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_2862d4b787d7b6fbaff0_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_2862d4b787d7b6fbaff0_binding.cu"
+      ],
+      "standalone": true
+    },
     "cake_deepgemm_dense_mqa_289792e4df970746b1eb": {
       "arches": [
         "sm_100a"
@@ -3449,112 +3880,6 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_289792e4df970746b1eb_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_289792e4df970746b1eb_binding.cu"
-      ],
-      "standalone": true
-    },
-    "cake_deepgemm_dense_mqa_2abdc35ce7f99149bfb5": {
-      "arches": [
-        "sm_103a"
-      ],
-      "arg_plan": [
-        [
-          "tma_buffer",
-          "Q"
-        ],
-        [
-          "tma_buffer",
-          "Q_scales_alias"
-        ],
-        [
-          "tma_buffer",
-          "KV"
-        ],
-        [
-          "tma_buffer",
-          "KV_scales"
-        ],
-        [
-          "tma_buffer",
-          "Weights"
-        ],
-        [
-          "buffer",
-          "Logits"
-        ],
-        [
-          "buffer",
-          "ScheduleMeta"
-        ],
-        [
-          "buffer",
-          "CandidateValues"
-        ],
-        [
-          "buffer",
-          "CandidateIndices"
-        ],
-        [
-          "buffer",
-          "CandidateCounts"
-        ],
-        [
-          "buffer",
-          "ScoreThresholds"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_start"
-        ],
-        [
-          "buffer",
-          "cu_seq_len_k_end"
-        ],
-        [
-          "parameter",
-          "seq_len"
-        ],
-        [
-          "parameter",
-          "seq_len_kv"
-        ],
-        [
-          "parameter",
-          "stride_logits"
-        ],
-        [
-          "parameter",
-          "num_q_blocks"
-        ],
-        [
-          "parameter",
-          "num_kv_splits"
-        ],
-        [
-          "parameter",
-          "candidate_capacity"
-        ],
-        [
-          "grid",
-          "grid_x"
-        ],
-        [
-          "grid",
-          "grid_y"
-        ],
-        [
-          "grid",
-          "grid_z"
-        ]
-      ],
-      "compile_flags": [
-        "--ptxas-options=--register-usage-level=10"
-      ],
-      "ffi_entry": "run",
-      "kind": "module",
-      "role": "kernel",
-      "sources": [
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_2abdc35ce7f99149bfb5_kernel.cu",
-        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_2abdc35ce7f99149bfb5_binding.cu"
       ],
       "standalone": true
     },
@@ -4604,6 +4929,112 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_4d7286e8fa15ac8b3b4b_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_4d7286e8fa15ac8b3b4b_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_4e198220ae61e820cfab": {
+      "arches": [
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_4e198220ae61e820cfab_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_4e198220ae61e820cfab_binding.cu"
       ],
       "standalone": true
     },
@@ -5937,6 +6368,112 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_7c4455398d04ad5e0780": {
+      "arches": [
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_7c4455398d04ad5e0780_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_7c4455398d04ad5e0780_binding.cu"
       ],
       "standalone": true
     },
@@ -7762,6 +8299,112 @@
       ],
       "standalone": true
     },
+    "cake_deepgemm_dense_mqa_b71534acb02a03f80713": {
+      "arches": [
+        "sm_100a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_b71534acb02a03f80713_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_b71534acb02a03f80713_binding.cu"
+      ],
+      "standalone": true
+    },
     "cake_deepgemm_dense_mqa_ba46ef67d3b7ac822e84": {
       "arches": [
         "sm_103a"
@@ -8795,6 +9438,113 @@
       ],
       "standalone": true
     },
+    "cake_deepgemm_dense_mqa_df5592c89d0f4e40dc36": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_df5592c89d0f4e40dc36_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_df5592c89d0f4e40dc36_binding.cu"
+      ],
+      "standalone": true
+    },
     "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2": {
       "arches": [
         "sm_100a",
@@ -8950,6 +9700,113 @@
       ],
       "standalone": true
     },
+    "cake_deepgemm_dense_mqa_e57230d5be4f873c83ed": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e57230d5be4f873c83ed_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e57230d5be4f873c83ed_binding.cu"
+      ],
+      "standalone": true
+    },
     "cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3": {
       "arches": [
         "sm_103a"
@@ -9053,6 +9910,220 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_e7b37a2731dbe57280f3_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_eae4753ac1c94309e458": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_eae4753ac1c94309e458_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_eae4753ac1c94309e458_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_ec8e38ef0b7d775c4f91": {
+      "arches": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_ec8e38ef0b7d775c4f91_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_ec8e38ef0b7d775c4f91_binding.cu"
       ],
       "standalone": true
     },
@@ -9239,6 +10310,112 @@
       "sources": [
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_edff6f9d8310efe62779_kernel.cu",
         "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_edff6f9d8310efe62779_binding.cu"
+      ],
+      "standalone": true
+    },
+    "cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c": {
+      "arches": [
+        "sm_103a"
+      ],
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "Q_scales_alias"
+        ],
+        [
+          "tma_buffer",
+          "KV"
+        ],
+        [
+          "tma_buffer",
+          "KV_scales"
+        ],
+        [
+          "tma_buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "Logits"
+        ],
+        [
+          "buffer",
+          "ScheduleMeta"
+        ],
+        [
+          "buffer",
+          "CandidateValues"
+        ],
+        [
+          "buffer",
+          "CandidateIndices"
+        ],
+        [
+          "buffer",
+          "CandidateCounts"
+        ],
+        [
+          "buffer",
+          "ScoreThresholds"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_start"
+        ],
+        [
+          "buffer",
+          "cu_seq_len_k_end"
+        ],
+        [
+          "parameter",
+          "seq_len"
+        ],
+        [
+          "parameter",
+          "seq_len_kv"
+        ],
+        [
+          "parameter",
+          "stride_logits"
+        ],
+        [
+          "parameter",
+          "num_q_blocks"
+        ],
+        [
+          "parameter",
+          "num_kv_splits"
+        ],
+        [
+          "parameter",
+          "candidate_capacity"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "ffi_entry": "run",
+      "kind": "module",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c_kernel.cu",
+        "csrc/experimental/deepgemm_dense_mqa/generated/cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c_binding.cu"
       ],
       "standalone": true
     },
@@ -10165,7 +11342,19 @@
             "sm_103a": "cake_deepgemm_dense_mqa_45642b3a5e6c10dcb474"
           }
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_6846d1718ab7505f345c"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_ec8e38ef0b7d775c4f91"
+          ]
+        ]
+      }
     },
     "fp8:full:le128": {
       "block_q": 4,
@@ -10189,7 +11378,19 @@
             "sm_103a": "cake_deepgemm_dense_mqa_45642b3a5e6c10dcb474"
           }
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_ec8e38ef0b7d775c4f91"
+          ]
+        ]
+      }
     },
     "fp8:full:le16": {
       "block_q": 4,
@@ -10210,7 +11411,19 @@
           "logits",
           "cake_deepgemm_dense_mqa_f796231b06aa3ce8860b"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_23fd530901062703f5d1"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_ec8e38ef0b7d775c4f91"
+          ]
+        ]
+      }
     },
     "fp8:full:le2048": {
       "block_q": 4,
@@ -10234,7 +11447,19 @@
             "sm_103a": "cake_deepgemm_dense_mqa_45642b3a5e6c10dcb474"
           }
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_ec8e38ef0b7d775c4f91"
+          ]
+        ]
+      }
     },
     "fp8:full:le32:short": {
       "block_q": 4,
@@ -10264,6 +11489,14 @@
             ]
           }
         ]
+      },
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_e57230d5be4f873c83ed"
+          ]
+        ]
       }
     },
     "fp8:full:le768:short": {
@@ -10281,7 +11514,15 @@
           "logits",
           "cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_2862d4b787d7b6fbaff0"
+          ]
+        ]
+      }
     },
     "fp8:h64:full:any": {
       "block_q": 2,
@@ -10582,7 +11823,19 @@
           "logits",
           "cake_deepgemm_dense_mqa_1f95430d7143a1737f61"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_6846d1718ab7505f345c"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_eae4753ac1c94309e458"
+          ]
+        ]
+      }
     },
     "fp8:partial:le128": {
       "block_q": 4,
@@ -10603,7 +11856,19 @@
           "logits",
           "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_7972d1c7b9410a9cb713"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_eae4753ac1c94309e458"
+          ]
+        ]
+      }
     },
     "fp8:partial:le16": {
       "block_q": 4,
@@ -10624,7 +11889,19 @@
           "logits",
           "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_23fd530901062703f5d1"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_eae4753ac1c94309e458"
+          ]
+        ]
+      }
     },
     "fp8:partial:le2048": {
       "block_q": 4,
@@ -10645,7 +11922,19 @@
           "logits",
           "cake_deepgemm_dense_mqa_1f95430d7143a1737f61"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_e0868d26b805c9fd31d2"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_eae4753ac1c94309e458"
+          ]
+        ]
+      }
     },
     "fp8:partial:le32:short": {
       "block_q": 4,
@@ -10662,7 +11951,15 @@
           "logits",
           "cake_deepgemm_dense_mqa_0113a6fbc388f6d5c46b"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_df5592c89d0f4e40dc36"
+          ]
+        ]
+      }
     },
     "fp8:partial:le768:short": {
       "block_q": 4,
@@ -10679,7 +11976,15 @@
           "logits",
           "cake_deepgemm_dense_mqa_b114a592b64fe088655d"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_0813c2bb0e98b02fba62"
+          ]
+        ]
+      }
     },
     "fp8:q1": {
       "block_q": 4,
@@ -10700,7 +12005,19 @@
           "logits",
           "cake_deepgemm_dense_mqa_3e56843a8c9823ef8193"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "metadata",
+            "cake_deepgemm_dense_mqa_2c9f274eb5a2741c7895"
+          ],
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_eae4753ac1c94309e458"
+          ]
+        ]
+      }
     },
     "fp8:q128:short": {
       "block_q": 4,
@@ -10741,6 +12058,14 @@
             ]
           }
         ]
+      },
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_e57230d5be4f873c83ed"
+          ]
+        ]
       }
     },
     "fp8:q1:short": {
@@ -10758,7 +12083,15 @@
           "logits",
           "cake_deepgemm_dense_mqa_adf83fa1a7fedd4f48e6"
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_0cd97f50abee6a4a7af8"
+          ]
+        ]
+      }
     },
     "fp8:qle128:short": {
       "block_q": 4,
@@ -10778,7 +12111,18 @@
             "sm_103a": "cake_deepgemm_dense_mqa_a11d0fbc31513a072ad3"
           }
         ]
-      ]
+      ],
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            {
+              "sm_100a": "cake_deepgemm_dense_mqa_b71534acb02a03f80713",
+              "sm_103a": "cake_deepgemm_dense_mqa_f1170ae1d9306c4c431c"
+            }
+          ]
+        ]
+      }
     },
     "fp8:qle2048:short": {
       "block_q": 4,
@@ -10793,7 +12137,10 @@
       "stages": [
         [
           "logits",
-          "cake_deepgemm_dense_mqa_4be5b4aaa1f52069837c"
+          {
+            "sm_100a": "cake_deepgemm_dense_mqa_4be5b4aaa1f52069837c",
+            "sm_103a": "cake_deepgemm_dense_mqa_7c4455398d04ad5e0780"
+          }
         ]
       ],
       "stage_buckets": {
@@ -10804,13 +12151,21 @@
             "stages": [
               [
                 "logits",
-                "cake_deepgemm_dense_mqa_2abdc35ce7f99149bfb5"
+                "cake_deepgemm_dense_mqa_4e198220ae61e820cfab"
               ]
             ]
           }
         ]
+      },
+      "variants": {
+        "raw": [
+          [
+            "logits",
+            "cake_deepgemm_dense_mqa_13be94a0007bc79b8ba9"
+          ]
+        ]
       }
     }
   },
-  "schema": "dense_mqa.v13"
+  "schema": "dense_mqa.v14"
 }
