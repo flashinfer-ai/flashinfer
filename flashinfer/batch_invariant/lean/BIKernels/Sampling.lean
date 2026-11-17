@@ -203,6 +203,10 @@ def specLogp (fmt : String) (N kb : Nat) (row : Nat → Term) (T : Option Term) 
   (specOutputs fmt N kb row T).map (fun o => o.logprobs i)
 def specLse (fmt : String) (N kb : Nat) (row : Nat → Term) (T : Option Term) : Option Term :=
   (specOutputs fmt N kb row T).map (fun o => o.lse)
+/-- The 16-bit log-softmax output member: the log-softmax element converted once to the input format, a function of
+`logprobs` (`LSESpec.outputs(row)["logprobs_cvt"]`; `Mode.logprobs_cvt`, `log_softmax(..., out_dtype=)`). -/
+def specLogpCvt (fmt : String) (N kb : Nat) (row : Nat → Term) (T : Option Term) (i : Nat) : Option Term :=
+  (specLogp fmt N kb row T i).map (Term.cvt fmt)
 
 theorem outputs_congr (fmt : String) (row : Nat → Term) {m m' s s' : Term} (c : Term) (hm : Equiv m m') (hs : Equiv s s') :
     (∀ i, Equiv ((outputsOf fmt row m s c).probs i) ((outputsOf fmt row m' s' c).probs i))
@@ -268,6 +272,24 @@ theorem lse_bits_equal {α : Type} (P : Prims α) (fmt : String) (N kb : Nat) (r
   unfold OutputsEquiv at h
   obtain ⟨h1, h2, h3⟩ := h
   exact ⟨fun i => eval_equiv P (h1 i), fun i => eval_equiv P (h2 i), eval_equiv P h3⟩
+
+/-- The 16-bit log-softmax output member: the converted element is a congruence of the fp32 one, so every placement's
+converted output is `Equiv` to the spec's converted output. -/
+theorem logp_cvt_equiv (fmt : String) (N kb : Nat) (row : Nat → Term) (T : Option Term) (ps : List (List Factor)) (cs : List (List Bool))
+    (hp : PlacementOK [kb, 5] ps) (hc : CoordsOK (flatten ps) cs)
+    {k o : Outputs} (hk : kernelOutputs fmt N kb row T ps cs = some k) (ho : specOutputs fmt N kb row T = some o) (i : Nat) :
+    Equiv (Term.cvt fmt (k.logprobs i)) (Term.cvt fmt (o.logprobs i)) := by
+  have h := lse_end_to_end fmt N kb row T ps cs hp hc
+  rw [hk, ho] at h
+  unfold OutputsEquiv at h
+  exact .cvt_congr fmt (h.2.1 i)
+
+/-- Bitwise form of `logp_cvt_equiv`: the 16-bit log-softmax output is the same value under any interpretation. -/
+theorem logp_cvt_bits_equal {α : Type} (P : Prims α) (fmt : String) (N kb : Nat) (row : Nat → Term) (T : Option Term)
+    (ps : List (List Factor)) (cs : List (List Bool)) (hp : PlacementOK [kb, 5] ps) (hc : CoordsOK (flatten ps) cs)
+    {k o : Outputs} (hk : kernelOutputs fmt N kb row T ps cs = some k) (ho : specOutputs fmt N kb row T = some o) (i : Nat) :
+    eval P (Term.cvt fmt (k.logprobs i)) = eval P (Term.cvt fmt (o.logprobs i)) :=
+  eval_equiv P (logp_cvt_equiv fmt N kb row T ps cs hp hc hk ho i)
 
 /-! ## The bucket kernel: `-inf` padding under the restricted identity
 

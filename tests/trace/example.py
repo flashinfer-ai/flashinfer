@@ -31,10 +31,12 @@ Results:
 - We would get these example json files under fi_trace_out directory:
 qsa_forward_h12_kv1_d256.json
 qsa_indexed_forward_h12_kv1_d256.json
+qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
+cute_dsl_fused_moe_topk2_e3_h768.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
 dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
@@ -65,6 +67,8 @@ gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 sdsa_gather_key_sample_page_size64_dim128.json
 sdsa_group_union_masks_top_k2048.json
+sdsa_gather_nvfp4_kv_cache_by_position_heads1_ps64_pd128_sd16_k512_one1_cd512_sides2.json
+sdsa_compact_nvfp4_kv_cache_heads1_ps64_pd128_sd16_k512_one1_cd512_sides2.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -85,6 +89,10 @@ gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
 fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
 fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_hnd_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_e5m2_kv2_d128_sl144_ps4.json
+fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_hnd_e5m2_kv2_d128_sl144_ps4.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
@@ -202,6 +210,7 @@ are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
+qsa_sparse_paged_attention_nvfp4_h12_kv1_d256_ps16.json requires SM80 through SM90 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
 
@@ -550,6 +559,52 @@ def example_qsa():
 
 
 example_qsa()
+
+
+def example_qsa_sparse_paged_attention():
+    if torch.cuda.get_device_capability(device)[0] not in (8, 9):
+        print("Skipping QSA sparse paged attention example: requires SM80 through SM90")
+        return
+    rows, num_blocks, page_size, width = 4, 8, 16, 64
+    q = torch.randn(rows, 12, 256, dtype=torch.bfloat16, device=device)
+    # NVFP4 cache: packed E2M1 bytes and one E4M3 block scale per 16 dims.
+    k_cache = torch.randint(
+        0, 256, (num_blocks, page_size, 1, 128), dtype=torch.uint8, device=device
+    )
+    v_cache = torch.randint_like(k_cache, 0, 256)
+    k_sf, v_sf = (
+        torch.rand(num_blocks, page_size, 1, 16, device=device).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    tokens = torch.arange(width, dtype=torch.int32, device=device)
+    logical_indices = torch.cat(
+        [
+            tokens.expand(rows, width),
+            torch.full((rows, 1), width, dtype=torch.int32, device=device),
+        ],
+        dim=1,
+    ).contiguous()
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
+    flashinfer.qsa_sparse_paged_attention(
+        q,
+        k_cache,
+        v_cache,
+        logical_indices,
+        block_table,
+        token_to_req,
+        False,
+        k_scale=1.0,
+        v_scale=1.0,
+        output_gate=torch.randn_like(q),
+        k_sf=k_sf,
+        v_sf=v_sf,
+    )
+
+
+example_qsa_sparse_paged_attention()
 
 
 def example_dsv41_fp4_cache():
@@ -1600,6 +1655,51 @@ with contextlib.suppress(Exception):
         renormalize=True,
     )
 
+# ── CuTe-DSL NVFP4 routing weights before FC2 ──────────────────────────────
+# This call reuses ClampedRelu2's runtime clamp tensor and rounds each
+# activation stage to BF16 before quantizing the weighted GEMM2 input.
+with contextlib.suppress(Exception):
+    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    from flashinfer.tllm_enums import ActivationType
+
+    _pre_T, _pre_H, _pre_I, _pre_E, _pre_K = 17, 768, 4096, 3, 2
+
+    def _pre_sf(rows, width):
+        scales = (
+            torch.ones((_pre_E * rows, width // 16), device=device)
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+        )
+        return convert_sf_to_mma_layout(scales, rows, width, num_groups=_pre_E)
+
+    _pre_output = flashinfer.cute_dsl_fused_moe(
+        x=torch.zeros((_pre_T, _pre_H // 2), dtype=torch.uint8, device=device),
+        x_sf=torch.ones((_pre_T, _pre_H // 16), device=device)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8),
+        token_selected_experts=(
+            torch.arange(_pre_T * _pre_K, device=device).reshape(_pre_T, _pre_K)
+            % _pre_E
+        ).int(),
+        token_final_scales=torch.full((_pre_T, _pre_K), 0.5, device=device),
+        w1_weight=torch.zeros(
+            (_pre_E, _pre_I, _pre_H // 2), dtype=torch.uint8, device=device
+        ),
+        w1_weight_sf=_pre_sf(_pre_I, _pre_H),
+        w1_alpha=torch.ones(_pre_E, device=device),
+        fc2_input_scale=torch.ones(1, device=device),
+        w2_weight=torch.zeros(
+            (_pre_E, _pre_H, _pre_I // 2), dtype=torch.uint8, device=device
+        ),
+        w2_weight_sf=_pre_sf(_pre_H, _pre_I),
+        w2_alpha=torch.ones(_pre_E, device=device),
+        num_experts=_pre_E,
+        top_k=_pre_K,
+        activation_type=ActivationType.ClampedRelu2.value,
+        clamped_relu2_limit=torch.tensor([16.0], device=device),
+        routing_weights_before_fc2=True,
+    )
+
 # ── SM90 CuTe-DSL fused MoE (Qwen3-30B-A3B: E=128, topk=8, h=2048, i=768) ───
 # Unquantized bf16, pre-routed. SM90-only and JIT-built, so wrapped in
 # suppress(): the trace JSON dumps before the kernel launches, so the
@@ -2531,6 +2631,30 @@ with contextlib.suppress(Exception):
         _nqsm_k_scale,
         _nqsm_v_scale,
     )
+
+# fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping: flat slot mapping.
+with contextlib.suppress(Exception):
+    from flashinfer import (
+        fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping,
+    )
+
+    for _fpth_layout in ("NHD", "HND"):
+        for _fpth_format in ("e4m3", "e5m2"):
+            _fpth_inputs = (
+                fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping.fi_init(
+                    nnz_kv=4,
+                    num_pages=4,
+                    num_kv_heads=2,
+                    head_dim=128,
+                    page_size=4,
+                    kv_layout=_fpth_layout,
+                    kv_data_type=_fpth_format,
+                    device=device,
+                )
+            )
+            fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping(
+                **_fpth_inputs
+            )
 
 # nvfp4_quantize_append_paged_mla_kv_cache: packed ckv plus FP8 kpe cache.
 with contextlib.suppress(Exception):
@@ -3690,6 +3814,48 @@ group_union_masks.fi_trace(
     union_sizes=torch.empty(2, dtype=torch.int32),
     mask=torch.empty(8, 256, dtype=torch.int32),
     num_keys=16384,
+)
+
+# Selected NVFP4 KV tokens to FP8 for token-sparse attention, from key positions.
+from flashinfer.sdsa.token_sparse import (
+    compact_nvfp4_kv_cache,
+    gather_nvfp4_kv_cache_by_position,
+)
+
+_nvfp4_kv = dict(
+    paged_kv_cache=tuple(
+        torch.empty(4, 1, 64, 128, dtype=torch.uint8) for _ in range(2)
+    ),
+    kv_cache_sf=tuple(
+        torch.empty(4, 1, 64, 16, dtype=torch.float8_e4m3fn) for _ in range(2)
+    ),
+    positions=torch.empty(2, 512, dtype=torch.int32),
+    block_table=torch.empty(2, 4, dtype=torch.int32),
+    out=torch.empty(1025, 1, 1, 512, dtype=torch.float8_e4m3fn),
+    block_tables=torch.empty(2, 2, 512, dtype=torch.int32),
+    seq_lens=torch.empty(2, dtype=torch.int32),
+)
+
+gather_nvfp4_kv_cache_by_position.fi_trace(
+    save_dir=SAVE_DIR,
+    requests=torch.arange(2, dtype=torch.int32),
+    requests_per_row=1,
+    **_nvfp4_kv,
+)
+
+compact_nvfp4_kv_cache.fi_trace(
+    save_dir=SAVE_DIR,
+    row_groups=torch.zeros(2, dtype=torch.int32),
+    group_requests=torch.zeros(1, dtype=torch.int32),
+    group_offsets=torch.zeros(1, dtype=torch.int64),
+    scratch=torch.empty(1155, dtype=torch.int32),
+    bitmap=torch.zeros(129, dtype=torch.int32),
+    max_keys=4096,
+    max_capacity=1024,
+    zero_row=1024,
+    group_base=0,
+    requests_per_row=1,
+    **_nvfp4_kv,
 )
 
 # ── SDSA (Simplified DSA) indexer ─────────────────────────────────────────────

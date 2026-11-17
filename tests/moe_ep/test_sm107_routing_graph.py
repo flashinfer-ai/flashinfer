@@ -130,10 +130,10 @@ def test_routing_graph_changes(monkeypatch, kind, early, family, capacity):
         ("inference", 4, 1024, 16, 4, False, True),
         ("inference", 4, 1024, 16, 4, True, False),
         ("inference", 4, 16384, 16, 4, False, False),
-        ("genphase", 1, 1024, 16, 4, False, False),
-        ("genphase", 4, 1024, 16, 4, False, True),
-        ("genphase", 4, 1024, 16, 4, True, False),
-        ("genphase", 16, 1024, 256, 16, False, False),
+        ("genphase", 1, 1024, 16, 4, False, None),
+        ("genphase", 4, 1024, 16, 4, False, None),
+        ("genphase", 4, 1024, 16, 4, True, None),
+        ("genphase", 16, 1024, 256, 16, False, None),
     ],
 )
 def test_tail_reset_ownership_for_workspace(
@@ -160,14 +160,34 @@ def test_tail_reset_ownership_for_workspace(
         fc2_tma_stages=1,
         fc2_use_bulk=True,
     )
-    # Build real layouts without allocating weights or buffers. GenPhase reset
-    # size depends on min(topk, local experts), not just capacity * topk.
+    # Build real layouts without allocating weights or buffers.
     kernel = pkg.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    workspace = kernel._device_workspace
+    if family == "genphase":
+        # The last arriving CTA resets the counter. Epoch and signal slots
+        # persist across calls and must remain outside the reset spans.
+        assert kernel.tail.world_size == world
+        for name, shape, space, reset in (
+            (kernel.tail.done_counter_region, (1,), "local", "tail_reset"),
+            (kernel.tail.epoch_region, (1,), "local", "zero_on_first_allocate"),
+            (kernel.tail.signal_region, (2,), "shared", "zero_on_first_allocate"),
+        ):
+            region = workspace.region(name)
+            assert (region.shape, region.buffer_space, region.reset) == (
+                shape,
+                space,
+                reset,
+            )
+            if reset == "tail_reset":
+                assert workspace.offset(name) + workspace.nbytes(name) <= (
+                    workspace.tail_reset_bytes(space)
+                )
+            else:
+                assert workspace.offset(name) >= workspace.tail_reset_bytes(space)
+        return
     reset_bytes = sum(
-        kernel._device_workspace.tail_reset_bytes(space)
-        for space in ("local", "shared")
+        workspace.tail_reset_bytes(space) for space in ("local", "shared")
     )
     assert (reset_bytes > 16384) == (world > 1 and not ncu and not single_cta)
-    reset_owner = kernel.token_comm if family == "inference" else kernel
-    assert reset_owner.tail_reset_single_cta is single_cta
+    assert kernel.token_comm.tail_reset_single_cta is single_cta
     assert f"singlectareset{int(single_cta)}_" in kernel.name()

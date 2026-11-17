@@ -1,3 +1,4 @@
+import struct
 import subprocess
 from types import SimpleNamespace
 
@@ -5,7 +6,7 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.jit import core, cpp_ext
+from flashinfer.jit import core, cpp_ext, embed_cubin_coff
 from flashinfer.jit.attention import modules as attention_modules
 from flashinfer.utils import (
     PosEncodingMode,
@@ -169,6 +170,131 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
             "8",
         ]
     ]
+
+
+def _read_coff_object(obj):
+    machine, sections, _, symbol_table, symbol_count, _, _ = struct.unpack_from(
+        "<HHIIIHH", obj, 0
+    )
+    name, _, _, size, data_offset, *_, flags = struct.unpack_from(
+        "<8sIIIIIIHHI", obj, 20
+    )
+    string_table = obj[symbol_table + 18 * symbol_count :]
+    symbols = {}
+    index = 0
+    while index < symbol_count:
+        raw_name, value, section, _, storage, aux = struct.unpack_from(
+            "<8sIhHBB", obj, symbol_table + 18 * index
+        )
+        if raw_name[:4] == b"\0\0\0\0":
+            offset = struct.unpack_from("<I", raw_name, 4)[0]
+            raw_name = string_table[offset : string_table.index(b"\0", offset)]
+        symbols[raw_name.rstrip(b"\0").decode()] = (value, section, storage)
+        index += 1 + aux
+    return {
+        "machine": machine,
+        "sections": sections,
+        "section_name": name.rstrip(b"\0"),
+        "section_flags": flags,
+        "data": obj[data_offset : data_offset + size],
+        "symbols": symbols,
+        "string_table_size": struct.unpack_from("<I", string_table, 0)[0],
+        "string_table_len": len(string_table),
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("machine", "machine_id"), [("arm64", 0xAA64), ("x64", 0x8664)]
+)
+def test_coff_cubin_object_spans_cubin_bytes(machine, machine_id):
+    cubin = bytes(range(256)) * 3 + b"\x7fELF"
+
+    coff = _read_coff_object(
+        embed_cubin_coff.coff_cubin_object(cubin, "alphamoe_small_sm_103a", machine)
+    )
+
+    assert coff["machine"] == machine_id
+    assert coff["sections"] == 1
+    assert coff["section_name"] == b".rdata"
+    assert coff["section_flags"] == 0x40700040
+    assert coff["data"] == cubin
+    assert coff["symbols"] == {
+        ".rdata": (0, 1, 3),
+        "__tvm_ffi__cubin_alphamoe_small_sm_103a": (0, 1, 2),
+        "__tvm_ffi__cubin_alphamoe_small_sm_103a_end": (len(cubin), 1, 2),
+    }
+    assert coff["string_table_size"] == coff["string_table_len"]
+
+
+@pytest.mark.cpu_only
+def test_generate_ninja_embeds_cubins_as_coff_objects_on_windows(monkeypatch, tmp_path):
+    cubin = tmp_path / "small.cubin"
+    cubin.write_bytes(b"\x7fELF")
+    monkeypatch.setattr(cpp_ext, "is_windows", True)
+    monkeypatch.setattr(cpp_ext.platform, "machine", lambda: "ARM64")
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "router.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        embedded_cubins={"alphamoe_small_sm_103a": cubin},
+    )
+
+    host_obj = (tmp_path / "jit" / "test_module" / "generated_router.cuda.o").resolve()
+    cubin_obj = (
+        tmp_path / "jit" / "test_module" / "embedded_cubin_alphamoe_small_sm_103a.o"
+    ).resolve()
+    assert "tvm_ffi.utils.embed_cubin" not in ninja
+    assert "embed_cubin_coff.py" in ninja
+    assert (
+        '--machine arm64 --name $cubin_name --cubin "$in" --output-obj "$out"' in ninja
+    )
+    assert f"build {cubin_obj}: embed_cubin {cubin.resolve()}" in ninja
+    assert "  cubin_name = alphamoe_small_sm_103a" in ninja
+    assert f": link {host_obj} {cubin_obj}" in ninja
+
+
+@pytest.mark.cpu_only
+def test_ninja_windows_path_escapes_drive_colon_and_spaces():
+    assert (
+        cpp_ext._ninja_windows_path(r"C:\Users\a b\jit\embedded_cubin_x.o")
+        == r"C$:\Users\a$ b\jit\embedded_cubin_x.o"
+    )
+
+
+@pytest.mark.cpu_only
+def test_generate_ninja_merges_cubins_into_host_object_on_linux(monkeypatch, tmp_path):
+    cubin = tmp_path / "small.cubin"
+    cubin.write_bytes(b"\x7fELF")
+    monkeypatch.setattr(cpp_ext, "is_windows", False)
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "router.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        embedded_cubins={"alphamoe_small_sm_103a": cubin},
+    )
+
+    module_dir = (tmp_path / "jit" / "test_module").resolve()
+    host_obj = module_dir / "generated_router.cuda.o"
+    embedded_obj = module_dir / "embedded_0_generated_router.cuda.o"
+    assert "-m tvm_ffi.utils.embed_cubin" in ninja
+    assert "embed_cubin_coff.py" not in ninja
+    assert f"build {embedded_obj}: embed_cubin {host_obj} | {cubin.resolve()}" in ninja
+    assert f": link {embedded_obj}\n" in ninja
 
 
 @pytest.fixture

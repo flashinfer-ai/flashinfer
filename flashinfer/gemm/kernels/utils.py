@@ -135,6 +135,7 @@ def _score_block_scaled_tactic(
     cluster_shape_mn,
     swap_ab,
     mma_inst_shape_m=None,
+    batch=1,
 ):
     """Score a block-scaled cute-dsl GEMM tactic (higher means better).
 
@@ -144,6 +145,8 @@ def _score_block_scaled_tactic(
 
     mma_inst_shape_m defaults to the tile M. SM107 mm_mxfp8 passes half the tile M
     for B-reuse, where each CTA issues two MMA instructions and so computes 256 rows.
+
+    batch counts independent (m, n) problems (bmm), each padded to whole tiles and clusters.
     """
     if m == 0 or n == 0:
         return 0.0
@@ -164,8 +167,10 @@ def _score_block_scaled_tactic(
     rows_per_cta = tile_m // cta_group
     ctas_m = m_tiles * cta_group
     # 2. Wave quantization effects: count waves over the real CTA grid
-    padded_ctas = ((ctas_m + cga_m - 1) // cga_m * cga_m) * (
-        (n_tiles + cga_n - 1) // cga_n * cga_n
+    padded_ctas = (
+        batch
+        * ((ctas_m + cga_m - 1) // cga_m * cga_m)
+        * ((n_tiles + cga_n - 1) // cga_n * cga_n)
     )
     num_waves = (padded_ctas + sm_count - 1) // sm_count
 

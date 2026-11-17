@@ -1477,7 +1477,7 @@ def gated_delta_rule_mtp(
         deprecation warning - the default will change to ``False`` in
         FlashInfer 0.8.0.
 
-        .. deprecated::
+        .. deprecated:: 0.6.7
             The implicit default of ``True`` is deprecated and will change
             to ``False`` in version 0.8.0.  Pass
             ``disable_state_update=True`` or ``disable_state_update=False``
