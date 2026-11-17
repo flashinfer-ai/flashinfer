@@ -136,7 +136,10 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
         "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
         :: "r"(mbar_addr), "r"(bytes) : "memory");
 }
+#if __CUDA_ARCH__ == 1030
+#else
 
+#endif
 
 
 
@@ -1225,34 +1228,100 @@ kernel_cake_sage_block_sparse_attention_c1a6884884e86854b97c(const __grid_consta
                             float acc_scale_p = scale_smem[slot_0];
                             int _warp_vote_0 = __any_sync(0xFFFFFFFF, acc_scale_p < 1.0f);
                             if (_warp_vote_0 != 0) {
+#if __CUDA_ARCH__ == 1030
+                                float o_half_0[16];
+#else
                                 float o_half_0[32];
+#endif
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[15]))
+#else
                                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
                                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_0[31]))
+#endif
                                     : "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 0));
                                 const float2 _scale2_1 = {acc_scale_p, acc_scale_p};
                                 #pragma unroll
+#if __CUDA_ARCH__ == 1030
+                                for (int _ls = 0; _ls < 8; _ls++)
+#else
                                 for (int _ls = 0; _ls < 16; _ls++)
+#endif
                                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_0)[_ls], _scale2_1);
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 0), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[15])));
+                                float o_half_1[16];
+#else
                                     "tcgen05.st.sync.aligned.16x32bx2.x32.b32"
                                     " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
                                     :: "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 0), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[15])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[16])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[17])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[18])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[19])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[20])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[21])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[22])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[23])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[24])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[25])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[26])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[27])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[28])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[29])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[30])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_0[31])));
                                 float o_half_1[32];
+#endif
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[15]))
+                                    : "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 16));
+#else
                                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
                                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[15])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[17])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[18])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[19])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[21])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[22])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[23])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[25])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[26])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[27])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[29])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[30])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_1[31]))
                                     : "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 32));
+#endif
                                 const float2 _scale2_2 = {acc_scale_p, acc_scale_p};
                                 #pragma unroll
+#if __CUDA_ARCH__ == 1030
+                                for (int _ls = 0; _ls < 8; _ls++)
+#else
                                 for (int _ls = 0; _ls < 16; _ls++)
+#endif
                                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_1)[_ls], _scale2_2);
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 16), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[15])));
+                                float o_half_2[16];
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[15]))
+                                    : "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 32));
+                                const float2 _scale2_3 = {acc_scale_p, acc_scale_p};
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 8; _ls++)
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_2)[_ls], _scale2_3);
+                                asm volatile(
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 32), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[15])));
+                                float o_half_3[16];
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[15]))
+                                    : "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 48));
+                                const float2 _scale2_4 = {acc_scale_p, acc_scale_p};
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 8; _ls++)
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_3)[_ls], _scale2_4);
+                                asm volatile(
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 48), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[15])));
+#else
                                     "tcgen05.st.sync.aligned.16x32bx2.x32.b32"
                                     " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
                                     :: "r"(taddr + (unsigned int)256 + (unsigned int)row_lf + 32), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[15])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[16])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[17])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[18])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[19])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[20])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[21])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[22])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[23])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[24])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[25])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[26])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[27])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[28])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[29])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[30])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_1[31])));
+#endif
                                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                             }
                             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1265,36 +1334,113 @@ kernel_cake_sage_block_sparse_attention_c1a6884884e86854b97c(const __grid_consta
                         if (step >= 2) {
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             float acc_scale_p_1 = scale_smem[slot_1];
+#if __CUDA_ARCH__ == 1030
+                            int _warp_vote_5 = __any_sync(0xFFFFFFFF, acc_scale_p_1 < 1.0f);
+                            if (_warp_vote_5 != 0) {
+                                float o_half_4[16];
+#else
                             int _warp_vote_3 = __any_sync(0xFFFFFFFF, acc_scale_p_1 < 1.0f);
                             if (_warp_vote_3 != 0) {
                                 float o_half_2[32];
+#endif
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_4[15]))
+#else
                                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
                                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[15])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[16])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[17])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[18])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[19])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[20])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[21])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[22])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[23])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[24])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[25])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[26])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[27])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[28])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[29])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[30])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_2[31]))
+#endif
                                     : "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 0));
+#if __CUDA_ARCH__ == 1030
+                                const float2 _scale2_6 = {acc_scale_p_1, acc_scale_p_1};
+#else
                                 const float2 _scale2_4 = {acc_scale_p_1, acc_scale_p_1};
+#endif
                                 #pragma unroll
+#if __CUDA_ARCH__ == 1030
+                                for (int _ls = 0; _ls < 8; _ls++)
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_4)[_ls], _scale2_6);
+#else
                                 for (int _ls = 0; _ls < 16; _ls++)
                                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_2)[_ls], _scale2_4);
+#endif
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 0), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_4[15])));
+                                float o_half_5[16];
+#else
                                     "tcgen05.st.sync.aligned.16x32bx2.x32.b32"
                                     " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
                                     :: "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 0), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[15])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[16])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[17])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[18])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[19])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[20])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[21])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[22])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[23])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[24])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[25])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[26])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[27])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[28])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[29])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[30])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_2[31])));
                                 float o_half_3[32];
+#endif
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_5[15]))
+                                    : "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 16));
+                                const float2 _scale2_7 = {acc_scale_p_1, acc_scale_p_1};
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 8; _ls++)
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_5)[_ls], _scale2_7);
+                                asm volatile(
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 16), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_5[15])));
+                                float o_half_6[16];
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_6[15]))
+#else
                                     "tcgen05.ld.sync.aligned.16x32bx2.x32.b32"
                                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
                                     : "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[15])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[16])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[17])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[18])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[19])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[20])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[21])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[22])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[23])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[24])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[25])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[26])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[27])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[28])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[29])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[30])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_3[31]))
+#endif
                                     : "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 32));
+#if __CUDA_ARCH__ == 1030
+                                const float2 _scale2_8 = {acc_scale_p_1, acc_scale_p_1};
+#else
                                 const float2 _scale2_5 = {acc_scale_p_1, acc_scale_p_1};
+#endif
                                 #pragma unroll
+#if __CUDA_ARCH__ == 1030
+                                for (int _ls = 0; _ls < 8; _ls++)
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_6)[_ls], _scale2_8);
+#else
                                 for (int _ls = 0; _ls < 16; _ls++)
                                     mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_3)[_ls], _scale2_5);
+#endif
                                 asm volatile(
+#if __CUDA_ARCH__ == 1030
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 32), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_6[15])));
+                                float o_half_7[16];
+                                asm volatile(
+                                    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32"
+                                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16], 64;"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[1])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[2])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[3])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[4])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[5])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[6])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[7])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[8])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[9])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[10])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[11])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[12])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[13])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[14])), "=r"(*reinterpret_cast<uint32_t*>(&o_half_7[15]))
+                                    : "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 48));
+                                const float2 _scale2_9 = {acc_scale_p_1, acc_scale_p_1};
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 8; _ls++)
+                                    mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(o_half_7)[_ls], _scale2_9);
+                                asm volatile(
+                                    "tcgen05.st.sync.aligned.16x32bx2.x16.b32"
+                                    " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 48), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_7[15])));
+#else
                                     "tcgen05.st.sync.aligned.16x32bx2.x32.b32"
                                     " [%0], 64, {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
                                     :: "r"(taddr + (unsigned int)384 + (unsigned int)row_lf + 32), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[0])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[1])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[2])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[3])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[4])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[5])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[6])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[7])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[8])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[9])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[10])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[11])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[12])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[13])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[14])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[15])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[16])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[17])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[18])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[19])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[20])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[21])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[22])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[23])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[24])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[25])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[26])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[27])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[28])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[29])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[30])), "r"(*reinterpret_cast<const uint32_t*>(&o_half_3[31])));
+#endif
                                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                             }
                             asm volatile("tcgen05.fence::before_thread_sync;");
