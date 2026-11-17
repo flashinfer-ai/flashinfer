@@ -66,6 +66,8 @@ gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 sdsa_gather_key_sample_page_size64_dim128.json
 sdsa_group_union_masks_top_k2048.json
+sdsa_gather_nvfp4_kv_cache_by_position_heads1_ps64_pd128_sd16_k512_one1_cd512_sides2.json
+sdsa_compact_nvfp4_kv_cache_heads1_ps64_pd128_sd16_k512_one1_cd512_sides2.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
@@ -3764,6 +3766,48 @@ group_union_masks.fi_trace(
     union_sizes=torch.empty(2, dtype=torch.int32),
     mask=torch.empty(8, 256, dtype=torch.int32),
     num_keys=16384,
+)
+
+# Selected NVFP4 KV tokens to FP8 for token-sparse attention, from key positions.
+from flashinfer.sdsa.token_sparse import (
+    compact_nvfp4_kv_cache,
+    gather_nvfp4_kv_cache_by_position,
+)
+
+_nvfp4_kv = dict(
+    paged_kv_cache=tuple(
+        torch.empty(4, 1, 64, 128, dtype=torch.uint8) for _ in range(2)
+    ),
+    kv_cache_sf=tuple(
+        torch.empty(4, 1, 64, 16, dtype=torch.float8_e4m3fn) for _ in range(2)
+    ),
+    positions=torch.empty(2, 512, dtype=torch.int32),
+    block_table=torch.empty(2, 4, dtype=torch.int32),
+    out=torch.empty(1025, 1, 1, 512, dtype=torch.float8_e4m3fn),
+    block_tables=torch.empty(2, 2, 512, dtype=torch.int32),
+    seq_lens=torch.empty(2, dtype=torch.int32),
+)
+
+gather_nvfp4_kv_cache_by_position.fi_trace(
+    save_dir=SAVE_DIR,
+    requests=torch.arange(2, dtype=torch.int32),
+    requests_per_row=1,
+    **_nvfp4_kv,
+)
+
+compact_nvfp4_kv_cache.fi_trace(
+    save_dir=SAVE_DIR,
+    row_groups=torch.zeros(2, dtype=torch.int32),
+    group_requests=torch.zeros(1, dtype=torch.int32),
+    group_offsets=torch.zeros(1, dtype=torch.int64),
+    scratch=torch.empty(1155, dtype=torch.int32),
+    bitmap=torch.zeros(129, dtype=torch.int32),
+    max_keys=4096,
+    max_capacity=1024,
+    zero_row=1024,
+    group_base=0,
+    requests_per_row=1,
+    **_nvfp4_kv,
 )
 
 # ── SDSA (Simplified DSA) indexer ─────────────────────────────────────────────
