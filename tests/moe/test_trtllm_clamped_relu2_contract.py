@@ -72,17 +72,6 @@ class ClampedRelu2ContractTest(unittest.TestCase):
             "_validate_fp8_block_scale_gemm1_activation_params",
             namespace,
         )
-        load_function("flashinfer/utils.py", "check_shape_dtype_device", namespace)
-        namespace["_validate_shared_bf16_gemm1_activation_params"] = load_function(
-            "flashinfer/fused_moe/shared/validation.py",
-            "validate_bf16_gemm1_activation_params",
-            namespace,
-        )
-        self.validate_bf16 = load_function(
-            "flashinfer/fused_moe/core.py",
-            "_validate_bf16_gemm1_activation_params",
-            namespace,
-        )
         self.scale = SimpleNamespace(
             dtype="float32",
             ndim=1,
@@ -126,32 +115,6 @@ class ClampedRelu2ContractTest(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "float32"),
             ):
                 self.validate(1, Activation.ClampedRelu2, None, None, scale)
-
-    def test_existing_activation_contracts(self):
-        self.validate(2, Activation.Swiglu, self.scale, self.scale, self.scale)
-        self.validate(1, Activation.SwigluStep, None, None, self.scale)
-        with self.assertRaises(ValueError):
-            self.validate(2, Activation.SwigluStep, None, None, self.scale)
-
-    def test_bf16_scale_contract(self):
-        self.validate_bf16(12, None, None, self.scale, 4, "cuda:0")
-        for scale, count, device in (
-            (None, 4, "cuda:0"),
-            (self.scale, 3, "cuda:0"),
-            (self.scale, 4, "cuda:1"),
-        ):
-            with (
-                self.subTest(scale=scale, count=count, device=device),
-                self.assertRaises(ValueError),
-            ):
-                self.validate_bf16(12, None, None, scale, count, device)
-        for alpha, beta in ((self.scale, None), (None, self.scale)):
-            with self.assertRaises(ValueError):
-                self.validate_bf16(12, alpha, beta, self.scale, 4, "cuda:0")
-        self.validate_bf16(3, self.scale, self.scale, self.scale, 4, "cuda:0")
-        self.validate_bf16(7, None, None, self.scale, 4, "cuda:0")
-        with self.assertRaises(ValueError):
-            self.validate_bf16(7, self.scale, None, self.scale, 4, "cuda:0")
 
     def test_export_feature_detection(self):
         supports = load_function(

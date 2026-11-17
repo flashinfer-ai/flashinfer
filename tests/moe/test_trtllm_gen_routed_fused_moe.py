@@ -1344,11 +1344,10 @@ def test_trtllm_gen_routed_activation_parity(
             gemm1_weights, gemm2_weights, hidden_states
         )
         quant_inputs = quant_impl.quantize_inputs(hidden_states)
-        epilogue_tile_m = 128
     else:
         quant_weights = {"gemm1_weights": gemm1_weights, "gemm2_weights": gemm2_weights}
         quant_inputs = {"hidden_states": hidden_states}
-        epilogue_tile_m = 128
+    epilogue_tile_m = 128
     w13_rows = (2 if is_gated else 1) * intermediate_size
     gemm1_weights_shuffled = []
     gemm1_scales_shuffled = []
@@ -1501,9 +1500,10 @@ def test_trtllm_gen_routed_activation_parity(
             run_routed(gemm1_clamp_limit=None)
         with pytest.raises(ValueError, match="float32"):
             run_routed(gemm1_clamp_limit=clamp_limit.bfloat16())
-        with pytest.raises(ValueError, match="accepts gemm1_clamp_limit only"):
-            run_routed(gemm1_alpha=clamp_limit)
-        with pytest.raises(Exception, match="shape"):
+        for parameter in ("gemm1_alpha", "gemm1_beta"):
+            with pytest.raises(ValueError, match="accepts gemm1_clamp_limit only"):
+                run_routed(**{parameter: clamp_limit})
+        with pytest.raises((ValueError, RuntimeError), match="shape"):
             run_routed(gemm1_clamp_limit=clamp_limit[:-1])
 
         def reference():
