@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .generator import CLUSTERS, SWIZZLES, Knobs, enumerate_space  # noqa: F401  (re-exported)
-from .spec import FP8_BLOCKSCALE_FMTS, chunk_unit
+from .spec import FP8_BLOCKSCALE_FMTS, MX_MIXED_FMTS, chunk_unit
 
 GemmConfig = Knobs
 
@@ -38,6 +38,12 @@ RANK_CACHE_TOPK = 10
 SPLIT_MIN_CTAS = 256  # below this many N tiles at 32 wide, a K split is considered
 SPLIT_MAX_CHUNKS = 128
 SPLIT_MIN_KC = 256  # elements of K per chunk at least
+# the mixed classes' chunk rule: the MX rule with a lower bound of MIXED_SPLIT_MIN_CHUNKS chunks for narrow, long weights -- at most
+# MIXED_SPLIT_MAX_N columns (so few weight tiles that the unsplit kernel runs on a fraction of the part) and at least MIXED_SPLIT_MIN_K
+# elements of K in whole runs of MIXED_SPLIT_MIN_CHUNKS granules; declared empirical, the same on every part, a function of (N, K) only
+MIXED_SPLIT_MAX_N = 512
+MIXED_SPLIT_MIN_K = 16384
+MIXED_SPLIT_MIN_CHUNKS = 8
 
 
 def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
@@ -48,8 +54,10 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     specification) and >= SPLIT_MIN_KC; and no split at all when N alone gives enough CTAs. Because the rule takes no
     M, a narrow weight runs the chunked class at every M, large prefills included (the fp32 partial round trip is then
     a bounded fraction of the operand traffic). An empty weight (N = 0) has no split, as the Lean mirror's natural-number
-    division gives. Mirrored by ``BIK.GEMM.chunksFor`` / ``chunksForFp8`` in Lean (checked by the generated conformance
-    cases)."""
+    division gives. The mixed classes raise the count to a lower bound of ``MIXED_SPLIT_MIN_CHUNKS`` for narrow, long weights
+    (``N <= MIXED_SPLIT_MAX_N``, ``K >= MIXED_SPLIT_MIN_K`` in whole runs of that many granules); the block-scale fp8 class has no
+    split variant. Mirrored by ``BIK.GEMM.chunksFor`` / ``chunksForFp8`` / ... / ``chunksForMxW48`` in Lean (checked by the
+    generated conformance cases)."""
     if in_fmt in FP8_BLOCKSCALE_FMTS:
         return 1  # the block-scale class has no split variant: its block fold already partitions K
     step = chunk_unit(
@@ -65,17 +73,28 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
         and K // (C * 2) >= SPLIT_MIN_KC
     ):
         C *= 2
+    if (
+        in_fmt in MX_MIXED_FMTS
+        and N <= MIXED_SPLIT_MAX_N
+        and K >= MIXED_SPLIT_MIN_K
+        and K % (MIXED_SPLIT_MIN_CHUNKS * step) == 0
+    ):
+        C = max(C, MIXED_SPLIT_MIN_CHUNKS)
     return C
 
 
 #: The sm_107 instructions' classes of the MX formats (the sm_100 / sm_103 instructions' classes elsewhere).
-MX_SM107_CLASS = {"mxfp8": "mxfp8_k64", "mxfp4": "mxfp4_k128"}
+MX_SM107_CLASS = {
+    "mxfp8": "mxfp8_k64",
+    "mxfp4": "mxfp4_k128",
+    "mxfp4w8a": "mxfp4w8a_k64",
+}
 
 
 def mx_class_for(base: str, family: Optional[str]) -> str:
     """The MX class a part runs for an MX format: the sm_107 instruction's class (64 elements per step for mxfp8,
-    ``mxfp8_k64``; 128 for mxfp4, ``mxfp4_k128``) on the sm_107 parts, the sm_100 instruction's class (``mxfp8`` /
-    ``mxfp4``) elsewhere. A function of the architecture family only (the fingerprint is scoped to the architecture),
+    ``mxfp8_k64``, and for the mixed pair, ``mxfp4w8a_k64``; 128 for mxfp4, ``mxfp4_k128``) on the sm_107 parts, the
+    sm_100 instruction's class (``mxfp8`` / ``mxfp4`` / ``mxfp4w8a``) elsewhere. A function of the architecture family only (the fingerprint is scoped to the architecture),
     never of the shape."""
     return MX_SM107_CLASS.get(base, base) if family == "sm_107" else base
 

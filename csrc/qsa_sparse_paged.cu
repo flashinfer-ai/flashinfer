@@ -13,11 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "qsa_nvfp4_attention.cuh"
+#include <flashinfer/attention/qsa_sparse_paged.cuh>
+
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
-using qsa_nvfp4::KvFormat;
+using qsa_sparse_paged::KvFormat;
 using tvm::ffi::Optional;
 
 template <typename Fn>
@@ -36,11 +37,12 @@ cudaError_t dispatch_format(int64_t kv_format, Fn&& fn) {
 
 // Inputs are validated by the Python API; this only forwards pointers, strides and sizes.
 // kv_format is 0 (NVFP4, with k_sf / v_sf), 1 (FP8-e4m3) or 2 (BF16).
-void run(TensorView q, TensorView k_data, TensorView v_data, Optional<TensorView> k_sf,
-         Optional<TensorView> v_sf, TensorView indices, TensorView block_table,
-         TensorView token_to_req, TensorView gate, TensorView out, double score_scale,
-         double output_scale, int64_t kv_format, int64_t num_splits) {
-  qsa_nvfp4::Params p;
+void QsaSparsePagedAttentionRun(TensorView q, TensorView k_data, TensorView v_data,
+                                Optional<TensorView> k_sf, Optional<TensorView> v_sf,
+                                TensorView indices, TensorView block_table, TensorView token_to_req,
+                                TensorView gate, TensorView out, double score_scale,
+                                double output_scale, int64_t kv_format, int64_t num_splits) {
+  qsa_sparse_paged::Params p;
   const int64_t element_bytes = get_element_size(k_data);
   p.q = static_cast<const nv_bfloat16*>(q.data_ptr());
   p.k_data = static_cast<const uint8_t*>(k_data.data_ptr());
@@ -90,24 +92,23 @@ void run(TensorView q, TensorView k_data, TensorView v_data, Optional<TensorView
     p.partial_lse = static_cast<float*>(partial_lse.value().data_ptr());
   }
   const cudaError_t status = dispatch_format(kv_format, [&](auto format) {
-    constexpr uint32_t kTileTokens = qsa_nvfp4::KvTraits<decltype(format)::value>::kTileTokens;
+    constexpr uint32_t kTileTokens =
+        qsa_sparse_paged::KvTraits<decltype(format)::value>::kTileTokens;
     p.num_tiles = (p.topk + kTileTokens - 1) / kTileTokens;
-    return qsa_nvfp4::SparsePagedAttention<decltype(format)::value>(p, get_stream(q.device()));
+    return qsa_sparse_paged::SparsePagedAttention<decltype(format)::value>(p,
+                                                                           get_stream(q.device()));
   });
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "QSA sparse paged attention failed: " << cudaGetErrorString(status);
 }
 
 // Resident attention CTAs per SM of the current device, for sizing splits.
-int64_t ctas_per_sm(int64_t kv_format) {
+int64_t QsaSparsePagedAttentionCtasPerSm(int64_t kv_format) {
   int num_ctas = 0;
   const cudaError_t status = dispatch_format(kv_format, [&](auto format) {
-    return qsa_nvfp4::CtasPerSm<decltype(format)::value>(&num_ctas);
+    return qsa_sparse_paged::CtasPerSm<decltype(format)::value>(&num_ctas);
   });
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "QSA sparse paged attention occupancy failed: " << cudaGetErrorString(status);
   return num_ctas;
 }
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, run);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(ctas_per_sm, ctas_per_sm);
