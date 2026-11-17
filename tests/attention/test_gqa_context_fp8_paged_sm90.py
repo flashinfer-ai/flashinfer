@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import math
 
 import pytest
@@ -293,7 +294,6 @@ def _plan_wrapper(
     q_data_type=torch.float8_e4m3fn,
     num_qo_heads=H_QO,
 ):
-    B = batch["seq_lens"].numel()
     ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
     kwargs = {}
     if use_cuda_graph:
@@ -426,10 +426,9 @@ def test_auto_routes_to_specialized_on_the_allowlist_only():
     _reset_gqa_ctx_fp8q_sm90_stats()
     batch4 = _make_batch([5, 7], [584, 75], device)
     batch4["q"] = batch4["q"][:, :4, :].contiguous()
-    try:
+    # stock auto may reject fp8-Q; it must simply never arm us
+    with contextlib.suppress(Exception):
         _plan_wrapper(batch4, device, backend="auto", num_qo_heads=4)
-    except Exception:
-        pass  # stock auto may reject fp8-Q; it must simply never arm us
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["plans_prepared"] == 0, stats
     assert any(r.startswith("auto:") for r in stats["fallback_reasons"]), stats
