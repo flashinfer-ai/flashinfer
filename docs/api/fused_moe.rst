@@ -229,6 +229,29 @@ The old ``flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm`
 imports are compatibility aliases for one release after graduation. The separate
 ``cudnn_frost_grouped_gemm1_swiglu`` API remains experimental.
 
+Specialized backend
+~~~~~~~~~~~~~~~~~~~
+
+``SpecializedMoEConfig`` is the backend of MoE kernels generated for one served
+configuration each: a model's expert geometry, routing, quantization and token
+counts on one GPU architecture. Each kernel registers automatically as a
+subpackage of ``flashinfer/fused_moe/backends/specialized/kernels/`` and reads the
+weight view of the backend whose data path it computes, so the default backend
+list includes it at no preparation cost. ``MoELayer`` binds the kernels that
+serve its configuration, runs every other call on its other candidates, and
+times a call a kernel admits against them like any candidate. A kernel is built
+for a device by the first eager call it admits; the first call of a token count
+under CUDA Graph capture runs on another candidate.
+``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` keeps every call on the other
+candidates. ``flashinfer.fused_moe.backends.specialized.registered_kernels()``
+lists the kernels and ``flashinfer.fused_moe.backends.specialized.stats()``
+returns their diagnostics.
+
+.. autosummary::
+    :toctree: ../generated
+
+    SpecializedMoEConfig
+
 Utility Functions
 -----------------
 

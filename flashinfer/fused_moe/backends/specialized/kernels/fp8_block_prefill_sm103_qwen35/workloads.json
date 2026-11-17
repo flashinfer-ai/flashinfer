@@ -1,0 +1,11 @@
+{
+  "op": "MoELayer specialized backend, kernel fp8_block_prefill_sm103_qwen35",
+  "path": "FP8 block-scale MoE prefill on SM103 (CuTe DSL); geometry fixed in kernel.py",
+  "compute_capability": [10, 3],
+  "num_tokens": {
+    "min": 1792,
+    "max": 32768,
+    "exclude": []
+  },
+  "note": "Calls with min <= num_tokens <= max (and not in exclude) are admitted; the compiled programs take the token count at run time, so the range costs no extra compilation. Trim min/max/exclude to the kernel-level A/B win surface (every serving bucket in the range timed against the autotuned trtllm-gen path)."
+}

@@ -988,6 +988,53 @@ b12x runners keep their flat-proven activation subsets. Weight preparation
 derives GEMM1 rows from `activation.is_gated` across backends (`2I` gated, `I`
 non-gated) and forwards the gated mode into TRTLLM row permutations.
 
+### Specialized backend (`specialized`)
+
+`SpecializedMoEConfig()` is the one backend for MoE kernels generated for a
+single served configuration: a model's expert geometry, routing, quantization and
+token counts on one GPU architecture (for example by a kernel-generation workflow
+from serving logs). Such a kernel is a fused fast path for that configuration
+only, so it does not get a backend of its own; it registers as a kernel of this
+backend.
+
+- **Registration.** Each kernel is a self-contained subpackage of
+  `flashinfer/fused_moe/backends/specialized/kernels/` that exports `KERNEL`, a
+  `SpecializedMoEKernel` subclass (`backends/specialized/kernel.py`) named after
+  the subpackage. The subpackage holds the kernel's configuration guard, per-call
+  guard, token-count allowlist (package data), lazy per-device build, launch and
+  diagnostics; its CUDA or CuTe DSL sources stay in the usual places (`csrc/`,
+  `flashinfer/jit/`, `flashinfer/fused_moe/cute_dsl/`).
+  `backends/specialized/registry.py` finds the subpackages, so adding a kernel
+  edits no shared file. `registered_kernels()` lists them, `stats()` returns
+  their diagnostics, and kernels with AOT modules hand them to `flashinfer.aot`
+  through the registry.
+- **Selection.** `SpecializedMoEConfig.supported(arch)` is true when a registered
+  kernel runs on that architecture. At `MoELayer` construction the runner
+  (`SpecializedMoERunner`) binds every kernel whose declarations (quantization
+  pair, output format, activation class, routing modes, expert parallelism,
+  fused shared experts) and configuration guard admit the layer's configuration;
+  with none bound, the layer skips the backend. The runner's class declarations
+  are the union of the registered kernels', so the backend is left out of the
+  generated activation matrix above, which lists backends whose capabilities are
+  fixed in code.
+- **Weights and numerics.** A kernel reads the weight view of the backend whose
+  data path it computes (for example `trtllm_bf16_routed` or
+  `trtllm_fp8_block`), so a default `MoELayer` needs no extra preparation, and it
+  keeps that backend's roundings and fp32 accumulation.
+- **Per call.** `accepts()` asks the bound kernels in name order and the first
+  that admits the call runs it. A call no kernel admits (token count outside its
+  allowlist, tensor layout, device) runs on the other candidates; an admitted
+  call is timed against them by `MoELayer` like any candidate, so the backend
+  serves a bucket only where it is faster.
+- **Build and CUDA graphs.** A kernel is built for a device by the first eager
+  call it admits, never at import or construction. Under CUDA-graph capture a
+  call is admitted only when the kernel is built and the layer already admitted
+  that token count eagerly, so its winner was timed outside capture; otherwise,
+  including the first call of a token count under capture, the call is captured
+  on another candidate. Nothing is built or timed inside a capture.
+- **Kill switch.** `FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`, read at call time,
+  keeps every call on the other candidates.
+
 ### Today's MVP Cut
 
 This is the May 27, 2026 working slice (executed May 31, 2026). It should improve the current PR without expanding it beyond NVFP4, CuteDSL plus TRTLLM-Gen, pre-routed inputs, cross-backend autotune, CUDA graph tests, and benchmark evidence.
