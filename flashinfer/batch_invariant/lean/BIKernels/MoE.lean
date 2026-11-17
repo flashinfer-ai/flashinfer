@@ -433,12 +433,12 @@ theorem grouped_tile_reset (cfg : GEMM.Config) (S : Nat) (prev₁ prev₂ : GEMM
 
 /-! ## The swapped records: a second placement space of the grouped GEMM
 
-The swapped body (`fused_moe/batch_invariant/blocks/swap_bf16.py`) computes `Cᵀ` per expert: the expert's weight rows on the
+The swapped body (`fused_moe/batch_invariant/blocks/swap.py`) computes `Cᵀ` per expert: the expert's weight rows on the
 MMA's M side (128 rows per CTA, or 64) and the group's tokens on its N side as a narrow tile of 8 / 16 / 32 rows. The tcgen05 step
 folds the same K sequence per output element whichever operand carries the token, so every output element is the dense
 class's `kfold` of the row's data and the expert's column: the swapped records are placements (`groupedRow` erases the
 orientation with the grouping), and the dispatcher ranks them with the grouped records. The predicate mirrors
-`blocks/swap_bf16.is_swapped_record`; the space is the three token tiles of the 128-row weight tile and the two wider ones of
+`blocks/swap.is_swapped_record` at the bf16 format; the space is the three token tiles of the 128-row weight tile and the two wider ones of
 the 64-row tile. -/
 
 /-- A swapped record of the bf16 classes: the swapped 1-CTA record at 128 weight rows and a narrow token tile (8 / 16 / 32) or

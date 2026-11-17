@@ -112,6 +112,10 @@ from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cutedsl import (
     Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync import (
+    Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights,
+)
 from .backends.mega.kernel.sm120.mxfp8_mxfp8_bf16_cutedsl import (
     Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm120_mxfp8_cutedsl_mega_weights,
@@ -236,7 +240,7 @@ from .core.validation import (
     validate_mega_forward_inputs,
     validate_split_forward_inputs,
 )
-from .layer import MoEEpLayer
+from .layer import MoEEpLayer, MoEEpNosyncLayer, NosyncOptions
 from .modes import (
     AutoConfig,
     MoEEpAutoLayer,
@@ -268,6 +272,8 @@ from .weights import (
 )
 
 __all__ = [
+    "Sm107SharedExpertConfig",
+    "Sm107SharedExpertWeights",
     "AutoConfig",
     "MoEEpAutoLayer",
     "MoEEpAutoWorkspace",
@@ -323,6 +329,7 @@ __all__ = [
     "MoEEpDispatchResult",
     "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
+    "MoEEpNosyncLayer",
     "MoEEpMegaLayer",
     "MoEEpMegaWorkspace",
     "MoEEpNotBuiltError",
@@ -360,6 +367,8 @@ __all__ = [
     "Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig",
+    "NosyncOptions",
     "Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "TransformedCakeMegaWeights",
     "TransformedCakeW8a8MegaWeights",
@@ -389,6 +398,7 @@ __all__ = [
     "preprocess_sm103_mxfp8_cake_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cake_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights",
+    "preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",
     "preprocess_sm107_mxfp4_mega_weights",
     "preprocess_sm107_mxfp8_mega_weights",
@@ -540,4 +550,9 @@ from .backends.split.comm.cake.communication import (  # noqa: E402
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
     NVLinkTwoSidedAlltoAll,
+)
+
+from .backends.mega.kernel.sm107.shared_expert import (
+    Sm107SharedExpertConfig,
+    Sm107SharedExpertWeights,
 )
