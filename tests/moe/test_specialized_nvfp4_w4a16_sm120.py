@@ -36,11 +36,12 @@ def _is_sm120_exactly():
     return torch.cuda.get_device_capability(0) == (12, 0)
 
 
-def _has_cuda_13_toolkit():
+def _has_cuda_13_1_toolkit():
     try:
         from flashinfer.jit.cpp_ext import get_cuda_version
 
-        return get_cuda_version().major >= 13
+        v = get_cuda_version()
+        return (v.major, v.minor) >= (13, 1)
     except Exception:
         return False
 
@@ -51,9 +52,9 @@ pytestmark = [
         reason="the specialized NVFP4-W4A16 MoE backend is SM120-only",
     ),
     pytest.mark.skipif(
-        not _has_cuda_13_toolkit(),
-        reason="the specialized backend JIT-builds an sm_120a module "
-        "(CUDA 13 toolkit required)",
+        not _has_cuda_13_1_toolkit(),
+        reason="the specialized backend JIT-builds an sm_120a module whose "
+        "cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.1-line ptxas",
     ),
     pytest.mark.skipif(
         not is_cute_dsl_available(),

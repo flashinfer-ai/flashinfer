@@ -26,7 +26,8 @@ Dispatch model (the ``backend`` kwarg of :func:`b12x_fused_moe`):
     the call cannot be served (this module has no composable fallback of
     its own; nothing is silently swapped to another fused backend).
   * ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the backend
-    entirely (``auto`` behaves as stock; explicit "specialized" raises).
+    entirely (``auto`` behaves as stock; explicit "specialized" raises;
+    :func:`warmup` refuses without loading or launching the module).
 
 Guard order: GPU-free checks (kill switch, geometry, dtypes, allowlist)
 -> layout checks (shapes, contiguity, alignment) -> device checks
@@ -42,9 +43,18 @@ float32 [E]``; same pattern for ``w2``.
 CUDA-graph contract: call :func:`warmup` (largest T first) on the capture
 stream before capturing — the module keeps a process-global workspace
 (cudaMalloc growth) and synchronizes on stream transitions, both illegal
-inside capture; the guard refuses capture until warmup has run. The T=1
-path uses a cooperative launch (stream-capturable; verified). All
-launches go to the caller's current stream, re-queried per call.
+inside capture; the guard refuses capture until warmup has run, when the
+captured token count exceeds the largest token count already run on the
+device (``graph_capture_token_count_exceeds_warmed``), and when the
+capture stream or device differs from the one the backend last ran on
+(``graph_capture_stream_mismatch`` — re-run :func:`warmup` on the capture
+stream). Replay is single-flight: captured graphs bake the shared
+process-global workspace addresses in, so two captured graphs must not
+replay concurrently, and the workspace must not grow (no call with a
+larger token count, on another device) while a captured graph may still
+be replayed. The T=1 path uses a cooperative launch (stream-capturable;
+verified). All launches go to the caller's current stream, re-queried
+per call.
 """
 
 import collections
@@ -71,7 +81,19 @@ ENV_DISABLE = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 dispatch_stats: collections.Counter = collections.Counter()
 fallback_reasons: collections.deque = collections.deque(maxlen=64)
 
-_warmed = {"done": False}
+# Warmup / last-run state for the CUDA-graph capture guard: the largest
+# token count run per current device (the process-global workspace grows
+# monotonically with it) and the stream/device of the last backend run.
+_warmed = {"done": False, "max_t": 0, "device": None, "stream": None}
+
+
+def _note_run(device: torch.device, t: int) -> None:
+    if _warmed["device"] != device:
+        # The native workspace is freed and re-created on a device change.
+        _warmed["max_t"] = 0
+    _warmed["device"] = device
+    _warmed["stream"] = torch.cuda.current_stream(device).cuda_stream
+    _warmed["max_t"] = max(_warmed["max_t"], t)
 
 
 def _disabled() -> bool:
@@ -114,6 +136,9 @@ def specialized_support_reasons(
     num_experts: int,
     top_k: int,
     *,
+    w1_alpha: Optional[torch.Tensor] = None,
+    w2_alpha: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
     activation: str = "relu2",
     quant_mode: Optional[str] = "w4a16",
     source_format: str = "modelopt",
@@ -179,20 +204,85 @@ def specialized_support_reasons(
         )
     ):
         reasons.append("non_contiguous")
-    if not all(
+    # The activation vector loads (all paths) need 32-byte alignment; the
+    # weight/scale loads need 16.
+    if x.data_ptr() % 32 != 0 or not all(
         t.data_ptr() % 16 == 0
-        for t in (x, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf)
+        for t in (w1_weight, w1_weight_sf, w2_weight, w2_weight_sf)
     ):
         reasons.append("alignment")
+    for name, a in (("w1_alpha", w1_alpha), ("w2_alpha", w2_alpha)):
+        if a is not None and (
+            a.dtype != torch.float32 or a.shape != (E,) or not a.is_contiguous()
+        ):
+            reasons.append(f"{name}_layout")
+    if output is not None and (
+        output.dtype != torch.bfloat16
+        or output.shape != (T, H)
+        or not output.is_contiguous()
+        or output.data_ptr() % 16 != 0
+    ):
+        reasons.append("output_layout")
+    devices = {
+        t.device
+        for t in (
+            x,
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_alpha,
+            w2_alpha,
+            output,
+        )
+        if t is not None
+    }
+    if len(devices) != 1:
+        reasons.append("device_mismatch")
     if reasons:
         return False, reasons
     # --- device checks
     if list(torch.cuda.get_device_capability(x.device)) != _C["compute_capability"]:
         reasons.append("compute_capability")
+    # cvt.rn.bf16x2.e2m1x2 needs a CUDA >= 13.1-line ptxas (the shared b12x
+    # gate only requires CUDA 13); refuse here so ``auto`` keeps the stock
+    # path on a 13.0 toolkit instead of failing the JIT build.
+    try:
+        from ..jit.cpp_ext import get_cuda_version
+
+        _v = get_cuda_version()
+        if (_v.major, _v.minor) < (13, 1):
+            reasons.append(f"cuda_version:{_v.major}.{_v.minor}")
+    except Exception:  # noqa: BLE001
+        reasons.append("cuda_version:unknown")
     if _autotune_active():
         reasons.append("autotune_capture")
-    if _is_capturing() and not _warmed["done"]:
-        reasons.append("graph_capture_before_warmup")
+    if _is_capturing():
+        if not _warmed["done"]:
+            reasons.append("graph_capture_before_warmup")
+        else:
+            if _warmed["max_t"] < T:
+                # Larger T grows the process-global workspace (cudaMalloc),
+                # which is illegal inside capture.
+                reasons.append("graph_capture_token_count_exceeds_warmed")
+            if (
+                _warmed["device"] != x.device
+                or _warmed["stream"] != torch.cuda.current_stream(x.device).cuda_stream
+            ):
+                # The native runner synchronizes the previous stream on a
+                # stream/device transition, which is illegal inside capture.
+                # Re-run warmup on the capture stream.
+                reasons.append("graph_capture_stream_mismatch")
+    if not reasons:
+        # The module must be buildable/loadable (e.g. FLASHINFER_DISABLE_JIT
+        # with a cold JIT cache raises); record a refusal so ``auto`` falls
+        # back to the stock path instead of propagating a build error.
+        try:
+            _module()
+        except Exception as e:  # noqa: BLE001
+            reasons.append(f"module_unavailable:{type(e).__name__}")
     return not reasons, reasons
 
 
@@ -213,6 +303,7 @@ def run_specialized_moe_nvfp4_w4a16(
     tw = token_final_scales
     if tw.dtype != torch.float32:
         tw = tw.float()
+    _note_run(x.device, int(x.shape[0]))
     output.zero_()
     _module().run(
         x,
@@ -243,6 +334,11 @@ def warmup(
     each admitted shape once. Call BEFORE CUDA graph capture, on the
     stream that will be captured (largest T first keeps the workspace
     monotone)."""
+    if _disabled():
+        raise RuntimeError(
+            f"specialized NVFP4-W4A16 SM120 warmup refused: {ENV_DISABLE}=1 "
+            "disables the backend entirely"
+        )
     TOPK, H = _C["top_k"], _C["hidden_size"]
     for T in token_counts:
         if T not in _T_EXACT and T < _T_MIN_LARGE:
