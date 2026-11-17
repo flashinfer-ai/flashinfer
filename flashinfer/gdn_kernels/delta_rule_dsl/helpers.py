@@ -434,19 +434,26 @@ def _cuda_device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+class _TransientProbeError(RuntimeError):
+    """A probe failure that may succeed on retry (for example out of memory)."""
+
+
 def _build_nsmid_cubin(major: int, minor: int) -> bytes:
     # A CUBIN rather than PTX: PTX from an nvrtc newer than the driver fails to
     # JIT (CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
     from cuda.bindings import nvrtc
 
-    prog = _check_cuda(
-        nvrtc.nvrtcCreateProgram(_NSMID_SRC, b"nsmid_probe.cu", 0, [], [])
-    )
+    def check(res):
+        if res[0] == nvrtc.nvrtcResult.NVRTC_ERROR_OUT_OF_MEMORY:
+            raise _TransientProbeError(f"%nsmid probe compilation failed: {res[0]}")
+        return _check_cuda(res)
+
+    prog = check(nvrtc.nvrtcCreateProgram(_NSMID_SRC, b"nsmid_probe.cu", 0, [], []))
     try:
         opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
-        _check_cuda(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
-        cubin = b" " * _check_cuda(nvrtc.nvrtcGetCUBINSize(prog))
-        _check_cuda(nvrtc.nvrtcGetCUBIN(prog, cubin))
+        check(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+        cubin = b" " * check(nvrtc.nvrtcGetCUBINSize(prog))
+        check(nvrtc.nvrtcGetCUBIN(prog, cubin))
     finally:
         nvrtc.nvrtcDestroyProgram(prog)
     return cubin
@@ -454,10 +461,14 @@ def _build_nsmid_cubin(major: int, minor: int) -> bytes:
 
 @functools.cache
 def _compile_nsmid_probe(major: int, minor: int) -> tuple[bytes, Exception | None]:
-    # Compilation failures are deterministic, so they are cached as well and a
-    # broken toolchain is not recompiled on every prefill call.
+    # Deterministic compilation failures (a compile error, an unsupported
+    # architecture, missing cuda.bindings) are cached so a broken toolchain is
+    # not recompiled on every prefill call. A transient one (NVRTC out of
+    # memory) propagates uncached and is retried on the next call.
     try:
         return _build_nsmid_cubin(major, minor), None
+    except _TransientProbeError:
+        raise
     except Exception as e:  # noqa: BLE001 - re-raised by probe_device_nsmid
         return b"", e
 

@@ -30,9 +30,11 @@ def _skip_unless_nsmid_backend():
         pytest.skip("GDN prefill workspace sized by %nsmid on SM90 / SM12x only")
 
 
-def _tensormap_workspace(device, use_cp):
+def _tensormap_workspace(device, use_cp, name=None):
     """The cached workspace that this wrapper (arch, CP or not) indexes by %smid."""
-    if not use_cp:
+    if name is not None:
+        pass
+    elif not use_cp:
         name = "gdn_prefill_tensormaps"
     elif is_sm12x_supported(device):
         name = "gdn_cp_sm120_prefill_tensormaps"
@@ -90,6 +92,27 @@ def test_compile_failure_raises_and_is_not_recompiled(monkeypatch, fresh_nsmid_c
         with pytest.raises(RuntimeError, match="cannot size the GDN prefill"):
             get_device_nsmid(device)
     assert len(builds) == 1  # deterministic failure: compiled once, not per call
+
+
+def test_transient_compile_failure_is_retried(monkeypatch, fresh_nsmid_cache):
+    _skip_unless_nsmid_backend()
+    device = torch.device("cuda")
+    real_build = helpers._build_nsmid_cubin
+    builds = []
+
+    def flaky_build(major, minor):
+        builds.append((major, minor))
+        if len(builds) == 1:
+            raise helpers._TransientProbeError("simulated NVRTC_ERROR_OUT_OF_MEMORY")
+        return real_build(major, minor)
+
+    monkeypatch.setattr(helpers, "_build_nsmid_cubin", flaky_build)
+    with pytest.raises(RuntimeError, match="cannot size the GDN prefill"):
+        get_device_nsmid(device)
+    assert get_device_nsmid(device) >= (
+        torch.cuda.get_device_properties(device).multi_processor_count
+    )
+    assert len(builds) == 2  # retried after the transient failure, then cached
 
 
 def test_transient_launch_failure_is_retried(monkeypatch, fresh_nsmid_cache):
@@ -189,7 +212,13 @@ def test_first_prefill_call_under_capture(qkv_factory, dtype, use_cp):
     else:
         tol_o, tol_state = dict(atol=2e-3, rtol=1e-3), dict(atol=1e-3, rtol=1e-4)
 
+    nsmid = get_device_nsmid(device)
     workspace = _tensormap_workspace(device, use_cp)
+    assert workspace.numel() >= nsmid * 128  # one 128-byte store tail map per %smid
+    if is_sm12x_supported(device) and not use_cp:
+        # #9373's load-tail maps: two 128-byte descriptors per %smid.
+        load = _tensormap_workspace(device, use_cp, name="gdn_prefill_load_tensormaps")
+        assert load.numel() >= 2 * nsmid * 128
     for replay in range(REPLAYS):
         if replay:  # the graph must follow new input contents
             for dst, src in zip((q, k, v, alpha, beta), make_inputs(), strict=True):
