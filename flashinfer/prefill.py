@@ -9459,23 +9459,39 @@ def trtllm_batch_context_with_kv_cache(
         from .gqa_ctx_fp8_ikv_cuda import maybe_dispatch_specialized as _mds
 
         _specialized_out = _mds(
-            backend=backend, query=query, kv_cache=kv_cache,
-            block_tables=block_tables, seq_lens=seq_lens,
-            max_q_len=max_q_len, max_kv_len=max_kv_len,
-            bmm1_scale=bmm1_scale, bmm2_scale=bmm2_scale,
-            batch_size=batch_size, cum_seq_lens_q=cum_seq_lens_q,
-            cum_seq_lens_kv=cum_seq_lens_kv, out=out,
+            backend=backend,
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            batch_size=batch_size,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            out=out,
             extras=dict(
-                out_dtype=out_dtype, lse=lse, return_lse=return_lse,
-                sinks=sinks, kv_cache_sf=kv_cache_sf, o_sf_scale=o_sf_scale,
+                out_dtype=out_dtype,
+                lse=lse,
+                return_lse=return_lse,
+                sinks=sinks,
+                kv_cache_sf=kv_cache_sf,
+                o_sf_scale=o_sf_scale,
                 skip_softmax=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-                multi_ctas=multi_ctas_kv_counter_buffer, causal=causal,
-                kv_layout=kv_layout, window_left=window_left,
-                window_right=window_right, use_fp16_softmax=use_fp16_softmax,
+                multi_ctas=multi_ctas_kv_counter_buffer,
+                causal=causal,
+                kv_layout=kv_layout,
+                window_left=window_left,
+                window_right=window_right,
+                use_fp16_softmax=use_fp16_softmax,
                 uses_spcompress=uses_spcompress,
                 vw_starts=variable_window_token_starts,
-                vw_ends=variable_window_token_ends))
+                vw_ends=variable_window_token_ends,
+            ),
+        )
         if _specialized_out is not None:
             return _specialized_out
         backend = "trtllm-gen"
