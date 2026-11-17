@@ -45,6 +45,11 @@ import torch
 
 from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
+from ._quant_output import (
+    implied_quant_out_dtype,
+    prepare_out_scale,
+    quant_output_format,
+)
 from ._scales import (
     GlobalScale,
     fake_scale,
@@ -184,6 +189,8 @@ class _ContextPlanGeometry:
     # The plan's Sage recipe, part of the compile identity; ``None`` without
     # Sage attention.
     sage: SageAttentionConfig | None = None
+    # Block-scale dtype of a quantized output (``_quant_output.py``), or None.
+    out_scale_dtype: Optional[torch.dtype] = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +236,8 @@ class _PagedContextPlanGeometry:
     has_q_offset: bool
     paged_v_tail_is_zero: bool
     packed_dense_k_mask: bool
+    # Block-scale dtype of a quantized output (``_quant_output.py``), or None.
+    out_scale_dtype: Optional[torch.dtype] = None
 
 
 @dataclass(frozen=True)
@@ -292,6 +301,7 @@ class _ContextCompileSpec:
     scale_types: tuple[bool, bool] = (False, False)
     # A Sage plan's prepared scale layout; the kernel reads the scales.
     sage_scale_layout: _SageScaleLayout | None = None
+    out_scale_dtype_key: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -321,6 +331,7 @@ class _PagedContextCompileSpec:
     runtime_lengths: bool = False
     shape_signature: tuple[int, ...] = ()
     scale_types: tuple[bool, bool] = (False, False)
+    out_scale_dtype_key: Optional[str] = None
 
 
 def _make_context_kernel(
@@ -348,6 +359,7 @@ def _make_context_kernel(
     max_kv_len: int | None = None,
     vc_attention: str | None = None,
     sage_scale_layout: _SageScaleLayout | None = None,
+    out_sf_dtype=None,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -400,6 +412,7 @@ def _make_context_kernel(
             torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
         ),
         sage_scale_layout=sage_scale_layout,
+        out_sf_dtype=out_sf_dtype,
         **paged_kwargs,
     )
     return fmha
@@ -443,6 +456,7 @@ def _dtype_key(dtype: torch.dtype) -> str:
         # MXFP8 Q/K: float8_e4m3fn data with one E8M0 scale per 32 channels.
         torch.float8_e8m0fnu: "float8_e8m0fnu",
         torch.int8: "int8",
+        None: None,
     }
     try:
         return keys[dtype]
@@ -521,6 +535,30 @@ def _validate_context_dtype_pair(
             "attention-ts context requires Q, K, and V to use the same dtype "
             "except for QK-BF16/PV-FP8 and Int8 Q/K with E4M3 V; "
             f"got q_dtype={q_dtype} and v_dtype={v_dtype}"
+        )
+
+
+def _kernel_out_scale_dtype(geometry) -> Optional[torch.dtype]:
+    """The canonical scale dtype the kernel compiles for, or None.
+
+    Scale-dtype aliases of one format (such as uint8 for MXFP8) share it.
+    """
+    fmt = quant_output_format(geometry.out_dtype, geometry.out_scale_dtype)
+    return None if fmt is None else fmt.sf_dtype
+
+
+def _validate_quant_output(
+    q_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    out_scale_dtype: Optional[torch.dtype],
+) -> None:
+    """Validate the quantized output that ``out_scale_dtype`` selects."""
+    if quant_output_format(out_dtype, out_scale_dtype) is None:
+        return
+    if q_dtype == torch.float8_e8m0fnu:
+        raise NotImplementedError(
+            f"quantized output (out_scale_dtype={out_scale_dtype}) requires "
+            "16-bit or E4M3 Q/K; MXFP8 Q/K plans write a 16-bit output"
         )
 
 
@@ -1590,12 +1628,14 @@ def _make_context_scheduler_probe(
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
         torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
         torch.int8: cutlass.Int8,
+        None: None,
     }
     probe = _make_context_kernel(
         device_index=geometry.device_index,
         input_qk_dtype=dtype_map[geometry.qk_dtype],
         input_pv_dtype=dtype_map[geometry.pv_dtype],
         out_dtype=dtype_map[geometry.out_dtype],
+        out_sf_dtype=dtype_map[_kernel_out_scale_dtype(geometry)],
         head_dim=geometry.head_dim,
         head_dim_vo=getattr(geometry, "head_dim_vo", None),
         mask_type=geometry.mask_type,
@@ -1932,6 +1972,7 @@ def _context_compile_spec(
         qk_dtype_key=_dtype_key(geometry.qk_dtype),
         pv_dtype_key=_dtype_key(geometry.pv_dtype),
         out_dtype_key=_dtype_key(geometry.out_dtype),
+        out_scale_dtype_key=_dtype_key(_kernel_out_scale_dtype(geometry)),
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
         packed_query=geometry.packed_query,
@@ -1979,6 +2020,7 @@ def _paged_context_compile_spec(
         qk_dtype_key=_dtype_key(geometry.qk_dtype),
         pv_dtype_key=_dtype_key(geometry.pv_dtype),
         out_dtype_key=_dtype_key(geometry.out_dtype),
+        out_scale_dtype_key=_dtype_key(_kernel_out_scale_dtype(geometry)),
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
         head_paired=geometry.head_paired,
@@ -2031,12 +2073,15 @@ def _get_compiled_context(
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
 
+    from .kernels.quant_output import quant_output_format
+
     dtype_map = {
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
         "int8": cutlass.Int8,
         "float8_e8m0fnu": cutlass.Float8E8M0FNU,
+        None: None,
     }
     input_qk_dtype = dtype_map[qk_dtype_key]
     # MXFP8 Q/K names the E8M0 scale dtype; the Q and K tensors hold E4M3.
@@ -2045,6 +2090,7 @@ def _get_compiled_context(
     )
     input_pv_dtype = dtype_map[pv_dtype_key]
     out_dtype = dtype_map[out_dtype_key]
+    out_sf_dtype = dtype_map[compile_spec.out_scale_dtype_key]
     has_variable_window = mask_type == "variable_window"
     with torch.cuda.device(device_index):
         max_active_clusters = get_max_active_clusters(1)
@@ -2076,6 +2122,7 @@ def _get_compiled_context(
         if vc_attention
         else None,
         sage_scale_layout=sage_scale_layout,
+        out_sf_dtype=out_sf_dtype,
         # The QK8 K-scale table is sized from the K/V rows of the fixed plan.
         max_kv_len=_fixed_kv_rows(max_seq_len_k, compile_spec.vc) if vc_qk8 else None,
     )
@@ -2122,6 +2169,7 @@ def _get_compiled_context(
         k: cute.Tensor,
         v: cute.Tensor,
         out: cute.Tensor,
+        out_scale: cute.Tensor | None,
         lse: cute.Tensor | None,
         attention_sinks: cute.Tensor | None,
         softmax_scale: cutlass.Float32 | cute.Tensor,
@@ -2169,6 +2217,7 @@ def _get_compiled_context(
                 vc_repair_tiles=static_vc_repair_tiles,
                 lse_output=lse,
                 attention_sinks=attention_sinks,
+                o_sf=out_scale,
             )
         else:
             fmha(
@@ -2192,6 +2241,7 @@ def _get_compiled_context(
                 lse_output=lse,
                 attention_sinks=attention_sinks,
                 sage_scales=sage_scales,
+                o_sf=out_scale,
             )
 
     # Describe row-major symbolic extents; assumed_align is in bytes.
@@ -2232,7 +2282,15 @@ def _get_compiled_context(
     q_fake = fake_compact(qk_data_dtype, q_shape, 16)
     k_fake = fake_compact(qk_data_dtype, kv_shape, 16)
     v_fake = fake_compact(input_pv_dtype, (*kv_shape[:-1], head_dim_vo), 16)
+    # A quantized output adds one flat swizzled scale buffer whose size
+    # follows the token count.
+    quant_output = quant_output_format(out_dtype, out_sf_dtype)
     out_fake = fake_compact(out_dtype, out_shape, 16)
+    out_scale_fake = (
+        None
+        if quant_output is None
+        else fake_compact(cutlass.Uint8, (cute.sym_int(),), 16)
+    )
     lse_fake = (
         fake_compact(cutlass.Float32, out_fake.shape[:-1], 4)
         if compile_spec.lse_mode != "none"
@@ -2353,6 +2411,7 @@ def _get_compiled_context(
                 k_fake,
                 v_fake,
                 out_fake,
+                out_scale_fake,
                 lse_fake,
                 sinks_fake,
                 scale_fake,
@@ -2418,14 +2477,24 @@ def _get_compiled_paged_context(
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
 
+    from .kernels.quant_output import quant_output_format
+
     dtype_map = {
         "float16": cutlass.Float16,
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
+        # Block-scale dtype of a quantized output (kernels/quant_output.py).
+        "float8_e8m0fnu": cutlass.Float8E8M0FNU,
     }
     input_qk_dtype = dtype_map[qk_dtype_key]
     input_pv_dtype = dtype_map[pv_dtype_key]
     out_dtype = dtype_map[out_dtype_key]
+    out_sf_dtype = (
+        None
+        if compile_spec.out_scale_dtype_key is None
+        else dtype_map[compile_spec.out_scale_dtype_key]
+    )
+    quant_output = quant_output_format(out_dtype, out_sf_dtype)
     with torch.cuda.device(device_index):
         max_active_clusters = get_max_active_clusters(1)
     fmha = _make_context_kernel(
@@ -2452,6 +2521,7 @@ def _get_compiled_paged_context(
         umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
         page_size=page_size,
         max_kv_len=compile_spec.max_kv_len,
+        out_sf_dtype=out_sf_dtype,
     )
     fmha.cfg.lse_mode = compile_spec.lse_mode
     fmha.cfg.use_attention_sinks = compile_spec.use_attention_sinks
@@ -2479,6 +2549,7 @@ def _get_compiled_paged_context(
         k_cache: cute.Tensor,
         v_cache: cute.Tensor,
         out: cute.Tensor,
+        out_scale: cute.Tensor | None,
         lse: cute.Tensor | None,
         attention_sinks: cute.Tensor | None,
         softmax_scale: cutlass.Float32 | cute.Tensor,
@@ -2507,6 +2578,7 @@ def _get_compiled_paged_context(
             seq_lens_kv=seq_lens_kv,
             lse_output=lse,
             attention_sinks=attention_sinks,
+            o_sf=out_scale,
         )
 
     # Describe compact metadata or Q/O storage with byte-aligned pointers.
@@ -2542,6 +2614,11 @@ def _get_compiled_paged_context(
     k_fake = fake_paged_cache(input_qk_dtype)
     v_fake = fake_paged_cache(input_pv_dtype)
     out_fake = fake_compact(out_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
+    out_scale_fake = (
+        None
+        if quant_output is None
+        else fake_compact(cutlass.Uint8, (cute.sym_int(),), 16)
+    )
     lse_fake = (
         fake_compact(cutlass.Float32, out_fake.shape[:-1], 4)
         if compile_spec.lse_mode != "none"
@@ -2578,6 +2655,7 @@ def _get_compiled_paged_context(
                 k_fake,
                 v_fake,
                 out_fake,
+                out_scale_fake,
                 lse_fake,
                 sinks_fake,
                 scale_fake,
@@ -3003,6 +3081,7 @@ class BatchPrefillTSWrapper:
         k_dtype: torch.dtype,
         v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
+        out_scale_dtype: Optional[torch.dtype] = None,
         packed_query: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
@@ -3040,6 +3119,12 @@ class BatchPrefillTSWrapper:
         q_dtype=k_dtype=torch.float8_e8m0fnu selects MXFP8 Q/K: float8_e4m3fn data
         with one E8M0 scale per 32 channels, E4M3 V by default, fixed dense or causal
         plans only; every run then supplies q_scales and k_scales.
+        out_scale_dtype selects a quantized output together with out_dtype
+        (MXFP8: out_dtype=torch.float8_e4m3fn with out_scale_dtype
+        torch.float8_e8m0fnu or torch.uint8, one UE8M0 scale per 32 channels).
+        Block scales cover the [tokens, Hq * Dv] output view, swizzled 128x4
+        as mxfp8_quantize writes them; every run then also returns them. It
+        excludes MXFP8 Q/K, Sage and VC plans.
         """
 
         lse_mode = validate_lse_mode(lse_mode)
@@ -3098,7 +3183,10 @@ class BatchPrefillTSWrapper:
             raise NotImplementedError(
                 "VC-Attention does not support LSE or attention sinks"
             )
-        geometry = replace(geometry, vc=vc_config)
+        _validate_quant_output(geometry.qk_dtype, geometry.out_dtype, out_scale_dtype)
+        if vc_config is not None and out_scale_dtype is not None:
+            raise NotImplementedError("VC-Attention writes a 16-bit output")
+        geometry = replace(geometry, vc=vc_config, out_scale_dtype=out_scale_dtype)
         if softmax_scale is None:
             softmax_scale = geometry.head_dim**-0.5
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
@@ -3182,6 +3270,7 @@ class BatchPrefillTSWrapper:
         max_q_len: int | None = None,
         max_kv_len: int | None = None,
         out: Optional[torch.Tensor] = None,
+        out_scale: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -3190,7 +3279,7 @@ class BatchPrefillTSWrapper:
         vc: Optional[VCAttentionParams] = None,
         sage: Optional[SageAttentionParams] = None,
         validate: bool = True,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Launch the prepared contiguous attention with live request tensors.
 
         Uses the policy and compiled kernels prepared by plan(). Batch and query
@@ -3226,7 +3315,15 @@ class BatchPrefillTSWrapper:
         its per-channel V scale multiplies output_scale in the plan-owned buffer.
         MXFP8 plans require q_scales and k_scales, one 512-byte 128x4 scale atom per
         128-token tile and head as mxfp8_quantize_bshd writes them; other plans
-        reject them."""
+        reject them.
+
+        Quantized-output plans write the format's data to ``out`` and its block
+        scales to ``out_scale``: a contiguous buffer of the planned
+        out_scale_dtype with round_up(tokens, 128) * round_up(Hq * Dv /
+        sf_vec_size, 4) swizzled scales, where tokens is B * Sq or total_q (allocated flat when
+        omitted). They return (out, out_scale), or (out, out_scale, lse) with
+        return_lse=True. output_scale applies before quantization. Scale
+        padding is not written."""
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -3386,9 +3483,10 @@ class BatchPrefillTSWrapper:
                 vc_output_scale, output_scale, out=state.vc_output_scale
             )
 
+        out_shape = (*q.shape[:-1], geometry.head_dim_vo or geometry.head_dim)
         if out is None:
             out = torch.empty(
-                (*q.shape[:-1], geometry.head_dim_vo or geometry.head_dim),
+                out_shape,
                 dtype=geometry.out_dtype,
                 device=q.device,
             )
@@ -3399,6 +3497,14 @@ class BatchPrefillTSWrapper:
                 out_dtype=geometry.out_dtype,
                 head_dim_vo=geometry.head_dim_vo,
             )
+        out_scale, runtime_out_scale = prepare_out_scale(
+            out_scale,
+            out_shape=out_shape,
+            out_dtype=geometry.out_dtype,
+            out_scale_dtype=geometry.out_scale_dtype,
+            device=q.device,
+            validate=validate,
+        )
         lse = prepare_lse(
             lse,
             q=q,
@@ -3424,6 +3530,7 @@ class BatchPrefillTSWrapper:
             k,
             v,
             out,
+            runtime_out_scale,
             lse,
             attention_sinks,
             softmax_scale,
@@ -3442,7 +3549,9 @@ class BatchPrefillTSWrapper:
             max_q_len,
             max_kv_len,
         )
-        return (out, lse) if return_lse else out
+        if out_scale is None:
+            return (out, lse) if return_lse else out
+        return (out, out_scale, lse) if return_lse else (out, out_scale)
 
 
 class BatchPrefillPagedTSWrapper:
@@ -3475,6 +3584,7 @@ class BatchPrefillPagedTSWrapper:
         k_dtype: torch.dtype,
         v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
+        out_scale_dtype: Optional[torch.dtype] = None,
         page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
         mask_type: Literal["dense", "causal"] = "dense",
         window_left: int = -1,
@@ -3500,7 +3610,8 @@ class BatchPrefillPagedTSWrapper:
         Tensor values must remain finite and positive; metadata validation never
         reads them back. Types specialize the kernel, while values and addresses
         do not. Softmax scales use natural-exponential units for either type.
-        Equivalent plans reuse policy and compiled-kernel caches."""
+        Equivalent plans reuse policy and compiled-kernel caches.
+        out_scale_dtype selects a quantized output as for BatchPrefillTSWrapper."""
 
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(use_attention_sinks, bool):
@@ -3536,6 +3647,8 @@ class BatchPrefillPagedTSWrapper:
             has_q_offset=has_q_offset,
             paged_v_tail_is_zero=paged_v_tail_is_zero,
         )
+        _validate_quant_output(geometry.qk_dtype, geometry.out_dtype, out_scale_dtype)
+        geometry = replace(geometry, out_scale_dtype=out_scale_dtype)
         if softmax_scale is None:
             softmax_scale = geometry.head_dim**-0.5
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
@@ -3578,13 +3691,14 @@ class BatchPrefillPagedTSWrapper:
         max_q_len: int | None = None,
         max_kv_len: int | None = None,
         out: Optional[torch.Tensor] = None,
+        out_scale: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
         softmax_scale: Optional[GlobalScale] = None,
         output_scale: Optional[GlobalScale] = None,
         validate: bool = True,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Launch packed-Q context with live offsets, page tables and KV lengths.
 
         Uses the policy and compiled kernels prepared by plan(). Batch and query
@@ -3625,7 +3739,10 @@ class BatchPrefillPagedTSWrapper:
         their contents before replay; captured floats remain fixed.
         Enabled attention_sinks is a compact CUDA FP32 [Hq]
         vector of finite or -inf natural-log sink logits after QK scaling, with zero
-        V contribution. Sink values and cache zero-tail promises are caller-owned."""
+        V contribution. Sink values and cache zero-tail promises are caller-owned.
+
+        Quantized-output plans also write ``out_scale`` (total_q token rows)
+        and return it after ``out``, as BatchPrefillTSWrapper.run describes."""
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -3672,9 +3789,21 @@ class BatchPrefillPagedTSWrapper:
         )
 
         if out is None:
-            out = torch.empty(tuple(q.shape), dtype=geometry.out_dtype, device=q.device)
+            out = torch.empty(
+                tuple(q.shape),
+                dtype=geometry.out_dtype,
+                device=q.device,
+            )
         elif validate:
             out = _prepare_out(out, q=q, out_dtype=geometry.out_dtype)
+        out_scale, runtime_out_scale = prepare_out_scale(
+            out_scale,
+            out_shape=tuple(q.shape),
+            out_dtype=geometry.out_dtype,
+            out_scale_dtype=geometry.out_scale_dtype,
+            device=q.device,
+            validate=validate,
+        )
         lse = prepare_lse(
             lse,
             q=q,
@@ -3693,6 +3822,7 @@ class BatchPrefillPagedTSWrapper:
             k_cache,
             v_cache,
             out,
+            runtime_out_scale,
             lse,
             attention_sinks,
             softmax_scale,
@@ -3703,7 +3833,9 @@ class BatchPrefillPagedTSWrapper:
             max_q_len,
             max_kv_len,
         )
-        return (out, lse) if return_lse else out
+        if out_scale is None:
+            return (out, lse) if return_lse else out
+        return (out, out_scale, lse) if return_lse else (out, out_scale)
 
 
 @flashinfer_experimental_api
@@ -3722,13 +3854,14 @@ def batch_prefill(
     output_scale: GlobalScale = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
     vc: Optional[VCAttentionParams] = None,
     vc_config: Optional[VCAttentionConfig] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     attention_sinks: Optional[torch.Tensor] = None,
     lse_mode: Literal["base2"] = "base2",
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Run one-shot fixed or packed-ragged task-scheduled context attention.
 
     Fixed tensors use ``[B, S, H, D]`` storage. Providing both cumulative
@@ -3769,16 +3902,24 @@ def batch_prefill(
         or a CUDA FP32 () or (1,) buffer with finite positive values.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
-        otherwise the query dtype.
+        otherwise the query dtype. With ``out_scale`` it is the quantized
+        data dtype, inferred from ``out_scale.dtype`` when omitted.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    out_scale : torch.Tensor, optional
+        Selects a quantized output and receives its block scales:
+        ``round_up(tokens, 128) * round_up(Hq * Dv / sf_vec_size, 4)``
+        swizzled scales of a supported scale dtype (MXFP8:
+        ``torch.float8_e8m0fnu`` or ``torch.uint8`` with
+        ``float8_e4m3fn`` output).
 
     Returns
     -------
     torch.Tensor
         The fixed or packed attention output.
 
-    ``return_lse=True`` returns ``(output, lse)``. ``lse_mode`` selects
+    ``return_lse=True`` returns ``(output, lse)``; a quantized output returns
+    ``(output, out_scale)`` or ``(output, out_scale, lse)``. ``lse_mode`` selects
     ``"base2"`` (the only supported base); it is used only when returning LSE
     or writing a caller-provided ``lse`` buffer.
 
@@ -3801,6 +3942,9 @@ def batch_prefill(
     resolved_out_dtype = (
         out.dtype if out_dtype is None and isinstance(out, torch.Tensor) else out_dtype
     )
+    if out_scale is not None:
+        # The scale buffer selects a quantized output with its own dtype.
+        resolved_out_dtype = implied_quant_out_dtype(out_dtype, out_scale)
     if resolved_out_dtype is None:
         if not isinstance(q, torch.Tensor):
             raise TypeError("q must be a torch.Tensor")
@@ -3849,6 +3993,7 @@ def batch_prefill(
         k_dtype=geometry.qk_dtype,
         v_dtype=geometry.pv_dtype,
         out_dtype=geometry.out_dtype,
+        out_scale_dtype=None if out_scale is None else out_scale.dtype,
         packed_query=geometry.packed_query,
         mask_type=mask_type,
         window_left=window_left,
@@ -3871,6 +4016,7 @@ def batch_prefill(
         max_q_len=geometry.max_q_len,
         max_kv_len=geometry.max_seq_len_k,
         out=out,
+        out_scale=out_scale,
         vc=vc,
         lse=lse,
         return_lse=return_lse,
@@ -3895,11 +4041,12 @@ def batch_prefill_with_paged_kv_cache(
     output_scale: GlobalScale = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     attention_sinks: Optional[torch.Tensor] = None,
     lse_mode: Literal["base2"] = "base2",
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Run one-shot packed-Q context attention over HND or NHD page pools.
 
     Q/output use ``[total_q, Hq, D]`` storage and K/V each use
@@ -3947,16 +4094,24 @@ def batch_prefill_with_paged_kv_cache(
         or a CUDA FP32 () or (1,) buffer with finite positive values.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
-        otherwise the query dtype.
+        otherwise the query dtype. With ``out_scale`` it is the quantized
+        data dtype, inferred from ``out_scale.dtype`` when omitted.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    out_scale : torch.Tensor, optional
+        Selects a quantized output and receives its block scales:
+        ``round_up(tokens, 128) * round_up(Hq * Dv / sf_vec_size, 4)``
+        swizzled scales of a supported scale dtype (MXFP8:
+        ``torch.float8_e8m0fnu`` or ``torch.uint8`` with
+        ``float8_e4m3fn`` output).
 
     Returns
     -------
     torch.Tensor
         The packed attention output.
 
-    ``return_lse=True`` returns ``(output, lse)``. ``lse_mode`` selects
+    ``return_lse=True`` returns ``(output, lse)``; a quantized output returns
+    ``(output, out_scale)`` or ``(output, out_scale, lse)``. ``lse_mode`` selects
     ``"base2"`` (the only supported base); it is used only when returning LSE
     or writing a caller-provided ``lse`` buffer.
 
@@ -3979,6 +4134,9 @@ def batch_prefill_with_paged_kv_cache(
     resolved_out_dtype = (
         out.dtype if out_dtype is None and isinstance(out, torch.Tensor) else out_dtype
     )
+    if out_scale is not None:
+        # The scale buffer selects a quantized output with its own dtype.
+        resolved_out_dtype = implied_quant_out_dtype(out_dtype, out_scale)
     if resolved_out_dtype is None:
         if not isinstance(q, torch.Tensor):
             raise TypeError("q must be a torch.Tensor")
@@ -4017,6 +4175,7 @@ def batch_prefill_with_paged_kv_cache(
         k_dtype=geometry.qk_dtype,
         v_dtype=geometry.pv_dtype,
         out_dtype=geometry.out_dtype,
+        out_scale_dtype=None if out_scale is None else out_scale.dtype,
         page_size=page_size,
         mask_type=mask_type,
         window_left=window_left,
@@ -4040,6 +4199,7 @@ def batch_prefill_with_paged_kv_cache(
         max_q_len=geometry.max_q_len,
         max_kv_len=geometry.max_kv_len,
         out=out,
+        out_scale=out_scale,
         lse=lse,
         return_lse=return_lse,
         attention_sinks=attention_sinks,

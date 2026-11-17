@@ -38,6 +38,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...quant_output import fragment_block_amax, quant_store_row_fragment
 from ...placeholder_helpers import _placeholder_smem_array
 from ..fmha_decode_config import FmhaDecodeConfig
 from .helpers_common import (
@@ -126,6 +127,8 @@ class TmemCorrResource(DecodeGenResourceBase):
     split_kv_counter_ptr: cute.Pointer = None
     attention_sinks_ptr: cute.Pointer = None
     lse_ptr: cute.Pointer | None = None
+    # A quantized output's flat swizzled block-scale buffer; None otherwise.
+    o_sf_ptr: cute.Pointer | None = None
     # The ``sfV`` / ``v_mean`` block the correction task stages per work tile;
     # the schedule waits and releases it, the epilogue only reads it. ``None``
     # without Sage attention.
@@ -1106,6 +1109,47 @@ class TmemCorrResource(DecodeGenResourceBase):
         return None
 
     @cute.jit
+    def _num_qo_heads_per_token(self) -> Int32:
+        """Q heads per output token, the row divisor of every final store."""
+        cfg = self.cfg
+        if cutlass.const_expr(cfg.use_variable_seqlens_q or cfg.is_multi_token_q):
+            return self.num_heads_kv * Int32(cfg.heads_q_per_kv)
+        return self.num_heads_kv * self.h_r
+
+    @cute.jit
+    def _store_quant_columns(
+        self,
+        output_vals,
+        norm_scale: Float32 | None,
+        o_offset: Int64,
+        *,
+        count: Constexpr[int],
+        store_ok=True,
+        raw_amax: Float32 | None = None,
+    ) -> None:
+        """Quantize ``count`` final columns at element ``o_offset`` of O.
+
+        Eight columns are the 16-byte fragment of the split-KV reducers and
+        the Swaps staged copy, combined with the adjacent lanes of its scale
+        block; wider counts are whole blocks of this lane. A fragment store
+        runs on every lane of the warp with ``store_ok``, or behind a row
+        branch with ``raw_amax`` (``quant_store_row_fragment``).
+        """
+        quant_store_row_fragment(
+            output_vals,
+            norm_scale,
+            self.o_ptr.toint(),
+            o_offset,
+            self.o_sf_ptr.toint(),
+            self._num_qo_heads_per_token(),
+            cutlass.Boolean(store_ok),
+            self.cfg.headdim,
+            count,
+            self.cfg.quant_output,
+            raw_amax=raw_amax,
+        )
+
+    @cute.jit
     def _store_final_o_columns(
         self,
         final_o_dst,
@@ -1114,6 +1158,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         *,
         count: Constexpr[int],
         sector_aligned: cutlass.Boolean,
+        quant_raw_amax: Float32 | None = None,
     ) -> None:
         """Scale, pack, and store ``count`` contiguous final output columns.
 
@@ -1125,10 +1170,21 @@ class TmemCorrResource(DecodeGenResourceBase):
         own whole rows (16-bit K/V) or 64-column half rows (byte-wide K/V) and
         pay for half-written sectors, while the split-KV reducers write
         eight-column fragments. A ``None`` scale packs the values as they are.
+        A quantized output's fragment takes ``quant_raw_amax``, the block
+        maximum every lane computed before its row branch.
         """
         cfg = self.cfg
         assert count % 8 == 0
-        if cutlass.const_expr(cfg.use_fp8_output):
+        if cutlass.const_expr(cfg.quant_output is not None):
+            # The destination offset in O is the element offset (one-byte data).
+            self._store_quant_columns(
+                output_vals,
+                norm_scale,
+                final_o_dst.toint() - self.o_ptr.toint(),
+                count=count,
+                raw_amax=quant_raw_amax,
+            )
+        elif cutlass.const_expr(cfg.use_fp8_output):
             for chunk_idx in cutlass.range_constexpr(count // 8):
                 fp8_regs = self._pack_fp8_output_quads(
                     output_vals, norm_scale, chunk_idx * 8
@@ -1224,8 +1280,13 @@ class TmemCorrResource(DecodeGenResourceBase):
         output_vals: cutlass.Array,
         sum_val: Float32,
         max_val: Float32,
+        quant_raw_amax: Float32 | None = None,
     ) -> None:
-        """Normalize one O fragment, apply attention sink, and store to GMEM."""
+        """Normalize one O fragment, apply attention sink, and store to GMEM.
+
+        Callers store valid rows only; a quantized output passes the
+        fragment's ``quant_raw_amax`` (``fragment_block_amax``).
+        """
         dst_row_base, norm_scale = self._softmax_output_row_state(
             logical_h_k_idx,
             logical_b_idx,
@@ -1234,7 +1295,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             max_val,
             lse_writer=reduce_col_idx == Int32(0),
         )
-        dst_offset = dst_row_base + reduce_col_idx * Int32(self.cfg.o_dtype_bytes)
+        dst_offset = dst_row_base + reduce_col_idx * Int32(self.cfg.final_o_dtype_bytes)
         final_o_dst = cutlass.inttoptr(
             self.o_ptr.toint() + cutlass.Int64(dst_offset),
             mem_space=1,
@@ -1246,6 +1307,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             norm_scale,
             count=8,
             sector_aligned=cutlass.Boolean(False),
+            quant_raw_amax=quant_raw_amax,
         )
 
     @cute.jit
@@ -1322,7 +1384,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             self.q_token_offset,
         )
         dst_row_base = Int64(physical_dst_row_idx) * Int64(
-            cfg.headdim * cfg.o_dtype_bytes
+            cfg.headdim * cfg.final_o_dtype_bytes
         )
         return dst_row_base, norm_scale
 
@@ -1658,6 +1720,11 @@ class TmemCorrResource(DecodeGenResourceBase):
                         )
                     )
 
+        # A quantized output's scale block spans adjacent lanes: every lane
+        # takes its block maximum before the row predicate (``group_amax``).
+        quant_raw_amax = None
+        if cutlass.const_expr(cfg.quant_output is not None):
+            quant_raw_amax = fragment_block_amax(output_vals, 8, cfg.quant_output)
         if valid_reduce_row:
             self._store_softmax_normalized_o_vec8(
                 logical_h_k_idx,
@@ -1667,6 +1734,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 output_vals,
                 sum_val,
                 max_val,
+                quant_raw_amax=quant_raw_amax,
             )
 
     @cute.jit
@@ -1954,6 +2022,11 @@ class TmemCorrResource(DecodeGenResourceBase):
                             loaded_partial_regs,
                         )
                     )
+        # A quantized output's scale block spans adjacent lanes: every lane
+        # takes its block maximum before the row predicate (``group_amax``).
+        quant_raw_amax = None
+        if cutlass.const_expr(cfg.quant_output is not None):
+            quant_raw_amax = fragment_block_amax(output_vals, 8, cfg.quant_output)
         if valid_reduce_row:
             self._store_softmax_normalized_o_vec8(
                 logical_h_k_idx,
@@ -1963,6 +2036,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                 output_vals,
                 sum_val,
                 max_val,
+                quant_raw_amax=quant_raw_amax,
             )
 
     @cute.jit
@@ -2200,6 +2274,51 @@ class TmemCorrResource(DecodeGenResourceBase):
                             smem_src.load(count=4, alignment=16),
                             alignment=16,
                         )
+            elif cutlass.const_expr(cfg.quant_output is not None):
+                # A quantized output stages O in its 16-bit carrier. Adjacent
+                # lanes hold the 16-byte fragments of one scale block of one
+                # row, which share its row and padded-band validity. Every
+                # lane quantizes, because the block maximum is a full-warp
+                # shuffle (``group_amax``), and validity predicates only the
+                # stores. The 128 lanes cover the whole staged segment, so the
+                # load stays in bounds for padded rows.
+                store_ok = _q_row_is_valid_for_seq(
+                    cfg,
+                    self.h_r,
+                    logical_q_group_idx,
+                    dst_row_idx,
+                    self.seq_len_q,
+                )
+                if cutlass.const_expr(cfg.swaps_output_head_dim != cfg.headdim):
+                    store_ok = store_ok & (
+                        dst_col_offset < Int32(cfg.headdim * cfg.o_dtype_bytes)
+                    )
+                staged_regs = (
+                    self._smem_base_o_i32.subview(load_smem_offset >> Int32(2))
+                    .data_ptr()
+                    .load(count=4, alignment=16)
+                )
+                staged_vals = _load_partial_o_vec8_as_f32(
+                    staged_regs, cfg.use_bf16_output
+                )
+                physical_dst_row_idx = _q_physical_output_row(
+                    cfg,
+                    self.h_r,
+                    self.num_heads_kv,
+                    logical_b_idx,
+                    logical_h_k_idx,
+                    logical_q_group_idx,
+                    dst_row_idx,
+                    self.q_token_offset,
+                )
+                self._store_quant_columns(
+                    staged_vals,
+                    None,
+                    Int64(physical_dst_row_idx) * Int64(cfg.headdim)
+                    + Int64(dst_col_offset // Int32(cfg.o_dtype_bytes)),
+                    count=8,
+                    store_ok=store_ok,
+                )
             else:
                 if _q_row_is_valid_for_seq(
                     cfg,
@@ -2711,6 +2830,20 @@ class TmemCorrResource(DecodeGenResourceBase):
         every sector half-written twice.
         """
         cfg = self.cfg
+        if cutlass.const_expr(cfg.quant_output is not None):
+            # One D32 fragment holds whole scale blocks of this lane's row.
+            assert 32 % cfg.quant_output.sf_vec_size == 0
+            merged_vals = self._merge_kv_tile_256_peer_fragment(
+                own_vals, peer_vals, 0, 32
+            )
+            if valid_output_row:
+                self._store_quant_columns(
+                    merged_vals,
+                    norm_scale,
+                    dst_row_base + Int64(fragment_col),
+                    count=32,
+                )
+            return
         for vector_pair in cutlass.range_constexpr(2):
             pair_col = vector_pair * 16
             merged_vals = self._merge_kv_tile_256_peer_fragment(
@@ -3623,6 +3756,55 @@ class TmemCorrResource(DecodeGenResourceBase):
             row_idx,
             self.q_token_offset,
         )
+        if cutlass.const_expr(cfg.quant_output is not None):
+            # Each lane owns 32-column multiples of one row, so every scale
+            # block is lane-local: load 32 columns from each tail O stage,
+            # combine the instances, and quantize.
+            assert 32 % cfg.quant_output.sf_vec_size == 0
+            for store_idx in cutlass.range_constexpr(output_pair_regs * 2 // 32):
+                chunk_col = store_idx * 32
+                o0_vals = _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(base_addr0 + Int32(chunk_col), Float32),
+                    num=32,
+                    offset=keeps_o_ldst_offset,
+                )
+                if cutlass.const_expr(cfg.num_insts_kv != 1):
+                    o1_vals = _keeps_tcgen05_ld(
+                        cfg,
+                        prims.make_tmem_ptr(base_addr1 + Int32(chunk_col), Float32),
+                        num=32,
+                        offset=keeps_o_ldst_offset,
+                    )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                final_vals = cutlass.Array(Float32, 32, space=cutlass.AddressSpace.rmem)
+                for pair_idx in cutlass.range_constexpr(16):
+                    reg_base = pair_idx * 2
+                    if cutlass.const_expr(cfg.num_insts_kv == 1):
+                        final_pair = fmul2(
+                            (final_scale0_0, final_scale0_0),
+                            (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                        )
+                    else:
+                        final_pair = ffma2(
+                            (final_scale1_0, final_scale1_0),
+                            (o1_vals[reg_base], o1_vals[reg_base + 1]),
+                            fmul2(
+                                (final_scale0_0, final_scale0_0),
+                                (o0_vals[reg_base], o0_vals[reg_base + 1]),
+                            ),
+                        )
+                    final_vals[reg_base] = final_pair[0]
+                    final_vals[reg_base + 1] = final_pair[1]
+                self._store_quant_columns(
+                    final_vals,
+                    None,
+                    Int64(physical_dst_row_idx) * Int64(cfg.headdim)
+                    + Int64(col_base + Int32(chunk_col)),
+                    count=32,
+                    store_ok=valid_output_row,
+                )
+            return
         dst_row_base = Int64(physical_dst_row_idx) * Int64(
             cfg.headdim * cfg.o_dtype_bytes
         )

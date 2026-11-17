@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING, Literal, Optional, Union, cast
 import torch
 
 from ._compile_cache import build_and_load_attention_kernel
+from ._quant_output import (
+    implied_quant_out_dtype,
+    quant_output_format,
+    prepare_out_scale,
+)
 from ._scales import (
     GlobalScale,
     fake_scale,
@@ -230,6 +235,7 @@ class _DecodePlanState:
     lse_mode: str = "none"
     use_attention_sinks: bool = False
     requested_splits: int = 1
+    out_scale_dtype: Optional[torch.dtype] = None
     planned_seq_lens_kv_host: Optional[tuple[int, ...]] = None
     planned_seq_lens_kv_device: Optional[torch.Tensor] = None
     fixed_q_offsets: Optional[torch.Tensor] = None
@@ -698,6 +704,7 @@ def _dtype_key(dtype: torch.dtype) -> str:
         torch.bfloat16: "bfloat16",
         torch.float8_e4m3fn: "float8_e4m3fn",
         torch.uint8: "float4_e2m1fn",
+        torch.float8_e8m0fnu: "float8_e8m0fnu",
     }
     try:
         return keys[dtype]
@@ -720,7 +727,16 @@ def _cutlass_dtype(dtype_key: str):
         "float8_e4m3fn": cutlass.Float8E4M3FN,
         "float4_e2m1fn": cutlass.Float4E2M1FN,
         "int8": cutlass.Int8,
+        "float8_e8m0fnu": cutlass.Float8E8M0FNU,
     }[dtype_key]
+
+
+def _out_scale_dtype_key(
+    out_dtype: torch.dtype, out_scale_dtype: Optional[torch.dtype]
+) -> Optional[str]:
+    """Key of the scale dtype kernels compile for; aliases such as uint8 share it."""
+    fmt = quant_output_format(out_dtype, out_scale_dtype)
+    return None if fmt is None else _dtype_key(fmt.sf_dtype)
 
 
 def _validate_dtype_pair(
@@ -728,13 +744,44 @@ def _validate_dtype_pair(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     out_dtype: torch.dtype,
+    out_scale_dtype: Optional[torch.dtype] = None,
 ) -> None:
     _dtype_key(q_dtype)
     _dtype_key(k_dtype)
     _dtype_key(v_dtype)
     _dtype_key(out_dtype)
+    if quant_output_format(out_dtype, out_scale_dtype) is not None:
+        # make_decode_config plans a quantized output as the 16-bit output of
+        # the same inputs, so accept the inputs that some 16-bit output takes.
+        if not any(
+            _is_supported_dtype_pair(q_dtype, k_dtype, v_dtype, carrier)
+            for carrier in (torch.float16, torch.bfloat16)
+        ):
+            raise NotImplementedError(
+                "attention-ts decode quantized output requires inputs that "
+                "support a 16-bit output; got "
+                f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{out_dtype}"
+                f"+{out_scale_dtype}"
+            )
+        return
+    if not _is_supported_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype):
+        raise NotImplementedError(
+            "attention-ts decode supports FP16->FP16, BF16->BF16, "
+            "FP8-E4M3->FP16/BF16/FP8-E4M3; "
+            "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
+            "and BF16 Q/K + FP8 V; got "
+            f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{out_dtype}"
+        )
+
+
+def _is_supported_dtype_pair(
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+) -> bool:
     matching_kv = k_dtype == v_dtype
-    supported = (
+    return (
         (
             q_dtype == torch.float16
             and k_dtype == v_dtype == torch.float16
@@ -758,14 +805,6 @@ def _validate_dtype_pair(
             and out_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         )
     )
-    if not supported:
-        raise NotImplementedError(
-            "attention-ts decode supports FP16->FP16, BF16->BF16, "
-            "FP8-E4M3->FP16/BF16/FP8-E4M3; "
-            "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
-            "and BF16 Q/K + FP8 V; got "
-            f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{out_dtype}"
-        )
 
 
 def _resolve_kv_dtypes(
@@ -1329,8 +1368,13 @@ def _resolve_decode_launch_spec(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     use_attention_sinks: bool = False,
+    out_scale_dtype_key: Optional[str] = None,
 ) -> _DecodeLaunchSpec:
-    """Resolve automatic policy and workspace geometry without compiling."""
+    """Resolve automatic policy and workspace geometry without compiling.
+
+    ``out_scale_dtype_key`` selects a quantized ``out_dtype_key`` output;
+    ``make_decode_config`` plans it on its 16-bit carrier.
+    """
 
     seq_len_q = _validate_seq_len_q(seq_len_q)
     _validate_head_geometry(num_qo_heads, num_kv_heads)
@@ -1359,6 +1403,9 @@ def _resolve_decode_launch_spec(
     k_dtype = _cutlass_dtype(k_dtype_key)
     v_dtype = _cutlass_dtype(v_dtype_key)
     out_dtype = _cutlass_dtype(out_dtype_key)
+    out_sf_dtype = (
+        None if out_scale_dtype_key is None else _cutlass_dtype(out_scale_dtype_key)
+    )
     arch_args = arch_config_args(torch.cuda.get_device_capability(device_index))
 
     # Resolve a candidate against this request geometry and device policy.
@@ -1382,6 +1429,7 @@ def _resolve_decode_launch_spec(
             k_dtype=k_dtype,
             v_dtype=v_dtype,
             o_dtype=out_dtype,
+            out_sf_dtype=out_sf_dtype,
             qkv_layout="pagedKv",
             num_tokens_per_page=page_size,
             storage_tokens_per_page=storage_page_size,
@@ -1707,13 +1755,17 @@ def _get_compiled_decode(
     k_storage_dtype = cutlass.Uint8 if k_dtype == cutlass.Float4E2M1FN else k_dtype
     v_storage_dtype = cutlass.Uint8 if v_dtype == cutlass.Float4E2M1FN else v_dtype
     storage_page_size = int(cfg.effective_storage_tokens_per_page)
-    partial_dtype = out_dtype
-    if cfg.use_separate_reduction_kernel and out_dtype in (
+    # A quantized output adds a flat swizzled scale buffer; partials follow
+    # its 16-bit carrier, the config's out_dtype.
+    quant_output = cfg.quant_output
+    carrier_dtype = cfg.out_dtype
+    partial_dtype = carrier_dtype
+    if cfg.use_separate_reduction_kernel and carrier_dtype in (
         cutlass.BFloat16,
         cutlass.Float8E4M3FN,
     ):
         partial_dtype = cutlass.BFloat16
-    elif out_dtype == cutlass.Float8E4M3FN or not cfg.use_split_kv:
+    elif carrier_dtype == cutlass.Float8E4M3FN or not cfg.use_split_kv:
         partial_dtype = cutlass.Float16
 
     Int32 = cutlass.Int32
@@ -1728,6 +1780,7 @@ def _get_compiled_decode(
         k_sf_cache: cute.Tensor,
         v_sf_cache: cute.Tensor,
         out: cute.Tensor,
+        out_scale: cute.Tensor | None,
         lse: cute.Tensor | None,
         seq_lens_kv: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
@@ -1866,6 +1919,7 @@ def _get_compiled_decode(
             static_full_split_prefix,
             static_native_uniform_kv,
             lse_ptr=lse.iterator if lse is not None else None,
+            o_sf_ptr=out_scale.iterator if out_scale is not None else None,
             requested_splits=requested_splits if static_cfg.runtime_split_kv else None,
             max_q_len=max_q_len,
             runtime_q_capacity_rows=(
@@ -1884,6 +1938,7 @@ def _get_compiled_decode(
         @cute.jit
         def reduction_tensor_adapter(
             out: cute.Tensor,
+            out_scale: cute.Tensor | None,
             lse: cute.Tensor | None,
             seq_lens_kv: cute.Tensor,
             cu_seqlens_q: cute.Tensor,
@@ -1947,6 +2002,7 @@ def _get_compiled_decode(
                 static_cfg,
                 static_full_split_prefix,
                 lse_ptr=lse.iterator if lse is not None else None,
+                o_sf_ptr=out_scale.iterator if out_scale is not None else None,
                 requested_splits=requested_splits
                 if static_cfg.runtime_split_kv
                 else None,
@@ -2025,6 +2081,13 @@ def _get_compiled_decode(
         out_shape,
         stride_order=tuple(reversed(range(len(out_shape)))),
         assumed_align=16,
+    )
+    out_scale_fake = (
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8, (cute.sym_int(),), stride_order=(0,), assumed_align=16
+        )
+        if quant_output is not None
+        else None
     )
 
     # Describe row-major symbolic storage; assumed_align is in bytes.
@@ -2141,6 +2204,7 @@ def _get_compiled_decode(
                 k_sf_fake,
                 v_sf_fake,
                 out_fake,
+                out_scale_fake,
                 lse_fake,
                 seq_lens_kv_fake,
                 cu_seqlens_q_fake,
@@ -2179,6 +2243,7 @@ def _get_compiled_decode(
                 lambda: cute.compile(
                     reduction_tensor_adapter,
                     out_fake,
+                    out_scale_fake,
                     lse_fake,
                     seq_lens_kv_fake,
                     cu_seqlens_q_fake,
@@ -2225,6 +2290,7 @@ def get_prims_ts_batch_decode_workspace_size(
     device: Optional[Union[int, str, torch.device]] = None,
     split_kv: bool = True,
     use_attention_sinks: bool = False,
+    out_scale_dtype: Optional[torch.dtype] = None,
 ) -> int:
     """Return caller-workspace bytes for one automatic FMHA policy.
 
@@ -2258,7 +2324,8 @@ def get_prims_ts_batch_decode_workspace_size(
     nonsplit execution when False. It is independent of Q layout and must
     match the value supplied to attention planning/launch.
     ``use_attention_sinks`` must also match planning because it can affect
-    the selected policy and scratch layout.
+    the selected policy and scratch layout. ``out_scale_dtype`` selects a
+    quantized output, as for planning; it sizes the 16-bit carrier plan.
     """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
@@ -2289,7 +2356,7 @@ def get_prims_ts_batch_decode_workspace_size(
     k_dtype, v_dtype = _resolve_kv_dtypes(q_dtype, k_dtype, v_dtype, kv_dtype)
     if out_dtype is None:
         out_dtype = q_dtype
-    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
+    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype, out_scale_dtype)
     inferred_device = (
         qo_indptr.device
         if device is None and isinstance(qo_indptr, torch.Tensor)
@@ -2327,6 +2394,7 @@ def get_prims_ts_batch_decode_workspace_size(
         resolved_device,
         split_kv=split_kv,
         use_attention_sinks=use_attention_sinks,
+        out_scale_dtype=out_scale_dtype,
     ).total_bytes
 
 
@@ -2460,8 +2528,12 @@ def _launch_decode(
     requested_splits: int = 1,
     max_kv_len: int,
     max_q_len: int,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Launch the compiled main kernel and its optional standalone reducer."""
+    """Launch the compiled main kernel and its optional standalone reducer.
+
+    ``out_scale`` is the flat uint8 scale view of a quantized-output plan.
+    """
 
     sinks = workspace.attention_sinks if attention_sinks is None else attention_sinks
     q_offsets = workspace.cu_seqlens_q if qo_indptr is None else qo_indptr
@@ -2472,6 +2544,7 @@ def _launch_decode(
         runtime.k_sf_cache,
         runtime.v_sf_cache,
         runtime.out.view(-1, runtime.out.shape[-2], runtime.out.shape[-1]),
+        out_scale,
         None if lse is None else lse.view(-1, lse.shape[-1]),
         seq_lens_kv,
         q_offsets,
@@ -2504,6 +2577,7 @@ def _launch_decode(
     if compiled_reducer is not None:
         compiled_reducer(
             runtime.out.view(-1, runtime.out.shape[-2], runtime.out.shape[-1]),
+            out_scale,
             None if lse is None else lse.view(-1, lse.shape[-1]),
             seq_lens_kv,
             q_offsets,
@@ -2899,6 +2973,7 @@ class PrimsTSBatchDecodePlan:
             self._k_sf_cache,
             self._v_sf_cache,
             out_view,
+            None,
             None if lse is None else lse.view(-1, lse.shape[-1]),
             self._seq_lens_kv,
             q_offsets,
@@ -2931,6 +3006,7 @@ class PrimsTSBatchDecodePlan:
         if self._compiled_reducer is not None:
             self._compiled_reducer(
                 out_view,
+                None,
                 None if lse is None else lse.view(-1, lse.shape[-1]),
                 self._seq_lens_kv,
                 q_offsets,
@@ -2970,6 +3046,7 @@ def _resolve_decode_workspace_layout(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     use_attention_sinks: bool = False,
+    out_scale_dtype: Optional[torch.dtype] = None,
 ) -> _DecodeWorkspaceLayout:
     """Resolve the byte layout for one already-validated semantic key."""
 
@@ -2998,10 +3075,14 @@ def _resolve_decode_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
         use_attention_sinks,
+        _out_scale_dtype_key(out_dtype, out_scale_dtype),
     )
+    import cutlass.torch as cutlass_torch
+
+    # Partials follow the config's out_dtype: a quantized output's carrier.
     return _make_decode_workspace_layout(
         spec.scratch_shapes,
-        out_dtype,
+        cutlass_torch.dtype(spec.config.out_dtype),
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
         scratch_reserve=spec.scratch_reserve,
@@ -4353,6 +4434,7 @@ class BatchDecodePagedTSWrapper:
         initialize_workspace: bool = True,
         softmax_scale: Optional[GlobalScale] = None,
         output_scale: GlobalScale = 1.0,
+        out_scale_dtype: Optional[torch.dtype] = None,
     ) -> None:
         """Select/cache a bounded paged-decode execution and bind reusable scratch.
 
@@ -4373,6 +4455,14 @@ class BatchDecodePagedTSWrapper:
         the compiled signature; run() inherits these defaults. Device values
         must be finite and positive and may change in place during graph replay.
         Softmax scales use natural, not base-2, units.
+
+        ``out_scale_dtype`` selects a quantized output together with
+        ``out_dtype`` (MXFP8: ``out_dtype=torch.float8_e4m3fn`` with
+        ``out_scale_dtype`` ``torch.float8_e8m0fnu`` or ``torch.uint8``, one
+        UE8M0 scale per 32 channels), for every Q/K/V combination that
+        supports a 16-bit output. Block scales cover the [tokens, Hq * D]
+        output view, swizzled 128x4 as ``mxfp8_quantize`` writes them. The kernel runs the FP16 (FP16 Q) or
+        BF16 plan and quantizes in its final stores.
         """
 
         if packed_query and max_q_len is None:
@@ -4418,6 +4508,7 @@ class BatchDecodePagedTSWrapper:
                 k_dtype,
                 v_dtype,
                 out_dtype,
+                out_scale_dtype,
             )
 
             planned_seq_lens = _normalize_plan_seq_lens_kv(
@@ -4473,7 +4564,10 @@ class BatchDecodePagedTSWrapper:
             storage_page_size,
         )
         spec = _resolve_decode_launch_spec(
-            *policy_args, split_kv=split_kv, use_attention_sinks=use_attention_sinks
+            *policy_args,
+            split_kv=split_kv,
+            use_attention_sinks=use_attention_sinks,
+            out_scale_dtype_key=_out_scale_dtype_key(out_dtype, out_scale_dtype),
         )
         kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
         kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic"
@@ -4565,9 +4659,12 @@ class BatchDecodePagedTSWrapper:
             ("kv_lengths_mode", compile_spec.kv_lengths_mode),
             ("split_kv_allowed", split_kv),
         )
+        import cutlass.torch as cutlass_torch
+
+        # Partials follow the config's out_dtype: a quantized output's carrier.
         workspace_layout = _make_decode_workspace_layout(
             spec.scratch_shapes,
-            out_dtype,
+            cutlass_torch.dtype(spec.config.out_dtype),
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
             use_split_kv=spec.config.use_split_kv,
             scratch_reserve=spec.scratch_reserve,
@@ -4619,6 +4716,7 @@ class BatchDecodePagedTSWrapper:
             k_dtype=k_dtype,
             v_dtype=v_dtype,
             out_dtype=out_dtype,
+            out_scale_dtype=out_scale_dtype,
             mask_type=mask_type,
             window_left=window_left,
             config=spec.config,
@@ -4662,11 +4760,12 @@ class BatchDecodePagedTSWrapper:
         max_q_len: int | None = None,
         max_kv_len: int | None = None,
         out: Optional[torch.Tensor] = None,
+        out_scale: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
         validate: bool = True,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Launch paged FMHA using live lengths and request metadata.
 
         Uses the policy and compiled kernels prepared by plan(). Batch and query
@@ -4713,7 +4812,16 @@ class BatchDecodePagedTSWrapper:
 
         Enabled attention_sinks requires compact CUDA FP32 [Hq] natural-log logits
         after QK scaling. Values must be finite or -inf and add zero V contribution;
-        validation checks metadata without reading sink values."""
+        validation checks metadata without reading sink values.
+
+        Quantized-output plans write the format's data to ``out`` and its
+        block scales to ``out_scale``: a contiguous buffer of the planned
+        out_scale_dtype with round_up(tokens, 128) * round_up(Hq * D /
+        sf_vec_size, 4) swizzled scales, where tokens is B, B * SQ or total_q (allocated flat
+        when omitted). They return (out, out_scale), or (out, out_scale, lse)
+        with return_lse=True.
+        output_scale applies before quantization; scale padding is not written.
+        Inactive requests leave their scale bytes untouched like their output."""
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -4839,6 +4947,14 @@ class BatchDecodePagedTSWrapper:
             enabled=state.use_attention_sinks,
             validate=validate,
         )
+        out_scale, runtime_out_scale = prepare_out_scale(
+            out_scale,
+            out_shape=tuple(runtime.out.shape),
+            out_dtype=state.out_dtype,
+            out_scale_dtype=state.out_scale_dtype,
+            device=state.device,
+            validate=validate,
+        )
         result = _launch_decode(
             runtime,
             seq_lens_kv=effective_seq_lens,
@@ -4854,8 +4970,11 @@ class BatchDecodePagedTSWrapper:
             requested_splits=state.requested_splits,
             max_kv_len=max_kv_len,
             max_q_len=max_q_len,
+            out_scale=runtime_out_scale,
         )
-        return (result, lse) if return_lse else result
+        if out_scale is None:
+            return (result, lse) if return_lse else result
+        return (result, out_scale, lse) if return_lse else (result, out_scale)
 
 
 @flashinfer_experimental_api(trace=attention_ts_decode_trace_dispatch)
@@ -4885,7 +5004,8 @@ def batch_decode_with_paged_kv_cache(
     workspace_buffer: Optional[torch.Tensor] = None,
     max_kv_len: Optional[int] = None,
     validate: bool = True,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    out_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """One-shot fixed or packed-Q paged decode from fixed page tables.
 
     SQ1 preserves the ``[B, Hq, D]`` query/output contract. For fixed
@@ -4942,6 +5062,8 @@ def batch_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` or the query dtype.
+        With ``out_scale`` it is the quantized data dtype, inferred from
+        ``out_scale.dtype`` when omitted.
     page_size : int, optional
         Semantic page-table size, defaulting to the physical cache extent.
         A smaller supported value must divide the physical extent and uses
@@ -4958,6 +5080,12 @@ def batch_decode_with_paged_kv_cache(
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
+    out_scale : torch.Tensor, optional
+        Selects a quantized output and receives its block scales:
+        ``round_up(tokens, 128) * round_up(Hq * D / sf_vec_size, 4)`` swizzled
+        scales of a supported scale dtype (MXFP8: ``torch.float8_e8m0fnu``
+        or ``torch.uint8`` with ``float8_e4m3fn`` output). A quantized output
+        returns ``(output, out_scale)`` or ``(output, out_scale, lse)``.
 
     Returns
     -------
@@ -5078,6 +5206,9 @@ def batch_decode_with_paged_kv_cache(
     num_qo_heads = int(q.shape[-2])
     if validate and out is not None and not isinstance(out, torch.Tensor):
         raise TypeError("out must be a torch.Tensor")
+    if out_scale is not None:
+        # The scale buffer selects a quantized output with its own dtype.
+        out_dtype = implied_quant_out_dtype(out_dtype, out_scale)
     out_dtype = (
         out_dtype
         if out_dtype is not None
@@ -5117,6 +5248,7 @@ def batch_decode_with_paged_kv_cache(
         k_dtype=k_cache.dtype,
         v_dtype=v_cache.dtype,
         out_dtype=out_dtype,
+        out_scale_dtype=None if out_scale is None else out_scale.dtype,
         mask_type=mask_type,
         window_left=window_left,
         use_attention_sinks=attention_sinks is not None,
@@ -5139,6 +5271,7 @@ def batch_decode_with_paged_kv_cache(
         softmax_scale=softmax_scale,
         output_scale=output_scale,
         out=out,
+        out_scale=out_scale,
         lse=lse,
         return_lse=return_lse,
         attention_sinks=attention_sinks,

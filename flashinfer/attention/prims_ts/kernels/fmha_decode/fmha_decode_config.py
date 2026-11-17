@@ -46,6 +46,7 @@ from ...sage.layout import (
 )
 from ...sage.modes import SageScoreScaling
 from ...split_kv_mode_policy import select_split_kv_modes
+from ..quant_output import QuantOutputFormat, quant_output_format
 from ..tcgen05_compat import ldtm_stat_supported
 from .fmha_decode_constants import (
     E4M3_MAX,
@@ -851,6 +852,14 @@ class FmhaDecodeConfig:
     v_dtype: type = Float16
     # Output O element type. One of Float16 / BFloat16 / Float8E4M3FN.
     out_dtype: type = Float16
+    # Quantized (block-scaled) output: the stored O dtype and its canonical
+    # block-scale dtype (``kernels/quant_output.py``), or None. The final
+    # stores then write that data with one scale per ``sf_vec_size``
+    # channels, and ``out_dtype`` is the 16-bit carrier that every other
+    # stage uses exactly as for that 16-bit output: profile selection, O
+    # staging, and split-KV partials.
+    out_data_dtype: type | None = None
+    out_sf_dtype: type | None = None
     # Accumulator type (BMM accumulators and softmax stats), always Float32
     # in the currently supported recipes.
     acc_dtype: type = Float32
@@ -2020,6 +2029,21 @@ class FmhaDecodeConfig:
         return self.out_dtype == Float8E4M3FN
 
     @property
+    def final_o_dtype_bytes(self) -> int:
+        """Byte width of one element of the public O tensor.
+
+        Equals ``o_dtype_bytes`` except under a quantized output, whose data
+        dtype is stored while ``out_dtype`` names the 16-bit staging carrier.
+        """
+        quant = self.quant_output
+        return self.o_dtype_bytes if quant is None else quant.data_dtype.itemsize
+
+    @property
+    def quant_output(self) -> QuantOutputFormat | None:
+        """The quantized output format, or None for a plain output."""
+        return quant_output_format(self.out_data_dtype, self.out_sf_dtype)
+
+    @property
     def use_bf16_separate_partial_o(self) -> bool:
         """Whether normalized separate-GMEM partial O uses BF16 storage.
 
@@ -2784,6 +2808,17 @@ class FmhaDecodeConfig:
         ):
             if dtype not in supported:
                 raise ValueError(f"Unsupported {name}: {dtype}")
+        if self.out_sf_dtype is not None and (
+            self.quant_output is None
+            or self.out_dtype not in (Float16, BFloat16)
+            or self.use_sage_attention
+            or self.use_block_sparse
+            or self.use_q_token_kv_block_sparse_route
+        ):
+            raise ValueError(
+                "a quantized output requires a registered format, a Float16 or "
+                "BFloat16 carrier out_dtype and dense attention"
+            )
         if self.use_sage_attention:
             if (self.q_dtype, self.k_dtype, self.out_dtype) not in _SAGE_DTYPE_RECIPES:
                 raise ValueError(
@@ -5814,13 +5849,30 @@ def _apply_dtype_config(
     k_dtype: type,
     v_dtype: type,
     o_dtype: type,
+    out_sf_dtype: type | None = None,
 ) -> None:
     """Apply independent Q/K/V storage dtypes before selecting MMA geometry."""
+    if quant_output_format(o_dtype, out_sf_dtype) is None:
+        output_fields = (
+            ("out_dtype", o_dtype),
+            ("out_data_dtype", None),
+        )
+    else:
+        # A quantized output (``o_dtype`` data with ``out_sf_dtype`` block scales)
+        # runs the 16-bit plan of its inputs -- FP16 for FP16 Q, BF16 otherwise --
+        # and quantizes only at the final stores. ``out_dtype`` names that
+        # carrier, so profile selection, O staging and split-KV partials stay
+        # those of the 16-bit output.
+        output_fields = (
+            ("out_dtype", Float16 if q_dtype == Float16 else BFloat16),
+            ("out_data_dtype", o_dtype),
+        )
     for name, dtype in (
         ("q_dtype", q_dtype),
         ("k_dtype", k_dtype),
         ("v_dtype", v_dtype),
-        ("out_dtype", o_dtype),
+        ("out_sf_dtype", out_sf_dtype),
+        *output_fields,
     ):
         _set_if_implicit(cfg, name, dtype, explicit_fields)
 
@@ -6754,6 +6806,7 @@ def make_decode_config(
     qkv_dtype: type | None = None,
     kv_dtype: type | None = None,
     o_dtype: type = Float16,
+    out_sf_dtype: type | None = None,
     qkv_layout: str = "contiguousKv",
     num_tokens_per_page: int = 32,
     storage_tokens_per_page: int | None = None,
@@ -6776,6 +6829,9 @@ def make_decode_config(
     additionally runs the decode kernel-selection workflow below.
 
     ``q_dtype``, ``k_dtype``, and ``v_dtype`` select independent storage types.
+    ``o_dtype`` is the stored output dtype; with a block-scale ``out_sf_dtype``
+    it selects a quantized output (e.g. ``Float8E4M3FN`` + ``Float8E8M0FNU``
+    for MXFP8), planned as the 16-bit output of its inputs.
     The legacy ``qkv_dtype`` sets their common default, while ``kv_dtype``
     sets a common K/V default. Mixed-profile scheduling derives from the
     effective dtypes before Q-tile or launch-mode selection.
@@ -6843,13 +6899,22 @@ def make_decode_config(
     )
     shape_values = (seq_len_kv, batch_size, num_heads_q, num_heads_kv)
     if all(value is None for value in shape_values):
-        if dtype_keywords_supplied:
+        if dtype_keywords_supplied or out_sf_dtype is not None:
+            # A quantized output plans on its 16-bit carrier, as in
+            # ``_apply_dtype_config``.
+            quantized = quant_output_format(o_dtype, out_sf_dtype) is not None
             args = (
                 {
                     "q_dtype": q_dtype,
                     "k_dtype": k_dtype,
                     "v_dtype": v_dtype,
-                    "out_dtype": o_dtype,
+                    "out_dtype": (
+                        (Float16 if q_dtype == Float16 else BFloat16)
+                        if quantized
+                        else o_dtype
+                    ),
+                    "out_data_dtype": o_dtype if quantized else None,
+                    "out_sf_dtype": out_sf_dtype,
                 },
                 args,
             )
@@ -6919,6 +6984,7 @@ def make_decode_config(
         k_dtype=k_dtype,
         v_dtype=v_dtype,
         o_dtype=o_dtype,
+        out_sf_dtype=out_sf_dtype,
     )
     _apply_feature_config(
         cfg,

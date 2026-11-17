@@ -185,7 +185,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_dtype`; defaults to `k_dtype`) |
-| Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
+| Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input; with `out_scale_dtype`, quantized outputs such as MXFP8 (`torch.float8_e4m3fn` O with `torch.float8_e8m0fnu` or `torch.uint8` swizzled UE8M0 scales) for every combination with a 16-bit output, through the wrapper and one-shot APIs (see [Quantized output](../../README.md#quantized-output)) |
 | K/V layout | HND or NHD paged cache, combined or separate K/V tensors; a V dtype that differs from K requires separate tensors |
 | Page size | 4, 8, 16, 32, 64, or 128 tokens; a logical fragment must divide the physical cache page |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |

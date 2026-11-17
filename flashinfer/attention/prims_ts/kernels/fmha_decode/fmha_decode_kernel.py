@@ -388,6 +388,7 @@ def _build_decode_gen_schedule(
     sparse_route_count: Int32 | None = None,
     sage_scales_ptr: cute.Pointer | None = None,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
     requested_splits=None,
 ) -> tuple[
     list[Task],
@@ -1586,6 +1587,7 @@ def _build_decode_gen_schedule(
         split_kv_counter_ptr=split_kv_counter_ptr,
         attention_sinks_ptr=attention_sinks_ptr,
         lse_ptr=lse_ptr,
+        o_sf_ptr=o_sf_ptr,
         seqlens_kv=kv_seqlens,
         max_seq_len_kv=corr_max_seq_len_kv,
         max_q_len=max_q_len,
@@ -1618,6 +1620,7 @@ def _build_decode_gen_schedule(
             split_kv_counter_ptr=split_kv_counter_ptr,
             attention_sinks_ptr=attention_sinks_ptr,
             lse_ptr=lse_ptr,
+            o_sf_ptr=o_sf_ptr,
             seqlens_kv=kv_seqlens,
             max_seq_len_kv=corr_max_seq_len_kv,
             max_q_len=max_q_len,
@@ -2929,6 +2932,7 @@ def _run_decode_gen_active(
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     g_sage_scales: cute.Pointer | None = None,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_max_q_len: Int32 = 1,
 ) -> None:
@@ -3099,6 +3103,7 @@ def _run_decode_gen_active(
         sparse_row_route_begin=sparse_row_route_begin,
         sparse_route_count=sparse_route_count,
         lse_ptr=lse_ptr,
+        o_sf_ptr=o_sf_ptr,
         requested_splits=requested_splits,
     )
 
@@ -3320,6 +3325,7 @@ def _run_decode_gen_runtime_prefix(
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     g_sage_scales: cute.Pointer | None = None,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_max_q_len: Int32 = 1,
 ) -> None:
@@ -3411,6 +3417,7 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
             )
@@ -3468,6 +3475,7 @@ def _run_decode_gen_runtime_prefix(
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
             )
@@ -3519,6 +3527,7 @@ def decode_gen_kernel(
     tma_desc_v_summary_atom: cutlass.GridConstant[cuda.TensorMap] | None = None,
     g_sage_scales: cute.Pointer | None = None,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
     requested_splits=None,
     g_max_q_len: Int32 = 1,
 ) -> None:
@@ -3658,6 +3667,7 @@ def decode_gen_kernel(
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
             )
@@ -3715,6 +3725,7 @@ def decode_gen_kernel(
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
             )
@@ -3768,6 +3779,7 @@ def decode_gen_kernel(
                 tma_desc_v_summary_atom=tma_desc_v_summary_atom,
                 g_sage_scales=g_sage_scales,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,
             )
@@ -3824,6 +3836,7 @@ def fmha_decode_launch(
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
     sage_scales_iter: cute.Pointer | None = None,
     lse_ptr: cute.Pointer | None = None,
+    o_sf_ptr: cute.Pointer | None = None,
     requested_splits=None,
     max_q_len: Int32 = 0,
     runtime_q_capacity_rows: Int32 = 0,
@@ -4330,6 +4343,7 @@ def fmha_decode_launch(
                 static_full_split_prefix,
                 g_sage_scales=sage_scales_iter,
                 lse_ptr=lse_ptr,
+                o_sf_ptr=o_sf_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=max_q_len,
             ).launch(

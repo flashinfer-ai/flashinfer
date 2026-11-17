@@ -53,6 +53,11 @@ from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
 )
 from flashinfer.quantization import mxfp8_quantize_bshd
 from flashinfer.utils import is_sm100a_supported
+from tests.attention.test_helpers.quant_output import (
+    assert_mxfp8_matches_quantized,
+    assert_mxfp8_output,
+    written_scale_mask,
+)
 
 
 _REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
@@ -508,8 +513,14 @@ def _make_native_paged_metadata(
     )
 
 
-def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
+def _plan_wrapper(
+    wrapper: BatchPrefillTSWrapper,
+    case: _ContextCase,
+    *,
+    out_scale_dtype: Optional[torch.dtype] = None,
+) -> None:
     wrapper.plan(
+        out_scale_dtype=out_scale_dtype,
         device=case.q.device,
         num_qo_heads=int(case.q.shape[-2]),
         num_kv_heads=int(case.k.shape[-2]),
@@ -557,6 +568,7 @@ def _plan_paged_wrapper(
     uniform_packed_lengths: bool = False,
     has_q_offset: bool = True,
     paged_v_tail_is_zero: bool = False,
+    out_scale_dtype: Optional[torch.dtype] = None,
 ) -> _NativePagedMetadata:
     """Compile a conservative paged plan and return its per-run metadata."""
 
@@ -577,6 +589,7 @@ def _plan_paged_wrapper(
         k_dtype=case.k_cache.dtype,
         v_dtype=case.v_cache.dtype,
         out_dtype=reference.out_dtype,
+        out_scale_dtype=out_scale_dtype,
         page_size=case.page_size,
         mask_type=reference.mask_type,
         window_left=reference.window_left,
@@ -5840,3 +5853,319 @@ def test_context_global_scales_graph_replay(paged):
     check(replace(reference, **{name: changed * 0.5}))
     wrapper.run(*args, out=out, validate=False)
     check(replace(reference, **{name: changed}))
+
+
+# ---------------------------------------------------------------------------
+# MXFP8 output
+# ---------------------------------------------------------------------------
+
+_E8M0 = torch.float8_e8m0fnu
+# (out_dtype, out_scale_dtype) of the 16-bit comparison run and of MXFP8.
+_BF16_OUT = (torch.bfloat16, None)
+_MXFP8_OUT = (_FP8, _E8M0)
+
+
+def _mxfp8_scale_numel(out_shape: Sequence[int]) -> int:
+    tokens = math.prod(out_shape[:-2])
+    scale_cols = out_shape[-2] * out_shape[-1] // 32
+    return (tokens + 127) // 128 * 128 * ((scale_cols + 3) // 4 * 4)
+
+
+def _mxfp8_relative_l2(qkv_dtype: torch.dtype) -> float:
+    # E4M3 output adds about 2**-5 relative RMS error to the attention error.
+    return 0.1 if qkv_dtype == _FP8 else 0.05
+
+
+@pytest.mark.parametrize("qkv_dtype", (torch.bfloat16, _FP8), ids=("bf16", "fp8"))
+@pytest.mark.parametrize(
+    "layout,mask_type,head_dim,head_dim_vo,window_left",
+    (
+        ("fixed", "dense", 128, None, -1),
+        ("fixed", "causal", 256, None, -1),
+        ("fixed", "causal", 192, 128, -1),
+        ("packed", "causal", 128, None, -1),
+        ("packed", "dense", 192, None, -1),
+        ("paged", "causal", 128, None, -1),
+        ("paged", "causal", 128, None, 63),
+    ),
+    ids=(
+        "fixed-dense-d128",
+        "fixed-causal-d256",
+        "fixed-causal-mla192x128",
+        "packed-causal-d128",
+        "packed-dense-d192",
+        "paged-causal-d128",
+        "paged-window-d128",
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_output(
+    qkv_dtype, layout, mask_type, head_dim, head_dim_vo, window_left
+):
+    """MXFP8 O follows the trtllm-gen recipe over the [tokens, Hq * Dv] view.
+
+    Partial final Q tiles, paired queries and heads, and every staging path
+    write their rows' scales. Padding stays untouched.
+    """
+    if head_dim_vo is not None and qkv_dtype == _FP8:
+        pytest.skip("the 192/128 MLA shape is covered with 16-bit Q/K")
+    q_lengths = (300, 300) if layout == "fixed" else (37, 200, 129)
+    k_lengths = q_lengths if layout == "fixed" else (101, 260, 129)
+    common = dict(
+        q_lengths=q_lengths,
+        k_lengths=k_lengths,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        mask_type=mask_type,
+        window_left=window_left,
+        seed=20261109,
+    )
+    runs = {}
+    if layout == "paged":
+        paged = _make_paged_context_case(qk_dtype=qkv_dtype, **common)
+        case = paged.reference
+        for out_dtype, out_scale_dtype in (_BF16_OUT, _MXFP8_OUT):
+            wrapper = BatchPrefillPagedTSWrapper()
+            metadata = _plan_paged_wrapper(
+                wrapper,
+                replace(paged, reference=replace(case, out_dtype=out_dtype)),
+                out_scale_dtype=out_scale_dtype,
+            )
+            runs[out_scale_dtype] = _run_paged_wrapper(wrapper, paged, metadata)
+    else:
+        case = _make_context_case(
+            qkv_dtype=qkv_dtype, packed_query=layout == "packed", **common
+        )
+        if head_dim_vo is not None:
+            v = case.v[..., :head_dim_vo].contiguous()
+            case = replace(case, v=v)
+        for out_dtype, out_scale_dtype in (_BF16_OUT, _MXFP8_OUT):
+            wrapper = BatchPrefillTSWrapper()
+            if head_dim_vo is None:
+                _plan_wrapper(
+                    wrapper,
+                    replace(case, out_dtype=out_dtype),
+                    out_scale_dtype=out_scale_dtype,
+                )
+            else:
+                wrapper.plan(
+                    device=case.q.device,
+                    batch_size=len(case.q_lengths),
+                    max_q_len=max(case.q_lengths),
+                    max_kv_len=max(case.k_lengths),
+                    num_qo_heads=8,
+                    num_kv_heads=2,
+                    head_dim=head_dim,
+                    head_dim_vo=head_dim_vo,
+                    q_dtype=qkv_dtype,
+                    k_dtype=qkv_dtype,
+                    mask_type=mask_type,
+                    softmax_scale=case.softmax_scale,
+                    output_scale=case.output_scale,
+                    out_dtype=out_dtype,
+                    out_scale_dtype=out_scale_dtype,
+                )
+            runs[out_scale_dtype] = _run_wrapper(wrapper, case)
+    expected = _context_reference(case)
+
+    out, out_scale = runs[_E8M0]
+    assert out.dtype == _FP8
+    assert out.shape == expected.shape
+    assert out_scale.dtype == _E8M0
+    assert out_scale.shape == (_mxfp8_scale_numel(out.shape),)
+    assert_mxfp8_output(
+        out, out_scale, expected, max_relative_l2=_mxfp8_relative_l2(qkv_dtype)
+    )
+    assert_mxfp8_matches_quantized(out, out_scale, runs[None])
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_output_buffers_and_graph():
+    """uint8 scales name MXFP8 too; caller buffers keep their shape, padding
+    stays untouched, LSE follows the scales, and graph replay rewrites both
+    outputs in place."""
+    case = _make_context_case(
+        q_lengths=(37, 200, 129),
+        k_lengths=(40, 260, 129),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        qkv_dtype=torch.bfloat16,
+        packed_query=True,
+        mask_type="causal",
+        seed=1109,
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=case.q.device,
+        batch_size=3,
+        max_q_len=200,
+        max_kv_len=260,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=_HEAD_DIM,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        packed_query=True,
+        mask_type="causal",
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+        out_dtype=_FP8,
+        out_scale_dtype=torch.uint8,
+        lse_mode="base2",
+    )
+    expected = _context_reference(case)
+    tokens = int(case.q.shape[0])
+    scale_cols = 8 * _HEAD_DIM // 32
+    out = torch.empty(case.q.shape, dtype=_FP8, device="cuda")
+    # The 2-D padded uint8 view that block-scaled GEMMs describe is accepted as is.
+    out_scale = torch.full(
+        ((tokens + 127) // 128 * 128, (scale_cols + 3) // 4 * 4),
+        0xEE,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    result = _run_wrapper(wrapper, case, out=out, out_scale=out_scale, return_lse=True)
+    assert len(result) == 3
+    assert result[0] is out and result[1] is out_scale
+    assert result[2].shape == case.q.shape[:-1]
+    assert_mxfp8_output(out, out_scale, expected, max_relative_l2=0.05)
+    padding = ~written_scale_mask(tokens, scale_cols, out_scale.device)
+    assert bool((out_scale.view(-1)[padding] == 0xEE).all())
+    # An omitted buffer takes the planned scale dtype.
+    assert _run_wrapper(wrapper, case)[1].dtype == torch.uint8
+
+    def launch():
+        return wrapper.run(
+            case.q,
+            case.k,
+            case.v,
+            case.qo_indptr,
+            case.kv_indptr,
+            max_q_len=200,
+            max_kv_len=260,
+            out=out,
+            out_scale=out_scale,
+            lse=result[2],
+            validate=False,
+        )
+
+    launch()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    out.view(torch.uint8).fill_(0x7F)
+    out_scale.view(-1)[~padding] = 0
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_mxfp8_output(out, out_scale, expected, max_relative_l2=0.05)
+
+    # The one-shot API takes the format from out_scale.dtype; an E8M0 buffer
+    # infers the E4M3 data dtype and matches the uint8 plan bit for bit.
+    one_shot_out, one_shot_scale = batch_prefill(
+        case.q,
+        case.k,
+        case.v,
+        qo_indptr=case.qo_indptr,
+        kv_indptr=case.kv_indptr,
+        mask_type="causal",
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
+        out_scale=torch.empty_like(out_scale).view(_E8M0),
+    )
+    assert one_shot_out.dtype == _FP8 and one_shot_scale.dtype == _E8M0
+    assert torch.equal(one_shot_out.view(torch.uint8), out.view(torch.uint8))
+    assert torch.equal(
+        one_shot_scale.view(torch.uint8).view(-1)[~padding],
+        out_scale.view(-1)[~padding],
+    )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mxfp8_output_contract():
+    """Plans and runs reject quantized outputs where their contract does not hold."""
+    case = _make_context_case(
+        q_lengths=(128,),
+        k_lengths=(128,),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        qkv_dtype=torch.bfloat16,
+        packed_query=False,
+        mask_type="dense",
+    )
+    plan = dict(
+        device="cuda",
+        batch_size=1,
+        max_q_len=128,
+        max_kv_len=128,
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=_HEAD_DIM,
+    )
+    with pytest.raises(NotImplementedError, match="unsupported quantized output"):
+        BatchPrefillTSWrapper().plan(
+            **plan,
+            q_dtype=torch.bfloat16,
+            k_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+            out_scale_dtype=_E8M0,
+        )
+    with pytest.raises(NotImplementedError, match="MXFP8 Q/K"):
+        BatchPrefillTSWrapper().plan(
+            **plan,
+            q_dtype=_E8M0,
+            k_dtype=_E8M0,
+            out_dtype=_FP8,
+            out_scale_dtype=_E8M0,
+        )
+    with pytest.raises(NotImplementedError, match="16-bit output"):
+        BatchPrefillTSWrapper().plan(
+            **plan,
+            q_dtype=torch.bfloat16,
+            k_dtype=torch.bfloat16,
+            v_dtype=_FP8,
+            out_dtype=_FP8,
+            out_scale_dtype=_E8M0,
+            vc_config=context_module.VCAttentionConfig(demean=True),
+        )
+
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(**plan, q_dtype=torch.bfloat16, k_dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="out_scale belongs to quantized-output plans"):
+        _run_wrapper(wrapper, case, out_scale=torch.empty(1, device="cuda"))
+
+    wrapper.plan(
+        **plan,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        out_dtype=_FP8,
+        out_scale_dtype=_E8M0,
+    )
+    with pytest.raises(ValueError, match="swizzled"):
+        _run_wrapper(
+            wrapper, case, out_scale=torch.empty(64, dtype=_E8M0, device="cuda")
+        )
+    with pytest.raises(ValueError, match="planned scale dtype"):
+        _run_wrapper(
+            wrapper,
+            case,
+            out_scale=torch.empty(
+                _mxfp8_scale_numel(case.q.shape), dtype=torch.uint8, device="cuda"
+            ),
+        )
+    with pytest.raises(ValueError, match="dtype"):
+        _run_wrapper(wrapper, case, out=torch.empty_like(case.q))
+    # A one-shot scale buffer must name a format.
+    with pytest.raises(ValueError, match="needs out_dtype"):
+        batch_prefill(
+            case.q,
+            case.k,
+            case.v,
+            out_scale=torch.empty(
+                _mxfp8_scale_numel(case.q.shape), dtype=torch.int8, device="cuda"
+            ),
+        )
