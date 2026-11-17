@@ -1,5 +1,7 @@
+import contextlib
 import ctypes
 import functools
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -426,6 +428,31 @@ def get_device_nsmid(device: torch.device) -> int:
 
     Under CUDA MPS with a reduced thread share, ``multi_processor_count`` shrinks
     but ``%smid`` still spans the physical SM ids, which ``%nsmid`` bounds.
+    If the probe fails, falls back to ``multi_processor_count`` (exact outside
+    MPS) and warns once per device; the fallback is cached, so a failed probe is
+    not recompiled on every call.
+    """
+    try:
+        return probe_device_nsmid(device)
+    except Exception as e:  # noqa: BLE001 - any probe failure takes the fallback
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        warnings.warn(
+            f"%nsmid probe failed on {device} ({e}); sizing the GDN prefill "
+            f"tensor-map workspace by multi_processor_count={sm_count}, which "
+            "under-sizes it when CUDA MPS limits the active thread percentage.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return sm_count
+
+
+def probe_device_nsmid(device: torch.device) -> int:
+    """Read ``%nsmid`` with a one-thread kernel; safe under CUDA graph capture.
+
+    The first prefill call may run inside ``torch.cuda.graph(...)``. The probe
+    switches this thread to relaxed capture mode (as PyTorch's allocator does
+    for ``cudaMalloc`` during capture) and uses only its own non-blocking
+    stream and allocation, so it never touches the capturing stream.
     """
     from cuda.bindings import driver, nvrtc
 
@@ -434,20 +461,49 @@ def get_device_nsmid(device: torch.device) -> int:
             raise RuntimeError(f"%nsmid probe failed: {res[0]}")
         return res[1] if len(res) == 2 else None
 
-    major, minor = torch.cuda.get_device_capability(device)
-    out = torch.zeros(1, dtype=torch.int32, device=device)
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(index)
+
+    # A CUBIN rather than PTX: PTX from an nvrtc newer than the driver fails to
+    # JIT (CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
     prog = check(nvrtc.nvrtcCreateProgram(_NSMID_SRC, b"nsmid_probe.cu", 0, [], []))
-    opts = [f"--gpu-architecture=compute_{major}{minor}".encode()]
-    check(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
-    ptx_size = check(nvrtc.nvrtcGetPTXSize(prog))
-    ptx = b" " * ptx_size
-    check(nvrtc.nvrtcGetPTX(prog, ptx))
-    with torch.cuda.device(device):
-        torch.cuda.current_stream(device).synchronize()
-        module = check(driver.cuModuleLoadData(ptx))
+    try:
+        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+        check(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+        cubin = b" " * check(nvrtc.nvrtcGetCUBINSize(prog))
+        check(nvrtc.nvrtcGetCUBIN(prog, cubin))
+    finally:
+        nvrtc.nvrtcDestroyProgram(prog)
+
+    host = ctypes.c_uint32(0)
+    with contextlib.ExitStack() as cleanup:
+        check(driver.cuInit(0))
+        cu_device = check(driver.cuDeviceGet(index))
+        ctx = check(driver.cuDevicePrimaryCtxRetain(cu_device))
+        cleanup.callback(driver.cuDevicePrimaryCtxRelease, cu_device)
+        check(driver.cuCtxPushCurrent(ctx))
+        cleanup.callback(driver.cuCtxPopCurrent)
+        prev_mode = check(
+            driver.cuThreadExchangeStreamCaptureMode(
+                driver.CUstreamCaptureMode.CU_STREAM_CAPTURE_MODE_RELAXED
+            )
+        )
+        cleanup.callback(driver.cuThreadExchangeStreamCaptureMode, prev_mode)
+        stream = check(
+            driver.cuStreamCreate(driver.CUstream_flags.CU_STREAM_NON_BLOCKING.value)
+        )
+        cleanup.callback(driver.cuStreamDestroy, stream)
+        dptr = check(driver.cuMemAlloc(ctypes.sizeof(host)))
+        cleanup.callback(driver.cuMemFree, dptr)
+        module = check(driver.cuModuleLoadData(cubin))
+        cleanup.callback(driver.cuModuleUnload, module)
         kernel = check(driver.cuModuleGetFunction(module, b"nsmid_probe"))
-        params = ((out.data_ptr(),), (ctypes.c_void_p,))
-        check(driver.cuLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0, 0, params, 0))
-        check(driver.cuCtxSynchronize())
-        check(driver.cuModuleUnload(module))
-    return int(out.item())
+        params = ((int(dptr),), (ctypes.c_void_p,))
+        check(driver.cuLaunchKernel(kernel, 1, 1, 1, 1, 1, 1, 0, stream, params, 0))
+        check(
+            driver.cuMemcpyDtoHAsync(
+                ctypes.addressof(host), dptr, ctypes.sizeof(host), stream
+            )
+        )
+        check(driver.cuStreamSynchronize(stream))
+    return int(host.value)
