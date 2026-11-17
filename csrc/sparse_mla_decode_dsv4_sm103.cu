@@ -8,6 +8,7 @@
 #endif
 #include <cooperative_groups.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cfloat>
@@ -3226,10 +3227,16 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
   }
 }
 
-static int g_sm = 0;
-static bool g_init = false;
-static int g_maxclu = 8;
-static int g_maxcl[11];
+// Per-device one-time setup state (multi-GPU: attributes, occupancy and SM
+// counts differ per device; the init block is idempotent per device).
+struct DevCfg {
+  int sm = 0;
+  bool init = false;
+  int maxclu = 8;
+  int maxcl[11];
+};
+constexpr int kMaxDevices = 64;
+static DevCfg g_devcfg[kMaxDevices];
 
 #define SET_ATTR(N)                                                                  \
   cudaFuncSetAttribute(mla_main<32, N>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
@@ -3267,9 +3274,15 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
       &ckv_tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, ckv.data_ptr(), ckv_dims, strides, box,
       elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  if (swa_map_ok != CUDA_SUCCESS || ckv_map_ok != CUDA_SUCCESS) return;
+  if (swa_map_ok != CUDA_SUCCESS || ckv_map_ok != CUDA_SUCCESS) {
+    TVM_FFI_THROW(RuntimeError) << "sparse_mla_decode_dsv4: cuTensorMapEncodeTiled failed (swa="
+                                << (int)swa_map_ok << ", ckv=" << (int)ckv_map_ok
+                                << "); refusing to return stale output";
+  }
 #endif
-  if (!g_init) {
+  ffi::CUDADeviceGuard device_guard(dev.device_id);
+  DevCfg& dc = g_devcfg[dev.device_id & (kMaxDevices - 1)];
+  if (!dc.init) {
     SET_ATTR(1)
     SET_ATTR(2)
     SET_ATTR(3)
@@ -3342,8 +3355,8 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
     cudaFuncSetAttribute(mla_b13<5>, cudaFuncAttributePreferredSharedMemoryCarveout,
                          cudaSharedmemCarveoutMaxShared);
     cudaFuncSetAttribute(mla_b13<5>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    cudaDeviceGetAttribute(&g_sm, cudaDevAttrMultiProcessorCount, dev.device_id);
-    if (g_sm <= 0) g_sm = 152;
+    cudaDeviceGetAttribute(&dc.sm, cudaDevAttrMultiProcessorCount, dev.device_id);
+    if (dc.sm <= 0) dc.sm = 152;
     int mc = 0;
     cudaLaunchConfig_t probe = {};
     probe.gridDim = dim3(1, 1, 1);
@@ -3353,8 +3366,8 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
             cudaSuccess ||
         mc <= 0)
       mc = 8;
-    g_maxclu = mc > 10 ? 10 : mc;
-    for (int i = 0; i < 11; ++i) g_maxcl[i] = 0;
+    dc.maxclu = mc > 10 ? 10 : mc;
+    for (int i = 0; i < 11; ++i) dc.maxcl[i] = 0;
     cudaLaunchAttribute pat[1];
     pat[0].id = cudaLaunchAttributeClusterDimension;
     pat[0].val.clusterDim.y = 1;
@@ -3369,9 +3382,9 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
     if (cudaOccupancyMaxActiveClusters(&nc, (const void*)mla_main<32, N>, &probe) == \
             cudaSuccess &&                                                           \
         nc > 0)                                                                      \
-      g_maxcl[N] = nc;                                                               \
+      dc.maxcl[N] = nc;                                                              \
     else                                                                             \
-      g_maxcl[N] = (2 * g_sm) / N;                                                   \
+      dc.maxcl[N] = (2 * dc.sm) / N;                                                 \
   }
     PROBE(1)
     PROBE(2)
@@ -3381,7 +3394,7 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
     PROBE(7)
     PROBE(10)
 #undef PROBE
-    g_init = true;
+    dc.init = true;
   }
   const int64_t T64 = q.shape()[0];
   // CUDA grid Y is limited to 65535.  Large in-scope packed-token counts use
@@ -3430,9 +3443,9 @@ void Run(ffi::TensorView q, ffi::TensorView swa, ffi::TensorView ckv,
   if (!use_tile16) {
     for (int i = 0; i < 7; ++i) {
       const int c = kCand[i];
-      if (c > g_maxclu) continue;
-      if ((long long)c * T > 2LL * g_sm) continue;
-      if (T > g_maxcl[c]) continue;
+      if (c > dc.maxclu) continue;
+      if ((long long)c * T > 2LL * dc.sm) continue;
+      if (T > dc.maxcl[c]) continue;
       nsplit = c;
       break;
     }

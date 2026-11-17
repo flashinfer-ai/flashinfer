@@ -50,7 +50,7 @@ KILL_SWITCH_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 DISPATCH_STATS = {"specialized": 0, "fallback": 0}
 LAST_FALLBACK_REASONS: list = []
 _BUILT = {"ready": False}
-_WARMED = {"ready": False}
+_WARMED: set = set()  # device indices warmed before capture
 
 
 @functools.cache
@@ -205,8 +205,11 @@ def supported_with_reasons(
             r.append(name + "_not_contiguous")
         if t.device != query.device:
             r.append(name + "_device_mismatch")
+        if t.data_ptr() % 16:
+            r.append(name + "_not_16B_aligned")
     if out is not None and (
         out.dtype != torch.bfloat16
+        or out.data_ptr() % 16
         or out.shape != query.shape
         or not out.is_contiguous()
         or out.device != query.device
@@ -217,7 +220,7 @@ def supported_with_reasons(
     # device guards
     if torch.cuda.get_device_capability(query.device) != (10, 3):
         return ["not_sm103"]
-    if torch.cuda.is_current_stream_capturing() and not _WARMED["ready"]:
+    if torch.cuda.is_current_stream_capturing() and query.device.index not in _WARMED:
         return ["not_warmed_before_graph_capture"]
     return []
 
@@ -259,6 +262,16 @@ def maybe_dispatch_specialized(
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
+        try:
+            get_sparse_mla_decode_dsv4_module()
+        except Exception as e:  # pragma: no cover - environment-dependent
+            if backend == "specialized":
+                raise
+            LAST_FALLBACK_REASONS[:] = [
+                "specialized_module_unavailable:" + type(e).__name__
+            ]
+            DISPATCH_STATS["fallback"] += 1
+            return None
         DISPATCH_STATS["specialized"] += 1
         return _run_specialized(
             query,
@@ -308,6 +321,6 @@ def _run_specialized(
         sinks,
         out,
     )
-    if not _WARMED["ready"] and not torch.cuda.is_current_stream_capturing():
-        _WARMED["ready"] = True
+    if not torch.cuda.is_current_stream_capturing():
+        _WARMED.add(query.device.index)
     return out
