@@ -123,7 +123,7 @@ from flashinfer.experimental.cake.cake_dsa_sparse_attention_nondet_train import 
     cake_jit,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (  # noqa: E402
     D_LATENT,
     D_QK,
     D_ROPE,

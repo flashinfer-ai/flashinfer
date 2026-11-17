@@ -32,7 +32,7 @@ from flashinfer.experimental.cake.cake_dsa_sparse_attention_det_train import (
     cake_backend,
     cake_jit,
 )
-from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
+from tests.experimental.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
     make_inputs,
 )
 

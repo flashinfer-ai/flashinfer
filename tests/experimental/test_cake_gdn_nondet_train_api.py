@@ -40,7 +40,7 @@ import warnings
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 FACADE = "flashinfer.cake_gdn_nondet_train"
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_nondet_train"

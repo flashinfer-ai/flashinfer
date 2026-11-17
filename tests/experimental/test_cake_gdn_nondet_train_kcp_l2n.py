@@ -31,7 +31,7 @@ CPU tests of the in-kernel Q / K L2 norm of the non-deterministic KCP GDN packag
 
 The fake backend is not bitwise the device programs in #1 / #8's bodies (different accumulation orders): these tests
 prove the plumbing and the oracle, not GPU numerics (``test_cake_gdn_nondet_train_kcp_dist.py`` holds the GPU rows).
-The suite imports the package and the deterministic package through ``tests/test_helpers/cake_package.py`` and nothing
+The suite imports the package and the deterministic package through ``tests/cake/test_helpers/cake_package.py`` and nothing
 else from flashinfer; the facade's hand-off of the option is tested in ``test_cake_gdn_nondet_train_kcp_api.py``.
 """
 
@@ -50,14 +50,14 @@ import torch
 
 def _mod(sub: str | None = None):
     """The package (or one of its modules) through the test-helper registry: a stale entry fails here, never skips."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_nondet_train_kcp", sub)
 
 
 def _det_mod(sub: str | None = None):
     """A module of the deterministic package through the test-helper registry (a stale entry fails, never skips)."""
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     return cake_package("cake_gdn_det_train_kcp", sub)
 

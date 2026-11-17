@@ -1195,10 +1195,3 @@ def test_deepseek_scale_block_rejects_wrong_expert_dim():
     ok, reason, _ = support._deepseek_fp8_scale_block(runner, inputs, kwargs)
     assert not ok
     assert "gemm1_weights_scale" in reason and "num_local_experts=4" in reason
-
-
-def test_deepseek_scale_block32_declined_on_sm107(monkeypatch):
-    monkeypatch.setattr(support, "_sm_arch_for_device", lambda device: 107)
-    ok, reason, _ = support._deepseek_fp8_scale_block(*_deepseek_block32_call())
-    assert not ok
-    assert "SM107" in reason

@@ -23,7 +23,7 @@ only needs these constants and bounds to carve the caller-owned workspace and
 to bound the kernel's ticket loop, so one prepared launch replays for any
 length distribution.  The exact host mirror of the planner used by the tests,
 including the packed-row merge-ticket rule (``mtp_merge_slices_for`` /
-``mtp_merge_items``), lives in ``tests/test_helpers/cake_balanced_gqa_plan.py``.
+``mtp_merge_items``), lives in ``tests/experimental/test_helpers/cake_balanced_gqa_plan.py``.
 
 Two generated programs share the workspace: the row-tile kernel (one 8-head
 query row per item, any ``q_len_per_req``) and the packed-row MTP kernel

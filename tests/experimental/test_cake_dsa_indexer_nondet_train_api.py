@@ -48,7 +48,7 @@ from flashinfer.experimental.cake.cake_dsa_indexer_nondet_train.cake_backend imp
     generated_program_available,
 )
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
 
 ALERT = "does not have a deterministic implementation"
 

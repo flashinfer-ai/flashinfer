@@ -11,10 +11,12 @@ The public module `flashinfer.cake_lm_head_det_train` is a stable API
 experimental, with no compatibility guarantee for its internal modules.
 SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
 SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
-built for `sm_107a`, under the base dispatch rules).  The feature does not participate in
-automatic backend selection, autotuning or trace-apply.  Its libraries are
-loaded prebuilt from `aot/` when the package ships them and JIT-built by
-FlashInfer from `build.json` otherwise (see "Layout of this package").
+built for `sm_107a`, under SM103's dispatch rules except the logits rasters,
+the long-chunk `dX` ring and the whole-chunk `dX` split).  The feature does
+not participate in automatic backend selection, autotuning or trace-apply.
+Its libraries are loaded prebuilt from `aot/` when the package ships them and
+JIT-built by FlashInfer from `build.json` otherwise (see "Layout of this
+package").
 
 ## Public entry points (`flashinfer/cake_lm_head_det_train.py`)
 
@@ -103,9 +105,9 @@ keyword.
   `"forward"`: every call with a trainable input forms the gradients in its
   forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
   bits either way.  `cake_lm_head_det_train_logprob` (with or without a
-  temperature, without `num_valid_rows`; a default call also when its
-  backward runs a budget form; not its explicit `"budget"` or kept-logits
-  forms, nor calls with `num_valid_rows`) forms no gradient in its
+  temperature; a default call also when its backward runs a budget form, an
+  explicit `"budget"` call and a call with `num_valid_rows`; not its
+  kept-logits form) forms no gradient in its
   forward; under `"auto"` inside a non-reentrant `torch.utils.checkpoint` its
   checkpointed forward keeps the call's row results (`logp`, the FP32 `lse`,
   the valid-row index and the compact temperature: O(T) bytes until the
@@ -324,14 +326,56 @@ keyword.
   B200 and +9.6 to +13.1 us on GB300; at `T` = 32 and 128 -3.3 to +1.2 us on
   B200 and 5.4 to 13.0 us faster on GB300) and holds the kept logits until its
   graph is freed.  The kept logits are outside the chunk bound of the memory
-  rule below.  The default entries are unchanged: the kept form has its own
-  entry points, plan (`_KeptPlan`), binding and cache keys.
+  rule below.  The kept form has its own entry points, plan (`_KeptPlan`),
+  binding and cache keys; a default log-probability call reaches it through
+  the one-chunk rule below.
   `prepare_lm_head_det_loss(..., logprob_keep=True)` prepares the kept plan for
   those entry points only (its runner's `forward` / `backward` raise
   `NotImplementedError`).  Like `"budget"`, `memory_mode="keep_logits"` is a
   `ValueError` on the reference backend (the backend-level
   `cake_lm_head_det_train_logprob_keep` runs the default entry there).
-* Memory rule (except the opt-in kept logits above): no logits, probability or
+* One-chunk kept logits (the default log-probability call;
+  `cake_backend_opt_in.set_logprob_one_chunk_keep`, on by default; the one
+  rule is `cake_backend_opt_in._one_chunk_keep_rule`): a default call of
+  `cake_lm_head_det_train_logprob` (`memory_mode=None`, no
+  `num_valid_rows`, no temperature) runs the kept form above when all of
+  these hold: the `cake` backend with `X` on CUDA; a backward can follow
+  (grad mode on, `X` or `W` trainable -- through the public entry also with
+  a frozen `W`); no `torch.utils.checkpoint` (no saved-tensor hooks on top,
+  so neither pass of a non-reentrant checkpoint and no CPU offload; outside
+  a backward, so not a reentrant checkpoint's recomputation, whose first
+  pass runs with grad mode off); fewer than three chunks of rows
+  (`cake_backend.HIDDEN_COUNT_MIN_CHUNKS`; a longer call counts its valid
+  rows on the device and keeps the default form); the valid rows fit one
+  chunk (`T_v <= chunk_size`; every row of an uncompacted call); and the
+  fast backward
+  would run no zero-gradient row skip on the call (fewer valid rows than
+  the device's `cake_backend.zero_dlogp_min_rows`, or the skip off; see
+  "Zero-gradient rows of the log-probability backward").  The kept backward
+  has no skip: with valid rows of a zero `dlogp` its `dW` would add the rows
+  in another order than the skip, so a call the skip can take keeps the
+  default form, and every output stays the bits of `memory_mode="fast"`, in
+  a checkpointed step too (which keeps the default form on every pass).
+  The call's forward counts its valid rows once, on the host, as the
+  default forward of a call of fewer than three chunks of rows does, and
+  applies the rule right after the count
+  (`cake_backend_opt_in.CakeLMHeadDetLogprobOneChunkFunction`): either form
+  runs on that count, with no other work between the count and its first
+  launch (a longer call keeps its route).  A kept call runs three GEMMs
+  instead of four: its
+  forward writes the whole `z_c` (the label-column arm is off) and its
+  backward forms `dz` with `row_grad` over the kept logits.  Memory: the
+  forward keeps `2 * T_v * V` bytes until the backward, at most one chunk
+  (`chunk_size` rows) of BF16 logits, which the backward overwrites with
+  `dz` in place; no logits or `dlogits` allocation spans more than one
+  chunk, so the memory rule below (#5680) holds.  Each pending forward
+  holds its own chunk: a caller that runs several forwards before their backwards (heads
+  of several positions, for example) holds one chunk per forward until each
+  backward runs, and a forward whose backward never runs holds it until its
+  graph is freed.  `memory_mode="fast"` (per call) or
+  `set_logprob_one_chunk_keep(False)` (per process) runs the call without it.
+* Memory rule (except the opt-in kept logits above; the default call's
+  one-chunk kept logits hold at most one chunk): no logits, probability or
   `dlogits` buffer ever spans more than `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
   an empty `logp` and zero gradients without binding or launching (`dW` is
@@ -357,7 +401,10 @@ keyword.
   trainable head) it runs the fast form's forward -- the loss entry's in
   `cake_backend_opt_in.py`, the log-probability entries' in
   `cake_backend.py` -- with its hidden valid-row count checked as below
-  (bitwise the same outputs).  Every other call without either keyword -- a
+  (bitwise the same outputs).  So does a default log-probability call
+  without a temperature whose `X` requires a gradient under grad mode and
+  whose rows fit two chunks, also with a frozen `W` (the one-chunk kept
+  logits below).  Every other call without either keyword -- a
   frozen `W`, an FP32 `W`, `X` off CUDA, another backend -- runs
   `cake_backend.py`'s entry unchanged, with its buffer lifetimes; the public
   entries of `flashinfer.cake_lm_head_det_train` run their argument checks
@@ -394,7 +441,9 @@ keyword.
   `cake_lm_head_det_train_logprob`, default `None`, the automatic form below;
   `"fast"` always runs the fast form; `"budget"` is opt-in, `cake` backend and
   BF16 `dW` only; `"keep_logits"`, the log-probability entry's kept logits
-  above, takes no `num_valid_rows` and is a `ValueError` on the loss entry).
+  above, also takes `num_valid_rows` (its forward then runs on the index
+  formed from the caller's count, no readback, bitwise the same outputs) and
+  is a `ValueError` on the loss entry).
   The fast form keeps the FP32 `[V, H]`
   weight-gradient accumulator next to the chunk buffers, so its step peak
   (forward through backward, outputs included) is above that of a head that
@@ -403,20 +452,36 @@ keyword.
   weight-gradient form whose predicted peak stays within `B` less a 2 % margin
   (`cake_backend_opt_in.memory_plan`, which returns the form and both byte counts;
   `ForwardResult.memory_plan` carries it): `"fused"` (the fast form),
-  `"fused_ip"` (loss entry, two or more chunks: the fast form's kernels with
+  `"fused_ip"` (two or more chunks: the fast form's kernels with
   the FP32 accumulator split at the vocabulary row `a =
   cake_backend_opt_in.dw_split_rows(V)`, half the vocabulary rounded up to
   the weight-gradient block, so each chunk runs the accumulate GEMM on rows
   `[0, a)` and `[a, V)`; a backward that frees the graph casts `dW` in place:
   the deferred last chunk's fused scale + cast GEMM writes the BF16 rows of
-  `[0, a)` into the first part's own storage, in pieces that each start at
-  most twice as far in as the previous one ends (the first one, `a / 16`
-  rows rounded up to the block, through a temporary), then the rows `[a,
-  V)`, so no `[V, H]` BF16 output is held beside the accumulator; a backward
-  that keeps the graph, and `ForwardResult.backward`, cast out of place),
+  `[0, a)` into the first part's own storage, in pieces: the first one, `a /
+  16` rows rounded up to the block, through a temporary, and after it each
+  piece `[m0, m1)` ends at most twice as far in as it starts (`m1 <= 2 *
+  m0`), so its BF16 rows overwrite only FP32 rows that earlier pieces have
+  read; then the rows `[a, V)`, so no `[V, H]` BF16 output is held beside
+  the accumulator; a backward that keeps the graph, and
+  `ForwardResult.backward`, cast out of place; the explicit pair carries the
+  split as `ForwardResult.dw_split` = `(a, V)`, `ForwardResult.dw_acc` = the
+  FP32 `[a, H]` rows `[0, a)` and `ForwardResult.dw_acc_hi` = the FP32 `[V -
+  a, H]` rows `[a, V)`, which `backward_loss(..., dw_acc_hi=...)` with the
+  deferred operands casts out of place, bitwise `ForwardResult.backward`; the
+  log-probability backward runs the same split accumulator in its own chunk
+  loop and always casts in place),
   `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),
+  `"partial_ip"` (two or more chunks: the split accumulator
+  covers the vocabulary rows `[0, dw_rows)` only, `dw_rows >= a`, as the
+  parts `[0, a)` and `[a, dw_rows)`; the backward keeps the deferred last
+  chunk's BF16 `dz` (and the loss entry's per-row gradient scale; the
+  log-probability entry's is `dlogp`), casts the rows `[0, dw_rows)`
+  as `"fused_ip"` does and recomputes the other rows as below, reading the
+  last chunk's block from the kept `dz`, so per block it runs one logits
+  GEMM fewer than `"partial"`),
   `"partial"` (the chunk loop accumulates the vocabulary rows `[0, dw_rows)`
-  only) or `"recompute"` (none).  The last two recompute the other rows of
+  only) or `"recompute"` (none).  The last three recompute the other rows of
   `dW` in the backward, one vocabulary block at a time: per block and chunk the
   logits GEMM's `dz` arm (`gemm_logits_dz`) on `W[v0:v1]` recomputes the
   block's `dz` from the saved row statistic `lse` and per-row gradient scale
@@ -441,8 +506,11 @@ keyword.
   B200 (other allocator settings are not measured): every measured
   `"budget"` step peak of a call whose plan fits, single calls and repeated
   calls that miss or hit the binding cache, at the issue's shapes and at
-  small heads, stayed within `B`; the highest reached 0.9794 `B`.  No
-  environment variable selects it.
+  small heads, stayed within `B`; the highest reached 0.9794 `B`.  The
+  forms whose `dW` the cake kernels finish (`"fused_ip"`, `"partial_ip"`,
+  `"partial"`, `"recompute"`) take no `backend="reference"` override in
+  `ForwardResult.backward` (`ValueError`; their forward runs on the `cake`
+  backend only).  No environment variable selects it.
 * Automatic memory form (the default, `memory_mode=None`;
   `cake_backend_opt_in.MEMORY_AUTO`, accepted by the resolver but not one of
   `MEMORY_MODES`): a call that forms a BF16 `dW` on the `cake` backend on
@@ -484,14 +552,21 @@ keyword.
   the threshold the cost depends on the form the call gets (B200, step
   medians of the default and `"fast"` calls in one process, `C = 4096`):
   at the issue's shapes (`T = 16384`, a third of the labels ignored) the
-  step peak went from 6.971 to 5.020 GiB at `H = 6144` (`"partial"`, 42.5
-  against 40.3 ms, about 5 % slower) and from 5.041 to 3.838 GiB at
+  step peak went from 6.971 to 5.015 GiB at `H = 6144` (`"partial_ip"`,
+  42.6 against 41.5 ms, about 3 % slower) and from 5.041 to 3.838 GiB at
   `H = 4096` (`"fused_ip"`, 27.3 against 27.2 ms, within the noise); with
   5 % of the labels ignored, at `H = 6144`, from 7.081 to 5.430 GiB
   (`"fused_ip"`, 57.0 against 56.9 ms, within the noise; a checkpointed step
-  about 2 % slower); at `T = 8117` (two chunks, `H = 6144`, `"partial"`)
-  from 6.811 to 4.005 GiB, 33.5 against 28.9 ms (about 15 % slower); a
-  short call that recomputes most of the vocabulary costs more.  The margin above was measured for the `"budget"`
+  about 2 % slower); at `T = 8117` (two chunks, `H = 6144`, `"partial_ip"`)
+  from 6.811 to 3.996 GiB, 31.8 against 29.7 ms (about 7 % slower).  The
+  log-probability entry's backward gets the same forms: `"partial_ip"` at
+  `T = 16384` with a third of the labels ignored (7.081 to 5.015 GiB, 54.5
+  against 53.0 ms, about 3 % slower) and at `T = 8117` (7.005 to 3.996 GiB,
+  40.6 against 38.2 ms, about 6 % slower), `"fused_ip"` at `H = 4096` (4.989
+  to 3.838 GiB, 36.5 against 35.7 ms, about 2 % slower) and with 5 % of the
+  labels ignored (7.185 to 5.430 GiB, 76.6 against 75.8 ms, within the
+  noise).  A short
+  call that recomputes most of the vocabulary costs more.  The margin above was measured for the `"budget"`
   form; the fast form's own-lifetime model is checked against measured peaks
   of the issue's shapes.  The hidden valid-row count allocates a whole
   chunk's buffers before the count is known.  A call that misses the binding
@@ -1117,7 +1192,8 @@ a record serves every admissible geometry and the host never selects by shape:
   (`cake_backend.dx_tile_rule`, evaluated after the slice count; `dX` is
   bitwise the same on both tiles);
 * `_st3`: the 3-deep operand ring of the 512-wide `dX` tile below `H` 7168 for
-  chunks of more than 4096 rows on both architectures
+  chunks of more than 4096 rows on sm_100a and sm_103a (sm_107a keeps the
+  table depth)
   (`cake_backend.dx_stages_variant`, `DX_LONG_CHUNK_STAGES`); the 256-wide
   fallback keeps its depth.  Bitwise: the ring depth only changes when a stage
   is refilled;
@@ -1126,11 +1202,11 @@ a record serves every admissible geometry and the host never selects by shape:
   `k_slices`) leave `r = W mod P` items in the last wave of the `P` SM pairs
   with `0 < r <= P / 2`, the last `r` wide items run as `2 r` 256-wide half
   items in the same launch (the grid carries `W + r` clusters; the split count
-  is the launch scalar `dx_split`).  Taken on both architectures for chunks
+  is the launch scalar `dx_split`).  Taken on every architecture for chunks
   that are not a whole number of 512-token tiles; for chunks of whole
   512-token tiles below `H` 7168 on sm_103a in every call
-  (`DX_SPLIT_WHOLE_ARCHES`) and on sm_100a in calls of fewer than three
-  chunks, whose dW accumulate shares the dX stream
+  (`DX_SPLIT_WHOLE_ARCHES`) and on sm_100a and sm_107a in calls of fewer
+  than three chunks, whose dW accumulate shares the dX stream
   (`DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES`, `DW_STREAM_MIN_CHUNKS`); on the
   long-chunk ring (`_st3_split`) on sm_103a only
   (`cake_backend.dx_split_rule`, `cake_backend.dx_split_eligible`,
@@ -1138,7 +1214,8 @@ a record serves every admissible geometry and the host never selects by shape:
   slices and per-element K order on both widths;
 * `_swab`: the swapped 512-wide `dX` tile (`dX^T = W^T dz^T`: a CTA's 128
   hidden columns of `W` on the MMA's M, the chunk's 512-token tile on its N,
-  the output stored per thread), at the table ring depth, on sm_103a only
+  the output stored per thread), at the table ring depth, on sm_103a and
+  sm_107a
   (`DX_SWAB_ARCHES`): a chunk of whole 512-token tiles of a cross-entropy
   loss call (the loss entry point with objective `"ce"`) of at least three
   chunks (`DW_STREAM_MIN_CHUNKS`) takes it ahead of the split-tail rule
@@ -1152,14 +1229,14 @@ On sm_100a the record's 512-wide `dX` stages (`gemm_dx`, `gemm_dx_s`, their
 its `_st3` form); sm_103a keeps the table depths.  Bitwise: only the pipeline
 depths differ.
 * `_gn`: the 2-D blocked raster of the weight-gradient accumulate and the fp32
-  fused cast below `H` 7168 for chunks of 2049 .. 4096 rows on both
-  architectures, with `group_n` = 12 column tiles per block
+  fused cast below `H` 7168 for chunks of 2049 .. 4096 rows on every
+  architecture, with `group_n` = 12 column tiles per block
   (`cake_backend.dw_block_variant`, `DW_BLOCK_GROUPS`); the bf16 cast keeps the
   1-D raster.  Bitwise: a permutation of the same tiles.
 * `_tma`: the TMA-epilogue form of the bf16 fused weight-gradient cast
   (`gemm_dw_cast_bf16_tma`): the deferred cast of the last chunk of a call of
   at least two chunks whose last chunk has at most 1792 rows
-  (`DW_CAST_TMA_MAX_ROWS`, both architectures; `cake_backend.dw_cast_tma_rule`)
+  (`DW_CAST_TMA_MAX_ROWS`, every architecture; `cake_backend.dw_cast_tma_rule`)
   reads the old FP32 sum and stores the bf16 tile as TMA sub-tiles.  A
   one-chunk call (no old sum) and a longer last chunk keep the shipped cast;
   an explicit `"epi_store"` knob of `gemm_tuning`'s `"dw"` wins over the rule.
@@ -1174,13 +1251,13 @@ depths differ.
   arithmetic on the rows before the count.
 
 The raster height is a scalar of the base forms: `group_m` 16 for the logits
-GEMMs and 32 for the weight-gradient GEMMs (accumulate and fused cast) at
-`H >= 7168` for chunks of more than 2048 rows (`cake_backend.raster_variant`,
-`RASTER_WIDE_GROUPS` per architecture); below that `H`, 16 for the logits
-GEMMs of chunks of at least 3841 rows (31 row tiles of 128:
-`LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`) and 16 for the
-weight-gradient GEMMs of chunks of more than 4096 rows, both on both
-architectures (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`); every
+GEMMs (32 on sm_107a, its record's height) and 32 for the weight-gradient GEMMs
+(accumulate and fused cast) at `H >= 7168` for chunks of more than 2048 rows
+(`cake_backend.raster_variant`, `RASTER_WIDE_GROUPS` per architecture); below
+that `H`, 16 for the logits GEMMs of chunks of at least 3841 rows (31 row tiles
+of 128: `LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`, sm_100a
+and sm_103a) and 16 for the weight-gradient GEMMs of chunks of more than 4096
+rows on every architecture (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`); every
 other chunk -- the default geometry's chunks of up to 30 row tiles, short tail
 chunks -- takes the GEMM's default height from the record geometry
 (`logits_group_m` / `dx_group_m` / `dw_group_m`).  Bitwise: only the tile
@@ -1202,7 +1279,7 @@ the knobs it names.  An explicit `"split"`, or a `"stages"` other than the
 table ring depth 4, keeps that form and turns the `_swab` rule off.
 `"swap_ab": true` applies to every chunk; it raises with such a `"stages"`,
 with a nonzero `"split"`, on an architecture without the swapped program
-(only SM103 has it), and on a chunk whose dX tile is the 256-column one
+(SM103 and SM107 have it), and on a chunk whose dX tile is the 256-column one
 (pin `"tile_n": 512` as well).  A `"k_slices"` pin that leaves a slice without
 a K step raises (e.g. 3 slices over `V` = 256's four K steps).
 
@@ -1284,9 +1361,12 @@ per index width, the two row stages, the gather and scatter of the dense form,
 the support logits gather GEMM and the segment gather-accumulate dX / dW /
 combine kernels in their BF16 and FP32-accumulate modes), exported from the
 kernel snapshot named in the pull request.  The `sm_107a` record registers
-every stage of the `sm_103a` record; no structural-form rule table lists
-`sm_107a`, so its rules reach five of the sixteen forms (the device-count
-logits forms and the K-sliced and 256-wide dX tiles).
+every stage of the `sm_103a` record; its rule tables take the `sm_103a`
+entries except the logits rasters (`LOGITS_LONG_RASTER_GROUPS`; the logits slot
+of `RASTER_WIDE_GROUPS` keeps the record's 32), the long-chunk `dX` ring
+(`DX_LONG_CHUNK_STAGES`) and the whole-chunk `dX` split, which follows
+`sm_100a` (`DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES`), so its rules reach twelve of
+the sixteen forms (all but the four `_st3` forms).
 `tests/experimental/test_cake_lm_head_det_train_support.py` tests the candidate-support
 entries (host rules and the reference backend on any device, the cake backend
 on a registered device).

@@ -798,12 +798,6 @@ def _deepseek_fp8_scale_block(
             f"hidden_size and intermediate_size must be multiples of {block}",
             0,
         )
-    if block != 128 and _sm_arch_for_device(moe_inputs.hidden_states.device) == 107:
-        return (
-            False,
-            "DeepSeek FP8 32x32 scale blocks are not validated on SM107 yet",
-            0,
-        )
     if _enum_eq(
         kwargs.get("weight_layout", runner.weight_layout), WeightLayout.BlockMajorK
     ) and (hidden_size % 128 != 0 or intermediate_size % 128 != 0):

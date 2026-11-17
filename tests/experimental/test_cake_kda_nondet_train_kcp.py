@@ -18,8 +18,8 @@ chunk stages of ``flashinfer.experimental.cake.cake_kda_nondet_train``).  CPU te
 (``cake_kcp_plan``): partitions against the rows of record, exchange splits and chain tables, head ownership, the plan
 rule, the byte queries, the private test knobs; the GPU parity test of the CPU-built chunk tables against the ``table``
 program (``-k gpu``); and the FP64 fake backend against the unpartitioned FP64 reference (``-k fake``).  Rows, reference
-partitions and operands come from the reference harness ``tests/test_helpers/cake_kda_kcp_shapes.py`` /
-``cake_kda_kcp_inputs.py``, the FP64 reference from ``tests/test_helpers/cake_kda_kcp_reference.py``.
+partitions and operands come from the reference harness ``tests/experimental/test_helpers/cake_kda_kcp_shapes.py`` /
+``cake_kda_kcp_inputs.py``, the FP64 reference from ``tests/experimental/test_helpers/cake_kda_kcp_reference.py``.
 """
 
 import ctypes
@@ -35,9 +35,12 @@ import weakref
 import pytest
 import torch
 
-from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
-from tests.test_helpers.cake_kda_train_kcp_saved import written_carry, written_tensors
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_kda_kcp_shapes as kcp_shapes
+from tests.experimental.test_helpers.cake_kda_train_kcp_saved import (
+    written_carry,
+    written_tensors,
+)
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_nondet_train_kcp", "cake_kcp_plan")
 cake_backend = cake_package("cake.cake_kda_nondet_train", "cake_backend")
@@ -3565,7 +3568,7 @@ CKPT_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in CKPT_ROWS]
 
 def _ckpt_problem(device, lengths, H):
     """A one-rank problem: the context, the operands (the delta rule's contract) and ``dout``."""
-    from tests.test_helpers.cake_kda_det_train_reference import make_inputs
+    from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
 
     cu = [0]
     for n in lengths:
@@ -4357,7 +4360,7 @@ _REFS: dict = {}
 
 @pytest.fixture(scope="module")
 def fake():
-    from tests.test_helpers import cake_kcp_fake_backend as fb
+    from tests.experimental.test_helpers import cake_kcp_fake_backend as fb
 
     # the shared FP64 fake backend builds its partitions and contexts through the plan module bound to its ``kp``
     # (the deterministic package's): run it on this package's plan for this module's tests
@@ -7534,7 +7537,7 @@ WALK_STREAMS_IDS = ("band-h16", "w4r1walks-h64", "s300_724_476-h2")
 
 def _walk_streams_problem(device, lengths, H: int, plan_sm: int | None):
     """A one-rank problem (``_ckpt_problem`` with an optional plan SM count) and the chunk counts of its offset walk."""
-    from tests.test_helpers.cake_kda_det_train_reference import make_inputs
+    from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs
 
     cu = [0]
     for n in lengths:
@@ -7745,7 +7748,9 @@ def test_gpu_against_the_deterministic_package(device, lengths, H) -> None:
     deterministic package's (``rel_rms`` and ``max_abs``), the worst case over three repeats, every repeat bitwise the
     first.  A context of either package serves both: this package's calls on the deterministic package's context are
     bitwise those on its own.  The local arena's replay plan takes the ``S1`` pair on the rows of the routing table."""
-    from tests.test_helpers.cake_kda_det_train_reference import kda_exact_with_grads
+    from tests.experimental.test_helpers.cake_kda_det_train_reference import (
+        kda_exact_with_grads,
+    )
 
     det_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")
     det_plan = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
@@ -9588,7 +9593,7 @@ def test_fwd_prologue_trim2_intra_rule_kept(monkeypatch) -> None:
 
 
 def _prologue_gpu_inputs(device, gate: str, l2n: bool, H: int = 2):
-    from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: PLC0415
+    from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: PLC0415
         LOWER_BOUND,
         make_inputs,
         make_raw_inputs,

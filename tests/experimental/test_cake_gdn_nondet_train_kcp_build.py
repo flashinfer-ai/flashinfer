@@ -57,7 +57,7 @@ def _few_cpu_threads():
 
 def _package_import() -> str:
     """The import path of the package: the test-helper registry's entry (a stale entry fails here, never skips)."""
-    from tests.test_helpers.cake_package import PACKAGES
+    from tests.cake.test_helpers.cake_package import PACKAGES
 
     return PACKAGES[PACKAGE]
 
@@ -324,7 +324,7 @@ def test_the_loader_and_header_are_the_pinned_bytes_of_every_cake_package() -> N
     _cake_build()
     if not (PACKAGE_DIR / "csrc" / "cake_ffi_checks.h").is_file():
         pytest.skip("csrc/cake_ffi_checks.h is not rendered into the package yet")
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     kda_dir = Path(
         cake_package("cake.cake_kda_det_train", "cake_build").__file__

@@ -95,6 +95,24 @@ def _opt_in_call(W, memory_mode, num_valid_rows) -> bool:
     )
 
 
+def _kept_logits_reach(X, labels, chunk_size) -> bool:
+    # A default log-probability call without a temperature whose ``X`` requires
+    # a gradient under grad mode and whose rows fit two chunks also takes the
+    # opt-in forms when its ``W`` is frozen: their one-chunk kept logits
+    # (``cake_backend_opt_in._one_chunk_keep_rule``, the rule) can apply to it.
+    # A pre-filter only: a call the rule does not keep runs the default entry's
+    # form there.
+    return (
+        isinstance(X, torch.Tensor)
+        and X.is_cuda
+        and X.requires_grad
+        and torch.is_grad_enabled()
+        and isinstance(labels, torch.Tensor)
+        and isinstance(chunk_size, int)
+        and 0 < labels.numel() <= 2 * chunk_size
+    )
+
+
 @flashinfer_api
 def cake_lm_head_det_train_loss(
     X: torch.Tensor,
@@ -521,14 +539,21 @@ def cake_lm_head_det_train_logprob(
     the same values); ``dW`` is returned in BF16.  ``memory_mode``
     (``"budget"``: the backward's weight-gradient form within the same bound;
     the default ``None``: the automatic form, decided in the backward, which
-    keeps the default entry's forward), ``num_valid_rows`` and
+    keeps the default entry's forward; a default call without a temperature,
+    of at most two chunks of rows, whose valid rows fit one chunk keeps their
+    BF16 logits, at most one chunk, from the forward to its backward, which
+    forms the logit gradient from them
+    instead of recomputing the logits, where the fast backward would run no
+    zero-gradient row skip -- not under ``torch.utils.checkpoint``, bitwise the
+    same outputs; ``"fast"`` turns this off), ``num_valid_rows`` and
     ``check_num_valid_rows`` (the forward's count) as in
     :func:`cake_lm_head_det_train_loss`.  A default call whose backward runs
     a budget form runs it without the zero-gradient row skip: its ``dX`` /
     ``dW`` bits can then differ from the fastest form's where valid rows have
     a zero upstream gradient (within the accuracy budget, the same bits on
     every run).  ``memory_mode="keep_logits"`` (this
-    entry only, without ``num_valid_rows``; opt-in): where a backward can
+    entry only; opt-in; with ``num_valid_rows`` its forward runs on the index
+    formed from the caller's count, without a readback): where a backward can
     follow (grad mode on, ``X`` or ``W`` trainable) the forward keeps the BF16
     logits of the valid rows, ``2 * T_v * V`` bytes from the forward to the
     backward (the chunk bound of the memory rule does not hold for them), and
@@ -563,6 +588,31 @@ def cake_lm_head_det_train_logprob(
     ``ValueError`` instead.  Outputs are defined while
     ``|z / tau_t| < 3e38`` on every row.  ``memory_mode="keep_logits"``
     takes no temperature (``ValueError``).
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        BF16 ``[T, H]`` hidden states, with the layout rules of :func:`cake_lm_head_det_train_loss`.
+    W : torch.Tensor
+        Contiguous BF16 ``[V, H]`` output weight.
+    labels : torch.Tensor
+        int64 ``[T]`` selected token ids; ``-100`` marks an ignored row.
+    chunk_size : int, default=4096
+        Maximum token rows per logits chunk.
+    backend : str, default="cake"
+        Only ``"cake"`` is supported.
+    compact_rows, fuse_dw_cast, dx_finalize, dw_stream, hidden_count, gemm_tuning
+        Execution switches with the contracts and defaults of :func:`cake_lm_head_det_train_loss`.
+    memory_mode : str, optional
+        Backward memory policy described above; this entry also accepts ``"keep_logits"``.
+    num_valid_rows : int, optional
+        Caller-supplied host count of labels other than ``-100``.
+    check_num_valid_rows : bool, default=False
+        Read the valid-row count back and raise ``ValueError`` on a mismatch.
+    temperature : float or torch.Tensor, optional
+        Positive finite scalar or FP32 ``[T]`` temperature; ``None`` is equivalent to 1.0.
+    check_temperature : bool, default=False
+        Read tensor-temperature validation back and raise ``ValueError`` instead of a device assertion.
     """
     if temperature is not None:
         return _logprob_temperature(
@@ -589,7 +639,9 @@ def cake_lm_head_det_train_logprob(
         )
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_knobs.CHECK_WITHOUT_COUNT)
-    if _opt_in_call(W, memory_mode, num_valid_rows):
+    if _opt_in_call(W, memory_mode, num_valid_rows) or _kept_logits_reach(
+        X, labels, chunk_size
+    ):
         return _cake_backend_opt_in().cake_lm_head_det_train_logprob(
             X,
             W,
@@ -648,6 +700,13 @@ def cake_lm_head_det_train_preload(
     :func:`cake_lm_head_det_train_logprob` temperature path and launches its PyTorch
     operators once; by default they are not loaded (callers that never pass
     a temperature build no temperature library).
+
+    Parameters
+    ----------
+    device : torch.device, int, str, optional
+        CUDA device whose libraries to load; ``None`` selects the current device.
+    temperature : bool, default=False
+        Also load the temperature-path libraries and warm up their PyTorch operators.
     """
     _cake_backend_opt_in().cake_lm_head_det_train_preload(
         device, temperature=temperature
@@ -696,6 +755,29 @@ def cake_lm_head_det_train_support_logprob(
     to ``X`` and ``W`` (BF16, FP32 accumulation, one cast each); outputs and gradients are bitwise
     reproducible run to run.  ``X [T, H]`` BF16 row-major (``H`` a multiple of 256), ``W [V, H]`` BF16
     contiguous (``V`` a multiple of 256, at most 1572864).
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Row-major BF16 ``[T, H]`` hidden states, with ``H`` a multiple of 256.
+    W : torch.Tensor
+        Contiguous BF16 ``[V, H]`` output weight, with ``V`` a multiple of 256.
+    support_ids : torch.Tensor
+        Packed int32 or int64 candidate ids ``[M]``, unique within each row.
+    support_offsets : torch.Tensor
+        int32 or int64 ``[T + 1]`` row offsets, first 0 and last ``M``.
+    labels : torch.Tensor, optional
+        int64 ``[T]`` selected candidate ids (``-100`` ignores a row); ``None`` returns all candidate log-probabilities.
+    k_cap : int
+        Maximum candidates per row; rows exceeding it are rejected, not trimmed.
+    temperature : float or torch.Tensor, optional
+        Positive finite scalar or FP32 ``[T]`` per-row temperature; default 1.0.
+    chunk_size : int, optional
+        Token chunk size for the dense pass and large-support weight gradient; default 4096.
+    check_inputs : bool, default=False
+        Synchronize validation and raise ``ValueError`` on invalid input; otherwise use a device assertion.
+    backend : str, default="cake"
+        Only ``"cake"`` is supported.
     """
     if backend != "cake":
         raise ValueError(
@@ -739,6 +821,31 @@ def cake_lm_head_det_train_support_kl(
     none.  Returns the FP32 ``kl [T]``, or ``(kl, logp)`` with the differentiable packed student
     ``logp [M]`` when ``return_logprobs=True``.  Weighting, reduction and any ``tau ** 2`` factor
     belong to the caller.  Other arguments as in :func:`cake_lm_head_det_train_support_logprob`.
+
+    Parameters
+    ----------
+    X : torch.Tensor
+        Row-major BF16 ``[T, H]`` hidden states, with ``H`` a multiple of 256.
+    W : torch.Tensor
+        Contiguous BF16 ``[V, H]`` output weight, with ``V`` a multiple of 256.
+    support_ids : torch.Tensor
+        Packed int32 or int64 candidate ids ``[M]``, unique within each row.
+    support_offsets : torch.Tensor
+        int32 or int64 ``[T + 1]`` row offsets, first 0 and last ``M``.
+    teacher_logprobs : torch.Tensor
+        Detached FP32 ``[M]`` teacher log-probabilities aligned with ``support_ids``.
+    return_logprobs : bool, default=False
+        Also return the differentiable packed student log-probabilities.
+    k_cap : int
+        Maximum candidates per row; rows exceeding it are rejected, not trimmed.
+    temperature : float or torch.Tensor, optional
+        Positive finite scalar or FP32 ``[T]`` per-row temperature; default 1.0.
+    chunk_size : int, optional
+        Token chunk size for the dense pass and large-support weight gradient; default 4096.
+    check_inputs : bool, default=False
+        Synchronize validation and raise ``ValueError`` on invalid input; otherwise use a device assertion.
+    backend : str, default="cake"
+        Only ``"cake"`` is supported.
     """
     if backend != "cake":
         raise ValueError(

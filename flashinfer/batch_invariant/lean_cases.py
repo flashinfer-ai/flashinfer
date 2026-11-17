@@ -24,7 +24,12 @@ alpha chain) the file carries
   shape with the in-cluster split's factor 2), every record checked against ``ConfigOK`` / ``ConfigOKFp8`` /
   ``ConfigOKMx8`` / ``ConfigOKMx8K64`` (the Lean mirrors of ``Knobs.well_formed``), counted, and
   ``space_invariant*`` instantiated on them; and every record the dispatchers return over a shape grid, each shown to
-  be a member of one of the emitted spaces.
+  be a member of one of the emitted spaces;
+* for the block-scale fp8 class ``gemm.e4m3.kblock128`` (``e4m3_bs``: the ``mma32`` step folded per 128-element block, the
+  block partials folded by ``fma`` with the product of the two fp32 block scales): the spec's output at (0, 0) and at
+  (3, 129) per (block count, output format) reproduced by ``BIK.GEMM.outputKblock``, the kernel's promotion loop
+  (``GEMMConfig.promoteLoop``) against the engine's per-block traces, its space against ``ConfigOKFp8BS``, and the
+  dispatcher's picks over the DeepSeek grid as members of that space.
 
 Consequently a change to a spec, a lowering, a knob constraint or a chunk rule that is not reflected in the
 Lean model makes ``lake build`` fail; and a regenerated file that differs from the committed one fails the
@@ -48,7 +53,13 @@ from ..gemm.batch_invariant.generator import (
     enumerate_space,
 )
 from ..gemm.batch_invariant.schedule import chunks_for, default_config, fp4_class_for
-from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, reduction
+from ..gemm.batch_invariant.spec import (
+    BLOCK_K,
+    MMA_K_OF,
+    GemmSpec,
+    reduction,
+    reduction_blockscale,
+)
 
 LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
@@ -166,6 +177,23 @@ GEMM_FP4_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
 GEMM_FP4_K128_CASES = [(512, 1), (1024, 1), (2048, 2), (2048, 4)]
 GEMM_FP4_OUT_CASES = [(256, "bf16"), (512, "f16"), (256, "f32")]
 GEMM_FP4_K128_OUT_CASES = [(512, "bf16"), (1024, "f16"), (512, "f32")]
+#: The block-scale fp8 class (``e4m3_bs``, ``gemm.e4m3.kblock128``): (K, out_fmt) at 1 .. 4 blocks of ``BLOCK_K`` elements; the
+#: block counts at which the kernel's promotion loop (Lean ``promoteLoop``) is conformed to the engine's per-block traces; the
+#: DeepSeek (N, K) grid and the M values over which the dispatcher's picks are shown to be members of the space.
+FP8BS_FMT = "e4m3_bs"
+GEMM_FP8BS_OUT_CASES = [(128, "bf16"), (256, "bf16"), (384, "f16"), (512, "f32")]
+GEMM_FP8BS_LOOP_CASES = [1, 2, 3]
+GEMM_FP8BS_PAIRS = (
+    (7168, 7168),
+    (7168, 2048),
+    (2048, 7168),
+    (4096, 7168),
+    (18432, 7168),
+    (7168, 18432),
+    (576, 7168),
+    (7168, 16384),
+)
+GEMM_FP8BS_MS = (1, 16, 128, 1024, 4096, 16384)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -443,6 +471,7 @@ BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: other case is kernel ``decide``. ``lean/Axioms.lean`` pins exactly these names.
 DECIDED_THEOREMS = (
     tuple(n for F in FORMATS for n in F.decided)
+    + ("gemm_fp8bs_space_ok", "gemm_fp8bs_dispatch_in_space")
     + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES)
     + tuple(
         f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
@@ -600,6 +629,55 @@ def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
                         grid_clusters=0,
                     )
                     disp.setdefault(k, (M, N, K))
+    return disp
+
+
+def fp8bs_cases() -> List[Tuple[int, str, str, str]]:
+    """``(KB, out_fmt, sexpr at (0, 0), sexpr at (3, 129))``: the block-scale class's output terms
+    (`GemmSpec(K, fmt, in_fmt="e4m3_bs")`); the element (3, 129) reads the second weight scale block."""
+    out = []
+    for K, fmt in GEMM_FP8BS_OUT_CASES:
+        s = GemmSpec(K, fmt, in_fmt=FP8BS_FMT)
+        out.append(
+            (K // BLOCK_K, fmt, term.sexpr(s.out(0, 0)), term.sexpr(s.out(3, 129)))
+        )
+    return out
+
+
+def fp8bs_loop_cases() -> List[Tuple[int, str]]:
+    """``(KB, sexpr)``: the kernel model of the block-scale class on the Python side -- the engine's one-stage trace of the
+    dense lowering per block (`MainloopBlock("e4m3_bs").lowering()`, what the MMA warp issues) folded by the block digit's
+    indexed step in block order (what the epilogue warps' promotion performs); Lean's `promoteLoop` prints it."""
+    low = MainloopBlock(FP8BS_FMT).lowering()
+    alg = term.TermAlgebra()
+    out = []
+    for KB in GEMM_FP8BS_LOOP_CASES:
+        red = reduction_blockscale(KB * BLOCK_K, 0, 0)
+        partials = [low.trace(red, alg, 1, fixed={"block": kb}) for kb in range(KB)]
+        out.append((KB, term.sexpr(red.digits[1].reduce(alg, partials))))
+    return out
+
+
+def fp8bs_space() -> List[Knobs]:
+    """The block-scale class's space at the reference shape (the knob product the body accepts in the K-major layout, the
+    only one the class takes)."""
+    return enumerate_space(*REFERENCE_SHAPE, b_major="k", in_fmt=FP8BS_FMT)
+
+
+def fp8bs_dispatch_cases() -> Dict[Knobs, Tuple[int, int, int]]:
+    """Every record the block-scale dispatcher returns over the DeepSeek grid at every part of `PARTS` at its nominal
+    numbers, with the first shape that selects it."""
+    disp: Dict[Knobs, Tuple[int, int, int]] = {}
+    for N, K in GEMM_FP8BS_PAIRS:
+        for M in GEMM_FP8BS_MS:
+            for family, sm in PARTS:
+                k = dataclasses.replace(
+                    default_config(
+                        M, N, K, 1, "k", sm, family, FP8BS_FMT, nominal=True
+                    ),
+                    grid_clusters=0,
+                )
+                disp.setdefault(k, (M, N, K))
     return disp
 
 
@@ -847,6 +925,88 @@ def _render_bias(L: List[str]) -> None:
     L.append("")
 
 
+def _render_fp8_blockscale(L: List[str]) -> None:
+    """The block-scale fp8 class: `outputKblock` against the Python spec at (0, 0) and at (3, 129), `promoteLoop` against the
+    engine's assembled per-block traces, the space against `ConfigOKFp8BS` with `space_invariantKB` instantiated on it, and
+    the dispatcher's picks over the DeepSeek grid as members of the space."""
+    L.append(
+        "/-! The block-scale fp8 class `gemm.e4m3.kblock128` (`gemm/spec.py: reduction_blockscale` vs `GEMM.lean: kblock128`: the "
+        "`mma32` step folded per 128-element block, the block partials folded by `fma` with the block scales' product, the "
+        "conversion alone): the Python spec's output element at (0, 0) and at (3, 129) -- the latter reads the second weight "
+        "scale block -- reproduced by the Lean model node for node. -/"
+    )
+    for i, (KB, fmt, sx0, sx1) in enumerate(fp8bs_cases()):
+        L.append(
+            f'theorem gemmfp8bs{i}_spec : (outputKblock "{fmt}" ⟨0⟩ ⟨0⟩ {KB}).sexpr = {lean_str(sx0)} := by decide  -- K={KB * BLOCK_K}'
+        )
+        L.append(
+            f'theorem gemmfp8bs{i}_spec2 : (outputKblock "{fmt}" ⟨3⟩ ⟨129⟩ {KB}).sexpr = {lean_str(sx1)} := by decide'
+        )
+    L.append(
+        "def gemmFp8BsOutCases : List (Nat × String) := ["
+        + ", ".join(f'({K // BLOCK_K}, "{f}")' for K, f in GEMM_FP8BS_OUT_CASES)
+        + "]"
+    )
+    L.append("")
+    L.append(
+        "/-! The kernel's promotion loop (`GEMMConfig.promoteLoop`: the dense lowering's one-stage fold per block, the partials "
+        "folded by `fma` in block order) equals `kblock128` for every stage count and block count, and the engine's per-block "
+        "traces assembled by the block digit are reproduced node for node at sampled block counts. -/"
+    )
+    L.append(
+        "theorem gemm_fp8bs_loop_eq_class : ∀ (S KB : Nat) (a : RowData) (b : ColData), promoteLoop a b S KB = kblock128 a b KB := "
+        "fun S KB a b => promoteLoop_eq_kblock128 a b S KB"
+    )
+    for i, (KB, sx) in enumerate(fp8bs_loop_cases()):
+        L.append(
+            f"theorem gemmfp8bsloop{i} : (promoteLoop ⟨0⟩ ⟨0⟩ 3 {KB}).sexpr = {lean_str(sx)} := by decide"
+        )
+    L.append(
+        "def gemmFp8BsLoopCases : List Nat := ["
+        + ", ".join(str(n) for n in GEMM_FP8BS_LOOP_CASES)
+        + "]"
+    )
+    L.append("")
+    space = fp8bs_space()
+    L.append(
+        f"/-! The block-scale class's configuration space at the reference shape {REFERENCE_SHAPE} "
+        f'(`gemm.generator.enumerate_space(..., in_fmt="{FP8BS_FMT}")`, the `k` weight layout: 128-row CTA tiles, tile N 16 .. 128 '
+        "dividing the weight scale block, no in-cluster split, swapped or in-CTA chunk-fold record): every knob record, checked "
+        "against the kernel's static constraints (`ConfigOKFp8BS`), counted, and the `config_invarianceKB` theorem instantiated on it. -/"
+    )
+    L.append(
+        "def gemmFp8BsSpace : List Config := ["
+        + ", ".join(k.lean() for k in space)
+        + "]"
+    )
+    _deep(L, len(space))
+    L.append(
+        f"theorem gemm_fp8bs_space_size : gemmFp8BsSpace.length = {len(space)} := by decide"
+    )
+    L.append(
+        "theorem gemm_fp8bs_space_ok : gemmFp8BsSpace.all ConfigOKFp8BS = true := by native_decide"
+    )
+    L.append(
+        "theorem gemm_fp8bs_space_invariant : ∀ c₁ ∈ gemmFp8BsSpace, ∀ c₂ ∈ gemmFp8BsSpace, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (KB : Nat), "
+        "tileResultKB c₁ S₁ p a b KB = tileResultKB c₂ S₂ q a b KB := space_invariantKB gemmFp8BsSpace"
+    )
+    disp = fp8bs_dispatch_cases()
+    L.append(
+        "/-! Every knob record the block-scale dispatcher returns over the DeepSeek (N, K) grid (the K-major weight layout; every "
+        "part of the nominal table Rubin NVL8 / NVL72, B200 / GB200, B300, never a device's queried numbers), with the first shape "
+        "that selects it: a member of the space above (R3 membership). -/"
+    )
+    L.append(
+        "def gemmFp8BsDispatch : List (Nat × Nat × Nat × Config) := ["
+        + ", ".join(f"({M}, {N}, {K}, {k.lean()})" for k, (M, N, K) in disp.items())
+        + "]"
+    )
+    L.append(
+        "theorem gemm_fp8bs_dispatch_in_space : gemmFp8BsDispatch.all (fun ⟨_, _, _, c⟩ => gemmFp8BsSpace.any (fun s => s == c)) = true := by native_decide"
+    )
+    L.append("")
+
+
 def _render_attention(L: List[str]) -> None:
     """The attention class: the toy-case spec terms and the per-head-dim configuration spaces."""
     mk = MMA_K_OF["bf16"]
@@ -916,6 +1076,7 @@ def render() -> str:
     _render_bias(L)
     for F in FORMATS[1:]:
         _render_format(L, F)
+    _render_fp8_blockscale(L)
     _render_attention(L)
     L.append("end BIK")
     return "\n".join(L) + "\n"
@@ -935,7 +1096,10 @@ def summary() -> str:
     return (
         "lean_cases coverage: "
         + "; ".join(parts)
-        + f"; bias cases={len(GEMM_BIAS_CASES)}; native_decide theorems={len(DECIDED_THEOREMS)}"
+        + f"; bias cases={len(GEMM_BIAS_CASES)}"
+        + f"; {FP8BS_FMT}: specs={2 * len(GEMM_FP8BS_OUT_CASES)} loops={len(GEMM_FP8BS_LOOP_CASES)} "
+        f"space={len(fp8bs_space())} dispatch={len(fp8bs_dispatch_cases())}"
+        + f"; native_decide theorems={len(DECIDED_THEOREMS)}"
         + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
     )
 

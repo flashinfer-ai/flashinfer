@@ -1286,13 +1286,21 @@ def _test_prefill_kernel_state_dtype(
     ref_state = ref_state.to(state_dtype).float()
     our_state = our_state.float()
 
-    atol_o = 1e-1 if state_dtype != torch.float32 else 5e-2
+    # Outputs are ~1e-2 in magnitude, so the bound must sit well below that (#4704).
+    atol_o = 5e-3
     rtol_o = 5e-2
-    atol_kv = 1e-1
+    # States peak near 1e-1; an fp8 state may differ from the reference by one ulp.
+    fp8_state = state_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    atol_kv = 2.5e-2 if fp8_state else 2e-3
     rtol_kv = 5e-2
+    rel_l2_kv_bound = 1e-1 if fp8_state else 2e-2
 
     torch.testing.assert_close(our_o, ref_o, atol=atol_o, rtol=rtol_o)
+    rel_l2 = (our_o.float() - ref_o.float()).norm() / ref_o.float().norm()
+    assert rel_l2 < 2e-2, f"output relative L2 {rel_l2:.4f}"
     torch.testing.assert_close(our_state, ref_state, atol=atol_kv, rtol=rtol_kv)
+    rel_l2_kv = (our_state - ref_state).norm() / ref_state.norm()
+    assert rel_l2_kv < rel_l2_kv_bound, f"state relative L2 {rel_l2_kv:.4f}"
 
 
 @pytest.mark.parametrize("scale", ["auto"])

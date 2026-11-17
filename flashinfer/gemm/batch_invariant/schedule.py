@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .generator import CLUSTERS, SWIZZLES, Knobs, enumerate_space  # noqa: F401  (re-exported)
-from .spec import chunk_unit
+from .spec import FP8_BLOCKSCALE_FMTS, chunk_unit
 
 GemmConfig = Knobs
 
@@ -50,6 +50,8 @@ def chunks_for(N: int, K: int, in_fmt: str = "bf16") -> int:
     a bounded fraction of the operand traffic). An empty weight (N = 0) has no split, as the Lean mirror's natural-number
     division gives. Mirrored by ``BIK.GEMM.chunksFor`` / ``chunksForFp8`` in Lean (checked by the generated conformance
     cases)."""
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        return 1  # the block-scale class has no split variant: its block fold already partitions K
     step = chunk_unit(
         in_fmt
     )  # the format's MMA step; for the block-scaled classes also a whole scale-factor atom column

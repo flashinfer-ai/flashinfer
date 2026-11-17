@@ -63,7 +63,7 @@ def test_inference_grid_covers_uniform_phase_launches(kind):
         == 32
     )
     depth = 256 if kind in ("nvfp4", "mxfp4") else 128
-    expected_prefix = [
+    expected_legacy = [
         (tile, cluster, epi, bulk)
         for tile in ((256, 128, depth), (256, 256, depth))
         for cluster, epi in (
@@ -74,16 +74,39 @@ def test_inference_grid_covers_uniform_phase_launches(kind):
         )
         for bulk in (False, True)
     ]
-    assert [
+    legacy = [
+        c
+        for c in candidates
+        if c["schedule_policy"] == ("grouped", None)
+        or c["fallback_cluster_shape_mn"] is not None
+    ]
+    assert {
         (
             c["mma_tiler_mnk"],
             c["cluster_shape_mn"],
             c["epi_flag_batches"],
             c["fc2_use_bulk"],
         )
-        for c in candidates[:16]
-    ] == expected_prefix
-    added = candidates[16:]
+        for c in legacy
+    } == set(expected_legacy)
+    assert [
+        (
+            c["mma_tiler_mnk"][1:],
+            c["cluster_shape_mn"],
+            c["fc2_use_bulk"],
+        )
+        for c in candidates[:8]
+    ] == [
+        ((256, depth), (2, 1), True),
+        ((128, depth), (2, 1), True),
+        ((64, depth), (4, 1), True),
+        ((128, depth), (4, 1), True),
+        ((256, depth), (4, 1), True),
+        ((64, 2 * depth), (2, 1), True),
+        ((64, 2 * depth), (4, 1), True),
+        ((64, depth), (4, 1), False),
+    ]
+    added = [c for c in candidates if c not in legacy]
     assert {c["mma_tiler_mnk"] for c in added} == {
         (256, 64, depth),
         (256, 64, 2 * depth),

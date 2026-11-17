@@ -444,6 +444,14 @@ def _fake_apply_llama31_rope_pos_ids(
     pass
 
 
+def _check_rotary_dim(rotary_dim: int, q: torch.Tensor, k: torch.Tensor) -> None:
+    """Reject a ``rotary_dim`` that would read past a q/k head into the next one."""
+    if rotary_dim > min(q.size(-1), k.size(-1)):
+        raise ValueError(
+            f"head_dim (q={q.size(-1)}, k={k.size(-1)}) must be >= rotary_dim ({rotary_dim})"
+        )
+
+
 @flashinfer_api(trace=apply_rope_inplace_trace)
 def apply_rope_inplace(
     q: torch.Tensor,
@@ -479,6 +487,7 @@ def apply_rope_inplace(
     rotary_dim : Optional[int]
         The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
         otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -526,6 +535,7 @@ def apply_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_rope(
         q, k, q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -560,6 +570,7 @@ def apply_rope_pos_ids_inplace(
     rotary_dim : Optional[int]
         The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
         otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -581,6 +592,7 @@ def apply_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_rope_pos_ids(
         q, k, q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -624,6 +636,7 @@ def apply_llama31_rope_inplace(
     rotary_dim : Optional[int]
         The dimensions to which to apply RoPE. If ``None``, RoPE is applied to the entire head dimension,
         otherwise it is applied to the first ``rotary_dim`` dimensions. Default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -677,6 +690,7 @@ def apply_llama31_rope_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_llama31_rope(
         q,
         k,
@@ -726,6 +740,7 @@ def apply_llama31_rope_pos_ids_inplace(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -753,6 +768,7 @@ def apply_llama31_rope_pos_ids_inplace(
     """
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
     _apply_llama31_rope_pos_ids(
         q,
         k,
@@ -804,6 +820,7 @@ def apply_rope(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -860,10 +877,11 @@ def apply_rope(
     --------
     apply_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_rope(
         q,
         k,
@@ -908,6 +926,7 @@ def apply_rope_pos_ids(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -934,10 +953,11 @@ def apply_rope_pos_ids(
     --------
     apply_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_rope_pos_ids(
         q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
@@ -982,6 +1002,7 @@ def apply_llama31_rope(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -1044,10 +1065,11 @@ def apply_llama31_rope(
     --------
     apply_llama31_rope_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_llama31_rope(
         q,
         k,
@@ -1098,6 +1120,7 @@ def apply_llama31_rope_pos_ids(
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
+        It must not exceed ``head_dim``; a ``ValueError`` is raised otherwise.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -1129,10 +1152,11 @@ def apply_llama31_rope_pos_ids(
     --------
     apply_llama31_rope_pos_ids_inplace
     """
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
     if rotary_dim is None:
         rotary_dim = q.size(-1)
+    _check_rotary_dim(rotary_dim, q, k)
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     _apply_llama31_rope_pos_ids(
         q,
         k,

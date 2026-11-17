@@ -468,12 +468,24 @@ DX_SLICED_STAGE = "gemm_dx_s"
 # operations in the same order as ``gemm_dw_acc`` followed by ``scale_cast_*``, so the weight gradient is bitwise
 # identical; the flat ``scale_cast`` pass over ``dW`` disappears.  Selected by ``fuse_dw_cast`` (default on).
 DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
+
+
+def _dw_cast_f32(stage: str) -> bool:
+    """Whether the stage that writes the final ``dW`` (:attr:`Plan.dw_cast_stage`) writes it in FP32: the flat FP32
+    cast or the fused FP32 cast in every form (the 2-D blocked ``_gn`` raster included)."""
+    return stage == "scale_cast_f32" or stage.startswith("gemm_dw_cast_f32")
+
+
 # TMA-epilogue form of the deferred BF16 dW cast (``gemm_dw_cast_bf16_tma``): the old FP32 sum is read and the
 # BF16 tile is stored as TMA sub-tiles.  It runs the cast of the LAST chunk of a call of >= 2 chunks whose last
 # chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
 # and its round-to-nearest order are the shipped form's, so dW is bitwise the same.  A one-chunk call has no old
 # sum to read and keeps the shipped form.
-DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
+DW_CAST_TMA_MAX_ROWS: dict[str, int] = {
+    "sm_100a": 1792,
+    "sm_103a": 1792,
+    "sm_107a": 1792,
+}
 # Its form under the zero-gradient row skip (:data:`DCNT_BASES`): the same TMA cast with the K steps bounded by the
 # last chunk's device count of live rows, so a counted plan keeps the rule's cast (a record without it: the shipped
 # cast's counted form).
@@ -590,17 +602,21 @@ RASTER_RULE_MIN_ROWS = 2049
 RASTER_WIDE_GROUPS = {
     "sm_100a": (16, 32),
     "sm_103a": (16, 32),
-}  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture
+    "sm_107a": (32, 32),
+}  # (logits group_m, weight-gradient group_m) of the wide geometries, per architecture (sm_107a: the logits slot keeps
+#    the record's group_m 32)
 DW_LONG_CHUNK_GROUP_M = 16  # weight-gradient group_m of the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
 DW_LONG_CHUNK_GROUPS = {
     "sm_100a": DW_LONG_CHUNK_GROUP_M,
     "sm_103a": DW_LONG_CHUNK_GROUP_M,
+    "sm_107a": DW_LONG_CHUNK_GROUP_M,
 }  # the same height on every supported architecture (the kernel source keeps a per-architecture table; the export mirrors it)
 DW_LONG_CHUNK_MIN_ROWS = 4097
 LOGITS_LONG_RASTER_GROUPS = {
     "sm_100a": 16,
     "sm_103a": 16,
 }  # logits group_m of the GLM-class chunks of >= LOGITS_LONG_RASTER_MIN_ROWS rows below RASTER_RULE_MIN_HIDDEN, per architecture
+#    (sm_107a is not listed: its chunks keep the record's logits group_m 32)
 LOGITS_LONG_RASTER_MIN_ROWS = (
     3841  # 30 row tiles of 128 + 1: the first chunk size with 31 row tiles
 )
@@ -608,10 +624,12 @@ DX_LONG_CHUNK_STAGES = {
     "sm_100a": 3,
     "sm_103a": 3,
 }  # operand-ring depth of the 512-wide dX tile at the long chunks (>= DW_LONG_CHUNK_MIN_ROWS rows) below RASTER_RULE_MIN_HIDDEN
+#    (sm_107a is not listed: its long chunks keep the table ring depth DX_WIDE_TILE_STAGES)
 DX_WIDE_TILE_STAGES = 4  # the 512-wide dX tile's table ring depth (an explicit ``stages`` of 4 pins the default form)
 DW_BLOCK_GROUPS = {
     "sm_100a": 12,
     "sm_103a": 12,
+    "sm_107a": 12,
 }  # column tiles per raster block of the weight-gradient accumulate / fp32 fused cast at the C 4096 chunk, per architecture
 DW_BLOCK_MIN_ROWS = RASTER_RULE_MIN_ROWS  # 2049
 DW_BLOCK_MAX_ROWS = (
@@ -640,15 +658,19 @@ DX_K_SLICES_MAX = 4
 DX_SPLIT_ARCHES = (
     "sm_100a",
     "sm_103a",
+    "sm_107a",
 )
 DX_SPLIT_LONG_RING_ARCHES = (
     "sm_103a",
-)  # architectures whose long-chunk ring (``_st3``) also takes the split (on sm_100a it ran slower at the power limit)
+    "sm_107a",
+)  # architectures whose long-chunk ring (``_st3``) also takes the split (on sm_100a it ran slower at the power limit; on
+#    sm_107a only an explicit ``stages`` pin selects the ring)
 DX_SPLIT_WHOLE_ARCHES: tuple[str, ...] = (
     "sm_103a",
 )  # whole-tile chunks below RASTER_RULE_MIN_HIDDEN split in every call
 DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
     "sm_100a",
+    "sm_107a",
 )  # ... only in a call of fewer than DW_STREAM_MIN_CHUNKS chunks
 DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # Swapped dX tile (``_swab``): dX^T = W^T dz^T, W's 128 hidden columns of a CTA on the MMA's M and the chunk's
@@ -656,7 +678,7 @@ DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
 # of whole 512-token tiles of a cross-entropy loss call of >= DW_STREAM_MIN_CHUNKS chunks (:func:`dx_swab_rule`), ahead
 # of the split-tail rule and of the H >= RASTER_RULE_MIN_HIDDEN base form.  Bitwise: the same bf16 products summed
 # over the same K slices in the same K order.
-DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a",)
+DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a", "sm_107a")
 _TUNING_KNOBS = {
     "logits": ("group_m",),
     "dx": ("k_slices", "tile_n", "stages", "split", "swap_ab"),
@@ -6901,9 +6923,7 @@ def prepare_lm_head_det_loss(
             dw_out,
             "dw_out",
             (V, H),
-            torch.float32
-            if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
-            else torch.bfloat16,
+            torch.float32 if _dw_cast_f32(plan.dw_cast_stage) else torch.bfloat16,
         )
     if layout.get("workspace"):
         t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
@@ -7351,9 +7371,7 @@ def prepare_lm_head_det_loss_temperature(
             dw_out,
             "dw_out",
             (V, H),
-            torch.float32
-            if plan.dw_cast_stage in ("scale_cast_f32", "gemm_dw_cast_f32")
-            else torch.bfloat16,
+            torch.float32 if _dw_cast_f32(plan.dw_cast_stage) else torch.bfloat16,
         )
     if layout.get("workspace"):
         t["workspace"] = carve("workspace", torch.uint8, (layout["workspace"][1],))
@@ -9768,6 +9786,7 @@ def forward_logprob(
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     logprob_lbl: Optional[bool] = None,
+    keep: Optional[Callable[[Optional[torch.Tensor]], bool]] = None,
 ) -> ForwardResult:
     """Forward of the log-probability entry: ``logp`` (FP32 ``[T]``, 0 on ignored rows) plus the saved statistic
     ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back,
@@ -9775,9 +9794,15 @@ def forward_logprob(
     :func:`hidden_count_default`) and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in
     :func:`forward_loss`; ``logprob_lbl`` (default :func:`logprob_lbl_default`) writes only the row statistics and
     the label column's logit from the logits GEMM (bitwise the same ``lse`` / ``logp``).  This forward has no
-    weight gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``."""
+    weight gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``.  ``keep`` (the opt-in module's
+    one-chunk kept logits: its rule's predicate on the valid-row index; ``cake`` backend): a call that counts its valid
+    rows on the host and that ``keep`` accepts on this count's index runs :func:`forward_logprob_keep`'s binding
+    instead (a :class:`KeptForwardResult`, bitwise the same ``logp`` / ``lse``); the decision follows the count with no
+    other work between them, and either form runs on that one count."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if keep is not None and backend != "cake":
+        raise ValueError("the kept logits (logprob_keep) run on the cake backend")
     problem = validate_lm_head_det_inputs(
         X,
         W,
@@ -9808,6 +9833,18 @@ def forward_logprob(
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
             problem, X, need_dx=False, need_dw=False, row_index=row_index
+        )
+    if keep is not None and hc is None and keep(row_index):
+        return _forward_keep_bound(
+            problem,
+            X,
+            W,
+            labels,
+            row_index,
+            None,
+            chunk_size=chunk_size,
+            backend=backend,
+            tuning=tuning,
         )
     logp, lse, memory = _forward_logprob_rows(
         problem,
@@ -10641,12 +10678,16 @@ def forward_logprob_keep(
     compact_rows: Optional[bool] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    row_index: Any = _RECOUNT,
 ) -> KeptForwardResult:
     """:func:`forward_logprob` that keeps every chunk's BF16 logits for the backward (``cake`` backend): the logits
     GEMM is the plain ``gemm_logits`` (the whole ``z_c``, not the label-column arm), chunk 0's logits stay in the
     chunk buffer and the later chunks' go to one ``[T_v - rows_0, V]`` buffer, ``2 * T_v * V`` bytes in all
     (:attr:`KeptForwardResult.logits`).  Pass them to :func:`backward_logprob_keep`, which forms ``dz`` from them
-    instead of recomputing the logits.  Bitwise the same ``logp`` / ``lse`` as :func:`forward_logprob`."""
+    instead of recomputing the logits.  Bitwise the same ``logp`` / ``lse`` as :func:`forward_logprob`.
+    ``row_index``: the caller's valid-row index of a compacted call (the ascending int64 rows whose label is ``>= 0``,
+    ``None`` when every row is valid; the opt-in module forms it on the device from ``num_valid_rows``) -- the call
+    then counts nothing (no host synchronization, no hidden count); the default counts the valid rows itself."""
     if backend != "cake":
         raise ValueError("the kept logits (logprob_keep) run on the cake backend")
     problem = validate_lm_head_det_inputs(
@@ -10663,20 +10704,27 @@ def forward_logprob_keep(
             _empty_forward(problem, X, need_dx=False, need_dw=False), None
         )
     compact = _resolve_compact(compact_rows)
-    hc = _hidden_count(
-        problem,
-        X,
-        W,
-        labels,
-        backend=backend,
-        compact=compact,
-        stats=True,
-        hidden_count=_resolve_hidden_count(hidden_count),
-    )
-    if hc is not None:
-        row_index = hc.row_index()
-    else:
-        row_index = valid_row_index(labels) if compact else None
+    hc = None
+    if row_index is _RECOUNT:
+        hc = _hidden_count(
+            problem,
+            X,
+            W,
+            labels,
+            backend=backend,
+            compact=compact,
+            stats=True,
+            hidden_count=_resolve_hidden_count(hidden_count),
+        )
+        if hc is not None:
+            row_index = hc.row_index()
+        else:
+            row_index = valid_row_index(labels) if compact else None
+    elif row_index is not None:
+        if not compact:
+            raise ValueError("a valid-row index belongs to a compacted forward")
+        if isinstance(row_index, torch.Tensor):
+            row_index = row_index.contiguous()  # the dX finalize reads a dense index
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _kept_result(
             _empty_forward(
@@ -10684,6 +10732,34 @@ def forward_logprob_keep(
             ),
             None,
         )
+    return _forward_keep_bound(
+        problem,
+        X,
+        W,
+        labels,
+        row_index,
+        hc,
+        chunk_size=chunk_size,
+        backend=backend,
+        tuning=tuning,
+    )
+
+
+def _forward_keep_bound(
+    problem: Problem,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    row_index: Optional[torch.Tensor],
+    hc: Optional[_HiddenCount],
+    *,
+    chunk_size: int,
+    backend: str,
+    tuning: dict[str, dict[str, Any]],
+) -> KeptForwardResult:
+    """:func:`forward_logprob_keep`'s body after its count (``row_index`` non-empty, or ``None``): the kept binding from
+    the cache or a new one, launched; also the kept form of :func:`forward_logprob` under its ``keep``."""
+    T = problem.num_rows
     cache = BINDING_CACHE
     key = None
     binding: Optional[_KeptBinding] = None
@@ -11853,7 +11929,10 @@ def _logprob_temperature_backward(ctx, dlogp, saved) -> tuple:
 
 class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
     """Entry (b) with the kept logits (:func:`cake_lm_head_det_train_logprob_keep`): the forward saves the row statistic
-    and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes."""
+    and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes.
+    ``row_index`` (optional, last): the caller's valid-row index (:func:`forward_logprob_keep`; the opt-in module's
+    ``num_valid_rows``); omitted, the forward counts the valid rows itself.  The backward returns one gradient slot per
+    input either way (PyTorch drops trailing ``None`` slots past the inputs given)."""
 
     @staticmethod
     def forward(
@@ -11869,6 +11948,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
         hidden_count,
         gemm_tuning,
         logprob_dz,
+        row_index=_RECOUNT,
     ):
         if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
             with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
@@ -11885,6 +11965,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
                     hidden_count,
                     gemm_tuning,
                     logprob_dz,
+                    row_index,
                 )
         compact = _resolve_compact(compact_rows)
         hidden = _resolve_hidden_count(hidden_count)
@@ -11897,6 +11978,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
             compact_rows=compact,
             hidden_count=hidden,
             gemm_tuning=tuning,
+            row_index=row_index,
         )
         ctx.set_materialize_grads(False)
         # the kept logits are saved tensors too, so a non-reentrant checkpoint drops them with the rest; ``row_grad``
@@ -11921,7 +12003,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 11
+            return (None,) * 12
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         X, W, labels, lse, row_index, *kept = ctx.saved_tensors
         common = dict(
@@ -11951,7 +12033,7 @@ class CakeLMHeadDetLogprobKeepFunction(torch.autograd.Function):
                 logprob_dz=ctx.logprob_dz,
                 **common,
             )
-        return (dx, dw) + (None,) * 9
+        return (dx, dw) + (None,) * 10
 
 
 def cake_lm_head_det_train_loss(

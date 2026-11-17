@@ -33,7 +33,7 @@ limitations under the License.
 #
 # The host tests run without a GPU; the device tests need a compute capability 10.0 / 10.3 / 10.7 device with the
 # generated programs of both packages registered and skip otherwise.  Both packages are named through
-# ``tests.test_helpers.cake_package``, as their own suites do.
+# ``tests.cake.test_helpers.cake_package``, as their own suites do.
 
 import dataclasses
 import itertools
@@ -41,8 +41,8 @@ import itertools
 import pytest
 import torch
 
-from tests.test_helpers import cake_dsa_indexer_reference as ref
-from tests.test_helpers.cake_package import cake_package
+from tests.experimental.test_helpers import cake_dsa_indexer_reference as ref
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake.cake_dsa_indexer_nondet_train", "cake_backend")
 cake_jit = cake_package("cake.cake_dsa_indexer_nondet_train", "cake_jit")

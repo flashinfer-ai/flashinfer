@@ -66,7 +66,7 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake.cake_gqa_det_train")
 cake_backend = cake_package("cake.cake_gqa_det_train", "cake_backend")

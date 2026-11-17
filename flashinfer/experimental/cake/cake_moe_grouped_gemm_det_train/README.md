@@ -19,6 +19,9 @@ equivalently, an `m_indptr[E + 1]` with a leading 0 (`torch._grouped_mm` /
 two forms apart). The kernels read the offsets on the device; the host never
 synchronises on them.
 
+The slice lower bound is `0` for `e == 0` and `offs[e-1]` for `e > 0`.
+For `m_indptr` input, `offs` in these formulas means `m_indptr[1:]`.
+
 | helper | computation | inputs | output |
 | --- | --- | --- | --- |
 | `cake_moe_grouped_gemm_det_train_forward(x, w, offs, out=None)` | `Y[offs[e-1]:offs[e]] = X[offs[e-1]:offs[e]] @ W[e].T` | `x [sum_m, K]`, `w [E, N, K]` bf16 | `Y [sum_m, N]` bf16 |
@@ -624,7 +627,7 @@ python benchmarks/bench_cake_moe_grouped_gemm_det_train.py --help
 ```
 
 `test_cake_moe_grouped_gemm_det_train.py` (the backend suite, which imports the package
-through `tests.test_helpers.cake_package`) compares against a per-group fp64
+through `tests.cake.test_helpers.cake_package`) compares against a per-group fp64
 reference (including an empty group, a one-row group, padded outputs,
 determinism and the fp32 output) and skips when no supported device or no
 registered program is present. `test_cake_moe_grouped_gemm_det_train_api.py` covers the

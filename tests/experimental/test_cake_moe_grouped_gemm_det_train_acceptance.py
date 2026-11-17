@@ -46,7 +46,7 @@ import torch.utils.checkpoint
 
 from tests.experimental import test_cake_moe_grouped_gemm_det_train as base
 from tests.experimental import test_cake_moe_grouped_gemm_det_train_determinism as det
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 PACKAGE = "cake_moe_grouped_gemm_det_train"
 cb = cake_package(PACKAGE, "cake_backend")

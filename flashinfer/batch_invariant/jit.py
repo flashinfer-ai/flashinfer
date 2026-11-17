@@ -35,6 +35,7 @@ MODE_DIRS: Tuple[Path, ...] = (
     _FI_DIR / "batch_invariant",
     _FI_DIR / "gemm" / "batch_invariant",
     _FI_DIR / "attention" / "batch_invariant",
+    _FI_DIR / "fused_moe" / "batch_invariant",
 )
 
 #: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
@@ -51,11 +52,25 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/blocks/compile_blockscaled.py",
     ),
+    # the block-scale fp8 kernels (the DeepSeek-style class behind gemm_fp8_nt_groupwise): their own module
+    "batch_invariant_gemm_fp8_blockscale": (
+        "gemm/batch_invariant/blocks/compile_fp8bs.py",
+    ),
     # the attention kernels (the row body, the Swaps-AB decode body) and the split-KV fixup share one module
     "batch_invariant_attention": (
         "attention/batch_invariant/blocks/compile.py",
         "attention/batch_invariant/swaps/compile.py",
         "attention/batch_invariant/fixup.py",
+    ),
+    # the MoE kernels of the bf16 and the fp8 per-tensor classes: the grouped and the swapped GEMM bodies (one source for
+    # both operand formats, composing the dense GEMM blocks: they are in its closure), the routing, permutation and
+    # combine kernels; the MoE API, dispatchers and runners stay outside
+    "batch_invariant_moe": (
+        "fused_moe/batch_invariant/blocks/compile.py",
+        "fused_moe/batch_invariant/route.py",
+        "fused_moe/batch_invariant/route_plan.py",
+        "fused_moe/batch_invariant/permute.py",
+        "fused_moe/batch_invariant/combine.py",
     ),
 }
 
@@ -66,6 +81,9 @@ MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
     "batch_invariant_gemm_blockscaled": (
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
+    "batch_invariant_gemm_fp8_blockscale": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
 }
@@ -79,6 +97,15 @@ MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/heuristic.py",
     ),
     "batch_invariant_gemm_blockscaled": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    # the grouped kernels compose the dense GEMM blocks, whose closure reaches the GEMM dispatcher files
+    "batch_invariant_moe": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_gemm_fp8_blockscale": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

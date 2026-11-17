@@ -15,7 +15,7 @@ limitations under the License.
 
 Host synchronization of the KCP route (``cake_kda_det_train_kcp.cake_kcp`` / ``cake_kcp_plan``): pack preparation and the
 KDA / conv halo calls never copy a table from pageable memory and never wait for queued device work, with or without
-a caller-owned workspace.  The signals of a window are those of ``tests/test_helpers/cake_host_sync.py``: an upload
+a caller-owned workspace.  The signals of a window are those of ``tests/experimental/test_helpers/cake_host_sync.py``: an upload
 counter that needs no device tracing (equal to the profiler's host-to-device copies by kind where the profiler
 traces the device), the caching allocator's device allocations, the synchronizing operations
 ``torch.cuda.set_sync_debug_mode("warn")`` reports, and a queue probe (``torch.cuda._sleep`` enqueued before the
@@ -31,7 +31,7 @@ import weakref
 import pytest
 import torch
 
-from tests.test_helpers.cake_host_sync import (
+from tests.experimental.test_helpers.cake_host_sync import (
     SLEEP_MS,
     allocator_counts,
     census,
@@ -40,7 +40,7 @@ from tests.test_helpers.cake_host_sync import (
     sleep_cycles,
     summary,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_plan")
 cake_kcp = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp")

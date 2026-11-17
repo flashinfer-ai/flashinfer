@@ -27,10 +27,10 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers import (
+from tests.experimental.test_helpers import (
     cake_dsa_sparse_attention_nondet_train_reference as nope_ref,
 )
-from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
+from tests.experimental.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import (
     calibrate_beta,
     compact_rows,
     compact_rows_loop,
@@ -41,7 +41,7 @@ from tests.test_helpers.cake_dsa_sparse_attention_nondet_train_reference import 
     rel_l2,
     rel_l2_rows,
 )
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 # The backend suite names its package once, through the shared alias helper, and imports nothing else from
 # flashinfer: a build that vendors the package under another import path runs it unchanged after pointing the

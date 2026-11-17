@@ -20,7 +20,7 @@ constants carries the mode token ``det`` (``Det`` in a class name), no public
 callable takes a ``deterministic`` keyword (the ``forward`` / ``backward`` of
 the autograd ``Function`` classes included), the former modules and names are
 gone (no module, no alias, no top-level name), and the package is wired at its
-path (test-helper key, package data, ignored ``aot/``, pre-commit exclude,
+path (test-helper key, package data, pre-commit exclude,
 manifest checker row).
 """
 
@@ -150,10 +150,10 @@ def test_former_names_are_gone() -> None:
 
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
-    """The test-helper key, the build manifest's package, the package data, the ignored ``aot/`` directory, the
+    """The test-helper key, the build manifest's package, the package data, the
     pre-commit exclude of the generated sources and the manifest checker's row name the package at its path; no
     key, package data, exclude, checker row or module file is left at the former path."""
-    from tests.test_helpers.cake_package import PACKAGES
+    from tests.cake.test_helpers.cake_package import PACKAGES
 
     backend = importlib.import_module(BACKEND)
     directory = Path(backend.__file__).resolve().parent
@@ -171,7 +171,6 @@ def test_package_wiring() -> None:
     package_data = data["tool"]["setuptools"]["package-data"]
     assert package_data[BACKEND] == ["csrc/**", "build.json"]
     assert former not in package_data
-    assert "aot/" in (directory / ".gitignore").read_text().split()
     pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
     # pre-commit skips every generated source of the package (a per-package entry or the generic #8928 rule), still
     # checks its Python modules; the former tree holds no sources (the shared exclude may still list its path)

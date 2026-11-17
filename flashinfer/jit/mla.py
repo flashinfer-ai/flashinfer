@@ -33,7 +33,7 @@ def gen_mla_module() -> JitSpec:
 
 
 def gen_mla_swa_sm90_module() -> JitSpec:
-    """BF16 Page64 DOTS-style sliding-window MLA, six frozen SM90 tactics."""
+    """BF16 Page64 DOTS-style sliding-window MLA, seven qualified SM90 tactics."""
     return gen_jit_spec(
         "mla_swa_sm90",
         [jit_env.FLASHINFER_CSRC_DIR / "mla_swa_sm90.cu"],
