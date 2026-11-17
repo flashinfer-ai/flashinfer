@@ -21,6 +21,8 @@ class AllocatingRunner(DummyRunner):
 
 def _private_pool_entries() -> int:
     stats = torch._C._cuda_memoryStats(torch.cuda.current_device())
+    if "reserved_bytes_by_private_pools" not in stats:
+        pytest.skip("this PyTorch does not report reserved_bytes_by_private_pools")
     return len(stats["reserved_bytes_by_private_pools"])
 
 
@@ -40,7 +42,12 @@ def test_profiling_captures_share_one_pool(config):
     runner = AllocatingRunner(valid_tactics=tuple(range(8)))
     before = _private_pool_entries()
     with autotune(tune_mode=True):
-        tuner.choose_one("profile_graph_pool_test", [runner], config, inputs)
+        _, tactic = tuner.choose_one(
+            "profile_graph_pool_test", [runner], config, inputs
+        )
     torch.cuda.synchronize()
+    # A fallback tactic or a recorded failure means nothing was measured.
+    assert tactic in range(8)
+    assert "profile_graph_pool_test" not in tuner.stats.failed_profiling_count
     # Each capture without a shared pool adds one entry per profiled tactic.
     assert _private_pool_entries() - before <= 1
