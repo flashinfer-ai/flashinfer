@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from flashinfer import (
+    mxfp8_dequantize_host,
     mxfp8_grouped_quantize,
     mxfp8_quantize,
     SfLayout,
@@ -1904,6 +1905,39 @@ def test_mxfp8_quantize_torch_device(m, k, dtype, is_sf_swizzled_layout, backend
         a, a_fp8, a_sf, is_sf_swizzled_layout=is_sf_swizzled_layout
     )
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("m", [1, 3, 64, 1024])
+@pytest.mark.parametrize("k", [128, 1024, 8192])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("is_sf_swizzled_layout", [True, False])
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_mxfp8_quantize_roundtrip(m, k, dtype, is_sf_swizzled_layout, backend):
+    """Quantize on the device, dequantize on the host and compare to the input."""
+    if not _is_mxfp8_supported(torch.device("cuda:0")):
+        pytest.skip("mxfp8 quantization is not supported on compute capability < 10")
+
+    if backend == "cute-dsl" and not is_cute_dsl_available():
+        pytest.skip("CuTe-DSL is not available")
+
+    torch.random.manual_seed(0)
+    a = (torch.randn([m, k], dtype=torch.float) * 16).to(dtype).cuda().contiguous()
+
+    a_fp8, a_sf = mxfp8_quantize(a, is_sf_swizzled_layout, backend=backend)
+    torch.cuda.synchronize()
+
+    a_deq = mxfp8_dequantize_host(
+        a_fp8.cpu().view(torch.uint8),
+        a_sf.cpu().view(torch.uint8).reshape(-1),
+        is_sf_swizzled_layout,
+    )
+    expected = a.float().cpu()
+    assert a_deq.shape == expected.shape
+    assert torch.isfinite(a_deq).all()
+    # E4M3 keeps three mantissa bits; the block scale bounds the absolute floor.
+    torch.testing.assert_close(
+        a_deq, expected, rtol=2**-4, atol=expected.abs().amax().item() * 2**-9
+    )
 
 
 @pytest.mark.parametrize("m", [1, 2, 16, 1024])
