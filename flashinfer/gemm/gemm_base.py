@@ -3974,7 +3974,7 @@ class SegmentGEMMWrapper:
         if seg_lens is None and seg_indptr is None:
             raise ValueError("Either seg_lens or seg_indptr should be provided.")
         if seg_indptr is None:
-            seg_indptr = get_indptr(seg_lens.to(x))
+            seg_indptr = get_indptr(seg_lens.to(device=x.device))
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
