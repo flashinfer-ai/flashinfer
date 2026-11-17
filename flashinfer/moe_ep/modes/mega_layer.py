@@ -417,6 +417,22 @@ class MoEEpMegaLayer(nn.Module):
         _, backend_workspace, kernel = self._resolve_workspace(None)
         return kernel.workspace_output(backend_workspace)
 
+    def get_transformed_weights(self) -> Any:
+        """Return writable aliases of the prepared tensors used by execution.
+
+        The structure and tensor layouts are backend-specific, matching
+        ``MegaConfig.transformed_weights``. No tensors are copied. Callers
+        implementing expert migration must move every per-expert tensor and
+        any separately supplied per-expert normalization state together.
+
+        In-place updates preserve CUDA graph bindings. Finish previous reads
+        and weight transfers before publishing routing for the new placement;
+        keep tensor addresses, physical slot capacity, and EP membership fixed.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError("MegaMoE layer has been destroyed")
+        return self._get_transformed_weights()
+
     def _get_transformed_weights(self) -> Any:
         """Return this layer's one-time backend weight transformation."""
         if self._transformed is None:
