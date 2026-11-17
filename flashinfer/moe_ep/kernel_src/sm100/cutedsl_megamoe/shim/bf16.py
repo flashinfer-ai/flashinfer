@@ -10,6 +10,8 @@ from typing import Callable, Literal, Optional, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
@@ -21,6 +23,7 @@ from .comm import (
 )
 
 
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class MegaMoEBf16Config:
     """Compile-time and launch-time BF16 MegaMoE configuration."""
@@ -48,10 +51,34 @@ class MegaMoEBf16Config:
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
     gate_up_clamp: Optional[float] = None
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     enable_iket: bool = False
+    use_custom_finalize: bool = dataclasses.field(default=False, kw_only=True)
+    batch_invariant: bool = dataclasses.field(default=False, kw_only=True)
+    activation: str = dataclasses.field(default="swiglu", kw_only=True)
+    swiglu_alpha: Optional[float] = dataclasses.field(default=None, kw_only=True)
+    swiglu_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
+    situ_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
+    situ_linear_beta: Optional[float] = dataclasses.field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+            bf16_plan_config,
+            validate_bf16_batch_invariant,
+        )
+
+        if type(self.batch_invariant) is not bool:
+            raise ValueError("batch_invariant must be a bool.")
+        validate_bf16_batch_invariant(self)
+        if not self.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+                batch_invariant_activation_fields,
+            )
+
+            if batch_invariant_activation_fields(self):
+                raise ValueError(
+                    "BF16 activation variants require batch_invariant=True"
+                )
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
             raise ValueError("rank must be in [0, world_size).")
         if self.num_tokens_per_rank <= 0:
@@ -64,13 +91,7 @@ class MegaMoEBf16Config:
             raise ValueError("hidden must be divisible by 32.")
         if self.intermediate % 64:
             raise ValueError("intermediate must be divisible by 64.")
-        if self.mma_tiler_mnk != (256, 256, 64):
-            raise ValueError("BF16 MegaMoE requires mma_tiler_mnk=(256, 256, 64).")
-        if self.cluster_shape_mnk != (2, 1, 1) or not self.use_2cta_instrs:
-            raise ValueError(
-                "BF16 MegaMoE requires cluster_shape_mnk=(2, 1, 1) "
-                "and use_2cta_instrs=True."
-            )
+        bf16_plan_config(self)
         if self.token_back_mode not in (
             "epi_warps",
             "standalone_warps",
@@ -85,6 +106,12 @@ class MegaMoEBf16Config:
             raise ValueError(
                 "in_kernel_fc2_reduce requires standalone or reused dispatch token-back."
             )
+        if self.use_custom_finalize and (
+            self.enable_in_kernel_fc2_reduce or self.in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "use_custom_finalize requires in_kernel_fc2_reduce to be disabled."
+            )
 
     @property
     def num_experts_per_rank(self) -> int:
@@ -98,7 +125,7 @@ class MegaMoEBf16Inputs:
     topk_weights: torch.Tensor
     fc1_weight: torch.Tensor
     fc2_weight: torch.Tensor
-    combine_output: torch.Tensor
+    output_activation: torch.Tensor
 
 
 class MegaMoEBf16Frontend:
@@ -109,31 +136,60 @@ class MegaMoEBf16Frontend:
         self._gate_up_clamp = config.gate_up_clamp
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+        self._compile_prepare: Optional[dict] = None
+        self._arithmetic_fingerprint: Optional[str] = None
+
+    def _same_clamp(self, a: Optional[float], b: Optional[float]) -> bool:
+        if not self._config.batch_invariant:
+            return a == b
+        from flashinfer.moe_ep.batch_invariant.spec import f32_bits
+
+        return (None if a is None else f32_bits(abs(a))) == (
+            None if b is None else f32_bits(abs(b))
+        )
 
     @property
     def config(self) -> MegaMoEBf16Config:
-        if self._gate_up_clamp == self._config.gate_up_clamp:
+        if self._same_clamp(self._gate_up_clamp, self._config.gate_up_clamp):
             return self._config
         return dataclasses.replace(self._config, gate_up_clamp=self._gate_up_clamp)
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
-        if self._gate_up_clamp != clamp:
+        if not self._same_clamp(self._gate_up_clamp, clamp):
             ensure_not_capturing("set_gate_up_clamp (clamp change)")
             self._release_workspace()
             self._gate_up_clamp = clamp
             self._mega_key = None
             self._mega = None
+            self._arithmetic_fingerprint = None
+
+    @property
+    def batch_invariant_fingerprint(self) -> Optional[str]:
+        """Arithmetic receipt, memoized independently of scheduling and capacity."""
+        if not self._config.batch_invariant:
+            return None
+        if self._arithmetic_fingerprint is None:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+                bf16_batch_invariant_fingerprint,
+            )
+
+            self._arithmetic_fingerprint = bf16_batch_invariant_fingerprint(self.config)
+        return self._arithmetic_fingerprint
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated BF16 tuning configuration and invalidate its compile."""
-        from .tuner import describe_invalid_knobs, is_valid_bf16_for_config, with_knobs
+        from .tuner import (
+            describe_invalid_knobs,
+            is_valid_bf16_for_config,
+            with_checked_knobs,
+        )
 
         if not is_valid_bf16_for_config(self.config, knobs):
             raise ValueError(
                 f"unsupported BF16 MegaMoE knobs {knobs}: "
                 f"{describe_invalid_knobs(self.config, knobs, is_valid_bf16_for_config)}."
             )
-        new_config = with_knobs(self.config, knobs)
+        new_config = with_checked_knobs(self.config, knobs)
         if new_config != self._config:
             ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
@@ -169,6 +225,7 @@ class MegaMoEBf16Frontend:
             c.intermediate,
             c.mma_tiler_mnk,
             c.cluster_shape_mnk,
+            c.use_2cta_instrs,
             c.load_balance_mode,
             c.group_hint,
             c.force_static_sched,
@@ -179,22 +236,78 @@ class MegaMoEBf16Frontend:
             c.in_kernel_fc2_reduce,
             c.token_back_mode,
             self._gate_up_clamp,
-            c.apply_topk_in_fc1,
+            c.apply_routing_weights_before_fc2,
             c.enable_iket,
+            c.use_custom_finalize,
+            c.batch_invariant,
+            self.batch_invariant_fingerprint,
         )
 
     def _ensure_compiled(self, inputs: MegaMoEBf16Inputs) -> _CompiledMega:
         key = self._compile_key()
-        if self._mega is not None and self._mega_key == key:
+        if (
+            self._mega is not None
+            and self._mega_key == key
+            and self._mega.compiled is not None
+        ):
             return self._mega
+        if self._compile_prepare is None:
+            prepared = self._prepare_compile_local()
+            self._release_workspace()
+            self._compile_prepare = prepared
+            self._allocate_compile_local()
+            self._prepare_compile_symmetric()
+        return self._compile_prepared(inputs)
 
-        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+    def prepare_tuning_local(self, knobs, *, config_overrides=None):
+        """Validate a candidate and construct its kernel without allocating storage."""
+        from .tuner import with_checked_knobs
+
+        trial = type(self)(with_checked_knobs(self.config, knobs))
+        overrides = dict(config_overrides or {})
+        if "gate_up_clamp" in overrides and hasattr(trial, "set_gate_up_clamp"):
+            trial.set_gate_up_clamp(overrides.pop("gate_up_clamp"))
+        if overrides:
+            trial._config = dataclasses.replace(trial.config, **overrides)
+        trial._compile_prepare = trial._prepare_compile_local()
+        return trial
+
+    def prepare_tuning_release(self, prepared):
+        """Release old storage collectively before allocating candidate scratch."""
+        if type(prepared) is not type(self):
+            raise TypeError("incompatible MegaMoE tuning preparation")
         self._release_workspace()
+        self.__dict__.update(prepared.__dict__)
+
+    def prepare_tuning_allocate_local(self, prepared):
+        """Allocate only local scratch; peers agree before symmetric allocation."""
+        self._allocate_compile_local()
+
+    def prepare_tuning_collective(self, prepared):
+        """Allocate symmetric storage after every rank has local scratch."""
+        self._prepare_compile_symmetric()
+
+    def _prepare_compile_local(self):
+        c = self.config
+        variant = None
+        if c.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.activation_batch_invariant import (
+                batch_invariant_activation,
+            )
+
+            variant = batch_invariant_activation(c, family="bf16", nondefault_only=True)
+        if c.batch_invariant:
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+                validate_bf16_batch_invariant_compile_target,
+                validate_bf16_batch_invariant_device,
+            )
+
+            validate_bf16_batch_invariant_device()
+            validate_bf16_batch_invariant_compile_target()
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         import cutlass
-        import cutlass.cute as cute
         from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel
 
-        c = self.config
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
         sm_count = torch.cuda.get_device_properties(
             torch.cuda.current_device()
@@ -222,34 +335,71 @@ class MegaMoEBf16Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
+            skip_topk_reduce=c.use_custom_finalize,
+            mask_invalid_routes=c.batch_invariant,
             token_back_by_dispatch=c.token_back_mode != "epi_warps",
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
-            gate_up_clamp=self._gate_up_clamp,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            gate_up_clamp=None if variant is not None else self._gate_up_clamp,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
         )
+        kernel.batch_invariant_chain = c.batch_invariant
+        if c.batch_invariant:
+            kernel.batch_invariant_activation = variant
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
-        local_workspace = torch.zeros(local_bytes, dtype=torch.uint8, device="cuda")
-        shared_workspace = sym_zeros((shared_bytes,), torch.uint8)
-        symmetric_base, peer_offsets_list = _compute_peer_offsets(
-            shared_workspace, c.world_size
-        )
-        mega = _CompiledMega(
-            compiled=None,
+        return dict(
+            key=self._compile_key(),
             kernel=kernel,
-            local_workspace=local_workspace,
-            shared_workspace=shared_workspace,
-            symmetric_base=symmetric_base,
-            peer_offsets_list=peer_offsets_list,
+            local_bytes=local_bytes,
+            shared_bytes=shared_bytes,
+            max_active_clusters=max_active_clusters,
         )
+
+    def _allocate_compile_local(self):
+        p = self._compile_prepare
+        if p is None:
+            raise RuntimeError("missing local MegaMoE preparation")
+        try:
+            p["local_workspace"] = torch.zeros(
+                p["local_bytes"], dtype=torch.uint8, device="cuda"
+            )
+        except Exception:
+            p.clear()
+            self._compile_prepare = None
+            raise
+
+    def _prepare_compile_symmetric(self):
+        p = self._compile_prepare
+        if p is None:
+            raise RuntimeError("missing local MegaMoE preparation")
+        shared_workspace = sym_zeros((p["shared_bytes"],), torch.uint8)
+        # Retain ownership even if peer mapping or compilation subsequently fails.
+        self._mega = _CompiledMega(
+            compiled=None,
+            kernel=p["kernel"],
+            local_workspace=p["local_workspace"],
+            shared_workspace=shared_workspace,
+            symmetric_base=0,
+            peer_offsets_list=(),
+        )
+        self._mega.symmetric_base, self._mega.peer_offsets_list = _compute_peer_offsets(
+            shared_workspace, self.config.world_size
+        )
+
+    def _compile_prepared(self, inputs: MegaMoEBf16Inputs) -> _CompiledMega:
+        import cutlass.cute as cute
+
+        p, mega = self._compile_prepare, self._mega
+        if p is None or mega is None:
+            raise RuntimeError("missing symmetric MegaMoE preparation")
         kwargs = self._runtime_kwargs(inputs, mega)
-        kwargs["max_active_clusters"] = max_active_clusters
-        if c.enable_iket:
+        kwargs["max_active_clusters"] = p["max_active_clusters"]
+        if self.config.enable_iket:
             kwargs["options"] = "iket"
-        mega.compiled = cute.compile(kernel, **kwargs)
-        self._mega = mega
-        self._mega_key = key
+        mega.compiled = cute.compile(mega.kernel, **kwargs)
+        self._mega_key = p["key"]
+        self._compile_prepare = None
         return mega
 
     def _runtime_kwargs(self, inputs: MegaMoEBf16Inputs, mega: _CompiledMega) -> dict:
@@ -270,9 +420,11 @@ class MegaMoEBf16Frontend:
             "fc1_weight": self._to_cute(inputs.fc1_weight),
             "fc2_weight": self._to_cute(inputs.fc2_weight),
             "fc1_c": None,
-            "combine_output": self._to_cute(inputs.combine_output),
+            "output_activation": self._to_cute(inputs.output_activation),
             "local_workspace": self._to_cute(mega.local_workspace, static_layout=True),
-            "shared_workspace": self._to_cute(mega.shared_workspace),
+            "shared_workspace": self._to_cute(
+                mega.shared_workspace, static_layout=True
+            ),
             "peer_rank_ptr_mapper_host": mapper,
             "stream": cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         }
@@ -284,6 +436,7 @@ class MegaMoEBf16Frontend:
         num_tokens: Optional[int] = None,
         sync: bool = False,
     ) -> torch.Tensor:
+        """Launch with cached bindings that track the output's live layout."""
         n = inputs.activation.shape[0] if num_tokens is None else num_tokens
         self._validate(inputs, n)
         mega = self._ensure_compiled(inputs)
@@ -293,18 +446,45 @@ class MegaMoEBf16Frontend:
             inputs.topk_weights.data_ptr(),
             inputs.fc1_weight.data_ptr(),
             inputs.fc2_weight.data_ptr(),
-            inputs.combine_output.data_ptr(),
+            inputs.output_activation.data_ptr(),
+            tuple(inputs.output_activation.shape),
+            tuple(inputs.output_activation.stride()),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
             mega.launch_kwargs = self._runtime_kwargs(inputs, mega)
             mega.launch_key = key
         if self.config.in_kernel_fc2_reduce:
-            inputs.combine_output.zero_()
+            inputs.output_activation.zero_()
+        if self.config.batch_invariant and self.config.use_custom_finalize:
+            self.custom_finalize_workspace()[0].zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
-        return inputs.combine_output[:n]
+        return inputs.output_activation[:n]
+
+    def custom_finalize_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return the zero-copy per-route partials and their canonical root descriptor."""
+        if not self.config.use_custom_finalize:
+            raise RuntimeError("custom finalize mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "custom finalize workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.topk_reduce_input_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
 
     def make_launch_thunk(self, inputs: MegaMoEBf16Inputs) -> Callable[[], None]:
         self._validate(inputs, inputs.activation.shape[0])
@@ -314,18 +494,23 @@ class MegaMoEBf16Frontend:
         if self.config.in_kernel_fc2_reduce:
 
             def thunk():
-                inputs.combine_output.zero_()
+                inputs.output_activation.zero_()
+                if self.config.batch_invariant and self.config.use_custom_finalize:
+                    self.custom_finalize_workspace()[0].zero_()
                 compiled(**kwargs)
 
             return thunk
         else:
 
             def thunk():
+                if self.config.batch_invariant and self.config.use_custom_finalize:
+                    self.custom_finalize_workspace()[0].zero_()
                 compiled(**kwargs)
 
             return thunk
 
     def _validate(self, inputs: MegaMoEBf16Inputs, num_tokens: int) -> None:
+        """Check padded inputs and the admitted live-output row count."""
         c = self.config
         if not 0 <= num_tokens <= c.num_tokens_per_rank:
             raise ValueError(
@@ -365,14 +550,26 @@ class MegaMoEBf16Frontend:
             or inputs.fc2_weight.dtype != torch.bfloat16
         ):
             raise ValueError("BF16 MegaMoE weights must be bfloat16.")
-        topk_dim = 1 if c.in_kernel_fc2_reduce else c.num_topk
-        if inputs.combine_output.shape != (c.num_tokens_per_rank, topk_dim, c.hidden):
-            raise ValueError("combine_output has an invalid shape.")
+        output_rows = {c.num_tokens_per_rank}
+        if not c.in_kernel_fc2_reduce and not c.use_custom_finalize:
+            output_rows.add(num_tokens)
+        if (
+            not inputs.output_activation.is_cuda
+            or inputs.output_activation.ndim != 2
+            or inputs.output_activation.shape[0] not in output_rows
+            or inputs.output_activation.shape[1] != c.hidden
+        ):
+            raise ValueError("output_activation has an invalid shape.")
+        if inputs.output_activation.dtype != torch.bfloat16:
+            raise ValueError("output_activation must be bfloat16.")
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
+        self._mega = None
+        self._mega_key = None
+        self._compile_prepare = None
 
 
 @dataclass
@@ -387,20 +584,12 @@ class MegaMoEBf16SymmBuffer:
     x: torch.Tensor
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    combine_output: torch.Tensor
-    reduced_output: torch.Tensor
+    output_activation: torch.Tensor
     _frontend: MegaMoEBf16Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
     _unfinalized_route_map: torch.Tensor | None = None
     _unfinalized_weights: torch.Tensor | None = None
-
-    @property
-    def kernel_combine_output(self) -> torch.Tensor:
-        """The tensor the kernel writes: reduced rows under ikr, else partials."""
-        if self._frontend.config.in_kernel_fc2_reduce:
-            return self.reduced_output
-        return self.combine_output
 
     def destroy(self) -> None:
         if not self._destroyed:
@@ -432,17 +621,30 @@ def get_symm_buffer_for_bf16_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    apply_routing_weights_before_fc2: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
+    use_custom_finalize: bool = False,
+    batch_invariant: bool = False,
+    activation: str = "swiglu",
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
     from .knob_cache import resolve_knobs
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.common.batch_invariant import (
+        BF16_BATCH_INVARIANT_VERSION,
+        bf16_plan_config,
+    )
     from .tuner import (
         describe_invalid_knobs,
         is_valid_bf16_for_config,
-        with_knobs,
+        reject_explicit_knobs,
+        with_checked_knobs,
     )
 
     if knobs is None:
@@ -455,32 +657,60 @@ def get_symm_buffer_for_bf16_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            batch_invariant_version=(
+                BF16_BATCH_INVARIANT_VERSION if batch_invariant else None
+            ),
+            gate_up_clamp=clamp,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
-    cfg = MegaMoEBf16Config(
-        rank=rank,
-        world_size=world_size,
-        num_tokens_per_rank=num_max_tokens,
-        num_topk=num_topk,
-        num_total_experts=num_total_experts,
-        hidden=hidden,
-        intermediate=intermediate,
-        gate_up_clamp=clamp,
-        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-    )
+    reject_explicit_knobs(knobs)
+    config_fields = {f.name for f in dataclasses.fields(MegaMoEBf16Config)}
+    config_knobs = {key: value for key, value in knobs.items() if key in config_fields}
+    try:
+        # Admission must see the selected plan: the default tile may exceed
+        # shared memory even when a narrower pinned or cached tile fits.
+        config_knobs.update(dataclasses.asdict(bf16_plan_config(knobs=knobs)))
+        cfg = MegaMoEBf16Config(
+            rank=rank,
+            world_size=world_size,
+            num_tokens_per_rank=num_max_tokens,
+            num_topk=num_topk,
+            num_total_experts=num_total_experts,
+            hidden=hidden,
+            intermediate=intermediate,
+            gate_up_clamp=clamp,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+            use_custom_finalize=use_custom_finalize,
+            batch_invariant=batch_invariant,
+            activation=activation,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            **config_knobs,
+        )
+    except ValueError as exc:
+        raise ValueError(f"unsupported BF16 MegaMoE knobs {knobs}: {exc}") from exc
     if not is_valid_bf16_for_config(cfg, knobs):
         raise ValueError(
             f"unsupported BF16 MegaMoE knobs {knobs}: "
             f"{describe_invalid_knobs(cfg, knobs, is_valid_bf16_for_config)}."
         )
-    cfg = with_knobs(cfg, knobs)
+    cfg = with_checked_knobs(cfg, knobs)
 
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
-    # We need to allocate both since we dont always know what final knobs will be selected
-    combine_output = sym_zeros((num_max_tokens, num_topk, hidden), torch.bfloat16)
-    reduced_output = sym_zeros((num_max_tokens, 1, hidden), torch.bfloat16)
+    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     return MegaMoEBf16SymmBuffer(
         num_total_experts,
         num_max_tokens,
@@ -492,10 +722,9 @@ def get_symm_buffer_for_bf16_mega_moe(
         x,
         topk_idx,
         topk_weights,
-        combine_output,
-        reduced_output,
+        output_activation,
         MegaMoEBf16Frontend(cfg),
-        [x, topk_idx, topk_weights, combine_output, reduced_output],
+        [x, topk_idx, topk_weights, output_activation],
     )
 
 
@@ -511,11 +740,11 @@ def bf16_mega_moe(
     fast_math: bool = True,
     sync: bool = False,
 ) -> Optional[torch.Tensor]:
+    """Write caller output directly when eligible, or return a borrowed view."""
     del fast_math
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
-    in_kernel_reduce = symm_buffer._frontend.config.in_kernel_fc2_reduce
     if y is not None and (
         y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16
     ):
@@ -525,6 +754,19 @@ def bf16_mega_moe(
     )
     if clamp is not None:
         symm_buffer._frontend.set_gate_up_clamp(clamp)
+    config = symm_buffer._frontend.config
+    # Form A's terminal reducer bounds its stores by the output's row count.
+    # Form B atomically writes a full-capacity symmetric target on peer GPUs,
+    # so it must retain the owned workspace and the final copy.
+    direct_output = (
+        y is not None
+        and n > 0
+        and not config.in_kernel_fc2_reduce
+        and not config.use_custom_finalize
+        and y.device == symm_buffer.output_activation.device
+        and y.is_contiguous()
+        and y.data_ptr() % 16 == 0
+    )
     result = symm_buffer._frontend.run(
         MegaMoEBf16Inputs(
             symm_buffer.x,
@@ -532,19 +774,14 @@ def bf16_mega_moe(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.kernel_combine_output,
+            y if direct_output else symm_buffer.output_activation,
         ),
         num_tokens=n,
         sync=False,
     )
-    if in_kernel_reduce:
-        out = result[:, 0]
-        if y is not None:
-            y.copy_(out)
-    else:
-        # Reduce straight into the result buffer
-        out = y if y is not None else symm_buffer.reduced_output[:n, 0]
-        torch.sum(result, dim=1, out=out)
+    out = result
+    if y is not None and not direct_output:
+        y.copy_(out)
 
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
@@ -679,22 +916,10 @@ def bf16_mega_launch_thunk(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.kernel_combine_output,
+            symm_buffer.output_activation,
         )
     )
-    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        return launch
-
-    # Form A's host reduce is part of the forward; a thunk without it would
-    # under-report the deterministic path against ikr.
-    partials = symm_buffer.combine_output
-    out = symm_buffer.reduced_output[:, 0]
-
-    def thunk() -> None:
-        launch()
-        torch.sum(partials, dim=1, out=out)
-
-    return thunk
+    return launch
 
 
 __all__ = [

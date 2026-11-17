@@ -70,7 +70,7 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
   const size_t merge_smem = static_cast<size_t>(active_splits) * sizeof(float);
   kernel<<<dim3(num_tokens, NUM_HEADS), dim3(MERGE_THREADS), merge_smem, stream>>>(
       mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, active_splits, NUM_HEADS, NUM_HEADS,
-      NUM_HEADS, lse_scale);
+      NUM_HEADS, lse_scale, {});
   return cudaGetLastError();
 }
 

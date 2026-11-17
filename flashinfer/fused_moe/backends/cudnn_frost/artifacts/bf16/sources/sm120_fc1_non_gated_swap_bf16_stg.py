@@ -1,42 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""sm120 (GeForce/consumer Blackwell, CC 12.x) MoE weight-by-token grouped
-matmul fwd: the swap-AB lowering of ``sm120_moe_grouped_matmul_fwd.py``.
-
-``fusion_ir.swap_ab`` rewrites ``out = token @ weight.T`` as its transpose
-``out.T = weight @ token.T`` without moving any storage: the expert's weight
-becomes A (batched by expert, ``(N_feat, K, E)``), the routed token matrix
-becomes B (``(S, K)``, K-major), and the routed groups partition N instead of
-M. Small per-expert token counts then ride the narrow N tile while the weight
-rows fill the M tile. The output is the same ``(S, N_feat)`` buffer seen as
-``(N_feat, S)``, so a row-major MoE output is M-major here.
-
-KEEP IN SYNC WITH ``sm120_moe_grouped_matmul_fwd.py`` (this tree) and
-``../../sm100/kernel_templates/sm100_moe_grouped_matmul_fwd_swap_ab.py``
------------------------------------------------------------------------
-* Mainloop, transposed-STG staging, register budget and the grouped
-  persistent scheduler are the non-swapped sm120 MoE kernel's. What moves:
-  - the scheduler counts ``ceil(group_tokens / cta_n) * ceil(M / cta_m)``
-    tiles per group and walks it with the sm100 swap-AB raster;
-  - A (weight) is TMA-loaded at ``(k, m, expert)``; an N-major weight arrives
-    as an M-major A and is read through ``ldmatrix.trans`` exactly like
-    ``sm120_matmul.py``'s M-major A;
-  - B (token) is addressed by COORDINATE on one global ``[K, S]`` descriptor
-    at ``group_begin + tile_n * cta_n`` (GATHER: GATHER4 rows through
-    ``token_index``). Token columns past ``group_end`` land in accumulator
-    columns the epilogue never stores (``col < group_end``), and weight rows
-    past ``M`` are TMA zero-fill the epilogue skips (``row < M``).
-* The epilogue's aux views are injected per row, after ``row`` is known: a
-  per-feature bias of the original graph is per-ROW here.
-* As in the non-swapped kernel: no per-group descriptor replacement, no
-  proxy fences, no TMA-store epilogue; the workspace is the scheduler counter.
-
-Multi-GEMM (e.g. SwiGLU: ``silu(W0 @ X) * (W1 @ X)`` after the swap) keeps one
-SMEM tile per DISTINCT operand per stage -- several weights become several A
-tiles -- and one register accumulator per GEMM, exactly as in the
-non-swapped template.
-"""
+"""sm120 (GeForce/consumer Blackwell, CC 12.x) MoE weight-by-token grouped matmul fwd: the swap-AB lowering of ``sm120_moe_grouped_matmul_fwd.py``."""
 
 from __future__ import annotations
 
@@ -48,23 +13,13 @@ import cutlass.experimental.primitives as nvvm
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Tile-level helpers shared by the SM100 and SM120 kernel templates.
-
-A template is RENDERED (its `@@INJECT_*@@` blocks become module-level
-constants) and then exec'd from the kernel cache under a synthetic module
-name, so it cannot use relative imports and this module is never rendered.
-Everything here therefore takes what it needs as ARGUMENTS -- a helper that
-reads an injected constant (`mma_size_m`, `tile_swizzle_n`, `ab_dtype`, ...)
-has to stay in the template, or receive it explicitly.
-
-Scheduling and gather helpers serve both families. The tcgen05 wrappers are
-used only by the SM100 family and retain its instruction-specific contracts.
-"""
+"""Tile-level helpers shared by the SM100 and SM120 kernel templates."""
 
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as nvvm
+import cutlass._mlir_helpers.vector as _cvec
 from cutlass._mlir.dialects import llvm
 
 
@@ -73,12 +28,15 @@ from cutlass._mlir.dialects import llvm
 
 
 TENSOR_MAP_QWORDS = 16
+CLUSTER_K_REDUCE_BARRIER_ID = 4
+
+
+
+
 
 
 def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
-    """Group-local linear tile index -> (m, n) under an N-super-block walk.
-    ``swizzle_w == nt_n`` reproduces the plain n-fast split; ``1`` gives m-fast.
-    """
+    """Group-local linear tile index -> (m, n) under an N-super-block walk."""
     blk = cutlass.max(nt_m * swizzle_w, cutlass.Int32(1))
     sb = t // blk
     off = t - sb * blk
@@ -103,12 +61,7 @@ def moe_swizzle_tile(t, nt_m, nt_n, swizzle_w):
 
 @cute.jit
 def moe_group_at(visit_idx, num_groups, num_experts):
-    """Visitation index -> routed group index.
-
-    ``num_groups == num_experts`` (or a non-multiple) walks groups in order. Batched MoE
-    (``num_groups == B * num_experts``) walks expert-major -- the B groups sharing expert
-    ``g % E`` become consecutive, so the expert weight is fetched once instead of B times.
-    """
+    """Visitation index -> routed group index."""
     per_expert = num_groups // cutlass.max(num_experts, cutlass.Int32(1))
     group = visit_idx
     if per_expert > 1 and per_expert * num_experts == num_groups:
@@ -120,8 +73,6 @@ def moe_group_at(visit_idx, num_groups, num_experts):
 
 @cute.jit
 def moe_gather_row(token_index, row, group_end, source_rows):
-    # Never read beyond the routed group. An out-of-range source row asks TMA
-    # to zero-fill the padding while still completing the expected byte count.
     src = cutlass.Int32(source_rows)
     if row < group_end:
         src = cutlass.Int32(token_index[row])
@@ -136,14 +87,15 @@ def moe_gather_row(token_index, row, group_end, source_rows):
 
 
 
+
+
+
+
+
+
 @cute.jit
 def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlass.Constexpr = 1):
-    """Gather four rows from a rank-2 tensor map with box_dims[1] == 1.
-
-    No mask selects shared::cta (SM120); a mask selects SM100 cluster multicast.
-    The experimental DSL TMA wrapper currently validates two coordinates for
-    this five-coordinate instruction, so issue the PTX directly.
-    """
+    """Gather four rows from a rank-2 tensor map with box_dims[1] == 1."""
     bar_addr = mbar.data_ptr().toint(dtype=cutlass.Int32)
     if cutlass.const_expr(cta_group == 2):
         bar_addr = bar_addr & cutlass.Int32(0xFEFFFFFF)
@@ -179,8 +131,6 @@ def tma_gather4(dst, desc, k, r0, r1, r2, r3, mbar, mask=None, cta_group: cutlas
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
-
-
 
 
 
@@ -239,13 +189,6 @@ def red_part_flush_cta(_red_part, lane, M, N, _red_part_ctx, _red_part_args):
 if b_is_n_major:
     raise NotImplementedError(f"{__name__}: the MoE token (B after swap-AB) is K-major only (the grouped token walk is a K-major TMA box)")
 
-# A TMA tensormap is 128 bytes = 16 int64 qwords. The workspace is laid out as
-# grid_ctas * moe_desc_slots tensormap slots followed by the scheduler counter;
-# this kernel patches no descriptor, so its slot count is zero and the counter
-# sits at the start of the buffer (the compiler carves it the same way). The
-# host zeroes it, stream-ordered, before every launch -- as the sm100 MoE hosts
-# do -- so the compiled launchable is self-contained: a caller that exports it
-# (or replays it in a CUDA graph) need not reset the counter itself.
 TENSOR_MAP_QWORDS = 16
 moe_desc_slots = 0
 
@@ -256,13 +199,8 @@ SCHED_SLOT_WORDS = 8
 # Programmatic Dependent Launch (PDL, sm_90+; supported on sm_120).
 USE_PDL = True
 
-# Named barrier id for cross-warp sync of the compute warps (unused by the STG
-# epilogue, kept for parity with the dense kernel's constants).
 EPI_SYNC_BAR_ID = 1
 
-# Compute-warp grid over the CTA tile (warp_row x warp_col), derived from the
-# injected geometry: one warp tile = mma_size x the 16x16 warp-MMA pair, so
-# the grid is cta_tile / warp_tile per axis.
 WARPS_M = cta_tile_mnk[0] // (mma_size_m * mma_inst_shape_mnk[0])
 WARPS_N = cta_tile_mnk[1] // (mma_size_n * mma_inst_shape_mnk[1])
 NUM_COMPUTE_WARPS = WARPS_M * WARPS_N
@@ -273,27 +211,16 @@ TMA_WARP_ID = NUM_COMPUTE_WARPS
 SCHEDULER_WARP_ID = NUM_COMPUTE_WARPS + 1
 NUM_WARPS = threads_per_cta // 32
 
-# Scheduler-ring consumers: every compute warp + the TMA producer each arrive
-# once (elected) per consumed record.
 NUM_SCHED_CONSUMER_WARPS = NUM_COMPUTE_WARPS + 1
 
 EPI_REG_COUNT = 232
-# One budget for the whole producer warpgroup (TMA, scheduler and donor warps).
-# PTX setmaxnreg is .sync.aligned over the warpgroup: it is issued once, before
-# the per-warp roles diverge, so the count cannot differ per warp.
 PROD_REG_COUNT = 24
 assert NUM_COMPUTE_WARPS % 4 == 0, "the producer warps must form whole warpgroups"
 
-# ---------------------------------------------------------------------------
-# Geometry derived from the injected tile constants (all plain Python ints —
-# resolved at render/import time, traced as constants). Verbatim sm120_matmul.
-# ---------------------------------------------------------------------------
 
 _ELEM_BITS = ab_dtype.width
 _ELEM_BYTES = _ELEM_BITS // 8
 _ELEMS_16B = 16 // _ELEM_BYTES
-# One k-block = 32 bytes of K = the K extent of one mma.sync (k16 for 16-bit,
-# k32 for 8-bit operands).
 _K_BLK_ELEMS = (32 * 8) // _ELEM_BITS
 _NUM_K_BLOCKS = (cta_tile_mnk[2] * _ELEM_BITS) // (32 * 8)
 _CTA_K_ELEMS = cta_tile_mnk[2]
@@ -305,15 +232,10 @@ _N_FRAGS = _WARP_TILE_N // 8
 _N_FRAG_PAIRS = _N_FRAGS // 2
 _ACC_REGS = _M_FRAGS * _N_FRAGS * 4
 
-# SMEM K-row swizzle: the K-row width IS the swizzle span (the renderer derives
-# ab_tma_swizzle from cta_tile_k_bytes). The TMA s{128,64,32}b pattern ==
-# cutlass.Swizzle(b, 4, 3) with b = log2(row_bytes / 16); ldmatrix addresses
-# below apply the same XOR.
 _AB_SMEM_SWIZZLE_BYTES = _CTA_K_ELEMS * _ELEM_BYTES
 _AB_SW_BBITS = (_AB_SMEM_SWIZZLE_BYTES // 16).bit_length() - 1
 _AB_SWIZZLE = cutlass.Swizzle(_AB_SW_BBITS, 4, 3)
 
-# ---- Transposed STG epilogue staging (fort "Sheet3" scheme) -----------------
 _STG_EPI_LANE_QUAD = 4  # one STS.128 = 4 x 32-bit acc regs per lane
 _STG_EPI_PAD = 4  # 16B skew after each 128-element batch (sheet's X cells)
 _STG_EPI_BATCH_STRIDE = 32 * _STG_EPI_LANE_QUAD + _STG_EPI_PAD  # 132
@@ -322,40 +244,22 @@ _STG_EPI_WARP_ELEMS = _STG_EPI_GROUP_FRAGS * _STG_EPI_BATCH_STRIDE  # 528
 _STG_EPI_NGRP = (_N_FRAGS + _STG_EPI_GROUP_FRAGS - 1) // _STG_EPI_GROUP_FRAGS
 _STG_V = (vec_bytes_epi * 8) // cd_dtype.width
 
-# Row-per-lane drain (block-scale quantize chains; the row_per_lane_drain tile
-# constant picks it over the lane-run drain). A 32-row slab is two 16-row m-fragments staged
-# in two sub-passes; a warp tile of one 16-row fragment gives a 16-row slab
-# owned by lanes 0..15.
 _RPL_SUBPASSES = 2 if _M_FRAGS % 2 == 0 else 1
 _RPL_SLABS = _M_FRAGS // _RPL_SUBPASSES
 
 
 def _rpl_swz(r):
-    """XOR key of the 16-byte granules of row-major staging row ``r``: keeps
-    the drain's STS.64 writes and LDS.128 reads of a 16x32 fp32 tile at the
-    two-words-per-bank minimum (an unswizzled tile hits eight)."""
+    """Return the row-major staging swizzle key."""
     rr = r % 8
     return ((rr & 3) << 1) | (rr >> 2)
 
 
 _STG_EPI_BYTES = 4 * _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS
-# One SMEM tile per DISTINCT operand per stage (multi-GEMM holds several A tiles,
-# one per expert weight, after the swap).
 _AB_STAGE_BYTES = (num_a_operands * cta_tile_mnk[0] + num_b_operands * cta_tile_mnk[1]) * _CTA_K_ELEMS * _ELEM_BYTES + 16
-# Single-GEMM: the staging is funded by giving up whole AB stages (legacy
-# accounting; the catalog sweep and every existing kernel count the same way).
-# Multi-GEMM: the renderer took the staging off the budget in BYTES before
-# sizing the ring (Sm120KernelTemplate.multi_gemm_ab_stages) -- a whole
-# multi-operand stage may be all that fits -- so nothing is deducted here.
 if not stg_epi_prefunded:
     ab_stages = ab_stages - -(-_STG_EPI_BYTES // _AB_STAGE_BYTES)
+assert ab_stages >= 1, f"{__name__}: the epilogue staging left an empty AB ring"
 
-
-# ---------------------------------------------------------------------------
-# The warp MMA instruction, resolved from the injected MMA dtypes.
-# sm120 tensor cores are warp-scoped: mma.sync.aligned.m16n8k16 (16-bit A/B)
-# or .m16n8k32 (8-bit A/B), row.col (both operands K-major), fp32/s32 acc.
-# ---------------------------------------------------------------------------
 
 _PTX_AB_TAG = {
     cutlass.BFloat16: "bf16",
@@ -376,11 +280,7 @@ _MMA_PTX = (
 
 @cute.jit
 def _mma_16x8_k32b(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
-    """One warp-wide mma.sync on a (16, 8, 32-byte-K) fragment.
-
-    A carrier: 4x b32 regs (ldmatrix.x4 of a [16 x 32B] K-major SMEM region).
-    B carrier: 2x b32 regs. D/C: 4 accumulator regs (f32 or s32).
-    """
+    """One warp-wide mma.sync on a (16, 8, 32-byte-K) fragment."""
     return cute.arch.inline_ptx(
         _MMA_PTX,
         write_only_types=[mma_c_dtype, mma_c_dtype, mma_c_dtype, mma_c_dtype],
@@ -388,20 +288,9 @@ def _mma_16x8_k32b(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3):
     )
 
 
-# ---------------------------------------------------------------------------
-# Group-local swizzle width depends on this template's injected constants.
-# Tile mapping and group visitation are shared through tile_helpers.
-# ---------------------------------------------------------------------------
-
-
 @cute.jit
 def _moe_auto_swizzle_w(group_rows, n, k, nt_n):
-    """N-super-block width for one routed group, resolved per group.
-
-    Same rule as the dense path, but the "M side" is THIS group's token slice, not the
-    whole token tensor: block along the shorter of (group tokens, expert weight), capped
-    by what L2 can hold onto. A group spanning one m-tile makes both orders identical.
-    """
+    """N-super-block width for one routed group, resolved per group."""
     if cutlass.const_expr(tile_swizzle_n > 0):
         return tile_swizzle_n
     budget = cutlass.Int64(swizzle_l2_budget_bytes)
@@ -440,8 +329,6 @@ def frost_template_kernel(
 
     tidx = cute.arch.thread_idx()[0]
 
-    # The dynamic tile scheduler's global counter: the one word this kernel
-    # keeps in the workspace (no descriptor slots precede it).
     sched_counter_ptr = cute.make_ptr(
         cutlass.Int32,
         (tma_workspace.iterator.raw_ptr() + grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS).toint(),
@@ -457,9 +344,6 @@ def frost_template_kernel(
     ab_full_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
     ab_empty_mbar_ptr = cutlass.Array(cutlass.Int64, ab_stages, space=cutlass.AddressSpace.smem)
 
-    # Scheduler ring: one record per stage --
-    # [0] expert (A's batch coordinate), [1] tile_m, [2] tile_n within the group,
-    # [3] valid, [4] group_begin, [5] group_end, [7] routed group index.
     sched_storage = cutlass.Array(
         cutlass.Int32,
         SCHED_STAGES * SCHED_SLOT_WORDS,
@@ -490,10 +374,6 @@ def frost_template_kernel(
         for _ in range(num_b_operands)
     ]
 
-    # Per-compute-warp staging stream for the transposed STG epilogue (raw
-    # accumulator dtype; 4 batches x (128 elems + 16B pad) = 528 elems, one
-    # 32-column group of one m-frag at a time). Slices are warp-private, so
-    # the round trip only needs bar.warp syncs — no CTA barrier.
     smem_stg_epi = cutlass.Array(
         mma_c_dtype,
         _STG_EPI_WARP_ELEMS * NUM_COMPUTE_WARPS,
@@ -501,10 +381,6 @@ def frost_template_kernel(
         alignment=1024,
     )
 
-    # ab full: one producer-elected arrive_expect_tx per stage.
-    # ab empty: one elected arrive per compute warp per stage.
-    # sched full: one elected arrive by the scheduler warp per record.
-    # sched empty: one elected arrive per consumer warp (compute + TMA) per record.
     if warp_idx == 0:
         for i in range(ab_stages):
             if elect_one:
@@ -533,23 +409,12 @@ def frost_template_kernel(
     M = m
     N = n
     num_k_tiles = cute.ceil_div(k, cta_tile_mnk[2])
-    # Every group is cut into the same M tiling (the expert's weight rows); only
-    # its N (token) tiling is its own.
     tiles_along_m = cute.ceil_div(cutlass.Int32(M), cgrp_tile_mnk[0])
     first_token_arr = cutlass.make_array_view(first_token_offset)
 
-    # -- Producer warpgroup ---------------------------------------------------
-    # Warps NUM_COMPUTE_WARPS.. (TMA, scheduler, donors) are whole warpgroups:
-    # release their registers once, warpgroup-uniformly, before the roles below
-    # diverge per warp. Donor warps have no further role and simply exit.
     if warp_idx >= NUM_COMPUTE_WARPS:
         nvvm.setmaxregister(PROD_REG_COUNT, nvvm.SetMaxRegisterAction.DECREASE)
 
-    # -- Grouped scheduler warp ------------------------------------------------
-    # Claim the next GLOBAL linear tile index off the counter, locate the group
-    # it falls in (a warp-parallel prefix scan over the group sizes, resumed
-    # from the last hit -- claims only ever grow), split the group-local index
-    # into (tile_m, tile_n) under the group's own L2 raster, and publish.
     if warp_idx == SCHEDULER_WARP_ID:
         if cutlass.const_expr(USE_PDL):
             nvvm.griddepcontrol("wait")
@@ -569,9 +434,6 @@ def frost_template_kernel(
         is_tile_valid = cutlass.Int32(1)
 
         while is_tile_valid != 0:
-            # Dynamic tile assignment: the CTAs live at any instant sit in one
-            # contiguous window of tile space and share L2. No cluster, so the
-            # claimed index is broadcast within the warp only.
             claimed = cutlass.Int32(0)
             if lane == 0:
                 claimed = nvvm.atomicrmw(
@@ -613,7 +475,9 @@ def frost_template_kernel(
                         nvvm.VoteSync.BALLOT,
                     )
                     if thread_succeed != 0:
-                        winning_lane = cutlass.Int32(31) - cute.arch.bfind(cute.arch.brev(thread_succeed)).to(cutlass.Int32)
+                        # The lowest succeeding lane, found on the Uint32 ballot: on the Int32 one bfind is bfind.s32,
+                        # which returns 0xFFFFFFFF for an all-lanes ballot (brev == -1), i.e. lane 32.
+                        winning_lane = cutlass.Int32(31) - cute.arch.bfind(cute.arch.brev(cutlass.Uint32(thread_succeed))).to(cutlass.Int32)
                         scan_base = nvvm.shfl_sync(full_warp_mask, visit_idx, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
                         group_idx = nvvm.shfl_sync(full_warp_mask, my_group, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
                         group_begin = nvvm.shfl_sync(full_warp_mask, my_begin, winning_lane, shfl_idx_clamp, nvvm.Shfl.IDX)
@@ -702,19 +566,10 @@ def frost_template_kernel(
                 sched_full_phase = sched_full_phase ^ 1
 
             if is_valid != 0:
-                # Tile origin: the expert's weight rows (A, a global M coordinate)
-                # and the routed group's tokens (B). GATHER maps the routed token
-                # rows to source tokens; NONE addresses them directly in the
-                # global token descriptor.
                 coord_m = tile_m * cgrp_tile_mnk[0]
                 coord_n = group_begin + tile_n * cgrp_tile_mnk[1]
 
                 if cutlass.const_expr(moe_gather):
-                    # Lane l owns the tile's 4-row GATHER groups l, l + 32, ...:
-                    # it reads their source rows once per tile and issues their
-                    # GATHER4s itself, so no lane holds the whole tile's rows
-                    # (one lane holding them all spilled once the producer warps
-                    # drop to PROD_REG_COUNT registers).
                     gather_lane = cute.arch.lane_idx()
                     gather_rows = []
                     for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
@@ -730,18 +585,10 @@ def frost_template_kernel(
                         pass
 
                     coord_k = k_tile_idx * cta_tile_mnk[2]
-                    # One elected lane only: the barrier's arrival count is 1, and
-                    # the TMA copies deliver exactly num_tma_copy_bytes once.
                     if elect_one:
                         nvvm.mbarrier_arrive_expect_tx(ab_full_mbar_ptr.subview(stage), num_tma_copy_bytes)
                     if cutlass.const_expr(moe_gather):
-                        # Every lane's GATHER4 completes on this stage's barrier:
-                        # order them after the elected lane's expect_tx.
                         nvvm.bar_warp_sync(0xFFFFFFFF)
-                    # The expert's weight is A's batch coordinate. K-major A: box
-                    # [K_tile, cta_m] at (k, m, e); M-major A (an N-major weight)
-                    # walks M in a_tma_group_elems-wide groups (same row bytes as a
-                    # K-major row, so both majors share ab_tma_swizzle).
                     for _ai in cutlass.range_constexpr(num_a_operands):
                         if cutlass.const_expr(a_is_m_major):
                             for m_group in cutlass.range_constexpr(cta_tile_mnk[0] // a_tma_group_elems):
@@ -760,8 +607,6 @@ def frost_template_kernel(
                                     (coord_k, coord_m, coord_expert),
                                     ab_full_mbar_ptr.subview(stage),
                                 )
-                    # The routed tokens: K-major box [K_tile, cta_n] at the group's
-                    # coordinate; hardware zero-fills K tails and rows past S.
                     for _bj in cutlass.range_constexpr(num_b_operands):
                         if cutlass.const_expr(moe_gather):
                             for _lg in cutlass.range_constexpr(_GATHER_LANE_GROUPS):
@@ -799,29 +644,16 @@ def frost_template_kernel(
         warp_row = warp_idx % WARPS_M
         warp_col = warp_idx // WARPS_M
 
-        # ldmatrix lane->address maps (see PTX ldmatrix; addresses are 16B rows).
-        # A x4 tile order = (rows 0-7, rows 8-15) x (16B col 0, 16B col 1) —
-        # matching the a0..a3 fragment order of mma.sync.
         a_ldm_row = (lane % 8) + 8 * ((lane // 8) % 2)
         a_ldm_col16 = lane // 16
-        # B x4 covers TWO 8-col n-frags: (n rows 0-7, n rows 8-15) each split
-        # over (16B col 0, 16B col 1) -> regs (b0,b1) frag0 + (b0,b1) frag1.
         b_ldm_pair_row = (lane % 8) + 8 * (lane // 16)
         b_ldm_pair_col16 = (lane // 8) % 2
         # B x2 tail: one n-frag (rows 0-7 x two 16B cols; lanes 16-31 unused).
         b_ldm_tail_row = lane % 8
         b_ldm_tail_col16 = (lane // 8) % 2
-        # Transposed (M-major SMEM) maps for the b16 form of A (an N-major
-        # weight): rows run along K, 16B units along M -- sm120_matmul's A maps.
-        # ldmatrix.trans keeps the x4 reg->tile order, so the tile-to-lane-group
-        # assignment reproduces the K-major fragment order above.
-        # A trans x4 tiles: (m0-7,k0-7), (m8-15,k0-7), (m0-7,k8-15), (m8-15,k8-15).
-        # (The 8-bit m16n16.trans.b8 form needs no map: k = kb_base + lane.)
         at_ldm_k = (lane % 8) + 8 * (lane // 16)
         at_ldm_m8 = (lane // 8) % 2
 
-        # One register accumulator per GEMM of the chain (multi-GEMM: past the
-        # warp's register grant ptxas spills -- a perf trade-off, never a gate).
         acc_list = [cutlass.Array(mma_c_dtype, _ACC_REGS, alignment=16) for _g in range(num_gemms)]
 
         ab_full_phase_bit = cutlass.Int32(0)
@@ -848,11 +680,9 @@ def frost_template_kernel(
             sched_stage = cutlass.Int32(0)
             sched_full_phase = sched_full_phase ^ 1
 
-        # Tile-invariant (scalar) reductions fold every epilogue vector into one
-        # register slot per thread; the red_part_* helpers, rendered with the tile
-        # constants (empty when the chain has none), seed the slots here and flush
-        # them -- one warp shuffle and one atomic per warp -- after each tile's
-        # drain and after the tile loop, where all 32 lanes are converged.
+        # Routed rows the groups cover (the final offset, at most the capacity N): the count an
+        # ungrouped AVG over tokens divides by. At least 1, so an empty routing flushes 0, not NaN.
+        moe_used_rows = cutlass.max(cutlass.min(cutlass.Int64(first_token_arr[num_groups]), N), cutlass.Int64(1))
         _red_part = cute.make_rmem_tensor(red_part_slots, cutlass.Float32)
         red_part_seed(_red_part)
         while is_valid != 0:
@@ -882,10 +712,6 @@ def frost_template_kernel(
                         sA_ptr = sA_ptrs[_ai]
                         a_frags = []
                         if cutlass.const_expr(a_is_m_major and _ELEM_BITS == 8):
-                            # Byte-granule transpose (ldmatrix.m16n16.x2.trans.b8): both
-                            # tiles are 16 k-rows x 16 m-bytes at the frag's M base --
-                            # lanes 0-15 address k = kb..kb+15, lanes 16-31 kb+16..kb+31
-                            # -- and the four result regs land as mma.sync a0..a3.
                             for mf in cutlass.range_constexpr(_M_FRAGS):
                                 a_m = warp_row * _WARP_TILE_M + mf * 16
                                 a_off = (
@@ -903,9 +729,6 @@ def frost_template_kernel(
                                     )
                                 )
                         elif cutlass.const_expr(a_is_m_major):
-                            # M-major SMEM: group g holds K_tile rows of
-                            # a_tma_group_elems M elements; ldmatrix.trans transposes
-                            # each (k x m) 8x8 b16 tile back into the (m x k) fragment.
                             for mf in cutlass.range_constexpr(_M_FRAGS):
                                 a_m = warp_row * _WARP_TILE_M + mf * 16 + at_ldm_m8 * 8
                                 a_off = (
@@ -984,19 +807,12 @@ def frost_template_kernel(
                     nvvm.mbarrier_arrive(ab_empty_mbar_ptr.subview(stage))
                 ab_iter += 1
 
-            # -- Epilogue: accumulators are already in registers ------------------
-            # (The aux views are injected per row below: `row` is the weight row.)
-
             _stg_stage = smem_stg_epi.subview(warp_idx * _STG_EPI_WARP_ELEMS)
             if cutlass.const_expr(not row_per_lane_drain):
                 for mf in cutlass.range_constexpr(_M_FRAGS):
                     for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
                         _nf0 = grp * _STG_EPI_GROUP_FRAGS
                         _grp_frags = min(_STG_EPI_GROUP_FRAGS, _N_FRAGS - _nf0)
-                        # -- STS_128: reg-index-order dump, one batch per fragment; then
-                        # LDS: 16 contiguous elems = both row-halves of one frag. One GEMM
-                        # at a time through the same warp-private buffer (multi-GEMM keeps
-                        # every GEMM's segment in registers, not extra SMEM).
                         _seg_list = []
                         for _g in cutlass.range_constexpr(num_gemms):
                             _acc_g = acc_list[_g]
@@ -1008,8 +824,6 @@ def frost_template_kernel(
                             _seg_list.append((_stg_stage.data_ptr() + lane_mod4 * _STG_EPI_BATCH_STRIDE + lane_div4 * 16).load(alignment=16, count=16))
                             if cutlass.const_expr(_g + 1 < num_gemms):
                                 nvvm.bar_warp_sync(0xFFFFFFFF)  # every lane has its segment before the buffer is reused
-                        # Short tail group: trailing lanes own no fragment there
-                        # (True at trace time for full groups — no guard emitted).
                         _lane_active = True if _grp_frags == _STG_EPI_GROUP_FRAGS else lane_mod4 < _grp_frags
                         if _lane_active:
                             for half in cutlass.range_constexpr(2):
@@ -1030,17 +844,7 @@ def frost_template_kernel(
                                     for sv in cutlass.range_constexpr(8 // _STG_V):
                                         col = coord_n + warp_col * _WARP_TILE_N + (_nf0 + lane_mod4) * 8 + sv * _STG_V
                                         col_j = col
-                                        # The ragged tail of a group: token columns at or past
-                                        # group_end hold the next group's tokens (or zero-fill)
-                                        # and are not this expert's output. The STG chunk divides
-                                        # the promised group-boundary alignment, and the stores
-                                        # re-check every column against group_end.
                                         if col_j < group_end:
-                                            # One epilogue input vector per GEMM: GEMM 0 is the
-                                            # template's `vec_f32`, GEMMs > 0 are bound as
-                                            # `vec_f32_<g>` by the injected STG bindings below.
-                                            # NB: Array slices are [start:COUNT], not
-                                            # [start:stop] (matches acc[_o:2] above).
                                             c_rmem_vecs = []
                                             for _g in cutlass.range_constexpr(num_gemms):
                                                 _vec = _row_list[_g][sv * _STG_V : _STG_V]
@@ -1050,8 +854,6 @@ def frost_template_kernel(
                                                 else:
                                                     c_rmem_vecs.append(_vec)
                                             vec_f32 = c_rmem_vecs[0]
-                                            # Every store carries its own output's offset: no template-level
-                                            # linear_idx, so a reduction-only chain (no output 0) renders.
 
                                             pass
 
@@ -1061,12 +863,6 @@ def frost_template_kernel(
                                                 (gC_tap_0_ptr + row * out_stride_m_0 + (col_j + 0) * out_stride_n_0).store(_tap_0[0 : 0 + 1], alignment=2)
                         nvvm.bar_warp_sync(0xFFFFFFFF)
             else:
-                # Row-per-lane drain: re-read the warp's accumulators row-major through the
-                # warp-private staging buffer so lane l owns row l of a 32-row slab (lanes
-                # 0..15 of a 16-row slab when the warp tile is one m-fragment) and a
-                # contiguous run of the slab's 32-column group -- the sm100 TMEM-drain view
-                # (thread = row, warp = 32 consecutive rows) the block-quantize emitters are
-                # written for. Each 16x32 sub-pass uses 512 of the warp's 528 staging floats.
                 for slab in cutlass.range_constexpr(_RPL_SLABS):
                     for grp in cutlass.range_constexpr(_STG_EPI_NGRP):
                         _nf0 = grp * _STG_EPI_GROUP_FRAGS
@@ -1077,8 +873,6 @@ def frost_template_kernel(
                             _run = cutlass.Array(mma_c_dtype, 32, alignment=16)
                             for _sp in cutlass.range_constexpr(_RPL_SUBPASSES):
                                 _mf = slab * _RPL_SUBPASSES + _sp
-                                # STS.64: regs (0,1) are row lane//4, regs (2,3) row lane//4 + 8,
-                                # columns 8b + 2*(lane%4) of n-fragment b.
                                 for b in cutlass.range_constexpr(_grp_frags):
                                     for _hr in cutlass.range_constexpr(2):
                                         _rr = lane_div4 + 8 * _hr
@@ -1105,8 +899,6 @@ def frost_template_kernel(
                                     col = coord_n + warp_col * _WARP_TILE_N + _nf0 * 8 + _jv * vsize
                                     col_j = col
                                     if col_j < group_end:
-                                        # One vsize-wide epilogue vector per GEMM (GEMM 0 is
-                                        # `vec_f32`; the injected bindings name the others).
                                         c_rmem_vecs = []
                                         for _g in cutlass.range_constexpr(num_gemms):
                                             _vec = _run_list[_g][_jv * vsize : vsize]
@@ -1123,7 +915,7 @@ def frost_template_kernel(
 # @@FROST_ACTIVATION_1@@
                                         if (row < M) & (col_j + 0 < group_end):
                                             (gC_tap_0_ptr + row * out_stride_m_0 + (col_j + 0) * out_stride_n_0).store(_tap_0[0 : 0 + 1], alignment=2)
-            red_part_flush_tile(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
+            red_part_flush_tile(_red_part, lane, M, N, (group_idx, group_begin, group_end, moe_used_rows), _red_part_args)
 
             # Next record.
             while not nvvm.mbarrier_try_wait_parity(sched_full_mbar_ptr.subview(sched_stage), sched_full_phase, time_limit=10_000_000):
@@ -1143,7 +935,7 @@ def frost_template_kernel(
                 sched_stage = cutlass.Int32(0)
                 sched_full_phase = sched_full_phase ^ 1
 
-        red_part_flush_cta(_red_part, lane, M, N, (group_idx, group_begin, group_end), _red_part_args)
+        red_part_flush_cta(_red_part, lane, M, N, (group_idx, group_begin, group_end, moe_used_rows), _red_part_args)
         # No more tiles for this CTA: all its global A/B reads have been issued.
         if cutlass.const_expr(USE_PDL):
             if warp_idx == 0:
@@ -1200,10 +992,6 @@ def _host(
     out_stride_l_0 = problem_size[_stride_idx + 2]
     _stride_idx += 3
 
-    # A is the expert's weight, batched by expert. K-major: box [K_tile, cta_m].
-    # M-major (an N-major weight): [group_elems, K_tile] boxes, one per M group
-    # (the group row bytes equal a K-major row's, so both majors share
-    # ab_tma_swizzle).
     tma_a_desc_list = []
     for _a_idx, _a_op in enumerate(_a_operands):
         a_stride_m, a_stride_k, a_stride_l = _a_stride_sets[_a_idx]
@@ -1219,6 +1007,7 @@ def _host(
                     ],
                     box_dims=[a_tma_group_elems, cta_tile_mnk[2], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
         else:
@@ -1233,10 +1022,9 @@ def _host(
                     ],
                     box_dims=[cta_tile_mnk[2], cta_tile_mnk[0], 1],
                     swizzle=ab_tma_swizzle,
+                    l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
                 )
             )
-    # B is the routed token matrix. GATHER uses the original source extent and
-    # one-row boxes. NONE walks whole tiles of the routed token matrix.
     tma_b_desc_list = []
     for _b_idx, _b_op in enumerate(_b_operands):
         b_stride_n, b_stride_k, b_stride_l = _b_stride_sets[_b_idx]
@@ -1256,17 +1044,17 @@ def _host(
                 global_strides=b_strides,
                 box_dims=b_box,
                 swizzle=ab_tma_swizzle,
+                l2_promotion=_tma.TensorMapL2Promotion.l2_128b,
             )
         )
 
-    # Persistent grid: as many CTAs as the device co-schedules; every CTA pulls
-    # tiles off the global counter until the group space is exhausted. No
-    # cluster launch on sm120 (CC 12.x has no thread-block clusters).
     grid_shape = (grid_num_clusters, 1, 1)
-    # Zero the scheduler counter on the launch stream. The PDL main kernel
-    # below reads it only after griddepcontrol.wait, i.e. once this has landed.
+    # A launch started at zero leaves the scheduler counter (the int32 at counter_qword) at its tile count + grid_num_clusters (one failing claim per CTA).
+    # With external_counter_reset True the runtime must zero it before every launch, visible at griddepcontrol.wait (which waits only for the previous grid);
+    # one zero for FC1 and FC2 on one workspace makes FC2 silently skip its tiles below FC1's final count.
     counter_qword = grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS
-    _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
+    if cutlass.const_expr(not external_counter_reset):
+        _dynamic_scheduler_counter_initialization(tma_workspace, cutlass.Int32(counter_qword)).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
     frost_template_kernel(
         problem_size[0],
         problem_size[1],
@@ -1287,14 +1075,6 @@ def _host(
         block=(threads_per_cta, 1, 1),
         use_pdl=USE_PDL,
         stream=stream,
-        # .minnctapersm 1. With .reqntid alone ptxas cannot tell the register
-        # count at entry, so it drops every setmaxnreg above (C7508): the compute
-        # warps never get EPI_REG_COUNT, and ptxas may also size every warp for
-        # several CTAs per SM (the dual MoE kernels fell to 40 registers). The
-        # SMEM ring is sized to the per-CTA budget, so one CTA per SM is all that
-        # fits anyway -- except the two smallest catalog tiles (32x64 / 64x32 at
-        # a 32-byte K, whose ring caps at 16 stages), which now run one per SM
-        # instead of two.
         min_blocks_per_mp=1,
     )
 
@@ -1304,12 +1084,7 @@ def compile() -> Callable:
     out_vec_elems = vec_bytes_epi // (cd_dtype.width // 8)
     ab_stride_elems = 16 // (ab_dtype.width // 8)
     sym_m = cute.sym_int64()
-    # The token extent: the STG chunk walks N, and runtime S must keep the
-    # promised group-boundary alignment the chunk was clamped to.
     sym_n = cute.sym_int64(divisibility=min(out_vec_elems, moe_token_alignment))
-    # K tails are supported: the K loop is ceil_div and the TMA descriptor's global K
-    # extent makes a partial box HW zero-filled. The only real K rule is the 16-byte
-    # TMA contiguous-extent one, already gated by _tma_alignment_reject.
     sym_k = cute.sym_int64()
     sym_e = cute.sym_int64()
     sym_g = cute.sym_int64()
@@ -1337,9 +1112,6 @@ def compile() -> Callable:
         stride_order=(0,),
         assumed_align=offset_cutlass_dtype.width // 8,
     )
-    # The compiler carves grid_ctas * moe_desc_slots tensormap slots plus one
-    # counter slot (16 int64 each); with no descriptor slots that is the one
-    # counter slot.
     fake_tma_workspace = make_fake_compact_tensor(
         cutlass.Int64,
         (grid_num_clusters * moe_desc_slots * TENSOR_MAP_QWORDS + TENSOR_MAP_QWORDS,),

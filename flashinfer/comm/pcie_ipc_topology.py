@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional
 
 import torch
@@ -66,6 +66,9 @@ class PcieIpcRankTopology:
 class PcieIpcProfileDecision:
     profile: str
     reason: str
+    # Bit h: the hop from rank h to rank h+1 crosses the CPU interconnect. See
+    # decide_ring_slow_hops.
+    slow_hops: int = 0
 
 
 def _profile_links(topology: PcieIpcTopologyEvidence) -> PcieIpcRankTopology:
@@ -156,6 +159,30 @@ def decide_pcie_ipc_profile(
     return PcieIpcProfileDecision(PROFILE_ROOTCPLX, "no switch-local pair observed")
 
 
+def decide_ring_slow_hops(topologies: List[PcieIpcTopologyEvidence]) -> int:
+    """Which hops of the rank-order ring cross the CPU interconnect. Pure function.
+
+    Bit h is set when rank h's GPU reaches rank (h+1)'s only through NVML's
+    SYSTEM level -- the inter-socket link -- which the copy-engine ring crosses
+    slower than the switch-local and root-complex hops around it. The pipelined
+    ring sizes its chunks from this mask, so it only changes speed: anything
+    unknown counts as fast, and an all-zero mask is an even split.
+    """
+    by_rank = {t.rank: t for t in topologies}
+    world_size = len(topologies)
+    if sorted(by_rank) != list(range(world_size)):
+        return 0
+    mask = 0
+    for hop in range(world_size):
+        src, dst = by_rank[hop], by_rank[(hop + 1) % world_size]
+        if src.probe_error or src.system_level is None or not dst.device_uuid:
+            continue
+        level = src.peer_ancestors.get(dst.device_uuid)
+        if level is not None and level >= src.system_level:
+            mask |= 1 << hop
+    return mask
+
+
 def resolve_pcie_ipc_profile(
     group: ProcessGroup,
     requested: Optional[str] = None,
@@ -168,4 +195,5 @@ def resolve_pcie_ipc_profile(
     every rank reaches the same decision from the same evidence.
     """
     gathered = collect_pcie_ipc_topology(group, device)
-    return decide_pcie_ipc_profile(requested, [_profile_links(t) for t in gathered])
+    decision = decide_pcie_ipc_profile(requested, [_profile_links(t) for t in gathered])
+    return replace(decision, slow_hops=decide_ring_slow_hops(gathered))

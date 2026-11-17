@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Generic BF16 bindings to the shared legacy-compatible device bodies."""
+"""BF16/FP16 bindings to the shared legacy-compatible device bodies."""
 
 import torch
 import cutlass
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver
 
 from ..activation_config import lower_activation
 from .fma_fc1 import _kernel as fc1
@@ -49,6 +48,28 @@ def down(
     )
 
 
+@cute.jit
+def launch(
+    x,
+    w1,
+    ids,
+    mid,
+    w2,
+    scores,
+    out,
+    columns: cutlass.Constexpr,
+    down_columns: cutlass.Constexpr,
+    name: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
+    parameters: cutlass.Constexpr,
+    narrow: cutlass.Constexpr,
+    finalize: cutlass.Constexpr,
+    stream,
+):
+    gate_up(x, w1, ids, mid, columns, name, gated, parameters, stream)
+    down(mid, w2, ids, scores, out, narrow, finalize, down_columns, stream)
+
+
 def execute(inputs, config, tactic):
     from ...runtime import _COMPILED, _COMPILE_LOCK
 
@@ -57,13 +78,14 @@ def execute(inputs, config, tactic):
     if tactic not in [
         ("ffma", first, second) for first in (1, 2, 4, 8) for second in (1, 2, 4, 8)
     ]:
-        raise ValueError("BF16 Frost requires FMA FC1/FC2 output-column tactics")
+        raise ValueError("BF16/FP16 Frost requires FMA FC1/FC2 output-column tactics")
     x, ids, scores, w1, w2, mid, routes, output, narrow = inputs
-    name, parameters = lower_activation(config.activation)
     columns, down_columns = tactic[1:]
     finalize = config.finalize.do_finalize
     key = (
-        "bf16-ffma-v2",
+        "float16-ffi-v2",
+        x.dtype,
+        output.dtype,
         tuple(x.shape),
         tuple(w1.shape),
         tuple(w2.shape),
@@ -78,12 +100,7 @@ def execute(inputs, config, tactic):
         x.device,
     )
     with torch.cuda.device(x.device):
-        stream = driver.CUstream(torch.cuda.current_stream(x.device).cuda_stream)
-        first = tuple(from_dlpack(v) for v in (x, w1, ids, mid))
-        second = tuple(
-            from_dlpack(v)
-            for v in (mid, w2, ids, scores, output if finalize else routes)
-        )
+        tensors = (x, w1, ids, mid, w2, scores, output if finalize else routes)
         compiled = _COMPILED.get(key)
         if compiled is None:
             if torch.cuda.is_current_stream_capturing():
@@ -94,31 +111,22 @@ def execute(inputs, config, tactic):
                 compiled = _COMPILED.get(key)
                 if compiled is None:
                     major, minor = torch.cuda.get_device_capability(x.device)
-                    options = f"--gpu-arch sm_{major}{minor}a"
-                    compiled = (
-                        cute.compile(
-                            gate_up,
-                            *first,
-                            columns,
-                            name,
-                            config.activation.is_gated,
-                            parameters,
-                            stream,
-                            options=options,
-                        ),
-                        cute.compile(
-                            down,
-                            *second,
-                            narrow,
-                            finalize,
-                            down_columns,
-                            stream,
-                            options=options,
-                        ),
+                    name, parameters = lower_activation(config.activation)
+                    compiled = cute.compile(
+                        launch,
+                        *(from_dlpack(v) for v in tensors),
+                        columns,
+                        down_columns,
+                        name,
+                        config.activation.is_gated,
+                        parameters,
+                        narrow,
+                        finalize,
+                        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                        options=f"--gpu-arch sm_{major}{minor}{'' if major == 8 else 'a'} --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
-        compiled[0](*first, stream)
-        compiled[1](*second, stream)
+        compiled(*tensors)
         if finalize:
             return output
         mapping = torch.arange(ids.numel(), device=x.device, dtype=torch.int32)

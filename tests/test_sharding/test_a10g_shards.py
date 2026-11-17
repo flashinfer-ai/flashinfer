@@ -52,6 +52,7 @@ def test_a10g_coverage_and_t4_scope(tmp_path):
             "deepseek_mla",
             "logits_cap",
             "mla_page",
+            "mla_paged_attention_fuzz",
             "rope",
             "sliding_window",
             "tensor_cores_decode",

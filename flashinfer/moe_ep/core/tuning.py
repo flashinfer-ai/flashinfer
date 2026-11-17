@@ -1,6 +1,9 @@
-"""Token bucketing shared by the offline MegaMoE caches."""
+"""Format version and token bucketing shared by the offline MegaMoE caches."""
 
 from typing import Any
+
+# Every backend shares one cache file; bump this for all of them together.
+KNOB_CACHE_VERSION = 2
 
 
 def tuning_live_tokens(tokens: int | None, capacity: int, group: Any = None) -> int:

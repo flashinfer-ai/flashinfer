@@ -88,12 +88,19 @@ from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl import (
+    Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+)
+from .backends.mega.kernel.sm100.kimi_k3 import Sm100_KimiK3_MegaMoeConfig
 from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
     Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
 )
 from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
     Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
+)
+from .backends.mega.kernel.sm103.bf16_nvfp4_bf16_cake import (
+    Sm103_Bf16_Nvfp4_Bf16_Cake_MegaMoeConfig,
 )
 from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
     CakePrequantizedMoEWeightsWithSharedExpert,
@@ -104,6 +111,10 @@ from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
 from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cutedsl import (
     Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights,
+)
+from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_nosync import (
+    Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights,
 )
 from .backends.mega.kernel.sm120.mxfp8_mxfp8_bf16_cutedsl import (
     Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
@@ -125,9 +136,17 @@ from .backends.mega.kernel.sm90.fp8_mxfp4_bf16_pull_cutedsl import (
     Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_pull_mxfp4_mega_weights,
 )
+from .backends.mega.kernel.sm90.fp8_nvfp4_bf16_pull_cutedsl import (
+    Nvfp4WeightPack,
+    Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm90_pull_nvfp4_mega_weights,
+)
 from .backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda import (
     Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm90_push_fp8_mega_weights,
+)
+from .backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+    Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from .backends.mega.kernel.sm107.mxfp8_mxfp4_bf16_cutedsl import (
     Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -182,6 +201,7 @@ from .config import (
     DispatchOutput,
     EpAlgorithm,
     EpLayout,
+    FinalizeMode,
     FleetParams,
     HandleParams,
     QuantType,
@@ -220,8 +240,11 @@ from .core.validation import (
     validate_mega_forward_inputs,
     validate_split_forward_inputs,
 )
-from .layer import MoEEpLayer
+from .layer import MoEEpLayer, MoEEpNosyncLayer, NosyncOptions
 from .modes import (
+    AutoConfig,
+    MoEEpAutoLayer,
+    MoEEpAutoWorkspace,
     CakeAlltoAllConfig,
     FusedMoeKernelConfig,
     IdentityConfig,
@@ -249,6 +272,11 @@ from .weights import (
 )
 
 __all__ = [
+    "Sm107SharedExpertConfig",
+    "Sm107SharedExpertWeights",
+    "AutoConfig",
+    "MoEEpAutoLayer",
+    "MoEEpAutoWorkspace",
     "AlgoKnob",
     "BootstrapConfig",
     "CakeAlltoAll",
@@ -274,6 +302,7 @@ __all__ = [
     "DispatchInputParams",
     "DispatchOutput",
     "EpAlgorithm",
+    "FinalizeMode",
     "EpLayout",
     "Fleet",
     "FleetAlgoKnobAllocator",
@@ -300,6 +329,7 @@ __all__ = [
     "MoEEpDispatchResult",
     "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
+    "MoEEpNosyncLayer",
     "MoEEpMegaLayer",
     "MoEEpMegaWorkspace",
     "MoEEpNotBuiltError",
@@ -313,6 +343,8 @@ __all__ = [
     "UnquantizedMoEWeights",
     "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm100_KimiK3_MegaMoeConfig",
     "NCCLEPConfig",
     "NVLinkOneSidedAlltoAll",
     "NVLinkOneSidedConfig",
@@ -323,14 +355,20 @@ __all__ = [
     "CakePrequantizedMoEWeightsWithSharedExpert",
     "NvepConfig",
     "QuantType",
+    "Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
     "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig",
+    "Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig",
+    "Nvfp4WeightPack",
+    "Sm103_Bf16_Nvfp4_Bf16_Cake_MegaMoeConfig",
     "Sm103_Mxfp8_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig",
     "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm120_Mxfp4_Mxfp8_Bf16_Nosync_MegaMoeConfig",
+    "NosyncOptions",
     "Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "TransformedCakeMegaWeights",
     "TransformedCakeW8a8MegaWeights",
@@ -360,6 +398,7 @@ __all__ = [
     "preprocess_sm103_mxfp8_cake_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cake_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights",
+    "preprocess_sm120_mxfp4_mxfp8_nosync_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",
     "preprocess_sm107_mxfp4_mega_weights",
     "preprocess_sm107_mxfp8_mega_weights",
@@ -367,6 +406,7 @@ __all__ = [
     "preprocess_sm90_pull_bf16_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_pull_mxfp4_mega_weights",
+    "preprocess_sm90_pull_nvfp4_mega_weights",
     "preprocess_sm90_push_cake_bf16_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
     "register_communication",
@@ -510,4 +550,9 @@ from .backends.split.comm.cake.communication import (  # noqa: E402
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
     NVLinkTwoSidedAlltoAll,
+)
+
+from .backends.mega.kernel.sm107.shared_expert import (
+    Sm107SharedExpertConfig,
+    Sm107SharedExpertWeights,
 )

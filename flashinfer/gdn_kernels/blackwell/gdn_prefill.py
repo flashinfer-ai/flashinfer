@@ -103,11 +103,15 @@ def _prefill_kernel_name(
     cu_checkpoints_dtype_str: str,
     initial_state_inner_strides,
     output_state_inner_strides,
+    state_stride_divisibility: int,
+    slot_key: tuple | None = None,
 ) -> str:
     """Specialization name within the gdn_blackwell_prefill module.
 
     Encodes every ``_get_compiled_cache`` key component, including ``num_sm``,
-    which the compile below bakes in as ``max_active_clusters``.
+    which the compile below bakes in as ``max_active_clusters``. ``slot_key``
+    (see :func:`_slot_key`) is appended only for slot-addressed calls, so the
+    names of all other specializations are unchanged.
     """
     return make_kernel_name(
         target_arch(target_key)
@@ -127,6 +131,8 @@ def _prefill_kernel_name(
         cu_checkpoints_dtype_str,
         initial_state_inner_strides,
         output_state_inner_strides,
+        state_stride_divisibility,
+        *(() if slot_key is None else ("slot", slot_key)),
     )
 
 
@@ -149,6 +155,8 @@ def _get_compiled_cache(
     cu_checkpoints_dtype_str: str,
     initial_state_inner_strides: tuple[int, ...] | None,
     output_state_inner_strides: tuple[int, ...] | None,
+    state_stride_divisibility: int,
+    slot_key: tuple | None = None,
 ):
     """Return a mutable dict that lazily stores the compiled kernel.
 
@@ -158,6 +166,51 @@ def _get_compiled_cache(
     streams and CUDA graphs.
     """
     return {}
+
+
+def _slot_key(
+    output_state_indices: Optional[torch.Tensor],
+    checkpoint_state_indices: Optional[torch.Tensor],
+    prefix_lens: Optional[torch.Tensor],
+    output_checkpoints: Optional[torch.Tensor],
+    state_align: tuple = (16, 16),
+) -> tuple | None:
+    """Compile key of the slot arguments; None when no slot argument is given.
+
+    Each argument is a compile-time switch, so its presence and dtype select the
+    kernel; a checkpoint pool also keys its inner strides like the state pools,
+    and the assumed byte alignments (stored, loaded) of the state tensors are
+    part of the key.
+    """
+    slot_args = (output_state_indices, checkpoint_state_indices, prefix_lens)
+    if all(t is None for t in slot_args):
+        return None
+    return (
+        "none" if output_state_indices is None else str(output_state_indices.dtype),
+        (
+            "none"
+            if checkpoint_state_indices is None
+            else str(checkpoint_state_indices.dtype)
+        ),
+        "none" if prefix_lens is None else str(prefix_lens.dtype),
+        (
+            tuple(output_checkpoints.stride()[1:])
+            if checkpoint_state_indices is not None
+            else None
+        ),
+        state_align,
+    )
+
+
+def _state_align(*states: Optional[torch.Tensor]) -> int:
+    """32 when every given state tensor starts on a 32-byte boundary, else 16.
+
+    Slot calls compile with this alignment so the state rows move in 256-bit
+    accesses (full 32-byte sectors) when the tensors allow it.
+    """
+    if all(s.data_ptr() % 32 == 0 for s in states if s is not None):
+        return 32
+    return 16
 
 
 def _cutlass_io_dtype(torch_dtype: torch.dtype):
@@ -189,6 +242,21 @@ def _cutlass_state_dtype(torch_dtype: torch.dtype):
         )
 
 
+def _state_stride_divisibility(states, max_divisibility: int) -> int:
+    """Largest power of two <= ``max_divisibility`` dividing all slot/head/V strides."""
+    divisibility = max_divisibility
+    for state in states:
+        if state is None:
+            continue
+        strides = state.stride()
+        if strides[3] != 1:
+            return 1
+        for stride in strides[:3]:
+            while divisibility > 1 and stride % divisibility:
+                divisibility //= 2
+    return divisibility
+
+
 def _mark_state_layout(s_cute, use_state_indices: bool, DK: int) -> None:
     """Mark the recurrent-state tensor layout for compilation.
 
@@ -197,21 +265,10 @@ def _mark_state_layout(s_cute, use_state_indices: bool, DK: int) -> None:
     makes the layout dynamic (stride-1 K dim auto-deduced) and attaches a
     ``divisibility=DK`` hint on the K dim for wider vectorized state copies.
 
-    Pool/indexed mode (``use_state_indices=True``): the caller passes its real
-    SSM state pool ``[N_pool, H, V, K]`` whose dim-0 (slot) stride is padded by
-    the mamba conv+ssm cache packing, i.e. ``stride[0] > H*V*K`` -> the layout is
-    NON-COMPACT. ``mark_compact_shape_dynamic`` asserts a compact layout and
-    raises ``RuntimeError: The stride_order is not consistent with the layout``.
-    ``mark_layout_dynamic()`` alone pins the single stride-1 dim (mode 3 = K) to
-    stride 1 and carries every other stride (including the padded dim-0) through
-    as a dynamic runtime value. The kernel addresses the state purely via
-    ``s.stride[...]`` (reshape at ~475-497 and ``mS_init/mS_out[..., state_row]``),
-    so a padded dim-0 stride is handled correctly. cutlass-dsl offers no way to
-    attach a divisibility hint without also requiring compactness, so this path
-    drops the ``divisibility=DK`` hint; the stride-1 K dim is retained, so the
-    128x128 state autovec copy still vectorizes (possibly a narrower vector).
-    That copy is a negligible fraction of the kernel, so correctness is kept
-    with no meaningful perf cost.
+    Pool/indexed mode (``use_state_indices=True``): the caller passes its SSM
+    state pool ``[N_pool, H, V, K]``, whose slot stride may be padded, so only
+    ``mark_layout_dynamic()`` applies. It carries no stride alignment; the
+    kernel restores it from ``state_stride_divisibility`` via ``cute.assume``.
     """
     if use_state_indices:
         s_cute.mark_layout_dynamic()
@@ -241,10 +298,14 @@ def chunk_gated_delta_rule_sm100(
     cu_checkpoints: Optional[torch.Tensor] = None,
     output_checkpoints: Optional[torch.Tensor] = None,
     state_indices: Optional[torch.Tensor] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
+    prefix_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
-    All tensors must be contiguous and on the same CUDA device.
+    All tensors are on the same CUDA device and contiguous, except the indexed
+    state and checkpoint pools, whose row stride may be padded.
 
     Args:
         q: ``(total_tokens, HQ, DK)`` float16/bfloat16
@@ -258,8 +319,22 @@ def chunk_gated_delta_rule_sm100(
         output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
         scale: attention scale factor (must not be 0)
         checkpoint_every_n_tokens: store intermediate state every N tokens (0 = disabled)
-        cu_checkpoints: ``(num_seqs + 1,)`` int32, cumulative checkpoint counts
-        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
+        cu_checkpoints: ``(num_seqs + 1,)`` int32/int64 cumulative checkpoint counts;
+            with ``checkpoint_state_indices`` only entry ``b`` is read, so
+            ``(num_seqs,)`` first entries are accepted
+        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16/float16/fp8,
+            or, with ``checkpoint_state_indices``, a ``[C, HO, DK, DK]`` pool; or None
+        state_indices: ``(num_seqs,)`` int32/int64 rows of the initial/output state pools
+        output_state_indices: ``(num_seqs,)`` int32/int64 final-state rows of ``output_state``
+        checkpoint_state_indices: int32/int64 ``output_checkpoints`` pool row of each
+            checkpoint entry (``cu_checkpoints[b] + j``)
+        prefix_lens: ``(num_seqs,)`` int32/int64 tokens processed before this call
+
+    With any of the last three (slot mode), a negative read row starts from the
+    zero state, and a negative final-state or checkpoint row skips that store.
+    ``prefix_lens`` places checkpoints at absolute positions; a sequence whose
+    prefix is not a multiple of 64 is chunked from its aligned absolute position
+    with leading identity rows (gate 1, beta 0), so checkpoints land on chunk ends.
     """
     HQ = q.size(1)
     HV = v.size(1)
@@ -270,11 +345,14 @@ def chunk_gated_delta_rule_sm100(
     enable_checkpoints = checkpoint_every_n_tokens > 0
     io_dtype = _cutlass_io_dtype(q.dtype)
 
-    # Auto-detect state dtype from initial_state, default to float32
+    # State dtype: from initial_state, else output_state, else the checkpoint
+    # buffer of a checkpoint-only call; float32 by default.
     if initial_state is not None:
         state_torch_dtype = initial_state.dtype
     elif output_state is not None:
         state_torch_dtype = output_state.dtype
+    elif enable_checkpoints and output_checkpoints is not None:
+        state_torch_dtype = output_checkpoints.dtype
     else:
         state_torch_dtype = torch.float32
     state_dtype = _cutlass_state_dtype(state_torch_dtype)
@@ -284,13 +362,53 @@ def chunk_gated_delta_rule_sm100(
     _output_state = output_state if store_final_state else None
     use_state_indices = state_indices is not None
     _state_indices = state_indices if use_state_indices else None
+    use_output_state_indices = output_state_indices is not None
+    use_checkpoint_state_indices = checkpoint_state_indices is not None
+    use_prefix_lens = prefix_lens is not None
+    slot_call = not (
+        output_state_indices is None
+        and checkpoint_state_indices is None
+        and prefix_lens is None
+    )
+    target = gdn_device_target(q.device)
+    kernel_variant = _prefill_kernel_variant(target.major, target.minor)
+    # Slot calls store final states and checkpoints with 256-bit accesses when
+    # those tensors are 32-byte aligned; the initial state is loaded that way
+    # too except on SM107, where the wider load measured slower.
+    store_align = (
+        _state_align(
+            output_state if store_final_state else None,
+            output_checkpoints if enable_checkpoints else None,
+        )
+        if slot_call
+        else 16
+    )
+    load_align = (
+        _state_align(initial_state) if slot_call and kernel_variant != "sm107" else 16
+    )
+    state_align = (store_align, load_align)
+    slot_key = _slot_key(
+        output_state_indices,
+        checkpoint_state_indices,
+        prefix_lens,
+        output_checkpoints,
+        state_align,
+    )
+    # Pools (indexed rows, possibly padded) restore their stride alignment from
+    # this divisibility; a checkpoint pool joins the state pools.
+    pools: tuple[Optional[torch.Tensor], ...]
+    if use_checkpoint_state_indices:
+        pools = (_initial_state, _output_state, output_checkpoints)
+    elif use_state_indices:
+        pools = (_initial_state, _output_state)
+    else:
+        pools = ()
+    state_stride_divisibility = _state_stride_divisibility(pools, DK) if pools else 1
 
     # num_sm is baked in as max_active_clusters, so it belongs to the key.
-    target = gdn_device_target(q.device)
     num_sm = get_num_sm(q.device)
-    kernel_variant = _prefill_kernel_variant(target.major, target.minor)
     kernel_cls = _PREFILL_KERNEL_CLASSES[kernel_variant]
-    cache_key = (
+    cache_key: tuple = (
         kernel_variant,
         target.compile_key,
         num_sm,
@@ -316,7 +434,10 @@ def chunk_gated_delta_rule_sm100(
             if use_state_indices and output_state is not None
             else None
         ),
+        state_stride_divisibility,
     )
+    if slot_key is not None:
+        cache_key += (slot_key,)
     cache = _get_compiled_cache(*cache_key)
 
     if "compiled" not in cache:
@@ -342,6 +463,10 @@ def chunk_gated_delta_rule_sm100(
             store_final_state=store_final_state,
             enable_checkpoints=enable_checkpoints,
             is_persistent=True,
+            state_stride_divisibility=state_stride_divisibility,
+            use_output_state_indices=use_output_state_indices,
+            use_checkpoint_state_indices=use_checkpoint_state_indices,
+            use_prefix_lens=use_prefix_lens,
         )
 
         # Convert PyTorch tensors to CuTe tensors for compilation.
@@ -375,12 +500,12 @@ def chunk_gated_delta_rule_sm100(
 
         s_in_cute = None
         if use_initial_state:
-            s_in_cute = from_dlpack(_initial_state, assumed_align=16)
+            s_in_cute = from_dlpack(_initial_state, assumed_align=load_align)
             _mark_state_layout(s_in_cute, use_state_indices, DK)
 
         s_out_cute = None
         if store_final_state:
-            s_out_cute = from_dlpack(_output_state, assumed_align=16)
+            s_out_cute = from_dlpack(_output_state, assumed_align=store_align)
             _mark_state_layout(s_out_cute, use_state_indices, DK)
 
         s_indices_cute = None
@@ -392,13 +517,28 @@ def chunk_gated_delta_rule_sm100(
         s_checkpoints_cute = None
         cu_checkpoints_cute = None
         if enable_checkpoints:
-            s_checkpoints_cute = from_dlpack(output_checkpoints, assumed_align=16)
-            s_checkpoints_cute.mark_layout_dynamic().mark_compact_shape_dynamic(
-                mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
+            s_checkpoints_cute = from_dlpack(
+                output_checkpoints, assumed_align=store_align
             )
+            if use_checkpoint_state_indices:
+                # A checkpoint pool may pad its row stride like the state pools.
+                _mark_state_layout(s_checkpoints_cute, True, DK)
+            else:
+                s_checkpoints_cute.mark_layout_dynamic().mark_compact_shape_dynamic(
+                    mode=3, stride_order=(0, 1, 2, 3), divisibility=DK
+                )
             cu_checkpoints_cute = from_dlpack(
                 cu_checkpoints, assumed_align=4
             ).mark_layout_dynamic()
+
+        def _index_cute(t):
+            if t is None:
+                return None
+            return from_dlpack(t, assumed_align=4).mark_layout_dynamic()
+
+        s_out_indices_cute = _index_cute(output_state_indices)
+        checkpoint_indices_cute = _index_cute(checkpoint_state_indices)
+        prefix_lens_cute = _index_cute(prefix_lens)
 
         workspace_size = GatedDeltaNetChunkedKernel.get_workspace_size(
             num_sm, B, HQ, HV, True
@@ -427,6 +567,9 @@ def chunk_gated_delta_rule_sm100(
                 s_indices_cute,
                 s_checkpoints_cute,
                 cu_checkpoints_cute,
+                s_out_indices_cute,
+                checkpoint_indices_cute,
+                prefix_lens_cute,
                 checkpoint_every_n_tokens,
                 scale,
                 workspace_cute,
@@ -465,6 +608,9 @@ def chunk_gated_delta_rule_sm100(
         _state_indices,
         output_checkpoints,
         cu_checkpoints,
+        output_state_indices,
+        checkpoint_state_indices,
+        prefix_lens,
         checkpoint_every_n_tokens,
         scale,
         workspace,

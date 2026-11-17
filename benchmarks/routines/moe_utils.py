@@ -50,6 +50,7 @@ def generate_moe_weights(
     intermediate_size: int,
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
+    is_gated: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Generate random weights for MoE experts.
@@ -60,13 +61,15 @@ def generate_moe_weights(
         intermediate_size: Intermediate FFN dimension
         device: Device to create tensors on
         dtype: Data type for the weights (default: bfloat16)
+        is_gated: Whether GEMM1 has separate gate and linear projections
 
     Returns:
-        gemm1_weights: [num_experts, 2 * intermediate_size, hidden_size]
+        gemm1_weights: [num_experts, (2 if is_gated else 1) * intermediate_size, hidden_size]
         gemm2_weights: [num_experts, hidden_size, intermediate_size]
     """
+    gemm1_rows = (2 if is_gated else 1) * intermediate_size
     gemm1_weights = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
+        (num_experts, gemm1_rows, hidden_size),
         device=device,
         dtype=dtype,
     )

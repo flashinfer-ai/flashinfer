@@ -16,13 +16,7 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_gdn_device_common.cuh"
 
-// Shared-memory descriptor address mask of this body: the 15-bit form on
-// SM107a, the 14-bit form on SM100a/SM103a (device compilation only).
-#if __CUDA_ARCH__ == 1070
-#define CAKE_GDN_SMEM_DESC_MASK 0x7FFF
-#else
 #define CAKE_GDN_SMEM_DESC_MASK 0x3FFF
-#endif  // __CUDA_ARCH__
 
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512

@@ -11,6 +11,8 @@ counts, widths and expert counts remain runtime values.
 """
 
 import math
+import operator
+from typing import Any
 
 # Scheduler layouts (EP size, local experts) with generated count/rows kernels.
 SCHEDULER_LAYOUTS = (
@@ -25,7 +27,6 @@ SCHEDULER_LAYOUTS = (
     (32, 9),
 )
 EPILOGUE_TOPKS = (2, 8)
-EPI_COLS = 1024  # Epilogue column vector.
 SWIGLU_BWD_TILES = 8  # 128 x 128 tiles per backward SwiGLU task half.
 
 
@@ -100,22 +101,358 @@ def _fast_divmod(divisor):
     return tvm_ffi.Shape((divisor, multiplier, p - 32))
 
 
+_FFI_DEVICES: dict[int, Any] = {}  # torch device index -> tvm_ffi.Device("cuda", index)
+
+
+def _ffi_stream():
+    """FFI stream context of the current torch stream on the current device.
+
+    The same context ``tvm_ffi.use_torch_stream()`` builds (the environment
+    stream of the current device is the current torch stream for the block,
+    the capture stream under graph capture, and is restored afterwards),
+    with the device object built once per index.
+    """
+    import torch
+    import tvm_ffi
+
+    index = torch.cuda.current_device()
+    device = _FFI_DEVICES.get(index)
+    if device is None:
+        device = _FFI_DEVICES[index] = tvm_ffi.device("cuda", index)
+    stream = torch.cuda.current_stream(index).cuda_stream
+    return tvm_ffi.use_raw_stream(device, stream)
+
+
+# 128 B in int32 elements: counters never share a cache line, as separate
+# allocations never did.
+_SLAB_ALIGN = 32
+
+
+def _slab_pieces(sizes):
+    """Split sizes of a counter slab: (pieces, kept flags, total elements)."""
+    pieces, keep, total = [], [], 0
+    for size in sizes:
+        pad = -total % _SLAB_ALIGN
+        if pad:
+            pieces.append(pad)
+            keep.append(False)
+            total += pad
+        for n in size if isinstance(size, tuple) else (size,):
+            pieces.append(n)
+            keep.append(True)
+            total += n
+    return pieces, keep, total
+
+
+def _zero_slab(device, *sizes):
+    """One zero-filled int32 slab split into contiguous counters.
+
+    Each int size starts 128-B aligned; a tuple of sizes is one aligned group
+    whose members are adjacent without padding. One ``torch.zeros`` and one
+    ``torch.split`` per call; every view is a contiguous 1-D int32 tensor the
+    launchers accept unchanged. Allocated per call, never cached.
+    """
+    import torch
+
+    pieces, keep, total = _slab_pieces(sizes)
+    slab = torch.zeros(total, dtype=torch.int32, device=device)
+    return tuple(
+        view for view, k in zip(torch.split(slab, pieces), keep, strict=True) if k
+    )
+
+
+def _counter_slab(device, *sizes):
+    """Persistent counterpart of :func:`_zero_slab` for a launch plan.
+
+    Same layout and views; returns ``(slab, views)``. The plan's owner resets
+    the whole slab with one ``slab.zero_()`` on the launch stream before every
+    launch that uses it, so the counters start at zero exactly as a fresh
+    :func:`_zero_slab` does.
+    """
+    import torch
+
+    pieces, keep, total = _slab_pieces(sizes)
+    slab = torch.zeros(total, dtype=torch.int32, device=device)
+    views = tuple(
+        view for view, k in zip(torch.split(slab, pieces), keep, strict=True) if k
+    )
+    return slab, views
+
+
+# Entries per memo (geometries per launcher, validated weight sets per
+# adapter); the least recently used entry leaves first, so a model with more
+# MoE layers x variants than the limit never thrashes a clear-all memo.
+_GEOMETRY_LIMIT = 4096
+
+
+class _Geometry:
+    """Launch-invariant geometry of one launcher call: row and task counts and
+    the fast-divmod carriers derived from the integer arguments, memoised per
+    launcher instance by the tuple of those arguments (``experts`` and, for the
+    MXFP8 tile width, the device included). ``comm_sms`` stays outside: the
+    grid is rebuilt per call."""
+
+
+def _recall(cache, key):
+    """Memo hit, refreshed as the most recently used entry; else None."""
+    value = cache.pop(key, None)
+    if value is not None:
+        cache[key] = value
+    return value
+
+
+def _remember(cache, key, value):
+    """Insert into an LRU memo (a dict kept in recency order by
+    :func:`_recall`); a full memo drops its least recently used entry."""
+    if key not in cache and len(cache) >= _GEOMETRY_LIMIT:
+        del cache[next(iter(cache))]
+    cache[key] = value
+    return value
+
+
+class _Plan:
+    """A validated, prebuilt launch of one exported kernel.
+
+    ``static`` holds the launch-invariant ABI values (grid, sizes, peer
+    tables, workspace buffers, counters); a call appends its per-call values
+    in the order the plan's builder fixed and launches
+    ``run(*getter(static + values))``, the ABI order of ``_Kernel.launch``
+    without the per-call keyword dictionary and its ABI check (done once
+    here). ``slab`` is the plan's persistent counter slab (None without
+    counters); ``extra`` carries launcher-specific constants.
+    """
+
+    __slots__ = ("run", "static", "getter", "slab", "extra")
+
+    def __init__(self, kernel, grid, fixed, per_call, slab=None, extra=None):
+        arguments = dict(fixed)
+        arguments.update(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
+        position = {name: i for i, name in enumerate(arguments)}
+        static = tuple(arguments.values())
+        for j, slot in enumerate(per_call):
+            for name in slot if isinstance(slot, tuple) else (slot,):
+                if name in position:
+                    raise ValueError(f"Kernel argument {name!r} is bound twice")
+                position[name] = len(static) + j
+        if position.keys() != kernel._argument_set:
+            raise ValueError("Kernel arguments do not match the exported ABI")
+        self.run = kernel._run
+        self.static = static
+        self.getter = operator.itemgetter(*(position[n] for n in kernel._arguments))
+        self.slab = slab
+        self.extra = extra
+
+    def launch(self, values):
+        """Launch with the per-call ``values``; call inside ``_ffi_stream()``."""
+        return self.run(*self.getter(self.static + values))
+
+
+def _forward_geometry(
+    local_tokens, hidden, intermediate, capacity, macro_size, mini_size
+):
+    g = _Geometry()
+    g.shared_rows, g.routed_rows = local_tokens // 256, capacity // 256
+    # Per 256-row block: fused gate/up/SwiGLU tiles, then 256 x 512 down tiles.
+    g.shared_tasks = g.shared_rows * (intermediate // 256) + g.shared_rows * (
+        (hidden + 511) // 512
+    )
+    g.mini_tasks = (mini_size // 256) * (intermediate // 256) + (mini_size // 256) * (
+        (hidden + 511) // 512
+    )
+    g.minis = (capacity + mini_size - 1) // mini_size
+    g.mini_tasks_div = _fast_divmod(g.mini_tasks)
+    g.minis_per_macro_div = _fast_divmod(macro_size // mini_size)
+    g.fused_col_blocks_div = _fast_divmod((intermediate + 255) // 256)
+    g.down_col_blocks_div = _fast_divmod((hidden + 511) // 512)
+    return g
+
+
+def _recompute_geometry(
+    local_tokens, hidden, intermediate, capacity, macro_size, mini_size
+):
+    g = _Geometry()
+    routed_capacity = min(capacity, macro_size)
+    g.shared_rows, g.routed_rows = local_tokens // 256, routed_capacity // 256
+    g.shared_tasks = g.shared_rows * (intermediate // 256)
+    g.mini_tasks = (mini_size // 256) * (intermediate // 256)
+    g.minis = (routed_capacity + mini_size - 1) // mini_size
+    g.mini_tasks_div = _fast_divmod(g.mini_tasks)
+    g.fused_col_blocks_div = _fast_divmod((intermediate + 255) // 256)
+    return g
+
+
+def _backward_geometry(
+    local_tokens, hidden, intermediate, capacity, macro_size, mini_size, experts
+):
+    g = _Geometry()
+    g.minis = (capacity + mini_size - 1) // mini_size
+    g.macros = (capacity + macro_size - 1) // macro_size
+    g.shared_rows, g.routed_rows = local_tokens // 256, capacity // 256
+    g.ib = intermediate // 256  # 256-column counter blocks
+    # 512-column GEMM tasks.
+    g.ibw, g.hbw = (intermediate + 511) // 512, (hidden + 511) // 512
+    g.shared_tasks = (
+        g.shared_rows * (g.ibw + g.hbw)
+        + swiglu_backward_tasks((local_tokens // 128) * (intermediate // 128))
+        + 3 * wgrad_tiles(hidden, intermediate)
+    )
+    g.mini_bwd = (mini_size // 256) * (g.ibw + g.hbw) + swiglu_backward_tasks(
+        (mini_size // 128) * (intermediate // 128)
+    )
+    g.mini_replay = (
+        2 * (mini_size // 256) * g.ibw
+        + ((mini_size // 128) * (intermediate // 128) + 5) // 6
+    )
+    g.clusters = (
+        g.shared_tasks
+        + g.minis * g.mini_bwd
+        + max(0, g.minis - macro_size // mini_size) * g.mini_replay
+        + g.macros * 3 * experts * wgrad_tiles(hidden, intermediate)
+    )
+    # Launch-invariant divisors of the per-task decode, passed as fast-divmod carriers.
+    g.shared_wgrad = wgrad_tiles(hidden, intermediate)
+    g.weight_tasks = experts * g.shared_wgrad
+    g.replay_macro_tasks = (macro_size // mini_size) * (
+        g.mini_replay + g.mini_bwd
+    ) + 3 * g.weight_tasks
+    g.mini_size_div = _fast_divmod(mini_size)
+    g.mini_bwd_div = _fast_divmod(g.mini_bwd)
+    g.mini_replay_div = _fast_divmod(g.mini_replay)
+    g.replay_macro_tasks_div = _fast_divmod(g.replay_macro_tasks)
+    g.weight_tasks_div = _fast_divmod(g.weight_tasks)
+    g.shared_wgrad_div = _fast_divmod(g.shared_wgrad)
+    g.dh_col_blocks_div = _fast_divmod(g.ibw)
+    g.dx_col_blocks_div = _fast_divmod(g.hbw)
+    g.replay_col_blocks_div = _fast_divmod(g.ibw)
+    return g
+
+
+def _forward_mxfp8_geometry(
+    local_tokens, hidden, intermediate, capacity, macro_size, mini_size, tile
+):
+    g = _Geometry()
+    g.m_tiles, g.h_tiles, g.i_tiles = (
+        macro_size // 128,
+        hidden // 128,
+        intermediate // 128,
+    )
+    g.shared_rows, g.routed_rows = local_tokens // 256, capacity // 256
+    g.shared_tasks = g.shared_rows * (intermediate // 256) + g.shared_rows * (
+        (hidden + 511) // 512
+    )
+    g.mini_swiglu = ((mini_size // 128) * (intermediate // 128) + 5) // 6
+    g.tile = tile
+    # 256 x 512 targets compute and save gate and up in one tile; 256 x 256
+    # targets use separate gate and up tiles per 256-column block.
+    g.gate_passes = 1 if tile == 512 else 2
+    g.mini_tasks = (
+        g.gate_passes * (mini_size // 256) * (intermediate // 256)
+        + g.mini_swiglu
+        + (mini_size // 256) * ((hidden + tile - 1) // tile)
+    )
+    g.minis = (capacity + mini_size - 1) // mini_size
+    g.mini_tasks_div = _fast_divmod(g.mini_tasks)
+    g.minis_per_macro_div = _fast_divmod(macro_size // mini_size)
+    g.gate_col_blocks_div = _fast_divmod((intermediate + 255) // 256)
+    g.down_col_blocks_div = _fast_divmod((hidden + tile - 1) // tile)
+    return g
+
+
+def _recompute_mxfp8_geometry(
+    local_tokens, hidden, intermediate, capacity, macro_size, mini_size
+):
+    g = _Geometry()
+    g.m_tiles, g.h_tiles, g.i_tiles = (
+        macro_size // 128,
+        hidden // 128,
+        intermediate // 128,
+    )
+    routed_capacity = min(capacity, macro_size)
+    g.shared_rows, g.routed_rows = local_tokens // 256, routed_capacity // 256
+    shared_gate_tasks = g.shared_rows * ((intermediate + 511) // 512)
+    mini_gate_tasks = (mini_size // 256) * (intermediate // 256)
+    shared_swiglu = ((local_tokens // 128) * (intermediate // 128) + 5) // 6
+    mini_swiglu = ((mini_size // 128) * (intermediate // 128) + 5) // 6
+    g.shared_tasks = 2 * shared_gate_tasks + shared_swiglu
+    g.mini_tasks = 2 * mini_gate_tasks + mini_swiglu
+    g.minis = (routed_capacity + mini_size - 1) // mini_size
+    g.mini_tasks_div = _fast_divmod(g.mini_tasks)
+    g.gate_col_blocks_div = _fast_divmod((intermediate + 255) // 256)
+    return g
+
+
+def _backward_mxfp8_geometry(
+    local_tokens, hidden, intermediate, capacity, macro_size, mini_size, experts, tile
+):
+    g = _Geometry()
+    g.m_tiles, g.h_tiles, g.i_tiles = (
+        macro_size // 128,
+        hidden // 128,
+        intermediate // 128,
+    )
+    g.minis = (capacity + mini_size - 1) // mini_size
+    g.macros = (capacity + macro_size - 1) // macro_size
+    g.shared_rows, g.routed_rows = local_tokens // 256, capacity // 256
+    g.ib = intermediate // 256
+    g.tile = tile
+    # Shared BF16 GEMM tasks use 512 columns; routed MXFP8 tasks use the target tile.
+    g.ibw, g.hbw = (intermediate + 511) // 512, (hidden + 511) // 512
+    g.ibr, g.hbr = (intermediate + tile - 1) // tile, (hidden + tile - 1) // tile
+    g.shared_tasks = (
+        g.shared_rows * (g.ibw + g.hbw)
+        + ((local_tokens // 128) * (intermediate // 128) + 3) // 4
+        + 3 * wgrad_tiles(hidden, intermediate)
+    )
+    g.mini_bwd = (mini_size // 256) * (g.ibr + g.hbr) + (
+        (mini_size // 128) * (intermediate // 128) + 3
+    ) // 4
+    g.mini_replay = (
+        2 * (mini_size // 256) * g.ib
+        + ((mini_size // 128) * (intermediate // 128) + 5) // 6
+    )
+    g.clusters = (
+        g.shared_tasks
+        + g.minis * g.mini_bwd
+        + max(0, g.minis - macro_size // mini_size) * g.mini_replay
+        + g.macros * 3 * experts * wgrad_tiles(hidden, intermediate, tile_cols=tile)
+    )
+    # Launch-invariant divisors of the per-task decode, passed as fast-divmod carriers.
+    g.shared_wgrad = wgrad_tiles(hidden, intermediate)
+    g.routed_wgrad = wgrad_tiles(hidden, intermediate, tile_cols=tile)
+    g.weight_tasks = experts * g.routed_wgrad
+    g.replay_macro_tasks = (macro_size // mini_size) * (
+        g.mini_replay + g.mini_bwd
+    ) + 3 * g.weight_tasks
+    g.mini_size_div = _fast_divmod(mini_size)
+    g.mini_bwd_div = _fast_divmod(g.mini_bwd)
+    g.mini_replay_div = _fast_divmod(g.mini_replay)
+    g.replay_macro_tasks_div = _fast_divmod(g.replay_macro_tasks)
+    g.weight_tasks_div = _fast_divmod(g.weight_tasks)
+    g.shared_wgrad_div = _fast_divmod(g.shared_wgrad)
+    g.routed_wgrad_div = _fast_divmod(g.routed_wgrad)
+    g.dh_col_blocks_div = _fast_divmod(g.ibr)
+    g.dx_col_blocks_div = _fast_divmod(g.hbr)
+    g.replay_col_blocks_div = _fast_divmod((intermediate + 255) // 256)
+    return g
+
+
 def expert_layout(module, counts, capacity, schedule_rank):
     """Device expert layout ``[counts | row offsets | real rows | block expert]``.
 
     ``module`` is the prepared ``expert_layout`` kernel. ``capacity`` bounds
     the routed rows (a multiple of 256); ``schedule_rank`` marks padding rows
-    with a negative peer. Blocks past the scheduled rows are left unwritten;
-    the fused kernels never read them.
+    with a negative peer, and within each expert's padded rows the real rows
+    come first (every schedule the scheduler builds has this form; the kernel
+    finds the real-row count by a search over the padding). Blocks past the
+    scheduled rows are left unwritten; the fused kernels never read them.
     """
     import torch
-    import tvm_ffi
 
     experts = counts.numel()
     layout = torch.empty(
         3 * experts + capacity // 256, dtype=torch.int32, device=counts.device
     )
-    with tvm_ffi.use_torch_stream():
+    with _ffi_stream():
         module.launch(
             grid=(1, 1, 1),
             counts=counts,
@@ -166,15 +503,32 @@ def _peer_table(cache, device, *pointer_lists):
 
 
 class MoKForward:
-    """Low-level native-signature BF16 forward; caller owns peer barriers."""
+    """Low-level native-signature BF16 forward; caller owns peer barriers.
 
-    def __init__(self, clamped=False):
+    Launch-invariant geometry is memoised per geometry; the counters are one
+    zero-filled slab per call.
+
+    ``context=False`` loads the context-free forward (role
+    ``forward[_clamped]_noctx``) for activation checkpointing: its fused tiles
+    store hidden, which the down projection reads, and skip the gate and up
+    stores only backward reads. It takes the same arguments; the unread gate
+    and up maps are given the hidden tensors, so the call allocates no gate or
+    up storage and returns ``None`` in their four places. ``y_shared``, the
+    combine rows, ``hidden_*`` and ``x_routed`` are the context forward's
+    words.
+    """
+
+    def __init__(self, clamped=False, context=True):
         from .jit import load_kernel
 
-        self.clamped = clamped
-        self.module = load_kernel(_role("forward", clamped))
+        if type(context) is not bool:
+            raise TypeError("context must be a boolean")
+        self.clamped, self.context = clamped, context
+        role = _role("forward", clamped) + ("" if context else "_noctx")
+        self.module = load_kernel(role)
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
+        self._geometry = {}
 
     def __call__(
         self,
@@ -197,9 +551,10 @@ class MoKForward:
         comm_sms,
         macro_size,
         mini_size,
+        *,
+        layout=None,
     ):
         import torch
-        import tvm_ffi
 
         check_swiglu_limit(swiglu_limit, self.clamped)
         local_tokens, hidden = x.shape
@@ -223,35 +578,46 @@ class MoKForward:
         )
         options = dict(device=x.device, dtype=torch.bfloat16)
         x_routed = torch.empty((macro_size, hidden), **options)
-        gate_shared = torch.empty((local_tokens, intermediate), **options)
-        gate_routed = torch.empty((macro_size, intermediate), **options)
-        up_shared, up_routed = (
-            torch.empty_like(gate_shared),
-            torch.empty_like(gate_routed),
-        )
-        hidden_shared, hidden_routed = (
-            torch.empty_like(gate_shared),
-            torch.empty_like(gate_routed),
-        )
+        if self.context:
+            gate_shared = torch.empty((local_tokens, intermediate), **options)
+            gate_routed = torch.empty((macro_size, intermediate), **options)
+            up_shared, up_routed = (
+                torch.empty_like(gate_shared),
+                torch.empty_like(gate_routed),
+            )
+            hidden_shared, hidden_routed = (
+                torch.empty_like(gate_shared),
+                torch.empty_like(gate_routed),
+            )
+            maps = (gate_shared, up_shared, gate_routed, up_routed)
+        else:
+            hidden_shared = torch.empty((local_tokens, intermediate), **options)
+            hidden_routed = torch.empty((macro_size, intermediate), **options)
+            gate_shared = gate_routed = up_shared = up_routed = None
+            maps = (hidden_shared, hidden_shared, hidden_routed, hidden_routed)
         y_shared, y_routed = torch.empty_like(x), torch.empty_like(x_routed)
-        shared_rows, routed_rows = local_tokens // 256, capacity // 256
-        # Per 256-row block: fused gate/up/SwiGLU tiles, then 256 x 512 down tiles.
-        shared_tasks = shared_rows * (intermediate // 256) + shared_rows * (
-            (hidden + 511) // 512
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
         )
-        mini_tasks = (mini_size // 256) * (intermediate // 256) + (mini_size // 256) * (
-            (hidden + 511) // 512
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(self._geometry, key, _forward_geometry(*key[:6]))
+        x_ready, hidden_ready, y_ready, y_done = _zero_slab(
+            x.device, g.minis, g.shared_rows + g.routed_rows, g.minis, capacity // 128
         )
-        minis = (capacity + mini_size - 1) // mini_size
-        counter_opts = dict(dtype=torch.int32, device=x.device)
-        x_ready = torch.zeros(minis, **counter_opts)
-        hidden_ready = torch.zeros(shared_rows + routed_rows, **counter_opts)
-        y_ready = torch.zeros(minis, **counter_opts)
-        y_done = torch.zeros(capacity // 128, **counter_opts)
-        layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
-        with tvm_ffi.use_torch_stream():
+        if layout is None:
+            layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
+        elif layout.numel() != 3 * experts + capacity // 256:
+            raise ValueError("layout does not match the schedule geometry")
+        with _ffi_stream():
             self.module.launch(
-                grid=(2 * (shared_tasks + minis * mini_tasks) + comm_sms, 1, 1),
+                grid=(2 * (g.shared_tasks + g.minis * g.mini_tasks) + comm_sms, 1, 1),
                 x_shared=x,
                 x_routed=x_routed,
                 wg_shared=shared_gate.unsqueeze(0),
@@ -260,10 +626,10 @@ class MoKForward:
                 wg_routed=routed_gate,
                 wu_routed=routed_up,
                 wd_routed=routed_down,
-                gate_shared_out=gate_shared,
-                up_shared_out=up_shared,
-                gate_routed_out=gate_routed,
-                up_routed_out=up_routed,
+                gate_shared_out=maps[0],
+                up_shared_out=maps[1],
+                gate_routed_out=maps[2],
+                up_routed_out=maps[3],
                 hidden_shared_out=hidden_shared,
                 hidden_routed_out=hidden_routed,
                 hidden_shared_in=hidden_shared,
@@ -291,11 +657,196 @@ class MoKForward:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
-                mini_tasks_div=_fast_divmod(mini_tasks),
-                minis_per_macro_div=_fast_divmod(macro_size // mini_size),
-                fused_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
-                down_col_blocks_div=_fast_divmod((hidden + 511) // 512),
+                mini_tasks_div=g.mini_tasks_div,
+                minis_per_macro_div=g.minis_per_macro_div,
+                fused_col_blocks_div=g.fused_col_blocks_div,
+                down_col_blocks_div=g.down_col_blocks_div,
             )
+        return (
+            x_routed,
+            gate_shared,
+            gate_routed,
+            up_shared,
+            up_routed,
+            hidden_shared,
+            hidden_routed,
+            y_shared,
+            y_routed,
+        )
+
+    def plan(
+        self,
+        x,
+        x_ptrs,
+        combine_ptrs,
+        intermediate,
+        experts,
+        capacity,
+        topk,
+        swiglu_limit,
+        comm_sms,
+        macro_size,
+        mini_size,
+    ):
+        """Validated launch plan for one geometry, split and SwiGLU variant.
+
+        ``x`` is the staged source rows the kernel reads (a fixed view of the
+        caller-owned symmetric x buffer); it, the peer tables and a persistent
+        counter slab are bound into the plan. Per call
+        :meth:`launch_planned` allocates the outputs and passes the weights
+        and the schedule, exactly the arguments ``__call__`` passes. The same
+        checks as ``__call__`` run here, once.
+        """
+        import torch
+
+        check_swiglu_limit(swiglu_limit, self.clamped)
+        local_tokens, hidden = x.shape
+        if (
+            x.dtype != torch.bfloat16
+            or local_tokens % 256
+            or hidden % 256
+            or intermediate % 256
+            or macro_size % mini_size
+            or mini_size % 256
+            or comm_sms <= 0
+            or comm_sms % 2
+        ):
+            raise ValueError(
+                "MoK native BF16 tile and communication geometry is required"
+            )
+        x_peers, y_peers = _peer_table(
+            self._peer_tables, x.device, x_ptrs, combine_ptrs
+        )
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
+        )
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(self._geometry, key, _forward_geometry(*key[:6]))
+        slab, (x_ready, hidden_ready, y_ready, y_done) = _counter_slab(
+            x.device, g.minis, g.shared_rows + g.routed_rows, g.minis, capacity // 128
+        )
+        return _Plan(
+            self.module,
+            (2 * (g.shared_tasks + g.minis * g.mini_tasks) + comm_sms, 1, 1),
+            dict(
+                x_shared=x,
+                x_peers=x_peers,
+                y_peers=y_peers,
+                hidden_ready=hidden_ready,
+                x_ready=x_ready,
+                y_ready=y_ready,
+                y_done=y_done,
+                local_tokens=local_tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                experts=experts,
+                topk=topk,
+                comm_sms=comm_sms,
+                macro_size=macro_size,
+                mini_size=mini_size,
+                swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_tasks_div=g.mini_tasks_div,
+                minis_per_macro_div=g.minis_per_macro_div,
+                fused_col_blocks_div=g.fused_col_blocks_div,
+                down_col_blocks_div=g.down_col_blocks_div,
+            ),
+            (
+                ("x_routed", "x_routed_ptr"),
+                "gate_shared_out",
+                "gate_routed_out",
+                "up_shared_out",
+                "up_routed_out",
+                ("hidden_shared_out", "hidden_shared_in"),
+                ("hidden_routed_out", "hidden_routed_in"),
+                "y_shared",
+                ("y_routed", "y_routed_ptr"),
+                "wg_shared",
+                "wu_shared",
+                "wd_shared",
+                "wg_routed",
+                "wu_routed",
+                "wd_routed",
+                "schedule_rank",
+                "schedule_token",
+                "num_tokens",
+                "counts",
+            ),
+            slab=slab,
+            extra=(
+                x,
+                (macro_size, hidden),
+                (local_tokens, intermediate),
+                (macro_size, intermediate),
+                3 * experts + capacity // 256,
+                self.context,
+            ),
+        )
+
+    @staticmethod
+    def launch_planned(
+        plan,
+        shared_gate,
+        routed_gate,
+        shared_up,
+        routed_up,
+        shared_down,
+        routed_down,
+        peer_rank,
+        peer_token,
+        num_tokens,
+        layout,
+    ):
+        """Launch a :meth:`plan` on the current stream; returns the nine
+        outputs of ``__call__`` (``None`` in the four gate/up places for a
+        context-free launcher). The caller resets ``plan.slab`` on this
+        stream before the launch, validated the weights against the plan's
+        geometry and runs this inside ``_ffi_stream()``."""
+        x, routed_rows, shared_shape, routed_shape, layout_numel, context = plan.extra
+        if layout.numel() != layout_numel:
+            raise ValueError("layout does not match the schedule geometry")
+        x_routed = x.new_empty(routed_rows)
+        if context:
+            gate_shared = x.new_empty(shared_shape)
+            gate_routed = x.new_empty(routed_shape)
+            up_shared, up_routed = x.new_empty(shared_shape), x.new_empty(routed_shape)
+            hidden_shared = x.new_empty(shared_shape)
+            hidden_routed = x.new_empty(routed_shape)
+            maps = (gate_shared, gate_routed, up_shared, up_routed)
+        else:
+            # The context-free kernel stores no gate/up: their slots get the
+            # hidden tensors, as in ``__call__``.
+            hidden_shared = x.new_empty(shared_shape)
+            hidden_routed = x.new_empty(routed_shape)
+            gate_shared = gate_routed = up_shared = up_routed = None
+            maps = (hidden_shared, hidden_routed, hidden_shared, hidden_routed)
+        y_shared, y_routed = x.new_empty(x.shape), x.new_empty(routed_rows)
+        plan.launch(
+            (
+                x_routed,
+                *maps,
+                hidden_shared,
+                hidden_routed,
+                y_shared,
+                y_routed,
+                shared_gate.unsqueeze(0),
+                shared_up.unsqueeze(0),
+                shared_down.unsqueeze(0),
+                routed_gate,
+                routed_up,
+                routed_down,
+                peer_rank,
+                peer_token,
+                num_tokens,
+                layout,
+            )
+        )
         return (
             x_routed,
             gate_shared,
@@ -314,7 +865,8 @@ class MoKRecompute:
 
     Rebuilds the backward context (first routed macrobatch plus the shared
     expert): dispatch and gate/up/SwiGLU tiles only, without down
-    projections, combine or the output epilogue.
+    projections, combine or the output epilogue. Launch-invariant geometry
+    is memoised per geometry; the counters are one zero-filled slab per call.
     """
 
     def __init__(self, clamped=False):
@@ -324,6 +876,7 @@ class MoKRecompute:
         self.module = load_kernel(_role("recompute", clamped))
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
+        self._geometry = {}
 
     def __call__(
         self,
@@ -342,9 +895,10 @@ class MoKRecompute:
         comm_sms,
         macro_size,
         mini_size,
+        *,
+        layout=None,
     ):
         import torch
-        import tvm_ffi
 
         check_swiglu_limit(swiglu_limit, self.clamped)
         local_tokens, hidden = x.shape
@@ -377,18 +931,28 @@ class MoKRecompute:
             torch.empty_like(gate_shared),
             torch.empty_like(gate_routed),
         )
-        routed_capacity = min(capacity, macro_size)
-        shared_rows, routed_rows = local_tokens // 256, routed_capacity // 256
-        shared_tasks = shared_rows * (intermediate // 256)
-        mini_tasks = (mini_size // 256) * (intermediate // 256)
-        minis = (routed_capacity + mini_size - 1) // mini_size
-        counter_opts = dict(dtype=torch.int32, device=x.device)
-        x_ready = torch.zeros(minis, **counter_opts)
-        hidden_ready = torch.zeros(shared_rows + routed_rows, **counter_opts)
-        layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
-        with tvm_ffi.use_torch_stream():
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
+        )
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(self._geometry, key, _recompute_geometry(*key[:6]))
+        x_ready, hidden_ready = _zero_slab(
+            x.device, g.minis, g.shared_rows + g.routed_rows
+        )
+        if layout is None:
+            layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
+        elif layout.numel() != 3 * experts + capacity // 256:
+            raise ValueError("layout does not match the schedule geometry")
+        with _ffi_stream():
             self.module.launch(
-                grid=(2 * (shared_tasks + minis * mini_tasks) + comm_sms, 1, 1),
+                grid=(2 * (g.shared_tasks + g.minis * g.mini_tasks) + comm_sms, 1, 1),
                 x_shared=x,
                 x_routed=x_routed,
                 wg_shared=shared_gate.unsqueeze(0),
@@ -418,9 +982,155 @@ class MoKRecompute:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
-                mini_tasks_div=_fast_divmod(mini_tasks),
-                fused_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
+                mini_tasks_div=g.mini_tasks_div,
+                fused_col_blocks_div=g.fused_col_blocks_div,
             )
+        return (
+            x_routed,
+            gate_shared,
+            gate_routed,
+            up_shared,
+            up_routed,
+            hidden_shared,
+            hidden_routed,
+        )
+
+    def plan(
+        self,
+        x,
+        x_ptrs,
+        intermediate,
+        experts,
+        capacity,
+        topk,
+        swiglu_limit,
+        comm_sms,
+        macro_size,
+        mini_size,
+    ):
+        """Validated launch plan; see :meth:`MoKForward.plan`."""
+        import torch
+
+        check_swiglu_limit(swiglu_limit, self.clamped)
+        local_tokens, hidden = x.shape
+        if (
+            x.dtype != torch.bfloat16
+            or local_tokens % 256
+            or hidden % 256
+            or intermediate % 256
+            or macro_size % mini_size
+            or mini_size % 256
+            or comm_sms <= 0
+            or comm_sms % 2
+        ):
+            raise ValueError(
+                "MoK native BF16 tile and communication geometry is required"
+            )
+        (x_peers,) = _peer_table(self._peer_tables, x.device, x_ptrs)
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
+        )
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(self._geometry, key, _recompute_geometry(*key[:6]))
+        slab, (x_ready, hidden_ready) = _counter_slab(
+            x.device, g.minis, g.shared_rows + g.routed_rows
+        )
+        return _Plan(
+            self.module,
+            (2 * (g.shared_tasks + g.minis * g.mini_tasks) + comm_sms, 1, 1),
+            dict(
+                x_shared=x,
+                x_peers=x_peers,
+                hidden_ready=hidden_ready,
+                x_ready=x_ready,
+                local_tokens=local_tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                experts=experts,
+                topk=topk,
+                comm_sms=comm_sms,
+                macro_size=macro_size,
+                mini_size=mini_size,
+                swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_tasks_div=g.mini_tasks_div,
+                fused_col_blocks_div=g.fused_col_blocks_div,
+            ),
+            (
+                ("x_routed", "x_routed_ptr"),
+                "gate_shared_out",
+                "gate_routed_out",
+                "up_shared_out",
+                "up_routed_out",
+                "hidden_shared_out",
+                "hidden_routed_out",
+                "wg_shared",
+                "wu_shared",
+                "wg_routed",
+                "wu_routed",
+                "schedule_rank",
+                "schedule_token",
+                "num_tokens",
+                "counts",
+            ),
+            slab=slab,
+            extra=(
+                x,
+                (macro_size, hidden),
+                (local_tokens, intermediate),
+                (macro_size, intermediate),
+                3 * experts + capacity // 256,
+            ),
+        )
+
+    @staticmethod
+    def launch_planned(
+        plan,
+        shared_gate,
+        routed_gate,
+        shared_up,
+        routed_up,
+        peer_rank,
+        peer_token,
+        num_tokens,
+        layout,
+    ):
+        """Launch a :meth:`plan`; returns the seven context tensors of
+        ``__call__``. Same caller contract as :meth:`MoKForward.launch_planned`."""
+        x, routed_rows, shared_shape, routed_shape, layout_numel = plan.extra
+        if layout.numel() != layout_numel:
+            raise ValueError("layout does not match the schedule geometry")
+        # Identical context storage to the forward ring.
+        x_routed = x.new_empty(routed_rows)
+        gate_shared, gate_routed = x.new_empty(shared_shape), x.new_empty(routed_shape)
+        up_shared, up_routed = x.new_empty(shared_shape), x.new_empty(routed_shape)
+        hidden_shared = x.new_empty(shared_shape)
+        hidden_routed = x.new_empty(routed_shape)
+        plan.launch(
+            (
+                x_routed,
+                gate_shared,
+                gate_routed,
+                up_shared,
+                up_routed,
+                hidden_shared,
+                hidden_routed,
+                shared_gate.unsqueeze(0),
+                shared_up.unsqueeze(0),
+                routed_gate,
+                routed_up,
+                peer_rank,
+                peer_token,
+                num_tokens,
+                layout,
+            )
+        )
         return (
             x_routed,
             gate_shared,
@@ -438,7 +1148,9 @@ class MoKBackward:
     The router-score gradient is fused into SwiGLU backward as
     ``dot(d_hidden, hidden) / score``, as in native MoK; a zero score yields a
     zero gradient. ``fp32_wgrad`` kernels add every weight-gradient
-    contribution into caller-owned FP32 accumulators.
+    contribution into caller-owned FP32 accumulators. Launch-invariant
+    geometry is memoised per geometry; the counters are one zero-filled slab
+    per call.
     """
 
     def __init__(self, clamped=False, fp32_wgrad=False):
@@ -449,6 +1161,7 @@ class MoKBackward:
         self.zero_module = load_kernel("zero")
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
+        self._geometry = {}
 
     def __call__(
         self,
@@ -485,12 +1198,13 @@ class MoKBackward:
         macro_size,
         mini_size,
         weight_grad_accumulators=None,
+        *,
+        layout=None,
     ):
         """``weight_grad_accumulators`` (FP32 kernels only): caller-owned FP32
         (shared gate, up, down, routed gate, up, down) tensors with the weight
         shapes; this call adds its weight gradients to them and returns them."""
         import torch
-        import tvm_ffi
 
         check_swiglu_limit(swiglu_limit, self.clamped)
         if (weight_grad_accumulators is not None) != self.fp32_wgrad:
@@ -571,50 +1285,48 @@ class MoKBackward:
                 torch.empty_like(shared_down),
                 torch.empty_like(routed_down),
             )
-        minis = (capacity + mini_size - 1) // mini_size
-        macros = (capacity + macro_size - 1) // macro_size
-        shared_rows, routed_rows = local_tokens // 256, capacity // 256
-        ib = intermediate // 256  # 256-column counter blocks
-        counter_options = dict(dtype=torch.int32, device=x.device)
-        dy_ready = torch.zeros(minis, **counter_options)
-        dh_ready = torch.zeros((shared_rows + routed_rows) * ib, **counter_options)
-        dg_ready = torch.zeros(shared_rows + routed_rows, **counter_options)
-        dx_ready = torch.zeros(minis, **counter_options)
-        replay_x = torch.zeros(minis, **counter_options)
-        replay_gu = torch.zeros(routed_rows * ib, **counter_options)
-        replay_h = torch.zeros(routed_rows, **counter_options)
-        buffers_done = torch.zeros(macros, **counter_options)
-        weight_ready = torch.zeros(macros, **counter_options)
-        # 512-column GEMM tasks.
-        ibw, hbw = (intermediate + 511) // 512, (hidden + 511) // 512
-        shared_tasks = (
-            shared_rows * (ibw + hbw)
-            + swiglu_backward_tasks((local_tokens // 128) * (intermediate // 128))
-            + 3 * wgrad_tiles(hidden, intermediate)
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
         )
-        mini_bwd = (mini_size // 256) * (ibw + hbw) + swiglu_backward_tasks(
-            (mini_size // 128) * (intermediate // 128)
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(self._geometry, key, _backward_geometry(*key))
+        rows = g.shared_rows + g.routed_rows
+        (
+            dy_ready,
+            dh_ready,
+            dg_ready,
+            dx_ready,
+            replay_x,
+            replay_gu,
+            replay_h,
+            buffers_done,
+            weight_ready,
+        ) = _zero_slab(
+            x.device,
+            g.minis,
+            rows * g.ib,
+            rows,
+            g.minis,
+            g.minis,
+            g.routed_rows * g.ib,
+            g.routed_rows,
+            g.macros,
+            g.macros,
         )
-        mini_replay = (
-            2 * (mini_size // 256) * ibw
-            + ((mini_size // 128) * (intermediate // 128) + 5) // 6
-        )
-        clusters = (
-            shared_tasks
-            + minis * mini_bwd
-            + max(0, minis - macro_size // mini_size) * mini_replay
-            + macros * 3 * experts * wgrad_tiles(hidden, intermediate)
-        )
-        # Launch-invariant divisors of the per-task decode, passed as fast-divmod carriers.
-        shared_wgrad = wgrad_tiles(hidden, intermediate)
-        weight_tasks = experts * shared_wgrad
-        replay_macro_tasks = (macro_size // mini_size) * (
-            mini_replay + mini_bwd
-        ) + 3 * weight_tasks
-        layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
-        with tvm_ffi.use_torch_stream():
+        if layout is None:
+            layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
+        elif layout.numel() != 3 * experts + capacity // 256:
+            raise ValueError("layout does not match the schedule geometry")
+        with _ffi_stream():
             self.module.launch(
-                grid=(comm_sms + 2 * clusters, 1, 1),
+                grid=(comm_sms + 2 * g.clusters, 1, 1),
                 dy_s=dy_buffer,
                 dy_r=dy_routed,
                 dg_s=dg_shared,
@@ -695,15 +1407,15 @@ class MoKBackward:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
-                mini_size_div=_fast_divmod(mini_size),
-                mini_bwd_div=_fast_divmod(mini_bwd),
-                mini_replay_div=_fast_divmod(mini_replay),
-                replay_macro_tasks_div=_fast_divmod(replay_macro_tasks),
-                weight_tasks_div=_fast_divmod(weight_tasks),
-                shared_wgrad_div=_fast_divmod(shared_wgrad),
-                dh_col_blocks_div=_fast_divmod(ibw),
-                dx_col_blocks_div=_fast_divmod(hbw),
-                replay_col_blocks_div=_fast_divmod(ibw),
+                mini_size_div=g.mini_size_div,
+                mini_bwd_div=g.mini_bwd_div,
+                mini_replay_div=g.mini_replay_div,
+                replay_macro_tasks_div=g.replay_macro_tasks_div,
+                weight_tasks_div=g.weight_tasks_div,
+                shared_wgrad_div=g.shared_wgrad_div,
+                dh_col_blocks_div=g.dh_col_blocks_div,
+                dx_col_blocks_div=g.dx_col_blocks_div,
+                replay_col_blocks_div=g.replay_col_blocks_div,
             )
             if not self.fp32_wgrad:
                 # Accumulation adds nothing for an empty expert; BF16 outputs are zeroed.
@@ -733,6 +1445,334 @@ class MoKBackward:
             dwd_routed,
         )
 
+    def plan(
+        self,
+        dy_buffer,
+        dy_ptrs,
+        dx_ptrs,
+        weight_ptrs,
+        dweight_ptrs,
+        x_ptrs,
+        intermediate,
+        experts,
+        capacity,
+        topk,
+        swiglu_limit,
+        comm_sms,
+        macro_size,
+        mini_size,
+    ):
+        """Validated launch plan; see :meth:`MoKForward.plan`. ``dy_buffer``
+        is the staged output-gradient rows (a fixed view of the symmetric
+        d_y buffer); the source rows ``x`` stay a per-call argument because
+        the shared-expert path may read the caller's tensor."""
+        import torch
+
+        check_swiglu_limit(swiglu_limit, self.clamped)
+        local_tokens, hidden = dy_buffer.shape
+        if (
+            dy_buffer.dtype != torch.bfloat16
+            or local_tokens % 256
+            or hidden % 256
+            or intermediate % 256
+            or macro_size % mini_size
+            or mini_size % 256
+            or comm_sms <= 0
+            or comm_sms % 2
+        ):
+            raise ValueError(
+                "MoK native BF16 tile and communication geometry is required"
+            )
+        device = dy_buffer.device
+        x_peers, dy_peers, dx_peers, weight_peers, dweight_peers = _peer_table(
+            self._peer_tables,
+            device,
+            x_ptrs,
+            dy_ptrs,
+            dx_ptrs,
+            weight_ptrs,
+            dweight_ptrs,
+        )
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
+        )
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(self._geometry, key, _backward_geometry(*key))
+        rows = g.shared_rows + g.routed_rows
+        slab, counters = _counter_slab(
+            device,
+            g.minis,
+            rows * g.ib,
+            rows,
+            g.minis,
+            g.minis,
+            g.routed_rows * g.ib,
+            g.routed_rows,
+            g.macros,
+            g.macros,
+        )
+        names = (
+            "dy_ready",
+            "dh_ready",
+            "dg_ready",
+            "dx_ready",
+            "replay_x",
+            "replay_gu",
+            "replay_h",
+            "buffers_done",
+            "weight_ready",
+        )
+        zero = None
+        if not self.fp32_wgrad:
+            zero = _Plan(
+                self.zero_module,
+                (128, experts, 1),
+                dict(elements=hidden * intermediate),
+                ("gate", "up", "down", "counts"),
+            )
+        return _Plan(
+            self.module,
+            (comm_sms + 2 * g.clusters, 1, 1),
+            dict(
+                dy_s=dy_buffer,
+                dy_atb_s=dy_buffer,
+                x_peers=x_peers,
+                dy_peers=dy_peers,
+                dx_peers=dx_peers,
+                weight_peers=weight_peers,
+                dweight_peers=dweight_peers,
+                **dict(zip(names, counters, strict=True)),
+                local_tokens=local_tokens,
+                hidden=hidden,
+                intermediate=intermediate,
+                experts=experts,
+                topk=topk,
+                comm_sms=comm_sms,
+                macro_size=macro_size,
+                mini_size=mini_size,
+                swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
+                mini_size_div=g.mini_size_div,
+                mini_bwd_div=g.mini_bwd_div,
+                mini_replay_div=g.mini_replay_div,
+                replay_macro_tasks_div=g.replay_macro_tasks_div,
+                weight_tasks_div=g.weight_tasks_div,
+                shared_wgrad_div=g.shared_wgrad_div,
+                dh_col_blocks_div=g.dh_col_blocks_div,
+                dx_col_blocks_div=g.dx_col_blocks_div,
+                replay_col_blocks_div=g.replay_col_blocks_div,
+            ),
+            (
+                ("dy_r", "dy_atb_r", "dy_routed_ptr"),
+                ("dg_s", "dg_atb_s", "dg_sw_s"),
+                ("dg_r", "dg_atb_r", "dg_sw_r"),
+                ("du_s", "du_atb_s", "du_sw_s"),
+                ("du_r", "du_atb_r", "du_sw_r"),
+                ("dh_s", "dh_sw_s"),
+                ("dh_r", "dh_sw_r"),
+                "dx_s",
+                ("dx_r", "dx_routed_ptr"),
+                "weights",
+                "partials",
+                ("x_nt_r", "x_atb_r", "x_routed_ptr"),
+                "gate_sw_s",
+                ("gate_out_r", "gate_sw_r"),
+                "up_sw_s",
+                ("up_out_r", "up_sw_r"),
+                "h_atb_s",
+                ("h_atb_r", "h_sw_r"),
+                "x_atb_s",
+                "wg_s",
+                "wu_s",
+                "wd_s",
+                ("wg_r", "wg_nt_r"),
+                ("wu_r", "wu_nt_r"),
+                "wd_r",
+                "dwg_s",
+                "dwu_s",
+                "dwd_s",
+                "dwg_r",
+                "dwu_r",
+                "dwd_r",
+                "schedule_rank",
+                "schedule_token",
+                "num_tokens",
+                "counts",
+            ),
+            slab=slab,
+            extra=(
+                dy_buffer,
+                local_tokens,
+                hidden,
+                intermediate,
+                macro_size,
+                3 * experts + capacity // 256,
+                zero,
+            ),
+        )
+
+    def check_accumulators(self, weights, weight_grad_accumulators):
+        """The FP32 accumulator checks of ``__call__``; ``weights`` in the
+        accumulator order (shared gate, up, down, routed gate, up, down)."""
+        import torch
+
+        if (weight_grad_accumulators is not None) != self.fp32_wgrad:
+            raise ValueError(
+                "FP32 weight-gradient kernels require exactly six FP32 accumulators"
+            )
+        if self.fp32_wgrad and (
+            len(weight_grad_accumulators) != 6
+            or any(
+                a.dtype != torch.float32
+                or a.shape != w.shape
+                or a.device != w.device
+                or not a.is_contiguous()
+                for a, w in zip(weight_grad_accumulators, weights, strict=True)
+            )
+        ):
+            raise ValueError(
+                "Accumulators must be contiguous FP32 tensors shaped like the weights"
+            )
+
+    def launch_planned(
+        self,
+        plan,
+        shared_gate,
+        routed_gate,
+        shared_up,
+        routed_up,
+        shared_down,
+        routed_down,
+        x_routed,
+        gate_shared,
+        gate_routed,
+        up_shared,
+        up_routed,
+        hidden_shared,
+        hidden_routed,
+        x,
+        peer_rank,
+        peer_token,
+        num_tokens,
+        counts,
+        layout,
+        weight_grad_accumulators=None,
+    ):
+        """Launch a :meth:`plan`; returns the fifteen values of ``__call__``.
+        ``counts`` is the schedule's tokens per expert (the empty-expert
+        zeroing reads it). Same caller contract as
+        :meth:`MoKForward.launch_planned`; the caller checked the FP32
+        accumulators with :meth:`check_accumulators` before staging."""
+        import torch
+
+        dy, local_tokens, hidden, intermediate, macro_size, layout_numel, zero = (
+            plan.extra
+        )
+        if x.shape != (local_tokens, hidden) or x.dtype != torch.bfloat16:
+            raise ValueError("Source rows do not match the planned geometry")
+        if layout.numel() != layout_numel:
+            raise ValueError("layout does not match the schedule geometry")
+        shared_shape = (local_tokens, intermediate)
+        routed_shape = (macro_size, intermediate)
+        router_weights = torch.empty(macro_size, dtype=torch.float32, device=x.device)
+        partials = torch.empty(
+            macro_size, intermediate // 128, dtype=torch.float32, device=x.device
+        )
+        dy_routed = dy.new_empty((macro_size, hidden))
+        dh_shared, dh_routed = dy.new_empty(shared_shape), dy.new_empty(routed_shape)
+        dg_shared, dg_routed = dy.new_empty(shared_shape), dy.new_empty(routed_shape)
+        du_shared, du_routed = dy.new_empty(shared_shape), dy.new_empty(routed_shape)
+        dx_shared, dx_routed = dy.new_empty(dy.shape), dy.new_empty(dy_routed.shape)
+        if self.fp32_wgrad:
+            dwg_shared, dwu_shared, dwd_shared, dwg_routed, dwu_routed, dwd_routed = (
+                weight_grad_accumulators
+            )
+        else:
+            dwg_shared, dwg_routed = (
+                torch.empty_like(shared_gate),
+                torch.empty_like(routed_gate),
+            )
+            dwu_shared, dwu_routed = (
+                torch.empty_like(shared_up),
+                torch.empty_like(routed_up),
+            )
+            dwd_shared, dwd_routed = (
+                torch.empty_like(shared_down),
+                torch.empty_like(routed_down),
+            )
+        plan.launch(
+            (
+                dy_routed,
+                dg_shared,
+                dg_routed,
+                du_shared,
+                du_routed,
+                dh_shared,
+                dh_routed,
+                dx_shared,
+                dx_routed,
+                router_weights,
+                partials,
+                x_routed,
+                gate_shared,
+                gate_routed,
+                up_shared,
+                up_routed,
+                hidden_shared,
+                hidden_routed,
+                x,
+                shared_gate.unsqueeze(0),
+                shared_up.unsqueeze(0),
+                shared_down.unsqueeze(0),
+                routed_gate,
+                routed_up,
+                routed_down,
+                dwg_shared.unsqueeze(0),
+                dwu_shared.unsqueeze(0),
+                dwd_shared.unsqueeze(0),
+                dwg_routed,
+                dwu_routed,
+                dwd_routed,
+                peer_rank,
+                peer_token,
+                num_tokens,
+                layout,
+            )
+        )
+        if zero is not None:
+            # Accumulation adds nothing for an empty expert; BF16 outputs are zeroed.
+            zero.launch(
+                (
+                    dwg_routed.view(torch.uint16),
+                    dwu_routed.view(torch.uint16),
+                    dwd_routed.view(torch.uint16),
+                    counts,
+                )
+            )
+        return (
+            dx_shared,
+            dx_routed,
+            dg_shared,
+            dg_routed,
+            du_shared,
+            du_routed,
+            dh_shared,
+            dh_routed,
+            dy_routed,
+            dwg_shared,
+            dwg_routed,
+            dwu_shared,
+            dwu_routed,
+            dwd_shared,
+            dwd_routed,
+        )
+
 
 class MoKForwardMXFP8:
     """Native-signature MXFP8 forward; caller owns peer barriers.
@@ -741,15 +1781,29 @@ class MoKForwardMXFP8:
     ``(data, scales)``; activations are quantized inside the kernel. The
     shared expert stays BF16. The context saves transposed MXFP8 x and
     activation (weight gradients) and E4M3 gate/up (SwiGLU backward).
+
+    Launch-invariant geometry is memoised per geometry; the counters are one
+    zero-filled slab per call.
+
+    On sm_107a the multimacro program is loaded beside the default one
+    (``multimacro=True`` launches it): the same contract and bitwise the same
+    results for any schedule, faster when the schedule holds two macro batches
+    (it streams macro batch 0's rows ahead of macro batch 1's combine).
     """
 
     def __init__(self, clamped=False):
-        from .jit import load_kernel
+        from .jit import load_kernel, target_arch
 
         self.clamped = clamped
         self.module = load_kernel(_role("forward_mxfp8", clamped))
+        self.multimacro_module = (
+            load_kernel(_role("forward_mxfp8", clamped) + "_multimacro")
+            if target_arch() == "sm_107a"
+            else None
+        )
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
+        self._geometry = {}
 
     def __call__(
         self,
@@ -772,11 +1826,18 @@ class MoKForwardMXFP8:
         comm_sms,
         macro_size,
         mini_size,
+        *,
+        layout=None,
+        multimacro=False,
     ):
         import torch
-        import tvm_ffi
 
         check_swiglu_limit(swiglu_limit, self.clamped)
+        module = self.multimacro_module if multimacro else self.module
+        if module is None:
+            raise ValueError(
+                "The multimacro MXFP8 forward is generated for sm_107a only"
+            )
         local_tokens, hidden = x.shape
         intermediate, experts = shared_gate.shape[0], counts.numel()
         capacity = peer_rank.numel()
@@ -805,11 +1866,24 @@ class MoKForwardMXFP8:
         )
         options = dict(device=x.device, dtype=torch.bfloat16)
         bytes_ = dict(device=x.device, dtype=torch.uint8)
-        m_tiles, h_tiles, i_tiles = (
-            macro_size // 128,
-            hidden // 128,
-            intermediate // 128,
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
+            x.device,
         )
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(
+                self._geometry,
+                key,
+                _forward_mxfp8_geometry(*key[:6], mxfp8_tile_cols(x.device)),
+            )
+        m_tiles, h_tiles, i_tiles = g.m_tiles, g.h_tiles, g.i_tiles
         x_q = torch.empty((macro_size, hidden), **bytes_)
         x_sc = torch.empty((m_tiles, h_tiles, 32, 16), **bytes_)
         x_t = torch.empty((hidden, macro_size), **bytes_)
@@ -831,36 +1905,26 @@ class MoKForwardMXFP8:
         hidden_sc_t = torch.empty((i_tiles, m_tiles, 32, 16), **bytes_)
         y_shared = torch.empty_like(x)
         y_routed = torch.empty((macro_size, hidden), **options)
-        shared_rows, routed_rows = local_tokens // 256, capacity // 256
-        shared_tasks = shared_rows * (intermediate // 256) + shared_rows * (
-            (hidden + 511) // 512
+        rows = g.shared_rows + g.routed_rows
+        # combine_next is the launch-wide task counter: compute CTAs that
+        # finished their GEMM and SwiGLU work claim final-combine tasks
+        # alongside communication CTAs.
+        x_ready, gate_ready, hidden_ready, y_ready, y_done, combine_next = _zero_slab(
+            x.device,
+            g.minis,
+            rows * (intermediate // 256),
+            rows,
+            g.minis,
+            capacity // 128,
+            1,
         )
-        mini_swiglu = ((mini_size // 128) * (intermediate // 128) + 5) // 6
-        tile = mxfp8_tile_cols(x.device)
-        # 256 x 512 targets compute and save gate and up in one tile; 256 x 256
-        # targets use separate gate and up tiles per 256-column block.
-        gate_passes = 1 if tile == 512 else 2
-        mini_tasks = (
-            gate_passes * (mini_size // 256) * (intermediate // 256)
-            + mini_swiglu
-            + (mini_size // 256) * ((hidden + tile - 1) // tile)
-        )
-        minis = (capacity + mini_size - 1) // mini_size
-        counter_opts = dict(dtype=torch.int32, device=x.device)
-        x_ready = torch.zeros(minis, **counter_opts)
-        gate_ready = torch.zeros(
-            (shared_rows + routed_rows) * (intermediate // 256), **counter_opts
-        )
-        hidden_ready = torch.zeros(shared_rows + routed_rows, **counter_opts)
-        y_ready = torch.zeros(minis, **counter_opts)
-        y_done = torch.zeros(capacity // 128, **counter_opts)
-        # Launch-wide task counter: compute CTAs that finished their GEMM and
-        # SwiGLU work claim final-combine tasks alongside communication CTAs.
-        combine_next = torch.zeros(1, **counter_opts)
-        layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
-        with tvm_ffi.use_torch_stream():
-            self.module.launch(
-                grid=(2 * (shared_tasks + minis * mini_tasks) + comm_sms, 1, 1),
+        if layout is None:
+            layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
+        elif layout.numel() != 3 * experts + capacity // 256:
+            raise ValueError("layout does not match the schedule geometry")
+        with _ffi_stream():
+            module.launch(
+                grid=(2 * (g.shared_tasks + g.minis * g.mini_tasks) + comm_sms, 1, 1),
                 x_shared=x,
                 wg_shared=shared_gate.unsqueeze(0),
                 wu_shared=shared_up.unsqueeze(0),
@@ -919,10 +1983,10 @@ class MoKForwardMXFP8:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
-                mini_tasks_div=_fast_divmod(mini_tasks),
-                minis_per_macro_div=_fast_divmod(macro_size // mini_size),
-                gate_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
-                down_col_blocks_div=_fast_divmod((hidden + tile - 1) // tile),
+                mini_tasks_div=g.mini_tasks_div,
+                minis_per_macro_div=g.minis_per_macro_div,
+                gate_col_blocks_div=g.gate_col_blocks_div,
+                down_col_blocks_div=g.down_col_blocks_div,
             )
         # Native MXFP8 context: transposed x and activation for the weight
         # gradients, E4M3 gate/up for SwiGLU backward, BF16 shared tensors.
@@ -940,7 +2004,11 @@ class MoKForwardMXFP8:
 
 
 class MoKRecomputeMXFP8:
-    """Native-signature MXFP8 context-only recompute; caller owns peer barriers."""
+    """Native-signature MXFP8 context-only recompute; caller owns peer barriers.
+
+    Launch-invariant geometry is memoised per geometry; the counters are one
+    zero-filled slab per call.
+    """
 
     def __init__(self, clamped=False):
         from .jit import load_kernel
@@ -949,6 +2017,7 @@ class MoKRecomputeMXFP8:
         self.module = load_kernel(_role("recompute_mxfp8", clamped))
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
+        self._geometry = {}
 
     def __call__(
         self,
@@ -967,9 +2036,10 @@ class MoKRecomputeMXFP8:
         comm_sms,
         macro_size,
         mini_size,
+        *,
+        layout=None,
     ):
         import torch
-        import tvm_ffi
 
         check_swiglu_limit(swiglu_limit, self.clamped)
         local_tokens, hidden = x.shape
@@ -995,7 +2065,19 @@ class MoKRecomputeMXFP8:
         (x_peers,) = _peer_table(self._peer_tables, x.device, x_ptrs)
         bf16 = dict(device=x.device, dtype=torch.bfloat16)
         u8 = dict(device=x.device, dtype=torch.uint8)
-        m_t, h_t, i_t = macro_size // 128, hidden // 128, intermediate // 128
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
+        )
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(self._geometry, key, _recompute_mxfp8_geometry(*key[:6]))
+        m_t, h_t, i_t = g.m_tiles, g.h_tiles, g.i_tiles
         x_q, x_sc = (
             torch.empty((macro_size, hidden), **u8),
             torch.empty((m_t, h_t, 32, 16), **u8),
@@ -1029,25 +2111,17 @@ class MoKRecomputeMXFP8:
             torch.empty((intermediate, macro_size), **u8),
             torch.empty((i_t, m_t, 32, 16), **u8),
         )
-        routed_capacity = min(capacity, macro_size)
-        shared_rows, routed_rows = local_tokens // 256, routed_capacity // 256
-        shared_gate_tasks = shared_rows * ((intermediate + 511) // 512)
-        mini_gate_tasks = (mini_size // 256) * (intermediate // 256)
-        shared_swiglu = ((local_tokens // 128) * (intermediate // 128) + 5) // 6
-        mini_swiglu = ((mini_size // 128) * (intermediate // 128) + 5) // 6
-        shared_tasks = 2 * shared_gate_tasks + shared_swiglu
-        mini_tasks = 2 * mini_gate_tasks + mini_swiglu
-        minis = (routed_capacity + mini_size - 1) // mini_size
-        c = dict(dtype=torch.int32, device=x.device)
-        x_ready = torch.zeros(minis, **c)
-        gate_ready = torch.zeros(
-            (shared_rows + routed_rows) * (intermediate // 256), **c
+        rows = g.shared_rows + g.routed_rows
+        x_ready, gate_ready, hidden_ready = _zero_slab(
+            x.device, g.minis, rows * (intermediate // 256), rows
         )
-        hidden_ready = torch.zeros(shared_rows + routed_rows, **c)
-        layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
-        with tvm_ffi.use_torch_stream():
+        if layout is None:
+            layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
+        elif layout.numel() != 3 * experts + capacity // 256:
+            raise ValueError("layout does not match the schedule geometry")
+        with _ffi_stream():
             self.module.launch(
-                grid=(2 * (shared_tasks + minis * mini_tasks) + comm_sms, 1, 1),
+                grid=(2 * (g.shared_tasks + g.minis * g.mini_tasks) + comm_sms, 1, 1),
                 x_shared=x,
                 wg_shared=shared_gate.unsqueeze(0),
                 wu_shared=shared_up.unsqueeze(0),
@@ -1095,8 +2169,8 @@ class MoKRecomputeMXFP8:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
-                mini_tasks_div=_fast_divmod(mini_tasks),
-                gate_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
+                mini_tasks_div=g.mini_tasks_div,
+                gate_col_blocks_div=g.gate_col_blocks_div,
             )
         return (
             (x_t, x_sc_t),
@@ -1115,6 +2189,9 @@ class MoKBackwardMXFP8:
     Routed gate/up weights are ``(fp8, sc, fp8_t, sc_t)`` and routed down
     weights ``(fp8_t, sc_t)``, as MoK's ``mxfp8_quantize(w, True, True)``
     produces them; the forward context is the MXFP8 forward's.
+
+    Launch-invariant geometry is memoised per geometry; the counters are one
+    zero-filled slab per call.
     """
 
     def __init__(self, clamped=False, fp32_wgrad=False):
@@ -1125,6 +2202,7 @@ class MoKBackwardMXFP8:
         self.zero_module = load_kernel("zero")
         self.layout_module = load_kernel("expert_layout")
         self._peer_tables = {}
+        self._geometry = {}
 
     def __call__(
         self,
@@ -1161,9 +2239,10 @@ class MoKBackwardMXFP8:
         macro_size,
         mini_size,
         weight_grad_accumulators=None,
+        *,
+        layout=None,
     ):
         import torch
-        import tvm_ffi
 
         check_swiglu_limit(swiglu_limit, self.clamped)
         if (weight_grad_accumulators is not None) != self.fp32_wgrad:
@@ -1225,7 +2304,24 @@ class MoKBackwardMXFP8:
         )
         bf16 = dict(device=dev, dtype=torch.bfloat16)
         u8 = dict(device=dev, dtype=torch.uint8)
-        m_t, h_tiles, i_tiles = macro_size // 128, hidden // 128, intermediate // 128
+        key = (
+            local_tokens,
+            hidden,
+            intermediate,
+            capacity,
+            macro_size,
+            mini_size,
+            experts,
+            dev,
+        )
+        g = _recall(self._geometry, key)
+        if g is None:
+            g = _remember(
+                self._geometry,
+                key,
+                _backward_mxfp8_geometry(*key[:7], mxfp8_tile_cols(dev)),
+            )
+        m_t, h_tiles, i_tiles = g.m_tiles, g.h_tiles, g.i_tiles
         router_weights = torch.empty(macro_size, dtype=torch.float32, device=dev)
         partials = torch.empty(
             macro_size, intermediate // 128, dtype=torch.float32, device=dev
@@ -1302,56 +2398,36 @@ class MoKBackwardMXFP8:
             dwg_routed = torch.empty((experts, intermediate, hidden), **bf16)
             dwu_routed = torch.empty_like(dwg_routed)
             dwd_routed = torch.empty((experts, hidden, intermediate), **bf16)
-        minis = (capacity + mini_size - 1) // mini_size
-        macros = (capacity + macro_size - 1) // macro_size
-        shared_rows, routed_rows = local_tokens // 256, capacity // 256
-        ib = intermediate // 256
-        c = dict(dtype=torch.int32, device=dev)
-        dy_ready, dx_ready, replay_x = (
-            torch.zeros(minis, **c),
-            torch.zeros(minis, **c),
-            torch.zeros(minis, **c),
+        rows = g.shared_rows + g.routed_rows
+        (
+            dy_ready,
+            dx_ready,
+            replay_x,
+            dh_ready,
+            dg_ready,
+            replay_gu,
+            replay_h,
+            buffers_done,
+            weight_ready,
+        ) = _zero_slab(
+            dev,
+            g.minis,
+            g.minis,
+            g.minis,
+            rows * g.ib,
+            rows,
+            g.routed_rows * g.ib,
+            g.routed_rows,
+            g.macros * (experts + 1),
+            g.macros,
         )
-        dh_ready = torch.zeros((shared_rows + routed_rows) * ib, **c)
-        dg_ready = torch.zeros(shared_rows + routed_rows, **c)
-        replay_gu, replay_h = (
-            torch.zeros(routed_rows * ib, **c),
-            torch.zeros(routed_rows, **c),
-        )
-        buffers_done, weight_ready = torch.zeros(macros, **c), torch.zeros(macros, **c)
-        tile = mxfp8_tile_cols(dev)
-        # Shared BF16 GEMM tasks use 512 columns; routed MXFP8 tasks use the target tile.
-        ibw, hbw = (intermediate + 511) // 512, (hidden + 511) // 512
-        ibr, hbr = (intermediate + tile - 1) // tile, (hidden + tile - 1) // tile
-        shared_tasks = (
-            shared_rows * (ibw + hbw)
-            + ((local_tokens // 128) * (intermediate // 128) + 3) // 4
-            + 3 * wgrad_tiles(hidden, intermediate)
-        )
-        mini_bwd = (mini_size // 256) * (ibr + hbr) + (
-            (mini_size // 128) * (intermediate // 128) + 3
-        ) // 4
-        mini_replay = (
-            2 * (mini_size // 256) * ib
-            + ((mini_size // 128) * (intermediate // 128) + 5) // 6
-        )
-        clusters = (
-            shared_tasks
-            + minis * mini_bwd
-            + max(0, minis - macro_size // mini_size) * mini_replay
-            + macros * 3 * experts * wgrad_tiles(hidden, intermediate, tile_cols=tile)
-        )
-        # Launch-invariant divisors of the per-task decode, passed as fast-divmod carriers.
-        shared_wgrad = wgrad_tiles(hidden, intermediate)
-        routed_wgrad = wgrad_tiles(hidden, intermediate, tile_cols=tile)
-        weight_tasks = experts * routed_wgrad
-        replay_macro_tasks = (macro_size // mini_size) * (
-            mini_replay + mini_bwd
-        ) + 3 * weight_tasks
-        layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
-        with tvm_ffi.use_torch_stream():
+        if layout is None:
+            layout = expert_layout(self.layout_module, counts, capacity, peer_rank)
+        elif layout.numel() != 3 * experts + capacity // 256:
+            raise ValueError("layout does not match the schedule geometry")
+        with _ffi_stream():
             self.module.launch(
-                grid=(comm_sms + 2 * clusters, 1, 1),
+                grid=(comm_sms + 2 * g.clusters, 1, 1),
                 dy_s=dy_buffer,
                 dg_s=dg_shared,
                 du_s=du_shared,
@@ -1469,16 +2545,16 @@ class MoKBackwardMXFP8:
                 macro_size=macro_size,
                 mini_size=mini_size,
                 swiglu_limit=0.0 if swiglu_limit is None else float(swiglu_limit),
-                mini_size_div=_fast_divmod(mini_size),
-                mini_bwd_div=_fast_divmod(mini_bwd),
-                mini_replay_div=_fast_divmod(mini_replay),
-                replay_macro_tasks_div=_fast_divmod(replay_macro_tasks),
-                weight_tasks_div=_fast_divmod(weight_tasks),
-                shared_wgrad_div=_fast_divmod(shared_wgrad),
-                routed_wgrad_div=_fast_divmod(routed_wgrad),
-                dh_col_blocks_div=_fast_divmod(ibr),
-                dx_col_blocks_div=_fast_divmod(hbr),
-                replay_col_blocks_div=_fast_divmod((intermediate + 255) // 256),
+                mini_size_div=g.mini_size_div,
+                mini_bwd_div=g.mini_bwd_div,
+                mini_replay_div=g.mini_replay_div,
+                replay_macro_tasks_div=g.replay_macro_tasks_div,
+                weight_tasks_div=g.weight_tasks_div,
+                shared_wgrad_div=g.shared_wgrad_div,
+                routed_wgrad_div=g.routed_wgrad_div,
+                dh_col_blocks_div=g.dh_col_blocks_div,
+                dx_col_blocks_div=g.dx_col_blocks_div,
+                replay_col_blocks_div=g.replay_col_blocks_div,
             )
             if not self.fp32_wgrad:
                 self.zero_module.launch(
@@ -1522,7 +2598,6 @@ class MoKCommunication:
 
     def all_gather_top_experts(self, routes, gathered, multicast_address, rank):
         import torch
-        import tvm_ffi
 
         if (
             not routes.is_cuda
@@ -1555,7 +2630,7 @@ class MoKCommunication:
         if ep == 1:
             gathered[0].copy_(routes)
         else:
-            with tvm_ffi.use_torch_stream():
+            with _ffi_stream():
                 self.gather_module.launch(
                     grid=(routes.numel() * 4 // self.chunk_bytes, 1, 1),
                     local_routes=routes,
@@ -1566,7 +2641,6 @@ class MoKCommunication:
 
     def barrier_all(self, counter, peer_pointers, multicast_address, target):
         import torch
-        import tvm_ffi
 
         ep = len(peer_pointers)
         if ep not in (1, 4, 8, 16, 32, 64):
@@ -1583,7 +2657,7 @@ class MoKCommunication:
             ):
                 raise ValueError("Barrier counters must be contiguous CUDA int32 [1]")
         if ep > 1:
-            with tvm_ffi.use_torch_stream():
+            with _ffi_stream():
                 self.barrier_module.launch(
                     grid=(1, 1, 1),
                     local_counter=counter.view(torch.uint32),
@@ -1592,12 +2666,53 @@ class MoKCommunication:
                     ep_size=ep,
                 )
 
+    def barrier_plan(self, counter, peer_pointers, multicast_address, target):
+        """:meth:`barrier_all` validated once: a :class:`_Plan` to launch with
+        ``plan.launch(())`` inside ``_ffi_stream()``, or None at EP 1 (no
+        barrier launch). The plan holds the uint32 views of the caller-owned
+        counters, which must outlive it."""
+        import torch
+
+        ep = len(peer_pointers)
+        if ep not in (1, 4, 8, 16, 32, 64):
+            raise ValueError("Unsupported EP size")
+        if type(multicast_address) is not int or multicast_address <= 0:
+            raise ValueError("A live multicast address is required")
+        for tensor in (counter, target):
+            if (
+                not tensor.is_cuda
+                or tensor.device != counter.device
+                or tensor.dtype != torch.int32
+                or tuple(tensor.shape) != (1,)
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError("Barrier counters must be contiguous CUDA int32 [1]")
+        if ep == 1:
+            return None
+        return _Plan(
+            self.barrier_module,
+            (1, 1, 1),
+            dict(
+                local_counter=counter.view(torch.uint32),
+                target_counter=target.view(torch.uint32),
+                multicast_address=multicast_address,
+                ep_size=ep,
+            ),
+            (),
+        )
+
 
 class MoKScheduler:
     """Three prepared kernel modules; allocations/resets match native MoK.
 
     Compilation is setup and must precede graph capture. The launch method
-    retains native recurring allocations, zeroes and sentinel initialization.
+    retains native recurring allocations: one zero-filled slab for the
+    counters and the ``-1`` sentinel of ``peer_rank``. The count kernel also
+    writes the per-owning-rank route counts into the tail of its ``counts``
+    buffer; :meth:`owner_loads` returns them (an int32 ``[world]`` view
+    created on demand, valid until :meth:`release_counts`). :meth:`layout`
+    derives the expert layout of a schedule once, with the ``expert_layout``
+    module loaded here, before capture.
     """
 
     def __init__(self, world_size: int, local_experts: int):
@@ -1610,10 +2725,11 @@ class MoKScheduler:
         self.count = load_kernel(f"count_{world_size}_{local_experts}")
         self.pad = load_kernel(f"pad_{world_size}")
         self.rows = load_kernel(f"rows_{world_size}_{local_experts}")
+        self.layout_module = load_kernel("expert_layout")
+        self._counts = None
 
     def __call__(self, topk_all, schedule_capacity: int, rank: int):
         import torch
-        import tvm_ffi
 
         if (
             not topk_all.is_cuda
@@ -1634,12 +2750,12 @@ class MoKScheduler:
         kwargs = dict(device=topk_all.device, dtype=torch.int32)
         peer_rank = torch.empty(schedule_capacity, **kwargs)
         peer_token = torch.empty(schedule_capacity, **kwargs)
-        num_tokens = torch.zeros(1, **kwargs)
-        per_expert = torch.empty(self.local_experts, **kwargs)
-        counts = torch.zeros(self.local_experts * world, **kwargs)
+        counts, num_tokens, per_expert = _zero_slab(
+            topk_all.device, self.local_experts * world + world, (1, self.local_experts)
+        )
         peer_rank.fill_(-1)
         # A single stream context preserves the surrounding native/graph stream.
-        with tvm_ffi.use_torch_stream():
+        with _ffi_stream():
             self.count.launch(
                 grid=((topk_all.numel() + 1023) // 1024, 1, 1),
                 topk_all=topk_all,
@@ -1667,15 +2783,38 @@ class MoKScheduler:
                 capacity=schedule_capacity,
                 rank=rank,
             )
+        self._counts = counts
         return peer_rank, peer_token, num_tokens, per_expert
+
+    def owner_loads(self):
+        """Routes per owning rank of the last call (int32 ``[world]``): the tail
+        the count kernel writes past its ``[local experts, world]`` block.
+        Padding (``-1``) and out-of-range ids count nowhere, as
+        ``count_routed_load`` specifies."""
+        if self._counts is None:
+            raise RuntimeError(
+                "Owner loads are produced by the scheduler call that precedes _observe_load"
+            )
+        return self._counts[self.local_experts * self.world_size :]
+
+    def release_counts(self):
+        """Drop the reference to the last call's counts; the schedule keeps the slab."""
+        self._counts = None
+
+    def layout(self, tokens_per_expert, capacity, peer_rank):
+        """The expert layout of a schedule: one launch per schedule, consumed by
+        every fused launch of it."""
+        return expert_layout(self.layout_module, tokens_per_expert, capacity, peer_rank)
 
 
 class MoKEpilogues:
-    """Prepared standalone epilogues: persistent (token, 1024-column) streams.
+    """Prepared standalone epilogues: persistent token-major streams.
 
+    CTA ``b`` of ``ctas`` reduces tokens ``b, b + ctas, ...`` through
+    registers, one 16-byte vector per thread and row, with no shared memory.
     Per vector the arithmetic is native: FP32 accumulation from the shared
     row, then the routed rows in ascending expert-slot order, one BF16
-    rounding. Top-k changes the physical shared-memory layout.
+    rounding.
     """
 
     def __init__(self, top_k: int):
@@ -1709,7 +2848,6 @@ class MoKEpilogues:
 
     def forward(self, shared, routed, scores):
         import torch
-        import tvm_ffi
 
         self._check(shared, routed)
         tokens, hidden = shared.shape
@@ -1721,8 +2859,8 @@ class MoKEpilogues:
         ):
             raise ValueError("Scores must be contiguous CUDA FP32 [tokens, top_k]")
         output = torch.empty_like(shared)
-        ctas = self._ctas(tokens, hidden, shared.device)
-        with tvm_ffi.use_torch_stream():
+        ctas = self._ctas(tokens, shared.device)
+        with _ffi_stream():
             self.forward_module.launch(
                 grid=(ctas, 1, 1),
                 shared=shared,
@@ -1735,15 +2873,57 @@ class MoKEpilogues:
             )
         return output
 
+    def plan(self, routed, scores=None):
+        """Validated epilogue launch over the caller-owned ``routed`` rows
+        (``[tokens * top_k, hidden]``) for ``tokens`` source rows: the forward
+        epilogue with per-call ``shared`` and ``scores``, or with
+        ``scores=False`` the backward epilogue. ``scores`` (forward only) is a
+        representative score tensor checked here; per call the caller passes
+        ``shared`` rows it allocated as ``[tokens, hidden]`` BF16 and FP32
+        ``[tokens, top_k]`` scores already validated against the same shape
+        (see :meth:`launch_planned`)."""
+        import torch
+
+        tokens, hidden = routed.shape[0] // self.top_k, routed.shape[1]
+        self._check(routed[:tokens], routed)
+        backward = scores is False
+        if not backward and (
+            tuple(scores.shape) != (tokens, self.top_k)
+            or scores.dtype != torch.float32
+            or scores.device != routed.device
+            or not scores.is_contiguous()
+        ):
+            raise ValueError("Scores must be contiguous CUDA FP32 [tokens, top_k]")
+        ctas = self._ctas(tokens, routed.device)
+        fixed = dict(routed=routed, tokens=tokens, hidden=hidden, ctas=ctas)
+        if backward:
+            fixed["scores"] = self._no_scores[routed.device]
+        return _Plan(
+            self.backward_module if backward else self.forward_module,
+            (ctas, 1, 1),
+            fixed,
+            ("shared", "output") if backward else ("shared", "scores", "output"),
+        )
+
+    @staticmethod
+    def launch_planned(plan, shared, scores=None):
+        """Launch an epilogue :meth:`plan` inside ``_ffi_stream()``; returns
+        the BF16 output, as :meth:`forward` / :meth:`backward` do."""
+        import torch
+
+        output = torch.empty_like(shared)
+        view = output.view(torch.uint32)
+        plan.launch((shared, view) if scores is None else (shared, scores, view))
+        return output
+
     def backward(self, shared, routed):
         import torch
-        import tvm_ffi
 
         self._check(shared, routed)
         tokens, hidden = shared.shape
         output = torch.empty_like(shared)
-        ctas = self._ctas(tokens, hidden, shared.device)
-        with tvm_ffi.use_torch_stream():
+        ctas = self._ctas(tokens, shared.device)
+        with _ffi_stream():
             self.backward_module.launch(
                 grid=(ctas, 1, 1),
                 shared=shared,
@@ -1756,7 +2936,7 @@ class MoKEpilogues:
             )
         return output
 
-    def _ctas(self, tokens, hidden, device):
+    def _ctas(self, tokens, device):
         import torch
 
         if device not in self._sms:
@@ -1764,6 +2944,6 @@ class MoKEpilogues:
                 device
             ).multi_processor_count
             self._no_scores[device] = torch.zeros(1, dtype=torch.float32, device=device)
-        # Two resident CTAs per SM (six 18 KB stages each for top-k 8).
-        units = tokens * ((hidden + EPI_COLS - 1) // EPI_COLS)
-        return max(1, min(units, 2 * self._sms[device]))
+        # Four CTAs per SM keep enough tokens in flight on the register path;
+        # a CTA owns at least one token.
+        return max(1, min(tokens, 4 * self._sms[device]))

@@ -22,7 +22,7 @@ FP64 token-serial reference of the same math (inputs at their BF16 values,
 the state rounded to FP32 after each real token) at ``atol = 1e-2``,
 ``rtol = 5e-3`` with no mismatch allowed; every slot the call must not touch
 is checked bitwise.  The matrix covers ``num_householder`` 1 to 4, the head
-counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 48 decode shapes
+counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 144 decode shapes
 of record among them), distinct write slots, padding rows (negative read
 slots, whose output rows keep the caller's values), rows without writeback,
 per-token state scatter with holes, ``disable_state_update``, the scale
@@ -31,7 +31,7 @@ the rejected arguments, batch-row independence, bitwise reproducibility and
 one launch of every exported program.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_gdp`` facade and the ``flashinfer`` top-level exposure are
@@ -49,7 +49,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_gdp")
 cake_build = cake_package("cake_gdp", "cake_build")
@@ -66,11 +66,11 @@ SEED = 760
 NUM_HOUSEHOLDER = (1, 2, 3, 4)
 HEADS = (1, 2, 3, 6, 10, 12, 20, 24, 40, 80)
 BATCHES = (1, 2, 3, 7, 16, 64, 257)
-TOKENS = (1, 2, 3, 4, 5, 8, 16)
-# The 48 decode shapes of record (num_householder = 3): every performance row is a correctness case.
+TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 16)
+# The 144 decode shapes of record (num_householder = 3): every performance row is a correctness case.
 PERF_HEADS = (80, 20, 10, 24)
 PERF_BATCHES = (1, 16, 64, 256)
-PERF_TOKENS = (1, 4, 8)
+PERF_TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16)
 SENTINEL = 7.5
 
 
@@ -442,7 +442,7 @@ def test_batch_sizes(B: int) -> None:
     ],
 )
 def test_decode_rows_of_record(H: int, B: int, T: int) -> None:
-    """The 48 decode shapes of record (num_householder = 3), each a full correctness case."""
+    """The 144 decode shapes of record (num_householder = 3), each a full correctness case."""
     _skip_unless_route(3, T)
     c = _make(B, T, H, 3, generator=_generator(4, H, B, T))
     out, _ = _run(c)
@@ -779,7 +779,8 @@ def _program_cases() -> list:
             and loader.max_num_tokens(arch, n, use_qk_l2norm) > T
         ):
             T = loader.max_num_tokens(arch, n, use_qk_l2norm)
-        # 27 x 24 = 648 lies in the one-wave-of-5 T = 1 band of SM100 / SM103 on 132-160 SMs.
+        # 27 x 24 = 648 lies in the T = 1 tail-wave rows (4 x sm, 5 x sm] of SM100 / SM103 on
+        # 132-160 SMs (l8r4 since the band rule change); 257 x 80 covers the many-wave rows.
         for B, H in itertools.product((1, 3, 7, 16, 64, 257, 27), (6, 12, 20, 24, 80)):
             if build["t_steps"] is None:
                 # The runtime program is the fallback: a T no static program owns selects it.
@@ -789,7 +790,7 @@ def _program_cases() -> list:
                 }
                 T = next(
                     t
-                    for t in (T, 16, 2, 3, 5, 6, 7)
+                    for t in (T, *range(2, build["max_t_steps"] + 1))
                     if t not in static and t <= build["max_t_steps"]
                 )
             if (
@@ -976,6 +977,32 @@ _STATE_HEAD_PROBES = (
     760,
     761,
     4096,
+    # the two-head edge 32 x sm and the many-wave edge 64 x sm, -1 / 0 / +1, for
+    # 132 / 148 / 152 / 160 SMs (every probe is tried on every SM count)
+    4223,
+    4224,
+    4225,
+    4735,
+    4736,
+    4737,
+    4863,
+    4864,
+    4865,
+    5119,
+    5120,
+    5121,
+    8447,
+    8448,
+    8449,
+    9471,
+    9472,
+    9473,
+    9727,
+    9728,
+    9729,
+    10239,
+    10240,
+    10241,
     20480,
 )
 
@@ -1070,10 +1097,18 @@ def test_misaligned_bf16_output_is_copied_back() -> None:
 def test_alignment_constants_match_the_kernel_sources() -> None:
     """The host checks' alignment constants are the widest vector accesses the shipped
     kernel sources make on q, k and the output (``reinterpret_cast`` on those pointers);
-    v, a and b are read element by element."""
+    v, a and b are read element by element (at most one 2-byte element per access)."""
     import flashinfer.cake_gdp_backend as backend
 
-    widths = {"__nv_bfloat162": 4, "uint2": 8, "uint4": 16, "float4": 16}
+    widths = {
+        "uint16_t": 2,
+        "unsigned": 4,
+        "__nv_bfloat162": 4,
+        "int2": 8,
+        "uint2": 8,
+        "uint4": 16,
+        "float4": 16,
+    }
     access = re.compile(
         r"reinterpret_cast<(?:const )?(\w+)\s*\*>\("
         r"(?:&\(\(\w+\*\)\()?(q|k|v|a|b|out)\b"
@@ -1086,7 +1121,7 @@ def test_alignment_constants_match_the_kernel_sources() -> None:
             widest[name] = max(widest.get(name, 0), widths[cast])
     assert widest["q"] == widest["k"] == backend._QK_ALIGNMENT_BYTES == 8
     assert widest["out"] == backend._OUTPUT_ALIGNMENT_BYTES == 8
-    assert not {"v", "a", "b"} & widest.keys(), widest
+    assert all(widest.get(name, 0) <= 2 for name in ("v", "a", "b")), widest
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
@@ -1145,22 +1180,27 @@ def _static_pick(
 @pytest.mark.parametrize("sm", (148, 152))
 def test_t1_band_edges_follow_the_sm_count(sm: int) -> None:
     """T = 1, three Householder steps, on `sm` SMs: the row-partition program up to 160
-    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], the
-    one-wave-of-5 program l8r4w5 takes (4 x sm, 5 x sm] and l8r4 resumes above it, while
-    SM90 ships neither program and keeps l8r4 above 160.  The choice depends on
+    state heads; on SM100 / SM103 the one-wave program l8r4p takes (160, 4 x sm], l8r4
+    takes (4 x sm, 64 x sm] (the tail-wave rows (4 x sm, 5 x sm] included: the
+    one-wave-of-5 band is off) and l8r4w5 takes every count above 64 x sm, while SM90
+    ships neither of the two and keeps l8r4 above 160.  The choice depends on
     (arch, T, B x HV, sm_count) only."""
     assert set(loader.ROUTES) == {"sm_90a", "sm_100a", "sm_103a"}
     for arch in loader.ROUTES:
         one_wave = "l8r4" if arch == "sm_90a" else "l8r4p"
-        tail_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
+        many_wave = "l8r4" if arch == "sm_90a" else "l8r4w5"
         expected = {
             160: ("splitv", "splitv8_tile8"),
             161: ("lanerow", one_wave),
             4 * sm: ("lanerow", one_wave),
-            4 * sm + 1: ("lanerow", tail_wave),
-            5 * sm: ("lanerow", tail_wave),
+            4 * sm + 1: ("lanerow", "l8r4"),
+            5 * sm: ("lanerow", "l8r4"),
             5 * sm + 1: ("lanerow", "l8r4"),
-            20480: ("lanerow", "l8r4"),
+            32 * sm - 1: ("lanerow", "l8r4"),
+            32 * sm: ("lanerow", "l8r4"),
+            64 * sm: ("lanerow", "l8r4"),
+            64 * sm + 1: ("lanerow", many_wave),
+            20480: ("lanerow", many_wave),
         }
         for state_heads, want in expected.items():
             assert _static_pick(arch, 3, 1, state_heads, sm) == want, (
@@ -1200,6 +1240,50 @@ def test_t4_band_follows_the_architecture(sm: int) -> None:
         assert ("l4r2" in variants) == (arch == "sm_90a"), (arch, sorted(variants))
         assert ("l8r4w5" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
         assert ("l8r4p" in variants) == (arch != "sm_90a"), (arch, sorted(variants))
+        assert "l8r4x2" not in variants, (
+            arch,
+            sorted(variants),
+        )  # the two-heads-per-CTA program ships nowhere
+
+
+# From T = 5 on, l8r2 serves up to k x SM state heads (one wave of k CTAs per SM).
+L8R2_CTAS_PER_SM = {
+    "sm_90a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 1},
+    "sm_100a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
+    "sm_103a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
+}
+
+
+@pytest.mark.parametrize("sm", (132, 148, 152, 160))
+def test_multi_token_bands_follow_the_architecture(sm: int) -> None:
+    """Three Householder steps at T = 2, 3, 5, 6, 7, 8 and 16: l8r4 serves every
+    state-head count at T = 2 and 3; from T = 5 on, l8r2 serves up to k x `sm` state
+    heads (``L8R2_CTAS_PER_SM``) and l8r4 the counts above."""
+    for arch in loader.ROUTES:
+        for T in (2, 3, 5, 6, 7, 8, 16):
+            k = L8R2_CTAS_PER_SM[arch][T] if T >= 5 else 0
+            for state_heads in (1, 24, k * sm, k * sm + 1, 4 * sm, 20480):
+                if state_heads < 1:
+                    continue
+                want = ("lanerow", "l8r2" if state_heads <= k * sm else "l8r4")
+                assert _static_pick(arch, 3, T, state_heads, sm) == want, (
+                    arch,
+                    T,
+                    state_heads,
+                    sm,
+                )
+
+
+@pytest.mark.parametrize("T", (2, 3, 4, 5, 6, 7, 8, 16))
+def test_static_programs_partition_every_token_count(T: int) -> None:
+    """For every static token count above one, exactly one static program of three
+    Householder steps admits every state-head count on every SM count the kernel may
+    meet, so the runtime program never serves these token counts."""
+    for arch in loader.ROUTES:
+        for sm in (132, 148, 152, 160):
+            for state_heads in (*range(1, 1300), 1536, 4096, 20480):
+                body, variant = _static_pick(arch, 3, T, state_heads, sm)
+                assert body == "lanerow", (arch, T, state_heads, sm, body, variant)
 
 
 def test_t1_static_programs_partition_every_sm_count() -> None:

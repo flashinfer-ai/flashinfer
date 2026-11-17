@@ -15,10 +15,22 @@ with per-variant SASS equivalence checks against the generated originals.
   out its own `defines`: the decode bodies that bake their constants in-file
   take none, and some bodies take only a subset of the keys), and the
   template, kernel symbol and parameters of its host shim (`host_binding`).
+  Five fields are not stored: `flashinfer/jit/cake_gdn.py` derives them when
+  it loads the manifest, so the record name `<domain>_<schedule>_<12 hex>`
+  is load-bearing for the resolver key. `domain` is its first token,
+  `source_schedule` is `flashinfer.cake_gdn.generated.<domain>:<schedule>`,
+  `tma_abi` is `grid_constant` for prefill and `pointer` for decode
+  (a decode record whose kernel takes its state as a tensor map spells
+  `"tma_abi": "grid_constant"`, and only such a record uses the TMA-state
+  host template), `host_binding.entry` is `run_<name>`, and the record-level
+  `architectures` is the sorted union of its outputs' `architectures`. An
+  entry that spells one of these out must agree with the derived value; the
+  loader refuses a disagreeing entry.
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
   several architectures carry each in `outputs[].architectures`; the
-  outputs of a record partition its `architectures`, and the loader
-  compiles the one output that lists the device's architecture. Genuine
+  outputs of a record are disjoint and their union is the record's derived
+  `architectures`; the loader compiles the one output that lists the
+  device's architecture. Genuine
   lowering differences sit behind exact `__CUDA_ARCH__` guards (SM107a takes
   the generic shared-address form, as Cake lowers it for every SM100-family
   target other than exact SM100a; the eight `fullgrid_vhold` prefill variants
@@ -63,15 +75,28 @@ with per-variant SASS equivalence checks against the generated originals.
   the templates take as `@NAME@` placeholders: `@ENTRY@`, `@MODULE_IDENT@`,
   `@CUDA_SYMBOL@` and `@SHIM_NAMESPACE@` come from `host_binding` (`entry`,
   `module_ident`, `cuda_symbol`, `shim_namespace`), every other placeholder
-  from `host_binding.params`. `flashinfer/jit/cake_gdn.py` renders the shim
-  text at load time; it is byte-identical to the former file
-  (`tests/gdn/cake_gdn_host_shim_sha256.json` pins it per variant). The
-  helpers the launchers share (device guard, tensor checks, dynamic
+  from `host_binding.params`. A `//@if metadata_i64` / `//@else` / `//@endif`
+  block of lines keeps its first arm for a record whose `metadata_i64` is true
+  and its second arm otherwise, so the int32-or-int64 metadata checks of the
+  SM107a prefill records render from their base's template; the directive
+  lines are dropped. `flashinfer/jit/cake_gdn.py` renders the shim
+  text at load time; `tests/cpu/gdn/cake_gdn_host_shim_sha256.json` pins
+  the rendered text per variant. The helpers the launchers share
+  (device guard, tensor checks, the `EncodeTma3D` TMA encoder, dynamic
   shared-memory opt-in) live in `host/cake_gdn_host_common.h`.
 
 `flashinfer/jit/cake_gdn.py` compiles the kernel to a cubin with `nvcc`,
 embeds it into the rendered host shim, and resolves requests to exactly one
 listed variant; requests outside the listed routes fail closed.
+
+Two more body-sharing `-D` knobs join `CAKE_GDN_KERNEL_SYMBOL` and `LAUNCH_MIN_BLOCKS`:
+`CAKE_GDN_METADATA_I64` (default 0 in-file) selects, inside the eight shared prefill bodies, the int32-or-int64 reads of
+`cu_seqlens` / `state_indices` / `checkpoint_cu_starts` and the `int metadata_i64_mask` kernel parameter (after `total_tiles`)
+(`CAKE_GDN_METADATA_I64_PARAM`); the SM107a `metadata_i64` records pass `-DCAKE_GDN_METADATA_I64=1` and their own
+kernel symbol and compile the same body as their SM100a/SM103a base record.  `CAKE_GDN_FP8_X2` (default `e4m3x2`)
+names the FP8 pair type inside the `cvt` instructions of the FP8-state bodies; the e5m2 records pass
+`-DCAKE_GDN_FP8_X2=e5m2x2`.  Expanding a shared body with a record's defines reproduces the former per-record file
+token for token (the e5m2 arm up to the names of a few local variables), under the per-variant SASS equivalence checks against the generated originals.
 
 ## Contracts
 
@@ -202,6 +227,40 @@ exported for `sm_107a` only; SM100a/SM103a keep `splitv8` at every count.  The
 host launches `B * HV` times the CTAs per state head of the resolved record
 (`cake_gdn_fp32_t1_ctas_per_state`, keyed by the record's schedule), and each
 shim checks that grid.
+
+The K-major (nontranspose) fp32-state T=1 row (`gated_delta_rule_decode`,
+H=16 / HV=32) follows the batch size on SM107a
+(`cake_gdn_nontranspose_fp32_t1_route`): `mid4_rc_kq128` below 10 rows and,
+from 10 rows on (the upper small band 10-31, which formerly ran
+`mid4_rc_kq128`, and the whole large band, which formerly ran `tilev32_x2` for
+32-36 and `hqsplit` from 37), `gdn_decode_nontranspose_fp32_t1_hqsplit_tma3`:
+the `hqsplit` statements and
+accumulation order (bitwise-identical output and state) with each 32-wide V
+panel of the state loaded and stored by TMA through a three-stage ring of
+128-byte-swizzled shared-memory panels (51328 bytes of dynamic shared memory,
+above the 48 KiB default, so the shim opts in once per device). Its kernel
+takes the state as a `const __grid_constant__ CUtensorMap`, so its records
+spell `"tma_abi": "grid_constant"` and launch through
+`host/templates/decode_fp32_t1_tma_state.cc.in`, which checks the state as
+the pointer template does (FP32, contiguous `[B, HV, 128, 128]`) plus a
+16-byte aligned base address, and passes the 4D map (V, K, HV, B; box
+32 x 128 x 1 x 1). The map is a function of the state's base address, batch
+and head count alone, so each host thread keeps the maps it encoded in a
+64-slot table keyed by (device, address, B, HV) and encodes only on a miss; a
+hit passes the bytes a fresh encode returns. The map is a by-value kernel
+parameter: a CUDA graph captures it with the launch, so a replay addresses the
+state tensor the capture saw, exactly as the pointer ABI's captured pointer
+does; a different state tensor needs its own capture (or the eager path, which
+looks the map up per call). The TMA-state records cover
+H=16 / HV=32 only; the H=4 / HV=8 trace row keeps `mid4_rc_kq128` in the
+upper small band. The H=16 / HV=32 B=28 row at scale 1.0 also keeps
+`mid4_rc_kq128` (`hqsplit_tma3` ran it at 0.996x on a 216-SM R200; the same
+row at scale K^-0.5 takes `hqsplit_tma3`). SM100a/SM103a keep the shipped
+bodies. On every architecture the public nontranspose decode keeps the kernel
+entry and grid it resolved per (device, B, H, HK, HV, scale, l2norm)
+(`gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES`) after the per-call checks, so an
+eager call resolves its route and loads its module only on the first call of
+a row.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

@@ -140,7 +140,7 @@ class ArtifactPath:
 
     # The trtllm-gen packages below are single-package, multi-architecture: one
     # publish carries the Blackwell (sm100f/sm103a) and Rubin (sm107a) cubins.
-    TRTLLM_GEN_FMHA: str = "35cb99413a3ebce2e87a03fc04196e528e22c8d5/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "f50085594b9adcf9cbde7b8ea108c8587fa99b4c/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "e643028ab99bd4aeeee924c81ddf4d47b4d7bcbd/batched_gemm-966f068-4d954ad/"
     )
@@ -167,7 +167,7 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "d7cfe9b3cd53bf197641d0ad0a04450130958206544604a17c3c6745095d851e"
+        "f53552f4c10c58b222162cd56f62eda24ae967aed88a955ea6b07be7416cbddc"
     )
     TRTLLM_GEN_BMM: str = (
         "0da698648f30f9c10e4d6649190eb8a1b1f93c17bd5509b285756d434cd5291a"

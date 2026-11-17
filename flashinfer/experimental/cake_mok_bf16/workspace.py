@@ -8,7 +8,7 @@ Modified: standalone host-only dependency closure and device admission.
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -41,8 +41,10 @@ class MoKConfig:
     all_gather_top_experts_chunk_bytes: int = 2048
     # Diagnostics of the imbalance-aware path: ``True`` prints each change of
     # the (forward, backward) communication-SM split to stderr, one line per
-    # rank, from the launch that applies it (``MoKFunctional._comm_split``).
-    # Off by default; no effect while ``imbalance_comm_sms`` is ``None``. The
+    # rank, from the launch that applies it (``MoKFunctional._comm_split``),
+    # and each change of the sm_107a MXFP8 forward program choice
+    # (``MoKFunctional._multimacro``). Off by default; the split lines need
+    # ``imbalance_comm_sms``. The
     # value is compared across ranks at workspace creation like every field; a
     # later ``dataclasses.replace`` on one rank only changes that rank's log.
     comm_split_log: bool = False
@@ -54,6 +56,14 @@ class MoKSchedule:
     peer_token_idx: torch.Tensor  # (schedule_capacity,) int32
     num_tokens: torch.Tensor  # (1,) int32
     tokens_per_expert: torch.Tensor  # (num_local_experts,) int32
+    # Expert layout the fused launches decode their tasks from, derived once per
+    # schedule by ``build_schedule`` from ``tokens_per_expert`` and ``peer_rank``:
+    # ``[counts | row offsets | real rows | expert of each 256-row block]``,
+    # (3 * num_local_experts + schedule_capacity // 256,) int32. ``None`` on a
+    # schedule built without it; every launcher then derives the layout itself.
+    # A copy made with ``dataclasses.replace`` that changes ``peer_rank``,
+    # ``tokens_per_expert`` or the capacity must pass ``layout=None``.
+    layout: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +115,17 @@ class MoKWorkspace:
     barrier_buffer_ptrs: list[int]  # (ep_size,) uintptr64
     barrier_buffer_multicast_ptr: int  # () uintptr64
     barrier_target: torch.Tensor  # (1,) int32
+    # Launch plans of the adapters that use this workspace
+    # (``MoKFunctional._plan``): validated, prebuilt launch arguments and the
+    # persistent counter slabs, keyed by launcher, geometry, split and SwiGLU
+    # variant. Owned here so they live and die with the buffers they name;
+    # weights and per-call tensors are never part of a plan. A plan's counter
+    # slab is reset on the stream of every launch that uses it, so all MoK
+    # operations on one workspace must run in one stream order (as the shared
+    # x/combine buffers already require).
+    launch_plans: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
 
 def validate_workspace_args(

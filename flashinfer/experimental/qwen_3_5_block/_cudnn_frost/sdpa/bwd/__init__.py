@@ -24,8 +24,6 @@ _LAZY_EXPORTS = {
     "SdpaBwdDslSm107": (".api_dsl_sm107", "SdpaBwdDslSm107"),
     "SdpaBwdDslSm107Fp8": (".api_dsl_sm107", "SdpaBwdDslSm107Fp8"),
     "SdpaBwdDslSm100D256": (".api_dsl_sm100_d256", "SdpaBwdDslSm100D256"),
-    "SparseGqaBwdDslSm100": (".sparse_gqa_sm100", "SparseGqaBwdDslSm100"),
-    "sparse_gqa_bwd_wrapper_sm100": (".sparse_gqa_sm100", "sparse_gqa_bwd_wrapper_sm100"),
     "Nvfp4AttentionQatBackward": (".qat", "Nvfp4AttentionQatBackward"),
     "nvfp4_attention_qat_backward": (".qat", "nvfp4_attention_qat_backward"),
 }

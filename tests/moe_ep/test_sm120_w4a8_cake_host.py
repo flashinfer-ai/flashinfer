@@ -1127,10 +1127,11 @@ def test_knob_cache_round_trip_and_bucket_choice(tmp_path, monkeypatch) -> None:
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
         cake_knob_cache as K,
     )
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
 
     path = tmp_path / "knobs.json"
     other = {"dtype": "fp8_e4m3", "world_size": 4, "max_tokens": 512, "knobs": {"x": 1}}
-    path.write_text(json.dumps({"version": 1, "entries": [other]}))
+    path.write_text(json.dumps({"version": KNOB_CACHE_VERSION, "entries": [other]}))
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(path))
     reach = [[i != j for j in range(4)] for i in range(4)]
     key = dict(

@@ -33,7 +33,6 @@ BYTES_PER_KIB = 1024
 # metadata and scratch) must fit it; TOTAL_SMEM_BUDGET_KIB sizes the Q and
 # K/V pipelines below it.
 SMEM_CAPACITY_KIB = 227
-
 # The M64N256 profile stages one 256-row K or V tile per shared-ring slot. A
 # 16-bit tile is 64 KiB, so three stages, the 16-KiB Q stage, the tail
 # exchange and the metadata fill the SM100 carveout. A byte-wide tile is
@@ -51,17 +50,27 @@ KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES = 4
 # column mapping undoes the permutation for masking and Sage scales.
 KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 
+# A fast SMEM conversion row has 128 FP4 values: sixteen packed 32-bit words.
+# Its register payload appends eight E4M3 scales packed into two more words.
+NVFP4_ROW_PACKED_WORDS = 16
+NVFP4_ROW_PACKET_WORDS = NVFP4_ROW_PACKED_WORDS + 2
+
 # Keep the old maximum as the exponent reference while a new maximum is at
 # most eight log2 units larger. This avoids an output-correction round without
 # letting an intermediate probability exceed 2**8; the softmax identity is
 # unchanged apart from normal finite-precision rounding. As in the
 # FlashInfer/TRT-LLM policy, this assumes normal model logits rather than
-# adversarial values outside the qualified probability bound. Streamed KV256
-# and block-sparse Keeps profiles apply it; see
-# ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
+# adversarial values outside the qualified probability bound. Keeps profiles
+# apply it; see ``FmhaDecodeConfig.defers_softmax_anchor_updates``. It bounds
 # ``FmhaDecodeConfig.softmax_rescale_threshold_log2``, is its 16-bit default,
 # and is the block-sparse plans' default for every P dtype.
 SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
+
+# KV256 tiles run at most this many score pairs of a streamed K32 fragment as
+# FMA polynomials, below the share that KV128 tiles take on SM100: their
+# 16-bit fragment loops slow down with a larger share. See
+# ``FmhaDecodeConfig.fragment_ex2_emulated_pairs``.
+KV_TILE_256_MAX_EX2_EMULATED_PAIRS = 4
 
 # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
 # the resulting register hand-off has a fixed cost. Paired B200 measurements
@@ -125,6 +134,12 @@ AUTO_LAUNCH_TILE_SIZE_KV = 128
 # enough K/V work to amortize GMEM reduction. The B200-qualified
 # crossover is 2,048 tokens: 16 KV128 tiles or 8 KV256 tiles.
 SPLIT_KV_MIN_TOKENS_PER_CTA = 2_048
+
+# Splitting a grid that already fills a wave only trims its partial final
+# wave, so each split must keep enough K/V work to repay the extra waves and
+# reduction. GB300 NVFP4 TileQ8 at B128/Hkv2: four splits lose 7% at 16K KV
+# tokens (4,096 per split), tie at 32K and win 4-8% at 64K.
+FULL_GRID_SPLIT_MIN_TOKENS_PER_CTA = 8_192
 
 # Two interleaved K/V instances form the decode cadence: instance 0 is the
 # first K/P/V stream in each loop iteration and instance 1 is the second. These

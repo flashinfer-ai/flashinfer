@@ -17,7 +17,11 @@
 Uses ``SmemDeepSeekSfAbSmem`` struct:
 
     float mDqSfsAct[num_stages_sf][max(tile_token_dim, 32)]
-    float mDqSfsWeights[num_stages_sf][1] # per-expert weight scales
+    float mDqSfsWeights[num_stages_sf][num_weight_sfs]  # per weight-row group
+
+``num_weight_sfs`` is ``tile_m / deepseek_fp8_block_size`` for swapAB (one
+scale per block of weight rows) and ``1`` for the non-swap path (one scale per
+``tile_n`` weight tile).
 
 A single cp.async producer warp (LoadSfAbTask) fills these arrays per K-chunk.
 The epilogue consumes them in
@@ -59,8 +63,8 @@ class SmemDeepSeekSfAbResource(MemoryResource):
     """SMEM staging for DeepSeek FP8 per-K-chunk FP32 dequant SFs.
 
     Producer (LoadSfAbTask, single warp): cp.async loads one tile of activation
-    floats from ``ptrSfB[token, k_chunk]`` and ``1`` weight float from
-    ``ptrSfA[expert, k_chunk]`` per K-tile into the current stage.
+    floats from ``ptrSfB[token, k_chunk]`` and the tile's weight floats from
+    ``ptrSfA[expert, row_group, k_chunk]`` per K-tile into the current stage.
 
     Consumer (epilogue, all 4 warps): waits per K-tile, reads
     ``act_lane * weight`` from the stage, FMA-applies to the partial
@@ -163,8 +167,8 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         self.dsfp8_expert_idx = Int32(0)
         self.dsfp8_token_base = Int32(0)
         self.dsfp8_token_limit = Int32(0)
-        self.dsfp8_weight_tile_idx = Int32(0)
-        self.dsfp8_num_weight_tiles = Int32(1)
+        self.dsfp8_weight_group_base = Int32(0)
+        self.dsfp8_num_weight_groups = Int32(1)
         self.dsfp8_num_k_blocks = Int32(1)
         self.dsfp8_act_token_stride = Int32(1)
         self.dsfp8_last_act_stage_ptr = Int64(0)
@@ -250,38 +254,40 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         )
 
         expert_idx = Int32(0)
+        token_cga = token_tile // Int32(self.cfg.token_cluster_dim)
         if cutlass.const_expr(self.tile_idx_view is not None):
-            expert_idx = self.tile_idx_view.load(
-                idx=token_tile // Int32(self.cfg.token_metadata_stride), vector_size=1
-            )[0]
+            expert_idx = self.tile_idx_view.load(idx=token_cga, vector_size=1)[0]
         tile_rows = self.cfg.tile_n if self.cfg.is_swap_ab else self.cfg.tile_m
         token_limit = Int32(tile_rows)
         if cutlass.const_expr(self.mn_limit_view is not None):
             token_limit = self._local_tile_limit(
-                self.mn_limit_view.load(
-                    idx=token_tile // Int32(self.cfg.token_metadata_stride),
-                    vector_size=1,
-                )[0],
+                self.mn_limit_view.load(idx=token_cga, vector_size=1)[0],
                 token_tile,
                 tile_rows,
             )
 
+        # Weight scales are [expert, row group, K block]. SwapAB groups rows by
+        # the scale block, so one tile_m tile spans
+        # num_dsfp8_weight_sfs_per_subblock consecutive groups (the per-stage
+        # count also multiplies in the K sub-blocks). The non-swap path keeps
+        # one group per tile_n tile.
+        block = Int32(self.cfg.deepseek_fp8_block_size)
         if cutlass.const_expr(self.cfg.is_swap_ab):
             self.dsfp8_token_base = tile_coord_n * Int32(self.cfg.tile_n)
-            self.dsfp8_weight_tile_idx = tile_coord_m
-            self.dsfp8_num_weight_tiles = (
-                self.problem_m + Int32(self.cfg.tile_m - 1)
-            ) // Int32(self.cfg.tile_m)
+            self.dsfp8_weight_group_base = tile_coord_m * Int32(
+                self.cfg.num_dsfp8_weight_sfs_per_subblock
+            )
+            self.dsfp8_num_weight_groups = (self.problem_m + block - Int32(1)) // block
         else:
             self.dsfp8_token_base = tile_coord_m * Int32(self.cfg.tile_m)
-            self.dsfp8_weight_tile_idx = tile_coord_n
-            self.dsfp8_num_weight_tiles = (
+            self.dsfp8_weight_group_base = tile_coord_n
+            self.dsfp8_num_weight_groups = (
                 self.problem_n + Int32(self.cfg.tile_n - 1)
             ) // Int32(self.cfg.tile_n)
 
         self.dsfp8_expert_idx = expert_idx
         self.dsfp8_token_limit = token_limit
-        self.dsfp8_num_k_blocks = (self.problem_k + Int32(127)) // Int32(128)
+        self.dsfp8_num_k_blocks = (self.problem_k + block - Int32(1)) // block
         if cutlass.const_expr(self.cfg.has_routed_act):
             # Routes expanded rows through ptrRouteMap,
             # then strides activation DQ SFs by params.numTokens.
@@ -302,52 +308,82 @@ class SmemDeepSeekSfAbResource(MemoryResource):
     @producer_work
     @cute.jit
     def load_sfab_tile(self, stage_info: StageInfo) -> None:
-        """LDGSTS copy activation SFs and one weight SF into this stage."""
+        """LDGSTS copy this K tile's activation and weight SFs into the stage.
+
+        Stage layout: ``[sub-block][token]`` activation scales, then
+        ``[sub-block][row group]`` weight scales. Sub-blocks past K (partial
+        last tile) load nothing; the epilogue applies a zero scale to them.
+        """
         stage_base = self.smem_buf.data_ptr(
             self.cfg.num_bytes_dsfp8_sfab_per_stage * stage_info.stage_idx
         )
 
         tidx, _, _ = cute.arch.thread_idx()
-        local_tid = tidx - Int32(self.cfg.load_sfab_warp_idx * 32)
-        k_block = stage_info.loop_offset
+        local_tid = tidx - Int32(self.cfg.warp_layout.load_sfab_warp_idx * 32)
+        k_tile = stage_info.loop_offset
+        num_subblocks = self.cfg.dsfp8_k_subblocks_per_tile
+        act_sfs_per_sub = self.cfg.num_dsfp8_act_sfs_per_subblock
+        wt_sfs_per_sub = self.cfg.num_dsfp8_weight_sfs_per_subblock
+        wt_stage_base = stage_base + Int32(self.cfg.num_dsfp8_act_sfs_per_stage * 4)
 
-        num_act_load_iters = (self.cfg.num_dsfp8_act_sfs_per_stage + 31) // 32
-        for load_iter in cutlass.range_constexpr(num_act_load_iters):
-            local_act_col = local_tid + Int32(load_iter * 32)
-            act_row = self.dsfp8_token_base + local_act_col
-            is_valid_act = (
-                (local_tid >= Int32(0))
-                & (local_act_col < Int32(self.cfg.num_dsfp8_act_sfs_per_stage))
-                & (local_act_col < self.dsfp8_token_limit)
-            )
-            if is_valid_act:
-                if cutlass.const_expr(
-                    self.cfg.has_routed_act and self.route_map_view is not None
-                ):
-                    act_row = self.route_map_view.load(idx=act_row, vector_size=1)[0]
-            act_gmem_offset = k_block * self.dsfp8_act_token_stride + act_row
-            act_gmem_src = self.sfb_gmem_base.data_ptr() + act_gmem_offset
-            act_smem_dst = stage_base + local_act_col * Int32(4)
-            # Predicated LDGSTS has no NVVM op form — emit @p cp.async inline.
-            prims.inline_ptx_hl(
-                "cp.async.ca.shared.global [{$r0}], [{$r1}], 4;",
-                read_only_args=[act_smem_dst, act_gmem_src],
-                pred=is_valid_act,
-            )
+        # One lane per weight-row group of this tile. A partial last tile has
+        # fewer groups than the tile, so clamp to the per-expert group count.
+        wt_group = self.dsfp8_weight_group_base + local_tid
+        is_valid_wt_group = (
+            (local_tid >= Int32(0))
+            & (local_tid < Int32(wt_sfs_per_sub))
+            & (wt_group < self.dsfp8_num_weight_groups)
+        )
 
-        wt_gmem_offset = (
-            (self.dsfp8_expert_idx * self.dsfp8_num_weight_tiles)
-            + self.dsfp8_weight_tile_idx
-        ) * self.dsfp8_num_k_blocks + k_block
-        wt_gmem_src = self.sfa_gmem_base.data_ptr() + wt_gmem_offset
-        wt_smem_dst = stage_base + Int32(self.cfg.num_dsfp8_act_sfs_per_stage * 4)
-        if local_tid == Int32(0):
-            prims.cp_async_shared_global(
-                wt_smem_dst,
-                wt_gmem_src,
-                size=4,
-                modifier=prims.LoadCacheModifier.CA,
+        num_act_load_iters = (act_sfs_per_sub + 31) // 32
+        for sub in cutlass.range_constexpr(num_subblocks):
+            k_block = k_tile * Int32(num_subblocks) + Int32(sub)
+            k_in_bounds = k_block < self.dsfp8_num_k_blocks
+            for load_iter in cutlass.range_constexpr(num_act_load_iters):
+                local_act_col = local_tid + Int32(load_iter * 32)
+                act_row = self.dsfp8_token_base + local_act_col
+                is_valid_act = (
+                    (local_tid >= Int32(0))
+                    & (local_act_col < Int32(act_sfs_per_sub))
+                    & (local_act_col < self.dsfp8_token_limit)
+                    & k_in_bounds
+                )
+                if is_valid_act:
+                    if cutlass.const_expr(
+                        self.cfg.has_routed_act and self.route_map_view is not None
+                    ):
+                        act_row = self.route_map_view.load(idx=act_row, vector_size=1)[
+                            0
+                        ]
+                act_gmem_offset = k_block * self.dsfp8_act_token_stride + act_row
+                act_gmem_src = self.sfb_gmem_base.data_ptr() + act_gmem_offset
+                act_smem_dst = (
+                    stage_base
+                    + Int32(sub * act_sfs_per_sub * 4)
+                    + local_act_col * Int32(4)
+                )
+                # Predicated LDGSTS has no NVVM op form — emit @p cp.async inline.
+                prims.inline_ptx_hl(
+                    "cp.async.ca.shared.global [{$r0}], [{$r1}], 4;",
+                    read_only_args=[act_smem_dst, act_gmem_src],
+                    pred=is_valid_act,
+                )
+
+            wt_gmem_offset = (
+                (self.dsfp8_expert_idx * self.dsfp8_num_weight_groups) + wt_group
+            ) * self.dsfp8_num_k_blocks + k_block
+            wt_gmem_src = self.sfa_gmem_base.data_ptr() + wt_gmem_offset
+            wt_smem_dst = (
+                wt_stage_base + Int32(sub * wt_sfs_per_sub * 4) + local_tid * Int32(4)
             )
+            is_valid_wt = is_valid_wt_group & k_in_bounds
+            if is_valid_wt:
+                prims.cp_async_shared_global(
+                    wt_smem_dst,
+                    wt_gmem_src,
+                    size=4,
+                    modifier=prims.LoadCacheModifier.CA,
+                )
 
         cute.arch.fence_view_async_shared()
 
@@ -380,8 +416,13 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         t2r_rmem,
         t2r_rmem_1,
         t2r_output_call_idx,
+        k_subblock: Constexpr[int] = 0,
     ):
         """Attach the cached DS-FP8 scales to a T2R fragment.
+
+        ``k_subblock`` selects the scale sub-block of the current K tile. A
+        sub-block past K (partial last tile) gets a zero scale, so its
+        zero-filled partial cannot pick up stale SMEM.
 
         The separate accumulation work hook consumes the returned fragment and
         scale vector. Keeping the loop-carried accumulator update in that hook
@@ -400,17 +441,37 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             shape=(self.cfg.num_dsfp8_weight_sfs_per_stage,),
             addrspace=3,
         )
-        dq_w = wt_smem.load(idx=0, vector_size=1)[0]
+        act_sub_base = Int32(k_subblock * self.cfg.num_dsfp8_act_sfs_per_subblock)
+        wt_sub_base = Int32(k_subblock * self.cfg.num_dsfp8_weight_sfs_per_subblock)
+        k_in_bounds = cutlass.Boolean(True)
+        if cutlass.const_expr(self.cfg.dsfp8_k_subblocks_per_tile > 1):
+            block = Int32(self.cfg.deepseek_fp8_block_size)
+            num_k_blocks = (self.problem_k + block - Int32(1)) // block
+            k_block = stage_info.loop_offset * Int32(
+                self.cfg.dsfp8_k_subblocks_per_tile
+            ) + Int32(k_subblock)
+            k_in_bounds = k_block < num_k_blocks
 
         if cutlass.const_expr(self.cfg.is_swap_ab):
             tidx, _, _ = cute.arch.thread_idx()
             lane_id = tidx % Int32(32)
             warp_idx = cute.arch.warp_idx()
-            warp_in_epi = warp_idx - Int32(self.cfg.epilogue_warp_idx)
+            warp_in_epi = warp_idx - Int32(self.cfg.warp_layout.epilogue_warp_idx)
             warp_in_epi = cute.arch.make_warp_uniform(warp_in_epi)
             warpgroup_idx = warp_in_epi // Int32(4)
             warpgroup_idx = cute.arch.make_warp_uniform(warpgroup_idx)
-            warpgroup_count = max(1, self.cfg.num_epilogue_warps // 4)
+            # Epilogue warps own tile_m / num_epilogue_warps consecutive rows,
+            # so every row of a warp lies in one scale group.
+            wt_group = Int32(0)
+            if cutlass.const_expr(self.cfg.num_dsfp8_weight_sfs_per_subblock > 1):
+                rows_per_warp = (
+                    self.cfg.tile_m // self.cfg.warp_layout.num_epilogue_warps
+                )
+                wt_group = (warp_in_epi * Int32(rows_per_warp)) // Int32(
+                    self.cfg.deepseek_fp8_block_size
+                )
+            dq_w = wt_smem.load(idx=wt_sub_base + wt_group, vector_size=1)[0]
+            warpgroup_count = max(1, self.cfg.warp_layout.num_epilogue_warps // 4)
             n_subtile_offset = t2r_output_call_idx * Int32(
                 self.cfg.epi_tile_n * warpgroup_count
             ) + warpgroup_idx * Int32(self.cfg.epi_tile_n)
@@ -422,9 +483,13 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             for group in cutlass.range_constexpr(max(1, self.cfg.epi_tile_n // 8)):
                 reg_base = group * 4
                 col_off = Int32(group * 8)
-                sf_col = n_subtile_offset + base_tmem_col + col_off
+                sf_col = act_sub_base + n_subtile_offset + base_tmem_col + col_off
                 dq_ab0 = act_smem.load(idx=sf_col, vector_size=1)[0] * dq_w
                 dq_ab1 = act_smem.load(idx=sf_col + Int32(1), vector_size=1)[0] * dq_w
+                if cutlass.const_expr(self.cfg.dsfp8_k_subblocks_per_tile > 1):
+                    if not k_in_bounds:
+                        dq_ab0 = Float32(0.0)
+                        dq_ab1 = Float32(0.0)
                 dequant_scales[reg_base] = dq_ab0
                 dequant_scales[reg_base + 1] = dq_ab1
                 dequant_scales[reg_base + 2] = dq_ab0
@@ -438,8 +503,9 @@ class SmemDeepSeekSfAbResource(MemoryResource):
                 ),
             )
 
+        dq_w = wt_smem.load(idx=0, vector_size=1)[0]
         warp_idx = cute.arch.warp_idx()
-        warp_in_epi = warp_idx - Int32(self.cfg.epilogue_warp_idx)
+        warp_in_epi = warp_idx - Int32(self.cfg.warp_layout.epilogue_warp_idx)
         warp_in_epi = cute.arch.make_warp_uniform(warp_in_epi)
         lane_id = cute.arch.lane_idx()
         row_in_tile = warp_in_epi * Int32(32) + lane_id

@@ -54,7 +54,7 @@ kernel_cake_mok_pad_16(int* __restrict__ counts, int* __restrict__ tokens_per_ex
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int total = 0;
     #pragma unroll 1
     for (int peer = 0; peer < WORLD_SIZE; peer++) {
