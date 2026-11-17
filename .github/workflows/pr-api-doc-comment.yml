@@ -20,6 +20,53 @@ jobs:
       github.event.workflow_run.conclusion != 'skipped'
     continue-on-error: true
     runs-on: ubuntu-latest
+    env:
+      DOC_FIX_API_RST_MISSING: |
+        Add the public name to the appropriate `docs/api/*.rst` page under its `.. currentmodule::` and `.. autosummary::` (or use `.. autofunction::`). Verify the name is exported by that module. If a new page is needed, also add it to the `docs/index.rst` toctree.
+      DOC_FIX_API_RST_STALE: |
+        Verify the symbol's definition and public exports before changing the docs. If it was removed or renamed, update the RST entry to the current public name. If it is still exported without `@flashinfer_api`, this may be a checker limitation: explain that evidence rather than deleting valid docs or adding a decorator just to silence the warning.
+      DOC_FIX_DOCSTRING_COMPLETENESS: |
+        Edit the reported function's docstring. Keep the existing contract and add a structured NumPy `Parameters` section (or Google `Args:`) documenting each explicit argument's meaning, type, shapes, constraints and default, as applicable. Replace the placeholders in this template with facts from the implementation:
+
+        ```python
+        Parameters
+        ----------
+        argument_name : actual_type
+            Describe the argument and its actual default and constraints.
+        ```
+      DOC_FIX_ARGS_CONSISTENCY: |
+        In the reported function's docstring, add a separate NumPy parameter entry for each listed argument, or Google `Args:` entries such as `argument_name (actual_type): description`. Check the signature and implementation for the actual types, defaults and meaning.
+
+        Do not mix ordinary names and `**knobs` / `**options` in one parameter heading: give the keyword dictionary its own entry. Template (replace placeholders; include `**knobs` only if accepted):
+
+        ```python
+        Parameters
+        ----------
+        argument_name : actual_type
+            Meaning, shape, constraints and default.
+        **knobs
+            Additional keyword options accepted by this function.
+        ```
+      DOC_FIX_ENV_VARS_CONSISTENCY: |
+        Add the reported variable to the appropriate section of `docs/development/environment_variables.md`, linked from `AGENTS.md`. Read the reported source location to establish its purpose, accepted values, default when unset, and when it is read. Match the existing table's columns and record those facts; do not guess the default.
+
+        Row template (replace the variable, value and description):
+
+        ```markdown
+        | Variable | Default | Read in | Effect |
+        | --- | --- | --- | --- |
+        | `FLASHINFER_EXAMPLE` | Verified unset default | `flashinfer/example.py` | Describe purpose, accepted values and when read |
+        ```
+
+        Example setting: `export FLASHINFER_EXAMPLE=example_value`.
+      DOC_FIX_SUPPORTED_ARCH_CONSISTENCY: |
+        Compare the **Architecture guards** list in `docs/development/testing.md` with `is_sm*_supported()` and the relevant `supported_major_versions` declarations. Correct the source that is out of date using actual implemented support; do not claim hardware support merely to satisfy the checker.
+      DOC_FIX_QUICKREF_PATHS_EXIST: |
+        Correct the referenced path in the reported Markdown file (`AGENTS.md` or its linked development references) to an existing repository-relative path, or remove the obsolete reference if the file was intentionally deleted. Verify the file exists; do not create an empty file just to satisfy the check.
+      DOC_FIX_SKILL_REFS_EXIST: |
+        Edit the reported skill Markdown reference to point to the existing file, resolving relative paths from that skill's directory. Remove an obsolete reference only if the referenced capability was intentionally removed.
+      DOC_FIX_DOCS_INDEX_REFS_EXIST: |
+        Fix the reported `docs/index.rst` toctree entry so it resolves to an existing `.rst` page under `docs/`. If the page moved, update its path; if the entry was added before the page, add the intended page with real content.
     steps:
       - name: Resolve pull request number
         id: pr
@@ -113,6 +160,8 @@ jobs:
               .replace(/>/g, '&gt;')
               .replace(/\r?\n/g, ' ')
               .slice(0, 500);
+            const fixFor = (finding) => process.env[`DOC_FIX_${String(finding.check).toUpperCase()}`]?.trim()
+              || 'Check the reported source location and update the corresponding documentation to match the implementation.';
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner, repo, issue_number: prNumber, per_page: 100,
             });
@@ -175,7 +224,7 @@ jobs:
             const sections = [marker];
             if (publicApiFindings.length) {
               sections.push(
-                '# 🚨 POTENTIAL BREAKING PUBLIC API CHANGE DETECTED 🚨',
+                '# 🚨 POTENTIAL API BREAK 🚨',
                 '',
                 '> [!CAUTION]',
                 '> **THIS PR APPEARS TO BREAK THE PUBLIC API. AUTHORS AND REVIEWERS: DO NOT MISS THIS.**',
@@ -193,7 +242,12 @@ jobs:
                 '',
                 `${documentationFindings.length} new documentation finding(s):`,
                 '',
-                documentationRows.map((f) => `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`).join('\n'),
+                documentationRows.map((f) => [
+                  `- \`${escape(f.path)}:${Number(f.line) || 1}\` — ${escape(f.message)}`,
+                  '',
+                  '  **How to fix:**',
+                  ...fixFor(f).split('\n').map((line) => `  ${line}`),
+                ].join('\n')).join('\n\n'),
               );
             }
             if (failedChecks.length || reportErrors.length) {
@@ -233,6 +287,9 @@ jobs:
               .replace(/>/g, '&gt;')
               .replace(/\r?\n/g, ' ')
               .slice(0, 500);
+            const fixFor = (finding) => process.env[`DOC_FIX_${String(finding.check).toUpperCase()}`]?.trim()
+              || 'Check the reported source location and update the corresponding documentation to match the implementation.';
+            const documentationBody = (finding, key) => `<!-- ${marker} --><!-- key:${key} -->\n⚠️ **Documentation check:** ${escape(finding.message)}\n\n**How to fix:**\n${fixFor(finding)}`;
             const findings = [];
             for (const [file, category] of [
               ['reports/public-api.json', 'public_api'],
@@ -256,17 +313,18 @@ jobs:
               github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number: prNumber, per_page: 100 }),
             ]);
             const changedPaths = new Set(changedFiles.map((file) => file.filename));
-            const existingKeys = new Set(
+            const existingByKey = new Map(
               existingComments
                 .filter((comment) =>
                   comment.user?.login === 'github-actions[bot]'
                   && comment.body.includes(marker)
                 )
-                .map((comment) => comment.body.match(/<!-- key:(.*?) -->/)?.[1])
-                .filter(Boolean),
+                .map((comment) => [comment.body.match(/<!-- key:(.*?) -->/)?.[1], comment])
+                .filter(([key]) => key),
             );
             const candidates = [];
             const candidateKeys = new Set();
+            const updates = new Map();
             for (const finding of findings) {
               const path = String(finding.path || '');
               const line = Number(finding.line);
@@ -274,9 +332,23 @@ jobs:
                 .update(JSON.stringify([finding.check, path, finding.message]))
                 .digest('hex');
               if (!path || !Number.isInteger(line) || line < 1 || !changedPaths.has(path)) continue;
-              if (!existingKeys.has(key) && !candidateKeys.has(key)) {
+              const existing = existingByKey.get(key);
+              if (existing && finding.category === 'documentation') {
+                const body = documentationBody(finding, key);
+                if (existing.body !== body) {
+                  updates.set(existing.id, { owner, repo, comment_id: existing.id, body });
+                }
+              }
+              if (!existing && !candidateKeys.has(key)) {
                 candidates.push({ finding, key, path, line });
                 candidateKeys.add(key);
+              }
+            }
+            for (const update of [...updates.values()].slice(0, 20)) {
+              try {
+                await github.rest.pulls.updateReviewComment(update);
+              } catch (error) {
+                core.warning(`Could not update documentation guidance: ${error.message}`);
               }
             }
             const reviewComments = candidates.slice(0, 20).map(
@@ -286,7 +358,7 @@ jobs:
                 side: 'RIGHT',
                 body: finding.category === 'public_api'
                   ? `<!-- ${marker} --><!-- key:${key} -->\n🚨🚨🚨 **POTENTIAL BREAKING PUBLIC API CHANGE:** ${escape(finding.message)}`
-                  : `<!-- ${marker} --><!-- key:${key} -->\n⚠️ **Documentation check:** ${escape(finding.message)}`,
+                  : documentationBody(finding, key),
               })
             );
             if (!reviewComments.length) {

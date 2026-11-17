@@ -19,7 +19,7 @@ The public names are the facade's ``__all__`` and the backend objects it forward
 (``flashinfer.experimental.cake.cake_gqa_det_train``): each carries the mode (``det``) as a token, neither the
 family's former names and package paths nor the non-deterministic package's names are bound (no alias), and no entry
 point takes a ``deterministic`` keyword.  The rules shared by every #8928 family are checked with
-``tests.test_helpers.cake_mode_names``; the checks here are this family's own.  Nothing reads torch's
+``tests.cake.test_helpers.cake_mode_names``; the checks here are this family's own.  Nothing reads torch's
 deterministic mode: the package raises no alert.  Internal helpers and build identities (library stems
 ``cake_gqa_det_train_<hex>``, kernel symbols, csrc file names) keep their names.
 """
@@ -37,7 +37,7 @@ import torch
 
 import flashinfer
 import flashinfer.cake_gqa_det_train as public
-from tests.test_helpers.cake_mode_names import (
+from tests.cake.test_helpers.cake_mode_names import (
     assert_mode_names,
     assert_no_deterministic_keyword,
     assert_old_names_fail,
@@ -175,7 +175,7 @@ def test_facade_all_is_the_entries_and_reexports():
 
 
 def test_the_shared_mode_rules_hold():
-    """The #8928 rules shared by every family (``tests.test_helpers.cake_mode_names``): the facade's public names
+    """The #8928 rules shared by every family (``tests.cake.test_helpers.cake_mode_names``): the facade's public names
     carry ``det`` after the op, no entry point takes ``deterministic``, ``flashinfer``, the backend package and
     ``cake_backend`` bind each facade object and each backend object a facade entry calls only under the facade's
     name, and the family's former module paths and names, and the other mode's names, fail at import in a fresh

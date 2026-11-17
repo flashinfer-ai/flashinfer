@@ -12,7 +12,7 @@ limitations under the License.
 
 The mode names (FlashInfer #8928) of the two NON-DETERMINISTIC GDN facades, ``flashinfer.cake_gdn_nondet_train``
 (single rank) and ``flashinfer.cake_gdn_nondet_train_kcp`` (context-parallel), through the shared check
-``tests/test_helpers/cake_mode_names.assert_cake_mode_module``, with no exemption: every public name carries the word
+``tests/cake/test_helpers/cake_mode_names.assert_cake_mode_module``, with no exemption: every public name carries the word
 ``nondet`` right after the op, no public callable binds ``deterministic=`` at its signature, the facade, the
 ``flashinfer`` top level and the backend package and modules bind each object under its facade name only, and the
 former module paths and names fail at import in a fresh interpreter.  CPU only: nothing launches.
@@ -23,7 +23,7 @@ from __future__ import annotations
 import importlib
 import pathlib
 
-from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 

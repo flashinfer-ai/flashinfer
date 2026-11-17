@@ -71,9 +71,12 @@ CTAs, 512 for the 128-thread form) and
 :func:`bwd_slab_program` names the column-slab form per token count, SM count
 and architecture (the token-count bands ``BWD_SLAB_BANDS`` ahead of the
 per-architecture ``BWD_SLAB_PROGRAM``: the dynamic-schedule form ``dynr`` on
-sm_100a and sm_103a, ``xrsg`` on sm_107a; on sm_100a for ``1024 < T <= 4096``
-its late-claim form ``dynl``, which ``BWD_SLAB_FIT`` replaces with ``xrsg_p160``
-where the K7 units fit the SMs and at the chunk counts / runs it lists; inside
+sm_100a and sm_103a, its late-claim form ``dynl`` on sm_107a; on sm_100a for
+``1024 < T <= 4096`` ``dynl`` too, which ``BWD_SLAB_FIT`` replaces with ``xrsg_p160``
+where the K7 units fit the SMs and at the chunk counts / runs it lists; at
+H 5120 / 7168 the per-size bands name ``dynl`` and ``xrsg_p160`` on sm_100a and
+``xrsg_p160`` (at 5120 ``dynl`` above 960 tokens) on sm_103a, whose one-round
+rows of ``xrsg_p160`` ``BWD_SLAB_FIT`` launches as ``dynr``; inside
 the token-count bands of ``BWD_DPL_BANDS`` -- on sm_100a ``4095 < T <= 8192`` -- the ``_dpl``
 form of ``dynr`` / ``dynl``, whose ``dfn_part`` stores carry the L2 hint
 EVICT_LAST, and then the reduction's ``_dpl`` form, whose ``dfn_part``
@@ -3926,6 +3929,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_mhc_det_train_bwd_slab__dynl": {
         "arches": [
             "sm_100a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -4242,65 +4246,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "program": "xrsg_p160",
             "rule": "bwd_slab_program",
         },
-        "workspace_rule": {
-            "kind": "regions",
-            "workspace": "bwd",
-        },
-    },
-    "cake_mhc_det_train_bwd_slab__xrsg__a7": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "X"],
-            ["buffer", "dY"],
-            ["buffer", "dU"],
-            ["buffer", "dzp"],
-            ["buffer", "fnTp"],
-            ["buffer", "dX"],
-            ["buffer", "tokp"],
-            ["buffer", "dfn_part"],
-            ["parameter", "T"],
-            ["parameter", "P"],
-            ["parameter", "rpc"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunks_rule": "k7_chunks",
-            "kind": "slab_chunks",
-            "slabs": 64,
-        },
-        "hidden": 4096,
-        "kernel": "cake_mhc_det_train_bwd_slab__xrsg",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 232448,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_slab__xrsg",
-        "logical": {
-            "P": "parts",
-            "T": "rows",
-            "X": "x_flat",
-            "dU": "du",
-            "dX": "dx_flat",
-            "dY": "dy_flat",
-            "dfn_part": "dfn_part",
-            "dzp": "dzp_rows",
-            "fnTp": "fnTp",
-            "rpc": "rows_per_chunk",
-            "tokp": "tokp",
-        },
-        "role": "bwd_slab",
-        "select_rule": None,
         "workspace_rule": {
             "kind": "regions",
             "workspace": "bwd",
@@ -6256,6 +6201,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -6301,114 +6247,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "bwd_prepare",
         "select_rule": None,
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__t160__h5120__a7": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 1,
-        },
-        "hidden": 5120,
-        "kernel": "cake_mhc_det_train_bwd_prepare__t160__h5120",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__t160__h5120",
-        "launch": {
-            "block": (160, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 896,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__t160__h5120",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 0,
-            "at_most": 8192,
-            "kind": "rows_between",
-        },
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__h5120": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 2,
-        },
-        "hidden": 5120,
-        "kernel": "cake_mhc_det_train_bwd_prepare__h5120",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__h5120",
-        "launch": {
-            "block": (320, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 1664,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__h5120",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 8192,
-            "at_most": None,
-            "kind": "rows_between",
-        },
         "workspace_rule": None,
     },
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120": {
@@ -6548,6 +6386,76 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 2,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 113664,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h5120",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "program",
+            "program": "dot_ao8_trows_dyn",
+            "rule": "bwd_token_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h5120": {
         "arches": [
             "sm_107a",
@@ -6609,71 +6517,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "program",
             "program": "dot_ao8_l2l",
             "rule": "bwd_token_program",
-        },
-        "workspace_rule": {
-            "kind": "regions",
-            "workspace": "bwd",
-        },
-    },
-    "cake_mhc_det_train_bwd_slab__xrsg__h5120": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "X"],
-            ["buffer", "dY"],
-            ["buffer", "dU"],
-            ["buffer", "dzp"],
-            ["buffer", "fnTp"],
-            ["buffer", "dX"],
-            ["buffer", "tokp"],
-            ["buffer", "dfn_part"],
-            ["parameter", "T"],
-            ["parameter", "P"],
-            ["parameter", "rpc"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunks_rule": "k7_chunks",
-            "kind": "slab_chunks",
-            "slabs": 80,
-        },
-        "hidden": 5120,
-        "kernel": "cake_mhc_det_train_bwd_slab__xrsg__h5120",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg__h5120",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 232448,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_slab__xrsg__h5120",
-        "logical": {
-            "P": "parts",
-            "T": "rows",
-            "X": "x_flat",
-            "dU": "du",
-            "dX": "dx_flat",
-            "dY": "dy_flat",
-            "dfn_part": "dfn_part",
-            "dzp": "dzp_rows",
-            "fnTp": "fnTp",
-            "rpc": "rows_per_chunk",
-            "tokp": "tokp",
-        },
-        "role": "bwd_slab",
-        "select_rule": {
-            "kind": "program",
-            "program": "xrsg",
-            "rule": "bwd_slab_program",
         },
         "workspace_rule": {
             "kind": "regions",
@@ -6749,6 +6592,8 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_mhc_det_train_bwd_slab__dynl__h5120": {
         "arches": [
             "sm_100a",
+            "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -6804,6 +6649,70 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "dynl",
+            "rule": "bwd_slab_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_slab__xrsg_p160__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn_part"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 80,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_det_train_bwd_slab__xrsg_p160__h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg_p160__h5120",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 230912,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_slab__xrsg_p160__h5120",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dfn_part": "dfn_part",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "rpc": "rows_per_chunk",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "xrsg_p160",
             "rule": "bwd_slab_program",
         },
         "workspace_rule": {
@@ -6867,6 +6776,62 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h5120": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 507,
+            "kind": "fixed",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h5120",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "s27_wcvt_fadd_fshfl_trows",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120": {
         "arches": [
             "sm_100a",
@@ -6916,6 +6881,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "wpu4_spred",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h5120": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 507,
+            "kind": "fixed",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h5120",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_spred_trows",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -6973,6 +6994,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "wpu4_fadd",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h5120": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 507,
+            "kind": "fixed",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h5120",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_fadd_trows",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -7197,6 +7274,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "pt32",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__pt32_trows__h5120": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 3867,
+            "kind": "fixed",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_det_train_bwd_reduce__pt32_trows__h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__pt32_trows__h5120",
+        "launch": {
+            "block": (32, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__pt32_trows__h5120",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "pt32_trows",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -8313,6 +8446,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "dy"],
@@ -8358,114 +8492,6 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "bwd_prepare",
         "select_rule": None,
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__t224__h7168__a7": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 1,
-        },
-        "hidden": 7168,
-        "kernel": "cake_mhc_det_train_bwd_prepare__t224__h7168",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__t224__h7168",
-        "launch": {
-            "block": (224, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 1152,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__t224__h7168",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 0,
-            "at_most": 8192,
-            "kind": "rows_between",
-        },
-        "workspace_rule": None,
-    },
-    "cake_mhc_det_train_bwd_prepare__h7168": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "dy"],
-            ["buffer", "b"],
-            ["buffer", "x"],
-            ["buffer", "stats"],
-            ["buffer", "db"],
-            ["buffer", "gstats"],
-            ["parameter", "T"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "col_split": 1,
-            "grid_limit": 0,
-            "grid_per_sm": 0,
-            "kind": "rows_per_cta",
-            "rows_per_cta": 2,
-        },
-        "hidden": 7168,
-        "kernel": "cake_mhc_det_train_bwd_prepare__h7168",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_prepare__h7168",
-        "launch": {
-            "block": (448, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 2304,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_prepare__h7168",
-        "logical": {
-            "T": "rows",
-            "b": "b",
-            "db": "db",
-            "dy": "dy",
-            "gstats": "gstats",
-            "stats": "stats",
-            "x": "x",
-        },
-        "role": "bwd_prepare",
-        "select_rule": {
-            "above": 8192,
-            "at_most": None,
-            "kind": "rows_between",
-        },
         "workspace_rule": None,
     },
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168": {
@@ -8605,6 +8631,76 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 1,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 154624,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h7168",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "program",
+            "program": "dot_ao8_trows_dyn",
+            "rule": "bwd_token_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h7168": {
         "arches": [
             "sm_107a",
@@ -8666,71 +8762,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "program",
             "program": "dot_ao8_l2l",
             "rule": "bwd_token_program",
-        },
-        "workspace_rule": {
-            "kind": "regions",
-            "workspace": "bwd",
-        },
-    },
-    "cake_mhc_det_train_bwd_slab__xrsg__h7168": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            ["buffer", "X"],
-            ["buffer", "dY"],
-            ["buffer", "dU"],
-            ["buffer", "dzp"],
-            ["buffer", "fnTp"],
-            ["buffer", "dX"],
-            ["buffer", "tokp"],
-            ["buffer", "dfn_part"],
-            ["parameter", "T"],
-            ["parameter", "P"],
-            ["parameter", "rpc"],
-            ["launch", "enable_pdl"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "chunks_rule": "k7_chunks",
-            "kind": "slab_chunks",
-            "slabs": 112,
-        },
-        "hidden": 7168,
-        "kernel": "cake_mhc_det_train_bwd_slab__xrsg__h7168",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 232448,
-            "persistent_ctas_per_sm": 1,
-            "use_pdl": "runtime",
-        },
-        "library": "cake_mhc_det_train_bwd_slab__xrsg__h7168",
-        "logical": {
-            "P": "parts",
-            "T": "rows",
-            "X": "x_flat",
-            "dU": "du",
-            "dX": "dx_flat",
-            "dY": "dy_flat",
-            "dfn_part": "dfn_part",
-            "dzp": "dzp_rows",
-            "fnTp": "fnTp",
-            "rpc": "rows_per_chunk",
-            "tokp": "tokp",
-        },
-        "role": "bwd_slab",
-        "select_rule": {
-            "kind": "program",
-            "program": "xrsg",
-            "rule": "bwd_slab_program",
         },
         "workspace_rule": {
             "kind": "regions",
@@ -8806,6 +8837,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "cake_mhc_det_train_bwd_slab__dynl__h7168": {
         "arches": [
             "sm_100a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "X"],
@@ -8861,6 +8893,70 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "dynl",
+            "rule": "bwd_slab_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_slab__xrsg_p160__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn_part"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 112,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_det_train_bwd_slab__xrsg_p160__h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg_p160__h7168",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 230912,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_slab__xrsg_p160__h7168",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dfn_part": "dfn_part",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "rpc": "rows_per_chunk",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "xrsg_p160",
             "rule": "bwd_slab_program",
         },
         "workspace_rule": {
@@ -8924,6 +9020,62 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h7168": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 699,
+            "kind": "fixed",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h7168",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "s27_wcvt_fadd_fshfl_trows",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_reduce__wpu4_spred__h7168": {
         "arches": [
             "sm_100a",
@@ -8973,6 +9125,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "wpu4_spred",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h7168": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 699,
+            "kind": "fixed",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h7168",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_spred_trows",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -9030,6 +9238,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "wpu4_fadd",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h7168": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 699,
+            "kind": "fixed",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h7168",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "wpu4_fadd_trows",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -9198,6 +9462,62 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "pt64",
+            "rule": "bwd_reduce_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_bwd_reduce__pt64_trows__h7168": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dfn_part"],
+            ["buffer", "param_partial"],
+            ["buffer", "dfn"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "n_parts"],
+            ["parameter", "n_rows"],
+            ["parameter", "accumulate"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 2715,
+            "kind": "fixed",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_det_train_bwd_reduce__pt64_trows__h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_reduce__pt64_trows__h7168",
+        "launch": {
+            "block": (64, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_reduce__pt64_trows__h7168",
+        "logical": {
+            "accumulate": "accumulate",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dfn_part": "dfn_part",
+            "dscale": "dscale",
+            "n_parts": "parts",
+            "n_rows": "groups",
+            "param_partial": "param_partial",
+        },
+        "role": "bwd_reduce",
+        "select_rule": {
+            "kind": "program",
+            "program": "pt64_trows",
             "rule": "bwd_reduce_program",
         },
         "workspace_rule": {
@@ -9560,13 +9880,17 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_fn_split__tv128__h5120__t",
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
             "cake_mhc_det_train_bwd_token__dot_ao8__h5120",
+            "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h5120",
             "cake_mhc_det_train_bwd_token__rt64__h5120",
-            "cake_mhc_det_train_bwd_slab__xrsg__h5120",
+            "cake_mhc_det_train_bwd_slab__xrsg_p160__h5120",
             "cake_mhc_det_train_bwd_slab__dynl__h5120",
             "cake_mhc_det_train_bwd_slab__dynr__h5120",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h5120",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120",
+            "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h5120",
+            "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h5120",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h5120",
         ],
         "bwd_prepare_h5120": [
             "cake_mhc_det_train_bwd_prepare__t160__h5120",
@@ -9607,13 +9931,17 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_fn_split__tv128__h7168__t",
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
             "cake_mhc_det_train_bwd_token__dot_ao8__h7168",
+            "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h7168",
             "cake_mhc_det_train_bwd_token__rt64__h7168",
-            "cake_mhc_det_train_bwd_slab__xrsg__h7168",
+            "cake_mhc_det_train_bwd_slab__xrsg_p160__h7168",
             "cake_mhc_det_train_bwd_slab__dynl__h7168",
             "cake_mhc_det_train_bwd_slab__dynr__h7168",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h7168",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred__h7168",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168",
+            "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl_trows__h7168",
+            "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows__h7168",
+            "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows__h7168",
         ],
         "bwd_prepare_h7168": [
             "cake_mhc_det_train_bwd_prepare__t224__h7168",
@@ -9719,11 +10047,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_fn_split__tv128__h5120__t",
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
             "cake_mhc_det_train_bwd_token__dot_ao8__h5120",
+            "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h5120",
             "cake_mhc_det_train_bwd_token__rt64__h5120",
             "cake_mhc_det_train_bwd_slab__dynr__h5120",
-            "cake_mhc_det_train_bwd_slab__xrsg__h5120",
+            "cake_mhc_det_train_bwd_slab__xrsg_p160__h5120",
+            "cake_mhc_det_train_bwd_slab__dynl__h5120",
             "cake_mhc_det_train_bwd_reduce__pt64__h5120",
             "cake_mhc_det_train_bwd_reduce__pt32__h5120",
+            "cake_mhc_det_train_bwd_reduce__pt32_trows__h5120",
         ],
         "bwd_prepare_h5120": [
             "cake_mhc_det_train_bwd_prepare__t160__h5120",
@@ -9762,10 +10093,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_fn_split__tv128__h7168__t",
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
             "cake_mhc_det_train_bwd_token__dot_ao8__h7168",
+            "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn__h7168",
             "cake_mhc_det_train_bwd_token__rt64__h7168",
             "cake_mhc_det_train_bwd_slab__dynr__h7168",
-            "cake_mhc_det_train_bwd_slab__xrsg__h7168",
+            "cake_mhc_det_train_bwd_slab__xrsg_p160__h7168",
             "cake_mhc_det_train_bwd_reduce__pt64__h7168",
+            "cake_mhc_det_train_bwd_reduce__pt64_trows__h7168",
         ],
         "bwd_prepare_h7168": [
             "cake_mhc_det_train_bwd_prepare__t224__h7168",
@@ -9810,7 +10143,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__dot_ao8_l2l",
             "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7",
             "cake_mhc_det_train_bwd_token__rt64",
-            "cake_mhc_det_train_bwd_slab__xrsg__a7",
+            "cake_mhc_det_train_bwd_slab__dynl",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred",
             "cake_mhc_det_train_bwd_reduce__wpu4",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
@@ -9862,14 +10195,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
             "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h5120",
             "cake_mhc_det_train_bwd_token__rt64__h5120",
-            "cake_mhc_det_train_bwd_slab__xrsg__h5120",
+            "cake_mhc_det_train_bwd_slab__dynl__h5120",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h5120",
             "cake_mhc_det_train_bwd_reduce__wpu4__h5120",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h5120",
         ],
         "bwd_prepare_h5120": [
-            "cake_mhc_det_train_bwd_prepare__t160__h5120__a7",
-            "cake_mhc_det_train_bwd_prepare__h5120",
+            "cake_mhc_det_train_bwd_prepare__t160__h5120",
         ],
         "fwd_finish_h5120": [
             "cake_mhc_det_train_fwd_finish__w1__h5120",
@@ -9906,14 +10238,13 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
             "cake_mhc_det_train_bwd_token__dot_ao8_l2l__h7168",
             "cake_mhc_det_train_bwd_token__rt64__h7168",
-            "cake_mhc_det_train_bwd_slab__xrsg__h7168",
+            "cake_mhc_det_train_bwd_slab__dynl__h7168",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred__h7168",
             "cake_mhc_det_train_bwd_reduce__wpu4__h7168",
             "cake_mhc_det_train_bwd_reduce__wpu4_fadd__h7168",
         ],
         "bwd_prepare_h7168": [
-            "cake_mhc_det_train_bwd_prepare__t224__h7168__a7",
-            "cake_mhc_det_train_bwd_prepare__h7168",
+            "cake_mhc_det_train_bwd_prepare__t224__h7168",
         ],
         "fwd_finish_h7168": [
             "cake_mhc_det_train_fwd_finish__w1__h7168",
@@ -10511,8 +10842,15 @@ BWD_ROW_BANDS = {
 # stays <= 1.01 (kernel sum) at the rows of record outside the bands, the identical-program control within
 # 0.99..1.01. Under the co-scheduled load (16 CTAs x 640 threads) xrsg takes up to 1.87 of its unloaded time, dynr up
 # to 1.29; with a 128-thread side CTA on every SM xrsg does not finish while the side load runs, dynr stays within
-# 1.03 and the path within 1.0625 (GB200 and GB300, 152 SMs). sm_107a has no such form (xrsg).
-BWD_SLAB_PROGRAM = {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"}
+# 1.03 and the path within 1.0625 (GB200 and GB300, 152 SMs). sm_107a routes the late-claim form "dynl" (below) at every
+# token count and hidden size: xrsg's 232,448-byte pool and 168 registers leave an R200 SM no room for a 128-thread side
+# CTA, so with one on every SM xrsg does not finish while the side load runs; dynl's 228,480-byte pool and 160 registers
+# leave that room, and under a load that holds SMs its late CTAs take fewer units. On R200 (216 and 212 SMs, 15 hidden
+# size / token count cells per board) dynl completes beside the side CTAs at every cell (1.003-1.060 of its unloaded
+# backward_finish) where xrsg completes at none; under the 16 x 640 load it takes 0.999-1.345 of its unloaded time where
+# xrsg takes 0.997-1.751; unloaded the backward path with dynl / with xrsg reads 0.980-1.008 at H 4096 (13 rows of
+# record), 0.998-1.014 at 5120 and 0.974-0.995 at 7168 (two sessions; bitwise).
+BWD_SLAB_PROGRAM = {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"}
 # BWD_SLAB_BANDS: the column-slab pass's token-count bands per architecture ((above, at_most, program), at_most None =
 # unbounded), checked before BWD_SLAB_PROGRAM. sm_100a routes "dynl" (dynr + claim="late": the load warp draws the
 # next unit when it loads the current unit's last tile, not one unit ahead; fn_group=4: the first round's groups of four
@@ -10745,19 +11083,27 @@ K6_CTAS_PER_SM = 2
 # record), and the token owner holds one 151552-B ring CTA per SM at 7168. K1: the exact "nsx_g2_ol2l" at every T,
 # "nsx_st5_mb1" where the K units fit the SM count, the cost model's P_K (no band). K2: the H 4096 regimes (the
 # per-token work is H-free; P_K enters through k1_units). K6: dot_ao8 (dot_ao8_l2l on sm_107a), the F_A form for R <=
-# 32, no token band. K7: on sm_100a per-size token bands to 4096 tokens -- the late-claim form "dynl" (bitwise xrsg)
-# where every sampled T of the band passed on B200 and GB200 in two sessions each (unloaded backward path on B200,
-# kernel sum on GB200, within 1.01 of xrsg's; with a 128-thread side CTA on every SM it completes where xrsg does not),
-# xrsg at the other T --, "dynr" (bitwise xrsg) above 4096; on sm_103a xrsg for T <= 1535 at 5120 and T <= 1151 at 7168,
-# "dynr" above; xrsg on sm_107a. K8: the H 4096 maps except the sm_100a P refinements measured at the size (every form
-# bitwise; P only chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the size at every T
-# on sm_100a / sm_103a, on sm_107a the one-token form to 8192 tokens; no persistent band.
+# 32, no token band; the group-row band of H 4096 (BWD_ROW_BANDS: the "_trows_dyn" / "_trows" forms above 14927 tokens
+# on sm_100a / sm_103a, none on sm_107a). K7: on sm_100a per-size token bands to 4096 tokens -- the late-claim form
+# "dynl" (bitwise xrsg) where every sampled T of the band passed on B200 and GB200 in two sessions each (unloaded
+# backward path on B200, kernel sum on GB200, within 1.01 of xrsg's; with a 128-thread side CTA on every SM it completes
+# where xrsg does not), "xrsg_p160" (xrsg's static schedule on the 160-register pool, bitwise xrsg; it completes with a
+# 128-thread side CTA on every SM) at the other T --, "dynr" (bitwise xrsg) above 4096; on sm_103a xrsg_p160 for T <=
+# 960 and dynl for 960 < T <= 1535 at 5120 (the same unloaded time on GB300, faster under a partial co-scheduled load),
+# xrsg_p160 for T <= 1151 at 7168, "dynr" above; where the K7 units of an xrsg_p160 row fit the SM count (one round)
+# BWD_SLAB_FIT launches dynr instead; "dynl" on sm_107a at every T (bitwise xrsg; beside a 128-thread side CTA on every
+# SM it completes where xrsg does not; unloaded backward path 0.998-1.014 / 0.974-0.995 of xrsg's at 5120 / 7168, R200,
+# two sessions). K8: the H 4096 maps except the sm_100a P refinements measured at the size (every form bitwise; P only
+# chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the size at every T (on sm_107a the
+# two-token record's 10 / 14 warps fill an SM sub-partition's 16384-register file, so with a 128-thread CTA on every SM
+# it waits for that load, where the one-token form runs; unloaded it reads 1.156-1.160 / 1.065-1.073 of the one-token
+# form at 5120 / 7168, T 14928-16263, R200, two sessions); no persistent band.
 H_TABLE_NAMES = (
     "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT",
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "BWD_ROW_BANDS",
     "BWD_SLAB_PROGRAM", "BWD_SLAB_BANDS", "BWD_SLAB_FIT", "BWD_REDUCE_PROGRAM", "BWD_REDUCE_REGIMES", "BWD_REDUCE_PARTS",
     "BWD_REDUCE_GRID", "K5_GRID_BANDS", "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS",
-    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "FWD_MAP_XNRM", "BWD_DPL_BANDS",
+    "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM", "FWD_MAP_XNRM", "BWD_DPL_BANDS", "PDL_OFF_BANDS",
 )  # fmt: skip
 H_TABLES: dict[int, dict[str, Any]] = {
     5120: {
@@ -10797,23 +11143,74 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "sm_107a": (("ao22_rae7_pd1_ntr", 0, 32),),
         },
         "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
-        "BWD_ROW_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
-        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"},
-        "BWD_SLAB_BANDS": {
-            "sm_100a": (
-                (0, 896, "xrsg"),
-                (896, 1920, "dynl"),
-                (1920, 2112, "xrsg"),
-                (2112, 2688, "dynl"),
-                (2688, 2816, "xrsg"),
-                (2816, 3584, "dynl"),
-                (3584, 3648, "xrsg"),
-                (3648, 4096, "dynl"),
-            ),
-            "sm_103a": ((0, 1535, "xrsg"),),
+        "BWD_ROW_BANDS": {
+            "sm_100a": ((14927, None),),
+            "sm_103a": ((14927, None),),
             "sm_107a": (),
         },
-        "BWD_SLAB_FIT": {"sm_100a": None, "sm_103a": None, "sm_107a": None},
+        # the H 4096 PDL_OFF_BANDS, plus K7->K8 off in the sm_103a group-row band (above 14927 tokens): there the
+        # column-slab pass releases the reduction as soon as it passes its own wait (the persistent token-owner pass
+        # ends at once), and the reduction's CTAs, resident through the slab pass, lengthen the tail after it
+        "PDL_OFF_BANDS": {
+            "sm_100a": {
+                "K1->K3": {
+                    "forward": ((4096, 8192),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((1024, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((1024, 32768),),
+                    "checkpoint": ((1024, 4096),),
+                },
+            },
+            "sm_103a": {
+                "K1->K3": {
+                    "forward": ((4096, 16263),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 16263),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((0, 4096), (14927, None)),
+                    "checkpoint": ((0, 4096), (14927, None)),
+                },
+            },
+            "sm_107a": {
+                "K6->K7": {
+                    "checkpoint": ((3583, 4096),),
+                },
+            },
+        },
+        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"},
+        "BWD_SLAB_BANDS": {
+            "sm_100a": (
+                (0, 896, "xrsg_p160"),
+                (896, 1920, "dynl"),
+                (1920, 2112, "xrsg_p160"),
+                (2112, 2688, "dynl"),
+                (2688, 2816, "xrsg_p160"),
+                (2816, 3584, "dynl"),
+                (3584, 3648, "xrsg_p160"),
+                (3648, 4096, "dynl"),
+            ),
+            "sm_103a": (
+                (0, 960, "xrsg_p160"),
+                (960, 1535, "dynl"),
+            ),
+            "sm_107a": (),
+        },
+        "BWD_SLAB_FIT": {
+            "sm_100a": ("xrsg_p160", "dynr", (), ()),
+            "sm_103a": ("xrsg_p160", "dynr", (), ()),
+            "sm_107a": None,
+        },
         "BWD_REDUCE_PROGRAM": {
             "sm_100a": "s27_wcvt",
             "sm_103a": "pt64",
@@ -10849,12 +11246,17 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "pt32": 3867,
             "s27_wcvt_spred": 507,
             "wpu4": 507,
+            # the group-row forms (BWD_ROW_BANDS) launch their program's grid
+            "pt32_trows": 3867,
+            "s27_wcvt_fadd_fshfl_trows": 507,
+            "wpu4_fadd_trows": 507,
+            "wpu4_spred_trows": 507,
         },
         "K5_GRID_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "K5_FORM_BANDS": {
             "sm_100a": ((0, None, "t160"),),
             "sm_103a": ((0, None, "t160"),),
-            "sm_107a": ((0, 8192, "t160"),),
+            "sm_107a": ((0, None, "t160"),),
         },
         "K5_FORM_ROWS": {"production": 2, "t160": 1},
         "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
@@ -10901,19 +11303,65 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "sm_107a": (("ao22_rae7_pd1_ntr", 0, 32),),
         },
         "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
-        "BWD_ROW_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
-        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"},
-        "BWD_SLAB_BANDS": {
-            "sm_100a": (
-                (0, 640, "xrsg"),
-                (640, 960, "dynl"),
-                (960, 1024, "xrsg"),
-                (1024, 4096, "dynl"),
-            ),
-            "sm_103a": ((0, 1151, "xrsg"),),
+        "BWD_ROW_BANDS": {
+            "sm_100a": ((14927, None),),
+            "sm_103a": ((14927, None),),
             "sm_107a": (),
         },
-        "BWD_SLAB_FIT": {"sm_100a": None, "sm_103a": None, "sm_107a": None},
+        # the H 4096 PDL_OFF_BANDS (at 7168 the group-row reduction's parameter CTAs fold during the slab pass)
+        "PDL_OFF_BANDS": {
+            "sm_100a": {
+                "K1->K3": {
+                    "forward": ((4096, 8192),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((1024, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((1024, 32768),),
+                    "checkpoint": ((1024, 4096),),
+                },
+            },
+            "sm_103a": {
+                "K1->K3": {
+                    "forward": ((4096, 16263),),
+                },
+                "K1->K5": {
+                    "checkpoint": ((4096, 16263),),
+                },
+                "K6->K7": {
+                    "checkpoint": ((4096, 8192),),
+                },
+                "K7->K8": {
+                    "backward": ((0, 4096),),
+                    "checkpoint": ((0, 4096),),
+                },
+            },
+            "sm_107a": {
+                "K6->K7": {
+                    "checkpoint": ((3583, 4096),),
+                },
+            },
+        },
+        "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "dynl"},
+        "BWD_SLAB_BANDS": {
+            "sm_100a": (
+                (0, 640, "xrsg_p160"),
+                (640, 960, "dynl"),
+                (960, 1024, "xrsg_p160"),
+                (1024, 4096, "dynl"),
+            ),
+            "sm_103a": ((0, 1151, "xrsg_p160"),),
+            "sm_107a": (),
+        },
+        "BWD_SLAB_FIT": {
+            "sm_100a": ("xrsg_p160", "dynr", (), ()),
+            "sm_103a": ("xrsg_p160", "dynr", (), ()),
+            "sm_107a": None,
+        },
         "BWD_REDUCE_PROGRAM": {
             "sm_100a": "s27_wcvt",
             "sm_103a": "pt64",
@@ -10944,12 +11392,17 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "pt64": 2715,
             "s27_wcvt_spred": 699,
             "wpu4": 699,
+            # the group-row forms (BWD_ROW_BANDS) launch their program's grid
+            "pt64_trows": 2715,
+            "s27_wcvt_fadd_fshfl_trows": 699,
+            "wpu4_fadd_trows": 699,
+            "wpu4_spred_trows": 699,
         },
         "K5_GRID_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "K5_FORM_BANDS": {
             "sm_100a": ((0, None, "t224"),),
             "sm_103a": ((0, None, "t224"),),
-            "sm_107a": ((0, 8192, "t224"),),
+            "sm_107a": ((0, None, "t224"),),
         },
         "K5_FORM_ROWS": {"production": 2, "t224": 1},
         "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
@@ -11935,7 +12388,12 @@ def enable_pdl(name: str, rows: int, arch: str, path: str) -> int:
             f"record {name!r} takes the per-call attribute but its library sits on no edge of PDL_EDGES"
         )
     rows = int(rows)
-    for above, at_most in PDL_OFF_BANDS.get(arch, {}).get(edge, {}).get(path, ()):
+    for above, at_most in (
+        _tab("PDL_OFF_BANDS", record["hidden"])
+        .get(arch, {})
+        .get(edge, {})
+        .get(path, ())
+    ):
         if int(above) < rows and (at_most is None or rows <= int(at_most)):
             return 0
     return 1

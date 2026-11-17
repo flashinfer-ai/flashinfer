@@ -88,7 +88,7 @@ import torch
 if __name__ == "__main__":  # script mode: the repository root on the path
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     GateFn,
     check_fla_gate,
@@ -100,7 +100,7 @@ from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     raw_gate,
     t_quantile,
 )
-from tests.test_helpers.cake_package import cake_package  # noqa: E402
+from tests.cake.test_helpers.cake_package import cake_package  # noqa: E402
 
 cake_backend = cake_package("cake.cake_kda_det_train", "cake_backend")
 cake_jit = cake_package("cake.cake_kda_det_train", "cake_jit")
@@ -298,7 +298,7 @@ CODE_FILES = (
     "flashinfer/experimental/cake/cake_kda_det_train/cake_jit.py",
     "flashinfer/cake_kda_det_train.py",
     "tests/experimental/test_cake_kda_det_train_raw_gate_accuracy.py",
-    "tests/test_helpers/cake_kda_det_train_reference.py",
+    "tests/experimental/test_helpers/cake_kda_det_train_reference.py",
 )
 
 

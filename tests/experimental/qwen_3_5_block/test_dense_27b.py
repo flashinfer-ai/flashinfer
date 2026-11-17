@@ -14,14 +14,14 @@ malformed packed pool refused by name at run time."""
 import pytest
 import torch
 
-from tests.test_helpers.qwen_3_5_block_cases import (
+from tests.experimental.test_helpers.qwen_3_5_block_cases import (
     PagedCase,
     cache_rows,
     new_kv_cache,
     random_weights,
     ref_geometry,
 )
-from tests.test_helpers.qwen_3_5_block_reference import (
+from tests.experimental.test_helpers.qwen_3_5_block_reference import (
     build_rope_tables,
     cosine,
     gated_attention_block_reference,

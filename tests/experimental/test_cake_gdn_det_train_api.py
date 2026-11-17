@@ -37,7 +37,7 @@ import flashinfer.cake_gdn_det_train as facade
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.experimental.cake import cake_gdn_det_train as pkg
 from flashinfer.experimental.cake.cake_gdn_det_train import cake_backend
-from tests.test_helpers.cake_mode_names import assert_mode_names
+from tests.cake.test_helpers.cake_mode_names import assert_mode_names
 
 FACADE_NAMES = (
     "CakeGDNDetFunction",

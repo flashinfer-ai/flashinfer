@@ -39,7 +39,7 @@ top-level names are rows of the lazy-export table ``flashinfer._LAZY_EXPORTS``
 (bound on first access): each mode's facade module, its functional, forward,
 backward, workspace size and autograd class, all with a mode word (checked in
 this process and in fresh interpreters).  The shared checks of the
-mode-in-name rule (``tests/test_helpers/cake_mode_names.py``) run over all four
+mode-in-name rule (``tests/cake/test_helpers/cake_mode_names.py``) run over all four
 namespaces; the checks here add what is particular to this family.  The JIT
 library names of the backends (``cake_rmsnorm_silu_gate_train_<hash>`` and
 ``cake_rmsnorm_silu_gate_det_train_<hash>``) are build identities, not Python
@@ -63,7 +63,7 @@ import flashinfer.cake_rmsnorm_silu_gate_det_train as det_facade
 import flashinfer.cake_rmsnorm_silu_gate_nondet_train as nd_facade
 import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_det_train as det_backend
 import flashinfer.experimental.cake.cake_rmsnorm_silu_gate_nondet_train as nd_backend
-from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
 pytestmark = pytest.mark.cpu_only
 

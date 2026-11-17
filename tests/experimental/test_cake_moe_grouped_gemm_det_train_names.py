@@ -187,7 +187,7 @@ def test_former_names_are_gone(module_name):
 
 def test_former_test_helper_keys_are_gone():
     """The test helper knows the package by its module name only."""
-    from tests.test_helpers.cake_package import PACKAGES, cake_package
+    from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
     for key in FORMER_HELPER_KEYS:
         assert key not in PACKAGES, key
@@ -300,12 +300,12 @@ def test_flashinfer_binds_the_names_on_first_access():
 
 
 def test_the_shared_mode_name_checks():
-    """The shared Cake mode-name checks (``tests/test_helpers/cake_mode_names.py``):
+    """The shared Cake mode-name checks (``tests/cake/test_helpers/cake_mode_names.py``):
     the mode word in every public name and in order, no ``deterministic``
     argument, one name per object across ``flashinfer``, the module and its
     backend, and the former paths and names failing at import in a fresh
     interpreter."""
-    from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+    from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
     import flashinfer
 

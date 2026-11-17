@@ -29,6 +29,8 @@ namespace details {
 static constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
 static constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 static constexpr int kBytesPerAccess = 16;
+// The Lamport clear-size slot counts 16-bit units (see LamportComm); one store clears this many.
+static constexpr int kClearUnitsPerAccess = kBytesPerAccess / 2;
 static constexpr int kOneShotMaxToken = 128;
 static constexpr int kBarrierFlagCount = 256;
 static constexpr float kFP8E4M3Max = 448.0f;
@@ -37,6 +39,48 @@ static constexpr float kFP8E4M3Max = 448.0f;
 // produce a zero scale.
 static constexpr float kFP8E4M3MinSubnormal = 1.0f / 512.0f;
 static constexpr float kDynamicFP8MinScale = kFP8E4M3MinSubnormal / kFP8E4M3Max;
+static constexpr float kUE8M0MinScaleInput = 1e-10f;
+
+__device__ __forceinline__ float compute_ue8m0_scale(float group_absmax) {
+  float scale = fmaxf(group_absmax / kFP8E4M3Max, kUE8M0MinScaleInput);
+  unsigned int scale_bits = __float_as_uint(scale);
+  if (scale_bits & 0x7fffff) {
+    scale_bits = (scale_bits + 0x800000) & 0x7f800000;
+  }
+  return __uint_as_float(scale_bits);
+}
+
+__device__ __forceinline__ void write_packed_ue8m0_scale(void* scale_out, int token_id,
+                                                         int token_num, int hidden_dim,
+                                                         int group_size, int tma_aligned_mn,
+                                                         int group_idx_in_row, float group_absmax) {
+  float scale = compute_ue8m0_scale(group_absmax);
+  int groups_per_row = hidden_dim / group_size;
+  int k_num_packed = (groups_per_row + 3) / 4;
+  int pack_idx = group_idx_in_row / 4;
+  int pos = group_idx_in_row % 4;
+  int elem_idx = pack_idx * tma_aligned_mn + token_id;
+
+  unsigned int bits = __float_as_uint(scale);
+  reinterpret_cast<uint8_t*>(scale_out)[elem_idx * 4 + pos] =
+      static_cast<uint8_t>((bits >> 23u) & 0xffu);
+
+  if (group_idx_in_row == groups_per_row - 1) {
+    for (int p = pos + 1; p < 4; p++) {
+      reinterpret_cast<uint8_t*>(scale_out)[elem_idx * 4 + p] = 0;
+    }
+  }
+
+  // The final packed column only allocates token_num rows. Earlier columns
+  // include the TMA-aligned token padding and must be initialized explicitly.
+  if (token_id == token_num - 1 && group_idx_in_row == 0) {
+    for (int pad_t = token_num; pad_t < tma_aligned_mn; pad_t++) {
+      for (int pk = 0; pk < k_num_packed - 1; pk++) {
+        reinterpret_cast<uint32_t*>(scale_out)[pk * tma_aligned_mn + pad_t] = 0;
+      }
+    }
+  }
+}
 // MXFP8: 32 consecutive elements share one UE8M0 scale.
 static constexpr int kMXFP8SFVecSize = 32;
 
@@ -1081,6 +1125,11 @@ struct LamportComm {
   __device__ __forceinline__ LamportComm(void** workspace, int rank) {
     counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
+    // Size of the previous Lamport kernel's write to its sub-buffer, in 16-bit units. Every
+    // Lamport kernel on this workspace reads and writes it whatever its dtype, including the
+    // cake kernels (csrc/cake_trtllm_moe_allreduce_union, csrc/cake_moe_finalize_allreduce_fusion),
+    // which count bf16 / fp16 elements, so the unit is fixed at 2 bytes; readers round it up to
+    // whole 16-byte stores.
     clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
     flag_value = *flag_ptr;
     int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
@@ -1260,7 +1309,6 @@ class FusedOp {
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenGroupFP8Packed) {
       // Per-token-group FP8 quantization with UE8M0 packed scales.
-      constexpr float FP8_E4M3_MAX = 448.0f;
       int group_size = m_params.block_quant_group_size;
       int groups_in_block = blockDim.x * VEC_SIZE / group_size;
       int block_elem_start = threadIdx.x * VEC_SIZE;
@@ -1314,23 +1362,13 @@ class FusedOp {
         }
       }
 
-      // compute UE8M0 scale and quantize to FP8
-      auto compute_ue8m0_scale = [](float group_absmax) -> float {
-        float y_s = fmaxf(group_absmax / FP8_E4M3_MAX, 1e-10f);
-        unsigned int y_s_bits = __float_as_uint(y_s);
-        if (y_s_bits & 0x7fffff) {
-          y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
-        }
-        return __uint_as_float(y_s_bits);
-      };
-
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
       PackedQuantizedType ret;
 #pragma unroll
       for (int i = 0; i < VEC_SIZE; ++i) {
-        float y_s = compute_ue8m0_scale(elem_group_absmax[i]);
+        float y_s = details::compute_ue8m0_scale(elem_group_absmax[i]);
         float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / y_s;
-        q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        q = fminf(fmaxf(q, -details::kFP8E4M3Max), details::kFP8E4M3Max);
         reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
       }
       reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
@@ -1339,47 +1377,15 @@ class FusedOp {
       // For warp-shuffle path: one thread per group (first thread in each group).
       // For smem path: one thread per group in the block (threadIdx.x < groups_in_block).
       int block_first_elem = (m_access_id_in_token - threadIdx.x) * VEC_SIZE;
-      auto write_group_scale = [&](int group_idx_in_row, float group_absmax) {
-        float y_s = compute_ue8m0_scale(group_absmax);
-        int groups_per_row = m_params.hidden_dim / group_size;
-        int k_num_packed = (groups_per_row + 3) / 4;
-        int token_num = m_params.size / m_params.hidden_dim;
-        int pack_idx = group_idx_in_row / 4;
-        int pos = group_idx_in_row % 4;
-        int elem_idx = pack_idx * m_params.tma_aligned_mn + token_id;
-
-        // Write valid exponent
-        unsigned int bits = __float_as_uint(y_s);
-        uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
-        reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + pos] = exponent;
-
-        // K-padding: last valid group zeros trailing bytes in its pack
-        if (group_idx_in_row == groups_per_row - 1) {
-          for (int p = pos + 1; p < 4; p++) {
-            reinterpret_cast<uint8_t*>(m_params.scale_out)[elem_idx * 4 + p] = 0;
-          }
-        }
-
-        // MN-padding: on last valid token, first group zeros all packs
-        // for padding tokens (token_num .. tma_aligned_mn - 1).
-        // Skip the last packed column (pk = k_num_packed - 1) because
-        // scale_out storage is (token_num + (k_num_packed-1)*tma_aligned_mn)
-        // elements — the last column only has token_num rows allocated.
-        if (token_id == token_num - 1 && group_idx_in_row == 0) {
-          for (int pad_t = token_num; pad_t < m_params.tma_aligned_mn; pad_t++) {
-            for (int pk = 0; pk < k_num_packed - 1; pk++) {
-              int pad_elem = pk * m_params.tma_aligned_mn + pad_t;
-              reinterpret_cast<uint32_t*>(m_params.scale_out)[pad_elem] = 0;
-            }
-          }
-        }
-      };
+      int token_num = m_params.size / m_params.hidden_dim;
 
       if (use_warp_shuffle) {
         int lane_in_group = m_access_id_in_token % group_size_in_vecs;
         if (lane_in_group == 0) {
           int group_idx_in_row = m_access_id_in_token / group_size_in_vecs;
-          write_group_scale(group_idx_in_row, elem_group_absmax[0]);
+          details::write_packed_ue8m0_scale(
+              m_params.scale_out, token_id, token_num, m_params.hidden_dim, group_size,
+              m_params.tma_aligned_mn, group_idx_in_row, elem_group_absmax[0]);
         }
       } else {
         // Loop: groups_in_block may exceed blockDim.x when group_size < VEC_SIZE
@@ -1387,7 +1393,9 @@ class FusedOp {
              local_group += blockDim.x) {
           float group_absmax = __uint_as_float(smem_group_absmax[local_group]);
           int group_idx_in_row = block_first_elem / group_size + local_group;
-          write_group_scale(group_idx_in_row, group_absmax);
+          details::write_packed_ue8m0_scale(
+              m_params.scale_out, token_id, token_num, m_params.hidden_dim, group_size,
+              m_params.tma_aligned_mn, group_idx_in_row, group_absmax);
         }
       }
     } else if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8) {
@@ -1649,8 +1657,12 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   int access_id = index_helper.access_id;
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
-  vec_t<T, VEC_SIZE> clear_vec;
-  clear_vec.fill(neg_zero_v<T>);
+  // The clear pattern is fp32 -0 (0x80000000 per word) for every T. A later Lamport kernel of any
+  // dtype on this workspace must still see "not written": an fp32 reader needs the full word, a
+  // bf16 / fp16 reader (trtllm or cake) tests each 16-bit half for 0x8000 and finds it in the high
+  // half. bf16 -0 pairs (0x80008000) would read as a finished fp32 value.
+  vec_t<float, details::kBytesPerAccess / sizeof(float)> clear_vec;
+  clear_vec.fill(-0.0f);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   cudaGridDependencySynchronize();
@@ -1663,7 +1675,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   // residual_in has completed.
   FusedOp<Pattern, T> fused_op(params, access_id, access_id_in_token);
   LamportComm<NRanks> comm(params.workspace, params.rank);
-  int clear_access = comm.clear_size / VEC_SIZE;
+  int clear_access = static_cast<int>((comm.clear_size + details::kClearUnitsPerAccess - 1) /
+                                      details::kClearUnitsPerAccess);
 
   for (int idx = access_id; idx < tot_access; idx += access_stride) {
     vec_t<T, VEC_SIZE> val;
@@ -1678,7 +1691,8 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
   }
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
     // Clear comm buffer that previous kernel used
-    clear_vec.store(reinterpret_cast<T*>(comm.clear_buf) + idx * VEC_SIZE);
+    clear_vec.store(reinterpret_cast<float*>(comm.clear_buf) +
+                    idx * details::kClearUnitsPerAccess / 2);
   }
 
   for (int idx = access_id, tidx = token_id; idx < tot_access;
@@ -1701,7 +1715,7 @@ __global__ void allreduce_fusion_kernel_oneshot_lamport(AllReduceFusionParams<T>
     fused_op(sum_val, tidx);
   }
 
-  comm.update(params.size * NRanks);
+  comm.update(params.size * NRanks * static_cast<int>(sizeof(T)) / 2);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if constexpr (TriggerCompletionAtEnd) {

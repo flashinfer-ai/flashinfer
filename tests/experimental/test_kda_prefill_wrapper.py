@@ -31,7 +31,7 @@ import torch
 from flashinfer.kda import RecurrentKDAPrefillWrapper, recurrent_kda
 from flashinfer.utils import get_compute_capability
 
-from tests.test_helpers.kda_prefill import (
+from tests.kda.test_helpers.kda_prefill import (
     _chunk16_debug_reference,
     _make_inputs,
     _reference,

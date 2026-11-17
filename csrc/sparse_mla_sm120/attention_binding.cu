@@ -13,7 +13,7 @@
 
 #include "attention_descriptor.h"
 #include "attention_dispatch.h"
-#include "attention_validation.h"
+#include "input_validation.h"
 
 using tvm::ffi::Optional;
 
@@ -368,12 +368,13 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "decode-dsv3_2: " << cudaGetErrorString(status);
 }
 
-void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache,
-                          TensorView indices, TensorView mid, TensorView mlse, TensorView output,
-                          TensorView lse, double scale, Optional<TensorView> lengths,
-                          Optional<TensorView> sink, Optional<TensorView> extra_cache,
-                          Optional<TensorView> extra_indices, Optional<TensorView> extra_lengths,
-                          double lse_scale) {
+void ExecuteAttentionPlanImpl(ffi::Module descriptor, TensorView q, TensorView cache,
+                              TensorView indices, TensorView mid, TensorView mlse,
+                              TensorView output, TensorView lse, double scale,
+                              Optional<TensorView> lengths, Optional<TensorView> sink,
+                              Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
+                              Optional<TensorView> extra_lengths, double lse_scale,
+                              SparseMlaMegaParams mega) {
   const auto& plan = execution::unpack_plan(descriptor, false);
   const auto& m = plan.metadata;
   const auto format = cache_format_info(static_cast<ModelType>(m.model));
@@ -405,6 +406,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   check_attention_vector(q, sink, m.heads, dl_float32, "attn_sink");
   check_attention_vector(q, extra_lengths, m.tokens, dl_int32, "extra_topk_length");
   execution::AttentionParams p{};
+  p.mega = mega;
   p.num_heads = m.heads;
   p.topk = m.topk;
   p.num_tokens = m.tokens;
@@ -480,6 +482,35 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "execute_attention: " << cudaGetErrorString(status);
 }
 
+void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache,
+                          TensorView indices, TensorView mid, TensorView mlse, TensorView output,
+                          TensorView lse, double scale, Optional<TensorView> lengths,
+                          Optional<TensorView> sink, Optional<TensorView> extra_cache,
+                          Optional<TensorView> extra_indices, Optional<TensorView> extra_lengths,
+                          double lse_scale) {
+  ExecuteAttentionPlanImpl(descriptor, q, cache, indices, mid, mlse, output, lse, scale, lengths,
+                           sink, extra_cache, extra_indices, extra_lengths, lse_scale, {});
+}
+
+void ExecuteAttentionRopeFp8Plan(
+    ffi::Module descriptor, TensorView q, TensorView cache, TensorView indices, TensorView mid,
+    TensorView mlse, TensorView output, TensorView lse, double scale, Optional<TensorView> lengths,
+    Optional<TensorView> sink, Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
+    Optional<TensorView> extra_lengths, double lse_scale, TensorView positions, TensorView cos_sin,
+    TensorView fp8_output, TensorView output_scales) {
+  const auto& plan = execution::unpack_plan(descriptor, false);
+  const auto mt = static_cast<ModelType>(plan.metadata.model);
+  TVM_FFI_ICHECK(mt == ModelType::DSV4 || is_dsv41(mt))
+      << "mega requires a 512-dimensional V4/V4.1 model";
+  TVM_FFI_ICHECK(plan.numeric != execution::NumericRoute::FullBF16 &&
+                 plan.implementation != execution::Implementation::SwapAB)
+      << "mega does not support full-BF16 or swapAB plans";
+  const auto mega =
+      check_attention_rope_fp8_inputs(q, positions, cos_sin, fp8_output, output_scales);
+  ExecuteAttentionPlanImpl(descriptor, q, cache, indices, mid, mlse, output, lse, scale, lengths,
+                           sink, extra_cache, extra_indices, extra_lengths, lse_scale, mega);
+}
+
 }  // namespace flashinfer::sparse_mla_sm120
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(inspect_metadata,
@@ -492,3 +523,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv4,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv3_2,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv3_2);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(execute_attention_rope_fp8,
+                              flashinfer::sparse_mla_sm120::ExecuteAttentionRopeFp8Plan);

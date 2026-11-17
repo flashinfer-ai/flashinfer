@@ -88,7 +88,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from flashinfer.experimental.cake.cake_kda_det_train import cake_backend, cake_jit  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     check_fla_gate,
     fla_kda_gate,

@@ -162,6 +162,7 @@ def build_plan(
     merge: str = "auto",
     small_swap: bool = False,
     swap_max_rows: int = INKERNEL_MAX_ROWS,
+    grid: int = 0,
 ) -> Plan:
     """``split_policy``: ``"auto"`` splits every multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows (a decode unit) when the fused
     unit count would leave the machine underfilled (``< 2 x SM``) -- and, in a D = 64 Swaps batch, the tiles of at least
@@ -175,7 +176,9 @@ def build_plan(
     force one kind (R3: same bits).
     ``merge``: where a split group's chunk fold runs -- ``"auto"`` (in-kernel for groups of at most
     ``INKERNEL_MAX_ROWS`` rows, the fixup kernel otherwise), ``"fixup"`` (always the kernel), ``"inkernel"``
-    (always in-kernel); the same fold in the same order either way (R3: same bits)."""
+    (always in-kernel); the same fold in the same order either way (R3: same bits).
+    ``grid``: the persistent grid the launch will use (0: ``min(units, sm_count)``), so that the unit order's waves
+    (``snake_order``) are the waves the CTAs actually walk."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
@@ -326,7 +329,9 @@ def build_plan(
     # u = bidx, bidx + grid, ..., so CTA j takes the j-th unit of every wave and the alternation pairs a wave's long units with the
     # next wave's short ones. A placement: the order of units reaches no value (every unit restarts its state)
     plan.desc.sort(key=lambda d: -(d[F_TILE_HI] - d[F_TILE_LO]))
-    plan.desc = snake_order(plan.desc, min(len(plan.desc), sm_count))
+    plan.desc = snake_order(
+        plan.desc, min(len(plan.desc), grid if grid > 0 else sm_count)
+    )
     return plan
 
 

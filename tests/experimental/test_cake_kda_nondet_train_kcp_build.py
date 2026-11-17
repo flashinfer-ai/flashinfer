@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 cake_build = cake_package("cake.cake_kda_nondet_train_kcp", "cake_build")
 det_kcp_jit = cake_package("cake.cake_kda_det_train_kcp", "cake_kcp_jit")

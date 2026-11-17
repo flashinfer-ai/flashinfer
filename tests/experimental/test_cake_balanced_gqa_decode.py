@@ -41,7 +41,7 @@ from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
     uses_packed_mtp,
     workspace_bounds,
 )
-from tests.test_helpers.cake_balanced_gqa_plan import (
+from tests.experimental.test_helpers.cake_balanced_gqa_plan import (
     chunk_pairs_for,
     device_plan,
     generated_program_available,

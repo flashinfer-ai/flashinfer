@@ -36,7 +36,7 @@ from pathlib import Path
 import pytest
 
 import flashinfer.cake_dsa_indexer_nondet_train as facade
-from tests.test_helpers.cake_mode_names import assert_cake_mode_module
+from tests.cake.test_helpers.cake_mode_names import assert_cake_mode_module
 
 pytestmark = pytest.mark.cpu_only
 
@@ -220,7 +220,7 @@ def test_the_manifest_names_the_package() -> None:
 
 
 def test_shared_mode_name_checks() -> None:
-    """The shared #8928 checks (``tests/test_helpers/cake_mode_names.py``) over the entry-point module: the mode word
+    """The shared #8928 checks (``tests/cake/test_helpers/cake_mode_names.py``) over the entry-point module: the mode word
     and its place in every public name, no ``deterministic`` keyword, and each object bound only under its own name in
     the entry-point module, ``flashinfer``, the backend package and its ``cake_backend``.  The module is new, so there
     are no former modules or names to check."""

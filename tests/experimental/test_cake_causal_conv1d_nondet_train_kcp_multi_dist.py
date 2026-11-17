@@ -70,7 +70,10 @@ from tests.test_cake_causal_conv1d_det_train_kcp_multi_dist import (
     _same,
     _setup,
 )
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 DW_ATOL, DW_RTOL = 5e-2, 1e-4
 # W = 16 (16-way context parallelism) on the deterministic rows' packs, for the layouts any world size partitions;
@@ -345,7 +348,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir, local_id: int) -> d
     # LAST_CALL["fwd_multi"] (the first tensor's main program before the exchange's wait on a rank with tokens; the
     # history-row program when the rank receives history rows and the form has two launches) and gives every
     # tensor's y / hist bitwise the one-launch single call's and the deterministic multi forward's.
-    from tests.test_helpers.cake_package import cake_package
+    from tests.cake.test_helpers.cake_package import cake_package
 
     det_kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
     n_hist = int(ctx.halo.n_hist_rows)

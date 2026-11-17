@@ -291,6 +291,8 @@ def cake_dsa_sparse_attention_nondet(
     lse : torch.Tensor
         Only with ``return_lse=True``.
 
+    Notes
+    -----
     Gradients flow to ``q_latent``, ``q_rope``, ``kv_latent`` and ``k_rope``
     (``dq`` bitwise deterministic; ``dkv`` accumulated in FP32 with atomics,
     then cast to BF16, or accumulated into ``dkv_acc``).  BF16 operands into the tensor cores, FP32
@@ -558,6 +560,8 @@ def cake_dsa_sparse_attention_nondet_nope(
     lse : torch.Tensor
         Only with ``return_lse=True``.
 
+    Notes
+    -----
     Gradients flow to ``q`` and ``kv``.  ``dq`` is BF16 and bitwise
     deterministic.  ``dkv`` is accumulated in FP32 by the kernels' atomics
     (run-to-run spread within FP32 rounding) and handed over in FP32: through
@@ -577,8 +581,8 @@ def cake_dsa_sparse_attention_nondet_nope(
     ``warn_only=True`` it issues a ``UserWarning`` and runs.  No deterministic
     package is chosen instead.
 
-    The incoming ``dout`` may be a head-major view (strides ``[512, T * 512,
-    1]``, the layout an output projection hands back) or any strided
+    The incoming ``dout`` may be a head-major view (strides ``[512, T * 512, 1]``,
+    the layout an output projection hands back) or any strided
     ``[T, 64, 512]`` view under the layout rules of ``q`` (unit channel
     stride, token and head strides multiples of 8 elements, 16-byte base): it
     is read in place -- the main stage through a stride-carrying tensor map,

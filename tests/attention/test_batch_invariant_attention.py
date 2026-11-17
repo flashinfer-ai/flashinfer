@@ -477,6 +477,58 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
         bi.fingerprint(op, head_dim=128, page_size=16)
 
 
+def test_planner_unit_kind_rules():
+    """The ``auto`` unit-kind rules of the planner (placements: every kind computes the same bits): a multi-chunk tile of at most
+    ``INKERNEL_MAX_ROWS`` rows splits when the fused units would fill under 2 x SM, a wider (prefill) tile only when they would fill
+    under 1 / ``WIDE_SPLIT_SM_FRACTION`` of the SMs."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    # 4 requests x 4096 tokens of prefill at g = 4: 32 tokens per tile -> 128 wide tiles per request and kv head, 8 heads = 4096 tiles
+    qo = [0, 4096, 8192, 12288, 16384]
+    kv = [0, 256, 512, 768, 1024]
+    last = [16] * 4
+    wide = lambda sm: P.build_plan(qo, kv, last, 32, 8, 128, 16, sm_count=sm)  # noqa: E731
+    n_tiles = 4 * 128 * 8
+    assert wide(148).num_units == n_tiles
+    assert all(
+        d[P.F_MODE] == 0 for d in wide(n_tiles).desc
+    )  # the tiles fill the SMs once: fused
+    assert all(
+        d[P.F_MODE] == 0 for d in wide(4 * n_tiles).desc
+    )  # exactly 1 / 4 of the SMs: still fused
+    assert any(
+        d[P.F_MODE] == 1 for d in wide(4 * n_tiles + 1).desc
+    )  # under 1 / 4: split
+    # decode-sized tiles (one token per request, g = 4 -> 4 rows): split under 2 x SM
+    qo_d = list(range(0, 5))
+    narrow = lambda sm: P.build_plan(qo_d, kv, last, 32, 8, 128, 16, sm_count=sm)  # noqa: E731
+    assert any(d[P.F_MODE] == 1 for d in narrow(32).desc)  # 32 tiles < 64
+    assert all(d[P.F_MODE] == 0 for d in narrow(16).desc)  # 32 tiles >= 32
+
+
+def test_planner_snake_order():
+    """``snake_order``: a permutation of the longest-first list whose waves of ``grid`` units alternate direction, and the order
+    ``build_plan`` emits follows the launch grid (``grid``: the persistent CTAs, else the SM count)."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    units = [[i, 100 - i] for i in range(23)]  # descending "lengths"
+    out = P.snake_order(units, 5)
+    assert sorted(map(tuple, out)) == sorted(map(tuple, units))
+    for w, start in enumerate(range(0, 23, 5)):
+        wave = units[start : start + 5]
+        assert out[start : start + 5] == (wave[::-1] if w % 2 else wave), w
+    assert P.snake_order(units, 0) == units and P.snake_order([], 4) == []
+    qo = [0, 4096, 8192]
+    kv = [0, 256, 512]
+    last = [16, 16]
+    for sm, grid in ((148, 0), (148, 64), (1000, 0)):
+        plan = P.build_plan(qo, kv, last, 32, 8, 128, 16, sm_count=sm, grid=grid)
+        lengths = [d[P.F_TILE_HI] - d[P.F_TILE_LO] for d in plan.desc]
+        g = min(len(plan.desc), grid if grid else sm)
+        ref = P.snake_order(sorted(lengths, reverse=True), g)
+        assert lengths == ref, (sm, grid)
+
+
 def test_cache_key_covers_every_kernel_source():
     from flashinfer.batch_invariant.jit import relative_sources
 

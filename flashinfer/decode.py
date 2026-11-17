@@ -42,9 +42,7 @@ from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
 from .cudnn.utils import (
-    cudnn_frontend_accepts_cuda_graph_replay_hint,
     cudnn_frontend_frost_runtime_available,
-    cudnn_frontend_leads_short_caches,
     cudnn_frontend_serves_frost_decode,
 )
 from .cudnn.decode import CudnnDecodeGraph, prepare_cudnn_batch_decode
@@ -698,8 +696,6 @@ def _auto_decode_prefers_cudnn(
     logits_soft_cap: float,
     q_len_per_req: int,
     fa2_available: bool = True,
-    declared_kv_len: Optional[int] = None,
-    frontend_leads_short_caches: bool = False,
     frost_runtime_available: bool = True,
     fixed_split_size: Optional[int] = None,
     disable_split_kv: bool = False,
@@ -760,18 +756,9 @@ def _auto_decode_prefers_cudnn(
     d256, no RoPE / soft-cap), whatever the envelope says, where the wrapper
     used to raise.
 
-    ``declared_kv_len`` is the cache length a caller-owned ``block_tables``
-    declares to cuDNN (its width in pages times the page size); the auto-built
-    table declares at least ``_CUDNN_DECODE_MAX_KV_BUCKET`` tokens. Below 2048
-    tokens cudnn-frontend 1.30 ranks the backend's prefill-class engine ahead
-    of the decode tile for multi-token rows (~8x fa2's time), so such a plan
-    stays on fa2 unless ``frontend_leads_short_caches`` (1.31+, which ranks the
-    tile first at every cache length) or fa2 cannot serve the rows at all.
-
     ``frost_runtime_available`` says the frontend's FROST engines can actually
     run on this install: its own CuTe-DSL check (``nvidia-cutlass-dsl``
-    present and not below its floor, 4.7.0 today, where both packages'
-    dependency metadata admit 4.6.2). Without it the frontend's rows decline
+    present and not below its kernel floor). Without it the frontend's rows decline
     and the backend engine serves the graph, so the performance-driven route
     stays on fa2; the no-fa2 route and the ``1`` override are not gated by it.
 
@@ -781,12 +768,9 @@ def _auto_decode_prefers_cudnn(
     cuDNN's plans have no equivalent, so a caller passing either keeps fa2
     wherever fa2 can serve the rows.
 
-    cudnn-frontend 1.30+ is required unless forced: an older frontend serves
-    the graph with the backend engine, which is ~8x slower than fa2 on
-    multi-token rows and rejects a sink at ``q_len_per_req == 1`` (1.30+ falls
-    through to the FROST row for that). ``FLASHINFER_DECODE_AUTO_CUDNN``
-    overrides: ``0`` never, ``1`` also on an older frontend (benchmarking /
-    bisection).
+    ``FLASHINFER_DECODE_AUTO_CUDNN`` overrides: ``0`` never, ``1`` bypasses
+    the FROST availability probes for benchmarking/bisection. Device and
+    graph-feature compatibility checks still apply.
     """
     if override is None:
         override = os.environ.get(_DECODE_AUTO_CUDNN_ENV, "")
@@ -822,14 +806,6 @@ def _auto_decode_prefers_cudnn(
         # The frontend is new enough but its FROST engines cannot run on this
         # install (CuTe DSL below the frontend's floor): the backend engine
         # would serve the graph, ~8x slower than fa2 on these rows.
-        return False
-    if (
-        declared_kv_len is not None
-        and declared_kv_len < _CUDNN_DECODE_MAX_KV_BUCKET
-        and not frontend_leads_short_caches
-    ):
-        # A caller-owned block table shorter than the bucket would hand the
-        # rows to the backend's prefill-class engine on cudnn-frontend 1.30.
         return False
     if head_dim not in (128, 256):
         return False
@@ -1709,7 +1685,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req,
         *,
         user_block_tables: bool,
-        declared_kv_len: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
     ) -> bool:
@@ -1749,18 +1724,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # The CUDA-core decode kernel is single-token: multi-token rows
             # without tensor cores have no fa2 kernel to compare against.
             fa2_available=self.use_tensor_cores or q_len_per_req <= 1,
-            declared_kv_len=declared_kv_len,
-            frontend_leads_short_caches=cudnn_frontend_leads_short_caches(),
             # The frontend's own CuTe-DSL check: new enough for the FROST rows
             # to run, not just a new enough frontend version.
             frost_runtime_available=cudnn_frontend_frost_runtime_available(),
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
-            # A CUDA-graph wrapper tells cudnn-frontend 1.31+ the graph is
+            # A CUDA-graph wrapper tells cudnn-frontend the graph is
             # replayed (prepare_cudnn_batch_decode); its d256 decode tile
             # then splits KV, which widens the single-token d256 band.
-            replay_hint=self.is_cuda_graph_enabled
-            and cudnn_frontend_accepts_cuda_graph_replay_hint(),
+            replay_hint=self.is_cuda_graph_enabled,
         )
 
     @property
@@ -1937,9 +1909,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer, "float_workspace_buffer"
         )
         user_block_tables = block_tables is not None
-        declared_kv_len = (
-            None if block_tables is None else block_tables.shape[1] * page_size
-        )
         del block_tables, rope_scale, rope_theta, sm_scale
         backend = self._backend
         batch_size = len(last_page_len)
@@ -1972,7 +1941,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             logits_soft_cap,
             q_len_per_req,
             user_block_tables=user_block_tables,
-            declared_kv_len=declared_kv_len,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         ):
@@ -2503,9 +2471,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             logits_soft_cap,
             q_len_per_req,
             user_block_tables=block_tables is not None,
-            declared_kv_len=None
-            if block_tables is None
-            else block_tables.shape[1] * page_size,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
@@ -4520,7 +4485,8 @@ def trtllm_batch_decode_with_kv_cache(
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
 
     out_dtype : Optional[Union[torch.dtype, str]] = None
-        output dtype, if not provided, will use the type of ``out``. For nvfp4, use string ``nvfp4``.
+        output dtype, if not provided, will use the type of ``out`` when given, otherwise the type of ``query``.
+        For nvfp4, use string ``nvfp4``.
 
     o_sf_scale : Optional[float] = None
         scale for nvfp4 output tensor scale factor.
@@ -5758,9 +5724,6 @@ def fast_decode_plan(
             logits_soft_cap,
             q_len_per_req,
             user_block_tables=getattr(self, "_user_block_tables", False),
-            declared_kv_len=self._block_tables.shape[1] * page_size
-            if getattr(self, "_user_block_tables", False)
-            else None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )

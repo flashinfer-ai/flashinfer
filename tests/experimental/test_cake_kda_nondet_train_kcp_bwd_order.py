@@ -71,7 +71,10 @@ from tests.experimental.test_cake_kda_nondet_train_kcp_handoff import (
     _mode_row_id,
     _same,
 )
-from tests.test_helpers.cake_kda_det_train_reference import LOWER_BOUND, make_inputs
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (
+    LOWER_BOUND,
+    make_inputs,
+)
 
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 # the knob pairs of the GPU rows (the private test knobs): "first_main" forces the previous order, the reference of

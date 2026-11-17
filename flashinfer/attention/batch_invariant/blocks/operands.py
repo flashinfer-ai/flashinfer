@@ -99,9 +99,15 @@ BAR_FOLD = 6  # the correction warpgroup's arrival barrier of the in-kernel chun
 BAR_SOFTMAX_ALL = 7  # every softmax thread has copied S out (P over S with two softmax warpgroups sharing TMEM lanes)
 REP_ROWS = 32  # units with at most this many live rows take the replicated-row placement (one warp's lanes)
 
+REGS_SOFTMAX_W2 = 160  # per softmax thread with two softmax warpgroups (64 keys per thread): 2 x 160 x 128 + 160 x 128 + 32 x 128 = 65536
+REGS_CORRECTION_W2 = 160
 STATS_SLOTS = 4  # softmax -> correction payload ring depth (one entry per tile: alpha, m', r_slices)
 STATS_SLOTS_PP = 8  # the same ring under the ping-pong placement: 2 entries per tile x 4 tiles (both warpgroups' tiles in tile order)
-SLOT_KEYS_256 = 64  # keys per ring slot at D = 256 (half tiles: 32 KB slots, four of them in the 128 KB ring)
+SLOT_KEYS_256 = 128  # keys per ring slot at D = 256: whole tiles (two 64 KB slots in the 128 KB ring). Half-tile slots (four of 32 KB)
+# let the producer run further ahead, but made QK^T two 128 x 64 x 16 instructions per K-step instead of one 128 x 128 x 16: the
+# MMA warp issues one tcgen05.mma per fixed interval whatever its N, so the tile's 48 instructions cost more issue time than
+# its tensor work; with whole slots the K / V loads of a tile still overlap the previous tile's MMAs (each slot's load is
+# issued when its predecessor's MMAs complete, a tile ahead of its use)
 Q_STAGES = 2  # Q tiles in smem: the load warp prefetches the next unit's Q while the MMA finishes this one
 REGS_SOFTMAX, REGS_OTHER = 192, 32
 
@@ -112,7 +118,7 @@ class Roles:
     their TMEM lanes), then the correction warpgroup, then MMA, load and empty warps completing the last
     warpgroup. Register budget: 65536 = 192 x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
 
-    def __init__(self, n_wg: int, D: int = 128):
+    def __init__(self, n_wg: int, D: int = 128, q2: bool = False):
         assert n_wg in (1, 2), n_wg
         self.n_wg = n_wg
         self.softmax_warps = tuple(range(4 * n_wg))
@@ -121,13 +127,24 @@ class Roles:
         self.load_warp = self.mma_warp + 1
         self.empty_warps = tuple(range(self.mma_warp + 2, self.mma_warp + 4))
         self.threads = 32 * (self.mma_warp + 4)
-        # the correction warpgroup: 96 with two softmax warpgroups, 128 at D <= 128, 208 when the chunk merge runs through the global scratch
-        # (MERGE_DEPTH O_m pieces in flight); the launch allocates 65536 / threads (168 at 384 threads) and the roles move above or below it
-        self.regs_correction = 96 if n_wg == 2 else (208 if not om_in_tmem(D) else 128)
+        # register budgets: one softmax warpgroup -- 192 per softmax thread (a whole row of scores), the correction 128 at D <= 128 and 208
+        # when the chunk merge runs through the global scratch (O_m pieces in flight); two softmax warpgroups on key slices -- 160 each
+        # (half a row of scores) and 160 for the correction; the paired placement (q2: each warpgroup a whole row) -- 192 and 96. The
+        # launch allocates 65536 / threads (168 at 384 threads) and the roles move above or below it
+        two_slices = n_wg == 2 and not q2
+        self.regs_softmax = REGS_SOFTMAX_W2 if two_slices else REGS_SOFTMAX
+        if two_slices:
+            self.regs_correction = REGS_CORRECTION_W2
+        elif q2:
+            self.regs_correction = 96
+        else:
+            self.regs_correction = 208 if not om_in_tmem(D) else 128
         self.n_tmem_users = 32 * (4 * n_wg + 4 + 1)
         self.regs_launch = (65536 // self.threads) // 8 * 8
         assert (
-            REGS_SOFTMAX * 128 * n_wg + self.regs_correction * 128 + REGS_OTHER * 32 * 4
+            self.regs_softmax * 128 * n_wg
+            + self.regs_correction * 128
+            + REGS_OTHER * 32 * 4
             <= 65536
         ), (n_wg, self.regs_correction)
 
@@ -176,12 +193,12 @@ class StaticPlan:
             D,
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
-        self.roles = Roles(n_wg, D)
+        self.roles = Roles(n_wg, D, q2)
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
-            32 if n_wg == 1 else 16
-        )  # the correction's TMEM piece (columns): 32 at 128 registers, 16 at 96
+            32 if self.roles.regs_correction >= 128 else 16
+        )  # the correction's TMEM piece (columns): 32 from 128 registers up, 16 below
         self.T = TILE_KEYS
         self.tokens_per_tile = (
             Q_ROWS // g
@@ -209,9 +226,8 @@ class StaticPlan:
         )  # keys per thread (replicated rows): warp wq of warpgroup k holds slice 4k + wq
         self.slices_rep = 4 * self.n_slices
         self.stats_slots = STATS_SLOTS_PP if q2 else STATS_SLOTS
-        # ring slots: a whole KV tile (T keys) at D <= 128; HALF tiles (64 keys, 32 KB) at D = 256, so that the 128 KB ring holds
-        # four slots instead of two and the producer runs further ahead (a placement: QK^T is then two N = 64 MMAs per tile and the
-        # PV releases its V slot per 4-step half; the per-element folds are unchanged)
+        # ring slots: a whole KV tile (T keys) at every D (SLOT_KEYS_256: the half-tile slots of D = 256 were a placement that cost more
+        # MMA issue than they saved in load latency); the code keeps the general slots_per_tile form
         self.slot_keys = SLOT_KEYS_256 if D == 256 else self.T
         self.slots_per_tile = self.T // self.slot_keys
         self.n_slots = (

@@ -11,7 +11,7 @@ the MLIR context; the results are plain attributes the kernel reads as constants
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -24,7 +24,7 @@ from flashinfer.cute_dsl.attention.fmha.helpers import (
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
-from ..spec import BLOCK_SCALED, ELEM_BITS_OF, SF_VEC
+from ..spec import BLOCK_K, BLOCK_SCALED, ELEM_BITS_OF, FP8_BLOCKSCALE_FMTS, SF_VEC
 
 
 def k_granule(in_fmt: str) -> int:
@@ -46,6 +46,7 @@ IN_DT = {
     "nvfp4_k128": cutlass.Float4E2M1FN,
     "mxfp4": cutlass.Float4E2M1FN,
     "mxfp4_k128": cutlass.Float4E2M1FN,
+    "e4m3_bs": cutlass.Float8E4M3FN,  # the block-scale fp8 class: e4m3 elements, fp32 block scales applied by the epilogue (blocks/blockscale_fp8.py)
 }
 OUT_DT = {
     "bf16": cutlass.BFloat16,
@@ -63,6 +64,7 @@ ALIGN = {
     "nvfp4_k128": 32,
     "mxfp4": 32,
     "mxfp4_k128": 32,
+    "e4m3_bs": 16,
     "f32": 4,
 }  # elements per 16-byte TMA alignment
 
@@ -97,12 +99,18 @@ class StaticPlan:
         extra_smem_bytes: int = 2048,
         chunks: int = 1,
         in_fmt: str = "bf16",
+        k_blocks: Optional[int] = None,
+        acc_stages: Optional[int] = None,
+        reserve_smem_bytes: int = 0,
     ):
-        """``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
+        """``k_blocks`` overrides the instruction K-steps per smem stage (default ``MMA_K_BLOCKS``: one 128-byte swizzle atom
+        of K per row; the grouped MoE kernels take two atoms for bf16) -- the lowering's inner radix, a placement of the same
+        fold (Lean's ``kblockLoopG_eq_kfoldG`` holds for every radix). ``c_in_smem=False`` reserves no C stages, so the whole leftover budget goes to the A/B ring, minus
         ``extra_smem_bytes`` for a caller's own shared storage (unused by this body). ``chunks`` is the
         class's chunk count: with ``knobs.cta_chunks`` the CTA folds all of them (``cta_chunks`` below) and the
         TMEM holds the running sum next to the accumulator stages. ``in_fmt`` names the operand format whose knob
-        constraints apply."""
+        constraints apply. ``acc_stages`` overrides the accumulator ring's depth (the block-scale body: one stage per K
+        block in flight); ``reserve_smem_bytes`` is smem the caller allocates itself (its scale ring), off the A/B/C budget."""
         assert knobs.well_formed(in_fmt) and knobs.use_tma_store, (knobs, in_fmt)
         self.knobs = knobs
         self.chunks = chunks
@@ -111,6 +119,8 @@ class StaticPlan:
         )  # chunks folded inside the CTA (1: none)
         self.c_in_smem = c_in_smem
         self.extra_smem_bytes = extra_smem_bytes
+        self.acc_stages = acc_stages
+        self.reserve_smem_bytes = reserve_smem_bytes
         self.a_dtype, self.b_dtype, self.c_dtype, self.c_layout = (
             a_dtype,
             b_dtype,
@@ -131,7 +141,7 @@ class StaticPlan:
         self.mma_tiler = (
             knobs.mma_tiler_mn[0],
             knobs.mma_tiler_mn[1],
-            inst_k * MMA_K_BLOCKS,
+            inst_k * (k_blocks or MMA_K_BLOCKS),
         )
         self.cta_tile_shape_mnk = (
             self.mma_tiler[0] // self.atom_thr_size,
@@ -198,7 +208,7 @@ class StaticPlan:
             self.b_dtype, b_one
         )
         c_bytes_per_stage = cute.size_in_bytes(self.c_dtype, c_one)
-        num_acc = NUM_ACC_STAGE
+        num_acc = self.acc_stages or NUM_ACC_STAGE
         if self.cta_chunks > 1:
             # accumulator stages + the running sum: 3 x tile N columns when they fit the 512-column allocation, else one stage; the
             # 64-row CTA tiles (the 16 x 4 lane split of their accumulator) take one stage too: the DSL's TMEM fragment of three
@@ -208,19 +218,16 @@ class StaticPlan:
                 if (3 * self.knobs.tile_n <= 512 and self.knobs.cta_tile_mn[0] != 64)
                 else 1
             )
+        cap = self.smem_capacity - OCCUPANCY * self.reserve_smem_bytes
         if not self.c_in_smem:
             num_ab = (
-                self.smem_capacity // OCCUPANCY
-                - MBAR_RESERVE_BYTES
-                - self.extra_smem_bytes
+                cap // OCCUPANCY - MBAR_RESERVE_BYTES - self.extra_smem_bytes
             ) // ab_bytes  # the caller's tables
             return num_acc, num_ab, 0
         c_bytes = c_bytes_per_stage * NUM_C_STAGE_MIN
-        num_ab = (
-            self.smem_capacity // OCCUPANCY - (MBAR_RESERVE_BYTES + c_bytes)
-        ) // ab_bytes
+        num_ab = (cap // OCCUPANCY - (MBAR_RESERVE_BYTES + c_bytes)) // ab_bytes
         num_c = NUM_C_STAGE_MIN + (
-            self.smem_capacity
+            cap
             - OCCUPANCY * ab_bytes * num_ab
             - OCCUPANCY * (MBAR_RESERVE_BYTES + c_bytes)
         ) // (OCCUPANCY * c_bytes_per_stage)
@@ -355,6 +362,17 @@ def can_implement(
                 and Kc % al_in == 0
                 and tiles <= MAX_GRID_Z
             )
+    if in_fmt in FP8_BLOCKSCALE_FMTS:
+        # the block-scale class: a K-major weight (the NT operator), K a whole number of scale blocks (= k-tiles), no split
+        # variant, no in-CTA fold; the output is stored directly
+        return (
+            b_major == "k"
+            and chunks == 1
+            and not knobs.cta_chunks
+            and K % BLOCK_K == 0
+            and K % al_in == 0
+            and N % al_out == 0
+        )
     return (
         Kc % al_in == 0
         and (N if b_major == "n" else Kc) % al_in == 0

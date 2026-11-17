@@ -44,6 +44,10 @@ CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Prefill bodies compile in two flavors: =1 assumes every state vector access is
+# 16-byte aligned (no address predicate: the main body); =0 guards each vector
+# block with a warp-uniform address predicate and a bit-identical scalar cold arm.
+_STATE_VEC_ALIGNED_DEFINE = "CAKE_GDN_STATE_VEC_ALIGNED"
 _RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
 _RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
 # A decode record whose kernel takes its state as a ``const __grid_constant__ CUtensorMap``
@@ -295,8 +299,14 @@ def _define_flags(record: dict[str, Any]) -> tuple[str, ...]:
     return tuple(flags)
 
 
-def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
-    """``nvcc`` options of the variant: ``--use_fast_math`` and its ``-D`` flags."""
+def _compile_options(
+    record: dict[str, Any], *, state_vec_aligned: bool = True
+) -> tuple[str, ...]:
+    """``nvcc`` options of the variant: ``--use_fast_math`` and its ``-D`` flags.
+
+    Every prefill record also gets ``-DCAKE_GDN_STATE_VEC_ALIGNED=1|0`` (the
+    16-byte-aligned or the guarded flavor); decode records have one flavor.
+    """
 
     options = tuple(record.get("compile_options", ("--use_fast_math",)))
     unsupported_options = set(options) - {"--use_fast_math"}
@@ -304,12 +314,25 @@ def _compile_options(record: dict[str, Any]) -> tuple[str, ...]:
         raise RuntimeError(
             f"unsupported Cake GDN compile options: {sorted(unsupported_options)!r}"
         )
-    return options + _define_flags(record)
+    options += _define_flags(record)
+    if record["name"].startswith("prefill_"):
+        options += (f"-D{_STATE_VEC_ALIGNED_DEFINE}={int(state_vec_aligned)}",)
+    elif not state_vec_aligned:
+        raise ValueError(
+            f"Cake GDN record {record['name']!r} has no state-alignment flavor"
+        )
+    return options
 
 
 @functools.cache
-def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
-    """Compile one Cake GDN kernel variant for ``arch`` and return its cubin path."""
+def compile_cake_gdn_cubin(
+    name: str, arch: CakeGDNArch, *, state_vec_aligned: bool = True
+) -> Path:
+    """Compile one Cake GDN kernel variant for ``arch`` and return its cubin path.
+
+    ``state_vec_aligned=False`` selects the guarded prefill flavor (element-aligned
+    state); the flavor enters the compile options and so the cubin digest.
+    """
 
     if arch not in _ARCH_ACTIVE_CLUSTERS:
         raise CakeGDNUnsupportedError(f"unsupported Cake GDN architecture: {arch!r}")
@@ -318,7 +341,7 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
     root = _source_dir()
     cuda_path = root / cuda["path"]
     headers = _manifest().get("cuda_headers", [])
-    compile_options = _compile_options(record)
+    compile_options = _compile_options(record, state_vec_aligned=state_vec_aligned)
     nvcc, nvcc_version = _nvcc_identity()
     compile_digest = _compile_cache_digest(
         arch=arch,
@@ -407,10 +430,17 @@ def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
 
 
 @functools.cache
-def load_cake_gdn_kernel(name: str, arch: CakeGDNArch):
-    """Compile and load one Cake GDN host entrypoint."""
+def load_cake_gdn_kernel(
+    name: str, arch: CakeGDNArch, *, state_vec_aligned: bool = True
+):
+    """Compile and load one Cake GDN host entrypoint.
 
-    cubin = compile_cake_gdn_cubin(name, arch)
+    ``state_vec_aligned=False`` loads the guarded prefill flavor; its module name
+    differs through the cubin stem.  Callers of the aligned flavor omit the keyword
+    (one cache entry per flavor).
+    """
+
+    cubin = compile_cake_gdn_cubin(name, arch, state_vec_aligned=state_vec_aligned)
     record = _kernel_record(name)
     host = record["host_binding"]
     root = _source_dir()
@@ -815,8 +845,13 @@ _SM107A_SEQ_TWINS: dict[str, tuple[str, ...]] = {
         "dvsplit_initial_f16io_gatepipe4",
     ),
     # bf16 / f16-state dvsplit schedules with shipped records (the bf16 one indexed or
-    # not): the same width lever on the low-precision state loads and stores,
-    # alignment-guarded on the indexed plans
+    # not): the same width lever on the low-precision state loads and stores.  As in
+    # every non-CP prefill body, the aligned flavor (`CAKE_GDN_STATE_VEC_ALIGNED=1`,
+    # picked when every state pointer and slot stride is 16-byte aligned) runs the
+    # vector blocks unguarded; the guarded flavor (`=0`) runs a vector state access
+    # block only when the tile's absolute state address (data pointer plus slot and
+    # head offset) is aligned to the block's widest vector access, and a bit-identical
+    # scalar block otherwise, on indexed and packed plans alike.
     "l7b_vec2lp": (
         "dvsplit_initial_bf16state",
         "dvsplit_initial_bf16state_indexed",

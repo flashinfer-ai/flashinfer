@@ -364,6 +364,7 @@ def plan_attention(
         merge=config.merge,
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
+        grid=config.grid,
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
