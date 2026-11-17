@@ -535,6 +535,9 @@ def test_decode_stacked_kv_cache(q_len, kernel):
         "seq_lens not contiguous",
         "query not packed",
         "out not packed",
+        "bmm1_scale zero",
+        "bmm1_scale zero in float",
+        "bmm1_scale negative",
     ],
 )
 def test_decode_declined_calls_run_trtllm_gen(q_len, declined):
@@ -554,6 +557,10 @@ def test_decode_declined_calls_run_trtllm_gen(q_len, declined):
         "seq_lens not contiguous": dict(seq_lens=lambda: _strided(inputs.seq_lens)),
         "query not packed": dict(query=lambda: _strided(inputs.query)),
         "out not packed": dict(out=lambda: _strided(torch.zeros_like(inputs.query))),
+        # Such scales would leave masked positions visible to the kernels.
+        "bmm1_scale zero": dict(bmm1_scale=lambda: 0.0),
+        "bmm1_scale zero in float": dict(bmm1_scale=lambda: 1e-300),
+        "bmm1_scale negative": dict(bmm1_scale=lambda: -inputs.bmm1_scale),
     }[declined]
     _check_decode_fallback(inputs, q_len, **overrides)
     if declined == "workspace too small":
@@ -833,6 +840,7 @@ def test_prefill_workspace_bytes_is_what_the_kernel_needs():
         "max_kv_len above the page table",
         "K and V strides differ",
         "query not packed",
+        "bmm1_scale zero",
     ],
 )
 def test_prefill_declined_calls_run_trtllm_gen(declined):
@@ -849,6 +857,7 @@ def test_prefill_declined_calls_run_trtllm_gen(declined):
         ),
         "K and V strides differ": dict(kv_cache=lambda: (_strided(k_cache), v_cache)),
         "query not packed": dict(query=lambda: _strided(inputs.query)),
+        "bmm1_scale zero": dict(bmm1_scale=lambda: 0.0),
     }[declined]
     _check_prefill_fallback(inputs, [512], required, **overrides)
 

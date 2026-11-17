@@ -156,11 +156,12 @@ std::string readCall(nm35::Call& c, TensorView const& out, TensorView const& que
   if (auto tensor = bmm1_scale.as<ffi::Tensor>()) {
     c.scaleSoftmaxLog2Ptr = static_cast<float const*>(tensor.value().data_ptr());
   } else if (auto value = bmm1_scale.as<double>()) {
-    // The kernels mask with a large negative finite score, which a zero or negative scale would
-    // turn into a visible one; trtllm-gen serves such calls.
-    if (!(value.value() > 0.0) || !std::isfinite(value.value()))
-      return "bmm1_scale is not positive and finite";
-    c.scaleSoftmaxLog2 = static_cast<float>(value.value() * flashinfer::math::log2e_d);
+    // The kernels mask with -FLT_MAX before scaling, so the scale applied in float must keep a
+    // masked score far below any visible one (and every product finite); trtllm-gen serves
+    // other scales. Real scales are many orders of magnitude inside this range.
+    float const scaleLog2 = static_cast<float>(value.value() * flashinfer::math::log2e_d);
+    if (!(scaleLog2 >= 1e-30f && scaleLog2 <= 1e30f)) return "bmm1_scale outside [1e-30, 1e30]";
+    c.scaleSoftmaxLog2 = scaleLog2;
   } else {
     return "bmm1_scale is neither a float nor a tensor";
   }
