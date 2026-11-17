@@ -269,17 +269,7 @@ class BatchInvariantGemmRunner(TunableRunner):
         self.scale_mode = scale_mode
 
     def _shape(self, inputs: List[torch.Tensor]) -> tuple:
-        a, b = inputs[0], inputs[1]
-        if self.api == "gemm_fp8_nt_groupwise":
-            return (
-                a.shape[0],
-                b.shape[0],
-                a.shape[1],
-            )  # the NT operator's weight is (N, K)
-        per_unit = (
-            2 if ELEM_BITS_OF[self.in_fmt] == 4 else 1
-        )  # the 4-bit formats arrive byte-packed: two elements per unit of a's K mode; every other format, one
-        return a.shape[-2], b.shape[-1], per_unit * a.shape[-1]
+        return _shape_of(self.api, self.in_fmt, inputs)
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         return (
@@ -436,15 +426,29 @@ def _pick(
     inputs: List[Any],
     scale_mode: str = "MN",
 ) -> Knobs:
-    """The configuration a public call runs: the autotuner's choice for the op (a tuned tactic, or its fallback -1, which
-    is the dispatcher's pick). The operands were validated by the caller, so the configuration goes to the class's launch
-    directly rather than through the class entry again."""
-    runner = _runner(api, in_fmt, b_major, chunks, sm_count, family, scale_mode)
-    chosen, tactic = AutoTuner.get().choose_one(
-        custom_op, [runner], tuning_config, inputs
-    )
-    assert chosen is runner
-    return runner.config_for(inputs, tactic)
+    """The configuration a public call runs. Where the autotuner may hold something for the op (tuning mode, a tuned
+    process, a loaded cache: ``AutoTuner._has_tune_data``) it is the autotuner's choice (a tuned tactic, or its fallback
+    -1, which is the dispatcher's pick); elsewhere the dispatcher's pick directly, which is what the lookup would have
+    fallen back to. The operands were validated by the caller, so the configuration goes to the class's launch directly
+    rather than through the class entry again."""
+    tuner = AutoTuner.get()
+    if tuner._has_tune_data(custom_op):
+        runner = _runner(api, in_fmt, b_major, chunks, sm_count, family, scale_mode)
+        chosen, tactic = tuner.choose_one(custom_op, [runner], tuning_config, inputs)
+        assert chosen is runner
+        return runner.config_for(inputs, tactic)
+    M, N, K = _shape_of(api, in_fmt, inputs)
+    return default_config(M, N, K, chunks, b_major, sm_count, family, in_fmt)
+
+
+def _shape_of(api: str, in_fmt: str, inputs: List[Any]) -> tuple:
+    """(M, N, K) of a runner's input list: the NT operator's weight is (N, K); the 4-bit formats arrive byte-packed, two
+    elements per unit of a's K mode (every other format, one)."""
+    a, b = inputs[0], inputs[1]
+    if api == "gemm_fp8_nt_groupwise":
+        return a.shape[0], b.shape[0], a.shape[1]
+    per_unit = 2 if ELEM_BITS_OF[in_fmt] == 4 else 1
+    return a.shape[-2], b.shape[-1], per_unit * a.shape[-1]
 
 
 def mm_bf16_batch_invariant_auto(

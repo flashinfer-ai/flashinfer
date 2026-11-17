@@ -313,6 +313,37 @@ def test_memoised_dispatcher_pick_equals_a_fresh_ranking(family, sm_count):
         H.rank.cache_clear()
 
 
+def test_autotuner_lookup_is_skipped_exactly_when_it_cannot_hit(monkeypatch):
+    """``AutoTuner._has_tune_data(op)`` is the public path's precondition for the autotuner's lookup: False only when every
+    source the lookup consults is empty for the op (no tuning mode, no replay diagnostics, no managed store, no loaded or
+    bundled configs, no in-memory winner of the op); it follows every publication and ``clear_cache``."""
+    from flashinfer.autotuner.autotuner import ProfilingCacheKey
+
+    monkeypatch.delenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", raising=False)
+    tuner = AutoTuner()  # a fresh instance: not the process singleton
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP)
+    tuner.is_tuning_mode = True
+    assert tuner._has_tune_data(tuning.CUSTOM_OP)
+    tuner.is_tuning_mode = False
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP)  # the memoised negative
+    key = ProfilingCacheKey(tuning.CUSTOM_OP_MM_FP4, "R", 1, ((1, 2),), ())
+    tuner._cache_profile_result(key, None, TUNING_CONFIG_OF_TEST, (1, 2), {})
+    assert tuner._has_tune_data(tuning.CUSTOM_OP_MM_FP4)
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP)  # another op's winner is not ours
+    tuner._file_configs["x"] = (
+        "R",
+        -1,
+    )  # a loaded cache: any op may hit (the file may name it)
+    assert tuner._has_tune_data(tuning.CUSTOM_OP)
+    tuner.clear_cache()
+    assert not tuner._has_tune_data(tuning.CUSTOM_OP_MM_FP4)
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "1")
+    assert tuner._has_tune_data(tuning.CUSTOM_OP)
+
+
+TUNING_CONFIG_OF_TEST = tuning.TUNING_CONFIG
+
+
 def test_hbm_traffic_follows_the_tile_order():
     """The traffic model: the operands' own bytes when every band's panels stay resident in the L2, refetches per band
     or per wave when they do not, fewer of them with a wider swizzle band, and never below the operands' own bytes."""
@@ -660,6 +691,35 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, layout, bi
     for r, t, p in zip(ref, tuned, post, strict=True):
         assert torch.equal(r, t) and torch.equal(r, p)
     assert torch.equal(post[1], post[2][:16])
+
+
+@needs_device
+def test_public_api_takes_the_autotuner_lookup_only_where_it_may_hit(monkeypatch):
+    """The public path asks the autotuner only where ``_has_tune_data`` says it may hold something; otherwise it runs the
+    dispatcher's pick directly, the same configuration the lookup would have fallen back to (the same bits as the class
+    entry). A process that tuned the op keeps the lookup."""
+    a, b = adv_bf16(16, 4096, 171), adv_bf16(4096, 4096, 172)
+    ref = bits(mm_bf16_batch_invariant(a, b))
+    calls = []
+    real = AutoTuner.choose_one
+
+    def counting(self, custom_op, *args, **kw):
+        calls.append(custom_op)
+        return real(self, custom_op, *args, **kw)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", counting)
+    monkeypatch.setattr(AutoTuner, "_has_tune_data", lambda self, op: False)
+    assert torch.equal(bits(bi_mm(a, b)), ref) and calls == []
+    monkeypatch.setattr(AutoTuner, "_has_tune_data", lambda self, op: True)
+    assert torch.equal(bits(bi_mm(a, b)), ref) and calls == [tuning.CUSTOM_OP]
+    monkeypatch.undo()
+    monkeypatch.setattr(AutoTuner, "choose_one", counting)
+    calls.clear()
+    with autotune(True):
+        assert torch.equal(bits(bi_mm(a, b)), ref)
+    assert AutoTuner.get()._has_tune_data(tuning.CUSTOM_OP)  # tuned in this process
+    n = len(calls)
+    assert torch.equal(bits(bi_mm(a, b)), ref) and len(calls) == n + 1
 
 
 @needs_device
