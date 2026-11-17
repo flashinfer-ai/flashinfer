@@ -88,9 +88,7 @@ def test_plan_guard_accepts_the_measured_contract():
         is None
     )
     assert (
-        _gqa_dec_fp8q_sm90_plan_eligibility(
-            **_plan_kwargs(batch_size=1, total_q=QL)
-        )
+        _gqa_dec_fp8q_sm90_plan_eligibility(**_plan_kwargs(batch_size=1, total_q=QL))
         is None
     )
 
@@ -400,8 +398,7 @@ def test_explicit_specialized_raises_for_contracts_it_has_no_kernel_for():
     device = torch.device("cuda:0")
     batch = _make_batch([584, 75], device)
     with pytest.raises(ValueError, match="specialized"):
-        _plan_wrapper(batch, device, backend="specialized",
-                      q_data_type=torch.bfloat16)
+        _plan_wrapper(batch, device, backend="specialized", q_data_type=torch.bfloat16)
     stats = _gqa_dec_fp8q_sm90_stats()
     assert stats["plans_prepared"] == 0 and stats["runs_dispatched"] == 0
 

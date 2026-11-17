@@ -2866,17 +2866,13 @@ def _gqa_dec_fp8q_sm90_prepare(
         if reason is None:
             # the kernel's compile-time verify width: every request carries
             # exactly 6 query rows, the last 6 positions of its sequence
-            q_lens = (
-                qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
-            )
+            q_lens = qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
             kv_lens = kv_lens_arr_host[:batch_size]
             if int(qo_indptr_host[batch_size]) != total_num_rows:
                 reason = "qo_indptr/total_num_rows mismatch"
             elif bool((q_lens != _GQA_DEC_FP8Q_SM90_Q_LEN).any()):
                 reason = "non-uniform q_len (kernel verify width is 6)"
-            elif bool(
-                (kv_lens.to(torch.int64) < _GQA_DEC_FP8Q_SM90_Q_LEN).any()
-            ):
+            elif bool((kv_lens.to(torch.int64) < _GQA_DEC_FP8Q_SM90_Q_LEN).any()):
                 reason = "kv_len < q_len (not a verify-decode batch)"
             elif int(kv_lens.max()) > _GQA_DEC_FP8Q_SM90_MAX_KV_LEN:
                 reason = f"kv_len={int(kv_lens.max())} above measured envelope"
@@ -2934,7 +2930,12 @@ def _gqa_dec_fp8q_sm90_prepare(
         )
     nb = max(nb, 1)
     bt = bufs.get("block_table")
-    if bt is None or bt.shape[0] < batch_size or bt.shape[1] != nb or bt.device != device:
+    if (
+        bt is None
+        or bt.shape[0] < batch_size
+        or bt.shape[1] != nb
+        or bt.device != device
+    ):
         bt = torch.empty((batch_size, nb), dtype=torch.int32, device=device)
         bufs["block_table"] = bt
         counters["workspace_allocs"] += 1
@@ -2951,9 +2952,7 @@ def _gqa_dec_fp8q_sm90_prepare(
 
     seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
     seq_lens_dev = seq_lens_buf[:batch_size]
-    seq_lens_dev.copy_(
-        kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True
-    )
+    seq_lens_dev.copy_(kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True)
 
     unit_descale = _buf("unit_descale", batch_size, torch.float32)[:batch_size]
     unit_descale.fill_(1.0)
