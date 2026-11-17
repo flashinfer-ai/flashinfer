@@ -1776,6 +1776,11 @@ _CUDA_NORM_ALIGNMENT_CASES = [
             else ()
         ),
     )
+] + [
+    ("rmsnorm", "single_row"),
+    ("qk_rmsnorm", "single_head"),
+    ("rmsnorm", "input_offset2"),
+    ("rmsnorm", "input_offset4"),
 ]
 
 
@@ -1788,6 +1793,10 @@ def test_cuda_norm_vector_alignment(operation, layout, dtype, enable_pdl, monkey
         pytest.skip("PDL requires SM90+")
     monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
     shape = (3, 5, 128) if operation == "qk_rmsnorm" else (19, 500)
+    if layout == "single_row":
+        shape = (1, 500)
+    elif layout == "single_head":
+        shape = (3, 1, 128)
     hidden = shape[-1]
     columns = torch.arange(hidden, device="cuda")
     sentinel = -16
@@ -1795,7 +1804,11 @@ def test_cuda_norm_vector_alignment(operation, layout, dtype, enable_pdl, monkey
 
     def tensor_with_layout(name, tensor_shape, tensor_dtype):
         offset = int(layout == name + "_offset")
+        if name == "input" and layout in ("input_offset2", "input_offset4"):
+            offset = int(layout[-1])
         padding = 1 if layout == name + "_stride" else 8
+        if layout == "single_row" and name == "input":
+            padding = 1
         storage = torch.full(
             (*tensor_shape[:-1], tensor_shape[-1] + padding),
             sentinel,
@@ -1803,6 +1816,10 @@ def test_cuda_norm_vector_alignment(operation, layout, dtype, enable_pdl, monkey
             dtype=tensor_dtype,
         )
         view = storage[..., offset : offset + tensor_shape[-1]]
+        if layout == "single_head" and name == "input":
+            view = view.as_strided(
+                tensor_shape, (view.stride(0), tensor_shape[-1] + 1, 1)
+            )
         guards.append((storage, offset, tensor_shape[-1]))
         return view
 
