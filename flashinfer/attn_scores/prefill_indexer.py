@@ -61,36 +61,51 @@ def get_fp8_paged_mqa_topk_indexer_module():
     return mod
 
 
-def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos,
-                            visible, out):
+def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos, visible, out):
     """Guard order: GPU-free (kill switch, dtype, geometry) -> layout ->
     device. Returns [] when servable, else reasons. No device syncs."""
     if _os.environ.get(KILL_SWITCH_ENV, "0") == "1":
         return ["kill_switch:" + KILL_SWITCH_ENV + "=1"]
     r = []
-    if qi.dim() != 3 or qi.shape[1] != 4 or qi.shape[2] != 128 \
-            or qi.dtype != torch.float8_e4m3fn:
+    if (
+        qi.dim() != 3
+        or qi.shape[1] != 4
+        or qi.shape[2] != 128
+        or qi.dtype != torch.float8_e4m3fn
+    ):
         r.append("qi_not_Tx4x128_fp8e4m3")
-    if ck_cache.dim() != 4 or ck_cache.shape[1] != 64 \
-            or ck_cache.shape[2] != 1 or ck_cache.shape[3] != 128 \
-            or ck_cache.dtype != torch.float8_e4m3fn:
+    if (
+        ck_cache.dim() != 4
+        or ck_cache.shape[1] != 64
+        or ck_cache.shape[2] != 1
+        or ck_cache.shape[3] != 128
+        or ck_cache.dtype != torch.float8_e4m3fn
+    ):
         r.append("ck_cache_not_Px64x1x128_fp8e4m3")
     if cpage_table.dim() != 2 or cpage_table.dtype != torch.int32:
         r.append("cpage_table_not_2d_int32")
-    if cu_seqlens.dim() != 1 or cu_seqlens.dtype != torch.int32 \
-            or (cpage_table.dim() == 2
-                and cu_seqlens.shape[0] != cpage_table.shape[0] + 1):
+    if (
+        cu_seqlens.dim() != 1
+        or cu_seqlens.dtype != torch.int32
+        or (cpage_table.dim() == 2 and cu_seqlens.shape[0] != cpage_table.shape[0] + 1)
+    ):
         r.append("cu_seqlens_not_Bplus1_int32")
-    if pos.dim() != 1 or pos.dtype != torch.int32 \
-            or pos.shape[0] != qi.shape[0]:
+    if pos.dim() != 1 or pos.dtype != torch.int32 or pos.shape[0] != qi.shape[0]:
         r.append("pos_not_T_int32")
-    if visible.dim() != 1 or visible.dtype != torch.int32 \
-            or visible.shape[0] != qi.shape[0]:
+    if (
+        visible.dim() != 1
+        or visible.dtype != torch.int32
+        or visible.shape[0] != qi.shape[0]
+    ):
         r.append("visible_not_T_int32")
     if out is not None and (
-            out.dtype != torch.int32 or out.dim() != 2
-            or out.shape[0] != qi.shape[0] or out.shape[1] != PACKED_WIDTH
-            or not out.is_contiguous() or out.device != qi.device):
+        out.dtype != torch.int32
+        or out.dim() != 2
+        or out.shape[0] != qi.shape[0]
+        or out.shape[1] != PACKED_WIDTH
+        or not out.is_contiguous()
+        or out.device != qi.device
+    ):
         r.append("out_not_TxPW_int32_contiguous")
     if r:
         return r
@@ -150,19 +165,23 @@ def fp8_paged_mqa_topk_indexer(
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
-    reasons = _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens,
-                                      pos, visible, out)
+    reasons = _supported_with_reasons(
+        qi, ck_cache, cpage_table, cu_seqlens, pos, visible, out
+    )
     LAST_FALLBACK_REASONS[:] = reasons
     if reasons:
         DISPATCH_STATS["rejected"] += 1
         raise ValueError(
             "fp8_paged_mqa_topk_indexer cannot serve this call; "
-            f"fallback_reasons={reasons}")
+            f"fallback_reasons={reasons}"
+        )
     DISPATCH_STATS["specialized"] += 1
     if out is None:
-        out = torch.empty((qi.shape[0], PACKED_WIDTH), dtype=torch.int32,
-                          device=qi.device)
+        out = torch.empty(
+            (qi.shape[0], PACKED_WIDTH), dtype=torch.int32, device=qi.device
+        )
     mod = get_fp8_paged_mqa_topk_indexer_module()
-    mod.fp8_paged_mqa_topk_indexer_run(qi, ck_cache, cpage_table, cu_seqlens,
-                                       pos, visible, out)
+    mod.fp8_paged_mqa_topk_indexer_run(
+        qi, ck_cache, cpage_table, cu_seqlens, pos, visible, out
+    )
     return out
