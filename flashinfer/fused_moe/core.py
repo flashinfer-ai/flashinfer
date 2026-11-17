@@ -8616,9 +8616,12 @@ def _trtllm_fused_moe_workspace_size_impl(
             *ordinary, *valid,
         )  # fmt: skip
     # Every entry point ends with (workspace_buffer, query_workspace_size); the FP4
-    # entry additionally takes the 4over6 recipe code.
-    tail = (
-        (NVFP4_4OVER6_CODE_FROM_ENV,) if fn is moe_op.trtllm_fp4_block_scale_moe else ()
+    # entry additionally takes the 4over6 recipe code and the (empty) localization
+    # arguments.
+    tail: Tuple[Any, ...] = (
+        (NVFP4_4OVER6_CODE_FROM_ENV, [], [], 0)
+        if fn is moe_op.trtllm_fp4_block_scale_moe
+        else ()
     )
     result = fn(*args, None, True, *tail)
     return int(_torch_view_of_ffi_tensor(result[0]).item())
