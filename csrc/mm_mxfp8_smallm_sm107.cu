@@ -27,12 +27,14 @@
 // fragments instead of one, and one load replaces two.  The mma k index is a
 // permutation of the real k index; A and B use the same permutation, so the
 // dot product is unchanged.
-#include <cuda_runtime.h>
 #include <cuda.h>
-#include <stdexcept>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
+
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
@@ -64,10 +66,11 @@ DEVI void cluster_sync() {
 // store one float4 into `rank`'s copy of a shared-memory object
 DEVI void st_rank_f4(const void* p, unsigned rank, const float4& v) {
   unsigned a = (unsigned)__cvta_generic_to_shared(p);
-  asm volatile("{ .reg .u32 m;\n mapa.shared::cluster.u32 m, %0, %1;\n"
-               " st.shared::cluster.v4.f32 [m], {%2,%3,%4,%5};\n}" ::"r"(a), "r"(rank),
-               "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
-               : "memory");
+  asm volatile(
+      "{ .reg .u32 m;\n mapa.shared::cluster.u32 m, %0, %1;\n"
+      " st.shared::cluster.v4.f32 [m], {%2,%3,%4,%5};\n}" ::"r"(a),
+      "r"(rank), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
+      : "memory");
 }
 DEVI unsigned smaddr(const void* p) { return (unsigned)__cvta_generic_to_shared(p); }
 // Blackwell/Rubin packed single-precision add: one instruction per two floats.
@@ -82,8 +85,7 @@ DEVI float4 add4(float4 a, float4 b) {
       " mov.b64 pa, {%6, %7};\n mov.b64 pb, {%10, %11};\n"
       " add.rn.f32x2 pd, pa, pb;\n mov.b64 {%2, %3}, pd;\n}"
       : "=f"(r.x), "=f"(r.y), "=f"(r.z), "=f"(r.w)
-      : "f"(a.x), "f"(a.y), "f"(a.z), "f"(a.w), "f"(b.x), "f"(b.y), "f"(b.z),
-        "f"(b.w));
+      : "f"(a.x), "f"(a.y), "f"(a.z), "f"(a.w), "f"(b.x), "f"(b.y), "f"(b.z), "f"(b.w));
   return r;
 }
 
@@ -113,24 +115,32 @@ DEVI float4 fold4<16>(float4* v) {
 }
 
 DEVI void mbar_init1(const void* mb) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(smaddr(mb)) : "memory");
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smaddr(mb)) : "memory");
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
 DEVI void mbar_expect(const void* mb, unsigned bytes) {
-  asm volatile("{ .reg .b64 st_;\n mbarrier.arrive.expect_tx.shared::cta.b64 st_, [%0], %1;\n}"
-               :: "r"(smaddr(mb)), "r"(bytes) : "memory");
+  asm volatile(
+      "{ .reg .b64 st_;\n mbarrier.arrive.expect_tx.shared::cta.b64 st_, [%0], %1;\n}" ::"r"(
+          smaddr(mb)),
+      "r"(bytes)
+      : "memory");
 }
 template <bool SUSPEND = false>
 DEVI void mbar_wait(const void* mb) {
   if constexpr (SUSPEND) {
     const unsigned suspend_ns = 10000000u;
-    asm volatile("{ .reg .pred p_;\n"
-                 "W%=: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p_, [%0], 0, %1;\n"
-                 " @!p_ bra W%=;\n}" :: "r"(smaddr(mb)), "r"(suspend_ns) : "memory");
+    asm volatile(
+        "{ .reg .pred p_;\n"
+        "W%=: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p_, [%0], 0, %1;\n"
+        " @!p_ bra W%=;\n}" ::"r"(smaddr(mb)),
+        "r"(suspend_ns)
+        : "memory");
   } else {
-    asm volatile("{ .reg .pred p_;\n"
-                 "W%=: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p_, [%0], 0;\n"
-                 " @!p_ bra W%=;\n}" :: "r"(smaddr(mb)) : "memory");
+    asm volatile(
+        "{ .reg .pred p_;\n"
+        "W%=: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p_, [%0], 0;\n"
+        " @!p_ bra W%=;\n}" ::"r"(smaddr(mb))
+        : "memory");
   }
 }
 DEVI void st_async_f4(const void* p, const void* mb, unsigned rank, const float4& v) {
@@ -138,15 +148,16 @@ DEVI void st_async_f4(const void* p, const void* mb, unsigned rank, const float4
       "{ .reg .u32 ra_, rm_;\n mapa.shared::cluster.u32 ra_, %0, %2;\n"
       " mapa.shared::cluster.u32 rm_, %1, %2;\n"
       " st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.f32 "
-      "[ra_], {%3,%4,%5,%6}, [rm_];\n}"
-      :: "r"(smaddr(p)), "r"(smaddr(mb)), "r"(rank), "f"(v.x), "f"(v.y),
-         "f"(v.z), "f"(v.w) : "memory");
+      "[ra_], {%3,%4,%5,%6}, [rm_];\n}" ::"r"(smaddr(p)),
+      "r"(smaddr(mb)), "r"(rank), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w)
+      : "memory");
 }
 
 DEVI uint4 ldg128(const uint8_t* p) {
   uint4 r;
   asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(p));
   return r;
 }
 // weight stream: every byte is read once, so keeping it out of L1 leaves the
@@ -155,7 +166,8 @@ DEVI uint4 ldg128(const uint8_t* p) {
 DEVI uint4 ldg128b(const uint8_t* p) {
   uint4 r;
   asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(p));
   return r;
 }
 // same stream, but asking L2 to pull 256 B per miss.  Each CTA walks a long
@@ -164,25 +176,29 @@ DEVI uint4 ldg128b(const uint8_t* p) {
 DEVI uint4 ldg128p(const uint8_t* p) {
   uint4 r;
   asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(p));
   return r;
 }
 // Q32 maps a lane's two 16-byte chunks onto one aligned 32-byte scale block.
 // Fetch both halves in one instruction to halve the load wavefront count.
 DEVI void ldg256(const uint8_t* p, uint4& a, uint4& b) {
   asm volatile("ld.global.nc.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-               : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w), "=r"(b.x), "=r"(b.y),
-                 "=r"(b.z), "=r"(b.w) : "l"(p));
+               : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w), "=r"(b.x), "=r"(b.y), "=r"(b.z),
+                 "=r"(b.w)
+               : "l"(p));
 }
 DEVI void ldg256b(const uint8_t* p, uint4& a, uint4& b) {
   asm volatile("ld.global.nc.L1::no_allocate.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-               : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w), "=r"(b.x), "=r"(b.y),
-                 "=r"(b.z), "=r"(b.w) : "l"(p));
+               : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w), "=r"(b.x), "=r"(b.y), "=r"(b.z),
+                 "=r"(b.w)
+               : "l"(p));
 }
 DEVI void ldg256p(const uint8_t* p, uint4& a, uint4& b) {
   asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-               : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w), "=r"(b.x), "=r"(b.y),
-                 "=r"(b.z), "=r"(b.w) : "l"(p));
+               : "=r"(a.x), "=r"(a.y), "=r"(a.z), "=r"(a.w), "=r"(b.x), "=r"(b.y), "=r"(b.z),
+                 "=r"(b.w)
+               : "l"(p));
 }
 DEVI uint2 ldg64(const uint8_t* p) {
   uint2 r;
@@ -207,9 +223,7 @@ DEVI unsigned sfsel(unsigned w, unsigned sel) {
   asm("prmt.b32 %0, %1, 0, %2;" : "=r"(t) : "r"(w), "r"(sel));
   return t;
 }
-DEVI unsigned sfbf(unsigned w, int c) {
-  return sfsel(w, 0x4400u | (unsigned)(c * 0x11));
-}
+DEVI unsigned sfbf(unsigned w, int c) { return sfsel(w, 0x4400u | (unsigned)(c * 0x11)); }
 
 // 4 e4m3 bytes -> 2 bf16x2 registers, each already multiplied by the ue8m0
 // block scale `sc`.  Rubin folds the power-of-two block-scale multiply into the
@@ -226,12 +240,14 @@ DEVI void cvt2(unsigned v, unsigned sc, unsigned* o) {
     asm("{ .reg .b16 lo,hi,s0,s1;\n mov.b32 {lo,hi}, %2;\n mov.b32 {s0,s1}, %3;\n"
         " cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 %0, lo, s0;\n"
         " cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2 %1, hi, s0;\n}"
-        : "=r"(o[0]), "=r"(o[1]) : "r"(v), "r"(sc));
+        : "=r"(o[0]), "=r"(o[1])
+        : "r"(v), "r"(sc));
   } else {
     unsigned c0, c1, m;
     asm("{ .reg .b16 lo,hi;\n mov.b32 {lo,hi}, %2;\n"
         " cvt.rn.bf16x2.e4m3x2 %0, lo;\n cvt.rn.bf16x2.e4m3x2 %1, hi;\n}"
-        : "=r"(c0), "=r"(c1) : "r"(v));
+        : "=r"(c0), "=r"(c1)
+        : "r"(v));
     // sc holds the ue8m0 byte b replicated in bytes 0 and 1; the bf16 bits of
     // 2^(b-127) are b<<7, and byte 0 means 2^-127 (the bf16 subnormal 0x0040).
     m = (sc & 0xffu) * 0x00800080u;
@@ -250,13 +266,10 @@ DEVI unsigned pick(const uint4& v, int t) {
   return t == 0 ? v.x : (t == 1 ? v.y : (t == 2 ? v.z : v.w));
 }
 
-
 // UE8M0 bytes below three can lose low E4M3 bits when rounded to bf16.
 // Test the scales already loaded for the mainloop; ordinary blocks retain the
 // existing conversion/MMA path, as do tiny blocks whose values convert exactly.
-DEVI bool small_scale_word(unsigned w) {
-  return ((w - 0x03030303u) & ~w & 0x80808080u) != 0;
-}
+DEVI bool small_scale_word(unsigned w) { return ((w - 0x03030303u) & ~w & 0x80808080u) != 0; }
 DEVI bool loses_bits(unsigned v, unsigned scale) {
   if (scale >= 3) return false;
 #pragma unroll
@@ -277,9 +290,12 @@ DEVI float dequant_f32(unsigned v, unsigned scale) {
   unsigned x = v & 127u;
   unsigned e = x >> 3;
   float q;
-  if (x == 127u) q = __uint_as_float(0x7fc00000u);
-  else if (e) q = __uint_as_float(((e + 120u) << 23) | ((x & 7u) << 20));
-  else q = float(x & 7u) * 0x1p-9f;
+  if (x == 127u)
+    q = __uint_as_float(0x7fc00000u);
+  else if (e)
+    q = __uint_as_float(((e + 120u) << 23) | ((x & 7u) << 20));
+  else
+    q = float(x & 7u) * 0x1p-9f;
   if (v & 128u) q = -q;
   float sc = __uint_as_float(scale ? scale << 23 : 0x00400000u);
   float r;
@@ -297,8 +313,8 @@ DEVI float fma_f32(float a, float b, float c) {
 // the same register fragments.  Keeping one accumulator live reduces the
 // helper's register requirement on the usual, tensor-core-only path.
 template <int BYTES>
-__device__ __noinline__ float precise_dot(uint4 b, uint4 a, unsigned sb, unsigned sa,
-                                         float acc, int acol) {
+__device__ __noinline__ float precise_dot(uint4 b, uint4 a, unsigned sb, unsigned sa, float acc,
+                                          int acol) {
   const int lane = threadIdx.x & 31;
   const int g = lane >> 2, q = lane & 3;
 #pragma unroll 1
@@ -321,8 +337,8 @@ __device__ __noinline__ float precise_dot(uint4 b, uint4 a, unsigned sb, unsigne
   return acc;
 }
 template <int BYTES>
-DEVI float4 precise_chunk(uint4 b0, uint4 b1, uint4 a,
-                          unsigned sb0, unsigned sb1, unsigned sa, float4 acc) {
+DEVI float4 precise_chunk(uint4 b0, uint4 b1, uint4 a, unsigned sb0, unsigned sb1, unsigned sa,
+                          float4 acc) {
   acc.x = precise_dot<BYTES>(b0, a, sb0, sa, acc.x, 0);
   acc.y = precise_dot<BYTES>(b0, a, sb0, sa, acc.y, 1);
   acc.z = precise_dot<BYTES>(b1, a, sb1, sa, acc.z, 0);
@@ -330,11 +346,11 @@ DEVI float4 precise_chunk(uint4 b0, uint4 b1, uint4 a,
   return acc;
 }
 
-#define MMA16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1)                         \
-  asm volatile(                                                               \
-      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "                  \
-      "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"                    \
-      : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)                                \
+#define MMA16(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1)        \
+  asm volatile(                                              \
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 " \
+      "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"   \
+      : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)               \
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 
 // 4 consecutive bf16 outputs, vector store when the tail allows it.  FULL is
@@ -371,18 +387,16 @@ DEVI Offset sfoff(Offset r, Offset k4d4) {
 // WK   : warps splitting the k range of the CTA      (reduced through smem)
 // MSUB : 8-row m sub-tiles (one CTA always covers all of M)
 // ---------------------------------------------------------------------------
-template <int MSUB, int NSUB, int WN, int WK, bool PIPE = false, int BPS = 1,
-          bool CLUSTER = false, int CLSC = 0, bool SCV = true, bool HALF = false,
-          int GPW = 0, bool Q32 = false, bool AFFB = false, bool AFFA = false,
-          bool FS = false, bool DACC = false, int CM = 0, int CN = 0, int CK = 0,
-          int CGPC = 0, bool L2P = false, bool MBH = false, bool L1B = false,
-          bool WIDE = false>
-__global__ void __launch_bounds__(32 * WN * WK, BPS)
-    __cluster_dims__(1, (CLSC > 0 ? CLSC : 1), 1) kmain(
-    const uint8_t* __restrict__ aq, const uint8_t* __restrict__ bq,
-    const uint8_t* __restrict__ asf, const uint8_t* __restrict__ bsf,
-    __nv_bfloat16* __restrict__ out, int64_t M_, int64_t N_, int64_t K_, int64_t nkb_, int64_t k4d4_,
-    int64_t gpc_, int CLS, int64_t m0) {
+template <int MSUB, int NSUB, int WN, int WK, bool PIPE = false, int BPS = 1, bool CLUSTER = false,
+          int CLSC = 0, bool SCV = true, bool HALF = false, int GPW = 0, bool Q32 = false,
+          bool AFFB = false, bool AFFA = false, bool FS = false, bool DACC = false, int CM = 0,
+          int CN = 0, int CK = 0, int CGPC = 0, bool L2P = false, bool MBH = false,
+          bool L1B = false, bool WIDE = false>
+__global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC > 0 ? CLSC : 1), 1)
+    kmain(const uint8_t* __restrict__ aq, const uint8_t* __restrict__ bq,
+          const uint8_t* __restrict__ asf, const uint8_t* __restrict__ bsf,
+          __nv_bfloat16* __restrict__ out, int64_t M_, int64_t N_, int64_t K_, int64_t nkb_,
+          int64_t k4d4_, int64_t gpc_, int CLS, int64_t m0) {
   // For every measured family the shape is known at dispatch time.  Folding
   // M/N/K (and the groups-per-rank) into the instantiation removes the whole
   // constant-bank load + integer chain that otherwise sits between the kernel
@@ -490,186 +504,192 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS)
   }
 
   const Index gtot = (nkb + 3) >> 2;
-  const Index gfull = nkb >> 2;           // number of complete 4-block groups
+  const Index gfull = nkb >> 2;  // number of complete 4-block groups
   Index gbeg = (cls == 1) ? 0 : blockIdx.y * gpc;
   Index gend = (cls == 1) ? gtot : gbeg + gpc;
   if (gend > gtot) gend = gtot;
   const Index gLast = gend < gfull ? gend : gfull;
 
-#define LOADG(G, WB, WA, BV, AV)                                                        \
-  {                                                                                      \
-    const Offset kb_ = Offset(G) << 7, so_ = Offset(G) * 512;                                           \
-    if constexpr (Q32 && CK == 1024) {                                                    \
-      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                 \
-        if constexpr (L1B) {                                                              \
-          ldg256(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                        \
-          ldg256(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                        \
-        } else if constexpr (L2P) {                                                       \
-          ldg256p(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                       \
-          ldg256p(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                       \
-        } else {                                                                          \
-          ldg256b(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                       \
-          ldg256b(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                       \
-        }                                                                                 \
-      }                                                                                   \
-      _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                   \
-          ldg256(aq + aoff[j] + kb_, AV[j][0], AV[j][1]);                                 \
-    }                                                                                     \
-    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) _Pragma("unroll") for (int i = 0;    \
-                                                                           i < 2; ++i)   \
-        if constexpr (Q32) WB[s][i] = ldg8(bsf + sboff[s][i] + so_ + q);                  \
-        else WB[s][i] = ldg32(bsf + sboff[s][i] + so_);                                   \
-    _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                                   \
-      if constexpr (Q32) WA[j] = ldg8(asf + saoff[j] + so_ + q);                          \
-      else WA[j] = ldg32(asf + saoff[j] + so_);                                           \
-    }                                                                                     \
-    if constexpr (Q32 && CK != 1024) {                                                    \
-      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                 \
-        if constexpr (L1B) {                                                              \
-          ldg256(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                        \
-          ldg256(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                        \
-        } else if constexpr (L2P) {                                                       \
-          ldg256p(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                       \
-          ldg256p(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                       \
-        } else {                                                                          \
-          ldg256b(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                       \
-          ldg256b(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                       \
-        }                                                                                 \
-      }                                                                                   \
-      _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                   \
-          ldg256(aq + aoff[j] + kb_, AV[j][0], AV[j][1]);                                 \
-    } else if constexpr (!Q32) {                                                          \
-      _Pragma("unroll") for (int h = 0; h < 2; ++h) _Pragma("unroll") for (int s = 0;   \
-                                                                          s < NSUB; ++s) {\
-        BV[s][0][h] = L1B ? ldg128(bq + boff[s][0] + kb_ + h * 64)                        \
-                          : (L2P ? ldg128p(bq + boff[s][0] + kb_ + h * 64)                \
-                                 : ldg128b(bq + boff[s][0] + kb_ + h * 64));              \
-        BV[s][1][h] = L1B ? ldg128(bq + boff[s][1] + kb_ + h * 64)                        \
-                          : (L2P ? ldg128p(bq + boff[s][1] + kb_ + h * 64)                \
-                                 : ldg128b(bq + boff[s][1] + kb_ + h * 64));              \
-      }                                                                                   \
-      _Pragma("unroll") for (int h = 0; h < 2; ++h) _Pragma("unroll") for (int j = 0;   \
-                                                                          j < MSUB; ++j)  \
-          AV[j][h] = ldg128(aq + aoff[j] + kb_ + h * 64);                                 \
-    }                                                                                     \
+#define LOADG(G, WB, WA, BV, AV)                                                    \
+  {                                                                                 \
+    const Offset kb_ = Offset(G) << 7, so_ = Offset(G) * 512;                       \
+    if constexpr (Q32 && CK == 1024) {                                              \
+      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                            \
+        if constexpr (L1B) {                                                        \
+          ldg256(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                  \
+          ldg256(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                  \
+        } else if constexpr (L2P) {                                                 \
+          ldg256p(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                 \
+          ldg256p(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                 \
+        } else {                                                                    \
+          ldg256b(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                 \
+          ldg256b(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                 \
+        }                                                                           \
+      }                                                                             \
+      _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                              \
+          ldg256(aq + aoff[j] + kb_, AV[j][0], AV[j][1]);                           \
+    }                                                                               \
+    _Pragma("unroll") for (int s = 0; s < NSUB; ++s)                                \
+        _Pragma("unroll") for (int i = 0; i < 2; ++i) if constexpr (Q32) WB[s][i] = \
+            ldg8(bsf + sboff[s][i] + so_ + q);                                      \
+    else WB[s][i] = ldg32(bsf + sboff[s][i] + so_);                                 \
+    _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                              \
+      if constexpr (Q32)                                                            \
+        WA[j] = ldg8(asf + saoff[j] + so_ + q);                                     \
+      else                                                                          \
+        WA[j] = ldg32(asf + saoff[j] + so_);                                        \
+    }                                                                               \
+    if constexpr (Q32 && CK != 1024) {                                              \
+      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                            \
+        if constexpr (L1B) {                                                        \
+          ldg256(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                  \
+          ldg256(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                  \
+        } else if constexpr (L2P) {                                                 \
+          ldg256p(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                 \
+          ldg256p(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                 \
+        } else {                                                                    \
+          ldg256b(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                 \
+          ldg256b(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                 \
+        }                                                                           \
+      }                                                                             \
+      _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                              \
+          ldg256(aq + aoff[j] + kb_, AV[j][0], AV[j][1]);                           \
+    } else if constexpr (!Q32) {                                                    \
+      _Pragma("unroll") for (int h = 0; h < 2; ++h)                                 \
+          _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                        \
+        BV[s][0][h] = L1B ? ldg128(bq + boff[s][0] + kb_ + h * 64)                  \
+                          : (L2P ? ldg128p(bq + boff[s][0] + kb_ + h * 64)          \
+                                 : ldg128b(bq + boff[s][0] + kb_ + h * 64));        \
+        BV[s][1][h] = L1B ? ldg128(bq + boff[s][1] + kb_ + h * 64)                  \
+                          : (L2P ? ldg128p(bq + boff[s][1] + kb_ + h * 64)          \
+                                 : ldg128b(bq + boff[s][1] + kb_ + h * 64));        \
+      }                                                                             \
+      _Pragma("unroll") for (int h = 0; h < 2; ++h)                                 \
+          _Pragma("unroll") for (int j = 0; j < MSUB; ++j) AV[j][h] =               \
+              ldg128(aq + aoff[j] + kb_ + h * 64);                                  \
+    }                                                                               \
   }
-#define LOADGBQ(G, WB, BV)                                                                \
-  {                                                                                       \
-    const Offset kb_ = Offset(G) << 7, so_ = Offset(G) * 512;                                            \
-    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) _Pragma("unroll") for (int i = 0;  \
-                                                                           i < 2; ++i)    \
-        WB[s][i] = ldg8(bsf + sboff[s][i] + so_ + q);                                     \
-    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                   \
-      if constexpr (L2P) {                                                                \
-        ldg256p(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                         \
-        ldg256p(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                         \
-      } else {                                                                            \
-        ldg256b(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                         \
-        ldg256b(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                         \
-      }                                                                                   \
-    }                                                                                     \
+#define LOADGBQ(G, WB, BV)                                                                         \
+  {                                                                                                \
+    const Offset kb_ = Offset(G) << 7, so_ = Offset(G) * 512;                                      \
+    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) _Pragma("unroll") for (int i = 0; i < 2; ++i) \
+        WB[s][i] = ldg8(bsf + sboff[s][i] + so_ + q);                                              \
+    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                             \
+      if constexpr (L2P) {                                                                         \
+        ldg256p(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                                  \
+        ldg256p(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                                  \
+      } else {                                                                                     \
+        ldg256b(bq + boff[s][0] + kb_, BV[s][0][0], BV[s][0][1]);                                  \
+        ldg256b(bq + boff[s][1] + kb_, BV[s][1][0], BV[s][1][1]);                                  \
+      }                                                                                            \
+    }                                                                                              \
   }
-#define LOADGAQ(G, WA, AV)                                                                \
-  {                                                                                       \
-    const Offset kb_ = Offset(G) << 7, so_ = Offset(G) * 512;                                            \
-    _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                     \
-        WA[j] = ldg8(asf + saoff[j] + so_ + q);                                           \
-    _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                     \
-        ldg256(aq + aoff[j] + kb_, AV[j][0], AV[j][1]);                                   \
+#define LOADGAQ(G, WA, AV)                                                                   \
+  {                                                                                          \
+    const Offset kb_ = Offset(G) << 7, so_ = Offset(G) * 512;                                \
+    _Pragma("unroll") for (int j = 0; j < MSUB; ++j) WA[j] = ldg8(asf + saoff[j] + so_ + q); \
+    _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                         \
+        ldg256(aq + aoff[j] + kb_, AV[j][0], AV[j][1]);                                      \
   }
-#define MATHG_NORMAL(WB, WA, BV, AV, AC)                                                             \
-  {                                                                                       \
-    _Pragma("unroll") for (int h = 0; h < 2; ++h) {                                        \
-      const unsigned sl_ = h ? sel1 : sel0;                                                \
-      unsigned sb_[NSUB][2], sa_[MSUB];                                                    \
-      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                   \
-        if constexpr (Q32) {                                                               \
-          sb_[s][0] = WB[s][0] * 0x101u;                                                   \
-          sb_[s][1] = WB[s][1] * 0x101u;                                                   \
-        } else {                                                                           \
-          sb_[s][0] = sfsel(WB[s][0], sl_);                                                \
-          sb_[s][1] = sfsel(WB[s][1], sl_);                                                \
-        }                                                                                  \
-      }                                                                                    \
-      _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                                  \
-        if constexpr (Q32) sa_[j] = WA[j] * 0x101u;                                       \
-        else sa_[j] = sfsel(WA[j], sl_);                                                   \
-      }                                                                                    \
-      _Pragma("unroll") for (int t = 0; t < 4; ++t) {                                      \
-        if constexpr (MSUB >= 2 * NSUB - 1) {                                              \
-          unsigned Bc[NSUB][2][2];                                                          \
-          _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                               \
-            cvt2<SCV>(pick(BV[s][0][h], t), sb_[s][0], Bc[s][0]);                           \
-            cvt2<SCV>(pick(BV[s][1][h], t), sb_[s][1], Bc[s][1]);                           \
-          }                                                                                 \
-          _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                               \
-            unsigned Ac[2];                                                                 \
-            cvt2<SCV>(pick(AV[j][h], t), sa_[j], Ac);                                       \
-            _Pragma("unroll") for (int s = 0; s < NSUB; ++s)                               \
-              MMA16(AC[s][j][0], AC[s][j][1], AC[s][j][2], AC[s][j][3], Bc[s][0][0],       \
-                    Bc[s][1][0], Bc[s][0][1], Bc[s][1][1], Ac[0], Ac[1]);                   \
-          }                                                                                 \
-        } else {                                                                            \
-          unsigned Ac[MSUB][2];                                                             \
-          _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                 \
-            cvt2<SCV>(pick(AV[j][h], t), sa_[j], Ac[j]);                                    \
-          _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                               \
-            unsigned Bc[2][2];                                                              \
-            cvt2<SCV>(pick(BV[s][0][h], t), sb_[s][0], Bc[0]);                              \
-            cvt2<SCV>(pick(BV[s][1][h], t), sb_[s][1], Bc[1]);                              \
-            _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                               \
-              MMA16(AC[s][j][0], AC[s][j][1], AC[s][j][2], AC[s][j][3], Bc[0][0],          \
-                    Bc[1][0], Bc[0][1], Bc[1][1], Ac[j][0], Ac[j][1]);                      \
-          }                                                                                 \
-        }                                                                                   \
-      }                                                                                     \
-    }                                                                                       \
+#define MATHG_NORMAL(WB, WA, BV, AV, AC)                                                      \
+  {                                                                                           \
+    _Pragma("unroll") for (int h = 0; h < 2; ++h) {                                           \
+      const unsigned sl_ = h ? sel1 : sel0;                                                   \
+      unsigned sb_[NSUB][2], sa_[MSUB];                                                       \
+      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                      \
+        if constexpr (Q32) {                                                                  \
+          sb_[s][0] = WB[s][0] * 0x101u;                                                      \
+          sb_[s][1] = WB[s][1] * 0x101u;                                                      \
+        } else {                                                                              \
+          sb_[s][0] = sfsel(WB[s][0], sl_);                                                   \
+          sb_[s][1] = sfsel(WB[s][1], sl_);                                                   \
+        }                                                                                     \
+      }                                                                                       \
+      _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                                      \
+        if constexpr (Q32)                                                                    \
+          sa_[j] = WA[j] * 0x101u;                                                            \
+        else                                                                                  \
+          sa_[j] = sfsel(WA[j], sl_);                                                         \
+      }                                                                                       \
+      _Pragma("unroll") for (int t = 0; t < 4; ++t) {                                         \
+        if constexpr (MSUB >= 2 * NSUB - 1) {                                                 \
+          unsigned Bc[NSUB][2][2];                                                            \
+          _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                  \
+            cvt2<SCV>(pick(BV[s][0][h], t), sb_[s][0], Bc[s][0]);                             \
+            cvt2<SCV>(pick(BV[s][1][h], t), sb_[s][1], Bc[s][1]);                             \
+          }                                                                                   \
+          _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                                  \
+            unsigned Ac[2];                                                                   \
+            cvt2<SCV>(pick(AV[j][h], t), sa_[j], Ac);                                         \
+            _Pragma("unroll") for (int s = 0; s < NSUB; ++s)                                  \
+                MMA16(AC[s][j][0], AC[s][j][1], AC[s][j][2], AC[s][j][3], Bc[s][0][0],        \
+                      Bc[s][1][0], Bc[s][0][1], Bc[s][1][1], Ac[0], Ac[1]);                   \
+          }                                                                                   \
+        } else {                                                                              \
+          unsigned Ac[MSUB][2];                                                               \
+          _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                    \
+              cvt2<SCV>(pick(AV[j][h], t), sa_[j], Ac[j]);                                    \
+          _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                  \
+            unsigned Bc[2][2];                                                                \
+            cvt2<SCV>(pick(BV[s][0][h], t), sb_[s][0], Bc[0]);                                \
+            cvt2<SCV>(pick(BV[s][1][h], t), sb_[s][1], Bc[1]);                                \
+            _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                  \
+                MMA16(AC[s][j][0], AC[s][j][1], AC[s][j][2], AC[s][j][3], Bc[0][0], Bc[1][0], \
+                      Bc[0][1], Bc[1][1], Ac[j][0], Ac[j][1]);                                \
+          }                                                                                   \
+        }                                                                                     \
+      }                                                                                       \
+    }                                                                                         \
   }
 
-#define MATHG(WB, WA, BV, AV, AC) \
-  { \
-    bool tiny_ = false; \
-    _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-      _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) \
-        tiny_ |= Q32 ? WB[s_][i_] < 3u : small_scale_word(WB[s_][i_]); \
-    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-      tiny_ |= Q32 ? WA[j_] < 3u : small_scale_word(WA[j_]); \
-    bool loss_ = false; \
-    if (__any_sync(0xffffffffu, tiny_)) { \
-      _Pragma("unroll") for (int h_ = 0; h_ < 2; ++h_) { \
-        unsigned bs_[NSUB][2], as_[MSUB]; \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-          _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) \
-            bs_[s_][i_] = Q32 ? WB[s_][i_] : (sfsel(WB[s_][i_], h_ ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-          as_[j_] = Q32 ? WA[j_] : (sfsel(WA[j_], h_ ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) { \
-          loss_ |= loses_chunk<16>(BV[s_][0][h_], bs_[s_][0]); \
-          loss_ |= loses_chunk<16>(BV[s_][1][h_], bs_[s_][1]); \
-        } \
-        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-          loss_ |= loses_chunk<16>(AV[j_][h_], as_[j_]); \
-      } \
-    } \
-    if (__any_sync(0xffffffffu, loss_)) { \
-      _Pragma("unroll") for (int h_ = 0; h_ < 2; ++h_) { \
-        unsigned bs_[NSUB][2], as_[MSUB]; \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-          _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) \
-            bs_[s_][i_] = Q32 ? WB[s_][i_] : (sfsel(WB[s_][i_], h_ ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-          as_[j_] = Q32 ? WA[j_] : (sfsel(WA[j_], h_ ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-          _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) { \
-            float4 tmp_ = make_float4(AC[s_][j_][0], AC[s_][j_][1], AC[s_][j_][2], AC[s_][j_][3]); \
-            tmp_ = precise_chunk<16>(BV[s_][0][h_], BV[s_][1][h_], AV[j_][h_], bs_[s_][0], bs_[s_][1], as_[j_], tmp_); \
-            AC[s_][j_][0] = tmp_.x; AC[s_][j_][1] = tmp_.y; \
-            AC[s_][j_][2] = tmp_.z; AC[s_][j_][3] = tmp_.w; \
-          } \
-      } \
-    } else { MATHG_NORMAL(WB, WA, BV, AV, AC) } \
-  } \
-
+#define MATHG(WB, WA, BV, AV, AC)                                                                \
+  {                                                                                              \
+    bool tiny_ = false;                                                                          \
+    _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                          \
+        _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) tiny_ |=                                \
+        Q32 ? WB[s_][i_] < 3u : small_scale_word(WB[s_][i_]);                                    \
+    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) tiny_ |=                                 \
+        Q32 ? WA[j_] < 3u : small_scale_word(WA[j_]);                                            \
+    bool loss_ = false;                                                                          \
+    if (__any_sync(0xffffffffu, tiny_)) {                                                        \
+      _Pragma("unroll") for (int h_ = 0; h_ < 2; ++h_) {                                         \
+        unsigned bs_[NSUB][2], as_[MSUB];                                                        \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                      \
+            _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) bs_[s_][i_] =                       \
+                Q32 ? WB[s_][i_] : (sfsel(WB[s_][i_], h_ ? sel1 : sel0) & 255u);                 \
+        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) as_[j_] =                            \
+            Q32 ? WA[j_] : (sfsel(WA[j_], h_ ? sel1 : sel0) & 255u);                             \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) {                                    \
+          loss_ |= loses_chunk<16>(BV[s_][0][h_], bs_[s_][0]);                                   \
+          loss_ |= loses_chunk<16>(BV[s_][1][h_], bs_[s_][1]);                                   \
+        }                                                                                        \
+        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) loss_ |=                             \
+            loses_chunk<16>(AV[j_][h_], as_[j_]);                                                \
+      }                                                                                          \
+    }                                                                                            \
+    if (__any_sync(0xffffffffu, loss_)) {                                                        \
+      _Pragma("unroll") for (int h_ = 0; h_ < 2; ++h_) {                                         \
+        unsigned bs_[NSUB][2], as_[MSUB];                                                        \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                      \
+            _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) bs_[s_][i_] =                       \
+                Q32 ? WB[s_][i_] : (sfsel(WB[s_][i_], h_ ? sel1 : sel0) & 255u);                 \
+        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) as_[j_] =                            \
+            Q32 ? WA[j_] : (sfsel(WA[j_], h_ ? sel1 : sel0) & 255u);                             \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                      \
+            _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) {                                \
+          float4 tmp_ = make_float4(AC[s_][j_][0], AC[s_][j_][1], AC[s_][j_][2], AC[s_][j_][3]); \
+          tmp_ = precise_chunk<16>(BV[s_][0][h_], BV[s_][1][h_], AV[j_][h_], bs_[s_][0],         \
+                                   bs_[s_][1], as_[j_], tmp_);                                   \
+          AC[s_][j_][0] = tmp_.x;                                                                \
+          AC[s_][j_][1] = tmp_.y;                                                                \
+          AC[s_][j_][2] = tmp_.z;                                                                \
+          AC[s_][j_][3] = tmp_.w;                                                                \
+        }                                                                                        \
+      }                                                                                          \
+    } else {                                                                                     \
+      MATHG_NORMAL(WB, WA, BV, AV, AC)                                                           \
+    }                                                                                            \
+  }
 
   if constexpr (HALF) {
     // Split k into 64-element units instead of 128.  A lane still fetches 16
@@ -682,101 +702,105 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS)
     Index ubeg = (cls == 1) ? 0 : blockIdx.y * gpc;
     Index uend = (cls == 1) ? utot : ubeg + gpc;
     if (uend > utot) uend = utot;
-#define HLOAD(U, WB, WA, BV, AV)                                                        \
-    {                                                                                    \
-      const Offset so_ = Offset((U) >> 1) * 512, koff_ = Offset(U) * 64;                                \
-      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) _Pragma("unroll") for (int i = 0;  \
-                                                                             i < 2; ++i) \
-          WB[s][i] = ldg32(bsf + sboff[s][i] + so_);                                      \
-      _Pragma("unroll") for (int j = 0; j < MSUB; ++j) WA[j] = ldg32(asf + saoff[j] + so_);\
-      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                  \
-        BV[s][0] = ldg128b(bq + boff[s][0] + koff_);                                      \
-        BV[s][1] = ldg128b(bq + boff[s][1] + koff_);                                      \
-      }                                                                                    \
-      _Pragma("unroll") for (int j = 0; j < MSUB; ++j) AV[j] = ldg128(aq + aoff[j] + koff_);\
-    }
-#define HMATH_NORMAL(U, WB, WA, BV, AV)                                                          \
-    {                                                                                      \
-      const unsigned sl_ = ((U) & 1) ? sel1 : sel0;                                         \
-      unsigned sb_[NSUB][2], sa_[MSUB];                                                     \
-      _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                    \
-        sb_[s][0] = sfsel(WB[s][0], sl_);                                                   \
-        sb_[s][1] = sfsel(WB[s][1], sl_);                                                   \
-      }                                                                                      \
-      _Pragma("unroll") for (int j = 0; j < MSUB; ++j) sa_[j] = sfsel(WA[j], sl_);          \
-      _Pragma("unroll") for (int t = 0; t < 4; ++t) {                                       \
-        if constexpr (MSUB >= 2 * NSUB - 1) {                                               \
-          unsigned Bc[NSUB][2][2];                                                           \
-          _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                               \
-            cvt2<SCV>(pick(BV[s][0], t), sb_[s][0], Bc[s][0]);                              \
-            cvt2<SCV>(pick(BV[s][1], t), sb_[s][1], Bc[s][1]);                              \
-          }                                                                                  \
-          _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                               \
-            unsigned Ac[2];                                                                  \
-            cvt2<SCV>(pick(AV[j], t), sa_[j], Ac);                                           \
-            _Pragma("unroll") for (int s = 0; s < NSUB; ++s)                               \
-              MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[s][0][0],     \
-                    Bc[s][1][0], Bc[s][0][1], Bc[s][1][1], Ac[0], Ac[1]);                    \
-          }                                                                                  \
-        } else {                                                                             \
-          unsigned Ac[MSUB][2];                                                              \
-          _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                 \
-            cvt2<SCV>(pick(AV[j], t), sa_[j], Ac[j]);                                        \
-          _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                               \
-            unsigned Bc[2][2];                                                               \
-            cvt2<SCV>(pick(BV[s][0], t), sb_[s][0], Bc[0]);                                  \
-            cvt2<SCV>(pick(BV[s][1], t), sb_[s][1], Bc[1]);                                  \
-            _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                               \
-              MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[0][0],        \
-                    Bc[1][0], Bc[0][1], Bc[1][1], Ac[j][0], Ac[j][1]);                       \
-          }                                                                                  \
-        }                                                                                    \
-      }                                                                                       \
-    }
+#define HLOAD(U, WB, WA, BV, AV)                                                                   \
+  {                                                                                                \
+    const Offset so_ = Offset((U) >> 1) * 512, koff_ = Offset(U) * 64;                             \
+    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) _Pragma("unroll") for (int i = 0; i < 2; ++i) \
+        WB[s][i] = ldg32(bsf + sboff[s][i] + so_);                                                 \
+    _Pragma("unroll") for (int j = 0; j < MSUB; ++j) WA[j] = ldg32(asf + saoff[j] + so_);          \
+    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                             \
+      BV[s][0] = ldg128b(bq + boff[s][0] + koff_);                                                 \
+      BV[s][1] = ldg128b(bq + boff[s][1] + koff_);                                                 \
+    }                                                                                              \
+    _Pragma("unroll") for (int j = 0; j < MSUB; ++j) AV[j] = ldg128(aq + aoff[j] + koff_);         \
+  }
+#define HMATH_NORMAL(U, WB, WA, BV, AV)                                                            \
+  {                                                                                                \
+    const unsigned sl_ = ((U) & 1) ? sel1 : sel0;                                                  \
+    unsigned sb_[NSUB][2], sa_[MSUB];                                                              \
+    _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                             \
+      sb_[s][0] = sfsel(WB[s][0], sl_);                                                            \
+      sb_[s][1] = sfsel(WB[s][1], sl_);                                                            \
+    }                                                                                              \
+    _Pragma("unroll") for (int j = 0; j < MSUB; ++j) sa_[j] = sfsel(WA[j], sl_);                   \
+    _Pragma("unroll") for (int t = 0; t < 4; ++t) {                                                \
+      if constexpr (MSUB >= 2 * NSUB - 1) {                                                        \
+        unsigned Bc[NSUB][2][2];                                                                   \
+        _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                         \
+          cvt2<SCV>(pick(BV[s][0], t), sb_[s][0], Bc[s][0]);                                       \
+          cvt2<SCV>(pick(BV[s][1], t), sb_[s][1], Bc[s][1]);                                       \
+        }                                                                                          \
+        _Pragma("unroll") for (int j = 0; j < MSUB; ++j) {                                         \
+          unsigned Ac[2];                                                                          \
+          cvt2<SCV>(pick(AV[j], t), sa_[j], Ac);                                                   \
+          _Pragma("unroll") for (int s = 0; s < NSUB; ++s)                                         \
+              MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[s][0][0],           \
+                    Bc[s][1][0], Bc[s][0][1], Bc[s][1][1], Ac[0], Ac[1]);                          \
+        }                                                                                          \
+      } else {                                                                                     \
+        unsigned Ac[MSUB][2];                                                                      \
+        _Pragma("unroll") for (int j = 0; j < MSUB; ++j) cvt2<SCV>(pick(AV[j], t), sa_[j], Ac[j]); \
+        _Pragma("unroll") for (int s = 0; s < NSUB; ++s) {                                         \
+          unsigned Bc[2][2];                                                                       \
+          cvt2<SCV>(pick(BV[s][0], t), sb_[s][0], Bc[0]);                                          \
+          cvt2<SCV>(pick(BV[s][1], t), sb_[s][1], Bc[1]);                                          \
+          _Pragma("unroll") for (int j = 0; j < MSUB; ++j)                                         \
+              MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[0][0], Bc[1][0],    \
+                    Bc[0][1], Bc[1][1], Ac[j][0], Ac[j][1]);                                       \
+        }                                                                                          \
+      }                                                                                            \
+    }                                                                                              \
+  }
 
-#define HMATH(U, WB, WA, BV, AV) \
-  { \
-    bool tiny_ = false; \
-    _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-      _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) \
-        tiny_ |= (sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u) < 3u; \
-    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-      tiny_ |= (sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u) < 3u; \
-    bool loss_ = false; \
-    if (__any_sync(0xffffffffu, tiny_)) { \
-      _Pragma("unroll") for (int h_ = 0; h_ < 1; ++h_) { \
-        unsigned bs_[NSUB][2], as_[MSUB]; \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-          _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) \
-            bs_[s_][i_] = (sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-          as_[j_] = (sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) { \
-          loss_ |= loses_chunk<16>(BV[s_][0], bs_[s_][0]); \
-          loss_ |= loses_chunk<16>(BV[s_][1], bs_[s_][1]); \
-        } \
-        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-          loss_ |= loses_chunk<16>(AV[j_], as_[j_]); \
-      } \
-    } \
-    if (__any_sync(0xffffffffu, loss_)) { \
-      _Pragma("unroll") for (int h_ = 0; h_ < 1; ++h_) { \
-        unsigned bs_[NSUB][2], as_[MSUB]; \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-          _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) \
-            bs_[s_][i_] = (sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) \
-          as_[j_] = (sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u); \
-        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) \
-          _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) { \
-            float4 tmp_ = make_float4(acc[s_][j_][0], acc[s_][j_][1], acc[s_][j_][2], acc[s_][j_][3]); \
-            tmp_ = precise_chunk<16>(BV[s_][0], BV[s_][1], AV[j_], bs_[s_][0], bs_[s_][1], as_[j_], tmp_); \
-            acc[s_][j_][0] = tmp_.x; acc[s_][j_][1] = tmp_.y; \
-            acc[s_][j_][2] = tmp_.z; acc[s_][j_][3] = tmp_.w; \
-          } \
-      } \
-    } else { HMATH_NORMAL(U, WB, WA, BV, AV) } \
-  } \
+#define HMATH(U, WB, WA, BV, AV)                                                                  \
+  {                                                                                               \
+    bool tiny_ = false;                                                                           \
+    _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                           \
+        _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) tiny_ |=                                 \
+        (sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u) < 3u;                                 \
+    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) tiny_ |=                                  \
+        (sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u) < 3u;                                     \
+    bool loss_ = false;                                                                           \
+    if (__any_sync(0xffffffffu, tiny_)) {                                                         \
+      _Pragma("unroll") for (int h_ = 0; h_ < 1; ++h_) {                                          \
+        unsigned bs_[NSUB][2], as_[MSUB];                                                         \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                       \
+            _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) bs_[s_][i_] =                        \
+                (sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u);                              \
+        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) as_[j_] =                             \
+            (sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u);                                      \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_) {                                     \
+          loss_ |= loses_chunk<16>(BV[s_][0], bs_[s_][0]);                                        \
+          loss_ |= loses_chunk<16>(BV[s_][1], bs_[s_][1]);                                        \
+        }                                                                                         \
+        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) loss_ |=                              \
+            loses_chunk<16>(AV[j_], as_[j_]);                                                     \
+      }                                                                                           \
+    }                                                                                             \
+    if (__any_sync(0xffffffffu, loss_)) {                                                         \
+      _Pragma("unroll") for (int h_ = 0; h_ < 1; ++h_) {                                          \
+        unsigned bs_[NSUB][2], as_[MSUB];                                                         \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                       \
+            _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) bs_[s_][i_] =                        \
+                (sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u);                              \
+        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) as_[j_] =                             \
+            (sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u);                                      \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                       \
+            _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) {                                 \
+          float4 tmp_ =                                                                           \
+              make_float4(acc[s_][j_][0], acc[s_][j_][1], acc[s_][j_][2], acc[s_][j_][3]);        \
+          tmp_ = precise_chunk<16>(BV[s_][0], BV[s_][1], AV[j_], bs_[s_][0], bs_[s_][1], as_[j_], \
+                                   tmp_);                                                         \
+          acc[s_][j_][0] = tmp_.x;                                                                \
+          acc[s_][j_][1] = tmp_.y;                                                                \
+          acc[s_][j_][2] = tmp_.z;                                                                \
+          acc[s_][j_][3] = tmp_.w;                                                                \
+        }                                                                                         \
+      }                                                                                           \
+    } else {                                                                                      \
+      HMATH_NORMAL(U, WB, WA, BV, AV)                                                             \
+    }                                                                                             \
+  }
 
     if constexpr (PIPE) {
       // Two 64-element units in flight: the second unit's global loads issue
@@ -828,7 +852,11 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS)
       LOADG(gbeg + wk + WK, wb2, wa2, Bv2, Av2)
       MATHG(wb1, wa1, Bv1, Av1, acc)
     }
-    if constexpr (DACC) { MATHG(wb2, wa2, Bv2, Av2, acc2) } else { MATHG(wb2, wa2, Bv2, Av2, acc) }
+    if constexpr (DACC) {
+      MATHG(wb2, wa2, Bv2, Av2, acc2)
+    } else {
+      MATHG(wb2, wa2, Bv2, Av2, acc)
+    }
   } else if constexpr (GPW == 2) {
     {
       unsigned wb1[NSUB][2], wa1[MSUB];
@@ -840,7 +868,11 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS)
       unsigned wb1[NSUB][2], wa1[MSUB];
       uint4 Bv1[NSUB][2][2], Av1[MSUB][2];
       LOADG(gbeg + wk + WK, wb1, wa1, Bv1, Av1)
-      if constexpr (DACC) { MATHG(wb1, wa1, Bv1, Av1, acc2) } else { MATHG(wb1, wa1, Bv1, Av1, acc) }
+      if constexpr (DACC) {
+        MATHG(wb1, wa1, Bv1, Av1, acc2)
+      } else {
+        MATHG(wb1, wa1, Bv1, Av1, acc)
+      }
     }
   } else if constexpr (PIPE) {
     // Two k groups deep: the second group's global loads are issued before the
@@ -853,7 +885,11 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS)
       LOADG(grp, wb1, wa1, Bv1, Av1)
       LOADG(grp + WK, wb2, wa2, Bv2, Av2)
       MATHG(wb1, wa1, Bv1, Av1, acc)
-      if constexpr (DACC) { MATHG(wb2, wa2, Bv2, Av2, acc2) } else { MATHG(wb2, wa2, Bv2, Av2, acc) }
+      if constexpr (DACC) {
+        MATHG(wb2, wa2, Bv2, Av2, acc2)
+      } else {
+        MATHG(wb2, wa2, Bv2, Av2, acc)
+      }
     }
     if (grp < gLast) {
       unsigned wb1[NSUB][2], wa1[MSUB];
@@ -878,71 +914,71 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS)
   // ragged tail: nkb not a multiple of 4 (only the last group is partial).
   // One 32-element block at a time, so the lane stride drops back to 8 bytes;
   // A and B still share one k permutation inside each mma.
-  if constexpr (!HALF && GPW == 0) if (gfull < gend && gfull >= gbeg &&
-                                      ((gfull - gbeg) % WK) == wk) {
-    const int rem = nkb & 3;
-    const Offset soff = Offset(gfull) * 512;
-    unsigned wb[NSUB][2], wa[MSUB];
-#pragma unroll
-    for (int s = 0; s < NSUB; ++s)
-#pragma unroll
-      for (int i = 0; i < 2; ++i) wb[s][i] = ldg32(bsf + sboff[s][i] + soff);
-#pragma unroll
-    for (int j = 0; j < MSUB; ++j) wa[j] = ldg32(asf + saoff[j] + soff);
-    for (int c = 0; c < rem; ++c) {
-      const Index kbase = ((gfull << 2) + c) * 32 - Index(q) * (Q32 ? 24 : 8);
-      uint2 Bv[NSUB][2], Av[MSUB];
-      bool loss = false;
+  if constexpr (!HALF && GPW == 0)
+    if (gfull < gend && gfull >= gbeg && ((gfull - gbeg) % WK) == wk) {
+      const int rem = nkb & 3;
+      const Offset soff = Offset(gfull) * 512;
+      unsigned wb[NSUB][2], wa[MSUB];
 #pragma unroll
       for (int s = 0; s < NSUB; ++s)
 #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-          Bv[s][i] = ldg64(bq + boff[s][i] + kbase);
-          loss |= loses_chunk<8>(make_uint4(Bv[s][i].x, Bv[s][i].y, 0, 0),
-                                 (wb[s][i] >> (8 * c)) & 255u);
-        }
+        for (int i = 0; i < 2; ++i) wb[s][i] = ldg32(bsf + sboff[s][i] + soff);
 #pragma unroll
-      for (int j = 0; j < MSUB; ++j) {
-        Av[j] = ldg64(aq + aoff[j] + kbase);
-        loss |= loses_chunk<8>(make_uint4(Av[j].x, Av[j].y, 0, 0), (wa[j] >> (8 * c)) & 255u);
-      }
-      if (__any_sync(0xffffffffu, loss)) {
+      for (int j = 0; j < MSUB; ++j) wa[j] = ldg32(asf + saoff[j] + soff);
+      for (int c = 0; c < rem; ++c) {
+        const Index kbase = ((gfull << 2) + c) * 32 - Index(q) * (Q32 ? 24 : 8);
+        uint2 Bv[NSUB][2], Av[MSUB];
+        bool loss = false;
 #pragma unroll
         for (int s = 0; s < NSUB; ++s)
 #pragma unroll
-          for (int j = 0; j < MSUB; ++j) {
-            float4 tmp = make_float4(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3]);
-            tmp = precise_chunk<8>(make_uint4(Bv[s][0].x, Bv[s][0].y, 0, 0),
-                                    make_uint4(Bv[s][1].x, Bv[s][1].y, 0, 0),
-                                    make_uint4(Av[j].x, Av[j].y, 0, 0),
-                                    (wb[s][0] >> (8 * c)) & 255u,
-                                    (wb[s][1] >> (8 * c)) & 255u,
-                                    (wa[j] >> (8 * c)) & 255u, tmp);
-            acc[s][j][0] = tmp.x; acc[s][j][1] = tmp.y;
-            acc[s][j][2] = tmp.z; acc[s][j][3] = tmp.w;
+          for (int i = 0; i < 2; ++i) {
+            Bv[s][i] = ldg64(bq + boff[s][i] + kbase);
+            loss |= loses_chunk<8>(make_uint4(Bv[s][i].x, Bv[s][i].y, 0, 0),
+                                   (wb[s][i] >> (8 * c)) & 255u);
           }
-      } else {
-      unsigned Bc[NSUB][2][4], Ac[MSUB][4];
 #pragma unroll
-      for (int s = 0; s < NSUB; ++s) {
-        cvt4<SCV>(Bv[s][0], sfbf(wb[s][0], c), Bc[s][0]);
-        cvt4<SCV>(Bv[s][1], sfbf(wb[s][1], c), Bc[s][1]);
-      }
+        for (int j = 0; j < MSUB; ++j) {
+          Av[j] = ldg64(aq + aoff[j] + kbase);
+          loss |= loses_chunk<8>(make_uint4(Av[j].x, Av[j].y, 0, 0), (wa[j] >> (8 * c)) & 255u);
+        }
+        if (__any_sync(0xffffffffu, loss)) {
 #pragma unroll
-      for (int j = 0; j < MSUB; ++j)
-        cvt4<SCV>(Av[j], sfbf(wa[j], c), Ac[j]);
+          for (int s = 0; s < NSUB; ++s)
 #pragma unroll
-      for (int j = 0; j < MSUB; ++j)
+            for (int j = 0; j < MSUB; ++j) {
+              float4 tmp = make_float4(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3]);
+              tmp =
+                  precise_chunk<8>(make_uint4(Bv[s][0].x, Bv[s][0].y, 0, 0),
+                                   make_uint4(Bv[s][1].x, Bv[s][1].y, 0, 0),
+                                   make_uint4(Av[j].x, Av[j].y, 0, 0), (wb[s][0] >> (8 * c)) & 255u,
+                                   (wb[s][1] >> (8 * c)) & 255u, (wa[j] >> (8 * c)) & 255u, tmp);
+              acc[s][j][0] = tmp.x;
+              acc[s][j][1] = tmp.y;
+              acc[s][j][2] = tmp.z;
+              acc[s][j][3] = tmp.w;
+            }
+        } else {
+          unsigned Bc[NSUB][2][4], Ac[MSUB][4];
 #pragma unroll
-        for (int s = 0; s < NSUB; ++s) {
-          MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[s][0][0],
-                Bc[s][1][0], Bc[s][0][1], Bc[s][1][1], Ac[j][0], Ac[j][1]);
-          MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[s][0][2],
-                Bc[s][1][2], Bc[s][0][3], Bc[s][1][3], Ac[j][2], Ac[j][3]);
+          for (int s = 0; s < NSUB; ++s) {
+            cvt4<SCV>(Bv[s][0], sfbf(wb[s][0], c), Bc[s][0]);
+            cvt4<SCV>(Bv[s][1], sfbf(wb[s][1], c), Bc[s][1]);
+          }
+#pragma unroll
+          for (int j = 0; j < MSUB; ++j) cvt4<SCV>(Av[j], sfbf(wa[j], c), Ac[j]);
+#pragma unroll
+          for (int j = 0; j < MSUB; ++j)
+#pragma unroll
+            for (int s = 0; s < NSUB; ++s) {
+              MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[s][0][0],
+                    Bc[s][1][0], Bc[s][0][1], Bc[s][1][1], Ac[j][0], Ac[j][1]);
+              MMA16(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3], Bc[s][0][2],
+                    Bc[s][1][2], Bc[s][0][3], Bc[s][1][3], Ac[j][2], Ac[j][3]);
+            }
         }
       }
     }
-  }
 
   if constexpr (DACC) {
 #pragma unroll
@@ -1011,11 +1047,11 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS)
     constexpr int EC4 = NE / 4;
     constexpr int EC6 = (NE + 5) / 6;  // rounded up: NE need not divide by 6
     constexpr int EC8 = NE / 8;
-    const int ec = (CLSC == 4)
-                       ? EC4
-                       : ((CLSC == 6) ? EC6
-                                      : ((CLSC == 8) ? EC8
-                                                     : ((CLS == 2) ? EC2 : ((CLS == 4) ? EC4 : EC8))));
+    const int ec =
+        (CLSC == 4)
+            ? EC4
+            : ((CLSC == 6) ? EC6
+                           : ((CLSC == 8) ? EC8 : ((CLS == 2) ? EC2 : ((CLS == 4) ? EC4 : EC8))));
     if constexpr (FS) {
       const int q0 = rank * ec;
       const int q1 = (q0 + ec < NE) ? q0 + ec : NE;
@@ -1136,11 +1172,10 @@ static void gen_m(const Args& A, cudaStream_t st);
 // One launch per measured shape family: CLS is a compile-time constant so the
 // cluster fold, the owner mapping and the grid shape are all resolved at
 // compile time, and only the kernel actually used by a route is instantiated.
-template <int MSUB, int NSUB, int WK, bool PIPE, int BPS, int CLS, bool SCV = SCVD,
-          int CLSC = CLS, int MZ = 1, bool HALF = false, int GPW = 0, bool Q32 = false,
-          bool AFFB = false, bool AFFA = false, bool FS = false, bool DACC = false,
-          int CM = 0, int CN = 0, int CK = 0, int CGPC = 0, bool L2P = false,
-          bool MBH = false, bool L1B = false>
+template <int MSUB, int NSUB, int WK, bool PIPE, int BPS, int CLS, bool SCV = SCVD, int CLSC = CLS,
+          int MZ = 1, bool HALF = false, int GPW = 0, bool Q32 = false, bool AFFB = false,
+          bool AFFA = false, bool FS = false, bool DACC = false, int CM = 0, int CN = 0, int CK = 0,
+          int CGPC = 0, bool L2P = false, bool MBH = false, bool L1B = false>
 static void launch(const Args& A, int64_t gpc, cudaStream_t st) {
   constexpr int NTOT = 16 * NSUB;
   const int64_t nkb = A.K / 32;
@@ -1158,9 +1193,11 @@ static void launch(const Args& A, int64_t gpc, cudaStream_t st) {
       cfg.blockDim = dim3(32 * WK, 1, 1);
       cfg.stream = st;
       int active = 0;
-      cudaError_t status = cudaOccupancyMaxActiveClusters(&active,
-          kmain<MSUB, NSUB, 1, WK, PIPE, BPS, (CLS > 1), (CLS > 1 ? CLSC : 0), SCV,
-                HALF, GPW, Q32, AFFB, AFFA, FS, DACC, CM, CN, CK, CGPC, L2P, MBH, L1B>, &cfg);
+      cudaError_t status = cudaOccupancyMaxActiveClusters(
+          &active,
+          kmain<MSUB, NSUB, 1, WK, PIPE, BPS, (CLS > 1), (CLS > 1 ? CLSC : 0), SCV, HALF, GPW, Q32,
+                AFFB, AFFA, FS, DACC, CM, CN, CK, CGPC, L2P, MBH, L1B>,
+          &cfg);
       if ((status == cudaSuccess && active == 0) || status == cudaErrorInvalidConfiguration ||
           status == cudaErrorInvalidClusterSize) {
         if (status != cudaSuccess) (void)cudaGetLastError();
@@ -1170,10 +1207,9 @@ static void launch(const Args& A, int64_t gpc, cudaStream_t st) {
       if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     }
   }
-  kmain<MSUB, NSUB, 1, WK, PIPE, BPS, (CLS > 1), (CLS > 1 ? CLSC : 0), SCV,
-        HALF, GPW, Q32, AFFB, AFFA, FS, DACC, CM, CN, CK, CGPC, L2P, MBH, L1B><<<grid, 32 * WK, 0, st>>>(
-      A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc,
-      CLS, A.m0);
+  kmain<MSUB, NSUB, 1, WK, PIPE, BPS, (CLS > 1), (CLS > 1 ? CLSC : 0), SCV, HALF, GPW, Q32, AFFB,
+        AFFA, FS, DACC, CM, CN, CK, CGPC, L2P, MBH, L1B><<<grid, 32 * WK, 0, st>>>(
+      A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc, CLS, A.m0);
 }
 
 // Fallback for shapes outside the measured families: correct and reasonable
@@ -1202,18 +1238,24 @@ static void launch_gen(const Args& A, int CLS, int64_t gpc, cudaStream_t st) {
     attr[0].val.clusterDim.z = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaLaunchKernelEx(&cfg, kmain<MSUB, 2, 1, WK, false, BPS, true, 0, SCVD, false, 0, false, false, false, false, false,
-                         0, 0, 0, 0, false, false, false, WIDE>, A.aq, A.bq, A.asf,
-                       A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc, CLS, A.m0);
+    cudaLaunchKernelEx(&cfg,
+                       kmain<MSUB, 2, 1, WK, false, BPS, true, 0, SCVD, false, 0, false, false,
+                             false, false, false, 0, 0, 0, 0, false, false, false, WIDE>,
+                       A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc, CLS,
+                       A.m0);
   }
 }
 
 template <int MSUB, bool CLU, bool WIDE>
 static void gen_wk(const Args& A, int CLS, int64_t gpc, int wk, cudaStream_t st) {
-  if (wk >= 8) launch_gen<MSUB, 8, CLU, WIDE>(A, CLS, gpc, st);
-  else if (wk >= 4) launch_gen<MSUB, 4, CLU, WIDE>(A, CLS, gpc, st);
-  else if (wk >= 2) launch_gen<MSUB, 2, CLU, WIDE>(A, CLS, gpc, st);
-  else launch_gen<MSUB, 1, CLU, WIDE>(A, CLS, gpc, st);
+  if (wk >= 8)
+    launch_gen<MSUB, 8, CLU, WIDE>(A, CLS, gpc, st);
+  else if (wk >= 4)
+    launch_gen<MSUB, 4, CLU, WIDE>(A, CLS, gpc, st);
+  else if (wk >= 2)
+    launch_gen<MSUB, 2, CLU, WIDE>(A, CLS, gpc, st);
+  else
+    launch_gen<MSUB, 1, CLU, WIDE>(A, CLS, gpc, st);
 }
 
 template <int MSUB>
@@ -1246,8 +1288,8 @@ static void gen_m(const Args& A, cudaStream_t st) {
     const int64_t rr = last & 127;
     const int64_t sr = rr < 31 ? rr * 16 : 496 + ((rr - 31) / 32) * 4;
     const int64_t last_block = A.K / 32 - 1;
-    const int64_t scale_offset = ((last >> 7) * gtot + (last_block >> 2)) * 512
-                                 + sr + (last_block & 3);
+    const int64_t scale_offset =
+        ((last >> 7) * gtot + (last_block >> 2)) * 512 + sr + (last_block & 3);
     return last * A.K + 48 > INT32_MAX || scale_offset > INT32_MAX;
   };
   if (needs_wide(A.M) || needs_wide(A.N))
@@ -1288,98 +1330,422 @@ void Run(TensorView aq, TensorView bq, TensorView a_sf, TensorView b_sf, TensorV
   // (128 or 64 elements), cluster width, resident-block budget and dequant form.
   if (K == 6144) {
     if (N == 768) {
-      if (M == 24) { launch<3, 1, 8, false, 2, 6, true, 6, 1, false, 1, true, true, true, true, false, 24, 768, 6144, 8, true, false, true>(A, 8, st); return; }
-      if (M == 12) { launch<2, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 12, 768, 6144, 6, true>(A, 6, st); return; }
-      if (M == 8) { launch<1, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, true, true, true, true, false, 8, 768, 6144, 6, true>(A, 6, st); return; }
-      if (M == 4) { launch<1, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 4, 768, 6144, 6, true>(A, 6, st); return; }
-      if (M <= 8) { launch<1, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768, 6144, 6, true>(A, 6, st); return; }
-      if (M <= 16) { launch<2, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768, 6144, 6, true>(A, 6, st); return; }
-      if (M <= 24) { launch<3, 1, 6, false, 3, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768, 6144, 6, true>(A, 6, st); return; }
-      if (M <= 32) { launch<4, 1, 6, false, 3, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768, 6144, 6, true>(A, 6, st); return; }
+      if (M == 24) {
+        launch<3, 1, 8, false, 2, 6, true, 6, 1, false, 1, true, true, true, true, false, 24, 768,
+               6144, 8, true, false, true>(A, 8, st);
+        return;
+      }
+      if (M == 12) {
+        launch<2, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 12, 768,
+               6144, 6, true>(A, 6, st);
+        return;
+      }
+      if (M == 8) {
+        launch<1, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, true, true, true, true, false, 8, 768,
+               6144, 6, true>(A, 6, st);
+        return;
+      }
+      if (M == 4) {
+        launch<1, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 4, 768,
+               6144, 6, true>(A, 6, st);
+        return;
+      }
+      if (M <= 8) {
+        launch<1, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768,
+               6144, 6, true>(A, 6, st);
+        return;
+      }
+      if (M <= 16) {
+        launch<2, 1, 6, false, 1, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768,
+               6144, 6, true>(A, 6, st);
+        return;
+      }
+      if (M <= 24) {
+        launch<3, 1, 6, false, 3, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768,
+               6144, 6, true>(A, 6, st);
+        return;
+      }
+      if (M <= 32) {
+        launch<4, 1, 6, false, 3, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 768,
+               6144, 6, true>(A, 6, st);
+        return;
+      }
     } else if (N == 1536) {
-      if (M == 12) { launch<2, 1, 8, false, 1, 6, true, 6, 1, false, 1, true, true, false, true, false, 12, 1536, 6144, 8, true>(A, 8, st); return; }
-      if (M == 24) { launch<3, 2, 8, false, 1, 6, true, 6, 1, false, 1, true, true, true, true, false, 24, 1536, 6144, 8, false, false, true>(A, 8, st); return; }
-      if (M == 32) { launch<4, 2, 4, true, 2, 6, true, 6, 1, false, 2, true, true, true, true, false, 32, 1536, 6144, 8, true>(A, 8, st); return; }
-      if (M == 8) { launch<1, 1, 8, false, 1, 6, SCVD, 6, 1, false, 1, true, true, true, true, false, 8, 1536, 6144, 8, true>(A, 8, st); return; }
-      if (M == 4) { launch<1, 1, 8, false, 1, 6, SCVD, 6, 1, false, 1, true, true, false, true, false, 4, 1536, 6144, 8, true>(A, 8, st); return; }
-      if (M <= 8) { launch<1, 1, 6, true, 1, 4, SCVD, 4, 1, false, 2, true, true, false, true, false, 0, 1536, 6144, 12, true>(A, 12, st); return; }
-      if (M <= 16) { launch<2, 2, 4, true, 1, 6, false, 6, 1, false, 2, false, true, false, true, false, 0, 1536, 6144, 8, true>(A, 8, st); return; }
-      if (M <= 24) { launch<3, 2, 4, true, 2, 6, true, 6, 1, false, 2, false, true, false, true, false, 0, 1536, 6144, 8, true>(A, 8, st); return; }
-      if (M <= 32) { launch<4, 2, 4, true, 2, 6, false, 6, 1, false, 2, false, true, false, true, false, 0, 1536, 6144, 8, true>(A, 8, st); return; }
+      if (M == 12) {
+        launch<2, 1, 8, false, 1, 6, true, 6, 1, false, 1, true, true, false, true, false, 12, 1536,
+               6144, 8, true>(A, 8, st);
+        return;
+      }
+      if (M == 24) {
+        launch<3, 2, 8, false, 1, 6, true, 6, 1, false, 1, true, true, true, true, false, 24, 1536,
+               6144, 8, false, false, true>(A, 8, st);
+        return;
+      }
+      if (M == 32) {
+        launch<4, 2, 4, true, 2, 6, true, 6, 1, false, 2, true, true, true, true, false, 32, 1536,
+               6144, 8, true>(A, 8, st);
+        return;
+      }
+      if (M == 8) {
+        launch<1, 1, 8, false, 1, 6, SCVD, 6, 1, false, 1, true, true, true, true, false, 8, 1536,
+               6144, 8, true>(A, 8, st);
+        return;
+      }
+      if (M == 4) {
+        launch<1, 1, 8, false, 1, 6, SCVD, 6, 1, false, 1, true, true, false, true, false, 4, 1536,
+               6144, 8, true>(A, 8, st);
+        return;
+      }
+      if (M <= 8) {
+        launch<1, 1, 6, true, 1, 4, SCVD, 4, 1, false, 2, true, true, false, true, false, 0, 1536,
+               6144, 12, true>(A, 12, st);
+        return;
+      }
+      if (M <= 16) {
+        launch<2, 2, 4, true, 1, 6, false, 6, 1, false, 2, false, true, false, true, false, 0, 1536,
+               6144, 8, true>(A, 8, st);
+        return;
+      }
+      if (M <= 24) {
+        launch<3, 2, 4, true, 2, 6, true, 6, 1, false, 2, false, true, false, true, false, 0, 1536,
+               6144, 8, true>(A, 8, st);
+        return;
+      }
+      if (M <= 32) {
+        launch<4, 2, 4, true, 2, 6, false, 6, 1, false, 2, false, true, false, true, false, 0, 1536,
+               6144, 8, true>(A, 8, st);
+        return;
+      }
     }
   } else if (K == 5120) {
     if (N == 1152) {
-      if (M == 1) { launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 1, 1152, 5120, 5, true>(A, 5, st); return; }
-      if (M == 2) { launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 2, 1152, 5120, 5, true>(A, 5, st); return; }
-      if (M == 4) { launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 4, 1152, 5120, 5, true>(A, 5, st); return; }
-      if (M == 8) { launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, true, true, false, 8, 1152, 5120, 5, true>(A, 5, st); return; }
-      if (M <= 8) { launch<1, 1, 10, false, 1, 4, SCVD, 4, 1, false, 1, false, true, false, true, false, 0, 1152, 5120, 10>(A, 10, st); return; }
-      if (M == 16) { launch<2, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, true, true, false, 16, 1152, 5120, 5, true>(A, 5, st); return; }
-      if (M <= 16) { launch<2, 1, 10, false, 1, 4, SCVD, 4, 1, false, 1, false, true, false, true, false, 0, 1152, 5120, 10>(A, 10, st); return; }
-      if (M == 32) { launch<4, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, false, true, true, true, false, 32, 1152, 5120, 5, false, true>(A, 5, st); return; }
-      if (M <= 32) { launch<4, 1, 5, true, 2, 4, SCVD, 4, 1, false, 2, false, true, false, true, false, 0, 1152, 5120, 10>(A, 10, st); return; }
+      if (M == 1) {
+        launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 1, 1152,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M == 2) {
+        launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 2, 1152,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M == 4) {
+        launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, false, true, false, 4, 1152,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M == 8) {
+        launch<1, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, true, true, false, 8, 1152,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M <= 8) {
+        launch<1, 1, 10, false, 1, 4, SCVD, 4, 1, false, 1, false, true, false, true, false, 0,
+               1152, 5120, 10>(A, 10, st);
+        return;
+      }
+      if (M == 16) {
+        launch<2, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, true, true, true, true, false, 16, 1152,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M <= 16) {
+        launch<2, 1, 10, false, 1, 4, SCVD, 4, 1, false, 1, false, true, false, true, false, 0,
+               1152, 5120, 10>(A, 10, st);
+        return;
+      }
+      if (M == 32) {
+        launch<4, 1, 5, false, 2, 8, SCVD, 8, 1, false, 1, false, true, true, true, false, 32, 1152,
+               5120, 5, false, true>(A, 5, st);
+        return;
+      }
+      if (M <= 32) {
+        launch<4, 1, 5, true, 2, 4, SCVD, 4, 1, false, 2, false, true, false, true, false, 0, 1152,
+               5120, 10>(A, 10, st);
+        return;
+      }
     } else if (N == 1792) {
-      if (M == 8) { launch<1, 1, 5, false, 3, 8, SCVD, 8, 1, false, 1, true, false, false, true, false, 8, 1792, 5120, 5, true>(A, 5, st); return; }
-      if (M <= 8) { launch<1, 1, 5, false, 3, 8, SCVD, 8, 1, false, 1, true, false, false, true, false, 0, 1792, 5120, 5, true>(A, 5, st); return; }
-      if (M == 16) { launch<2, 1, 5, false, 4, 8, SCVD, 8, 1, false, 1, false, true, true, true, false, 16, 1792, 5120, 5, true>(A, 5, st); return; }
-      if (M <= 16) { launch<2, 2, 5, false, 2, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 1792, 5120, 5, true>(A, 5, st); return; }
-      if (M <= 24) { launch<3, 1, 5, false, 3, 4, SCVD, 4, 1, false, 2, false, true, false, true, false, 0, 1792, 5120, 10, true>(A, 10, st); return; }
-      if (M == 32) { launch<4, 1, 5, true, 3, 4, SCVD, 4, 1, false, 2, true, true, true, true, false, 32, 1792, 5120, 10, true>(A, 10, st); return; }
-      if (M <= 32) { launch<4, 1, 5, false, 3, 4, SCVD, 4, 1, false, 2, true, true, false, true, false, 0, 1792, 5120, 10, true>(A, 10, st); return; }
+      if (M == 8) {
+        launch<1, 1, 5, false, 3, 8, SCVD, 8, 1, false, 1, true, false, false, true, false, 8, 1792,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M <= 8) {
+        launch<1, 1, 5, false, 3, 8, SCVD, 8, 1, false, 1, true, false, false, true, false, 0, 1792,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M == 16) {
+        launch<2, 1, 5, false, 4, 8, SCVD, 8, 1, false, 1, false, true, true, true, false, 16, 1792,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M <= 16) {
+        launch<2, 2, 5, false, 2, 8, SCVD, 8, 1, false, 1, false, true, false, true, false, 0, 1792,
+               5120, 5, true>(A, 5, st);
+        return;
+      }
+      if (M <= 24) {
+        launch<3, 1, 5, false, 3, 4, SCVD, 4, 1, false, 2, false, true, false, true, false, 0, 1792,
+               5120, 10, true>(A, 10, st);
+        return;
+      }
+      if (M == 32) {
+        launch<4, 1, 5, true, 3, 4, SCVD, 4, 1, false, 2, true, true, true, true, false, 32, 1792,
+               5120, 10, true>(A, 10, st);
+        return;
+      }
+      if (M <= 32) {
+        launch<4, 1, 5, false, 3, 4, SCVD, 4, 1, false, 2, true, true, false, true, false, 0, 1792,
+               5120, 10, true>(A, 10, st);
+        return;
+      }
     }
   } else if (N == 6144 && K == 384) {
-    if (M == 4) { launch<1, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 4, 6144, 384, 6>(A, 6, st); return; }
-    if (M == 8) { launch<1, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 8, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M <= 8) { launch<1, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M == 12) { launch<2, 1, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 12, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M == 16) { launch<2, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 16, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M <= 16) { launch<2, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M == 24) { launch<3, 1, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 24, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M <= 24) { launch<3, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M == 32) { launch<4, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 32, 6144, 384, 6, true>(A, 6, st); return; }
-    if (M <= 32) { launch<4, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144, 384, 6, true>(A, 6, st); return; }
+    if (M == 4) {
+      launch<1, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 4, 6144,
+             384, 6>(A, 6, st);
+      return;
+    }
+    if (M == 8) {
+      launch<1, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 8, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M <= 8) {
+      launch<1, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M == 12) {
+      launch<2, 1, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 12, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M == 16) {
+      launch<2, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 16, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M <= 16) {
+      launch<2, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M == 24) {
+      launch<3, 1, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 24, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M <= 24) {
+      launch<3, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M == 32) {
+      launch<4, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 32, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
+    if (M <= 32) {
+      launch<4, 2, 6, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144,
+             384, 6, true>(A, 6, st);
+      return;
+    }
   } else if (N == 5120 && K == 576) {
-    if (M == 1) { launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 1, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M == 2) { launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 2, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M == 4) { launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 4, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M == 8) { launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 8, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M <= 8) { launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M == 16) { launch<2, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 16, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M <= 16) { launch<2, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M == 24) { launch<3, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 24, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M <= 24) { launch<3, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M == 32) { launch<4, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 32, 5120, 576, 9, true>(A, 9, st); return; }
-    if (M <= 32) { launch<4, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120, 576, 9, true>(A, 9, st); return; }
+    if (M == 1) {
+      launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 1, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M == 2) {
+      launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 2, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M == 4) {
+      launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 4, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M == 8) {
+      launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 8, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M <= 8) {
+      launch<1, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M == 16) {
+      launch<2, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 16, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M <= 16) {
+      launch<2, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M == 24) {
+      launch<3, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 24, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M <= 24) {
+      launch<3, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M == 32) {
+      launch<4, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 32, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
+    if (M <= 32) {
+      launch<4, 2, 9, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 5120,
+             576, 9, true>(A, 9, st);
+      return;
+    }
   } else if (N == 6144 && K == 1024) {
-    if (M == 4) { launch<1, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 4, 6144, 1024, 8, true>(A, 8, st); return; }
-    if (M == 8) { launch<1, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 8, 6144, 1024, 8, true>(A, 8, st); return; }
-    if (M <= 8) { launch<1, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 0, 6144, 1024, 8, true>(A, 8, st); return; }
-    if (M == 12) { launch<2, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 12, 6144, 1024, 8, true>(A, 8, st); return; }
-    if (M == 16) { launch<2, 2, 16, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 16, 6144, 1024, 16, true>(A, 16, st); return; }
-    if (M <= 16) { launch<2, 2, 16, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144, 1024, 16, true>(A, 16, st); return; }
-    if (M == 24) { launch<3, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 24, 6144, 1024, 8, true>(A, 8, st); return; }
-    if (M <= 24) { launch<3, 2, 8, false, 1, 1, SCVD, 1, 1, false, 1, false, true, false, false, false, 0, 6144, 1024, 8, true>(A, 8, st); return; }
-    if (M == 32) { launch<4, 1, 4, true, 2, 1, SCVD, 1, 1, false, 2, true, true, true, false, false, 32, 6144, 1024, 8, true>(A, 8, st); return; }
-    if (M <= 32) { launch<4, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, false, true, false, false, false, 0, 6144, 1024, 8, true>(A, 8, st); return; }
+    if (M == 4) {
+      launch<1, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 4, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
+    if (M == 8) {
+      launch<1, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 8, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
+    if (M <= 8) {
+      launch<1, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 0, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
+    if (M == 12) {
+      launch<2, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 12, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
+    if (M == 16) {
+      launch<2, 2, 16, false, 1, 1, SCVD, 1, 1, true, 0, false, true, true, false, false, 16, 6144,
+             1024, 16, true>(A, 16, st);
+      return;
+    }
+    if (M <= 16) {
+      launch<2, 2, 16, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 6144,
+             1024, 16, true>(A, 16, st);
+      return;
+    }
+    if (M == 24) {
+      launch<3, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 24, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
+    if (M <= 24) {
+      launch<3, 2, 8, false, 1, 1, SCVD, 1, 1, false, 1, false, true, false, false, false, 0, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
+    if (M == 32) {
+      launch<4, 1, 4, true, 2, 1, SCVD, 1, 1, false, 2, true, true, true, false, false, 32, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
+    if (M <= 32) {
+      launch<4, 1, 8, false, 2, 1, SCVD, 1, 1, false, 1, false, true, false, false, false, 0, 6144,
+             1024, 8, true>(A, 8, st);
+      return;
+    }
   } else if (N == 8192 && K == 1280) {
-    if (M == 16) { launch<2, 1, 10, false, 1, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 16, 8192, 1280, 10, true>(A, 10, st); return; }
-    if (M <= 16) { launch<2, 1, 10, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 8192, 1280, 20, true>(A, 20, st); return; }
-    if (M == 24) { launch<3, 1, 5, false, 2, 2, SCVD, 2, 1, false, 1, true, true, true, true, false, 24, 8192, 1280, 5, true>(A, 5, st); return; }
-    if (M <= 24) { launch<3, 1, 5, false, 3, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 8192, 1280, 10, true>(A, 10, st); return; }
-    if (M == 32) { launch<4, 1, 5, false, 3, 1, SCVD, 1, 1, false, 0, false, true, true, false, false, 32, 8192, 1280, 10, true>(A, 10, st); return; }
-    if (M <= 32) { launch<4, 1, 5, false, 3, 1, SCVD, 1, 1, false, 0, false, true, false, false, false, 0, 8192, 1280, 10, true>(A, 10, st); return; }
+    if (M == 16) {
+      launch<2, 1, 10, false, 1, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 16, 8192,
+             1280, 10, true>(A, 10, st);
+      return;
+    }
+    if (M <= 16) {
+      launch<2, 1, 10, false, 1, 1, SCVD, 1, 1, true, 0, false, true, false, false, false, 0, 8192,
+             1280, 20, true>(A, 20, st);
+      return;
+    }
+    if (M == 24) {
+      launch<3, 1, 5, false, 2, 2, SCVD, 2, 1, false, 1, true, true, true, true, false, 24, 8192,
+             1280, 5, true>(A, 5, st);
+      return;
+    }
+    if (M <= 24) {
+      launch<3, 1, 5, false, 3, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 8192,
+             1280, 10, true>(A, 10, st);
+      return;
+    }
+    if (M == 32) {
+      launch<4, 1, 5, false, 3, 1, SCVD, 1, 1, false, 0, false, true, true, false, false, 32, 8192,
+             1280, 10, true>(A, 10, st);
+      return;
+    }
+    if (M <= 32) {
+      launch<4, 1, 5, false, 3, 1, SCVD, 1, 1, false, 0, false, true, false, false, false, 0, 8192,
+             1280, 10, true>(A, 10, st);
+      return;
+    }
   } else if (N == 5120 && K == 2048) {
-    if (M == 24) { launch<3, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, true, false, true, false, false, 24, 5120, 2048, 16>(A, 16, st); return; }
-    if (M == 2) { launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 2, 5120, 2048, 16>(A, 16, st); return; }
-    if (M == 1) { launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 1, 5120, 2048, 16>(A, 16, st); return; }
-    if (M == 4) { launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 4, 5120, 2048, 16>(A, 16, st); return; }
-    if (M == 8) { launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 8, 5120, 2048, 16>(A, 16, st); return; }
-    if (M <= 8) { launch<1, 1, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120, 2048, 16>(A, 16, st); return; }
-    if (M == 16) { launch<2, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, true, false, false, 16, 5120, 2048, 16>(A, 16, st); return; }
-    if (M <= 16) { launch<2, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120, 2048, 16>(A, 16, st); return; }
-    if (M <= 24) { launch<3, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120, 2048, 16>(A, 16, st); return; }
-    if (M == 32) { launch<4, 2, 8, true, 2, 1, SCVD, 1, 1, false, 2, false, true, true, false, false, 32, 5120, 2048, 16>(A, 16, st); return; }
-    if (M <= 32) { launch<4, 2, 8, true, 2, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120, 2048, 16>(A, 16, st); return; }
+    if (M == 24) {
+      launch<3, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, true, false, true, false, false, 24, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M == 2) {
+      launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 2, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M == 1) {
+      launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 1, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M == 4) {
+      launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, false, false, false, 4, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M == 8) {
+      launch<1, 1, 16, false, 1, 1, SCVD, 1, 1, false, 1, true, true, true, false, false, 8, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M <= 8) {
+      launch<1, 1, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M == 16) {
+      launch<2, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, true, false, false, 16, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M <= 16) {
+      launch<2, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M <= 24) {
+      launch<3, 2, 8, true, 1, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M == 32) {
+      launch<4, 2, 8, true, 2, 1, SCVD, 1, 1, false, 2, false, true, true, false, false, 32, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
+    if (M <= 32) {
+      launch<4, 2, 8, true, 2, 1, SCVD, 1, 1, false, 2, false, true, false, false, false, 0, 5120,
+             2048, 16>(A, 16, st);
+      return;
+    }
   }
 
   // decode M is 1..32, but the declared scope has no upper bound: cover any M
@@ -1387,10 +1753,18 @@ void Run(TensorView aq, TensorView bq, TensorView a_sf, TensorView b_sf, TensorV
   for (A.m0 = 0; A.m0 < A.M; A.m0 += 32) {
     const int mrem = A.M - A.m0 < 32 ? A.M - A.m0 : 32;
     switch (cdiv(mrem, 8)) {
-      case 1: gen_m<1>(A, st); break;
-      case 2: gen_m<2>(A, st); break;
-      case 3: gen_m<3>(A, st); break;
-      default: gen_m<4>(A, st); break;
+      case 1:
+        gen_m<1>(A, st);
+        break;
+      case 2:
+        gen_m<2>(A, st);
+        break;
+      case 3:
+        gen_m<3>(A, st);
+        break;
+      default:
+        gen_m<4>(A, st);
+        break;
     }
   }
 }
@@ -1398,5 +1772,4 @@ void Run(TensorView aq, TensorView bq, TensorView a_sf, TensorView b_sf, TensorV
 }  // namespace mxfp8_smallm_sm107
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_mxfp8_smallm_sm107_run,
-                              flashinfer::mxfp8_smallm_sm107::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mm_mxfp8_smallm_sm107_run, flashinfer::mxfp8_smallm_sm107::Run);
