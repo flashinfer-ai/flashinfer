@@ -1796,3 +1796,22 @@ def test_hardware_row_max_equals_the_register_tree(D, monkeypatch):
     tree = bits(run_paged_prefill(pr))
     assert torch.equal(hw, tree)
     assert torch.isnan(tree.view(torch.bfloat16).float()).any()
+
+
+@needs_device
+def test_hardware_row_max_is_a_head_dim_placement(monkeypatch):
+    """The hardware row maximum is taken at D <= 128 only (the two-stage TMEM plan at D = 256 keeps the register tree); the kill
+    switch turns it off everywhere. The D = 256 kernels are the same either way, so the switch reaches no kernel there."""
+    from flashinfer.attention.batch_invariant import engine
+
+    dev = torch.device("cuda")
+    assert not engine.hw_row_max_enabled(dev, 256)
+    assert (
+        engine.hw_row_max_enabled(dev, 128)
+        == engine.hw_row_max_enabled(dev, 64)
+        == engine.hw_row_max_enabled(dev)
+    )
+    monkeypatch.setenv(engine.HW_ROW_MAX_ENV, "0")
+    assert not engine.hw_row_max_enabled(dev, 64) and not engine.hw_row_max_enabled(
+        dev, 128
+    )
