@@ -403,7 +403,7 @@ def unit_loop(
             rPq_e = cute.make_tensor(
                 cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
             )
-        if cutlass.const_expr(not rep and not st.q2):
+        if cutlass.const_expr(not rep and st.streamed):
             r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE)
         else:
             ps = [None] * kpt
