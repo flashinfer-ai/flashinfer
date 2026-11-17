@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import check_pr_api_diff as api_diff  # noqa: E402
+from pr_checks.git_compare import resolve_pr_comparison  # noqa: E402
 
 
 def api_function(signature: str) -> api_diff.ApiFunction:
@@ -90,6 +92,171 @@ def compare_snapshots(
         head = commit_snapshot(repo, head_files, "head")
         with working_directory(repo):
             return api_diff.check(base, head)
+
+
+class PrComparisonTest(unittest.TestCase):
+    @contextmanager
+    def repository(
+        self,
+        *,
+        sync_main: bool,
+        change_pr_api: bool,
+        add_undocumented_apis: bool = False,
+    ) -> Iterator[tuple[Path, str, str, str, str]]:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            run_git(repo, "init", "-q", "-b", "main")
+            run_git(repo, "config", "user.name", "API checker test")
+            run_git(repo, "config", "user.email", "api-checker@example.com")
+            source = (
+                "@flashinfer_api\ndef api(*, mode: str = 'old') -> None:\n    pass\n"
+            )
+            files = {
+                "flashinfer/main_api.py": source,
+                "flashinfer/pr_api.py": source,
+            }
+            if add_undocumented_apis:
+                files["docs/api/example.rst"] = (
+                    ".. currentmodule:: flashinfer.main_api\n\n"
+                    ".. autofunction:: api\n\n"
+                    ".. currentmodule:: flashinfer.pr_api\n\n"
+                    ".. autofunction:: api\n"
+                )
+            stale_base = commit_snapshot(repo, files, "initial main")
+            run_git(repo, "checkout", "-q", "-b", "pr")
+            pr_files = {**files, "packaging.txt": "PR packaging fix\n"}
+            if change_pr_api:
+                pr_files["flashinfer/pr_api.py"] = source.replace("'old'", "'new'")
+                if add_undocumented_apis:
+                    pr_files["flashinfer/pr_api.py"] += (
+                        "\n@flashinfer_api\ndef pr_added() -> None:\n"
+                        '    """Run the PR operation."""\n    pass\n'
+                    )
+            commit_snapshot(repo, pr_files, "PR changes")
+            run_git(repo, "checkout", "-q", "main")
+            main_files = {
+                **files,
+                "flashinfer/main_api.py": source.replace("'old'", "'new'"),
+            }
+            if add_undocumented_apis:
+                main_files["flashinfer/main_api.py"] += (
+                    "\n@flashinfer_api\ndef main_added() -> None:\n"
+                    '    """Run the main operation."""\n    pass\n'
+                )
+            target = commit_snapshot(repo, main_files, "unrelated main API change")
+            run_git(repo, "checkout", "-q", "pr")
+            if sync_main:
+                run_git(repo, "merge", "--no-ff", "main", "-m", "sync main")
+            pr_head = run_git(repo, "rev-parse", "HEAD")
+            run_git(repo, "checkout", "-q", "main")
+            run_git(repo, "merge", "--no-ff", "pr", "-m", "PR test merge")
+            merge = run_git(repo, "rev-parse", "HEAD")
+            yield repo, stale_base, target, pr_head, merge
+
+    def test_main_sync_does_not_introduce_pr_api_findings(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, merge = snapshot
+            with working_directory(repo):
+                self.assertEqual(len(api_diff.check(stale_base, pr_head)), 1)
+                base, head = resolve_pr_comparison(merge, pr_head)
+                self.assertEqual((base, head), (target, pr_head))
+                self.assertEqual(api_diff.check(base, head), [])
+
+    def test_own_api_changes_still_report_with_or_without_main_sync(self) -> None:
+        for sync_main in (False, True):
+            with (
+                self.subTest(sync_main=sync_main),
+                self.repository(sync_main=sync_main, change_pr_api=True) as snapshot,
+            ):
+                repo, _, _, pr_head, merge = snapshot
+                with working_directory(repo):
+                    base, head = resolve_pr_comparison(merge, pr_head)
+                    findings = api_diff.check(base, head)
+                self.assertEqual(
+                    [(f.check, f.path) for f in findings],
+                    [("public_api_signature_changed", "flashinfer/pr_api.py")],
+                )
+
+    def test_reject_non_merge_and_mismatched_head(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, merge = snapshot
+            with working_directory(repo):
+                with self.assertRaisesRegex(RuntimeError, "two-parent PR test merge"):
+                    resolve_pr_comparison(target, pr_head)
+                with self.assertRaisesRegex(RuntimeError, "expected head"):
+                    resolve_pr_comparison(merge, stale_base)
+
+    def test_static_documentation_filters_synced_main_findings(self) -> None:
+        for change_pr_api in (False, True):
+            with (
+                self.subTest(change_pr_api=change_pr_api),
+                self.repository(
+                    sync_main=True,
+                    change_pr_api=change_pr_api,
+                    add_undocumented_apis=True,
+                ) as snapshot,
+            ):
+                repo, stale_base, target, pr_head, merge = snapshot
+                with working_directory(repo):
+                    base, head = resolve_pr_comparison(merge, pr_head)
+                reports = {}
+                for label, comparison_base in (
+                    ("stale", stale_base),
+                    ("aligned", base),
+                ):
+                    report = repo / f"{label}.json"
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPTS_DIR / "check_pr_document.py"),
+                            "--base",
+                            comparison_base,
+                            "--head",
+                            head,
+                            "--report-json",
+                            str(report),
+                        ],
+                        cwd=repo,
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    reports[label] = json.loads(report.read_text())
+
+                main_message = (
+                    "flashinfer.main_api.main_added is absent from docs/api/*.rst"
+                )
+                pr_message = "flashinfer.pr_api.pr_added is absent from docs/api/*.rst"
+                self.assertIn(
+                    main_message, [f["message"] for f in reports["stale"]["findings"]]
+                )
+                aligned = reports["aligned"]
+                self.assertEqual((aligned["base"], aligned["head"]), (target, pr_head))
+                self.assertEqual(
+                    [f["message"] for f in aligned["findings"]],
+                    [pr_message] if change_pr_api else [],
+                )
+
+    def test_cli_outputs_one_comparison_for_both_checkers(self) -> None:
+        with self.repository(sync_main=True, change_pr_api=False) as snapshot:
+            repo, stale_base, target, pr_head, _ = snapshot
+            output = repo / "github-output"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS_DIR / "pr_checks/git_compare.py"),
+                    "--head",
+                    pr_head,
+                    "--github-output",
+                    str(output),
+                ],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(output.read_text(), f"base={target}\nhead={pr_head}\n")
+            self.assertNotIn(stale_base, result.stdout)
 
 
 class SignatureCompatibilityTest(unittest.TestCase):
