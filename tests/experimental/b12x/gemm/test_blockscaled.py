@@ -403,7 +403,7 @@ def test_mm_pair_replays_under_cuda_graph() -> None:
             graph.reset()
 
 
-@pytest.mark.parametrize("m,n,k", [(6, 128, 256), (64, 2560, 4096)])
+@pytest.mark.parametrize("m,n,k", [(6, 128, 256), (64, 2560, 4096), (64, 4096, 4096)])
 def test_mm_serialized_mxfp4_matches_independent_dequantized_reference(
     m: int, n: int, k: int
 ) -> None:
