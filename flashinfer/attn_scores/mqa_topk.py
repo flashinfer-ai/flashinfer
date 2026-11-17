@@ -85,7 +85,7 @@ class FP8MQATopKWrapper:
         max_batch_size: int,
         device,
         strategy: Literal["selective"] = "selective",
-        backend: Literal["cutedsl"] = "cutedsl",
+        backend: Literal["cutedsl", "specialized"] = "cutedsl",
         num_heads: int,
         head_dim=128,
         top_k=512,
@@ -99,9 +99,8 @@ class FP8MQATopKWrapper:
     ):
         if strategy != "selective":
             raise ValueError("continuous TopK supports selective only")
-        if backend != "cutedsl":
-            raise ValueError("backend must be 'cutedsl'")
-        from ..experimental.attn_scores import _continuous_plan_type
+        if backend not in ("cutedsl", "specialized"):
+            raise ValueError("backend must be 'cutedsl' or 'specialized'")
 
         options = dict(
             max_context_length=max_context_length,
@@ -121,7 +120,19 @@ class FP8MQATopKWrapper:
             weights_dtype=weights_dtype,
             model_config=model_config,
         )
-        self._capacity_plan = _continuous_plan_type("cutedsl")(**options)
+        if backend == "specialized":
+            # Agent-generated SM103 kernel; adds multi-request support
+            # (qo/kv_indptr of shape [B + 1]). Inherits the functional
+            # entry's validated-toolkit refusal semantics. See
+            # flashinfer/attn_scores/mqa_topk_specialized.py for the
+            # validated contract and restrictions.
+            from .mqa_topk_specialized import SpecializedTopKPlan
+
+            self._capacity_plan = SpecializedTopKPlan(**options)
+        else:
+            from ..experimental.attn_scores import _continuous_plan_type
+
+            self._capacity_plan = _continuous_plan_type("cutedsl")(**options)
         self._compression_ratio = compression_ratio
         self._backend = backend
         self._strategy = strategy
