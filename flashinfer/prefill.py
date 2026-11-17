@@ -8547,6 +8547,19 @@ def trtllm_sage_attention_quantize(
     return q_quant, k_quant, v_quant, q_scale, k_scale, v_scale
 
 
+# Backends for trtllm_ragged_attention_deepseek. "auto" (the default)
+# behaves exactly like "trtllm-gen" except that calls matching the
+# "specialized" allowlist route to an agent-generated SM103 kernel
+# (flashinfer/mla_ragged_prefill_dsr1_cuda.py); explicitly selected
+# backends are never silently swapped.
+TRTLLM_RAGGED_DEEPSEEK_BACKENDS = (
+    "auto",
+    "specialized",
+    "trtllm-gen",
+    "cute-dsl",
+)
+
+
 @flashinfer_api(trace=trtllm_ragged_attention_deepseek_trace)
 def trtllm_ragged_attention_deepseek(
     query: torch.Tensor,
@@ -8577,7 +8590,7 @@ def trtllm_ragged_attention_deepseek(
         Optional[torch.Tensor],
     ] = (None, None, None, None),
     num_elts_per_sage_attn_blk: Tuple[int, int, int, int] = (0, 0, 0, 0),
-    backend: str = "trtllm-gen",
+    backend: str = "auto",
     q_seq_lens_cpu: Optional[torch.Tensor] = None,
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
@@ -8659,7 +8672,19 @@ def trtllm_ragged_attention_deepseek(
         which disables SageAttention.  Only consulted when ``sage_attn_sfs``
         contains non-``None`` tensors.
     backend : str
-        Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
+        One of ``("auto", "specialized", "trtllm-gen", "cute-dsl")``.
+        ``"auto"`` (the default) behaves exactly like ``"trtllm-gen"``
+        except that calls matching the ``"specialized"`` allowlist — the
+        DeepSeek-R1 head geometry (fp8 e4m3 q/k/v, 12 heads, qk 192 /
+        v 128), ragged calls at a measured set of (batch, token-count,
+        max-len, causal) classes, ``return_lse=True`` (the serve call
+        form; the kernel emits the base-2 LSE), default scales, full
+        window, on SM103 — route to an agent-generated kernel
+        (:mod:`flashinfer.mla_ragged_prefill_dsr1_cuda`). An explicitly
+        selected backend is never silently swapped: ``"specialized"``
+        raises with its ``fallback_reasons`` when it cannot serve the call.
+        The specialized route bails to the stock path under CUDA-graph
+        capture. Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``.
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
         together with ``kv_seq_lens_cpu``, the Python wrapper can detect empty
@@ -8703,11 +8728,60 @@ def trtllm_ragged_attention_deepseek(
     check_trtllm_gen_sm107_only_feature(
         uses_spcompress, "uses_spcompress", query.device
     )
+    if backend not in TRTLLM_RAGGED_DEEPSEEK_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {TRTLLM_RAGGED_DEEPSEEK_BACKENDS}, got {backend!r}"
+        )
     if backend != "cute-dsl" and not is_causal and window_left >= 0:
         raise NotImplementedError(
             "trtllm-gen ragged attention requires a right-window bound for non-causal "
             "sliding-window attention, but the ragged interface exposes only window_left"
         )
+    # "specialized" backend: an agent-generated SM103 kernel for the
+    # DeepSeek-R1-geometry non-causal ragged context-chunk classes
+    # (flashinfer/mla_ragged_prefill_dsr1_cuda.py). backend="auto" (the
+    # default; otherwise identical to "trtllm-gen") routes to it only on its
+    # strict allowlist; explicitly selected backends are never swapped; the
+    # route bails to the stock path under CUDA-graph capture; kill switch:
+    # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1.
+    if backend in ("auto", "specialized"):
+        from .mla_ragged_prefill_dsr1_cuda import (
+            maybe_dispatch_specialized as _mds,
+        )
+
+        _specialized_out = _mds(
+            backend=backend,
+            query=query,
+            key=key,
+            value=value,
+            workspace_buffer=workspace_buffer,
+            seq_lens=seq_lens,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            batch_size=batch_size,
+            out=out,
+            extras=dict(
+                is_causal=is_causal,
+                return_lse=return_lse,
+                lse=lse,
+                window_left=window_left,
+                attention_sinks=attention_sinks,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                sage_attn_sfs=sage_attn_sfs,
+                num_elts_per_sage_attn_blk=num_elts_per_sage_attn_blk,
+                use_fp16_softmax=use_fp16_softmax,
+                uses_spcompress=uses_spcompress,
+                q_seq_lens_cpu=q_seq_lens_cpu,
+                kv_seq_lens_cpu=kv_seq_lens_cpu,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                o_sf_scale=o_sf_scale,
+            ),
+        )
+        if _specialized_out is not None:
+            return _specialized_out
     is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
