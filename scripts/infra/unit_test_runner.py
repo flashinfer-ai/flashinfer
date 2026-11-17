@@ -396,7 +396,8 @@ def _shell_settings(argv: list[str]) -> int:
     except (RunnerStateError, ValueError) as error:
         parser.error(str(error))
     print(operation)
-    print(" ".join(str(path) for path in args.test_path))
+    # The shell entrypoint word-splits this line; keep separators POSIX-style.
+    print(" ".join(path.as_posix() for path in args.test_path))
     return 0
 
 
