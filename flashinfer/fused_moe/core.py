@@ -1881,6 +1881,10 @@ def cutlass_fused_moe(
                 "min_latency_mode": min_latency_mode,
                 "use_packed_weights": use_packed_weights,
                 "use_wfp4afp8_humming": use_wfp4afp8_humming,
+                # A tactic-pinned call is the stock kernel's own tuned launch
+                # (the unified CutlassFp8BlockRunner always pins profile_ids);
+                # on the unified surface the specialized kernel competes as
+                # its own backend, SpecializedFp8BlockSmallTRunner.
                 "profile_ids": profile_ids is not None,
                 "clamped_relu2_limit": clamped_relu2_limit is not None,
                 "situ_beta": situ_beta is not None,

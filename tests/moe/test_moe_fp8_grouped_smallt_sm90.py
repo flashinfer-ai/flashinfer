@@ -17,7 +17,23 @@ limitations under the License.
 import pytest
 import torch
 
-from flashinfer.fused_moe import cutlass_fused_moe
+from flashinfer.fused_moe import (
+    BackendOptions,
+    CutlassFp8BlockConfig,
+    ExecutionConfig,
+    ExpertConfig,
+    MoEActivationPack,
+    MoEConfig,
+    MoELayer,
+    MoEWeightPack,
+    QuantConfig,
+    QuantFormat,
+    RoutingConfig,
+    SpecializedFp8BlockSmallTConfig,
+    SpecializedFp8BlockSmallTRunner,
+    SwiGLU,
+    cutlass_fused_moe,
+)
 from flashinfer.fused_moe.smallt_sm90 import (
     CUTLASS_FUSED_MOE_BACKENDS,
     _dispatch_table,
@@ -522,3 +538,137 @@ def test_return_type_parity_across_backends(monkeypatch):
         assert isinstance(r, list) and len(r) >= 1, (name, type(r))
         assert isinstance(r[0], torch.Tensor) and r[0].dtype == torch.bfloat16, name
         assert r[0].shape == b["x"].shape, name
+
+
+# --------------------------------------------------------------------------
+# Unified MoELayer surface: first-class cross-backend autotune candidacy
+# --------------------------------------------------------------------------
+
+
+def _unified_layer(T, backends=None, tune_max=64, seed=0):
+    """Build a dsfp8 MoELayer over the contract geometry plus matching packs."""
+    if backends is None:
+        backends = (SpecializedFp8BlockSmallTConfig(),)
+    device = torch.device("cuda", torch.cuda.current_device())
+    b = _make(T, device, seed=seed)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=E, top_k=K),
+        quant=QuantConfig(
+            weight=QuantFormat.DeepSeekFp8,
+            activation=QuantFormat.DeepSeekFp8,
+        ),
+        experts=ExpertConfig(intermediate_size=I),
+        activation=SwiGLU(),
+        backend=BackendOptions(candidates=backends),
+        execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tune_max),
+    )
+    act = MoEActivationPack(b["x"], None, b["ids"], b["tw"])
+    weights = MoEWeightPack()
+    # The stock dsfp8 view serves both backends (weight_view_aliases).
+    weights.prepare_for(
+        "cutlass_fp8_block",
+        {
+            "fc1_expert_weights": b["w13"],
+            "fc2_expert_weights": b["w2"],
+            "fc1_block_scale": b["s13"],
+            "fc2_block_scale": b["s2"],
+        },
+    )
+    return MoELayer(config), act, weights, b
+
+
+def test_unified_config_gating_and_registration():
+    """GPU-free: SM90-only gating, runner registration, opt-in default."""
+    from flashinfer.fused_moe.api import _DEFAULT_BACKEND, ALL_BACKEND_CONFIGS
+    from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+    assert SpecializedFp8BlockSmallTConfig.supported(90)
+    for arch in (80, 89, 100, 103, 107, 110, 120, 121):
+        assert not SpecializedFp8BlockSmallTConfig.supported(arch)
+    # First-class registration on the unified surface...
+    assert (
+        _BACKEND_RUNNERS[SpecializedFp8BlockSmallTConfig]
+        is SpecializedFp8BlockSmallTRunner
+    )
+    assert SpecializedFp8BlockSmallTConfig in ALL_BACKEND_CONFIGS
+    # ... but opt-in, like the other specialized backends: never in the
+    # default search order.
+    assert not any(
+        isinstance(c, SpecializedFp8BlockSmallTConfig) for c in _DEFAULT_BACKEND
+    )
+    # Same prepared-weight contract as the stock dsfp8 backend.
+    assert SpecializedFp8BlockSmallTRunner.weight_view_aliases == ("cutlass_fp8_block",)
+    assert (
+        SpecializedFp8BlockSmallTConfig.prepare_weights
+        is CutlassFp8BlockConfig.prepare_weights
+    )
+
+
+def test_unified_layer_dispatches_specialized_kernel():
+    """MoELayer with the opt-in backend serves an in-band call with the
+    specialized kernel (the determinism premise: eligible shape => the
+    specialized kernel, not the stock route)."""
+    _sm90_or_skip()
+    layer, act, weights, b = _unified_layer(4, None)
+    assert [r.backend_key for r in layer.runners] == ["specialized_fp8_block_smallt"]
+    before = _moe_smallt_sm90_stats()
+    out = layer(act, weights)
+    after = _moe_smallt_sm90_stats()
+    assert layer.winner_backend == "specialized_fp8_block_smallt"
+    assert after["runs_dispatched"] > before["runs_dispatched"]
+    assert after["backend_dispatches"]["specialized"] > 0
+    ts, l2 = _gate(out, _reference(b))
+    assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)
+
+
+def test_unified_autotune_reaches_both_backends():
+    """Cross-backend shootout: the specialized runner is a first-class timed
+    candidate next to the stock dsfp8 runner, not an allowlist hook inside
+    it."""
+    _sm90_or_skip()
+    layer, act, weights, b = _unified_layer(
+        4,
+        (SpecializedFp8BlockSmallTConfig(), CutlassFp8BlockConfig()),
+    )
+    keys = [r.backend_key for r in layer.runners]
+    assert keys == ["specialized_fp8_block_smallt", "cutlass_fp8_block"]
+    # The tuning surface enumerates BOTH backends as candidates.
+    candidates = layer._tuning_candidates(act, weights)
+    assert {c["backend"] for c in candidates} == set(keys)
+    # The cross-backend shootout actually launches the specialized kernel
+    # while timing its candidate.
+    before = _moe_smallt_sm90_stats()["runs_dispatched"]
+    out = layer(act, weights)
+    assert _moe_smallt_sm90_stats()["runs_dispatched"] > before
+    assert layer.winner_backend in keys
+    ts, l2 = _gate(out, _reference(b))
+    assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)
+
+
+def test_unified_kill_switch_serves_stock_route(monkeypatch):
+    """With the kill switch set, the specialized runner serves through the
+    stock cutlass route — the layer keeps working, nothing launches the
+    specialized kernel."""
+    _sm90_or_skip()
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    layer, act, weights, b = _unified_layer(4, None)
+    out = layer(act, weights)
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert stats["backend_dispatches"]["stock"] > 0
+    assert any("kill switch" in r for r in stats["fallback_reasons"])
+    ts, l2 = _gate(out, _reference(b))
+    assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)
+
+
+def test_unified_out_of_band_tokens_serve_stock_route():
+    """A specialized-only layer still serves token counts outside the won
+    bands (the 17..255 gap) through the stock route instead of failing."""
+    _sm90_or_skip()
+    layer, act, weights, b = _unified_layer(64, None)
+    out = layer(act, weights)
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert any("outside the measured won bands" in r for r in stats["fallback_reasons"])
+    ts, l2 = _gate(out, _reference(b))
+    assert ts < TOKEN_SUM_REL and l2 < TOKEN_L2_REL, (ts, l2)

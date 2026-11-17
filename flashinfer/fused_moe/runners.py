@@ -2728,6 +2728,131 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
         return [inputs[6], inputs[7]]
 
 
+class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
+    """First-class unified adapter for the specialized SM90 small-T dsfp8 MoE
+    kernel (:mod:`flashinfer.fused_moe.smallt_sm90`; an agent-generated
+    kernel).
+
+    ``forward`` routes through ``cutlass_fused_moe(backend="specialized")``
+    with no pinned tactics: calls on the kernel's allowlist (the measured won
+    token bands, geometry, contiguity, SM90) launch the specialized kernel,
+    and every other call — including every call while
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` is set — is served by the
+    stock CUTLASS dsfp8 route with its default tactic heuristic, this op's
+    composable path. The runner therefore accepts every call its
+    configuration supports: ``MoELayer``'s per-token-bucket cross-backend
+    shootout times the specialized kernel directly on allowlisted buckets
+    (first-class candidacy), while on out-of-band buckets this candidate
+    times (and would serve) the stock route, where the tactic-tuned
+    ``CutlassFp8BlockRunner`` normally wins the bucket.
+
+    The specialized kernel has no tactic space, so ``get_valid_tactics``
+    returns the single sentinel tactic and tactic preparation is a no-op.
+    Reuses ``CutlassFp8BlockRunner``'s packing, workspace and support checks
+    (same quant family, archs and prepared-weight view).
+    """
+
+    backend_key = "specialized_fp8_block_smallt"
+    # The specialized kernel consumes the stock CUTLASS dsfp8 weight view
+    # unchanged, so a pack prepared for that backend serves this one too.
+    weight_view_aliases = ("cutlass_fp8_block",)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        # The config-static slice of the kernel's allowlist. The per-call
+        # slice (token bands, hidden alignment, per-band top_k/expert
+        # geometry, contiguity, kill switch) is enforced by the dispatch at
+        # call time, with the stock route serving declined calls.
+        if self.config.experts.intermediate_size % 128:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires 128-aligned intermediate_size "
+                f"(the [128,128] block-scale grid), got "
+                f"{self.config.experts.intermediate_size}."
+            )
+
+    def _build(self) -> None:
+        super()._build()
+        # Build the specialized module at layer init, never inside a CUDA
+        # graph capture (the dispatch refuses to compile under capture). A
+        # failed build is recorded once and every call is then served by the
+        # stock route; smallt_sm90 logs the reason.
+        from .smallt_sm90 import _get_module
+
+        _get_module()
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        # Accept a pack prepared for the stock dsfp8 backend: the view is the
+        # same tensors, registered under this key on first use so the base
+        # class's exact-key lookup finds it.
+        if self.backend_key not in weights.native_views:
+            for alias in self.weight_view_aliases:
+                if alias in weights.native_views:
+                    weights.prepare_for(self.backend_key, weights.get_view(alias))
+                    break
+        return super().pack_inputs(act, weights)
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self._require_built()
+        self._validate_input_count(inputs)
+        # No tactic space: the specialized kernel's launch is fully determined
+        # by the call shape, and the stock-route fallback runs its default
+        # heuristic rather than a pinned pair (a tactic-pinned call is the
+        # stock kernel's own tuned launch, which the specialized dispatch
+        # declines by design).
+        return [-1]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        self._validate_input_count(inputs)
+        if self._workspace is None:
+            raise RuntimeError("pack_inputs must allocate the CUTLASS workspace first.")
+        if do_preparation:
+            return inputs[0]  # no tactics to prepare
+
+        # Deterministic geometric-capacity workspace for the stock-route
+        # fallback; older cached buffers remain alive for captured graphs.
+        num_tokens = inputs[1].shape[0]
+        bucket = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        self._ensure_workspace(bucket, self._hidden_size_of(inputs[1]))
+
+        from .core import cutlass_fused_moe
+
+        # profile_ids stays unset: the specialized dispatch declines
+        # tactic-pinned calls, and pinning would also constrain the fallback.
+        cutlass_fused_moe(
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            output_dtype=torch.bfloat16,
+            quant_scales=self._quant_scales(inputs),
+            input_sf=self._input_sf(inputs),
+            output=inputs[0],
+            tune_max_num_tokens=self.config.execution.tune_max_num_tokens,
+            enable_pdl=self._enable_pdl,
+            activation_type=self.config.activation.type,
+            use_deepseek_fp8_block_scale=True,
+            use_fused_finalize=self._use_fused_finalize,
+            workspace_buffer=self._workspace,
+            backend="specialized",
+            **self._activation_params,
+            nvfp4_4over6=self.config.quant.nvfp4_4over6,
+        )
+        return inputs[0]
+
+
 class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS MXFP8 x MXFP4 fused MoE.
 

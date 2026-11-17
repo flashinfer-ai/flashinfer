@@ -46,6 +46,19 @@ the stock cutlass route bitwise;
 ``FLASHINFER_DISABLE_MOE_FP8_GROUPED_SMALLT_SM90=1`` is a deprecated alias
 kept for one release.
 
+On the unified ``MoELayer`` surface the kernel is a FIRST-CLASS cross-backend
+autotune candidate through the opt-in ``SpecializedFp8BlockSmallTConfig``
+backend (``api.py``; not in the default search order, matching the SM12x/B12x
+specialized backends) and its ``SpecializedFp8BlockSmallTRunner``
+(``runners.py``), which routes through ``backend="specialized"`` with no
+pinned tactics: ``MoELayer``'s per-token-bucket shootout times the kernel
+directly against the other configured backends and caches the winner. The
+kernel is deliberately NOT reachable through the stock
+``CutlassFp8BlockRunner``: that runner always pins CUTLASS tactics
+(``profile_ids``), which this dispatch declines — a tactic-pinned call is the
+stock kernel's own tuned launch, and serving it with a different kernel would
+silently invalidate the autotuner's measurements.
+
 The dispatch never allocates on the hot path except the output tensor when
 the caller did not pass one (the stock path allocates it in the same
 place): the fp16 intermediate workspace is cached per (device, stream) at

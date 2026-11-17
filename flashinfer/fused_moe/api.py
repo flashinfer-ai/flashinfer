@@ -2327,6 +2327,42 @@ class CutlassFp8BlockConfig:
         return "CutlassFp8BlockConfig()"
 
 
+@dataclass(frozen=True)
+class SpecializedFp8BlockSmallTConfig:
+    """Specialized SM90 small/banded-batch backend over the CUTLASS DeepSeek
+    128x128 FP8 block-scale format (an agent-generated kernel).
+
+    Same weight, activation and routing contract as
+    :class:`CutlassFp8BlockConfig`: prepare weights once with either class and
+    register the view under either backend key — the runner accepts the
+    ``"cutlass_fp8_block"`` view as its own. Calls on the kernel's measured
+    allowlist (:mod:`flashinfer.fused_moe.smallt_sm90`: the won token bands,
+    geometry, contiguity, SM90) launch the specialized kernel; every other
+    call is served by the stock CUTLASS dsfp8 route — this op's composable
+    path, never another fused backend — so a layer configured with this
+    backend alone still serves every batch size.
+
+    Opt-in: not part of the default backend search order, matching the SM12x /
+    B12x specialized backends. List it next to :class:`CutlassFp8BlockConfig`
+    in ``BackendOptions`` to make the specialized kernel a first-class
+    cross-backend autotune candidate: ``MoELayer``'s per-token-bucket shootout
+    then times the kernel directly and caches the per-bucket winner.
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) makes the
+    runner serve exclusively through the stock route.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 90
+
+    # The specialized kernel consumes the stock CUTLASS dsfp8 weight view
+    # unchanged (fc1 [up; gate] stacking, [128,128] f32 block-scale grids).
+    prepare_weights = staticmethod(CutlassFp8BlockConfig.prepare_weights)
+
+    def __repr__(self) -> str:
+        return "SpecializedFp8BlockSmallTConfig()"
+
+
 def _mxfp8_activation_quant(
     quant: Optional[QuantConfig],
     pair: tuple[QuantFormat, QuantFormat],
@@ -3445,6 +3481,7 @@ BackendConfigType = Union[
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
     CutlassFp8BlockConfig,
+    SpecializedFp8BlockSmallTConfig,
     CutlassMxfp8Mxfp4Config,
     CutlassMxfp8Config,
     CutlassW4A8Config,
@@ -3491,6 +3528,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
     CutlassFp8BlockConfig,
+    SpecializedFp8BlockSmallTConfig,
     CutlassMxfp8Mxfp4Config,
     CutlassMxfp8Config,
     CutlassW4A8Config,
