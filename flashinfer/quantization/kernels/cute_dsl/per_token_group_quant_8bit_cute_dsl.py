@@ -350,7 +350,7 @@ def _build(lanes_per_group, threads):
     return launch
 
 
-_CACHE = {}
+_CACHE: dict = {}
 
 
 def _compiled(lanes_per_group, threads, x, q_bytes, s):
