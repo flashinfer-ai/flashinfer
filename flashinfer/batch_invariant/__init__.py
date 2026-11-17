@@ -151,6 +151,31 @@ def _mm_fp4_fingerprint(
     )
 
 
+def _mm_mxfp4w8a_fingerprint(
+    N: int, K: int, out_dtype: Union[torch.dtype, str], arch=None
+) -> str:
+    from ..gemm.batch_invariant.schedule import chunks_for, mx_class_for
+    from ..gemm.batch_invariant.spec import k_granule, spec_fingerprint
+
+    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp8_mxfp4"))
+    if N <= 0 or K <= 0:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} and K {K} must be positive"
+        )
+    gran = k_granule(fmt)
+    if K % gran:  # the operator's contract: the class exists for these weights only
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): K {K} must be a multiple of {gran} for the {fmt} class"
+        )
+    if N % 8:
+        raise ValueError(
+            f"fingerprint('mm_mxfp8_mxfp4'): N {N} must be a multiple of 8"
+        )
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "mm_mxfp8_mxfp4"), chunks_for(N, K, fmt), fmt
+    )
+
+
 def _moe_class_terms(
     op: str,
     top_k: int,
@@ -239,31 +264,6 @@ def _moe_class_terms(
     else:
         raise ValueError(f"no MoE chain named {act!r}")
     return rm, name, params, gated
-
-
-def _mm_mxfp4w8a_fingerprint(
-    N: int, K: int, out_dtype: Union[torch.dtype, str], arch=None
-) -> str:
-    from ..gemm.batch_invariant.schedule import chunks_for, mx_class_for
-    from ..gemm.batch_invariant.spec import k_granule, spec_fingerprint
-
-    fmt = mx_class_for("mxfp4w8a", _mx_family(arch, "mm_mxfp8_mxfp4"))
-    if N <= 0 or K <= 0:
-        raise ValueError(
-            f"fingerprint('mm_mxfp8_mxfp4'): N {N} and K {K} must be positive"
-        )
-    gran = k_granule(fmt)
-    if K % gran:  # the operator's contract: the class exists for these weights only
-        raise ValueError(
-            f"fingerprint('mm_mxfp8_mxfp4'): K {K} must be a multiple of {gran} for the {fmt} class"
-        )
-    if N % 8:
-        raise ValueError(
-            f"fingerprint('mm_mxfp8_mxfp4'): N {N} must be a multiple of 8"
-        )
-    return spec_fingerprint(
-        K, _out_fmt(out_dtype, "mm_mxfp8_mxfp4"), chunks_for(N, K, fmt), fmt
-    )
 
 
 def _moe_bf16_fingerprint(
@@ -859,18 +859,18 @@ CLASSES: Dict[str, ClassInfo] = {
     ),
     # the MXFP4 x MXFP4 pair of the same backend (UE8M0 block scales on both operands: no global or per-token scale, no
     # static-intermediate class)
+    "fused_moe_mxfp4": ClassInfo(
+        "moe.mxfp4",
+        ("H", "I", "top_k", "num_experts"),
+        _moe_mxfp4_fingerprint,
+        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
+    ),
     # the unified MoE layer with `BatchInvariantFp4Config` (the MXFP4 x MXFP8 pair): the bf16 classes' dimensions plus the
     # architecture (the instruction class of the dense mixed MXFP4 x MXFP8 GEMM, as for mm_mxfp8_mxfp4)
     "fused_moe_mxfp4w8a": ClassInfo(
         "moe.mxfp4w8a",
         ("H", "I", "top_k", "num_experts"),
         _moe_mxfp4w8a_fingerprint,
-        ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
-    ),
-    "fused_moe_mxfp4": ClassInfo(
-        "moe.mxfp4",
-        ("H", "I", "top_k", "num_experts"),
-        _moe_mxfp4_fingerprint,
         ("method", "act", "params", "gated", "arch", "n_group", "topk_group"),
     ),
 }

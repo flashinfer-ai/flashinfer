@@ -1182,9 +1182,11 @@ def _run_mx(
             enable_pdl=enable_pdl,
         )
     else:
-        assert not enable_pdl, (
-            "programmatic dependent launch: the mixed classes' kernels"
-        )
+        if enable_pdl:
+            raise ValueError(
+                "enable_pdl is wired for the mixed classes only; the mxfp8 and fp4 classes launch without programmatic "
+                "dependent launch"
+            )
         kernel = get_compiled_blockscaled(
             config,
             C,

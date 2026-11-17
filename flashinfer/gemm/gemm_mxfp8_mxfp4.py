@@ -97,7 +97,11 @@ def mm_mxfp8_mxfp4(
     ``k`` is a multiple of 32 and ``n`` of 8 on every part; on SM100 / SM103 ``k``
     is a multiple of 128 (the instruction reads the e2m1 weight through the TMA's
     unpacking format in 128-element runs of the row; a smaller ``k`` raises, it is
-    not padded). Supported on SM100 / SM103 / SM107.
+    not padded). Where ``k`` is not a multiple of the class's step (128 on SM107) the
+    last step is partial and its scales are read from the scale buffers' padding:
+    the buffers must come from the quantizers (which write zeros there) or carry
+    finite padding; a NaN or Inf in those bytes poisons the row. Supported on
+    SM100 / SM103 / SM107.
 
     Examples
     --------
