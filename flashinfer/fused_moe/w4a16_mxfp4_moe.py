@@ -108,9 +108,7 @@ _stats = {
 
 
 def _fallback(reason):
-    _stats["fallback_reasons"][reason] = (
-        _stats["fallback_reasons"].get(reason, 0) + 1
-    )
+    _stats["fallback_reasons"][reason] = _stats["fallback_reasons"].get(reason, 0) + 1
 
 
 def _w4a16_mxfp4_latent_moe_stats() -> dict:
@@ -151,8 +149,7 @@ def _dispatch_table():
     return _DISPATCH_TABLE
 
 
-_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                     dtype=torch.float32)
+_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32)
 
 
 def _dequant_mxfp4(wp: torch.Tensor, ws: torch.Tensor) -> torch.Tensor:
@@ -214,7 +211,8 @@ _warmed_tokens: dict = {}
 
 def _killed() -> bool:
     if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "").strip() not in (
-        "", "0",
+        "",
+        "0",
     ):
         return True
     value = os.environ.get(_ENV_VAR, "").strip().lower()
@@ -338,15 +336,22 @@ def w4a16_mxfp4_latent_routed_moe(
     _check(tokens > 0, "token count must be positive")
     _check(x.dtype is torch.bfloat16, "x must be bf16 (W4A16 contract)")
     # generic shape CONSISTENCY (both paths; violations raise)
-    _check(w13_packed.dim() == 3 and w2_packed.dim() == 3
-           and w13_scale.dim() == 3 and w2_scale.dim() == 3,
-           "weights/scales must be 3D [E_local, N, K-packed]")
-    _check(w13_packed.shape[2] * 2 == x.shape[1]
-           and w13_scale.shape[2] * _GROUP == x.shape[1],
-           "w13 packing/scales must match x's hidden size")
-    _check(w2_packed.shape[1] == x.shape[1]
-           and w2_scale.shape[1] == x.shape[1],
-           "w2 rows must match x's hidden size")
+    _check(
+        w13_packed.dim() == 3
+        and w2_packed.dim() == 3
+        and w13_scale.dim() == 3
+        and w2_scale.dim() == 3,
+        "weights/scales must be 3D [E_local, N, K-packed]",
+    )
+    _check(
+        w13_packed.shape[2] * 2 == x.shape[1]
+        and w13_scale.shape[2] * _GROUP == x.shape[1],
+        "w13 packing/scales must match x's hidden size",
+    )
+    _check(
+        w2_packed.shape[1] == x.shape[1] and w2_scale.shape[1] == x.shape[1],
+        "w2 rows must match x's hidden size",
+    )
     # fixed-geometry ELIGIBILITY of the specialized kernel (a miss is a
     # fallback reason, not an error — the reference serves any consistent
     # geometry)
@@ -373,29 +378,44 @@ def w4a16_mxfp4_latent_routed_moe(
     ):
         _check(t.dtype is torch.uint8, f"{name} must be uint8 (mxfp4-g32 packing)")
     _check(
-        topk_ids.dim() == 2 and topk_ids.shape[0] == tokens
+        topk_ids.dim() == 2
+        and topk_ids.shape[0] == tokens
         and topk_ids.dtype is torch.int32,
         "topk_ids must be int32 [T, K]",
     )
     _check(
-        topk_weights.shape == topk_ids.shape
-        and topk_weights.dtype is torch.float32,
+        topk_weights.shape == topk_ids.shape and topk_weights.dtype is torch.float32,
         "topk_weights must be float32 with topk_ids's shape",
     )
     if _spec_reason is None and topk_ids.shape[1] != _TOP_K:
         _spec_reason = f"top_k={topk_ids.shape[1]} != {_TOP_K}"
     if out is None:
-        out = torch.empty(tokens, x.shape[1], dtype=torch.bfloat16,
-                          device=x.device)
+        out = torch.empty(tokens, x.shape[1], dtype=torch.bfloat16, device=x.device)
     _check(
         out.shape == (tokens, x.shape[1]) and out.dtype is torch.bfloat16,
         "out must be bf16 [T, L]",
     )
-    tensors = (x, w13_packed, w13_scale, w2_packed, w2_scale, topk_ids,
-               topk_weights, out)
+    tensors = (
+        x,
+        w13_packed,
+        w13_scale,
+        w2_packed,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        out,
+    )
     for name, t in zip(
-        ("x", "w13_packed", "w13_scale", "w2_packed", "w2_scale", "topk_ids",
-         "topk_weights", "out"),
+        (
+            "x",
+            "w13_packed",
+            "w13_scale",
+            "w2_packed",
+            "w2_scale",
+            "topk_ids",
+            "topk_weights",
+            "out",
+        ),
         tensors,
     ):
         _check(t.is_contiguous(), f"{name} must be contiguous")
@@ -426,8 +446,14 @@ def w4a16_mxfp4_latent_routed_moe(
             chosen = "reference"
     if chosen == "reference":
         _composable_reference(
-            x, w13_packed, w13_scale, w2_packed, w2_scale, topk_ids,
-            topk_weights, out,
+            x,
+            w13_packed,
+            w13_scale,
+            w2_packed,
+            w2_scale,
+            topk_ids,
+            topk_weights,
+            out,
         )
         _stats["backend_dispatches"]["reference"] += 1
         return out
@@ -452,7 +478,13 @@ def w4a16_mxfp4_latent_routed_moe(
             )
     module = _get_module()
     module.w4a16_mxfp4_latent_routed_moe(
-        x, w13_packed, w13_scale, w2_packed, w2_scale, topk_ids, topk_weights,
+        x,
+        w13_packed,
+        w13_scale,
+        w2_packed,
+        w2_scale,
+        topk_ids,
+        topk_weights,
         out,
     )
     _stats["backend_dispatches"]["specialized"] += 1

@@ -49,30 +49,31 @@ def _sm90_or_skip():
 
 def _case(T=8, el=EL, l=L, i=I, k=K, seed=0, device="cuda"):
     g = torch.Generator(device=device).manual_seed(seed)
-    x = (torch.randn((T, l), generator=g, device=device) * 1.0).to(
-        torch.bfloat16)
-    w13p = torch.randint(0, 256, (el, 2 * i, l // 2), generator=g,
-                         device=device, dtype=torch.uint8)
-    w13s = torch.randint(118, 122, (el, 2 * i, l // G), generator=g,
-                         device=device, dtype=torch.uint8)
-    w2p = torch.randint(0, 256, (el, l, i // 2), generator=g,
-                        device=device, dtype=torch.uint8)
-    w2s = torch.randint(118, 122, (el, l, i // G), generator=g,
-                        device=device, dtype=torch.uint8)
+    x = (torch.randn((T, l), generator=g, device=device) * 1.0).to(torch.bfloat16)
+    w13p = torch.randint(
+        0, 256, (el, 2 * i, l // 2), generator=g, device=device, dtype=torch.uint8
+    )
+    w13s = torch.randint(
+        118, 122, (el, 2 * i, l // G), generator=g, device=device, dtype=torch.uint8
+    )
+    w2p = torch.randint(
+        0, 256, (el, l, i // 2), generator=g, device=device, dtype=torch.uint8
+    )
+    w2s = torch.randint(
+        118, 122, (el, l, i // G), generator=g, device=device, dtype=torch.uint8
+    )
     # realistic routing: DISTINCT global expert ids per token (duplicates
     # would double-hit an expert, which real routers never emit)
-    ids = torch.stack([
-        torch.randperm(el * 2, generator=g, device=device)[:k]
-        for _ in range(T)
-    ]).to(torch.int32)
+    ids = torch.stack(
+        [torch.randperm(el * 2, generator=g, device=device)[:k] for _ in range(T)]
+    ).to(torch.int32)
     w = torch.rand((T, k), generator=g, device=device, dtype=torch.float32)
     return x, w13p, w13s, w2p, w2s, ids, w
 
 
 def _matched(y, ref, rtol=0.03, atol=0.02):
     yf, rf = y.float(), ref.float()
-    return float(((yf - rf).abs() <= (atol + rtol * rf.abs()))
-                 .float().mean().item())
+    return float(((yf - rf).abs() <= (atol + rtol * rf.abs())).float().mean().item())
 
 
 def test_backends_tuple_and_table():
@@ -88,10 +89,12 @@ def test_unknown_backend_raises_gpu_free():
     x = torch.zeros((1, L), dtype=torch.bfloat16)
     with pytest.raises(NotImplementedError, match="never silently swapped"):
         w4a16_mxfp4_latent_routed_moe(
-            x, *(torch.zeros(1, dtype=torch.uint8) for _ in range(4)),
+            x,
+            *(torch.zeros(1, dtype=torch.uint8) for _ in range(4)),
             torch.zeros((1, K), dtype=torch.int32),
             torch.zeros((1, K), dtype=torch.float32),
-            backend="cutlass")
+            backend="cutlass",
+        )
 
 
 def test_specialized_matches_reference_backend():
@@ -114,7 +117,8 @@ def test_specialized_matches_reference_backend():
         # is nondeterministic (disclosed in the PR); reruns must still agree
         # within the package gate band
         assert _matched(y2, y_spec, rtol=0.03, atol=0.02) >= 0.999, (
-            "reruns diverged beyond the documented atomic-order band")
+            "reruns diverged beyond the documented atomic-order band"
+        )
 
 
 def test_explicit_reference_never_fused_and_auto_routes():
@@ -144,8 +148,7 @@ def test_off_geometry_served_by_reference_only():
     assert _matched(y, ref) >= 0.999
 
 
-@pytest.mark.parametrize("env,val", [(DISABLE_ENV, "1"),
-                                     (DISABLE_ENV_LEGACY, "0")])
+@pytest.mark.parametrize("env,val", [(DISABLE_ENV, "1"), (DISABLE_ENV_LEGACY, "0")])
 def test_kill_switch_forces_the_reference_path(env, val, monkeypatch):
     _sm90_or_skip()
     monkeypatch.setenv(env, val)

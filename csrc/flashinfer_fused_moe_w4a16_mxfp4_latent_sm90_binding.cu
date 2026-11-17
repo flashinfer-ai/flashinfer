@@ -15,10 +15,8 @@
  */
 #include "tvm_ffi_utils.h"
 
-void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p,
-                                       TensorView w13s, TensorView w2p,
-                                       TensorView w2s, TensorView ids,
+void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView w13s,
+                                       TensorView w2p, TensorView w2s, TensorView ids,
                                        TensorView tw, TensorView out);
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(w4a16_mxfp4_latent_routed_moe,
-                              w4a16_mxfp4_latent_routed_moe_run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(w4a16_mxfp4_latent_routed_moe, w4a16_mxfp4_latent_routed_moe_run);

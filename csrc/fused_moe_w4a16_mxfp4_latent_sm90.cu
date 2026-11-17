@@ -34,10 +34,11 @@
  * The device code and the decode/prefill launch heuristic are kept verbatim
  * from the measured artifact; only the host binding differs.
  */
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
 #include <cooperative_groups.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
 #include <mutex>
 
 #include "tvm_ffi_utils.h"
@@ -75,11 +76,9 @@ __device__ __forceinline__ uint32_t prm3424(uint32_t a) {
   return d;
 }
 
-__device__ __forceinline__ uint32_t lop3ea(uint32_t a, uint32_t b,
-                                          uint32_t c) {
+__device__ __forceinline__ uint32_t lop3ea(uint32_t a, uint32_t b, uint32_t c) {
   uint32_t d;
-  asm("lop3.b32 %0, %1, %2, %3, 0xEA;"
-      : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
   return d;
 }
 
@@ -93,17 +92,20 @@ __device__ __forceinline__ float ue8m0(uint32_t e) {
 
 // Eight E2M1 nibbles -> four half2 values scaled by 2^-14.  The emitted
 // order is (n0,n2),(n4,n6),(n1,n3),(n5,n7), matched by cvt8 below.
-__device__ __forceinline__ void dq8(uint32_t w, __half2 &a, __half2 &b,
-                                    __half2 &c, __half2 &d) {
+__device__ __forceinline__ void dq8(uint32_t w, __half2& a, __half2& b, __half2& c, __half2& d) {
   uint32_t t = w & 0x0F0F0F0Fu, s = w & 0x08080808u, be, m;
   asm("mad.lo.u32 %0, %1, 14, 0;" : "=r"(m) : "r"(s));
   asm("mad.lo.u32 %0, %1, 2, %2;" : "=r"(be) : "r"(t), "r"(m));
   uint32_t bo = lop3ea(w, 0x80808080u, (w >> 3) & 0x0E0E0E0Eu);
   uint32_t r;
-  r = prm1404(be); a = *reinterpret_cast<__half2*>(&r);
-  r = prm3424(be); b = *reinterpret_cast<__half2*>(&r);
-  r = prm1404(bo); c = *reinterpret_cast<__half2*>(&r);
-  r = prm3424(bo); d = *reinterpret_cast<__half2*>(&r);
+  r = prm1404(be);
+  a = *reinterpret_cast<__half2*>(&r);
+  r = prm3424(be);
+  b = *reinterpret_cast<__half2*>(&r);
+  r = prm1404(bo);
+  c = *reinterpret_cast<__half2*>(&r);
+  r = prm3424(bo);
+  d = *reinterpret_cast<__half2*>(&r);
 }
 
 // Eight BF16 activations -> eight FP16 values scaled by 2^7 and permuted to
@@ -127,22 +129,16 @@ __device__ __forceinline__ uint4 cvt8(uint4 v) {
   return o;
 }
 
-__device__ __forceinline__ int hperm(int c) {
-  return (c & ~7) | ((c & 1) << 2) | ((c & 7) >> 1);
-}
+__device__ __forceinline__ int hperm(int c) { return (c & ~7) | ((c & 1) << 2) | ((c & 7) >> 1); }
 
 // Transpose each 64-uint4 K slice from [lane][half] to [half][lane].  This
 // makes the two LDS.128 warp reads below conflict-free on Hopper shared memory.
-__device__ __forceinline__ int xswz(int i) {
-  return (i & ~63) | ((i & 1) << 5) | ((i & 63) >> 1);
-}
+__device__ __forceinline__ int xswz(int i) { return (i & ~63) | ((i & 1) << 5) | ((i & 63) >> 1); }
 
 template <bool ZERO_OUT>
-__global__ void route_k(const int* __restrict__ ids,
-                        const float* __restrict__ tw, int T, int MT,
-                        int* __restrict__ eoff, int* __restrict__ moff,
-                        int* __restrict__ mex, int* __restrict__ ptok,
-                        float* __restrict__ pw,
+__global__ void route_k(const int* __restrict__ ids, const float* __restrict__ tw, int T, int MT,
+                        int* __restrict__ eoff, int* __restrict__ moff, int* __restrict__ mex,
+                        int* __restrict__ ptok, float* __restrict__ pw,
                         __nv_bfloat16* __restrict__ out) {
   __shared__ int cnt[64];
   __shared__ int cur[64];
@@ -150,8 +146,7 @@ __global__ void route_k(const int* __restrict__ ids,
   if (ZERO_OUT) {
     uint4* out4 = reinterpret_cast<uint4*>(out);
     int n4 = T * (LH / 8);
-    for (int i = tid; i < n4; i += blockDim.x)
-      out4[i] = make_uint4(0, 0, 0, 0);
+    for (int i = tid; i < n4; i += blockDim.x) out4[i] = make_uint4(0, 0, 0, 0);
   }
   if (tid < 64) cnt[tid] = 0;
   __syncthreads();
@@ -189,10 +184,8 @@ __global__ void route_k(const int* __restrict__ ids,
 
 // Decode hits are independent, so expert-grouped offsets are unnecessary.
 // Compact local slots in one pass and publish only the total hit count.
-__global__ void route_dec_k(const int* __restrict__ ids,
-                            const float* __restrict__ tw, int T,
-                            int* __restrict__ moff, int* __restrict__ mex,
-                            float* __restrict__ pw) {
+__global__ void route_dec_k(const int* __restrict__ ids, const float* __restrict__ tw, int T,
+                            int* __restrict__ moff, int* __restrict__ mex, float* __restrict__ pw) {
   __shared__ int count;
   const int tid = threadIdx.x;
   if (tid == 0) count = 0;
@@ -213,16 +206,18 @@ __global__ void route_dec_k(const int* __restrict__ ids,
 template <int MT>
 __global__ __launch_bounds__(512) void fc1_k(
     const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ wp,
-    const uint8_t* __restrict__ ws, const int* __restrict__ eoff,
-    const int* __restrict__ moff, const int* __restrict__ mex,
-    const int* __restrict__ ptok, __half* __restrict__ hbuf) {
+    const uint8_t* __restrict__ ws, const int* __restrict__ eoff, const int* __restrict__ moff,
+    const int* __restrict__ mex, const int* __restrict__ ptok, __half* __restrict__ hbuf) {
   extern __shared__ char smem[];
   __half* xs = reinterpret_cast<__half*>(smem);
   __shared__ int smoff[64], seoff[64];
   __shared__ float gs[NT1][MT], us[NT1][MT];
 
   int tid = threadIdx.x;
-  if (tid <= EL) { smoff[tid] = moff[tid]; seoff[tid] = eoff[tid]; }
+  if (tid <= EL) {
+    smoff[tid] = moff[tid];
+    seoff[tid] = eoff[tid];
+  }
   __syncthreads();
   int Wtot = smoff[EL] * NGRP1;
   int lane = tid & 31, warp = tid >> 5;
@@ -239,8 +234,7 @@ __global__ __launch_bounds__(512) void fc1_k(
 
     __syncthreads();
     for (int r = 0; r < rows; ++r) {
-      const uint4* src = reinterpret_cast<const uint4*>(
-          x + (size_t)ptok[p0 + r] * LH);
+      const uint4* src = reinterpret_cast<const uint4*>(x + (size_t)ptok[p0 + r] * LH);
       uint4* dst = reinterpret_cast<uint4*>(xs + r * LH);
       for (int i = tid; i < LH / 8; i += 512) dst[i] = cvt8(src[i]);
     }
@@ -251,58 +245,57 @@ __global__ __launch_bounds__(512) void fc1_k(
     for (int bn = 0; bn < BN1; ++bn) {
       int n0 = (ng * BN1 + bn) * NT1;
       for (int task = warp; task < 2 * NT1; task += 16) {
-      int row = task < NT1 ? n0 + task : IH + n0 + task - NT1;
-      const uint32_t* wrow = reinterpret_cast<const uint32_t*>(
-          wp + ((size_t)e * (2 * IH) + row) * (LH / 2));
-      const uint8_t* srow = ws + ((size_t)e * (2 * IH) + row) * (LH / 32);
-      float acc[MT];
+        int row = task < NT1 ? n0 + task : IH + n0 + task - NT1;
+        const uint32_t* wrow =
+            reinterpret_cast<const uint32_t*>(wp + ((size_t)e * (2 * IH) + row) * (LH / 2));
+        const uint8_t* srow = ws + ((size_t)e * (2 * IH) + row) * (LH / 32);
+        float acc[MT];
 #pragma unroll
-      for (int m = 0; m < MT; ++m) acc[m] = 0.f;
+        for (int m = 0; m < MT; ++m) acc[m] = 0.f;
 #pragma unroll 2
-      for (int it = 0; it < LH / 256; ++it) {
-        int j = lane + 32 * it;
-        uint32_t wv = wrow[j];
-        float sc = ue8m0(srow[j >> 2]);
-        __half2 d0, d1, d2, d3;
-        dq8(wv, d0, d1, d2, d3);
+        for (int it = 0; it < LH / 256; ++it) {
+          int j = lane + 32 * it;
+          uint32_t wv = wrow[j];
+          float sc = ue8m0(srow[j >> 2]);
+          __half2 d0, d1, d2, d3;
+          dq8(wv, d0, d1, d2, d3);
+#pragma unroll
+          for (int m = 0; m < MT; ++m) {
+            if (m < rows) {
+              const __half2* xp = reinterpret_cast<const __half2*>(xs + m * LH + j * 8);
+              __half2 p = __hmul2(d0, xp[0]);
+              p = __hfma2(d1, xp[1], p);
+              p = __hfma2(d2, xp[2], p);
+              p = __hfma2(d3, xp[3], p);
+              acc[m] = fmaf(sc, __low2float(p) + __high2float(p), acc[m]);
+            }
+          }
+        }
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
-          if (m < rows) {
-            const __half2* xp = reinterpret_cast<const __half2*>(
-                xs + m * LH + j * 8);
-            __half2 p = __hmul2(d0, xp[0]);
-            p = __hfma2(d1, xp[1], p);
-            p = __hfma2(d2, xp[2], p);
-            p = __hfma2(d3, xp[3], p);
-            acc[m] = fmaf(sc, __low2float(p) + __high2float(p), acc[m]);
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
+        }
+        if (lane == 0) {
+#pragma unroll
+          for (int m = 0; m < MT; ++m) {
+            if (task < NT1)
+              gs[task][m] = acc[m];
+            else
+              us[task - NT1][m] = acc[m];
           }
         }
       }
-#pragma unroll
-      for (int m = 0; m < MT; ++m) {
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1)
-          acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
-      }
-      if (lane == 0) {
-#pragma unroll
-        for (int m = 0; m < MT; ++m) {
-          if (task < NT1) gs[task][m] = acc[m];
-          else us[task - NT1][m] = acc[m];
-        }
-      }
-      }
       __syncthreads();
       for (int idx = tid; idx < NT1 * MT; idx += 512) {
-      int m = idx / NT1, c = idx - m * NT1;
-      if (m < rows) {
-        float g = gs[c][m], u = us[c][m];
-        float a = 4.f * tanhf(g * 0.25f) * (1.f / (1.f + __expf(-g)));
-        float b = 25.f * tanhf(u * 0.04f);
-        float h = __bfloat162float(__float2bfloat16(a * b));
-        hbuf[(size_t)(p0 + m) * IH + hperm(n0 + c)] =
-            __float2half(h * 128.f);
-      }
+        int m = idx / NT1, c = idx - m * NT1;
+        if (m < rows) {
+          float g = gs[c][m], u = us[c][m];
+          float a = 4.f * tanhf(g * 0.25f) * (1.f / (1.f + __expf(-g)));
+          float b = 25.f * tanhf(u * 0.04f);
+          float h = __bfloat162float(__float2bfloat16(a * b));
+          hbuf[(size_t)(p0 + m) * IH + hperm(n0 + c)] = __float2half(h * 128.f);
+        }
       }
       if (bn + 1 < BN1) __syncthreads();
     }
@@ -311,17 +304,18 @@ __global__ __launch_bounds__(512) void fc1_k(
 
 template <int MT>
 __global__ __launch_bounds__(512) void fc2_k(
-    const __half* __restrict__ hbuf, const uint8_t* __restrict__ wp,
-    const uint8_t* __restrict__ ws, const int* __restrict__ eoff,
-    const int* __restrict__ moff, const int* __restrict__ mex,
-    const int* __restrict__ ptok, const float* __restrict__ pw,
-    __nv_bfloat16* __restrict__ out) {
+    const __half* __restrict__ hbuf, const uint8_t* __restrict__ wp, const uint8_t* __restrict__ ws,
+    const int* __restrict__ eoff, const int* __restrict__ moff, const int* __restrict__ mex,
+    const int* __restrict__ ptok, const float* __restrict__ pw, __nv_bfloat16* __restrict__ out) {
   extern __shared__ char smem[];
   __half* xs = reinterpret_cast<__half*>(smem);
   __shared__ int smoff[64], seoff[64];
 
   int tid = threadIdx.x;
-  if (tid <= EL) { smoff[tid] = moff[tid]; seoff[tid] = eoff[tid]; }
+  if (tid <= EL) {
+    smoff[tid] = moff[tid];
+    seoff[tid] = eoff[tid];
+  }
   __syncthreads();
   int Wtot = smoff[EL] * PNTILES2;
   int lane = tid & 31, warp = tid >> 5;
@@ -339,8 +333,7 @@ __global__ __launch_bounds__(512) void fc2_k(
 
     __syncthreads();
     for (int r = 0; r < rows; ++r) {
-      const uint4* src = reinterpret_cast<const uint4*>(
-          hbuf + (size_t)(p0 + r) * IH);
+      const uint4* src = reinterpret_cast<const uint4*>(hbuf + (size_t)(p0 + r) * IH);
       uint4* dst = reinterpret_cast<uint4*>(xs + r * IH);
       for (int i = tid; i < IH / 8; i += 512) dst[i] = src[i];
     }
@@ -348,8 +341,8 @@ __global__ __launch_bounds__(512) void fc2_k(
 
     for (int task = warp; task < PNT2; task += 16) {
       int row = n0 + task;
-      const uint32_t* wrow = reinterpret_cast<const uint32_t*>(
-          wp + ((size_t)e * LH + row) * (IH / 2));
+      const uint32_t* wrow =
+          reinterpret_cast<const uint32_t*>(wp + ((size_t)e * LH + row) * (IH / 2));
       const uint8_t* srow = ws + ((size_t)e * LH + row) * (IH / 32);
       float acc[MT];
 #pragma unroll
@@ -364,8 +357,7 @@ __global__ __launch_bounds__(512) void fc2_k(
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
           if (m < rows) {
-            const __half2* xp = reinterpret_cast<const __half2*>(
-                xs + m * IH + j * 8);
+            const __half2* xp = reinterpret_cast<const __half2*>(xs + m * IH + j * 8);
             __half2 p = __hmul2(d0, xp[0]);
             p = __hfma2(d1, xp[1], p);
             p = __hfma2(d2, xp[2], p);
@@ -377,16 +369,14 @@ __global__ __launch_bounds__(512) void fc2_k(
 #pragma unroll
       for (int m = 0; m < MT; ++m) {
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1)
-          acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
+        for (int o = 16; o > 0; o >>= 1) acc[m] += __shfl_down_sync(0xffffffffu, acc[m], o);
       }
       if (lane == 0) {
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
           if (m < rows) {
             float v = acc[m] * pw[p0 + m];
-            atomicAdd(out + (size_t)ptok[p0 + m] * LH + row,
-                      __float2bfloat16(v));
+            atomicAdd(out + (size_t)ptok[p0 + m] * LH + row, __float2bfloat16(v));
           }
         }
       }
@@ -401,24 +391,22 @@ __global__ __launch_bounds__(512) void fc2_k(
 // registers and feeds mma.m16n8k16 from ldmatrix fragments: weights are
 // dequantized straight to BF16 in registers and staged once per K chunk.
 // ---------------------------------------------------------------------------
-#define MSTR 72          // shared row stride in bf16 (64 + 8 pad)
-#define MMM 64           // M rows per CTA tile
-#define MNT 128          // N rows per CTA tile (per gate/up half for fc1)
-#define MNW 16           // N rows per warp
+#define MSTR 72  // shared row stride in bf16 (64 + 8 pad)
+#define MMM 64   // M rows per CTA tile
+#define MNT 128  // N rows per CTA tile (per gate/up half for fc1)
+#define MNW 16   // N rows per warp
 
-__device__ __forceinline__ uint32_t smaddr(const void *p) {
+__device__ __forceinline__ uint32_t smaddr(const void* p) {
   return (uint32_t)__cvta_generic_to_shared(p);
 }
 
-__device__ __forceinline__ void ldm4(uint32_t a, uint32_t *r) {
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-      : "r"(a));
+__device__ __forceinline__ void ldm4(uint32_t a, uint32_t* r) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
 }
 
-__device__ __forceinline__ void mmaf(float *d, const uint32_t *a,
-                                     const uint32_t *b) {
+__device__ __forceinline__ void mmaf(float* d, const uint32_t* a, const uint32_t* b) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -436,10 +424,9 @@ __device__ __forceinline__ uint32_t mulbf2(uint32_t a, uint32_t b) {
 // magnitude lookup is two PRMTs against the eight E2M1 bit patterns; the sign
 // bit is re-inserted with a third PRMT and the group scale folds into one
 // bf16x2 multiply (exact: e2m1 needs 2 mantissa bits, the scale is 2^k).
-__device__ __forceinline__ void dq32(const uint4 &w, uint32_t su,
-                                     uint32_t *o) {
+__device__ __forceinline__ void dq32(const uint4& w, uint32_t su, uint32_t* o) {
   const uint32_t sc2 = su * 0x00800080u;
-  const uint32_t *wv = reinterpret_cast<const uint32_t *>(&w);
+  const uint32_t* wv = reinterpret_cast<const uint32_t*>(&w);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     uint32_t v = wv[i];
@@ -450,30 +437,28 @@ __device__ __forceinline__ void dq32(const uint4 &w, uint32_t su,
     uint32_t hiB = prm(0x3F3F3F00u, 0x40404040u, m2);
     uint32_t loB = prm(0xC0800000u, 0xC0804000u, m2);
     uint32_t v4 = v << 4;
-    o[4 * i + 0] = mulbf2(
-        prm(loA, hiA, 0x5140u) | (prm(v4, v, 0x4000u) & 0x80008000u), sc2);
-    o[4 * i + 1] = mulbf2(
-        prm(loA, hiA, 0x7362u) | (prm(v4, v, 0x5010u) & 0x80008000u), sc2);
-    o[4 * i + 2] = mulbf2(
-        prm(loB, hiB, 0x5140u) | (prm(v4, v, 0x6020u) & 0x80008000u), sc2);
-    o[4 * i + 3] = mulbf2(
-        prm(loB, hiB, 0x7362u) | (prm(v4, v, 0x7030u) & 0x80008000u), sc2);
+    o[4 * i + 0] = mulbf2(prm(loA, hiA, 0x5140u) | (prm(v4, v, 0x4000u) & 0x80008000u), sc2);
+    o[4 * i + 1] = mulbf2(prm(loA, hiA, 0x7362u) | (prm(v4, v, 0x5010u) & 0x80008000u), sc2);
+    o[4 * i + 2] = mulbf2(prm(loB, hiB, 0x5140u) | (prm(v4, v, 0x6020u) & 0x80008000u), sc2);
+    o[4 * i + 3] = mulbf2(prm(loB, hiB, 0x7362u) | (prm(v4, v, 0x7030u) & 0x80008000u), sc2);
   }
 }
 
 __global__ __launch_bounds__(256) void fc1_m_k(
-    const __nv_bfloat16 *__restrict__ x, const uint8_t *__restrict__ wp,
-    const uint8_t *__restrict__ ws, const int *__restrict__ eoff,
-    const int *__restrict__ moff, const int *__restrict__ mex,
-    const int *__restrict__ ptok, __nv_bfloat16 *__restrict__ hbuf) {
+    const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ wp,
+    const uint8_t* __restrict__ ws, const int* __restrict__ eoff, const int* __restrict__ moff,
+    const int* __restrict__ mex, const int* __restrict__ ptok, __nv_bfloat16* __restrict__ hbuf) {
   extern __shared__ char smem[];
-  __nv_bfloat16 *As = reinterpret_cast<__nv_bfloat16 *>(smem);
-  __nv_bfloat16 *Bs = As + MMM * MSTR;         // 2*MNT rows (gate then up)
+  __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem);
+  __nv_bfloat16* Bs = As + MMM * MSTR;  // 2*MNT rows (gate then up)
   __shared__ int sptok[MMM];
   __shared__ int smoff[64], seoff[64];
 
   const int tid = threadIdx.x;
-  if (tid <= EL) { smoff[tid] = moff[tid]; seoff[tid] = eoff[tid]; }
+  if (tid <= EL) {
+    smoff[tid] = moff[tid];
+    seoff[tid] = eoff[tid];
+  }
   __syncthreads();
   const int NT = IH / MNT;
   const int Wtot = smoff[EL] * NT;
@@ -500,9 +485,9 @@ __global__ __launch_bounds__(256) void fc1_m_k(
     if (tid < MMM) sptok[tid] = ptok[p0 + (tid < rows ? tid : rows - 1)];
 
     const int grow = (tid < MNT) ? (n0 + tid) : (IH + n0 + tid - MNT);
-    const uint8_t *wrow = wp + ((size_t)e * (2 * IH) + grow) * (LH / 2);
-    const uint8_t *srow = ws + ((size_t)e * (2 * IH) + grow) * (LH / 32);
-    __nv_bfloat16 *bdst = Bs + tid * MSTR;
+    const uint8_t* wrow = wp + ((size_t)e * (2 * IH) + grow) * (LH / 2);
+    const uint8_t* srow = ws + ((size_t)e * (2 * IH) + grow) * (LH / 32);
+    __nv_bfloat16* bdst = Bs + tid * MSTR;
 
     float ag[4][2][4], au[4][2][4];
 #pragma unroll
@@ -510,7 +495,10 @@ __global__ __launch_bounds__(256) void fc1_m_k(
 #pragma unroll
       for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int c = 0; c < 4; ++c) { ag[i][j][c] = 0.f; au[i][j][c] = 0.f; }
+        for (int c = 0; c < 4; ++c) {
+          ag[i][j][c] = 0.f;
+          au[i][j][c] = 0.f;
+        }
 
     const int mblk = (rows + 15) >> 4;
     const int ar0 = tid >> 3, ac0 = (tid & 7) * 8;
@@ -522,43 +510,39 @@ __global__ __launch_bounds__(256) void fc1_m_k(
     uint4 pw0, pw1, pa0, pa1;
     uint32_t ps0, ps1;
     {
-      const uint4 *wsrc = reinterpret_cast<const uint4 *>(wrow);
+      const uint4* wsrc = reinterpret_cast<const uint4*>(wrow);
       pw0 = wsrc[0];
       pw1 = wsrc[1];
       ps0 = srow[0];
       ps1 = srow[1];
-      pa0 = *reinterpret_cast<const uint4 *>(x + (size_t)sptok[ar0] * LH + ac0);
-      pa1 = *reinterpret_cast<const uint4 *>(x + (size_t)sptok[ar1] * LH + ac1);
+      pa0 = *reinterpret_cast<const uint4*>(x + (size_t)sptok[ar0] * LH + ac0);
+      pa1 = *reinterpret_cast<const uint4*>(x + (size_t)sptok[ar1] * LH + ac1);
     }
 
     for (int k0 = 0; k0 < LH; k0 += 64) {
       {
         __align__(16) uint32_t o[16];
         dq32(pw0, ps0, o);
-        uint4 *d0 = reinterpret_cast<uint4 *>(bdst);
+        uint4* d0 = reinterpret_cast<uint4*>(bdst);
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-          d0[i] = reinterpret_cast<const uint4 *>(o)[i];
+        for (int i = 0; i < 4; ++i) d0[i] = reinterpret_cast<const uint4*>(o)[i];
         dq32(pw1, ps1, o);
-        uint4 *d1 = reinterpret_cast<uint4 *>(bdst + 32);
+        uint4* d1 = reinterpret_cast<uint4*>(bdst + 32);
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-          d1[i] = reinterpret_cast<const uint4 *>(o)[i];
+        for (int i = 0; i < 4; ++i) d1[i] = reinterpret_cast<const uint4*>(o)[i];
       }
-      *reinterpret_cast<uint4 *>(As + ar0 * MSTR + ac0) = pa0;
-      *reinterpret_cast<uint4 *>(As + ar1 * MSTR + ac1) = pa1;
+      *reinterpret_cast<uint4*>(As + ar0 * MSTR + ac0) = pa0;
+      *reinterpret_cast<uint4*>(As + ar1 * MSTR + ac1) = pa1;
       __syncthreads();
       const int kn = k0 + 64;
       if (kn < LH) {
-        const uint4 *wsrc = reinterpret_cast<const uint4 *>(wrow + (kn >> 1));
+        const uint4* wsrc = reinterpret_cast<const uint4*>(wrow + (kn >> 1));
         pw0 = wsrc[0];
         pw1 = wsrc[1];
         ps0 = srow[kn >> 5];
         ps1 = srow[(kn >> 5) + 1];
-        pa0 = *reinterpret_cast<const uint4 *>(x + (size_t)sptok[ar0] * LH +
-                                               kn + ac0);
-        pa1 = *reinterpret_cast<const uint4 *>(x + (size_t)sptok[ar1] * LH +
-                                               kn + ac1);
+        pa0 = *reinterpret_cast<const uint4*>(x + (size_t)sptok[ar0] * LH + kn + ac0);
+        pa1 = *reinterpret_cast<const uint4*>(x + (size_t)sptok[ar1] * LH + kn + ac1);
       }
 
 #pragma unroll
@@ -600,8 +584,7 @@ __global__ __launch_bounds__(256) void fc1_m_k(
               float b0 = 25.f * tanhf(u0 * 0.04f);
               float b1 = 25.f * tanhf(u1 * 0.04f);
               __nv_bfloat162 hv = __floats2bfloat162_rn(a0 * b0, a1 * b1);
-              *reinterpret_cast<__nv_bfloat162 *>(
-                  hbuf + (size_t)(p0 + m) * IH + n) = hv;
+              *reinterpret_cast<__nv_bfloat162*>(hbuf + (size_t)(p0 + m) * IH + n) = hv;
             }
           }
         }
@@ -611,18 +594,20 @@ __global__ __launch_bounds__(256) void fc1_m_k(
 }
 
 __global__ __launch_bounds__(256) void fc2_m_k(
-    const __nv_bfloat16 *__restrict__ hbuf, const uint8_t *__restrict__ wp,
-    const uint8_t *__restrict__ ws, const int *__restrict__ eoff,
-    const int *__restrict__ moff, const int *__restrict__ mex,
-    const int *__restrict__ ptok, const float *__restrict__ pw,
-    __nv_bfloat16 *__restrict__ out) {
+    const __nv_bfloat16* __restrict__ hbuf, const uint8_t* __restrict__ wp,
+    const uint8_t* __restrict__ ws, const int* __restrict__ eoff, const int* __restrict__ moff,
+    const int* __restrict__ mex, const int* __restrict__ ptok, const float* __restrict__ pw,
+    __nv_bfloat16* __restrict__ out) {
   extern __shared__ char smem[];
-  __nv_bfloat16 *As = reinterpret_cast<__nv_bfloat16 *>(smem);
-  __nv_bfloat16 *Bs = As + MMM * MSTR;         // 2*MNT rows
+  __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem);
+  __nv_bfloat16* Bs = As + MMM * MSTR;  // 2*MNT rows
   __shared__ int smoff[64], seoff[64];
 
   const int tid = threadIdx.x;
-  if (tid <= EL) { smoff[tid] = moff[tid]; seoff[tid] = eoff[tid]; }
+  if (tid <= EL) {
+    smoff[tid] = moff[tid];
+    seoff[tid] = eoff[tid];
+  }
   __syncthreads();
   const int NT = LH / (2 * MNT);
   const int Wtot = smoff[EL] * NT;
@@ -646,9 +631,9 @@ __global__ __launch_bounds__(256) void fc2_m_k(
     const int p0 = seoff[e] + m0;
     const int n0 = nt * (2 * MNT);
 
-    const uint8_t *wrow = wp + ((size_t)e * LH + n0 + tid) * (IH / 2);
-    const uint8_t *srow = ws + ((size_t)e * LH + n0 + tid) * (IH / 32);
-    __nv_bfloat16 *bdst = Bs + tid * MSTR;
+    const uint8_t* wrow = wp + ((size_t)e * LH + n0 + tid) * (IH / 2);
+    const uint8_t* srow = ws + ((size_t)e * LH + n0 + tid) * (IH / 32);
+    __nv_bfloat16* bdst = Bs + tid * MSTR;
     const int arc0 = ar0 < rows ? ar0 : rows - 1;
     const int arc1 = ar1 < rows ? ar1 : rows - 1;
 
@@ -658,7 +643,10 @@ __global__ __launch_bounds__(256) void fc2_m_k(
 #pragma unroll
       for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int c = 0; c < 4; ++c) { a0[i][j][c] = 0.f; a1[i][j][c] = 0.f; }
+        for (int c = 0; c < 4; ++c) {
+          a0[i][j][c] = 0.f;
+          a1[i][j][c] = 0.f;
+        }
 
     const int mblk = (rows + 15) >> 4;
     __syncthreads();
@@ -666,47 +654,39 @@ __global__ __launch_bounds__(256) void fc2_m_k(
     uint4 pw0, pw1, pa0, pa1;
     uint32_t ps0, ps1;
     {
-      const uint4 *wsrc = reinterpret_cast<const uint4 *>(wrow);
+      const uint4* wsrc = reinterpret_cast<const uint4*>(wrow);
       pw0 = wsrc[0];
       pw1 = wsrc[1];
       ps0 = srow[0];
       ps1 = srow[1];
-      pa0 = *reinterpret_cast<const uint4 *>(hbuf + (size_t)(p0 + arc0) * IH +
-                                             ac0);
-      pa1 = *reinterpret_cast<const uint4 *>(hbuf + (size_t)(p0 + arc1) * IH +
-                                             ac1);
+      pa0 = *reinterpret_cast<const uint4*>(hbuf + (size_t)(p0 + arc0) * IH + ac0);
+      pa1 = *reinterpret_cast<const uint4*>(hbuf + (size_t)(p0 + arc1) * IH + ac1);
     }
 
     for (int k0 = 0; k0 < IH; k0 += 64) {
       {
         __align__(16) uint32_t o[16];
         dq32(pw0, ps0, o);
-        uint4 *d0 = reinterpret_cast<uint4 *>(bdst);
+        uint4* d0 = reinterpret_cast<uint4*>(bdst);
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-          d0[i] = reinterpret_cast<const uint4 *>(o)[i];
+        for (int i = 0; i < 4; ++i) d0[i] = reinterpret_cast<const uint4*>(o)[i];
         dq32(pw1, ps1, o);
-        uint4 *d1 = reinterpret_cast<uint4 *>(bdst + 32);
+        uint4* d1 = reinterpret_cast<uint4*>(bdst + 32);
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-          d1[i] = reinterpret_cast<const uint4 *>(o)[i];
+        for (int i = 0; i < 4; ++i) d1[i] = reinterpret_cast<const uint4*>(o)[i];
       }
-      *reinterpret_cast<uint4 *>(As + ar0 * MSTR + ac0) = pa0;
-      *reinterpret_cast<uint4 *>(As + ar1 * MSTR + ac1) = pa1;
+      *reinterpret_cast<uint4*>(As + ar0 * MSTR + ac0) = pa0;
+      *reinterpret_cast<uint4*>(As + ar1 * MSTR + ac1) = pa1;
       __syncthreads();
       const int kn = k0 + 64;
       if (kn < IH) {
-        const uint4 *wsrc = reinterpret_cast<const uint4 *>(wrow + (kn >> 1));
+        const uint4* wsrc = reinterpret_cast<const uint4*>(wrow + (kn >> 1));
         pw0 = wsrc[0];
         pw1 = wsrc[1];
         ps0 = srow[kn >> 5];
         ps1 = srow[(kn >> 5) + 1];
-        pa0 = *reinterpret_cast<const uint4 *>(hbuf +
-                                               (size_t)(p0 + arc0) * IH + kn +
-                                               ac0);
-        pa1 = *reinterpret_cast<const uint4 *>(hbuf +
-                                               (size_t)(p0 + arc1) * IH + kn +
-                                               ac1);
+        pa0 = *reinterpret_cast<const uint4*>(hbuf + (size_t)(p0 + arc0) * IH + kn + ac0);
+        pa1 = *reinterpret_cast<const uint4*>(hbuf + (size_t)(p0 + arc1) * IH + kn + ac1);
       }
 
 #pragma unroll
@@ -742,13 +722,12 @@ __global__ __launch_bounds__(256) void fc2_m_k(
 #pragma unroll
             for (int nb = 0; nb < 2; ++nb) {
               const int n = n0 + nbase + nb * 8 + (lane & 3) * 2;
-              __nv_bfloat162 v0 = __floats2bfloat162_rn(
-                  a0[mb][nb][h * 2] * sw, a0[mb][nb][h * 2 + 1] * sw);
-              atomicAdd(reinterpret_cast<__nv_bfloat162 *>(out + ob + n), v0);
-              __nv_bfloat162 v1 = __floats2bfloat162_rn(
-                  a1[mb][nb][h * 2] * sw, a1[mb][nb][h * 2 + 1] * sw);
-              atomicAdd(reinterpret_cast<__nv_bfloat162 *>(out + ob + n + MNT),
-                        v1);
+              __nv_bfloat162 v0 =
+                  __floats2bfloat162_rn(a0[mb][nb][h * 2] * sw, a0[mb][nb][h * 2 + 1] * sw);
+              atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob + n), v0);
+              __nv_bfloat162 v1 =
+                  __floats2bfloat162_rn(a1[mb][nb][h * 2] * sw, a1[mb][nb][h * 2 + 1] * sw);
+              atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob + n + MNT), v1);
             }
           }
         }
@@ -762,8 +741,7 @@ __global__ __launch_bounds__(256) void fc2_m_k(
 // one naturally-coalesced uint4 from each quarter of a group-32 slice.
 __device__ __forceinline__ int hpos(int c) {
   const int j = (c & 1023) >> 3;
-  return (c & ~1023) + (((j & 3) * 32 + (j >> 2)) << 3) +
-         (((c & 1) << 2) | ((c & 7) >> 1));
+  return (c & ~1023) + (((j & 3) * 32 + (j >> 2)) << 3) + (((c & 1) << 2) | ((c & 7) >> 1));
 }
 // Four-way transpose for the three full 1024-element fc1 chunks, followed by
 // the original two-way layout for the final 512-element tail.
@@ -784,10 +762,9 @@ __device__ __forceinline__ int xswz4(int i) {
 // ---------------------------------------------------------------------------
 
 // Dot of 16 e2m1 weights (one uint2) against 16 staged fp16 activations.
-__device__ __forceinline__ float dot16(uint2 w, const uint4 &xa,
-                                       const uint4 &xb) {
-  const __half2 *pa = reinterpret_cast<const __half2 *>(&xa);
-  const __half2 *pb = reinterpret_cast<const __half2 *>(&xb);
+__device__ __forceinline__ float dot16(uint2 w, const uint4& xa, const uint4& xb) {
+  const __half2* pa = reinterpret_cast<const __half2*>(&xa);
+  const __half2* pb = reinterpret_cast<const __half2*>(&xb);
   __half2 d0, d1, d2, d3;
   dq8(w.x, d0, d1, d2, d3);
   __half2 p = __hmul2(d0, pa[0]);
@@ -804,11 +781,10 @@ __device__ __forceinline__ float dot16(uint2 w, const uint4 &xa,
 
 __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
-               :: "r"(smem), "l"(src) : "memory");
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(src) : "memory");
 }
 
-#define RCAP 1024   // decode path is T <= 64, so T*KTOP <= 1024
+#define RCAP 1024  // decode path is T <= 64, so T*KTOP <= 1024
 
 // Deterministic in-CTA compaction of the local routing slots.  Every CTA
 // rebuilds the identical compact list (stable, slot-index order) from a block
@@ -816,9 +792,8 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
 // id stream is a few hundred bytes and lands in L2 after the first reader.
 template <bool NEEDW>
 __device__ __forceinline__ int route_build(const int* __restrict__ ids,
-                                           const float* __restrict__ tw,
-                                           int n, int* smeta, float* sw,
-                                           int* wsum, int* ranges) {
+                                           const float* __restrict__ tw, int n, int* smeta,
+                                           float* sw, int* wsum, int* ranges) {
   const int tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
   int base = 0;
@@ -859,38 +834,36 @@ __device__ __forceinline__ int route_build(const int* __restrict__ ids,
   return base;
 }
 
-#define C1TILE 32            // fc1 columns per block (16 warps x 2 columns)
-#define NT1D (IH / C1TILE)   // 96 column tiles
-#define N2TILE 64            // fc2 rows per block (16 warps x 4 rows)
-#define NT2D (LH / N2TILE)   // 56 row tiles
+#define C1TILE 32           // fc1 columns per block (16 warps x 2 columns)
+#define NT1D (IH / C1TILE)  // 96 column tiles
+#define N2TILE 64           // fc2 rows per block (16 warps x 4 rows)
+#define NT2D (LH / N2TILE)  // 56 row tiles
 
 // fc1: warp owns columns c0 and c0+16, i.e. four weight rows (two gate, two
 // up).  One staged activation fragment feeds all four dequant chains.  Each
 // CTA takes a CONTIGUOUS span of (hit, column-tile) work so consecutive tiles
 // almost always share one hit and the activation staging is paid once.
-__global__ __launch_bounds__(512, 2) void fc1_dec_k(
-    const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ wp,
-    const uint8_t* __restrict__ ws, const int* __restrict__ ids,
-    __half* __restrict__ hbuf, int T, __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(512, 2) void fc1_dec_k(const __nv_bfloat16* __restrict__ x,
+                                                    const uint8_t* __restrict__ wp,
+                                                    const uint8_t* __restrict__ ws,
+                                                    const int* __restrict__ ids,
+                                                    __half* __restrict__ hbuf, int T,
+                                                    __nv_bfloat16* __restrict__ out) {
   extern __shared__ char smem_raw[];
   __half* xs = reinterpret_cast<__half*>(smem_raw);
   int* smeta = reinterpret_cast<int*>(smem_raw + LH * 2);
   __shared__ int wsum[16];
   const int tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
-  constexpr int WOFF[4] = {0, 16 * (LH / 2) / 8, IH * (LH / 2) / 8,
-                           (IH + 16) * (LH / 2) / 8};
-  constexpr int SOFF[4] = {0, 16 * (LH / 32), IH * (LH / 32),
-                           (IH + 16) * (LH / 32)};
+  constexpr int WOFF[4] = {0, 16 * (LH / 2) / 8, IH * (LH / 2) / 8, (IH + 16) * (LH / 2) / 8};
+  constexpr int SOFF[4] = {0, 16 * (LH / 32), IH * (LH / 32), (IH + 16) * (LH / 32)};
 
   uint4* out4 = reinterpret_cast<uint4*>(out);
   const int n4 = T * (LH / 8);
-  for (int i = blockIdx.x * blockDim.x + tid; i < n4;
-       i += gridDim.x * blockDim.x)
+  for (int i = blockIdx.x * blockDim.x + tid; i < n4; i += gridDim.x * blockDim.x)
     out4[i] = make_uint4(0, 0, 0, 0);
 
-  const int nh = route_build<false>(ids, nullptr, T * KTOP, smeta, nullptr,
-                                    wsum, nullptr);
+  const int nh = route_build<false>(ids, nullptr, T * KTOP, smeta, nullptr, wsum, nullptr);
   const int Wtot = nh * NT1D;
   const int begin = (int)(((long long)blockIdx.x * Wtot) / gridDim.x);
   const int end = (int)(((long long)(blockIdx.x + 1) * Wtot) / gridDim.x);
@@ -905,8 +878,7 @@ __global__ __launch_bounds__(512, 2) void fc1_dec_k(
 
     if (p0 != cur) {
       __syncthreads();
-      const uint4* src =
-          reinterpret_cast<const uint4*>(x + (size_t)(meta >> 6) * LH);
+      const uint4* src = reinterpret_cast<const uint4*>(x + (size_t)(meta >> 6) * LH);
       uint4* dst = reinterpret_cast<uint4*>(xs);
       for (int i = tid; i < LH / 8; i += 512) dst[xswz(i)] = cvt8(src[i]);
       __syncthreads();
@@ -933,8 +905,7 @@ __global__ __launch_bounds__(512, 2) void fc1_dec_k(
       uint4 xa = xp[lane], xb = xp[32 + lane];
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        acc[q] = fmaf(ue8m0(sq[it & 1][q]),
-                      dot16(wq[it & 1][q], xa, xb), acc[q]);
+        acc[q] = fmaf(ue8m0(sq[it & 1][q]), dot16(wq[it & 1][q], xa, xb), acc[q]);
         if (it + 2 < LH / 512) {
           wq[it & 1][q] = W[WOFF[q] + lane + 32 * (it + 2)];
           sq[it & 1][q] = S[SOFF[q] + 16 * (it + 2) + (lane >> 1)];
@@ -944,8 +915,7 @@ __global__ __launch_bounds__(512, 2) void fc1_dec_k(
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
 #pragma unroll
-      for (int q = 0; q < 4; ++q)
-        acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
+      for (int q = 0; q < 4; ++q) acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
     }
     if (lane == 0) {
 #pragma unroll
@@ -962,11 +932,12 @@ __global__ __launch_bounds__(512, 2) void fc1_dec_k(
 
 // fc2: warp owns four adjacent output rows inside a 64-row tile.  Adjacent
 // ownership permits two aligned bf16x2 atomics in the combine epilogue.
-__global__ __launch_bounds__(512, 2) void fc2_dec_k(
-    const __half* __restrict__ hbuf, const uint8_t* __restrict__ wp,
-    const uint8_t* __restrict__ ws, const int* __restrict__ ids,
-    const float* __restrict__ tw, int T,
-    __nv_bfloat16* __restrict__ out) {
+__global__ __launch_bounds__(512, 2) void fc2_dec_k(const __half* __restrict__ hbuf,
+                                                    const uint8_t* __restrict__ wp,
+                                                    const uint8_t* __restrict__ ws,
+                                                    const int* __restrict__ ids,
+                                                    const float* __restrict__ tw, int T,
+                                                    __nv_bfloat16* __restrict__ out) {
   extern __shared__ char smem_raw2[];
   __half* xs = reinterpret_cast<__half*>(smem_raw2);
   int* smeta = reinterpret_cast<int*>(smem_raw2 + IH * 2);
@@ -977,8 +948,7 @@ __global__ __launch_bounds__(512, 2) void fc2_dec_k(
   constexpr int WOFF = (IH / 2) / 8;
   constexpr int SOFF = IH / 32;
 
-  const int nh = route_build<true>(ids, tw, T * KTOP, smeta, sw, wsum,
-                                   nullptr);
+  const int nh = route_build<true>(ids, tw, T * KTOP, smeta, sw, wsum, nullptr);
   const int Wtot = nh * NT2D;
   const int begin = (int)(((long long)blockIdx.x * Wtot) / gridDim.x);
   const int end = (int)(((long long)(blockIdx.x + 1) * Wtot) / gridDim.x);
@@ -1006,13 +976,11 @@ __global__ __launch_bounds__(512, 2) void fc2_dec_k(
       }
 #pragma unroll
     for (int it = 0; it < IH / 512; ++it) {
-      const uint4* xp = reinterpret_cast<const uint4*>(
-          hbuf + (size_t)p0 * IH + it * 512);
+      const uint4* xp = reinterpret_cast<const uint4*>(hbuf + (size_t)p0 * IH + it * 512);
       uint4 xa = xp[2 * lane], xb = xp[2 * lane + 1];
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        acc[q] = fmaf(ue8m0(sq[it & 1][q]),
-                      dot16(wq[it & 1][q], xa, xb), acc[q]);
+        acc[q] = fmaf(ue8m0(sq[it & 1][q]), dot16(wq[it & 1][q], xa, xb), acc[q]);
         if (it + 2 < IH / 512) {
           wq[it & 1][q] = W[q * WOFF + lane + 32 * (it + 2)];
           sq[it & 1][q] = S[q * SOFF + 16 * (it + 2) + (lane >> 1)];
@@ -1022,8 +990,7 @@ __global__ __launch_bounds__(512, 2) void fc2_dec_k(
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
 #pragma unroll
-      for (int q = 0; q < 4; ++q)
-        acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
+      for (int q = 0; q < 4; ++q) acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
     }
     if (lane == 0) {
       const float w = sw[p0];
@@ -1042,9 +1009,8 @@ __global__ __launch_bounds__(512, 2) void fc2_dec_k(
 __global__ __launch_bounds__(512, 2) void moe_dec_k(
     const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ wp1,
     const uint8_t* __restrict__ ws1, const uint8_t* __restrict__ wp2,
-    const uint8_t* __restrict__ ws2, const int* __restrict__ ids,
-    const float* __restrict__ tw, __half* __restrict__ hbuf, int T,
-    __nv_bfloat16* __restrict__ out) {
+    const uint8_t* __restrict__ ws2, const int* __restrict__ ids, const float* __restrict__ tw,
+    __half* __restrict__ hbuf, int T, __nv_bfloat16* __restrict__ out) {
   extern __shared__ char smem_raw[];
   __half* xs = reinterpret_cast<__half*>(smem_raw);
   int* smeta = reinterpret_cast<int*>(smem_raw + LH * 2);
@@ -1054,104 +1020,96 @@ __global__ __launch_bounds__(512, 2) void moe_dec_k(
   const int tid = threadIdx.x;
   const int lane = tid & 31, warp = tid >> 5;
 
-  const int nh = route_build<true>(ids, tw, T * KTOP, smeta, sw, wsum,
-                                   ranges);
+  const int nh = route_build<true>(ids, tw, T * KTOP, smeta, sw, wsum, ranges);
   {
-    constexpr int WOFF[4] = {0, 16 * (LH / 2) / 16, IH * (LH / 2) / 16,
-                             (IH + 16) * (LH / 2) / 16};
-    constexpr int WOF2[4] = {0, 16 * (LH / 2) / 8, IH * (LH / 2) / 8,
-                             (IH + 16) * (LH / 2) / 8};
-    constexpr int SOFF[4] = {0, 16 * (LH / 32), IH * (LH / 32),
-                             (IH + 16) * (LH / 32)};
+    constexpr int WOFF[4] = {0, 16 * (LH / 2) / 16, IH * (LH / 2) / 16, (IH + 16) * (LH / 2) / 16};
+    constexpr int WOF2[4] = {0, 16 * (LH / 2) / 8, IH * (LH / 2) / 8, (IH + 16) * (LH / 2) / 8};
+    constexpr int SOFF[4] = {0, 16 * (LH / 32), IH * (LH / 32), (IH + 16) * (LH / 32)};
     const uint8_t* __restrict__ wp = wp1;
     const uint8_t* __restrict__ ws = ws1;
-  const int Wtot = nh * NT1D;
-  const int begin = ranges[0];
-  const int end = ranges[1];
-  int cur = -1;
+    const int Wtot = nh * NT1D;
+    const int begin = ranges[0];
+    const int end = ranges[1];
+    int cur = -1;
 
-  for (int wi = begin; wi < end; ++wi) {
-    const int p0 = wi / NT1D;
-    const int nt = wi - p0 * NT1D;
-    const int meta = smeta[p0];
-    const int e = meta & 63;
-    const int c0 = nt * C1TILE + warp;
+    for (int wi = begin; wi < end; ++wi) {
+      const int p0 = wi / NT1D;
+      const int nt = wi - p0 * NT1D;
+      const int meta = smeta[p0];
+      const int e = meta & 63;
+      const int c0 = nt * C1TILE + warp;
 
-    if (p0 != cur) {
-      __syncthreads();
-      const uint4* src =
-          reinterpret_cast<const uint4*>(x + (size_t)(meta >> 6) * LH);
-      uint4* dst = reinterpret_cast<uint4*>(xs);
-      for (int i = tid; i < LH / 8; i += 512) dst[xswz4(i)] = cvt8(src[i]);
-      __syncthreads();
-      cur = p0;
-    }
+      if (p0 != cur) {
+        __syncthreads();
+        const uint4* src = reinterpret_cast<const uint4*>(x + (size_t)(meta >> 6) * LH);
+        uint4* dst = reinterpret_cast<uint4*>(xs);
+        for (int i = tid; i < LH / 8; i += 512) dst[xswz4(i)] = cvt8(src[i]);
+        __syncthreads();
+        cur = p0;
+      }
 
-    const size_t rb = (size_t)e * (2 * IH) + c0;
-    const uint4* W = reinterpret_cast<const uint4*>(wp + rb * (LH / 2));
-    const uint2* W2 = reinterpret_cast<const uint2*>(wp + rb * (LH / 2));
-    const uint8_t* S = ws + rb * (LH / 32);
+      const size_t rb = (size_t)e * (2 * IH) + c0;
+      const uint4* W = reinterpret_cast<const uint4*>(wp + rb * (LH / 2));
+      const uint2* W2 = reinterpret_cast<const uint2*>(wp + rb * (LH / 2));
+      const uint8_t* S = ws + rb * (LH / 32);
 
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    uint4 wq[2][4];
-    float sq[2][4];
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      uint4 wq[2][4];
+      float sq[2][4];
 #pragma unroll
-    for (int p = 0; p < 2; ++p)
+      for (int p = 0; p < 2; ++p)
 #pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        wq[p][q] = W[WOFF[q] + lane + 32 * p];
-        sq[p][q] = ue8m0(S[SOFF[q] + 32 * p + lane]);
+        for (int q = 0; q < 4; ++q) {
+          wq[p][q] = W[WOFF[q] + lane + 32 * p];
+          sq[p][q] = ue8m0(S[SOFF[q] + 32 * p + lane]);
+        }
+#pragma unroll
+      for (int it = 0; it < 3; ++it) {
+        const uint4* xp = reinterpret_cast<const uint4*>(xs + it * 1024);
+        uint4 xa = xp[lane], xb = xp[32 + lane];
+        uint4 xc = xp[64 + lane], xd = xp[96 + lane];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const uint4 w = wq[it & 1][q];
+          const float d = dot16(make_uint2(w.x, w.y), xa, xb) + dot16(make_uint2(w.z, w.w), xc, xd);
+          acc[q] = fmaf(sq[it & 1][q], d, acc[q]);
+          if (it + 2 < 3) {
+            wq[it & 1][q] = W[WOFF[q] + lane + 32 * (it + 2)];
+            sq[it & 1][q] = ue8m0(S[SOFF[q] + 32 * (it + 2) + lane]);
+          }
+        }
+      }
+      {
+        const uint4* xp = reinterpret_cast<const uint4*>(xs + 3072);
+        uint4 xa = xp[lane], xb = xp[32 + lane];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+          const uint2 w = W2[WOF2[q] + 192 + lane];
+          const uint32_t sc = S[SOFF[q] + 96 + (lane >> 1)];
+          acc[q] = fmaf(ue8m0(sc), dot16(w, xa, xb), acc[q]);
+        }
       }
 #pragma unroll
-    for (int it = 0; it < 3; ++it) {
-      const uint4* xp = reinterpret_cast<const uint4*>(xs + it * 1024);
-      uint4 xa = xp[lane], xb = xp[32 + lane];
-      uint4 xc = xp[64 + lane], xd = xp[96 + lane];
+      for (int o = 16; o > 0; o >>= 1) {
 #pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const uint4 w = wq[it & 1][q];
-        const float d = dot16(make_uint2(w.x, w.y), xa, xb) +
-                        dot16(make_uint2(w.z, w.w), xc, xd);
-        acc[q] = fmaf(sq[it & 1][q], d, acc[q]);
-        if (it + 2 < 3) {
-          wq[it & 1][q] = W[WOFF[q] + lane + 32 * (it + 2)];
-          sq[it & 1][q] = ue8m0(S[SOFF[q] + 32 * (it + 2) + lane]);
+        for (int q = 0; q < 4; ++q) acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
+      }
+      if (lane == 0) {
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+          float g = acc[q], u = acc[q + 2];
+          float a = 4.f * tanhf(g * 0.25f) * (1.f / (1.f + __expf(-g)));
+          float b = 25.f * tanhf(u * 0.04f);
+          float h = __bfloat162float(__float2bfloat16(a * b));
+          hbuf[(size_t)p0 * IH + hpos(c0 + 16 * q)] = __float2half(h * 128.f);
         }
       }
     }
-    {
-      const uint4* xp = reinterpret_cast<const uint4*>(xs + 3072);
-      uint4 xa = xp[lane], xb = xp[32 + lane];
-#pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const uint2 w = W2[WOF2[q] + 192 + lane];
-        const uint32_t sc = S[SOFF[q] + 96 + (lane >> 1)];
-        acc[q] = fmaf(ue8m0(sc), dot16(w, xa, xb), acc[q]);
-      }
-    }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-#pragma unroll
-      for (int q = 0; q < 4; ++q)
-        acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
-    }
-    if (lane == 0) {
-#pragma unroll
-      for (int q = 0; q < 2; ++q) {
-        float g = acc[q], u = acc[q + 2];
-        float a = 4.f * tanhf(g * 0.25f) * (1.f / (1.f + __expf(-g)));
-        float b = 25.f * tanhf(u * 0.04f);
-        float h = __bfloat162float(__float2bfloat16(a * b));
-        hbuf[(size_t)p0 * IH + hpos(c0 + 16 * q)] = __float2half(h * 128.f);
-      }
-    }
-  }
   }
   {
     uint4* out4 = reinterpret_cast<uint4*>(out);
     const int n4 = T * (LH / 8);
-    for (int i = blockIdx.x * blockDim.x + tid; i < n4;
-         i += gridDim.x * blockDim.x)
+    for (int i = blockIdx.x * blockDim.x + tid; i < n4; i += gridDim.x * blockDim.x)
       out4[i] = make_uint4(0, 0, 0, 0);
   }
   cooperative_groups::this_grid().sync();
@@ -1160,64 +1118,61 @@ __global__ __launch_bounds__(512, 2) void moe_dec_k(
     constexpr int SOFF = IH / 32;
     const uint8_t* __restrict__ wp = wp2;
     const uint8_t* __restrict__ ws = ws2;
-  const int Wtot = nh * NT2D;
-  const int begin = ranges[2];
-  const int end = ranges[3];
+    const int Wtot = nh * NT2D;
+    const int begin = ranges[2];
+    const int end = ranges[3];
 
-  for (int wi = begin; wi < end; ++wi) {
-    const int p0 = wi / NT2D;
-    const int nt = wi - p0 * NT2D;
-    const int meta = smeta[p0];
-    const int e = meta & 63;
-    const int row0 = nt * N2TILE + 4 * warp;
+    for (int wi = begin; wi < end; ++wi) {
+      const int p0 = wi / NT2D;
+      const int nt = wi - p0 * NT2D;
+      const int meta = smeta[p0];
+      const int e = meta & 63;
+      const int row0 = nt * N2TILE + 4 * warp;
 
-    const size_t rb = (size_t)e * LH + row0;
-    const uint4* W = reinterpret_cast<const uint4*>(wp + rb * (IH / 2));
-    const uint8_t* S = ws + rb * (IH / 32);
+      const size_t rb = (size_t)e * LH + row0;
+      const uint4* W = reinterpret_cast<const uint4*>(wp + rb * (IH / 2));
+      const uint8_t* S = ws + rb * (IH / 32);
 
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    uint4 wq[2][4];
-    float sq[2][4];
+      float acc[4] = {0.f, 0.f, 0.f, 0.f};
+      uint4 wq[2][4];
+      float sq[2][4];
 #pragma unroll
-    for (int p = 0; p < 2; ++p)
+      for (int p = 0; p < 2; ++p)
 #pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        wq[p][q] = W[q * WOFF + lane + 32 * p];
-        sq[p][q] = ue8m0(S[q * SOFF + 32 * p + lane]);
-      }
+        for (int q = 0; q < 4; ++q) {
+          wq[p][q] = W[q * WOFF + lane + 32 * p];
+          sq[p][q] = ue8m0(S[q * SOFF + 32 * p + lane]);
+        }
 #pragma unroll
-    for (int it = 0; it < IH / 1024; ++it) {
-      const uint4* xp = reinterpret_cast<const uint4*>(
-          hbuf + (size_t)p0 * IH + it * 1024);
-      uint4 xa = xp[lane], xb = xp[32 + lane];
-      uint4 xc = xp[64 + lane], xd = xp[96 + lane];
+      for (int it = 0; it < IH / 1024; ++it) {
+        const uint4* xp = reinterpret_cast<const uint4*>(hbuf + (size_t)p0 * IH + it * 1024);
+        uint4 xa = xp[lane], xb = xp[32 + lane];
+        uint4 xc = xp[64 + lane], xd = xp[96 + lane];
 #pragma unroll
-      for (int q = 0; q < 4; ++q) {
-        const uint4 w = wq[it & 1][q];
-        const float d = dot16(make_uint2(w.x, w.y), xa, xb) +
-                        dot16(make_uint2(w.z, w.w), xc, xd);
-        acc[q] = fmaf(sq[it & 1][q], d, acc[q]);
-        if (it + 2 < IH / 1024) {
-          wq[it & 1][q] = W[q * WOFF + lane + 32 * (it + 2)];
-          sq[it & 1][q] = ue8m0(S[q * SOFF + 32 * (it + 2) + lane]);
+        for (int q = 0; q < 4; ++q) {
+          const uint4 w = wq[it & 1][q];
+          const float d = dot16(make_uint2(w.x, w.y), xa, xb) + dot16(make_uint2(w.z, w.w), xc, xd);
+          acc[q] = fmaf(sq[it & 1][q], d, acc[q]);
+          if (it + 2 < IH / 1024) {
+            wq[it & 1][q] = W[q * WOFF + lane + 32 * (it + 2)];
+            sq[it & 1][q] = ue8m0(S[q * SOFF + 32 * (it + 2) + lane]);
+          }
         }
       }
-    }
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
+      for (int o = 16; o > 0; o >>= 1) {
 #pragma unroll
-      for (int q = 0; q < 4; ++q)
-        acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
+        for (int q = 0; q < 4; ++q) acc[q] += __shfl_down_sync(0xffffffffu, acc[q], o);
+      }
+      if (lane == 0) {
+        const float w = sw[p0];
+        const size_t ob = (size_t)(meta >> 6) * LH + row0;
+        __nv_bfloat162 v01 = __floats2bfloat162_rn(acc[0] * w, acc[1] * w);
+        __nv_bfloat162 v23 = __floats2bfloat162_rn(acc[2] * w, acc[3] * w);
+        atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob), v01);
+        atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob + 2), v23);
+      }
     }
-    if (lane == 0) {
-      const float w = sw[p0];
-      const size_t ob = (size_t)(meta >> 6) * LH + row0;
-      __nv_bfloat162 v01 = __floats2bfloat162_rn(acc[0] * w, acc[1] * w);
-      __nv_bfloat162 v23 = __floats2bfloat162_rn(acc[2] * w, acc[3] * w);
-      atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob), v01);
-      atomicAdd(reinterpret_cast<__nv_bfloat162*>(out + ob + 2), v23);
-    }
-  }
   }
 }
 
@@ -1233,14 +1188,12 @@ static WorkspaceSlot g_ws_slots[64];
 static std::mutex g_ws_registry_mu;
 static bool g_attr[64] = {};
 
-void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p,
-                                       TensorView w13s, TensorView w2p,
-                                       TensorView w2s, TensorView ids,
+void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p, TensorView w13s,
+                                       TensorView w2p, TensorView w2s, TensorView ids,
                                        TensorView tw, TensorView out) {
   int T = (int)x.shape()[0];
   const int device = x.device().device_id;
-  cudaStream_t st = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, device));
+  cudaStream_t st = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, device));
   int MT = (T <= 64) ? 1 : MMM;
   size_t cap = (size_t)T * KTOP;
 
@@ -1253,7 +1206,10 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p,
   {
     std::lock_guard<std::mutex> registry(g_ws_registry_mu);
     for (auto& s : g_ws_slots) {
-      if (s.used && s.device == device && s.stream == st) { slot = &s; break; }
+      if (s.used && s.device == device && s.stream == st) {
+        slot = &s;
+        break;
+      }
     }
     if (!slot) {
       for (auto& s : g_ws_slots) {
@@ -1297,19 +1253,17 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p,
 
   if (MT != 1) {
     cudaMemsetAsync(out.data_ptr(), 0, (size_t)T * LH * 2, st);
-    route_k<false><<<1, 256, 0, st>>>(
-        static_cast<const int*>(ids.data_ptr()),
-        static_cast<const float*>(tw.data_ptr()), T, MT,
-        eoff, moff, mex, ptok, pw,
-        static_cast<__nv_bfloat16*>(out.data_ptr()));
+    route_k<false><<<1, 256, 0, st>>>(static_cast<const int*>(ids.data_ptr()),
+                                      static_cast<const float*>(tw.data_ptr()), T, MT, eoff, moff,
+                                      mex, ptok, pw, static_cast<__nv_bfloat16*>(out.data_ptr()));
   }
 
   if (MT == 1) {
     static int g_coop = 0;
     if (g_coop == 0) {
       int nb = 0, nsm = 0;
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &nb, moe_dec_k, 512, (size_t)(LH * 2 + RCAP * 8));
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, moe_dec_k, 512,
+                                                    (size_t)(LH * 2 + RCAP * 8));
       cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, device);
       int g = nb * nsm;
       g_coop = (g < 1) ? 1 : (g > DGRID ? DGRID : g);
@@ -1322,24 +1276,20 @@ void w4a16_mxfp4_latent_routed_moe_run(TensorView x, TensorView w13p,
     const int* a5 = static_cast<const int*>(ids.data_ptr());
     const float* a6 = static_cast<const float*>(tw.data_ptr());
     __nv_bfloat16* a7 = static_cast<__nv_bfloat16*>(out.data_ptr());
-    void* args[] = {(void*)&xp, (void*)&a1, (void*)&a2, (void*)&a3,
-                    (void*)&a4, (void*)&a5, (void*)&a6, (void*)&hbuf,
-                    (void*)&T, (void*)&a7};
-    cudaLaunchCooperativeKernel((const void*)moe_dec_k, dim3(g_coop),
-                                dim3(512), args,
+    void* args[] = {(void*)&xp, (void*)&a1, (void*)&a2,   (void*)&a3, (void*)&a4,
+                    (void*)&a5, (void*)&a6, (void*)&hbuf, (void*)&T,  (void*)&a7};
+    cudaLaunchCooperativeKernel((const void*)moe_dec_k, dim3(g_coop), dim3(512), args,
                                 (size_t)(LH * 2 + RCAP * 8), st);
   } else {
     size_t sm1 = (size_t)(MMM + 2 * MNT) * MSTR * 2;
     size_t sm2 = (size_t)(MMM + 2 * MNT) * MSTR * 2;
-    fc1_m_k<<<528, 256, sm1, st>>>(
-        static_cast<const __nv_bfloat16*>(x.data_ptr()),
-        static_cast<const uint8_t*>(w13p.data_ptr()),
-        static_cast<const uint8_t*>(w13s.data_ptr()), eoff, moff, mex, ptok,
-        hbufb);
-    fc2_m_k<<<528, 256, sm2, st>>>(
-        hbufb, static_cast<const uint8_t*>(w2p.data_ptr()),
-        static_cast<const uint8_t*>(w2s.data_ptr()), eoff, moff, mex, ptok,
-        pw, static_cast<__nv_bfloat16*>(out.data_ptr()));
+    fc1_m_k<<<528, 256, sm1, st>>>(static_cast<const __nv_bfloat16*>(x.data_ptr()),
+                                   static_cast<const uint8_t*>(w13p.data_ptr()),
+                                   static_cast<const uint8_t*>(w13s.data_ptr()), eoff, moff, mex,
+                                   ptok, hbufb);
+    fc2_m_k<<<528, 256, sm2, st>>>(hbufb, static_cast<const uint8_t*>(w2p.data_ptr()),
+                                   static_cast<const uint8_t*>(w2s.data_ptr()), eoff, moff, mex,
+                                   ptok, pw, static_cast<__nv_bfloat16*>(out.data_ptr()));
   }
   if (fallback) cudaFreeAsync(fallback, st);
 }
