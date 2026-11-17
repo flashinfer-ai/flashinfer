@@ -99,11 +99,11 @@ def supported_with_reasons(
     serve the call, else the fallback reasons. No device syncs."""
     if _os.environ.get(KILL_SWITCH_ENV, "0") == "1":
         return ["kill_switch:" + KILL_SWITCH_ENV + "=1"]
-    if (
-        query.is_cuda
-        and hasattr(torch.cuda, "is_current_stream_capturing")
-        and torch.cuda.is_current_stream_capturing()
-    ):
+    _capturing = False
+    if query.is_cuda and hasattr(torch.cuda, "is_current_stream_capturing"):
+        with torch.cuda.device(query.device):
+            _capturing = torch.cuda.is_current_stream_capturing()
+    if _capturing:
         # Uniform capture bail (all routes): capture is served by the stock
         # path. See the module docstring.
         return ["cuda_graph_capture_bail"]
@@ -176,6 +176,12 @@ def supported_with_reasons(
         r.append("v_not_fp8e4m3_12x128")
     if r:
         return r
+    # TMA globalAddress and the vectorized output/workspace accesses need
+    # 16B pointers; contiguity does not exclude a storage-offset view.
+    if any(t.data_ptr() % 16 for t in (query, key, value, workspace_buffer)):
+        r.append("qkv_or_workspace_not_16B_aligned")
+    if out is not None and out.data_ptr() % 16:
+        r.append("out_not_16B_aligned")
     lse_buf = extras.get("lse")
     if lse_buf is not None and (
         lse_buf.dtype != torch.float32
@@ -286,6 +292,16 @@ def maybe_dispatch_specialized(
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
+        try:
+            get_mla_ragged_prefill_dsr1_module()
+        except Exception as e:  # pragma: no cover - environment-dependent
+            if backend == "specialized":
+                raise
+            LAST_FALLBACK_REASONS[:] = [
+                "specialized_module_unavailable:" + type(e).__name__
+            ]
+            DISPATCH_STATS["fallback"] += 1
+            return None
         DISPATCH_STATS["specialized"] += 1
         return _run_specialized(
             query,

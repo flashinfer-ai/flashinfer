@@ -14,9 +14,11 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -2246,9 +2248,12 @@ static CUtensorMap mk_map(void* p, uint64_t d0, uint64_t d1, uint64_t d2, uint64
   uint64_t gs[2] = {s1, s2};
   uint32_t bd[3] = {b0, 1u, b2};
   uint32_t es[3] = {1u, 1u, 1u};
-  cuTensorMapEncodeTiled(&m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, p, gd, gs, bd, es,
-                         CU_TENSOR_MAP_INTERLEAVE_NONE, sw, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-                         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  const CUresult rc = cuTensorMapEncodeTiled(
+      &m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, p, gd, gs, bd, es, CU_TENSOR_MAP_INTERLEAVE_NONE, sw,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (rc != CUDA_SUCCESS)
+    throw std::invalid_argument("cuTensorMapEncodeTiled failed (rc=" + std::to_string((int)rc) +
+                                "): unsupported tensor layout/alignment");
   return m;
 }
 
@@ -2348,6 +2353,7 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
          ffi::TensorView out, ffi::TensorView lse) {
   // The stream is re-queried on every call (CUDA-graph requirement: never a
   // cached stream).
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, q.device().device_id));
   (void)num_sms();
@@ -2430,8 +2436,16 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
 
   size_t smem = SMEM_BYTES;
   size_t smem1 = SMEM_BYTES_V1;
-  static std::once_flag attr_once;
-  std::call_once(attr_once, [&]() {
+  static std::mutex attr_mu;
+  static std::set<int> attr_done;
+  int attr_dev = 0;
+  cudaGetDevice(&attr_dev);
+  bool attr_needed = false;
+  {
+    std::lock_guard<std::mutex> lk(attr_mu);
+    attr_needed = attr_done.insert(attr_dev).second;
+  }
+  if (attr_needed) {
     cudaFuncSetAttribute(mla_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     cudaFuncSetAttribute(mla_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                          (int)(smem + PSZ));
@@ -2599,7 +2613,7 @@ void Run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::TensorVie
                        false, false, true, true>));
 #undef CARVE
 #undef CARVE_LB
-  });
+  }
 
   dim3 grid(usepair ? (2 * base * NSPLIT) : (B * QT * HQ * NSPLIT));
   dim3 grid_q128(HQ, NSPLIT);

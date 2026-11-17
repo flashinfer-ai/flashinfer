@@ -166,7 +166,10 @@ def _check(o, l, gold_o, gold_l, out_atol, out_cap, lse_atol, lse_cap):
 CASES = [
     (1, 128, 12416, 128, 12416, 0, 0.0016, 0.0048, 0.0019, 0.0057),
     (1, 256, 15872, 256, 15872, 0, 0.0014, 0.0042, 0.0018, 0.0054),
-    (1, 16128, 16128, 16128, 16128, 1, 0.002, 0.037, 0.0047, 1.6),
+    # causal lse cap: measured max |err| is 1.5e-3 on this class (per-row
+    # re-time + 4-fresh-seed battery on an internal GB300 node); 0.02 keeps
+    # >10x margin without admitting a broken LSE.
+    (1, 16128, 16128, 16128, 16128, 1, 0.002, 0.037, 0.0047, 0.02),
 ]
 
 
