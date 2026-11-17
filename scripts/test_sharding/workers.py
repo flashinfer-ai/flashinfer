@@ -21,7 +21,7 @@ from .host_cpu import (
 from .io import atomic_write_json, atomic_write_text
 from .junit import annotate_batch_xml, validate_batch_xml
 from .models import Batch, Unit
-from .processes import terminate_process_group
+from .processes import start_process_group, terminate_process_group
 from .progress import PYTEST_EVENT_PREFIX, decode_pytest_event
 from .summary import batch_directory, batch_xml_path
 
@@ -533,13 +533,12 @@ def _run_pytest(
     with artifacts.log.open("a", encoding="utf-8") as log:
         log.write(f"command: {' '.join(command)}\n")
         log.flush()
-        process = subprocess.Popen(
+        process = start_process_group(
             command,
             cwd=request.pytest_root,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
             text=True,
             bufsize=1,
             errors="replace",
