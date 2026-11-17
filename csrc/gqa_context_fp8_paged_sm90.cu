@@ -45,6 +45,17 @@
 // a higher-precision input contract. The error is deterministic (the kernel is
 // atomics-free and bit-stable) and scales with input magnitude.
 //
+// OPERAND RANGE (f16 accumulation): the QK^T scores and the unnormalised P.V
+// partial sums accumulate in packed f16 (the measured kernel's
+// register-budget choice; wgmma_qk16_r / wgmma_pv8_h below). Raw per-row dot
+// products (sum over the 128 dims of q_k * k_k, before the descales fold in)
+// and per-split unnormalised P.V sums must therefore stay inside f16 range
+// (|x| <= 65504); operands quantised to exploit the full e4m3 range (values
+// up to 448) can push either past it and saturate to +-inf. The measured
+// serving contract (calibrated per-sequence descales over O(1)-magnitude
+// quantised operands) sits well inside the bound; widening both accumulators
+// to fp32 is a different (slower) kernel, not a patch to this one.
+//
 // Host contract of the device code (asserted by the Python dispatcher at plan
 // time, never read back from the device):
 //  * q / out are contiguous [total_q, 8, 128] (1024-element rows);
@@ -400,7 +411,15 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
   const int hA = PACK ? 2 * warp : warp;
   const int hB = PACK ? hA + 1 : warp;
 
-  const float scale = 0.08838834764831845f * 1.4426950408889634f * qds[r] * kds[r];
+  /* Clamp the folded softmax scale from below at the smallest positive f16
+     value (2^-24): the packed-f16 softmax multiplies scores by this scale,
+     and a pathologically small q/k descale product would otherwise round the
+     packed scale to +0 and turn the masked -inf scores into NaN (-inf * 0).
+     exp2 of a score scaled by <= 2^-24 is ~1 either way (f16 scores are
+     bounded by +-65504, so the exponent magnitude stays <= 2^-8), making the
+     clamp the correct uniform-softmax limit of scale -> 0. */
+  const float scale =
+      fmaxf(0.08838834764831845f * 1.4426950408889634f * qds[r] * kds[r], 5.9604644775390625e-8f);
   const float vdsc = vds[r];
 
   /* ---- load loop-invariant Q into the wgmma A register fragment ---- */
@@ -559,8 +578,16 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
       }
       thrA = pack_h2(fminf(mA + capd, 60000.f));
       thrB = pack_h2(fminf(mB + capd, 60000.f));
-      rnA = pack_h2(-fmaxf(mA, -1e4f) * scale);
-      rnB = pack_h2(-fmaxf(mB, -1e4f) * scale);
+      /* The renormaliser -m*scale must stay f16-finite, but clamping the raw
+         max at -1e4 subtracted the clamp instead of the recorded maximum:
+         rows whose scores sit uniformly below -1e4 - ~25/scale (e.g. a
+         constant -16384) had every probability flushed to zero and returned
+         0 instead of the softmax-weighted value. Clamp in scaled (log2)
+         units instead: +-30000 fits f16 with margin and is far beyond exp2's
+         dynamic range, so the clamp can only engage where the probabilities
+         are 0/inf in any arithmetic. */
+      rnA = pack_h2(-fminf(fmaxf(mA * scale, -30000.f), 30000.f));
+      rnB = pack_h2(-fminf(fmaxf(mB * scale, -30000.f), 30000.f));
     }
     uint32_t sumA = 0u, sumB = 0u;
     /* Pack P straight into the fp8 wgmma A fragment.  Accumulator group j

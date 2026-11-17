@@ -253,9 +253,10 @@ def _make_batch(q_lens, kv_lens, device, seed=0):
     )
 
 
-def _reference(batch):
+def _reference(batch, qk_descale=1.0, sm_scale=None):
     """fp32 dequant-then-attend chunked-prefill reference (row pos of request
-    r sees kv_len_r - q_len_r + pos + 1 keys)."""
+    r sees kv_len_r - q_len_r + pos + 1 keys). ``qk_descale`` folds a uniform
+    per-sequence q_descale * k_descale product into the logits."""
     device = batch["q"].device
     q = batch["q"].float()
     k_flat = batch["k_cache"].float().reshape(-1, HEAD_DIM)
@@ -264,7 +265,7 @@ def _reference(batch):
     kv_lens = batch["seq_lens"].tolist()
     bt = batch["block_table"]
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
-    scale = HEAD_DIM**-0.5
+    scale = (HEAD_DIM**-0.5 if sm_scale is None else sm_scale) * qk_descale
     off = torch.arange(PAGE, device=device)
     for r in range(len(kv_lens)):
         q0, q1 = cu[r], cu[r + 1]
@@ -482,3 +483,297 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     torch.cuda.synchronize()
     eager2 = wrapper.run(q, kv)
     assert torch.equal(out, eager2)
+
+
+# --------------------------------------------------------------------------
+# Review regressions: kernel numerics clamps, replan capacity, guard surface
+# --------------------------------------------------------------------------
+
+
+def test_uniform_large_negative_scores_keep_softmax_weight():
+    """Rows whose scores are a constant -16384 must return the value row
+    (softmax is uniform), not 0: the renormaliser clamps in scaled units, not
+    at a raw -1e4."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    # covers packed decode (q_len 4), regular decode (q_len 12) and the
+    # (possibly split) prefill tiles (q_len 60)
+    batch = _make_batch([4, 12, 60], [640, 320, 700], device)
+    batch["q"] = torch.full_like(batch["q"].float(), 16.0).to(torch.float8_e4m3fn)
+    batch["k_cache"] = torch.full_like(batch["k_cache"].float(), -8.0).to(
+        torch.float8_e4m3fn
+    )
+    batch["v_cache"] = torch.ones_like(batch["v_cache"].float()).to(torch.float8_e4m3fn)
+    # every score is 16 * -8 * 128 = -16384 (all partial sums inside f16)
+    wrapper = _plan_wrapper(batch, device)
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert torch.isfinite(out.float()).all()
+    # uniform softmax over V == 1 gives exactly 1; allow the disclosed e4m3
+    # P-quantisation error
+    assert (out.float() - 1.0).abs().max().item() < 0.15
+
+
+def test_tiny_descales_stay_finite_and_uniform():
+    """A pathologically small q/k descale product must not round the packed
+    softmax scale to zero (masked -inf * 0 = NaN); the kernel clamps the scale
+    at the f16 minimum, the correct uniform-softmax limit."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    descale = torch.full((3,), 1e-4, dtype=torch.float32, device=device)
+    out = wrapper.run(
+        batch["q"],
+        (batch["k_cache"], batch["v_cache"]),
+        q_scale=descale,
+        k_scale=descale,
+    )
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert torch.isfinite(out.float()).all()
+    ref = _reference(batch, qk_descale=1e-8)
+    assert _matched_ratio(out, ref) >= MATCHED
+
+
+def test_replan_to_fewer_pages_keeps_dispatching():
+    """After a large plan, a smaller replan must only require the pages it
+    references: the V^T scratch is sliced to the plan's coverage, so a small
+    v_cache is accepted."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    big = _make_batch([6, 6, 120], [2030, 1500, 863], device)
+    wrapper = _plan_wrapper(big, device)
+    out = wrapper.run(big["q"], (big["k_cache"], big["v_cache"]))
+    assert _matched_ratio(out, _reference(big)) >= MATCHED
+
+    small = _make_batch([5, 7, 9], [75, 84, 60], device)
+    wrapper.plan(
+        small["qo_indptr"],
+        small["kv_indptr"],
+        small["kv_indices"],
+        small["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    # the small caches hold exactly the pages the small plan references
+    out = wrapper.run(small["q"], (small["k_cache"], small["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 2, stats
+    assert _matched_ratio(out, _reference(small)) >= MATCHED
+
+
+def test_graph_mode_replan_never_swaps_buffer_pointers():
+    """In CUDA-graph mode a replan must refresh the plan-owned buffers in
+    place (a captured graph holds their pointers); a replan that would need
+    bigger buffers declines the specialized kernel instead."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    wide = _make_batch([6, 6, 120], [2030, 1500, 863], device)
+    narrow = _make_batch([5, 7, 9], [75, 84, 60], device)
+
+    # wide first: the narrow replan reuses every buffer in place
+    wrapper = _plan_wrapper(wide, device, use_cuda_graph=True)
+    wrapper.run(wide["q"], (wide["k_cache"], wide["v_cache"]))
+    bufs = wrapper._gqa_ctx_fp8q_sm90_bufs
+    ptrs = {name: t.data_ptr() for name, t in bufs.items()}
+    wrapper.plan(
+        narrow["qo_indptr"],
+        narrow["kv_indptr"],
+        narrow["kv_indices"],
+        narrow["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    assert wrapper._gqa_ctx_fp8q_sm90_state is not None
+    # every retained buffer keeps its pointer (new names may be added: a
+    # buffer that never existed has no captured pointer to preserve)
+    assert {name: bufs[name].data_ptr() for name in ptrs} == ptrs
+    out = wrapper.run(narrow["q"], (wide["k_cache"], wide["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 2
+    small_ref = dict(narrow)
+    small_ref["k_cache"], small_ref["v_cache"] = wide["k_cache"], wide["v_cache"]
+    assert _matched_ratio(out, _reference(small_ref)) >= MATCHED
+
+    # narrow first: a wider replan would need a pointer swap -> decline
+    # (fresh batches: the replan above wrote through the graph-mode metadata
+    # buffers, which _plan_wrapper aliases to the batch tensors)
+    wide = _make_batch([6, 6, 120], [2030, 1500, 863], device)
+    narrow = _make_batch([5, 7, 9], [75, 84, 60], device)
+    _reset_gqa_ctx_fp8q_sm90_stats()
+    ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper2 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws,
+        kv_layout="NHD",
+        backend="specialized",
+        use_cuda_graph=True,
+        max_total_num_rows=int(wide["qo_indptr"][-1]),
+        qo_indptr_buf=wide["qo_indptr"].clone(),
+        paged_kv_indptr_buf=wide["kv_indptr"].clone(),
+        paged_kv_indices_buf=wide["kv_indices"].clone(),
+        paged_kv_last_page_len_buf=wide["last_page_len"].clone(),
+    )
+
+    def _plan2(b):
+        wrapper2.plan(
+            b["qo_indptr"],
+            b["kv_indptr"],
+            b["kv_indices"],
+            b["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+
+    _plan2(narrow)
+    assert _gqa_ctx_fp8q_sm90_stats()["plans_prepared"] == 1
+    bufs2 = wrapper2._gqa_ctx_fp8q_sm90_bufs
+    ptrs2 = {name: t.data_ptr() for name, t in bufs2.items()}
+    _plan2(wide)  # fits the stock graph buffers, not the retained plan buffers
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 1, stats  # only the narrow plan armed
+    assert wrapper2._gqa_ctx_fp8q_sm90_state is None
+    assert "plan: graph-retained workspace capacity" in stats["fallback_reasons"]
+    assert {name: bufs2[name].data_ptr() for name in ptrs2} == ptrs2
+    # the declined plan is still served, by the composable path
+    out2 = wrapper2.run(wide["q"], (wide["k_cache"], wide["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dequant_fallback"] == 1, stats
+    assert _matched_ratio(out2, _reference(wide)) >= MATCHED
+
+
+def test_kill_switch_before_plan_still_serves_tensor_q_scale(monkeypatch):
+    """The row->request map must exist for every specialized-requested plan,
+    so a per-sequence q_scale tensor is served by the dequant fallback even
+    when the kill switch was set before plan()."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    q_scale = torch.ones(3, dtype=torch.float32, device=device)
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=q_scale)
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert stats["runs_dequant_fallback"] == 1, stats
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_mutated_sm_scale_declines_specialization():
+    """forward()-style mutators can rewrite _sm_scale after an armed plan;
+    the fixed-scale kernel must decline and let the stock path serve it."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    wrapper._sm_scale = 0.5
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert stats["runs_ineligible"] == 1 and stats["runs_dequant_fallback"] == 1
+    assert _matched_ratio(out, _reference(batch, sm_scale=0.5)) >= MATCHED
+    wrapper._sm_scale = None
+    out2 = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]))
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _matched_ratio(out2, _reference(batch)) >= MATCHED
+
+
+def test_workspace_size_matches_the_armed_plan():
+    """workspace_size(backend='specialized' or allowlisted fp8 'auto') must
+    size the fa2 route the armed plan is actually planned on (bf16 query),
+    and raise plan()'s contract error for contracts plan() would reject."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+
+    def _ws(backend, q_dtype):
+        ws = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, kv_layout="NHD", backend=backend
+        )
+        return wrapper.workspace_size(
+            batch["qo_indptr"],
+            batch["kv_indptr"],
+            batch["kv_indices"],
+            batch["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=q_dtype,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+
+    stock = _ws("fa2", torch.bfloat16)
+    specialized = _ws("specialized", torch.float8_e4m3fn)
+    auto = _ws("auto", torch.float8_e4m3fn)
+    assert specialized == stock
+    assert auto == stock
+    with pytest.raises(ValueError, match="specialized"):
+        _ws("specialized", torch.bfloat16)
+
+
+def test_auto_arming_declines_on_a_captured_fa3_graph():
+    """An allowlisted fp8 auto plan must not rewrite the backend to fa2 when
+    the wrapper's captured CUDA-graph backend is fa3 (the fa2 schedule would
+    clobber the captured graph's integer workspace)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device, use_cuda_graph=True, backend="auto")
+    assert _gqa_ctx_fp8q_sm90_stats()["plans_prepared"] == 1
+    _reset_gqa_ctx_fp8q_sm90_stats()
+    # simulate a wrapper whose captured graphs hold an fa3 workspace layout
+    wrapper._cuda_graph_backend = "fa3"
+    with contextlib.suppress(Exception):
+        wrapper.plan(
+            batch["qo_indptr"],
+            batch["kv_indptr"],
+            batch["kv_indices"],
+            batch["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+    stats = _gqa_ctx_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0, stats
+    assert any("captured CUDA-graph backend" in r for r in stats["fallback_reasons"]), (
+        stats
+    )
+
+
+def test_positional_fp8_scale_args_are_rejected_loudly():
+    """The stock positional (q_scale, k_scale, v_scale) *args contract is
+    consumed by fp8 stock kernels; the specialized-armed route dequantises Q
+    to bf16, so silent dropping must be a loud error instead."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([5, 90, 7], [584, 727, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    ones = torch.ones(3, dtype=torch.float32, device=device)
+    with pytest.raises(NotImplementedError, match="positional"):
+        wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), ones, ones, ones)
+    assert _gqa_ctx_fp8q_sm90_stats()["runs_dispatched"] == 0

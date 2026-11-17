@@ -2593,6 +2593,12 @@ _gqa_ctx_fp8q_sm90_init_devices: set = set()
 _gqa_ctx_fp8q_sm90_announced = False
 
 
+class _GqaCtxFp8qSm90Capacity(Exception):
+    """A CUDA-graph-mode replan needed a bigger plan-owned buffer than the
+    retained one a capture may already hold a pointer to; the plan declines
+    the specialized kernel instead of swapping the pointer."""
+
+
 def _gqa_ctx_fp8q_sm90_disabled() -> bool:
     if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "") not in ("", "0"):
         return True
@@ -2839,6 +2845,25 @@ def _gqa_ctx_fp8q_sm90_prepare(
     wrapper._gqa_ctx_fp8q_sm90_state = None
     wrapper._gqa_ctx_fp8q_sm90_row_seq = None
     counters["plans_seen"] += 1
+    # The composable dequant fallback needs the row -> request map whenever a
+    # per-sequence q_scale tensor arrives at run time, including when this
+    # plan never arms (kill switch, ineligibility): build it for every
+    # specialized-requested plan, not only the armed ones. Never allocate
+    # inside a CUDA-graph capture (the dequant fallback cannot be captured
+    # anyway, so the map is useless there).
+    try:
+        if not (
+            hasattr(torch.cuda, "is_current_stream_capturing")
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            row_lens = qo_indptr_host[1 : batch_size + 1] - qo_indptr_host[:batch_size]
+            if batch_size >= 1 and not bool((row_lens < 0).any()):
+                wrapper._gqa_ctx_fp8q_sm90_row_seq = torch.repeat_interleave(
+                    torch.arange(batch_size, device=wrapper.device),
+                    row_lens.to(device=wrapper.device, dtype=torch.int64),
+                )
+    except Exception:  # the map must never break planning
+        wrapper._gqa_ctx_fp8q_sm90_row_seq = None
     if _gqa_ctx_fp8q_sm90_disabled():
         counters["plans_disabled"] += 1
         _gqa_ctx_fp8q_sm90_fallback("plan: kill switch")
@@ -2958,11 +2983,17 @@ def _gqa_ctx_fp8q_sm90_prepare(
         bufs = {}
         wrapper._gqa_ctx_fp8q_sm90_bufs = bufs
 
+    graph_mode = bool(getattr(wrapper, "is_cuda_graph_enabled", False))
+
     def _buf(name, numel, dtype):
         t = bufs.get(name)
         if t is None or t.numel() < numel or t.device != device:
-            # grows monotonically; with CUDA graphs the shapes are fixed per
-            # wrapper, so this happens exactly once per wrapper (pre-capture)
+            if t is not None and graph_mode:
+                # a captured graph may hold this buffer's pointer: never swap
+                # it under a CUDA-graph wrapper; decline this plan instead
+                raise _GqaCtxFp8qSm90Capacity(name)
+            # grows monotonically; in graph mode this happens exactly once
+            # per wrapper and buffer (pre-capture)
             t = torch.empty(numel, dtype=dtype, device=device)
             bufs[name] = t
             counters["workspace_allocs"] += 1
@@ -2972,56 +3003,74 @@ def _gqa_ctx_fp8q_sm90_prepare(
     hq = _GQA_CTX_FP8Q_SM90_NUM_QO_HEADS
     hd = _GQA_CTX_FP8Q_SM90_HEAD_DIM
     bq = _GQA_CTX_FP8Q_SM90_BQ
-    po = _buf("po", nsp * batch_size * bq * hq * hd, torch.float32)
-    pml = _buf("pml", nsp * batch_size * bq * hq * 2, torch.float32)
-    if psplit > 1:
-        po2 = _buf("po2", psplit * cap_rows * hq * hd, torch.float32)
-        pml2 = _buf("pml2", psplit * cap_rows * hq * 2, torch.float32)
-    else:
-        po2 = _buf("po2_min", 1, torch.float32)
-        pml2 = _buf("pml2_min", 1, torch.float32)
-    vt = _buf("vt", vt_pages * 2048, torch.uint8)
-    tasks = _buf("tasks", 2 * npt, torch.int32)
+    try:
+        po = _buf("po", nsp * batch_size * bq * hq * hd, torch.float32)
+        pml = _buf("pml", nsp * batch_size * bq * hq * 2, torch.float32)
+        if psplit > 1:
+            po2 = _buf("po2", psplit * cap_rows * hq * hd, torch.float32)
+            pml2 = _buf("pml2", psplit * cap_rows * hq * 2, torch.float32)
+        else:
+            po2 = _buf("po2_min", 1, torch.float32)
+            pml2 = _buf("pml2_min", 1, torch.float32)
+        # Slice the retained scratch to this plan's exact page coverage: the
+        # kernel derives its V^T coverage (and its v_cache size requirement)
+        # from vt.numel(), so handing it the whole retained buffer after a
+        # smaller replan would demand cache pages the plan never references.
+        vt = _buf("vt", vt_pages * 2048, torch.uint8)[: vt_pages * 2048]
+        tasks = _buf("tasks", 2 * npt, torch.int32)
 
-    seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
-    seq_lens_dev = seq_lens_buf[:batch_size]
-    seq_lens_dev.copy_(kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True)
-
-    nb = 0
-    if batch_size:
-        nb = int(
-            (
-                paged_kv_indptr_host[1 : batch_size + 1]
-                - paged_kv_indptr_host[:batch_size]
-            ).max()
+        seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
+        seq_lens_dev = seq_lens_buf[:batch_size]
+        seq_lens_dev.copy_(
+            kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True
         )
-    nb = max(nb, 1)
-    bt = bufs.get("block_table")
-    if (
-        bt is None
-        or bt.shape[0] < batch_size
-        or bt.shape[1] != nb
-        or bt.device != device
-    ):
-        bt = torch.empty((batch_size, nb), dtype=torch.int32, device=device)
-        bufs["block_table"] = bt
-        counters["workspace_allocs"] += 1
-    block_table = _build_block_tables_from_paged_kv_indices(
-        paged_kv_indptr_host,
-        paged_kv_indices,
-        batch_size,
-        device,
-        out=bt[:batch_size],
-    )
 
-    unit_descale = _buf("unit_descale", batch_size, torch.float32)[:batch_size]
-    unit_descale.fill_(1.0)
-    # row -> request map, for per-sequence descale tensors on the dequant
-    # fallback path (built here so the fallback never allocates in run())
-    wrapper._gqa_ctx_fp8q_sm90_row_seq = torch.repeat_interleave(
-        torch.arange(batch_size, device=device),
-        q_lens.to(device=device, dtype=torch.int64),
-    )
+        nb = 0
+        if batch_size:
+            nb = int(
+                (
+                    paged_kv_indptr_host[1 : batch_size + 1]
+                    - paged_kv_indptr_host[:batch_size]
+                ).max()
+            )
+        nb = max(nb, 1)
+        bt = bufs.get("block_table")
+        if (
+            bt is not None
+            and bt.device == device
+            and bt.shape[0] >= batch_size
+            and bt.shape[1] >= nb
+        ):
+            # refresh the retained table in place (the builder zero-pads the
+            # unused tails; the kernel never reads past a request's page
+            # count), keeping its pointer stable for retained captures
+            nb = int(bt.shape[1])
+        else:
+            if bt is not None and graph_mode:
+                raise _GqaCtxFp8qSm90Capacity("block_table")
+            bt = torch.empty((batch_size, nb), dtype=torch.int32, device=device)
+            bufs["block_table"] = bt
+            counters["workspace_allocs"] += 1
+        block_table = _build_block_tables_from_paged_kv_indices(
+            paged_kv_indptr_host,
+            paged_kv_indices,
+            batch_size,
+            device,
+            out=bt[:batch_size],
+        )
+
+        unit_descale = _buf("unit_descale", batch_size, torch.float32)[:batch_size]
+        unit_descale.fill_(1.0)
+    except _GqaCtxFp8qSm90Capacity as exc:
+        counters["plans_ineligible"] += 1
+        _gqa_ctx_fp8q_sm90_fallback("plan: graph-retained workspace capacity")
+        logger.info_once(
+            "gqa_context_fp8_paged_sm90: not dispatched for this plan (the "
+            "CUDA-graph wrapper's retained %s buffer is too small and a "
+            "captured graph may hold its pointer); the stock path serves it",
+            exc,
+        )
+        return
 
     wrapper._gqa_ctx_fp8q_sm90_state = SimpleNamespace(
         batch_size=batch_size,
@@ -3093,6 +3142,23 @@ def _gqa_ctx_fp8q_sm90_run_eligibility(
         return "kv_cache_sf"
     if skip_softmax_threshold_scale_factor is not None:
         return "skip_softmax_threshold_scale_factor"
+    # deprecated forward()-style mutators can rewrite plan-time fields after
+    # the plan armed; the kernel bakes them, so re-check the mutable ones
+    sm_scale = getattr(wrapper, "_sm_scale", None)
+    if sm_scale is not None and not (
+        abs(float(sm_scale) - _GQA_CTX_FP8Q_SM90_SM_SCALE) < 1e-8
+    ):
+        return f"sm_scale={sm_scale}"
+    if not getattr(wrapper, "_causal", True):
+        return "causal=False"
+    if getattr(wrapper, "_pos_encoding_mode", "NONE") != "NONE":
+        return f"pos_encoding_mode={wrapper._pos_encoding_mode}"
+    if getattr(wrapper, "_use_fp16_qk_reduction", False):
+        return "use_fp16_qk_reduction"
+    if getattr(wrapper, "_logits_soft_cap", 0.0):
+        return f"logits_soft_cap={wrapper._logits_soft_cap}"
+    if window_left is None:
+        window_left = getattr(wrapper, "_window_left", -1)
     if window_left is not None and window_left >= 0:
         return f"window_left={window_left}"
     expected_shape = (
@@ -4580,9 +4646,54 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
-        _check_head_dim(head_dim_qk, head_dim_vo, self._backend)
         if fixed_split_size is None:
             fixed_split_size = -1
+
+        # gqa_context_fp8_paged_sm90: size the workspace for the plan that
+        # plan() would actually make. An armed specialized (or allowlisted
+        # auto) fp8-Q plan is planned on the stock fa2 route with a
+        # bf16-dequantised query, so apply the same rewrite here — and raise
+        # plan()'s contract error for backend="specialized" requests the plan
+        # would reject — instead of handing "specialized" (or the un-rewritten
+        # fp8 dtype) to the stock module query.
+        _fp8q_sizing_as_fa2 = False
+        if self._requested_backend in ("specialized", "auto"):
+            _fp8q_contract_ok = (
+                q_data_type == torch.float8_e4m3fn
+                and kv_data_type == torch.float8_e4m3fn
+                and o_data_type == torch.bfloat16
+                and self._jit_module is None
+                and self.device.type == "cuda"
+                and tuple(get_compute_capability(self.device))
+                == _GQA_CTX_FP8Q_SM90_COMPUTE_CAPABILITY
+            )
+            if self._requested_backend == "specialized":
+                if not _fp8q_contract_ok:
+                    raise ValueError(
+                        "backend='specialized' on BatchPrefillWithPagedKVCacheWrapper "
+                        "selects the specialized SM90 fp8-Q paged context kernel and "
+                        "requires q_data_type=kv_data_type=torch.float8_e4m3fn and "
+                        "o_data_type=torch.bfloat16 on an SM90 CUDA device (without "
+                        "a custom JIT module, batch_invariant or use_token_head_sf). "
+                        f"Supported backends: {GQA_CTX_FP8Q_SM90_BACKENDS}; use "
+                        "backend='auto' or a stock backend for other contracts."
+                    )
+                _fp8q_sizing_as_fa2 = True
+            elif _fp8q_contract_ok and self._cuda_graph_backend in (None, "fa2"):
+                _fp8q_sizing_as_fa2 = _gqa_ctx_fp8q_sm90_auto_routes(
+                    num_qo_heads,
+                    num_kv_heads,
+                    head_dim_qk,
+                    head_dim_vo,
+                    page_size,
+                    self._kv_layout,
+                    causal,
+                )[0]
+        if _fp8q_sizing_as_fa2:
+            q_data_type = torch.bfloat16
+        _check_head_dim(
+            head_dim_qk, head_dim_vo, "fa2" if _fp8q_sizing_as_fa2 else self._backend
+        )
 
         # Normalized like plan(): the native size query reads raw pointers (#5260).
         qo_indptr = qo_indptr.contiguous()
@@ -4630,6 +4741,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         use_custom_mask = custom_mask is not None or packed_custom_mask is not None
         backend = self._requested_backend
+        if _fp8q_sizing_as_fa2:
+            # the armed plan's composable fallback is planned on fa2
+            backend = "fa2"
         if self._jit_module is not None:
             module = self._jit_module
         else:
@@ -4983,6 +5097,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._kv_layout,
                 causal,
             )
+            if _auto_routed and self._cuda_graph_backend not in (None, "fa2"):
+                # the armed plan is planned on the stock fa2 route; replanning
+                # it under a wrapper whose captured graphs hold another
+                # backend's integer-workspace layout (fa3) would clobber them.
+                # Leave the plan to the stock auto resolution, whose
+                # _cuda_graph_backend guard rejects it loudly.
+                _auto_routed = False
+                _auto_reason = (
+                    "captured CUDA-graph backend "
+                    f"{self._cuda_graph_backend!r} is not fa2"
+                )
             if _auto_routed:
                 _gqa_ctx_fp8q_sm90_armed = True
                 self._gqa_ctx_fp8q_sm90_requested = True
@@ -6179,6 +6304,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 uses_spcompress=uses_spcompress,
             )
         if getattr(self, "_gqa_ctx_fp8q_sm90_requested", False) and is_float8(q):
+            if args:
+                # the stock fp8 kernels read positional *args as
+                # (q_scale, k_scale, v_scale) tensors, but this wrapper's
+                # composable fallback dequantises Q to bf16 first, after
+                # which the stock path no longer extracts them — they would
+                # be dropped silently. Reject them loudly instead.
+                raise NotImplementedError(
+                    "positional run() arguments are not supported on an "
+                    "fp8-Q 'specialized' (or specialized-armed 'auto') plan: "
+                    "the positional FP8 scale contract is consumed by the "
+                    "stock fp8 kernels, while this plan's fallback "
+                    "dequantises Q to bf16 and would silently drop them. "
+                    "Pass q_scale=, k_scale= and v_scale= keywords instead."
+                )
             # fp8 Q on the SM90 paged route, armed by backend="specialized"
             # or an allowlisted backend="auto" plan: the specialized kernel at
             # the supported contract, the composable path (exact
