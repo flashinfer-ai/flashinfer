@@ -207,8 +207,10 @@ def _eligibility(
         return f"input {input.dtype} dim={input.dim()}"
     T = input.shape[0]
     if not (1 <= T <= _MAX_TOKENS or _BAND2_LO <= T <= _BAND2_HI):
-        return (f"num_tokens={T} outside the measured won bands "
-                f"[1,{_MAX_TOKENS}] u [{_BAND2_LO},{_BAND2_HI}]")
+        return (
+            f"num_tokens={T} outside the measured won bands "
+            f"[1,{_MAX_TOKENS}] u [{_BAND2_LO},{_BAND2_HI}]"
+        )
     if output_dtype != torch.bfloat16:
         return f"output_dtype={output_dtype}"
     if not isinstance(quant_scales, (list, tuple)) or len(quant_scales) != 2:
@@ -239,7 +241,11 @@ def _eligibility(
     ):
         return "block scales are not the [128,128] f32 grids"
     ids, tw = token_selected_experts, token_final_scales
-    if ids.dtype not in (torch.int32, torch.int64) or ids.dim() != 2 or ids.shape[0] != T:
+    if (
+        ids.dtype not in (torch.int32, torch.int64)
+        or ids.dim() != 2
+        or ids.shape[0] != T
+    ):
         return f"token_selected_experts {ids.dtype} {tuple(ids.shape)}"
     if tw is None or tw.dim() != 2 or tuple(tw.shape) != tuple(ids.shape):
         return "token_final_scales shape"

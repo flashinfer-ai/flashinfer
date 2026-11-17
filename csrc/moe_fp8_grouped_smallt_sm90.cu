@@ -74,12 +74,10 @@
 
 __device__ __forceinline__ uint64_t wgmma_desc_fp8(const uint8_t* p) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
-  return ((uint64_t)(a & 0x3ffff) >> 4) |
-         (1ull << 16) | (64ull << 32) | (1ull << 62);
+  return ((uint64_t)(a & 0x3ffff) >> 4) | (1ull << 16) | (64ull << 32) | (1ull << 62);
 }
 
-__device__ __forceinline__ void wgmma128_fp8(float d[64],
-                                              uint64_t da, uint64_t db) {
+__device__ __forceinline__ void wgmma128_fp8(float d[64], uint64_t da, uint64_t db) {
   asm volatile(
       "wgmma.mma_async.sync.aligned.m64n128k32.f32.e4m3.e4m3 "
       "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,"
@@ -87,36 +85,33 @@ __device__ __forceinline__ void wgmma128_fp8(float d[64],
       "%32,%33,%34,%35,%36,%37,%38,%39,%40,%41,%42,%43,%44,%45,%46,%47,"
       "%48,%49,%50,%51,%52,%53,%54,%55,%56,%57,%58,%59,%60,%61,%62,%63},"
       "%64,%65,1,1,1;\n"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-        "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-        "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]),
-        "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
-        "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
-        "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
-        "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
-        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]),
-        "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]),
-        "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]),
-        "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]),
-        "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]),
-        "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]),
-        "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
-        "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]),
-        "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63])
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]),
+        "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]),
+        "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+        "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]),
+        "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]),
+        "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]),
+        "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]),
+        "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]),
+        "+f"(d[63])
       : "l"(da), "l"(db));
 }
 
 // The two rows represented by each thread's accumulator fragment have
 // independent activation scales.  The weight scale is common to the N128
 // tile, so only two multipliers are needed for all 64 registers.
-__device__ __forceinline__ void scale_wgmma128_rows(float d[64],
-                                                     float s0, float s8) {
-  #pragma unroll
+__device__ __forceinline__ void scale_wgmma128_rows(float d[64], float s0, float s8) {
+#pragma unroll
   for (int w = 0; w < 8; ++w) {
-    d[w * 8 + 0] *= s0; d[w * 8 + 1] *= s0;
-    d[w * 8 + 2] *= s8; d[w * 8 + 3] *= s8;
-    d[w * 8 + 4] *= s0; d[w * 8 + 5] *= s0;
-    d[w * 8 + 6] *= s8; d[w * 8 + 7] *= s8;
+    d[w * 8 + 0] *= s0;
+    d[w * 8 + 1] *= s0;
+    d[w * 8 + 2] *= s8;
+    d[w * 8 + 3] *= s8;
+    d[w * 8 + 4] *= s0;
+    d[w * 8 + 5] *= s0;
+    d[w * 8 + 6] *= s8;
+    d[w * 8 + 7] *= s8;
   }
 }
 
@@ -124,56 +119,49 @@ __device__ __forceinline__ void scale_wgmma128_rows(float d[64],
 // owns a sorted routed pair and handles its two K128 blocks serially.  Packing
 // sixteen pairs per CTA avoids both the cross-warp barrier and tiny CTAs while
 // retaining the block-major grouped layout consumed by FC2.
-__global__ __launch_bounds__(512) void k_silu_q_fp8(
-    const __nv_bfloat16* __restrict__ raw,
-    uint8_t* __restrict__ hq, float2* __restrict__ hs,
-    const int* __restrict__ order, int I, int pairs) {
+__global__ __launch_bounds__(512) void k_silu_q_fp8(const __nv_bfloat16* __restrict__ raw,
+                                                    uint8_t* __restrict__ hq,
+                                                    float2* __restrict__ hs,
+                                                    const int* __restrict__ order, int I,
+                                                    int pairs) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int gidx = blockIdx.x * 16 + (tid >> 5);
   if (gidx >= pairs) return;
   const int p = order[gidx];
   float invs[2];
-  #pragma unroll
+#pragma unroll
   for (int b = 0; b < 2; ++b) {
     const int i = b * 128 + lane * 4;
-    float2 up0 = __bfloat1622float2(
-        *(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + i));
-    float2 up1 = __bfloat1622float2(
-        *(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + i + 2));
-    float2 g0 = __bfloat1622float2(
-        *(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + I + i));
-    float2 g1 = __bfloat1622float2(
-        *(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + I + i + 2));
+    float2 up0 = __bfloat1622float2(*(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + i));
+    float2 up1 = __bfloat1622float2(*(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + i + 2));
+    float2 g0 = __bfloat1622float2(*(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + I + i));
+    float2 g1 = __bfloat1622float2(*(const __nv_bfloat162*)(raw + (size_t)p * 2 * I + I + i + 2));
     float2 h0, h1;
     h0.x = (g0.x / (1.f + __expf(-g0.x))) * up0.x;
     h0.y = (g0.y / (1.f + __expf(-g0.y))) * up0.y;
     h1.x = (g1.x / (1.f + __expf(-g1.x))) * up1.x;
     h1.y = (g1.y / (1.f + __expf(-g1.y))) * up1.y;
-    float amax = fmaxf(fmaxf(fabsf(h0.x), fabsf(h0.y)),
-                       fmaxf(fabsf(h1.x), fabsf(h1.y)));
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-      amax = fmaxf(amax, __shfl_xor_sync(FULLM, amax, o));
+    float amax = fmaxf(fmaxf(fabsf(h0.x), fabsf(h0.y)), fmaxf(fabsf(h1.x), fabsf(h1.y)));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(FULLM, amax, o));
     const float inv = (amax > 0.f) ? 448.f / amax : 1.f;
     invs[b] = inv;
-    h0.x *= inv; h0.y *= inv; h1.x *= inv; h1.y *= inv;
+    h0.x *= inv;
+    h0.y *= inv;
+    h1.x *= inv;
+    h1.y *= inv;
     const size_t qoff = ((size_t)b * pairs + gidx) * 128 + lane * 4;
-    *(__nv_fp8x2_storage_t*)(hq + qoff) =
-        __nv_cvt_float2_to_fp8x2(h0, __NV_SATFINITE, __NV_E4M3);
+    *(__nv_fp8x2_storage_t*)(hq + qoff) = __nv_cvt_float2_to_fp8x2(h0, __NV_SATFINITE, __NV_E4M3);
     *(__nv_fp8x2_storage_t*)(hq + qoff + 2) =
         __nv_cvt_float2_to_fp8x2(h1, __NV_SATFINITE, __NV_E4M3);
   }
-  if (lane == 0)
-    hs[gidx] = make_float2(__frcp_rn(invs[0]) * invs[1],
-                           __frcp_rn(invs[1]));
+  if (lane == 0) hs[gidx] = make_float2(__frcp_rn(invs[0]) * invs[1], __frcp_rn(invs[1]));
 }
 
-__global__ __launch_bounds__(128, 8) void k_reduce9_v16(
-    const __half* __restrict__ partial,
-    const float* __restrict__ tw,
-    __nv_bfloat16* __restrict__ out,
-    int H) {
+__global__ __launch_bounds__(128, 8) void k_reduce9_v16(const __half* __restrict__ partial,
+                                                        const float* __restrict__ tw,
+                                                        __nv_bfloat16* __restrict__ out, int H) {
   __shared__ float sw[9];
   const int tid = threadIdx.x;
   const int t = blockIdx.x;
@@ -181,46 +169,41 @@ __global__ __launch_bounds__(128, 8) void k_reduce9_v16(
   __syncthreads();
   for (int d16 = tid; d16 < (H >> 4); d16 += blockDim.x) {
     float acc[16];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 16; ++i) acc[i] = 0.f;
-    #pragma unroll
+#pragma unroll
     for (int k = 0; k < 9; ++k) {
-      const uint4* src = (const uint4*)(
-          partial + ((size_t)t * 9 + k) * H + d16 * 16);
+      const uint4* src = (const uint4*)(partial + ((size_t)t * 9 + k) * H + d16 * 16);
       const uint4 h0 = src[0];
       const uint4 h1 = src[1];
       const __half2* hh0 = (const __half2*)&h0;
       const __half2* hh1 = (const __half2*)&h1;
       const float w = sw[k];
-      #pragma unroll
+#pragma unroll
       for (int q = 0; q < 4; ++q) {
         const float2 f = __half22float2(hh0[q]);
         acc[2 * q] = fmaf(w, f.x, acc[2 * q]);
         acc[2 * q + 1] = fmaf(w, f.y, acc[2 * q + 1]);
       }
-      #pragma unroll
+#pragma unroll
       for (int q = 0; q < 4; ++q) {
         const float2 f = __half22float2(hh1[q]);
         acc[8 + 2 * q] = fmaf(w, f.x, acc[8 + 2 * q]);
         acc[8 + 2 * q + 1] = fmaf(w, f.y, acc[8 + 2 * q + 1]);
       }
     }
-    __nv_bfloat162* dst = (__nv_bfloat162*)(
-        out + (size_t)t * H + d16 * 16);
-    #pragma unroll
-    for (int q = 0; q < 8; ++q)
-      dst[q] = __floats2bfloat162_rn(acc[2 * q], acc[2 * q + 1]);
+    __nv_bfloat162* dst = (__nv_bfloat162*)(out + (size_t)t * H + d16 * 16);
+#pragma unroll
+    for (int q = 0; q < 8; ++q) dst[q] = __floats2bfloat162_rn(acc[2 * q], acc[2 * q + 1]);
   }
 }
 
-template<int BM, int THREADS, int NGROUP>
+template <int BM, int THREADS, int NGROUP>
 __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
-    const uint8_t* __restrict__ hq, const float2* __restrict__ hs,
-    const uint8_t* __restrict__ W2, const float* __restrict__ W2S,
-    const int* __restrict__ order, const int* __restrict__ cnt,
-    const int* __restrict__ off, const int* __restrict__ toff,
-    const int2* __restrict__ tasks, __half* __restrict__ partial,
-    int H, int I, int KTOP, int Si, int Sh, int E, int pairs) {
+    const uint8_t* __restrict__ hq, const float2* __restrict__ hs, const uint8_t* __restrict__ W2,
+    const float* __restrict__ W2S, const int* __restrict__ order, const int* __restrict__ cnt,
+    const int* __restrict__ off, const int* __restrict__ toff, const int2* __restrict__ tasks,
+    __half* __restrict__ partial, int H, int I, int KTOP, int Si, int Sh, int E, int pairs) {
   static_assert(BM == 128 && THREADS == 256,
                 "This first native-FP8 path is specialized for wide M");
   const int ntl = H >> 7;
@@ -262,19 +245,18 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
   }
   __syncthreads();
 
-  // Quantized activation is reused across every persistent N tile.  Each
-  // K128 block is one 128B-swizzled atom wide (8 uint4 cells per row).
-  #pragma unroll
+// Quantized activation is reused across every persistent N tile.  Each
+// K128 block is one 128B-swizzled atom wide (8 uint4 cells per row).
+#pragma unroll
   for (int kb = 0; kb < 256; kb += 128) {
-    #pragma unroll
+#pragma unroll
     for (int q = 0; q < BM * 8 / THREADS; ++q) {
       const int ii = tid + q * THREADS;
       const int r = ii >> 3;
       const int c = ii & 7;
       uint4 v = make_uint4(0, 0, 0, 0);
       if (r < rows)
-        v = *(const uint4*)(hq +
-            ((size_t)(kb >> 7) * pairs + start + r) * 128 + c * 16);
+        v = *(const uint4*)(hq + ((size_t)(kb >> 7) * pairs + start + r) * 128 + c * 16);
       ((uint4*)(sA + kb * BM))[r * 8 + (c ^ (r & 7))] = v;
     }
   }
@@ -294,32 +276,30 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
     const int nt = nt0 + ni;
     {
       uint4 rb[128 * 8 / THREADS];
-      #pragma unroll
+#pragma unroll
       for (int q = 0; q < 128 * 8 / THREADS; ++q) {
         const int ii = tid + q * THREADS;
         const int r = ii >> 3;
         const int c = ii & 7;
         const int grow = nt * 128 + r;
-        rb[q] = *(const uint4*)(
-            W2 + ((size_t)e * H + grow) * I + c * 16);
+        rb[q] = *(const uint4*)(W2 + ((size_t)e * H + grow) * I + c * 16);
       }
-      #pragma unroll
+#pragma unroll
       for (int q = 0; q < 128 * 8 / THREADS; ++q) {
         const int ii = tid + q * THREADS;
         const int r = ii >> 3;
         const int c = ii & 7;
         ((uint4*)sB)[r * 8 + (c ^ (r & 7))] = rb[q];
       }
-      #pragma unroll
+#pragma unroll
       for (int q = 0; q < 128 * 8 / THREADS; ++q) {
         const int ii = tid + q * THREADS;
         const int r = ii >> 3;
         const int c = ii & 7;
         const int grow = nt * 128 + r;
-        rb[q] = *(const uint4*)(
-            W2 + ((size_t)e * H + grow) * I + 128 + c * 16);
+        rb[q] = *(const uint4*)(W2 + ((size_t)e * H + grow) * I + 128 + c * 16);
       }
-      #pragma unroll
+#pragma unroll
       for (int q = 0; q < 128 * 8 / THREADS; ++q) {
         const int ii = tid + q * THREADS;
         const int r = ii >> 3;
@@ -331,17 +311,18 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
     __syncthreads();
 
     float acc[64];
-    #pragma unroll
+#pragma unroll
     for (int i = 0; i < 64; ++i) acc[i] = 0.f;
 
     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
     uint64_t da = wgmma_desc_fp8(sA + wgid * 64 * 128);
     uint64_t db = wgmma_desc_fp8(sB);
-    #pragma unroll
-    for (int kk = 0; kk < 128; kk += 32)
-      wgmma128_fp8(acc, da + (kk >> 4), db + (kk >> 4));
-    asm volatile("wgmma.commit_group.sync.aligned;\n"
-                 "wgmma.wait_group.sync.aligned 0;" ::: "memory");
+#pragma unroll
+    for (int kk = 0; kk < 128; kk += 32) wgmma128_fp8(acc, da + (kk >> 4), db + (kk >> 4));
+    asm volatile(
+        "wgmma.commit_group.sync.aligned;\n"
+        "wgmma.wait_group.sync.aligned 0;" ::
+            : "memory");
 
     // Convert the block-0-normalized accumulator to block-1 raw units.
     const float wr = sWr[ni];
@@ -350,45 +331,41 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
     da = wgmma_desc_fp8(sA + 128 * BM + wgid * 64 * 128);
     db = wgmma_desc_fp8(sB1);
-    #pragma unroll
-    for (int kk = 0; kk < 128; kk += 32)
-      wgmma128_fp8(acc, da + (kk >> 4), db + (kk >> 4));
-    asm volatile("wgmma.commit_group.sync.aligned;\n"
-                 "wgmma.wait_group.sync.aligned 0;" ::: "memory");
+#pragma unroll
+    for (int kk = 0; kk < 128; kk += 32) wgmma128_fp8(acc, da + (kk >> 4), db + (kk >> 4));
+    asm volatile(
+        "wgmma.commit_group.sync.aligned;\n"
+        "wgmma.wait_group.sync.aligned 0;" ::
+            : "memory");
     __syncthreads();
 
     // Return from raw block-1 units to the physical output scale.
     scale_wgmma128_rows(acc, a0.y * ws1, a8.y * ws1);
 
-    #pragma unroll
+#pragma unroll
     for (int w = 0; w < 8; ++w) {
       const int c = w * 16 + cb;
       if (row < rows) {
         __half* dst = partial + (size_t)sPair[row] * H + nt * 128 + c;
         *(__half2*)dst = __floats2half2_rn(acc[w * 8], acc[w * 8 + 1]);
-        *(__half2*)(dst + 8) =
-            __floats2half2_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
+        *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
       }
       if (row8 < rows) {
         __half* dst = partial + (size_t)sPair[row8] * H + nt * 128 + c;
         *(__half2*)dst = __floats2half2_rn(acc[w * 8 + 2], acc[w * 8 + 3]);
-        *(__half2*)(dst + 8) =
-            __floats2half2_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
+        *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
       }
     }
   }
 }
 
-void launch_moe_grouped(const void* X, const void* W13, const float* W13S,
-                        const void* W2, const float* W2S, const int* ids,
-                        const float* tw, void* out, void* raw, void* Hb,
-                        void* partial, int* ibuf, int2* tasks,
-                        int T, int H, int I, int E, int KTOP, int max_tasks,
-                        cudaStream_t st) {
+void launch_moe_grouped(const void* X, const void* W13, const float* W13S, const void* W2,
+                        const float* W2S, const int* ids, const float* tw, void* out, void* raw,
+                        void* Hb, void* partial, int* ibuf, int2* tasks, int T, int H, int I, int E,
+                        int KTOP, int max_tasks, cudaStream_t st) {
   // Preserve the submitted incumbent byte-for-byte for T=256 and T=1024.
   if (T < 2048) {
-    launch_moe_grouped_fp16_base(X, W13, W13S, W2, W2S, ids, tw, out,
-                                 raw, Hb, partial, ibuf, tasks,
+    launch_moe_grouped_fp16_base(X, W13, W13S, W2, W2S, ids, tw, out, raw, Hb, partial, ibuf, tasks,
                                  T, H, I, E, KTOP, max_tasks, st);
     return;
   }
@@ -409,36 +386,28 @@ void launch_moe_grouped(const void* X, const void* W13, const float* W13S,
   k_prefix<128><<<1, 288, 0, st>>>(cnt, off, cur, toff, tasks, E);
   k_scatter<<<(pairs + 255) / 256, 256, 0, st>>>(ids, cur, order, pairs);
 
-  fc1_wmma<128,256,512><<<task_bound * ((2 * I) / 256), 512, 0, st>>>(
-      (const __nv_bfloat16*)X, (const uint8_t*)W13, W13S,
-      order, cnt, off, toff, tasks, (__nv_bfloat16*)raw,
-      H, 2 * I, KTOP, Sh1, Sn1, E);
+  fc1_wmma<128, 256, 512><<<task_bound * ((2 * I) / 256), 512, 0, st>>>(
+      (const __nv_bfloat16*)X, (const uint8_t*)W13, W13S, order, cnt, off, toff, tasks,
+      (__nv_bfloat16*)raw, H, 2 * I, KTOP, Sh1, Sn1, E);
 
   // Hb is a 2*pairs*I-byte BF16 allocation.  Native FP8 uses pairs*I bytes
   // for values and only pairs*2*sizeof(float2) more bytes for scales.
   uint8_t* hq = (uint8_t*)Hb;
   float2* hs = (float2*)(hq + (size_t)pairs * I);
-  k_silu_q_fp8<<<(pairs + 15) / 16, 512, 0, st>>>(
-      (const __nv_bfloat16*)raw, hq, hs, order, I, pairs);
+  k_silu_q_fp8<<<(pairs + 15) / 16, 512, 0, st>>>((const __nv_bfloat16*)raw, hq, hs, order, I,
+                                                  pairs);
 
   constexpr int FC2_NGROUP = 8;
   constexpr int FC2_SMEM = 1024 + 128 * 256 + 2 * 128 * 128;
   const int fc2_ng = ((H >> 7) + FC2_NGROUP - 1) / FC2_NGROUP;
-  cudaFuncSetAttribute(fc2_wgmma_np_fp8<128,256,FC2_NGROUP>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, FC2_SMEM);
-  fc2_wgmma_np_fp8<128,256,FC2_NGROUP>
-      <<<task_bound * fc2_ng, 256, FC2_SMEM, st>>>(
-          hq, hs, (const uint8_t*)W2, W2S,
-          order, cnt, off, toff, tasks, (__half*)partial,
-          H, I, KTOP, Si, Sh1, E, pairs);
+  cudaFuncSetAttribute(fc2_wgmma_np_fp8<128, 256, FC2_NGROUP>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, FC2_SMEM);
+  fc2_wgmma_np_fp8<128, 256, FC2_NGROUP><<<task_bound * fc2_ng, 256, FC2_SMEM, st>>>(
+      hq, hs, (const uint8_t*)W2, W2S, order, cnt, off, toff, tasks, (__half*)partial, H, I, KTOP,
+      Si, Sh1, E, pairs);
 
-  k_reduce9_v16<<<T, 128, 0, st>>>(
-      (const __half*)partial, tw, (__nv_bfloat16*)out, H);
+  k_reduce9_v16<<<T, 128, 0, st>>>((const __half*)partial, tw, (__nv_bfloat16*)out, H);
 }
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Host side. `launch_moe_small` above is carried verbatim from the measured
@@ -461,17 +430,15 @@ struct MoeWsLayout {
 
 inline size_t moe_align16(size_t x) { return (x + 15) & ~size_t(15); }
 
-MoeWsLayout moe_grouped_ws_layout(int64_t T, int64_t K, int64_t I, int64_t H,
-                                  int64_t E) {
+MoeWsLayout moe_grouped_ws_layout(int64_t T, int64_t K, int64_t I, int64_t H, int64_t E) {
   MoeWsLayout L;
   const int64_t pairs = T * K;
   L.max_tasks = (int)(E + (pairs + 63) / 64);
   L.raw_off = 0;
-  L.hb_off = moe_align16(L.raw_off + (size_t)pairs * 2 * I * 2);   // bf16
-  L.partial_off = moe_align16(L.hb_off + (size_t)pairs * I * 2);   // bf16
-  L.ibuf_off = moe_align16(L.partial_off + (size_t)pairs * H * 2); // fp16
-  L.tasks_off =
-      moe_align16(L.ibuf_off + (size_t)(3 * E + E + 1 + pairs) * 4);
+  L.hb_off = moe_align16(L.raw_off + (size_t)pairs * 2 * I * 2);    // bf16
+  L.partial_off = moe_align16(L.hb_off + (size_t)pairs * I * 2);    // bf16
+  L.ibuf_off = moe_align16(L.partial_off + (size_t)pairs * H * 2);  // fp16
+  L.tasks_off = moe_align16(L.ibuf_off + (size_t)(3 * E + E + 1 + pairs) * 4);
   L.total = moe_align16(L.tasks_off + (size_t)L.max_tasks * 2 * 4);
   return L;
 }
@@ -484,8 +451,7 @@ MoeWsLayout moe_grouped_ws_layout(int64_t T, int64_t K, int64_t I, int64_t H,
 // measured entry point's sizes.
 int64_t moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(int64_t tokens, int64_t top_k,
                                                          int64_t intermediate_size,
-                                                         int64_t hidden_size,
-                                                         int64_t num_experts) {
+                                                         int64_t hidden_size, int64_t num_experts) {
   TVM_FFI_ICHECK_GE(tokens, 1);
   TVM_FFI_ICHECK_GE(top_k, 1);
   TVM_FFI_ICHECK_GE(intermediate_size, 1);
@@ -494,8 +460,7 @@ int64_t moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(int64_t tokens, int64_t
   if (tokens < 256) {
     return tokens * top_k * intermediate_size * (int64_t)sizeof(__half);
   }
-  return (int64_t)moe_grouped_ws_layout(tokens, top_k, intermediate_size,
-                                        hidden_size, num_experts)
+  return (int64_t)moe_grouped_ws_layout(tokens, top_k, intermediate_size, hidden_size, num_experts)
       .total;
 }
 
@@ -551,10 +516,9 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
   TVM_FFI_ICHECK_EQ(topk_weights.size(0), T);
   TVM_FFI_ICHECK_EQ(topk_weights.size(1), KTOP);
   TVM_FFI_ICHECK_GE((int64_t)workspace.numel(),
-                    moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(
-                        T, KTOP, I, H, E))
-      << "workspace too small: plan with plan_workspace_bytes(" << T << ", " << KTOP
-      << ", " << I << ")";
+                    moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(T, KTOP, I, H, E))
+      << "workspace too small: plan with plan_workspace_bytes(" << T << ", " << KTOP << ", " << I
+      << ")";
 
   CHECK_DEVICE(hidden_states, fc1_weights);
   CHECK_DEVICE(hidden_states, fc1_scales);
@@ -570,27 +534,22 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
 
   if (T < 256) {
     launch_moe_small(hidden_states.data_ptr(), fc1_weights.data_ptr(),
-                     static_cast<const float*>(fc1_scales.data_ptr()),
-                     fc2_weights.data_ptr(),
+                     static_cast<const float*>(fc1_scales.data_ptr()), fc2_weights.data_ptr(),
                      static_cast<const float*>(fc2_scales.data_ptr()),
                      static_cast<const int*>(topk_ids.data_ptr()),
-                     static_cast<const float*>(topk_weights.data_ptr()),
-                     out.data_ptr(), workspace.data_ptr(), T, H, I, E, KTOP,
-                     stream);
+                     static_cast<const float*>(topk_weights.data_ptr()), out.data_ptr(),
+                     workspace.data_ptr(), T, H, I, E, KTOP, stream);
   } else {
     const MoeWsLayout L = moe_grouped_ws_layout(T, KTOP, I, H, E);
     char* wp = static_cast<char*>(workspace.data_ptr());
-    launch_moe_grouped(hidden_states.data_ptr(), fc1_weights.data_ptr(),
-                       static_cast<const float*>(fc1_scales.data_ptr()),
-                       fc2_weights.data_ptr(),
-                       static_cast<const float*>(fc2_scales.data_ptr()),
-                       static_cast<const int*>(topk_ids.data_ptr()),
-                       static_cast<const float*>(topk_weights.data_ptr()),
-                       out.data_ptr(), wp + L.raw_off, wp + L.hb_off,
-                       wp + L.partial_off,
-                       reinterpret_cast<int*>(wp + L.ibuf_off),
-                       reinterpret_cast<int2*>(wp + L.tasks_off), T, H, I, E,
-                       KTOP, L.max_tasks, stream);
+    launch_moe_grouped(
+        hidden_states.data_ptr(), fc1_weights.data_ptr(),
+        static_cast<const float*>(fc1_scales.data_ptr()), fc2_weights.data_ptr(),
+        static_cast<const float*>(fc2_scales.data_ptr()),
+        static_cast<const int*>(topk_ids.data_ptr()),
+        static_cast<const float*>(topk_weights.data_ptr()), out.data_ptr(), wp + L.raw_off,
+        wp + L.hb_off, wp + L.partial_off, reinterpret_cast<int*>(wp + L.ibuf_off),
+        reinterpret_cast<int2*>(wp + L.tasks_off), T, H, I, E, KTOP, L.max_tasks, stream);
   }
   cudaError_t status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)

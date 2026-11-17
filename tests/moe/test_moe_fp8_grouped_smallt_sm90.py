@@ -57,19 +57,37 @@ def _make(T, device, seed=0, e=E, k=K, h=H, i=I):
     g.manual_seed(seed)
 
     def f8(shape):
-        return (
-            torch.randn(shape, generator=g, device=device, dtype=torch.float32)
-        ).to(torch.float8_e4m3fn)
+        return (torch.randn(shape, generator=g, device=device, dtype=torch.float32)).to(
+            torch.float8_e4m3fn
+        )
 
     pow2 = torch.tensor([0.0625, 0.125, 0.25], device=device)
-    s1 = pow2[
-        torch.randint(0, 3, (e, (2 * i + 127) // 128, (h + 127) // 128),
-                      generator=g, device=device)
-    ].float().contiguous()
-    s2 = pow2[
-        torch.randint(0, 3, (e, (h + 127) // 128, (i + 127) // 128),
-                      generator=g, device=device)
-    ].float().contiguous()
+    s1 = (
+        pow2[
+            torch.randint(
+                0,
+                3,
+                (e, (2 * i + 127) // 128, (h + 127) // 128),
+                generator=g,
+                device=device,
+            )
+        ]
+        .float()
+        .contiguous()
+    )
+    s2 = (
+        pow2[
+            torch.randint(
+                0,
+                3,
+                (e, (h + 127) // 128, (i + 127) // 128),
+                generator=g,
+                device=device,
+            )
+        ]
+        .float()
+        .contiguous()
+    )
     # Distinct expert ids per token (as real top-k routing produces): the
     # stock route's semantics for duplicate ids differ from an additive sum,
     # so duplicates would compare arms on an off-contract input.
@@ -78,10 +96,12 @@ def _make(T, device, seed=0, e=E, k=K, h=H, i=I):
     ).to(torch.int32)
     tw = torch.rand((T, k), generator=g, device=device, dtype=torch.float32)
     tw = tw / tw.sum(-1, keepdim=True)
-    x = torch.randn((T, h), generator=g, device=device,
-                    dtype=torch.float32).to(torch.bfloat16)
-    return dict(x=x, w13=f8((e, 2 * i, h)), s13=s1, w2=f8((e, h, i)), s2=s2,
-                ids=ids, tw=tw)
+    x = torch.randn((T, h), generator=g, device=device, dtype=torch.float32).to(
+        torch.bfloat16
+    )
+    return dict(
+        x=x, w13=f8((e, 2 * i, h)), s13=s1, w2=f8((e, h, i)), s2=s2, ids=ids, tw=tw
+    )
 
 
 def _dequant(w, s, block=128):
@@ -199,17 +219,23 @@ def test_allowlist_rejects_large_batches_and_flags():
 
 def test_stats_report_build_state_and_counters():
     stats = _moe_smallt_sm90_stats()
-    for key in ("calls_seen", "runs_dispatched", "module_loaded",
-                "module_error", "backends", "backend_dispatches",
-                "fallback_reasons", "dispatch_table_loaded"):
+    for key in (
+        "calls_seen",
+        "runs_dispatched",
+        "module_loaded",
+        "module_error",
+        "backends",
+        "backend_dispatches",
+        "fallback_reasons",
+        "dispatch_table_loaded",
+    ):
         assert key in stats
     assert stats["backends"] == CUTLASS_FUSED_MOE_BACKENDS
     assert set(stats["backend_dispatches"]) == {"specialized", "stock"}
 
 
 def test_backends_tuple_and_dispatch_table():
-    assert CUTLASS_FUSED_MOE_BACKENDS == ("auto", "specialized", "cutlass",
-                                          "cake")
+    assert CUTLASS_FUSED_MOE_BACKENDS == ("auto", "specialized", "cutlass", "cake")
     table = _dispatch_table()
     assert table is not None
     assert table["kill_switch"] == DISABLE_ENV
@@ -225,10 +251,8 @@ def test_unknown_backend_raises_gpu_free():
             input=x,
             token_selected_experts=torch.zeros((1, K), dtype=torch.int32),
             token_final_scales=torch.zeros((1, K)),
-            fc1_expert_weights=torch.zeros((E, 2 * I, H),
-                                           dtype=torch.float8_e4m3fn),
-            fc2_expert_weights=torch.zeros((E, H, I),
-                                           dtype=torch.float8_e4m3fn),
+            fc1_expert_weights=torch.zeros((E, 2 * I, H), dtype=torch.float8_e4m3fn),
+            fc2_expert_weights=torch.zeros((E, H, I), dtype=torch.float8_e4m3fn),
             output_dtype=torch.bfloat16,
             quant_scales=[],
             use_deepseek_fp8_block_scale=True,
@@ -332,8 +356,7 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 9,
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="needs an sm90 device",
 )
 def test_return_type_parity_across_backends(monkeypatch):
@@ -357,8 +380,11 @@ def test_return_type_parity_across_backends(monkeypatch):
             **kw,
         )
 
-    results = {"auto": raw(), "specialized": raw(backend="specialized"),
-               "cutlass": raw(backend="cutlass")}
+    results = {
+        "auto": raw(),
+        "specialized": raw(backend="specialized"),
+        "cutlass": raw(backend="cutlass"),
+    }
     monkeypatch.setenv(DISABLE_ENV, "1")
     results["auto+kill"] = raw()
     monkeypatch.delenv(DISABLE_ENV)
