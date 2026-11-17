@@ -117,7 +117,7 @@ kernel family, a family larger than the generator's per-file budget as numbered 
 from the Python specification and engine (`python -m flashinfer.batch_invariant.lean_cases`):
 the Lean model reproduces the Python S-expressions node for node, re-derives the dispatchers' shape rules and checks
 every record of a configuration space and every dispatcher pick against the class's constraints. The device-free test
-`tests/batch_invariant/test_lean.py` byte-compares the committed modules and fails on a stale or missing one; its `lake`
+`tests/batch_invariant/test_lean.py` byte-compares the committed modules and fails on a stale or missing generated one; its `lake`
 steps run when the toolchain is installed.
 
 The MoE classes have their own tier. `lean/BIKernels/MoE.lean` (and `MoEFp8.lean` for the fp8 per-tensor classes: the per-tile alpha from the multipliers' reciprocals, the fused e4m3 quantization of every chain as the standalone quantization term of the activation value, GEMM2's scaled chain) states the declared `exp`, sigmoid, tanh, erf and log

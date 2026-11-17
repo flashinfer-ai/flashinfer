@@ -1350,11 +1350,34 @@ def summary() -> str:
     )
 
 
-def main(out_path: str = CASES_PATH) -> str:
-    """Write the umbrella at ``out_path`` and the family modules in ``Cases/`` next to it; a generated module of an
-    earlier rendering that this one no longer emits is removed."""
+def is_generated(path: str) -> bool:
+    """Whether the Lean file at ``path`` is one of this generator's family modules: its header (the comment, import and
+    namespace lines before the first declaration) carries the ``GENERATED`` marker line."""
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line == GENERATED:
+                return True
+            if line and not line.startswith(("--", "import ", "namespace ")):
+                return False
+    return False
+
+
+def generated_parts(parts_dir: str) -> List[str]:
+    """The file names in ``parts_dir`` that are generated family modules (``is_generated``), sorted; a hand-written Lean
+    file kept there is not one."""
+    return sorted(
+        name
+        for name in os.listdir(parts_dir)
+        if name.endswith(".lean") and is_generated(os.path.join(parts_dir, name))
+    )
+
+
+def write_modules(out_path: str, modules: Dict[str, str]) -> None:
+    """Write ``modules`` (``render_modules``): the umbrella at ``out_path`` and the family modules in ``Cases/`` next to
+    it. A generated module of an earlier rendering that this one no longer emits is removed; a file without the
+    ``GENERATED`` marker is left alone."""
     root = os.path.dirname(out_path)
-    modules = render_modules()
     paths = {
         os.path.join(
             root, os.path.basename(out_path) if rel == "Cases.lean" else rel
@@ -1363,12 +1386,16 @@ def main(out_path: str = CASES_PATH) -> str:
     }
     parts_dir = os.path.join(root, "Cases")
     os.makedirs(parts_dir, exist_ok=True)
-    for stale in sorted(os.listdir(parts_dir)):
-        if stale.endswith(".lean") and os.path.join(parts_dir, stale) not in paths:
+    for stale in generated_parts(parts_dir):
+        if os.path.join(parts_dir, stale) not in paths:
             os.remove(os.path.join(parts_dir, stale))
     for path, text in paths.items():
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+
+
+def main(out_path: str = CASES_PATH) -> str:
+    write_modules(out_path, render_modules())
     s = summary()
     print(s)
     return s
