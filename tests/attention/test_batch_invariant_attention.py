@@ -131,7 +131,9 @@ def workspace(device, mb=128):
     return torch.empty(mb << 20, dtype=torch.uint8, device=device)
 
 
-def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
+def run_paged_prefill(
+    pr: Problem, layout="NHD", window_left=-1, ws=None, run_kw=None, **plan_kw
+):
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
     )
@@ -150,10 +152,12 @@ def run_paged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan
         kv_data_type=torch.bfloat16,
         **plan_kw,
     )
-    return w.run(pr.q, pr.cache(layout))
+    return w.run(pr.q, pr.cache(layout), **(run_kw or {}))
 
 
-def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
+def run_ragged_prefill(
+    pr: Problem, layout="NHD", window_left=-1, ws=None, run_kw=None, **plan_kw
+):
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         ws if ws is not None else workspace(pr.device), layout, batch_invariant=True
     )
@@ -170,10 +174,12 @@ def run_ragged_prefill(pr: Problem, layout="NHD", window_left=-1, ws=None, **pla
         **plan_kw,
     )
     k, v = pr.ragged(layout)
-    return w.run(pr.q, k, v)
+    return w.run(pr.q, k, v, **(run_kw or {}))
 
 
-def run_decode(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
+def run_decode(
+    pr: Problem, layout="NHD", window_left=-1, ws=None, run_kw=None, **plan_kw
+):
     """Decode of the LAST token of every request of ``pr`` (q rows picked from the prefill problem)."""
     assert all(ql >= 1 for ql in pr.q_lens)
     last = torch.tensor(
@@ -196,12 +202,17 @@ def run_decode(pr: Problem, layout="NHD", window_left=-1, ws=None, **plan_kw):
         kv_data_type=torch.bfloat16,
         **plan_kw,
     )
-    return w.run(q, pr.cache(layout)), last
+    return w.run(q, pr.cache(layout), **(run_kw or {})), last
 
 
-def reference(pr: Problem, window_left=-1):
-    """fp32 causal (bottom-right aligned) attention per request, the yardstick for accuracy (never for bits)."""
+LSE = {"return_lse": True}
+
+
+def reference(pr: Problem, window_left=-1, return_lse=False):
+    """fp32 causal (bottom-right aligned) attention per request, the yardstick for accuracy (never for bits); with
+    ``return_lse`` also the natural-log LSE of the scaled scores, ``(total_q, Hq)``."""
     outs = []
+    lses = []
     tok_q = tok_kv = 0
     g = pr.Hq // pr.Hkv
     for ql, kl in zip(pr.q_lens, pr.kv_lens, strict=True):
@@ -219,9 +230,10 @@ def reference(pr: Problem, window_left=-1):
         s = s.masked_fill(~mask[None], float("-inf"))
         p = torch.softmax(s, dim=-1)
         outs.append(torch.einsum("hqk,khd->qhd", p, v))
+        lses.append(torch.logsumexp(s, dim=-1).t())
         tok_q += ql
         tok_kv += kl
-    return torch.cat(outs)
+    return (torch.cat(outs), torch.cat(lses)) if return_lse else torch.cat(outs)
 
 
 def _wrapper_case(kind, pr, metadata_device="cuda", **plan_options):
@@ -477,6 +489,64 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
         bi.fingerprint(op, head_dim=128, page_size=16)
 
 
+@pytest.mark.parametrize("op", WRAPPERS)
+def test_lse_fingerprints_are_pinned(op):
+    """The LSE member's receipts, per head dim and base; the class receipts are the output's and do not move with them."""
+    from flashinfer.attention.batch_invariant import spec
+
+    assert spec.FINGERPRINTS == {
+        64: "attn-bf16-d64-9a05233ec9351b0d",
+        128: "attn-bf16-d128-027b0379515b82e2",
+        256: "attn-bf16-d256-b8cb59dab4eb6c0f",
+    }
+    pins = {
+        (64, "log2"): "attn-bf16-d64-lse-log2-a8c548ec287e23bd",
+        (64, "ln"): "attn-bf16-d64-lse-ln-d94f46b73185b273",
+        (128, "log2"): "attn-bf16-d128-lse-log2-c9084818e797cacf",
+        (128, "ln"): "attn-bf16-d128-lse-ln-8e4f2608bce73f6c",
+        (256, "log2"): "attn-bf16-d256-lse-log2-ad95fa9071f86c5c",
+        (256, "ln"): "attn-bf16-d256-lse-ln-54b51dc083581fce",
+    }
+    assert pins == spec.LSE_FINGERPRINTS
+    for (D, base), fp in pins.items():
+        assert bi.fingerprint(op, head_dim=D, lse_base=base) == fp
+        assert bi.fingerprint(op, head_dim=D) == spec.FINGERPRINTS[D]
+    with pytest.raises(ValueError):
+        bi.fingerprint(op, head_dim=128, lse_base="log10")
+    with pytest.raises(TypeError):
+        bi.fingerprint(op, head_dim=128, lse_layout="HN")
+
+
+def test_lse_term_is_declared():
+    """``lse2 = add(mul(m, c), lg2(l))`` of the state that normalises the output, ``lse_e = mul(lse2, fp32(ln 2))``; the output
+    term contains no ``lg2``."""
+    import struct
+
+    from flashinfer.attention.batch_invariant import spec
+    from flashinfer.batch_invariant.fp_interface.term import sexpr
+
+    assert struct.pack("<f", spec.LN2) == struct.pack("<f", math.log(2.0))
+    assert struct.unpack("<I", struct.pack("<f", spec.LN2))[0] == 0x3F317218
+    for D, p, win in ((64, 7, -1), (128, 40, -1), (256, 33, 5)):
+        s = spec.AttentionSpec(D, T=16, C=32)
+        row = spec.RowSpec(p=p, window_left=win, row=1)
+        st = s.state(row, 0)
+        m, l = sexpr(st.m), sexpr(st.l)
+        lse2 = "(add " + " ".join(sorted([f"(mul {m} (sym c))", f"(op:lg2 {l})"])) + ")"
+        assert sexpr(s.lse(row, "log2")) == lse2
+        ln = "(mul " + " ".join(sorted([lse2, f"(const {spec.LN2!r})"])) + ")"
+        assert sexpr(s.lse(row, "ln")) == ln
+        # every output column is normalised by the (m, l) the LSE reads
+        other = s.state(row, 3)
+        assert other.m is st.m and other.l is st.l
+        assert "op:lg2" not in sexpr(s.output(row, 0))
+    init = spec.init_state(s.alg)
+    assert (
+        sexpr(spec.lse_term(s.alg, init, s.c))
+        == "(add (mul (const -inf) (sym c)) (op:lg2 (const 0.0)))"
+    )
+
+
 def test_planner_unit_kind_rules():
     """The ``auto`` unit-kind rules of the planner (placements: every kind computes the same bits): a multi-chunk tile of at most
     ``INKERNEL_MAX_ROWS`` rows splits when the fused units would fill under 2 x SM, a wider (prefill) tile only when they would fill
@@ -538,6 +608,8 @@ def test_cache_key_covers_every_kernel_source():
         "attention/batch_invariant/blocks/kernel.py",
         "attention/batch_invariant/swaps/kernel.py",
         "attention/batch_invariant/fixup.py",
+        "attention/batch_invariant/lse.py",
+        "batch_invariant/sampling/cute_ext.py",
         "attention/batch_invariant/spec.py",
         "attention/batch_invariant/plan.py",
         "batch_invariant/canon.py",
@@ -998,6 +1070,479 @@ def test_sliding_window_prefill_equals_decode():
     assert torch.equal(bits(pre), bits(run_ragged_prefill(pr, window_left=600)))
 
 
+# ------------------------------------------------------------------------------------------------------ the LSE member
+def _both(res):
+    out, lse = res
+    assert lse.dtype == torch.float32
+    return bits(out), bits(lse)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("Hq,Hkv", [(32, 8), (8, 8)])
+def test_lse_matches_reference(D, Hq, Hkv):
+    pr = Problem([300, 1000, 64], [700, 2500, 3000], Hq, Hkv, D, 16, seed=1)
+    _, ref = reference(pr, return_lse=True)
+    tol = 1e-3 * max(1.0, ref.abs().max().item())
+    _, ln = run_paged_prefill(pr, run_kw=dict(LSE, lse_base="ln"))
+    _, log2 = run_paged_prefill(pr, run_kw=LSE)
+    assert ln.shape == log2.shape == (sum(pr.q_lens), Hq)
+    assert not torch.isnan(ln).any() and not torch.isnan(log2).any()
+    assert (ln - ref).abs().max().item() < tol
+    assert (log2 - ref / math.log(2.0)).abs().max().item() < tol / math.log(2.0)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_lse_request_leaves_output_bits(D, kind):
+    """The LSE reads the ``(m, l)`` that normalise the output: the output bits are the same without it, with it in base 2
+    and (prefill) in base e."""
+    pr = Problem([1] * 6, [1024, 4096, 33, 700, 2500, 1], 32, 8, D, 16, seed=40)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    plain = bits(w.run(*args)).clone()
+    out, lse = w.run(*args, return_lse=True)
+    assert torch.equal(bits(out), plain)
+    out_r, lse_r = w.run_return_lse(*args)
+    assert torch.equal(bits(out_r), plain) and torch.equal(bits(lse_r), bits(lse))
+    if kind:
+        out_e, _ = w.run(*args, return_lse=True, lse_base="ln")
+        assert torch.equal(bits(out_e), plain)
+    # prefill-shaped units (fused multi-chunk, the paired placement at D = 64)
+    big = Problem([2048, 300, 1], [4096, 700, 3000], 32, 8, D, 16, seed=41)
+    plain = bits(run_paged_prefill(big))
+    for base in ("log2", "ln"):
+        out, _ = run_paged_prefill(big, run_kw=dict(LSE, lse_base=base))
+        assert torch.equal(bits(out), plain), base
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_lse_prefill_equals_decode_equals_ragged(D, layout):
+    """R4 for the LSE: a token's LSE is the same bits as a paged prefill row, a ragged prefill row, a decode step and a row of
+    a multi-token decode."""
+    pr = Problem([256, 4, 1024, 33], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=2)
+    out, lse = _both(run_paged_prefill(pr, layout, run_kw=LSE))
+    out_r, lse_r = _both(run_ragged_prefill(pr, layout, run_kw=LSE))
+    assert torch.equal(out, out_r) and torch.equal(lse, lse_r)
+    (dec, dec_lse), last = run_decode(pr, layout, run_kw=LSE)
+    assert torch.equal(bits(dec), out[last]) and torch.equal(bits(dec_lse), lse[last])
+    q_len = 4
+    last4 = torch.cat(
+        [
+            torch.arange(
+                int(pr.qo_indptr[i + 1]) - q_len,
+                int(pr.qo_indptr[i + 1]),
+                device=pr.device,
+            )
+            for i in range(4)
+        ]
+    )
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), layout, batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+    )
+    mtd, mtd_lse = _both(w.run(pr.q[last4].contiguous(), pr.cache(layout), **LSE))
+    assert mtd_lse.shape == (4 * q_len, pr.Hq)
+    assert torch.equal(mtd, out[last4]) and torch.equal(mtd_lse, lse[last4])
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_lse_batch_permutation_and_subbatch_invariance(D):
+    """R2 for the LSE: a request's LSE bits do not depend on its neighbours, its position in the batch or the batch size."""
+    q_lens, kv_lens = [300, 1000, 64, 2048, 1], [700, 2500, 3000, 2048, 5000]
+    pr = Problem(q_lens, kv_lens, 32, 8, D, 16, seed=5)
+    out, full = _both(run_paged_prefill(pr, run_kw=LSE))
+    rows = [
+        slice(int(pr.qo_indptr[i]), int(pr.qo_indptr[i + 1]))
+        for i in range(len(q_lens))
+    ]
+    kv = [
+        slice(int(pr.kv_indptr_rag[i]), int(pr.kv_indptr_rag[i + 1]))
+        for i in range(len(q_lens))
+    ]
+    for i in (0, 2, 4):
+        single = Problem([q_lens[i]], [kv_lens[i]], 32, 8, D, 16, seed=5)
+        single.q = pr.q[rows[i]].clone()
+        single.k_rag = pr.k_rag[kv[i]].clone()
+        single.v_rag = pr.v_rag[kv[i]].clone()
+        o1, l1 = _both(run_ragged_prefill(single, run_kw=LSE))
+        assert torch.equal(l1, full[rows[i]]) and torch.equal(o1, out[rows[i]]), i
+    perm = [3, 0, 4, 1, 2]
+    pp = Problem(
+        [q_lens[i] for i in perm], [kv_lens[i] for i in perm], 32, 8, D, 16, seed=5
+    )
+    pp.q = torch.cat([pr.q[rows[i]] for i in perm]).contiguous()
+    pp.k_rag = torch.cat([pr.k_rag[kv[i]] for i in perm]).contiguous()
+    pp.v_rag = torch.cat([pr.v_rag[kv[i]] for i in perm]).contiguous()
+    _, permuted = _both(run_ragged_prefill(pp, run_kw=LSE))
+    off = 0
+    for i in perm:
+        n = q_lens[i]
+        assert torch.equal(permuted[off : off + n], full[rows[i]]), i
+        off += n
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_lse_decode_batch_invariance(D):
+    """R2 for decode: a request's LSE in a batch of one (a fresh page table) and in a batch of eight is the same bits."""
+    kv = [1024, 4096, 33, 700, 2500, 8192, 1, 1500]
+    pr = Problem([1] * 8, kv, 32, 8, D, 16, seed=6)
+    (_, lse8), _ = run_decode(pr, run_kw=LSE)
+    for i in (0, 1, 5, 6):
+        one = Problem([1], [kv[i]], 32, 8, D, 16, seed=100 + i)
+        one.q = pr.q[i : i + 1].clone()
+        one.k_rag = pr.k_rag[
+            int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])
+        ].clone()
+        one.v_rag = pr.v_rag[
+            int(pr.kv_indptr_rag[i]) : int(pr.kv_indptr_rag[i + 1])
+        ].clone()
+        one = _repack(one)
+        (_, lse1), _ = run_decode(one, run_kw=LSE)
+        assert torch.equal(bits(lse1), bits(lse8[i : i + 1])), i
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_lse_chunked_prefill_equals_full(D):
+    """R4 for incremental prefill: the LSE of a token is the same bits whether its request is prefilled in one shot or in two
+    chunks (the second over the first's cached keys)."""
+    kv = [1700, 1000]
+    cut = [700, 512]
+    full = Problem(kv, kv, 32, 8, D, 16, seed=12)
+    _, lse_full = _both(run_paged_prefill(full, run_kw=LSE))
+    rows = [slice(int(full.qo_indptr[i]), int(full.qo_indptr[i + 1])) for i in range(2)]
+    kv_off = [int(full.kv_indptr_rag[i]) for i in range(2)]
+    c1 = Problem(cut, cut, 32, 8, D, 16, seed=13)
+    c1.q = torch.cat([full.q[rows[i]][: cut[i]] for i in range(2)]).contiguous()
+    c1.k_rag = torch.cat(
+        [full.k_rag[kv_off[i] : kv_off[i] + cut[i]] for i in range(2)]
+    ).contiguous()
+    c1.v_rag = torch.cat(
+        [full.v_rag[kv_off[i] : kv_off[i] + cut[i]] for i in range(2)]
+    ).contiguous()
+    c1 = _repack(c1)
+    c2 = Problem([kv[i] - cut[i] for i in range(2)], kv, 32, 8, D, 16, seed=14)
+    c2.q = torch.cat([full.q[rows[i]][cut[i] :] for i in range(2)]).contiguous()
+    c2.k_rag, c2.v_rag = full.k_rag.clone(), full.v_rag.clone()
+    c2 = _repack(c2)
+    for prob, part in ((c1, 0), (c2, 1)):
+        _, lse_p = _both(run_paged_prefill(prob, run_kw=LSE))
+        _, lse_r = _both(run_ragged_prefill(prob, run_kw=LSE))
+        off = 0
+        for i in range(2):
+            n = cut[i] if part == 0 else kv[i] - cut[i]
+            ref = (
+                lse_full[rows[i]][: cut[i]]
+                if part == 0
+                else lse_full[rows[i]][cut[i] :]
+            )
+            assert torch.equal(lse_p[off : off + n], ref), (D, part, i, "paged")
+            assert torch.equal(lse_r[off : off + n], ref), (D, part, i, "ragged")
+            off += n
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_lse_config_agreement(D):
+    """R3 for the LSE: every kernel site that holds a row's final ``(m, l)`` stores the same bits -- the fused unit's epilogue,
+    the fixup kernel, the in-kernel fold, the Swaps body and (D = 64) the paired placement -- over the configuration space on a
+    prefill-shaped and a decode-shaped batch, in both bases; the output bits stay the wrapper's."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    if D == 64:
+        prefill = Problem([2048, 2048, 1], [4096, 3000, 1000], 32, 8, D, 16, seed=8)
+    else:
+        prefill = Problem(
+            [256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, D, 16, seed=8
+        )
+    decode = Problem([1] * 6, [1024, 4096, 33, 700, 2500, 1], 32, 8, D, 16, seed=42)
+    space = engine.all_valid_configs(D)
+    cfgs = list(space[::7] if D == 64 else space)
+    if D == 64:
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        rings = (2, 3) + ((4,) if arch_smem_cap(prefill.device) >= (300 << 10) else ())
+        cfgs += [replace(two, kv_slots=s) for s in rings]
+    sites = set()
+    for pr in (prefill, decode):
+        ref = {
+            base: _both(run_paged_prefill(pr, run_kw=dict(LSE, lse_base=base)))
+            for base in ("log2", "ln")
+        }
+        for n, cfg in enumerate(cfgs):
+            planned = engine.plan_attention(
+                pr.qo_indptr,
+                pr.kv_indptr,
+                pr.kv_last,
+                32,
+                8,
+                D,
+                16,
+                -1,
+                cfg,
+                None,
+                pr.device,
+            )
+            plan = planned.plan
+            swaps = cfg.small == "swap" and engine.swaps_n_pad(plan) > 0
+            body = "swaps" if swaps else "row"
+            if any(d[6] == 0 for d in plan.desc):
+                sites.add(f"{body}-fused")
+            if plan.fixup_groups:
+                sites.add(f"{body}-fixup")
+            if any(plan.group_inkernel):
+                sites.add(f"{body}-inkernel")
+            if cfg.q2 and plan.num_launch is not None:
+                sites.add("paired")
+            for base in ("log2", "ln") if n % 4 == 0 else ("log2",):
+                got = engine.run_attention(
+                    planned,
+                    pr.q,
+                    pr.k_nhd,
+                    pr.v_nhd,
+                    pr.kv_indptr,
+                    pr.kv_indices,
+                    1.0 / math.sqrt(D),
+                    -1,
+                    "NHD",
+                    None,
+                    cfg,
+                    return_lse=True,
+                    lse_base=base,
+                )
+                out, lse = _both(got)
+                assert torch.equal(out, ref[base][0]), (cfg, base)
+                assert torch.equal(lse, ref[base][1]), (cfg, base)
+    want = {
+        f"{b}-{k}" for b in ("row", "swaps") for k in ("fused", "fixup", "inkernel")
+    }
+    if D == 64:
+        want.add("paired")
+    assert sites >= want, want - sites
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_lse_natural_log_is_the_declared_multiply(D):
+    """``lse_base="ln"`` is ``mul.rn(lse2, fp32(ln 2))`` of the base-2 bits, formed in the kernel: IEEE ``mul`` on the host
+    reproduces it bit for bit."""
+    from flashinfer.attention.batch_invariant.spec import LN2
+
+    pr = Problem([300, 1, 1000, 64], [700, 2500, 2500, 3000], 32, 8, D, 16, seed=43)
+    ln2 = torch.tensor(LN2, dtype=torch.float32)
+    for run in (run_paged_prefill, run_ragged_prefill):
+        _, log2 = run(pr, run_kw=LSE)
+        _, ln = run(pr, run_kw=dict(LSE, lse_base="ln"))
+        assert torch.equal(bits(log2.cpu() * ln2), bits(ln.cpu()))
+
+
+@needs_device
+@pytest.mark.parametrize("kind", [1, 2], ids=["paged", "ragged"])
+def test_lse_layouts_and_buffers(kind):
+    """``lse_layout="HN"`` is the ``(total_q, Hq)`` bits transposed; a caller's ``lse`` buffer is written in place and returned."""
+    pr = Problem([300, 1, 64], [700, 2500, 3000], 32, 8, 128, 16, seed=44)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    total_q = sum(pr.q_lens)
+    for base in ("log2", "ln"):
+        out, nh = w.run(*args, return_lse=True, lse_base=base)
+        assert nh.shape == (total_q, pr.Hq)
+        _, hn = w.run(*args, return_lse=True, lse_base=base, lse_layout="HN")
+        assert hn.shape == (pr.Hq, total_q) and hn.is_contiguous()
+        assert torch.equal(bits(hn), bits(nh.t().contiguous()))
+        buf = torch.full((total_q, pr.Hq), float("nan"), device=pr.device)
+        out_b = torch.empty_like(pr.q)
+        res = w.run(*args, out=out_b, lse=buf, return_lse=True, lse_base=base)
+        assert res[0] is out_b and res[1] is buf
+        assert torch.equal(bits(buf), bits(nh)) and torch.equal(bits(out_b), bits(out))
+        buf_hn = torch.full((pr.Hq, total_q), float("nan"), device=pr.device)
+        res = w.run(*args, lse=buf_hn, return_lse=True, lse_base=base, lse_layout="HN")
+        assert res[1] is buf_hn and torch.equal(bits(buf_hn), bits(hn))
+    # an lse buffer without return_lse is not used, as on the other backends
+    untouched = torch.full((total_q, pr.Hq), float("nan"), device=pr.device)
+    res = w.run(*args, lse=untouched)
+    assert isinstance(res, torch.Tensor) and bool(torch.isnan(untouched).all())
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_lse_deprecated_forward_and_decode_buffer(kind):
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=45)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    out, lse = w.run_return_lse(*args)
+    assert lse.shape == (4, 8)
+    buf = torch.full((4, 8), float("nan"), device=pr.device)
+    res = w.run(*args, lse=buf, return_lse=True)
+    assert res[1] is buf and torch.equal(bits(buf), bits(lse))
+    options = {} if kind == 0 else {"causal": True}
+    out_f, lse_f = w.forward_return_lse(*args, **options)
+    assert torch.equal(bits(out_f), bits(out)) and torch.equal(bits(lse_f), bits(lse))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_lse_graph_replay(D):
+    """A CUDA graph captured after ``plan()`` replays the output and the LSE (kernel and fixup nodes)."""
+    pr = Problem([512, 7, 1000, 1], [4096, 1025, 1000, 6000], 32, 8, D, 16, seed=4)
+    ref_out, ref_lse = _both(run_paged_prefill(pr, run_kw=dict(LSE, lse_base="ln")))
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    out = torch.empty_like(pr.q)
+    lse = torch.empty(pr.q.shape[0], pr.Hq, dtype=torch.float32, device=pr.device)
+    kw = dict(out=out, lse=lse, return_lse=True, lse_base="ln")
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        w.run(pr.q, pr.cache("NHD"), **kw)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            w.run(pr.q, pr.cache("NHD"), **kw)
+    torch.cuda.synchronize()
+    for _ in range(3):
+        out.zero_()
+        lse.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref_out) and torch.equal(bits(lse), ref_lse)
+
+
+@needs_device
+def test_lse_sliding_window():
+    pr = Problem([256, 1, 2000], [1500, 2500, 5000], 32, 8, 128, 16, seed=9)
+    out, lse = _both(run_paged_prefill(pr, window_left=600, run_kw=LSE))
+    (dec, dec_lse), last = run_decode(pr, window_left=600, run_kw=LSE)
+    assert torch.equal(bits(dec), out[last]) and torch.equal(bits(dec_lse), lse[last])
+    _, lse_r = _both(run_ragged_prefill(pr, window_left=600, run_kw=LSE))
+    assert torch.equal(lse_r, lse)
+    assert not torch.equal(lse, _both(run_paged_prefill(pr, run_kw=LSE))[1])
+    _, ref = reference(pr, window_left=600, return_lse=True)
+    _, ln = run_paged_prefill(pr, window_left=600, run_kw=dict(LSE, lse_base="ln"))
+    assert (ln - ref).abs().max().item() < 1e-3 * max(1.0, ref.abs().max().item())
+
+
+@needs_device
+def test_lse_rows_are_never_empty():
+    """Every row of the class sees at least its own key: a request with more query tokens than keys is refused at ``plan()``
+    and a request without query tokens has no LSE row. The term's value at the fold's init state ``(-inf, +0)`` is ``-inf``
+    (``lg2.approx.ftz(+0) = -inf``, ``mul.rn(-inf, c) = -inf``), the value a row without keys would take."""
+    from flashinfer.batch_invariant.sampling.mufu_device import lg2_device
+
+    probe = lg2_device(torch.tensor([0.0, 1.0]))
+    assert torch.equal(bits(probe), bits(torch.tensor([float("-inf"), 0.0])))
+    c = torch.tensor(128**-0.5 / math.log(2.0), dtype=torch.float32)
+    assert (torch.tensor(float("-inf")) * c + probe[0]).item() == float("-inf")
+    pr = Problem([4], [3], 8, 2, 128, 16, seed=46)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        _wrapper_case(1, pr)
+    # a request without query tokens between two others: its neighbours' rows are the rows of the batch without it
+    with_empty = Problem([5, 0, 1], [40, 9, 700], 8, 2, 128, 16, seed=47)
+    out, lse = run_ragged_prefill(with_empty, run_kw=LSE)
+    assert lse.shape == (6, 8) and bool(torch.isfinite(lse).all())
+    without = Problem([5, 1], [40, 700], 8, 2, 128, 16, seed=47)
+    without.q = with_empty.q
+    without.k_rag = torch.cat([with_empty.k_rag[:40], with_empty.k_rag[49:]])
+    without.v_rag = torch.cat([with_empty.v_rag[:40], with_empty.v_rag[49:]])
+    out2, lse2 = run_ragged_prefill(without, run_kw=LSE)
+    assert torch.equal(bits(out2), bits(out)) and torch.equal(bits(lse2), bits(lse))
+    empty = Problem([], [], 8, 2, 128, 16, seed=38)
+    for kind in range(3):
+        w, args, _, _ = _wrapper_case(kind, empty)
+        out, lse = w.run(*args, return_lse=True)
+        assert out.shape == (0, 8, 128) and lse.shape == (0, 8)
+
+
+@needs_device
+@pytest.mark.parametrize("kind", range(3), ids=["decode", "paged", "ragged"])
+def test_lse_buffer_refusals(kind):
+    """A caller's ``lse`` buffer must be a contiguous fp32 tensor of the layout's shape on the wrapper's device whose bytes are
+    disjoint from the output, the queries and the KV cache; anything else raises and the plan stays usable."""
+    pr = Problem([1] * 4, [17, 700, 2500, 1], 8, 2, 128, 16, seed=48)
+    w, args, _, _ = _wrapper_case(kind, pr)
+    out, lse = w.run(*args, return_lse=True)
+    expected = (bits(out).clone(), bits(lse).clone())
+    dev = pr.device
+    k = args[1][0] if kind < 2 else args[1]
+    out_buf = torch.empty_like(pr.q)
+    bad = [
+        torch.empty(4, 8, dtype=torch.float64, device=dev),
+        torch.empty(4, 8, dtype=torch.bfloat16, device=dev),
+        torch.empty(8, 4, dtype=torch.float32, device=dev),
+        torch.empty(32, dtype=torch.float32, device=dev),
+        torch.empty(4, 16, dtype=torch.float32, device=dev)[:, ::2],
+        torch.empty(4, 8, dtype=torch.float32),
+        pr.q.view(torch.float32).reshape(-1)[:32].view(4, 8),
+        k.view(torch.float32).reshape(-1)[:32].view(4, 8),
+    ]
+    for buf in bad:
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.run(*args, lse=buf, return_lse=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.run(
+            *args,
+            out=out_buf,
+            lse=out_buf.view(torch.float32).reshape(-1)[:32].view(4, 8),
+            return_lse=True,
+        )
+    if kind:
+        with pytest.raises(ValueError):
+            w.run(*args, return_lse=True, lse_base="log10")
+        with pytest.raises(ValueError):
+            w.run(*args, return_lse=True, lse_layout="NHD")
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.run(
+                *args,
+                lse=torch.empty(4, 8, dtype=torch.float32, device=dev),
+                return_lse=True,
+                lse_layout="HN",
+            )
+    got = w.run(*args, return_lse=True)
+    assert torch.equal(bits(got[0]), expected[0])
+    assert torch.equal(bits(got[1]), expected[1])
+    from flashinfer.attention.batch_invariant import engine
+
+    planned = engine.plan_attention(
+        pr.qo_indptr, pr.kv_indptr, pr.kv_last, 8, 2, 128, 16, -1, None, None, dev
+    )
+    eargs = (planned, pr.q, pr.k_nhd, pr.v_nhd, pr.kv_indptr, pr.kv_indices)
+    eargs += (128**-0.5,)
+    for buf in bad[:3]:
+        with pytest.raises(ValueError):
+            engine.run_attention(*eargs, lse=buf, return_lse=True)
+    with pytest.raises(ValueError):
+        engine.run_attention(*eargs, return_lse=True, lse_base="e")
+
+
 @needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     pr = Problem([64], [700], 32, 8, 128, 16, seed=10)
@@ -1084,8 +1629,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         causal=True,
         **kw,
     )
-    with pytest.raises(bi.BatchInvariantUnsupportedError):
-        w.run(pr.q, pr.cache("NHD"), return_lse=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         w.run(pr.q, pr.cache("NHD"), k_scale=2.0)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
