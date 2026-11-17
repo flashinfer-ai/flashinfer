@@ -2855,7 +2855,7 @@ def test_source_public_api_signatures_are_stable():
         False,
         False,
         torch.int64,
-        "cute",
+        "auto",
     )
     assert _signature_contract(module.SSDCombined) == tuple(
         zip(
@@ -3065,7 +3065,10 @@ def test_source_public_constructor_forwards_complete_cake_contract(monkeypatch):
     assert runner._backend == "cake"
     assert runner._cake_runner.__class__ is CakeRunner
 
-    with pytest.raises(ValueError, match="backend must be 'cute' or 'cake'"):
+    with pytest.raises(
+        ValueError,
+        match=r"backend must be one of \('auto', 'specialized', 'cute', 'cake'\)",
+    ):
         module.SSDCombined(128, 8, 64, 128, 8, backend="unknown")
 
 
