@@ -130,9 +130,9 @@ struct Cfg {
   static constexpr int BarOFree = BarOFull + 1;        // 1: O-owning threads read the final O
   static constexpr int BarODone = BarOFree + 1;  // PStages ring: PV commit after every step's MMAs
   static constexpr int BarPFull =
-      BarODone + PStages;  // PStages (EarlyS): all softmax threads, P[s] (and O rescale) done
+      BarODone + PStages;  // PStages: all softmax threads, P[s] (and O rescale) done
   static constexpr int BarPCons =
-      BarPFull + PStages;  // PStages (!EarlyS): PV warp, P[s] captured by issued MMAs
+      BarPFull + PStages;  // PStages (!EarlyS): PV commit, the MMAs reading P[s] are complete
   static_assert(BarPCons + PStages <= kNumBars, "barrier storage");
   // tcgen05 instruction descriptor: D F32, A/B E4M3, K-major, M=128, N=16G.
   static constexpr uint32_t Idesc = (1u << 4) | ((uint32_t(N) >> 3) << 17) | ((128u >> 4) << 24);
@@ -1112,12 +1112,11 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
           asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         }
         // Tell the PV warp that this part of P (and any O rescale) is complete (without EarlyS this
-        // also releases S).
+        // also releases S). P readiness has its own PStages ring: with PStages > Stages, the S ring
+        // can complete a phase twice before PV observes it.
         tcFenceBefore();
-        if constexpr (C::EarlyS)
-          mbarArrive(&bars[C::BarPFull + sIt % C::PStages]);
-        else
-          mbarArrive(&bars[C::BarSEmpty + sStage]);
+        mbarArrive(&bars[C::BarPFull + sIt % C::PStages]);
+        if constexpr (!C::EarlyS) mbarArrive(&bars[C::BarSEmpty + sStage]);
         ++sIt;
 #pragma unroll
         for (int lt = 0; lt < C::TokPerGrp; ++lt) {
@@ -1238,8 +1237,8 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
             mbarWait(&bars[C::BarSEmpty + prevS % C::Stages], (prevS / C::Stages) & 1u);
           }
         } else {
-          // PV publishes that P[s] has been captured before QK makes S[s + Stages] available to
-          // softmax, which may overwrite the same probability buffer.
+          // PV publishes that the MMAs reading P[s] are complete before QK makes S[s + PStages]
+          // available to softmax, which overwrites the same probability buffer.
           if (C::PStages > C::Stages && sIt >= C::Stages) {
             // S[sIt - Stages] has been read by the softmax (P lags further behind).
             uint32_t const prevS = sIt - C::Stages;
@@ -1320,10 +1319,7 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
       int const numSteps = seg.numPages / C::SP;
       if (numSteps == 0) continue;
       for (int t = 0; t < numSteps; ++t) {
-        if constexpr (C::EarlyS)
-          mbarWait(&bars[C::BarPFull + pIt % C::PStages], (pIt / C::PStages) & 1u);
-        else
-          mbarWait(&bars[C::BarSEmpty + pIt % C::Stages], (pIt / C::Stages) & 1u);
+        mbarWait(&bars[C::BarPFull + pIt % C::PStages], (pIt / C::PStages) & 1u);
         tcFenceAfter();
         uint32_t const pSlot = pIt % C::PStages;
         uint8_t const* pStage = smem + C::SmemP + pSlot * C::PStageBytes;
@@ -1360,8 +1356,12 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
         }
         if (electOne()) tcCommit(&bars[C::BarODone + pIt % C::PStages]);
         __syncwarp();
-        if (!C::EarlyS && static_cast<int>(pIt) + C::PStages < totalSteps && lane == 0)
-          mbarArrive(&bars[C::BarPCons + pIt % C::PStages]);
+        // P[pSlot] may be overwritten once the MMAs that read it complete (tcgen05.mma is
+        // asynchronous, so issuing them is not enough).
+        if (!C::EarlyS && static_cast<int>(pIt) + C::PStages < totalSteps) {
+          if (electOne()) tcCommit(&bars[C::BarPCons + pIt % C::PStages]);
+          __syncwarp();
+        }
         if (t == numSteps - 1) {
           if (electOne()) tcCommit(&bars[C::BarOFull]);
           __syncwarp();

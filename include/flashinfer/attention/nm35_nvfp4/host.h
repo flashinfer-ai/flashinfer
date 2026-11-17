@@ -97,6 +97,8 @@ inline std::string layoutReason(Call const& c) {
   if (c.maxKv > c.maxPagesPerSeq * kPageSize)
     return "max KV length " + std::to_string(c.maxKv) + " exceeds the page table";
   if (!c.out || !c.pageTable || !c.seqLensKv) return "missing output, page table or KV lengths";
+  // The decode combine kernels store the output as 4-byte words.
+  if (!aligned(c.out, 4)) return "output pointer not 4-byte aligned";
   // TMA descriptors and vector loads need 16-byte aligned bases and strides.
   for (void const* ptr : {c.q, c.k, c.v, c.kSf, c.vSf})
     if (!aligned(ptr, 16)) return "Q/KV pointer null or not 16-byte aligned";

@@ -127,7 +127,7 @@ struct Cfg {
   static constexpr int BarOFree = BarOFull + 1;        // 1: O-owning threads read the final O
   static constexpr int BarODone = BarOFree + 1;  // PStages ring: PV commit after every step's MMAs
   static constexpr int BarPCons =
-      BarODone + PStages;  // PStages: PV warp, P[s] captured by issued MMAs
+      BarODone + PStages;  // PStages: PV commit, the MMAs reading P[s] are complete
   static_assert(BarPCons + PStages <= kNumBars, "barrier storage");
   // tcgen05 instruction descriptor: D F32, A/B E4M3, K-major, M=128, N=16G.
   static constexpr uint32_t Idesc = (1u << 4) | ((uint32_t(N) >> 3) << 17) | ((128u >> 4) << 24);
@@ -1096,8 +1096,8 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
       tcFenceAfter();
       uint64_t const qDesc = smemDescSw128(smem + C::SmemQ + (qIt % 2) * C::QStageBytes);
       for (int t = 0; t < numSteps; ++t) {
-        // PV publishes that P[s] has been captured before QK makes S[s + Stages] available to
-        // softmax, which may overwrite the same probability buffer.
+        // PV publishes that the MMAs reading P[s] are complete before QK makes S[s + PStages]
+        // available to softmax, which overwrites the same probability buffer.
         if (C::PStages > C::Stages && sIt >= C::Stages) {
           // S[sIt - Stages] has been read by the softmax (P lags further behind).
           uint32_t const prevS = sIt - C::Stages;
@@ -1219,8 +1219,12 @@ __device__ __forceinline__ void nvfp4PagedDecodeBody(DecodeParams const& p) {
           if (electOne()) tcCommit(&bars[C::BarOFull]);
           __syncwarp();
         }
-        if (static_cast<int>(pIt) + C::PStages < totalSteps && lane == 0)
-          mbarArrive(&bars[C::BarPCons + pIt % C::PStages]);
+        // P[pSlot] may be overwritten once the MMAs that read it complete (tcgen05.mma is
+        // asynchronous, so issuing them is not enough).
+        if (static_cast<int>(pIt) + C::PStages < totalSteps) {
+          if (electOne()) tcCommit(&bars[C::BarPCons + pIt % C::PStages]);
+          __syncwarp();
+        }
         ++pIt;
       }
       ++segDone;

@@ -798,7 +798,9 @@ def test_prefill_causal_range():
 def test_prefill_tail_only_schedule():
     q_len = _tail_only_q_len()
     torch.manual_seed(q_len)
-    inputs = _make_inputs([2000 + q_len], q_len, sharpness=4.0)
+    # The prefill kernel serves only KV lengths above 8192 (fewer SMs mean a shorter q_len).
+    prefix_len = max(2000, nm35.TRTLLM_GEN_MAX_KV_LEN + 1 - q_len)
+    inputs = _make_inputs([prefix_len + q_len], q_len, sharpness=4.0)
     _check_prefill(inputs, q_len)
 
 

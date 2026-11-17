@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 #include <tvm/ffi/container/variant.h>
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 
@@ -155,6 +156,10 @@ std::string readCall(nm35::Call& c, TensorView const& out, TensorView const& que
   if (auto tensor = bmm1_scale.as<ffi::Tensor>()) {
     c.scaleSoftmaxLog2Ptr = static_cast<float const*>(tensor.value().data_ptr());
   } else if (auto value = bmm1_scale.as<double>()) {
+    // The kernels mask with a large negative finite score, which a zero or negative scale would
+    // turn into a visible one; trtllm-gen serves such calls.
+    if (!(value.value() > 0.0) || !std::isfinite(value.value()))
+      return "bmm1_scale is not positive and finite";
     c.scaleSoftmaxLog2 = static_cast<float>(value.value() * flashinfer::math::log2e_d);
   } else {
     return "bmm1_scale is neither a float nor a tensor";
