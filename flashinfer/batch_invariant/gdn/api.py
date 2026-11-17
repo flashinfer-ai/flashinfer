@@ -42,7 +42,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 import torch
 
 from ..support import check_device, unsupported
-from .pool import get_pool
+from .pool import capturing, get_pool
 from .spec import CHUNK, CLASS, GDN_ARCHS, HEAD_DIM, uses_step_kernel
 
 _IO = torch.bfloat16
@@ -308,7 +308,7 @@ def chunk_gated_delta_rule_batch_invariant(
         (b - a) % CHUNK for a, b in zip(offs, offs[1:], strict=False)
     )
     slot_list = None
-    if not (whole and torch.cuda.is_current_stream_capturing()):
+    if not (whole and capturing(dev)):
         slot_list = slots.tolist()
         if (
             len(set(slot_list)) != N

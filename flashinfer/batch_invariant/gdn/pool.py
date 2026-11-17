@@ -54,13 +54,21 @@ def pool_key(pool: torch.Tensor) -> Tuple[int, int, int, torch.device]:
     )
 
 
+def capturing(device: torch.device) -> bool:
+    """Whether a CUDA graph capture is open on ``device`` (which need not be the current device)."""
+    if device.index is None or device.index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
 def get_pool(pool: torch.Tensor, num_q_heads: int) -> "GdnPool":
     """The class's state next to ``pool`` (created on first use for every slot the pool's storage can hold from the
     pool's offset, released when that storage is freed, so any view of a long-lived buffer keeps its state)."""
     key = pool_key(pool)
     gp = _POOLS.get(key)
     if gp is None:
-        if torch.cuda.is_current_stream_capturing():
+        if capturing(pool.device):
             raise RuntimeError(
                 "the first call on a pool allocates the class's state next to it: run it outside the CUDA graph"
                 " capture"
@@ -205,7 +213,7 @@ class GdnPool:
         work = [(s, n) for s, n in self.pending.items() if s < limit]
         if not work:
             return
-        if torch.cuda.is_current_stream_capturing():
+        if capturing(self.device):
             raise RuntimeError(
                 "a slot of this pool holds a prefill's open tail: run the first call after the prefill outside the"
                 " CUDA graph capture"
