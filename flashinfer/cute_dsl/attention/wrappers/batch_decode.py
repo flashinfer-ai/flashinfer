@@ -998,6 +998,10 @@ class BatchDecodeCuteDSLWrapper:
             raise ValueError(
                 f"k.shape={tuple(k.shape)} must equal v.shape={tuple(v.shape)}"
             )
+        if 0 < s_k < s_q:
+            raise ValueError(
+                f"non-zero K/V seqlen({s_k}) must be at least query seqlen({s_q})"
+            )
 
         device = q.device
         # Atomic reduction accumulates into out via atomic_add and requires

@@ -428,7 +428,9 @@ class GroupedQueryAttentionDecode:
         q_stage_bits = tiles_dk * mma_tile_n * mma_tile_k * mma_dtype.width
         o_stage_bits = tiles_dm * mma_tile_m * mma_tile_n * o_smem_dtype.width
         qo_stage_bits = max(q_stage_bits, o_stage_bits)  # alias QO stages
-        smem_alloc_bits += q_stages * qo_stage_bits + mbarrier_bits  # 1 mbar for Q
+        smem_alloc_bits += (
+            q_stages * qo_stage_bits + q_stages * 2 * mbarrier_bits
+        )  # producer + consumer mbar per Q stage
         # S, P
         smem_alloc_bits += s_stages * pipe_stage_bits  # s in tmem
         smem_alloc_bits += p_stages * (tiles_sm * mn_stage_bits + pipe_stage_bits)
@@ -805,7 +807,10 @@ class GroupedQueryAttentionDecode:
         )
         iters_s = cute.ceil_div(tiles_s - kv_split_idx, kv_splits)
         prefetch_iters = min(2, self.s_stages - 1)  # MMA KQ iters to hide first softmax
-        exit_early = not is_persistent and kv_split_idx >= tiles_s
+        # With a uniform KV length of 0 or at least the query length,
+        # tiles_s is either 0 for every work tile or nonzero for every one,
+        # so safe to exit early even if persistent kernel.
+        exit_early = kv_split_idx >= tiles_s
         lane_store_max = blk_tile_n == warp_threads or lane_idx < blk_tile_n
 
         ##############################
@@ -1111,9 +1116,11 @@ class GroupedQueryAttentionDecode:
         # Exit early
         ##############################
         if exit_early:
-            if warpgroup_idx == correction_warpgroup_id:
-                sM_final_nbar.arrive()
-                sL_final_nbar.arrive()
+            # Only the non-persistent reduction warp waits on these.
+            if cutlass.const_expr(not is_persistent):
+                if warpgroup_idx == correction_warpgroup_id:
+                    sM_final_nbar.arrive()
+                    sL_final_nbar.arrive()
 
         ##############################
         # TMA KV Dispatch
