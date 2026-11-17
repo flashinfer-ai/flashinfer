@@ -838,6 +838,8 @@ extern "C" __global__ void k_scatter(const int* __restrict__ ids, int* __restric
     }                                                                       \
   }
 
+constexpr int fc1_wmma_smem(int BM, int BN) { return 1024 + BM * 128 + BN * 128; }
+
 template <int BM, int BN, int THREADS>
 __global__ __launch_bounds__(THREADS) void fc1_wmma(
     const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__ W13,
@@ -853,7 +855,12 @@ __global__ __launch_bounds__(THREADS) void fc1_wmma(
   const int e = tk.x, start = tk.y;
   const int rows = min(BM, off[e] + cnt[e] - start);
 
-  __shared__ __align__(1024) unsigned char swg1[1024 + BM * 128 + BN * 128];
+  // Dynamic shared memory (sized by fc1_wmma_smem at the launch site): the
+  // <128, 256> variant needs 50,176 bytes, over the 48 KiB static-smem
+  // ptxas limit on sm_90a — a static array is a hard build error on CUDA
+  // 12.x toolkits. The over-48 KiB variant is opted in with
+  // cudaFuncAttributeMaxDynamicSharedMemorySize before launch.
+  extern __shared__ __align__(1024) unsigned char swg1[];
   int* sPair = (int*)swg1;
   int* sTok = sPair + BM;
   __half* sA = (__half*)(swg1 + 1024);
@@ -1193,16 +1200,19 @@ void launch_moe_grouped(const void* X, const void* W13, const float* W13S, const
     k_prefix<64><<<1, 288, 0, st>>>(cnt, off, cur, toff, tasks, E);
   k_scatter<<<(pairs + 255) / 256, 256, 0, st>>>(ids, cur, order, pairs);
 
-  if (wide_m)
-    fc1_wmma<128, 256, 512><<<max_tasks * ((2 * I) / 256), 512, 0, st>>>(
+  if (wide_m) {
+    constexpr int FC1_SMEM = fc1_wmma_smem(128, 256);
+    cudaFuncSetAttribute(fc1_wmma<128, 256, 512>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         FC1_SMEM);
+    fc1_wmma<128, 256, 512><<<max_tasks * ((2 * I) / 256), 512, FC1_SMEM, st>>>(
         (const __nv_bfloat16*)X, (const uint8_t*)W13, W13S, order, cnt, off, toff, tasks,
         (__nv_bfloat16*)raw, H, 2 * I, KTOP, Sh1, Sn1, E);
-  else if (wide_n)
-    fc1_wmma<64, 256, 256><<<max_tasks * ((2 * I) / 256), 256, 0, st>>>(
+  } else if (wide_n)
+    fc1_wmma<64, 256, 256><<<max_tasks * ((2 * I) / 256), 256, fc1_wmma_smem(64, 256), st>>>(
         (const __nv_bfloat16*)X, (const uint8_t*)W13, W13S, order, cnt, off, toff, tasks,
         (__nv_bfloat16*)raw, H, 2 * I, KTOP, Sh1, Sn1, E);
   else
-    fc1_wmma<64, 128, 128><<<max_tasks * ((2 * I) >> 7), 128, 0, st>>>(
+    fc1_wmma<64, 128, 128><<<max_tasks * ((2 * I) >> 7), 128, fc1_wmma_smem(64, 128), st>>>(
         (const __nv_bfloat16*)X, (const uint8_t*)W13, W13S, order, cnt, off, toff, tasks,
         (__nv_bfloat16*)raw, H, 2 * I, KTOP, Sh1, Sn1, E);
   k_silu<<<pairs, 128, 0, st>>>((const __nv_bfloat16*)raw, (__nv_bfloat16*)Hb, I, pairs);

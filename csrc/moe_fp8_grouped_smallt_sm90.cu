@@ -386,7 +386,10 @@ void launch_moe_grouped(const void* X, const void* W13, const float* W13S, const
   k_prefix<128><<<1, 288, 0, st>>>(cnt, off, cur, toff, tasks, E);
   k_scatter<<<(pairs + 255) / 256, 256, 0, st>>>(ids, cur, order, pairs);
 
-  fc1_wmma<128, 256, 512><<<task_bound * ((2 * I) / 256), 512, 0, st>>>(
+  constexpr int FC1_SMEM = fc1_wmma_smem(128, 256);
+  cudaFuncSetAttribute(fc1_wmma<128, 256, 512>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       FC1_SMEM);
+  fc1_wmma<128, 256, 512><<<task_bound * ((2 * I) / 256), 512, FC1_SMEM, st>>>(
       (const __nv_bfloat16*)X, (const uint8_t*)W13, W13S, order, cnt, off, toff, tasks,
       (__nv_bfloat16*)raw, H, 2 * I, KTOP, Sh1, Sn1, E);
 
