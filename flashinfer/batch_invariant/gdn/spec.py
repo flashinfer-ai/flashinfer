@@ -28,7 +28,7 @@ HEAD_DIM = 128
 GDN_ARCHS = ((10, 0), (10, 3), (10, 7))
 #: Calls with fewer tokens per sequence than this run in the step kernel alone.
 STEP_MAX_TOKENS = CHUNK
-#: The kernel sources the fingerprint digests (package-relative, and relative to the C++ include directory).
+#: The sources the fingerprint digests (package-relative, and relative to the C++ include and csrc directories).
 TERM_SOURCES = (
     "gdn_kernels/blackwell/gated_delta_net_chunked.py",
     "gdn_kernels/qk_l2norm.py",
@@ -36,6 +36,7 @@ TERM_SOURCES = (
     "jit/gdn_batch_invariant.py",
 )
 TERM_INCLUDES = ("flashinfer/gdn/batch_invariant_decode.cuh",)
+TERM_CSRC = ("gdn_batch_invariant.cu",)
 
 
 def boundary(p: int) -> int:
@@ -82,6 +83,10 @@ def source_digest() -> str:
         (rel, os.path.join(str(jit_env.FLASHINFER_INCLUDE_DIR), rel))
         for rel in TERM_INCLUDES
     ]
+    paths += [
+        (f"csrc/{rel}", os.path.join(str(jit_env.FLASHINFER_CSRC_DIR), rel))
+        for rel in TERM_CSRC
+    ]
     for rel, path in paths:
         with open(path, "rb") as f:
             h.update(rel.encode())
@@ -91,9 +96,9 @@ def source_digest() -> str:
 
 @functools.lru_cache(maxsize=None)
 def spec_fingerprint() -> str:
-    """Identifier of the class: the class constants and the digest of the kernel sources listed in ``TERM_SOURCES`` and
-    ``TERM_INCLUDES`` (the kernels are hand-written, so their source is the dataflow; an edit to one of those files
-    renames the class, an edit to a module they import does not)."""
+    """Identifier of the class: the class constants and the digest of the kernel sources listed in ``TERM_SOURCES``,
+    ``TERM_INCLUDES`` and ``TERM_CSRC`` (the kernels are hand-written, so their source is the dataflow; an edit to one
+    of those files renames the class, an edit to a module they import does not)."""
     parts = [
         f"class={CLASS}",
         f"chunk={CHUNK}",
