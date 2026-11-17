@@ -1,19 +1,27 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The grouped GEMM kernel body on the dense blocks (bf16 operands): the dense blocks (operands, TMA ring, the
-per-instruction MMA fold, TMEM lifecycle) under the group scheduler, with per-tile TMA coordinates (A offset by the
-group's rows through ``cute.domain_offset``, B indexed by the expert as the batch coordinate) and the group-masked
-epilogue.
+"""The grouped GEMM kernel body on the dense blocks: the dense blocks (operands, TMA ring, the per-instruction MMA fold,
+TMEM lifecycle) under the group scheduler, with per-tile TMA coordinates (A offset by the group's rows through
+``cute.domain_offset``, B indexed by the expert as the batch coordinate) and the group-masked epilogue.
+
+One body for the bf16 and the fp8 per-tensor classes: the operand block (:class:`DenseOperands`, keyed by the chain's
+operand format: the format's dtype, alignment, K-steps per stage, mainloop block and static plan) and the epilogue block
+(the chain, :class:`.epilogue.GroupedEpilogueBlock`: the bf16 chains, or the W8A8 chains with the per-expert weight scales,
+the A operand's scale and the intermediate multiplier as further operands) are resolved at trace time, so every
+format-dependent choice is a ``const_expr`` branch and each format compiles to its own kernel.
 
 Operands: A ``(Tk, K, 1)`` K-major (the permuted activations), B ``(N, K, E)`` K-major (the stacked expert weights,
 ``l`` = expert), out ``(Tk, Nout)`` row-major (``Nout = N`` for the plain and the ungated chains, ``N / 2`` for the
-gated chain; bf16 / f16 / f32), ``counts (E,)`` int32 (tokens per expert, in group order). The group's rows are
-``[off_e, off_e + counts[e])`` with ``off`` the exclusive prefix of ``counts`` (the dense packing).
+gated chain; bf16 / f16 / f32, or the uint8 bytes of e4m3 for the fp8 classes' GEMM1), ``counts (E,)`` int32 (tokens per
+expert, in group order); for a chain with scale operands ``alpha (E,)`` fp32 (``s_w[e]``), ``sa (1,)`` fp32 (``s_x`` /
+``s_inter``), ``si (1,)`` fp32 (``m_inter``). The group's rows are ``[off_e, off_e + counts[e])`` with ``off`` the
+exclusive prefix of ``counts`` (the dense packing).
 """
 
 from __future__ import annotations
 
-from typing import Union
+from dataclasses import dataclass
+from typing import Dict, Optional, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -27,6 +35,7 @@ from cutlass.tensor_utils import LayoutEnum
 from ....gemm.batch_invariant.blocks.mainloop import mma_loop
 from ....gemm.batch_invariant.blocks.operands import (
     ACC_DTYPE,
+    ALIGN,
     BAR_TMEM_ALLOC,
     IN_DT,
     StaticPlan,
@@ -36,6 +45,7 @@ from ....gemm.batch_invariant.generator import Knobs, MainloopBlock
 from .epilogue import (
     BAR_EPI_JOIN,
     GroupedChain,
+    GroupedEpilogueBlock,
     grouped_epilogue_loop,
     staged_store,
     staging_bytes,
@@ -56,20 +66,89 @@ CHAINS = ("plain", "swiglu", "relu2")
 # is one), halving the pipeline round trips per weight byte of a decode tile; a placement of the same fold (the lowering's inner
 # radix; Lean's ``kblockLoopG_eq_kfoldG`` holds for every radix)
 GROUPED_K_BLOCKS = 8
+#: Instruction K-steps per smem stage by body and operand format (``None``: the format's default, one swizzle atom of K):
+#: the bf16 grouped body and both formats' swapped box bodies stream two atoms per stage, the e4m3 grouped body the
+#: format's default, the gather form one atom (the gather4 box is the atom).
+K_BLOCKS_OF: Dict[str, Dict[str, Optional[int]]] = {
+    "grouped": {"bf16": GROUPED_K_BLOCKS, "e4m3": None},
+    "swapped": {"bf16": GROUPED_K_BLOCKS, "e4m3": GROUPED_K_BLOCKS},
+    "gather": {"bf16": None},
+}
 EPILOGUE_WARPS, MMA_WARP, TMA_WARP, THREADS = warp_roles(EPI_WARPGROUPS_DENSE)
 
 
+@dataclass(frozen=True)
+class DenseOperands:
+    """The operand block of the dense formats (``bf16`` / ``e4m3``): the format's operand dtype and alignment, the K-steps
+    per smem stage of each body (:data:`K_BLOCKS_OF`), the mainloop block whose lowering ``mma_loop`` executes and the
+    static plan (tiled MMA, tilers, stages, smem layouts); the TMA ring is the dense GEMM's (one A and one B box per
+    stage, ``TmaSetup``), the smem beyond the ring is the group tables' and the epilogue's. A block-scaled operand block
+    (a scale-factor ring beside the operand ring, the padded packing of its groups, its own extra smem and operands)
+    implements this surface for :class:`GroupedBlockGemm` and :class:`.swap.SwappedGroupedGemm`."""
+
+    in_fmt: str = "bf16"
+
+    def __post_init__(self):
+        assert self.in_fmt in K_BLOCKS_OF["grouped"], self.in_fmt
+
+    @property
+    def dtype(self):
+        return IN_DT[self.in_fmt]
+
+    @property
+    def align(self) -> int:
+        """Elements per 16-byte row: the TMA alignment of every operand."""
+        return ALIGN[self.in_fmt]
+
+    def k_blocks(self, body: str) -> Optional[int]:
+        return K_BLOCKS_OF[body][self.in_fmt]
+
+    def mainloop(self, body: str) -> MainloopBlock:
+        """The generator's mainloop block for the format and body: its lowering (blocked issue order, accumulator reset) is
+        what ``mma_loop`` executes (the override by name: the block's overrides are siblings, never positional)."""
+        return MainloopBlock(self.in_fmt, inner_steps=self.k_blocks(body))
+
+    def plan(self, knobs: Knobs, a, b, extra_smem_bytes: int, body: str) -> StaticPlan:
+        """The static plan of a body for the operands ``a`` / ``b`` (their dtypes and majors); the accumulator-side "C" is
+        fp32 row-major and only sizes the epilogue tile; ``extra_smem_bytes`` is the caller's own shared storage."""
+        assert a.element_type is self.dtype and b.element_type is self.dtype, (
+            a.element_type,
+            b.element_type,
+            self.in_fmt,
+        )
+        return StaticPlan(
+            knobs,
+            a.element_type,
+            b.element_type,
+            ACC_DTYPE,
+            LayoutEnum.from_tensor(a).mma_major_mode(),
+            LayoutEnum.from_tensor(b).mma_major_mode(),
+            LayoutEnum.ROW_MAJOR,
+            c_in_smem=False,
+            extra_smem_bytes=extra_smem_bytes,
+            in_fmt=self.in_fmt,
+            k_blocks=self.k_blocks(body),
+        )
+
+
 class GroupedBlockGemm:
-    """``out[p, n] = chain(sum_k A[p, k] B[n, k, e(p)])`` for every row ``p`` of every group. The persistent grid
-    (``max_active_clusters``, in clusters) is a dynamic launch argument: which cluster computes a tile, never the bits."""
+    """``out[p, n] = chain(sum_k A[p, k] B[n, k, e(p)])`` for every row ``p`` of every group (with the fp8 classes' chains
+    ``alpha = mul(sa[0], alpha[e(p)])`` scales the accumulators). The persistent grid (``max_active_clusters``, in
+    clusters) is a dynamic launch argument: which cluster computes a tile, never the bits. The chain's operand format
+    selects the operand block; a chain with scale operands launches through :meth:`with_scales`."""
 
     def __init__(
-        self, knobs: Knobs, chain: Union[str, GroupedChain], out_fmt: str = "bf16"
+        self,
+        knobs: Knobs,
+        chain: Union[str, GroupedEpilogueBlock],
+        out_fmt: str = "bf16",
     ):
         if isinstance(chain, str):  # the bf16 class's names
             chain = GroupedChain.legacy(chain, out_fmt)
-        assert isinstance(chain, GroupedChain), chain
+        assert isinstance(chain, GroupedEpilogueBlock), chain
         self.knobs, self.chain, self.out_fmt = knobs, chain, chain.out_fmt
+        self.in_fmt = chain.in_fmt
+        self.operands = DenseOperands(self.in_fmt)
         self.cluster_shape_mn = knobs.cluster_shape_mn
 
     @cute.jit
@@ -82,31 +161,40 @@ class GroupedBlockGemm:
         max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self._launch(a, b, out, counts, max_active_clusters, stream)
+        """The entry of the chains without scale operands (the bf16 classes)."""
+        assert not self.chain.scale_operands, self.chain
+        self._launch(a, b, out, counts, max_active_clusters, stream, None, None, None)
+
+    @cute.jit
+    def with_scales(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        out: cute.Tensor,
+        counts: cute.Tensor,
+        alpha: cute.Tensor,
+        sa: cute.Tensor,
+        si: cute.Tensor,
+        max_active_clusters: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        """The entry of the chains with scale operands (the fp8 per-tensor classes): ``alpha (E,)`` the per-expert weight
+        scales, ``sa (1,)`` the A operand's scale, ``si (1,)`` the intermediate multiplier."""
+        assert self.chain.scale_operands, self.chain
+        self._launch(a, b, out, counts, max_active_clusters, stream, alpha, sa, si)
 
     # host side (trace time)
-    def _launch(self, a, b, out, counts, max_active_clusters, stream):
+    def _launch(self, a, b, out, counts, max_active_clusters, stream, alpha, sa, si):
         if cutlass.const_expr(a.element_type != b.element_type):
             raise TypeError(
                 f"A and B must have one type: {a.element_type} != {b.element_type}"
             )
-        assert a.element_type is IN_DT["bf16"], a.element_type
-        # the accumulator-side "C" of the static plan is fp32 row-major: it only sizes the epilogue tile; the ring leaves room
-        # for the group tables and the epilogue staging buffers
+        # the ring leaves room for the group tables and the epilogue staging buffers
         self.staged = staged_store(self.chain.out_fmt)
 
         def plan(extra: int) -> StaticPlan:
-            return StaticPlan(
-                self.knobs,
-                a.element_type,
-                b.element_type,
-                ACC_DTYPE,
-                LayoutEnum.from_tensor(a).mma_major_mode(),
-                LayoutEnum.from_tensor(b).mma_major_mode(),
-                LayoutEnum.ROW_MAJOR,
-                c_in_smem=False,
-                extra_smem_bytes=TABLE_SMEM_BYTES + extra,
-                k_blocks=GROUPED_K_BLOCKS,
+            return self.operands.plan(
+                self.knobs, a, b, TABLE_SMEM_BYTES + extra, "grouped"
             )
 
         st = plan(0)
@@ -120,11 +208,7 @@ class GroupedBlockGemm:
             if self.staged
             else st.a_smem_layout_staged
         )
-        # the generator's mainloop block for the format: its lowering (blocked issue order, accumulator reset) is what
-        # mma_loop executes
-        self.block = MainloopBlock(
-            "bf16", inner_steps=GROUPED_K_BLOCKS
-        )  # the override by name: the block's overrides are siblings, never positional
+        self.block = self.operands.mainloop("grouped")
         self.lowering = self.block.lowering()
         assert st.mma_tiler[2] == self.block.k_block, (st.mma_tiler, self.block.k_block)
         tma = TmaSetup(st, a, b, None)
@@ -144,6 +228,9 @@ class GroupedBlockGemm:
             st.b_smem_layout_staged,
             st.epi_tile,
             self.c_smem_layout_staged,
+            alpha,
+            sa,
+            si,
         ).launch(
             grid=grid,
             block=[THREADS, 1, 1],
@@ -168,6 +255,9 @@ class GroupedBlockGemm:
         b_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
         c_smem_layout_staged,
+        mAlpha: cute.Tensor = None,
+        mSa: cute.Tensor = None,
+        mSi: cute.Tensor = None,
     ):
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -240,8 +330,8 @@ class GroupedBlockGemm:
         s_pre = storage.group_pre.get_tensor(cute.make_layout((MAX_E + 1,)))
         cluster_rows = st.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
         # programmatic dependent launch: the prologue above (descriptor prefetch, barrier init, the pipelines) depends on no
-        # predecessor; the wait sits before the first dependent read (counts: the group tables, then the operands), and the
-        # trigger placement (pdl.py) follows it
+        # predecessor; the wait sits before the first dependent read (counts: the group tables, then the operands and the
+        # scales), and the trigger placement (pdl.py) follows it
         cute.arch.griddepcontrol_wait()
         pdl.trigger_early()
         if warp_idx == EPILOGUE_WARPS[0]:
@@ -416,6 +506,9 @@ class GroupedBlockGemm:
                 EPI_WARPGROUPS_DENSE,
                 sC=sC,
                 cta_v=mma_tile_coord_v,
+                mAlpha=mAlpha,
+                mSa=mSa,
+                mSi=mSi,
             )
             tmem.relinquish_alloc_permit()
             # the allocator warp alone frees the columns: every epilogue warpgroup joins here after its last TMEM load (the

@@ -12,7 +12,9 @@ and the chains around them.
 * ``s = sum_j e_j``: the ``add`` tree with the same digits (elem fold from ``+0``).
 * outputs: ``p_j = cvt(mul(e_j, div(1, s)))`` in the input format (softmax); ``lse = mul(add(mul(m, c), LG2(s)), LN2)``
   with ``LG2 = lg2.approx.ftz.f32`` (opaque), natural base; ``logp_j = mul(add(z_j, neg(LG2(s))), LN2)`` (the natural
-  log-probability of element ``j``: the log-softmax row, and the log-probability of a given token id).
+  log-probability of element ``j``: the log-softmax row, and the log-probability of a given token id);
+  ``cvt(logp_j)`` in the input format: the 16-bit log-softmax output member (``Mode.logprobs_cvt``, the trainers'
+  ``aten::_log_softmax(bf16) -> bf16`` shape; its own fingerprint, ``spec_fingerprint(..., logprobs_cvt=True)``).
 
 NaN propagates through the sum (``fmaxc`` drops it from the max). A ``-inf`` logit contributes ``EX2(-inf) = +0``.
 Elements beyond the row are absent from the trees; a kernel fills them with ``-inf`` (max identity; ``EX2(-inf) = +0``
@@ -162,6 +164,9 @@ class Mode:
     lse: bool = False
     logp: bool = False
     probs_f32: bool = False
+    #: the log-softmax row converted once (RNE) to the input dtype: the 16-bit output member (``log_softmax(...,
+    #: out_dtype=logits.dtype)``), with its own fingerprint (``spec_fingerprint(..., logprobs_cvt=True)``)
+    logprobs_cvt: bool = False
 
     def __post_init__(self):
         if not (self.probs or self.logprobs or self.lse or self.logp):
@@ -170,6 +175,8 @@ class Mode:
             raise ValueError("one row output per launch (probs or logprobs)")
         if self.probs_f32 and not self.probs:
             raise ValueError("probs_f32 qualifies the probabilities output")
+        if self.logprobs_cvt and not self.logprobs:
+            raise ValueError("logprobs_cvt qualifies the log-softmax row output")
 
     @property
     def name(self) -> str:
@@ -179,6 +186,7 @@ class Mode:
                 ("p", self.probs),
                 ("f", self.probs_f32),
                 ("l", self.logprobs),
+                ("c", self.logprobs_cvt),
                 ("s", self.lse),
                 ("t", self.logp),
             )
@@ -193,6 +201,7 @@ class Mode:
 SOFTMAX = Mode(probs=True)
 SOFTMAX_F32 = Mode(probs=True, probs_f32=True)
 LOG_SOFTMAX = Mode(logprobs=True)
+LOG_SOFTMAX_CVT = Mode(logprobs=True, logprobs_cvt=True)
 LSE = Mode(lse=True)
 LOGP = Mode(logp=True)
 LOGP_LSE = Mode(logp=True, lse=True)
@@ -256,27 +265,39 @@ class LSESpec:
             z = shifted(a, self.leaf(row, i), nm, c)
             probs.append(a.cvt_out(prob(a, weight(a, z), inv_s), self.in_fmt))
             logprobs.append(logp(a, z, nlg))
+        # the 16-bit output member: the log-softmax row converted once to the input format (the identity at f32)
+        logprobs_cvt = [a.cvt_out(lp, self.in_fmt) for lp in logprobs]
         return {
             "m": m,
             "s": s,
             "probs": probs,
             "logprobs": logprobs,
+            "logprobs_cvt": logprobs_cvt,
             "lse": lse_nat(a, m, c, lg2(a, s)),
         }
 
 
-def spec_fingerprint(N: int, in_fmt: str = "bf16", temperature: bool = False) -> str:
+def spec_fingerprint(
+    N: int, in_fmt: str = "bf16", temperature: bool = False, logprobs_cvt: bool = False
+) -> str:
     """Identifier of the numerical specification for vocabulary ``N``: a structural hash (``sterm.fingerprint_dag``,
     linear in the term DAG, so computable at every vocabulary) of the two reductions, the first and last probability (the
-    last exercises the padding), the log-softmax element and the ``lse`` of row 0."""
+    last exercises the padding), the log-softmax element and the ``lse`` of row 0. With ``logprobs_cvt`` the log-softmax
+    element is the 16-bit output member's (converted to ``in_fmt``): a different receipt for a different output; at
+    ``in_fmt = "f32"`` the conversion is the identity and the receipt the plain one."""
     spec = LSESpec(N, in_fmt=in_fmt, temperature=temperature)
     outs = spec.outputs(0)
+    lp0 = (
+        outs["logprobs_cvt"][0]
+        if (logprobs_cvt and in_fmt != "f32")
+        else outs["logprobs"][0]
+    )
     parts = [
         fingerprint(outs["m"]),
         fingerprint(outs["s"]),
         fingerprint(outs["probs"][0]),
         fingerprint(outs["probs"][N - 1]),
-        fingerprint(outs["logprobs"][0]),
+        fingerprint(lp0),
         fingerprint(outs["lse"]),
     ]
     return "lse-row-" + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
