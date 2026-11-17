@@ -403,12 +403,14 @@ def test_mm_pair_replays_under_cuda_graph() -> None:
             graph.reset()
 
 
-def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None:
+@pytest.mark.parametrize("m,n,k", [(6, 128, 256), (64, 2560, 4096)])
+def test_mm_serialized_mxfp4_matches_independent_dequantized_reference(
+    m: int, n: int, k: int
+) -> None:
     """Non-unit E8M0 scales catch scale-fragment ordering regressions."""
 
     require_b12x()
     torch.manual_seed(20260823)
-    m, n, k = 6, 128, 256
     lhs_source = torch.randn((m, k), device="cuda") * 0.3
     rhs_source = torch.randn((n, k), device="cuda") * 0.3
     lhs_values, lhs_scale_rows = _quantize_mxfp4_rows(lhs_source)
@@ -418,9 +420,13 @@ def test_mm_serialized_mxfp4_matches_independent_dequantized_reference() -> None
 
     lhs_dequant = _dequantize_mxfp4_rows(lhs_values, lhs_scale_rows)
     rhs_dequant = _dequantize_mxfp4_rows(rhs_values, rhs_scale_rows)
-    expected = (lhs_dequant.to(torch.bfloat16) @ rhs_dequant.to(torch.bfloat16).T).to(
-        torch.bfloat16
+    # Accumulate in FP32 to avoid reduced-precision BF16 reductions for long K.
+    expected = (lhs_dequant @ rhs_dequant.T).bfloat16()
+    implicit = blockscaled.mm_mxfp4(
+        lhs_values, lhs_scale_storage, rhs_values, rhs_scale_storage
     )
+    torch.testing.assert_close(implicit, expected, rtol=0, atol=0)
+
     with prepared(
         (lhs_values, lhs_scale_storage),
         (rhs_values, rhs_scale_storage),
