@@ -63,9 +63,10 @@ def test_packed_view_reconstruction_and_rejection():
     # packed tensor passes through
     assert _packed_fp8_view(q, (CKV, KPE), "query") is not None
     # independent (non-adjacent) split pairs are rejected, not copied
-    assert _packed_fp8_view(
-        (qn.contiguous(), qp.contiguous()), (CKV, KPE), "query"
-    ) is None
+    assert (
+        _packed_fp8_view((qn.contiguous(), qp.contiguous()), (CKV, KPE), "query")
+        is None
+    )
     # wrong dtype rejected
     qb = torch.zeros((4 * QL, NH, DIMQ), dtype=torch.bfloat16)
     assert _packed_fp8_view(qb, (CKV, KPE), "query") is None
@@ -116,8 +117,7 @@ def _make_batch(kv_lens, device, seed=0):
     return dict(
         q=rnd((TQ, NH, DIMQ)),
         kv=rnd((P, PAGE, DIMQ)),
-        qo_indptr=torch.arange(0, (B + 1) * QL, QL, dtype=torch.int32,
-                               device=device),
+        qo_indptr=torch.arange(0, (B + 1) * QL, QL, dtype=torch.int32, device=device),
         kv_indptr=torch.tensor(indptr, dtype=torch.int32, device=device),
         kv_indices=torch.tensor(indices, dtype=torch.int32, device=device),
         kv_len_arr=torch.tensor(kv_lens, dtype=torch.int32, device=device),
@@ -140,14 +140,12 @@ def _reference(batch, q_scale=1.0, kv_scale=1.0):
         kvl = kv_lens[r]
         npages = (kvl + PAGE - 1) // PAGE
         flat = (bt[r, :npages].long().unsqueeze(1) * PAGE + off).reshape(-1)[:kvl]
-        k = kvf[flat]                      # (kvl, 576)
-        v = k[:, :CKV]                     # (kvl, 512)
-        qr = q[r * QL : (r + 1) * QL]      # (QL, 8, 576)
+        k = kvf[flat]  # (kvl, 576)
+        v = k[:, :CKV]  # (kvl, 512)
+        qr = q[r * QL : (r + 1) * QL]  # (QL, 8, 576)
         sc = torch.einsum("qhd,ld->qhl", qr, k) * SM_SCALE
         vis = (kvl - QL) + torch.arange(QL, device=device) + 1
-        mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(
-            QL, 1, 1
-        )
+        mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(QL, 1, 1)
         sc = sc.masked_fill(mask, float("-inf"))
         out[r * QL : (r + 1) * QL] = torch.einsum(
             "qhl,ld->qhd", torch.softmax(sc, -1), v
@@ -157,9 +155,9 @@ def _reference(batch, q_scale=1.0, kv_scale=1.0):
 
 def _plan_wrapper(batch, device, fp8q_backend="auto"):
     ws = torch.zeros(160 * 1024 * 1024, dtype=torch.uint8, device=device)
-    w = BatchMLAPagedAttentionWrapper(float_workspace_buffer=ws,
-                                      backend="auto",
-                                      fp8q_backend=fp8q_backend)
+    w = BatchMLAPagedAttentionWrapper(
+        float_workspace_buffer=ws, backend="auto", fp8q_backend=fp8q_backend
+    )
     w.plan(
         qo_indptr=batch["qo_indptr"],
         kv_indptr=batch["kv_indptr"],
@@ -316,10 +314,12 @@ SHARED_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 
 def test_fp8q_backend_selector_values():
     import pytest as _pytest
+
     ws = torch.zeros(16, dtype=torch.uint8)
     with _pytest.raises(ValueError):
-        BatchMLAPagedAttentionWrapper(float_workspace_buffer=ws,
-                                      backend="auto", fp8q_backend="fa2")
+        BatchMLAPagedAttentionWrapper(
+            float_workspace_buffer=ws, backend="auto", fp8q_backend="fa2"
+        )
 
 
 def test_fp8q_backend_stock_never_prepares():
@@ -356,6 +356,7 @@ def test_fp8q_backend_specialized_raises_when_unservable(monkeypatch):
     # fast path disabled (either kill-switch env), plan must RAISE under
     # fp8q_backend='specialized' instead of dequant-serving
     import pytest as _pytest
+
     _sm90_or_skip()
     device = torch.device("cuda:0")
     batch = _make_batch([2983], device)

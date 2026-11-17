@@ -181,7 +181,8 @@ def _mla_dec_fp8q_sm90_prepare(
         logger.info_once(
             "mla_decode_fp8_paged_sm90: fp8q_backend='stock'; the fast "
             "path is never prepared, fp8-Q calls are served by exact "
-            "dequantisation into the stock MLA path")
+            "dequantisation into the stock MLA path"
+        )
         return
     fired = _disabled_by()
     if fired is not None:
@@ -192,7 +193,8 @@ def _mla_dec_fp8q_sm90_prepare(
                 "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
                 "the kill switch %s=%s disables the fast path (an "
                 "explicitly selected backend is never silently swapped)"
-                % (fired, os.environ.get(fired, "")))
+                % (fired, os.environ.get(fired, ""))
+            )
         logger.info_once(
             "mla_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
             "served by exact dequantisation into the stock MLA path",
@@ -270,10 +272,7 @@ def _mla_dec_fp8q_sm90_prepare(
             if kv_lens_host.numel() < B:
                 reason = "kv-length metadata shorter than batch"
             elif int(kv_lens_host[:B].max()) > _MAX_KV_LEN:
-                reason = (
-                    f"kv_len={int(kv_lens_host[:B].max())} above measured "
-                    "envelope"
-                )
+                reason = f"kv_len={int(kv_lens_host[:B].max())} above measured envelope"
             elif int(kv_lens_host[:B].min()) < 1:
                 reason = "kv_len < 1"
     except Exception as exc:  # a guard failure must never break the stock path
@@ -286,7 +285,8 @@ def _mla_dec_fp8q_sm90_prepare(
                 "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
                 "this plan is outside the measured contract (%s); an "
                 "explicitly selected backend is never silently swapped — "
-                "use fp8q_backend='auto' for guarded fallback" % reason)
+                "use fp8q_backend='auto' for guarded fallback" % reason
+            )
         logger.info_once(
             "mla_decode_fp8_paged_sm90: not dispatched for this plan (%s); "
             "fp8-Q calls are served by exact dequantisation into the stock "
@@ -327,11 +327,7 @@ def _mla_dec_fp8q_sm90_prepare(
     md = plan_metadata
     if md.block_tables is not None:
         bt_src = md.block_tables
-        if (
-            bt_src.dtype != torch.int32
-            or bt_src.dim() != 2
-            or bt_src.shape[0] < B
-        ):
+        if bt_src.dtype != torch.int32 or bt_src.dim() != 2 or bt_src.shape[0] < B:
             counters["plans_ineligible"] += 1
             logger.info_once(
                 "mla_decode_fp8_paged_sm90: dense block_tables form "
@@ -348,12 +344,7 @@ def _mla_dec_fp8q_sm90_prepare(
         pprs = (indptr[1 : B + 1] - indptr[:B]).tolist()
         pps = max(1, max(pprs) if pprs else 1)
         bt = bufs.get("block_table")
-        if (
-            bt is None
-            or bt.shape[0] < B
-            or bt.shape[1] != pps
-            or bt.device != device
-        ):
+        if bt is None or bt.shape[0] < B or bt.shape[1] != pps or bt.device != device:
             bt = torch.zeros((B, pps), dtype=torch.int32, device=device)
             bufs["block_table"] = bt
             _counters["workspace_allocs"] += 1
@@ -367,9 +358,7 @@ def _mla_dec_fp8q_sm90_prepare(
         block_table = bt[:B]
 
     seq_lens_buf = _buf("seq_lens", B, torch.int32)[:B]
-    seq_lens_buf.copy_(
-        kv_lens_host[:B].to(torch.int32).to(device), non_blocking=True
-    )
+    seq_lens_buf.copy_(kv_lens_host[:B].to(torch.int32).to(device), non_blocking=True)
     # caller-owned split workspace, sized for the worst split count the
     # launch arithmetic can choose for this (B, QL, pps) plan. The repaired
     # launcher's B>=5 compact-dual path consumes ONE page per split (its
@@ -485,8 +474,8 @@ def _mla_dec_fp8q_sm90_dispatch(
             raise RuntimeError(
                 "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
                 "this call cannot be served by the fast path (%s); an "
-                "explicitly selected backend is never silently swapped"
-                % reason)
+                "explicitly selected backend is never silently swapped" % reason
+            )
         logger.info_once(
             "mla_decode_fp8_paged_sm90: not dispatched for this call (%s); "
             "the dequant + stock MLA path serves it",
@@ -502,7 +491,8 @@ def _mla_dec_fp8q_sm90_dispatch(
             raise RuntimeError(
                 "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
                 "the kill switch %s=%s disables the fast path"
-                % (fired, os.environ.get(fired, "")))
+                % (fired, os.environ.get(fired, ""))
+            )
         logger.info_once(
             "mla_decode_fp8_paged_sm90: disabled by %s=%s; fp8-Q calls are "
             "served by exact dequantisation into the stock MLA path",
@@ -522,8 +512,7 @@ def _mla_dec_fp8q_sm90_dispatch(
             return _fallback("skip_softmax_threshold_scale_factor")
         if ckv_scale_arr is not None:
             return _fallback("ckv_scale_arr (per-token scales)")
-        q_packed = _packed_fp8_view(query, (_HEAD_DIM_CKV, _HEAD_DIM_KPE),
-                                    "query")
+        q_packed = _packed_fp8_view(query, (_HEAD_DIM_CKV, _HEAD_DIM_KPE), "query")
         if q_packed is None or q_packed.dim() != 3:
             return _fallback("query is not a packed/adjacent fp8 form")
         if q_packed.shape[0] != state.total_q or q_packed.shape[1] != _NUM_HEADS:
@@ -531,16 +520,15 @@ def _mla_dec_fp8q_sm90_dispatch(
                 f"query shape {tuple(q_packed.shape)} != planned "
                 f"({state.total_q}, {_NUM_HEADS}, {_DIMQ})"
             )
-        kv_packed = _packed_fp8_view(kv_cache, (_HEAD_DIM_CKV, _HEAD_DIM_KPE),
-                                     "kv_cache")
+        kv_packed = _packed_fp8_view(
+            kv_cache, (_HEAD_DIM_CKV, _HEAD_DIM_KPE), "kv_cache"
+        )
         if kv_packed is None or kv_packed.dim() not in (3, 4):
             return _fallback("kv_cache is not a packed/adjacent fp8 form")
         if kv_packed.dim() == 4:
             if kv_packed.shape[2] != 1:
                 return _fallback("kv_cache head dim != 1")
-            kv_packed = kv_packed.reshape(
-                kv_packed.shape[0], kv_packed.shape[1], _DIMQ
-            )
+            kv_packed = kv_packed.reshape(kv_packed.shape[0], kv_packed.shape[1], _DIMQ)
         if kv_packed.shape[1] != _PAGE_SIZE:
             return _fallback(f"kv page size {kv_packed.shape[1]}")
         qs, reason = _scale_value(q_scale, "q_scale")
@@ -560,8 +548,7 @@ def _mla_dec_fp8q_sm90_dispatch(
                 )
         if out is not None and (
             out.dtype != torch.bfloat16
-            or tuple(out.shape)
-            != (state.total_q, _NUM_HEADS, _HEAD_DIM_CKV)
+            or tuple(out.shape) != (state.total_q, _NUM_HEADS, _HEAD_DIM_CKV)
             or not out.is_contiguous()
         ):
             return _fallback(f"out {out.dtype} {tuple(out.shape)}")

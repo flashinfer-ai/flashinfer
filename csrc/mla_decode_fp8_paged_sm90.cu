@@ -68,24 +68,22 @@
 namespace {
 
 constexpr int DIMQ = 576;
-constexpr int CKV  = 512;
+constexpr int CKV = 512;
 constexpr int PAGE = 64;
-constexpr int NH   = 8;
-constexpr int TT   = 128;   // tokens per kv tile == 2 pages
-constexpr int KSTR = 592;   // linear fp8 byte stride of a Q/K row (592%128==80)
-constexpr int PSTR = 144;   // fp8 byte stride of a P row (128 slots + pad)
+constexpr int NH = 8;
+constexpr int TT = 128;    // tokens per kv tile == 2 pages
+constexpr int KSTR = 592;  // linear fp8 byte stride of a Q/K row (592%128==80)
+constexpr int PSTR = 144;  // fp8 byte stride of a P row (128 slots + pad)
 constexpr float LOG2E = 1.4426950408889634f;
 
 static PFN_cuTensorMapEncodeTiled_v12000 get_tmap_encoder() {
   static PFN_cuTensorMapEncodeTiled_v12000 fn = [] {
     void* p = nullptr;
     cudaDriverEntryPointQueryResult status;
-    cudaError_t err = cudaGetDriverEntryPointByVersion(
-        "cuTensorMapEncodeTiled", &p, 12000, cudaEnableDefault, &status);
-    TVM_FFI_ICHECK(err == cudaSuccess &&
-                   status == cudaDriverEntryPointSuccess && p)
-        << "cuTensorMapEncodeTiled is unavailable: "
-        << cudaGetErrorString(err);
+    cudaError_t err = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &p, 12000,
+                                                       cudaEnableDefault, &status);
+    TVM_FFI_ICHECK(err == cudaSuccess && status == cudaDriverEntryPointSuccess && p)
+        << "cuTensorMapEncodeTiled is unavailable: " << cudaGetErrorString(err);
     return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(p);
   }();
   return fn;
@@ -99,23 +97,21 @@ __device__ __forceinline__ uint32_t prm(uint32_t a, uint32_t b, uint32_t s) {
 __device__ __forceinline__ uint32_t sptr(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
-__device__ __forceinline__ void mma32(float* d, uint32_t a0, uint32_t a1,
-                                      uint32_t a2, uint32_t a3,
+__device__ __forceinline__ void mma32(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                       uint32_t b0, uint32_t b1) {
   asm volatile(
-    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-__device__ __forceinline__ void mma32h(uint32_t* d, uint32_t a0, uint32_t a1,
-                                       uint32_t a2, uint32_t a3,
-                                       uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma32h(uint32_t* d, uint32_t a0, uint32_t a1, uint32_t a2,
+                                       uint32_t a3, uint32_t b0, uint32_t b1) {
   asm volatile(
-    "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
-    "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-    : "+r"(d[0]), "+r"(d[1])
-    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+      "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+      "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+      : "+r"(d[0]), "+r"(d[1])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 // SM90 lowers fp8 mma.sync through explicit operand conversion. Convert each
 // P/V fragment once and reuse it across all three row groups.
@@ -134,44 +130,43 @@ __device__ __forceinline__ uint32_t cvth(uint32_t x) {
 // cheap exceptional-path guard and leaves the common WGMMA path unchanged.
 __device__ __forceinline__ uint32_t hmax_abs_nan(uint32_t a, uint32_t b) {
   uint32_t r;
-  asm("max.NaN.xorsign.abs.f16x2 %0, %1, %2;"
-      : "=r"(r) : "r"(a), "r"(b));
+  asm("max.NaN.xorsign.abs.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
   return r;
 }
 __device__ __forceinline__ bool half2_nonfinite(uint32_t max_abs) {
   return (((max_abs & 0x7c007c00u) + 0x04000400u) & 0x80008000u) != 0;
 }
-__device__ __forceinline__ void mma16h(uint32_t* d, uint32_t a0, uint32_t a1,
-                                       uint32_t a2, uint32_t a3,
-                                       uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma16h(uint32_t* d, uint32_t a0, uint32_t a1, uint32_t a2,
+                                       uint32_t a3, uint32_t b0, uint32_t b1) {
   asm volatile(
-    "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-    "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-    : "+r"(d[0]), "+r"(d[1])
-    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+      "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+      : "+r"(d[0]), "+r"(d[1])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
-__device__ __forceinline__ void mma16f(float* d, uint32_t a0, uint32_t a1,
-                                       uint32_t a2, uint32_t a3,
+__device__ __forceinline__ void mma16f(float* d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                        uint32_t b0, uint32_t b1) {
   asm volatile(
-    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-    : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 __device__ __forceinline__ void ldm4(uint32_t* r, uint32_t a) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
 }
 __device__ __forceinline__ void ldm4t(uint32_t* r, uint32_t a) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
 }
 __device__ __forceinline__ void sts32(uint32_t a, uint32_t v) {
-  asm volatile("st.shared.u32 [%0], %1;" :: "r"(a), "r"(v) : "memory");
+  asm volatile("st.shared.u32 [%0], %1;" ::"r"(a), "r"(v) : "memory");
 }
 __device__ __forceinline__ void sts16(uint32_t a, unsigned short v) {
-  asm volatile("st.shared.u16 [%0], %1;" :: "r"(a), "h"(v) : "memory");
+  asm volatile("st.shared.u16 [%0], %1;" ::"r"(a), "h"(v) : "memory");
 }
 
 // Guard rail for the packed-FP16 PV accumulator (|O| <= l * 448): if the
@@ -189,7 +184,7 @@ __device__ __forceinline__ float exp2i(float ex) {
 }
 
 __device__ __forceinline__ void row_group_sync(int id) {
-  asm volatile("bar.sync %0, 128;" :: "r"(id) : "memory");
+  asm volatile("bar.sync %0, 128;" ::"r"(id) : "memory");
 }
 
 // Exceptional replay for one 16-row slice of a split.  The fast kernels use
@@ -198,17 +193,12 @@ __device__ __forceinline__ void row_group_sync(int id) {
 // tile-local FP8 probabilities and FP32 mma.sync accumulation.  b/sp are
 // passed explicitly because the fast rectangular grid is not the flattened
 // grid used by the legacy path.
-__device__ __noinline__
-void repair_split(const uint8_t* __restrict__ qg,
-                  const uint8_t* __restrict__ kvg,
-                  const int* __restrict__ btab,
-                  const int* __restrict__ slen,
-                  const float* __restrict__ dqp,
-                  const float* __restrict__ dkp,
-                  float sm_scale, __nv_bfloat16* __restrict__ outp,
-                  uint8_t* __restrict__ Op, float* __restrict__ Mp,
-                  float* __restrict__ Lp, int QL, int pps, int ns,
-                  int pps_split, int b, int sp, int qbase, char* smraw) {
+__device__ __noinline__ void repair_split(
+    const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg, const int* __restrict__ btab,
+    const int* __restrict__ slen, const float* __restrict__ dqp, const float* __restrict__ dkp,
+    float sm_scale, __nv_bfloat16* __restrict__ outp, uint8_t* __restrict__ Op,
+    float* __restrict__ Mp, float* __restrict__ Lp, int QL, int pps, int ns, int pps_split, int b,
+    int sp, int qbase, char* smraw) {
   constexpr int NTHR = 128;
   constexpr int ROWS = 16;
   constexpr int NLD = (PAGE * 36) / NTHR;
@@ -232,8 +222,7 @@ void repair_split(const uint8_t* __restrict__ qg,
   if (pg0 >= pg1) {
     if (ns == 1) {
       for (int i = tid; i < vrows * CKV; i += NTHR)
-        outp[(size_t)(b * rows_tot + q0 * NH) * CKV + i] =
-            __float2bfloat16(0.f);
+        outp[(size_t)(b * rows_tot + q0 * NH) * CKV + i] = __float2bfloat16(0.f);
     } else {
       for (int r = tid; r < vrows; r += NTHR) {
         const size_t gi = (size_t)(b * rows_tot + q0 * NH + r) * ns + sp;
@@ -251,8 +240,7 @@ void repair_split(const uint8_t* __restrict__ qg,
     for (int j = tid; j < ROWS * 36; j += NTHR) {
       const int row = j / 36, c = j % 36;
       uint4 v = make_uint4(0, 0, 0, 0);
-      if (row < vrows)
-        v = *reinterpret_cast<const uint4*>(qb + (size_t)j * 16);
+      if (row < vrows) v = *reinterpret_cast<const uint4*>(qb + (size_t)j * 16);
       *reinterpret_cast<uint4*>(Qs + row * KSTR + (c << 4)) = v;
     }
   }
@@ -281,20 +269,19 @@ void repair_split(const uint8_t* __restrict__ qg,
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       int pgh = min(pg + h, pg1 - 1);
-      const uint8_t* kb =
-          kvg + (size_t)btab[b * pps + pgh] * PAGE * DIMQ;
+      const uint8_t* kb = kvg + (size_t)btab[b * pps + pgh] * PAGE * DIMQ;
       uint8_t* d2 = dst + h * PAGE * KSTR;
 #pragma unroll
       for (int i = 0; i < NLD; ++i) {
         const int j = tid + i * NTHR, row = j / 36, c = j % 36;
         const uint32_t a = sptr(d2 + row * KSTR + (c << 4));
         if ((pgh + 1) * PAGE <= L)
-          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                       :: "r"(a), "l"(kb + (size_t)j * 16));
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a),
+                       "l"(kb + (size_t)j * 16));
         else {
           const int bytes = (pgh * PAGE + row < L) ? 16 : 0;
-          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
-                       :: "r"(a), "l"(kb + (size_t)j * 16), "r"(bytes));
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a),
+                       "l"(kb + (size_t)j * 16), "r"(bytes));
         }
       }
     }
@@ -317,11 +304,10 @@ void repair_split(const uint8_t* __restrict__ qg,
   const uint32_t Psb = sptr(Ps);
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
-    const int col =
-        s * 32 + ((j >> 1) << 4) + ((j & 1) << 3) + 2 * (lane & 3);
+    const int col = s * 32 + ((j >> 1) << 4) + ((j & 1) << 3) + 2 * (lane & 3);
     const int t16 = col & 15;
-    const int slot = (col >> 5) * 32 + (((col >> 4) & 1) << 4) +
-                     4 * ((t16 & 7) >> 1) + 2 * (t16 >> 3);
+    const int slot =
+        (col >> 5) * 32 + (((col >> 4) & 1) << 4) + 4 * ((t16 & 7) >> 1) + 2 * (t16 >> 3);
     psA[j] = Psb + rA * PSTR + slot;
     psB[j] = Psb + rB * PSTR + slot;
   }
@@ -364,10 +350,8 @@ void repair_split(const uint8_t* __restrict__ qg,
       const int c0 = cbase + ((j >> 1) << 4) + ((j & 1) << 3);
 #pragma unroll
       for (int e = 0; e < 2; ++e) {
-        const float xa =
-            (c0 + e < remA) ? sacc[j][e] * qk_scale : -INFINITY;
-        const float xb =
-            (c0 + e < remB) ? sacc[j][2 + e] * qk_scale : -INFINITY;
+        const float xa = (c0 + e < remA) ? sacc[j][e] * qk_scale : -INFINITY;
+        const float xb = (c0 + e < remB) ? sacc[j][2 + e] * qk_scale : -INFINITY;
         sacc[j][e] = xa;
         sacc[j][2 + e] = xb;
         mxA = fmaxf(mxA, xa);
@@ -398,19 +382,15 @@ void repair_split(const uint8_t* __restrict__ qg,
       float pa[2], pb[2];
 #pragma unroll
       for (int e = 0; e < 2; ++e) {
-        const float xa =
-            (eA == -INFINITY) ? 0.f : exp2f(sacc[j][e] - eA);
-        const float xb =
-            (eB == -INFINITY) ? 0.f : exp2f(sacc[j][2 + e] - eB);
+        const float xa = (eA == -INFINITY) ? 0.f : exp2f(sacc[j][e] - eA);
+        const float xb = (eB == -INFINITY) ? 0.f : exp2f(sacc[j][2 + e] - eB);
         sA += xa;
         sB += xb;
         pa[e] = xa;
         pb[e] = xb;
       }
-      sts16(psA[j], __nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]),
-                                               __NV_SATFINITE, __NV_E4M3));
-      sts16(psB[j], __nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]),
-                                               __NV_SATFINITE, __NV_E4M3));
+      sts16(psA[j], __nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]), __NV_SATFINITE, __NV_E4M3));
+      sts16(psB[j], __nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]), __NV_SATFINITE, __NV_E4M3));
     }
 #pragma unroll
     for (int d = 1; d < 4; d <<= 1) {
@@ -428,10 +408,8 @@ void repair_split(const uint8_t* __restrict__ qg,
     const float4 fb = *reinterpret_cast<const float4*>(red + rB * 4);
     const float4 ga = *reinterpret_cast<const float4*>(red2 + rA * 4);
     const float4 gb = *reinterpret_cast<const float4*>(red2 + rB * 4);
-    const float mnA =
-        fmaxf(mrun0, fmaxf(fmaxf(fa.x, fa.y), fmaxf(fa.z, fa.w)));
-    const float mnB =
-        fmaxf(mrun1, fmaxf(fmaxf(fb.x, fb.y), fmaxf(fb.z, fb.w)));
+    const float mnA = fmaxf(mrun0, fmaxf(fmaxf(fa.x, fa.y), fmaxf(fa.z, fa.w)));
+    const float mnB = fmaxf(mrun1, fmaxf(fmaxf(fb.x, fb.y), fmaxf(fb.z, fb.w)));
     const float corrA = (mnA == -INFINITY) ? 1.f : exp2f(mrun0 - mnA);
     const float corrB = (mnB == -INFINITY) ? 1.f : exp2f(mrun1 - mnB);
     const float tcA = (tileA == -INFINITY) ? 0.f : exp2f(tileA - mnA);
@@ -463,28 +441,23 @@ void repair_split(const uint8_t* __restrict__ qg,
           mma32(tile_acc[g * 2], a[0], a[1], a[2], a[3], be0, be1);
           const uint32_t bo0 = prm(r[0], r[1], 0x7531u);
           const uint32_t bo1 = prm(r[2], r[3], 0x7531u);
-          mma32(tile_acc[g * 2 + 1], a[0], a[1], a[2], a[3], bo0,
-                bo1);
+          mma32(tile_acc[g * 2 + 1], a[0], a[1], a[2], a[3], bo0, bo1);
         }
       }
     }
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
 #pragma unroll
-      for (int k = 0; k < 2; ++k)
-        oacc[i][k] = fmaf(tile_acc[i][k], tcA, oacc[i][k] * corrA);
+      for (int k = 0; k < 2; ++k) oacc[i][k] = fmaf(tile_acc[i][k], tcA, oacc[i][k] * corrA);
 #pragma unroll
-      for (int k = 2; k < 4; ++k)
-        oacc[i][k] = fmaf(tile_acc[i][k], tcB, oacc[i][k] * corrB);
+      for (int k = 2; k < 4; ++k) oacc[i][k] = fmaf(tile_acc[i][k], tcB, oacc[i][k] * corrB);
     }
     row_group_sync(12);
   }
 
   const bool single = (ns == 1);
-  const float rAi =
-      (lrun0 > 0.f) ? (single ? o_scale : 1.f) / lrun0 : 0.f;
-  const float rBi =
-      (lrun1 > 0.f) ? (single ? o_scale : 1.f) / lrun1 : 0.f;
+  const float rAi = (lrun0 > 0.f) ? (single ? o_scale : 1.f) / lrun0 : 0.f;
+  const float rBi = (lrun1 > 0.f) ? (single ? o_scale : 1.f) / lrun1 : 0.f;
   if (!single) {
     const int giA = (b * rows_tot + gA) * ns + sp;
     const int giB = (b * rows_tot + gB) * ns + sp;
@@ -508,53 +481,48 @@ void repair_split(const uint8_t* __restrict__ qg,
     const float b2 = oacc[2 * g][3], b3 = oacc[2 * g + 1][3];
     if (single) {
       if (rA < vrows) {
-        __nv_bfloat162* d = reinterpret_cast<__nv_bfloat162*>(
-            outp + (size_t)(b * QL * NH + gA) * CKV + col);
+        __nv_bfloat162* d =
+            reinterpret_cast<__nv_bfloat162*>(outp + (size_t)(b * QL * NH + gA) * CKV + col);
         d[0] = __floats2bfloat162_rn(a0 * rAi, a1 * rAi);
         d[1] = __floats2bfloat162_rn(a2 * rAi, a3 * rAi);
       }
       if (rB < vrows) {
-        __nv_bfloat162* d = reinterpret_cast<__nv_bfloat162*>(
-            outp + (size_t)(b * QL * NH + gB) * CKV + col);
+        __nv_bfloat162* d =
+            reinterpret_cast<__nv_bfloat162*>(outp + (size_t)(b * QL * NH + gB) * CKV + col);
         d[0] = __floats2bfloat162_rn(b0 * rBi, b1 * rBi);
         d[1] = __floats2bfloat162_rn(b2 * rBi, b3 * rBi);
       }
     } else {
       const size_t base = (size_t)((b * ns + sp) * rows_tot) * CKV;
       if (rA < vrows) {
-        __nv_fp8x4_e4m3 t(
-            make_float4(a0 * rAi, a1 * rAi, a2 * rAi, a3 * rAi));
-        *reinterpret_cast<uint32_t*>(Op + base + (size_t)gA * CKV + col) =
-            t.__x;
+        __nv_fp8x4_e4m3 t(make_float4(a0 * rAi, a1 * rAi, a2 * rAi, a3 * rAi));
+        *reinterpret_cast<uint32_t*>(Op + base + (size_t)gA * CKV + col) = t.__x;
       }
       if (rB < vrows) {
-        __nv_fp8x4_e4m3 t(
-            make_float4(b0 * rBi, b1 * rBi, b2 * rBi, b3 * rBi));
-        *reinterpret_cast<uint32_t*>(Op + base + (size_t)gB * CKV + col) =
-            t.__x;
+        __nv_fp8x4_e4m3 t(make_float4(b0 * rBi, b1 * rBi, b2 * rBi, b3 * rBi));
+        *reinterpret_cast<uint32_t*>(Op + base + (size_t)gB * CKV + col) = t.__x;
       }
     }
   }
 }
 
 template <int MT, bool HALF_ACC>
-__global__ __launch_bounds__(128 * MT, 1)
-void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
-                const int* __restrict__ btab, const int* __restrict__ slen,
-                const float* __restrict__ dqp, const float* __restrict__ dkp,
-                float sm_scale, __nv_bfloat16* __restrict__ outp,
-                uint8_t* __restrict__ Op, float* __restrict__ Mp, float* __restrict__ Lp,
-                int B, int QL, int pps, int ns, int pps_split, int QPC) {
+__global__ __launch_bounds__(128 * MT, 1) void mla_kernel(
+    const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg, const int* __restrict__ btab,
+    const int* __restrict__ slen, const float* __restrict__ dqp, const float* __restrict__ dkp,
+    float sm_scale, __nv_bfloat16* __restrict__ outp, uint8_t* __restrict__ Op,
+    float* __restrict__ Mp, float* __restrict__ Lp, int B, int QL, int pps, int ns, int pps_split,
+    int QPC) {
   constexpr int NTHR = 128 * MT;
   constexpr int ROWS = 16 * MT;
-  constexpr int NLD  = (PAGE * 36) / NTHR;
+  constexpr int NLD = (PAGE * 36) / NTHR;
 
   extern __shared__ char smraw[];
   uint8_t* Qs = reinterpret_cast<uint8_t*>(smraw);
   uint8_t* Ks = Qs + ROWS * KSTR;
   uint8_t* Ps = Ks + 2 * TT * KSTR;
-  float*   red = reinterpret_cast<float*>(Ps + ROWS * PSTR);   // [ROWS][4] max
-  float*   red2 = red + ROWS * 4;                              // [ROWS][4] sum
+  float* red = reinterpret_cast<float*>(Ps + ROWS * PSTR);  // [ROWS][4] max
+  float* red2 = red + ROWS * 4;                             // [ROWS][4] sum
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int m = warp >> 2, s = warp & 3;
@@ -579,7 +547,8 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
   if (pg0 >= pg1) {
     for (int r = tid; r < vrows; r += NTHR) {
       int gi = (b * rows_tot + q0 * NH + r) * ns + sp;
-      Mp[gi] = -INFINITY; Lp[gi] = 0.f;
+      Mp[gi] = -INFINITY;
+      Lp[gi] = 0.f;
     }
     return;
   }
@@ -618,15 +587,15 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       int pgh = pg + h;
-      if (pgh >= pg1) pgh = pg1 - 1;      // clamp: duplicate data is masked out
+      if (pgh >= pg1) pgh = pg1 - 1;  // clamp: duplicate data is masked out
       const uint8_t* kb = kvg + (size_t)btab[b * pps + pgh] * PAGE * DIMQ;
       uint8_t* d2 = dst + h * PAGE * KSTR;
 #pragma unroll
       for (int i = 0; i < NLD; ++i) {
         int j = tid + i * NTHR, row = j / 36, c = j % 36;
         uint32_t a = sptr(d2 + row * KSTR + (c << 4));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
-                     :: "r"(a), "l"(kb + (size_t)j * 16));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a),
+                     "l"(kb + (size_t)j * 16));
       }
     }
     asm volatile("cp.async.commit_group;\n" ::);
@@ -634,15 +603,15 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
 
   const int mi = lane >> 3, l7 = lane & 7;
   const int qrow = m * 16 + ((mi & 1) << 3) + l7;
-  const int bcA  = (mi >> 1) << 4;
+  const int bcA = (mi >> 1) << 4;
   const int krow = s * 32 + ((mi >> 1) << 3) + l7;
-  const int bcB  = (mi & 1) << 4;
+  const int bcB = (mi & 1) << 4;
   const int prow = m * 16 + ((mi & 1) << 3) + l7;
-  const int pbc  = (mi >> 1) << 4;
+  const int pbc = (mi >> 1) << 4;
 
   // --- page-invariant base addresses (linear layout: base + immediate) ---
   const uint32_t qA = sptr(Qs) + qrow * KSTR + bcA;
-  const uint32_t kA = krow * KSTR + bcB;        // offset within one K buffer
+  const uint32_t kA = krow * KSTR + bcB;  // offset within one K buffer
   const uint32_t Ksb = sptr(Ks);
   const uint32_t pA = sptr(Ps) + prow * PSTR + pbc;
   const uint32_t vofs = lane * KSTR + s * 128;
@@ -654,12 +623,11 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
   for (int j = 0; j < 4; ++j) {
     int col = s * 32 + ((j >> 1) << 4) + ((j & 1) << 3) + 2 * (lane & 3);
     int t16 = col & 15;
-    int slot = (col >> 5) * 32 + (((col >> 4) & 1) << 4)
-             + 4 * ((t16 & 7) >> 1) + 2 * (t16 >> 3);
+    int slot = (col >> 5) * 32 + (((col >> 4) & 1) << 4) + 4 * ((t16 & 7) >> 1) + 2 * (t16 >> 3);
     psA[j] = Psb + rA * PSTR + slot;
     psB[j] = Psb + rB * PSTR + slot;
   }
-  const int cbase = s * 32 + 2 * (lane & 3);   // tile-local token col for j=0
+  const int cbase = s * 32 + 2 * (lane & 3);  // tile-local token col for j=0
 
   loadpair(pg0, 0);
   int cur = 0;
@@ -667,8 +635,10 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
   for (int pg = pg0; pg < pg1; pg += 2) {
     const bool more = (pg + 2) < pg1;
     if (more) loadpair(pg + 2, cur ^ 1);
-    if (more) asm volatile("cp.async.wait_group 1;\n" ::);
-    else      asm volatile("cp.async.wait_group 0;\n" ::);
+    if (more)
+      asm volatile("cp.async.wait_group 1;\n" ::);
+    else
+      asm volatile("cp.async.wait_group 0;\n" ::);
     __syncthreads();
 
     const uint32_t Kbase = Ksb + cur * (TT * KSTR);
@@ -685,12 +655,15 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
 #pragma unroll 2
       for (int kk = 0; kk < 18; ++kk) {
         uint32_t a[4], b0[4], b1[4];
-        ldm4(a, qp); ldm4(b0, kp); ldm4(b1, kp + 16 * KSTR);
+        ldm4(a, qp);
+        ldm4(b0, kp);
+        ldm4(b1, kp + 16 * KSTR);
         mma32(sacc[0], a[0], a[1], a[2], a[3], b0[0], b0[1]);
         mma32(sacc[1], a[0], a[1], a[2], a[3], b0[2], b0[3]);
         mma32(sacc[2], a[0], a[1], a[2], a[3], b1[0], b1[1]);
         mma32(sacc[3], a[0], a[1], a[2], a[3], b1[2], b1[3]);
-        qp += 32; kp += 32;
+        qp += 32;
+        kp += 32;
       }
     }
 
@@ -703,8 +676,10 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
       for (int e = 0; e < 2; ++e) {
         float xa = (c0 + e < remA) ? sacc[j][e] * qk_scale : -INFINITY;
         float xb = (c0 + e < remB) ? sacc[j][2 + e] * qk_scale : -INFINITY;
-        sacc[j][e] = xa; sacc[j][2 + e] = xb;
-        mxA = fmaxf(mxA, xa); mxB = fmaxf(mxB, xb);
+        sacc[j][e] = xa;
+        sacc[j][2 + e] = xb;
+        mxA = fmaxf(mxA, xa);
+        mxB = fmaxf(mxB, xb);
       }
     }
 #pragma unroll
@@ -717,7 +692,10 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
     // and can never exceed 1.  A lagged reference lets a record-setting tile
     // produce P up to 2^(s-m_lagged), which saturates E4M3 and overflows the
     // packed-FP16 PV accumulator on long-context rows.
-    if ((lane & 3) == 0) { red[rA * 4 + s] = mxA; red[rB * 4 + s] = mxB; }
+    if ((lane & 3) == 0) {
+      red[rA * 4 + s] = mxA;
+      red[rB * 4 + s] = mxB;
+    }
     row_group_sync(m + 1);
     {
       float4 ia = *reinterpret_cast<const float4*>(red + rA * 4);
@@ -731,10 +709,13 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
     {
       const float exA = lcap_shift(fmaf(lrun0, corrA, (float)TT));
       const float exB = lcap_shift(fmaf(lrun1, corrB, (float)TT));
-      mnA += exA; corrA *= exp2i(exA);
-      mnB += exB; corrB *= exp2i(exB);
+      mnA += exA;
+      corrA *= exp2i(exA);
+      mnB += exB;
+      corrB *= exp2i(exB);
     }
-    mrun0 = mnA; mrun1 = mnB;
+    mrun0 = mnA;
+    mrun1 = mnB;
     // O carries the previous reference, so rescale it before this tile's PV.
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
@@ -747,8 +728,10 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
         oacc[i][1] = *reinterpret_cast<uint32_t*>(&hb);
       } else {
         float* of = reinterpret_cast<float*>(oacc[i]);
-        of[0] *= corrA; of[1] *= corrA;
-        of[2] *= corrB; of[3] *= corrB;
+        of[0] *= corrA;
+        of[1] *= corrA;
+        of[2] *= corrB;
+        of[3] *= corrB;
       }
     }
     const float eA = mnA, eB = mnB;
@@ -760,13 +743,15 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
       for (int e = 0; e < 2; ++e) {
         float xa = (eA == -INFINITY) ? 0.f : exp2f(sacc[j][e] - eA);
         float xb = (eB == -INFINITY) ? 0.f : exp2f(sacc[j][2 + e] - eB);
-        sA += xa; sB += xb;
-        pa[e] = xa; pb[e] = xb;
+        sA += xa;
+        sB += xb;
+        pa[e] = xa;
+        pb[e] = xb;
       }
-      unsigned short qa = __nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]),
-                                                   __NV_SATFINITE, __NV_E4M3);
-      unsigned short qb2 = __nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]),
-                                                    __NV_SATFINITE, __NV_E4M3);
+      unsigned short qa =
+          __nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]), __NV_SATFINITE, __NV_E4M3);
+      unsigned short qb2 =
+          __nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]), __NV_SATFINITE, __NV_E4M3);
       sts16(psA[j], qa);
       sts16(psB[j], qb2);
     }
@@ -775,7 +760,10 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
       sA += __shfl_xor_sync(0xffffffff, sA, d);
       sB += __shfl_xor_sync(0xffffffff, sB, d);
     }
-    if ((lane & 3) == 0) { red2[rA * 4 + s] = sA; red2[rB * 4 + s] = sB; }
+    if ((lane & 3) == 0) {
+      red2[rA * 4 + s] = sA;
+      red2[rB * 4 + s] = sB;
+    }
     // Publishes both the tile sums and the probability tile itself.
     row_group_sync(m + 1);
     {
@@ -825,8 +813,14 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
   if (!single) {
     int giA = (b * rows_tot + gA) * ns + sp, giB = (b * rows_tot + gB) * ns + sp;
     if (s == 0 && (lane & 3) == 0) {
-      if (rA < vrows) { Mp[giA] = mrun0; Lp[giA] = lrun0; }
-      if (rB < vrows) { Mp[giB] = mrun1; Lp[giB] = lrun1; }
+      if (rA < vrows) {
+        Mp[giA] = mrun0;
+        Lp[giA] = lrun0;
+      }
+      if (rB < vrows) {
+        Mp[giB] = mrun1;
+        Lp[giB] = lrun1;
+      }
     }
   }
 #pragma unroll
@@ -838,28 +832,42 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
       float2 av1 = __half22float2(*reinterpret_cast<__half2*>(&oacc[2 * g + 1][0]));
       float2 bv0 = __half22float2(*reinterpret_cast<__half2*>(&oacc[2 * g][1]));
       float2 bv1 = __half22float2(*reinterpret_cast<__half2*>(&oacc[2 * g + 1][1]));
-      a0 = av0.x; a1 = av1.x; a2 = av0.y; a3 = av1.y;
-      b0 = bv0.x; b1 = bv1.x; b2 = bv0.y; b3 = bv1.y;
+      a0 = av0.x;
+      a1 = av1.x;
+      a2 = av0.y;
+      a3 = av1.y;
+      b0 = bv0.x;
+      b1 = bv1.x;
+      b2 = bv0.y;
+      b3 = bv1.y;
     } else {
       float* oa0 = reinterpret_cast<float*>(oacc[2 * g]);
       float* oa1 = reinterpret_cast<float*>(oacc[2 * g + 1]);
-      a0 = oa0[0]; a1 = oa1[0]; a2 = oa0[1]; a3 = oa1[1];
-      b0 = oa0[2]; b1 = oa1[2]; b2 = oa0[3]; b3 = oa1[3];
+      a0 = oa0[0];
+      a1 = oa1[0];
+      a2 = oa0[1];
+      a3 = oa1[1];
+      b0 = oa0[2];
+      b1 = oa1[2];
+      b2 = oa0[3];
+      b3 = oa1[3];
     }
     if (single) {
       if (rA < vrows) {
         __nv_bfloat162 t0 = __floats2bfloat162_rn(a0 * rAi, a1 * rAi);
         __nv_bfloat162 t1 = __floats2bfloat162_rn(a2 * rAi, a3 * rAi);
-        __nv_bfloat162* d = reinterpret_cast<__nv_bfloat162*>(
-            outp + (size_t)(b * QL * NH + gA) * CKV + col);
-        d[0] = t0; d[1] = t1;
+        __nv_bfloat162* d =
+            reinterpret_cast<__nv_bfloat162*>(outp + (size_t)(b * QL * NH + gA) * CKV + col);
+        d[0] = t0;
+        d[1] = t1;
       }
       if (rB < vrows) {
         __nv_bfloat162 t0 = __floats2bfloat162_rn(b0 * rBi, b1 * rBi);
         __nv_bfloat162 t1 = __floats2bfloat162_rn(b2 * rBi, b3 * rBi);
-        __nv_bfloat162* d = reinterpret_cast<__nv_bfloat162*>(
-            outp + (size_t)(b * QL * NH + gB) * CKV + col);
-        d[0] = t0; d[1] = t1;
+        __nv_bfloat162* d =
+            reinterpret_cast<__nv_bfloat162*>(outp + (size_t)(b * QL * NH + gB) * CKV + col);
+        d[0] = t0;
+        d[1] = t1;
       }
     } else {
       size_t base = (size_t)((b * ns + sp) * rows_tot) * CKV;
@@ -876,43 +884,39 @@ void mla_kernel(const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg,
 }
 
 // ===== wgmma (sm_90a) 48-row kernel, 2 compute WGs + 1 TMA producer WG =====
-constexpr int CMS = 144;          // LBO: byte stride between 16B core-matrix cols
-constexpr int SBOX = 36 * CMS;    // 5184: stride between 8-row groups
-constexpr int PGB = 8 * SBOX;     // 41472: bytes for 64 rows (one page)
+constexpr int CMS = 144;        // LBO: byte stride between 16B core-matrix cols
+constexpr int SBOX = 36 * CMS;  // 5184: stride between 8-row groups
+constexpr int PGB = 8 * SBOX;   // 41472: bytes for 64 rows (one page)
 
 // Native 128B WGMMA swizzle: five 64x128B K slabs cover the 576-byte row.
 // Each 8x128B atom is contiguous and XORs its 16B column by row&7.
 constexpr int SW_ATOM = 8 * 128;
-constexpr int SW_LBO  = 64 * 128;
+constexpr int SW_LBO = 64 * 128;
 constexpr int SW_PAGE = 5 * SW_LBO;
 constexpr uint32_t TMA_PAIR_BYTES = 2 * 5 * SW_LBO;
 
-static_assert((SW_ATOM % 1024) == 0 && (SW_LBO % 1024) == 0 &&
-              (SW_PAGE % 1024) == 0,
+static_assert((SW_ATOM % 1024) == 0 && (SW_LBO % 1024) == 0 && (SW_PAGE % 1024) == 0,
               "SW128 slabs must preserve the 1024-byte swizzle origin");
 
 __device__ __forceinline__ uint32_t swofs64(int row, int c16) {
   const int lr = row & 7;
-  return (uint32_t)((c16 >> 3) * SW_LBO + (row >> 3) * SW_ATOM
-                  + lr * 128 + ((c16 & 7) ^ lr) * 16);
+  return (uint32_t)((c16 >> 3) * SW_LBO + (row >> 3) * SW_ATOM + lr * 128 + ((c16 & 7) ^ lr) * 16);
 }
 
 __device__ __forceinline__ uint64_t gdesc_sw(uint32_t addr) {
-  return ((uint64_t)((addr & 0x3FFFFu) >> 4))
-       | ((uint64_t)((uint32_t)SW_LBO >> 4) << 16)
-       | ((uint64_t)((uint32_t)SW_ATOM >> 4) << 32)
-       | (1ull << 62);
+  return ((uint64_t)((addr & 0x3FFFFu) >> 4)) | ((uint64_t)((uint32_t)SW_LBO >> 4) << 16) |
+         ((uint64_t)((uint32_t)SW_ATOM >> 4) << 32) | (1ull << 62);
 }
 
 // Packed page: four 128B-swizzled CKV slabs plus one 64B-swizzled KPE slab.
 // Dropping the 64 wasted bytes per row of the old fifth 128B slab shrinks a
 // page from 40960 to 36864 bytes, which buys a fifth ring slot.
-constexpr int KPE_OFS  = 4 * SW_LBO;          // 32768
-constexpr int SW64_ATOM = 8 * 64;             // 512
-constexpr int PAGE_SZ  = KPE_OFS + 64 * 64;   // 36864
+constexpr int KPE_OFS = 4 * SW_LBO;         // 32768
+constexpr int SW64_ATOM = 8 * 64;           // 512
+constexpr int PAGE_SZ = KPE_OFS + 64 * 64;  // 36864
 constexpr uint32_t TMA_PAGE_BYTES = PAGE_SZ;
 constexpr int NSLOT = 5;
-constexpr int MAXPG = 288;            // page ids staged in shared memory
+constexpr int MAXPG = 288;  // page ids staged in shared memory
 
 __device__ __forceinline__ uint32_t swofs64b(int row, int c16) {
   const int lr = (row >> 1) & 3;
@@ -920,21 +924,20 @@ __device__ __forceinline__ uint32_t swofs64b(int row, int c16) {
 }
 
 __device__ __forceinline__ uint64_t gdesc_sw64(uint32_t addr) {
-  return ((uint64_t)((addr & 0x3FFFFu) >> 4))
-       | (1ull << 16)
-       | ((uint64_t)((uint32_t)SW64_ATOM >> 4) << 32)
-       | (2ull << 62);
+  return ((uint64_t)((addr & 0x3FFFFu) >> 4)) | (1ull << 16) |
+         ((uint64_t)((uint32_t)SW64_ATOM >> 4) << 32) | (2ull << 62);
 }
 
 __device__ __forceinline__ void tma_bar_init(uint64_t* bar, uint32_t arrivals = 1) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-               :: "r"(sptr(bar)), "r"(arrivals) : "memory");
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(sptr(bar)), "r"(arrivals)
+               : "memory");
 }
 
 __device__ __forceinline__ void tma_bar_expect(uint64_t* bar, uint32_t bytes) {
   asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-      :: "r"(sptr(bar)), "r"(bytes) : "memory");
+      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(sptr(bar)),
+      "r"(bytes)
+      : "memory");
 }
 
 __device__ __forceinline__ void tma_bar_wait(uint64_t* bar, int phase) {
@@ -944,22 +947,23 @@ __device__ __forceinline__ void tma_bar_wait(uint64_t* bar, int phase) {
         "{ .reg .pred p;\n"
         "  mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%1], %2;\n"
         "  selp.b32 %0, 1, 0, p;\n}"
-        : "=r"(done) : "r"(sptr(bar)), "r"(phase) : "memory");
+        : "=r"(done)
+        : "r"(sptr(bar)), "r"(phase)
+        : "memory");
   } while (!done);
 }
 
 __device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
-  asm volatile(
-      "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], 1;"
-      :: "r"(sptr(bar)) : "memory");
+  asm volatile("mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], 1;" ::"r"(sptr(bar))
+               : "memory");
 }
 
-__device__ __forceinline__ void tma_load_slab(
-    uint8_t* dst, const CUtensorMap* map, int col, int row, uint64_t* bar) {
+__device__ __forceinline__ void tma_load_slab(uint8_t* dst, const CUtensorMap* map, int col,
+                                              int row, uint64_t* bar) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes "
-      "[%0], [%1, {%2, %3}], [%4];"
-      :: "r"(sptr(dst)), "l"(map), "r"(col), "r"(row), "r"(sptr(bar))
+      "[%0], [%1, {%2, %3}], [%4];" ::"r"(sptr(dst)),
+      "l"(map), "r"(col), "r"(row), "r"(sptr(bar))
       : "memory");
 }
 
@@ -972,69 +976,80 @@ __device__ __forceinline__ uint64_t evict_first_policy() {
   return p;
 }
 
-__device__ __forceinline__ void tma_load_slab_ef(
-    uint8_t* dst, const CUtensorMap* map, int col, int row, uint64_t* bar,
-    uint64_t pol) {
+__device__ __forceinline__ void tma_load_slab_ef(uint8_t* dst, const CUtensorMap* map, int col,
+                                                 int row, uint64_t* bar, uint64_t pol) {
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
-      ".L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;"
-      :: "r"(sptr(dst)), "l"(map), "r"(col), "r"(row), "r"(sptr(bar)), "l"(pol)
+      ".L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(sptr(dst)),
+      "l"(map), "r"(col), "r"(row), "r"(sptr(bar)), "l"(pol)
       : "memory");
 }
 
-__device__ __forceinline__ void compute_sync() {
-  asm volatile("bar.sync 8, 256;" ::: "memory");
-}
+__device__ __forceinline__ void compute_sync() { asm volatile("bar.sync 8, 256;" ::: "memory"); }
 
 template <int N>
 __device__ __forceinline__ void warpgroup_reg_inc() {
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(N));
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" ::"n"(N));
 }
 
 template <int N>
 __device__ __forceinline__ void warpgroup_reg_dec() {
-  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(N));
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" ::"n"(N));
 }
 
-#define WGMMA64(SD)                                                            \
-  asm volatile("{\n.reg .pred p;\n setp.ne.b32 p, %34, 0;\n"                \
-    "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 "                    \
-    "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1;\n}\n"                                         \
-    : "+f"(sa[0]),"+f"(sa[1]),"+f"(sa[2]),"+f"(sa[3]),"+f"(sa[4]),"+f"(sa[5]),"+f"(sa[6]),"+f"(sa[7]),"+f"(sa[8]),"+f"(sa[9]),"+f"(sa[10]),"+f"(sa[11]),"+f"(sa[12]),"+f"(sa[13]),"+f"(sa[14]),"+f"(sa[15]),"+f"(sa[16]),"+f"(sa[17]),"+f"(sa[18]),"+f"(sa[19]),"+f"(sa[20]),"+f"(sa[21]),"+f"(sa[22]),"+f"(sa[23]),"+f"(sa[24]),"+f"(sa[25]),"+f"(sa[26]),"+f"(sa[27]),"+f"(sa[28]),"+f"(sa[29]),"+f"(sa[30]),"+f"(sa[31]) : "l"(da), "l"(db), "n"(SD))
+#define WGMMA64(SD)                                                                                \
+  asm volatile(                                                                                    \
+      "{\n.reg .pred p;\n setp.ne.b32 p, %34, 0;\n"                                                \
+      "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 "                                      \
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%"   \
+      "24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1;\n}\n"                                   \
+      : "+f"(sa[0]), "+f"(sa[1]), "+f"(sa[2]), "+f"(sa[3]), "+f"(sa[4]), "+f"(sa[5]), "+f"(sa[6]), \
+        "+f"(sa[7]), "+f"(sa[8]), "+f"(sa[9]), "+f"(sa[10]), "+f"(sa[11]), "+f"(sa[12]),           \
+        "+f"(sa[13]), "+f"(sa[14]), "+f"(sa[15]), "+f"(sa[16]), "+f"(sa[17]), "+f"(sa[18]),        \
+        "+f"(sa[19]), "+f"(sa[20]), "+f"(sa[21]), "+f"(sa[22]), "+f"(sa[23]), "+f"(sa[24]),        \
+        "+f"(sa[25]), "+f"(sa[26]), "+f"(sa[27]), "+f"(sa[28]), "+f"(sa[29]), "+f"(sa[30]),        \
+        "+f"(sa[31])                                                                               \
+      : "l"(da), "l"(db), "n"(SD))
 
-#define WGMMA64_INIT                                                           \
-  asm volatile("{\n.reg .pred p;\n setp.ne.b32 p, 0, 0;\n"                  \
-    "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 "                    \
-    "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1;\n}\n" \
-    : "=f"(sa[0]),"=f"(sa[1]),"=f"(sa[2]),"=f"(sa[3]),"=f"(sa[4]),"=f"(sa[5]),"=f"(sa[6]),"=f"(sa[7]),"=f"(sa[8]),"=f"(sa[9]),"=f"(sa[10]),"=f"(sa[11]),"=f"(sa[12]),"=f"(sa[13]),"=f"(sa[14]),"=f"(sa[15]),"=f"(sa[16]),"=f"(sa[17]),"=f"(sa[18]),"=f"(sa[19]),"=f"(sa[20]),"=f"(sa[21]),"=f"(sa[22]),"=f"(sa[23]),"=f"(sa[24]),"=f"(sa[25]),"=f"(sa[26]),"=f"(sa[27]),"=f"(sa[28]),"=f"(sa[29]),"=f"(sa[30]),"=f"(sa[31]) : "l"(da), "l"(db))
+#define WGMMA64_INIT                                                                               \
+  asm volatile(                                                                                    \
+      "{\n.reg .pred p;\n setp.ne.b32 p, 0, 0;\n"                                                  \
+      "wgmma.mma_async.sync.aligned.m64n64k32.f32.e4m3.e4m3 "                                      \
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,%17,%18,%19,%20,%21,%22,%23,%"   \
+      "24,%25,%26,%27,%28,%29,%30,%31}, %32, %33, p, 1, 1;\n}\n"                                   \
+      : "=f"(sa[0]), "=f"(sa[1]), "=f"(sa[2]), "=f"(sa[3]), "=f"(sa[4]), "=f"(sa[5]), "=f"(sa[6]), \
+        "=f"(sa[7]), "=f"(sa[8]), "=f"(sa[9]), "=f"(sa[10]), "=f"(sa[11]), "=f"(sa[12]),           \
+        "=f"(sa[13]), "=f"(sa[14]), "=f"(sa[15]), "=f"(sa[16]), "=f"(sa[17]), "=f"(sa[18]),        \
+        "=f"(sa[19]), "=f"(sa[20]), "=f"(sa[21]), "=f"(sa[22]), "=f"(sa[23]), "=f"(sa[24]),        \
+        "=f"(sa[25]), "=f"(sa[26]), "=f"(sa[27]), "=f"(sa[28]), "=f"(sa[29]), "=f"(sa[30]),        \
+        "=f"(sa[31])                                                                               \
+      : "l"(da), "l"(db))
 
-constexpr int PSZ = 6 * 1024;         // 48 query rows x 128 kappa slots, SW128
-constexpr int SRS = 528;              // epilogue transpose row stride (fp8)
+constexpr int PSZ = 6 * 1024;  // 48 query rows x 128 kappa slots, SW128
+constexpr int SRS = 528;       // epilogue transpose row stride (fp8)
 
 // Dual-resident MT3 path: only the 48 live query rows are stored.  Each
 // 128-byte CKV slab therefore has six 8-row SW128 atoms rather than eight;
 // the KPE tail analogously has six SW64 atoms.  WGMMA's unused rows 48..63
 // may alias the following slab, but they map only to the ignored fourth warp.
-constexpr int Q_SW_LBO  = 6 * SW_ATOM;           // 6144 bytes / CKV slab
-constexpr int Q_KPE_OFS = 4 * Q_SW_LBO;          // 24576
-constexpr int Q_PAGE_SZ = Q_KPE_OFS + 48 * 64;   // 27648
-constexpr int Q_GUARD_SZ = 1024;                  // ignored KPE rows 48..63
+constexpr int Q_SW_LBO = 6 * SW_ATOM;           // 6144 bytes / CKV slab
+constexpr int Q_KPE_OFS = 4 * Q_SW_LBO;         // 24576
+constexpr int Q_PAGE_SZ = Q_KPE_OFS + 48 * 64;  // 27648
+constexpr int Q_GUARD_SZ = 1024;                // ignored KPE rows 48..63
 constexpr int Q_STORAGE_SZ = Q_PAGE_SZ + Q_GUARD_SZ;
-constexpr int D_NSLOT   = 2;
+constexpr int D_NSLOT = 2;
 static_assert((Q_SW_LBO % 1024) == 0 && (Q_STORAGE_SZ % 1024) == 0,
               "compact Q slabs must preserve WGMMA swizzle alignment");
 
 __device__ __forceinline__ uint32_t swofs48(int row, int c16) {
   const int lr = row & 7;
-  return (uint32_t)((c16 >> 3) * Q_SW_LBO + (row >> 3) * SW_ATOM
-                  + lr * 128 + ((c16 & 7) ^ lr) * 16);
+  return (uint32_t)((c16 >> 3) * Q_SW_LBO + (row >> 3) * SW_ATOM + lr * 128 +
+                    ((c16 & 7) ^ lr) * 16);
 }
 
 __device__ __forceinline__ uint64_t gdesc_q(uint32_t addr) {
-  return ((uint64_t)((addr & 0x3FFFFu) >> 4))
-       | ((uint64_t)((uint32_t)Q_SW_LBO >> 4) << 16)
-       | ((uint64_t)((uint32_t)SW_ATOM >> 4) << 32)
-       | (1ull << 62);
+  return ((uint64_t)((addr & 0x3FFFFu) >> 4)) | ((uint64_t)((uint32_t)Q_SW_LBO >> 4) << 16) |
+         ((uint64_t)((uint32_t)SW_ATOM >> 4) << 32) | (1ull << 62);
 }
 
 __device__ __forceinline__ void dual_compute_sync() {
@@ -1044,50 +1059,46 @@ __device__ __forceinline__ void dual_compute_sync() {
 // O^T = V^T . P^T : the V^T operand lives in registers (built by ldmatrix.trans
 // + prmt), P^T is read straight from shared memory by the descriptor, so the
 // PV GEMM runs natively in fp8 with no operand up-conversion at all.
-#define WGMMA_PV(ACC, A0, A1, A2, A3, DB)                                      \
-  asm volatile("{\n.reg .pred p;\n setp.ne.b32 p, 1, 0;\n"                     \
-    "wgmma.mma_async.sync.aligned.m64n48k32.f16.e4m3.e4m3 "                    \
-    "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11}, "                                \
-    "{%12,%13,%14,%15}, %16, p, 1, 1;\n}\n"                                    \
-    : "+r"(ACC[0]),"+r"(ACC[1]),"+r"(ACC[2]),"+r"(ACC[3]),                     \
-      "+r"(ACC[4]),"+r"(ACC[5]),"+r"(ACC[6]),"+r"(ACC[7]),                     \
-      "+r"(ACC[8]),"+r"(ACC[9]),"+r"(ACC[10]),"+r"(ACC[11])                    \
-    : "r"(A0),"r"(A1),"r"(A2),"r"(A3), "l"(DB))
+#define WGMMA_PV(ACC, A0, A1, A2, A3, DB)                                                    \
+  asm volatile(                                                                              \
+      "{\n.reg .pred p;\n setp.ne.b32 p, 1, 0;\n"                                            \
+      "wgmma.mma_async.sync.aligned.m64n48k32.f16.e4m3.e4m3 "                                \
+      "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11}, "                                            \
+      "{%12,%13,%14,%15}, %16, p, 1, 1;\n}\n"                                                \
+      : "+r"(ACC[0]), "+r"(ACC[1]), "+r"(ACC[2]), "+r"(ACC[3]), "+r"(ACC[4]), "+r"(ACC[5]),  \
+        "+r"(ACC[6]), "+r"(ACC[7]), "+r"(ACC[8]), "+r"(ACC[9]), "+r"(ACC[10]), "+r"(ACC[11]) \
+      : "r"(A0), "r"(A1), "r"(A2), "r"(A3), "l"(DB))
 
 // L2-only tile prefetch: costs no shared memory, so the producer can run far
 // further ahead in the KV stream than the two-slot smem queue allows.
-__device__ __forceinline__ void tma_prefetch_slab(const CUtensorMap* map,
-                                                  int col, int row) {
-  asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global [%0, {%1, %2}];"
-               :: "l"(map), "r"(col), "r"(row) : "memory");
+__device__ __forceinline__ void tma_prefetch_slab(const CUtensorMap* map, int col, int row) {
+  asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global [%0, {%1, %2}];" ::"l"(map), "r"(col),
+               "r"(row)
+               : "memory");
 }
 
-template <bool HALF_ACC, bool FAST_SPLIT, bool ONE_B, bool QLEN6, bool RECT_B,
-          bool LCHECK = true, bool REPAIR_CHECK = true, int SLOTS = NSLOT>
-__global__ __launch_bounds__(288, 1)
-void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
-                const uint8_t* __restrict__ kvg,
-                const int* __restrict__ btab, const int* __restrict__ slen,
-                const float* __restrict__ dqp, const float* __restrict__ dkp,
-                float sm_scale, __nv_bfloat16* __restrict__ outp,
-                uint8_t* __restrict__ Op, float* __restrict__ Mp, float* __restrict__ Lp,
-                const __grid_constant__ CUtensorMap kv_map,
-                const __grid_constant__ CUtensorMap pe_map,
-                int B, int QL, int pps, int ns, int pps_split, int QPC,
-                int rect_hint) {
+template <bool HALF_ACC, bool FAST_SPLIT, bool ONE_B, bool QLEN6, bool RECT_B, bool LCHECK = true,
+          bool REPAIR_CHECK = true, int SLOTS = NSLOT>
+__global__ __launch_bounds__(288, 1) void mla_kernel_tmaproducer(
+    const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg, const int* __restrict__ btab,
+    const int* __restrict__ slen, const float* __restrict__ dqp, const float* __restrict__ dkp,
+    float sm_scale, __nv_bfloat16* __restrict__ outp, uint8_t* __restrict__ Op,
+    float* __restrict__ Mp, float* __restrict__ Lp, const __grid_constant__ CUtensorMap kv_map,
+    const __grid_constant__ CUtensorMap pe_map, int B, int QL, int pps, int ns, int pps_split,
+    int QPC, int rect_hint) {
   constexpr int NTHR = 288;
   constexpr int ROWS = 48;
 
   extern __shared__ __align__(1024) char smraw[];
-  uint8_t* Qs = reinterpret_cast<uint8_t*>(smraw);   // 64 rows, packed page
-  uint8_t* Ks = Qs + PAGE_SZ;                        // SLOTS single-page slots
-  uint8_t* Ps = Ks + SLOTS * PAGE_SZ;                // wgmma B operand, SW128
-  float*   tmx = reinterpret_cast<float*>(Ps + PSZ);           // [48][2]
-  float*   tsm = tmx + 2 * ROWS;                               // [48][2]
-  float*   gl  = tsm + 2 * ROWS;                               // [48]
-  float*   rinv = gl + ROWS;                                   // [48]
-  __half*  hc  = reinterpret_cast<__half*>(rinv + ROWS);       // [48]
-  int*     pgt = reinterpret_cast<int*>(hc + 64);              // [MAXPG] page ids
+  uint8_t* Qs = reinterpret_cast<uint8_t*>(smraw);      // 64 rows, packed page
+  uint8_t* Ks = Qs + PAGE_SZ;                           // SLOTS single-page slots
+  uint8_t* Ps = Ks + SLOTS * PAGE_SZ;                   // wgmma B operand, SW128
+  float* tmx = reinterpret_cast<float*>(Ps + PSZ);      // [48][2]
+  float* tsm = tmx + 2 * ROWS;                          // [48][2]
+  float* gl = tsm + 2 * ROWS;                           // [48]
+  float* rinv = gl + ROWS;                              // [48]
+  __half* hc = reinterpret_cast<__half*>(rinv + ROWS);  // [48]
+  int* pgt = reinterpret_cast<int*>(hc + 64);           // [MAXPG] page ids
   __shared__ __align__(8) uint64_t tma_full[SLOTS];
   __shared__ __align__(8) uint64_t slot_empty[SLOTS];
 
@@ -1140,11 +1151,12 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
       const int row = j / 36, c = j % 36;
       const uint32_t o = (c < 32) ? swofs64(row, c) : (KPE_OFS + swofs64b(row, c - 32));
       if (row < (FAST_SPLIT ? ROWS : vrows))
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                     :: "r"(sptr(Qs + o)), "l"(qb + (size_t)j * 16) : "memory");
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(sptr(Qs + o)),
+                     "l"(qb + (size_t)j * 16)
+                     : "memory");
       else
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 0;\n"
-                     :: "r"(sptr(Qs + o)), "l"(qb) : "memory");
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 0;\n" ::"r"(sptr(Qs + o)), "l"(qb)
+                     : "memory");
     }
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   }
@@ -1156,8 +1168,7 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
     const int nload = min((pps_split + 1) & ~1, MAXPG);
     const int* bt0 = btab + b * pps;
     if (wg == 2)
-      for (int i = tid - 256; i < nload; i += 32)
-        pgt[i] = bt0[min(pg0 + i, pps - 1)];
+      for (int i = tid - 256; i < nload; i += 32) pgt[i] = bt0[min(pg0 + i, pps - 1)];
   }
 
   const int L = slen[b];
@@ -1168,7 +1179,8 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     for (int r = tid; r < vrows; r += NTHR) {
       int gi = (b * rows_tot + q0 * NH + r) * ns + sp;
-      Mp[gi] = -INFINITY; Lp[gi] = 0.f;
+      Mp[gi] = -INFINITY;
+      Lp[gi] = 0.f;
     }
     return;
   }
@@ -1183,7 +1195,7 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
   }
   __syncthreads();
 
-  const int npg = ((pg1 - pg0 + 1) >> 1) << 1;   // even, last page may repeat
+  const int npg = ((pg1 - pg0 + 1) >> 1) << 1;  // even, last page may repeat
 
   if (wg == 2) {
     // Five single-page ring slots let the producer run up to three pages ahead
@@ -1199,10 +1211,13 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
         uint8_t* dst = Ks + ps * PAGE_SZ;
 #pragma unroll
         for (int slab = 0; slab < 4; ++slab)
-          tma_load_slab_ef(dst + slab * SW_LBO, &kv_map, slab * 128, phys * PAGE,
-                           &tma_full[ps], pol);
+          tma_load_slab_ef(dst + slab * SW_LBO, &kv_map, slab * 128, phys * PAGE, &tma_full[ps],
+                           pol);
         tma_load_slab_ef(dst + KPE_OFS, &pe_map, 0, phys * PAGE, &tma_full[ps], pol);
-        if (++ps == SLOTS) { ps = 0; ++kcnt; }
+        if (++ps == SLOTS) {
+          ps = 0;
+          ++kcnt;
+        }
       }
     }
     return;
@@ -1263,12 +1278,11 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
   }
 
   const uint64_t dqbase = gdesc_sw(sptr(Qs));
-  const uint64_t dqpe   = gdesc_sw64(sptr(Qs) + KPE_OFS);
-  const uint64_t pdesc  = gdesc_sw(Psb);
+  const uint64_t dqpe = gdesc_sw64(sptr(Qs) + KPE_OFS);
+  const uint64_t pdesc = gdesc_sw(Psb);
   uint64_t qd[18];
 #pragma unroll
-  for (int i = 0; i < 16; ++i)
-    qd[i] = dqbase + (uint64_t)((i >> 2) * 512 + (i & 3) * 2);
+  for (int i = 0; i < 16; ++i) qd[i] = dqbase + (uint64_t)((i >> 2) * 512 + (i & 3) * 2);
   qd[16] = dqpe;
   qd[17] = dqpe + 2;
   // Each tile consumes two independent single-page ring slots; a warpgroup
@@ -1286,7 +1300,8 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
       uint64_t da = qd[0];
       uint64_t db = gdesc_sw(Ksb + sw * PAGE_SZ);
       asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-      WGMMA64_INIT; db += 2;
+      WGMMA64_INIT;
+      db += 2;
 #pragma unroll
       for (int kk = 1; kk < 16; ++kk) {
         da = qd[kk];
@@ -1296,7 +1311,9 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
       // The 64-byte rope tail lives in its own 64B-swizzled slab.
       da = qd[16];
       db = gdesc_sw64(Ksb + sw * PAGE_SZ + KPE_OFS);
-      WGMMA64(1); da = qd[17]; db += 2;
+      WGMMA64(1);
+      da = qd[17];
+      db += 2;
       WGMMA64(1);
       asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
       asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
@@ -1315,27 +1332,31 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
         }
       } else {
 #pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        int c0 = cbase + 8 * j;
+        for (int j = 0; j < 8; ++j) {
+          int c0 = cbase + 8 * j;
 #pragma unroll
-        for (int e = 0; e < 2; ++e) {
-          float xa = (c0 + e < remA) ? sa[4 * j + e] : -INFINITY;
-          float xb = (c0 + e < remB) ? sa[4 * j + 2 + e] : -INFINITY;
-          sa[4 * j + e] = xa; sa[4 * j + 2 + e] = xb;
-          mxA = fmaxf(mxA, xa); mxB = fmaxf(mxB, xb);
+          for (int e = 0; e < 2; ++e) {
+            float xa = (c0 + e < remA) ? sa[4 * j + e] : -INFINITY;
+            float xb = (c0 + e < remB) ? sa[4 * j + 2 + e] : -INFINITY;
+            sa[4 * j + e] = xa;
+            sa[4 * j + 2 + e] = xb;
+            mxA = fmaxf(mxA, xa);
+            mxB = fmaxf(mxB, xb);
+          }
         }
-      }
       }
 #pragma unroll
       for (int d = 1; d < 4; d <<= 1) {
         mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffff, mxA, d));
         mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffff, mxB, d));
       }
-      mxA *= qk_scale; mxB *= qk_scale;
+      mxA *= qk_scale;
+      mxB *= qk_scale;
     }
 
     if (w < 3 && (lane & 3) == 0) {
-      tmx[qrA * 2 + wg] = mxA; tmx[qrB * 2 + wg] = mxB;
+      tmx[qrA * 2 + wg] = mxA;
+      tmx[qrB * 2 + wg] = mxB;
     }
     // Exact online-softmax reference.  The two compute warpgroups own disjoint
     // halves of the token tile, so they exchange this tile's row maxima before
@@ -1355,8 +1376,10 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
       {
         const float ex0 = LCHECK ? lcap_shift(fmaf(lq0, c0, (float)TT)) : 0.f;
         const float ex1 = LCHECK ? lcap_shift(fmaf(lq1, c1, (float)TT)) : 0.f;
-        mq0 += ex0; c0 *= exp2i(ex0);
-        mq1 += ex1; c1 *= exp2i(ex1);
+        mq0 += ex0;
+        c0 *= exp2i(ex0);
+        mq1 += ex1;
+        c1 *= exp2i(ex1);
       }
       if ((lane & 3) == 0) {
         const int r = w * 16 + (lane >> 2) + wg * 8;
@@ -1371,17 +1394,21 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
         for (int e = 0; e < 4; ++e) {
           float xa = exp2f(fmaf(sa[8 * j + 4 * (e >> 1) + (e & 1)], qk_scale, eA));
           float xb = exp2f(fmaf(sa[8 * j + 4 * (e >> 1) + 2 + (e & 1)], qk_scale, eB));
-          sA += xa; sB += xb;
-          pa[e] = xa; pb[e] = xb;
+          sA += xa;
+          sB += xb;
+          pa[e] = xa;
+          pb[e] = xb;
         }
-        uint32_t qa = (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]),
-                                                         __NV_SATFINITE, __NV_E4M3)
-                    | ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[2], pa[3]),
-                                                          __NV_SATFINITE, __NV_E4M3) << 16);
-        uint32_t qb = (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]),
-                                                         __NV_SATFINITE, __NV_E4M3)
-                    | ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[2], pb[3]),
-                                                          __NV_SATFINITE, __NV_E4M3) << 16);
+        uint32_t qa = (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]), __NV_SATFINITE,
+                                                         __NV_E4M3) |
+                      ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[2], pa[3]), __NV_SATFINITE,
+                                                          __NV_E4M3)
+                       << 16);
+        uint32_t qb = (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]), __NV_SATFINITE,
+                                                         __NV_E4M3) |
+                      ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[2], pb[3]), __NV_SATFINITE,
+                                                          __NV_E4M3)
+                       << 16);
         sts32(psA[j], qa);
         sts32(psB[j], qb);
       }
@@ -1391,7 +1418,8 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
         sB += __shfl_xor_sync(0xffffffff, sB, d);
       }
       if ((lane & 3) == 0) {
-        tsm[qrA * 2 + wg] = sA; tsm[qrB * 2 + wg] = sB;
+        tsm[qrA * 2 + wg] = sA;
+        tsm[qrB * 2 + wg] = sB;
       }
     }
     // Publishes the probability tile, the per-row rescale and the tile sums.
@@ -1408,8 +1436,8 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
       uint32_t hcv[6];
 #pragma unroll
       for (int j = 0; j < 6; ++j)
-        hcv[j] = *reinterpret_cast<const uint32_t*>(
-            reinterpret_cast<const char*>(hc) + 2 * (8 * j + 2 * (lane & 3)));
+        hcv[j] = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const char*>(hc) +
+                                                    2 * (8 * j + 2 * (lane & 3)));
 #pragma unroll
       for (int mb = 0; mb < 4; ++mb)
 #pragma unroll
@@ -1417,7 +1445,7 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
           const __half2 h = *reinterpret_cast<__half2*>(&hcv[j]);
           __half2 x0 = __hmul2(*reinterpret_cast<__half2*>(&oacc[mb][2 * j]), h);
           __half2 x1 = __hmul2(*reinterpret_cast<__half2*>(&oacc[mb][2 * j + 1]), h);
-          oacc[mb][2 * j]     = *reinterpret_cast<uint32_t*>(&x0);
+          oacc[mb][2 * j] = *reinterpret_cast<uint32_t*>(&x0);
           oacc[mb][2 * j + 1] = *reinterpret_cast<uint32_t*>(&x1);
         }
     }
@@ -1431,8 +1459,7 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
 #pragma unroll
       for (int kk = 0; kk < 4; ++kk) {
         ldm4t(&Ar[0][4 * kk],
-              (kk < 2 ? vbA : vbB) + vadd[0]
-              + (uint32_t)((kk & 1) * (4 * SW_ATOM)));
+              (kk < 2 ? vbA : vbB) + vadd[0] + (uint32_t)((kk & 1) * (4 * SW_ATOM)));
       }
 #pragma unroll
       for (int kk = 0; kk < 4; ++kk) {
@@ -1450,19 +1477,17 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk)
-          WGMMA_PV(oacc[mb], Ar[buf][4 * kk + 0], Ar[buf][4 * kk + 1],
-                   Ar[buf][4 * kk + 2], Ar[buf][4 * kk + 3], pdesc + 2 * kk);
+          WGMMA_PV(oacc[mb], Ar[buf][4 * kk + 0], Ar[buf][4 * kk + 1], Ar[buf][4 * kk + 2],
+                   Ar[buf][4 * kk + 3], pdesc + 2 * kk);
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
         // Retire only the previous M block, so this one stays in flight while
         // its successor's V^T fragments are fetched: no pipeline drain per block.
-        if (mb >= 1 && mb < 3)
-          asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+        if (mb >= 1 && mb < 3) asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
         if (mb < 3) {
 #pragma unroll
           for (int kk = 0; kk < 4; ++kk) {
             ldm4t(&Ar[buf ^ 1][4 * kk],
-                  (kk < 2 ? vbA : vbB) + vadd[mb + 1]
-                  + (uint32_t)((kk & 1) * (4 * SW_ATOM)));
+                  (kk < 2 ? vbA : vbB) + vadd[mb + 1] + (uint32_t)((kk & 1) * (4 * SW_ATOM)));
           }
 #pragma unroll
           for (int kk = 0; kk < 4; ++kk) {
@@ -1487,13 +1512,20 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
       // of serializing it after a complete WGMMA drain.
       int ns0 = s0 + 2, ns1 = s1 + 2;
       int nph0 = ph0, nph1 = ph1;
-      if (ns0 >= SLOTS) { ns0 -= SLOTS; nph0 ^= 1; }
-      if (ns1 >= SLOTS) { ns1 -= SLOTS; nph1 ^= 1; }
-      if (pg + 2 < pg1)
-        tma_bar_wait(&tma_full[(wg == 0) ? ns0 : ns1],
-                     (wg == 0) ? nph0 : nph1);
+      if (ns0 >= SLOTS) {
+        ns0 -= SLOTS;
+        nph0 ^= 1;
+      }
+      if (ns1 >= SLOTS) {
+        ns1 -= SLOTS;
+        nph1 ^= 1;
+      }
+      if (pg + 2 < pg1) tma_bar_wait(&tma_full[(wg == 0) ? ns0 : ns1], (wg == 0) ? nph0 : nph1);
       asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-      s0 = ns0; s1 = ns1; ph0 = nph0; ph1 = nph1;
+      s0 = ns0;
+      s1 = ns1;
+      ph0 = nph0;
+      ph1 = nph1;
     }
   }
 
@@ -1511,14 +1543,13 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
 #pragma unroll
           for (int j = 0; j < 2; ++j) {
             const uint32_t v = oacc[mb][2 * g + j];
-            nonfinite_chain[(2 * mb + j) & 3] =
-                hmax_abs_nan(nonfinite_chain[(2 * mb + j) & 3], v);
+            nonfinite_chain[(2 * mb + j) & 3] = hmax_abs_nan(nonfinite_chain[(2 * mb + j) & 3], v);
           }
       }
     }
-    const uint32_t nonfinite_bits = hmax_abs_nan(
-        hmax_abs_nan(nonfinite_chain[0], nonfinite_chain[1]),
-        hmax_abs_nan(nonfinite_chain[2], nonfinite_chain[3]));
+    const uint32_t nonfinite_bits =
+        hmax_abs_nan(hmax_abs_nan(nonfinite_chain[0], nonfinite_chain[1]),
+                     hmax_abs_nan(nonfinite_chain[2], nonfinite_chain[3]));
     if (__any_sync(0xffffffffu, half2_nonfinite(nonfinite_bits)) && lane == 0)
       atomicExch(&repair_needed_cta, 1);
   }
@@ -1538,9 +1569,11 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
     if (!single) {
       int gi = (b * rows_tot + q0 * NH + r) * ns + sp;
       if constexpr (FAST_SPLIT) {
-        Mp[gi] = mrun; Lp[gi] = lrun;
+        Mp[gi] = mrun;
+        Lp[gi] = lrun;
       } else if (r < vrows) {
-        Mp[gi] = mrun; Lp[gi] = lrun;
+        Mp[gi] = mrun;
+        Lp[gi] = lrun;
       }
     }
   }
@@ -1549,9 +1582,8 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
     if (repair_needed_cta) {
       if (tid < 128)
         for (int j = 0; j < 3 && q0 + 2 * j < qlen; ++j)
-          repair_split(qg, kvg, btab, slen, dqp, dkp, sm_scale, outp, Op,
-                       Mp, Lp, qlen, pps, ns, pps_split, b, sp,
-                       q0 + 2 * j, smraw);
+          repair_split(qg, kvg, btab, slen, dqp, dkp, sm_scale, outp, Op, Mp, Lp, qlen, pps, ns,
+                       pps_split, b, sp, q0 + 2 * j, smraw);
       return;
     }
   }
@@ -1562,28 +1594,28 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
   compute_sync();
 
   const int a3 = lane & 3, l4 = lane >> 2;
-  if constexpr (!FAST_SPLIT) if (single) {
+  if constexpr (!FAST_SPLIT)
+    if (single) {
 #pragma unroll
-    for (int mb = 0; mb < 4; ++mb) {
-      const int c = wg * 256 + mb * 64 + w * 16 + 2 * l4;
+      for (int mb = 0; mb < 4; ++mb) {
+        const int c = wg * 256 + mb * 64 + w * 16 + 2 * l4;
 #pragma unroll
-      for (int g = 0; g < 6; ++g) {
-        const int n0 = 8 * g + 2 * a3;
-        float2 ri = *reinterpret_cast<const float2*>(rinv + n0);
-        float2 f0 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g]));
-        float2 f1 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g + 1]));
-        if (n0 < vrows)
-          *reinterpret_cast<__nv_bfloat162*>(
-              outp + (size_t)(b * qlen * NH + q0 * NH + n0) * CKV + c) =
-              __floats2bfloat162_rn(f0.x * ri.x, f1.x * ri.x);
-        if (n0 + 1 < vrows)
-          *reinterpret_cast<__nv_bfloat162*>(
-              outp + (size_t)(b * qlen * NH + q0 * NH + n0 + 1) * CKV + c) =
-              __floats2bfloat162_rn(f0.y * ri.y, f1.y * ri.y);
+        for (int g = 0; g < 6; ++g) {
+          const int n0 = 8 * g + 2 * a3;
+          float2 ri = *reinterpret_cast<const float2*>(rinv + n0);
+          float2 f0 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g]));
+          float2 f1 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g + 1]));
+          if (n0 < vrows)
+            *reinterpret_cast<__nv_bfloat162*>(outp + (size_t)(b * qlen * NH + q0 * NH + n0) * CKV +
+                                               c) = __floats2bfloat162_rn(f0.x * ri.x, f1.x * ri.x);
+          if (n0 + 1 < vrows)
+            *reinterpret_cast<__nv_bfloat162*>(
+                outp + (size_t)(b * qlen * NH + q0 * NH + n0 + 1) * CKV + c) =
+                __floats2bfloat162_rn(f0.y * ri.y, f1.y * ri.y);
+        }
       }
+      return;
     }
-    return;
-  }
 
   uint8_t* S = Ks;
 #pragma unroll
@@ -1595,12 +1627,11 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
       float2 ri = *reinterpret_cast<const float2*>(rinv + n0);
       float2 f0 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g]));
       float2 f1 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g + 1]));
-      sts16(sptr(S + n0 * SRS + c),
-            __nv_cvt_float2_to_fp8x2(make_float2(f0.x * ri.x, f1.x * ri.x),
-                                     __NV_SATFINITE, __NV_E4M3));
+      sts16(sptr(S + n0 * SRS + c), __nv_cvt_float2_to_fp8x2(make_float2(f0.x * ri.x, f1.x * ri.x),
+                                                             __NV_SATFINITE, __NV_E4M3));
       sts16(sptr(S + (n0 + 1) * SRS + c),
-            __nv_cvt_float2_to_fp8x2(make_float2(f0.y * ri.y, f1.y * ri.y),
-                                     __NV_SATFINITE, __NV_E4M3));
+            __nv_cvt_float2_to_fp8x2(make_float2(f0.y * ri.y, f1.y * ri.y), __NV_SATFINITE,
+                                     __NV_E4M3));
     }
   }
   compute_sync();
@@ -1619,18 +1650,14 @@ void mla_kernel_tmaproducer(const uint8_t* __restrict__ qg,
 // 48 live query rows and all 512 output columns, while a dedicated producer
 // warp keeps a two-page TMA ring full.  Five warps plus the 110208-byte shared
 // footprint permit two CTAs per H200 SM without a 128-register launch cap.
-template <bool HALF_ACC, bool QLEN6, bool LCHECK = true,
-          bool REPAIR_CHECK = true>
-__global__ __launch_bounds__(160, 2)
-void mla_kernel_dual(const uint8_t* __restrict__ qg,
-                const uint8_t* __restrict__ kvg,
-                const int* __restrict__ btab, const int* __restrict__ slen,
-                const float* __restrict__ dqp, const float* __restrict__ dkp,
-                float sm_scale, __nv_bfloat16* __restrict__ outp,
-                uint8_t* __restrict__ Op, float* __restrict__ Mp, float* __restrict__ Lp,
-                const __grid_constant__ CUtensorMap kv_map,
-                const __grid_constant__ CUtensorMap pe_map,
-                int B, int QL, int pps, int ns, int pps_split, int QPC) {
+template <bool HALF_ACC, bool QLEN6, bool LCHECK = true, bool REPAIR_CHECK = true>
+__global__ __launch_bounds__(160, 2) void mla_kernel_dual(
+    const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kvg, const int* __restrict__ btab,
+    const int* __restrict__ slen, const float* __restrict__ dqp, const float* __restrict__ dkp,
+    float sm_scale, __nv_bfloat16* __restrict__ outp, uint8_t* __restrict__ Op,
+    float* __restrict__ Mp, float* __restrict__ Lp, const __grid_constant__ CUtensorMap kv_map,
+    const __grid_constant__ CUtensorMap pe_map, int B, int QL, int pps, int ns, int pps_split,
+    int QPC) {
   constexpr int NTHR = 160;
   constexpr int ROWS = 48;
 
@@ -1641,10 +1668,10 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
   uint8_t* Qguard = Qs + Q_PAGE_SZ;
   uint8_t* Ks = Qs + Q_STORAGE_SZ;
   uint8_t* Ps = Ks + D_NSLOT * PAGE_SZ;
-  float*   gl = reinterpret_cast<float*>(Ps + PSZ);             // [48]
-  float*   rinv = gl + ROWS;                                    // [48]
-  __half*  hc = reinterpret_cast<__half*>(rinv + ROWS);         // [64]
-  int*     pgt = reinterpret_cast<int*>(hc + 64);               // [MAXPG]
+  float* gl = reinterpret_cast<float*>(Ps + PSZ);       // [48]
+  float* rinv = gl + ROWS;                              // [48]
+  __half* hc = reinterpret_cast<__half*>(rinv + ROWS);  // [64]
+  int* pgt = reinterpret_cast<int*>(hc + 64);           // [MAXPG]
   __shared__ __align__(8) uint64_t tma_full[D_NSLOT];
   __shared__ __align__(8) uint64_t slot_empty[D_NSLOT];
 
@@ -1676,16 +1703,15 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
     const uint8_t* qb = qg + (size_t)(b * qlen + q0) * NH * DIMQ;
     for (int j = (wg == 0) ? tid : ROWS * 36; j < ROWS * 36; j += 128) {
       const int row = j / 36, c = j % 36;
-      const uint32_t o = (c < 32) ? swofs48(row, c)
-                                  : (Q_KPE_OFS + swofs64b(row, c - 32));
+      const uint32_t o = (c < 32) ? swofs48(row, c) : (Q_KPE_OFS + swofs64b(row, c - 32));
       if (row < vrows)
-        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
-                     :: "r"(sptr(Qs + o)), "l"(qb + (size_t)j * 16) : "memory");
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" ::"r"(sptr(Qs + o)),
+                     "l"(qb + (size_t)j * 16)
+                     : "memory");
       else
         *reinterpret_cast<uint4*>(Qs + o) = make_uint4(0, 0, 0, 0);
     }
-    for (int j = (wg == 0) ? tid : Q_GUARD_SZ / 16;
-         j < Q_GUARD_SZ / 16; j += 128)
+    for (int j = (wg == 0) ? tid : Q_GUARD_SZ / 16; j < Q_GUARD_SZ / 16; j += 128)
       *reinterpret_cast<uint4*>(Qguard + 16 * j) = make_uint4(0, 0, 0, 0);
     asm volatile("cp.async.commit_group;\n" ::: "memory");
   }
@@ -1699,7 +1725,8 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
     for (int r = tid; r < vrows; r += NTHR) {
       const int gi = (b * rows_tot + q0 * NH + r) * ns + sp;
-      Mp[gi] = -INFINITY; Lp[gi] = 0.f;
+      Mp[gi] = -INFINITY;
+      Lp[gi] = 0.f;
     }
     return;
   }
@@ -1708,8 +1735,7 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
   if (wg == 1) {
     const int nload = min(npg, MAXPG);
     const int* bt = btab + b * pps;
-    for (int i = tid - 128; i < nload; i += 32)
-      pgt[i] = bt[pg0 + i];
+    for (int i = tid - 128; i < nload; i += 32) pgt[i] = bt[pg0 + i];
   }
   if (tid == 0) {
 #pragma unroll
@@ -1726,18 +1752,18 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
       const int* bt = btab + b * pps;
       int ps = 0, cycle = 0;
       for (int p = 0; p < npg; ++p) {
-        if (p >= D_NSLOT)
-          tma_bar_wait(&slot_empty[ps], (cycle - 1) & 1);
+        if (p >= D_NSLOT) tma_bar_wait(&slot_empty[ps], (cycle - 1) & 1);
         tma_bar_expect(&tma_full[ps], TMA_PAGE_BYTES);
         const int phys = (p < MAXPG) ? pgt[p] : bt[pg0 + p];
         uint8_t* dst = Ks + ps * PAGE_SZ;
 #pragma unroll
         for (int slab = 0; slab < 4; ++slab)
-          tma_load_slab(dst + slab * SW_LBO, &kv_map,
-                        slab * 128, phys * PAGE, &tma_full[ps]);
-        tma_load_slab(dst + KPE_OFS, &pe_map,
-                      0, phys * PAGE, &tma_full[ps]);
-        if (++ps == D_NSLOT) { ps = 0; ++cycle; }
+          tma_load_slab(dst + slab * SW_LBO, &kv_map, slab * 128, phys * PAGE, &tma_full[ps]);
+        tma_load_slab(dst + KPE_OFS, &pe_map, 0, phys * PAGE, &tma_full[ps]);
+        if (++ps == D_NSLOT) {
+          ps = 0;
+          ++cycle;
+        }
       }
     }
     return;
@@ -1783,8 +1809,7 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
 #pragma unroll
   for (int mb = 0; mb < 8; ++mb) {
     const int c16 = mb * 4 + w;
-    vadd[mb] = (uint32_t)((c16 >> 3) * SW_LBO
-                         + (((c16 & 7) ^ (lane & 7)) << 4));
+    vadd[mb] = (uint32_t)((c16 >> 3) * SW_LBO + (((c16 & 7) ^ (lane & 7)) << 4));
   }
 
   const uint64_t dqbase = gdesc_q(sptr(Qs));
@@ -1803,18 +1828,27 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
       uint64_t da = dqbase;
       uint64_t db = gdesc_sw(Ksb + sw * PAGE_SZ);
       asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
-      WGMMA64_INIT; da += 2; db += 2;
+      WGMMA64_INIT;
+      da += 2;
+      db += 2;
 #pragma unroll
       for (int kk = 1; kk < 16; ++kk) {
         WGMMA64(1);
         // Compact Q advances 6144 bytes per 128-byte slab; KV retains its
         // full 8192-byte stride.  Descriptor units are 16 bytes.
-        if ((kk & 3) == 3) { da += 378; db += 506; }
-        else               { da += 2;   db += 2; }
+        if ((kk & 3) == 3) {
+          da += 378;
+          db += 506;
+        } else {
+          da += 2;
+          db += 2;
+        }
       }
       da = dqpe;
       db = gdesc_sw64(Ksb + sw * PAGE_SZ + KPE_OFS);
-      WGMMA64(1); da += 2; db += 2;
+      WGMMA64(1);
+      da += 2;
+      db += 2;
       WGMMA64(1);
       asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 
@@ -1840,8 +1874,10 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
           for (int e = 0; e < 2; ++e) {
             const float xa = (c0 + e < remA) ? sa[4 * j + e] : -INFINITY;
             const float xb = (c0 + e < remB) ? sa[4 * j + 2 + e] : -INFINITY;
-            sa[4 * j + e] = xa; sa[4 * j + 2 + e] = xb;
-            mxA = fmaxf(mxA, xa); mxB = fmaxf(mxB, xb);
+            sa[4 * j + e] = xa;
+            sa[4 * j + 2 + e] = xb;
+            mxA = fmaxf(mxA, xa);
+            mxB = fmaxf(mxB, xb);
           }
         }
       }
@@ -1850,7 +1886,8 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
         mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffff, mxA, d));
         mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffff, mxB, d));
       }
-      mxA *= qk_scale; mxB *= qk_scale;
+      mxA *= qk_scale;
+      mxB *= qk_scale;
       // Exact online-softmax reference: a four-lane subgroup already holds the
       // complete row max of this page, so P is quantized against
       // max(running, tile) and never exceeds 1.  Against a lagged reference a
@@ -1862,10 +1899,13 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
       {
         const float ex0 = LCHECK ? lcap_shift(fmaf(lrun0, corr0, (float)PAGE)) : 0.f;
         const float ex1 = LCHECK ? lcap_shift(fmaf(lrun1, corr1, (float)PAGE)) : 0.f;
-        mn0 += ex0; corr0 *= exp2i(ex0);
-        mn1 += ex1; corr1 *= exp2i(ex1);
+        mn0 += ex0;
+        corr0 *= exp2i(ex0);
+        mn1 += ex1;
+        corr1 *= exp2i(ex1);
       }
-      mrun0 = mn0; mrun1 = mn1;
+      mrun0 = mn0;
+      mrun1 = mn1;
       if ((lane & 3) == 0) {
         hc[qrA] = __float2half(corr0);
         hc[qrB] = __float2half(corr1);
@@ -1879,19 +1919,21 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
         for (int e = 0; e < 4; ++e) {
           const float xa = exp2f(fmaf(sa[8 * j + 4 * (e >> 1) + (e & 1)], qk_scale, eA));
           const float xb = exp2f(fmaf(sa[8 * j + 4 * (e >> 1) + 2 + (e & 1)], qk_scale, eB));
-          sA += xa; sB += xb;
-          pa[e] = xa; pb[e] = xb;
+          sA += xa;
+          sB += xb;
+          pa[e] = xa;
+          pb[e] = xb;
         }
-        const uint32_t qa =
-            (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]),
-                                                __NV_SATFINITE, __NV_E4M3)
-          | ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[2], pa[3]),
-                                                 __NV_SATFINITE, __NV_E4M3) << 16);
-        const uint32_t qb =
-            (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]),
-                                                __NV_SATFINITE, __NV_E4M3)
-          | ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[2], pb[3]),
-                                                 __NV_SATFINITE, __NV_E4M3) << 16);
+        const uint32_t qa = (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[0], pa[1]),
+                                                               __NV_SATFINITE, __NV_E4M3) |
+                            ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pa[2], pa[3]),
+                                                                __NV_SATFINITE, __NV_E4M3)
+                             << 16);
+        const uint32_t qb = (uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[0], pb[1]),
+                                                               __NV_SATFINITE, __NV_E4M3) |
+                            ((uint32_t)__nv_cvt_float2_to_fp8x2(make_float2(pb[2], pb[3]),
+                                                                __NV_SATFINITE, __NV_E4M3)
+                             << 16);
         sts32(psA[j], qa);
         sts32(psB[j], qb);
       }
@@ -1912,8 +1954,8 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
       uint32_t hcv[6];
 #pragma unroll
       for (int j = 0; j < 6; ++j)
-        hcv[j] = *reinterpret_cast<const uint32_t*>(
-            reinterpret_cast<const char*>(hc) + 2 * (8 * j + 2 * (lane & 3)));
+        hcv[j] = *reinterpret_cast<const uint32_t*>(reinterpret_cast<const char*>(hc) +
+                                                    2 * (8 * j + 2 * (lane & 3)));
 #pragma unroll
       for (int mb = 0; mb < 8; ++mb)
 #pragma unroll
@@ -1946,11 +1988,10 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
         asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
 #pragma unroll
         for (int kk = 0; kk < 2; ++kk)
-          WGMMA_PV(oacc[mb], Ar[buf][4 * kk + 0], Ar[buf][4 * kk + 1],
-                   Ar[buf][4 * kk + 2], Ar[buf][4 * kk + 3], pdesc + 2 * kk);
+          WGMMA_PV(oacc[mb], Ar[buf][4 * kk + 0], Ar[buf][4 * kk + 1], Ar[buf][4 * kk + 2],
+                   Ar[buf][4 * kk + 3], pdesc + 2 * kk);
         asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
-        if (mb >= 1 && mb < 7)
-          asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
+        if (mb >= 1 && mb < 7) asm volatile("wgmma.wait_group.sync.aligned 1;\n" ::: "memory");
         if (mb < 7) {
 #pragma unroll
           for (int kk = 0; kk < 2; ++kk) {
@@ -1961,16 +2002,19 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
             Ar[buf ^ 1][4 * kk + 2] = prm(r[2], r[3], 0x6420u);
             Ar[buf ^ 1][4 * kk + 3] = prm(r[2], r[3], 0x7531u);
           }
-          if (mb == 6 && lane == 0)
-            mbar_arrive(&slot_empty[sw]);
+          if (mb == 6 && lane == 0) mbar_arrive(&slot_empty[sw]);
         }
         buf ^= 1;
       }
       int nsw = sw + 1, nphase = phase;
-      if (nsw == D_NSLOT) { nsw = 0; nphase ^= 1; }
+      if (nsw == D_NSLOT) {
+        nsw = 0;
+        nphase ^= 1;
+      }
       if (pg + 1 < pg1) tma_bar_wait(&tma_full[nsw], nphase);
       asm volatile("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-      sw = nsw; phase = nphase;
+      sw = nsw;
+      phase = nphase;
     }
   }
 
@@ -1984,14 +2028,13 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
 #pragma unroll
           for (int j = 0; j < 2; ++j) {
             const uint32_t v = oacc[mb][2 * g + j];
-            nonfinite_chain[(2 * mb + j) & 3] =
-                hmax_abs_nan(nonfinite_chain[(2 * mb + j) & 3], v);
+            nonfinite_chain[(2 * mb + j) & 3] = hmax_abs_nan(nonfinite_chain[(2 * mb + j) & 3], v);
           }
       }
     }
-    const uint32_t nonfinite_bits = hmax_abs_nan(
-        hmax_abs_nan(nonfinite_chain[0], nonfinite_chain[1]),
-        hmax_abs_nan(nonfinite_chain[2], nonfinite_chain[3]));
+    const uint32_t nonfinite_bits =
+        hmax_abs_nan(hmax_abs_nan(nonfinite_chain[0], nonfinite_chain[1]),
+                     hmax_abs_nan(nonfinite_chain[2], nonfinite_chain[3]));
     if (__any_sync(0xffffffffu, half2_nonfinite(nonfinite_bits)) && lane == 0)
       atomicExch(&repair_needed_cta, 1);
   }
@@ -2005,17 +2048,22 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
     if (!single) {
       const int giA = (b * rows_tot + q0 * NH + qrA) * ns + sp;
       const int giB = (b * rows_tot + q0 * NH + qrB) * ns + sp;
-      if (qrA < vrows) { Mp[giA] = mrun0; Lp[giA] = lrun0; }
-      if (qrB < vrows) { Mp[giB] = mrun1; Lp[giB] = lrun1; }
+      if (qrA < vrows) {
+        Mp[giA] = mrun0;
+        Lp[giA] = lrun0;
+      }
+      if (qrB < vrows) {
+        Mp[giB] = mrun1;
+        Lp[giB] = lrun1;
+      }
     }
   }
   dual_compute_sync();
   if constexpr (REPAIR_CHECK) {
     if (repair_needed_cta) {
       for (int j = 0; j < 3 && q0 + 2 * j < qlen; ++j)
-        repair_split(qg, kvg, btab, slen, dqp, dkp, sm_scale, outp, Op,
-                     Mp, Lp, qlen, pps, ns, pps_split, b, sp, q0 + 2 * j,
-                     smraw);
+        repair_split(qg, kvg, btab, slen, dqp, dkp, sm_scale, outp, Op, Mp, Lp, qlen, pps, ns,
+                     pps_split, b, sp, q0 + 2 * j, smraw);
       return;
     }
   }
@@ -2037,12 +2085,11 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
         const float2 f0 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g]));
         const float2 f1 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g + 1]));
         if (n0 < vrows)
-          *reinterpret_cast<__nv_bfloat162*>(
-              outp + (size_t)(b * qlen * NH + q0 * NH + n0) * CKV + c) =
-              __floats2bfloat162_rn(f0.x * ri.x, f1.x * ri.x);
+          *reinterpret_cast<__nv_bfloat162*>(outp + (size_t)(b * qlen * NH + q0 * NH + n0) * CKV +
+                                             c) = __floats2bfloat162_rn(f0.x * ri.x, f1.x * ri.x);
         if (n0 + 1 < vrows)
-          *reinterpret_cast<__nv_bfloat162*>(
-              outp + (size_t)(b * qlen * NH + q0 * NH + n0 + 1) * CKV + c) =
+          *reinterpret_cast<__nv_bfloat162*>(outp +
+                                             (size_t)(b * qlen * NH + q0 * NH + n0 + 1) * CKV + c) =
               __floats2bfloat162_rn(f0.y * ri.y, f1.y * ri.y);
       }
     }
@@ -2059,12 +2106,11 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
       const float2 ri = *reinterpret_cast<const float2*>(rinv + n0);
       const float2 f0 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g]));
       const float2 f1 = __half22float2(*reinterpret_cast<__half2*>(&oacc[mb][2 * g + 1]));
-      sts16(sptr(S + n0 * SRS + c),
-            __nv_cvt_float2_to_fp8x2(make_float2(f0.x * ri.x, f1.x * ri.x),
-                                     __NV_SATFINITE, __NV_E4M3));
+      sts16(sptr(S + n0 * SRS + c), __nv_cvt_float2_to_fp8x2(make_float2(f0.x * ri.x, f1.x * ri.x),
+                                                             __NV_SATFINITE, __NV_E4M3));
       sts16(sptr(S + (n0 + 1) * SRS + c),
-            __nv_cvt_float2_to_fp8x2(make_float2(f0.y * ri.y, f1.y * ri.y),
-                                     __NV_SATFINITE, __NV_E4M3));
+            __nv_cvt_float2_to_fp8x2(make_float2(f0.y * ri.y, f1.y * ri.y), __NV_SATFINITE,
+                                     __NV_E4M3));
     }
   }
   dual_compute_sync();
@@ -2083,11 +2129,10 @@ void mla_kernel_dual(const uint8_t* __restrict__ qg,
 #define C1WARPS 16
 #define CSHORTWARPS 8
 template <int GROUP, bool PREFETCH, int NWARPS, int VMAX>
-__global__ __launch_bounds__(32 * NWARPS, 1)
-void combine_kernel(const uint8_t* __restrict__ Op, const float* __restrict__ Mp,
-                    const float* __restrict__ Lp, const float* __restrict__ dkp,
-                    const int* __restrict__ slen, __nv_bfloat16* __restrict__ outp,
-                    int ns, int rows_tot, int pps_split) {
+__global__ __launch_bounds__(32 * NWARPS, 1) void combine_kernel(
+    const uint8_t* __restrict__ Op, const float* __restrict__ Mp, const float* __restrict__ Lp,
+    const float* __restrict__ dkp, const int* __restrict__ slen, __nv_bfloat16* __restrict__ outp,
+    int ns, int rows_tot, int pps_split) {
   constexpr int NT = 32 * NWARPS;
   constexpr int PARTS = NWARPS / GROUP;
   const int b = blockIdx.z;
@@ -2145,14 +2190,16 @@ void combine_kernel(const uint8_t* __restrict__ Op, const float* __restrict__ Mp
   float mv0 = -INFINITY, lv0 = 0.f;
   {
     const int sx = part + lane * PARTS;
-    if (sx < nsb) { mv0 = Mp[stat_base + sx]; lv0 = Lp[stat_base + sx]; }
+    if (sx < nsb) {
+      mv0 = Mp[stat_base + sx];
+      lv0 = Lp[stat_base + sx];
+    }
   }
   float mw = mv0;
   for (int sx = part + (32 + lane) * PARTS; sx < nsb; sx += 32 * PARTS)
     mw = fmaxf(mw, Mp[stat_base + sx]);
 #pragma unroll
-  for (int d = 16; d > 0; d >>= 1)
-    mw = fmaxf(mw, __shfl_xor_sync(0xffffffffu, mw, d));
+  for (int d = 16; d > 0; d >>= 1) mw = fmaxf(mw, __shfl_xor_sync(0xffffffffu, mw, d));
 
   float wv = (mv0 > -INFINITY) ? exp2f(mv0 - mw) * lv0 : 0.f;
   float lsum = wv;
@@ -2161,8 +2208,7 @@ void combine_kernel(const uint8_t* __restrict__ Op, const float* __restrict__ Mp
     lsum += (mm > -INFINITY) ? exp2f(mm - mw) * Lp[stat_base + sx] : 0.f;
   }
 #pragma unroll
-  for (int d = 16; d > 0; d >>= 1)
-    lsum += __shfl_xor_sync(0xffffffffu, lsum, d);
+  for (int d = 16; d > 0; d >>= 1) lsum += __shfl_xor_sync(0xffffffffu, lsum, d);
 
   float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
   if constexpr (PREFETCH) {
@@ -2171,10 +2217,13 @@ void combine_kernel(const uint8_t* __restrict__ Op, const float* __restrict__ Mp
       const int sx = part + i * PARTS;
       if (sx < nsb) {
         const float ww = __shfl_sync(0xffffffffu, wv, i);
-        __nv_fp8x4_e4m3 v; v.__x = vraw[i];
+        __nv_fp8x4_e4m3 v;
+        v.__x = vraw[i];
         const float4 a = static_cast<float4>(v);
-        acc.x = fmaf(ww, a.x, acc.x); acc.y = fmaf(ww, a.y, acc.y);
-        acc.z = fmaf(ww, a.z, acc.z); acc.w = fmaf(ww, a.w, acc.w);
+        acc.x = fmaf(ww, a.x, acc.x);
+        acc.y = fmaf(ww, a.y, acc.y);
+        acc.z = fmaf(ww, a.z, acc.z);
+        acc.w = fmaf(ww, a.w, acc.w);
       }
     }
   }
@@ -2182,7 +2231,8 @@ void combine_kernel(const uint8_t* __restrict__ Op, const float* __restrict__ Mp
     int i = PREFETCH ? VMAX : 0;
     for (int sx = part + i * PARTS; sx < nsb; sx += PARTS, ++i) {
       float ww;
-      if (i < 32) ww = __shfl_sync(0xffffffffu, wv, i);
+      if (i < 32)
+        ww = __shfl_sync(0xffffffffu, wv, i);
       else {
         const float mm = Mp[stat_base + sx];
         ww = (mm > -INFINITY) ? exp2f(mm - mw) * Lp[stat_base + sx] : 0.f;
@@ -2190,13 +2240,18 @@ void combine_kernel(const uint8_t* __restrict__ Op, const float* __restrict__ Mp
       __nv_fp8x4_e4m3 v;
       v.__x = *reinterpret_cast<const uint32_t*>(base + (size_t)sx * stride);
       const float4 a = static_cast<float4>(v);
-      acc.x = fmaf(ww, a.x, acc.x); acc.y = fmaf(ww, a.y, acc.y);
-      acc.z = fmaf(ww, a.z, acc.z); acc.w = fmaf(ww, a.w, acc.w);
+      acc.x = fmaf(ww, a.x, acc.x);
+      acc.y = fmaf(ww, a.y, acc.y);
+      acc.z = fmaf(ww, a.z, acc.z);
+      acc.w = fmaf(ww, a.w, acc.w);
     }
   }
 
   *reinterpret_cast<float4*>(&sred[wp][lane * 4]) = acc;
-  if (lane == 0) { smw[wp] = mw; sls[wp] = lsum; }
+  if (lane == 0) {
+    smw[wp] = mw;
+    sls[wp] = lsum;
+  }
   __syncthreads();
   if (tid < 128 * GROUP) {
     const int out_chunk = blockIdx.y * GROUP + tid / 128;
@@ -2219,8 +2274,7 @@ void combine_kernel(const uint8_t* __restrict__ Op, const float* __restrict__ Mp
 }
 
 template <int GROUP, bool PREFETCH, int NWARPS, int VMAX, typename... Args>
-static void launch_combine(dim3 grid, int nthr, size_t smem, cudaStream_t st,
-                           Args... args) {
+static void launch_combine(dim3 grid, int nthr, size_t smem, cudaStream_t st, Args... args) {
   cudaLaunchConfig_t cfg{};
   cfg.gridDim = grid;
   cfg.blockDim = dim3(nthr, 1, 1);
@@ -2266,12 +2320,13 @@ struct MlaSplitPlan {
 
 // Verbatim split arithmetic of the measured launcher (`run`), parameterised
 // on the plan-time facts it read from its tensors.
-MlaSplitPlan mla_decode_fp8_split_plan(int B, int QL, int pps, int total_pages,
-                                       int sm) {
+MlaSplitPlan mla_decode_fp8_split_plan(int B, int QL, int pps, int total_pages, int sm) {
   using std::max;
   MlaSplitPlan P{};
-  const int maxsp = (pps + 1) / 2;            // tiles cover 2 pages
-  int MT = (QL + 1) / 2; if (MT > 3) MT = 3; if (MT < 1) MT = 1;
+  const int maxsp = (pps + 1) / 2;  // tiles cover 2 pages
+  int MT = (QL + 1) / 2;
+  if (MT > 3) MT = 3;
+  if (MT < 1) MT = 1;
   if (B == 1 && QL < 5 && maxsp * ((QL + 1) / 2) <= 2 * sm) MT = 1;
   int QPC = 2 * MT;
   int nqc = (QL + QPC - 1) / QPC;
@@ -2319,7 +2374,6 @@ MlaSplitPlan mla_decode_fp8_split_plan(int B, int QL, int pps, int total_pages,
     }
   }
 
-
   P.MT = MT;
   P.QPC = QPC;
   P.nqc = nqc;
@@ -2349,30 +2403,24 @@ void mla_decode_fp8_paged_sm90_init(int64_t device_id) {
   ffi::CUDADeviceGuard device_guard(static_cast<int>(device_id));
   int sm = 0;
   cudaError_t st =
-      cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount,
-                             static_cast<int>(device_id));
+      cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, static_cast<int>(device_id));
   TVM_FFI_ICHECK(st == cudaSuccess && sm > 0)
-      << "mla_decode_fp8_paged_sm90: SM-count query failed: "
-      << cudaGetErrorString(st);
+      << "mla_decode_fp8_paged_sm90: SM-count query failed: " << cudaGetErrorString(st);
   g_sm_count[device_id] = sm;
   for (int MT = 1; MT <= 2; ++MT) {
     const int ROWS = 16 * MT;
-    const size_t smem = (size_t)ROWS * KSTR + (size_t)2 * TT * KSTR +
-                        (size_t)ROWS * PSTR + (size_t)8 * ROWS * 4;
+    const size_t smem =
+        (size_t)ROWS * KSTR + (size_t)2 * TT * KSTR + (size_t)ROWS * PSTR + (size_t)8 * ROWS * 4;
     cudaError_t s1, s2;
     if (MT == 1) {
-      s1 = cudaFuncSetAttribute(mla_kernel<1, true>,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+      s1 = cudaFuncSetAttribute(mla_kernel<1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int)smem);
-      s2 = cudaFuncSetAttribute(mla_kernel<1, false>,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+      s2 = cudaFuncSetAttribute(mla_kernel<1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int)smem);
     } else {
-      s1 = cudaFuncSetAttribute(mla_kernel<2, true>,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+      s1 = cudaFuncSetAttribute(mla_kernel<2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int)smem);
-      s2 = cudaFuncSetAttribute(mla_kernel<2, false>,
-                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+      s2 = cudaFuncSetAttribute(mla_kernel<2, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 (int)smem);
     }
     TVM_FFI_ICHECK(s1 == cudaSuccess && s2 == cudaSuccess)
@@ -2382,10 +2430,8 @@ void mla_decode_fp8_paged_sm90_init(int64_t device_id) {
 
 // Workspace bytes the dispatcher must plan-allocate for a
 // (batch, q_len, pages_per_seq, total_pages) plan on `device_id`.
-int64_t mla_decode_fp8_paged_sm90_plan_workspace_bytes(int64_t batch_size,
-                                                       int64_t q_len,
-                                                       int64_t pages_per_seq,
-                                                       int64_t total_pages,
+int64_t mla_decode_fp8_paged_sm90_plan_workspace_bytes(int64_t batch_size, int64_t q_len,
+                                                       int64_t pages_per_seq, int64_t total_pages,
                                                        int64_t device_id) {
   TVM_FFI_ICHECK_GE(device_id, 0);
   TVM_FFI_ICHECK_LT(device_id, kMaxDevices);
@@ -2393,9 +2439,8 @@ int64_t mla_decode_fp8_paged_sm90_plan_workspace_bytes(int64_t batch_size,
       << "mla_decode_fp8_paged_sm90: init(device_id) must run before "
          "plan_workspace_bytes";
   const MlaSplitPlan P = mla_decode_fp8_split_plan(
-      static_cast<int>(batch_size), static_cast<int>(q_len),
-      static_cast<int>(pages_per_seq), static_cast<int>(total_pages),
-      g_sm_count[device_id]);
+      static_cast<int>(batch_size), static_cast<int>(q_len), static_cast<int>(pages_per_seq),
+      static_cast<int>(total_pages), g_sm_count[device_id]);
   return (int64_t)mla_decode_fp8_ws_bytes(P, static_cast<int>(batch_size));
 }
 
@@ -2403,11 +2448,9 @@ int64_t mla_decode_fp8_paged_sm90_plan_workspace_bytes(int64_t batch_size,
 // the verbatim split plan, then the measured combine selection when the
 // plan splits. No allocation, no sync; see the header for the per-class
 // one-eager-warm-up capture contract.
-void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache,
-                                   TensorView block_table, TensorView seq_lens,
-                                   TensorView q_descale, TensorView k_descale,
-                                   double sm_scale, TensorView out,
-                                   TensorView workspace) {
+void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView block_table,
+                                   TensorView seq_lens, TensorView q_descale, TensorView k_descale,
+                                   double sm_scale, TensorView out, TensorView workspace) {
   CHECK_INPUT_AND_TYPE(q, dl_float8_e4m3fn);
   CHECK_INPUT_AND_TYPE(out, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(block_table, dl_int32);
@@ -2438,8 +2481,7 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache,
   // packed paged cache: (num_pages, 64, 576) or (num_pages, 64, 1, 576),
   // 576-byte contiguous rows, page-contiguous
   const int kv_dim = kv_cache.dim();
-  TVM_FFI_ICHECK(kv_dim == 3 || kv_dim == 4)
-      << "kv_cache must be (pages, 64, [1,] 576)";
+  TVM_FFI_ICHECK(kv_dim == 3 || kv_dim == 4) << "kv_cache must be (pages, 64, [1,] 576)";
   TVM_FFI_ICHECK_EQ(kv_cache.size(1), PAGE);
   TVM_FFI_ICHECK_EQ(kv_cache.size(kv_dim - 1), DIMQ);
   if (kv_dim == 4) TVM_FFI_ICHECK_EQ(kv_cache.size(2), 1);
@@ -2456,12 +2498,11 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache,
   TVM_FFI_ICHECK_GT(sm_count, 0)
       << "mla_decode_fp8_paged_sm90: init(device_id) must run before run";
 
-  const MlaSplitPlan P =
-      mla_decode_fp8_split_plan(B, QL, pps, total_pages, sm_count);
+  const MlaSplitPlan P = mla_decode_fp8_split_plan(B, QL, pps, total_pages, sm_count);
   const size_t need = mla_decode_fp8_ws_bytes(P, B);
   TVM_FFI_ICHECK_GE((size_t)workspace.numel(), need)
-      << "workspace too small: plan with plan_workspace_bytes(" << B << ", "
-      << QL << ", " << pps << ", " << total_pages << ", " << device_id << ")";
+      << "workspace too small: plan with plan_workspace_bytes(" << B << ", " << QL << ", " << pps
+      << ", " << total_pages << ", " << device_id << ")";
 
   CHECK_DEVICE(q, kv_cache);
   CHECK_DEVICE(q, block_table);
@@ -2501,8 +2542,8 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache,
   const float* dqp = static_cast<const float*>(q_descale.data_ptr());
   const float* dkp = static_cast<const float*>(k_descale.data_ptr());
   int ROWS = 16 * MT;
-  size_t smem = (size_t)ROWS * KSTR + (size_t)2 * TT * KSTR + (size_t)ROWS * PSTR
-              + (size_t)8 * ROWS * 4;
+  size_t smem =
+      (size_t)ROWS * KSTR + (size_t)2 * TT * KSTR + (size_t)ROWS * PSTR + (size_t)8 * ROWS * 4;
   dim3 grid(nblocks, 1, nqc);
   int nthr = 128 * MT;
 
@@ -2523,31 +2564,23 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache,
       const uint64_t dims[2] = {CKV, rows};
       const uint32_t box[2] = {128, PAGE};
       CUresult result = get_tmap_encoder()(
-          &kv_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-          const_cast<uint8_t*>(kp), dims, strides, box, elem_strides,
-          CU_TENSOR_MAP_INTERLEAVE_NONE,
-          CU_TENSOR_MAP_SWIZZLE_128B,
-          no_promote ? CU_TENSOR_MAP_L2_PROMOTION_NONE :
-                       CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+          &kv_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(kp), dims, strides, box,
+          elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+          no_promote ? CU_TENSOR_MAP_L2_PROMOTION_NONE : CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       TVM_FFI_ICHECK(result == CUDA_SUCCESS)
-          << "cuTensorMapEncodeTiled(ckv) failed: "
-          << static_cast<int>(result);
+          << "cuTensorMapEncodeTiled(ckv) failed: " << static_cast<int>(result);
     }
     {
       const uint64_t dims[2] = {DIMQ - CKV, rows};
       const uint32_t box[2] = {64, PAGE};
       CUresult result = get_tmap_encoder()(
-          &pe_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-          const_cast<uint8_t*>(kp) + CKV, dims, strides, box, elem_strides,
-          CU_TENSOR_MAP_INTERLEAVE_NONE,
-          CU_TENSOR_MAP_SWIZZLE_64B,
-          no_promote ? CU_TENSOR_MAP_L2_PROMOTION_NONE :
-                       CU_TENSOR_MAP_L2_PROMOTION_L2_64B,
+          &pe_map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(kp) + CKV, dims, strides,
+          box, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
+          no_promote ? CU_TENSOR_MAP_L2_PROMOTION_NONE : CU_TENSOR_MAP_L2_PROMOTION_L2_64B,
           CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
       TVM_FFI_ICHECK(result == CUDA_SUCCESS)
-          << "cuTensorMapEncodeTiled(kpe) failed: "
-          << static_cast<int>(result);
+          << "cuTensorMapEncodeTiled(kpe) failed: " << static_cast<int>(result);
     }
     g_tmap.base = static_cast<const void*>(kp);
     g_tmap.rows = map_rows;
@@ -2557,141 +2590,174 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache,
   const CUtensorMap& kv_map = g_tmap.kv;
   const CUtensorMap& pe_map = g_tmap.pe;
 
-#define LAUNCH(M, H, TAG)                                                                \
-  do {                                                                                   \
-    static std::once_flag init_##TAG;                                                     \
-    std::call_once(init_##TAG, [&] { cudaFuncSetAttribute(mla_kernel<M, H>,                \
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem); });                       \
-    mla_kernel<M, H><<<grid, nthr, smem, st>>>(qp, kp, btp,       \
-        slp, dqp, dkp,\
-        (float)sm_scale, op, Opp, Mpp, Lpp, B, QL, pps, ns, pps_split, QPC);              \
+#define LAUNCH(M, H, TAG)                                                                       \
+  do {                                                                                          \
+    static std::once_flag init_##TAG;                                                           \
+    std::call_once(init_##TAG, [&] {                                                            \
+      cudaFuncSetAttribute(mla_kernel<M, H>, cudaFuncAttributeMaxDynamicSharedMemorySize,       \
+                           (int)smem);                                                          \
+    });                                                                                         \
+    mla_kernel<M, H><<<grid, nthr, smem, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, \
+                                               Opp, Mpp, Lpp, B, QL, pps, ns, pps_split, QPC);  \
   } while (0)
 
   // Unit-max probability quantization on long splits keeps packed-FP16 PV
   // below overflow while preserving the same softmax ratio in the epilogue.
   const bool half_acc = true;
-  const size_t smw = (size_t)(NSLOT + 1) * PAGE_SZ + (size_t)PSZ + 1280
-                   + (size_t)MAXPG * 4;
-  const size_t smw4 = (size_t)(4 + 1) * PAGE_SZ + (size_t)PSZ + 1280
-                    + (size_t)MAXPG * 4;
-  const size_t smw_dual = (size_t)Q_STORAGE_SZ + (size_t)D_NSLOT * PAGE_SZ
-                        + (size_t)PSZ + 512 + (size_t)MAXPG * 4;
-#define LAUNCHW(H, F, O, Q6, R, TAG)                                                     \
-  do {                                                                                   \
-    static std::once_flag initw_##TAG;                                                    \
-    std::call_once(initw_##TAG, [&] { cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R>,\
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw); });                        \
-    mla_kernel_tmaproducer<H, F, O, Q6, R><<<grid, 288, smw, st>>>(                      \
-        qp, kp, btp,                                               \
-        slp, dqp, dkp,\
-        (float)sm_scale, op, Opp, Mpp, Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint); \
+  const size_t smw = (size_t)(NSLOT + 1) * PAGE_SZ + (size_t)PSZ + 1280 + (size_t)MAXPG * 4;
+  const size_t smw4 = (size_t)(4 + 1) * PAGE_SZ + (size_t)PSZ + 1280 + (size_t)MAXPG * 4;
+  const size_t smw_dual =
+      (size_t)Q_STORAGE_SZ + (size_t)D_NSLOT * PAGE_SZ + (size_t)PSZ + 512 + (size_t)MAXPG * 4;
+#define LAUNCHW(H, F, O, Q6, R, TAG)                                                             \
+  do {                                                                                           \
+    static std::once_flag initw_##TAG;                                                           \
+    std::call_once(initw_##TAG, [&] {                                                            \
+      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R>,                               \
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw);               \
+    });                                                                                          \
+    mla_kernel_tmaproducer<H, F, O, Q6, R>                                                       \
+        <<<grid, 288, smw, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
+                                 kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
-#define LAUNCHD(H, Q6, TAG)                                                              \
-  do {                                                                                   \
-    static std::once_flag initd_##TAG;                                                    \
-    std::call_once(initd_##TAG, [&] { cudaFuncSetAttribute(mla_kernel_dual<H, Q6>,        \
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw_dual); });                   \
-    mla_kernel_dual<H, Q6><<<grid, 160, smw_dual, st>>>(                                 \
-        qp, kp, btp,                                             \
-        slp, dqp, dkp,\
-        (float)sm_scale, op, Opp, Mpp, Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC); \
+#define LAUNCHD(H, Q6, TAG)                                                                      \
+  do {                                                                                           \
+    static std::once_flag initd_##TAG;                                                           \
+    std::call_once(initd_##TAG, [&] {                                                            \
+      cudaFuncSetAttribute(mla_kernel_dual<H, Q6>, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
+                           (int)smw_dual);                                                       \
+    });                                                                                          \
+    mla_kernel_dual<H, Q6>                                                                       \
+        <<<grid, 160, smw_dual, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, \
+                                      Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC);      \
   } while (0)
-#define LAUNCHW_NOCAP(H, F, O, Q6, R, TAG)                                               \
-  do {                                                                                   \
-    static std::once_flag initw_##TAG;                                                    \
-    std::call_once(initw_##TAG, [&] { cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false>,\
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw); });                       \
-    mla_kernel_tmaproducer<H, F, O, Q6, R, false><<<grid, 288, smw, st>>>(               \
-        qp, kp, btp,                                              \
-        slp, dqp, dkp,\
-        (float)sm_scale, op, Opp, Mpp, Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint); \
+#define LAUNCHW_NOCAP(H, F, O, Q6, R, TAG)                                                       \
+  do {                                                                                           \
+    static std::once_flag initw_##TAG;                                                           \
+    std::call_once(initw_##TAG, [&] {                                                            \
+      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false>,                        \
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw);               \
+    });                                                                                          \
+    mla_kernel_tmaproducer<H, F, O, Q6, R, false>                                                \
+        <<<grid, 288, smw, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
+                                 kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
-#define LAUNCHW4_NOCAP(H, F, O, Q6, R, TAG)                                              \
-  do {                                                                                   \
-    static std::once_flag initw_##TAG;                                                   \
-    std::call_once(initw_##TAG, [&] { cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false, true, 4>,\
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw4); });                      \
-    mla_kernel_tmaproducer<H, F, O, Q6, R, false, true, 4><<<grid, 288, smw4, st>>>(      \
-        qp, kp, btp,                                              \
-        slp, dqp, dkp,\
-        (float)sm_scale, op, Opp, Mpp, Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint); \
+#define LAUNCHW4_NOCAP(H, F, O, Q6, R, TAG)                                                       \
+  do {                                                                                            \
+    static std::once_flag initw_##TAG;                                                            \
+    std::call_once(initw_##TAG, [&] {                                                             \
+      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false, true, 4>,                \
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw4);               \
+    });                                                                                           \
+    mla_kernel_tmaproducer<H, F, O, Q6, R, false, true, 4>                                        \
+        <<<grid, 288, smw4, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
+                                  kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
-#define LAUNCHW_SAFE(H, F, O, Q6, R, TAG)                                                \
-  do {                                                                                   \
-    static std::once_flag initw_##TAG;                                                    \
-    std::call_once(initw_##TAG, [&] { cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false, false>,\
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw); });                       \
-    mla_kernel_tmaproducer<H, F, O, Q6, R, false, false><<<grid, 288, smw, st>>>(         \
-        qp, kp, btp,                                              \
-        slp, dqp, dkp,\
-        (float)sm_scale, op, Opp, Mpp, Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint); \
+#define LAUNCHW_SAFE(H, F, O, Q6, R, TAG)                                                        \
+  do {                                                                                           \
+    static std::once_flag initw_##TAG;                                                           \
+    std::call_once(initw_##TAG, [&] {                                                            \
+      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false, false>,                 \
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw);               \
+    });                                                                                          \
+    mla_kernel_tmaproducer<H, F, O, Q6, R, false, false>                                         \
+        <<<grid, 288, smw, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
+                                 kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
-#define LAUNCHD_NOCAP(H, Q6, TAG)                                                        \
-  do {                                                                                   \
-    static std::once_flag initd_##TAG;                                                    \
-    std::call_once(initd_##TAG, [&] { cudaFuncSetAttribute(mla_kernel_dual<H, Q6, false>,\
-        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw_dual); });                  \
-    mla_kernel_dual<H, Q6, false><<<grid, 160, smw_dual, st>>>(                          \
-        qp, kp, btp,                                              \
-        slp, dqp, dkp,\
-        (float)sm_scale, op, Opp, Mpp, Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC); \
+#define LAUNCHD_NOCAP(H, Q6, TAG)                                                                \
+  do {                                                                                           \
+    static std::once_flag initd_##TAG;                                                           \
+    std::call_once(initd_##TAG, [&] {                                                            \
+      cudaFuncSetAttribute(mla_kernel_dual<H, Q6, false>,                                        \
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw_dual);          \
+    });                                                                                          \
+    mla_kernel_dual<H, Q6, false>                                                                \
+        <<<grid, 160, smw_dual, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, \
+                                      Lpp, kv_map, pe_map, B, QL, pps, ns, pps_split, QPC);      \
   } while (0)
   // A split can increase L by at most 64*pps_split.  The guard cannot fire
   // below 2^25 tokens, so use a specialization with those instructions
   // compiled out while preserving the guarded path for unbounded contexts.
   const bool lcheck = pps_split >= (1 << 19);
   if (half_acc) {
-    if (MT == 1) LAUNCH(1, true, h1); else if (MT == 2) LAUNCH(2, true, h2);
+    if (MT == 1)
+      LAUNCH(1, true, h1);
+    else if (MT == 2)
+      LAUNCH(2, true, h2);
     else if (B >= 5) {
       if (QL == 6) {
-        if (lcheck) LAUNCHD(true, true, dh6c);
-        else        LAUNCHD_NOCAP(true, true, dh6);
+        if (lcheck)
+          LAUNCHD(true, true, dh6c);
+        else
+          LAUNCHD_NOCAP(true, true, dh6);
       } else {
-        if (lcheck) LAUNCHD(true, false, dhc);
-        else        LAUNCHD_NOCAP(true, false, dh);
+        if (lcheck)
+          LAUNCHD(true, false, dhc);
+        else
+          LAUNCHD_NOCAP(true, false, dh);
       }
-    }
-    else if (QL == 6 && ns > 1) {
+    } else if (QL == 6 && ns > 1) {
       if (B == 1) {
-        if (lcheck) LAUNCHW(true, true, true, true, false, wh6b1c);
+        if (lcheck)
+          LAUNCHW(true, true, true, true, false, wh6b1c);
         else if (pps_split <= 2)
-                    LAUNCHW_SAFE(true, true, true, true, false, wh6b1s);
+          LAUNCHW_SAFE(true, true, true, true, false, wh6b1s);
         else if (pps_split >= 16)
-                    LAUNCHW4_NOCAP(true, true, true, true, false, wh6b1r4);
-        else        LAUNCHW_NOCAP(true, true, true, true, false, wh6b1);
+          LAUNCHW4_NOCAP(true, true, true, true, false, wh6b1r4);
+        else
+          LAUNCHW_NOCAP(true, true, true, true, false, wh6b1);
       } else if (B == 2) {
-        if (lcheck) LAUNCHW(true, true, false, true, true, wh6b2c);
-        else        LAUNCHW_NOCAP(true, true, false, true, true, wh6b2);
+        if (lcheck)
+          LAUNCHW(true, true, false, true, true, wh6b2c);
+        else
+          LAUNCHW_NOCAP(true, true, false, true, true, wh6b2);
       } else {
-        if (lcheck) LAUNCHW(true, true, false, true, false, wh6fc);
-        else        LAUNCHW_NOCAP(true, true, false, true, false, wh6f);
+        if (lcheck)
+          LAUNCHW(true, true, false, true, false, wh6fc);
+        else
+          LAUNCHW_NOCAP(true, true, false, true, false, wh6f);
       }
     } else if ((QL % 6) == 0 && ns > 1) {
       if (B == 1) {
-        if (lcheck) LAUNCHW(true, true, true, false, false, whb1c);
-        else        LAUNCHW_NOCAP(true, true, true, false, false, whb1);
+        if (lcheck)
+          LAUNCHW(true, true, true, false, false, whb1c);
+        else
+          LAUNCHW_NOCAP(true, true, true, false, false, whb1);
       } else {
-        if (lcheck) LAUNCHW(true, true, false, false, false, whfc);
-        else        LAUNCHW_NOCAP(true, true, false, false, false, whf);
+        if (lcheck)
+          LAUNCHW(true, true, false, false, false, whfc);
+        else
+          LAUNCHW_NOCAP(true, true, false, false, false, whf);
       }
     } else {
-      if (lcheck) LAUNCHW(true, false, false, false, false, whc);
-      else        LAUNCHW_NOCAP(true, false, false, false, false, wh);
+      if (lcheck)
+        LAUNCHW(true, false, false, false, false, whc);
+      else
+        LAUNCHW_NOCAP(true, false, false, false, false, wh);
     }
   } else {
-    if (MT == 1) LAUNCH(1, false, f1); else if (MT == 2) LAUNCH(2, false, f2);
+    if (MT == 1)
+      LAUNCH(1, false, f1);
+    else if (MT == 2)
+      LAUNCH(2, false, f2);
     else if (B >= 5) {
-      if (QL == 6) LAUNCHD(false, true, df6);
-      else         LAUNCHD(false, false, df);
-    }
-    else if (QL == 6 && ns > 1) {
-      if (B == 1)      LAUNCHW(false, true, true, true, false, wf6b1);
-      else if (B == 2) LAUNCHW(false, true, false, true, true, wf6b2);
-      else             LAUNCHW(false, true, false, true, false, wf6f);
+      if (QL == 6)
+        LAUNCHD(false, true, df6);
+      else
+        LAUNCHD(false, false, df);
+    } else if (QL == 6 && ns > 1) {
+      if (B == 1)
+        LAUNCHW(false, true, true, true, false, wf6b1);
+      else if (B == 2)
+        LAUNCHW(false, true, false, true, true, wf6b2);
+      else
+        LAUNCHW(false, true, false, true, false, wf6f);
     } else if ((QL % 6) == 0 && ns > 1) {
-      if (B == 1) LAUNCHW(false, true, true, false, false, wfb1);
-      else        LAUNCHW(false, true, false, false, false, wff);
-    } else LAUNCHW(false, false, false, false, false, wf);
+      if (B == 1)
+        LAUNCHW(false, true, true, false, false, wfb1);
+      else
+        LAUNCHW(false, true, false, false, false, wff);
+    } else
+      LAUNCHW(false, false, false, false, false, wf);
   }
 #undef LAUNCHD
 #undef LAUNCHW
@@ -2710,56 +2776,45 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache,
       // reduce each shared reduction/barrier domain to one 128-column chunk.
       dim3 cgrid(rows_tot, CKV / 128, B);
       if (ns <= 40)
-        launch_combine<1, false, 4, 1>(cgrid, 128, ns * sizeof(float), st,
-            Opp, Mpp, Lpp, dkp, slp, op,
-            ns, rows_tot, combine_span);
+        launch_combine<1, false, 4, 1>(cgrid, 128, ns * sizeof(float), st, Opp, Mpp, Lpp, dkp, slp,
+                                       op, ns, rows_tot, combine_span);
       else
-        launch_combine<1, true, 4, 13>(cgrid, 128, ns * sizeof(float), st,
-            Opp, Mpp, Lpp, dkp, slp, op,
-            ns, rows_tot, combine_span);
+        launch_combine<1, true, 4, 13>(cgrid, 128, ns * sizeof(float), st, Opp, Mpp, Lpp, dkp, slp,
+                                       op, ns, rows_tot, combine_span);
     } else {
       const int group = (nrows >= sm_count) ? 4 : 1;
       dim3 cgrid(rows_tot, (CKV / 128) / group, B);
       if (group == 4)
-      launch_combine<4, false, CWARPS, 12>(cgrid, 32 * CWARPS, ns * sizeof(float), st,
-          Opp, Mpp, Lpp, dkp, slp, op,
-          ns, rows_tot, combine_span);
+        launch_combine<4, false, CWARPS, 12>(cgrid, 32 * CWARPS, ns * sizeof(float), st, Opp, Mpp,
+                                             Lpp, dkp, slp, op, ns, rows_tot, combine_span);
       else if (B == 1 && ns < 64)
         launch_combine<1, true, CSHORTWARPS, 5>(cgrid, 32 * CSHORTWARPS, ns * sizeof(float), st,
-          Opp, Mpp, Lpp, dkp, slp, op,
-          ns, rows_tot, combine_span);
+                                                Opp, Mpp, Lpp, dkp, slp, op, ns, rows_tot,
+                                                combine_span);
       else if (B == 1 && ns >= 96) {
         if (ns <= 112)
-          launch_combine<1, true, C1WARPS, 7>(cgrid, 32 * C1WARPS, ns * sizeof(float), st,
-            Opp, Mpp, Lpp, dkp, slp, op,
-            ns, rows_tot, combine_span);
+          launch_combine<1, true, C1WARPS, 7>(cgrid, 32 * C1WARPS, ns * sizeof(float), st, Opp, Mpp,
+                                              Lpp, dkp, slp, op, ns, rows_tot, combine_span);
         else if (ns <= 128)
-          launch_combine<1, true, C1WARPS, 8>(cgrid, 32 * C1WARPS, ns * sizeof(float), st,
-            Opp, Mpp, Lpp, dkp, slp, op,
-            ns, rows_tot, combine_span);
+          launch_combine<1, true, C1WARPS, 8>(cgrid, 32 * C1WARPS, ns * sizeof(float), st, Opp, Mpp,
+                                              Lpp, dkp, slp, op, ns, rows_tot, combine_span);
         else
-          launch_combine<1, true, C1WARPS, 9>(cgrid, 32 * C1WARPS, ns * sizeof(float), st,
-            Opp, Mpp, Lpp, dkp, slp, op,
-            ns, rows_tot, combine_span);
-      }
-      else if (B == 2)
-        launch_combine<1, true, 8, 10>(cgrid, 256, ns * sizeof(float), st,
-          Opp, Mpp, Lpp, dkp, slp, op,
-          ns, rows_tot, combine_span);
+          launch_combine<1, true, C1WARPS, 9>(cgrid, 32 * C1WARPS, ns * sizeof(float), st, Opp, Mpp,
+                                              Lpp, dkp, slp, op, ns, rows_tot, combine_span);
+      } else if (B == 2)
+        launch_combine<1, true, 8, 10>(cgrid, 256, ns * sizeof(float), st, Opp, Mpp, Lpp, dkp, slp,
+                                       op, ns, rows_tot, combine_span);
       else
-        launch_combine<1, false, CWARPS, 12>(cgrid, 32 * CWARPS, ns * sizeof(float), st,
-          Opp, Mpp, Lpp, dkp, slp, op,
-          ns, rows_tot, combine_span);
+        launch_combine<1, false, CWARPS, 12>(cgrid, 32 * CWARPS, ns * sizeof(float), st, Opp, Mpp,
+                                             Lpp, dkp, slp, op, ns, rows_tot, combine_span);
     }
   }
 
   cudaError_t status = cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
-      << "mla_decode_fp8_paged_sm90 launch failed: "
-      << cudaGetErrorString(status);
+      << "mla_decode_fp8_paged_sm90 launch failed: " << cudaGetErrorString(status);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, mla_decode_fp8_paged_sm90_run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(init, mla_decode_fp8_paged_sm90_init);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_workspace_bytes,
-                              mla_decode_fp8_paged_sm90_plan_workspace_bytes);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan_workspace_bytes, mla_decode_fp8_paged_sm90_plan_workspace_bytes);

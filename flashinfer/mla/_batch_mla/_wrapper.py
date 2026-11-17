@@ -309,7 +309,8 @@ class BatchMLAPagedAttentionWrapper:
         if fp8q_backend not in ("auto", "specialized", "stock"):
             raise ValueError(
                 "fp8q_backend must be one of ('auto', 'specialized', "
-                "'stock'), got %r" % (fp8q_backend,))
+                "'stock'), got %r" % (fp8q_backend,)
+            )
         # SM90 fp8-query fast-path selector (orthogonal to `backend`, which
         # names the PLANNER backend): 'auto' = guarded dispatch with
         # fail-closed dequant fallback; 'specialized' = explicit selection,
