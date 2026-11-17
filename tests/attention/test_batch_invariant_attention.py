@@ -1496,3 +1496,27 @@ def test_fixup_beyond_grid_y_limit():
         cfg,
     )
     assert torch.equal(bits(out), bits(ref))
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128])
+def test_hardware_row_max_equals_the_register_tree(D, monkeypatch):
+    """The tile row maximum taken from the TMEM load (the parts that have the instruction) gives the bits of the register
+    tree, on finite rows and on rows whose scores hold NaN, +-inf and signed zeros: the maximum is exact and order-free, so
+    the placement reaches no value. The kill switch selects the tree kernel for the comparison."""
+    from flashinfer.attention.batch_invariant import engine
+
+    dev = torch.device("cuda")
+    if not engine.hw_row_max_enabled(dev):
+        pytest.skip("this part has no hardware row maximum")
+    pr = Problem([300, 1000, 64], [700, 2500, 3000], 32, 8, D, 16, seed=3)
+    pr.q[5, 3, 7] = float("nan")
+    pr.q[310, 1, 0] = float("inf")
+    pr.q[311, 2, 1] = float("-inf")
+    pr.q[1300] = 0.0
+    hw = bits(run_paged_prefill(pr))
+    monkeypatch.setenv(engine.HW_ROW_MAX_ENV, "0")
+    assert not engine.hw_row_max_enabled(dev)
+    tree = bits(run_paged_prefill(pr))
+    assert torch.equal(hw, tree)
+    assert torch.isnan(tree.view(torch.bfloat16).float()).any()
