@@ -2676,6 +2676,58 @@ class SM12xFp8Config:
 
 
 @dataclass(frozen=True)
+class SpecializedFp8BlockConfig:
+    """Specialized (agent-generated) SM120 DeepSeek FP8 block-scale backend.
+
+    Serves the same agent-generated kernels as the flat
+    ``cutlass_fused_moe(..., backend="specialized")`` path
+    (``flashinfer/fused_moe/specialized/fp8_blockscale_moe_sm120.py``):
+    fp8 e4m3 weights with fp32 ``[128, 128]`` block scales, BF16 activations
+    in/out, default SwiGLU, pre-routed (``PackedPrecomputed``) inputs only.
+    The kernels' shipped dispatch surface stays authoritative: the backend
+    serves only its generated contract (``num_experts=256, top_k=8,
+    hidden_size=2048, intermediate_size=512``), the validated SM120 device
+    profile, and the shipped ``num_tokens`` allowlist; the
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` kill switch removes it from
+    the candidate set at layer construction and refuses it at call time.
+
+    Opt-in only: like the other SM12x backends it is not part of the default
+    backend search order — list it in ``BackendOptions`` to let ``MoELayer``'s
+    cross-backend autotune reach it.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        # The shipped dispatch surface pins CC 12.0 exactly (its cooperative
+        # grids are sized for the validated device profile); SM121 is not
+        # guard-allowed.
+        return arch == 120
+
+    @staticmethod
+    def prepare_weights(w13_weight, w13_weight_sf, w2_weight, w2_weight_sf):
+        """Build the native weight view in the kernels' own layout.
+
+        ``w13_weight`` is the fp8 ``[E, 2I, H]`` fc1 stack in the serving
+        engines' ``[gate; up]`` row order (NOTE: the canonical
+        ``MoEWeightPack`` source convention is ``[up, gate]`` — swap halves
+        before calling this when starting from canonical weights);
+        ``w13_weight_sf`` is fp32 ``[E, 2I/128, H/128]``; ``w2_weight`` is
+        fp8 ``[E, H, I]`` with ``w2_weight_sf`` fp32 ``[E, H/128, I/128]``.
+        Register the result with
+        ``MoEWeightPack.prepare_for("specialized_fp8_block", ...)``.
+        """
+        return {
+            "w13_weight": w13_weight,
+            "w13_weight_sf": w13_weight_sf,
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+        }
+
+    def __repr__(self) -> str:
+        return "SpecializedFp8BlockConfig()"
+
+
+@dataclass(frozen=True)
 class SM12xMxfp8Mxfp4Config:
     """SM120/SM121 CuTe-DSL MXFP8 x MXFP4 backend."""
 
@@ -3451,6 +3503,7 @@ BackendConfigType = Union[
     CutlassHummingConfig,
     CuteDslConfig,
     SM12xFp8Config,
+    SpecializedFp8BlockConfig,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
@@ -3497,6 +3550,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassHummingConfig,
     CuteDslConfig,
     SM12xFp8Config,
+    SpecializedFp8BlockConfig,
     SM12xMxfp8Mxfp4Config,
     SM12xNvfp4Bf16Config,
     SM12xNvfp4Config,
