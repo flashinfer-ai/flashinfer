@@ -43,29 +43,24 @@ def cache_permute_indices():
 
 
 @pytest.mark.parametrize(
-    ("quant_mode", "case_id"),
+    ("quant_mode", "num_tokens"),
     [
-        pytest.param(QuantMode.FP8_BLOCK_SCALE_MXFP8, "mxfp8", id="MxFp8"),
-        pytest.param(QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, "deepseek", id="DeepSeekFp8"),
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_MXFP8, 32, id="MxFp8"),
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, 128, id="DeepSeekFp8"),
+        pytest.param(
+            QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, 1024, id="DeepSeekFp8-prefill"
+        ),
     ],
 )
 def test_prims_ts_fp8_block_scale_moe_smoke(
     quant_mode,
-    case_id,
+    num_tokens,
     cache_permute_indices,
 ):
-    if case_id == "deepseek":
-        num_tokens = 128
-        hidden_size = 512
-        intermediate_size = 512
-        num_experts = 64
-        top_k = 8
-    else:
-        num_tokens = 32
-        hidden_size = 512
-        intermediate_size = 512
-        num_experts = 64
-        top_k = 8
+    hidden_size = 512
+    intermediate_size = 512
+    num_experts = 64
+    top_k = 8
 
     run_moe_test(
         num_tokens=num_tokens,

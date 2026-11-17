@@ -4001,6 +4001,14 @@ def test_mxfp8_block_scale_moe_matches_megatron_glu_clamp_offset(
     ("num_tokens", "expert_params"),
     [
         pytest.param(64, [(1.702, 1.0, 2.0)] * 32, id="64"),
+        pytest.param(
+            64,
+            [
+                (0.5 + 0.5 * (expert % 4), 0.25 * (expert % 3), 1.0 + expert % 5)
+                for expert in range(32)
+            ],
+            id="64-distinct-experts",
+        ),
         pytest.param(1024, [(1.702, 1.0, 2.0)] * 32, id="1024"),
         pytest.param(
             1024,
@@ -4022,8 +4030,8 @@ def test_dsfp8_block_scale_moe_swiglu_oa_activation_params(
     ``run_moe_test``'s dequantized reference applies alpha/beta/clamp itself, so a
     kernel that dropped them would not match it. FC1 outputs land around unit scale
     for this data generator, so a limit of 2.0 clamps a meaningful fraction of both
-    halves rather than being a no-op. The mixed case alternates the sign of beta
-    and varies its magnitude so a wrong expert changes the vector-path output.
+    halves rather than being a no-op. The distinct-expert cases check that the
+    kernel looks up the controls for the expert that owns each row.
     """
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):

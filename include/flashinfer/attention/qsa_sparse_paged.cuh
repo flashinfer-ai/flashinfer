@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_EXPERIMENTAL_QSA_NVFP4_ATTENTION_CUH_
-#define FLASHINFER_EXPERIMENTAL_QSA_NVFP4_ATTENTION_CUH_
+#ifndef FLASHINFER_ATTENTION_QSA_SPARSE_PAGED_CUH_
+#define FLASHINFER_ATTENTION_QSA_SPARSE_PAGED_CUH_
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -26,7 +26,7 @@
 #include <flashinfer/vec_dtypes.cuh>
 
 namespace flashinfer {
-namespace qsa_nvfp4 {
+namespace qsa_sparse_paged {
 
 // Sparse paged GQA attention over an NVFP4, FP8-e4m3 or BF16 KV cache (head_dim 256), with the
 // semantics of vLLM's Triton qsa_sparse_paged_attention: one CTA per (row, KV head, split) walks
@@ -904,7 +904,7 @@ inline cudaError_t SparsePagedAttention(const Params& p, cudaStream_t stream) {
   return cudaGetLastError();
 }
 
-}  // namespace qsa_nvfp4
+}  // namespace qsa_sparse_paged
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_EXPERIMENTAL_QSA_NVFP4_ATTENTION_CUH_
+#endif  // FLASHINFER_ATTENTION_QSA_SPARSE_PAGED_CUH_
