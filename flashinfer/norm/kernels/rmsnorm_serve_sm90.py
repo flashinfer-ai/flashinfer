@@ -78,7 +78,10 @@ _SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 RMSNORM_BACKENDS = ("auto", "specialized", "stock")
 _DISPATCH_FILE = "rmsnorm_serve_sm90_dispatch.json"
 
-# Per-backend dispatch census and fallback reasons (#5667-style).
+# Per-backend dispatch census and fallback reasons (#5667-style).  Every
+# call is attributed to exactly one backend ("specialized" when these
+# kernels produced the output, "stock" otherwise, including every guard
+# fallback), so ``calls == specialized + stock`` always holds.
 _stats: dict = {
     "calls": 0,
     "backend_dispatches": {"specialized": 0, "stock": 0},
@@ -88,7 +91,19 @@ _stats: dict = {
 
 
 def _fallback(reason):
+    # A fallback is served by the stock path: record both the reason and the
+    # stock dispatch so the per-backend census stays complete.
+    _stats["backend_dispatches"]["stock"] += 1
     _stats["fallback_reasons"][reason] = _stats["fallback_reasons"].get(reason, 0) + 1
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two tensors' storage byte ranges overlap (both contiguous
+    here, so [data_ptr, data_ptr + numel * itemsize) covers each)."""
+    a_lo, b_lo = a.data_ptr(), b.data_ptr()
+    a_hi = a_lo + a.numel() * a.element_size()
+    b_hi = b_lo + b.numel() * b.element_size()
+    return a_lo < b_hi and b_lo < a_hi
 
 
 def _rmsnorm_serve_sm90_stats() -> dict:
@@ -444,12 +459,22 @@ def try_rmsnorm_serve_sm90(
         _fallback(f"{requested}: non-CUDA device")
         return False
     if weight.shape != (hidden,) or out.shape != input.shape:
+        _fallback(f"{requested}: shape mismatch")
         return False
     if weight.device != input.device or out.device != input.device:
+        _fallback(f"{requested}: device mismatch")
         return False
     if not (input.is_contiguous() and out.is_contiguous() and weight.is_contiguous()):
+        _fallback(f"{requested}: non-contiguous tensor")
         return False
     if (input.data_ptr() | out.data_ptr() | weight.data_ptr()) % 16 != 0:
+        _fallback(f"{requested}: data pointer not 16B-aligned")
+        return False
+    if out.data_ptr() != input.data_ptr() and _overlaps(out, input):
+        # A partial (non-identical) out/input overlap is unsafe for every
+        # one-CTA-per-row variant too: row r's write can land in a byte range
+        # another row's CTA has yet to read.
+        _fallback(f"{requested}: out partially overlaps input")
         return False
     if torch.cuda.get_device_capability(input.device) != (9, 0):
         _fallback(f"{requested}: not SM90")
@@ -459,6 +484,14 @@ def try_rmsnorm_serve_sm90(
         return False
 
     if backend == "cuda":
+        if _overlaps(out, input):
+            # The cuda variant's split launches (H=2048 at 2 tokens, H=6144
+            # up to 64 tokens) cover one row with several CTAs, each reading
+            # the full row while writing only a slice of it, so with out
+            # aliasing input one CTA's write can land before another CTA's
+            # read of the same row.  In-place calls take the stock path.
+            _fallback(f"{requested}: cuda variant does not support in-place")
+            return False
         if _cuda_module is None and torch.cuda.is_current_stream_capturing():
             # Never JIT-build the module under CUDA-graph capture.
             _fallback(f"{requested}: cuda variant uncompiled under capture")
@@ -484,7 +517,12 @@ def try_rmsnorm_serve_sm90(
             _fallback(f"{requested}: cutedsl variant uncompiled under capture")
             return False
         try:
-            fn = _build(hidden, input.dtype)
+            # Compile under the input tensor's device: the guard admits any
+            # SM90 device, but on a mixed-architecture host the process's
+            # current device may be a different architecture, and a callable
+            # compiled there would not launch on this one.
+            with torch.cuda.device(input.device):
+                fn = _build(hidden, input.dtype)
         except Exception:
             _fallback(f"{requested}: cutedsl variant JIT build failed")
             return False

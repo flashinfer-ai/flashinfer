@@ -1319,9 +1319,15 @@ def _rmsnorm_impl(
     # dispatch unchanged (the composable path; backend="stock" pins it);
     # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 is the kill switch
     # (FLASHINFER_SM90_SERVE_RMSNORM=0 a deprecated alias).
+    # FLASHINFER_USE_CUDA_NORM=1 keeps its pre-existing meaning: under the
+    # default backend="auto" it pins the legacy CUDA JIT norm kernels, so the
+    # specialized path is not consulted.  An explicit backend="specialized"
+    # or "stock" request still goes through the backend dispatch (an
+    # explicitly selected backend is never silently swapped).
     if (
         _try_rmsnorm_serve_sm90 is not None
         and input.dim() == 2
+        and not (backend == "auto" and _USE_CUDA_NORM)
         and _try_rmsnorm_serve_sm90(out, input, weight, eps, backend)
     ):
         return

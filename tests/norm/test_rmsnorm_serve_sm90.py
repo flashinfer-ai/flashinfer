@@ -107,9 +107,16 @@ def _matched(y, ref, rtol=0.02, atol=0.01):
     return float(((yf - rf).abs() <= (atol + rtol * rf.abs())).float().mean().item())
 
 
-def test_specialized_dispatches_and_matches_stock():
+# Shape grid: the cutedsl plan's launch regimes (H=512 single-warp, H=2048,
+# H=6144 12-warp, H=520 non-allowlist generic-band) at small and large token
+# counts, including both sides of the cuda variant's 6144 split boundary.
+@pytest.mark.parametrize(
+    "tokens,hidden",
+    [(64, 2048), (2, 2048), (16, 512), (8, 520), (64, 6144), (65, 6144)],
+)
+def test_specialized_dispatches_and_matches_stock(tokens, hidden):
     _sm90_or_skip()
-    x, w = _case()
+    x, w = _case(tokens=tokens, hidden=hidden)
     y_spec = flashinfer.norm.rmsnorm(x, w, backend="specialized")
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["backend_dispatches"]["specialized"] == 1, stats
@@ -178,21 +185,96 @@ def test_kill_switch_and_deprecated_alias_force_stock(env, value, monkeypatch):
     assert _matched(y, _ref(x, w)) >= 0.999
 
 
-def test_cuda_variant_behind_the_one_specialized_backend(monkeypatch):
+# Shape grid: every launch regime of the cuda specialist — H=512
+# (launch_exact<32,2>), H=2048 2-token (osplit2) and >2-token (launch_exact),
+# H=6144 on both sides of the 64-token split boundary (osplit8 /
+# launch_exact<384,2>).
+@pytest.mark.parametrize(
+    "tokens,hidden",
+    [(32, 2048), (2, 2048), (16, 512), (64, 6144), (65, 6144)],
+)
+def test_cuda_variant_behind_the_one_specialized_backend(tokens, hidden, monkeypatch):
     _sm90_or_skip()
     monkeypatch.setenv(VARIANT_ENV, "cuda")
-    x, w = _case(tokens=32, hidden=2048)  # on the cuda exact allowlist
+    x, w = _case(tokens=tokens, hidden=hidden)  # on the cuda exact allowlist
     y = flashinfer.norm.rmsnorm(x, w, backend="specialized")
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["backend_dispatches"]["specialized"] == 1, stats
     assert stats["variant_dispatches"]["cuda"] == 1, stats
     assert _matched(y, _ref(x, w)) >= 0.999
+
+
+def test_cuda_variant_off_exact_list_falls_back_to_stock(monkeypatch):
     # off the cuda exact list, the specialized backend serves via fallback
     # to the stock path (never a silent variant swap)
-    _reset_rmsnorm_serve_sm90_stats()
-    x2, w2 = _case(tokens=8, hidden=1024)
-    y2 = flashinfer.norm.rmsnorm(x2, w2, backend="specialized")
+    _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    x, w = _case(tokens=8, hidden=1024)
+    y = flashinfer.norm.rmsnorm(x, w, backend="specialized")
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["variant_dispatches"]["cuda"] == 0, stats
     assert stats["backend_dispatches"]["specialized"] == 0, stats
-    assert _matched(y2, _ref(x2, w2)) >= 0.999
+    assert _matched(y, _ref(x, w)) >= 0.999
+
+
+@pytest.mark.parametrize("tokens,hidden", [(2, 2048), (64, 6144)])
+def test_cuda_variant_in_place_falls_back_to_stock(tokens, hidden, monkeypatch):
+    """out aliasing input must not reach the cuda variant's split kernels
+    (several CTAs per row: a write could land before another CTA's read)."""
+    _sm90_or_skip()
+    monkeypatch.setenv(VARIANT_ENV, "cuda")
+    x, w = _case(tokens=tokens, hidden=hidden)
+    ref = _ref(x, w)
+    y = flashinfer.norm.rmsnorm(x, w, out=x, backend="specialized")
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["variant_dispatches"]["cuda"] == 0, stats
+    assert any("in-place" in r for r in stats["fallback_reasons"]), stats
+    assert y.data_ptr() == x.data_ptr()
+    assert _matched(y, ref) >= 0.999
+
+
+def test_cutedsl_in_place_is_supported():
+    """The cutedsl variant is one CTA per row with register staging, so exact
+    out-is-input aliasing stays on the specialized path and is correct."""
+    _sm90_or_skip()
+    x, w = _case(tokens=16, hidden=2048)
+    ref = _ref(x, w)
+    y = flashinfer.norm.rmsnorm(x, w, out=x, backend="specialized")
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["variant_dispatches"]["cutedsl"] == 1, stats
+    assert y.data_ptr() == x.data_ptr()
+    assert _matched(y, ref) >= 0.999
+
+
+def test_stats_census_sums_to_calls(monkeypatch):
+    """Every call is attributed to exactly one backend, fallbacks included:
+    calls == specialized + stock."""
+    _sm90_or_skip()
+    x, w = _case(tokens=16, hidden=2048)
+    flashinfer.norm.rmsnorm(x, w, backend="specialized")  # specialized
+    flashinfer.norm.rmsnorm(x, w, backend="stock")  # explicit stock
+    x2, w2 = _case(tokens=8, hidden=516)
+    flashinfer.norm.rmsnorm(x2, w2, backend="specialized")  # guard fallback
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    flashinfer.norm.rmsnorm(x, w)  # kill-switch fallback
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["calls"] == 4, stats
+    assert (
+        stats["backend_dispatches"]["specialized"]
+        + stats["backend_dispatches"]["stock"]
+        == stats["calls"]
+    ), stats
+
+
+def test_use_cuda_norm_env_still_pins_legacy_cuda_kernels(monkeypatch):
+    """FLASHINFER_USE_CUDA_NORM=1 keeps its pre-existing meaning under
+    backend="auto": the legacy CUDA JIT norm kernels serve the call and the
+    specialized dispatch is not consulted."""
+    _sm90_or_skip()
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    x, w = _case(tokens=16, hidden=2048)  # on the auto allowlist
+    y = flashinfer.norm.rmsnorm(x, w)
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["calls"] == 0, stats
+    assert stats["backend_dispatches"]["specialized"] == 0, stats
+    assert _matched(y, _ref(x, w)) >= 0.999
