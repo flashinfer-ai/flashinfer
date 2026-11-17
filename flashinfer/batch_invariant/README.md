@@ -290,26 +290,51 @@ tails' raw rows next to the pool; their cached rows are built by one span launch
 then the slot's count cell is negative and a step launched without that rebuild (a captured graph) returns NaN rows
 for the slot. While any slot of the pool waits for its rebuild, the pool's next step or span call starts with that
 rebuild; a slot restarted since is skipped on the device, and nothing is read on the host. Such a call cannot be captured
-in a CUDA graph and raises. A sequence that continues an open chunk and brings whole
+in a CUDA graph and raises, whichever slots it touches: a tail waiting in one slot blocks the capture of a step on
+another, so run one eager call on the pool between a ragged prefill and a capture. The first call on a pool allocates
+the state next to it and cannot be captured either (it raises). A sequence that continues an open chunk and brings whole
 chunks first completes its chunk in a span launch. Per slot the class holds
 `HV * (32 KB + 48.5 KB + 16 KB)` bytes next to the pool (4.6 MB at 16 / 48 heads), and
-`64 * (HQ * 256 + HV * 264)` more (1.1 MB) once a prefill has left an open tail in the pool.
+`64 * (HQ * 256 + HV * 264)` more (1.1 MB) once a prefill has left an open tail in the pool. It is allocated at the
+pool's first call for every slot the pool's storage holds from the pool's offset, not for the slots of the view that
+was passed (which is what lets views of one buffer share it): a pool carved from the start of a larger buffer pays for
+the whole remainder, so give the pool a storage of its own.
 
-What the caller owes the class: a new sequence loaded into a slot starts with a prefill call (more tokens than
-sequences) or carries `prefix_lens`; a one-token call without `prefix_lens` continues what the slot holds (nothing
-detects a slot whose state the caller replaced). Every call on a pool passes a view that starts at the pool's first
-slot (a view that starts at another slot is another pool, with its own open rows). Slot indices are unique and inside the pool (checked on the host
-only by the calls that bring whole chunks from open chunks or leave tails); `cu_seqlens_cpu` agrees with `cu_seqlens`
-and spares a call of 64 tokens or more the read of `cu_seqlens`; a decode call's `cu_seqlens` are `arange(N + 1)`. `output_final_state` returns the pool. A state
-saved for reuse (a prefix cache) is exact at multiples of 64 tokens, where the slot's state is the sequence's state.
-The decode entries (`gated_delta_rule_decode_pretranspose`, `gated_delta_rule_mtp`) do not take the flag: they compute
-the gates from the raw parameters and keep another state layout; a decode step of the class is a one-token call of
-`chunk_gated_delta_rule`.
+What the caller owes the class:
+
+* A new sequence loaded into a slot starts with a prefill call (more tokens than sequences) or carries `prefix_lens`.
+  A one-token call without `prefix_lens` continues what the slot holds: on a reused slot it continues the previous
+  sequence, with finite rows that are not the new sequence's (nothing detects a slot whose state the caller replaced).
+* A sequence moves to another slot, or is saved for reuse (a prefix cache), only at a multiple of 64 tokens, where the
+  slot's fp32 state is the sequence's state. Inside a chunk the open rows live next to the pool and are not exported,
+  so a copy of the fp32 state does not continue the sequence.
+* Every call on a pool passes a view that starts at the pool's first slot (a view that starts at another slot is
+  another pool, with its own open rows).
+* Slot indices are unique and inside the pool. A call that brings whole chunks together with open chunks or tails
+  checks them on the host, and a call of fewer than 64 tokens per sequence checks the range on the device (NaN rows)
+  and does not detect a repeated slot. A prefill of whole chunks from chunk boundaries trusts them, like the
+  operator's other state-pool routes: an out-of-range slot there writes outside the pool (reading the slots back
+  would stop the host at every such call).
+* `cu_seqlens_cpu` agrees with `cu_seqlens` and spares a call of 64 tokens or more the read of `cu_seqlens`; a decode
+  call's `cu_seqlens` are `arange(N + 1)`. A call of fewer than 64 tokens without `cu_seqlens_cpu` does not check a
+  device `cu_seqlens`: it stays inside its buffers, and rows that no sequence covers are left unwritten.
+* The inputs, `output` and the pool are 16-byte aligned (a typed error otherwise), and `output` does not partly
+  overlap an input (not checked, as for the operator without the flag).
+* The inputs are finite. A NaN or inf in `k`, `v`, `g` or `beta` reaches every row of its 64-token chunk in a
+  prefill and only the rows from its own on in decode, so the two differ on the rows before it; another sequence's
+  rows are never affected.
+
+`output_final_state` returns the pool. The decode entries (`gated_delta_rule_decode_pretranspose`,
+`gated_delta_rule_mtp`) do not take the flag: they compute the gates from the raw parameters and keep another state
+layout; a decode step of the class is a one-token call of `chunk_gated_delta_rule`.
 
 `lean/BIKernels/Gdn.lean` models the two kernels as an opaque chunk step and an opaque row step and defines the
-prefill as the fold of the chunk step over 64-row chunks. Two hypotheses are taken, both checked bit for bit on the
-device together with determinism and independence of the batch: the chunk step is causal (the outputs of a chunk
-prefix are the prefix of the chunk's outputs) and the row step returns the chunk step's last output on the same rows.
+prefill as the fold of the chunk step over 64-row chunks. Four device facts carry the model, all checked bit for bit
+on the device, for finite inputs, together with determinism and independence of the batch. Two are hypotheses of the
+theorems: the chunk step is causal (the outputs of a chunk prefix are the prefix of the chunk's outputs) and the row
+step returns the chunk step's last output on the same rows. Two are built into the definitions: a long prefill is the
+fold of the chunk step (`stateAfter`, `prefillRow`), and the commit on a chunk's 64th row stores the chunk step's
+state (`poolState`).
 Proved from them: the decode row equals the prefill row at every position (`decode_eq_prefill`), the prefill kernel
 run over whole chunks and an open tail returns the prefill's rows (`replay_eq_prefill`), the commit rule (the boundary state advances
 on a chunk's 64th row) carries the prefill's boundary states (`pool_eq_stateAfter`), and a call's whole chunks and
@@ -319,4 +344,5 @@ not modelled and is covered by the device tests. R3 is not claimed as a configur
 `lake exe gdnconformance` prints the arithmetic for the generated cases (`lean/BIKernels/GdnCases.lean`, rendered by
 `gdn/lean_cases.py`; kernel `decide` only), which the device-free test `tests/batch_invariant/test_gdn_lean.py`
 compares with the Python specification. Tests: `tests/gdn/test_batch_invariant_gdn.py` (every comparison
-`torch.equal`; `FLASHINFER_GDN_BI_HASH_DIR` records the output hashes in one process and asserts them in another).
+`torch.equal`; one test runs a set of cases in two fresh processes and asserts that the second returns the hashes and
+the case set of the first, and `FLASHINFER_GDN_BI_HASH_DIR` does the same for the whole file across two runs).
