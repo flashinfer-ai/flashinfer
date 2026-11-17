@@ -257,6 +257,62 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                         assert cfg in space, cfg.describe()
 
 
+@pytest.mark.parametrize("family,sm_count", PARTS)
+def test_memoised_dispatcher_pick_equals_a_fresh_ranking(family, sm_count):
+    """The dispatcher's pick, its candidate list and the enumerated space are memoised per argument tuple: a memoised
+    answer is the fresh computation's, element for element, over a grid of shapes of every format; the memos are
+    cleared with the rankings (a device's registered numbers, ``rank.cache_clear()``), and a memoised list is never the
+    caller's to mutate into the memo."""
+    from flashinfer.gemm.batch_invariant import heuristic as H
+    from flashinfer.gemm.batch_invariant import schedule as S
+    from flashinfer.gemm.batch_invariant.generator import _enumerate_space_cached
+
+    cases = []
+    for in_fmt, layouts in [
+        ("bf16", ("n", "k")),
+        ("e4m3", ("n", "k")),
+        ("mxfp8", ("k",)),
+        ("nvfp4", ("k",)),
+        ("mxfp4w8a", ("k",)),
+        ("e4m3_bs", ("k",)),
+    ]:
+        for N, K in [(4096, 4096), (128, 8192), (2048, 16384)]:
+            C = chunks_for(N, K, in_fmt)
+            for M in (1, 16, 300, 4096):
+                for b_major in layouts:
+                    cases.append((M, N, K, C, b_major, sm_count, family, in_fmt))
+    for args in cases:
+        memo = default_config(*args)
+        assert memo == default_config.__wrapped__(*args), args
+        assert memo == default_config(*args)  # the hit
+        top = rank_topk(*args[:6], 10, *args[6:])
+        fresh = S._rank_topk_cached.__wrapped__(*args[:6], 10, *args[6:], False)
+        assert tuple(top) == fresh and top[0] == memo, args
+        top.append(memo)  # the caller's list, not the memo
+        assert len(rank_topk(*args[:6], 10, *args[6:])) == len(fresh)
+    M, N, K, C, b_major, _, _, in_fmt = cases[0]
+    space = enumerate_space(M, N, K, chunks=C, b_major=b_major, in_fmt=in_fmt)
+    assert tuple(space) == _enumerate_space_cached.__wrapped__(
+        M, N, K, S.SWIZZLES, S.CLUSTERS, C, b_major, in_fmt
+    )
+    space.clear()
+    assert enumerate_space(M, N, K, chunks=C, b_major=b_major, in_fmt=in_fmt)
+    assert default_config.cache_info().currsize >= len(cases) // 2
+    H.rank.cache_clear()  # the rankings' clear takes the memos with it
+    assert default_config.cache_info().currsize == 0
+    assert S._rank_topk_cached.cache_info().currsize == 0
+    default_config(*cases[0])
+    saved = {k: dict(v) for k, v in H._QUERIED_CAPACITY.items()}
+    try:
+        cap = H.capacity_for(family, sm_count)
+        H.register_capacity(family, sm_count, 2, cap[2] + 1)  # a changed device number
+        assert default_config.cache_info().currsize == 0
+    finally:
+        H._QUERIED_CAPACITY.clear()
+        H._QUERIED_CAPACITY.update(saved)
+        H.rank.cache_clear()
+
+
 def test_hbm_traffic_follows_the_tile_order():
     """The traffic model: the operands' own bytes when every band's panels stay resident in the L2, refetches per band
     or per wave when they do not, fewer of them with a wider swizzle band, and never below the operands' own bytes."""
