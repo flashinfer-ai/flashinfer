@@ -12,7 +12,9 @@
 //  identity sequence 0..pos and cannot depend on the fp8 scores.  Scoring +
 //  exact top-512 therefore only runs for rows with pos+1 >= 2052.
 #include <cuda_runtime.h>
+
 #include <cstdint>
+
 #include "tvm_ffi_utils.h"
 
 namespace ffi = tvm::ffi;
@@ -22,7 +24,7 @@ namespace ffi = tvm::ffi;
 #define PWIDTH 2052
 #define CPAGE 64
 #define IDX_D 128
-#define SLOW_CNT 2052            // pos+1 >= 2052  <=>  vis > 512
+#define SLOW_CNT 2052  // pos+1 >= 2052  <=>  vis > 512
 
 // warp-cooperative 32-ary search: largest r in [0,B) with cu[r] <= t
 __device__ __forceinline__ int find_req32(const int* __restrict__ cu, int B, int t, int lane) {
@@ -46,100 +48,116 @@ __device__ __forceinline__ int find_req32(const int* __restrict__ cu, int B, int
 // store straddles sectors.  Instead every CTA owns a flat, 128B-aligned range of
 // int4s of the whole output and derives (row, col) from the flat index.
 #define FK_THR 256
-#define RW 513                      // int4 per row
+#define RW 513  // int4 per row
 
 template <int PT, bool SINGLE_REQ>
-__global__ __launch_bounds__(FK_THR) void qsa_fast(
-    const int* __restrict__ cu, int B, int T, int ntot, int4* __restrict__ out4) {
+__global__ __launch_bounds__(FK_THR) void qsa_fast(const int* __restrict__ cu, int B, int T,
+                                                   int ntot, int4* __restrict__ out4) {
   const int tid = threadIdx.x;
   const int g0 = blockIdx.x * (FK_THR * PT);
   if (g0 >= ntot) return;
 
   const int row0 = g0 / RW;
   __shared__ int s_cnt[8];
-  int cbase = row0 + 1;            // cnt == row + cbase - row0 when uniform
+  int cbase = row0 + 1;  // cnt == row + cbase - row0 when uniform
   bool uni = true;
   if (!SINGLE_REQ) {
-    const int warp = tid >> 5, lane = tid & 31;   // one warp per covered row
+    const int warp = tid >> 5, lane = tid & 31;  // one warp per covered row
     const int rr = row0 + warp;
     const int q = find_req32(cu, B, rr, lane);
     if (lane == 0) s_cnt[warp] = rr - cu[q] + 1;
     __syncthreads();
     cbase = s_cnt[0];
-    uni = (s_cnt[7] == cbase + 7);                // cnt-w is monotone: ends equal => all equal
+    uni = (s_cnt[7] == cbase + 7);  // cnt-w is monotone: ends equal => all equal
   }
 
   int row = row0;
   int col4 = g0 + tid - row0 * RW;
-  if (col4 >= RW) { row += col4 / RW; col4 -= (col4 / RW) * RW; }
+  if (col4 >= RW) {
+    row += col4 / RW;
+    col4 -= (col4 / RW) * RW;
+  }
 #pragma unroll
   for (int k = 0; k < PT; ++k) {
     const int g = g0 + tid + k * FK_THR;
     if (g >= ntot) break;
     const int cnt = SINGLE_REQ ? (row + 1) : (uni ? (row - row0 + cbase) : s_cnt[row - row0]);
-    if (cnt < SLOW_CNT) {                     // else handled by qsa_slow
+    if (cnt < SLOW_CNT) {  // else handled by qsa_slow
       const int c = col4 * 4;
       int4 v;
-      v.x = (c     < cnt) ? c     : -1;
+      v.x = (c < cnt) ? c : -1;
       v.y = (c + 1 < cnt) ? c + 1 : -1;
       v.z = (c + 2 < cnt) ? c + 2 : -1;
       v.w = (col4 == RW - 1) ? cnt : ((c + 3 < cnt) ? c + 3 : -1);
       out4[g] = v;
     }
     col4 += FK_THR;
-    if (col4 >= RW) { col4 -= RW; ++row; }
+    if (col4 >= RW) {
+      col4 -= RW;
+      ++row;
+    }
   }
 }
 
 // ------------------------------------------------------------------ fp8 MMA
-#define MMA(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1)                               \
-  asm volatile(                                                                   \
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "                      \
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"                   \
-      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)                                    \
+#define MMA(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1)             \
+  asm volatile(                                                 \
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)                  \
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
 }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() {
+template <int N>
+__device__ __forceinline__ void cp_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-#define SROW 36            // smem words per 128B operand row (144B, conflict-free)
-#define NTILE 128          // ck blocks per pipeline stage
-#define GMAX 16            // tokens owned by one CTA
+#define SROW 36    // smem words per 128B operand row (144B, conflict-free)
+#define NTILE 128  // ck blocks per pipeline stage
+#define GMAX 16    // tokens owned by one CTA
 #define NTHR 512
 #define NWARP (NTHR / 32)
 
 // --------------------------------------------------------------- slow rows
 template <int NSTAGE>
-__global__ __launch_bounds__(NTHR, 1) void qsa_slow(
-    const uint8_t* __restrict__ qi, const uint8_t* __restrict__ ckc,
-    const int* __restrict__ cu, int B, int T, const int* __restrict__ cpb,
-    int scap, int* __restrict__ out) {
+__global__ __launch_bounds__(NTHR, 1) void qsa_slow(const uint8_t* __restrict__ qi,
+                                                    const uint8_t* __restrict__ ckc,
+                                                    const int* __restrict__ cu, int B, int T,
+                                                    const int* __restrict__ cpb, int scap,
+                                                    int* __restrict__ out) {
   extern __shared__ uint32_t smem[];
-  uint32_t* q_s  = smem;                                   // 4*GMAX rows
-  int*      hist = (int*)(q_s + 4 * GMAX * SROW);          // NWARP * 256
-  int*      meta = hist + NWARP * 256;                     // 2*GMAX
-  float*    sc   = (float*)(meta + 2 * GMAX);              // scap floats
-  uint32_t* ck_s = (uint32_t*)(sc + scap);                 // NSTAGE * NTILE rows
+  uint32_t* q_s = smem;                       // 4*GMAX rows
+  int* hist = (int*)(q_s + 4 * GMAX * SROW);  // NWARP * 256
+  int* meta = hist + NWARP * 256;             // 2*GMAX
+  float* sc = (float*)(meta + 2 * GMAX);      // scap floats
+  uint32_t* ck_s = (uint32_t*)(sc + scap);    // NSTAGE * NTILE rows
 
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
   const int t0 = blockIdx.x * GMAX;
   if (t0 >= T) return;
 
-  {   // one warp per token: 16 independent searches issue in parallel
+  {  // one warp per token: 16 independent searches issue in parallel
     const int j = warp;
     const int t = t0 + j;
     int r = -1, pos = -1;
     if (j < GMAX && t < T) {
-      if (B == 1) { r = 0; pos = t; }
-      else { r = find_req32(cu, B, t, lane); pos = t - cu[r]; }
+      if (B == 1) {
+        r = 0;
+        pos = t;
+      } else {
+        r = find_req32(cu, B, t, lane);
+        pos = t - cu[r];
+      }
     }
-    if (j < GMAX && lane == 0) { meta[j] = r; meta[GMAX + j] = pos; }
+    if (j < GMAX && lane == 0) {
+      meta[j] = r;
+      meta[GMAX + j] = pos;
+    }
   }
   __syncthreads();
 
@@ -149,8 +167,8 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
     if (meta[GMAX + j] + 1 >= SLOW_CNT) todo |= (1u << j);
   if (todo == 0) return;
 
-  {   // q -> smem, rows laid out as head*GMAX + token (row == MMA M index)
-    const int row = tid >> 3, jj = tid & 7;     // 64 rows x 8 chunks
+  {  // q -> smem, rows laid out as head*GMAX + token (row == MMA M index)
+    const int row = tid >> 3, jj = tid & 7;  // 64 rows x 8 chunks
     const int tok = row & (GMAX - 1), h = row >> 4;
     uint4 val = make_uint4(0, 0, 0, 0);
     if (t0 + tok < T)
@@ -167,8 +185,8 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
     const uint32_t* p1 = p0 + 8 * SROW;
 #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
-      af[h][2 * kk]     = p0[8 * kk];            // a0 : row,   k=32kk
-      af[h][2 * kk + 1] = p1[8 * kk];            // a1 : row+8, k=32kk
+      af[h][2 * kk] = p0[8 * kk];      // a0 : row,   k=32kk
+      af[h][2 * kk + 1] = p1[8 * kk];  // a1 : row+8, k=32kk
     }
   }
   uint32_t af2[4][8];
@@ -178,8 +196,8 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
     const uint32_t* p1 = p0 + 8 * SROW;
 #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
-      af2[h][2 * kk]     = p0[8 * kk];           // a2 : row,   k=32kk+16
-      af2[h][2 * kk + 1] = p1[8 * kk];           // a3 : row+8, k=32kk+16
+      af2[h][2 * kk] = p0[8 * kk];      // a2 : row,   k=32kk+16
+      af2[h][2 * kk + 1] = p1[8 * kk];  // a3 : row+8, k=32kk+16
     }
   }
 
@@ -194,10 +212,10 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
     for (int j = 0; j < GMAX; ++j)
       if (((todo >> j) & 1) && meta[j] == r0) sub |= (1u << j);
     const int jhi = 31 - __clz(sub);
-    const int V = (meta[GMAX + jhi] + 1) >> 2;          // max vis in this subset
+    const int V = (meta[GMAX + jhi] + 1) >> 2;  // max vis in this subset
     const size_t ckbase = (size_t)cpb[r0] * CPAGE;
     const int gb = min(GMAX, max(1, scap / max(V, 1)));
-    if ((size_t)gb * (size_t)V > (size_t)scap) break;   // V > scap: unsupported extent
+    if ((size_t)gb * (size_t)V > (size_t)scap) break;  // V > scap: unsupported extent
     const int ntiles = (V + NTILE - 1) / NTILE;
 
     for (int bst = 0; bst < GMAX; bst += gb) {
@@ -246,7 +264,10 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
         const uint32_t* bp = tile + colb * SROW + (lane & 3);
         uint32_t bf[4], bf2[4];
 #pragma unroll
-        for (int kk = 0; kk < 4; ++kk) { bf[kk] = bp[8 * kk]; bf2[kk] = bp[8 * kk + 4]; }
+        for (int kk = 0; kk < 4; ++kk) {
+          bf[kk] = bp[8 * kk];
+          bf2[kk] = bp[8 * kk + 4];
+        }
 
         float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
 #pragma unroll
@@ -255,13 +276,10 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
           float z0 = 0.f, z1 = 0.f, z2 = 0.f, z3 = 0.f;
 #pragma unroll
           for (int kk = 0; kk < 4; ++kk) {
-            MMA(c0, c1, c2, c3, af[h][2 * kk], af[h][2 * kk + 1],
-                af2[h][2 * kk], af2[h][2 * kk + 1], bf[kk], bf2[kk]);
-            MMA(z0, z1, z2, z3,
-                af[h][2 * kk] & 0x7f7f7f7fu,
-                af[h][2 * kk + 1] & 0x7f7f7f7fu,
-                af2[h][2 * kk] & 0x7f7f7f7fu,
-                af2[h][2 * kk + 1] & 0x7f7f7f7fu,
+            MMA(c0, c1, c2, c3, af[h][2 * kk], af[h][2 * kk + 1], af2[h][2 * kk],
+                af2[h][2 * kk + 1], bf[kk], bf2[kk]);
+            MMA(z0, z1, z2, z3, af[h][2 * kk] & 0x7f7f7f7fu, af[h][2 * kk + 1] & 0x7f7f7f7fu,
+                af2[h][2 * kk] & 0x7f7f7f7fu, af2[h][2 * kk + 1] & 0x7f7f7f7fu,
                 bf[kk] & 0x7f7f7f7fu, bf2[kk] & 0x7f7f7f7fu);
           }
           const int ta = t0 + (lane >> 2), tb = ta + 8;
@@ -273,8 +291,10 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
           c1 = qsa_checked_dot(c1, z1, qa, kp + 128, ta < T && ca + 1 < V);
           c2 = qsa_checked_dot(c2, z2, qb, kp, tb < T && ca < V);
           c3 = qsa_checked_dot(c3, z3, qb, kp + 128, tb < T && ca + 1 < V);
-          a0 += qsa_relu_exact(c0); a1 += qsa_relu_exact(c1);
-          a2 += qsa_relu_exact(c2); a3 += qsa_relu_exact(c3);
+          a0 += qsa_relu_exact(c0);
+          a1 += qsa_relu_exact(c1);
+          a2 += qsa_relu_exact(c2);
+          a3 += qsa_relu_exact(c3);
         }
         {
           const int tA = lane >> 2, tB = tA + 8;
@@ -331,7 +351,11 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
               int acc = x - s;
               for (int i = 7; i >= 0; --i) {
                 const int c = h[L * 8 + i];
-                if (acc + c >= k) { d = L * 8 + i; above = acc; break; }
+                if (acc + c >= k) {
+                  d = L * 8 + i;
+                  above = acc;
+                  break;
+                }
                 acc += c;
               }
             }
@@ -357,7 +381,11 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
             const unsigned bt = __ballot_sync(0xffffffffu, take);
             const int myrank = rank + __popc(bt & ((1u << lane) - 1u));
             if (take) {
-              int4 q4; q4.x = 4 * v; q4.y = 4 * v + 1; q4.z = 4 * v + 2; q4.w = 4 * v + 3;
+              int4 q4;
+              q4.x = 4 * v;
+              q4.y = 4 * v + 1;
+              q4.z = 4 * v + 2;
+              q4.w = 4 * v + 3;
               *reinterpret_cast<int4*>(orow + 4 * myrank) = q4;
             }
             rank += __popc(bt);
@@ -367,7 +395,7 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(
             const int rem = (pos + 1) & 3;
             const int ts = vis * CR;
             int4 tl;
-            tl.x = (0 < rem) ? ts     : -1;
+            tl.x = (0 < rem) ? ts : -1;
             tl.y = (1 < rem) ? ts + 1 : -1;
             tl.z = (2 < rem) ? ts + 2 : -1;
             tl.w = CR * BLOCK_TOPK + rem;
@@ -387,8 +415,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlen
   const int T = (int)qi.shape()[0];
   const int B = (int)cpage_base.shape()[0];
   if (T <= 0) return;
-  cudaStream_t stream =
-      (cudaStream_t)TVMFFIEnvGetStream(kDLCUDA, qi.device().device_id);
+  cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(kDLCUDA, qi.device().device_id);
 
   const int* cu = (const int*)cu_seqlens.data_ptr();
   int* out = (int*)packed.data_ptr();
@@ -398,10 +425,26 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlen
     int pt = ntot / (FK_THR * 424);
     pt = (pt >= 8) ? 8 : ((pt >= 4) ? 4 : ((pt >= 2) ? 2 : 1));
     const int grid = (ntot + FK_THR * pt - 1) / (FK_THR * pt);
-#define LF(P)                                                                        \
-    do { if (B == 1) qsa_fast<P, true><<<grid, FK_THR, 0, stream>>>(cu, B, T, ntot, (int4*)out);  \
-         else        qsa_fast<P, false><<<grid, FK_THR, 0, stream>>>(cu, B, T, ntot, (int4*)out); } while (0)
-    switch (pt) { case 8: LF(8); break; case 4: LF(4); break; case 2: LF(2); break; default: LF(1); }
+#define LF(P)                                                                      \
+  do {                                                                             \
+    if (B == 1)                                                                    \
+      qsa_fast<P, true><<<grid, FK_THR, 0, stream>>>(cu, B, T, ntot, (int4*)out);  \
+    else                                                                           \
+      qsa_fast<P, false><<<grid, FK_THR, 0, stream>>>(cu, B, T, ntot, (int4*)out); \
+  } while (0)
+    switch (pt) {
+      case 8:
+        LF(8);
+        break;
+      case 4:
+        LF(4);
+        break;
+      case 2:
+        LF(2);
+        break;
+      default:
+        LF(1);
+    }
 #undef LF
   }
 
@@ -414,8 +457,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlen
     constexpr int scap = 32768;
     constexpr int fixed = (4 * GMAX * SROW + NWARP * 256 + 2 * GMAX) * 4;
     constexpr int stbytes = NTILE * SROW * 4;
-    constexpr size_t smem =
-        (size_t)fixed + (size_t)scap * 4 + (size_t)3 * stbytes;
+    constexpr size_t smem = (size_t)fixed + (size_t)scap * 4 + (size_t)3 * stbytes;
     static_assert(smem == 212096 && smem <= 227 * 1024,
                   "SM107 non-portable shared-memory budget exceeded");
     const int grid = (T + GMAX - 1) / GMAX;
@@ -429,17 +471,12 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlen
     config.stream = stream;
     config.attrs = &attr;
     config.numAttrs = 1;
-    cudaLaunchKernelEx(
-        &config, qsa_slow<3>,
-        (const uint8_t*)qi.data_ptr(), (const uint8_t*)ck_cache.data_ptr(), cu, B, T,
-        (const int*)cpage_base.data_ptr(), scap, out);
+    cudaLaunchKernelEx(&config, qsa_slow<3>, (const uint8_t*)qi.data_ptr(),
+                       (const uint8_t*)ck_cache.data_ptr(), cu, B, T,
+                       (const int*)cpage_base.data_ptr(), scap, out);
   }
 }
 
 #ifndef DEVICE_ONLY
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
 #endif
-
-
-
-

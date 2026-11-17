@@ -6,9 +6,10 @@
 // token ids with the causal tail, packed int32 output (ascending ids, -1 pad,
 // count in the last column). Ties break toward the lower block index; see the
 // pure-PyTorch reference in tests/attention/test_qsa_topk_indexer.py.
-#include <cuda_runtime.h>
-#include <cstdint>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+#include <cstdint>
 
 #include "tvm_ffi_utils.h"
 
@@ -35,14 +36,15 @@ __device__ __noinline__ float qsa_dot_rn(const uint8_t* q, const uint8_t* k) {
 #pragma unroll 4
   for (int i = 0; i < 128; ++i) {
     __nv_fp8_e4m3 a, b;
-    a.__x = q[i]; b.__x = k[i];
+    a.__x = q[i];
+    b.__x = k[i];
     d = __fmaf_rn((float)a, (float)b, d);
   }
   return d;
 }
 
-__device__ __forceinline__ float qsa_checked_dot(
-    float d, float abs_sum, const uint8_t* q, const uint8_t* k, bool valid) {
+__device__ __forceinline__ float qsa_checked_dot(float d, float abs_sum, const uint8_t* q,
+                                                 const uint8_t* k, bool valid) {
   return (valid && abs_sum > 64.0f) ? qsa_dot_rn(q, k) : d;
 }
 
@@ -88,8 +90,7 @@ namespace split_impl {
 #undef CR
 }  // namespace split_impl
 
-__device__ __forceinline__ int4 qsa_fast_identity_value(
-    int col4, int count) {
+__device__ __forceinline__ int4 qsa_fast_identity_value(int col4, int count) {
   const int c = col4 << 2;
   int4 v = make_int4(-1, -1, -1, -1);
 
@@ -119,10 +120,8 @@ constexpr int kItems = kTokens * packfill::QF_RW;
 constexpr int kGrid = (kItems + kThreads - 1) / kThreads;
 static_assert(kGrid == 193, "W0 store grid changed");
 
-__global__ __launch_bounds__(kThreads) void qsa_fast_w0(
-    int4 *__restrict__ out4) {
-  const int g = static_cast<int>(blockIdx.x) * kThreads +
-                static_cast<int>(threadIdx.x);
+__global__ __launch_bounds__(kThreads) void qsa_fast_w0(int4* __restrict__ out4) {
+  const int g = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
   if (g >= kItems) return;
   const int row = g / packfill::QF_RW;
   const int col4 = g - row * packfill::QF_RW;
@@ -141,10 +140,8 @@ constexpr int kItems = kTokens * packfill::QF_RW;
 constexpr int kGrid = (kItems + kThreads - 1) / kThreads;
 static_assert(kGrid == 211, "W1 store grid changed");
 
-__global__ __launch_bounds__(kThreads, 1) void qsa_fast_w1(
-    int4 *__restrict__ out4) {
-  const int g = static_cast<int>(blockIdx.x) * kThreads +
-                static_cast<int>(threadIdx.x);
+__global__ __launch_bounds__(kThreads, 1) void qsa_fast_w1(int4* __restrict__ out4) {
+  const int g = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
   if (g >= kItems) return;
   const int row = g / packfill::QF_RW;
   const int col4 = g - row * packfill::QF_RW;
@@ -163,10 +160,8 @@ constexpr int kItems = kTokens * packfill::QF_RW;
 constexpr int kGrid = (kItems + kThreads - 1) / kThreads;
 static_assert(kGrid == 211, "W2 store grid changed");
 
-__global__ __launch_bounds__(kThreads, 1) void qsa_fast_w2(
-    int4 *__restrict__ out4) {
-  const int g = static_cast<int>(blockIdx.x) * kThreads +
-                static_cast<int>(threadIdx.x);
+__global__ __launch_bounds__(kThreads, 1) void qsa_fast_w2(int4* __restrict__ out4) {
+  const int g = static_cast<int>(blockIdx.x) * kThreads + static_cast<int>(threadIdx.x);
   if (g >= kItems) return;
   const int row = g / packfill::QF_RW;
   const int col4 = g - row * packfill::QF_RW;
@@ -183,16 +178,13 @@ constexpr int kTokens = 768;
 constexpr int kThreads = 640;
 constexpr int kPT = 3;
 constexpr int kItems = kTokens * packfill::QF_RW;
-constexpr int kGrid =
-    (kItems + kThreads * kPT - 1) / (kThreads * kPT);
+constexpr int kGrid = (kItems + kThreads * kPT - 1) / (kThreads * kPT);
 static_assert(kGrid == 206, "W3 store grid changed");
 static_assert(kThreads >= packfill::QF_RW && kThreads < 2 * packfill::QF_RW,
               "W3 row/column carry assumptions changed");
 
-__global__ __launch_bounds__(kThreads, 1) void qsa_fast_w3(
-    int4 *__restrict__ out4) {
-  const int g0 = static_cast<int>(blockIdx.x) * (kThreads * kPT) +
-                 static_cast<int>(threadIdx.x);
+__global__ __launch_bounds__(kThreads, 1) void qsa_fast_w3(int4* __restrict__ out4) {
+  const int g0 = static_cast<int>(blockIdx.x) * (kThreads * kPT) + static_cast<int>(threadIdx.x);
   int row = g0 / packfill::QF_RW;
   int col4 = g0 - row * packfill::QF_RW;
 #pragma unroll
@@ -216,81 +208,66 @@ __global__ __launch_bounds__(kThreads, 1) void qsa_fast_w3(
 
 }  // namespace w3_store_impl
 
-static void LaunchGenericScopeSafe(ffi::TensorView qi,
-                                   ffi::TensorView ck_cache,
-                                   ffi::TensorView cu_seqlens,
-                                   ffi::TensorView cpage_base,
-                                   ffi::TensorView packed,
-                                   cudaStream_t stream) {
+static void LaunchGenericScopeSafe(ffi::TensorView qi, ffi::TensorView ck_cache,
+                                   ffi::TensorView cu_seqlens, ffi::TensorView cpage_base,
+                                   ffi::TensorView packed, cudaStream_t stream) {
   const int total_tokens = static_cast<int>(qi.shape()[0]);
   const int batch = static_cast<int>(cpage_base.shape()[0]);
   constexpr int rows_per_cta = 8;
-  const int row_ctas =
-      (total_tokens + rows_per_cta - 1) / rows_per_cta;
+  const int row_ctas = (total_tokens + rows_per_cta - 1) / rows_per_cta;
 
   split_impl::qsa_store<<<static_cast<unsigned>(row_ctas), 256, 0, stream>>>(
-      static_cast<const int *>(cu_seqlens.data_ptr()),
-      static_cast<int *>(packed.data_ptr()), total_tokens, batch,
-      kPackV4, rows_per_cta);
+      static_cast<const int*>(cu_seqlens.data_ptr()), static_cast<int*>(packed.data_ptr()),
+      total_tokens, batch, kPackV4, rows_per_cta);
 
   // Upper bound on the sum of request-local post-FASTPOS tiles.  Retain the
   // same overlaunch so fast and safe-slow kernels use identical mapping.
   const int num_tiles = (total_tokens + 15) / 16 + batch;
   split_impl::qsa_topk_fast<<<static_cast<unsigned>(num_tiles), 256, 0, stream>>>(
-      static_cast<const split_impl::u8 *>(qi.data_ptr()),
-      static_cast<const split_impl::u8 *>(ck_cache.data_ptr()),
-      static_cast<const int *>(cu_seqlens.data_ptr()),
-      static_cast<const int *>(cpage_base.data_ptr()),
-      static_cast<int *>(packed.data_ptr()), batch);
-  split_impl::qsa_topk_slow_scope_safe
-      <<<static_cast<unsigned>(num_tiles), 256, 0, stream>>>(
-          static_cast<const split_impl::u8 *>(qi.data_ptr()),
-          static_cast<const split_impl::u8 *>(ck_cache.data_ptr()),
-          static_cast<const int *>(cu_seqlens.data_ptr()),
-          static_cast<const int *>(cpage_base.data_ptr()),
-          static_cast<int *>(packed.data_ptr()), batch);
+      static_cast<const split_impl::u8*>(qi.data_ptr()),
+      static_cast<const split_impl::u8*>(ck_cache.data_ptr()),
+      static_cast<const int*>(cu_seqlens.data_ptr()),
+      static_cast<const int*>(cpage_base.data_ptr()), static_cast<int*>(packed.data_ptr()), batch);
+  split_impl::qsa_topk_slow_scope_safe<<<static_cast<unsigned>(num_tiles), 256, 0, stream>>>(
+      static_cast<const split_impl::u8*>(qi.data_ptr()),
+      static_cast<const split_impl::u8*>(ck_cache.data_ptr()),
+      static_cast<const int*>(cu_seqlens.data_ptr()),
+      static_cast<const int*>(cpage_base.data_ptr()), static_cast<int*>(packed.data_ptr()), batch);
 }
 
-void Run(ffi::TensorView qi,
-         ffi::TensorView ck_cache,
-         ffi::TensorView cu_seqlens,
-         ffi::TensorView cpage_base,
-         ffi::TensorView packed) {
+void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlens,
+         ffi::TensorView cpage_base, ffi::TensorView packed) {
   const int total_tokens = static_cast<int>(qi.shape()[0]);
   if (total_tokens <= 0) return;
   const int batch = static_cast<int>(cpage_base.shape()[0]);
 
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, packed.device().device_id));
-  const int *cu = static_cast<const int *>(cu_seqlens.data_ptr());
-  int *out = static_cast<int *>(packed.data_ptr());
+  cudaStream_t stream =
+      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, packed.device().device_id));
+  const int* cu = static_cast<const int*>(cu_seqlens.data_ptr());
+  int* out = static_cast<int*>(packed.data_ptr());
 
   if (batch == 1 && total_tokens == w0_store_impl::kTokens) {
-    w0_store_impl::qsa_fast_w0
-        <<<w0_store_impl::kGrid, w0_store_impl::kThreads, 0, stream>>>(
-            reinterpret_cast<int4 *>(out));
+    w0_store_impl::qsa_fast_w0<<<w0_store_impl::kGrid, w0_store_impl::kThreads, 0, stream>>>(
+        reinterpret_cast<int4*>(out));
     return;
   }
 
   if (batch == 1 && total_tokens == w1_store_impl::kTokens) {
-    w1_store_impl::qsa_fast_w1
-        <<<w1_store_impl::kGrid, w1_store_impl::kThreads, 0, stream>>>(
-            reinterpret_cast<int4 *>(out));
+    w1_store_impl::qsa_fast_w1<<<w1_store_impl::kGrid, w1_store_impl::kThreads, 0, stream>>>(
+        reinterpret_cast<int4*>(out));
     return;
   }
 
   // Exact W2 dispatch; it remains independent of the W3 experiment below.
   if (batch == 1 && total_tokens == w2_store_impl::kTokens) {
-    w2_store_impl::qsa_fast_w2
-        <<<w2_store_impl::kGrid, w2_store_impl::kThreads, 0, stream>>>(
-            reinterpret_cast<int4 *>(out));
+    w2_store_impl::qsa_fast_w2<<<w2_store_impl::kGrid, w2_store_impl::kThreads, 0, stream>>>(
+        reinterpret_cast<int4*>(out));
     return;
   }
 
   if (batch == 1 && total_tokens == w3_store_impl::kTokens) {
-    w3_store_impl::qsa_fast_w3
-        <<<w3_store_impl::kGrid, w3_store_impl::kThreads, 0, stream>>>(
-            reinterpret_cast<int4 *>(out));
+    w3_store_impl::qsa_fast_w3<<<w3_store_impl::kGrid, w3_store_impl::kThreads, 0, stream>>>(
+        reinterpret_cast<int4*>(out));
     return;
   }
 
@@ -306,22 +283,20 @@ void Run(ffi::TensorView qi,
   // Conservatively route larger totals to the recomputing scope-safe path;
   // arbitrary legal cu_seqlens may put every token in one request.
   if (total_tokens > 65535) {
-    LaunchGenericScopeSafe(
-        qi, ck_cache, cu_seqlens, cpage_base, packed, stream);
+    LaunchGenericScopeSafe(qi, ck_cache, cu_seqlens, cpage_base, packed, stream);
     return;
   }
 
   if (total_tokens > 6000 && total_tokens <= 8208) {
-    packmid::Launch(static_cast<const uint8_t *>(qi.data_ptr()),
-                    static_cast<const uint8_t *>(ck_cache.data_ptr()), cu,
-                    static_cast<const int *>(cpage_base.data_ptr()), batch,
-                    total_tokens, out, stream);
+    packmid::Launch(static_cast<const uint8_t*>(qi.data_ptr()),
+                    static_cast<const uint8_t*>(ck_cache.data_ptr()), cu,
+                    static_cast<const int*>(cpage_base.data_ptr()), batch, total_tokens, out,
+                    stream);
     return;
   }
 
   // Preserve the verified single-kernel regime when every request is short.
-  if (batch <= 4 &&
-      (total_tokens + batch - 1) / batch <= 2051) {
+  if (batch <= 4 && (total_tokens + batch - 1) / batch <= 2051) {
     mid_impl::RunLegacy(qi, ck_cache, cu_seqlens, cpage_base, packed);
     return;
   }
@@ -329,25 +304,16 @@ void Run(ffi::TensorView qi,
   if (total_tokens > 10000) {
     // w7n keeps 2048 score slots per token, i.e. vis <= 16384 (pos <= 65535).
     if (total_tokens <= 65536) {
-      w7n::Run(static_cast<const uint8_t *>(qi.data_ptr()),
-               static_cast<const uint8_t *>(ck_cache.data_ptr()), cu,
-               static_cast<const int *>(cpage_base.data_ptr()), batch,
-               total_tokens, out, stream);
+      w7n::Run(static_cast<const uint8_t*>(qi.data_ptr()),
+               static_cast<const uint8_t*>(ck_cache.data_ptr()), cu,
+               static_cast<const int*>(cpage_base.data_ptr()), batch, total_tokens, out, stream);
     } else {
       a3_impl::RunLegacy(qi, ck_cache, cu_seqlens, cpage_base, packed);
     }
     return;
   }
 
-  cross_best_impl::RunLegacy(
-      qi, ck_cache, cu_seqlens, cpage_base, packed);
+  cross_best_impl::RunLegacy(qi, ck_cache, cu_seqlens, cpage_base, packed);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
-
-
-
-
-
-
-

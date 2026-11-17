@@ -9,24 +9,25 @@
 // selected exactly.  Scores live in that row's own destination words (vis <=
 // PWIDTH here), keeping shared memory small so the fill keeps its occupancy.
 #pragma once
-#include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #include <stdint.h>
 
 namespace packmid {
 
-constexpr int MR = 2;         // rows per CTA
-constexpr int MT = 192;       // threads per CTA
-constexpr int MW4 = 513;      // int4 per packed row
-constexpr int MW = 2052;      // int32 per packed row
+constexpr int MR = 2;     // rows per CTA
+constexpr int MT = 192;   // threads per CTA
+constexpr int MW4 = 513;  // int4 per packed row
+constexpr int MW = 2052;  // int32 per packed row
 constexpr int MFLAT = MR * MW4;
 constexpr int MPT = (MFLAT + MT - 1) / MT;
 constexpr int MTOPK = 512;
 constexpr int MBMW = (MW + 31) / 32;  // bitmap words covering any in-regime vis
 
 __device__ __forceinline__ void qf_mid_store_cs(int4* p, const int4& v) {
-  asm volatile("st.global.cs.v4.s32 [%0], {%1,%2,%3,%4};\n" ::
-               "l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+  asm volatile("st.global.cs.v4.s32 [%0], {%1,%2,%3,%4};\n" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z),
+               "r"(v.w)
+               : "memory");
 }
 
 __device__ __forceinline__ float f8(uint32_t byte) {
@@ -35,11 +36,10 @@ __device__ __forceinline__ float f8(uint32_t byte) {
   return (float)v;
 }
 
-__global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
-                                                const uint8_t *__restrict__ ckc,
-                                                const int *__restrict__ cu,
-                                                const int *__restrict__ cpb, int B, int T,
-                                                int *__restrict__ out) {
+__global__ __maxnreg__(32) void qf_mid(const uint8_t* __restrict__ qi,
+                                       const uint8_t* __restrict__ ckc, const int* __restrict__ cu,
+                                       const int* __restrict__ cpb, int B, int T,
+                                       int* __restrict__ out) {
   __shared__ int s_cnt[MR];
   __shared__ int s_req[MR];
   __shared__ float s_q[512];
@@ -56,8 +56,7 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
   // rows, every range and every warp pass stays 128B aligned.
   if (B == 4 && T == 8181) {
     const int c1 = cu[1], c2 = cu[2], c3 = cu[3];
-    if (c1 <= 2051 && c2 - c1 <= 2051 && c3 - c2 <= 2051 &&
-        T - c3 <= 2051) {
+    if (c1 <= 2051 && c2 - c1 <= 2051 && c3 - c2 <= 2051 && T - c3 <= 2051) {
       constexpr int kChunk = 1024;
       const int ntot = T * MW4;
       const int g0 = (int)blockIdx.x * kChunk;
@@ -66,7 +65,10 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
       const int row0 = g0 / MW4;
       int col4 = g0 - row0 * MW4 + tid;
       int row = row0;
-      if (col4 >= MW4) { col4 -= MW4; ++row; }
+      if (col4 >= MW4) {
+        col4 -= MW4;
+        ++row;
+      }
       int req = (row >= c1) + (row >= c2) + (row >= c3);
       int base = req == 0 ? 0 : (req == 1 ? c1 : (req == 2 ? c2 : c3));
 #pragma unroll
@@ -97,20 +99,25 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
   {
     int q = packfill::qf_find(cu, B, r0 < T ? r0 : T - 1, lane);
     int lo = cu[q], hi = cu[q + 1];
-    int4 *o4 = (int4 *)out + (size_t)r0 * MW4;
+    int4* o4 = (int4*)out + (size_t)r0 * MW4;
     int row = r0, col4 = tid, cnt = r0 - lo + 1;
 #pragma unroll
     for (int k = 0; k < MPT; ++k) {
       const int f = tid + k * MT;
       if (f < MFLAT && row < T) {
-        if (cnt < 2052) o4[f] = packfill::qf_rowval(col4, cnt);
-        else anyslow = 1;
+        if (cnt < 2052)
+          o4[f] = packfill::qf_rowval(col4, cnt);
+        else
+          anyslow = 1;
       }
       col4 += MT;
       if (col4 >= MW4) {
         col4 -= MW4;
         ++row;
-        if (row >= hi && q + 1 < B) { lo = hi; hi = cu[++q + 1]; }
+        if (row >= hi && q + 1 < B) {
+          lo = hi;
+          hi = cu[++q + 1];
+        }
         cnt = row - lo + 1;
       }
     }
@@ -125,7 +132,10 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
       q = packfill::qf_find(cu, B, row, lane);
       c = row - cu[q] + 1;
     }
-    if (lane == 0) { s_cnt[warp] = c; s_req[warp] = q; }
+    if (lane == 0) {
+      s_cnt[warp] = c;
+      s_req[warp] = q;
+    }
   }
   __syncthreads();
 
@@ -141,8 +151,8 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
     const int pos = s_cnt[rr] - 1;
     const int vis = (pos + 1) >> 2;  // 513 .. MW in this regime
     const size_t kbase = (size_t)cpb[s_req[rr]] * 64;
-    int *orow = out + (size_t)t * MW;
-    float *gsc = (float *)orow;  // scores reuse this row, overwritten on emit
+    int* orow = out + (size_t)t * MW;
+    float* gsc = (float*)orow;  // scores reuse this row, overwritten on emit
     __syncthreads();
 
     for (int i = tid; i < 512; i += MT) s_q[i] = f8(qi[(size_t)t * 512 + i]);
@@ -150,14 +160,14 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
     __syncthreads();
 
     for (int b = tid; b < vis; b += MT) {
-      const uint8_t *kp = ckc + (kbase + b) * 128;
+      const uint8_t* kp = ckc + (kbase + b) * 128;
       float s = 0.f;
 #pragma unroll 1
       for (int h = 0; h < 4; ++h) {
         float d = 0.f;
 #pragma unroll 1
         for (int j = 0; j < 8; ++j) {
-          const uint4 kv = *(const uint4 *)(kp + j * 16);
+          const uint4 kv = *(const uint4*)(kp + j * 16);
           const uint32_t w[4] = {kv.x, kv.y, kv.z, kv.w};
 #pragma unroll
           for (int c = 0; c < 4; ++c)
@@ -220,7 +230,10 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
     __syncthreads();
     if (tid == 0) {
       int acc = 0;
-      for (int w = 0; w < MBMW; ++w) { s_pc[w] = acc; acc += __popc(s_bm[w]); }
+      for (int w = 0; w < MBMW; ++w) {
+        s_pc[w] = acc;
+        acc += __popc(s_bm[w]);
+      }
     }
     __syncthreads();
 
@@ -229,8 +242,11 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
       if ((wrd >> (v & 31)) & 1u) {
         const int myrank = s_pc[v >> 5] + __popc(wrd & ((1u << (v & 31)) - 1u));
         int4 q4;
-        q4.x = 4 * v; q4.y = 4 * v + 1; q4.z = 4 * v + 2; q4.w = 4 * v + 3;
-        *(int4 *)(orow + 4 * myrank) = q4;
+        q4.x = 4 * v;
+        q4.y = 4 * v + 1;
+        q4.z = 4 * v + 2;
+        q4.w = 4 * v + 3;
+        *(int4*)(orow + 4 * myrank) = q4;
       }
     }
     if (tid == 0) {
@@ -241,26 +257,18 @@ __global__ __maxnreg__(32) void qf_mid(const uint8_t *__restrict__ qi,
       tl.y = (1 < rem) ? ts + 1 : -1;
       tl.z = (2 < rem) ? ts + 2 : -1;
       tl.w = 4 * MTOPK + rem;
-      *(int4 *)(orow + 4 * MTOPK) = tl;
+      *(int4*)(orow + 4 * MTOPK) = tl;
     }
     __syncthreads();
   }
 }
 
 // Requires T <= 8208 so vis <= PWIDTH and the destination row can hold scores.
-inline void Launch(const uint8_t *qi, const uint8_t *ckc, const int *cu, const int *cpb, int B,
-                   int T, int *out, cudaStream_t stream) {
-  const unsigned grid = (B == 4 && T == 8181)
-                            ? (unsigned)((T * MW4 + 1023) / 1024)
-                            : (unsigned)((T + MR - 1) / MR);
+inline void Launch(const uint8_t* qi, const uint8_t* ckc, const int* cu, const int* cpb, int B,
+                   int T, int* out, cudaStream_t stream) {
+  const unsigned grid =
+      (B == 4 && T == 8181) ? (unsigned)((T * MW4 + 1023) / 1024) : (unsigned)((T + MR - 1) / MR);
   qf_mid<<<grid, MT, 0, stream>>>(qi, ckc, cu, cpb, B, T, out);
 }
 
 }  // namespace packmid
-
-
-
-
-
-
-

@@ -8,10 +8,10 @@
 // known, it recomputes scores one final time and compacts each warp ballot
 // directly to the destination row in ascending block-index order.
 
-extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
-    const u8 *__restrict__ qi, const u8 *__restrict__ ck,
-    const int *__restrict__ cu, const int *__restrict__ cpb,
-    int *__restrict__ packed, int B) {
+extern "C" __global__ void __launch_bounds__(NTK, 2)
+    qsa_topk_slow_scope_safe(const u8* __restrict__ qi, const u8* __restrict__ ck,
+                             const int* __restrict__ cu, const int* __restrict__ cpb,
+                             int* __restrict__ packed, int B) {
   __shared__ int hist[TM * 256];
 
   const int tid = static_cast<int>(threadIdx.x);
@@ -52,7 +52,7 @@ extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
   const int visMax = (pos0 + nTok) >> 2;
   if (visMax <= VCAP) return;
 
-  const u8 *kbase = ck + static_cast<size_t>(cpb[r]) * CPAGE * IDXD;
+  const u8* kbase = ck + static_cast<size_t>(cpb[r]) * CPAGE * IDXD;
 
   for (int i = tid; i < TM * 256; i += NTK) hist[i] = 0;
   __syncthreads();
@@ -64,8 +64,8 @@ extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
   for (int m = warp; m < nTok; m += 8) {
     const int pos = pos0 + m;
     const int vis = (pos + 1) >> 2;
-    const u8 *qg = qi + static_cast<size_t>(t0 + m) * (IDXH * IDXD);
-    int *hw = hist + m * 256;
+    const u8* qg = qi + static_cast<size_t>(t0 + m) * (IDXH * IDXD);
+    int* hw = hist + m * 256;
 
     unsigned tau = 0u;
     int krem = KTOP;
@@ -75,19 +75,17 @@ extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
         __syncwarp();
       }
 
-      const unsigned hmask =
-          (shift == 24) ? 0u : (0xffffffffu << (shift + 8));
+      const unsigned hmask = (shift == 24) ? 0u : (0xffffffffu << (shift + 8));
       for (int base = 0; base < vis; base += 32) {
         const int v = base + lane;
         unsigned bin = 0x100u;
         if (v < vis) {
-          const unsigned bits = qsa_score_key_exact(
-              scoreG(qg, kbase + static_cast<size_t>(v) * IDXD));
+          const unsigned bits =
+              qsa_score_key_exact(scoreG(qg, kbase + static_cast<size_t>(v) * IDXD));
           if ((bits & hmask) == tau) bin = (bits >> shift) & 0xffu;
         }
         const unsigned peers = __match_any_sync(full, bin);
-        if (bin != 0x100u && (__ffs(peers) - 1) == lane)
-          atomicAdd(&hw[bin], __popc(peers));
+        if (bin != 0x100u && (__ffs(peers) - 1) == lane) atomicAdd(&hw[bin], __popc(peers));
       }
       __syncwarp();
 
@@ -108,8 +106,7 @@ extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
       int selected_digit = 0;
       int accumulated = above;
       if (owner) {
-        for (selected_digit = lane * 8 + 7;
-             selected_digit >= lane * 8; --selected_digit) {
+        for (selected_digit = lane * 8 + 7; selected_digit >= lane * 8; --selected_digit) {
           if (accumulated + hw[selected_digit] >= krem) break;
           accumulated += hw[selected_digit];
         }
@@ -126,8 +123,7 @@ extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
     }
 
     const int need = krem;
-    int4 *out = reinterpret_cast<int4 *>(
-        packed + static_cast<size_t>(t0 + m) * PWIDTH);
+    int4* out = reinterpret_cast<int4*>(packed + static_cast<size_t>(t0 + m) * PWIDTH);
 
     // Direct stable compaction.  Blocks are visited in increasing index order,
     // and the prefix popcount assigns consecutive output slots.  Thus equal
@@ -139,8 +135,8 @@ extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
       int gt = 0;
       int eq = 0;
       if (v < vis) {
-        const unsigned bits = qsa_score_key_exact(
-            scoreG(qg, kbase + static_cast<size_t>(v) * IDXD));
+        const unsigned bits =
+            qsa_score_key_exact(scoreG(qg, kbase + static_cast<size_t>(v) * IDXD));
         gt = bits > tau;
         eq = bits == tau;
       }
@@ -161,14 +157,9 @@ extern "C" __global__ void __launch_bounds__(NTK, 2) qsa_topk_slow_scope_safe(
       const int tailStart = vis << 2;
       const int tailCnt = (pos + 1) & 3;
       st_cs(out + ROW_V4 - 1,
-            make_int4(tailCnt > 0 ? tailStart : -1,
-                      tailCnt > 1 ? tailStart + 1 : -1,
-                      tailCnt > 2 ? tailStart + 2 : -1,
-                      KTOP * CR + tailCnt));
+            make_int4(tailCnt > 0 ? tailStart : -1, tailCnt > 1 ? tailStart + 1 : -1,
+                      tailCnt > 2 ? tailStart + 2 : -1, KTOP * CR + tailCnt));
     }
     __syncwarp();
   }
 }
-
-
-
