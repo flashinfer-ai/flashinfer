@@ -1980,8 +1980,10 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, op_name=None, nvfp4_4over6=
     code = NVFP4_4OVER6_CODE_STANDARD
     quant_scales = [s1, alpha1, s2, alpha2]  # W4A8 as W4A16, x_sf holding MXFP8 scales
     if not (w4a16 or w4a8):
-        one = torch.ones((), device=x.device)
-        quant_scales = [one, s1, alpha1, fc2_scale.reshape(-1)[0], s2, alpha2]
+        # The FP4 rows are quantized: CUTLASS takes an FC1 activation global scale only as
+        # W4A4's mark (none is W4A16) and reads no value, so any FP32 scalar does.
+        fc1_act = alpha1.reshape(-1)[0]
+        quant_scales = [fc1_act, s1, alpha1, fc2_scale.reshape(-1)[0], s2, alpha2]
         quant_scales += inputs[11:-1]  # per-token activation scales
         x_sf = x_sf.view(x.shape[0], -1)
         if x_sf.shape[1] % 4 or not x_sf.is_contiguous():  # K padded to 64
@@ -1990,7 +1992,7 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, op_name=None, nvfp4_4over6=
             if nvfp4_4over6 is not _UNSET:
                 _check_gemm2_input_scale(fc2_scale, resolve_nvfp4_4over6(nvfp4_4over6))
             code = _trtllm_fp4_nvfp4_4over6_code(nvfp4_4over6, inputs[11], x)
-    experts_here = runner.num_local_experts
+    experts_here, offset = runner.num_local_experts, runner.local_expert_offset
     per_expert = (
         lambda v: None if v is None else torch.full((experts_here,), v, device=x.device)
     )
@@ -1999,7 +2001,7 @@ def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, op_name=None, nvfp4_4over6=
         swiglu = (None, None, None)
     with torch.cuda.device(x.device):
         get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe(
-            out, x, experts - runner.local_expert_offset, scales.float(),
+            out, x, experts - offset if offset else experts.contiguous(), scales.float(),
             w1, None, w2, None, out.dtype, quant_scales, x_sf,
             *map(per_expert, (None,) * 3 if situ else swiglu), None,  # SiTU takes none of them
             per_expert(runner.situ_beta),

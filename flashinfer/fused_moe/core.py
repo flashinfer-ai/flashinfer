@@ -7850,12 +7850,13 @@ def _trtllm_fp4_routed_moe_sm80(
     if s1.dtype != torch.int32:  # the SM90 operands keep their uint8 weights
         w1, w2 = w1.view(torch.int64), w2.view(torch.int64)
     mx = hidden_states.dtype != torch.uint8  # MXFP4 with MXFP8 or BF16 activations
-    ones = torch.ones(w1.shape[0], device=hidden_states.device)  # shared experts too
-    scalar = lambda s: ones if s is None or mx else s.float()
+    # Shared experts too; filled only where a scale is missing (or MXFP4).
+    ones = functools.cache(lambda: torch.ones(w1.shape[0], device=hidden_states.device))
+    scalar = lambda s: ones() if s is None or mx else s.float()
     fc1_dequant = scalar(output1_scale_gate_scalar)
     situ, swiglu = (None, None), (None, None, None)
     if act == ActivationType.Situ:
-        situ = tuple(ones if v is None else v for v in (gemm1_alpha, gemm1_beta))
+        situ = tuple(ones() if v is None else v for v in (gemm1_alpha, gemm1_beta))
         swiglu = (None, None, gemm1_clamp_limit)
     elif act in (ActivationType.Swiglu, ActivationType.SwigluStep):
         swiglu = (gemm1_alpha, gemm1_beta, gemm1_clamp_limit)
@@ -7865,7 +7866,7 @@ def _trtllm_fp4_routed_moe_sm80(
     fc2_scale = scalar(output1_scale_scalar)
     if act.is_gated and act != ActivationType.Situ:
         # A zero gate scalar zeroes the FC1 output, whatever the GEMM2-input scale.
-        fc2_scale = fc2_scale / torch.where(fc1_dequant == 0, 1.0, fc1_dequant)
+        fc2_scale = torch.where(fc1_dequant == 0, fc2_scale, fc2_scale / fc1_dequant)
     fc2_dequant = scalar(output2_scale_scalar)
     biases = (None, None)
     if gemm1_bias is not None or gemm2_bias is not None:
@@ -7905,11 +7906,13 @@ def _trtllm_fp4_routed_moe_sm80(
         hidden_states = hidden_states[:, :cols].contiguous()
     if mx:  # MXFP4: the weight scales alone, as for NVFP4 W4A16
         # BF16 activations' global scales take back the 8 the SM80 weight scales are over.
-        alpha = ones if mxfp8 else torch.full_like(ones, 8.0)
+        alpha = ones() if mxfp8 else torch.full_like(ones(), 8.0)
         quant_scales = [s1, alpha, s2, alpha]
     else:
+        # The FP4 rows are quantized: CUTLASS takes an FC1 activation global scale only as
+        # W4A4's mark (none is W4A16) and reads no value, so any FP32 scalar does.
         quant_scales = [
-            ones[0], s1, fc1_dequant, fc2_scale, s2, fc2_dequant,
+            fc1_dequant.reshape(-1)[0], s1, fc1_dequant, fc2_scale, s2, fc2_dequant,
         ] + ([] if per_token_scale is None else [per_token_scale.float().contiguous()])  # fmt: skip
         if x_sf.shape[1] % 4 or not x_sf.is_contiguous():
             x_sf = torch.nn.functional.pad(x_sf, (0, -x_sf.shape[1] % 4))
@@ -7925,7 +7928,7 @@ def _trtllm_fp4_routed_moe_sm80(
             dtype=torch.uint8 if codes or mxfp8 else torch.bfloat16,
         )
     if not do_finalize:  # as above SM100, the unfinalized rows are allocated
-        output = ones.new_empty((rows.numel(), w2.shape[1]), dtype=torch.bfloat16)
+        output = local.new_empty((rows.numel(), w2.shape[1]), dtype=torch.bfloat16)
     major, minor = get_compute_capability(hidden_states.device)
     module = get_cutlass_fused_moe_module(f"{major * 10 + minor}")
     ep_size = 1 if local_num_experts == num_experts else 2
