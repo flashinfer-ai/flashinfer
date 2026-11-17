@@ -594,8 +594,17 @@ __global__ __launch_bounds__(128 * MT, 1) void mla_kernel(
       for (int i = 0; i < NLD; ++i) {
         int j = tid + i * NTHR, row = j / 36, c = j % 36;
         uint32_t a = sptr(d2 + row * KSTR + (c << 4));
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a),
-                     "l"(kb + (size_t)j * 16));
+        if ((pgh + 1) * PAGE <= L)
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(a),
+                       "l"(kb + (size_t)j * 16));
+        else {
+          // Zero-fill the rows past the sequence in a partially-filled page.
+          // Their probabilities are exactly 0, but an unwritten fp8 cache
+          // byte can be NaN (0x7f) and 0 * NaN would poison the PV sum.
+          const int bytes = (pgh * PAGE + row < L) ? 16 : 0;
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(a),
+                       "l"(kb + (size_t)j * 16), "r"(bytes));
+        }
       }
     }
     asm volatile("cp.async.commit_group;\n" ::);
@@ -2217,13 +2226,18 @@ __global__ __launch_bounds__(32 * NWARPS, 1) void combine_kernel(
       const int sx = part + i * PARTS;
       if (sx < nsb) {
         const float ww = __shfl_sync(0xffffffffu, wv, i);
-        __nv_fp8x4_e4m3 v;
-        v.__x = vraw[i];
-        const float4 a = static_cast<float4>(v);
-        acc.x = fmaf(ww, a.x, acc.x);
-        acc.y = fmaf(ww, a.y, acc.y);
-        acc.z = fmaf(ww, a.z, acc.z);
-        acc.w = fmaf(ww, a.w, acc.w);
+        // A planned-but-empty split publishes M=-inf/L=0 and never writes its
+        // O partial; skip zero-weight splits entirely so an uninitialized fp8
+        // byte cannot poison the sum through fmaf(0, NaN, acc).
+        if (ww != 0.f) {
+          __nv_fp8x4_e4m3 v;
+          v.__x = vraw[i];
+          const float4 a = static_cast<float4>(v);
+          acc.x = fmaf(ww, a.x, acc.x);
+          acc.y = fmaf(ww, a.y, acc.y);
+          acc.z = fmaf(ww, a.z, acc.z);
+          acc.w = fmaf(ww, a.w, acc.w);
+        }
       }
     }
   }
@@ -2237,13 +2251,15 @@ __global__ __launch_bounds__(32 * NWARPS, 1) void combine_kernel(
         const float mm = Mp[stat_base + sx];
         ww = (mm > -INFINITY) ? exp2f(mm - mw) * Lp[stat_base + sx] : 0.f;
       }
-      __nv_fp8x4_e4m3 v;
-      v.__x = *reinterpret_cast<const uint32_t*>(base + (size_t)sx * stride);
-      const float4 a = static_cast<float4>(v);
-      acc.x = fmaf(ww, a.x, acc.x);
-      acc.y = fmaf(ww, a.y, acc.y);
-      acc.z = fmaf(ww, a.z, acc.z);
-      acc.w = fmaf(ww, a.w, acc.w);
+      if (ww != 0.f) {
+        __nv_fp8x4_e4m3 v;
+        v.__x = *reinterpret_cast<const uint32_t*>(base + (size_t)sx * stride);
+        const float4 a = static_cast<float4>(v);
+        acc.x = fmaf(ww, a.x, acc.x);
+        acc.y = fmaf(ww, a.y, acc.y);
+        acc.z = fmaf(ww, a.z, acc.z);
+        acc.w = fmaf(ww, a.w, acc.w);
+      }
     }
   }
 
@@ -2351,6 +2367,14 @@ MlaSplitPlan mla_decode_fp8_split_plan(int B, int QL, int pps, int total_pages, 
       const int target = max(1, 2 * sm - (B + 1) / 2);
       pps_split = max(1, (total_pages + target - 1) / target);
       ns = (pps + pps_split - 1) / pps_split;
+      if (ns > 256) {
+        // Keep the dispatcher's 256-split workspace bound: with one-page
+        // splits ns otherwise reaches `target` (up to 2*sm), e.g. a ragged
+        // B>=5 batch whose longest sequence nearly fills the page pool.
+        ns = 256;
+        pps_split = (pps + ns - 1) / ns;
+        ns = (pps + pps_split - 1) / pps_split;
+      }
     } else {
       // Preserve the champion's two-page planner for B2-B4 (and lower-Q MTs).
       // Roughly B/2 extra ranges compensate the per-sequence ceil.
@@ -2652,17 +2676,6 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
         <<<grid, 288, smw4, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
                                   kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
   } while (0)
-#define LAUNCHW_SAFE(H, F, O, Q6, R, TAG)                                                        \
-  do {                                                                                           \
-    static std::once_flag initw_##TAG;                                                           \
-    std::call_once(initw_##TAG, [&] {                                                            \
-      cudaFuncSetAttribute(mla_kernel_tmaproducer<H, F, O, Q6, R, false, false>,                 \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smw);               \
-    });                                                                                          \
-    mla_kernel_tmaproducer<H, F, O, Q6, R, false, false>                                         \
-        <<<grid, 288, smw, st>>>(qp, kp, btp, slp, dqp, dkp, (float)sm_scale, op, Opp, Mpp, Lpp, \
-                                 kv_map, pe_map, B, QL, pps, ns, pps_split, QPC, rect_hint);     \
-  } while (0)
 #define LAUNCHD_NOCAP(H, Q6, TAG)                                                                \
   do {                                                                                           \
     static std::once_flag initd_##TAG;                                                           \
@@ -2678,12 +2691,23 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
   // below 2^25 tokens, so use a specialization with those instructions
   // compiled out while preserving the guarded path for unbounded contexts.
   const bool lcheck = pps_split >= (1 << 19);
+  // Packed-FP16 PV accumulation in the MT<=2 kernels is statically safe only
+  // while a split spans at most two pages (128 tokens * 448 = 57344 < 65504);
+  // unlike the warp-group kernels they have no nonfinite repair path, so
+  // deeper splits take the FP32-accumulator instantiations instead.
+  const bool shallow_half = (ns == 1 ? pps : pps_split) <= 2;
   if (half_acc) {
-    if (MT == 1)
-      LAUNCH(1, true, h1);
-    else if (MT == 2)
-      LAUNCH(2, true, h2);
-    else if (B >= 5) {
+    if (MT == 1) {
+      if (shallow_half)
+        LAUNCH(1, true, h1);
+      else
+        LAUNCH(1, false, h1f);
+    } else if (MT == 2) {
+      if (shallow_half)
+        LAUNCH(2, true, h2);
+      else
+        LAUNCH(2, false, h2f);
+    } else if (B >= 5) {
       if (QL == 6) {
         if (lcheck)
           LAUNCHD(true, true, dh6c);
@@ -2697,10 +2721,12 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
       }
     } else if (QL == 6 && ns > 1) {
       if (B == 1) {
+        // No REPAIR_CHECK-free two-page variant: static overflow safety
+        // (128 * 448 < 65504) does not cover NaN bytes in the unwritten tail
+        // rows of a partially-filled page, which the repair replay recomputes
+        // with zero-filled loads.
         if (lcheck)
           LAUNCHW(true, true, true, true, false, wh6b1c);
-        else if (pps_split <= 2)
-          LAUNCHW_SAFE(true, true, true, true, false, wh6b1s);
         else if (pps_split >= 16)
           LAUNCHW4_NOCAP(true, true, true, true, false, wh6b1r4);
         else
@@ -2764,7 +2790,6 @@ void mla_decode_fp8_paged_sm90_run(TensorView q, TensorView kv_cache, TensorView
 #undef LAUNCHD_NOCAP
 #undef LAUNCHW_NOCAP
 #undef LAUNCHW4_NOCAP
-#undef LAUNCHW_SAFE
 #undef LAUNCH
 
   if (ns > 1) {

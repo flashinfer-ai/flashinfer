@@ -91,7 +91,7 @@ def test_stats_report_build_state_and_counters():
 # --------------------------------------------------------------------------
 
 
-def _make_batch(kv_lens, device, seed=0):
+def _make_batch(kv_lens, device, seed=0, ql=QL):
     g = torch.Generator(device=device)
     g.manual_seed(seed)
     B = len(kv_lens)
@@ -112,11 +112,11 @@ def _make_batch(kv_lens, device, seed=0):
         x = torch.randn(shape, generator=g, device=device, dtype=torch.float32)
         return (x * 0.5).to(torch.float8_e4m3fn)
 
-    TQ = B * QL
+    TQ = B * ql
     return dict(
         q=rnd((TQ, NH, DIMQ)),
         kv=rnd((P, PAGE, DIMQ)),
-        qo_indptr=torch.arange(0, (B + 1) * QL, QL, dtype=torch.int32, device=device),
+        qo_indptr=torch.arange(0, (B + 1) * ql, ql, dtype=torch.int32, device=device),
         kv_indptr=torch.tensor(indptr, dtype=torch.int32, device=device),
         kv_indices=torch.tensor(indices, dtype=torch.int32, device=device),
         kv_len_arr=torch.tensor(kv_lens, dtype=torch.int32, device=device),
@@ -126,14 +126,15 @@ def _make_batch(kv_lens, device, seed=0):
 
 def _reference(batch, q_scale=1.0, kv_scale=1.0):
     """fp32 dequant-then-attend MLA decode reference (query row i of request
-    r sees kv positions 0..kv_len_r - QL + i)."""
+    r sees kv positions 0..kv_len_r - q_len + i)."""
     device = batch["q"].device
     q = batch["q"].float() * q_scale
     kvf = batch["kv"].float().reshape(-1, DIMQ) * kv_scale
     kv_lens = batch["kv_len_arr"].tolist()
     bt = batch["block_table"]
     B = len(kv_lens)
-    out = torch.empty((B * QL, NH, CKV), dtype=torch.bfloat16, device=device)
+    ql = batch["q"].shape[0] // B
+    out = torch.empty((B * ql, NH, CKV), dtype=torch.bfloat16, device=device)
     off = torch.arange(PAGE, device=device)
     for r in range(B):
         kvl = kv_lens[r]
@@ -141,12 +142,12 @@ def _reference(batch, q_scale=1.0, kv_scale=1.0):
         flat = (bt[r, :npages].long().unsqueeze(1) * PAGE + off).reshape(-1)[:kvl]
         k = kvf[flat]  # (kvl, 576)
         v = k[:, :CKV]  # (kvl, 512)
-        qr = q[r * QL : (r + 1) * QL]  # (QL, 8, 576)
+        qr = q[r * ql : (r + 1) * ql]  # (ql, 8, 576)
         sc = torch.einsum("qhd,ld->qhl", qr, k) * SM_SCALE
-        vis = (kvl - QL) + torch.arange(QL, device=device) + 1
-        mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(QL, 1, 1)
+        vis = (kvl - ql) + torch.arange(ql, device=device) + 1
+        mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(ql, 1, 1)
         sc = sc.masked_fill(mask, float("-inf"))
-        out[r * QL : (r + 1) * QL] = torch.einsum(
+        out[r * ql : (r + 1) * ql] = torch.einsum(
             "qhl,ld->qhd", torch.softmax(sc, -1), v
         ).to(torch.bfloat16)
     return out
@@ -380,4 +381,352 @@ def test_shared_kill_switch_alias(monkeypatch):
     stats = _mla_dec_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0, stats
     ref = _reference(batch)
+    assert _matched_ratio(out, ref) >= MATCHED
+
+
+# --------------------------------------------------------------------------
+# Review regressions
+# --------------------------------------------------------------------------
+
+
+def test_fp8q_backend_specialized_raises_on_build_failure(monkeypatch):
+    """A failed module build/load must raise under fp8q_backend='specialized'
+    (no silent substitution) and disclose + dequant-serve under 'auto'."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    import flashinfer.mla._batch_mla._decode_fp8_sm90 as fp8q_mod
+
+    monkeypatch.setattr(fp8q_mod, "_get_module", lambda: None)
+    _reset_mla_dec_fp8q_sm90_stats()
+    with pytest.raises(RuntimeError, match="failed to build"):
+        _plan_wrapper(batch, device, fp8q_backend="specialized")
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["specialized_raises"] == 1, stats
+
+    _reset_mla_dec_fp8q_sm90_stats()
+    w = _plan_wrapper(batch, device, fp8q_backend="auto")
+    out = _run(w, batch)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_nonpositive_scales_never_reach_the_kernel():
+    """q_scale<=0 (or a nonfinite descale) would turn the kernel's -inf score
+    masks into NaN through the fused qk scale; such calls must be served by
+    the exact dequant path ('auto') or raise ('specialized')."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    w = _plan_wrapper(batch, device)
+    out = _run(w, batch, q_scale=0.0)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
+    assert torch.isfinite(out.float()).all()
+    assert _matched_ratio(out, _reference(batch, q_scale=0.0)) >= MATCHED
+
+    w2 = _plan_wrapper(batch, device, fp8q_backend="specialized")
+    with pytest.raises(RuntimeError, match="finite positive"):
+        _run(w2, batch, q_scale=0.0)
+
+
+def test_specialized_path_enforces_run_contract():
+    """The specialized return path honors the same planned run contract as
+    the stock path: a missing kpe_scale and options the plan does not carry
+    (o_scale, BMM scales) are rejected, never silently ignored."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    w = _plan_wrapper(batch, device)
+    q, kv = batch["q"], batch["kv"]
+    qs = (q[..., :CKV], q[..., CKV:])
+    kvs = (kv[..., :CKV], kv[..., CKV:])
+    with pytest.raises(ValueError, match="kpe_scale"):
+        w.run(query=qs, kv_cache=kvs, q_scale=1.0, ckv_scale=1.0)
+    with pytest.raises(ValueError):
+        w.run(
+            query=qs,
+            kv_cache=kvs,
+            q_scale=1.0,
+            ckv_scale=1.0,
+            kpe_scale=1.0,
+            o_scale=1.0,
+        )
+    with pytest.raises(ValueError):
+        w.run(query=qs, kv_cache=kvs, q_scale=1.0, bmm1_scale=1.0, bmm2_scale=1.0)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 0
+
+
+def test_failed_plan_does_not_publish_specialized_state(monkeypatch):
+    """A plan the backend rejects must not leave fresh specialized state next
+    to the previous backend plan; run() then refuses until the next
+    successful plan instead of mixing the two."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    w = _plan_wrapper(batch, device)
+    assert w._mla_dec_fp8q_sm90_state is not None
+
+    class _Boom:
+        @classmethod
+        def plan_from_wrapper(cls, args):
+            raise RuntimeError("backend planning failed")
+
+    monkeypatch.setattr(w, "_backend_type", _Boom)
+    batch2 = _make_batch([4097], device)
+    with pytest.raises(RuntimeError, match="backend planning failed"):
+        w.plan(
+            qo_indptr=batch2["qo_indptr"],
+            kv_indptr=batch2["kv_indptr"],
+            kv_indices=batch2["kv_indices"],
+            kv_len_arr=batch2["kv_len_arr"],
+            num_heads=NH,
+            head_dim_ckv=CKV,
+            head_dim_kpe=KPE,
+            page_size=PAGE,
+            causal=True,
+            sm_scale=SM_SCALE,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+        )
+    assert w._mla_dec_fp8q_sm90_state is None
+    assert w._mla_dec_fp8q_sm90_requested is False
+    with pytest.raises(ValueError, match="does not match the planned"):
+        _run(w, batch2)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 0
+
+
+def test_dequant_query_preserves_structural_forms():
+    """GPU-free: the dequant fallback must keep an adjacent split pair
+    adjacent (one packed dequantisation, not two independent copies, so a
+    packed-layout plan still accepts it zero-copy) and must accept the
+    redundant dual form without crashing on its nested tuple."""
+    from flashinfer.mla._batch_mla._contracts import _are_adjacent_last_dim_views
+    from flashinfer.mla._batch_mla._decode_fp8_sm90 import _dequant_query
+
+    q = torch.full((QL, NH, DIMQ), 0.5).to(torch.float8_e4m3fn)
+    qn, qp = q[..., :CKV], q[..., CKV:]
+
+    dn, dp = _dequant_query((qn, qp), 2.0)
+    assert dn.dtype == dp.dtype == torch.bfloat16
+    assert _are_adjacent_last_dim_views(dn, dp)
+    assert torch.all(dn.float() == 1.0)
+
+    dual = _dequant_query((q, (qn, qp)), 1.0)
+    dpk, (dn2, dp2) = dual
+    assert dpk.dtype == torch.bfloat16 and tuple(dpk.shape) == (QL, NH, DIMQ)
+    assert _are_adjacent_last_dim_views(dn2, dp2)
+
+    # independent split pairs stay independent (and still dequantise)
+    in0, in1 = _dequant_query((qn.contiguous(), qp.contiguous()), 1.0)
+    assert not _are_adjacent_last_dim_views(in0, in1)
+
+
+def test_dual_structural_query_dequant_fallback(monkeypatch):
+    """The redundant (packed, (nope, pe)) query form must be served by the
+    dequant fallback instead of crashing on the nested tuple."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    w = _plan_wrapper(batch, device)
+    q, kv = batch["q"], batch["kv"]
+    out = w.run(
+        query=(q, (q[..., :CKV], q[..., CKV:])),
+        kv_cache=(kv[..., :CKV], kv[..., CKV:]),
+        q_scale=1.0,
+        ckv_scale=1.0,
+        kpe_scale=1.0,
+    )
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 0
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_graph_plan_never_reallocates_prepared_buffers():
+    """A CUDA-graph wrapper replan whose geometry outgrows the prepared
+    buffers must not reallocate them (a captured graph may hold their
+    addresses): it is ineligible under 'auto' and raises under
+    'specialized'."""
+    _sm90_or_skip()
+    from flashinfer.mla._batch_mla import _decode_fp8_sm90 as fp8q_mod
+    from flashinfer.mla._batch_mla._contracts import MLAPlanMetadata
+
+    device = torch.device("cuda:0")
+
+    class _W:
+        pass
+
+    w = _W()
+    w.device = device
+    w._use_cuda_graph = True
+    w._fp8q_backend = "auto"
+    b1 = _make_batch([2983], device)
+    md1 = MLAPlanMetadata.csr(
+        b1["qo_indptr"], b1["kv_indptr"], b1["kv_indices"], b1["kv_len_arr"]
+    )
+    fp8q_mod._mla_dec_fp8q_sm90_prepare(
+        w, md1, NH, CKV, KPE, PAGE, True, SM_SCALE, "none", False, False, None
+    )
+    st = w._mla_dec_fp8q_sm90_state
+    assert st is not None
+    ptrs = {name: t.data_ptr() for name, t in w._mla_dec_fp8q_sm90_bufs.items()}
+
+    b2 = _make_batch([8192], device)
+    md2 = MLAPlanMetadata.csr(
+        b2["qo_indptr"], b2["kv_indptr"], b2["kv_indices"], b2["kv_len_arr"]
+    )
+    fp8q_mod._mla_dec_fp8q_sm90_prepare(
+        w, md2, NH, CKV, KPE, PAGE, True, SM_SCALE, "none", False, False, None
+    )
+    assert w._mla_dec_fp8q_sm90_state is None  # ineligible, not reallocated
+    for name, t in w._mla_dec_fp8q_sm90_bufs.items():
+        assert t.data_ptr() == ptrs[name], name
+
+    w._fp8q_backend = "specialized"
+    with pytest.raises(RuntimeError, match="captured buffer addresses"):
+        fp8q_mod._mla_dec_fp8q_sm90_prepare(
+            w, md2, NH, CKV, KPE, PAGE, True, SM_SCALE, "none", False, False, None
+        )
+
+
+def test_captured_scales_survive_later_eager_scale_changes():
+    """The scale writes are recorded inside the capture, so a later eager
+    call with different scales cannot retroactively change what a replay
+    computes, and eager calls stay correct after replays."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    w = _plan_wrapper(batch, device)
+    out = torch.empty((QL, NH, CKV), dtype=torch.bfloat16, device=device)
+
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _run(w, batch, q_scale=0.5, kv_scale=2.0, out=out)  # warmup
+    torch.cuda.current_stream().wait_stream(stream)
+    with torch.cuda.graph(graph):
+        _run(w, batch, q_scale=0.5, kv_scale=2.0, out=out)
+
+    eager = _run(w, batch, q_scale=1.0, kv_scale=1.0)  # mutates the buffers
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _matched_ratio(out, _reference(batch, q_scale=0.5, kv_scale=2.0)) >= MATCHED
+
+    # an eager call after a replay must also refill the buffers
+    eager2 = _run(w, batch, q_scale=1.0, kv_scale=1.0)
+    torch.cuda.synchronize()
+    assert torch.equal(eager2, eager)
+    assert _matched_ratio(eager2, _reference(batch)) >= MATCHED
+
+
+@pytest.mark.parametrize(
+    "ql,kv_lens",
+    [
+        (1, [67]),
+        (2, [131, 67]),
+        (6, [131]),
+        (6, [1500, 658, 760, 341, 863]),
+    ],
+)
+def test_partial_page_garbage_rows_never_poison_output(ql, kv_lens):
+    """Rows past each sequence's length in a partially-filled page are never
+    written by the cache; an fp8 NaN byte there must not reach the output
+    (their probabilities are exactly 0, but 0 * NaN = NaN)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch(kv_lens, device, ql=ql)
+    ref = _reference(batch)
+    kv = batch["kv"]
+    s = 0
+    for L in kv_lens:
+        ppr = (L + PAGE - 1) // PAGE
+        tail = L - (ppr - 1) * PAGE
+        if tail < PAGE:
+            kv[s + ppr - 1, tail:, :] = float("nan")
+        s += ppr
+    w = _plan_wrapper(batch, device)
+    out = _run(w, batch)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert torch.isfinite(out.float()).all()
+    assert _matched_ratio(out, ref) >= MATCHED
+
+
+def test_deep_shallow_splits_use_fp32_pv_accumulation():
+    """The MT<=2 split kernels have no nonfinite repair path, so deep splits
+    must not use the packed-FP16 PV accumulator: runs of near-max same-sign
+    KV rows overflow FP16 beyond ~146 tokens per split, and the fp8 partial
+    write then saturates the Inf to 448 where the true balanced average is
+    ~0."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([38400], device, ql=1)  # 600 pages, MT=1 split path
+    batch["q"] = torch.zeros((1, NH, DIMQ), device=device).to(torch.float8_e4m3fn)
+    pages = torch.arange(600, device=device)
+    sign = torch.where((pages // 3) % 2 == 0, 448.0, -448.0)
+    batch["kv"] = (sign.view(600, 1, 1).expand(batch["kv"].shape).contiguous()).to(
+        torch.float8_e4m3fn
+    )
+    w = _plan_wrapper(batch, device)
+    out = _run(w, batch)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert torch.isfinite(out.float()).all()
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_b5_one_page_splits_above_256_are_capped():
+    """Regression: the B>=5 one-page-split planner must cap the split count
+    at the dispatcher's 256-split workspace bound (a ragged batch whose
+    longest sequence nearly fills the page pool otherwise plans ns > 256 and
+    run() refuses an eligible call fail-closed)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([257 * PAGE, 64, 64, 64, 64], device)
+    w = _plan_wrapper(batch, device)
+    out = _run(w, batch)
+    assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 1
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+
+def test_empty_splits_never_read_uninitialized_partials():
+    """A dense page table wider than the live pages (the padded-capacity
+    dense layout; CSR plans reject padding) leaves planned splits empty.
+    Their workspace partials are never written, so the combine must skip
+    them outright: their weight is exactly 0, but fmaf(0, NaN) would poison
+    the reduction."""
+    _sm90_or_skip()
+    from flashinfer.mla._batch_mla import _decode_fp8_sm90 as fp8q_mod
+    from flashinfer.mla._batch_mla._contracts import MLAPlanMetadata
+
+    device = torch.device("cuda:0")
+    batch = _make_batch([128 * PAGE], device)  # 128-page pool and table
+    batch["kv_len_arr"] = torch.tensor([2983], dtype=torch.int32, device=device)
+    ref = _reference(batch)
+
+    class _W:
+        pass
+
+    w = _W()
+    w.device = device
+    w._use_cuda_graph = False
+    w._fp8q_backend = "auto"
+    md = MLAPlanMetadata.dense(
+        cum_seq_lens_q=batch["qo_indptr"],
+        block_tables=batch["block_table"],
+        seq_lens=batch["kv_len_arr"],
+    )
+    fp8q_mod._mla_dec_fp8q_sm90_prepare(
+        w, md, NH, CKV, KPE, PAGE, True, SM_SCALE, "none", False, False, None
+    )
+    st = w._mla_dec_fp8q_sm90_state
+    assert st is not None and st.pps == 128
+    st.workspace.fill_(0x7F)  # e4m3 NaN byte pattern
+    out, _ = fp8q_mod._mla_dec_fp8q_sm90_dispatch(
+        w, batch["q"], batch["kv"], None, None, False, 1.0, 1.0, None, 1.0, None, None
+    )
+    assert out is not None
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all()
     assert _matched_ratio(out, ref) >= MATCHED

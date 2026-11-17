@@ -51,6 +51,7 @@ CUDA-graph capture the values present at capture are baked into the graph
 (the same semantics as the baked sm_scale).
 """
 
+import math
 import os
 from typing import Any, Dict, Optional, Tuple
 
@@ -58,6 +59,17 @@ import torch
 
 from ...jit.core import logger
 from ...utils import get_compute_capability
+from ._contracts import (
+    _adjacent_last_dim_view,
+    _are_adjacent_last_dim_views,
+    _parse_structural_mla_input,
+)
+
+
+class _GraphRealloc(Exception):
+    """A CUDA-graph wrapper replan would reallocate prepared buffers whose
+    addresses an already-captured graph may hold."""
+
 
 _DISABLE_ENV = "FLASHINFER_DISABLE_MLA_DECODE_FP8_PAGED_SM90"
 # shared specialized-kernel kill switch (#5667 convention), honored as an
@@ -299,9 +311,25 @@ def _mla_dec_fp8q_sm90_prepare(
         and torch.cuda.is_current_stream_capturing()
     ):
         counters["runs_ineligible"] += 1
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "plan() ran under CUDA-graph capture, where the fast path "
+                "cannot be prepared (allocation and compilation are plan-time "
+                "work); plan outside capture first"
+            )
         return
     module = _get_module()
     if module is None:
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "the kernel module failed to build or load (%s); an "
+                "explicitly selected backend is never silently swapped"
+                % (_module_error,)
+            )
         return
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
@@ -315,63 +343,108 @@ def _mla_dec_fp8q_sm90_prepare(
     if bufs is None:
         bufs = {}
         wrapper._mla_dec_fp8q_sm90_bufs = bufs
+    # Under a CUDA-graph wrapper an already-captured graph may hold the
+    # addresses of the prepared buffers, so a replan must never reallocate
+    # them: a replan whose geometry outgrows them is ineligible instead.
+    use_graph = bool(getattr(wrapper, "_use_cuda_graph", False))
 
     def _buf(name, numel, dtype):
         t = bufs.get(name)
         if t is None or t.numel() < numel or t.device != device:
+            if use_graph and t is not None:
+                raise _GraphRealloc(
+                    f"{name} buffer would be reallocated "
+                    f"({t.numel()} -> {numel} elements)"
+                )
             t = torch.empty(numel, dtype=dtype, device=device)
             bufs[name] = t
             _counters["workspace_allocs"] += 1
         return t
 
-    md = plan_metadata
-    if md.block_tables is not None:
-        bt_src = md.block_tables
-        if bt_src.dtype != torch.int32 or bt_src.dim() != 2 or bt_src.shape[0] < B:
-            counters["plans_ineligible"] += 1
-            logger.info_once(
-                "mla_decode_fp8_paged_sm90: dense block_tables form "
-                "unusable (%s %s); the stock path serves this plan",
-                bt_src.dtype,
-                tuple(bt_src.shape),
-            )
-            return
-        block_table = bt_src[:B].to(device=device, dtype=torch.int32)
-        pps = int(block_table.shape[1])
-    else:
-        indptr = md.kv_indptr.cpu().to(torch.int64)
-        indices = md.kv_indices
-        pprs = (indptr[1 : B + 1] - indptr[:B]).tolist()
-        pps = max(1, max(pprs) if pprs else 1)
-        bt = bufs.get("block_table")
-        if bt is None or bt.shape[0] < B or bt.shape[1] != pps or bt.device != device:
-            bt = torch.zeros((B, pps), dtype=torch.int32, device=device)
-            bufs["block_table"] = bt
-            _counters["workspace_allocs"] += 1
+    try:
+        md = plan_metadata
+        if md.block_tables is not None:
+            bt_src = md.block_tables
+            if bt_src.dtype != torch.int32 or bt_src.dim() != 2 or bt_src.shape[0] < B:
+                counters["plans_ineligible"] += 1
+                logger.info_once(
+                    "mla_decode_fp8_paged_sm90: dense block_tables form "
+                    "unusable (%s %s); the stock path serves this plan",
+                    bt_src.dtype,
+                    tuple(bt_src.shape),
+                )
+                return
+            if use_graph and bt_src.device != device:
+                raise _GraphRealloc(
+                    "dense block_tables must already live on the wrapper "
+                    "device (a plan-time copy would not be seen by a "
+                    "captured graph)"
+                )
+            block_table = bt_src[:B].to(device=device, dtype=torch.int32)
+            pps = int(block_table.shape[1])
         else:
-            bt.zero_()
-        idx_dev = indices.to(device)
-        for i in range(B):
-            s, e = int(indptr[i]), int(indptr[i + 1])
-            if e > s:
-                bt[i, : e - s].copy_(idx_dev[s:e].to(torch.int32))
-        block_table = bt[:B]
+            indptr = md.kv_indptr.cpu().to(torch.int64)
+            indices = md.kv_indices
+            pprs = (indptr[1 : B + 1] - indptr[:B]).tolist()
+            pps = max(1, max(pprs) if pprs else 1)
+            bt = bufs.get("block_table")
+            if (
+                bt is None
+                or bt.shape[0] < B
+                or bt.shape[1] != pps
+                or bt.device != device
+            ):
+                if use_graph and bt is not None:
+                    raise _GraphRealloc(
+                        "block_table geometry changed "
+                        f"({tuple(bt.shape)} -> ({B}, {pps}))"
+                    )
+                bt = torch.zeros((B, pps), dtype=torch.int32, device=device)
+                bufs["block_table"] = bt
+                _counters["workspace_allocs"] += 1
+            else:
+                bt.zero_()
+            idx_dev = indices.to(device)
+            for i in range(B):
+                s, e = int(indptr[i]), int(indptr[i + 1])
+                if e > s:
+                    bt[i, : e - s].copy_(idx_dev[s:e].to(torch.int32))
+            block_table = bt[:B]
 
-    seq_lens_buf = _buf("seq_lens", B, torch.int32)[:B]
-    seq_lens_buf.copy_(kv_lens_host[:B].to(torch.int32).to(device), non_blocking=True)
-    # caller-owned split workspace, sized for the worst split count the
-    # launch arithmetic can choose for this (B, QL, pps) plan. The repaired
-    # launcher's B>=5 compact-dual path consumes ONE page per split (its
-    # pps_split is not forced even), so ns can reach pps; the other branches
-    # stay under this bound too (B==1 is capped by min(sm_count,
-    # ceil(pps/2), 256); B2-B4 even two-page splits sit under that). The
-    # earlier two-page-only bound min(256, ceil(pps/2)) undersized exactly
-    # the ragged short-kv B>=5 class and run() refused fail-closed.
-    ns_max = min(256, pps) if pps > 1 else 1
-    ws_bytes = B * ns_max * QL * _NUM_HEADS * (_HEAD_DIM_CKV + 8)
-    workspace = _buf("workspace", max(ws_bytes, 16), torch.uint8)
-    q_descale = _buf("q_descale", 1, torch.float32)
-    k_descale = _buf("k_descale", 1, torch.float32)
+        seq_lens_buf = _buf("seq_lens", B, torch.int32)[:B]
+        seq_lens_buf.copy_(
+            kv_lens_host[:B].to(torch.int32).to(device), non_blocking=True
+        )
+        # caller-owned split workspace, sized for the worst split count the
+        # launch arithmetic can choose for this (B, QL, pps) plan. The
+        # repaired launcher's B>=5 compact-dual path consumes ONE page per
+        # split (its pps_split is not forced even), so ns can reach pps; the
+        # other branches stay under this bound too, and every branch is
+        # capped at 256 splits in the launch arithmetic itself. The earlier
+        # two-page-only bound min(256, ceil(pps/2)) undersized exactly the
+        # ragged short-kv B>=5 class and run() refused fail-closed.
+        ns_max = min(256, pps) if pps > 1 else 1
+        ws_bytes = B * ns_max * QL * _NUM_HEADS * (_HEAD_DIM_CKV + 8)
+        workspace = _buf("workspace", max(ws_bytes, 16), torch.uint8)
+        q_descale = _buf("q_descale", 1, torch.float32)
+        k_descale = _buf("k_descale", 1, torch.float32)
+    except _GraphRealloc as exc:
+        counters["plans_ineligible"] += 1
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "this CUDA-graph replan cannot keep the captured buffer "
+                "addresses stable (%s); use a new wrapper for the new "
+                "capture shape" % exc
+            ) from None
+        logger.info_once(
+            "mla_decode_fp8_paged_sm90: not prepared for this CUDA-graph "
+            "replan (%s); fp8-Q calls are served by exact dequantisation "
+            "into the stock MLA path",
+            exc,
+        )
+        return
 
     from types import SimpleNamespace
 
@@ -388,6 +461,7 @@ def _mla_dec_fp8q_sm90_prepare(
         sm_scale=float(sm_scale),
         device_index=device_index,
         scales_cached=None,
+        graph_captured=False,
     )
     counters["plans_prepared"] += 1
 
@@ -501,6 +575,13 @@ def _mla_dec_fp8q_sm90_dispatch(
         )
         return None, _dequant_query(query, q_scale)
     if state is None:
+        if selector == "specialized":
+            counters["specialized_raises"] += 1
+            raise RuntimeError(
+                "mla_decode_fp8_paged_sm90: fp8q_backend='specialized' but "
+                "no prepared fast-path state exists for this plan; an "
+                "explicitly selected backend is never silently swapped"
+            )
         counters["runs_dequant_fallback"] += 1
         return None, _dequant_query(query, q_scale)
     try:
@@ -541,10 +622,19 @@ def _mla_dec_fp8q_sm90_dispatch(
             ps, reason = _scale_value(kpe_scale, "kpe_scale")
             if reason is not None:
                 return _fallback(reason)
-            if abs(ps - ks) > 1e-12:
+            if not (math.isfinite(ps) and abs(ps - ks) <= 1e-12):
                 return _fallback(
-                    "the packed cache takes one KV descale; "
+                    "the packed cache takes one finite KV descale; "
                     f"kpe_scale={ps} != ckv_scale={ks}"
+                )
+        # The kernel's masked-score arithmetic multiplies -inf sentinels by
+        # the fused qk scale, so a zero, negative, or nonfinite descale would
+        # turn masked positions into NaN/+inf; the exact dequant path handles
+        # those values instead.
+        for sv, sname in ((qs, "q_scale"), (ks, "ckv_scale")):
+            if not (math.isfinite(sv) and sv > 0.0):
+                return _fallback(
+                    f"{sname}={sv} is not a finite positive scalar descale"
                 )
         if out is not None and (
             out.dtype != torch.bfloat16
@@ -575,9 +665,21 @@ def _mla_dec_fp8q_sm90_dispatch(
         )
     # Scalar descales are written into plan-owned buffers only when they
     # change (per-tensor serve scales are constant across steps, so the
-    # steady-state hot path launches no extra kernels); under CUDA-graph
-    # capture the values present at capture are baked (like sm_scale).
-    if state.scales_cached != (qs, ks):
+    # steady-state hot path launches no extra kernels). Under CUDA-graph
+    # capture the writes are always recorded into the graph, whatever the
+    # eager cache says: every replay then rewrites the buffers to the
+    # capture-time values (truly baked, like sm_scale), so a later eager
+    # call with different scales cannot retroactively change what a replay
+    # computes. The eager cache is invalidated so the next eager call
+    # refills the buffers.
+    if capturing:
+        state.q_descale.fill_(qs)
+        state.k_descale.fill_(ks)
+        state.graph_captured = True
+    elif state.graph_captured or state.scales_cached != (qs, ks):
+        # Once any graph holds these buffers, a replay rewrites them to the
+        # captured values behind the cache's back, so eager calls must always
+        # refill instead of trusting the cache.
         state.q_descale.fill_(qs)
         state.k_descale.fill_(ks)
         state.scales_cached = (qs, ks)
@@ -610,7 +712,12 @@ def _mla_dec_fp8q_sm90_dispatch(
 def _dequant_query(query: Any, q_scale: Any) -> Any:
     """Exact dequantisation of an fp8 (e4m3) query for the stock MLA path
     (bf16 holds every e4m3 value exactly; the scalar q descale is applied
-    here and consumed)."""
+    here and consumed). The structural form of `query` is preserved through
+    the shared structural parser: an adjacent split pair (and the redundant
+    dual form) is dequantised once through its packed parent, so the result
+    still satisfies a packed-layout plan zero-copy; a dual form never
+    reaches the per-leaf path (where its nested tuple would not be a
+    tensor), and independent split pairs stay independent."""
     _counters["runs_dequant_fallback"] += 1
     qs, reason = _scale_value(q_scale, "q_scale")
     if reason is not None:
@@ -619,7 +726,19 @@ def _dequant_query(query: Any, q_scale: Any) -> Any:
     def _dq(t: torch.Tensor) -> torch.Tensor:
         return (t.to(torch.float32) * qs).to(torch.bfloat16)
 
-    if isinstance(query, torch.Tensor):
-        return _dq(query)
-    a, b = query
+    packed, split = _parse_structural_mla_input(query, name="query")
+    if packed is not None:
+        dq_packed = _dq(packed)
+        if split is None:
+            return dq_packed
+        w0 = int(split[0].shape[-1])
+        return (dq_packed, (dq_packed[..., :w0], dq_packed[..., w0:]))
+    assert split is not None
+    a, b = split
+    if _are_adjacent_last_dim_views(a, b):
+        parent = _adjacent_last_dim_view(a, b, assume_adjacent=True)
+        assert parent is not None
+        dq = _dq(parent)
+        w0 = int(a.shape[-1])
+        return (dq[..., :w0], dq[..., w0:])
     return (_dq(a), _dq(b))

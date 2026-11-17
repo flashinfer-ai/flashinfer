@@ -665,13 +665,15 @@ class BatchMLAPagedAttentionWrapper:
         # flashinfer/mla/_batch_mla/_decode_fp8_sm90.py).
         self._mla_dec_fp8q_sm90_state = None
         self._mla_dec_fp8q_sm90_requested = False
+        _fp8q_sm90_prospective = False
+        _fp8q_sm90_prospective_state = None
         if (
             q_data_type == torch.float8_e4m3fn
             and kv_data_type == torch.float8_e4m3fn
             and _fp8q_sm90_explicit_output_dtype in (None, torch.bfloat16)
             and _get_compute_capability(self.device) == (9, 0)
         ):
-            self._mla_dec_fp8q_sm90_requested = True
+            _fp8q_sm90_prospective = True
             _mla_dec_fp8q_sm90_prepare(
                 self,
                 plan_metadata,
@@ -686,6 +688,13 @@ class BatchMLAPagedAttentionWrapper:
                 use_sinks,
                 _fp8q_sm90_explicit_output_dtype,
             )
+            # Hold the prospective fast-path decision in locals until the
+            # backend plan below validates and succeeds: a plan the backend
+            # rejects must not leave fresh specialized state (or the
+            # requested flag) next to the previous backend plan, which run()
+            # would then mix.
+            _fp8q_sm90_prospective_state = self._mla_dec_fp8q_sm90_state
+            self._mla_dec_fp8q_sm90_state = None
             q_data_type = torch.bfloat16
             output_dtype = torch.bfloat16
         if (
@@ -776,6 +785,9 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         # Publish the successful plan state
         # ---------------------------------------------------------------------------
+        if _fp8q_sm90_prospective:
+            self._mla_dec_fp8q_sm90_requested = True
+            self._mla_dec_fp8q_sm90_state = _fp8q_sm90_prospective_state
         self._backend = planned_backend._backend
         self._planned_backend = planned_backend
         self._planned_backend_name = planned_backend._backend
@@ -1074,6 +1086,44 @@ class BatchMLAPagedAttentionWrapper:
                 "BatchMLAPagedAttentionWrapper.run() called before plan()."
             )
 
+        # ---------------------------------------------------------------------------
+        # Validate the declared run contract (planned wrappers)
+        # ---------------------------------------------------------------------------
+        # This runs before any specialized dispatch so that options the plan
+        # does not support (o_scale, BMM scales, a missing kpe_scale, ...)
+        # are rejected on every path instead of being silently ignored by a
+        # fast-path return.
+        contract: Optional[MLAInputContract] = None
+        if not is_unplanned_cutlass:
+            contract = self._input_contract
+            assert contract is not None
+            if (
+                getattr(self, "_legacy_flat_csr_plan", False)
+                and self._planned_query_layout == "split"
+                and self._planned_kv_cache_layout == "split"
+                and contract.lse_mode == "none"
+                and (return_lse or lse is not None or return_lse_base_on_e)
+            ):
+                self._warn_legacy_dynamic_lse_once()
+                contract = replace(
+                    contract,
+                    lse_mode="basee" if return_lse_base_on_e else "base2",
+                )
+            contract.validate_run_options(
+                out=out,
+                lse=lse,
+                return_lse=return_lse,
+                return_lse_base_on_e=return_lse_base_on_e,
+                o_scale=o_scale,
+                ckv_scale=ckv_scale,
+                ckv_scale_arr=ckv_scale_arr,
+                kpe_scale=kpe_scale,
+                sinks=sinks,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+            )
+
         # mla_decode_fp8_paged_sm90: fp8 Q on the SM90 MLA route — the
         # specialized all-fp8 kernel at the supported contract, exact
         # dequantisation into the stock plan otherwise (including under
@@ -1179,40 +1229,9 @@ class BatchMLAPagedAttentionWrapper:
             )
 
         # ---------------------------------------------------------------------------
-        # Validate the declared run contract
-        # ---------------------------------------------------------------------------
-        contract = self._input_contract
-        assert contract is not None
-        if (
-            getattr(self, "_legacy_flat_csr_plan", False)
-            and self._planned_query_layout == "split"
-            and self._planned_kv_cache_layout == "split"
-            and contract.lse_mode == "none"
-            and (return_lse or lse is not None or return_lse_base_on_e)
-        ):
-            self._warn_legacy_dynamic_lse_once()
-            contract = replace(
-                contract,
-                lse_mode="basee" if return_lse_base_on_e else "base2",
-            )
-        contract.validate_run_options(
-            out=out,
-            lse=lse,
-            return_lse=return_lse,
-            return_lse_base_on_e=return_lse_base_on_e,
-            o_scale=o_scale,
-            ckv_scale=ckv_scale,
-            ckv_scale_arr=ckv_scale_arr,
-            kpe_scale=kpe_scale,
-            sinks=sinks,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-        )
-
-        # ---------------------------------------------------------------------------
         # Lower structural inputs to backend layouts
         # ---------------------------------------------------------------------------
+        assert contract is not None
         widths = (contract.head_dim_ckv, contract.head_dim_kpe)
         assert widths[0] is not None and widths[1] is not None
         typed_widths = (widths[0], widths[1])
