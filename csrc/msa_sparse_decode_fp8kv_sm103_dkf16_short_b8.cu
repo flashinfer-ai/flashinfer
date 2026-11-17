@@ -6,28 +6,29 @@
 // cp.async staged, so the page loop needs just two __syncthreads (row-max
 // exchange + P publication) instead of four, shared-memory traffic per page
 // drops by ~45%, and the K latency is prefetched a whole page ahead in registers.
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
 #include <cooperative_groups.h>
-#include <cstdint>
-#include <algorithm>
-#include <tvm/ffi/tvm_ffi.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <algorithm>
+#include <cstdint>
 
 namespace ffi = tvm::ffi;
 namespace cg = cooperative_groups;
 
 namespace dkf16c6b8 {
 
-#define HQ    16
-#define DH    128
-#define BLKT  128
+#define HQ 16
+#define DH 128
+#define BLKT 128
 #define TOPKC 16
 
-#define PGB      16384
-#define FSTRIDE  272            // 128 f16 + 16B pad
-#define PBYTES   (HQ * FSTRIDE)   // 4352, also hosts the q staging buffer
-#define SCRB     1152             // 144 maxes/scales + 128 row sums
+#define PGB 16384
+#define FSTRIDE 272            // 128 f16 + 16B pad
+#define PBYTES (HQ * FSTRIDE)  // 4352, also hosts the q staging buffer
+#define SCRB 1152              // 144 maxes/scales + 128 row sums
 
 template <int CLU>
 struct Geo {
@@ -38,7 +39,7 @@ struct Geo {
 
 #define QSCALE 0.08838834764831845f
 #define LOG2EF 1.4426950408889634f
-#define SCL    (QSCALE * LOG2EF)
+#define SCL (QSCALE * LOG2EF)
 
 __device__ __forceinline__ uint32_t sptr(const void* p) {
   return (uint32_t)__cvta_generic_to_shared(p);
@@ -63,14 +64,12 @@ __device__ __forceinline__ void cluster_arrive_release() {
 __device__ __forceinline__ void cluster_wait_acquire_merge() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
-__device__ __forceinline__ void mbar_init_expect(uint64_t* bar,
-                                                 uint32_t bytes) {
+__device__ __forceinline__ void mbar_init_expect(uint64_t* bar, uint32_t bytes) {
   const uint32_t addr = sptr(bar);
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
-               :: "r"(addr) : "memory");
-  asm volatile(
-      "mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [%0], %1;\n"
-      :: "r"(addr), "r"(bytes) : "memory");
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(addr) : "memory");
+  asm volatile("mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(addr),
+               "r"(bytes)
+               : "memory");
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 }
 __device__ __forceinline__ void mbar_wait_local(uint64_t* bar) {
@@ -88,34 +87,35 @@ __device__ __forceinline__ void mbar_wait_local(uint64_t* bar) {
         : "memory");
   } while (!done);
 }
-__device__ __forceinline__ void st_async_u32(uint32_t dst, uint32_t value,
-                                             uint32_t remote_bar) {
+__device__ __forceinline__ void st_async_u32(uint32_t dst, uint32_t value, uint32_t remote_bar) {
   asm volatile(
       "st.async.shared::cluster.mbarrier::complete_tx::bytes.u32 "
-      "[%0], %1, [%2];\n"
-      :: "r"(dst), "r"(value), "r"(remote_bar) : "memory");
+      "[%0], %1, [%2];\n" ::"r"(dst),
+      "r"(value), "r"(remote_bar)
+      : "memory");
 }
-__device__ __forceinline__ void st_async_u64(uint32_t dst, uint64_t value,
-                                             uint32_t remote_bar) {
+__device__ __forceinline__ void st_async_u64(uint32_t dst, uint64_t value, uint32_t remote_bar) {
   asm volatile(
       "st.async.shared::cluster.mbarrier::complete_tx::bytes.b64 "
-      "[%0], %1, [%2];\n"
-      :: "r"(dst), "l"(value), "r"(remote_bar) : "memory");
+      "[%0], %1, [%2];\n" ::"r"(dst),
+      "l"(value), "r"(remote_bar)
+      : "memory");
 }
 __device__ __forceinline__ void ldm4(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d,
                                      uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "r"(addr));
+               : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+               : "r"(addr));
 }
-__device__ __forceinline__ void ldm2t_b8(uint32_t& a, uint32_t& b, uint32_t& c,
-                                         uint32_t& d, uint32_t addr) {
-  asm volatile(
-      "ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "r"(addr));
+__device__ __forceinline__ void ldm2t_b8(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d,
+                                         uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+               : "r"(addr));
 }
-__device__ __forceinline__ void mma16(float& d0, float& d1, float& d2, float& d3,
-                                      uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                      uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma16(float& d0, float& d1, float& d2, float& d3, uint32_t a0,
+                                      uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                      uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
       "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
@@ -126,7 +126,8 @@ __device__ __forceinline__ void mma16(float& d0, float& d1, float& d2, float& d3
 __device__ __forceinline__ void cvt8(uint32_t s, uint32_t& lo, uint32_t& hi) {
   asm("{\n .reg .b16 l_, h_;\n mov.b32 {l_, h_}, %2;\n"
       " cvt.rn.f16x2.e4m3x2 %0, l_;\n cvt.rn.f16x2.e4m3x2 %1, h_;\n}\n"
-      : "=r"(lo), "=r"(hi) : "r"(s));
+      : "=r"(lo), "=r"(hi)
+      : "r"(s));
 }
 __device__ __forceinline__ uint32_t f2h2(float lo, float hi) {
   uint32_t r;
@@ -149,27 +150,25 @@ __device__ __forceinline__ int perm16(int t) {
 __device__ __forceinline__ uint4 ldg128(const void* p) {
   uint4 r;
   asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(p));
   return r;
 }
 __device__ __forceinline__ void ldg256(const void* p, uint4& lo, uint4& hi) {
   asm volatile("ld.global.nc.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
-               : "=r"(lo.x), "=r"(lo.y), "=r"(lo.z), "=r"(lo.w),
-                 "=r"(hi.x), "=r"(hi.y), "=r"(hi.z), "=r"(hi.w)
+               : "=r"(lo.x), "=r"(lo.y), "=r"(lo.z), "=r"(lo.w), "=r"(hi.x), "=r"(hi.y), "=r"(hi.z),
+                 "=r"(hi.w)
                : "l"(p));
 }
-template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1,
-          bool HALFPAGE64 = false, bool EARLY_TOPK = false>
-__global__ void __cluster_dims__(CLU, 1, 1)
-    __launch_bounds__(HALFPAGE64 ? 128 : 256, OCC)
+template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1, bool HALFPAGE64 = false,
+          bool EARLY_TOPK = false>
+__global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(HALFPAGE64 ? 128 : 256, OCC)
     dkf_kernel(const __nv_bfloat16* __restrict__ q, const uint8_t* __restrict__ kc,
                const uint8_t* __restrict__ vc, const int* __restrict__ topk,
                const int* __restrict__ ptab, const int* __restrict__ seqlens,
                __nv_bfloat16* __restrict__ outp, int pages, int bpc, int nblk) {
   static_assert(OSPLIT == 1 || OSPLIT == 2 || OSPLIT == 4 || OSPLIT == 8);
-  static_assert(!HALFPAGE64 ||
-                (NSTAGE == 1 && CLU == 6 &&
-                 (OSPLIT == 2 || OSPLIT == 4)));
+  static_assert(!HALFPAGE64 || (NSTAGE == 1 && CLU == 6 && (OSPLIT == 2 || OSPLIT == 4)));
   static_assert(!EARLY_TOPK || HALFPAGE64);
   constexpr int OWARPS = 8 / OSPLIT;
   const int b = blockIdx.y / OSPLIT;
@@ -187,11 +186,9 @@ __global__ void __cluster_dims__(CLU, 1, 1)
   if (jj > TOPKC - 1) jj = TOPKC - 1;
   int blkr = 0;
   if constexpr (EARLY_TOPK)
-    asm volatile("ld.global.nc.u32 %0, [%1];\n"
-                 : "=r"(blkr) : "l"(topk + b * TOPKC + jj));
+    asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(blkr) : "l"(topk + b * TOPKC + jj));
 
-  const __nv_bfloat16* qptr =
-      q + (size_t)b * (HQ * DH) + (tid >> 4) * DH + (tid & 15) * 8;
+  const __nv_bfloat16* qptr = q + (size_t)b * (HQ * DH) + (tid >> 4) * DH + (tid & 15) * 8;
   uint4 qw = ldg128(qptr);
   uint4 qw_hi;
   if constexpr (HALFPAGE64) qw_hi = ldg128(qptr + 8 * DH);
@@ -199,8 +196,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
   asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(seqlen) : "l"(seqlens + b));
 
   if constexpr (!EARLY_TOPK)
-    asm volatile("ld.global.nc.u32 %0, [%1];\n"
-                 : "=r"(blkr) : "l"(topk + b * TOPKC + jj));
+    asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(blkr) : "l"(topk + b * TOPKC + jj));
   const int* pt = ptab + (size_t)b * pages;
   int pv0 = 0, pv1 = 0;
   if (pages <= 64) {
@@ -212,17 +208,14 @@ __global__ void __cluster_dims__(CLU, 1, 1)
   uint8_t* Vb = sm;
   uint8_t* Mg = Vb + NSTAGE * PGB;
   uint8_t* Pb = Mg + Geo<CLU>::MERGE;
-  uint8_t* Qs = Pb;                          // q dies before the first P write
-  float*   scr = (float*)(Pb + PBYTES);
-  float*   scrl = scr + 144;
-  uint64_t* merge_bar = reinterpret_cast<uint64_t*>(
-      sm + SMEM_F(NSTAGE, CLU) - 64);
+  uint8_t* Qs = Pb;  // q dies before the first P write
+  float* scr = (float*)(Pb + PBYTES);
+  float* scrl = scr + 144;
+  uint64_t* merge_bar = reinterpret_cast<uint64_t*>(sm + SMEM_F(NSTAGE, CLU) - 64);
   if constexpr (CLU > 1) {
     const uint32_t owned_heads = (HQ - sp + CLU - 1) / CLU;
     constexpr uint32_t out_bytes = 256 / OSPLIT;
-    if (tid == 0)
-      mbar_init_expect(merge_bar,
-                       owned_heads * CLU * (out_bytes + 8));
+    if (tid == 0) mbar_init_expect(merge_bar, owned_heads * CLU * (out_bytes + 8));
   }
   if constexpr (CLU > 1) cluster_arrive_relaxed();
 
@@ -236,65 +229,61 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     pgr = pt[blkr >= 0 ? blkr : 0];
   }
   bool visible = (blkr >= 0);
-  if (seqlen != pages * BLKT)
-    visible = visible &&
-              (blkr * BLKT + (HALFPAGE64 ? hoff : 0) < seqlen);
-  unsigned vmask = __ballot_sync(
-      0xffffffffu, (lane < 16) && (lane < lim) && visible);
+  if (seqlen != pages * BLKT) visible = visible && (blkr * BLKT + (HALFPAGE64 ? hoff : 0) < seqlen);
+  unsigned vmask = __ballot_sync(0xffffffffu, (lane < 16) && (lane < lim) && visible);
   const int nb = __popc(vmask & 0xffffu);
 
   // Keep the original 16 KiB shared page layout for every output split.  A
   // split stages only its own contiguous V columns: 4/2/1/1 cp.async copies
   // per participating thread for OSPLIT 1/2/4/8 respectively.
-  const int vtok0 = HALFPAGE64 ? (OSPLIT == 2 ? (tid >> 2) : (tid >> 1))
-                   : OSPLIT == 1 ? (tid >> 3)
-                   : OSPLIT == 2 ? (tid >> 2)
-                   : OSPLIT == 4 ? (tid >> 1) : (tid & 127);
-  const int vc0 = OSPLIT == 1 ? (tid & 7)
-                : OSPLIT == 2 ? (4 * dgroup + (tid & 3))
-                : OSPLIT == 4 ? (2 * dgroup + (tid & 1)) : dgroup;
-  const uint32_t vsoff0 =
-      (uint32_t)((vtok0 << 7) | ((vc0 ^ (vtok0 & 7)) << 4));
+  const int vtok0 = HALFPAGE64    ? (OSPLIT == 2 ? (tid >> 2) : (tid >> 1))
+                    : OSPLIT == 1 ? (tid >> 3)
+                    : OSPLIT == 2 ? (tid >> 2)
+                    : OSPLIT == 4 ? (tid >> 1)
+                                  : (tid & 127);
+  const int vc0 = OSPLIT == 1   ? (tid & 7)
+                  : OSPLIT == 2 ? (4 * dgroup + (tid & 3))
+                  : OSPLIT == 4 ? (2 * dgroup + (tid & 1))
+                                : dgroup;
+  const uint32_t vsoff0 = (uint32_t)((vtok0 << 7) | ((vc0 ^ (vtok0 & 7)) << 4));
   const uint8_t* vvbase = vc + (size_t)(hoff + vtok0) * DH + vc0 * 16;
   const uint32_t vsvbase = sptr(Vb) + vsoff0;
-#define ISSUEV(J, ST)                                                            \
-  do {                                                                           \
-    if ((J) < nb) {                                                              \
-      int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                              \
-      uint32_t d_ = vsvbase + (uint32_t)((ST) * PGB);                            \
-      const uint8_t* s_ = vvbase + (size_t)pg_ * PGB;                            \
-      if constexpr (HALFPAGE64) {                                                 \
-        cp16(d_, s_);                                                             \
-        if constexpr (OSPLIT == 2) cp16(d_ + 4096, s_ + 4096);                   \
-      } else if constexpr (OSPLIT == 8) {                                         \
-        if (tid < (HALFPAGE64 ? 64 : 128)) cp16(d_, s_);                         \
-      } else if (!HALFPAGE64 ||                                                   \
-                 (OSPLIT <= 2 || tid < 128)) {                                    \
-        cp16(d_, s_);                                                             \
-        if constexpr (OSPLIT == 1) {                                              \
-          cp16(d_ + 4096, s_ + 4096);                                             \
-          if constexpr (!HALFPAGE64) {                                            \
-            cp16(d_ + 8192, s_ + 8192);                                           \
-            cp16(d_ + 12288, s_ + 12288);                                         \
-          }                                                                       \
-        } else if constexpr (OSPLIT == 2) {                                       \
-          if constexpr (!HALFPAGE64) cp16(d_ + 8192, s_ + 8192);                 \
-        }                                                                         \
-      }                                                                           \
-    }                                                                            \
-    cpcommit();                                                                  \
+#define ISSUEV(J, ST)                                            \
+  do {                                                           \
+    if ((J) < nb) {                                              \
+      int pg_ = __shfl_sync(0xffffffffu, pgr, (J));              \
+      uint32_t d_ = vsvbase + (uint32_t)((ST) * PGB);            \
+      const uint8_t* s_ = vvbase + (size_t)pg_ * PGB;            \
+      if constexpr (HALFPAGE64) {                                \
+        cp16(d_, s_);                                            \
+        if constexpr (OSPLIT == 2) cp16(d_ + 4096, s_ + 4096);   \
+      } else if constexpr (OSPLIT == 8) {                        \
+        if (tid < (HALFPAGE64 ? 64 : 128)) cp16(d_, s_);         \
+      } else if (!HALFPAGE64 || (OSPLIT <= 2 || tid < 128)) {    \
+        cp16(d_, s_);                                            \
+        if constexpr (OSPLIT == 1) {                             \
+          cp16(d_ + 4096, s_ + 4096);                            \
+          if constexpr (!HALFPAGE64) {                           \
+            cp16(d_ + 8192, s_ + 8192);                          \
+            cp16(d_ + 12288, s_ + 12288);                        \
+          }                                                      \
+        } else if constexpr (OSPLIT == 2) {                      \
+          if constexpr (!HALFPAGE64) cp16(d_ + 8192, s_ + 8192); \
+        }                                                        \
+      }                                                          \
+    }                                                            \
+    cpcommit();                                                  \
   } while (0)
 
   const int tbase0 = 16 * (HALFPAGE64 ? (warp & 3) : warp);
-  const uint32_t koff =
-      (uint32_t)((hoff + tbase0 + g) * DH + 32 * tig);
+  const uint32_t koff = (uint32_t)((hoff + tbase0 + g) * DH + 32 * tig);
   uint4 ka[2], kb[2];
-#define LOADK(J)                                                                 \
-  do {                                                                           \
-    int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                                \
-    const uint8_t* kg_ = kc + (size_t)pg_ * PGB + koff;                          \
-    ldg256(kg_, ka[0], kb[0]);                                                    \
-    ldg256(kg_ + 8 * DH, ka[1], kb[1]);                                          \
+#define LOADK(J)                                        \
+  do {                                                  \
+    int pg_ = __shfl_sync(0xffffffffu, pgr, (J));       \
+    const uint8_t* kg_ = kc + (size_t)pg_ * PGB + koff; \
+    ldg256(kg_, ka[0], kb[0]);                          \
+    ldg256(kg_ + 8 * DH, ka[1], kb[1]);                 \
   } while (0)
   if (nb > 0 && (!HALFPAGE64 || warp < 4)) LOADK(0);
 #pragma unroll
@@ -316,9 +305,9 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       float am = 0.f;
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        float2 f = __bfloat1622float2(
-            *reinterpret_cast<__nv_bfloat162*>(&raw[i]));
-        v[2 * i] = f.x; v[2 * i + 1] = f.y;
+        float2 f = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&raw[i]));
+        v[2 * i] = f.x;
+        v[2 * i + 1] = f.y;
         am = fmaxf(am, fmaxf(fabsf(f.x), fabsf(f.y)));
       }
       am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
@@ -386,17 +375,13 @@ __global__ void __cluster_dims__(CLU, 1, 1)
         const uint32_t a1 = (w & 1) ? qb[i].z : qb[i].x;
         const uint32_t a2 = (w & 1) ? qa[i].w : qa[i].y;
         const uint32_t a3 = (w & 1) ? qb[i].w : qb[i].y;
-        uint32_t kw0 = (w < 4) ? ((const uint32_t*)&ka[0])[w]
-                               : ((const uint32_t*)&kb[0])[w - 4];
-        uint32_t kw1 = (w < 4) ? ((const uint32_t*)&ka[1])[w]
-                               : ((const uint32_t*)&kb[1])[w - 4];
+        uint32_t kw0 = (w < 4) ? ((const uint32_t*)&ka[0])[w] : ((const uint32_t*)&kb[0])[w - 4];
+        uint32_t kw1 = (w < 4) ? ((const uint32_t*)&ka[1])[w] : ((const uint32_t*)&kb[1])[w - 4];
         uint32_t b0, b1;
         cvt8(kw0, b0, b1);
-        mma16(S[0][0], S[0][1], S[0][2], S[0][3],
-              a0, a1, a2, a3, b0, b1);
+        mma16(S[0][0], S[0][1], S[0][2], S[0][3], a0, a1, a2, a3, b0, b1);
         cvt8(kw1, b0, b1);
-        mma16(S[1][0], S[1][1], S[1][2], S[1][3],
-              a0, a1, a2, a3, b0, b1);
+        mma16(S[1][0], S[1][1], S[1][2], S[1][3], a0, a1, a2, a3, b0, b1);
       }
     }
     if (j + 1 < nb && (!HALFPAGE64 || warp < 4)) LOADK(j + 1);
@@ -410,11 +395,19 @@ __global__ void __cluster_dims__(CLU, 1, 1)
         float v0 = S[t2][0] * fac0, v1 = S[t2][1] * fac0;
         float v2 = S[t2][2] * fac1, v3 = S[t2][3] * fac1;
         if (needs_mask) {
-          if (t0 >= cnt)     { v0 = -INFINITY; v2 = -INFINITY; }
-          if (t0 + 1 >= cnt) { v1 = -INFINITY; v3 = -INFINITY; }
+          if (t0 >= cnt) {
+            v0 = -INFINITY;
+            v2 = -INFINITY;
+          }
+          if (t0 + 1 >= cnt) {
+            v1 = -INFINITY;
+            v3 = -INFINITY;
+          }
         }
-        S[t2][0] = v0; S[t2][1] = v1;
-        S[t2][2] = v2; S[t2][3] = v3;
+        S[t2][0] = v0;
+        S[t2][1] = v1;
+        S[t2][2] = v2;
+        S[t2][3] = v3;
         rmax0 = fmaxf(rmax0, fmaxf(v0, v1));
         rmax1 = fmaxf(rmax1, fmaxf(v2, v3));
       }
@@ -429,7 +422,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     }
 
     cpwait<NSTAGE - 1>();
-    __syncthreads();                       // row maxes visible + V stage ready
+    __syncthreads();  // row maxes visible + V stage ready
 
     uint8_t* vd = Vb + st * PGB;
     uint32_t vf[4][4];
@@ -437,24 +430,21 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     if (warp < OWARPS) {
 #pragma unroll
       for (int gq = 0; gq < (HALFPAGE64 ? 2 : 4); ++gq)
-        ldm2t_b8(vf[gq][0], vf[gq][1], vf[gq][2], vf[gq][3],
-                 vb + (uint32_t)(gq << 12));
+        ldm2t_b8(vf[gq][0], vf[gq][1], vf[gq][2], vf[gq][3], vb + (uint32_t)(gq << 12));
     }
 
     float4 r0a = *(const float4*)(scr + g * 8);
     float bm0 = fmaxf(fmaxf(r0a.x, r0a.y), fmaxf(r0a.z, r0a.w));
     if constexpr (!HALFPAGE64) {
       float4 r0b = *(const float4*)(scr + g * 8 + 4);
-      bm0 = fmaxf(bm0, fmaxf(fmaxf(r0b.x, r0b.y),
-                             fmaxf(r0b.z, r0b.w)));
+      bm0 = fmaxf(bm0, fmaxf(fmaxf(r0b.x, r0b.y), fmaxf(r0b.z, r0b.w)));
     }
 
     float4 r1a = *(const float4*)(scr + (g + 8) * 8);
     float bm1 = fmaxf(fmaxf(r1a.x, r1a.y), fmaxf(r1a.z, r1a.w));
     if constexpr (!HALFPAGE64) {
       float4 r1b = *(const float4*)(scr + (g + 8) * 8 + 4);
-      bm1 = fmaxf(bm1, fmaxf(fmaxf(r1b.x, r1b.y),
-                             fmaxf(r1b.z, r1b.w)));
+      bm1 = fmaxf(bm1, fmaxf(fmaxf(r1b.x, r1b.y), fmaxf(r1b.z, r1b.w)));
     }
 
     float nm0 = fmaxf(m0, bm0), nm1 = fmaxf(m1, bm1);
@@ -463,12 +453,17 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       if (warp < OWARPS) {
 #pragma unroll
         for (int nd = 0; nd < 2; ++nd) {
-          O[nd][0] *= al0; O[nd][1] *= al0; O[nd][2] *= al1; O[nd][3] *= al1;
+          O[nd][0] *= al0;
+          O[nd][1] *= al0;
+          O[nd][2] *= al1;
+          O[nd][3] *= al1;
         }
       }
-      l0 *= al0; l1 *= al1;
+      l0 *= al0;
+      l1 *= al1;
     }
-    m0 = nm0; m1 = nm1;
+    m0 = nm0;
+    m1 = nm1;
 
     float sum0 = 0.f, sum1 = 0.f;
     if (!HALFPAGE64 || warp < 4) {
@@ -485,9 +480,10 @@ __global__ void __cluster_dims__(CLU, 1, 1)
         *(uint32_t*)(Pb + (g + 8) * FSTRIDE + tok * 2) = f2h2(p2, p3);
       }
     }
-    l0 += sum0; l1 += sum1;
+    l0 += sum0;
+    l1 += sum1;
 
-    __syncthreads();                       // P complete + V stage consumed
+    __syncthreads();  // P complete + V stage consumed
     ISSUEV(j + NSTAGE, st);
 
     if (warp < OWARPS) {
@@ -525,10 +521,8 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 #pragma unroll
       for (int nd = 0; nd < 2; ++nd) {
         int d = 16 * owarp + 8 * nd + 2 * tig;
-        st_async_u32(sptr(oa + sa * DH + d),
-                     f2bf2(O[nd][0], O[nd][1]), sptr(bara));
-        st_async_u32(sptr(ob + sb * DH + d),
-                     f2bf2(O[nd][2], O[nd][3]), sptr(barb));
+        st_async_u32(sptr(oa + sa * DH + d), f2bf2(O[nd][0], O[nd][1]), sptr(bara));
+        st_async_u32(sptr(ob + sb * DH + d), f2bf2(O[nd][2], O[nd][3]), sptr(barb));
       }
     }
   }
@@ -550,10 +544,8 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     float4 lb = *(const float4*)(scrl + g * 8 + 4);
     float4 lc = *(const float4*)(scrl + (g + 8) * 8);
     float4 ld = *(const float4*)(scrl + (g + 8) * 8 + 4);
-    float L0 = (la.x + la.y) + (la.z + la.w) +
-               (lb.x + lb.y) + (lb.z + lb.w);
-    float L1 = (lc.x + lc.y) + (lc.z + lc.w) +
-               (ld.x + ld.y) + (ld.z + ld.w);
+    float L0 = (la.x + la.y) + (la.z + la.w) + (lb.x + lb.y) + (lb.z + lb.w);
+    float L1 = (lc.x + lc.y) + (lc.z + lc.w) + (ld.x + ld.y) + (ld.z + ld.w);
     float i0f = 1.0f / L0, i1f = 1.0f / L1;
     if (warp < OWARPS) {
 #pragma unroll
@@ -625,8 +617,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       float a0 = 0.f, a1 = 0.f;
 #pragma unroll
       for (int c = 0; c < CLU; ++c) {
-        float2 o = __bfloat1622float2(
-            *(const __nv_bfloat162*)(oh + (hi * CLU + c) * DH + dd));
+        float2 o = __bfloat1622float2(*(const __nv_bfloat162*)(oh + (hi * CLU + c) * DH + dd));
         float w = wv[c] * inv;
         a0 += o.x * w;
         a1 += o.y * w;
@@ -639,8 +630,8 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 
 static bool g_attrf = false;
 
-template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1,
-          bool HALFPAGE64 = false, bool EARLY_TOPK = false>
+template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1, bool HALFPAGE64 = false,
+          bool EARLY_TOPK = false>
 static void setattrf() {
   cudaFuncSetAttribute(dkf_kernel<NSTAGE, CLU, OCC, OSPLIT, HALFPAGE64, EARLY_TOPK>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_F(NSTAGE, CLU));
@@ -653,8 +644,8 @@ static void setattrf() {
                          cudaClusterSchedulingPolicyLoadBalancing);
 }
 
-template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1,
-          bool HALFPAGE64 = false, bool EARLY_TOPK = false>
+template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1, bool HALFPAGE64 = false,
+          bool EARLY_TOPK = false>
 static void launchf(int B, const void* qp, const void* kp, const void* vp, const void* tkp,
                     const void* ptp, const void* slp, void* op, int pages, int bpc, int nblk,
                     cudaStream_t stream) {
@@ -663,13 +654,10 @@ static void launchf(int B, const void* qp, const void* kp, const void* vp, const
     dim3 grid(CLU, chunk * OSPLIT);
     dkf_kernel<NSTAGE, CLU, OCC, OSPLIT, HALFPAGE64, EARLY_TOPK>
         <<<grid, HALFPAGE64 ? 128 : 256, SMEM_F(NSTAGE, CLU), stream>>>(
-        (const __nv_bfloat16*)qp + (size_t)base * HQ * DH,
-        (const uint8_t*)kp, (const uint8_t*)vp,
-        (const int*)tkp + (size_t)base * TOPKC,
-        (const int*)ptp + (size_t)base * pages,
-        (const int*)slp + base,
-        (__nv_bfloat16*)op + (size_t)base * HQ * DH,
-        pages, bpc, nblk);
+            (const __nv_bfloat16*)qp + (size_t)base * HQ * DH, (const uint8_t*)kp,
+            (const uint8_t*)vp, (const int*)tkp + (size_t)base * TOPKC,
+            (const int*)ptp + (size_t)base * pages, (const int*)slp + base,
+            (__nv_bfloat16*)op + (size_t)base * HQ * DH, pages, bpc, nblk);
     base += chunk;
   }
 }
@@ -677,8 +665,8 @@ static void launchf(int B, const void* qp, const void* kp, const void* vp, const
 }  // namespace dkf16c6b8
 
 void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc,
-                   ffi::TensorView topk, ffi::TensorView ptab, ffi::TensorView seqlens,
-                   ffi::TensorView out) {
+                       ffi::TensorView topk, ffi::TensorView ptab, ffi::TensorView seqlens,
+                       ffi::TensorView out) {
   using namespace dkf16c6b8;
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(kDLCUDA, q.device().device_id);
   const int B = (int)q.shape()[0];
@@ -690,10 +678,14 @@ void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc
     setattrf<1, 16, 2, 4>();
     setattrf<1, 8, 2, 2>();
     setattrf<2, 8, 2, 2>();
-    setattrf<1, 8, 2>(); setattrf<2, 8, 2>();
-    setattrf<1, 4, 2>(); setattrf<2, 4, 2>();
-    setattrf<1, 2, 2>(); setattrf<2, 2, 2>();
-    setattrf<1, 1, 2>(); setattrf<2, 1, 2>();
+    setattrf<1, 8, 2>();
+    setattrf<2, 8, 2>();
+    setattrf<1, 4, 2>();
+    setattrf<2, 4, 2>();
+    setattrf<1, 2, 2>();
+    setattrf<2, 2, 2>();
+    setattrf<1, 1, 2>();
+    setattrf<2, 1, 2>();
     setattrf<1, 3, 2>();
     setattrf<1, 3, 2, 2>();
     setattrf<1, 3, 2, 4>();
@@ -713,20 +705,29 @@ void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc
   const void* ptp = ptab.data_ptr();
   const void* slp = seqlens.data_ptr();
   void* op = out.data_ptr();
-#define LF(NS, C, O, BPC) \
-  do { launchf<NS, C, O>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, stream); return; } while (0)
-#define LFS(NS, C, O, BPC, OS) \
-  do { launchf<NS, C, O, OS>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, stream); return; } while (0)
-#define LFSH(NS, C, O, BPC, OS) \
-  do { launchf<NS, C, O, OS, true>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, stream); return; } while (0)
+#define LF(NS, C, O, BPC)                                                          \
+  do {                                                                             \
+    launchf<NS, C, O>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, stream); \
+    return;                                                                        \
+  } while (0)
+#define LFS(NS, C, O, BPC, OS)                                                         \
+  do {                                                                                 \
+    launchf<NS, C, O, OS>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, stream); \
+    return;                                                                            \
+  } while (0)
+#define LFSH(NS, C, O, BPC, OS)                                                              \
+  do {                                                                                       \
+    launchf<NS, C, O, OS, true>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, stream); \
+    return;                                                                                  \
+  } while (0)
   if (nblk <= 3) {
     // Raise the short-row CTA census at B2/B8 by assigning each CTA a
     // disjoint 16- or 32-dimension output slice.  B16/B48 retain halves.
     if (B == 2) LFS(1, 3, 2, 1, 8);
-    if (B == 8)
-      do { launchf<1, 6, 1, 2, true, true>(
-               B, qp, kp, vp, tkp, ptp, slp, op,
-               pages, 1, nblk, stream); return; } while (0);
+    if (B == 8) do {
+        launchf<1, 6, 1, 2, true, true>(B, qp, kp, vp, tkp, ptp, slp, op, pages, 1, nblk, stream);
+        return;
+      } while (0);
     if (B == 16) LFSH(1, 6, 2, 1, 2);
     if (B == 32) LF(1, 4, 2, 1);
     if (B == 48) LFS(1, 3, 2, 1, 2);
@@ -745,10 +746,18 @@ void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc
   const int bpc = (nblk + splits - 1) / splits;
   const int ns = bpc >= 2 ? 2 : 1;
   switch (splits) {
-    case 8: if (ns == 1) LF(1, 8, 2, 1); LF(2, 8, 2, bpc);
-    case 4: if (ns == 1) LF(1, 4, 2, 1); LF(2, 4, 2, bpc);
-    case 2: if (ns == 1) LF(1, 2, 2, 1); LF(2, 2, 2, bpc);
-    default: if (ns == 1) LF(1, 1, 2, 1); LF(2, 1, 2, bpc);
+    case 8:
+      if (ns == 1) LF(1, 8, 2, 1);
+      LF(2, 8, 2, bpc);
+    case 4:
+      if (ns == 1) LF(1, 4, 2, 1);
+      LF(2, 4, 2, bpc);
+    case 2:
+      if (ns == 1) LF(1, 2, 2, 1);
+      LF(2, 2, 2, bpc);
+    default:
+      if (ns == 1) LF(1, 1, 2, 1);
+      LF(2, 1, 2, bpc);
   }
 #undef LF
 #undef LFS
@@ -756,13 +765,3 @@ void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(direct_k_short_b8_run, DirectKShortB8Run);
-
-
-
-
-
-
-
-
-
-

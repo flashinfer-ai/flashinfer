@@ -18,6 +18,5 @@ def gen_msa_sparse_decode_fp8kv_module() -> JitSpec:
     return gen_jit_spec(
         "msa_sparse_decode_fp8kv_sm103",
         [jit_env.FLASHINFER_CSRC_DIR / s for s in _SOURCES],
-        extra_cuda_cflags=sm103a_nvcc_flags
-        + ["--use_fast_math", "-lineinfo"],
+        extra_cuda_cflags=sm103a_nvcc_flags + ["--use_fast_math", "-lineinfo"],
     )

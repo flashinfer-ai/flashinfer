@@ -6,32 +6,33 @@
 // cp.async staged, so the page loop needs just two __syncthreads (row-max
 // exchange + P publication) instead of four, shared-memory traffic per page
 // drops by ~45%, and the K latency is prefetched a whole page ahead in registers.
-#include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
-#include <cooperative_groups.h>
-#include <cstdint>
-#include <algorithm>
-#include <tvm/ffi/tvm_ffi.h>
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <algorithm>
+#include <cstdint>
 
 namespace ffi = tvm::ffi;
 namespace cg = cooperative_groups;
 
 namespace dkf16 {
 
-#define HQ    16
-#define DH    128
-#define BLKT  128
+#define HQ 16
+#define DH 128
+#define BLKT 128
 #define TOPKC 16
 
-#define PGB      16384
-#define FSTRIDE  272            // 128 f16 + 16B pad for P
-#define QSTRIDE  304            // gapped 18-chunk Q row + one 16B pad
-#define PBYTES   (HQ * QSTRIDE) // P aliases the larger Q staging buffer
-#define HSTRIDE  12             // conflict-free float4 rows for 8 warps
+#define PGB 16384
+#define FSTRIDE 272            // 128 f16 + 16B pad for P
+#define QSTRIDE 304            // gapped 18-chunk Q row + one 16B pad
+#define PBYTES (HQ * QSTRIDE)  // P aliases the larger Q staging buffer
+#define HSTRIDE 12             // conflict-free float4 rows for 8 warps
 #define QSCALE_BASE (HQ * HSTRIDE)
-#define SCRB     1152           // aliased max/sum rows, Q scales, barrier tail
+#define SCRB 1152  // aliased max/sum rows, Q scales, barrier tail
 
 template <int CLU>
 struct Geo {
@@ -42,7 +43,7 @@ struct Geo {
 
 #define QSCALE 0.08838834764831845f
 #define LOG2EF 1.4426950408889634f
-#define SCL    (QSCALE * LOG2EF)
+#define SCL (QSCALE * LOG2EF)
 
 __device__ __forceinline__ uint32_t sptr(const void* p) {
   return (uint32_t)__cvta_generic_to_shared(p);
@@ -67,14 +68,12 @@ __device__ __forceinline__ void cluster_arrive_release() {
 __device__ __forceinline__ void cluster_wait_acquire_merge() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
-__device__ __forceinline__ void mbar_init_expect(uint64_t* bar,
-                                                 uint32_t bytes) {
+__device__ __forceinline__ void mbar_init_expect(uint64_t* bar, uint32_t bytes) {
   const uint32_t addr = sptr(bar);
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
-               :: "r"(addr) : "memory");
-  asm volatile(
-      "mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [%0], %1;\n"
-      :: "r"(addr), "r"(bytes) : "memory");
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(addr) : "memory");
+  asm volatile("mbarrier.arrive.expect_tx.relaxed.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(addr),
+               "r"(bytes)
+               : "memory");
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 }
 __device__ __forceinline__ void mbar_wait_local(uint64_t* bar) {
@@ -94,19 +93,16 @@ __device__ __forceinline__ void mbar_wait_local(uint64_t* bar) {
 }
 __device__ __forceinline__ void tma_bar_init(uint64_t* bar) {
   const uint32_t addr = sptr(bar);
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
-               :: "r"(addr) : "memory");
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(addr) : "memory");
   asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
 }
-__device__ __forceinline__ void tma_bar_expect(uint64_t* bar,
-                                               uint32_t bytes) {
+__device__ __forceinline__ void tma_bar_expect(uint64_t* bar, uint32_t bytes) {
   const uint32_t addr = sptr(bar);
-  asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n"
-      :: "r"(addr), "r"(bytes) : "memory");
+  asm volatile("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;\n" ::"r"(addr),
+               "r"(bytes)
+               : "memory");
 }
-__device__ __forceinline__ void tma_bar_wait(uint64_t* bar,
-                                             uint32_t phase) {
+__device__ __forceinline__ void tma_bar_wait(uint64_t* bar, uint32_t phase) {
   const uint32_t addr = sptr(bar);
   uint32_t done;
   do {
@@ -121,59 +117,57 @@ __device__ __forceinline__ void tma_bar_wait(uint64_t* bar,
         : "memory");
   } while (!done);
 }
-__device__ __forceinline__ void tma_load_v(uint8_t* dst,
-                                           const CUtensorMap* map,
-                                           int page, uint64_t* bar) {
+__device__ __forceinline__ void tma_load_v(uint8_t* dst, const CUtensorMap* map, int page,
+                                           uint64_t* bar) {
   const uint32_t d = sptr(dst);
   const uint32_t b = sptr(bar);
   asm volatile(
       "cp.async.bulk.tensor.3d.shared::cta.global.tile."
       "mbarrier::complete_tx::bytes.cta_group::1 "
-      "[%0], [%1, {%2, %3, %4}], [%5];\n"
-      :: "r"(d), "l"(map), "r"(0), "r"(0), "r"(page), "r"(b)
+      "[%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(d),
+      "l"(map), "r"(0), "r"(0), "r"(page), "r"(b)
       : "memory");
 }
-__device__ __forceinline__ void tma_load_v_half(uint8_t* dst,
-                                                const CUtensorMap* map,
-                                                int x, int page,
-                                                uint64_t* bar) {
+__device__ __forceinline__ void tma_load_v_half(uint8_t* dst, const CUtensorMap* map, int x,
+                                                int page, uint64_t* bar) {
   const uint32_t d = sptr(dst);
   const uint32_t b = sptr(bar);
   asm volatile(
       "cp.async.bulk.tensor.3d.shared::cta.global.tile."
       "mbarrier::complete_tx::bytes.cta_group::1 "
-      "[%0], [%1, {%2, %3, %4}], [%5];\n"
-      :: "r"(d), "l"(map), "r"(x), "r"(0), "r"(page), "r"(b)
+      "[%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(d),
+      "l"(map), "r"(x), "r"(0), "r"(page), "r"(b)
       : "memory");
 }
-__device__ __forceinline__ void st_async_u32(uint32_t dst, uint32_t value,
-                                             uint32_t remote_bar) {
+__device__ __forceinline__ void st_async_u32(uint32_t dst, uint32_t value, uint32_t remote_bar) {
   asm volatile(
       "st.async.shared::cluster.mbarrier::complete_tx::bytes.u32 "
-      "[%0], %1, [%2];\n"
-      :: "r"(dst), "r"(value), "r"(remote_bar) : "memory");
+      "[%0], %1, [%2];\n" ::"r"(dst),
+      "r"(value), "r"(remote_bar)
+      : "memory");
 }
-__device__ __forceinline__ void st_async_u64(uint32_t dst, uint64_t value,
-                                             uint32_t remote_bar) {
+__device__ __forceinline__ void st_async_u64(uint32_t dst, uint64_t value, uint32_t remote_bar) {
   asm volatile(
       "st.async.shared::cluster.mbarrier::complete_tx::bytes.b64 "
-      "[%0], %1, [%2];\n"
-      :: "r"(dst), "l"(value), "r"(remote_bar) : "memory");
+      "[%0], %1, [%2];\n" ::"r"(dst),
+      "l"(value), "r"(remote_bar)
+      : "memory");
 }
 __device__ __forceinline__ void ldm4(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d,
                                      uint32_t addr) {
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "r"(addr));
+               : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+               : "r"(addr));
 }
-__device__ __forceinline__ void ldm2t_b8(uint32_t& a, uint32_t& b, uint32_t& c,
-                                         uint32_t& d, uint32_t addr) {
-  asm volatile(
-      "ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "r"(addr));
+__device__ __forceinline__ void ldm2t_b8(uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d,
+                                         uint32_t addr) {
+  asm volatile("ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+               : "r"(addr));
 }
-__device__ __forceinline__ void mma16(float& d0, float& d1, float& d2, float& d3,
-                                      uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-                                      uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma16(float& d0, float& d1, float& d2, float& d3, uint32_t a0,
+                                      uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                      uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
       "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
@@ -184,7 +178,8 @@ __device__ __forceinline__ void mma16(float& d0, float& d1, float& d2, float& d3
 __device__ __forceinline__ void cvt8(uint32_t s, uint32_t& lo, uint32_t& hi) {
   asm("{\n .reg .b16 l_, h_;\n mov.b32 {l_, h_}, %2;\n"
       " cvt.rn.f16x2.e4m3x2 %0, l_;\n cvt.rn.f16x2.e4m3x2 %1, h_;\n}\n"
-      : "=r"(lo), "=r"(hi) : "r"(s));
+      : "=r"(lo), "=r"(hi)
+      : "r"(s));
 }
 __device__ __forceinline__ uint32_t f2h2(float lo, float hi) {
   uint32_t r;
@@ -207,16 +202,16 @@ __device__ __forceinline__ int perm16(int t) {
 __device__ __forceinline__ uint4 ldg128(const void* p) {
   uint4 r;
   asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
+               : "l"(p));
   return r;
 }
 __device__ __forceinline__ void ldg256(const void* p, uint4& lo, uint4& hi) {
   asm volatile("ld.global.nc.v8.u32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];\n"
-               : "=r"(lo.x), "=r"(lo.y), "=r"(lo.z), "=r"(lo.w),
-                 "=r"(hi.x), "=r"(hi.y), "=r"(hi.z), "=r"(hi.w)
+               : "=r"(lo.x), "=r"(lo.y), "=r"(lo.z), "=r"(lo.w), "=r"(hi.x), "=r"(hi.y), "=r"(hi.z),
+                 "=r"(hi.w)
                : "l"(p));
 }
-
 
 template <int NSTAGE, int CLU, int OCC, bool HALFOUT = false>
 __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
@@ -231,8 +226,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31, g = lane >> 2, tig = lane & 3;
 
-  const __nv_bfloat16* qptr =
-      q + (size_t)b * (HQ * DH) + (tid >> 4) * DH + (tid & 15) * 8;
+  const __nv_bfloat16* qptr = q + (size_t)b * (HQ * DH) + (tid >> 4) * DH + (tid & 15) * 8;
   uint4 qw = ldg128(qptr);
   int seqlen;
   asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(seqlen) : "l"(seqlens + b));
@@ -255,19 +249,16 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   uint8_t* Vb = sm;
   uint8_t* Mg = Vb + NSTAGE * PGB;
   uint8_t* Pb = Mg + Geo<CLU>::MERGE;
-  uint8_t* Qs = Pb;                          // q dies before the first P write
-  float*   scr = (float*)(Pb + PBYTES);
-  float*   scrl = scr;                       // sums reuse dead row maxima
-  uint64_t* merge_bar = reinterpret_cast<uint64_t*>(
-      sm + SMEM_F(NSTAGE, CLU) - 64);
+  uint8_t* Qs = Pb;  // q dies before the first P write
+  float* scr = (float*)(Pb + PBYTES);
+  float* scrl = scr;  // sums reuse dead row maxima
+  uint64_t* merge_bar = reinterpret_cast<uint64_t*>(sm + SMEM_F(NSTAGE, CLU) - 64);
   uint64_t* vbar = merge_bar + 1;
   if (tid < NSTAGE) tma_bar_init(vbar + tid);
   if constexpr (CLU > 1) {
     const uint32_t owned_heads = (HQ - sp + CLU - 1) / CLU;
     constexpr uint32_t out_bytes = HALFOUT ? 128 : 256;
-    if (tid == 0)
-      mbar_init_expect(merge_bar,
-                       owned_heads * CLU * (out_bytes + 8));
+    if (tid == 0) mbar_init_expect(merge_bar, owned_heads * CLU * (out_bytes + 8));
   }
   if constexpr (CLU > 1) cluster_arrive_relaxed();
 
@@ -284,36 +275,33 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   const int nb = __popc(vmask & 0xffffu);
 
   const int tok0 = tid >> 3, c0 = tid & 7;
-  const uint32_t soff0 =
-      (uint32_t)((tok0 << 7) | ((c0 ^ (tok0 & 7)) << 4));
+  const uint32_t soff0 = (uint32_t)((tok0 << 7) | ((c0 ^ (tok0 & 7)) << 4));
   const uint8_t* vbase = vc + (size_t)tid * 16;
   const uint32_t svbase = sptr(Vb) + soff0;
   const int htok0 = 8 * warp + (lane >> 3) + 4 * ((lane & 7) >> 2);
   const int hc0 = 4 * dgroup + (tid & 3);
-  const uint32_t hsoff0 =
-      (uint32_t)((htok0 << 7) | ((hc0 ^ (htok0 & 7)) << 4));
+  const uint32_t hsoff0 = (uint32_t)((htok0 << 7) | ((hc0 ^ (htok0 & 7)) << 4));
   const uint8_t* hvbase = vc + (size_t)htok0 * DH + hc0 * 16;
   const uint32_t hsvbase = sptr(Vb) + hsoff0;
-#define ISSUEV(J, ST)                                                            \
-  do {                                                                           \
-    if ((J) < nb) {                                                              \
-      if constexpr (HALFOUT) {                                                    \
-        if (warp == 0) {                                                         \
-          int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                          \
-          if (tid == 0) {                                                        \
-            tma_bar_expect(vbar + (ST), PGB / 2);                                \
-            tma_load_v_half(Vb + (ST) * PGB, &vmap, dgroup * 64, pg_,            \
-                            vbar + (ST));                                         \
-          }                                                                       \
-        }                                                                         \
-      } else if (warp == 0) {                                                     \
-        int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                            \
-        if (tid == 0) {                                                           \
-          tma_bar_expect(vbar + (ST), PGB);                                       \
-          tma_load_v(Vb + (ST) * PGB, &vmap, pg_, vbar + (ST));                  \
-        }                                                                         \
-      }                                                                           \
-    }                                                                            \
+#define ISSUEV(J, ST)                                                               \
+  do {                                                                              \
+    if ((J) < nb) {                                                                 \
+      if constexpr (HALFOUT) {                                                      \
+        if (warp == 0) {                                                            \
+          int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                             \
+          if (tid == 0) {                                                           \
+            tma_bar_expect(vbar + (ST), PGB / 2);                                   \
+            tma_load_v_half(Vb + (ST) * PGB, &vmap, dgroup * 64, pg_, vbar + (ST)); \
+          }                                                                         \
+        }                                                                           \
+      } else if (warp == 0) {                                                       \
+        int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                               \
+        if (tid == 0) {                                                             \
+          tma_bar_expect(vbar + (ST), PGB);                                         \
+          tma_load_v(Vb + (ST) * PGB, &vmap, pg_, vbar + (ST));                     \
+        }                                                                           \
+      }                                                                             \
+    }                                                                               \
   } while (0)
 
 #pragma unroll
@@ -322,12 +310,12 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   const int tbase0 = 16 * warp;
   const uint32_t koff = (uint32_t)((tbase0 + g) * DH + 32 * tig);
   uint4 ka[2], kb[2];
-#define LOADK(J)                                                                 \
-  do {                                                                           \
-    int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                                \
-    const uint8_t* kg_ = kc + (size_t)pg_ * PGB + koff;                          \
-    ldg256(kg_, ka[0], kb[0]);                                                    \
-    ldg256(kg_ + 8 * DH, ka[1], kb[1]);                                          \
+#define LOADK(J)                                        \
+  do {                                                  \
+    int pg_ = __shfl_sync(0xffffffffu, pgr, (J));       \
+    const uint8_t* kg_ = kc + (size_t)pg_ * PGB + koff; \
+    ldg256(kg_, ka[0], kb[0]);                          \
+    ldg256(kg_ + 8 * DH, ka[1], kb[1]);                 \
   } while (0)
   if (nb > 0) LOADK(0);
   if constexpr (CLU > 1) cluster_wait_acquire();
@@ -341,7 +329,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       float2 f = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&raw[i]));
-      v[2 * i] = f.x; v[2 * i + 1] = f.y;
+      v[2 * i] = f.x;
+      v[2 * i + 1] = f.y;
       am = fmaxf(am, fmaxf(fabsf(f.x), fabsf(f.y)));
     }
     am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
@@ -427,10 +416,19 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
       float v0 = S[t2][0] * fac0, v1 = S[t2][1] * fac0;
       float v2 = S[t2][2] * fac1, v3 = S[t2][3] * fac1;
       if (needs_mask) {
-        if (t0 >= cnt)     { v0 = -INFINITY; v2 = -INFINITY; }
-        if (t0 + 1 >= cnt) { v1 = -INFINITY; v3 = -INFINITY; }
+        if (t0 >= cnt) {
+          v0 = -INFINITY;
+          v2 = -INFINITY;
+        }
+        if (t0 + 1 >= cnt) {
+          v1 = -INFINITY;
+          v3 = -INFINITY;
+        }
       }
-      S[t2][0] = v0; S[t2][1] = v1; S[t2][2] = v2; S[t2][3] = v3;
+      S[t2][0] = v0;
+      S[t2][1] = v1;
+      S[t2][2] = v2;
+      S[t2][3] = v3;
       rmax0 = fmaxf(rmax0, fmaxf(v0, v1));
       rmax1 = fmaxf(rmax1, fmaxf(v2, v3));
     }
@@ -450,17 +448,16 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
     // publishes the row maxima.
     uint8_t* vd = Vb + st * PGB;
     uint32_t vf[4][4];
-    const uint32_t vb = HALFOUT
-        ? sptr(vd) + (uint32_t)(lane << 6) +
-              (uint32_t)((warp ^ ((lane >> 1) & 3)) << 4)
-        : sptr(vd) + (uint32_t)(lane << 7) + vswz;
+    const uint32_t vb =
+        HALFOUT ? sptr(vd) + (uint32_t)(lane << 6) + (uint32_t)((warp ^ ((lane >> 1) & 3)) << 4)
+                : sptr(vd) + (uint32_t)(lane << 7) + vswz;
     if (!HALFOUT || warp < 4) {
 #pragma unroll
       for (int gq = 0; gq < 4; ++gq)
         ldm2t_b8(vf[gq][0], vf[gq][1], vf[gq][2], vf[gq][3],
                  vb + (uint32_t)(gq << (HALFOUT ? 11 : 12)));
     }
-    __syncthreads();                       // row maxes visible + V consumed
+    __syncthreads();  // row maxes visible + V consumed
     // Every warp pulled its V fragments before the barrier above, so the
     // stage is already free: re-arm the next TMA here instead of after the
     // P exchange and buy it a whole softmax of lead time.
@@ -481,12 +478,17 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
       if (!HALFOUT || warp < 4) {
 #pragma unroll
         for (int nd = 0; nd < 2; ++nd) {
-          O[nd][0] *= al0; O[nd][1] *= al0; O[nd][2] *= al1; O[nd][3] *= al1;
+          O[nd][0] *= al0;
+          O[nd][1] *= al0;
+          O[nd][2] *= al1;
+          O[nd][3] *= al1;
         }
       }
-      l0 *= al0; l1 *= al1;
+      l0 *= al0;
+      l1 *= al1;
     }
-    m0 = nm0; m1 = nm1;
+    m0 = nm0;
+    m1 = nm1;
 
     float sum0 = 0.f, sum1 = 0.f;
 #pragma unroll
@@ -501,9 +503,10 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
       *(uint32_t*)(Pb + g * FSTRIDE + tok * 2) = f2h2(p0, p1);
       *(uint32_t*)(Pb + (g + 8) * FSTRIDE + tok * 2) = f2h2(p2, p3);
     }
-    l0 += sum0; l1 += sum1;
+    l0 += sum0;
+    l1 += sum1;
 
-    __syncthreads();                       // P complete
+    __syncthreads();  // P complete
 
     if (!HALFOUT || warp < 4) {
 #pragma unroll
@@ -540,10 +543,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
 #pragma unroll
       for (int nd = 0; nd < 2; ++nd) {
         int d = 16 * owarp + 8 * nd + 2 * tig;
-        st_async_u32(sptr(oa + sa * DH + d),
-                     f2bf2(O[nd][0], O[nd][1]), sptr(bara));
-        st_async_u32(sptr(ob + sb * DH + d),
-                     f2bf2(O[nd][2], O[nd][3]), sptr(barb));
+        st_async_u32(sptr(oa + sa * DH + d), f2bf2(O[nd][0], O[nd][1]), sptr(bara));
+        st_async_u32(sptr(ob + sb * DH + d), f2bf2(O[nd][2], O[nd][3]), sptr(barb));
       }
     }
   }
@@ -565,10 +566,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
     float4 lb = *(const float4*)(scrl + g * HSTRIDE + 4);
     float4 lc = *(const float4*)(scrl + (g + 8) * HSTRIDE);
     float4 ld = *(const float4*)(scrl + (g + 8) * HSTRIDE + 4);
-    float L0 = (la.x + la.y) + (la.z + la.w) +
-               (lb.x + lb.y) + (lb.z + lb.w);
-    float L1 = (lc.x + lc.y) + (lc.z + lc.w) +
-               (ld.x + ld.y) + (ld.z + ld.w);
+    float L0 = (la.x + la.y) + (la.z + la.w) + (lb.x + lb.y) + (lb.z + lb.w);
+    float L1 = (lc.x + lc.y) + (lc.z + lc.w) + (ld.x + ld.y) + (ld.z + ld.w);
     float i0f = 1.0f / L0, i1f = 1.0f / L1;
 #pragma unroll
     for (int nd = 0; nd < 2; ++nd) {
@@ -596,10 +595,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
       float4 lb = *(const float4*)(scrl + g * HSTRIDE + 4);
       float4 lc = *(const float4*)(scrl + (g + 8) * HSTRIDE);
       float4 ld = *(const float4*)(scrl + (g + 8) * HSTRIDE + 4);
-      float L0 = (la.x + la.y) + (la.z + la.w) +
-                 (lb.x + lb.y) + (lb.z + lb.w);
-      float L1 = (lc.x + lc.y) + (lc.z + lc.w) +
-                 (ld.x + ld.y) + (ld.z + ld.w);
+      float L0 = (la.x + la.y) + (la.z + la.w) + (lb.x + lb.y) + (lb.z + lb.w);
+      float L1 = (lc.x + lc.y) + (lc.z + lc.w) + (ld.x + ld.y) + (ld.z + ld.w);
       float* mla = (float*)clu.map_shared_rank(ml, ha % CLU);
       float* mlb = (float*)clu.map_shared_rank(ml, hb % CLU);
       union Pack64 {
@@ -635,8 +632,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
       float a0 = 0.f, a1 = 0.f;
 #pragma unroll
       for (int c = 0; c < CLU; ++c) {
-        float2 o = __bfloat1622float2(
-            *(const __nv_bfloat162*)(oh + (hi * CLU + c) * DH + dd));
+        float2 o = __bfloat1622float2(*(const __nv_bfloat162*)(oh + (hi * CLU + c) * DH + dd));
         float w = wv[c] * inv;
         a0 += o.x * w;
         a1 += o.y * w;
@@ -669,24 +665,19 @@ static void launchf(int B, const void* qp, const void* kp, const void* vp, const
   for (int base = 0; base < B;) {
     const int chunk = min(B - base, 65535);
     dim3 grid(CLU, HALFOUT ? chunk * 2 : chunk);
-    dkf_kernel<NSTAGE, CLU, OCC, HALFOUT>
-        <<<grid, 256, SMEM_F(NSTAGE, CLU), stream>>>(
-        (const __nv_bfloat16*)qp + (size_t)base * HQ * DH,
-        (const uint8_t*)kp, (const uint8_t*)vp,
-        (const int*)tkp + (size_t)base * TOPKC,
-        (const int*)ptp + (size_t)base * pages,
-        (const int*)slp + base,
-        (__nv_bfloat16*)op + (size_t)base * HQ * DH,
-        pages, bpc, nblk, vmap);
+    dkf_kernel<NSTAGE, CLU, OCC, HALFOUT><<<grid, 256, SMEM_F(NSTAGE, CLU), stream>>>(
+        (const __nv_bfloat16*)qp + (size_t)base * HQ * DH, (const uint8_t*)kp, (const uint8_t*)vp,
+        (const int*)tkp + (size_t)base * TOPKC, (const int*)ptp + (size_t)base * pages,
+        (const int*)slp + base, (__nv_bfloat16*)op + (size_t)base * HQ * DH, pages, bpc, nblk,
+        vmap);
     base += chunk;
   }
 }
 
 }  // namespace dkf16
 
-void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc,
-                   ffi::TensorView topk, ffi::TensorView ptab, ffi::TensorView seqlens,
-                   ffi::TensorView out) {
+void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::TensorView topk,
+                   ffi::TensorView ptab, ffi::TensorView seqlens, ffi::TensorView out) {
   using namespace dkf16;
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(kDLCUDA, q.device().device_id);
   const int B = (int)q.shape()[0];
@@ -696,10 +687,14 @@ void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc,
     setattrf<1, 16, 2>();
     setattrf<1, 8, 2, true>();
     setattrf<2, 8, 2, true>();
-    setattrf<1, 8, 2>(); setattrf<2, 8, 2>();
-    setattrf<1, 4, 2>(); setattrf<2, 4, 2>();
-    setattrf<1, 2, 2>(); setattrf<2, 2, 2>();
-    setattrf<1, 1, 2>(); setattrf<2, 1, 2>();
+    setattrf<1, 8, 2>();
+    setattrf<2, 8, 2>();
+    setattrf<1, 4, 2>();
+    setattrf<2, 4, 2>();
+    setattrf<1, 2, 2>();
+    setattrf<2, 2, 2>();
+    setattrf<1, 1, 2>();
+    setattrf<2, 1, 2>();
     setattrf<1, 3, 2>();
     g_attrf = true;
   }
@@ -716,25 +711,27 @@ void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc,
   const uint64_t vstrides[2] = {DH, PGB};
   const uint32_t vbox[3] = {DH, BLKT, 1};
   const uint32_t vsteps[3] = {1, 1, 1};
-  if (cuTensorMapEncodeTiled(
-          &vmap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
-          const_cast<void*>(vp), vdims, vstrides, vbox, vsteps,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-          CU_TENSOR_MAP_L2_PROMOTION_NONE,
-          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
+  if (cuTensorMapEncodeTiled(&vmap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(vp), vdims,
+                             vstrides, vbox, vsteps, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                             CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
     return;
   const uint32_t vhbox[3] = {64, BLKT, 1};
-  if (cuTensorMapEncodeTiled(
-          &vhmap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
-          const_cast<void*>(vp), vdims, vstrides, vhbox, vsteps,
-          CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
-          CU_TENSOR_MAP_L2_PROMOTION_NONE,
-          CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
+  if (cuTensorMapEncodeTiled(&vhmap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(vp), vdims,
+                             vstrides, vhbox, vsteps, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                             CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+                             CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
     return;
-#define LF(NS, C, O, BPC) \
-  do { launchf<NS, C, O>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, vmap, stream); return; } while (0)
-#define LFH(NS, C, O, BPC) \
-  do { launchf<NS, C, O, true>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, vhmap, stream); return; } while (0)
+#define LF(NS, C, O, BPC)                                                                \
+  do {                                                                                   \
+    launchf<NS, C, O>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, vmap, stream); \
+    return;                                                                              \
+  } while (0)
+#define LFH(NS, C, O, BPC)                                                                      \
+  do {                                                                                          \
+    launchf<NS, C, O, true>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, vhmap, stream); \
+    return;                                                                                     \
+  } while (0)
   if (nblk <= 3) LF(1, 3, 2, 1);
   if (nblk == TOPKC && B <= 8) LF(1, 16, 2, 1);
   if (nblk == TOPKC && B == 16) LFH(1, 8, 2, 2);
@@ -748,20 +745,21 @@ void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc,
   // removes a redundant 16 KiB stage on the multi-page long routes.
   const int ns = 1;
   switch (splits) {
-    case 8: if (ns == 1) LF(1, 8, 2, bpc); LF(2, 8, 2, bpc);
-    case 4: if (ns == 1) LF(1, 4, 2, bpc); LF(2, 4, 2, bpc);
-    case 2: if (ns == 1) LF(1, 2, 2, bpc); LF(2, 2, 2, bpc);
-    default: if (ns == 1) LF(1, 1, 2, bpc); LF(2, 1, 2, bpc);
+    case 8:
+      if (ns == 1) LF(1, 8, 2, bpc);
+      LF(2, 8, 2, bpc);
+    case 4:
+      if (ns == 1) LF(1, 4, 2, bpc);
+      LF(2, 4, 2, bpc);
+    case 2:
+      if (ns == 1) LF(1, 2, 2, bpc);
+      LF(2, 2, 2, bpc);
+    default:
+      if (ns == 1) LF(1, 1, 2, bpc);
+      LF(2, 1, 2, bpc);
   }
 #undef LF
 #undef LFH
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(direct_k_f16_run, DirectKF16Run);
-
-
-
-
-
-
-

@@ -1,29 +1,26 @@
 #include <tvm/ffi/tvm_ffi.h>
 
-void C12Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
-            tvm::ffi::TensorView v_cache, tvm::ffi::TensorView topk,
-            tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
-            tvm::ffi::TensorView out);
-void F16Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
-            tvm::ffi::TensorView v_cache, tvm::ffi::TensorView topk,
-            tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
-            tvm::ffi::TensorView out);
+void C12Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache, tvm::ffi::TensorView v_cache,
+            tvm::ffi::TensorView topk, tvm::ffi::TensorView page_table,
+            tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView out);
+void F16Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache, tvm::ffi::TensorView v_cache,
+            tvm::ffi::TensorView topk, tvm::ffi::TensorView page_table,
+            tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView out);
 void DirectKF16Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
                    tvm::ffi::TensorView v_cache, tvm::ffi::TensorView topk,
-                   tvm::ffi::TensorView page_table,
-                   tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView out);
+                   tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
+                   tvm::ffi::TensorView out);
 void DirectKShortB8Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
-                     tvm::ffi::TensorView v_cache, tvm::ffi::TensorView topk,
-                     tvm::ffi::TensorView page_table,
-                     tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView out);
+                       tvm::ffi::TensorView v_cache, tvm::ffi::TensorView topk,
+                       tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
+                       tvm::ffi::TensorView out);
 void DirectKShortRun(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
                      tvm::ffi::TensorView v_cache, tvm::ffi::TensorView topk,
-                     tvm::ffi::TensorView page_table,
-                     tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView out);
+                     tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
+                     tvm::ffi::TensorView out);
 
-void Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
-         tvm::ffi::TensorView v_cache, tvm::ffi::TensorView topk,
-         tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
+void Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache, tvm::ffi::TensorView v_cache,
+         tvm::ffi::TensorView topk, tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
          tvm::ffi::TensorView out) {
   const int B = static_cast<int>(q.shape()[0]);
   const int pages = static_cast<int>(page_table.shape()[1]);
@@ -54,5 +51,3 @@ void Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(msa_sparse_decode_fp8kv_run, Run);
-
-

@@ -338,8 +338,8 @@ def msa_sparse_decode_attention(
     """
     if backend not in MSA_SPARSE_DECODE_BACKENDS:
         raise ValueError(
-            f"backend must be one of {MSA_SPARSE_DECODE_BACKENDS}, "
-            f"got {backend!r}")
+            f"backend must be one of {MSA_SPARSE_DECODE_BACKENDS}, got {backend!r}"
+        )
     # "specialized" backend: an agent-generated kernel for the bf16-Q /
     # fp8-E4M3 paged-KV single-token decode contract
     # (flashinfer/msa_sparse_decode_fp8kv_cuda.py). backend="auto" (the
@@ -352,16 +352,30 @@ def msa_sparse_decode_attention(
         )
 
         _specialized_out = _mds(
-            backend=backend, q=q, k=k, v=v, q2k_indices=q2k_indices,
-            page_table=page_table, seqused_k=seqused_k,
-            softmax_scale=softmax_scale, out=out,
+            backend=backend,
+            q=q,
+            k=k,
+            v=v,
+            q2k_indices=q2k_indices,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            softmax_scale=softmax_scale,
+            out=out,
             extras=dict(
-                seqlen_q=seqlen_q, causal=causal,
+                seqlen_q=seqlen_q,
+                causal=causal,
                 return_softmax_lse=return_softmax_lse,
-                cu_seqlens_k=cu_seqlens_k, k_scale=k_scale, v_scale=v_scale,
-                k_global_scale=k_global_scale, v_global_scale=v_global_scale,
-                q_offset=q_offset, partial_dtype=partial_dtype,
-                force_fused=force_fused, workspace=workspace))
+                cu_seqlens_k=cu_seqlens_k,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                k_global_scale=k_global_scale,
+                v_global_scale=v_global_scale,
+                q_offset=q_offset,
+                partial_dtype=partial_dtype,
+                force_fused=force_fused,
+                workspace=workspace,
+            ),
+        )
         if _specialized_out is not None:
             return _specialized_out
     if is_blackwell_msa_device(q.device):
