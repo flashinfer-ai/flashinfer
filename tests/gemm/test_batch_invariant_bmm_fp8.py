@@ -632,6 +632,41 @@ def test_public_api_skips_backend_selection(monkeypatch):
 
 
 @needs_device
+@pytest.mark.parametrize("b,M,N,K", [(2, 16, 4096, 4096), (2, 16, 64, 8192)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(b, M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    A, B = adv_fp8(b, M, K, seed=181), weights(b, N, K, 182)
+    sa, sb = scales()
+    ref = bits(bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16))
+    assert torch.equal(bits(bi_bmm(A, B, sa, sb)), ref)
+    out = torch.empty(b, M, N, dtype=torch.bfloat16, device="cuda")
+    assert bi_bmm(A, B, sa, sb, out=out) is out and torch.equal(bits(out), ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        bi_bmm(A, B, sa, sb, out=out)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            bi_bmm(A, B, sa, sb, out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    out.zero_()
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(bits(out), ref)
+    if (
+        chunks_for(N, K, "e4m3") > 1
+    ):  # the split classes launch per element through the checked path
+        buf = adv_fp8(b, M, K, seed=183)
+        alias = buf.view(torch.bfloat16).view(-1)[: b * M * N].view(b, M, N)
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+        ):
+            bi_bmm(buf, B, sa, sb, out=alias)
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     A, B = adv_fp8(2, 16, 4096, seed=121), weights(2, 4096, 4096, 122)
     sa, sb = scales()

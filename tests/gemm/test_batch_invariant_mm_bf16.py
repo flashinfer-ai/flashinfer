@@ -897,6 +897,47 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
 
 
 @needs_device
+@pytest.mark.parametrize("M,N,K", [(16, 4096, 4096), (37, 128, 8192)])
+def test_public_path_equals_the_class_entry_and_checks_caller_buffers(M, N, K):
+    """The public path validates once and launches on the prepared operands: its bits are the class entry's with its own
+    output, with a caller's output and under graph replay; a caller's output that aliases an operand is still refused
+    (only the entry's own fresh output skips the aliasing check)."""
+    a, b = adv_bf16(M, K, 181), adv_bf16(K, N, 182)
+    bias = adv_bf16(1, N, 183)[0]
+    for kw in ({}, {"bias": bias}):
+        ref = bits(mm_bf16_batch_invariant(a, b, **kw))
+        assert torch.equal(bits(bi_mm(a, b, **kw)), ref)
+        out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        assert bi_mm(a, b, out=out, **kw) is out and torch.equal(bits(out), ref)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            bi_mm(a, b, out=out, **kw)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                bi_mm(a, b, out=out, **kw)
+        torch.cuda.current_stream().wait_stream(s)
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out), ref)
+    buf = torch.empty(M, K, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        bi_mm(buf, b, out=buf.view(-1)[: M * N].view(M, N))
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="B overlapping the output"
+    ):
+        bi_mm(a, b, out=b[:M])
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="bias overlapping the output"
+    ):
+        bi_mm(a, b, bias=out[0], out=out)
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     a, b = rnd_bf16(16, 4096, 101), rnd_bf16(4096, 4096, 102)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="K > 0 and N > 0"):

@@ -471,11 +471,15 @@ def _run(
     workspace: Optional[torch.Tensor],
     cls: str,
     bias: Optional[torch.Tensor] = None,
+    *,
+    out_fresh: bool = False,
 ) -> torch.Tensor:
     """The launch shared by the classes for one (M, K) x (K, N) product: ``b_nk`` is the (N, K) view of the weight (strides
     (1, N) for the ``n`` layout, (K, 1) for ``k``); ``scales`` the fp8 classes' two per-tensor scale tensors (empty for
     bf16); ``bias`` the bf16 class's (N,) bias (the biased chain: added once after the whole fold, in the epilogue of a
-    direct store or in the fixup of the workspace split, whose partials stay bias-free)."""
+    direct store or in the fixup of the workspace split, whose partials stay bias-free). ``out_fresh`` says the entry
+    allocated ``out`` in this call: a fresh buffer aliases no live tensor, so its aliasing check is skipped (every
+    caller-provided buffer is checked)."""
     from .blocks.compile import get_compiled_gemm
     from .blocks.operands import can_implement
     from .fixup import MAX_GRID_Y, get_fixup
@@ -511,7 +515,8 @@ def _run(
     if bias is not None:
         reads.append((bias, "the bias"))
     if direct:
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, c3, *extra)  # the chain in the epilogue
         return out
@@ -519,10 +524,12 @@ def _run(
     # applied there, once)
     if workspace is None:
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
+        writes = [(ws, "the workspace")] + ([] if out_fresh else [(out, "the output")])
+        _require_disjoint(cls, writes, reads)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
@@ -580,6 +587,7 @@ def mm_bf16_batch_invariant(
     configuration (a member of the enumerated space: the bits never depend on it); ``chunks`` forces the class's
     chunk count (tests); ``workspace`` (fp32, at least ``chunks * M * N`` elements) is the split class's partials
     buffer, otherwise allocated per call from the caching allocator (stream-ordered)."""
+    out_fresh = out is None
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
     bias = prepare_bias(bias, N, a)
     if M == 0:
@@ -611,6 +619,7 @@ def mm_bf16_batch_invariant(
         workspace,
         CLASS,
         bias=bias,
+        out_fresh=out_fresh,
     )
 
 
@@ -701,6 +710,7 @@ def mm_fp8_batch_invariant(
     (N, K) tensor (:func:`flashinfer.bmm_fp8`'s column-major layout) or row-major; the scales are 1-element fp32 tensors;
     ``out_dtype`` bf16 / fp16 (fp32 exposes the fp32 chain input for tests). ``config``, ``chunks`` and ``workspace`` as in
     :func:`mm_bf16_batch_invariant`. :func:`bmm_fp8_batch_invariant` is the batched entry behind the FlashInfer API."""
+    out_fresh = out is None
     a, a_scale, b_scale, out, in_fmt, b_major, M, N, K = prepare_fp8_operands(
         a, b, a_scale, b_scale, out, out_dtype
     )
@@ -733,6 +743,7 @@ def mm_fp8_batch_invariant(
         (a_scale, b_scale),
         workspace,
         cls,
+        out_fresh=out_fresh,
     )
 
 
@@ -862,6 +873,7 @@ def bmm_fp8_batch_invariant(
     as ONE launch whose third operand mode is the batch, the split classes run the batch elements one after another
     (bit-equal by construction: each element is one launch of the class). ``config``, ``chunks`` and ``workspace`` (the
     split class's partials buffer, reused per element) as in :func:`mm_bf16_batch_invariant`."""
+    out_fresh = out is None
     A, A_scale, B_scale, out, in_fmt, b_major, b, M, N, K = prepare_bmm_fp8_operands(
         A, B, A_scale, B_scale, dtype, out
     )
@@ -896,6 +908,7 @@ def bmm_fp8_batch_invariant(
         OUT_FMT_OF_DTYPE[dtype],
         workspace,
         cls,
+        out_fresh=out_fresh,
     )
 
 
@@ -916,9 +929,11 @@ def _launch_bmm_fp8(
     out_fmt: str,
     workspace: Optional[torch.Tensor],
     cls: str,
+    *,
+    out_fresh: bool = False,
 ) -> torch.Tensor:
     """The batched fp8 classes' launch on prepared operands (:func:`prepare_bmm_fp8_operands`'s): the unsplit class as one
-    launch over the batch, the split classes one launch of the class per element."""
+    launch over the batch, the split classes one launch of the class per element; ``out_fresh`` as in :func:`_run`."""
     if C == 1:
         from .blocks.compile import get_compiled_gemm
         from .blocks.operands import can_implement
@@ -969,6 +984,7 @@ def _launch_bmm_fp8(
             (A_scale, B_scale),
             workspace,
             cls,
+            out_fresh=out_fresh,
         )
     return out
 
@@ -1125,6 +1141,7 @@ def mm_mxfp8_batch_invariant(
     (:func:`flashinfer.mm_mxfp8`'s column-major layout); the scales are the 1-D swizzled uint8 buffers of
     :func:`flashinfer.mxfp8_quantize`; ``out_dtype`` bf16 / fp16 (fp32 exposes the fp32 chain input for tests).
     ``config``, ``chunks`` and ``workspace`` as in :func:`mm_bf16_batch_invariant`; ``in_fmt`` forces the class (tests)."""
+    out_fresh = out is None
     a, sfa, sfb, out, M, N, K = prepare_mxfp8_operands(
         a, b, a_descale, b_descale, out, out_dtype
     )
@@ -1158,6 +1175,7 @@ def mm_mxfp8_batch_invariant(
         OUT_FMT_OF_DTYPE[out_dtype],
         workspace,
         cls,
+        out_fresh=out_fresh,
     )
 
 
@@ -1187,13 +1205,15 @@ def _run_mx(
     cls: str,
     alpha: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    *,
+    out_fresh: bool = False,
 ) -> torch.Tensor:
     """The launch of the block-scaled classes for one product: ``b_nk`` the (N, K) row-major view of the weight (in bytes
-    for the 4-bit formats: (N, K / 2)), the scale buffers flat, ``alpha`` the 4-bit classes' scalar. Four placements of one
-    class: the direct store (the unsplit class; the in-CTA chunk fold and the in-cluster split of the split class), the
-    swapped decode record (the weights as the kernel's A, the tokens as its B, the output transposed: the block-scaled step
-    is symmetric in its two operands) and the workspace split with the dense module's fixup (the fp32 partials folded in
-    chunk order from +0, then the chain)."""
+    for the 4-bit formats: (N, K / 2)), the scale buffers flat, ``alpha`` the 4-bit classes' scalar, ``out_fresh`` as in
+    :func:`_run`. Four placements of one class: the direct store (the unsplit class; the in-CTA chunk fold and the
+    in-cluster split of the split class), the swapped decode record (the weights as the kernel's A, the tokens as its B,
+    the output transposed: the block-scaled step is symmetric in its two operands) and the workspace split with the dense
+    module's fixup (the fp32 partials folded in chunk order from +0, then the chain)."""
     from .blocks.compile_blockscaled import get_compiled_blockscaled
     from .blocks.compile_blockscaled_mixed import get_compiled_blockscaled_mixed
     from .blocks.operands import can_implement
@@ -1242,12 +1262,13 @@ def _run_mx(
     if config.swap_ab and C == 1:
         # the decode specialisation: C^T = B^T A^T with the operands exchanged; the kernel's A is the weight (N rows), its B
         # the tokens (any count, one tile), its C the M-major (N, M) view of the output
-        _require_disjoint(
-            cls,
-            [(out, "the output")],
-            [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
-            + ([(alpha, "alpha")] if alpha is not None else []),
-        )
+        if not out_fresh:
+            _require_disjoint(
+                cls,
+                [(out, "the output")],
+                [(a, "A"), (b_nk, "B"), (sfa, "A's scales"), (sfb, "B's scales")]
+                + ([(alpha, "alpha")] if alpha is not None else []),
+            )
         kernel(
             b_nk.as_strided((N, Kb_b, 1), (b_nk.stride(0), 1, Kb_b)),
             a.as_strided((M, Kb_a, 1), (a.stride(0), 1, Kb_a)),
@@ -1268,7 +1289,8 @@ def _run_mx(
     if alpha is not None:
         reads.append((alpha, "alpha"))
     if C == 1 or config.cta_chunks or config.cluster_k > 1:
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, sfa, sfb, c3, *extra)  # the chain in the epilogue
         return out
@@ -1276,10 +1298,12 @@ def _run_mx(
     # applied there, once)
     if workspace is None:
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
-        _require_disjoint(cls, [(out, "the output")], reads)
+        if not out_fresh:
+            _require_disjoint(cls, [(out, "the output")], reads)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        _require_disjoint(cls, [(ws, "the workspace"), (out, "the output")], reads)
+        writes = [(ws, "the workspace")] + ([] if out_fresh else [(out, "the output")])
+        _require_disjoint(cls, writes, reads)
     if config.swap_ab:
         # the swapped record of a split class (the mixed classes): the exchanged operands' chunk partials P_c^T into the
         # workspace's (N, M, C) view (the kernel's M contiguous), then the same fixup over the (M, N, C) view
@@ -1476,6 +1500,7 @@ def mm_fp4_batch_invariant(
             f"block_size={block_size} with use_nvfp4={use_nvfp4}",
             "block_size 16 for NVFP4 and 32 for MXFP4 (the formats' block scales)",
         )
+    out_fresh = out is None
     a, b, sfa, sfb, alpha, out, M, N, K = prepare_fp4_operands(
         a, b, a_descale, b_descale, alpha, out, out_dtype, use_nvfp4
     )
@@ -1510,6 +1535,7 @@ def mm_fp4_batch_invariant(
         workspace,
         cls,
         alpha=alpha,
+        out_fresh=out_fresh,
     )
 
 
@@ -1642,6 +1668,7 @@ def mm_mxfp8_mxfp4_batch_invariant(
     its dependents once its loads are issued -- a placement, the same bits as the plain launch)."""
     from ...utils import device_support_pdl
 
+    out_fresh = out is None
     a, b, sfa, sfb, alpha, out, M, N, K = prepare_mxfp4w8a_operands(
         a, b, a_descale, b_descale, alpha, out, out_dtype
     )
@@ -1687,6 +1714,7 @@ def mm_mxfp8_mxfp4_batch_invariant(
         cls,
         alpha=alpha,
         enable_pdl=bool(enable_pdl),
+        out_fresh=out_fresh,
     )
 
 
@@ -1831,6 +1859,7 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     ``config`` forces a record of the class's space (the dispatcher's pick by default: every record computes the same
     bits), ``native_k`` the ``K`` layout's scale staging (:func:`native_k_staging` by default; a placement). One launch,
     no split, no workspace."""
+    out_fresh = out is None
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
         a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
     )
@@ -1853,7 +1882,18 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     if scale_major_mode == "K" and not native_k:
         sfa = sfa.t().contiguous().t()
     return _launch_fp8bs(
-        a, b, sfa, sfb, out, M, N, K, config, native_k, OUT_FMT_OF_DTYPE[out_dtype]
+        a,
+        b,
+        sfa,
+        sfb,
+        out,
+        M,
+        N,
+        K,
+        config,
+        native_k,
+        OUT_FMT_OF_DTYPE[out_dtype],
+        out_fresh=out_fresh,
     )
 
 
@@ -1869,10 +1909,12 @@ def _launch_fp8bs(
     config: Knobs,
     native_k: bool,
     out_fmt: str,
+    *,
+    out_fresh: bool = False,
 ) -> torch.Tensor:
     """The block-scale class's launch on prepared operands: ``sfa`` (M, K / 128) and ``sfb`` (ceil(N / 128), K / 128) views
     in the layout the staging reads (``native_k``: the caller's K-layout tensors as they are; else M-major views of the
-    MN-layout copies)."""
+    MN-layout copies); ``out_fresh`` as in :func:`_run`."""
     from .blocks.compile_fp8bs import get_compiled_fp8bs
     from .blocks.operands import can_implement
 
@@ -1883,11 +1925,12 @@ def _launch_fp8bs(
             f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K})",
             "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
         )
-    _require_disjoint(
-        cls,
-        [(out, "the output")],
-        [(a, "A"), (b, "B"), (sfa, "a_scale"), (sfb, "b_scale")],
-    )
+    if not out_fresh:
+        _require_disjoint(
+            cls,
+            [(out, "the output")],
+            [(a, "A"), (b, "B"), (sfa, "a_scale"), (sfb, "b_scale")],
+        )
     # the kernel sees (m, k, l) / (n, k, l) / (m, n, l) operands with l = 1 and the scale views with their own strides
     a3 = a.as_strided((M, K, 1), (a.stride(0), 1, K))
     b3 = b.as_strided((N, K, 1), (b.stride(0), 1, K))

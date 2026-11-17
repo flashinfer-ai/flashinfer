@@ -473,6 +473,7 @@ def mm_bf16_batch_invariant_auto(
     if out_dtype != torch.bfloat16:
         raise unsupported(CLASS, f"out_dtype={out_dtype}", "bf16 output")
     # every typed check runs before the autotuner sees the shape: it only ever profiles shapes the class accepts
+    out_fresh = out is None
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
     bias = prepare_bias(bias, N, a)
     if M == 0:
@@ -506,6 +507,7 @@ def mm_bf16_batch_invariant_auto(
         None,
         CLASS,
         bias=bias,
+        out_fresh=out_fresh,
     )
 
 
@@ -526,6 +528,7 @@ def bmm_fp8_batch_invariant_auto(
             f"backend={backend!r} together with batch_invariant=True",
             'backend="auto" (the flag selects the batch-invariant class in place of the backends)',
         )
+    out_fresh = out is None
     A, A_scale, B_scale, out, in_fmt, b_major, b, M, N, K = prepare_bmm_fp8_operands(
         A, B, A_scale, B_scale, dtype, out
     )
@@ -561,6 +564,7 @@ def bmm_fp8_batch_invariant_auto(
         OUT_FMT_OF_DTYPE[dtype],
         None,
         f"gemm.{in_fmt}",
+        out_fresh=out_fresh,
     )
 
 
@@ -589,6 +593,7 @@ def mm_mxfp8_batch_invariant_auto(
             "the 8x4 scale-factor layout (use_8x4_sf_layout=True)",
             "the 128x4 swizzled layout (mxfp8_quantize(..., is_sf_swizzled_layout=True))",
         )
+    out_fresh = out is None
     a, sfa, sfb, out, M, N, K = prepare_mxfp8_operands(
         a, b, a_descale, b_descale, out, out_dtype, MM_MXFP8_API_OUT_DTYPES
     )
@@ -623,6 +628,7 @@ def mm_mxfp8_batch_invariant_auto(
         OUT_FMT_OF_DTYPE[out_dtype],
         None,
         f"gemm.{in_fmt}",
+        out_fresh=out_fresh,
     )
 
 
@@ -661,6 +667,7 @@ def mm_fp4_batch_invariant_auto(
             f"block_size={block_size} with use_nvfp4={use_nvfp4}",
             "block_size 16 for NVFP4 and 32 for MXFP4 (the formats' block scales)",
         )
+    out_fresh = out is None
     a, b, sfa, sfb, alpha, out, M, N, K = prepare_fp4_operands(
         a,
         b,
@@ -704,6 +711,7 @@ def mm_fp4_batch_invariant_auto(
         None,
         f"gemm.{in_fmt}",
         alpha=alpha,
+        out_fresh=out_fresh,
     )
 
 
@@ -742,6 +750,7 @@ def gemm_fp8_nt_groupwise_batch_invariant_auto(
     out_dtype = out_dtype or torch.bfloat16
     if out_dtype not in GEMM_FP8BS_API_OUT_DTYPES:
         raise unsupported(CLASS_FP8BS, f"out_dtype={out_dtype}", "bf16 or fp16 output")
+    out_fresh = out is None
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
         a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
     )
@@ -786,5 +795,16 @@ def gemm_fp8_nt_groupwise_batch_invariant_auto(
         mode,
     )
     return _launch_fp8bs(
-        a, b, sfa, sfb, out, M, N, K, cfg, native_k, OUT_FMT_OF_DTYPE[out_dtype]
+        a,
+        b,
+        sfa,
+        sfb,
+        out,
+        M,
+        N,
+        K,
+        cfg,
+        native_k,
+        OUT_FMT_OF_DTYPE[out_dtype],
+        out_fresh=out_fresh,
     )
