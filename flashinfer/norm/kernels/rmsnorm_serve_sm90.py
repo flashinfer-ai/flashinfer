@@ -88,9 +88,7 @@ _stats = {
 
 
 def _fallback(reason):
-    _stats["fallback_reasons"][reason] = (
-        _stats["fallback_reasons"].get(reason, 0) + 1
-    )
+    _stats["fallback_reasons"][reason] = _stats["fallback_reasons"].get(reason, 0) + 1
 
 
 def _rmsnorm_serve_sm90_stats() -> dict:
@@ -131,6 +129,7 @@ def _dispatch_table():
     except Exception:
         _DISPATCH_TABLE = None
     return _DISPATCH_TABLE
+
 
 try:
     import math
@@ -315,9 +314,7 @@ if _HAS_CUTE_DSL:
         fo = cute.runtime.make_fake_tensor(
             dt, (batch, h), stride=(h, 1), assumed_align=align
         )
-        fw = cute.runtime.make_fake_tensor(
-            dt, (h,), stride=(1,), assumed_align=align
-        )
+        fw = cute.runtime.make_fake_tensor(dt, (h,), stride=(1,), assumed_align=align)
         return cute.compile(
             _rmsnorm_host,
             fx,
@@ -358,7 +355,8 @@ def _get_cuda_module():
 
 def _disabled() -> bool:
     if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "").strip() not in (
-        "", "0",
+        "",
+        "0",
     ):
         return True
     value = os.environ.get(_ENV_VAR, "").strip().lower()
@@ -449,9 +447,7 @@ def try_rmsnorm_serve_sm90(
         return False
     if weight.device != input.device or out.device != input.device:
         return False
-    if not (
-        input.is_contiguous() and out.is_contiguous() and weight.is_contiguous()
-    ):
+    if not (input.is_contiguous() and out.is_contiguous() and weight.is_contiguous()):
         return False
     if (input.data_ptr() | out.data_ptr() | weight.data_ptr()) % 16 != 0:
         return False

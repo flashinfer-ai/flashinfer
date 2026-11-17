@@ -52,9 +52,10 @@ __device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
   return r;
 }
 
-__global__ __launch_bounds__(384) void rmsnorm_6144_osplit8(
-    const uint4* __restrict__ x, const uint4* __restrict__ weight, uint4* __restrict__ output,
-    float inverse_h, float epsilon) {
+__global__ __launch_bounds__(384) void rmsnorm_6144_osplit8(const uint4* __restrict__ x,
+                                                            const uint4* __restrict__ weight,
+                                                            uint4* __restrict__ output,
+                                                            float inverse_h, float epsilon) {
   constexpr int BLOCK = 384;
   constexpr int CHUNK = 96;
   const int tid = threadIdx.x;
@@ -297,9 +298,8 @@ void rmsnorm_serve_sm90(TensorView output, TensorView input, TensorView weight, 
   } else if (hidden == 2048) {
     if (tokens == 2) {
       rmsnorm_2048_osplit2<<<dim3(2, tokens), 256, 0, stream>>>(
-          static_cast<const uint4*>(input.data_ptr()),
-          static_cast<const uint4*>(weight.data_ptr()), static_cast<uint4*>(output.data_ptr()),
-          inverse_h, eps);
+          static_cast<const uint4*>(input.data_ptr()), static_cast<const uint4*>(weight.data_ptr()),
+          static_cast<uint4*>(output.data_ptr()), inverse_h, eps);
     } else {
       launch_exact<256, 1>(static_cast<const uint4*>(input.data_ptr()),
                            static_cast<const uint4*>(weight.data_ptr()),
@@ -308,9 +308,8 @@ void rmsnorm_serve_sm90(TensorView output, TensorView input, TensorView weight, 
   } else if (hidden == 6144) {
     if (tokens <= 64) {
       rmsnorm_6144_osplit8<<<dim3(8, tokens), 384, 0, stream>>>(
-          static_cast<const uint4*>(input.data_ptr()),
-          static_cast<const uint4*>(weight.data_ptr()), static_cast<uint4*>(output.data_ptr()),
-          inverse_h, eps);
+          static_cast<const uint4*>(input.data_ptr()), static_cast<const uint4*>(weight.data_ptr()),
+          static_cast<uint4*>(output.data_ptr()), inverse_h, eps);
     } else {
       launch_exact<384, 2>(static_cast<const uint4*>(input.data_ptr()),
                            static_cast<const uint4*>(weight.data_ptr()),

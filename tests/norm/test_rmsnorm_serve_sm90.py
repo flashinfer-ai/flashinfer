@@ -98,16 +98,13 @@ def _case(tokens=64, hidden=2048, seed=0, device="cuda"):
     x = (torch.randn((tokens, hidden), generator=g, device=device) * 0.5).to(
         torch.bfloat16
     )
-    w = (torch.randn((hidden,), generator=g, device=device) * 0.5).to(
-        torch.bfloat16
-    )
+    w = (torch.randn((hidden,), generator=g, device=device) * 0.5).to(torch.bfloat16)
     return x, w
 
 
 def _matched(y, ref, rtol=0.02, atol=0.01):
     yf, rf = y.float(), ref.float()
-    return float(((yf - rf).abs() <= (atol + rtol * rf.abs()))
-                 .float().mean().item())
+    return float(((yf - rf).abs() <= (atol + rtol * rf.abs())).float().mean().item())
 
 
 def test_specialized_dispatches_and_matches_stock():
