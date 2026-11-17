@@ -10,7 +10,7 @@ constructor inspects the relevant set.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, FrozenSet, Sequence
+from typing import TYPE_CHECKING, FrozenSet, Literal, Sequence
 
 if TYPE_CHECKING:
     import torch
@@ -35,6 +35,48 @@ class FleetAlgoKnobQuantization(AlgoKnob):
 @dataclass(frozen=True)
 class FleetAlgoKnobNumChannelsPerRank(AlgoKnob):
     n: int
+
+
+@dataclass(frozen=True)
+class FleetAlgoKnobNcclEpConfig(AlgoKnob):
+    """Configure NCCL EP group bounds and communication resources.
+
+    ``None`` preserves the provider default; zero selects its automatic value.
+    ``num_topk`` bounds every handle's top-k. Independent dispatch/combine SM
+    budgets, HT flow and metadata policy require nccl-extensions 0.2 (EP 0.3).
+    Flow and metadata policy apply only to HT. ``require_fused`` is incompatible
+    with handle-time received-token counters. Flat layout supports both flows;
+    ``None`` leaves selection to the provider. ``eager_recv`` sizes HT receive
+    arrays from the actual row count. It synchronizes that count to the host
+    and does not support dispatch capture.
+    """
+
+    num_topk: int | None = None
+    max_num_sms: int | None = None
+    dispatch_num_sms: int | None = None
+    combine_num_sms: int | None = None
+    ht_flow: Literal["auto", "push_pull", "pull_push"] | None = None
+    meta_exchange_policy: Literal["auto", "require_fused", "force_scan"] | None = None
+    eager_recv: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.eager_recv) is not bool:
+            raise ValueError("eager_recv must be a bool")
+        for name in ("num_topk", "max_num_sms", "dispatch_num_sms", "combine_num_sms"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{name} must be a nonnegative integer or None")
+        if self.ht_flow not in (None, "auto", "push_pull", "pull_push"):
+            raise ValueError("ht_flow must be auto, push_pull, or pull_push")
+        if self.meta_exchange_policy not in (
+            None,
+            "auto",
+            "require_fused",
+            "force_scan",
+        ):
+            raise ValueError(
+                "meta_exchange_policy must be auto, require_fused, or force_scan"
+            )
 
 
 @dataclass(frozen=True)

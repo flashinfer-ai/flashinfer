@@ -101,6 +101,7 @@ class NcclEpHandle(Handle):
         self._destroyed = False
 
         self._is_ht = fleet.params.algorithm == EpAlgorithm.HIGH_THROUGHPUT
+        self._eager_recv = self._is_ht and fleet._nccl_options().eager_recv
         self._is_rank_major = (not self._is_ht) and (
             fleet.params.layout is EpLayout.RANK_MAJOR
         )
@@ -142,20 +143,18 @@ class NcclEpHandle(Handle):
         else:
             layout = self._ep.Layout.EXPERT_MAJOR
 
-        # GAP 3 (opt-in): expose HT's actual received-token count. When the caller
-        # sets HandleAlgoKnobNumReceivedTokens, bind its target as
-        # LayoutInfo.recv_total_counter so ncclEpCreateHandle -> ncclEpUpdateHandle
-        # -> metadata preprocessing writes the actual total into it (nccl_ep.cc
-        # ~2316-2357). This works in the static max_tokens mode too — only dynamic
-        # *buffer sizing* is unsupported in v0.1, not the count readback — letting an
-        # HT consumer trim compute to recv_x[:actual_recv] on the static buffer.
-        # HT-only: LL rejects handle-time layout_info (nccl_ep.cc:2201), and without
-        # the knob HT keeps the verified layout_info=None path unchanged.
+        # HT preprocessing writes this counter before dispatch. Fixed sizing
+        # exposes it only when requested; eager sizing also needs it internally.
+        # LL rejects handle-time layout_info.
         self._recv_total_target = None
         create_layout_info = None
         num_recv_knob = self._handle_knobs.get(HandleAlgoKnobNumReceivedTokens)
-        if num_recv_knob is not None and self._is_ht:
-            tgt = num_recv_knob.target  # type: ignore[attr-defined]
+        if self._is_ht and (num_recv_knob is not None or self._eager_recv):
+            tgt = (
+                num_recv_knob.target  # type: ignore[attr-defined]
+                if num_recv_knob is not None
+                else torch.empty(1, dtype=torch.int32, device=topk_idx.device)
+            )
             if tgt.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
                     "HandleAlgoKnobNumReceivedTokens.target must be int32 or int64, "
@@ -242,7 +241,7 @@ class NcclEpHandle(Handle):
         here on the assumption that a repeated address proves stability, since
         a freed-then-reallocated buffer repeats on the very next call.
         """
-        if t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
+        if self._eager_recv or t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
             return self._ep.Tensor(t)
         hot = self._hot
         key = (t.data_ptr(), t.dtype, tuple(t.shape))
@@ -290,6 +289,8 @@ class NcclEpHandle(Handle):
         """
         import torch
 
+        if self._eager_recv and torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError("eager_recv does not support CUDA graph capture")
         topk_idx = params.topk_ids
         if topk_idx.dtype != torch.int64:
             topk_idx = topk_idx.to(torch.int64)
@@ -556,11 +557,27 @@ class NcclEpHandle(Handle):
     def _dispatch_ht(self, x) -> DispatchOutput:
         import torch
 
+        if self._eager_recv and torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError(
+                "eager_recv does not support CUDA graph dispatch capture"
+            )
         max_per_rank = self._fleet.params.max_tokens_per_rank
         # Recv row mirrors the sent row; see _dispatch_ll.
         hidden = x.shape[1]
         world = self._fleet.params.num_experts // self._num_local_experts
         num_recv = max_per_rank * world
+        if self._eager_recv:
+            target = self._recv_total_target
+            if target.is_cuda:
+                stream = torch.cuda.ExternalStream(self._op_stream(), device=x.device)
+                with torch.cuda.stream(stream):
+                    num_recv = int(target.reshape(-1)[0].item())
+            else:
+                num_recv = int(target.reshape(-1)[0].item())
+            if not 0 <= num_recv <= max_per_rank * world:
+                raise MoEEpConfigError(f"invalid received-token count: {num_recv}")
+        # Keep an inactive row for compute backends that reject an empty batch.
+        capacity = max(1, num_recv) if self._eager_recv else num_recv
 
         # The HT staging buffers (and this recv buffer) are sized to max_per_rank,
         # which the fleet clamps to the library's MAX_SUPPORTED_TOKENS_PER_RANK. A
@@ -591,21 +608,25 @@ class NcclEpHandle(Handle):
         cached = self._hot.get("ht_recv_bufs")
         if (
             cached is None
-            or cached[0].shape != (num_recv, hidden)
+            or cached[0].shape != (capacity, hidden)
             or cached[1].shape[1] != self._top_k
             or cached[0].dtype != x.dtype
             or cached[0].device != x.device
         ):
-            out_t = torch.empty(num_recv, hidden, dtype=x.dtype, device=x.device)
+            out_t = torch.empty(capacity, hidden, dtype=x.dtype, device=x.device)
             out_w = torch.empty(
-                num_recv, self._top_k, dtype=torch.float32, device=x.device
+                capacity, self._top_k, dtype=torch.float32, device=x.device
             )
             out_idx = torch.empty(
-                num_recv, self._top_k, dtype=torch.int64, device=x.device
+                capacity, self._top_k, dtype=torch.int64, device=x.device
             )
             self._hot["ht_recv_bufs"] = (out_t, out_w, out_idx)
         else:
             out_t, out_w, out_idx = cached
+        if self._eager_recv and num_recv == 0:
+            out_t.zero_()
+            out_w.zero_()
+            out_idx.fill_(-1)
         _t = _hp("ht_disp.alloc_cached", _t)
 
         # Fleet-cached output wraps (over the cached recv bufs) + config; the
@@ -645,7 +666,11 @@ class NcclEpHandle(Handle):
         self._dispatch_out_w = out_w
         self._dispatch_out_idx = out_idx
 
-        out_3d = out_t.view(world, max_per_rank, hidden)
+        out_3d = (
+            out_t.view(1, capacity, hidden)
+            if self._eager_recv
+            else out_t.view(world, max_per_rank, hidden)
+        )
         return DispatchOutput(
             expert_tensors=out_3d,
             num_tokens=num_recv,

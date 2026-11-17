@@ -1,6 +1,6 @@
 """NcclEpFleet — NCCL-EP-backed Fleet implementation.
 
-Uses the ``nccl-ep-v0.1.0`` Pythonic API (``nccl.ep``): builds an
+Uses the ``nccl.ep`` Pythonic API from nccl-extensions 0.1 and 0.2: builds an
 ``nccl.core.Communicator`` and an ``nccl.ep.Group``, and hands the live
 ``Group`` to each :class:`NcclEpHandle`.
 """
@@ -13,9 +13,12 @@ import logging
 import warnings
 from typing import TYPE_CHECKING, Sequence
 
+from packaging.version import Version
+
 from ..... import _require_built
 from .....errors import MoEEpFaultToleranceUnsupportedError, MoEEpNotBuiltError
 from .....core.validation.common import (
+    MoEEpConfigError,
     validate_arch_for_backend,
     validate_ll_hidden_size,
     validate_bootstrap_world_size,
@@ -25,10 +28,12 @@ from .....algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobAllocator,
     FleetAlgoKnobFaultTolerance,
+    FleetAlgoKnobNcclEpConfig,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
     FleetAlgoKnobRdmaBufferSize,
+    HandleAlgoKnobNumReceivedTokens,
     _index_knobs,
 )
 from .....config import EpAlgorithm, EpLayout, FleetParams
@@ -51,25 +56,18 @@ logger = logging.getLogger(__name__)
 
 NCCL_EP_AUTO = 0
 
-# nccl_ep HT hard limit: ``ncclEpCreateGroup`` *asserts* (SIGABRT, nccl_ep.cc:1253)
-# when a HIGH_THROUGHPUT group is created with
-# ``max_dispatch_tokens_per_rank > MAX_SUPPORTED_TOKENS_PER_RANK``. The constant is
-# a build-time template bound in the wheel
-# (``nccl/ep/include/nccl_ep/common.hpp``: ``#define MAX_SUPPORTED_TOKENS_PER_RANK
-# 8192``). We mirror it here to *clamp* the HT dispatch budget (graceful) rather
-# than let a large caller value (e.g. vLLM ``max_num_batched_tokens``) hit the C++
-# assert. LL has no such cap. Kept in sync with the nccl-extensions wheel.
+# Match the HT dispatch bound used by legacy providers and EP 0.3.
 _HT_MAX_SUPPORTED_TOKENS_PER_RANK = 8192
 
 
 def _clamp_ht_max_tokens(params: FleetParams) -> FleetParams:
-    """Clamp a HT fleet's ``max_tokens_per_rank`` to the nccl_ep build-time cap.
+    """Clamp an HT fleet to the provider's dispatch capacity.
 
     HT's ``ncclEpCreateGroup`` aborts when ``max_dispatch_tokens_per_rank`` exceeds
     ``MAX_SUPPORTED_TOKENS_PER_RANK`` (8192). We return a clamped copy so group
     creation succeeds; a single forward that actually dispatches more than the cap
     per rank is caught with a clear error at dispatch (see ``NcclEpHandle._dispatch_ht``)
-    rather than silently truncated. No-op for LL (unbounded) or when already within cap.
+    rather than silently truncated. No-op for LL or when within the cap.
     """
     if (
         params.algorithm is EpAlgorithm.HIGH_THROUGHPUT
@@ -77,8 +75,8 @@ def _clamp_ht_max_tokens(params: FleetParams) -> FleetParams:
     ):
         logger.warning(
             "nccl_ep HT caps max_dispatch_tokens_per_rank at %d "
-            "(MAX_SUPPORTED_TOKENS_PER_RANK); requested %d — clamping to avoid the "
-            "ncclEpCreateGroup abort. Ensure the per-forward token count per rank "
+            "for compatibility with legacy providers; requested %d — clamping. "
+            "Ensure the per-forward token count per rank "
             "stays <= %d (e.g. vLLM --max-num-batched-tokens); a larger dispatch "
             "will raise at forward time.",
             _HT_MAX_SUPPORTED_TOKENS_PER_RANK,
@@ -101,7 +99,7 @@ def _import_nccl_ep():
         raise MoEEpNotBuiltError(
             "nccl.ep (nccl-ep-v0.1.0) python package unavailable. It ships in "
             "the nccl-extensions wheel, a base dependency of flashinfer-python "
-            "— install with `pip install 'nccl-extensions>=0.1.0'`. NOTE: "
+            "— install with `pip install 'nccl-extensions>=0.2.0'`. NOTE: "
             "nccl.ep used to ship in nccl4py; it moved out in nccl4py 0.4.1, "
             "so an environment pinned to nccl4py alone no longer provides it."
         ) from e
@@ -164,8 +162,13 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     ) -> None:
         _require_built("nccl_ep")
         validate_arch_for_backend("nccl_ep")
-        validate_ll_hidden_size(params, "nccl_ep")
         validate_bootstrap_world_size(bootstrap)
+        self._nccl_ep = _import_nccl_ep()
+        get_version = getattr(self._nccl_ep, "get_lib_version", None)
+        self._ep_version = (
+            Version(str(get_version())) if get_version is not None else None
+        )
+        validate_ll_hidden_size(params, "nccl_ep", nccl_ep_version=self._ep_version)
 
         # HT: clamp the per-rank dispatch budget to the library's build-time cap so
         # ncclEpCreateGroup doesn't abort; must clamp the stored params (not just the
@@ -184,8 +187,6 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         )
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
-        self._nccl_ep = _import_nccl_ep()
-        self._comm = _resolve_comm(bootstrap)
         self._ft_epoch = 0
         self._ft_store_obj = None
         self._any_handle_created = False
@@ -198,7 +199,9 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         # forward while the Fleet persists — per-handle caches never hit.
         self._hot_cache: dict = {}
 
-        self._group = self._nccl_ep.Group.create(self._comm, self._build_group_config())
+        config = self._build_group_config()
+        self._comm = _resolve_comm(bootstrap)
+        self._group = self._nccl_ep.Group.create(self._comm, config)
         self._destroyed = False
 
     def _knob_or_auto(self, knob_cls: type, field: str) -> int:
@@ -219,7 +222,9 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         )
         if p.algorithm == EpAlgorithm.HIGH_THROUGHPUT:
             world = self._bootstrap.world_size
-            kwargs["max_recv_tokens_per_rank"] = p.max_tokens_per_rank * world
+            kwargs["max_recv_tokens_per_rank"] = (
+                0 if self._nccl_options().eager_recv else p.max_tokens_per_rank * world
+            )
         alloc = self._build_alloc_config()
         if alloc is not None:
             kwargs["alloc"] = alloc
@@ -229,7 +234,61 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
             kwargs["enable_mask"] = True
             if self._ft.timeout_ms:  # type: ignore[attr-defined]
                 kwargs["timeout_ns"] = int(self._ft.timeout_ms) * 1_000_000  # type: ignore[attr-defined]
+        kwargs.update(self._release_group_config())
         return self._nccl_ep.GroupConfig(**kwargs)
+
+    def _nccl_options(self) -> FleetAlgoKnobNcclEpConfig:
+        knob = self._fleet_knobs.get(FleetAlgoKnobNcclEpConfig)
+        return (
+            knob
+            if isinstance(knob, FleetAlgoKnobNcclEpConfig)
+            else FleetAlgoKnobNcclEpConfig()
+        )
+
+    def _release_group_config(self) -> dict:
+        options = self._nccl_options()
+        modern = self._ep_version is not None and self._ep_version >= Version("0.3.0")
+        kwargs = {}
+        if options.eager_recv:
+            if not modern:
+                raise MoEEpConfigError(
+                    "eager_recv requires nccl-extensions 0.2 (EP 0.3)"
+                )
+            if self._params.algorithm is not EpAlgorithm.HIGH_THROUGHPUT:
+                raise MoEEpConfigError("eager_recv applies only to HIGH_THROUGHPUT")
+            if options.meta_exchange_policy == "require_fused":
+                raise MoEEpConfigError(
+                    "eager_recv requires early received-token metadata"
+                )
+        for name in ("num_topk", "max_num_sms", "dispatch_num_sms", "combine_num_sms"):
+            value = getattr(options, name)
+            if value is None:
+                continue
+            if name in ("dispatch_num_sms", "combine_num_sms") and not modern:
+                raise MoEEpConfigError(f"{name} requires nccl-extensions 0.2 (EP 0.3)")
+            kwargs[name] = value
+        if options.num_topk is not None and options.num_topk > self._params.num_experts:
+            raise MoEEpConfigError("num_topk must not exceed num_experts")
+        if options.ht_flow is not None:
+            if not modern:
+                raise MoEEpConfigError("HT flow requires nccl-extensions 0.2 (EP 0.3)")
+            if self._params.algorithm is not EpAlgorithm.HIGH_THROUGHPUT:
+                raise MoEEpConfigError("HT flow applies only to HIGH_THROUGHPUT")
+            kwargs["ht_flow"] = getattr(self._nccl_ep.HtFlow, options.ht_flow.upper())
+        policy = options.meta_exchange_policy
+        if policy is not None:
+            if not modern:
+                raise MoEEpConfigError(
+                    "metadata policy requires nccl-extensions 0.2 (EP 0.3)"
+                )
+            if self._params.algorithm is not EpAlgorithm.HIGH_THROUGHPUT:
+                raise MoEEpConfigError(
+                    "metadata policy applies only to HIGH_THROUGHPUT"
+                )
+            kwargs["meta_exchange_policy"] = getattr(
+                self._nccl_ep.MetaExchangePolicy, policy.upper()
+            )
+        return kwargs
 
     def _build_alloc_config(self):
         """Build an ``nccl.ep.AllocConfig`` from FleetAlgoKnobAllocator, or None.
@@ -297,8 +356,25 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     ) -> "Handle":
         from .handle import NcclEpHandle
 
+        options = self._nccl_options()
+        if options.eager_recv:
+            import torch
+
+            if torch.cuda.is_current_stream_capturing():
+                raise MoEEpConfigError("eager_recv does not support CUDA graph capture")
+        if options.num_topk and params.topk_ids.shape[1] > options.num_topk:
+            raise MoEEpConfigError(
+                "handle top-k exceeds FleetAlgoKnobNcclEpConfig.num_topk"
+            )
+        if options.meta_exchange_policy == "require_fused" and any(
+            isinstance(knob, HandleAlgoKnobNumReceivedTokens) for knob in algo_knobs
+        ):
+            raise MoEEpConfigError(
+                "require_fused metadata does not support received-token counters"
+            )
+        handle = NcclEpHandle(self, params, algo_knobs)
         self._any_handle_created = True
-        return NcclEpHandle(self, params, algo_knobs)
+        return handle
 
     # ------------------------------------------------------- fault tolerance
 
@@ -427,9 +503,23 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         _, host = self._ft_bufs()
         import torch
 
+        self._wait_mask_update()
         host.copy_(torch.tensor(self._normalize_mask(mask), dtype=torch.int32))
-        mask_ffi().mask_update(self._group, host.data_ptr(), self._current_stream())
+        stream = self._current_stream()
+        mask_ffi().mask_update(self._group, host.data_ptr(), stream)
+        event = self._hot_cache.get("ft_update_done")
+        if event is None:
+            event = torch.cuda.Event()
+            self._hot_cache["ft_update_done"] = event
+        event.record(torch.cuda.ExternalStream(stream))
         self._ft_epoch += 1
+
+    def _wait_mask_update(self) -> None:
+        # MaskUpdate copies asynchronously from the cached pinned host buffer.
+        # Finish that copy before overwriting or releasing its storage.
+        event = self._hot_cache.get("ft_update_done")
+        if event is not None:
+            event.synchronize()
 
     def clear_faults(self, *, readmit: bool = False) -> None:
         self._require_ft("clear_faults")
@@ -470,6 +560,7 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         algo_knobs: Sequence[AlgoKnob] = (),
     ) -> None:
         """Re-create the EP group over a fresh communicator (grow/shrink)."""
+        self._wait_mask_update()
         if not self._destroyed:
             self._group.destroy()
         self._fleet_knobs = (
@@ -482,11 +573,13 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         # recv buffers / counters / FFI descriptors are rebuilt at the new sizes.
         self._hot_cache.clear()
         self._group = self._nccl_ep.Group.create(self._comm, self._build_group_config())
+        self._any_handle_created = False
         self._destroyed = False
 
     def destroy(self) -> None:
         if self._destroyed:
             return
+        self._wait_mask_update()
         self._group.destroy()
         self._destroyed = True
 

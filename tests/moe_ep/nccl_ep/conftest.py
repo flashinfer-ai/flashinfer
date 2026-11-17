@@ -197,5 +197,7 @@ def bypass_build_checks():
             nccl_fleet, "validate_bootstrap_world_size", return_value=None
         ),
         mock.patch.object(nccl_fleet, "_resolve_comm", return_value=object()),
+        mock.patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        mock.patch.object(nccl_fleet.NcclEpFleet, "_current_stream", return_value=0),
     ):
         yield
