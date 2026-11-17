@@ -104,7 +104,8 @@ from .prepare import (
 )
 from .prepare import _TRTLLM_PERMUTE_CACHE, _check_sm80_nvfp4_operands, _trtllm_fc1_rows
 from .prepare import cutlass_nvfp4_sm80_weights, trtllm_nvfp4_sm80_weights
-from .trtllm_gen_routing import trtllm_gen_routing
+from .trtllm_gen_routing import _check_trtllm_gen_routing_supported, _max_num_ctas_in_batch_dim
+from .trtllm_gen_routing import get_trtllm_gen_routing_module
 from ..utils import (
     check_shape_dtype_device,
     device_support_pdl,
@@ -7805,14 +7806,24 @@ def _trtllm_routing_sm80(
     routed_scaling_factor, norm_topk_prob, enable_pdl, num_fused_shared_experts=0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
     """TRT-LLM routing over all experts: global ids (other ranks' dropped by the CUTLASS kernels),
-    BF16 weights, fused shared experts last."""
-    routing = trtllm_gen_routing(
-        routing_logits, routing_bias, RoutingMethodType(routing_method_type), top_k,
-        num_fused_shared_experts=num_fused_shared_experts, norm_topk_prob=norm_topk_prob,
-        n_group=n_group or 0, topk_group=topk_group or 0, enable_pdl=enable_pdl,
-        routed_scaling_factor=1.0 if routed_scaling_factor is None else routed_scaling_factor,
+    BF16 weights, fused shared experts last. As ``trtllm_gen_routing``, but one-token tiles make
+    each (token, k)'s permuted slot its own CTA tile, so one gather gives its expert."""
+    method = RoutingMethodType(routing_method_type)
+    _check_trtllm_gen_routing_supported(routing_logits, routing_bias, method, top_k)
+    device, (tokens, experts) = routing_logits.device, routing_logits.shape
+    k, all_experts = top_k + num_fused_shared_experts, experts + num_fused_shared_experts
+    ctas = _max_num_ctas_in_batch_dim(tokens, k, all_experts, 1)
+    i32 = functools.partial(torch.empty, dtype=torch.int32, device=device)
+    slots, expert_of_slot = i32(tokens * k), i32(ctas)
+    weights = torch.empty((tokens, k), dtype=torch.bfloat16, device=device)
+    get_trtllm_gen_routing_module().trtllm_gen_routing(
+        routing_logits, routing_bias, i32(tokens * k), weights, i32(max(2 * all_experts, 512)),
+        i32(1), slots, i32(ctas), expert_of_slot, i32(ctas), i32(1), top_k,
+        num_fused_shared_experts, n_group or 0, topk_group or 0, 0, experts,
+        1.0 if routed_scaling_factor is None else float(routed_scaling_factor), 1, int(method),
+        norm_topk_prob, device_support_pdl(device) if enable_pdl is None else enable_pdl,
     )  # fmt: skip
-    return routing.topk_ids, routing.topk_weights
+    return torch.gather(expert_of_slot, 0, slots).view(tokens, k), weights
 
 
 def _trtllm_fp4_routed_moe_sm80(
