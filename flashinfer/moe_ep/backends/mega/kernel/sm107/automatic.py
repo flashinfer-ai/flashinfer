@@ -224,8 +224,12 @@ def ep_tuning_contract(backend, fleet_params):
         "gate_up_clamp": cfg.gate_up_clamp,
         "situ_beta": cfg.situ_beta,
         "situ_linear_beta": cfg.situ_linear_beta,
-        "use_tanh_sigmoid": cfg.use_tanh_sigmoid,
-        "epilogue_warpgroups": cfg.epilogue_warpgroups,
+        **({"use_tanh_sigmoid": True} if cfg.use_tanh_sigmoid else {}),
+        **(
+            {"epilogue_warpgroups": cfg.epilogue_warpgroups}
+            if cfg.epilogue_warpgroups != 1
+            else {}
+        ),
         **(
             {"shared_expert": dataclasses.asdict(cfg.shared_expert)}
             if cfg.shared_expert is not None

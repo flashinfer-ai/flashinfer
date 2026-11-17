@@ -17,6 +17,7 @@ from .....core.tuning_state import AutoTuningState
 from .....core.validation.common import MoEEpConfigError
 from .forward_tuning import ForwardExecution
 from .automatic import prepared_for_serving, record_prepared
+from .shared_expert import Sm107SharedExpertWeights
 
 if TYPE_CHECKING:
     from .....config import FleetParams
@@ -347,7 +348,7 @@ class _VariantProtocol:
         self,
         backend: RubinVariantBackend,
         owner: VariantWorkspace,
-        weights: TransformedMegaWeights,
+        weights: TransformedMegaWeights | Sm107SharedExpertWeights,
         output: torch.Tensor | None,
         *,
         candidates: dict[str, list[dict]] | None = None,
@@ -378,7 +379,7 @@ class _VariantProtocol:
             shared_weights=getattr(self.weights, "shared", None),
         )
         # Native compatibility covers numerical settings, SM budget and environment.
-        if getattr(self.weights, "shared", None) is not None:
+        if isinstance(self.weights, Sm107SharedExpertWeights):
             owner.workspace.bind_shared_weights(self.weights.shared)
         native = RubinTuningProtocol(
             self.output,
@@ -562,7 +563,7 @@ class _VariantProtocol:
                     output=self.output,
                     shared_weights=getattr(self.weights, "shared", None),
                 )
-                if getattr(self.weights, "shared", None) is not None:
+                if isinstance(self.weights, Sm107SharedExpertWeights):
                     workspace.bind_shared_weights(self.weights.shared)
                 kernel.stage_inputs(
                     self.tensors, workspace, quantize_input=owner.quantize_input
