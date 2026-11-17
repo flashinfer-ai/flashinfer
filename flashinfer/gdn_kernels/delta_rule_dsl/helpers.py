@@ -1,7 +1,6 @@
 import contextlib
 import ctypes
 import functools
-import warnings
 from dataclasses import dataclass
 
 import torch
@@ -422,36 +421,31 @@ _NSMID_SRC = b"""extern "C" __global__ void nsmid_probe(unsigned int* out) {
 """
 
 
-# Slots used when the %nsmid probe fails: well above any GPU's SM count today
-# (the largest is 188), at 128 B per slot (64 KB per device). Under MPS,
-# multi_processor_count can be below the %smid bound, so it is not a safe
-# fallback by itself.
-_NSMID_FALLBACK_SLOTS = 512
-
-
 @functools.cache
+def _cached_nsmid_probe(device: torch.device) -> tuple[int, Exception | None]:
+    # Caches a failure too, so a broken probe is not recompiled on every call.
+    try:
+        return probe_device_nsmid(device), None
+    except Exception as e:  # noqa: BLE001 - re-raised by get_device_nsmid
+        return 0, e
+
+
 def get_device_nsmid(device: torch.device) -> int:
     """Upper bound (exclusive) on ``%smid``, read on the device.
 
     Under CUDA MPS with a reduced thread share, ``multi_processor_count`` shrinks
     but ``%smid`` still spans the physical SM ids, which ``%nsmid`` bounds.
-    If the probe fails, falls back to ``max(multi_processor_count,
-    _NSMID_FALLBACK_SLOTS)`` and warns once per device. The fallback is cached,
-    so a failed probe is not recompiled on every call, and it is never below
-    the SM count, so prefill cannot write past the workspace.
+    No host-side value is a safe substitute (``%nsmid`` may exceed the SM count
+    and SM ids need not be contiguous), so a failed probe raises before prefill
+    launches rather than sizing the workspace from a guess.
     """
-    try:
-        return probe_device_nsmid(device)
-    except Exception as e:  # noqa: BLE001 - any probe failure takes the fallback
-        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        slots = max(sm_count, _NSMID_FALLBACK_SLOTS)
-        warnings.warn(
-            f"%nsmid probe failed on {device} ({e}); sizing the GDN prefill "
-            f"tensor-map workspace for {slots} SM ids instead.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return slots
+    nsmid, error = _cached_nsmid_probe(device)
+    if error is not None:
+        raise RuntimeError(
+            f"%nsmid probe failed on {device}; cannot size the GDN prefill "
+            "tensor-map workspace safely"
+        ) from error
+    return nsmid
 
 
 def probe_device_nsmid(device: torch.device) -> int:

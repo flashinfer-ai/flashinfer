@@ -1,11 +1,9 @@
 """GDN prefill tensor-map workspace: %nsmid probe under CUDA graph capture (#9484).
 
-The workspace holds one 128-byte tensor map per ``%smid``, so it is sized by
+The workspace holds one 128-byte tail tensor map per ``%smid``, so it is sized by
 ``%nsmid``, which a device probe reads. The first prefill call in a process may
 be made under ``torch.cuda.graph(...)``; the probe must not break that capture.
 """
-
-import warnings
 
 import pytest
 import torch
@@ -16,15 +14,38 @@ from flashinfer.gdn_kernels.delta_rule_dsl.helpers import (
     probe_device_nsmid,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
-from flashinfer.utils import is_sm90a_supported, is_sm12x_supported
+from flashinfer.utils import _cache_buf, is_sm90a_supported, is_sm12x_supported
 
-from .reference_delta_rule import exclusive_cumsum
+from .reference_delta_rule import blockwise_delta_rule, exclusive_cumsum
+
+# Tail descriptors are written only for a non-final sequence whose length is not
+# a multiple of the 64-token tile, so these lengths exercise the workspace.
+SEQ_LENS = [93, 130, 512]
+REPLAYS = 3
 
 
 def _skip_unless_nsmid_backend():
     device = torch.device("cuda")
     if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
         pytest.skip("GDN prefill workspace sized by %nsmid on SM90 / SM12x only")
+
+
+def _tensormap_workspace(device, use_cp):
+    """The cached workspace that this wrapper (arch, CP or not) indexes by %smid."""
+    if not use_cp:
+        name = "gdn_prefill_tensormaps"
+    elif is_sm12x_supported(device):
+        name = "gdn_cp_sm120_prefill_tensormaps"
+    else:
+        name = "gdn_cp_prefill_tensormaps"
+    index = torch.cuda.current_device() if device.index is None else device.index
+    bufs = [
+        buf
+        for (key, _), buf in _cache_buf.items()
+        if key == name and buf.device.index == index
+    ]
+    assert len(bufs) == 1, f"expected one {name} buffer on cuda:{index}"
+    return bufs[0]
 
 
 def test_nsmid_probe_under_capture():
@@ -47,27 +68,25 @@ def test_nsmid_probe_under_capture():
     assert torch.equal(x, torch.full_like(x, 2))
 
 
-def test_probe_failure_fallback_is_not_undersized(monkeypatch):
-    """A failed probe must not size the workspace below the SM count (#9484)."""
+def test_probe_failure_raises_once_compiled(monkeypatch):
+    """A failed probe raises instead of sizing the workspace from a guess (#9484)."""
     _skip_unless_nsmid_backend()
     device = torch.device("cuda")
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    calls = []
 
     def broken_probe(_device):
+        calls.append(_device)
         raise RuntimeError("simulated probe failure")
 
     monkeypatch.setattr(helpers, "probe_device_nsmid", broken_probe)
-    get_device_nsmid.cache_clear()
+    helpers._cached_nsmid_probe.cache_clear()
     try:
-        with pytest.warns(RuntimeWarning, match="probe failed"):
-            slots = get_device_nsmid(device)
-        assert slots >= max(sm_count, helpers._NSMID_FALLBACK_SLOTS)
-        # Cached: the failed probe is not retried (or re-warned) on later calls.
-        with warnings.catch_warnings():
-            warnings.simplefilter("error")
-            assert get_device_nsmid(device) == slots
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="cannot size the GDN prefill"):
+                get_device_nsmid(device)
+        assert len(calls) == 1  # the failure is cached, not re-probed per call
     finally:
-        get_device_nsmid.cache_clear()
+        helpers._cached_nsmid_probe.cache_clear()
 
 
 @pytest.mark.parametrize("use_cp", [False, True])
@@ -78,18 +97,23 @@ def test_first_prefill_call_under_capture(qkv_factory, dtype, use_cp):
     device = torch.device("cuda")
     torch.manual_seed(0)
 
-    seq_lens = [64, 128, 512]
     num_q_heads, num_k_heads, num_v_heads, head_size = 16, 16, 32, 128
-    total, num_seqs = sum(seq_lens), len(seq_lens)
+    total, num_seqs = sum(SEQ_LENS), len(SEQ_LENS)
     num_heads = max(num_q_heads, num_v_heads)
-    with device:
-        q, k, v = qkv_factory(
-            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
-        )
-        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
-        cu_seq_lens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
-        alpha = torch.rand(total, num_heads)
-        beta = torch.rand(total, num_heads)
+    scale = head_size**-0.5
+
+    def make_inputs():
+        with device:
+            q, k, v = qkv_factory(
+                SEQ_LENS, num_q_heads, num_k_heads, num_v_heads, head_size, dtype
+            )
+            k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+            return q, k, v, torch.rand(total, num_heads), torch.rand(total, num_heads)
+
+    q, k, v, alpha, beta = make_inputs()
+    cu_seq_lens = torch.tensor(
+        exclusive_cumsum(SEQ_LENS), dtype=torch.int64, device=device
+    )
 
     def run(o, state):
         chunk_gated_delta_rule(
@@ -98,7 +122,7 @@ def test_first_prefill_call_under_capture(qkv_factory, dtype, use_cp):
             v,
             alpha,
             beta,
-            head_size**-0.5,
+            scale,
             None,
             True,
             cu_seq_lens,
@@ -106,7 +130,7 @@ def test_first_prefill_call_under_capture(qkv_factory, dtype, use_cp):
             output=o,
             output_state=state,
             use_cp=use_cp,
-            max_seqlen=max(seq_lens),
+            max_seqlen=max(SEQ_LENS),
         )
 
     def outputs():
@@ -119,22 +143,48 @@ def test_first_prefill_call_under_capture(qkv_factory, dtype, use_cp):
         return o, state
 
     graph_o, graph_state = outputs()
-    get_device_nsmid.cache_clear()
+    helpers._cached_nsmid_probe.cache_clear()
     graph = torch.cuda.CUDAGraph()
-    # A probe failure would take the multi_processor_count fallback and still
-    # pass the checks below without MPS, so the fallback warning fails the test.
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RuntimeWarning)
-        with torch.cuda.graph(graph):
-            run(graph_o, graph_state)
+    with torch.cuda.graph(graph):
+        run(graph_o, graph_state)
     assert get_device_nsmid(device) == probe_device_nsmid(device)
     assert get_device_nsmid(device) >= (
         torch.cuda.get_device_properties(device).multi_processor_count
     )
 
-    graph.replay()
-    eager_o, eager_state = outputs()
-    run(eager_o, eager_state)
-    torch.cuda.synchronize()
-    assert torch.equal(graph_o, eager_o)
-    assert torch.equal(graph_state, eager_state)
+    if dtype == torch.bfloat16:
+        tol_o, tol_state = dict(atol=1e-2, rtol=1e-2), dict(atol=5e-3, rtol=1e-3)
+    else:
+        tol_o, tol_state = dict(atol=2e-3, rtol=1e-3), dict(atol=1e-3, rtol=1e-4)
+
+    workspace = _tensormap_workspace(device, use_cp)
+    for replay in range(REPLAYS):
+        if replay:  # the graph must follow new input contents
+            for dst, src in zip((q, k, v, alpha, beta), make_inputs(), strict=True):
+                dst.copy_(src)
+        graph_o.fill_(float("nan"))
+        graph_state.fill_(float("nan"))
+        graph.replay()
+
+        eager_o, eager_state = outputs()
+        workspace.zero_()
+        run(eager_o, eager_state)
+        torch.cuda.synchronize()
+        assert workspace.any(), "no tail tensor map was written"
+        assert torch.equal(graph_o, eager_o)
+        assert torch.equal(graph_state, eager_state)
+
+        ref_o, ref_state = blockwise_delta_rule(
+            q.float(),
+            k.float(),
+            v.float(),
+            SEQ_LENS,
+            scale_factor=scale,
+            alpha=alpha,
+            beta=beta,
+            state_dtype=torch.float32,
+        )
+        torch.testing.assert_close(eager_o, ref_o.to(dtype), **tol_o)
+        torch.testing.assert_close(
+            eager_state.transpose(-1, -2), ref_state.float(), **tol_state
+        )
