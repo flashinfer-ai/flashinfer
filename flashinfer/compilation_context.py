@@ -19,10 +19,16 @@ Global compilation context management for FlashInfer.
 
 import functools
 import os
+import re
 import torch
 import logging
 
 logger = logging.getLogger(__name__)
+
+# One FLASHINFER_CUDA_ARCH_LIST entry: "<major>.<minor>" plus an optional
+# one-letter nvcc suffix, e.g. "8.0", "9.0a" or "12.0f".
+_CUDA_ARCH_ENTRY_RE = re.compile(r"(\d+)\.(\d+)([a-z]?)")
+_CUDA_ARCH_LIST_EXAMPLE = "8.0 9.0a 12.0f"
 
 
 @functools.cache
@@ -109,20 +115,46 @@ class CompilationContext:
             return (major, str(minor) + "a")
         return (major, str(minor))
 
+    @classmethod
+    def _parse_cuda_arch_list(cls, arch_list: str) -> set[tuple[int, str]]:
+        """Parse ``FLASHINFER_CUDA_ARCH_LIST`` into (major, minor_str) tuples.
+
+        Entries are separated by whitespace; leading, trailing and repeated
+        whitespace is ignored. Each entry is ``<major>.<minor>`` with an
+        optional one-letter suffix, for example ``"8.0 9.0a 12.0f"``. An entry
+        that already carries a suffix is respected as-is; otherwise it is
+        normalised. Anything else raises a ``ValueError`` that names the
+        variable and the offending entry.
+        """
+        entries = arch_list.split()
+        if not entries:
+            raise ValueError(
+                "FLASHINFER_CUDA_ARCH_LIST is set but empty. Unset it to detect "
+                f"the visible GPUs, or use a value such as {_CUDA_ARCH_LIST_EXAMPLE!r}."
+            )
+        archs = set()
+        for entry in entries:
+            match = _CUDA_ARCH_ENTRY_RE.fullmatch(entry)
+            if match is None:
+                raise ValueError(
+                    f"Invalid entry {entry!r} in FLASHINFER_CUDA_ARCH_LIST="
+                    f"{arch_list!r}. Expected whitespace-separated "
+                    "'<major>.<minor>' entries with an optional one-letter "
+                    f"suffix, such as {_CUDA_ARCH_LIST_EXAMPLE!r}."
+                )
+            major, minor, suffix = match.groups()
+            if suffix:
+                archs.add((int(major), minor + suffix))
+            else:
+                archs.add(cls._normalize_cuda_arch(int(major), int(minor)))
+        return archs
+
     def __init__(self):
         self.TARGET_CUDA_ARCHS = set()
         if "FLASHINFER_CUDA_ARCH_LIST" in os.environ:
-            for arch in os.environ["FLASHINFER_CUDA_ARCH_LIST"].split(" "):
-                major, minor = arch.split(".")
-                major = int(major)
-                # If the user already provided a suffix (e.g. "12.0f"),
-                # respect it as-is; otherwise normalise.
-                if minor[-1].isalpha():
-                    self.TARGET_CUDA_ARCHS.add((major, minor))
-                else:
-                    self.TARGET_CUDA_ARCHS.add(
-                        self._normalize_cuda_arch(major, int(minor))
-                    )
+            self.TARGET_CUDA_ARCHS.update(
+                self._parse_cuda_arch_list(os.environ["FLASHINFER_CUDA_ARCH_LIST"])
+            )
         else:
             try:
                 for device in range(torch.cuda.device_count()):
