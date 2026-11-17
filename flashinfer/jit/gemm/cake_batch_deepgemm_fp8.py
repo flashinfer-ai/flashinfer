@@ -9,7 +9,10 @@ symbol and the id of its positional argument plan in ``ARG_PLANS``.  ``MODULES``
 names one JIT module per (program, architecture).  ``SERVING_PROGRAMS`` maps a
 packed-scale serving configuration to its program (a key qualified by an
 architecture, ``"sm_103a:<configuration>"`` or ``"sm_107a:<configuration>"``,
-takes precedence on that architecture).  ``DISPATCH_TABLES`` holds, per
+takes precedence on that architecture).  ``DOMAIN_SERVING_PROGRAMS`` maps an
+sm_107a serving configuration to its locality-domain twin and
+``DOMAIN_SERVING_CELLS`` lists, per SM count, the (die class, expected_m class)
+cells routed to it.  ``DISPATCH_TABLES`` holds, per
 architecture and SM count, the ordered first-match route chain of the Cake
 dispatcher, driven by the route table at the end of this module (``_ROUTES`` read
 by ``select``): every predicate, launch grid, argument binding and workspace shape
@@ -158,6 +161,25 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "num_groups"],
         ["parameter", "M"],
         ["parameter", "num_n_tiles"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "plan8": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C_tma"],
+        ["tma_buffer", "SFA_packed"],
+        ["tma_buffer", "SFB_packed"],
+        ["buffer", "masked_m"],
+        ["parameter", "num_groups"],
+        ["parameter", "shape_m"],
+        ["parameter", "N"],
+        ["parameter", "K"],
+        ["parameter", "g_cut"],
+        ["buffer", "counters0"],
+        ["buffer", "counters1"],
+        ["param_array", "sm_table"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -1646,6 +1668,42 @@ SERVING_PROGRAMS: dict[str, str] = {
     "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_eeb77812570514381d69",
     "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
     "sm_107a:n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_afcc5247e82d569b4b01",
+}
+
+# The locality-domain twins of sm_107a serving programs: one launch over both dies
+# of a dual-die GPU with B homed by groups (bitwise equal to the whole program).
+DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
+    "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ab6c89e07571f01aee29",
+    "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d",
+    "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_c576a29e5579b897f827",
+    "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_b441a90659c1399a88eb",
+    "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_0166ddf470f84c0cfe4f",
+}
+# The cells routed to a twin: SM count -> (die class, expected_m class) -> the
+# serving keys of DOMAIN_SERVING_PROGRAMS.  Die class: "even" when the two dies'
+# SM counts differ by at most 4, else "uneven"; expected_m class: "em<=1", "em2-7",
+# "em8-15" or "em16+".  Every other call runs the whole program.
+DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
+    212: {
+        ("even", "em8-15"): (
+            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
+            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
+        ),
+        ("uneven", "em8-15"): (
+            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
+            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
+        ),
+        ("even", "em<=1"): (
+            "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",
+        ),
+        ("uneven", "em<=1"): (
+            "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",
+        ),
+    },
 }
 
 ARCH_NVCC_FLAGS = {
