@@ -471,6 +471,8 @@ class SplitKVFixup:
         tidx, _, _ = cute.arch.thread_idx()
         bx, grp0, _ = cute.arch.block_idx()
         _, grid_y, _ = cute.arch.grid_dim()
+        # the next kernel of the stream may be scheduled now (a programmatic dependent waits for this grid before reading)
+        cute.arch.griddepcontrol_launch_dependents()
         V = wide_vec(D)
         thr_per_row = D // V
         rows_per_block = THREADS // thr_per_row

@@ -723,5 +723,6 @@ class BatchInvariantAttention:
             out,
             self._config,
             ragged=self.kind == "ragged",
+            enable_pdl=enable_pdl,
         )
         return out

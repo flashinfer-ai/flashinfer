@@ -641,8 +641,10 @@ def _run_attention_validated(
     out: torch.Tensor,
     config: AttnConfig,
     ragged: bool,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale."""
+    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale. ``enable_pdl``: launch the
+    attention kernel as a programmatic dependent of the preceding kernel (None: the device's default, ``device_support_pdl``)."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -682,8 +684,13 @@ def _run_attention_validated(
 
         from .swaps.operands import arch_smem_cap
 
+        from ...utils import device_support_pdl
+
+        pdl = device_support_pdl(q.device) if enable_pdl is None else bool(enable_pdl)
         # the ring depth follows the execution device's shared memory: part of the kernel's identity, in-process and on disk
-        kernel = get_compiled_swaps(D, g, page, n_pad, ragged, arch_smem_cap(q.device))
+        kernel = get_compiled_swaps(
+            D, g, page, n_pad, ragged, arch_smem_cap(q.device), pdl
+        )
         kernel(
             q_view,
             kv_k,
