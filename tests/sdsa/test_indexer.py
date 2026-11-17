@@ -2,7 +2,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 
 """The SDSA (Simplified DSA) indexer kernels and quantize_write_index_qk_nvfp4
-against exact references over random paged BF16 or NVFP4 keys."""
+against exact references over random paged BF16, FP8 or NVFP4 keys."""
 
 from functools import partial
 
@@ -25,13 +25,19 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 sm10x_only = pytest.mark.skipif(not SM10X, reason="requires SM10x")
 
 
-def rows_of(nvfp4: bool, rows: int) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Random BF16 rows of small integers, or NVFP4 ones, times scales in
-    {1/8, ..., 2}: dot products are exact in FP32 either way."""
-    if not nvfp4:
+def rows_of(fmt: str, rows: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Random BF16 rows of small integers times scales in {1/8, ..., 2}, FP8
+    E4M3 ones times {1, 2}, or NVFP4 ones: dot products are exact in FP32 either
+    way. FP8 products are integers, so their sums (far below 2**14) also stay
+    exact in an accumulator of about 14 bits, as Hopper's FP8 MMA keeps."""
+    if fmt == "bf16":
         scales = 2.0 ** torch.randint(-3, 2, (rows, 128), device="cuda")
         values = torch.randint(-8, 9, (rows, 128), device="cuda") * scales
         return values.bfloat16(), None
+    if fmt == "fp8":
+        scales = 2.0 ** torch.randint(0, 2, (rows, 128), device="cuda")
+        values = torch.randint(-8, 9, (rows, 128), device="cuda") * scales
+        return values.to(torch.float8_e4m3fn), None
     scales = 2.0 ** torch.randint(-3, 2, (rows, 8), device="cuda")
     values = torch.randint(256, (rows, 64), device="cuda").byte()
     return values, scales.to(torch.float8_e4m3fn)
@@ -81,7 +87,17 @@ def dequantize(values: torch.Tensor, scales: torch.Tensor | None) -> torch.Tenso
     ],
 )
 @pytest.mark.parametrize("rows", [1, 3, 8])
-@pytest.mark.parametrize("keys", ["bf16", "bf16_triton", "nvfp4", "nvfp4_packed"])
+@pytest.mark.parametrize(
+    "keys",
+    [
+        "bf16",
+        "bf16_triton",
+        "fp8",
+        "fp8_scaled",
+        "nvfp4",
+        "nvfp4_packed",
+    ],
+)
 @torch.inference_mode()
 def test_indexer_scores_match_reference_and_replay(
     lengths, rows, keys, monkeypatch
@@ -89,18 +105,23 @@ def test_indexer_scores_match_reference_and_replay(
     """Keys on shuffled pages; table entries past a length would fault if read,
     and scores past it stay unwritten. A replay sees new lengths and tables.
     nvfp4_packed: keys and scales are views of one cache, each page's 64 keys
-    then their scales."""
+    then their scales. fp8 *_scaled: the scores are times a power-of-two
+    score_scale, given a new value before the replay."""
     if keys.startswith("nvfp4") and not SM10X:
         pytest.skip("Off SM10x, keys are BF16 (scored by Triton)")
-    if keys == "bf16_triton":  # the path off SM10x, also on SM10x
+    if keys.startswith("fp8") and not SM10X:
+        pytest.skip("FP8 needs SM10x")
+    if "_triton" in keys:  # the path off SM10x, also on SM10x
         monkeypatch.setattr(indexer, "get_compute_capability", lambda _: (9, 0))
-        keys = "bf16"
+    scaled = keys.endswith("_scaled")
+    fmt = keys.split("_")[0]
+    keys = "nvfp4_packed" if keys == "nvfp4_packed" else fmt
     torch.manual_seed(rows)
-    nvfp4 = keys != "bf16"
+    nvfp4 = fmt == "nvfp4"
     batch, capacity = len(lengths), max(lengths) + 300
     width = -(-capacity // 64)
     pages = batch * width
-    values, scales = rows_of(nvfp4, 64 * pages)
+    values, scales = rows_of(fmt, 64 * pages)
     key_cache, key_scales = values.view(pages, 64, -1), None
     if nvfp4:
         key_scales = scales.view(pages, 64, 8)
@@ -113,8 +134,11 @@ def test_indexer_scores_match_reference_and_replay(
     table = torch.empty(batch, width, dtype=torch.int32, device="cuda")
     context = torch.empty(batch, dtype=torch.int32, device="cuda")
     requests = torch.arange(batch, dtype=torch.int32, device="cuda").flip(0)
-    query, query_scales = rows_of(nvfp4, batch * rows)
+    query, query_scales = rows_of(fmt, batch * rows)
     scores = torch.empty(batch * rows, capacity, device="cuda")
+    score_scale = torch.full((1,), 0.25, device="cuda") if scaled else None
+    # The reference reads FP8 keys as FP64 (not every indexing op takes FP8).
+    reference_keys = key_cache.double() if fmt == "fp8" else key_cache
 
     def prepare(lengths: list[int]) -> None:
         context.copy_(torch.tensor(lengths, dtype=torch.int32))
@@ -131,13 +155,15 @@ def test_indexer_scores_match_reference_and_replay(
             if not length:
                 continue
             page = table[int(requests[group]), : -(-length // 64)].long()
-            key = key_cache[page].flatten(0, 1)[:length]
+            key = reference_keys[page].flatten(0, 1)[:length]
             key_scale = query_scale = None
             if nvfp4:
                 key_scale = key_scales[page].flatten(0, 1)[:length]
                 query_scale = query_scales[mine]
             expected = dequantize(query[mine], query_scale)
             expected = expected @ dequantize(key, key_scale).T
+            if scaled:
+                expected *= float(score_scale)
             torch.testing.assert_close(
                 scores[mine, :length], expected.float(), rtol=0, atol=0
             )
@@ -152,6 +178,7 @@ def test_indexer_scores_match_reference_and_replay(
             scores=scores,
             query_scales=query_scales,
             key_scales=key_scales,
+            score_scale=score_scale,
         )
 
     prepare(list(lengths))
@@ -162,6 +189,8 @@ def test_indexer_scores_match_reference_and_replay(
         run()
     replayed = [max(n - 61, 0) for n in reversed(lengths)]
     prepare(replayed)
+    if scaled:  # read on the device: the replay sees it
+        score_scale.fill_(8.0)
     graph.replay()
     check(replayed)
 
@@ -176,7 +205,7 @@ def test_indexer_scores_match_reference_and_replay(
         ((3, 128, 641), (16384, 16000, 12289)),
     ],
 )
-@pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("keys", ["bf16", "fp8", "fp8_scaled", "nvfp4"])
 @pytest.mark.parametrize("repair", [False, True])
 @pytest.mark.parametrize("top_k", [64, 512, 2048])
 @torch.inference_mode()
@@ -187,8 +216,11 @@ def test_indexer_threshold_select_matches_reference_and_replay(
     the tie slots), rows 5 mod 8 NaN. Counts are exact, and each written slot
     holds a distinct key of its class with its score (less the threshold). The
     repair reselects each row that misses at or below its Top-K cutoff, and
-    top_k_from_candidates then writes each row's Top-K keys."""
+    top_k_from_candidates then writes each row's Top-K keys. fp8_scaled: scores,
+    thresholds and stored pairs are in the units of a power-of-two score_scale,
+    given a new value before the replay."""
     torch.manual_seed(0)
+    scaled, keys = keys == "fp8_scaled", keys.removesuffix("_scaled")
     nvfp4, width = keys == "nvfp4", max(context_lens)
     capacity, blocks = max(width // 2, top_k - 1), -(-width // 64)
     tiles = [(r, s) for r, n in enumerate(query_lens) for s in range(0, n, 128)]
@@ -201,16 +233,19 @@ def test_indexer_threshold_select_matches_reference_and_replay(
     ends, rows = ends.flatten().cuda(), 128 * len(tiles)
     requests = torch.tensor([r for r, _ in tiles], dtype=torch.int32, device="cuda")
     pages = len(query_lens) * blocks
-    values, scales = rows_of(nvfp4, 64 * pages)
+    values, scales = rows_of(keys, 64 * pages)
     key_cache = values.view(pages, 64, -1)
     key_scales = scales.view(pages, 64, 8) if nvfp4 else None
     table = torch.randperm(pages, device="cuda").int().view(-1, blocks)
-    query, query_scales = rows_of(nvfp4, rows)
-    query[2::8] = 0
+    query, query_scales = rows_of(keys, rows)
+    query.view(torch.uint8)[2::8] = 0
     if nvfp4:
         query_scales.view(torch.uint8)[5::8] = 0x7F  # E4M3 NaN
+    elif keys == "fp8":
+        query.view(torch.uint8)[5::8] = 0x7F
     else:
         query[5::8] = torch.nan
+    score_scale = torch.full((1,), 0.125, device="cuda") if scaled else None
     thresholds, requested = torch.empty(2, rows, device="cuda")
     arrivals = torch.zeros(len(tiles), dtype=torch.int32, device="cuda")
     ranges = torch.empty(2, rows, dtype=torch.int32, device="cuda")
@@ -232,6 +267,7 @@ def test_indexer_threshold_select_matches_reference_and_replay(
             top_k=top_k,
             query_scales=query_scales,
             key_scales=key_scales,
+            score_scale=score_scale,
             **repairs,
         )
         if repair:
@@ -245,6 +281,8 @@ def test_indexer_threshold_select_matches_reference_and_replay(
             mine = slice(128 * tile, 128 * tile + 128)
             slot = table[request].long()[:, None] * 64 + torch.arange(64).cuda()
             scores[mine] = (queries[mine] @ keys[slot.flatten()[:width]].T).float()
+        if scaled:
+            scores *= float(score_scale)
         return scores, torch.arange(width, device="cuda") < ends[:, None]
 
     def check(scores: torch.Tensor, valid: torch.Tensor) -> None:
@@ -300,6 +338,8 @@ def test_indexer_threshold_select_matches_reference_and_replay(
     with torch.cuda.graph(graph):
         run()
     ends.copy_((ends - 9).clamp(min=0))
+    if scaled:
+        score_scale.fill_(4.0)
     scores, valid = reference()
     requested.copy_(scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values)
     graph.replay()
@@ -380,7 +420,7 @@ def test_top_k_from_candidates_rejects_bad_shapes() -> None:
 
 @sm10x_only
 @pytest.mark.parametrize("far", [False, True])
-@pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("keys", ["bf16", "fp8", "nvfp4"])
 @torch.inference_mode()
 def test_gather_key_sample_matches_reference(keys, far) -> None:
     """Slots below a request's sample end get the key, and its scales, at their
@@ -390,16 +430,19 @@ def test_gather_key_sample_matches_reference(keys, far) -> None:
     nvfp4, samples, run_keys, lengths = keys == "nvfp4", 3, 128, [1, 200, 4097, 8193]
     blocks = -(-max(lengths) // 64)
     pages = len(lengths) * blocks
-    values, scales = rows_of(nvfp4, 64 * pages)
+    values, scales = rows_of(keys, 64 * pages)
     key_cache, key_scales = values.view(pages, 64, -1), None
     table = torch.randperm(pages, device="cuda").int().view(-1, blocks)
     if nvfp4:
         key_scales = scales.view(pages, 64, 8)
+    # The reference copies keys as bytes (not every indexing op takes FP8).
+    key_bytes = key_cache.view(torch.uint8)
     if far:
         skip = 2**31 // (key_cache[0].numel() * key_cache.element_size())
-        key_cache = torch.cat(
-            (key_cache.new_zeros(skip, 64, key_cache.shape[2]), key_cache)
+        key_bytes = torch.cat(
+            (key_bytes.new_zeros(skip, *key_bytes.shape[1:]), key_bytes)
         )
+        key_cache = key_bytes.view(key_cache.dtype)
         if nvfp4:
             key_scales = torch.cat((key_scales.new_zeros(skip, 64, 8), key_scales))
         table += skip
@@ -407,18 +450,19 @@ def test_gather_key_sample_matches_reference(keys, far) -> None:
     offsets = torch.randint(run_keys, (capacity,), dtype=torch.uint8, device="cuda")
     ends = [length // run_keys * samples for length in lengths]
     shape = (len(ends), capacity)
-    sample_keys = torch.full((*shape, key_cache.shape[2]), 85, device="cuda")
-    sample_keys = sample_keys.to(key_cache.dtype)
+    sample_keys = torch.full((*shape, key_bytes.shape[2]), 85, device="cuda")
+    sample_keys = sample_keys.byte().view(key_cache.dtype)
     sample_scales = None
     if nvfp4:
         sample_scales = torch.full((*shape, 8), 85, dtype=torch.uint8, device="cuda")
         sample_scales = sample_scales.view(torch.float8_e4m3fn)
     expected = [t if t is None else t.clone() for t in (sample_keys, sample_scales)]
+    expected[0] = expected[0].view(torch.uint8)
     for request, end in enumerate(ends):
         key = torch.arange(end, device="cuda") // samples * run_keys
         key += offsets[:end].long()
         page = table[request, key // 64].long()
-        expected[0][request, :end] = key_cache[page, key % 64]
+        expected[0][request, :end] = key_bytes[page, key % 64]
         if nvfp4:
             expected[1][request, :end] = key_scales[page, key % 64]
     gather_key_sample(
@@ -429,7 +473,7 @@ def test_gather_key_sample_matches_reference(keys, far) -> None:
         key_scales=key_scales,
         sample_scales=sample_scales,
     )
-    assert torch.equal(sample_keys.view(torch.uint8), expected[0].view(torch.uint8))
+    assert torch.equal(sample_keys.view(torch.uint8), expected[0])
     if nvfp4:
         got = sample_scales.view(torch.uint8)
         assert torch.equal(got, expected[1].view(torch.uint8))
@@ -585,8 +629,66 @@ def test_indexer_scores_rejects_bad_shapes() -> None:
     run = indexer_scores
     with pytest.raises(ValueError, match="block table must cover"):
         run(query, key_cache, table[:, :1], context, requests=requests, scores=scores)
-    with pytest.raises(ValueError, match="both BF16 or both NVFP4"):
+    with pytest.raises(ValueError, match="both BF16, both FP8"):
         run(query.float(), key_cache, table, context, requests=requests, scores=scores)
+    fp8_query = torch.zeros(4, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    fp8_keys = torch.zeros(4, 64, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="both BF16, both FP8"):
+        run(fp8_query, key_cache, table, context, requests=requests, scores=scores)
+    with pytest.raises(ValueError, match="Keys must be"):
+        run(
+            fp8_query,
+            fp8_keys[..., :64],
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+        )
+    with pytest.raises(ValueError, match="BF16 and FP8 ones none"):
+        run(
+            fp8_query,
+            fp8_keys,
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            query_scales=torch.zeros(4, 8, dtype=torch.uint8, device="cuda"),
+            key_scales=torch.zeros(4, 64, 8, dtype=torch.uint8, device="cuda"),
+        )
+    one = torch.ones(1, device="cuda")
+    with pytest.raises(ValueError, match="applies only to FP8"):
+        run(
+            query,
+            key_cache,
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            score_scale=one,
+        )
+    with pytest.raises(ValueError, match="applies only to FP8"):
+        run(
+            torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
+            torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda"),
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            query_scales=torch.zeros(4, 8, dtype=torch.uint8, device="cuda"),
+            key_scales=torch.zeros(4, 64, 8, dtype=torch.uint8, device="cuda"),
+            score_scale=one,
+        )
+    for wrong in (one.repeat(2), one.double(), one.cpu()):
+        with pytest.raises(ValueError, match="score_scale must be a float32"):
+            run(
+                fp8_query,
+                fp8_keys,
+                table,
+                context,
+                requests=requests,
+                scores=scores,
+                score_scale=wrong,
+            )
     with pytest.raises(ValueError, match="need scales"):
         run(
             query.view(torch.uint8)[:, :64],
@@ -674,6 +776,19 @@ def test_indexer_threshold_select_rejects_bad_shapes() -> None:
             max_context=128,
             top_k=8,
         )
+    # BF16 scores are in real units already: a score scale is for FP8 only.
+    with pytest.raises(ValueError, match="applies only to FP8"):
+        run(
+            query,
+            key_cache,
+            ends,
+            requests,
+            table,
+            **outputs,
+            max_context=128,
+            top_k=8,
+            score_scale=torch.ones(1, device="cuda"),
+        )
     for wrong in (bad, dict(outputs, candidates=bad["candidates"])):
         with pytest.raises(ValueError, match="counters must be"):
             run(
@@ -713,6 +828,21 @@ def test_indexer_scores_off_sm10x_rejects_bad_layouts(
         )
     with pytest.raises(ValueError, match="contiguous rows"):  # every other length
         run(query, key_cache, table, context.repeat(2)[::2], scores=scores)
+    fp8_query = torch.zeros(4, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    fp8_keys = torch.zeros(4, 64, 128, dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="as does FP8"):
+        run(fp8_query, fp8_keys, table, context, scores=scores)
+    with pytest.raises(ValueError, match="NVFP4 needs SM10x"):
+        run(
+            torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
+            torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda"),
+            table,
+            context,
+            scores=scores,
+        )
+    one = torch.ones(1, device="cuda")
+    with pytest.raises(ValueError, match="applies only to FP8"):
+        run(query, key_cache, table, context, scores=scores, score_scale=one)
 
 
 @sm10x_only
@@ -766,6 +896,13 @@ def test_gather_key_sample_rejects_bad_shapes() -> None:
             run(**wrong)
     with pytest.raises(ValueError, match="dtypes"):  # uint8 scale bytes
         run(sample_scales=args["sample_scales"].view(torch.uint8))
+    fp8 = dict(
+        key_cache=zeros(4, 64, 128, dtype=torch.float8_e4m3fn),
+        sample_keys=zeros(2, 128, 128, dtype=torch.float8_e4m3fn),
+    )
+    run(**fp8, key_scales=None, sample_scales=None)  # FP8 keys have no scales
+    with pytest.raises(ValueError, match="Only NVFP4"):
+        run(**fp8)
     with pytest.raises(ValueError, match="Mismatched"):  # BF16 keys, 32 a page
         run(
             key_cache=zeros(4, 32, 128, dtype=torch.bfloat16),

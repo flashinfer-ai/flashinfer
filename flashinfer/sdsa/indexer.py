@@ -34,6 +34,7 @@ def indexer_scores(
     scores: torch.Tensor,
     query_scales: Optional[torch.Tensor] = None,
     key_scales: Optional[torch.Tensor] = None,
+    score_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute FP32 scores of query rows against their request's paged keys.
 
@@ -44,17 +45,17 @@ def indexer_scores(
     It runs as one launch without host synchronization, so it can be captured in a
     CUDA graph (run it once before capture to compile it). Queries, keys, pages and lengths can change between replays.
     On SM10x it runs a CuTe DSL kernel; on other GPUs (e.g. Hopper) it scores BF16
-    keys with a Triton kernel, and NVFP4 keys are not supported.
+    keys with a Triton kernel, and FP8 and NVFP4 keys are not supported.
 
     Parameters
     ----------
     query : torch.Tensor
-        BF16 ``[rows, 128]``, or NVFP4 uint8 ``[rows, 64]`` (E2M1 values, two to
-        a byte).
+        BF16 or FP8 (float8_e4m3fn) ``[rows, 128]``, or NVFP4 uint8 ``[rows, 64]``
+        (E2M1 values, two to a byte). The keys have the same format.
     key_cache : torch.Tensor
-        BF16 ``[pages, 64, 128]``, or NVFP4 uint8 ``[pages, 64, 64]``. Pages can
-        be any multiple of 16 bytes apart, such as views of one cache that holds
-        each page's keys and then their scales.
+        BF16 or FP8 ``[pages, 64, 128]``, or NVFP4 uint8 ``[pages, 64, 64]``.
+        Pages can be any multiple of 16 bytes apart, such as views of one cache
+        that holds each page's keys and then their scales.
     block_table : torch.Tensor
         int32 ``[requests, blocks]``: each request's pages of 64 keys. Only pages
         below a group's length are read.
@@ -74,6 +75,11 @@ def indexer_scores(
     key_scales : torch.Tensor, optional
         E4M3 ``[pages, 64, 8]`` for NVFP4 keys, paged like the keys. Pages can
         be any multiple of 8 bytes apart. None for BF16.
+    score_scale : torch.Tensor, optional
+        FP8 only: float32, one element on the queries' device, the product of
+        the query and key per-tensor scales. Each score is the FP32 dot product
+        times it, so FP8 scores are in the units of BF16 ones. None means 1. It
+        is read on the device, so a CUDA graph replay sees a new value.
     """
     from .shapes import DIM, MAX_ROWS, PAGE
 
@@ -93,8 +99,9 @@ def indexer_scores(
         # BF16 keys: one program per request group and 64-key page.
         if key_scales is not None or {query.dtype, key_cache.dtype} != {torch.bfloat16}:
             raise ValueError(
-                "Off SM10x, queries and keys must be BF16 (NVFP4 needs SM10x)"
+                "Off SM10x, queries and keys must be BF16 (NVFP4 needs SM10x, as does FP8)"
             )
+        _check_score_scale(score_scale, False, query)
         # The kernel reads DIM-value keys PAGE to a page and contiguous rows.
         if query.shape[1] != DIM or key_cache.shape[1:] != (PAGE, DIM):
             raise ValueError(
@@ -140,16 +147,39 @@ def indexer_scores(
     key_tiles = (max_context + TILE - 1) // TILE
     runs = -(-key_tiles // TILES_PER_CTA)
     workers = max(CTAS_PER_SM * get_device_sm_count(query.device) // batch, runs, 1)
-    keys = (query, query_scales, key_cache, key_scales)
+    keys = (query, query_scales, key_cache, key_scales, score_scale)
     tables = (context_lengths, requests, block_table)
     outputs = (None, None, None, None, scores)
     _score("decode", rows, keys, (*tables, *outputs, max_context, workers, 0, 0))
 
 
+def _check_score_scale(
+    score_scale: Optional[torch.Tensor], fp8: bool, query: torch.Tensor
+) -> None:
+    """FP8 scores take an optional per-tensor scale: one float32 on the device.
+    BF16 and NVFP4 scores are in real units already."""
+    if score_scale is None:
+        return
+    if not fp8:
+        raise ValueError("score_scale applies only to FP8 queries and keys")
+    if (
+        score_scale.dtype != torch.float32
+        or score_scale.numel() != 1
+        or score_scale.device != query.device
+    ):
+        raise ValueError(
+            "score_scale must be a float32 tensor of one element on the queries' device"
+        )
+
+
+# Each key format by its dtype: uint8 holds NVFP4's packed E2M1 values.
+FORMATS = {torch.bfloat16: "bf16", torch.float8_e4m3fn: "fp8", torch.uint8: "nvfp4"}
+
+
 def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
     """Check the key format, then run the scorer in `mode` for `rows` query rows
-    per job. `keys` is (query, query_scales, key_cache, key_scales), and `args`
-    holds the kernel's other arguments."""
+    per job. `keys` is (query, query_scales, key_cache, key_scales, score_scale),
+    and `args` holds the kernel's other arguments."""
     from ..cute_dsl.launch import argument_kind, compiled
     from . import indexer_sm100
     from .indexer_sm100 import (
@@ -159,15 +189,19 @@ def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
         SCALES_PER_KEY,
     )
 
-    query, query_scales, key_cache, key_scales = keys
-    nvfp4 = key_cache.dtype == torch.uint8
-    if (
-        key_cache.dtype not in (torch.uint8, torch.bfloat16)
-        or query.dtype != key_cache.dtype
-    ):
-        raise ValueError("Queries and keys must be both BF16 or both NVFP4 (uint8)")
+    query, query_scales, key_cache, key_scales, score_scale = keys
+    fmt = FORMATS.get(key_cache.dtype)
+    if fmt is None or query.dtype != key_cache.dtype:
+        raise ValueError(
+            "Queries and keys must be both BF16, both FP8 (float8_e4m3fn) or both "
+            "NVFP4 (uint8)"
+        )
+    nvfp4 = fmt == "nvfp4"
     if nvfp4 != (key_scales is not None) or nvfp4 != (query_scales is not None):
-        raise ValueError("NVFP4 keys and queries need scales, BF16 ones none")
+        raise ValueError("NVFP4 keys and queries need scales, BF16 and FP8 ones none")
+    _check_score_scale(score_scale, fmt == "fp8", query)
+    if score_scale is not None:
+        score_scale = score_scale.reshape(1)  # the kernel reads element 0
     dim = PACKED_DIM if nvfp4 else DIM  # elements of key_cache's dtype per key
     if query.shape[1] != dim or key_cache.shape[1:] != (PAGE, dim):
         raise ValueError(
@@ -204,11 +238,11 @@ def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
     tensors = (query, query_scales, *args)
     if not all(t.is_contiguous() for t in tensors if isinstance(t, torch.Tensor)):
         raise ValueError("Queries, lengths, tables and outputs must be contiguous")
-    args = (*keys, *args)
+    args = (query, query_scales, key_cache, key_scales, score_scale, *args)
     function = compiled(
-        indexer_sm100.scorers(mode, rows, nvfp4),
+        indexer_sm100.scorers(mode, rows, fmt),
         "sdsa_indexer",
-        f"{mode}_{rows}_{'nvfp4' if nvfp4 else 'bf16'}",
+        f"{mode}_{rows}_{fmt}",
         (),
         query.device,
         tuple(map(argument_kind, args)),
@@ -234,6 +268,7 @@ def indexer_threshold_select(
     key_scales: Optional[torch.Tensor] = None,
     arrivals: Optional[torch.Tensor] = None,
     ranges: Optional[torch.Tensor] = None,
+    score_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """Select the keys that score above each query row's threshold, in one pass
     over the row's paged keys and without writing its scores.
@@ -289,6 +324,10 @@ def indexer_threshold_select(
     ranges : torch.Tensor, optional
         int32 ``[2, rows]``, output: the range of slots holding each row's
         candidates and ties. Other slots are unspecified.
+    score_scale : torch.Tensor, optional
+        FP8 only, as in :func:`indexer_scores`. Scores are scaled before they
+        are compared with the thresholds, stored, or repaired, so thresholds are
+        in scaled units: score the key sample with the same scale.
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("Threshold select needs CuTe DSL 4.7 or newer")
@@ -347,7 +386,7 @@ def indexer_threshold_select(
         min(SELECT_CTAS_PER_TILE, key_tiles // SELECT_MIN_TILES),
     )
     workers, wide = divmod(sms * -(-tiles * runs // sms), tiles)
-    keys = (query, query_scales, key_cache, key_scales)
+    keys = (query, query_scales, key_cache, key_scales, score_scale)
     tables = (row_ends, tile_requests, block_table)
     outputs = (thresholds, counters, arrivals, ranges, candidates)
     _score("select", TILE, keys, (*tables, *outputs, max_context, workers, wide, top_k))
@@ -563,8 +602,9 @@ def gather_key_sample(
         int32 ``[requests]``: each request's number of samples. Later slots are
         left as they are.
     sample_keys : torch.Tensor
-        BF16 ``[requests, capacity, 128]`` or NVFP4 uint8 ``[..., 64]``, output,
-        ``capacity`` a multiple of 128.
+        BF16 or FP8 ``[requests, capacity, 128]`` or NVFP4 uint8 ``[..., 64]``,
+        output, ``capacity`` a multiple of 128. Score FP8 samples with the
+        ``score_scale`` of the select, so the thresholds are in its units.
     samples_per_run : int
         Samples per run of ``pages_per_run`` pages.
     pages_per_run : int
@@ -585,6 +625,8 @@ def gather_key_sample(
         raise ValueError(
             f"Sample rows hold whole {TILE}-key tiles, with scales if NVFP4"
         )
+    if key_scales is not None and key_cache.dtype != torch.uint8:
+        raise ValueError("Only NVFP4 (uint8) keys have scales")
     # The kernel writes SCALES_PER_KEY scales to every slot below a sample end.
     if key_scales is not None and (
         key_scales.shape != (key_cache.shape[0], PAGE, SCALES_PER_KEY)
@@ -606,6 +648,11 @@ def gather_key_sample(
         or samples_per_run < 1
     ):
         raise ValueError("Mismatched sample rows, keys, sample ends, offsets or table")
+    if key_cache.dtype == torch.float8_e4m3fn:  # copied as bytes, like NVFP4's
+        key_cache, sample_keys = (
+            key_cache.view(torch.uint8),
+            sample_keys.view(torch.uint8),
+        )
     args = (key_cache, key_scales, block_table, offsets, sample_ends, sample_keys)
     if requests and capacity:
         launch(

@@ -1,6 +1,6 @@
 {
   "name": "sdsa_gather_key_sample_page_size64_dim128",
-  "description": "A strided random sample of each request's paged BF16 or NVFP4 keys, copied into dense sample rows.",
+  "description": "A strided random sample of each request's paged BF16, FP8 or NVFP4 keys, copied into dense sample rows.",
   "op_type": "sdsa_gather_key_sample",
   "tags": [
     "fi_api:flashinfer.sdsa.indexer.gather_key_sample",
@@ -20,7 +20,7 @@
     "dim": {
       "type": "const",
       "value": 128,
-      "description": "Elements per key: 128 BF16, or 64 NVFP4 bytes."
+      "description": "Elements per key: 128 BF16 or FP8, or 64 NVFP4 bytes."
     },
     "scales": {
       "type": "var",

@@ -2,8 +2,8 @@
 # Copyright (c) 2026 by FlashInfer team.
 
 """The paged scorer of the SDSA (Simplified DSA) indexer: FP32 dot products of
-query rows with their request's paged BF16 or NVFP4 keys, on SM100 tensor cores
-(tcgen05), stored as scores or selected against per-row thresholds."""
+query rows with their request's paged BF16, FP8 or NVFP4 keys, on SM100 tensor
+cores (tcgen05), stored as scores or selected against per-row thresholds."""
 
 from functools import cache
 from typing import Optional
@@ -41,6 +41,7 @@ MMA_WARP, LOAD_WARP = STORE_WARPS, STORE_WARPS + 1
 THREADS = 32 * (LOAD_WARP + 1)
 ALIGN = 128  # bytes, of the shared-memory operands TMA writes
 SMEM_RESERVED_PER_CTA = 1024  # bytes the driver keeps per CTA
+MIN_KEY_STAGES = 2  # key stages a CTA needs to overlap a load with an MMA
 # The most key tiles a CTA runs over, since it stages their page indices (8 bytes
 # a tile): 256 in decode, so a run covers 32K keys, and 128 in select.
 TILES_PER_CTA = 256
@@ -64,6 +65,13 @@ PACKED_DIM, MXF4_K = DIM // 2, DIM // 2
 SCALES_PER_KEY = DIM // SCALE_VECTOR
 SCALE_WORDS = SCALES_PER_KEY // 4
 E2M1_MAX = 6.0
+# The element type of each key format: BF16, FP8 E4M3 (one per-tensor scale,
+# score_scale, outside the cache) and NVFP4 (E2M1 values with E4M3 scales).
+VALUES = {
+    "bf16": cutlass.BFloat16,
+    "fp8": cutlass.Float8E4M3FN,
+    "nvfp4": cutlass.Float4E2M1FN,
+}
 # Select: a job is a TILE-row query tile on the TMEM lanes, scored by
 # SELECT_THREADS threads; each warpgroup compares its rows' scores of KEY_GROUP
 # keys of every tile. A selected (key, score) pair takes PAIR_BYTES.
@@ -125,8 +133,10 @@ def partition_scales(shared: cute.Tensor, tensor: cute.Tensor):
 
 
 class PagedScorer:
-    """Scores of query rows against their request's paged keys, BF16 or NVFP4
-    (``nvfp4``: E2M1 values with E4M3 scales).
+    """Scores of query rows against their request's paged keys, in format
+    ``fmt``: "bf16", "fp8" (E4M3) or "nvfp4" (E2M1 values with E4M3 scales).
+    With ``score_scale`` (FP8), each score is multiplied by it as it leaves
+    TMEM, before it is stored or compared with a threshold.
 
     A job is ``rows`` consecutive query rows that share block-table row
     ``tile_requests[j]``. In "decode", a job is 1 to 8 rows that all see keys
@@ -150,11 +160,11 @@ class PagedScorer:
     last of a tile's CTAs repairs the rows that miss (see the sweep loop).
     """
 
-    def __init__(self, mode: str, rows: int, nvfp4: bool):
+    def __init__(self, mode: str, rows: int, fmt: str):
         self.decode = mode == "decode"
         self.rows = rows  # query rows per job
-        self.values = cutlass.Float4E2M1FN if nvfp4 else cutlass.BFloat16
-        self.scaled = nvfp4
+        self.values = VALUES[fmt]
+        self.scaled = fmt == "nvfp4"  # block-scaled MMA
         # The MMA tile (M, N, K) of TILE keys, MAX_ROWS query columns and DIM
         # values; two accumulators of MAX_ROWS columns and NVFP4's scale blocks in
         # the 32 TMEM columns tcgen05.alloc takes at least.
@@ -175,6 +185,7 @@ class PagedScorer:
         query_scales: Optional[cute.Tensor],
         key_cache: cute.Tensor,
         key_scales: Optional[cute.Tensor],
+        score_scale: Optional[cute.Tensor],
         row_ends: cute.Tensor,
         tile_requests: cute.Tensor,
         block_table: cute.Tensor,
@@ -211,7 +222,7 @@ class PagedScorer:
                     tcgen05.OperandSource.SMEM,
                 )
             )
-        else:  # BF16 with FP32 accumulation, K = 16: eight per 128-value tile
+        else:  # FP32 accumulation; BF16 K = 16, FP8 (kind::f8f6f4) K = 32
             tiled_mma = sm100_utils.make_trivial_tiled_mma(
                 self.values,
                 self.values,
@@ -252,7 +263,10 @@ class PagedScorer:
         fixed += 4 * PAGES_PER_TILE * self.max_tiles
         fixed += 0 if self.decode else 4 * KEY_GROUP * self.threads
         stage = 2 * 8 + operand(make_key, 1)[2]
-        ctas = min(CTAS_PER_SM, capacity // (fixed + stage + SMEM_RESERVED_PER_CTA))
+        # Two CTAs per SM only if each keeps MIN_KEY_STAGES key stages, so that it
+        # can load a tile while the MMA reads another (FP8 select would get one).
+        per_cta = fixed + MIN_KEY_STAGES * stage + SMEM_RESERVED_PER_CTA
+        ctas = max(1, min(CTAS_PER_SM, capacity // per_cta))
         self.stages = (capacity // ctas - SMEM_RESERVED_PER_CTA - fixed) // stage
         layout_key, scales_key, _ = operand(make_key, self.stages)
         shared_bytes = fixed + self.stages * stage
@@ -298,6 +312,7 @@ class PagedScorer:
             tensor_query,
             key_scales,
             query_scales,
+            score_scale,
             row_ends,
             tile_requests,
             block_table,
@@ -333,6 +348,7 @@ class PagedScorer:
         tensor_query: cute.Tensor,
         key_scales: Optional[cute.Tensor],
         query_scales: Optional[cute.Tensor],
+        score_scale: Optional[cute.Tensor],
         row_ends: cute.Tensor,
         tile_requests: cute.Tensor,
         block_table: cute.Tensor,
@@ -568,6 +584,10 @@ class PagedScorer:
             thread_copy.partition_D(cute.make_identity_tensor((TILE, columns))),
             cutlass.Float32,
         )
+        # FP8's per-tensor score scale, once per CTA.
+        scale = cutlass.Float32(1.0)
+        if cutlass.const_expr(score_scale is not None):
+            scale = score_scale[0]
         copies = scale_loads = None
         if cutlass.const_expr(self.scaled):
             copies = (
@@ -636,6 +656,10 @@ class PagedScorer:
                         cute.copy(tiled_copy, source, registers)
                         cute.arch.fence_view_async_tmem_load()
                         acc_full.release()
+                        # Thresholds, stored scores and the repair's digits are
+                        # all in scaled units.
+                        if cutlass.const_expr(score_scale is not None):
+                            registers.store(registers.load() * scale)
                     if step + ahead >= 0 and step + ahead < tile_count:
                         if warp == 0:
                             key_empty = key_producer.acquire_and_advance()
@@ -817,6 +841,8 @@ class PagedScorer:
                 )
                 cute.arch.fence_view_async_tmem_load()
                 acc_full.release()
+                if cutlass.const_expr(score_scale is not None):
+                    registers.store(registers.load() * scale)
                 # Register r is the job's query row r; a warp holds 32 keys.
                 key = (first_tile + tile) * TILE + local_thread
                 if key < job_end:
@@ -866,7 +892,7 @@ class PagedScorer:
         partial = accumulator[None, None, None, acc_empty.index]
         stage_a, stage_b = (key_full.index, 0) if self.decode else (0, key_full.index)
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        # MMAs per tile: NVFP4 2, BF16 8.
+        # MMAs per tile: NVFP4 2, FP8 4, BF16 8.
         for depth in cutlass.range(cute.size(fragment_a, mode=[2]), unroll_full=True):
             if cutlass.const_expr(self.scaled):
                 tiled_mma.set(tcgen05.Field.SFA, scale_a[None, None, depth].iterator)

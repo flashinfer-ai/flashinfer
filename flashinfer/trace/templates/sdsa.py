@@ -9,7 +9,8 @@ indexer_scores_trace = TraceTemplate(
     op_type="sdsa_indexer_scores",
     description=(
         "Single-head paged MQA logits: FP32 dot products of query rows with their "
-        "request's paged BF16 or NVFP4 keys (no head weights or ReLU). SM100/SM103."
+        "request's paged BF16, FP8 or NVFP4 keys (no head weights or ReLU), FP8 "
+        "ones times an optional score scale. SM100/SM103."
     ),
     axes={
         "rows": Var(description="Query rows, 1 to 8 per request group."),
@@ -19,8 +20,11 @@ indexer_scores_trace = TraceTemplate(
         "blocks": Var(description="64-key blocks per request."),
         "max_context": Var(description="Score columns: the context capacity."),
         "page_size": Const(description="Keys per page."),
-        "dim": Const(description="Elements per key: 128 BF16, or 64 NVFP4 bytes."),
+        "dim": Const(
+            description="Elements per key: 128 BF16 or FP8, or 64 NVFP4 bytes."
+        ),
         "scales": Var(description="NVFP4's E4M3 scales per key, one per 16 values."),
+        "one": Const(abbrev="", value=1, description="FP8 score_scale's element."),
     },
     inputs={
         "query": Tensor(["rows", "dim"]),
@@ -31,6 +35,7 @@ indexer_scores_trace = TraceTemplate(
         "scores": Tensor(["rows", "max_context"]),
         "query_scales": Tensor(["rows", "scales"], optional=True),
         "key_scales": Tensor(["pages", "page_size", "scales"], optional=True),
+        "score_scale": Tensor(["one"], optional=True),
     },
     outputs={
         "scores": Tensor(["rows", "max_context"], dtype="float32", param="scores")
@@ -43,8 +48,9 @@ indexer_threshold_select_trace = TraceTemplate(
     op_type="sdsa_indexer_threshold_select",
     description=(
         "Keys of each query row's request scoring above the row's threshold, with "
-        "one query head over paged BF16 or NVFP4 keys, written as (key, score) "
-        "candidate and tie slots. SM100/SM103."
+        "one query head over paged BF16, FP8 or NVFP4 keys (FP8 scores times an "
+        "optional score scale), written as (key, score) candidate and tie slots. "
+        "SM100/SM103."
     ),
     axes={
         "rows": Var(description="Query rows, 128 per tile."),
@@ -53,12 +59,15 @@ indexer_threshold_select_trace = TraceTemplate(
         "pages": Var(description="Key cache pages."),
         "blocks": Var(description="64-key blocks per request."),
         "page_size": Const(description="Keys per page."),
-        "dim": Const(description="Elements per key: 128 BF16, or 64 NVFP4 bytes."),
+        "dim": Const(
+            description="Elements per key: 128 BF16 or FP8, or 64 NVFP4 bytes."
+        ),
         "scales": Var(description="NVFP4's E4M3 scales per key, one per 16 values."),
         "slots": Var(description="Tie slots, then candidate slots."),
         "counters": Const(description="Candidate and tie counts."),
         "pair": Const(description="Key index and score bits."),
         "range": Var(description="A row's first and past-last Top-K slot."),
+        "one": Const(abbrev="", value=1, description="FP8 score_scale's element."),
     },
     inputs={
         "query": Tensor(["rows", "dim"]),
@@ -75,6 +84,7 @@ indexer_threshold_select_trace = TraceTemplate(
         "key_scales": Tensor(["pages", "page_size", "scales"], optional=True),
         "arrivals": Tensor(["tiles"], optional=True),
         "ranges": Tensor(["range", "rows"], optional=True),
+        "score_scale": Tensor(["one"], optional=True),
     },
     outputs={
         "thresholds": Tensor(["rows"], dtype="float32", param="thresholds"),
@@ -146,13 +156,15 @@ quantize_write_index_qk_nvfp4_trace = TraceTemplate(
 gather_key_sample_trace = TraceTemplate(
     op_type="sdsa_gather_key_sample",
     description=(
-        "A strided random sample of each request's paged BF16 or NVFP4 keys, "
+        "A strided random sample of each request's paged BF16, FP8 or NVFP4 keys, "
         "copied into dense sample rows."
     ),
     axes={
         "pages": Var(description="Key cache pages."),
         "page_size": Const(description="Keys per page."),
-        "dim": Const(description="Elements per key: 128 BF16, or 64 NVFP4 bytes."),
+        "dim": Const(
+            description="Elements per key: 128 BF16 or FP8, or 64 NVFP4 bytes."
+        ),
         "scales": Var(description="NVFP4's E4M3 scales per key, one per 16 values."),
         "requests": Var(description="Block-table rows, one sample row each."),
         "blocks": Var(description="64-key blocks per request."),
