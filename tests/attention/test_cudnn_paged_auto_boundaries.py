@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Public D128 paged-auto admission and captured execution on Blackwell."""
+"""Public D128/D256 paged-auto admission and captured execution on Blackwell."""
 
 import pytest
 import torch
@@ -27,23 +27,66 @@ _PAGED_D128_CASES = [
 ]
 
 
+_PAGED_D256_CASES = [
+    ("work_floor", [128], [4096], 32, 8, "cpu", True),
+    ("work_below", [128], [4095], 32, 8, "cpu", False),
+    ("q_floor_gqa2", [64], [4096], 64, 32, "cpu", True),
+    ("q_below", [63], [8192], 64, 32, "cpu", False),
+    ("q_upper", [1024], [4096], 8, 1, "cpu", True),
+    ("q_above", [1025], [8192], 8, 1, "cpu", False),
+    ("long_kv", [64], [32768], 8, 4, "cpu", True),
+    ("mixed_short", [64, 128], [8192, 4096], 16, 2, "cpu", True),
+    ("mixed_long", [129, 257], [8192, 4097], 16, 1, "cpu", True),
+    ("mixed_q_class", [128, 129], [8192, 8192], 16, 4, "cpu", False),
+    ("batch4", [64, 64, 64, 64], [2048, 2048, 2048, 2048], 32, 8, "cpu", True),
+    (
+        "batch5",
+        [64, 64, 64, 64, 64],
+        [2048, 2048, 2048, 2048, 2048],
+        32,
+        8,
+        "cpu",
+        False,
+    ),
+    ("mha", [128], [16384], 8, 8, "cpu", False),
+    ("device_lengths", [128], [16384], 8, 4, "cuda", False),
+    ("kv_below", [128], [2047], 64, 8, "cpu", False),
+    ("kv_above", [128], [32769], 8, 1, "cpu", False),
+    ("kv_ratio_below", [1024], [4095], 8, 1, "cpu", False),
+    ("gqa16", [128], [8192], 16, 1, "cpu", True),
+]
+
+_CASES = [
+    (dim, case)
+    for dim, cases in ((128, _PAGED_D128_CASES), (256, _PAGED_D256_CASES))
+    for case in cases
+]
+
+
 @pytest.mark.parametrize(
-    "case", _PAGED_D128_CASES, ids=[x[0] for x in _PAGED_D128_CASES]
+    "dim,case", _CASES, ids=[f"d{dim}_{case[0]}" for dim, case in _CASES]
 )
 @pytest.mark.parametrize("causal", [True, False])
-def test_paged_d128_auto_boundary_replay(case, causal):
+def test_paged_auto_boundary_replay(dim, case, causal):
     """Exercise both sides of real admission rules, then replay changed Q/K/V."""
-    from flashinfer.prefill import _cudnn_supports_paged_auto
+    from flashinfer.prefill import (
+        _cudnn_supports_paged_auto,
+        _cudnn_supports_paged_gqa_auto,
+    )
 
     if (
         not cudnn_prefill.CUDNN_AVAILABLE
         or torch.cuda.get_device_capability() != (10, 0)
-        or not _cudnn_supports_paged_auto()
+        or not (
+            _cudnn_supports_paged_auto()
+            if dim == 128
+            else _cudnn_supports_paged_gqa_auto(dim)
+        )
     ):
         pytest.skip("requires SM100 and the cuDNN paged-auto runtime")
     name, qs, ks, hq, hk, metadata_device, admitted = case
     torch.manual_seed(1781)
-    dtype, dim, page = torch.bfloat16, 128, 16
+    dtype, page = torch.bfloat16, 16
     qptr = torch.tensor(
         [0] + list(torch.tensor(qs).cumsum(0).tolist()), dtype=torch.int32
     )
