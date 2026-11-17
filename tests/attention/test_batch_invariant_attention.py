@@ -470,7 +470,7 @@ def test_forward_return_lse_rejection_preserves_plan(kind):
 # ------------------------------------------------------------------------------------------------------ device-free
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_fingerprint_is_a_function_of_the_head_dim(op):
-    fps = {D: bi.fingerprint(op, head_dim=D) for D in (64, 128, 256)}
+    fps = {D: bi.fingerprint(op, head_dim=D, causal=True) for D in (64, 128, 256)}
     assert len(set(fps.values())) == 3
     for D, fp in fps.items():
         assert fp.startswith("attn-bf16-d") and fp == bi.fingerprint(
@@ -478,7 +478,7 @@ def test_fingerprint_is_a_function_of_the_head_dim(op):
         )  # one class for the three wrappers
     assert bi.class_name(op) == "attention.bf16"
     with pytest.raises(TypeError):
-        bi.fingerprint(op, head_dim=128, page_size=16)
+        bi.fingerprint(op, head_dim=128, causal=True, page_size=16)
 
 
 def test_cache_key_covers_every_kernel_source():
@@ -1561,13 +1561,13 @@ def run_decode_noncausal(pr: Problem, q_len: int, layout="NHD", ws=None):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("op", WRAPPERS)
 def test_noncausal_fingerprint_is_a_function_of_head_dim_and_mode(op):
-    """The mask mode is a class dimension: the non-causal fingerprint differs from the causal one at every head dim, is shared by
-    the three wrappers, and ``causal=True`` is the default class."""
+    """The mask mode is a class dimension: the non-causal fingerprint differs from the causal one at every head dim and each is
+    shared by the three wrappers."""
     for D in (64, 128, 256):
         nc = bi.fingerprint(op, head_dim=D, causal=False)
-        c = bi.fingerprint(op, head_dim=D)
+        c = bi.fingerprint(op, head_dim=D, causal=True)
         assert nc != c and nc.startswith(f"attn-bf16-d{D}-nc-")
-        assert c == bi.fingerprint(op, head_dim=D, causal=True)
+        assert c == bi.fingerprint(WRAPPERS[0], head_dim=D, causal=True)
         assert nc == bi.fingerprint(WRAPPERS[0], head_dim=D, causal=False)
     assert (
         len({bi.fingerprint(op, head_dim=D, causal=False) for D in (64, 128, 256)}) == 3
@@ -1576,7 +1576,40 @@ def test_noncausal_fingerprint_is_a_function_of_head_dim_and_mode(op):
     from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
 
     for D, fp in FINGERPRINTS.items():
+        assert bi.fingerprint(op, head_dim=D, causal=True) == fp
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("op", WRAPPERS[1:])
+def test_prefill_fingerprint_needs_the_mask_mode(op):
+    """The prefill wrappers' ``plan()`` defaults to ``causal=False``, the non-causal class: their receipt takes the mode as a
+    fixed dimension, so a receipt asked without it (or with ``None``) raises instead of naming the causal class."""
+    from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
+
+    for dims in (dict(head_dim=128), dict(head_dim=128, causal=None)):
+        with pytest.raises(TypeError, match="causal") as e:
+            bi.fingerprint(op, **dims)
+        assert "causal=True" in str(e.value) and "causal=False" in str(e.value)
+    with pytest.raises(TypeError, match="head_dim"):
+        bi.fingerprint(op, causal=True)
+    for D, fp in FINGERPRINTS.items():
+        assert bi.fingerprint(op, head_dim=D, causal=True) == fp
+        assert bi.fingerprint(op, head_dim=D, causal=False) != fp
+
+
+@pytest.mark.cpu_only
+def test_decode_fingerprint_defaults_to_the_causal_class():
+    """The decode wrapper's mode is optional: omitted or ``None`` is the causal class (its ``is_causal=None``), never the
+    truth value of ``None``."""
+    from flashinfer.attention.batch_invariant.spec import FINGERPRINTS
+
+    op = WRAPPERS[0]
+    for D, fp in FINGERPRINTS.items():
         assert bi.fingerprint(op, head_dim=D) == fp
+        assert bi.fingerprint(op, head_dim=D, causal=None) == fp
+        assert bi.fingerprint(op, head_dim=D, causal=True) == fp
+        nc = bi.fingerprint(op, head_dim=D, causal=False)
+        assert nc != fp and nc == bi.fingerprint(WRAPPERS[1], head_dim=D, causal=False)
 
 
 @needs_device
