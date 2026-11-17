@@ -55,6 +55,8 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T as mlir_T
 
 from ..._hardware import is_sm107_compile_target
 from ..._block_sparse.common import (
@@ -105,6 +107,7 @@ from .fmha_decode_resources.helpers_common import (
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_active_splits_kv,
+    runtime_split_kv_is_active,
 )
 from .fmha_decode_resources.sage_scales import (
     SageKScalesResource,
@@ -2860,17 +2863,73 @@ def _q_seq_bounds_reads_memory(
 def _decode_acquires_at_entry(
     cfg: FmhaDecodeConfig,
     cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None,
-    reads_runtime_seqlens_kv: bool,
+    kv_len_prunes_q_tiles: bool,
 ) -> bool:
     """Whether a nonpersistent decode CTA acquires the preceding grid at entry.
 
-    Under PDL the tile predicate and split pruning read ``cu_seqlens_q`` and
-    runtime KV lengths, which the preceding grid may write, so a launch that
-    reads either acquires before them. Every other launch acquires later.
+    Under PDL the tile predicate reads ``cu_seqlens_q`` and, where KV lengths
+    prune Q tiles, ``seq_lens``; the preceding grid may write both, so a launch
+    whose predicate reads either acquires before it. Every other launch
+    acquires later, which lets its resource setup overlap the preceding grid.
     """
     return bool(cfg.use_pdl) and (
-        _q_seq_bounds_reads_memory(cfg, cu_seqlens_q) or reads_runtime_seqlens_kv
+        _q_seq_bounds_reads_memory(cfg, cu_seqlens_q) or kv_len_prunes_q_tiles
     )
+
+
+def _decode_defers_split_pruning(
+    cfg: FmhaDecodeConfig,
+    cu_seqlens_q: cute.Pointer | UniformQueryOffsets | None,
+    kv_len_prunes_q_tiles: bool,
+    reads_runtime_seqlens_kv: bool,
+) -> bool:
+    """Whether a split launch prunes its runtime split prefix after the acquire.
+
+    Split pruning reads the runtime KV length. A launch that already acquired at
+    entry prunes before it initializes resources; one that did not (the QToken
+    route, whose metadata lengths never empty a Q tile) sends every configured
+    split through resource initialization and prunes after the acquire in
+    ``_run_decode_gen_active``.
+    """
+    return (
+        bool(cfg.use_pdl)
+        and bool(cfg.use_split_kv)
+        and reads_runtime_seqlens_kv
+        and not _decode_acquires_at_entry(cfg, cu_seqlens_q, kv_len_prunes_q_tiles)
+    )
+
+
+@cute.jit
+def _exit_cta_if_inactive(is_active: cutlass.Boolean) -> None:
+    """Retire all threads in a CTA when a uniform activity predicate is false."""
+    active_i32 = Int32(is_active)
+    llvm.inline_asm(
+        mlir_T.i32(),
+        [active_i32.ir_value()],
+        "{ .reg .pred _pexit; setp.eq.s32 _pexit, $1, 0;"
+        " @_pexit exit; mov.u32 $0, 0; }",
+        "=r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def _retire_inactive_pdl_split(
+    is_active: cutlass.Boolean,
+    tmem_ptr_i32: cute.Pointer,
+    tmem_alloc_cols: Int32,
+    cfg: cutlass.Constexpr[FmhaDecodeConfig],
+) -> None:
+    """Cleanly retire a post-acquire split without staging TaskManager."""
+    if not is_active:
+        _deallocate_decode_tmem(tmem_ptr_i32, tmem_alloc_cols, cfg)
+        _release_decode_dependents(cfg)
+    # A runtime branch around ``TaskManager.run`` would make the DSL carry the
+    # Python TaskManager meta object through ``scf.if``. Retiring only the
+    # inactive, CTA-uniform path here leaves the active task graph straight-line.
+    _exit_cta_if_inactive(is_active)
 
 
 @cute.jit
@@ -2908,6 +2967,7 @@ def _run_decode_gen_active(
     seq_len_q: Int32,
     active_splits_kv: Int32,
     static_full_split_prefix: cutlass.Constexpr[bool],
+    defer_runtime_split_pruning: cutlass.Constexpr[bool],
     tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams | None,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     seq_len_kv: cutlass.Constexpr[int | None] = 2048,
@@ -3085,7 +3145,7 @@ def _run_decode_gen_active(
         q_group_idx=q_group_idx,
         q_token_offset=q_token_offset,
         seq_len_q=seq_len_q,
-        active_splits_kv=active_splits_kv,
+        active_splits_kv=(None if defer_runtime_split_pruning else active_splits_kv),
         static_full_split_prefix=static_full_split_prefix,
         tile_sched_params=tile_sched_params,
         use_variable_seqlens_kv=use_variable_seqlens_kv,
@@ -3157,6 +3217,47 @@ def _run_decode_gen_active(
         # read above. Acquire that grid before TaskManager reads any input it
         # may write; a repeated wait returns once the predecessor completed.
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    if cutlass.const_expr(defer_runtime_split_pruning):
+        # A split launch that did not acquire at entry cannot read its
+        # producer-owned sequence length before the acquire above. Every
+        # physical split CTA initializes the same static task resources first;
+        # only the useful runtime prefix enters TaskManager. Pruned CTAs take
+        # the equivalent TMEM teardown and dependent-release helpers, then
+        # retire before the straight-line task graph.
+        runtime_seq_len_kv = g_s_k
+        if cutlass.const_expr(
+            use_variable_seqlens_kv
+            or (use_native_paged_kv and not use_static_native_seqlens_kv)
+        ):
+            runtime_seq_len_kv = Int32(g_seqlens_kv[b_idx])
+        split_idx = Int32(cute.arch.block_idx()[0])
+        if cutlass.const_expr(not cfg.uses_compact_split_grid):
+            split_idx = split_idx % Int32(cfg.splits_kv)
+        if cutlass.const_expr(cfg.runtime_split_kv and requested_splits is not None):
+            active_splits = _runtime_active_splits_kv(
+                cfg,
+                runtime_seq_len_kv,
+                seq_len_q,
+                _q_group_token_base(cfg, q_group_idx),
+                requested_splits=requested_splits,
+            )
+            run_task_graph = cute.arch.make_warp_uniform(split_idx < active_splits)
+        else:
+            run_task_graph = cute.arch.make_warp_uniform(
+                runtime_split_kv_is_active(
+                    cfg,
+                    runtime_seq_len_kv,
+                    seq_len_q,
+                    _q_group_token_base(cfg, q_group_idx),
+                    split_idx,
+                )
+            )
+        _retire_inactive_pdl_split(
+            run_task_graph,
+            tmem_ptr_i32,
+            Int32(tmem_alloc_cols),
+            cfg,
+        )
     # The preceding grid may write device scales, which the task bodies
     # consume first. Load them after the acquire above and bind them to the
     # resources, which hold unit placeholders until here.
@@ -3355,6 +3456,7 @@ def _run_decode_gen_runtime_prefix(
                 seq_len_q,
                 active_splits_kv,
                 False,
+                False,
                 tile_sched_params,
                 cfg,
                 seq_len_kv,
@@ -3410,6 +3512,7 @@ def _run_decode_gen_runtime_prefix(
                 q_token_offset,
                 seq_len_q,
                 active_splits_kv,
+                False,
                 False,
                 tile_sched_params,
                 cfg,
@@ -3534,26 +3637,24 @@ def decode_gen_kernel(
     # CTAs initialize their resources while the metadata grid runs and
     # acquire it before TaskManager reads any metadata. Direct G1 lengths come
     # from the raw inputs and keep the check.
-    kv_len_prunes_q_tiles = (
-        use_variable_seqlens_kv
-        or (use_native_paged_kv and not use_static_native_seqlens_kv)
-    ) and not (
+    reads_runtime_seqlens_kv = use_variable_seqlens_kv or (
+        use_native_paged_kv and not use_static_native_seqlens_kv
+    )
+    kv_len_prunes_q_tiles = reads_runtime_seqlens_kv and not (
         cfg.use_q_token_kv_block_sparse_route
         and not isinstance(g_page_idx_kv, DirectSparseMetadataView)
     )
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
-        reads_runtime_seqlens_kv = use_variable_seqlens_kv or (
-            use_native_paged_kv and not use_static_native_seqlens_kv
-        )
         if cutlass.const_expr(
-            _decode_acquires_at_entry(cfg, g_cu_seqlens_q, reads_runtime_seqlens_kv)
+            _decode_acquires_at_entry(cfg, g_cu_seqlens_q, kv_len_prunes_q_tiles)
         ):
             # The preceding grid may write cu_seqlens_q and seq_lens: acquire
             # it before the tile predicate and split pruning read them. A
             # launch that reads neither acquires in _run_decode_gen_active,
             # before a block-sparse row header read or otherwise after its
-            # local resources are initialized, or in
-            # _signal_padded_pdl_producer when it has no work.
+            # local resources are initialized (pruning its split prefix after
+            # that acquire), or in _signal_padded_pdl_producer when it has no
+            # work.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
@@ -3605,6 +3706,7 @@ def decode_gen_kernel(
                 if requested_splits is None
                 else requested_splits[0],
                 requested_splits is None,
+                False,
                 tile_sched_params,
                 cfg,
                 seq_len_kv,
@@ -3614,6 +3716,68 @@ def decode_gen_kernel(
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
+                lse_ptr=lse_ptr,
+                requested_splits=requested_splits,
+                g_max_q_len=g_max_q_len,
+            )
+        elif cutlass.const_expr(
+            _decode_defers_split_pruning(
+                cfg, g_cu_seqlens_q, kv_len_prunes_q_tiles, reads_runtime_seqlens_kv
+            )
+        ):
+            # This launch did not acquire at entry, and its split pruning reads
+            # a KV length the preceding grid may write. Send every configured
+            # split through resource initialization and prune the useful prefix
+            # after the PDL acquire in _run_decode_gen_active.
+            _run_decode_gen_active(
+                tma_desc_q,
+                tma_desc_k,
+                tma_desc_v,
+                tma_desc_k_sf,
+                tma_desc_v_sf,
+                tma_desc_k_atom,
+                tma_desc_v_atom,
+                o_iter,
+                g_s_k,
+                g_h_k,
+                softmax_scale_operand,
+                output_scale,
+                g_seqlens_kv,
+                g_cu_seqlens_q,
+                g_page_idx_kv,
+                g_k_sf,
+                g_v_sf,
+                g_page_table_stride,
+                g_page_table_capacity,
+                g_q_token_kv_block_sparse_page_memberships,
+                g_q_token_kv_block_sparse_page_membership_stride,
+                g_partial_o,
+                g_partial_stats,
+                g_split_kv_counter,
+                g_attention_sinks,
+                g_h_r,
+                q_group_idx,
+                h_k_idx,
+                b_idx,
+                q_token_offset,
+                seq_len_q,
+                Int32(cfg.splits_kv),
+                False,
+                True,
+                tile_sched_params,
+                cfg,
+                seq_len_kv,
+                use_variable_seqlens_kv,
+                use_native_paged_kv,
+                use_static_native_seqlens_kv,
+                g_sparse_row_route_offsets,
+                g_sparse_row_route_counts,
+                g_sparse_route_metadata,
+                tma_desc_k_summary=tma_desc_k_summary,
+                tma_desc_v_summary=tma_desc_v_summary,
+                tma_desc_k_summary_atom=tma_desc_k_summary_atom,
+                tma_desc_v_summary_atom=tma_desc_v_summary_atom,
+                g_sage_scales=g_sage_scales,
                 lse_ptr=lse_ptr,
                 requested_splits=requested_splits,
                 g_max_q_len=g_max_q_len,

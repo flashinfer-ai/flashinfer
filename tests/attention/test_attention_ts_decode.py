@@ -78,6 +78,7 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants imp
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
     _build_decode_gen_schedule,
     _decode_acquires_at_entry,
+    _decode_defers_split_pruning,
     _decode_min_blocks_per_mp,
     _q_seq_bounds_reads_memory,
     build_decode_task_manager,
@@ -3014,7 +3015,9 @@ def test_attention_ts_decode_static_config_resolves_pdl(
 
 
 def test_attention_ts_decode_entry_acquire_follows_query_offset_reads() -> None:
-    """A PDL decode CTA acquires at entry only before a load of query offsets or KV lengths."""
+    """A PDL decode CTA acquires at entry only before its tile predicate loads
+    query offsets or Q-tile-pruning KV lengths; a split launch that skips that
+    acquire prunes its runtime split prefix after the later one."""
 
     offsets = make_ptr(Int32, 16, cute.AddressSpace.gmem, assumed_align=4)
     uniform = UniformQueryOffsets(4)
@@ -3026,10 +3029,27 @@ def test_attention_ts_decode_entry_acquire_follows_query_offset_reads() -> None:
     pdl = FmhaDecodeConfig(use_variable_seqlens_q=True, use_pdl=True)
     assert _decode_acquires_at_entry(pdl, offsets, False)
     assert _decode_acquires_at_entry(pdl, uniform, True)
-    # Uniform query offsets and static KV lengths: nothing to read before
-    # resource setup, so the acquire waits until after it.
+    # Uniform query offsets and no KV-length tile pruning (static lengths, or
+    # the QToken route): nothing to read before resource setup, so the acquire
+    # waits until after it.
     assert not _decode_acquires_at_entry(pdl, uniform, False)
     assert not _decode_acquires_at_entry(packed, offsets, True)
+
+    split = FmhaDecodeConfig(use_pdl=True, use_split_kv=True)
+    packed_split = FmhaDecodeConfig(
+        use_variable_seqlens_q=True, use_pdl=True, use_split_kv=True
+    )
+    # Runtime KV lengths without an entry acquire: prune after the acquire.
+    assert _decode_defers_split_pruning(split, uniform, False, True)
+    # An entry acquire (pruning KV lengths or packed offsets) already covers it.
+    assert not _decode_defers_split_pruning(split, uniform, True, True)
+    assert not _decode_defers_split_pruning(packed_split, offsets, False, True)
+    # Static KV lengths, no split, or no PDL: nothing to defer.
+    assert not _decode_defers_split_pruning(split, uniform, False, False)
+    assert not _decode_defers_split_pruning(pdl, uniform, False, True)
+    assert not _decode_defers_split_pruning(
+        FmhaDecodeConfig(use_split_kv=True), uniform, False, True
+    )
 
 
 def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
