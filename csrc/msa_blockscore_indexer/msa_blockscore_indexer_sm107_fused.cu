@@ -401,6 +401,11 @@ __device__ __forceinline__ void write_sel(const TileInfo& T, const int* I, int* 
   const int n = T.nqt * TOPK;
   for (int o = tid; o < n; o += NTHR)
     sel[(size_t)T.qbase * TOPK + o] = stage[(o >> 4) * 17 + (o & 15)];
+  // The staging aliases the shared memory a later tile's TMA copies (async
+  // proxy) write into; __syncthreads() alone gives no generic-to-async proxy
+  // ordering, so publish these generic-proxy accesses to the async proxy
+  // before the storage is reused (callers synchronize threads right after).
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
 __device__ __forceinline__ void fill_direct(const TileInfo& T, const int* __restrict__ cu,
@@ -814,7 +819,8 @@ static void make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t b
                          CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-static int g_attr_set = 0;
+// cudaFuncSetAttribute is per device: key the one-time setup by device id.
+static int g_attr_set[64] = {};
 static int g_sm_count = 0;
 static std::mutex g_launch_mutex;
 static bool g_primary_stream_set = false;
@@ -860,10 +866,11 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
     make_map(&qmap, qi.data_ptr(), (uint64_t)TQ, BMT);
     make_map(&kmap, ki.data_ptr(), (uint64_t)TKPAD, BN);
     const int smem = NAT * ASZ + STAGES * BSZ;
-    if (!g_attr_set) {
+    const int attr_dev = qi.device().device_id;
+    if (attr_dev >= 0 && attr_dev < 64 && !g_attr_set[attr_dev]) {
       cudaFuncSetAttribute(score_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
       cudaFuncSetAttribute(score_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      g_attr_set = 1;
+      g_attr_set[attr_dev] = 1;
     }
     int ncta = g_sm_count > 0 ? g_sm_count : 212;
     // Few query tiles would otherwise give each tile ncta/ntiles chunks to

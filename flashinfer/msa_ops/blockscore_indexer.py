@@ -127,7 +127,11 @@ def msa_blockscore_topk_indexer(
 
     The call path performs no device synchronization and allocates nothing
     once the module is built, so it is CUDA-graph capturable; build the module
-    (one eager warm-up call) before capture.
+    (one eager warm-up call) before capture. The scoring workspace is chosen
+    per stream when the call is enqueued (the process's first stream owns the
+    primary slot): a captured graph bakes that choice in, so replay a graph
+    only on the stream it was captured from, and do not run eager calls of
+    this op concurrently with a replay on another stream.
 
     Parameters
     ----------
@@ -214,6 +218,12 @@ def msa_blockscore_topk_indexer(
             )
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+        # Contiguity does not establish alignment: a contiguous view into
+        # offset storage keeps the offset address, and the TMA descriptors
+        # require a 16-byte-aligned global address (fresh torch allocations
+        # are 256-byte aligned; only offset storage views can fail this).
+        if t.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned (storage-offset view)")
 
     tq = qi.shape[0]
     tkpad = ki.shape[0]
@@ -267,6 +277,10 @@ def msa_blockscore_topk_indexer(
             raise ValueError("output must be contiguous")
         if output.device != qi.device:
             raise ValueError(f"output must be on qi's device ({qi.device})")
+        # The fill kernels store rows with 16-byte vector writes: reject
+        # storage-offset views whose address they cannot serve.
+        if output.data_ptr() % 16:
+            raise ValueError("output must be 16-byte aligned (storage-offset view)")
 
     try:
         module = _get_module()

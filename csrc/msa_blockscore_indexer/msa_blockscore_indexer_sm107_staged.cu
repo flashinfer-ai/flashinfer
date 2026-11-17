@@ -2053,7 +2053,8 @@ static void make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t b
                          CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-static int g_score_attr_set = 0;
+// cudaFuncSetAttribute is per device: key the one-time setup by device id.
+static int g_score_attr_set[64] = {};
 static std::mutex g_launch_mutex;
 static bool g_primary_stream_set = false;
 static cudaStream_t g_primary_stream = nullptr;
@@ -2193,7 +2194,8 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
   const int fixed_chunk = fixed22_w1 ? 22 : ((B == 1 && pgtot <= 128) ? 24 : 0);
 
   const int smem = NAT * ASZ + STAGES * BSZ;
-  if (!g_score_attr_set) {
+  const int attr_dev = qi.device().device_id;
+  if (attr_dev >= 0 && attr_dev < 64 && !g_score_attr_set[attr_dev]) {
     cudaFuncSetAttribute(score_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaFuncSetAttribute(score_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaFuncSetAttribute(persistent_score_kernel<false, false, false, false>,
@@ -2216,7 +2218,7 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     cudaFuncSetAttribute(persistent_score_kernel<false, true, true, true>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    g_score_attr_set = 1;
+    g_score_attr_set[attr_dev] = 1;
   }
 
   if (guarded) acquire_workspace<<<1, 1, 0, stream>>>();
