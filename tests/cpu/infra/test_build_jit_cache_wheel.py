@@ -68,25 +68,37 @@ def test_dependency_resolution_error_is_not_retried(wheel_builder):
     wheel_builder.time.sleep.assert_not_called()
 
 
-def _fake_python(tmp_path, body):
-    """A stand-in interpreter that records `-m pip install ...` invocations."""
+def _fake_python(tmp_path, failures):
+    """A stand-in interpreter that records `-m pip install ...` invocations and
+    fails the first ``failures`` of them with a retryable pip error.
+
+    The logic is a Python script behind a thin launcher named like an
+    interpreter: a shell script on POSIX, a ``.cmd`` on Windows (which cannot
+    execute a ``#!`` script)."""
     log = tmp_path / "pip.log"
-    python = tmp_path / "python"
-    python.write_text(f'#!/bin/bash\necho "$*" >> "{log}"\n{body}\n')
-    python.chmod(0o755)
+    script = tmp_path / "fake_pip.py"
+    script.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"log = Path({str(log)!r})\n"
+        "with log.open('a') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        f"if len(log.read_text().splitlines()) <= {failures}:\n"
+        "    sys.exit('ReadTimeoutError: read timed out')\n"
+    )
+    if os.name == "nt":
+        python = tmp_path / "python.cmd"
+        python.write_text(f'@"{sys.executable}" "{script}" %*\n')
+    else:
+        python = tmp_path / "python"
+        python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+        python.chmod(0o755)
     return python, log
 
 
 @pytest.mark.cpu_only
 def test_current_interpreter_install_retries_interrupted_pip(wheel_builder, tmp_path):
-    attempts = tmp_path / "attempts"
-    python, log = _fake_python(
-        tmp_path,
-        f'echo x >> "{attempts}"\n'
-        f'if [ "$(wc -l < "{attempts}")" -lt 2 ]; then\n'
-        '  echo "ReadTimeoutError: read timed out" >&2; exit 1\n'
-        "fi",
-    )
+    python, log = _fake_python(tmp_path, failures=1)
     env = wheel_builder.CurrentInterpreterEnv()
     env.python_executable = str(python)
 
@@ -98,7 +110,7 @@ def test_current_interpreter_install_retries_interrupted_pip(wheel_builder, tmp_
 
 @pytest.mark.cpu_only
 def test_current_interpreter_install_skips_empty_requirements(wheel_builder, tmp_path):
-    python, log = _fake_python(tmp_path, "exit 1")
+    python, log = _fake_python(tmp_path, failures=1)
     env = wheel_builder.CurrentInterpreterEnv()
     env.python_executable = str(python)
 
