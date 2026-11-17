@@ -100,6 +100,7 @@ from .jit.cake_kda_packed_t1 import (
     gen_cake_kda_packed_t1_module,
 )
 from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
+from .fused_moe.backends.specialized.registry import gen_specialized_moe_aot_modules
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
@@ -1040,6 +1041,9 @@ def gen_all_modules(
             jit_specs.append(gen_gemm_sm103_module_cutlass_fp4())
         if sm_capabilities.get("sm103a_exact", False):
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm103a"))
+        # Kernels of the specialized MoELayer backend register their own modules
+        # (flashinfer/fused_moe/backends/specialized/kernels/).
+        jit_specs.extend(gen_specialized_moe_aot_modules(sm_capabilities))
         if has_sm107:
             jit_specs.extend(
                 gen_cudnn_frost_moe_module(dtype) for dtype in FROST_DTYPES
