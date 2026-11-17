@@ -88,6 +88,13 @@ def _rule(N: int, M: int, elem_bytes: int, sm: int) -> LSEConfig:
     while C > 1 and Kp % C:
         C //= 2
     share = row_bytes // C
+    if (
+        share > SMEM_BUDGET
+    ):  # no member stages this row: the budget binds at the largest cluster
+        raise ValueError(
+            f"no configuration of support.row.v1 stages a {row_bytes}-byte row within the {SMEM_BUDGET}-byte budget at "
+            f"a cluster of {MAX_CLUSTER} CTAs ({share} bytes per CTA)"
+        )
     if few:
         T = THREADS_SMALL
     elif once:

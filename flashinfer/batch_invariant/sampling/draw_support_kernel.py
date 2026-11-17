@@ -25,6 +25,8 @@ to either of them recompiles this one too).
 
 from __future__ import annotations
 
+from typing import Optional
+
 import functools
 
 import cutlass
@@ -87,6 +89,7 @@ class DrawSupportKernel:
         early_finish: str = "mass",
         return_kept_logprob: bool = False,
         score: bool = False,
+        count_list: Optional[bool] = None,
     ):
         N = Kp * BLOCK
         cfg.validate(N)
@@ -139,8 +142,13 @@ class DrawSupportKernel:
         self.elem_bytes = dtype.width // 8
         self.kind = _kind(dtype)
         self.n_passes = n_passes_for(self.kind, from_logits)
-        self.count_list = count_list_default(
-            self.n_passes, cfg.blocks_per_cta(N) * BLOCK * self.elem_bytes
+        # the count selection's list mode: the rule's choice, or forced either way (a placement the suite pins)
+        self.count_list = (
+            count_list_default(
+                self.n_passes, cfg.blocks_per_cta(N) * BLOCK * self.elem_bytes
+            )
+            if count_list is None
+            else bool(count_list)
         )
         _, tile, _, _, _, _ = _smem_layout(self)
         assert tile <= SMEM_BUDGET, (
@@ -566,6 +574,9 @@ def _exact_draw(
         use_radix = (tot_m >= target) & (tot_c > Int32(0)) & (pv < Float32(1.0))
         fallback = _select(min_pos == Int32(INT_MAX), Int32(INF_BITS), min_pos)
         thr_bits = _imax(thr_bits, _select(use_radix, sel_p, fallback))
+        # a (kept) sum below ~2^-84 overflows the fixed-point scale and every positive weight would saturate to the
+        # same mass: such a row keeps nothing and is invalid (support_spec.SELECT_RULE: scale-overflow -> +inf)
+        thr_bits = _select(scale_fix < Float32(float("inf")), thr_bits, Int32(INF_BITS))
     if cutlass.const_expr(k.use_m):
         thr_bits = _imax(thr_bits, _f32_bits(fp.mul(wmax, mMinP[row_c])))
 
@@ -626,14 +637,16 @@ def kernel_name(
     early_finish: str = "mass",
     return_kept_logprob: bool = False,
     score: bool = False,
+    count_list: Optional[bool] = None,
 ) -> str:
     """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, gather,
-    the two log-probabilities, pdl, the selection's placement, the score form)."""
+    the two log-probabilities, pdl, the selection's placements, the score form)."""
     return jit.sanitize_symbol_name(
         f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_"
         f"{'trow' if temp_rows else 'tconst'}{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
         f"{'_lpk' if return_kept_logprob else ''}"
         f"_pdl{int(enable_pdl)}{f'_ef{early_finish}' if early_finish else ''}"
+        f"{'' if count_list is None else ('_cl1' if count_list else '_cl0')}"
     )
 
 
@@ -650,10 +663,11 @@ def get_compiled_kernel(
     early_finish: str = "mass",
     return_kept_logprob: bool = False,
     score: bool = False,
+    count_list: Optional[bool] = None,
 ):
     """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set,
-    temperature form, gather, the two log-probabilities, pdl, placement, the score form); ``N``, ``M`` and the row strides
-    are runtime arguments."""
+    temperature form, gather, the two log-probabilities, pdl, the placements, the score form); ``N``, ``M`` and the row
+    strides are runtime arguments."""
     from .schedule import padded_blocks
 
     return _compile_bucket(
@@ -669,6 +683,7 @@ def get_compiled_kernel(
         early_finish,
         return_kept_logprob,
         score,
+        count_list,
     )
 
 
@@ -686,6 +701,7 @@ def _compile_bucket(
     early_finish,
     return_kept_logprob=False,
     score=False,
+    count_list=None,
 ):
     """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
@@ -704,6 +720,7 @@ def _compile_bucket(
         early_finish,
         return_kept_logprob,
         score,
+        count_list,
     )
 
     def compile_fn():
@@ -719,6 +736,7 @@ def _compile_bucket(
             early_finish,
             return_kept_logprob,
             score,
+            count_list,
         )
         sym_m, sym_n = cute.sym_int(64), cute.sym_int(32)
         x = cute.runtime.make_fake_tensor(

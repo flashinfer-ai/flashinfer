@@ -220,6 +220,10 @@ def draw_support_reference(
         words = stream.words(int(seeds[r]), int(offsets[r]), draw)
         u = stream.uniform32(words[0])
         tok, ok, mass, _ = draw_row(wk, N, u)
+        mass_k = float(res["mass"])  # type: ignore[arg-type]
+        if not (0.0 < mass_k < float("inf")):
+            # the support's mass decides validity: a NaN / infinite weight or a tiny-sum row keeps nothing usable
+            tok, ok, mass = -1, False, mass_k
         lp = lpk = float("nan")
         if from_logits and ok:
             lg2S = float(lg2_device(torch.tensor([S], dtype=torch.float32))[0])

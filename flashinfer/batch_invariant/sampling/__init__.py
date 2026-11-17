@@ -4,12 +4,12 @@
 ``flashinfer.sampling.softmax(..., batch_invariant=True)`` and ``flashinfer.sampling.log_probs`` (``api``), and the
 inverse-CDF draw ``sample.icdf.v1`` behind ``sampling_from_probs(..., batch_invariant=True)`` /
 ``sampling_from_logits(..., batch_invariant=True)`` (``draw_api``) on the request-keyed stream (``stream``), and the
-support class ``support.row.v1`` (``support_api``: the kept set of a row under top-k / top-p / min-p filters; its
-renormalisation entries are internal in this release) with the truncated draw over it behind
-``top_k_sampling_from_probs`` / ``top_p_sampling_from_probs`` / ``min_p_sampling_from_probs`` /
-``top_k_top_p_sampling_from_probs`` / ``top_k_top_p_sampling_from_logits(..., batch_invariant=True)``
-(``draw_support_api``). Light imports
-only: the CuTe-DSL kernel modules are imported on first use.
+support class ``support.row.v1`` (``support_spec`` / ``support_reference``: the kept set of a row under top-k / top-p /
+min-p filters, ties kept; no entry of its own) with the truncated draw over it behind ``top_k_sampling_from_probs`` /
+``top_p_sampling_from_probs`` / ``min_p_sampling_from_probs`` / ``top_k_top_p_sampling_from_probs`` /
+``top_k_top_p_sampling_from_logits(..., batch_invariant=True)`` and the kept-set log-probability of
+``log_probs(..., top_k / top_p / min_p)`` (``draw_support_api``). Light imports only: the CuTe-DSL kernel modules are
+imported on first use.
 
 The kernels' compiled-object cache modules are registered here (the kernel modules are their roots: an edit to a kernel
 module, or to anything it imports within the mode's directories, invalidates its objects and nothing else's)."""
@@ -31,15 +31,9 @@ _jit.MODULE_ROOTS.setdefault(
         "batch_invariant/sampling/stream_kernel.py",
     ),
 )
-# the support kernel of support.row.v1 (the kept set under top-k / top-p / min-p): its own module, so an edit to it never
-# recompiles the row or the draw kernels (it imports the row kernel's plumbing and the draw kernel's loader, so an edit
-# to either recompiles it too)
-_jit.MODULE_ROOTS.setdefault(
-    "batch_invariant_sampling_support",
-    ("batch_invariant/sampling/support_kernel.py",),
-)
-# the truncated draw (the support's thresholds, then the draw over the kept weights): its own module; it imports both
-# kernels' plumbing, so an edit to either of them recompiles it too, and an edit here recompiles nothing else
+# the truncated draw (the support class's selection passes of support_kernel.py, then the draw over the kept weights):
+# its own module; it imports the row and draw kernels' plumbing, so an edit to either of them recompiles it too, and an
+# edit to it or to support_kernel.py recompiles nothing else
 _jit.MODULE_ROOTS.setdefault(
     "batch_invariant_sampling_draw_support",
     ("batch_invariant/sampling/draw_support_kernel.py",),

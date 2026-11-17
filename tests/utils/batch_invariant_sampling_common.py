@@ -1,7 +1,7 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 """Shared helpers of the batch-invariant sampling suites (``test_batch_invariant_sampling_draw.py``,
-``test_batch_invariant_sampling_support.py``): the device gate, the adversarial inputs, the session precompile of the
+``test_batch_invariant_sampling_draw_support.py``): the device gate, the adversarial inputs, the session precompile of the
 device tests' kernels on device-free workers, and the device-free compile with the PTX admission check of the IR pins."""
 
 from __future__ import annotations
@@ -110,9 +110,12 @@ def precompile(
     such validation) compiles with no device visible and the device's architecture passed explicitly instead."""
     from flashinfer.compilation_context import CompilationContext
     from flashinfer.jit import env as jit_env
+    from flashinfer.jit.cute_dsl_core import _get_compile_arch
 
     archs = sorted(CompilationContext().TARGET_CUDA_ARCHS)
-    major, minor = archs[0]
+    # the module directory's segment is the JIT's own compile target (``CUTE_DSL_ARCH`` when set, else the current
+    # device's architecture with its suffix: ``sm107a``), never the lowest target of a multi-architecture list
+    arch = _get_compile_arch()
     specs = list(dict.fromkeys(specs))
     random.Random(0).shuffle(
         specs
@@ -129,7 +132,7 @@ def precompile(
         # process loads from
         env.update(
             CUDA_VISIBLE_DEVICES="",
-            CUTE_DSL_ARCH=f"sm_{major}{minor}",
+            CUTE_DSL_ARCH=os.environ.get("CUTE_DSL_ARCH") or f"sm_{arch[2:]}",
             FLASHINFER_CUDA_ARCH_LIST=" ".join(f"{a}.{b}" for a, b in archs),
         )
     chunks = [specs[i::workers] for i in range(workers)]
@@ -157,7 +160,7 @@ def precompile(
         flush=True,
     )
     assert not bad, bad[:3]
-    module_dir = jit_env.FLASHINFER_JIT_DIR / f"{module}_sm{major}{minor}_cute_dsl"
+    module_dir = jit_env.FLASHINFER_JIT_DIR / f"{module}_{arch}_cute_dsl"
     n_cached = len(list(module_dir.glob("*.o"))) if module_dir.exists() else 0
     print(f"{label} {n_cached} kernels in {module_dir}", flush=True)
     assert n_cached >= len(specs) // 2, (
@@ -242,23 +245,78 @@ def ptx_fp_ops(ptx: str) -> set:
     ops = set()
     for line in ptx.splitlines():
         tok = line.strip().split()
-        if not tok or tok[0].startswith(("//", ".", "@", "{", "}", "bra", "ret")):
+        if tok and tok[0].startswith("@"):
+            tok = tok[1:]  # a predicated instruction: the opcode follows the predicate
+        if not tok or tok[0].startswith(("//", ".", "{", "}", "bra", "ret")):
             continue
         if PTX_FP_LIKE.match(tok[0].rstrip(";")):
             ops.add(tok[0].rstrip(";"))
     return ops
 
 
+#: What may stand between a PTX mnemonic and its result type: rounding and saturation modifiers, the multiply widths,
+#: vector lanes, and the comparison operators of ``setp`` / ``set`` / ``slct``.
+_PTX_MODIFIERS = frozenset(
+    [
+        "rn",
+        "rz",
+        "rm",
+        "rp",
+        "rni",
+        "rzi",
+        "rmi",
+        "rpi",
+        "sat",
+        "ftz",
+        "approx",
+        "full",
+        "lo",
+        "hi",
+        "wide",
+    ]
+    + ["x", "y", "z", "w"]
+    + [
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "ls",
+        "hs",
+        "equ",
+        "neu",
+        "ltu",
+        "leu",
+        "gtu",
+        "geu",
+        "num",
+        "nan",
+    ]
+)
+
+
+def _int_result(op: str) -> bool:
+    """Whether a PTX opcode's RESULT type is an integer (``cvt.rzi.s64.f32``, ``add.s32``, ``mul.wide.u32``): the first
+    type suffix after the mnemonic and its modifiers. A conversion INTO a float (``cvt.rz.f32.s32``) is not exempt by
+    its integer source."""
+    for part in op.split(".")[1:]:
+        if part in _PTX_MODIFIERS:
+            continue
+        return re.fullmatch(r"(b|u|s)(8|16|32|64)", part) is not None
+    return False
+
+
 def bad_ptx_ops(
     ptx: str, extra_allowed: Callable[[str], bool] = lambda o: False
 ) -> List[str]:
-    """The fp-like opcodes outside the admitted forms (integer-typed forms, ``cvt.rzi`` and wide / lo / hi multiplies
+    """The fp-like opcodes outside the admitted forms (integer-RESULT forms, ``cvt.rzi`` and wide / lo / hi multiplies
     are admitted everywhere; ``extra_allowed`` admits a suite's own declared forms)."""
     return sorted(
         o
         for o in ptx_fp_ops(ptx)
         if not PTX_FP_ALLOWED.match(o)
-        and not re.search(r"\.(b|u|s)(8|16|32|64)(\.|$)", o)
+        and not _int_result(o)
         and not re.match(r"^(cvt\.rzi|mul\.(wide|lo|hi))", o)
         and not extra_allowed(o)
     )

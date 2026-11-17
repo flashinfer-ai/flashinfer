@@ -45,10 +45,18 @@ def top_p_threshold(w: torch.Tensor, p: float, S: float) -> float:
     """The largest weight ``t`` such that the fixed-point mass of ``{w_j >= t}`` reaches ``trunc(p * 2^44)``; every
     positive weight when the positive mass does not reach it or ``p >= 1``; ``+inf`` when no weight is positive."""
     scale = fixed_scale(S)
+    pats = _patterns(w)
+    if not (scale < float("inf")):
+        # the (kept) sum is below ~2^-84: the fixed-point scale overflows and every positive weight would saturate to
+        # the same mass -- the row keeps nothing (SELECT_RULE: scale-overflow -> +inf) and is invalid
+        return float("inf")
+    if p >= 1.0:
+        # every positive weight, directly (the kernel: the target is unreachable, the fallback the smallest positive)
+        pos = pats[pats > 0]
+        return float("inf") if pos.numel() == 0 else _as_f32(int(pos.min()))
     q = torch.tensor(
         [fixed_weight(float(x), scale) for x in w.tolist()], dtype=torch.int64
     )
-    pats = _patterns(w)
     order = torch.argsort(pats, descending=True, stable=True)
     target = fixed_target(p)
     cum, thr = 0, None
@@ -105,6 +113,9 @@ def support_row(
         thr = _combine(thr, fp32.mul(wm, f.min_p))
         keep &= w >= thr
     mass = row_sum(torch.where(keep, w, torch.zeros_like(w)), N)
+    if bool(torch.isnan(w).any()):
+        # a NaN weight: the kernel's bit-pattern mask keeps it (NaN orders above +inf), its mass is NaN, the row invalid
+        mass = float("nan")
     return {
         "mask": keep,
         "threshold": thr,

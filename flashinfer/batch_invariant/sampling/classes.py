@@ -94,10 +94,10 @@ def _draw_fingerprint(
 def _support_fingerprint(
     N: int, dtype, filters, from_logits: bool, temperature: bool = False
 ) -> str:
-    """The support class's fingerprint (``support_api.py``): the filter set, the selection rules, the vocabulary
+    """The support class's fingerprint (``support_spec.py``): the filter set, the selection rules, the vocabulary
     (the sum tree the kept mass is read from), the weight form (with or without a temperature in the scale) and the
-    output format. The class has no registry entry of its own: its renormalisation entries are internal in this release
-    (the operators' flag is deferred)."""
+    output format. The class has no registry entry of its own: the truncated samplers' and ``log_probs``' receipts join
+    it (the operators' renormalisation entries keep their own kernels; a flag there is deferred)."""
     from .support_spec import spec_fingerprint
 
     return spec_fingerprint(

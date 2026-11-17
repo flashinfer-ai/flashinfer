@@ -6,8 +6,10 @@ draw -- the support class ``support.row.v1``'s kept set, then the draw class ``s
 one launch (``draw_support_kernel.py``; the generic entry ``draw_support_api.draw_support``).
 
 Device-free: the pinned receipts (the two classes' fingerprints joined; the dimensions move them, the parameter values do
-not), the exact model is the support model then the draw model over the masked row, the error contract, the kernel's PTX
-(only the declared forms). On an SM100 / SM103 / SM107 device with the CuTe DSL: tokens, validity and the kept mass bitwise
+not), the exact model is the support model then the draw model over the masked row, the support model's declared
+properties (top-k an upward-closed cut with ties, top-p reaching its fixed-point target minimally, the two orders, min-p on
+the row maximum, the exact fixed point, the renormalisation term, the tiny-sum / ``p >= 1`` / NaN rules), the support
+dispatcher's membership over the grid and four SM counts, the error contract, the kernel's PTX (only the declared forms). On an SM100 / SM103 / SM107 device with the CuTe DSL: tokens, validity and the kept mass bitwise
 against the exact model for probability and logits inputs (with the drawn token's log-probability under the full
 distribution and under the kept set), f32 / bf16, every filter set and both orders, across single-CTA / cluster / staged
 members and the dispatcher's picks; the composition equals the support's mask then the plain draw over the masked weights,
@@ -17,7 +19,8 @@ log-probability there (R4); the index gather; the
 generator-only call shape (the pair reserved as the operator's own path reserves it: 32 per row for the rejection
 samplers, one for min-p) and the key forms; batch invariance the way the operator's kernels were probed (a row alone == at
 slot 5 of 64 == at slot 5 of 8; a permutation moves no token) and sub-batches; degenerate parameters and invalid rows;
-the drawn distribution against the kept set's renormalisation; SM-count independence where the picks differ;
+the drawn distribution against the kept set's renormalisation; the selection's placements (the early finish, the list
+mode) pinned against the plain passes on every output; SM-count independence where the picks differ;
 determinism, CUDA-graph replay and PDL; ``batch_invariant=False`` is the operator's kernel, byte for byte; 3-D inputs,
 views, M = 0; the big vocabulary.
 """
@@ -29,8 +32,10 @@ import torch
 
 import flashinfer
 from flashinfer import batch_invariant as bi
+from flashinfer.batch_invariant.sampling import classes as CL
 from flashinfer.batch_invariant.sampling import draw_reference as DR
 from flashinfer.batch_invariant.sampling import schedule as C
+from flashinfer.batch_invariant.sampling import sterm as term
 from flashinfer.batch_invariant.sampling import stream
 from flashinfer.batch_invariant.sampling import support_schedule as DS
 from flashinfer.batch_invariant.sampling import support_spec as SS
@@ -39,6 +44,7 @@ from flashinfer.batch_invariant.sampling.draw_api import (
 )
 from flashinfer.batch_invariant.sampling.draw_support_api import (
     CLASS,
+    SUPPORT_ARCHS,
     draw_support,
     kept_log_probs,
     min_p_sampling_from_probs_batch_invariant,
@@ -47,15 +53,13 @@ from flashinfer.batch_invariant.sampling.draw_support_api import (
     top_k_top_p_sampling_from_probs_batch_invariant,
     top_p_sampling_from_probs_batch_invariant,
 )
+from flashinfer.batch_invariant.sampling.reference import row_sum
 from flashinfer.batch_invariant.sampling.schedule import device_sm_count
-from flashinfer.batch_invariant.sampling.support_api import (
-    SUPPORT_ARCHS,
-    sampling_support,
-)
 from flashinfer.batch_invariant.sampling.support_reference import (
     kept_log_probs_reference,
     support_reference,
     support_row,
+    top_p_threshold,
 )
 from flashinfer.batch_invariant.sampling.support_spec import Filters
 
@@ -90,8 +94,12 @@ SETS_BY_N = {
     4097: ("kpj", "p"),
     32768: ("kpm", "k"),
 }
-#: ``(N, M)`` at which the SM counts split the support dispatcher's pick (the support suite's).
+#: ``(N, M)`` at which the SM counts split the support dispatcher's pick (512 threads below the device's row count, 256 at it).
 SM_SPLIT_ROWS = ((152064, 180),)
+#: The placement test: its vocabularies, rows and filter sets.
+EF_NS = (1000, 32768)
+EF_M = 24
+EF_SETS = ("k", "p", "kp", "kpj", "kpm")
 ENTRIES = (
     "top_k_sampling_from_probs",
     "top_p_sampling_from_probs",
@@ -225,11 +233,11 @@ def test_fingerprints_are_pinned():
     kept mass and the prefixes are read from) with the support class's (the kept set); the dimensions move them (the
     vocabulary, the dtype, the order, the weight form), the parameter values do not."""
     pins = {
-        "top_k_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-4a26c16577a204b6",
-        "top_p_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-475956ca58f276bb",
-        "min_p_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-d6605a499dd10213",
-        "top_k_top_p_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-a18e33002ad6e1d6",
-        "top_k_top_p_sampling_from_logits": "sample-icdf-5d0ecdc7569e9635+support-row-37d93a3dcdf2723b",
+        "top_k_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-0ee75ed8feeed558",
+        "top_p_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-57019f67170488a7",
+        "min_p_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-df29dce700e84519",
+        "top_k_top_p_sampling_from_probs": "sample-icdf-f2947e7df54776f2+support-row-012a346dec8b8fe2",
+        "top_k_top_p_sampling_from_logits": "sample-icdf-5d0ecdc7569e9635+support-row-2de73f721e6ad273",
     }
     for op in ENTRIES:
         assert bi.class_name(op) == CLASS == "sample.icdf.v1+support.row.v1"
@@ -241,7 +249,7 @@ def test_fingerprints_are_pinned():
             dtype="bf16",
             filter_apply_order="joint",
         )
-        == "sample-icdf-f2947e7df54776f2+support-row-33c2845857c90a47"
+        == "sample-icdf-f2947e7df54776f2+support-row-4356219c7e86c68d"
     )
     draw_fp = bi.fingerprint("sampling_from_probs", N=1000, dtype="bf16")
     sup_fp = SS.spec_fingerprint(Filters(top_k=1), 1000, False, "bf16")
@@ -255,7 +263,7 @@ def test_fingerprints_are_pinned():
     fl_t = bi.fingerprint(
         "top_k_top_p_sampling_from_logits", N=1000, dtype="bf16", temperature=True
     )
-    assert fl_t == "sample-icdf-ce7d921bf6afce4b+support-row-2039ae06e93b6c1e"
+    assert fl_t == "sample-icdf-ce7d921bf6afce4b+support-row-379e5bbe6455d9ce"
     assert fl_t != pins["top_k_top_p_sampling_from_logits"]
     assert fl_t.endswith(
         "+" + SS.spec_fingerprint(Filters(top_k=1, top_p=1.0), 1000, True, "bf16", True)
@@ -352,6 +360,228 @@ def test_unsupported_inputs_raise_before_any_kernel():
         top_k_top_p_sampling_from_logits_batch_invariant(
             x, 5, 0.5, filter_apply_order="p_first", seed=s, offset=s
         )
+    assert (
+        SS.Filters(top_k=3).name == "k"
+        and SS.Filters(top_p=0.5, min_p=0.1, order="joint").name == "pm_joint"
+    )
+    with pytest.raises(ValueError):
+        Filters(top_k=1, order="first")
+
+
+# ------------------------------------------------------------------------------------------------ the support model
+def _row(N=1000, seed=0):
+    """A CPU weight row with two tied maxima, a third value and zeros every 97th element (the model's property tests)."""
+    g = torch.Generator().manual_seed(seed)
+    w = torch.rand(N, generator=g).to(torch.float32) * 0.01
+    w[10] = 0.3
+    w[20] = 0.3
+    w[30] = 0.2
+    w[::97] = 0.0
+    return w
+
+
+def test_support_fingerprints_are_pinned():
+    """The support class's own receipts (the half the truncated samplers' and ``log_probs``' receipts carry): the filter
+    set, the selection rules, the vocabulary's sum tree, the weight form and the output format are hashed; the dimensions
+    move them, the parameter values do not."""
+    f = SS.spec_fingerprint
+    assert f(Filters(top_k=1), 1000, False, "bf16") == "support-row-0ee75ed8feeed558"
+    assert f(Filters(top_p=1.0), 1000, False, "bf16") == "support-row-57019f67170488a7"
+    assert f(Filters(top_k=1), 1000, True, "bf16") == "support-row-a01d6d83330b932c"
+    assert CL._support_fingerprint(1000, torch.bfloat16, Filters(top_k=1), False) == f(
+        Filters(top_k=1), 1000, False, "bf16"
+    )
+    assert f(Filters(top_k=1), 1000) != f(Filters(top_p=0.5), 1000)
+    assert f(Filters(top_k=1, top_p=0.5), 1000) != f(
+        Filters(top_k=1, top_p=0.5, order="joint"), 1000
+    )
+    assert f(Filters(top_k=1), 1000) != f(Filters(top_k=1), 1001)
+    assert f(Filters(top_k=1), 1000, False) != f(Filters(top_k=1), 1000, True)
+    assert f(Filters(top_k=1), 1000, False, "f32") != f(
+        Filters(top_k=1), 1000, False, "bf16"
+    )
+    assert "ties-kept" in SS.SELECT_RULE and "trunc(p*2^44)" in SS.SELECT_RULE
+    with pytest.raises(ValueError):
+        CL._support_fingerprint(1000, "f64", Filters(top_k=1), False)
+
+
+@pytest.mark.parametrize("k", [0, 1, 2, 3, 17, 500, 999, 1000, 5000])
+def test_top_k_is_an_upward_closed_cut_with_ties(k):
+    w = _row()
+    r = support_row(w, w.numel(), Filters(top_k=k))
+    thr = r["threshold"]
+    assert bool(((w >= thr) == r["mask"]).all())
+    if k <= 0:
+        assert r["count"] == 0
+    elif k >= w.numel():
+        assert r["count"] == w.numel()
+    else:
+        # at least k kept, and dropping the threshold value would leave fewer than k
+        assert r["count"] >= k and int((w > thr).sum()) < k
+    assert support_row(w, w.numel(), Filters(top_k=1))["count"] == 2  # the tied maxima
+
+
+@pytest.mark.parametrize("p", [0.0, 0.1, 0.5, 0.9, 0.999, 1.0])
+def test_top_p_reaches_the_target_mass_minimally(p):
+    w = _row()
+    N = w.numel()
+    r = support_row(w, N, Filters(top_p=p))
+    thr = r["threshold"]
+    assert bool(((w >= thr) == r["mask"]).all())
+    scale = SS.fixed_scale(r["S"])
+    q = torch.tensor(
+        [SS.fixed_weight(float(x), scale) for x in w.tolist()], dtype=torch.int64
+    )
+    target = SS.fixed_target(p)
+    kept_mass = int(q[r["mask"]].sum())
+    assert kept_mass >= target or r["count"] == int(
+        (w > 0).sum()
+    )  # reached, or everything positive is kept
+    if p >= 1.0:
+        assert r["count"] == int((w > 0).sum())  # the filter off: every positive weight
+    if r["count"] and thr < float("inf") and target > 0:
+        assert int(q[w > thr].sum()) < target  # the next cut up would miss the target
+    assert not bool(r["mask"][w == 0].any())  # zero weights are never kept
+
+
+def test_orders_differ_as_declared():
+    w = _row()
+    N = w.numel()
+    a = support_row(w, N, Filters(top_k=50, top_p=0.5))
+    b = support_row(w, N, Filters(top_k=50, top_p=0.5, order="joint"))
+    assert (
+        a["count"] == 3 and b["count"] == 50
+    )  # top-p on the kept 50 vs the intersection
+    assert bool(
+        (a["mask"] & ~b["mask"]).sum() == 0
+    )  # top_k_first's set is within the joint set here
+    for r in (
+        a,
+        b,
+        support_row(w, N, Filters(top_k=50, top_p=0.5, min_p=0.1, order="joint")),
+    ):
+        assert bool(
+            ((w >= r["threshold"]) == r["mask"]).all()
+        )  # the effective threshold cuts the mask
+
+
+def test_min_p_uses_the_row_maximum():
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+
+    w = _row()
+    r = support_row(w, w.numel(), Filters(min_p=0.5))
+    assert r["threshold"] == fp32.mul(0.3, fp32.to_f32(0.5)) and r["count"] == 3
+    r = support_row(
+        w, w.numel(), Filters(min_p=0.5), w_max=1.0
+    )  # logits: e_max = 1 by the shift
+    assert r["threshold"] == 0.5 and r["count"] == 0
+
+
+def test_fixed_point_mass_is_exact_and_declared():
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+
+    S = 5.7959
+    scale = SS.fixed_scale(S)
+    assert scale == fp32.div(float(1 << SS.FIX_BITS), S)
+    assert (
+        SS.fixed_weight(0.3, scale) == int(fp32.mul(0.3, scale))
+        and SS.fixed_weight(0.0, scale) == 0
+    )
+    assert SS.fixed_target(1.0) == SS.UNREACHABLE
+    assert SS.fixed_target(0.5) == 1 << (SS.FIX_BITS - 1) and SS.fixed_target(0.0) == 0
+
+
+def test_model_rows_and_renormalisation():
+    """The model over rows with per-row filters; the kept set's renormalised probabilities (the distribution the draw
+    samples) are ``lse.row``'s prob chain over the kept mass (``cvt(mul(w, div(1, mass)))``, +0 elsewhere, in the input
+    dtype); the term is the spec's."""
+    from flashinfer.batch_invariant.fp_interface import exact as fp32
+
+    w = torch.stack([_row(300, 1), _row(300, 2)])
+    r = support_reference(w, [Filters(top_k=5), Filters(top_p=0.3)])
+    assert r["mask"].shape == (2, 300) and r["count"].tolist()[0] >= 5
+    wb = w.to(torch.bfloat16)
+    r = support_reference(wb, [Filters(top_k=5), Filters(top_p=0.3)])
+    assert r["probs"].dtype == torch.bfloat16
+    for i in range(2):
+        inv = fp32.div(1.0, float(r["mass"][i]))
+        want = torch.where(
+            r["mask"][i],
+            torch.mul(wb[i].float(), torch.tensor(inv, dtype=torch.float32)),
+            torch.zeros(300),
+        ).to(torch.bfloat16)
+        assert torch.equal(r["probs"][i], want)
+        assert (
+            abs(float(r["probs"][i].float().sum()) - 1.0) < 2e-2
+        )  # bf16 outputs: renormalised within rounding
+    sx = term.sexpr(SS.renorm_term(40, [True] * 40, 3))
+    assert sx.startswith("(mul (div (const 1.0) (add") and sx.endswith(
+        "(x 3))"
+    )  # mul(x_3, div(1, mass tree))
+    assert term.sexpr(SS.mass_term(40, [True] * 40)) == term.sexpr(
+        __import__(
+            "flashinfer.batch_invariant.sampling.draw_spec", fromlist=["DrawSpec"]
+        )
+        .DrawSpec(40)
+        .total(0)
+    )  # keeping everything is the draw's total (Lean: massTree_all)
+
+
+def test_model_tiny_sum_p_ge_1_and_nan_rows():
+    """A row whose sum is below ~2^-84 overflows the fixed-point scale: top-p keeps nothing (threshold +inf, mass 0: the
+    row invalid) while top-k and min-p, which have no scale, keep what they keep; ``p >= 1`` keeps every positive weight
+    directly; a NaN weight makes the mass NaN (the row invalid); the dispatcher refuses a row no member stages."""
+    N = 1000
+    w = torch.rand(N, generator=torch.Generator().manual_seed(4)) ** 3
+    w[::7] = 0.0
+    tiny = w * 2.0**-100
+    S_tiny = row_sum(tiny, N)
+    assert 0.0 < S_tiny < 2.0**-84
+    assert top_p_threshold(tiny, 0.5, S_tiny) == float("inf")
+    assert support_row(tiny, N, Filters(top_p=0.5))["mass"] == 0.0
+    assert float(support_row(tiny, N, Filters(top_k=5))["mass"]) > 0.0  # type: ignore[arg-type]
+    assert float(support_row(tiny, N, Filters(min_p=0.1))["mass"]) > 0.0  # type: ignore[arg-type]
+    pos = w[w > 0]
+    assert top_p_threshold(w, 1.0, row_sum(w, N)) == float(pos.min())
+    assert top_p_threshold(w, 1.5, row_sum(w, N)) == float(pos.min())
+    nan_row = w.clone()
+    nan_row[3] = float("nan")
+    assert torch.isnan(torch.tensor(support_row(nan_row, N, Filters(top_k=5))["mass"]))
+    assert torch.isnan(
+        torch.tensor(support_row(nan_row, N, Filters(top_p=0.5))["mass"])
+    )
+    with pytest.raises(ValueError, match="no configuration"):
+        DS.support_config(1 << 20, 1, 4, 148)
+    DS.support_config(1 << 20, 1, 2, 148)  # the bf16 row of the same vocabulary fits
+
+
+def test_dispatcher_picks_are_members_of_the_space():
+    """R3 membership: every pick of the support's closed-form dispatcher, over the grid, both element widths and the
+    SM counts of the SM100 / SM103 / SM107 parts, is a member of the enumerated space at one row per CTA whose staged
+    share fits the budget; the picks split by the SM count only through the device's row count."""
+    for N in (8, 64, 1000, 4097, 32000, 32768, 128256, 152064, 65537, 262145):
+        for eb in (2, 4):
+            members = set(C.all_valid_configs(N, eb))
+            for M in (1, 4, 37, 256, 4096):
+                for sm in SM_COUNTS:
+                    cfg = DS.support_config(N, M, eb, sm)
+                    assert cfg in members and cfg.rows_per_cta == 1, (
+                        N,
+                        eb,
+                        M,
+                        sm,
+                        cfg.describe(),
+                    )
+                    assert cfg.blocks_per_cta(N) * C.BLOCK * eb <= C.SMEM_BUDGET, (
+                        N,
+                        eb,
+                        M,
+                        sm,
+                        cfg.describe(),
+                    )
+                    assert cfg.vec_elems <= C.max_vec_elems(N, eb)
+    for N, M in SM_SPLIT_ROWS:
+        assert len({DS.support_config(N, M, 2, sm) for sm in SM_COUNTS}) >= 2
 
 
 # The admitted PTX forms (the row kernels' suite); the cases: probabilities under top-k + top-p on a single CTA (the mass
@@ -446,6 +676,8 @@ def _spec(
     pdl=_PDL,
     lpk=False,
     score=False,
+    ef="mass",
+    cl=None,
 ):
     return (
         ds,
@@ -457,9 +689,10 @@ def _spec(
         idx,
         lp,
         pdl,
-        "mass",
+        ef,
         lpk,
         score,
+        cl,
     )
 
 
@@ -549,6 +782,25 @@ def _suite_specs(sm):
     # views / 3-D inputs / empty batches
     specs.append(_spec("bf16", 4096, _d(4096, 6, 2, sm), False, "k", False))
     specs.append(_spec("bf16", 4096, _d(4096, 6, 2, sm), True, "kp", False))
+    # the placements: the early finish three ways and the list mode both ways, against the default
+    for dtype in DT:
+        ds, eb = _DS[dtype], dtype.itemsize
+        for N in EF_NS:
+            cfg = _d(N, EF_M, eb, sm)
+            for fset in EF_SETS:
+                for fl in (False, True):
+                    for ef, cl in (
+                        ("mass", None),
+                        ("", None),
+                        ("all", None),
+                        ("mass", False),
+                        ("mass", True),
+                    ):
+                        specs.append(
+                            _spec(
+                                ds, N, cfg, fl, fset, False, lp=fl, lpk=fl, ef=ef, cl=cl
+                            )
+                        )
     return list(dict.fromkeys(specs))
 
 
@@ -643,14 +895,14 @@ def test_support_then_draw_and_the_public_entries():
     w = weights(M, N, torch.float32)
     s, o = keys(M, 4)
     ks = torch.tensor([1, 5, 0, N, 50, 7], dtype=torch.int32, device="cuda")
-    sup = sampling_support(w, top_k=ks)
-    wk = torch.where(sup.mask, w, torch.zeros_like(w))
+    sup = support_reference(w, [Filters(top_k=int(k)) for k in ks.tolist()])
+    wk = torch.where(sup["mask"].cuda(), w, torch.zeros_like(w))
     tok3, ok3 = sampling_from_probs_batch_invariant(
         wk, seed=s, offset=o, return_valid=True
     )
     r = probs_draw(w, s, o, top_k=ks)
     assert torch.equal(r["samples"], tok3) and torch.equal(r["valid"], ok3)
-    assert torch.equal(r["mass"], sup.mass)
+    assert torch.equal(_bits(r["mass"]), _bits(sup["mass"]))
     assert not bool(r["valid"][2]) and int(r["samples"][2]) == -1  # k = 0 keeps nothing
     assert bool(r["valid"][0]) and bool(r["valid"][3])  # k = 1 / k = N draw
     assert not bool(r["valid"][5])  # the all-zero row
@@ -710,11 +962,17 @@ def test_support_then_draw_and_the_public_entries():
             ),
             r2["samples"],
         )
-        sup2 = sampling_support(w, top_k=ks, top_p=ps, order=order)
-        assert torch.equal(r2["mass"], sup2.mass)
+        sup2 = support_reference(
+            w,
+            [
+                Filters(top_k=int(k), top_p=float(pp), order=order)
+                for k, pp in zip(ks.tolist(), ps.tolist(), strict=False)
+            ],
+        )
+        assert torch.equal(_bits(r2["mass"]), _bits(sup2["mass"]))
         for i in range(M):
             if bool(r2["valid"][i]):
-                assert bool(sup2.mask[i, int(r2["samples"][i])])
+                assert bool(sup2["mask"][i, int(r2["samples"][i])])
     # logits: the kept log-probability is the support's renormalised one at the token and the full one is log_probs
     # there (R4); the public entry returns (samples[, logp][, kept_logp]) and takes the temperature the classes take
     x = tied_logits(M, N, torch.bfloat16, seed=2)
@@ -781,17 +1039,22 @@ def test_support_then_draw_and_the_public_entries():
             ),
             rt["samples"],
         )
-        supl = sampling_support(
-            x, top_k=ks, top_p=ps, order=order, from_logits=True, return_logprobs=True
+        supl = support_reference(
+            x,
+            [
+                Filters(top_k=int(k), top_p=float(pp), order=order)
+                for k, pp in zip(ks.tolist(), ps.tolist(), strict=False)
+            ],
+            from_logits=True,
         )
-        assert torch.equal(rl["mass"], supl.mass)
+        assert torch.equal(_bits(rl["mass"]), _bits(supl["mass"]))
         full = flashinfer.sampling.log_probs(x, rl["samples"].clamp(min=0))
         for i in range(M):
             if bool(rl["valid"][i]):
                 t = int(rl["samples"][i])
-                assert bool(supl.mask[i, t])
+                assert bool(supl["mask"][i, t])
                 assert rl["kept_logp"][i].view(torch.int32).item() == (
-                    supl.logprobs[i, t].view(torch.int32).item()
+                    supl["logprobs"][i, t].view(torch.int32).item()
                 )
                 assert rl["logp"][i].view(torch.int32).item() == (
                     full[i].view(torch.int32).item()
@@ -845,9 +1108,13 @@ def test_index_gather_and_batch_invariance():
     w = weights(8, N, torch.float32, seed=2)
     idx = torch.tensor([3, 0, 0, 7, 1, 3], device="cuda")
     s, o = keys(6, 7)
-    ks = torch.tensor([2, 9, 9, 4, 1, 2], dtype=torch.int32, device="cuda")
-    ps = torch.tensor([0.5, 0.9, 0.9, 0.7, 1.0, 0.5], device="cuda")
-    filters = [Filters(top_k=int(ks[i]), top_p=float(ps[i])) for i in range(6)]
+    # a per-row filter tensor is one entry per SOURCE row under indices (the operator's rule, #5340): 8 entries for
+    # the 8 rows of w, output i reading indices[i]'s
+    ks = torch.tensor([2, 9, 9, 4, 1, 2, 7, 3], dtype=torch.int32, device="cuda")
+    ps = torch.tensor([0.5, 0.9, 0.9, 0.7, 1.0, 0.5, 0.8, 0.6], device="cuda")
+    filters = [
+        Filters(top_k=int(ks[idx[i]]), top_p=float(ps[idx[i]])) for i in range(6)
+    ]
     r = probs_draw(w, s, o, top_k=ks, top_p=ps, indices=idx)
     ref = DR.draw_support_reference(w[idx].cpu(), s.tolist(), o.tolist(), filters)
     _same(r, ref)
@@ -865,6 +1132,16 @@ def test_index_gather_and_batch_invariance():
     rb = probs_draw(w, s, o, top_k=ks, top_p=ps, indices=bad)
     assert not bool(rb["valid"][4]) and int(rb["samples"][4]) == -1
     assert torch.equal(rb["samples"][:4], r["samples"][:4])
+    with pytest.raises(
+        ValueError, match="source row"
+    ):  # a per-output tensor is not the operator's rule
+        probs_draw(w, s, o, top_k=ks[:6], top_p=ps[:6], indices=idx)
+    one = probs_draw(
+        w, s, o, top_k=torch.tensor([3], device="cuda"), top_p=0.9, indices=idx
+    )
+    assert torch.equal(
+        one["samples"], probs_draw(w, s, o, top_k=3, top_p=0.9, indices=idx)["samples"]
+    )  # a one-value tensor broadcasts
     x = tied_logits(8, N, torch.float32, seed=3)
     rl = logits_draw(x, s, o, top_k=ks, top_p=ps, indices=idx, return_logprob=True)
     refl = DR.draw_support_reference(
@@ -1065,12 +1342,18 @@ def test_degenerate_parameters_and_invalid_rows():
     """``k <= 0`` keeps nothing (invalid), ``k >= N`` everything (the plain draw); ``p >= 1`` every positive weight (the
     plain draw); ``min_p = 1`` the maximum (ties), ``min_p > 1`` nothing, ``min_p = 0`` every positive weight; an all-zero
     row and a row with an infinite weight are invalid; every case the exact model's; ``return_valid`` reports them."""
-    N, M = 1000, 8
+    N, M = 1000, 10
     w = weights(M, N, torch.float32, seed=6)
     w[6] = 0.0
     w[6, 10] = float("inf")
+    w[8] = (
+        w[8] * 2.0**-100
+    )  # a tiny-sum row: the fixed-point scale overflows under top-p (nothing kept, invalid)
+    w[9, 3] = float("nan")  # a NaN weight: the row is invalid under every filter
     s, o = keys(M, 5)
-    ks = torch.tensor([0, -3, N, 2 * N, 1, 5, 5, 5], dtype=torch.int32, device="cuda")
+    ks = torch.tensor(
+        [0, -3, N, 2 * N, 1, 5, 5, 5, 5, 5], dtype=torch.int32, device="cuda"
+    )
     r = probs_draw(w, s, o, top_k=ks)
     _same(
         r,
@@ -1078,7 +1361,7 @@ def test_degenerate_parameters_and_invalid_rows():
             w, s.tolist(), o.tolist(), [Filters(top_k=int(k)) for k in ks]
         ),
     )
-    want = torch.tensor([0, 0, 1, 1, 1, 0, 0, 1], dtype=torch.bool, device="cuda")
+    want = torch.tensor([0, 0, 1, 1, 1, 0, 0, 1, 1, 0], dtype=torch.bool, device="cuda")
     assert torch.equal(r["valid"], want)
     assert torch.equal(
         r["samples"][2:4],
@@ -1090,7 +1373,9 @@ def test_degenerate_parameters_and_invalid_rows():
         w, ks, seed=s, offset=o, return_valid=True, batch_invariant=True
     )
     assert torch.equal(vk, want) and torch.equal(tk, r["samples"])
-    ps = torch.tensor([0.0, 1.0, 1.5, 0.5, 0.999, 0.5, 0.5, 1e-9], device="cuda")
+    ps = torch.tensor(
+        [0.0, 1.0, 1.5, 0.5, 0.999, 0.5, 0.5, 1e-9, 0.5, 0.5], device="cuda"
+    )
     r = probs_draw(w, s, o, top_p=ps)
     _same(
         r,
@@ -1103,7 +1388,10 @@ def test_degenerate_parameters_and_invalid_rows():
         sampling_from_probs_batch_invariant(w[1:3], seed=s[1:3], offset=o[1:3]),
     )
     assert not bool(r["valid"][5]) and not bool(r["valid"][6])
-    ms = torch.tensor([0.0, 1.0, 1.5, 0.3, 0.0, 0.0, 0.0, 0.5], device="cuda")
+    assert not bool(r["valid"][8]) and not bool(
+        r["valid"][9]
+    )  # the tiny-sum row under top-p, the NaN row
+    ms = torch.tensor([0.0, 1.0, 1.5, 0.3, 0.0, 0.0, 0.0, 0.5, 0.1, 0.5], device="cuda")
     r = probs_draw(w, s, o, min_p=ms)
     _same(
         r,
@@ -1118,6 +1406,18 @@ def test_degenerate_parameters_and_invalid_rows():
         sampling_from_probs_batch_invariant(w[0:1], seed=s[:1], offset=o[:1]),
     )
     assert not bool(r["valid"][5]) and not bool(r["valid"][6])
+    assert bool(r["valid"][8]) and not bool(
+        r["valid"][9]
+    )  # min-p has no fixed-point scale: the tiny row is valid
+    # no configuration stages a 4 MB fp32 row within the budget at a cluster of 16: refused, never an assertion
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        flashinfer.sampling.top_k_sampling_from_probs(
+            torch.rand(1, 1 << 20, device="cuda"),
+            5,
+            seed=s[:1],
+            offset=o[:1],
+            batch_invariant=True,
+        )
 
 
 @needs_device
@@ -1129,8 +1429,8 @@ def test_distribution_follows_the_kept_set():
     w = row.repeat(M, 1).contiguous()
     s = torch.full((M,), 12345, dtype=torch.int64, device="cuda")
     o = torch.arange(M, device="cuda", dtype=torch.int64)
-    sup = sampling_support(w[:1], top_k=5, top_p=0.9)
-    kept = sup.mask[0]
+    sup = support_reference(w[:1], [Filters(top_k=5, top_p=0.9)])
+    kept = sup["mask"][0].cuda()
     p = torch.where(kept, row, torch.zeros_like(row))
     p = (p / p.sum()).cpu()
     tok = flashinfer.sampling.top_k_top_p_sampling_from_probs(
@@ -1160,6 +1460,95 @@ def test_big_vocabulary():
             x, s, o, temperature=temps, return_logprob=True, config=cfg, **kw
         )
         _same(r, ref, lp=True, label=cfg.describe() if cfg else "default")
+
+
+def _ef_cases(M, g):
+    ks = torch.randint(1, 200, (M,), generator=g).to(torch.int32).cuda()
+    ps = torch.rand(M, generator=g).cuda()
+    return [
+        dict(top_k=1),
+        dict(top_k=50),
+        dict(top_p=0.0),
+        dict(top_p=0.9),
+        dict(top_k=50, top_p=0.9),
+        dict(top_k=50, top_p=0.9, order="joint"),
+        dict(top_k=50, top_p=0.9, min_p=0.05),
+        dict(top_k=ks, top_p=ps),
+    ]
+
+
+def _ef_rows(M, N, g):
+    """Random logits (the early finish runs), eight tie levels and two levels with 100 at the top (the four-pass tail
+    runs), half the weights absent."""
+    rows = [
+        torch.randn(M, N, generator=g) * 2,
+        torch.randint(0, 8, (M, N), generator=g).float() * 1.5,
+    ]
+    two = torch.zeros(M, N)
+    two.scatter_(1, torch.rand(M, N, generator=g).argsort(dim=-1)[:, :100], 6.0)
+    rows.append(two)
+    sparse = torch.randn(M, N, generator=g) * 2
+    sparse[torch.rand(M, N, generator=g) < 0.5] = float("-inf")
+    rows.append(sparse)
+    return rows
+
+
+def _same_outputs(a, b, label):
+    assert a.keys() == b.keys(), label
+    for key in a:
+        if a[key].dtype.is_floating_point:
+            _same_nan(a[key], b[key], f"{label} {key}")
+        else:
+            assert torch.equal(a[key], b[key]), f"{label} {key}"
+
+
+@needs_device
+def test_early_finish_and_list_mode_are_placements():
+    """The selection's placements give the same bits on every output (token, validity, mass, the two log-probabilities):
+    the early finish -- after two passes, the compaction of the selected bin's candidates and the exact rank selection
+    over them in place of the last two passes when they fit the list -- on the mass selection (the default), on both
+    selections and off, and the count selection's list mode forced on and off against the kernel's rule. Rows whose cuts
+    fall in small bins (random logits: the early finish runs), in large tie groups (eight levels; two levels with 100 at
+    the top: the four-pass tail runs) and with half the weights absent; top-k / top-p / both orders / with min-p, per-row
+    parameters, probabilities and logits, both dtypes, the dispatcher's pick."""
+    sm = device_sm_count(torch.device("cuda"))
+    g = torch.Generator().manual_seed(7)
+    M = EF_M
+    s, o = keys(M, 9)
+    n_checked = 0
+    for dtype in DT:
+        eb = dtype.itemsize
+        for N in EF_NS:
+            cfg = DS.support_config(N, M, eb, sm)
+            cases = _ef_cases(M, g)
+            for lg_cpu in _ef_rows(M, N, g):
+                lg = lg_cpu.to(dtype).cuda()
+                probs = torch.nan_to_num(torch.softmax(lg.float(), dim=-1), nan=0.0).to(
+                    dtype
+                )
+                for from_logits in (False, True):
+                    x = lg if from_logits else probs
+                    f = logits_draw if from_logits else probs_draw
+                    for case in cases:
+                        kw = dict(
+                            case,
+                            config=cfg,
+                            return_logprob=from_logits,
+                            return_kept_logprob=from_logits,
+                        )
+                        ref = f(x, s, o, early_finish="", **kw)
+                        label = (
+                            dtype,
+                            N,
+                            from_logits,
+                            {k: v for k, v in case.items() if not torch.is_tensor(v)},
+                        )
+                        _same_outputs(f(x, s, o, early_finish="all", **kw), ref, label)
+                        _same_outputs(f(x, s, o, **kw), ref, label)
+                        _same_outputs(f(x, s, o, count_list=False, **kw), ref, label)
+                        _same_outputs(f(x, s, o, count_list=True, **kw), ref, label)
+                        n_checked += 1
+    assert n_checked == len(DT) * len(EF_NS) * 4 * 2 * 8
 
 
 @needs_device
@@ -1322,6 +1711,18 @@ def test_preallocated_outputs():
     with pytest.raises(ValueError, match="overlap"):
         flashinfer.sampling.top_k_sampling_from_probs(
             w, ks, seed=s, offset=o, batch_invariant=True, out=ks
+        )
+    ks64 = ks.to(
+        torch.int64
+    )  # the caller's own int64 tensor, not the kernel's int32 copy of it
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.sampling.top_k_sampling_from_probs(
+            w,
+            ks64,
+            seed=s,
+            offset=o,
+            batch_invariant=True,
+            out=ks64.view(torch.int32)[:M],
         )
     # an int64 samples buffer (the gather's dtype contract) overlapping a log-probability buffer
     idx = torch.arange(M, device="cuda")

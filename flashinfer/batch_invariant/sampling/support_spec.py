@@ -1,8 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""``support.row.v1``: the kept set of a row under top-k / top-p / min-p with ties kept (the class behind
-``flashinfer.sampling.top_k_renorm_probs`` / ``top_p_renorm_probs`` / ``top_k_mask_logits`` under ``batch_invariant=True``
-and behind ``flashinfer.sampling.sampling_support``).
+"""``support.row.v1``: the kept set of a row under top-k / top-p / min-p with ties kept -- the selection stage of the
+truncated samplers ``top_k_sampling_from_probs`` / ``top_p_sampling_from_probs`` / ``min_p_sampling_from_probs`` /
+``top_k_top_p_sampling_from_probs`` / ``top_k_top_p_sampling_from_logits`` under ``batch_invariant=True`` and of
+``log_probs(..., top_k / top_p / min_p)``; no entry of its own.
 
 Weights ``w_j >= 0`` (the given probabilities, or ``e_j = EX2(z_j)`` of ``lse.row`` for logits); ``S`` their canonical sum
 tree. Every filter keeps ``{j : w_j >= threshold}`` for a per-row threshold, so the kept set is closed upwards (ties kept):
@@ -50,11 +51,13 @@ FIX_SCALE = float(1 << FIX_BITS)
 ORDERS = ("top_k_first", "joint")
 INF_PATTERN = 0x7F800000  # the threshold that keeps nothing finite
 #: The selection rules, named in the fingerprint (a change is a change of the class): the cut, the ties, the three
-#: thresholds with their fallbacks, the two orders.
+#: thresholds with their fallbacks, the two orders; since 2026-11-17 a row whose (kept) sum is below ~2^-84 -- where
+#: ``div(2^44, S)`` overflows and every positive weight would saturate to the same fixed-point mass -- keeps nothing
+#: under top-p and is invalid (unreachable for logits, whose maximum weight is 1).
 SELECT_RULE = (
     "cut=w>=t;ties-kept;"
     "topk=kth-largest-pattern|k<=0:+inf|k>=N:0;"
-    "topp=largest-positive-pattern:mass>=trunc(p*2^44)|unreached-or-p>=1:min-positive|no-positive:+inf;"
+    "topp=largest-positive-pattern:mass>=trunc(p*2^44)|unreached-or-p>=1:min-positive|no-positive-or-scale-overflow(sum<2^-84):+inf;"
     "minp=mul(wmax,minp);order=top_k_first:topp-on-kept-mass|joint:intersect;effective=max"
 )
 

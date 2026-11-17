@@ -1149,6 +1149,19 @@ def log_probs(
         returned; nothing is allocated for it.
     lse_out : Optional[torch.Tensor]
         With ``return_lse=True``: a caller-owned buffer for ``lse`` (float32, ``logits.shape[:-1]``, contiguous).
+    top_k : Optional[Union[torch.Tensor, int]]
+        With ``batch_invariant=True`` only (the default path refuses it). The sampler's top-k, a scalar or one value
+        per row as ``top_k_top_p_sampling_from_logits`` takes it. With any of ``top_k`` / ``top_p`` / ``min_p`` the
+        returned value is the token's log-probability under the sampler's kept-set distribution -- bit for bit the
+        ``kept_logp`` the truncated samplers return for the token they drew -- ``-inf`` for a token outside the kept
+        set, NaN for an id outside ``[0, vocab_size)`` or a row with nothing kept; one id per row, ``return_lse``
+        refused.
+    top_p : Optional[Union[torch.Tensor, float]]
+        The sampler's top-p, a scalar or one value per row; see ``top_k``.
+    min_p : Optional[Union[torch.Tensor, float]]
+        The sampler's min-p, a scalar or one value per row; see ``top_k``.
+    filter_apply_order : str
+        ``"top_k_first"`` (default) or ``"joint"``, as for ``top_k_top_p_sampling_from_logits``; read only with a filter.
 
     Returns
     -------

@@ -40,7 +40,6 @@ from .api import (
 )
 from .draw_api import _resolve_keys, _row_keys
 from .schedule import BLOCK, SMEM_BUDGET, LSEConfig, device_sm_count, max_vec_elems
-from .support_api import SUPPORT_ARCHS, _row_param
 from .support_schedule import support_config
 from .support_spec import ORDERS, Filters
 
@@ -49,10 +48,67 @@ CLASS = "sample.icdf.v1+support.row.v1"
 #: The key reservation of the operator's own entries per output row (``get_seed_and_offset``'s increment: 32 for the
 #: rejection samplers, one for min-p) -- the generator-only call shape reserves the pair as the operator's path does.
 INCREMENT_PER_ROW = {"top_k": 32, "top_p": 32, "min_p": 1, "top_k_top_p": 32}
+#: The compute capabilities the support class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
+SUPPORT_ARCHS = ((10, 0), (10, 3), (10, 7))
 
 
 def _check_input(x: torch.Tensor, name: str) -> int:
     return check_input(x, name, CLASS, SUPPORT_ARCHS)
+
+
+def _row_param(
+    value,
+    M: int,
+    lead: Tuple[int, ...],
+    device,
+    dtype: torch.dtype,
+    name: str,
+    lo: float = 0.0,
+) -> Tuple[Optional[torch.Tensor], bool]:
+    """``None`` -> ``(None, False)``; a scalar or a tensor of one value, of shape ``(M,)`` or of the input's leading
+    shape -> ``((M,) tensor of dtype, True)``. The parameters are exact in their dtype (``top_k`` int32, ``top_p`` /
+    ``min_p`` the binary32 values the class compares with)."""
+    if value is None:
+        return None, False
+    if isinstance(value, torch.Tensor):
+        t = value.to(device=device, dtype=dtype).reshape(-1)
+        if t.numel() == 1 and M != 1:
+            t = t.expand(M)
+        if t.shape != (M,):
+            raise ValueError(
+                f"{name} must be a scalar or a tensor of one value, of shape ({M},) or of the input's leading shape "
+                f"{lead}; got {tuple(value.shape)}"
+            )
+        return t.contiguous(), True
+    v: Union[int, float]
+    if dtype == torch.int32:
+        v = int(value)
+        if not (-(1 << 31) <= v < (1 << 31)):
+            raise ValueError(f"{name}={value!r} out of the int32 range")
+    else:
+        v = float(value)
+        if not (v >= lo) or v != v or v == float("inf"):
+            raise ValueError(f"{name}={value!r} must be a finite number >= {lo}")
+    return torch.full((M,), v, dtype=dtype, device=device), True
+
+
+def _source_row_param(value, indices, idx, Msrc: int, name: str):
+    """The operator's rule for a per-row filter tensor under an index gather (#5340): one entry per SOURCE row (a row
+    of ``probs`` / ``logits``), read at ``indices[i]`` for output ``i``, so outputs that map to the same row share it.
+    Gathered here once, so every entry reads output ``i``'s threshold at ``indices[i]`` (an index outside the source
+    rows reads row 0: that output is invalid anyway); a tensor of one value broadcasts; without ``indices`` the tensor
+    is per row as given."""
+    if indices is None or not isinstance(value, torch.Tensor) or value.numel() == 1:
+        return value
+    t = value.reshape(-1).to(idx.device)
+    if t.numel() != Msrc:
+        raise ValueError(
+            f"{name}: with indices a per-row tensor has one entry per source row ({Msrc}, the operator's rule); got "
+            f"{t.numel()}"
+        )
+    if Msrc == 0:
+        return torch.zeros(idx.numel(), dtype=t.dtype, device=t.device)
+    return t[idx.clamp(0, Msrc - 1)]
 
 
 def draw_support(
@@ -74,6 +130,7 @@ def draw_support(
     config: Optional[LSEConfig] = None,
     sm_count: Optional[int] = None,
     early_finish: str = "mass",
+    count_list: Optional[bool] = None,
     return_valid: bool = True,
     return_mass: bool = True,
     out: Optional[torch.Tensor] = None,
@@ -93,8 +150,9 @@ def draw_support(
     one row), ``draw`` the block of the stream the uniform is read from. A row whose kept mass is not a positive finite
     number (nothing kept: ``k <= 0``, no positive weight; a non-finite row) is invalid, and so is an output whose index
     lies outside the source rows. Bitwise identical for every ``config`` of the support kernel's space (one row per CTA,
-    the staged share within the budget), every batch composition and every ``sm_count``; ``early_finish`` is the
-    selection's placement (the support kernel's). ``out`` (int32), ``logprob_out`` and ``kept_logprob_out`` (fp32; each
+    the staged share within the budget), every batch composition and every ``sm_count``; ``early_finish`` (``"mass"``,
+    ``"all"``, ``""``) and ``count_list`` (``None``: the kernel's rule) are the selection's placements, pinned against each
+    other by the suite. ``out`` (int32), ``logprob_out`` and ``kept_logprob_out`` (fp32; each
     implies its ``return_*``) are caller-owned buffers of the output shape, written in place and returned as given."""
     from .draw_support_kernel import get_compiled_kernel
 
@@ -135,6 +193,13 @@ def draw_support(
         idx = _dummy(dev, torch.int64)
         M = Msrc
     seeds, offs = _row_keys(seed, offset, M, dev)
+    top_k_in, top_p_in, min_p_in = (
+        v if isinstance(v, torch.Tensor) else None for v in (top_k, top_p, min_p)
+    )
+    # a per-row filter tensor is one entry per SOURCE row when indices is given (the operator's rule, #5340)
+    top_k = _source_row_param(top_k, indices, idx, Msrc, "top_k")
+    top_p = _source_row_param(top_p, indices, idx, Msrc, "top_p")
+    min_p = _source_row_param(min_p, indices, idx, Msrc, "min_p")
     k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k")
     p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
     m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
@@ -147,7 +212,14 @@ def draw_support(
     temp_t, c = _temperature(temperature, M, lead, dev) if from_logits else (None, 0.0)
     elem_bytes = x.element_size()
     if config is None:
-        config = support_config(N, M, elem_bytes, sm_count or device_sm_count(dev))
+        try:
+            config = support_config(N, M, elem_bytes, sm_count or device_sm_count(dev))
+        except (
+            ValueError
+        ) as e:  # no member of the space stages this row within the budget
+            raise unsupported(
+                CLASS, f"a vocabulary of {N} with {elem_bytes}-byte elements", str(e)
+            ) from None
     else:
         config.validate(N, elem_bytes)
         if config.rows_per_cta != 1:
@@ -196,9 +268,16 @@ def draw_support(
             ("offset", offs),
             ("indices", indices),
             ("temperature", temp_t),
+            (
+                "temperature (as given)",
+                temperature if isinstance(temperature, torch.Tensor) else None,
+            ),
             ("top_k", k_t if use_k else None),
+            ("top_k (as given)", top_k_in),
             ("top_p", p_t if use_p else None),
+            ("top_p (as given)", top_p_in),
             ("min_p", m_t if use_m else None),
+            ("min_p (as given)", min_p_in),
         ],
     )
     if M > 0 and (indices is None or Msrc > 0):
@@ -214,6 +293,7 @@ def draw_support(
             bool(enable_pdl),
             early_finish,
             return_kept_logprob,
+            count_list=count_list,
         )
         kernel(
             x2,
@@ -324,7 +404,14 @@ def kept_log_probs(
     temp_t, c = _temperature(temperature, M, lead, dev)
     elem_bytes = logits.element_size()
     if config is None:
-        config = support_config(N, M, elem_bytes, sm_count or device_sm_count(dev))
+        try:
+            config = support_config(N, M, elem_bytes, sm_count or device_sm_count(dev))
+        except (
+            ValueError
+        ) as e:  # no member of the space stages this row within the budget
+            raise unsupported(
+                CLASS, f"a vocabulary of {N} with {elem_bytes}-byte elements", str(e)
+            ) from None
     else:
         config.validate(N, elem_bytes)
         if config.rows_per_cta != 1:
@@ -360,9 +447,16 @@ def kept_log_probs(
             ("logits", logits),
             ("token_ids", token_ids),
             ("temperature", temp_t),
+            (
+                "temperature (as given)",
+                temperature if isinstance(temperature, torch.Tensor) else None,
+            ),
             ("top_k", k_t if use_k else None),
+            ("top_k (as given)", top_k if isinstance(top_k, torch.Tensor) else None),
             ("top_p", p_t if use_p else None),
+            ("top_p (as given)", top_p if isinstance(top_p, torch.Tensor) else None),
             ("min_p", m_t if use_m else None),
+            ("min_p (as given)", min_p if isinstance(min_p, torch.Tensor) else None),
         ],
     )
     if M > 0:
@@ -472,6 +566,11 @@ def _entry(
                 (
                     "temperature",
                     temperature if isinstance(temperature, torch.Tensor) else None,
+                ),
+                *(
+                    (name, filters.get(name))
+                    for name in ("top_k", "top_p", "min_p")
+                    if isinstance(filters.get(name), torch.Tensor)
                 ),
             ],
         )
