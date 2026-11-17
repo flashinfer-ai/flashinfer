@@ -37,6 +37,55 @@ KNOB_KEYS = (
     "reduce_topk_in_kernel",
 )
 
+# Structural choices before expanding the optional in-kernel reduction axis.
+_INFERENCE_CANDIDATE_ORDER = (
+    29,
+    25,
+    19,
+    27,
+    31,
+    21,
+    23,
+    18,
+    17,
+    15,
+    7,
+    22,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    16,
+    20,
+    24,
+    26,
+    28,
+    30,
+)
+
+_GENPHASE_CANDIDATE_ORDER = (8, 3, 0, 1, 2, 4, 5, 6, 7, 9, 10)
+
+
+def _unique_candidates(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize tuple-valued knobs and retain each choice's first occurrence."""
+    from .knob_cache import _knobs_from_json
+
+    unique: Dict[tuple, Dict[str, Any]] = {}
+    for knobs in candidates:
+        normalized = _knobs_from_json(knobs)
+        unique.setdefault(tuple(sorted(normalized.items())), normalized)
+    return list(unique.values())
+
 
 def is_valid_sm107(knobs: Dict[str, Any], base_config: Any) -> bool:
     """``True`` if ``knobs`` is constructible on ``base_config``'s geometry.
@@ -50,6 +99,12 @@ def is_valid_sm107(knobs: Dict[str, Any], base_config: Any) -> bool:
     if unknown:
         raise ValueError(f"unknown SM107 knob keys: {sorted(unknown)}")
     try:
+        if getattr(base_config, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                validate_block_scaled_batch_invariant,
+            )
+
+            validate_block_scaled_batch_invariant(base_config, knobs, arch="sm_107")
         dataclasses.replace(base_config, **knobs)
     except (ValueError, TypeError):
         return False
@@ -61,18 +116,20 @@ def sm107_candidates(
     *,
     allow_in_kernel_fc2_reduce: bool = False,
     kernel_variant: str = "inference",
+    batch_invariant: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
-    Inference uses 32 candidates (64 with the ikr axis). The first 16 retain:
+    Inference uses 32 candidates (64 with the ikr axis), ordered for callers
+    taking a prefix. The grid includes:
 
-    - tile N 128 vs 256 (K fixed at the kind's 2x-mode depth),
+    - tile N 128 vs 256 at the kind's base K depth,
     - uniform (2,1) grouped/grid-stride launch vs mixed-CGA (4,1)+(2,1)
       phase-interleave/atomic launch,
     - epi flag batches (1,4) vs (2,4),
     - FC2 bulk TMA (2 stages) on/off.
 
-    The remaining candidates use uniform clusters (2,1) or (4,1) with
+    Additional candidates use uniform clusters (2,1) or (4,1) with
     phase-interleave/atomic launches and epi flag batches (2,4): N64 at the
     kind's base and doubled K depths, plus N128/N256 at the base K depth.
     FC2 bulk stores use one stage for N64 and two for the wider tiles.
@@ -85,6 +142,41 @@ def sm107_candidates(
     sweep them with :func:`sm107_schedule_candidates` instead.  An ikr winner
     makes the output accumulation order nondeterministic; it stays opt-in.
     """
+    if batch_invariant:
+        if (
+            quant_kind
+            not in ("nvfp4", "mxfp4", "mxfp4_mxfp8", "mxfp8_e4m3", "mxfp8_e5m2")
+            or allow_in_kernel_fc2_reduce
+        ):
+            raise ValueError(
+                "batch_invariant SM107 candidates require an admitted block-scaled kind without in-kernel reduction"
+            )
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_default_knobs,
+        )
+
+        from types import SimpleNamespace
+
+        base = block_scaled_batch_invariant_default_knobs(
+            SimpleNamespace(quant_kind=quant_kind),
+            "genphase" if kernel_variant == "genphase" else "standard",
+            arch="sm_107",
+        )
+        if kernel_variant == "genphase":
+            return [
+                dict(base, work_id_mode=work)
+                for work in ("grid_stride", "atomic_counter")
+            ]
+        from flashinfer.moe_ep.backends.mega.kernel.sm100.common.quantized_batch_invariant_tiles import (
+            quantized_batch_invariant_tiles,
+        )
+
+        return [
+            dict(base, mma_tiler_mnk=tile, token_back_mode=carrier, work_id_mode=work)
+            for tile in quantized_batch_invariant_tiles(quant_kind, arch="sm_107")
+            for carrier in ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+            for work in ("grid_stride", "atomic_counter")
+        ]
     tile_k = 256 if quant_kind in ("nvfp4", "mxfp4") else 128
     launches = (
         # (cluster, fallback, schedule_policy, work_id_mode)
@@ -124,7 +216,6 @@ def sm107_candidates(
                             }
                         )
     if kernel_variant == "inference":
-        # Preserve the original prefix for callers using --max-candidates.
         for tile_n, depth in (
             (64, tile_k),
             (64, 2 * tile_k),
@@ -179,6 +270,26 @@ def sm107_candidates(
                     "reduce_topk_in_kernel": False,
                 }
             )
+    if kernel_variant == "inference":
+        # Keep each structural choice's reduction variants adjacent.
+        stride = 2 if allow_in_kernel_fc2_reduce else 1
+        out = [
+            candidate
+            for index in _INFERENCE_CANDIDATE_ORDER
+            for candidate in out[index * stride : (index + 1) * stride]
+        ]
+    else:
+        # Only the eight wider-tile choices expand the reduction axis.
+        stride = 2 if allow_in_kernel_fc2_reduce else 1
+        base_count = 8 * stride
+        groups = [out[i : i + stride] for i in range(0, base_count, stride)]
+        groups.extend([candidate] for candidate in out[base_count:])
+        out = [
+            candidate
+            for index in _GENPHASE_CANDIDATE_ORDER
+            if index < len(groups)
+            for candidate in groups[index]
+        ]
     return out
 
 
@@ -203,9 +314,9 @@ def sm107_schedule_candidates(
 
 def _prepare_collectively(prepare, world_size, process_group):
     """Finish host preparation on every rank before launching collective kernels."""
-    error = None
+    result, error = None, None
     try:
-        prepare()
+        result = prepare()
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     errors = [error]
@@ -215,7 +326,9 @@ def _prepare_collectively(prepare, world_size, process_group):
         errors = [None] * world_size
         dist.all_gather_object(errors, error, group=process_group)
     if any(errors):
+        result = None
         raise RuntimeError(f"MegaMoE preparation failed on EP ranks: {errors}")
+    return result
 
 
 def _sweep_sm107_block_scaled_mega_moe(
@@ -254,8 +367,12 @@ def _sweep_sm107_block_scaled_mega_moe(
 
     ensure_not_capturing("SM107 collective autotune sweep")
     cfg = symm_buffer.config
-    candidates = (
-        sm107_candidates(cfg.quant_kind, kernel_variant=cfg.kernel_variant)
+    candidates = _unique_candidates(
+        sm107_candidates(
+            cfg.quant_kind,
+            kernel_variant=cfg.kernel_variant,
+            batch_invariant=getattr(cfg, "batch_invariant", False),
+        )
         if candidates is None
         else candidates
     )
@@ -266,11 +383,6 @@ def _sweep_sm107_block_scaled_mega_moe(
     num_tokens = symm_buffer.staged_tokens() if num_tokens is None else num_tokens
     if num_tokens is None or not 0 <= num_tokens <= cfg.max_tokens_per_rank:
         raise ValueError("stage a valid num_tokens before autotuning.")
-
-    if y is None and make_trial is None:
-        y = torch.empty(
-            num_tokens, cfg.hidden, dtype=torch.bfloat16, device=symm_buffer.device
-        )
 
     collective = cfg.world_size > 1
     if collective:
@@ -291,6 +403,15 @@ def _sweep_sm107_block_scaled_mega_moe(
             raise ValueError(
                 "all EP ranks must use identical autotune geometry, candidates, and iteration counts"
             )
+
+    if y is None and make_trial is None:
+        y = _prepare_collectively(
+            lambda: torch.empty(
+                num_tokens, cfg.hidden, dtype=torch.bfloat16, device=symm_buffer.device
+            ),
+            cfg.world_size,
+            process_group,
+        )
 
     def barrier():
         if collective:
@@ -334,23 +455,29 @@ def _sweep_sm107_block_scaled_mega_moe(
         # No finally/collective free on failure: another rank may already be
         # inside a kernel or have a failed CUDA context. The supervisor must
         # terminate the whole job, then retry a candidate in a fresh job.
-        trial = Sm107BlockScaledSymmBuffer(trial_cfg)
-        trial.x.view(torch.uint8).copy_(symm_buffer.x.view(torch.uint8))
-        trial.x_sf.view(torch.uint8).copy_(symm_buffer.x_sf.view(torch.uint8))
-        trial.topk_idx.copy_(symm_buffer.topk_idx)
-        trial.topk_weights.copy_(symm_buffer.topk_weights)
-        if cfg.quant_kind == "nvfp4":
-            for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
-                # the scalars the workspace's launches use (bound per-call tensors by
-                # default, where the workspace tensors stay unwritten)
-                getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
-        trial.note_staged_tokens(num_tokens)
-        _prepare_collectively(
-            lambda: trial.prepare(transformed_l1, transformed_l2),
+        trial = Sm107BlockScaledSymmBuffer(
+            trial_cfg,
+            **({"process_group": process_group} if process_group is not None else {}),
+        )
+
+        def prepare_trial():
+            trial.x.view(torch.uint8).copy_(symm_buffer.x.view(torch.uint8))
+            trial.x_sf.view(torch.uint8).copy_(symm_buffer.x_sf.view(torch.uint8))
+            trial.topk_idx.copy_(symm_buffer.topk_idx)
+            trial.topk_weights.copy_(symm_buffer.topk_weights)
+            if cfg.quant_kind == "nvfp4":
+                for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
+                    # Copy the actual bound per-call scales, including defaults.
+                    getattr(trial, name).copy_(symm_buffer._scalar_tensor(name))
+            trial.note_staged_tokens(num_tokens)
+            trial.prepare(transformed_l1, transformed_l2)
+            return trial if make_trial is None else make_trial(trial)
+
+        measured_trial = _prepare_collectively(
+            prepare_trial,
             cfg.world_size,
             process_group,
         )
-        measured_trial = trial if make_trial is None else make_trial(trial)
         barrier()
         for _ in range(warmup_iters):
             if make_trial is None:
@@ -454,6 +581,7 @@ def autotune_sm107_block_scaled_mega_moe(
     context and ``install_winner=True`` to prepare the winner in this workspace.
     A disabled cache miss returns None. Layer and CLI tuning measure complete
     forwards through the same protocol with a staging-aware execution trial.
+    Supplied candidates retain their order; repeated choices are measured once.
     """
     from .tuning_protocol import RubinTuningProtocol
 

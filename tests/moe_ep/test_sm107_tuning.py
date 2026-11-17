@@ -1,6 +1,7 @@
 """Tuner failure policy, numerical gating, and collective latency statistics."""
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -17,6 +18,46 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
     correctness,
     knob_cache,
 )
+
+
+def test_candidate_deduplication_preserves_order_and_normalizes_json():
+    grid = autotune.sm107_candidates()
+    first, second = grid[1], grid[0]
+    duplicate = dict(reversed(json.loads(json.dumps(first)).items()))
+    supplied = [first, duplicate, second, first]
+    snapshot = json.dumps(supplied)
+    assert autotune._unique_candidates(supplied) == [first, second]
+    assert json.dumps(supplied) == snapshot
+    assert autotune._unique_candidates([]) == []
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("limit", [2, 16])
+def test_cli_deduplicates_before_limiting_candidates(monkeypatch, variant, limit):
+    from flashinfer.moe_ep.backends.mega.kernel import tuning as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    first, second = autotune.sm107_candidates(kernel_variant=variant)[:2]
+    monkeypatch.setattr(
+        package,
+        "sm107_candidates",
+        lambda *a, **kw: [first, json.loads(json.dumps(first)), second],
+    )
+    args = SimpleNamespace(
+        sweep="structural",
+        allow_nondeterministic=False,
+        combine_dtype="bf16",
+        skew=None,
+        max_candidates=limit,
+        dtype="nvfp4",
+        warmup_iters=1,
+        timed_iters=2,
+    )
+    candidates = tuning._candidates(args, 0, 1, 128, "nvfp4", variant)
+    selected = mock.Mock(return_value=first)
+    shared.finish_sweep(args, 0, 128, 4, None, None, None, None, candidates, selected)
+    assert selected.call_args.kwargs["candidates"] == [first, second]
 
 
 def _load_benchmark_module(path: Path):
@@ -97,7 +138,14 @@ def test_benchmark_reports_staging_and_capture_allocation(
     benchmark_module, mode, execution, no_flush, staging, ownership, allocation
 ):
     protocol = benchmark_module._timing_protocol(
-        SimpleNamespace(mode=mode, execution=execution, no_l2_flush=no_flush, warmup=20)
+        SimpleNamespace(
+            mode=mode,
+            execution=execution,
+            no_l2_flush=no_flush,
+            warmup=20,
+            eager_completed_wall=False,
+            prequantized=False,
+        )
     )
     assert protocol["input_staging_in_timed_span"] is staging
     assert protocol["output_ownership"] == ownership
@@ -241,11 +289,17 @@ def test_incorrect_candidate_cannot_enter_cache(fake_trials):
         None,
         None,
         state.source,
-        candidates=[{"fc2_use_bulk": True}, {"fc2_use_bulk": False}],
+        candidates=[
+            {"fc2_use_bulk": True},
+            {"fc2_use_bulk": True},
+            {"fc2_use_bulk": False},
+            {"fc2_use_bulk": False},
+        ],
         warmup_iters=1,
         timed_iters=2,
     )
     assert winner == {"fc2_use_bulk": False}
+    assert len(state.trials) == 3  # Source workspace and two distinct candidates.
     assert all(t.destroyed for t in state.trials[1:])
     assert state.recorded.call_args.args[0]["knobs"] == winner
 

@@ -1138,3 +1138,60 @@ def test_support_rejects_unshuffled_major_k(monkeypatch):
 
     assert not ok
     assert "shuffled weights" in reason
+
+
+def _deepseek_block32_call(**overrides):
+    hidden_size = overrides.pop("hidden_size", 256)
+    intermediate_size = overrides.pop("intermediate_size", 160)
+    num_local_experts = overrides.pop("num_local_experts", 4)
+    weight_layout = overrides.pop("weight_layout", WeightLayout.MajorK)
+    runner = _runner(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_local_experts=num_local_experts,
+        weight_layout=weight_layout,
+    )
+    inputs = _inputs(
+        hidden_states=torch.empty((4, hidden_size), dtype=torch.float8_e4m3fn),
+        hidden_states_scale=torch.empty((hidden_size // 32, 4), dtype=torch.float32),
+    )
+    kwargs = dict(
+        weight_layout=weight_layout,
+        gemm1_weights_scale=torch.empty(
+            (num_local_experts, 2 * intermediate_size // 32, hidden_size // 32),
+            dtype=torch.float32,
+        ),
+        gemm2_weights_scale=torch.empty(
+            (num_local_experts, hidden_size // 32, intermediate_size // 32),
+            dtype=torch.float32,
+        ),
+    )
+    kwargs.update(overrides)
+    return runner, inputs, kwargs
+
+
+def test_deepseek_scale_block_accepts_block32_major_k():
+    ok, reason, block = support._deepseek_fp8_scale_block(*_deepseek_block32_call())
+    assert ok, reason
+    assert block == 32
+
+
+def test_deepseek_scale_block_rejects_block_major_k_hidden_not_128():
+    # FC1's K is hidden_size; BlockMajorK stores it in 128-element blocks.
+    ok, reason, _ = support._deepseek_fp8_scale_block(
+        *_deepseek_block32_call(
+            hidden_size=160,
+            intermediate_size=256,
+            weight_layout=WeightLayout.BlockMajorK,
+        )
+    )
+    assert not ok
+    assert "BlockMajorK" in reason and "hidden_size=160" in reason
+
+
+def test_deepseek_scale_block_rejects_wrong_expert_dim():
+    runner, inputs, kwargs = _deepseek_block32_call()
+    kwargs["gemm1_weights_scale"] = kwargs["gemm1_weights_scale"][:2]
+    ok, reason, _ = support._deepseek_fp8_scale_block(runner, inputs, kwargs)
+    assert not ok
+    assert "gemm1_weights_scale" in reason and "num_local_experts=4" in reason

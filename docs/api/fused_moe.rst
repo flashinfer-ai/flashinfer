@@ -283,7 +283,10 @@ publish and the expand kernels read in O(1) per CTA; the generic shrink splits t
 dimension over extra CTAs at small pair counts and reduces the partials in a fixed order.
 Other inputs fall back to the portable
 ``bgmv_moe_shrink`` / ``bgmv_moe_expand`` kernels (``plan.backend_used ==
-"portable"``) unless ``fallback=False`` is passed.
+"portable"``) unless ``fallback=False`` is passed. ``backend="blackwell"`` and
+``BGMVMoEBlackwellPlan`` are deprecated aliases of ``backend="cake"`` and
+:class:`BGMVMoECakePlan`; with ``backend="blackwell"`` unsupported inputs raise
+``ValueError`` unless ``fallback=True`` is passed.
 
 .. autosummary::
     :toctree: ../generated
@@ -685,8 +688,10 @@ uses Prims-TS. NVFP4 and MXFP4 reuse ``TrtllmFp4Config``, BF16 reuses
 ``TrtllmBf16Config``, MXFP8 reuses ``TrtllmFp8BlockConfig``, and per-tensor FP8
 reuses ``TrtllmFp8PerTensorConfig``. DeepSeekFp8 activations and scales match
 ``TrtllmFp8BlockConfig``, but the weight payloads are shuffled with epilogue
-tile 64 and must not be registered under ``trtllm_fp8_block``. One shared view
-can be registered for both keys::
+tile 64 and must not be registered under ``trtllm_fp8_block``. Prims-TS also
+accepts 32x32 DeepSeekFp8 scale blocks (``hidden_states_scale`` of shape
+``[hidden_size / 32, num_tokens]`` with matching weight scales), which the
+TRT-LLM Gen path does not. One shared view can be registered for both keys::
 
     backend = PrimsTsConfig()
     quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
@@ -714,8 +719,10 @@ can be registered for both keys::
     )
     output = MoELayer(config)(activations, weights)
 
-``intermediate_size`` must be a multiple of 128. Fused shared experts and
-LoRA stay out of scope.
+``intermediate_size`` must be a multiple of 128, except for DeepSeekFp8 with
+32x32 scale blocks and MajorK weights, where ``hidden_size`` and
+``intermediate_size`` need only be multiples of 32 (BlockMajorK weights keep
+the 128 requirement). Fused shared experts and LoRA stay out of scope.
 
 .. autosummary::
     :toctree: ../generated

@@ -617,7 +617,7 @@ kernel_cake_kimi_k3_fp8_projection_41ee4a88e4ed94d581c4(const __grid_constant__ 
                     }
                     asm volatile("barrier.sync %0, 128;" :: "r"(2 + epi_group) : "memory");
                 } else {
-                    unsigned long long pbase = (unsigned long long)(tile_2 * split + rank_2) * 2048 + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128;
+                    unsigned long long pbase = (unsigned long long)(tile_2 * split + rank_2) * 2048ull + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128ull;
                     #pragma unroll
                     for (int t = 0; t < 16; t++) {
                         partials[pbase + (unsigned long long)(t * 128)] = _tmem_load_0[t];
@@ -636,7 +636,7 @@ kernel_cake_kimi_k3_fp8_projection_41ee4a88e4ed94d581c4(const __grid_constant__ 
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                     int t_first = rank_2 * tok_per_cta;
                     int t_last = ((16) < (t_first + tok_per_cta) ? (16) : (t_first + tok_per_cta));
-                    unsigned long long rbase = (unsigned long long)(tile_2 * split) * 2048 + (unsigned long long)lane_row;
+                    unsigned long long rbase = (unsigned long long)(tile_2 * split) * 2048ull + (unsigned long long)lane_row;
                     #pragma unroll
                     for (int tb = 0; tb < 16; tb++) {
                         if (t_first < tb + 1 && t_last > tb && tok_g0 <= tb && tb < tok_g0 + 16) {
@@ -651,7 +651,7 @@ kernel_cake_kimi_k3_fp8_projection_41ee4a88e4ed94d581c4(const __grid_constant__ 
                                 #pragma unroll
                                 for (int j_3 = 0; j_3 < 16; j_3++) {
                                     int s_j = ((s_0 + j_3) < (split - 1) ? (s_0 + j_3) : (split - 1));
-                                    unsigned long long rank_off = rbase + (unsigned long long)s_j * 2048;
+                                    unsigned long long rank_off = rbase + (unsigned long long)s_j * 2048ull;
                                     #pragma unroll
                                     for (int u_1 = 0; u_1 < 1; u_1++) {
                                         parts[u_1 * 16 + j_3] = partials[rank_off + (unsigned long long)((tb + u_1) * 128)];

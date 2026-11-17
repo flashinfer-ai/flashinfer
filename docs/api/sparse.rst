@@ -26,6 +26,21 @@ Kernels for block sparse flashattention.
     .. automethod:: __init__
 
 
+QSA Sparse Paged Attention
+--------------------------
+
+Gated sparse paged GQA attention of the Qwen QSA layer over an NVFP4, FP8 or
+BF16 paged KV cache, with the argument order of vLLM's
+``qsa_sparse_paged_attention``. The default implementation runs on SM80
+through SM90. NVFP4 on compute capability 10.0, 10.3, 10.7 and 12.0 is served by
+the experimental Cake backend (``backend="cake"``).
+
+.. autosummary::
+    :toctree: ../generated
+
+    qsa_sparse_paged_attention
+
+
 Cake VSA
 --------
 
@@ -44,13 +59,14 @@ Token-Sparse Attention Inputs
 Build cache-slot lists for token-sparse attention.
 Build grouped key unions and masks for masked dense attention.
 
-.. currentmodule:: flashinfer.token_sparse
+.. currentmodule:: flashinfer.sdsa.token_sparse
 
 .. autosummary::
     :toctree: ../generated
 
     token_sparse_kv_indices
     group_union_masks
+    union_key_limit
 
 
 SDSA Indexer

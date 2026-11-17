@@ -24,6 +24,14 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
+    LamportPeerStoreConfig,
+    bind_peer_store_args,
+    make_lamport_peer_store_config,
+    split_peer_store_config,
+    store_tile_to_peers,
+)
+
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 
@@ -378,6 +386,7 @@ __all__ = [
     "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
+    "run_splitk_dense_peer_store",
 ]
 
 
@@ -506,7 +515,9 @@ class SplitKDenseGemmKernel:
         use_pdl: bool,
         has_bias: bool,
         arch: str = "sm_100",
+        peer_store: LamportPeerStoreConfig | None = None,
     ) -> None:
+        self.peer_store = peer_store
         self.acc_dtype = cutlass.Float32
         # Dynamic SMEM requested at launch: the capacity of ``arch``.
         self.arch = arch
@@ -545,9 +556,10 @@ class SplitKDenseGemmKernel:
         c: cute.Tensor,
         bias: cute.Tensor,
         stream: _cuda.CUstream,
+        peer_args=None,
     ):
         # Grid-y packs output-N tile and cluster rank.
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, peer_args).launch(
             grid=(
                 cute.ceil_div(c.layout.shape[0], self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
@@ -567,6 +579,7 @@ class SplitKDenseGemmKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
+        peer_args,
     ):
         """Allocate storage and dispatch the specialized warps."""
         stages = self.num_ab_stage
@@ -663,6 +676,11 @@ class SplitKDenseGemmKernel:
             mailbox = sA
             bar_reduce = bar_mma_epilog
 
+        # None compiles the peer-store epilogue out.
+        peer_store_operands = None
+        if cutlass.const_expr(self.peer_store is not None):
+            peer_store_operands = (sA, mC, bidx, n_idx, peer_args)
+
         if warp_idx == 0:
             with cute.arch.elect_one():
                 for i in range(stages):
@@ -744,6 +762,7 @@ class SplitKDenseGemmKernel:
                 mailbox,
                 bar_reduce,
                 split_rank,
+                peer_store_operands=peer_store_operands,
             )
 
     @cute.experimental.jit
@@ -762,6 +781,10 @@ class SplitKDenseGemmKernel:
         stages = self.num_ab_stage
         if cutlass.const_expr(not is_a and self.use_pdl):
             cute.arch.griddepcontrol_wait()
+            if cutlass.const_expr(self.peer_store is not None):
+                # A pre-pushed consumer reads the epoch at launch: release it only after
+                # this wait, once every earlier push-plane kernel has finished.
+                cute.arch.griddepcontrol_launch_dependents()
 
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
@@ -786,7 +809,7 @@ class SplitKDenseGemmKernel:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        if cutlass.const_expr(is_a and self.use_pdl):
+        if cutlass.const_expr(is_a and self.use_pdl and self.peer_store is None):
             cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(not is_a and self.has_bias):
             cute.arch.mbarrier_arrive(bar_tma_epilog)
@@ -878,6 +901,7 @@ class SplitKDenseGemmKernel:
         mailbox,
         bar_reduce,
         split_rank: cutlass.Int32,
+        peer_store_operands=None,
     ):
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
@@ -998,8 +1022,26 @@ class SplitKDenseGemmKernel:
                 rAcc.store(rAcc.load() + rBiasAcc.load())
 
             rD.store(rAcc.load().to(c_dtype))
-            # Preserve TMEM coordinates; the copy predicates output tails.
-            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.peer_store is None):
+                # Preserve TMEM coordinates; the copy predicates output tails.
+                cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            else:
+                sA, mC, bidx, n_idx, peer_args = peer_store_operands
+                assert self.cta_n <= self.cta_k  # the tile fits in one A stage
+                store_tile_to_peers(
+                    bind_peer_store_args(self.peer_store, peer_args),
+                    rD,
+                    tiled_copy_t2r,
+                    epi_tid,
+                    d_layout,
+                    self.acc_dtype,
+                    sA,
+                    mC,
+                    bidx,
+                    n_idx,
+                    self.cta_m,
+                    self.cta_n,
+                )
 
         # The reduction mbarrier covers remote stores; no cluster barrier needed.
 
@@ -1007,6 +1049,8 @@ class SplitKDenseGemmKernel:
 import torch as _torch
 
 _SUPPORTED_TORCH_DTYPES = (_torch.bfloat16, _torch.float16)
+# Peer-store kernels keyed without addresses; functools.cache would key on the launch arguments.
+_PEER_STORE_KERNELS: dict = {}
 
 
 @cute.experimental.jit
@@ -1016,6 +1060,7 @@ def _bmm_no_bias(
     b: cute.Tensor,
     c: cute.Tensor,
     stream: _cuda.CUstream,
+    peer_args=None,
 ):
     c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
     gemm_op(
@@ -1024,6 +1069,7 @@ def _bmm_no_bias(
         c,
         cute.make_tensor(c.iterator, cute.select(c.layout, mode=[0, 1, 2])),
         stream,
+        peer_args,
     )
 
 
@@ -1223,3 +1269,59 @@ def run_splitk_dense(
             _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
         )
     return out
+
+
+def run_splitk_dense_peer_store(
+    a,
+    b,
+    out,
+    tactic: SplitKTactic,
+    *,
+    peer_ptrs=None,
+    multicast_ptr=None,
+    epoch_ptr: int,
+    slot_bytes: int,
+    rank: int,
+    world_size: int,
+    layout: str = "broadcast",
+    pdl: bool = True,
+) -> None:
+    """``run_splitk_dense`` (BF16, no bias) storing into peer buffers (``LamportPeerStoreConfig``); ``out`` is not written."""
+    m, n, k = _validate_runtime_tensors(a, b, None, out)
+    smem_capacity = _smem_capacity_bytes(a.get_device())
+    validate_tactic(tactic, m, n, k, smem_capacity=smem_capacity)
+    if a.dtype != _torch.bfloat16:
+        raise ValueError("split-K peer store supports bfloat16 only")
+    # The epilogue stages the tile for a row-major output.
+    if not out.is_contiguous():
+        raise ValueError("split-K peer store needs a row-major out")
+    # The peer-store epilogue stores 16 B chunks (8 features), predicated against N.
+    if n % 8:
+        raise ValueError(f"N={n} must be a multiple of 8")
+    peer_store = make_lamport_peer_store_config(
+        peer_ptrs=peer_ptrs,
+        multicast_ptr=multicast_ptr,
+        epoch_ptr=epoch_ptr,
+        slot_bytes=slot_bytes,
+        rank=rank,
+        world_size=world_size,
+        layout=layout,
+        m=m,
+        n=n,
+    )
+    peer_store, peer_args = split_peer_store_config(peer_store)
+    with _torch.cuda.device(a.device):
+        tensors = _to_cute_swap(a, b, out, None)
+        stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+        args = (*tensors[:3], stream, peer_args)
+        key = (a.get_device(), tactic, pdl, tensors[4], peer_store)
+        if key not in _PEER_STORE_KERNELS:
+            kernel = SplitKDenseGemmKernel(
+                tactic=tactic,
+                use_pdl=pdl,
+                has_bias=False,
+                arch=_arch(a.get_device()),
+                peer_store=peer_store,
+            )
+            _PEER_STORE_KERNELS[key] = cute_ext.compile(_bmm_no_bias, kernel, *args)
+        _PEER_STORE_KERNELS[key](*args)

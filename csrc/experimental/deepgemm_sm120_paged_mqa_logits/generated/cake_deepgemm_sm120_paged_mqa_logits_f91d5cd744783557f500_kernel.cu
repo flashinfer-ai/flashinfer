@@ -96,7 +96,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_f91d5cd744783557f500(int* __restrict
     #pragma unroll
     for (int i_1 = 0; i_1 < 16; i_1++) {
         unsigned int num = (unsigned int)(ctx[i_1] + split_kv - 1);
-        unsigned int q0 = (unsigned int)((unsigned long long)num * (unsigned long long)inv >> 32);
+        unsigned int q0 = (unsigned int)((unsigned long long)num * (unsigned long long)inv >> 32ull);
         int quo = (int)((num - q0 * divisor >= divisor) ? q0 + 1 : q0);
         int segs = ((row_base + i_1 < batch_size) ? quo : 0);
         running += segs;

@@ -16,6 +16,7 @@ from dataclasses import replace
 import io
 import json
 import math
+from pathlib import Path
 import sys
 from types import SimpleNamespace
 
@@ -46,9 +47,11 @@ from flashinfer.prims_ts.moe.tools.sweep.engine import (
 )
 from flashinfer.prims_ts.moe.tools.sweep.workers import (
     FailureKind,
+    GPULockTimeout,
     ProcessResult,
     WorkerActivity,
     WorkerStatus,
+    gpu_lock,
 )
 from flashinfer.prims_ts.moe.tools.sweep.measure import (
     TimingProtocol,
@@ -81,6 +84,28 @@ from flashinfer.prims_ts.moe.tools.sweep.search import (
 )
 from flashinfer.prims_ts.moe.tools.sweep.shapes import model_moe_shape
 from flashinfer.prims_ts.moe.tools.sweep.space import Candidate as SpaceCandidate
+
+
+def test_gpu_lock_timeout_releases_turnstile_and_preserves_owner(
+    tmp_path: Path,
+) -> None:
+    import os
+
+    import _flashinfer_filelock as filelock
+
+    with gpu_lock("test-gpu", lock_dir=tmp_path) as path:
+        with (
+            pytest.raises(GPULockTimeout),
+            gpu_lock("test-gpu", lock_dir=tmp_path, timeout_seconds=0),
+        ):
+            pytest.fail("contender acquired the occupied GPU lock")
+        with path.with_suffix(path.suffix + ".turnstile").open("a+") as turnstile:
+            filelock.lock(turnstile.fileno(), blocking=False)
+            filelock.unlock(turnstile.fileno())
+
+    assert path.read_text() == f"{os.getpid()}\n"
+    with gpu_lock("test-gpu", lock_dir=tmp_path, timeout_seconds=0):
+        pass
 
 
 def test_shape_timeout_defaults_to_sixty_seconds() -> None:

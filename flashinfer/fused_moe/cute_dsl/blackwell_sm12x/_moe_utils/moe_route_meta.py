@@ -11,17 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared expert-route metadata kernels for Q0-to-route implementations.
-
-A negative expert id marks an unrouted (token, slot) pair: vLLM writes -1 into
-the CUDA-graph padding rows of ``topk_ids`` and leaves their weights as-is.
-These kernels give such pairs no routed row: they are left out of the expert
-counts and ``offsets``, write nothing to ``token_map``/``token_weights``, and get
-``dst_rows``/``scale_dst_rows`` = -1 so the Q0 scatter skips them.  The grouped
-GEMMs only touch rows inside ``offsets``, so an unrouted pair contributes
-nothing and a token whose slots are all unrouted finalizes to exact zeros.
-Ids >= num_experts remain a caller error.
-"""
+"""Shared expert-route metadata kernels for Q0-to-route implementations."""
 
 from __future__ import annotations
 
@@ -46,12 +36,68 @@ def count_expert_kernel(
 
 @triton.jit
 def count_routes_kernel(
-    topk_ids, counts, total_pairs: tl.constexpr, block_n: tl.constexpr
+    topk_ids,
+    counts,
+    total_pairs: tl.constexpr,
+    block_n: tl.constexpr,
+    has_padding: tl.constexpr = True,
+    num_experts: tl.constexpr = None,
 ):
     pair_idx = tl.program_id(0) * block_n + tl.arange(0, block_n)
     valid = pair_idx < total_pairs
-    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
-    tl.atomic_add(counts + expert, 1, mask=expert >= 0, sem="relaxed")
+    expert = tl.load(topk_ids + pair_idx, mask=valid, other=0)
+    if has_padding:
+        valid &= expert >= 0
+        if num_experts is not None:
+            valid &= expert < num_experts
+    tl.atomic_add(counts + expert, 1, mask=valid, sem="relaxed")
+
+
+@triton.jit
+def write_worklist(
+    count,
+    begin,
+    worklist,
+    workcount,
+    num_experts: tl.constexpr,
+    block_e: tl.constexpr,
+    bm: tl.constexpr,
+    capacity: tl.constexpr,
+):
+    expert = tl.arange(0, block_e)
+    tiles = (count + bm - 1) // bm
+    inclusive = tl.cumsum(tiles, axis=0)
+    exclusive = inclusive - tiles
+    tl.store(workcount, tl.sum(tiles, axis=0))
+    for tile in tl.range(0, tl.max(tiles, axis=0)):
+        active = (expert < num_experts) & (tile < tiles)
+        index = exclusive + tile
+        tl.store(worklist + index, expert, mask=active)
+        tl.store(worklist + capacity + index, begin + tile * bm, mask=active)
+        tl.store(
+            worklist + capacity * 2 + index,
+            tl.minimum(count - tile * bm, bm),
+            mask=active,
+        )
+
+
+@triton.jit
+def worklist_kernel(
+    offsets,
+    worklist,
+    workcount,
+    num_experts: tl.constexpr,
+    capacity: tl.constexpr,
+    bm: tl.constexpr,
+    block_e: tl.constexpr,
+):
+    expert = tl.arange(0, block_e)
+    valid = expert < num_experts
+    begin = tl.load(offsets + expert, mask=valid, other=0)
+    end = tl.load(offsets + expert + 1, mask=valid, other=0)
+    write_worklist(
+        end - begin, begin, worklist, workcount, num_experts, block_e, bm, capacity
+    )
 
 
 @triton.jit
@@ -61,6 +107,10 @@ def prefix_cursor_kernel(
     cursor,
     num_experts: tl.constexpr,
     block_e: tl.constexpr,
+    worklist=None,
+    workcount=None,
+    worklist_bm: tl.constexpr = 0,
+    worklist_capacity: tl.constexpr = 0,
 ):
     expert = tl.arange(0, block_e)
     valid = expert < num_experts
@@ -70,6 +120,17 @@ def prefix_cursor_kernel(
     tl.store(offsets + expert, exclusive, mask=valid)
     tl.store(cursor + expert, exclusive, mask=valid)
     tl.store(offsets + expert + 1, inclusive, mask=expert == num_experts - 1)
+    if worklist_bm > 0:
+        write_worklist(
+            count,
+            exclusive,
+            worklist,
+            workcount,
+            num_experts,
+            block_e,
+            worklist_bm,
+            worklist_capacity,
+        )
 
 
 @triton.jit
@@ -86,30 +147,47 @@ def route_assign_kernel(
     top_k: tl.constexpr,
     scale_align: tl.constexpr,
     block_n: tl.constexpr,
+    has_padding: tl.constexpr = True,
+    num_experts: tl.constexpr = None,
 ):
     pid = tl.program_id(0)
     offs = tl.arange(0, block_n)
     pair_idx = pid * block_n + offs
-    valid = pair_idx < total_pairs
-    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
-    # Unrouted (negative id) pairs take no row; see the module docstring.
-    routed = expert >= 0
-    routed_row = tl.atomic_add(expert_cursor + expert, 1, mask=routed, sem="relaxed")
+    pair_valid = pair_idx < total_pairs
+    expert = tl.load(topk_ids + pair_idx, mask=pair_valid, other=0)
+    route_valid = pair_valid
+    if has_padding:
+        route_valid &= expert >= 0
+        if num_experts is not None:
+            route_valid &= expert < num_experts
+    routed_row = tl.atomic_add(
+        expert_cursor + expert, 1, mask=route_valid, sem="relaxed"
+    )
     token_idx = pair_idx // top_k
-    expert_begin = tl.load(offsets + expert, mask=routed, other=0)
+    expert_begin = tl.load(offsets + expert, mask=route_valid, other=0)
     scale_begin = (expert_begin + expert * (scale_align - 1)) & -scale_align
-    tl.store(token_map + routed_row, token_idx, mask=routed)
+    tl.store(token_map + routed_row, token_idx, mask=route_valid)
     tl.store(
         token_weights + routed_row,
-        tl.load(topk_weights + pair_idx, mask=routed, other=0.0),
-        mask=routed,
+        tl.load(topk_weights + pair_idx, mask=route_valid, other=0.0),
+        mask=route_valid,
     )
-    tl.store(dst_rows + pair_idx, tl.where(routed, routed_row, -1), mask=valid)
-    tl.store(
-        scale_dst_rows + pair_idx,
-        tl.where(routed, scale_begin + routed_row - expert_begin, -1),
-        mask=valid,
-    )
+    if has_padding:
+        tl.store(
+            dst_rows + pair_idx, tl.where(route_valid, routed_row, -1), mask=pair_valid
+        )
+        tl.store(
+            scale_dst_rows + pair_idx,
+            tl.where(route_valid, scale_begin + routed_row - expert_begin, -1),
+            mask=pair_valid,
+        )
+    else:
+        tl.store(dst_rows + pair_idx, routed_row, mask=pair_valid)
+        tl.store(
+            scale_dst_rows + pair_idx,
+            scale_begin + routed_row - expert_begin,
+            mask=pair_valid,
+        )
 
 
 @triton.jit
@@ -131,41 +209,77 @@ def route_assign_decode_kernel(
     padded_rows: tl.constexpr,
     s_som: tl.constexpr,
     s_sok: tl.constexpr,
+    has_padding: tl.constexpr = True,
+    worklist=None,
+    workcount=None,
+    worklist_bm: tl.constexpr = 0,
+    worklist_capacity: tl.constexpr = 0,
+    block_e: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     offs = tl.arange(0, block_n)
-    # Unrouted (negative id) pairs take no row; see the module docstring.
-    experts = tl.load(topk_ids + offs, mask=offs < total_pairs, other=-1)
-    routed = experts >= 0
+    pair_valid = offs < total_pairs
+    experts = tl.load(topk_ids + offs, mask=pair_valid, other=num_experts)
+    route_valid = pair_valid
+    if has_padding:
+        route_valid &= (experts >= 0) & (experts < num_experts)
     flat = pid * block_n + offs
     k_block = flat // padded_rows
     scale_row = flat - k_block * padded_rows
     tl.store(
         scale_out + k_block * s_som + scale_row * s_sok, 0, mask=flat < total_scale
     )
-    expert_prefix = tl.sum(tl.where(routed & (experts < pid), 1, 0), 0)
+    expert_prefix = tl.sum(tl.where(route_valid & (experts < pid), 1, 0), 0)
+    routed_pairs = (
+        tl.sum(tl.where(route_valid, 1, 0), 0) if has_padding else total_pairs
+    )
     tl.store(offsets + pid, expert_prefix, mask=pid < num_experts)
-    tl.store(offsets + num_experts, tl.sum(tl.where(routed, 1, 0), 0), mask=pid == 0)
-    is_pair = pid < total_pairs
-    pair_expert = tl.load(topk_ids + pid, mask=is_pair, other=-1)
-    pair_routed = pair_expert >= 0
-    expert_begin = tl.sum(tl.where(routed & (experts < pair_expert), 1, 0), 0)
-    rank = tl.sum(tl.where(routed & (experts == pair_expert) & (offs < pid), 1, 0), 0)
+    tl.store(offsets + num_experts, routed_pairs, mask=pid == 0)
+    pair_expert = tl.load(topk_ids + pid, mask=pid < total_pairs, other=0)
+    route_valid_pid = pid < total_pairs
+    if has_padding:
+        route_valid_pid &= (pair_expert >= 0) & (pair_expert < num_experts)
+    expert_begin = tl.sum(tl.where(route_valid & (experts < pair_expert), 1, 0), 0)
+    rank = tl.sum(
+        tl.where(route_valid & (experts == pair_expert) & (offs < pid), 1, 0), 0
+    )
     routed_row = expert_begin + rank
     scale_begin = (expert_begin + pair_expert * (scale_align - 1)) & -scale_align
     token_idx = pid // top_k
-    tl.store(token_map + routed_row, token_idx, mask=pair_routed)
+    tl.store(token_map + routed_row, token_idx, mask=route_valid_pid)
     tl.store(
         token_weights + routed_row,
-        tl.load(topk_weights + pid, mask=pair_routed, other=0.0),
-        mask=pair_routed,
+        tl.load(topk_weights + pid, mask=route_valid_pid, other=0.0),
+        mask=route_valid_pid,
     )
-    tl.store(dst_rows + pid, tl.where(pair_routed, routed_row, -1), mask=is_pair)
-    tl.store(
-        scale_dst_rows + pid,
-        tl.where(pair_routed, scale_begin + rank, -1),
-        mask=is_pair,
-    )
+    if has_padding:
+        tl.store(
+            dst_rows + pid,
+            tl.where(route_valid_pid, routed_row, -1),
+            mask=pid < total_pairs,
+        )
+        tl.store(
+            scale_dst_rows + pid,
+            tl.where(route_valid_pid, scale_begin + rank, -1),
+            mask=pid < total_pairs,
+        )
+    else:
+        tl.store(dst_rows + pid, routed_row, mask=pid < total_pairs)
+        tl.store(scale_dst_rows + pid, scale_begin + rank, mask=pid < total_pairs)
+    if worklist_bm > 0:
+        if pid == 0:
+            count = tl.histogram(experts, block_e, mask=route_valid)
+            inclusive = tl.cumsum(count, axis=0)
+            write_worklist(
+                count,
+                inclusive - count,
+                worklist,
+                workcount,
+                num_experts,
+                block_e,
+                worklist_bm,
+                worklist_capacity,
+            )
 
 
 @triton.jit
@@ -351,4 +465,6 @@ __all__ = [
     "prefix_cursor_kernel",
     "route_assign_decode_kernel",
     "route_assign_kernel",
+    "worklist_kernel",
+    "write_worklist",
 ]

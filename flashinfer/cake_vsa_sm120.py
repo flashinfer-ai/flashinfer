@@ -32,7 +32,8 @@ The part size and the kernel are the pair of least time under the plan's cost
 model: the static grid-stride's longest virtual CTA when every one runs one
 item, else its longest SM, two virtual CTAs sharing one, plus the merge of the
 most-split row, at the kernel's rates; a split part costs more once the K and
-V of all KV heads pass half the L2.  Below three rows per virtual CTA, and
+V of all KV heads pass half the L2 (three eighths of it for a plan that may be
+packed).  Below three rows per virtual CTA, and
 while the K and V of all KV heads fit the L2 (a quarter of it below one row per
 virtual CTA), the plan may instead be packed: the items of every full wave keep
 their places and those of the last partial wave fill the virtual CTAs one after
@@ -80,8 +81,12 @@ _MERGE_COST = 1
 # Past _SPLIT_KV_BLOCKS blocks of K and V over all KV heads (64 MB in 16 bits,
 # half of an RTX PRO 6000's L2) a split part's extra is _FAR_SPLIT_COST: the
 # blocks then come from memory, and a row split to fill the virtual CTAs gains
-# less than when they come from the L2.
+# less than when they come from the L2.  For a plan that may be packed (below)
+# the limit is _PACK_SPLIT_KV_BLOCKS (48 MB, three eighths of the L2): the
+# packing fills the last partial wave itself, so splitting every row to fill
+# the virtual CTAs gains less.
 _SPLIT_KV_BLOCKS = 2048
+_PACK_SPLIT_KV_BLOCKS = 1536
 _FAR_SPLIT_COST = 4
 _PART_DIVISORS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 # Packing, when there are fewer rows than _PACK_ROWS per virtual CTA and the K
@@ -441,17 +446,17 @@ def build_work(
     row_head = torch.div(order, mb, rounding_mode="floor")
     row_block = order % mb
     row_data = (row_count, row_first, row_head, row_block)
-    split_cost = (
-        _FAR_SPLIT_COST if kv_heads * num_kv_blocks > _SPLIT_KV_BLOCKS else _SPLIT_COST
-    )
-    chosen_part, chosen = _choose(row_count, resident, part, kernel, split_cost)
-    work, groups, slots = _table(*row_data, chosen_part)
     packing = pack if pack is not None else part is None
-    if (
+    admitted = (
         packing
         and 0 < row_count.numel() < _PACK_ROWS * resident
         and kv_heads * num_kv_blocks <= _PACK_KV_BLOCKS[row_count.numel() >= resident]
-    ):
+    )
+    far = _PACK_SPLIT_KV_BLOCKS if admitted else _SPLIT_KV_BLOCKS
+    split_cost = _FAR_SPLIT_COST if kv_heads * num_kv_blocks > far else _SPLIT_COST
+    chosen_part, chosen = _choose(row_count, resident, part, kernel, split_cost)
+    work, groups, slots = _table(*row_data, chosen_part)
+    if admitted:
         uniform = work.tolist()
         best = None if pack else _pack_time(uniform, resident, chosen)
         for k in [kernel] if kernel is not None else list(_GROUPS):

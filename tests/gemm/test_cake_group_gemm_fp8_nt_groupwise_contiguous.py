@@ -1333,9 +1333,7 @@ def test_block_scaled_route_rule():
         == BS_N256_RUN32_ROUTE
     )
     for route in BS_ROUTES | BS_SWAP_ROUTES:
-        assert route in ROUTES or any(
-            route in table for table in ROUTES.values() if isinstance(table, dict)
-        )
+        assert route in ROUTES or route in SM107A_ROUTES
     with pytest.raises(ValueError, match="multiple of 32"):
         bs_route_for_shape(4096, 1024, 2048, alignment=48, sm_count=148)
 

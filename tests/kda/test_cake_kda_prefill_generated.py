@@ -30,10 +30,14 @@ parts, and ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` the long-task builds of the
 bin-mix programs, which bin-mix launches of longer tasks take instead,
 ``_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES`` the hybrid builds of the M64
 owner/helper programs, which the equal-length launches of a one-helper rule row
-take cooperatively instead of the pair-share program, and
+take cooperatively instead of the pair-share program,
 ``_RENDERED_WORK_BIN_TURN_E128_ROUTES`` the 128-token builds of the turnover
 programs, which turnover launches whose sequences all hold 128 tokens take
-instead (bit for bit the turnover launch).
+instead (bit for bit the turnover launch), and
+``_RENDERED_WORK_BIN_PRELOAD_ROUTES`` the TMEM-preload builds of the
+work-binned programs, which work-binned launches with an initial state,
+sequences of 64 to 256 tokens and more tasks than SMs take instead (bit for
+bit the work-binned launch).
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -271,6 +275,16 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_PRELOAD_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_PRELOAD_ROUTES.items():
+        for module, program in modules.items():
+            # Every other work-binned launch keeps the module's work-binned
+            # program.
+            assert module in registry._RENDERED_WORK_BIN_ROUTES[arch], (arch, module)
+            assert program != registry._RENDERED_WORK_BIN_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES) == set(registry.ARCHES)
     for arch, modules in registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES.items():
         for module, program in modules.items():
@@ -369,6 +383,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].items(),
             *registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_PRELOAD_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1183,6 +1198,7 @@ def unrouted(monkeypatch):
             "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
             "_RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES",
             "_RENDERED_WORK_BIN_TURN_E128_ROUTES",
+            "_RENDERED_WORK_BIN_PRELOAD_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1232,6 +1248,7 @@ def test_serving_rows_match_the_fp32_reference(
         | set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_TURN_E128_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_PRELOAD_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1466,6 +1483,25 @@ def _turn_of(lengths=None, heads=None):
     }
 
 
+def _work_bin_programs(arch):
+    """The work-binned programs, with their TMEM-preload builds (bit for bit
+    the work-binned launch, ``_RENDERED_WORK_BIN_PRELOAD_ROUTES``)."""
+    return set(registry._RENDERED_WORK_BIN_ROUTES[arch].values()) | set(
+        registry._RENDERED_WORK_BIN_PRELOAD_ROUTES[arch].values()
+    )
+
+
+def _work_binned(programs):
+    """``programs`` with each TMEM-preload build replaced by the work-binned
+    program it stands for (``_RENDERED_WORK_BIN_PRELOAD_ROUTES``)."""
+    arch = registry.device_arch()
+    of = {
+        program: registry._RENDERED_WORK_BIN_ROUTES[arch][module]
+        for module, program in registry._RENDERED_WORK_BIN_PRELOAD_ROUTES[arch].items()
+    }
+    return {of.get(p, p) for p in programs}
+
+
 def _without_turnover(patch):
     patch.setattr(
         registry,
@@ -1485,6 +1521,9 @@ def _assert_turnover_schedule(turn, plain, expect):
     plain_programs = _modules(plain.prepared)
     if expect:
         turn_of = _turn_of(turn.d["lengths"], turn.d["heads"])
+        # A plain launch in the TMEM-preload scope holds the TMEM-preload
+        # build of the work-binned program the turnover build replaces.
+        plain_programs = _work_binned(plain_programs)
         assert plain_programs & set(turn_of), plain_schedule
         assert schedule.count("_turnover") == 1, schedule
         assert schedule.replace("_turnover", "", 1) == plain_schedule
@@ -1520,8 +1559,8 @@ def _assert_route(route, prepared):
     if route == "m64-hybrid" and not hybrid:
         route = "pair-share"  # a loader without the build keeps the pair-share one
     if route == "m64-hybrid":
-        if (arch, _sm_count()) != HYBRID_PART:
-            pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+        if (arch, _sm_count()) not in HYBRID_PARTS:
+            pytest.skip(f"the hybrid rule rows are for {HYBRID_PARTS}")
         assert schedule == HYBRID_SCHEDULE, schedule
         assert loaded & hybrid
         return
@@ -1943,6 +1982,112 @@ def test_e128_launch_is_bitwise_the_turnover_launch(
     _assert_bitwise(turn.run(), got, "turnover repeat")
 
 
+# Bounded work-binned launches on either side of the TMEM-preload scope
+# (``runtime._work_bin_preload_scope``): work bins from the strict bin test,
+# an initial state, every sequence of 64 to 256 tokens and more tasks than
+# SMs (the TMEM-preload build where the loader names one), and 33-token
+# sequences, no more tasks than SMs or bins of the bounded rule (the
+# work-binned build).  The third field: the launch must take its module's
+# work-binned program without the TMEM-preload table (the bench rows).
+PRELOAD_ROWS = [
+    pytest.param([64] * 64, 16, True, id="bs64x64-h16"),
+    pytest.param([64] * 16, 16, True, id="bs16x64-h16"),
+    pytest.param([65] * 37, 16, False, id="bs37x65-h16"),
+    pytest.param([96] * 38, 16, False, id="bs38x96-h16"),
+    pytest.param([64, 96] * 24, 16, False, id="alt64-96-h16"),
+    pytest.param([64, 256, 128, 200] * 10, 16, False, id="mixed64-256-h16"),
+    pytest.param([33] * 37, 16, False, id="bs37x33-h16"),
+    pytest.param([64] * 9, 16, False, id="bs9x64-h16"),
+    pytest.param(
+        [114, 104, 110, 152, 142, 114, 252, 160, 147, 120, 149],
+        16,
+        False,
+        id="mixed11-max252-h16",
+    ),
+    pytest.param(
+        [229, 115, 228, 134, 119, 114, 226, 226, 232, 108],
+        16,
+        False,
+        id="mixed10-max232-h16",
+    ),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads,bench", PRELOAD_ROWS)
+def test_preload_launch_is_bitwise_the_work_binned_launch(
+    lengths, heads, bench, rows, monkeypatch
+):
+    """A bounded work-binned launch in the TMEM-preload scope takes its
+    module's TMEM-preload build where the loader names one: the same bins,
+    grid and schedule, the work-binned program replaced, bit for bit the
+    work-binned launch (the same call without the TMEM-preload table), with
+    and without checkpoint rows, in either order.  Every other launch keeps
+    its build."""
+    arch = registry.device_arch()
+    preload_routes = registry._RENDERED_WORK_BIN_PRELOAD_ROUTES[arch]
+    preload_of = {
+        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: program
+        for module, program in preload_routes.items()
+    }
+    d = _inputs(lengths, heads)
+    got_call = _Call(d, -5.0, rows=rows)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_PRELOAD_ROUTES",
+            {name: {} for name in registry.ARCHES},
+        )
+        plain = _Call(d, -5.0, rows=rows)
+    assert str(got_call.prepared.schedule) == str(plain.prepared.schedule)
+    binned = _modules(plain.prepared)
+    loaded = _modules(got_call.prepared)
+    strict = runtime._use_direct_work_bins(
+        tuple(lengths),
+        num_heads=heads,
+        sm_count=_sm_count(),
+        chunk_tokens=runtime.BF16_M128_CHUNK,
+    )
+    takes = bool(binned & set(preload_of)) and runtime._work_bin_preload_scope(
+        lengths, heads, _sm_count(), True, strict
+    )
+    if bench and preload_routes:
+        assert takes, str(plain.prepared.schedule)
+    if takes:
+        assert loaded == {preload_of.get(p, p) for p in binned}
+    else:
+        assert loaded == binned
+        assert not loaded & set(preload_routes.values())
+    got = got_call.run()
+    want = plain.run()
+    _assert_bitwise(got, want, "TMEM preload vs work-binned")
+    _assert_bitwise(got_call.run(), want, "TMEM preload after the work-binned launch")
+    _assert_bitwise(plain.run(), got, "work-binned repeat")
+
+
+@requires_blackwell
+def test_preload_launch_without_an_initial_state_keeps_its_build(monkeypatch):
+    """A launch from the zero state (no initial state) keeps its build: the
+    same programs and schedule with and without the TMEM-preload table, bit
+    for bit."""
+    arch = registry.device_arch()
+    d = _inputs([64] * 64, 16)
+    zero = _Call(d, -5.0, indexed=False, initial=False)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_PRELOAD_ROUTES",
+            {name: {} for name in registry.ARCHES},
+        )
+        plain = _Call(d, -5.0, indexed=False, initial=False)
+    assert str(zero.prepared.schedule) == str(plain.prepared.schedule)
+    assert _modules(zero.prepared) == _modules(plain.prepared)
+    preload = set(registry._RENDERED_WORK_BIN_PRELOAD_ROUTES[arch].values())
+    assert not _modules(zero.prepared) & preload
+    _assert_bitwise(zero.run(), plain.run(), "zero state, with and without the table")
+
+
 TURNOVER_PARTS = [
     pytest.param("sm_100a", None, 8, id="sm_100a"),
     pytest.param("sm_103a", 152, 16, id="sm_103a-152"),
@@ -1978,7 +2123,9 @@ def test_turnover_route_takes_the_part_chunk_limit(
         plain = _Call(d, None)
     # Past the limit the launch is still work binned: the limit, not the
     # bins, keeps the work-binned build.
-    assert _modules(plain.prepared) & set(_turn_of()), str(plain.prepared.schedule)
+    assert _work_binned(_modules(plain.prepared)) & set(_turn_of()), str(
+        plain.prepared.schedule
+    )
     _assert_turnover_schedule(turn, plain, side == "at")
     _assert_bitwise(turn.run(), plain.run(), f"{side} the limit")
 
@@ -2219,7 +2366,7 @@ def test_turnover_bins_launch_is_bitwise_the_one_task_per_cta_launch(
         patch.setattr(runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False)
         direct = _Call(d, None, rows=rows)
     arch = registry.device_arch()
-    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+    work_bin_programs = _work_bin_programs(arch)
     schedule = str(turn.prepared.schedule)
     assert schedule.count("_turnover") == 1, schedule
     assert _modules(turn.prepared) & _turn_programs(), schedule
@@ -2356,7 +2503,7 @@ def test_bounded_launches_never_take_turnover_bins(lengths, heads, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(runtime, "_use_bounded_work_bins", lambda *args, **kwargs: False)
         one_task = _Call(d, -5.0)
-    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+    work_bin_programs = _work_bin_programs(arch)
     assert str(ruled.prepared.schedule) == str(plain.prepared.schedule)
     assert _modules(ruled.prepared) == _modules(plain.prepared)
     assert _modules(ruled.prepared) & work_bin_programs
@@ -2413,7 +2560,7 @@ def test_bounded_bins_launch_is_bitwise_the_one_task_per_cta_launch(
         patch.setattr(runtime, "_use_bounded_work_bins", lambda *args, **kwargs: False)
         direct = _Call(d, -5.0, rows=rows)
     arch = registry.device_arch()
-    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+    work_bin_programs = _work_bin_programs(arch)
     assert _modules(binned.prepared) & work_bin_programs
     assert not _modules(binned.prepared) & _turn_programs()
     assert "_turnover" not in str(binned.prepared.schedule)
@@ -3010,10 +3157,11 @@ def test_refused_m64_owner_helper_launch_runs_its_fallback(monkeypatch):
     _assert_bitwise(result, kept.run(), "refused owner/helper vs its fallback")
 
 
-# The M64 owner/helper hybrid build: equal-length launches of 37 to 48 tasks
-# at 2048 tokens or more that the pair-share rule takes (the shipped one-helper
-# row of a 148-SM sm_100a part), on a grid (tasks, 3).
-HYBRID_PART = ("sm_100a", 148)
+# The M64 owner/helper hybrid build: equal-length launches at 2048 tokens or
+# more that the pair-share rule takes, of 37 to 48 tasks on a 148-SM sm_100a
+# part and 37 to 50 on a 152-SM sm_103a part (the shipped one-helper rows), on
+# a grid (tasks, 3).
+HYBRID_PARTS = (("sm_100a", 148), ("sm_103a", 152))
 HYBRID_SCHEDULE = "fused_m64_independent_dvsplit_fp32_state_owner1helper_hybrid"
 M64_HYBRID_ROWS = [
     pytest.param([4096] * 4, 12, id="4x4096-h12"),
@@ -3029,8 +3177,8 @@ def _m64_hybrid_programs():
     programs = set(registry._RENDERED_M64_OWNER_HELPER_HYBRID_ROUTES[arch].values())
     if not programs:
         pytest.skip(f"the loader names no M64 owner/helper hybrid build on {arch}")
-    if (arch, _sm_count()) != HYBRID_PART:
-        pytest.skip(f"the hybrid rule row is for {HYBRID_PART}")
+    if (arch, _sm_count()) not in HYBRID_PARTS:
+        pytest.skip(f"the hybrid rule rows are for {HYBRID_PARTS}")
     return programs
 
 
@@ -3092,8 +3240,13 @@ def test_refused_m64_owner_helper_hybrid_launch_runs_its_fallback(monkeypatch):
     assert tasks * 3 > _sm_count()
     d = _inputs(lengths, heads)
     monkeypatch.setattr(runtime, "_m64_cooperative_capacity", lambda device: 1 << 20)
-    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN", ((tasks, 2048, 1),))
-    monkeypatch.setattr(runtime, "M64_PAIR_SHARE_MIN_SEQ_LEN", ((tasks, 2048),))
+    for suffix in ("", "_GB300"):
+        monkeypatch.setattr(
+            runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN" + suffix, ((tasks, 2048, 1),)
+        )
+        monkeypatch.setattr(
+            runtime, "M64_PAIR_SHARE_MIN_SEQ_LEN" + suffix, ((tasks, 2048),)
+        )
     device = torch.device("cuda", torch.cuda.current_device())
     if runtime._probe_m64_pair_cluster_capacity(device) < tasks:
         pytest.skip(f"fewer 2-CTA clusters than {tasks} tasks")
