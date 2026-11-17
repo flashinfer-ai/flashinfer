@@ -1073,6 +1073,7 @@ def testChunkGatedDeltaRule(args):
                 output=output,
                 output_state=output_state,
                 use_cp=use_cp,
+                max_seqlen=s_qo if use_cp is True else None,
             )[0]
         elif backend == "fla":
             return fla_gdn(
