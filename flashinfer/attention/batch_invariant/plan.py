@@ -56,6 +56,10 @@ STREAM_SAT_FRACTION = {
     256: 0.30,
 }  # per head dim: the fraction of the SMs whose CTAs, each walking one unit, together reach the HBM rate (the HBM rate over a lone
 # CTA's stream rate, over the SM count): a wave of fewer CTAs is bound by the per-CTA rate, a fuller wave by the HBM rate
+GRID_SEARCH_ARCHES = (
+    (10, 7),
+)  # the parts whose stream rates the launch-grid model was fitted on: elsewhere the fused walk keeps the
+# full grid and the model decides only fuse-or-split (``build_plan(grid_search=...)``)
 GRID_MIN_FRACTION = 0.45  # a multi-wave fused walk keeps at least this fraction of the SMs (and the saturating fraction): above it
 # the HBM rate holds and fewer concurrent streams run the HBM more efficiently
 GRID_LONG_TILES = 16  # units of fewer tiles keep the default grid unless its last wave is under a third full: their boundary
@@ -236,18 +240,29 @@ def swaps_fused_grids(
 
 
 def swaps_unit_kinds(
-    units: Sequence[tuple], sm_count: int, D: int, inkernel_max_chunks: int
+    units: Sequence[tuple],
+    sm_count: int,
+    D: int,
+    inkernel_max_chunks: int,
+    grid_search: bool = True,
 ) -> tuple:
     """The unit kinds and the launch grid of a Swaps-body batch under ``"auto"`` (``units`` as in ``swaps_kind_cost``): ``(split, grid)``
     with ``split[i]`` whether unit ``i`` splits into its chunks. The candidates are every unit fused on each grid of
     ``swaps_fused_grids`` and every multi-chunk unit split on the full grid; the cheapest wins (among equal fused grids the one of
-    most waves: the fewest CTAs that still stream at the HBM rate). A placement: every choice computes the same bits."""
+    most waves: the fewest CTAs that still stream at the HBM rate). ``grid_search`` False keeps the fused walk on the full grid
+    (the parts whose stream rates the grid model was not fitted on: ``GRID_SEARCH_ARCHES``); the fuse-or-split choice stays.
+    A placement: every choice computes the same bits."""
     n = len(units)
     if n == 0:
         return [], 0
     fused = [False] * n
     best_grid, best_cost = 0, float("inf")
-    for g in swaps_fused_grids(n, sm_count, D, max(u[0] for u in units)):
+    grids = (
+        swaps_fused_grids(n, sm_count, D, max(u[0] for u in units))
+        if grid_search
+        else [min(n, sm_count)]
+    )
+    for g in grids:
         c = swaps_kind_cost(units, fused, g, sm_count, D, inkernel_max_chunks)
         if c <= best_cost:
             best_grid, best_cost = g, c
@@ -275,6 +290,7 @@ def build_plan(
     small_swap: bool = False,
     swap_max_rows: int = INKERNEL_MAX_ROWS,
     grid: int = 0,
+    grid_search: bool = True,
 ) -> Plan:
     """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
     live rows) takes the kinds and the launch grid of ``swaps_unit_kinds`` (a makespan model over the SM count: every unit fused on
@@ -376,6 +392,7 @@ def build_plan(
             sm_count,
             D,
             inkernel_max_chunks,
+            grid_search,
         )
         if plan.grid == min(len(tiles), sm_count):
             plan.grid = 0  # the default launch grid

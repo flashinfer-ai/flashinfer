@@ -17,13 +17,21 @@ split units, the fixup.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
 
-from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, snake_order, ws_row
+from .plan import (
+    DESC_FIELDS,
+    GRID_SEARCH_ARCHES,
+    GROUP_FIELDS,
+    build_plan,
+    snake_order,
+    ws_row,
+)
 from .spec import HEAD_DIMS, scale_log2
 
 
@@ -86,6 +94,24 @@ HW_ROW_MAX_MAX_D = 128  # the hardware row maximum serves the one-stage TMEM pla
 # its exponentials off the slice copies and gains nothing from it
 
 
+@functools.cache
+def device_sm_count(device: torch.device) -> int:
+    """The device's SM count (a launch parameter: it steers the unit kinds and the grid, never the bits); cached per device."""
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+@functools.cache
+def planner_grid_search(device: torch.device) -> bool:
+    """Whether the planner may shrink a fused walk's launch grid on ``device``: only on the parts the launch-grid model was fitted on
+    (``plan.GRID_SEARCH_ARCHES``); elsewhere the fused walk keeps the full grid and the model decides only fuse-or-split."""
+    from ...utils import get_compute_capability
+
+    if device.type != "cuda":
+        return False
+    major, minor = get_compute_capability(device)
+    return (int(major), int(minor)) in GRID_SEARCH_ARCHES
+
+
 def hw_row_max_enabled(device=None, D: int = 128) -> bool:
     """Whether the row body on ``device`` at head dim ``D`` takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``:
     each 32-column piece's maximum in an extra register, the pieces joined by ``max.f32``) instead of the register tree: the parts
@@ -94,13 +120,17 @@ def hw_row_max_enabled(device=None, D: int = 128) -> bool:
     function)."""
     if D > HW_ROW_MAX_MAX_D:
         return False
-    from ...utils import get_compute_capability
-
     if device is None:
         if not torch.cuda.is_available():
             return False
         device = torch.device("cuda", torch.cuda.current_device())
-    device = torch.device(device)
+    return _part_has_hw_row_max(torch.device(device))
+
+
+@functools.cache
+def _part_has_hw_row_max(device: torch.device) -> bool:
+    from ...utils import get_compute_capability
+
     if device.type != "cuda":
         return False
     major, minor = get_compute_capability(device)
@@ -360,15 +390,11 @@ def plan_attention(
     check_supported(D, Hq, Hkv, page)
     config = config or default_config(D=D)
     assert config.well_formed(D), (config, D)
-    device = device or qo_indptr.device
+    device = torch.device(device or qo_indptr.device)
     sm = (
         sm_count
         if sm_count is not None
-        else (
-            torch.cuda.get_device_properties(device).multi_processor_count
-            if torch.device(device).type == "cuda"
-            else 204
-        )
+        else (device_sm_count(device) if device.type == "cuda" else 204)
     )
     plan = build_plan(
         qo_indptr.cpu().tolist(),
@@ -385,6 +411,7 @@ def plan_attention(
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
         grid=config.grid,
+        grid_search=planner_grid_search(device),
     )  # Swaps batches at D = 256 take the
     # D = 128 rules (TMEM merges)
     desc = torch.tensor(
@@ -469,12 +496,8 @@ def workspace_bytes(
     assert kv_last_page_len is not None
     check_supported(D, Hq, Hkv, page)
     config = config or default_config(D=D)
-    device = device or qo_indptr.device
-    sm = (
-        torch.cuda.get_device_properties(device).multi_processor_count
-        if torch.device(device).type == "cuda"
-        else 204
-    )
+    device = torch.device(device or qo_indptr.device)
+    sm = device_sm_count(device) if device.type == "cuda" else 204
     plan = build_plan(
         qo_indptr.cpu().tolist(),
         kv_indptr.cpu().tolist(),
@@ -489,6 +512,7 @@ def workspace_bytes(
         merge=config.merge,
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
+        grid_search=planner_grid_search(device),
     )
     return plan.ws_rows * ws_row(D) * 4
 
@@ -667,7 +691,7 @@ def _run_attention_validated(
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
-    sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sm = device_sm_count(q.device)
     grid = (
         config.grid
         if config.grid

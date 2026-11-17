@@ -537,13 +537,23 @@ def test_planner_swaps_unit_kinds():
 
     SM = 212
 
-    def decode(B, L, D, sm=SM, swap=True, page=32):
+    def decode(B, L, D, sm=SM, swap=True, page=32, grid_search=True):
         per = -(-L // page)
         qo = list(range(B + 1))
         kv = [b * per for b in range(B + 1)]
         last = [L - (per - 1) * page] * B
         return P.build_plan(
-            qo, kv, last, 32, 8, D, page, sm_count=sm, small_swap=swap, swap_max_rows=8
+            qo,
+            kv,
+            last,
+            32,
+            8,
+            D,
+            page,
+            sm_count=sm,
+            small_swap=swap,
+            swap_max_rows=8,
+            grid_search=grid_search,
         )
 
     def kinds(plan):
@@ -570,6 +580,14 @@ def test_planner_swaps_unit_kinds():
     assert kinds(decode(16, 8192, 64)) == (0, 2048, 128, 0)
     assert kinds(decode(8, 1024, 64)) == (64, 0, 0, 0)
     assert kinds(decode(64, 32768, 64)) == (512, 0, 0, 171)
+    # off the parts the grid model was fitted on (grid_search False: the engine's rule for every other part) the fused walk keeps
+    # the full grid while the fuse-or-split choice stands: on 148 SMs 512 long units fuse on the full grid (74 with the search),
+    # 64 long units fuse on their own 64 CTAs, one unit of 16 chunks still splits
+    assert kinds(decode(64, 8192, 128, sm=148, grid_search=False)) == (512, 0, 0, 0)
+    assert kinds(decode(64, 8192, 128, sm=148)) == (512, 0, 0, 74)
+    assert kinds(decode(8, 8192, 128, sm=148, grid_search=False)) == (64, 0, 0, 0)
+    assert kinds(decode(1, 8192, 128, sm=148, grid_search=False)) == (0, 128, 8, 0)
+    assert kinds(decode(256, 8192, 256, sm=148, grid_search=False)) == (2048, 0, 0, 0)
     # the grid search terminates on parts of one or two SMs (the integral-wave grid is one CTA there) and never names a grid
     # below one CTA or above the part
     for sm in (1, 2, 3):
