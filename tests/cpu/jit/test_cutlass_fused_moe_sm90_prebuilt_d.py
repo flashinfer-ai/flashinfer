@@ -62,14 +62,14 @@ def host(monkeypatch):
             name=module_name or f"fused_moe_{device_arch}", nvcc_flags=nvcc_flags
         )
 
+    def which(cmd):
+        # pathlib prints backslashes on Windows; compare in POSIX form.
+        return cmd if cmd.replace("\\", "/") in state.tools else None
+
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_properties", get_device_properties)
     monkeypatch.setattr(fused_moe.jit_env, "get_aot_artifacts", get_aot_artifacts)
-    monkeypatch.setattr(
-        fused_moe,
-        "shutil",
-        SimpleNamespace(which=lambda cmd: cmd if cmd in state.tools else None),
-    )
+    monkeypatch.setattr(fused_moe, "shutil", SimpleNamespace(which=which))
     monkeypatch.setattr(fused_moe, "get_cuda_path", lambda: "/usr/local/cuda")
     monkeypatch.setattr(fused_moe, "is_cuda_version_at_least", lambda version: True)
     monkeypatch.setattr(fused_moe, "gen_cutlass_fused_moe_module", gen_module)
