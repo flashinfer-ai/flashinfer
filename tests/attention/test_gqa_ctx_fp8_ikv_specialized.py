@@ -134,6 +134,9 @@ def _out_like(inp):
         ([2] * 64, [2] * 64),  # tiny-KV batch, large B
         ([128], [128]),  # single-page single request
         ([2, 1, 1, 1], [100, 1, 1, 1]),  # ragged, deep-context causal row
+        ([1], [3]),  # tiny-cap route
+        ([2], [4]),
+        ([128] * 10, [128] * 10),  # uniform full-page batch routes
     ],
 )
 def test_specialized_correct_and_routed(q_lens, kv_lens):
@@ -200,6 +203,7 @@ def test_cuda_graph_replay_matches_eager():
     eager = out.clone()
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         _api(inp, out)
     torch.cuda.current_stream().wait_stream(stream)
@@ -210,3 +214,14 @@ def test_cuda_graph_replay_matches_eager():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, eager)
+    # replay with mutated inputs: the graph must read the live buffers
+    kv = inp["kv_buf"]
+    kv.copy_((torch.randn_like(kv.to(torch.float32)) * 0.5).to(torch.float8_e4m3fn))
+    inp["q"].copy_(
+        (torch.randn_like(inp["q"].to(torch.float32)) * 0.5).to(torch.float8_e4m3fn)
+    )
+    g.replay()
+    torch.cuda.synchronize()
+    gold2 = _reference(inp).float()
+    diff2 = (out.float() - gold2).abs()
+    assert float((diff2 <= 0.005 + 0.05 * gold2.abs()).float().mean()) == 1.0

@@ -47,6 +47,8 @@ def supported_with_reasons(
     kv_cache,
     block_tables,
     seq_lens,
+    cum_seq_lens_q,
+    cum_seq_lens_kv,
     max_q_len,
     max_kv_len,
     bmm1_scale,
@@ -97,7 +99,12 @@ def supported_with_reasons(
         or v.dtype != torch.float8_e4m3fn
     ):
         r.append("dtype_not_fp8e4m3")
-    if out.dtype != torch.bfloat16 or not out.is_contiguous():
+    if (
+        out.dtype != torch.bfloat16
+        or out.shape != query.shape
+        or not out.is_contiguous()
+        or out.device != query.device
+    ):
         r.append("out_not_bf16_contiguous")
     if (
         query.dim() != 3
@@ -115,10 +122,30 @@ def supported_with_reasons(
         r.append("scale_mismatch")
     if max_kv_len > 128 or max_q_len > 128:
         r.append("multi_page_regime")  # stock path wins there (measured)
-    if block_tables.dim() != 2 or block_tables.dtype != torch.int32:
+    if (
+        block_tables.dim() != 2
+        or block_tables.dtype != torch.int32
+        or not block_tables.is_contiguous()
+        or block_tables.device != query.device
+    ):
         r.append("block_tables_geometry")
-    if seq_lens.dtype != torch.int32:
+    if (
+        seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or seq_lens.device != query.device
+    ):
         r.append("seq_lens_dtype")
+    for _name, _t in (
+        ("cum_seq_lens_q", cum_seq_lens_q),
+        ("cum_seq_lens_kv", cum_seq_lens_kv),
+    ):
+        if (
+            _t is None
+            or _t.dtype != torch.int32
+            or not _t.is_contiguous()
+            or _t.device != query.device
+        ):
+            r.append(_name + "_not_int32_cuda_contiguous")
     if r:
         return r
     if (
@@ -128,7 +155,10 @@ def supported_with_reasons(
         or k.shape[3] != 128
         or k.stride(3) != 1
         or k.stride(2) != 256
+        or k.stride(0) != 128 * 256
         or v.stride(2) != 256
+        or v.stride(0) != 128 * 256
+        or k.device != query.device
         or v.data_ptr() != k.data_ptr() + 128
     ):
         return ["kv_layout_not_token_interleaved"]
@@ -165,6 +195,8 @@ def maybe_dispatch_specialized(
         kv_cache,
         block_tables,
         seq_lens,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
         max_q_len,
         max_kv_len,
         bmm1_scale,
@@ -174,6 +206,18 @@ def maybe_dispatch_specialized(
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
+        try:
+            get_gqa_ctx_fp8_ikv_module()
+        except Exception as e:  # pragma: no cover - environment-dependent
+            # A missing prebuilt JIT artifact (or a build failure) must not
+            # take down "auto": record the reason and keep the stock path.
+            if backend == "specialized":
+                raise
+            LAST_FALLBACK_REASONS[:] = [
+                "specialized_module_unavailable:" + type(e).__name__
+            ]
+            DISPATCH_STATS["fallback"] += 1
+            return None
         DISPATCH_STATS["specialized"] += 1
         return _run_specialized(
             query,

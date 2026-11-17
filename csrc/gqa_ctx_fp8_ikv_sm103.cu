@@ -9,6 +9,7 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
@@ -2308,6 +2309,7 @@ void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
   const bool uniform128 =
       max_q == 128 && max_kv_len == 128 && q.shape()[0] == (int64_t)total_B * 128;
 
+  ffi::CUDADeviceGuard device_guard(q.device().device_id);
   cudaStream_t st = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, q.device().device_id));
 
   const bool uniform2 = max_q == 2 && max_kv_len == 2 && q.shape()[0] == (int64_t)total_B * 2;
