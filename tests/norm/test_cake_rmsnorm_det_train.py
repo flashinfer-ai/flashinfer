@@ -28,7 +28,7 @@ gradient), bitwise reproducibility of ``dw``, changing token counts in one
 process and the autograd wrapper end to end.
 
 This suite exercises the backend package alone: it names the package once,
-through ``tests.test_helpers.cake_package``, and imports nothing else from
+through ``tests.cake.test_helpers.cake_package``, and imports nothing else from
 flashinfer, so a build that vendors the package under another import path
 runs it unchanged after pointing that table entry at its package.  The
 ``flashinfer.cake_rmsnorm_det_train`` facade and the ``flashinfer`` top-level
@@ -44,7 +44,7 @@ from pathlib import Path
 
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_det_train")
 cake_build = cake_package("cake_rmsnorm_det_train", "cake_build")
@@ -1106,45 +1106,86 @@ def _fp32_case(
     )
 
 
-# The backward windows where the FP32-weight route keeps a program of the BF16 route's earlier windows (the BF16 route
-# runs a pipelined program there that has no FP32-weight build; ``RECUT_FP32_ROUTES`` of the pairs test): (arch,
-# hidden) -> {FP32-weight window: the BF16 window whose program and dw reduce are the BF16 twins of the FP32-weight
-# window's}.  The twin records share the FP32-weight records' grid and workspace rules.
+# The backward windows where the FP32-weight route runs a program that the BF16 route does not run over those rows
+# (``RECUT_FP32_ROUTES`` of the pairs test): a program of the BF16 route's earlier windows where the BF16 route runs a
+# pipelined program that has no FP32-weight build, and at T = 1 another column-task program than the BF16 route's.
+# (arch, hidden) -> {FP32-weight window: (the BF16 window, the first 8 hex digits of the BF16 program) whose program
+# and dw reduce are the BF16 twins of the FP32-weight window's}.  The twin records share the FP32-weight records' grid
+# and workspace rules; a twin window the BF16 route no longer runs keeps its records in the registry under no route.
 RECUT_FP32_BACKWARD_TWINS: dict[
-    tuple[str, int], dict[tuple[int, int], tuple[int, int]]
+    tuple[str, int], dict[tuple[int, int], tuple[tuple[int, int], str]]
 ] = {
     ("sm_100a", 2048): {
-        (288, 1024): (288, 768),
-        (1024, 16384): (1024, 2047),
-        (16384, 58880): (22528, 58880),
+        (768, 1024): ((288, 768), "caf6978e"),
+        (1024, 16384): ((1024, 2047), "c73074cf"),
+        (16384, 58880): ((22528, 58880), "ceeef043"),
     },
-    ("sm_100a", 6144): {(256, 4096): (256, 767)},
-    ("sm_103a", 6144): {(20, 4096): (20, 767)},
+    ("sm_100a", 5120): {(0, 1): ((1, 256), "baa071a2")},
+    ("sm_100a", 6144): {(384, 4096): ((384, 767), "5c804aed")},
+    ("sm_103a", 4096): {(0, 1): ((0, 152), "ff0156d5")},
+    ("sm_103a", 6144): {
+        (0, 1): ((0, 20), "38b1c6bc"),
+        (256, 4096): ((256, 767), "5c804aed"),
+    },
 }
 
 
+def _twin_records(names, twin: tuple[int, int], program: str) -> list[str]:
+    """The records among ``names`` whose window is ``twin``: the program ``program`` (the first 8 hex digits of its
+    name) and the dw reduces."""
+
+    return [
+        name
+        for name in names
+        if (
+            (loader.MODULES[name]["select_rule"] or {}).get("above"),
+            (loader.MODULES[name]["select_rule"] or {}).get("at_most"),
+        )
+        == twin
+        and (
+            loader.MODULES[name]["role"] == "bwd_reduce"
+            or loader.MODULES[name]["library"].startswith(
+                f"cake_rmsnorm_det_train_{program}"
+            )
+        )
+    ]
+
+
 def _recut_backward_twin(hidden: int, residual: bool, rows: int) -> tuple[str, ...]:
-    """The BF16 twin modules (main program and dw reduce) of the FP32-weight backward program a call of ``rows``
-    tokens launches in a window of ``RECUT_FP32_BACKWARD_TWINS``; empty elsewhere."""
+    """The BF16 twin modules (the main program and its dw reduce, or a column-task program alone) of the FP32-weight
+    backward program a call of ``rows`` tokens launches in a window of ``RECUT_FP32_BACKWARD_TWINS``; empty elsewhere.
+    The twin records are the BF16 route's where it runs the twin's window, else the registry's records of that
+    window."""
 
     if residual:
         return ()
     arch = loader.arch_for_capability(_capability())
-    for (above, at_most), twin in RECUT_FP32_BACKWARD_TWINS.get(
+    for (above, at_most), (twin, program) in RECUT_FP32_BACKWARD_TWINS.get(
         (arch, hidden), {}
     ).items():
         if above < rows <= at_most:
-            names = tuple(
-                name
-                for name in loader.route_modules(arch, hidden, "bwd", False)
-                if (
-                    (loader.MODULES[name]["select_rule"] or {}).get("above"),
-                    (loader.MODULES[name]["select_rule"] or {}).get("at_most"),
-                )
-                == twin
+            names = _twin_records(
+                loader.route_modules(arch, hidden, "bwd", False), twin, program
+            ) or _twin_records(
+                (
+                    name
+                    for name, record in loader.MODULES.items()
+                    if arch in record["arches"]
+                    and int(record["hidden"]) == hidden
+                    and "_w32" not in record["role"]
+                    and not record["role"].endswith("_residual")
+                ),
+                twin,
+                program,
             )
-            assert names, (arch, hidden, twin)
-            return names
+            mains = [n for n in names if loader.MODULES[n]["role"] != "bwd_reduce"]
+            assert len(mains) == 1, (arch, hidden, twin, program, names)
+            workspace = loader.MODULES[mains[0]]["workspace_rule"] or {}
+            if workspace.get("kind") != "chunk_partials":
+                return (mains[0],)  # a column-task program runs alone
+            reduces = [n for n in names if loader.MODULES[n]["role"] == "bwd_reduce"]
+            assert len(reduces) == 1, (arch, hidden, twin, names)
+            return (mains[0], reduces[0])
     return ()
 
 
@@ -1430,9 +1471,12 @@ def test_changing_rows_in_one_process_does_not_rebuild(hidden: int) -> None:
     eps = EPS[hidden]
     generator = _generator(hidden, 17)
     w = _weight(hidden, generator)
-    _check_case(hidden, 64)
+    row_counts = (1, 65, 16172, 7, 16231, 255)
+    # Each row-count window can select a different module on first use.
+    for rows in (64, *row_counts):
+        _check_case(hidden, rows)
     loaded_before = loader.load.cache_info().misses
-    for rows in (1, 65, 16172, 7, 16231, 255):
+    for rows in row_counts:
         x = _rows(rows, hidden, generator=generator)
         g = _rows(rows, hidden, generator=generator)
         y, rstd = cake_rmsnorm_det_train_forward(x, w, eps)
@@ -1443,7 +1487,7 @@ def test_changing_rows_in_one_process_does_not_rebuild(hidden: int) -> None:
         _assert_bf16_close(dx, dx_ref, f"dx rows={rows}")
         _assert_dw(dw, dw_ref, g, x, rstd, f"dw rows={rows}")
     assert loader.load.cache_info().misses == loaded_before, (
-        "a changed token count rebuilt a module"
+        "revisiting token counts loaded another module"
     )
 
 

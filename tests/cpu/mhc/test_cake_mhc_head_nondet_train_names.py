@@ -25,7 +25,7 @@ modules and names are gone, the top level of ``flashinfer`` has no mHC
 never imports the deterministic head package, its registry (records and
 routes) is the deterministic head's under the library stem
 ``cake_mhc_train_head_*``, and the package is wired at its path (test-helper
-key, package data, ignored ``aot/``, pre-commit exclude, manifest checker row).
+key, package data, pre-commit exclude, manifest checker row).
 """
 
 import ast
@@ -319,10 +319,10 @@ def test_the_registry_is_the_det_head_registry_renamed() -> None:
 
 @pytest.mark.cpu_only
 def test_package_wiring() -> None:
-    """The test-helper key, the build manifest's package and libraries, the package data, the ignored ``aot/``
-    directory, the pre-commit exclude of the generated sources and the manifest checker's row name the package
+    """The test-helper key, the build manifest's package and libraries, the package data,
+    the pre-commit exclude of the generated sources and the manifest checker's row name the package
     at its path."""
-    from tests.test_helpers.cake_package import PACKAGES
+    from tests.cake.test_helpers.cake_package import PACKAGES
 
     directory = _backend_dir()
     assert PACKAGES[KEY] == BACKEND
@@ -343,7 +343,6 @@ def test_package_wiring() -> None:
     data = tomllib.loads((REPO / "pyproject.toml").read_text())
     package_data = data["tool"]["setuptools"]["package-data"]
     assert package_data[BACKEND] == ["csrc/**", "build.json"]
-    assert "aot/" in (directory / ".gitignore").read_text().split()
     pre_commit = (REPO / ".pre-commit-config.yaml").read_text()
     # pre-commit skips every generated source of the package (the generic #8928 rule), still checks its Python
     # modules

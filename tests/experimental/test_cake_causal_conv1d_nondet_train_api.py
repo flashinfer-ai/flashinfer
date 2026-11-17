@@ -54,7 +54,7 @@ import flashinfer.cake_causal_conv1d_nondet_train as facade
 import flashinfer.cake_causal_conv1d_nondet_train_kcp as kcp_facade
 import flashinfer.experimental.cake.cake_causal_conv1d_nondet_train as backend
 from flashinfer.api_logging import ExperimentalWarning
-from tests.test_helpers.cake_package import cake_package
+from tests.cake.test_helpers.cake_package import cake_package
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 SEED = 8066

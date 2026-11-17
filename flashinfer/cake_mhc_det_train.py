@@ -389,9 +389,10 @@ def cake_mhc_det_train_backward_prepare(
 
     Returns
     -------
-    ``(dB, grad_stats)``: ``dB[t, d] = BF16(sum_j post[t, j] dY[t, j, d])`` (one
-    rounding of the full FP32 sum) and the FP32 ``[T, 32]`` record
-    ``dpost[4] | dC[16] | zeros[12]`` that :func:`cake_mhc_det_train_backward_finish` consumes.
+    tuple of torch.Tensor
+        ``(dB, grad_stats)``: ``dB[t, d] = BF16(sum_j post[t, j] dY[t, j, d])`` (one
+        rounding of the full FP32 sum) and the FP32 ``[T, 32]`` record
+        ``dpost[4] | dC[16] | zeros[12]`` that :func:`cake_mhc_det_train_backward_finish` consumes.
     """
 
     return _pkg().cake_mhc_det_train_backward_prepare(

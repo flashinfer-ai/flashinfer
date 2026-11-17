@@ -220,10 +220,11 @@ def cake_kda_det_train_backward(
 
     Returns
     -------
-    ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
-    like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
-    the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
-    FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs.
+    tuple of torch.Tensor
+        ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
+        like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
+        the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
+        FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs.
     """
     from .experimental.cake.cake_kda_det_train import cake_backend
 
@@ -276,6 +277,39 @@ def cake_kda_det(
     (``use_gate_in_kernel=True``, ``A_log``, ``dt_bias``, ``lower_bound``: gradients to the raw gate ``g``, BF16,
     and to ``A_log`` / ``dt_bias``, FP32), the in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``: raw ``q`` /
     ``k`` in, their gradients out) and :func:`cake_kda_det_train_backward` for the gradients.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        BF16 packed rows ``[1, S, H, 128]`` (or ``[S, H, 128]``), as in
+        :func:`cake_kda_det_train_forward`.
+    g : torch.Tensor
+        FP32 activated decay gate; raw BF16 gate when ``use_gate_in_kernel=True``.
+    beta : torch.Tensor
+        BF16 ``[1, S, H]`` delta-rule gate after the sigmoid.
+    cu_seqlens : torch.Tensor
+        int32 device document offsets, first 0 and last ``S``.
+    scale : float, optional
+        Output scale; ``128 ** -0.5`` when ``None``.
+    workspace : optional
+        Caller-owned workspace from :func:`cake_kda_det_train_workspace`.
+    save_mode : str, optional
+        ``"light"`` or ``"tape"``; ``None`` uses the workspace's default (``"light"`` without one).
+    arena : optional
+        Lower-memory arena option from :func:`cake_kda_det_train_arena`.
+    doc_lengths : sequence of int, optional
+        Host document lengths in offset order; required by a batched arena.
+    use_gate_in_kernel : bool, default=False
+        Activate the raw BF16 gate inside the kernels.
+    A_log : torch.Tensor, optional
+        Contiguous FP32 ``[H]`` raw-gate parameter.
+    dt_bias : torch.Tensor, optional
+        Contiguous FP32 ``[H * 128]`` or ``[H, 128]`` raw-gate bias.
+    lower_bound : float, optional
+        Required in raw-gate mode, with ``-5 <= lower_bound < 0``.
+    use_qk_l2norm_in_kernel : bool, default=False
+        Normalize raw query and key rows inside the kernels; input layout rules are
+        those of :func:`cake_kda_det_train_forward`.
     """
     from .experimental.cake.cake_kda_det_train import cake_backend
 

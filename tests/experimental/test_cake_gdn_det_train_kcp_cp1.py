@@ -15,7 +15,7 @@ limitations under the License.
 
 The CP = 1 local path of the Cake packed GDN training package
 (``flashinfer.cake_gdn_det_train_kcp`` with a one-rank context) against the exact FP64
-reference of ``tests/test_helpers/cake_gdn_det_train_kcp_reference.py``.
+reference of ``tests/experimental/test_helpers/cake_gdn_det_train_kcp_reference.py``.
 
 Covered here: the six outputs ``out, dq, dk, dv, dbeta, dg`` on ragged packs
 of the normal gate regime (natural-log gates down to the -42 class; zero
@@ -39,7 +39,7 @@ import importlib
 import pytest
 import torch
 
-from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
+from tests.experimental.test_helpers.cake_gdn_det_train_kcp_reference import (
     BLOCK,
     D,
     GRAD_NAMES,
@@ -51,7 +51,7 @@ from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
     make_inputs,
     reference_pack,
 )
-from tests.test_helpers.cake_package import PACKAGES, cake_package
+from tests.cake.test_helpers.cake_package import PACKAGES, cake_package
 
 gdn_api = importlib.import_module("flashinfer.cake_gdn_det_train_kcp")
 

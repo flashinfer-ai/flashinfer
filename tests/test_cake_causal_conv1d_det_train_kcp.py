@@ -1187,14 +1187,14 @@ def test_every_output_repeats_bitwise_per_launch_form(
 
 
 def test_steady_state_calls_do_not_block_or_allocate() -> None:
-    """Census (``tests/test_helpers/cake_host_sync.py``) of a steady round on one context: the explicit forward, the
+    """Census (``tests/experimental/test_helpers/cake_host_sync.py``) of a steady round on one context: the explicit forward, the
     backward in both launch forms, the autograd entry and the three-tensor multi forward / backward.  No pageable or
     pinned host-to-device copy, no synchronizing operation (the probe queued before the round still runs when the
     host returns), no device allocation or free once the first rounds have run; bitwise the first round."""
     from flashinfer.experimental.cake.cake_causal_conv1d_det_train import (
         kcp as conv_kcp,
     )
-    from tests.test_helpers.cake_host_sync import (
+    from tests.experimental.test_helpers.cake_host_sync import (
         allocator_counts,
         census,
         nonblocking,

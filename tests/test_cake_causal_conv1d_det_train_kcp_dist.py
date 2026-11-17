@@ -41,7 +41,7 @@ fragment that reads its history from three predecessor ranks).  Per row and rank
   at the single-GPU suite's tolerances: ``y`` / ``dx`` within one BF16 ulp of FP64, ``dx`` within the no-CP clause,
   and the ranks' ``dweight`` partials summed in rank order within the ``dweight`` budget of the FP64 ``dweight``;
 - a steady explicit forward + backward of each form issues no host-to-device copy, no synchronizing operation and
-  no device allocation (``tests/test_helpers/cake_host_sync.py``), bitwise the first call;
+  no device allocation (``tests/experimental/test_helpers/cake_host_sync.py``), bitwise the first call;
 - per-document zigzag rows: the longest document is a chain of ``2 W`` fragments over every rank.
 
 ``ROWS`` are W = 2 / 4 / 8; ``ROWS_SCALE`` are per-document zigzag at W = 16 / 32 / 64 (FlashInfer issue #7815: at
@@ -557,7 +557,7 @@ def _run_rank(
     # Steady state: an explicit forward + backward of each form after the calls above issues no host-to-device copy,
     # no synchronizing operation (the probe queued before it still runs when the host returns) and no device
     # allocation or free; bitwise the first calls.
-    from tests.test_helpers.cake_host_sync import (
+    from tests.experimental.test_helpers.cake_host_sync import (
         allocator_counts,
         census,
         nonblocking,

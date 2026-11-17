@@ -10,13 +10,12 @@ of every row (the warps of the warpgroups share their TMEM lanes, so a row's key
   the row for the exponentials, masks both by absolute key (``select``; only on boundary tiles),
 * forms ``m' = fmax(m, m_t)``, ``alpha`` exactly as ``spec.alpha_term`` and hands ``alpha`` to the correction
   warpgroup at once (its O rescale overlaps the exponentials),
-* forms the slice's probabilities ``p_k = EX2(fma(s_k, c, mul(m', nc)))`` as values (a write-back of each
-  into the register tensor compiled to a dependent move after every MUFU and serialised the pass on its
-  latency), reduces them with the ``rowsum`` plan restricted to the slice -- the canonical tree's subtree
-  over the slice's keys -- and hands ``(m', r_slice)`` to the correction warpgroup, which owns the
+* forms the slice's probabilities ``p_k = EX2(fma(s_k, c, mul(m', nc)))``, their bf16 words and the ``rowsum``
+  plan restricted to the slice -- the canonical tree's subtree over the slice's keys -- as one stream in key
+  order (``streamed_tile_probs``), and hands ``(m', r_slice)`` to the correction warpgroup, which owns the
   row's ``l`` chain, the chunk merges and the normaliser (``correction.py``: the top level of the
   ``rowsum`` tree is its ``add`` of the slices' partials, in slice order),
-* converts the slice to bf16 and stores its own ``P`` columns to TMEM, in key order.
+* stores its own ``P`` columns to TMEM, in key order.
 
 A tile with no visible key for the row is a *null step* (``alpha = 1``, ``P`` row ``+0``, ``m`` untouched). Padding
 rows (beyond the unit's live rows) are neither masked nor stored: whatever they compute stays in their
@@ -58,6 +57,35 @@ class _RegLoader:
 
     def __call__(self, key):
         return self.vals[key[0]]
+
+
+def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype):
+    """The slice's exponentials, their bf16 conversion and the rowsum tree's subtree over the slice, emitted in KEY order as a stream:
+    for every pair of keys ``p = EX2(fma(s, c, nms))`` (the two fmas as one ``fma.rn.f32x2``), the pair's bf16 words, and the
+    pair's ``add`` -- the first level of the engine's adjacent pairwise tree (``canon._pairwise``: low index first, level by level) --
+    with every higher level's ``add`` issued as soon as both of its operands exist (a binary counter over the levels: the same
+    tree, the same operand order). Written this way the live values at any point are the unprocessed scores, the finished P words
+    and at most ``log2(keys)`` partial sums, so the P words can take the registers of the scores they came from; emitting every
+    exponential before the first conversion kept all of them live next to the P block and cost the register allocator a copy of
+    most of them per tile. ``ss[i]`` is the score of key ``i`` of the slice (register ``i``). Plain Python: trace-time structure."""
+    assert len(ss) % 2 == 0 and len(ss) & (len(ss) - 1) == 0, len(ss)
+    stack = []  # (level, partial sum) of the completed subtrees, highest level first
+    for i in range(0, len(ss), 2):
+        x0, x1 = fp.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
+        p0 = fp.ex2(x0)
+        p1 = fp.ex2(x1)
+        rP_e[i] = p0.to(in_dtype)
+        rP_e[i + 1] = p1.to(in_dtype)
+        v = fp.add(p0, p1)
+        level = 1
+        while stack and stack[-1][0] == level:
+            v = fp.add(
+                stack.pop()[1], v
+            )  # the lower keys' subtree first (the tree's operand order)
+            level += 1
+        stack.append((level, v))
+    assert len(stack) == 1, [lv for lv, _ in stack]
+    return stack[0][1]
 
 
 def packed_pairwise_add(vals, fp):
@@ -124,6 +152,7 @@ def unit_loop(
     s_m: cute.Tensor,
     s_r: cute.Tensor,
     s_p: cute.Tensor,
+    s_mx: cute.Tensor,
     c: Float32,
     nc: Float32,
     window_left: Int32,
@@ -161,16 +190,32 @@ def unit_loop(
     # full (128, T) tile composed down to the slice's columns, as the correction block does for its pieces)
     cS = cute.make_identity_tensor((Q_ROWS, T))
     tScS = qk_thr_mma.partition_C(cS)
-    ld_full = cute.make_copy_atom(
-        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
-    )
+    HWM = st.hw_rowmax
+    if cutlass.const_expr(HWM):
+        # the load returns each 32-column piece's maximum in an extra register (tcgen05.ld.red::max): the unmasked tile's row maximum
+        # is the max.f32 join of the pieces -- the same exact maximum as the register tree
+        ld_full = cute.make_copy_atom(
+            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+        )
+    else:
+        ld_full = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), ACC_DTYPE
+        )
     tiled_full = tcgen05.make_tmem_copy(ld_full, tStS)
     thr_full = tiled_full.get_slice(thread_idx)
     tFtS = thr_full.partition_S(tStS)
     tFcS = thr_full.partition_D(tScS)
     rF = cute.make_rmem_tensor(tFcS.shape, ACC_DTYPE)
     assert cute.size(rF) == T
+    rRed = None
+    if cutlass.const_expr(HWM):
+        rRed = cute.make_rmem_tensor(((1, 1), *tFcS.shape[1:]), ACC_DTYPE)
+        assert cute.size(rRed) == T // 32, cute.size(rRed)
     one_slice = kpt == T  # one warpgroup: the slice is the row, loaded once
+    # two warpgroups on whole rows: each loads ONLY its key slice, forms the slice's maximum and exchanges it with the other
+    # warpgroup through shared memory (fmax is exact and order-free, so the maximum of the two partials is the row maximum: a
+    # placement); the replicated-row placement keeps the full-row load (its slices are spread over the warps of a warpgroup)
+    exchange = (not one_slice) and (not rep)
     if cutlass.const_expr(one_slice):
         tiled_slice, tStS_part, tScS_part, rS = tiled_full, tFtS, tFcS, rF
     else:
@@ -201,8 +246,8 @@ def unit_loop(
         tScS.iterator,
         cute.composition(tScS.layout, cute.make_layout((Q_ROWS, p_words))),
     )
-    # one tcgen05.st for the warpgroup's P columns (Repetition(p_words), 64 at the full tile): the packed bf16 pairs are
-    # written from one register block instead of two 32-column pieces
+    # one tcgen05.st covers the warpgroup's P columns (Repetition(p_words), 64 at the full tile): the packed bf16 pairs are
+    # written from a single register block
     st_atom = cute.make_copy_atom(
         tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(p_words)), ACC_DTYPE
     )
@@ -254,7 +299,19 @@ def unit_loop(
         if cutlass.const_expr(OWN2):
             s_cons.advance(1)  # the other warpgroup's stage
         s_off = sh.index * st.tmem_s_stride  # this tile's S stage (0 with one stage)
-        cute.copy(tiled_full, cute.make_tensor(tFtS.iterator + s_off, tFtS.layout), rF)
+        if cutlass.const_expr(not exchange):
+            if cutlass.const_expr(HWM):
+                cute.copy(
+                    tiled_full,
+                    cute.make_tensor(tFtS.iterator + s_off, tFtS.layout),
+                    (rF, rRed),
+                )
+            else:
+                cute.copy(
+                    tiled_full,
+                    cute.make_tensor(tFtS.iterator + s_off, tFtS.layout),
+                    rF,
+                )
         if cutlass.const_expr(not one_slice):
             cute.copy(
                 tiled_slice,
@@ -263,7 +320,7 @@ def unit_loop(
             )
         cute.arch.fence_view_async_tmem_load()
         sh.release()
-        if cutlass.const_expr(st.p_over_s and st.n_slices > 1):
+        if cutlass.const_expr(st.p_over_s and st.n_slices > 1 and not exchange):
             # P is written over this stage's S columns: with two softmax warpgroups sharing TMEM lanes, no thread may store its P
             # slice before EVERY softmax thread has copied S out (the other warpgroup reads the whole row for its maximum)
             cute.arch.barrier(
@@ -277,21 +334,44 @@ def unit_loop(
             ((k0 < lo_row) | (k0 + T > L_row)) & (row < rows_valid)
         )
         if need_mask:
-            for i in cutlass.range_constexpr(T):
-                key = k0 + cols_f[i]
-                if (key < lo_row) | (key >= L_row):
-                    rF[i] = neg_inf
+            if cutlass.const_expr(not exchange):
+                for i in cutlass.range_constexpr(T):
+                    key = k0 + cols_f[i]
+                    if (key < lo_row) | (key >= L_row):
+                        rF[i] = neg_inf
             if cutlass.const_expr(not one_slice):
                 for i in cutlass.range_constexpr(kpt):
                     key = k0 + col_base + cols_s[i]
                     if (key < lo_row) | (key >= L_row):
                         rS[i] = neg_inf
-        sf = []
-        for i in cutlass.range_constexpr(T):
-            sf.append(rF[i])
-        m_t = max3_tree(
-            sf
-        )  # the same value as the rowmax plan (max is exact and order-free)
+        if cutlass.const_expr(exchange):
+            sp = []
+            for i in cutlass.range_constexpr(kpt):
+                sp.append(rS[i])
+            m_part = max3_tree(sp)  # this slice's maximum
+            par = n % 2
+            s_mx[(par, ks, row)] = m_part
+            cute.arch.barrier(
+                barrier_id=BAR_SOFTMAX_ALL, number_of_threads=st.softmax_threads
+            )
+            m_t = CuteF32.fmaxc(m_part, s_mx[(par, 1 - ks, row)])
+        else:
+            sf = []
+            for i in cutlass.range_constexpr(T):
+                sf.append(rF[i])
+            if cutlass.const_expr(HWM):
+                sr = []
+                for i in cutlass.range_constexpr(T // 32):
+                    sr.append(rRed[i])
+                m_t = max3_tree(
+                    sr
+                )  # the pieces' hardware maxima joined (an unmasked tile)
+                if need_mask:  # the maximum of the masked values: the register tree
+                    m_t = max3_tree(sf)
+            else:
+                m_t = max3_tree(
+                    sf
+                )  # the same value as the rowmax plan (max is exact and order-free)
         if chunk_first:
             m = neg_inf
         null = m_t == neg_inf  # no visible key for this row: a null step
@@ -311,20 +391,33 @@ def unit_loop(
         s_alpha[(sth.index, row)] = alpha
         sth.commit()
         ss = []
-        for i in cutlass.range_constexpr(kpt):
-            ss.append(rS[i])
-        # p_k = EX2(fma(s_k, c, mul(m_new, nc))); masked -> +0; the fma of two keys in one fma.rn.f32x2 (a packing placement)
-        ps = [None] * kpt
-        for i in cutlass.range_constexpr(0, kpt, 2):
-            x0, x1 = CuteF32.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
-            ps[i] = CuteF32.ex2(x0)
-            ps[i + 1] = CuteF32.ex2(x1)
-        leaves = []
         for kk in cutlass.range_constexpr(kpt):
-            leaves.append(ps[reg_s[kk]])
-        r_s = packed_pairwise_add(
-            leaves, CuteF32
-        )  # the rowsum tree's subtree over the slice (packed adds)
+            ss.append(rS[reg_s[kk]])  # the slice's scores in key order
+        # p_k = EX2(fma(s_k, c, mul(m_new, nc))); masked -> +0. Whole or sliced rows under one softmax warp per scheduler: the
+        # exponentials, their bf16 words and the rowsum tree as one stream in key order (streamed_tile_probs: the P words take the
+        # scores' registers). The paired placement (two warpgroups on whole rows) and the replicated rows: the exponentials two keys
+        # per fma.rn.f32x2, the subtree with packed adds, the conversion after -- measured faster there, where two softmax warps
+        # share a scheduler and the fewer instructions of the packed adds matter more than the register copies
+        if cutlass.const_expr(rep):
+            rPq = cute.make_rmem_tensor(cute.make_layout((kpt // 2,)), ACC_DTYPE)
+            rPq_e = cute.make_tensor(
+                cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
+            )
+        if cutlass.const_expr(not rep and not st.q2):
+            r_s = streamed_tile_probs(ss, rP_e, c, nms, CuteF32, IN_DTYPE)
+        else:
+            ps = [None] * kpt
+            for i in cutlass.range_constexpr(0, kpt, 2):
+                x0, x1 = CuteF32.fma2((ss[i], ss[i + 1]), (c, c), (nms, nms))
+                ps[i] = CuteF32.ex2(x0)
+                ps[i + 1] = CuteF32.ex2(x1)
+            r_s = packed_pairwise_add(ps, CuteF32)
+            if cutlass.const_expr(rep):
+                for i in cutlass.range_constexpr(kpt):
+                    rPq_e[i] = ps[i].to(IN_DTYPE)
+            else:
+                for i in cutlass.range_constexpr(kpt):
+                    rP_e[i] = ps[i].to(IN_DTYPE)
         # ---- (m', r_slice) to the correction warpgroup, which owns the l chain and the merges
         sth = stats_prod.acquire_and_advance()
         s_m[(sth.index, row)] = m_new
@@ -340,13 +433,7 @@ def unit_loop(
             tPtS.iterator + ph.index * st.tmem_p_stride, tPtS.layout
         )  # this tile's P stage (= its S stage)
         if cutlass.const_expr(rep):
-            # every warp converts its slice; warps 1..3 hand theirs to warp 0 through smem, which stores the warpgroup's columns
-            rPq = cute.make_rmem_tensor(cute.make_layout((kpt // 2,)), ACC_DTYPE)
-            rPq_e = cute.make_tensor(
-                cute.recast_ptr(rPq.iterator, dtype=IN_DTYPE), cute.make_layout((kpt,))
-            )
-            for i in cutlass.range_constexpr(kpt):
-                rPq_e[i] = ps[i].to(IN_DTYPE)
+            # every warp converted its slice above; warps 1..3 hand theirs to warp 0 through smem, which stores the warpgroup's columns
             if wq > 0:
                 for i in cutlass.range_constexpr(kpt // 2):
                     s_p[(k, wq - 1, lane, i)] = rPq[i]
@@ -367,8 +454,6 @@ def unit_loop(
                 # Placed after warp 0's store so that no register state lives across the barrier (register spills otherwise)
                 cute.arch.barrier(barrier_id=BAR_XCHG + k, number_of_threads=128)
         else:
-            for i in cutlass.range_constexpr(kpt):
-                rP_e[i] = ps[i].to(IN_DTYPE)
             cute.copy(tiled_st, rP, tPtS_k)
             cute.arch.fence_view_async_tmem_store()
         ph.commit()
@@ -388,6 +473,7 @@ def softmax_loop(
     s_m: cute.Tensor,
     s_r: cute.Tensor,
     s_p: cute.Tensor,
+    s_mx: cute.Tensor,
     c: Float32,
     nc: Float32,
     window_left: Int32,
@@ -415,6 +501,7 @@ def softmax_loop(
                 s_m,
                 s_r,
                 s_p,
+                s_mx,
                 c,
                 nc,
                 window_left,
@@ -439,6 +526,7 @@ def softmax_loop(
                 s_m,
                 s_r,
                 s_p,
+                s_mx,
                 c,
                 nc,
                 window_left,
@@ -463,6 +551,7 @@ def softmax_loop(
             s_m,
             s_r,
             s_p,
+            s_mx,
             c,
             nc,
             window_left,

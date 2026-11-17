@@ -97,7 +97,7 @@ of eight to read the caller's table in place at every launch.
 
 `cake_bounds.py` holds the planner constants and the shape-independent workspace
 and ticket-loop bounds; nothing on the host reads KV lengths. The exact host mirror
-of the device planner is test-only (`tests/test_helpers/cake_balanced_gqa_plan.py`):
+of the device planner is test-only (`tests/experimental/test_helpers/cake_balanced_gqa_plan.py`):
 the tests use it to check the plan the kernel publishes in its queue counters (it
 also holds `device_plan(runner)`, which reads that plan, and the packed-row
 merge-ticket rule), and it documents the scheduling rule.

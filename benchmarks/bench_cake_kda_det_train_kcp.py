@@ -128,14 +128,14 @@ from flashinfer.cake_kda_det_train_kcp import (  # noqa: E402
     cake_kda_det_train_kcp_reduce_gate_param_grads,
 )
 from flashinfer.cake_kda_det_train import cake_kda_det  # noqa: E402
-from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
     LOWER_BOUND,
     check_fla_gate,
     fla_kda_gate,
     make_raw_inputs,
     raw_gate,
 )
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
+from tests.experimental.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
 
 ARMS = ("cake", "control", "local", "fla")
 GATE_ARMS = ("R", "E_T", "E_F")

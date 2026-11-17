@@ -38,7 +38,7 @@ import torch.utils.checkpoint
 
 import flashinfer.cake_lm_head_det_train as det_public
 import flashinfer.cake_lm_head_nondet_train as public
-from tests.test_helpers.cake_lm_head_loss_reference import (
+from tests.experimental.test_helpers.cake_lm_head_loss_reference import (
     error_report,
     make_inputs,
     reference_fp64,

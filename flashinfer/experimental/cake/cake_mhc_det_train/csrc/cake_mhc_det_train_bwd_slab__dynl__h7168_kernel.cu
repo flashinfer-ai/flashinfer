@@ -630,8 +630,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                             mbarrier_wait(fn_full_addr, _phase_fn_full);
                         }
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_2) >> 4) & 0x7FFF);
+#else
                         int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_2) >> 4) & 0x3FFF);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -656,8 +661,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accw + (acc_mm * 128))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_t_2) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x7FFF);
+#else
                         int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_t_2) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -682,8 +692,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x7FFF);
+#else
                         int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -708,7 +723,11 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -733,7 +752,11 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_t_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -758,7 +781,11 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_t_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -792,8 +819,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                         int in_grp = tile_1 % 16;
                         int small_init = ((in_grp == 0) ? 1 : 0);
                         unsigned int sbuf = grp_mm % 2;
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -828,8 +860,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_3), "r"((tmem_dfb0 + (acc_mm * 32))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -864,8 +901,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_4), "r"((tmem_dfs0 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -900,8 +942,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_5), "r"((tmem_dfs0 + (sbuf * 32))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -936,8 +983,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_6), "r"((tmem_dfb1 + (acc_mm * 32))), "r"(0) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -972,8 +1024,13 @@ kernel_cake_mhc_det_train_bwd_slab__dynl__h7168(const __grid_constant__ CUtensor
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_7), "r"((tmem_dfs1 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
+                        int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
+#else
                         int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

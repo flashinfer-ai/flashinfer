@@ -73,16 +73,17 @@ PROGRAMS = base.PROGRAMS
 HOST_PLAN_CONSTANTS = base.HOST_PLAN_CONSTANTS
 DTYPE_NAMES = base.DTYPE_NAMES
 ACC = cb.ACC_SUFFIX
-# The stages with an accumulate build: the planner-reachable 512-wide k tile forms.
-TWIN_FORMS = ("main_halves", "main_wave_halves", "main_halves_k256t")
+# The stages with an accumulate build: the planner-reachable 512-wide k tile forms and
+# the queue walk (``cake_backend.wgrad_queue_walk``).
+TWIN_FORMS = ("main_halves", "main_wave_halves", "main_halves_k256t", cb.QUEUE_STAGE)
 # The accumulate builds this release ships, route -> architecture -> stages: fp32 ``out``
 # only (a bf16 ``out`` composes: the bf16 overwrite and a same-dtype ``add_``).  The
 # registry serves exactly these (``test_acc_bindings_are_the_shipped_set``), and the README
 # and rst feature matrices state the same (``test_docs_list_the_shipped_acc_builds``).
 SHIPPED_ACC_STAGES = {
     "cake_moe_grouped_gemm_wgrad_f32_k512": {
-        "sm_100a": ("main_halves_acc", "main_wave_halves_acc"),
-        "sm_103a": ("main_halves_acc", "main_wave_halves_acc"),
+        "sm_100a": ("main_halves_acc", "main_wave_halves_acc", "main_halves_queue_acc"),
+        "sm_103a": ("main_halves_acc", "main_wave_halves_acc", "main_halves_queue_acc"),
         "sm_107a": ("main_halves_acc", "main_halves_k256t_acc"),
     },
 }
@@ -244,6 +245,27 @@ def _assert_twin_launch(ovw, acc, arch):
         assert acc.stages == () and acc.add_from is None and not acc.zero_fill
         return
     if mode == "fused":
+        # The fused accumulate binds the twin's accumulate stage, or the queue walk's where a
+        # ``queue_walk`` rule names the fused accumulate (``wgrad_queue_walk``).
+        queue_acc = cb.QUEUE_STAGE + ACC
+        if acc.stages == (queue_acc,) and stage != cb.QUEUE_STAGE:
+            e = acc.out.shape[0]
+            assert stage in cb.QUEUE_SELECTED_STAGES, (stage, arch)
+            assert cb.wgrad_queue_walk(
+                stage, "accumulate", arch, cb.sm_count(acc.out.device), e
+            ), (stage, arch, e)
+            stage = cb.QUEUE_STAGE
+        elif stage in cb.QUEUE_SELECTED_STAGES:
+            assert not (
+                cb.wgrad_queue_walk(
+                    stage,
+                    "accumulate",
+                    arch,
+                    cb.sm_count(acc.out.device),
+                    acc.out.shape[0],
+                )
+                and cake_jit.stage_served(acc.record_name, queue_acc, arch)
+            ), (stage, arch, acc.stages)
         assert acc.stages == (stage + ACC,) and len(acc.launches) == 1
         assert acc.plan["tail_reduce_grid"] is None and acc.plan["launches"] == 1
         assert acc.plan["ordered_tail"] and not acc.plan["unordered_tail"], acc.plan
@@ -266,7 +288,8 @@ def _assert_twin_launch(ovw, acc, arch):
 def test_acc_bindings_are_the_shipped_set():
     """The registry serves exactly the accumulate builds of ``SHIPPED_ACC_STAGES``: the
     fp32 512-wide k tile route serves ``main_halves_acc`` on sm_100a / sm_103a / sm_107a,
-    ``main_wave_halves_acc`` on sm_100a / sm_103a and ``main_halves_k256t_acc`` on sm_107a;
+    ``main_wave_halves_acc`` and ``main_halves_queue_acc`` on sm_100a / sm_103a and
+    ``main_halves_k256t_acc`` on sm_107a;
     the bf16 routes serve none (a bf16 ``out`` composes).  A render that lost or added an
     accumulate stage fails here."""
     assert sorted(_acc_bindings()) == sorted(_shipped_bindings())
@@ -321,6 +344,7 @@ def test_docs_list_the_shipped_acc_builds():
         "main_halves_acc": "planned",
         "main_wave_halves_acc": "wave",
         "main_halves_k256t_acc": "k256t",
+        "main_halves_queue_acc": "queue",
     }
     cells = re.split(r"\s{2,}", rest.strip())
     assert len(cells) == len(cake_jit.ARCHES), line
@@ -1213,7 +1237,7 @@ def test_build_manifest_lists_the_acc_libraries(tmp_path):
         assert binding["specializations"].get("WGRAD_OUT") == 32, (name, stage)
         assert floor == (13, 4), (library, entry["min_cuda"])
         found.add(library)
-    assert len(found) == len(_shipped_bindings()) == 6
+    assert len(found) == len(_shipped_bindings()) == 8
 
 
 def test_fuse_flag_refusals_on_the_host():

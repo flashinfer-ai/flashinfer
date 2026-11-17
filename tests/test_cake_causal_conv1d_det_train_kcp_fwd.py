@@ -546,11 +546,11 @@ def test_recompute_handle_replays_the_waiting_form_bitwise(
 def test_two_launch_forward_steady_round_does_not_block_or_allocate(
     monkeypatch,
 ) -> None:
-    """Census (``tests/test_helpers/cake_host_sync.py``) of a steady round of every two-launch form: the single entry
+    """Census (``tests/experimental/test_helpers/cake_host_sync.py``) of a steady round of every two-launch form: the single entry
     and the three-tensor multi entry, each with an exchange in flight.  No pageable or pinned host-to-device copy, no
     synchronizing operation (the probe queued before the round still runs when the host returns), no device
     allocation or free once the first rounds have run; bitwise the first round."""
-    from tests.test_helpers.cake_host_sync import (
+    from tests.experimental.test_helpers.cake_host_sync import (
         allocator_counts,
         census,
         nonblocking,

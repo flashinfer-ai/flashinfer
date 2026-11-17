@@ -25,13 +25,15 @@ so ``GEMMConfig.lean`` validates the actual spaces (``gemm_space_ok``, ``gemm_fp
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Optional, List, Tuple
 
 from ...batch_invariant import canon
 from .spec import (
     ALPHA_GIVEN,
+    BLOCK_K,
     BLOCK_SCALED,
     ELEM_BITS_OF,
+    FP8_BLOCKSCALE_FMTS,
     MMA_K_OF,
     MMA_OP_OF,
     SF_FMT,
@@ -89,12 +91,19 @@ CTA_CHUNKS_MAX_TN = {
     "nvfp4_k128": 256,
     "mxfp4": 192,
     "mxfp4_k128": 256,
+    "e4m3_bs": 128,
 }
 #: The block-scaled instruction fixes MMA M at 128 (1-CTA) / 256 (2-CTA): its scale-factor atom spans 128 rows, so no
 #: 64-row CTA tile exists; tile N below 64 would need sub-tile scale-factor addressing; a scale-factor tile multicasts to
 #: at most 4 CTAs.
 TILES_N_BLOCKSCALED = (64, 128, 192, 256)
 TILES_M_BLOCKSCALED = {False: (128,), True: (256,)}
+#: The block-scale fp8 class (``e4m3_bs``: the dense ``kind::f8f6f4`` body with a per-block promotion by the epilogue warps): the
+#: 128-row CTA tile of the one-row-per-thread promotion (MMA M 128 1-CTA / 256 2-CTA), tile N dividing the 128-column weight
+#: scale block (the register running sum bounds it at 128), the 16-wide tile on the 1-CTA instruction only; no split variant,
+#: no in-CTA fold, no swapped record.
+TILES_N_FP8BS = (16, 32, 64, 128, 256)
+TILES_M_FP8BS = TILES_M_BLOCKSCALED
 MAX_CLUSTER_DIM_BLOCKSCALED = 4
 #: In-cluster split-K (block-scaled body): the ``cluster_k`` CTAs of a (cluster_k, 1, 1) cluster each fold one K chunk and
 #: the partials are folded in chunk order through distributed shared memory in the epilogue; the record computes the class
@@ -187,6 +196,16 @@ class Knobs:
             and self.swizzle_size in SWIZZLES
             and self.use_tma_store
         )
+        if in_fmt in FP8_BLOCKSCALE_FMTS:
+            return (
+                ok
+                and self.tile_m in TILES_M_FP8BS[two]
+                and self.tile_n in TILES_N_FP8BS
+                and (self.tile_n >= 32 or not two)
+                and self.cluster_k == 1
+                and not self.swap_ab
+                and not self.cta_chunks
+            )
         if in_fmt in BLOCK_SCALED:
             tm_ok = self.tile_m in TILES_M_BLOCKSCALED[two] or (
                 self.b_reuse
@@ -384,6 +403,8 @@ class MainloopBlock:
     fixed by the format; its instruction variant by the knobs."""
 
     in_fmt: str = "bf16"
+    #: an override of the K-steps per smem stage (``StaticPlan(k_blocks=)``); None: the format's ``inner_radix``
+    inner_steps: Optional[int] = None
 
     @property
     def step(self) -> int:
@@ -392,7 +413,7 @@ class MainloopBlock:
     @property
     def inner(self) -> int:
         """Instruction K-steps per smem stage (the lowering's inner radix)."""
-        return inner_radix(self.in_fmt)
+        return self.inner_steps or inner_radix(self.in_fmt)
 
     @property
     def k_block(self) -> int:
@@ -437,6 +458,12 @@ class GemmKernelPlan:
         return MainloopBlock(self.in_fmt)
 
     @property
+    def block_scale(self) -> bool:
+        """The block-scale fp8 class: the K fold per 128-element block, the block fold with the scales
+        (`spec.reduction_blockscale`)."""
+        return self.in_fmt in FP8_BLOCKSCALE_FMTS
+
+    @property
     def epilogue(self) -> EpilogueChain:
         return EpilogueChain.for_class(self.out_fmt, is_scaled(self.in_fmt))
 
@@ -447,7 +474,15 @@ class GemmKernelPlan:
 
     def placement(self) -> canon.Placement:
         """Both folds are register-level: the K fold is the accumulator of one output element (TMEM lane); the chunk
-        fold is one fixup thread (or the owning CTA's epilogue) folding the partials in index order."""
+        fold is one fixup thread (or the owning CTA's epilogue) folding the partials in index order; the block-scale
+        class's block fold is one epilogue thread's running sum over the blocks in index order."""
+        if self.block_scale:
+            return canon.Placement.make(
+                {
+                    "kstep": [(BLOCK_K // self.block.step, "reg")],
+                    "block": [(self.K // BLOCK_K, "reg")],
+                }
+            )
         f = {
             "kstep": [
                 (
@@ -463,8 +498,12 @@ class GemmKernelPlan:
         return canon.Placement.make(f)
 
     def plan(self):
-        from .spec import reduction, reduction_chunked
+        from .spec import reduction, reduction_blockscale, reduction_chunked
 
+        if self.block_scale:
+            return canon.plan(
+                reduction_blockscale(self.K, 0, 0, self.in_fmt), self.placement()
+            )
         red = (
             reduction(self.K, 0, 0, self.in_fmt)
             if self.chunks == 1
@@ -485,6 +524,29 @@ class GemmKernelPlan:
         got = canon.verify(p, alg)
         assert got is p.red.canonical(alg), "generated plan is not canonical"
         low = self.block.lowering()
+        if self.block_scale:
+            # every block is one stage of the lowering (one block of `inner` steps from the reset accumulator: the kernel issues
+            # `mma_fold` once per k-tile), and its trace is the block's partial of the spec
+            from .spec import reduction_blockscale
+
+            red = reduction_blockscale(self.K, 0, 0, self.in_fmt)
+            kstep = red.digits[0]
+            assert low.inner == kstep.radix == BLOCK_K // self.block.step, (
+                low.inner,
+                kstep.radix,
+            )
+            for kb in range(self.K // BLOCK_K):
+                partial = kstep.reduce(
+                    alg,
+                    [
+                        red.leaf(alg, {"block": kb, "kstep": t})
+                        for t in range(kstep.radix)
+                    ],
+                )
+                assert low.trace(red, alg, 1, fixed={"block": kb}) is partial, (
+                    f"mainloop lowering differs on block {kb}"
+                )
+            return got
         steps_per_chunk = self.block.steps(self.K // self.chunks)
         nb = low.blocks_for(steps_per_chunk)
         K_pad = nb * low.inner * self.block.step * self.chunks

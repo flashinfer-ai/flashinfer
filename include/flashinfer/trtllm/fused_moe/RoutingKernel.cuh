@@ -51,6 +51,21 @@ static constexpr int kDefaultReservedSMsForOverlapping = 8;
 static constexpr char kReservedSMsForOverlappingEnv[] =
     "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS";
 
+// PDL trigger for a routing kernel whose global writes are read by the kernels after it. Every
+// thread of the CTA must call it after its last global write.
+// - The trigger counts for the whole CTA as soon as one thread runs it, so without the barrier
+//   a thread that finishes early lets the next kernel start while other threads still write.
+// - A trigger is not a memory fence. Writes are guaranteed visible at the start of the dependent
+//   grid only if a GPU-scope release fence comes before the trigger in the triggering thread
+//   (PTX ISA, griddepcontrol). The fence after the barrier covers the writes of the whole CTA.
+__device__ __forceinline__ void triggerDependentLaunchAfterWrites() {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  __syncthreads();
+  __threadfence();
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
 // Parsed reserved-SM value and whether it came from the environment.
 struct ReservedSMsForOverlappingConfig {
   // Number of SMs to reserve for overlapping kernels.
@@ -279,15 +294,24 @@ __device__ DataType calcSoftmax(cg::thread_block_tile<WarpSize> const& warp, Dat
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// The NumBlocks CTAs of one cluster share the expanded indexes and exchange their histograms
+// through distributed shared memory. With NumBlocks == 1 a single CTA (no cluster) does all of it.
+// The CUDA headers declare the cluster intrinsics only for SM90+, so the statements using them are
+// compiled only there, also in branches that if constexpr discards. Below SM90 only the single-CTA
+// permutation of precomputed top-k ids compiles.
 template <typename KernelParams, typename BaseType, int NumThreads, int NumWarps,
           int MaxNumTopExperts, bool LoadExpertIdxFromGlobal = false,
-          typename PrecomputedExpertId = int32_t>
+          typename PrecomputedExpertId = int32_t, int NumBlocks = NumBlocksPerCluster>
 __device__ void routingPermutation(KernelParams params,
                                    PackedScoreIdx<BaseType>* smemPackedScoreIdx,
                                    int32_t const warpIdx, uint32_t const clusterBlockRank,
                                    PrecomputedExpertId const* precomputedExpertIds = nullptr) {
   using OutputT = typename KernelParams::OutputT;
   using TypePacked = PackedScoreIdx<BaseType>;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 900))
+  static_assert(NumBlocks == 1 && LoadExpertIdxFromGlobal,
+                "Below SM90 only the single-CTA permutation of precomputed top-k ids compiles");
+#endif
 
   // When MaxNumExperts > NumThreads, each thread handles multiple experts. Use ceiling division
   // so non-divisible expert tiers (notably E=896 with 256- or 512-thread cluster blocks) are
@@ -300,9 +324,9 @@ __device__ void routingPermutation(KernelParams params,
   static_assert(ExpertsPerThread * NumThreads >= MaxNumExperts,
                 "Thread-local expert slots must cover MaxNumExperts");
 
-  static constexpr int MaxNumTokensSingleCluster = NumBlocksPerCluster * NumThreads;
+  static constexpr int MaxNumTokensSingleCluster = NumBlocks * NumThreads;
   // Number of threads in the cluster.
-  static constexpr int NumThreadsPerCluster = NumThreads * NumBlocksPerCluster;
+  static constexpr int NumThreadsPerCluster = NumThreads * NumBlocks;
   // same as max num tokens
   static constexpr int MaxExpandedIdxPerThread =
       (MaxNumTokensSingleCluster * MaxNumTopExperts + NumThreadsPerCluster - 1) /
@@ -352,9 +376,11 @@ __device__ void routingPermutation(KernelParams params,
                               static_cast<int16_t>(params.mPtrTopKPacked[expandedIdx].idx)};
       }
     } else {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
       TypePacked const* remoteSmem = cg::cluster_group::map_shared_rank(
           smemPackedScoreIdx, expandedIdx / (NumWarps * params.mTopK));
       scoreIdx = remoteSmem[expandedIdx % (NumWarps * params.mTopK)];
+#endif
     }
 
     expertIndexes[ii] = scoreIdx.idx;
@@ -399,8 +425,14 @@ __device__ void routingPermutation(KernelParams params,
     }
   }
   // Make local histogram (token counts per expert) available to all threads in the cluster.
-  __cluster_barrier_arrive();
-  __cluster_barrier_wait();
+  if constexpr (NumBlocks > 1) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    __cluster_barrier_arrive();
+    __cluster_barrier_wait();
+#endif
+  } else {
+    __syncthreads();
+  }
 
   //
   // Each thread now represents ExpertsPerThread experts
@@ -418,27 +450,37 @@ __device__ void routingPermutation(KernelParams params,
     blockExpertOffset[e] = 0;
 
     if (expert < params.mNumExperts) {
-      // Get the histogram bin from each rank for this expert.
-      int32_t expertCounts[NumBlocksPerCluster];
+      if constexpr (NumBlocks == 1) {
+        count[e] = smemExpertCount[expert];
+      } else {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        // Get the histogram bin from each rank for this expert.
+        int32_t expertCounts[NumBlocks];
 #pragma unroll
-      for (int rank = 0; rank < NumBlocksPerCluster; rank++) {
-        int32_t const* remoteSmem = cg::cluster_group::map_shared_rank(smemExpertCount, rank);
-        expertCounts[rank] = rank * NumWarps < params.mNumTokens ? remoteSmem[expert] : 0;
-      }
-
-      // Compute an exclusive prefix sum of the block-local count.
-#pragma unroll
-      for (int rank = 0; rank < NumBlocksPerCluster; rank++) {
-        if (rank == clusterBlockRank) {
-          blockExpertOffset[e] = count[e];
+        for (int rank = 0; rank < NumBlocks; rank++) {
+          int32_t const* remoteSmem = cg::cluster_group::map_shared_rank(smemExpertCount, rank);
+          expertCounts[rank] = rank * NumWarps < params.mNumTokens ? remoteSmem[expert] : 0;
         }
-        count[e] += expertCounts[rank];
+
+        // Compute an exclusive prefix sum of the block-local count.
+#pragma unroll
+        for (int rank = 0; rank < NumBlocks; rank++) {
+          if (rank == clusterBlockRank) {
+            blockExpertOffset[e] = count[e];
+          }
+          count[e] += expertCounts[rank];
+        }
+#endif
       }
     }
   }
 
   // Arrive: we do not access distributed shared memory after this point.
-  __cluster_barrier_arrive();
+  if constexpr (NumBlocks > 1) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    __cluster_barrier_arrive();
+#endif
+  }
 
   // Compute the runtime config for projections
   // Whether or not an expert is local is taken into account when smemExpertCount is computed
@@ -467,7 +509,7 @@ __device__ void routingPermutation(KernelParams params,
         params.mPtrNumTokensPerExpert[expert] = count[e];
       }
       // Strided loop to share this work between blocks.
-      for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocksPerCluster) {
+      for (int32_t cta = clusterBlockRank; cta < numCta[e]; cta += NumBlocks) {
         const int32_t localExpertIdx =
             (expert - params.mLocalExpertsStartIdx) >> params.mLocalExpertsStrideLog2;
         params.mPtrCtaIdxXyToBatchIdx[ctaOffset[e] + cta] = localExpertIdx;
@@ -516,7 +558,11 @@ __device__ void routingPermutation(KernelParams params,
   // Wait: we cannot exit while other blocks may be accessing the current block's shared memory.
   // Note: I observed a perf benefit to doing this before the final loop so the compiler can
   // implement break with EXIT.
-  __cluster_barrier_wait();
+  if constexpr (NumBlocks > 1) {
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    __cluster_barrier_wait();
+#endif
+  }
 
   // each thread has the same "expanded indexes" assigned to it as above
   // at this point, we know the final offsets of experts and the offsets within
@@ -552,11 +598,11 @@ __device__ void routingPermutation(KernelParams params,
   // mPtrCtaIdxXyToMnLimit, mPtrNumNonExitingCtas, mPtrPermutedIdxSize, AND
   // mPtrExpandedIdxToPermutedIdx / mPtrPermutedIdxToTokenIdx.
   // Triggering before the permutation writes causes the consumer to read stale data → NaN.
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // The trigger takes effect for the whole CTA when its first thread reaches it, so trigger only
+  // after every thread of the CTA has written its part (see triggerDependentLaunchAfterWrites).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -938,12 +984,11 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
     }
   }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger secondary kernel.
+  // Trigger the secondary kernel only after every thread of the CTA wrote its permutation
+  // indices (see routingPermutation).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
-#endif  // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1226,9 +1271,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
     }
   }
 
-  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
+  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices)
+  // of every thread in the CTA (see routingPermutation).
   if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
+    triggerDependentLaunchAfterWrites();
   }
 }
 #else

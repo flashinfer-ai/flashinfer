@@ -66,14 +66,17 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+from tests.experimental.test_helpers.kcp_collective_shims import (
+    CollectiveCounter,
+    RecomputePhase,
+)
 
 PACKAGE = "flashinfer.experimental.cake.cake_gdn_det_train_kcp"
 
 
 def _mod(sub: str | None = None):
     try:
-        from tests.test_helpers.cake_package import cake_package
+        from tests.cake.test_helpers.cake_package import cake_package
 
         return cake_package("cake_gdn_det_train_kcp", sub)
     except (ImportError, KeyError):
@@ -104,7 +107,9 @@ SIDE_STREAM_ITERS = 7
 def _reference():
     """The FP64 reference: the FlashInfer test helper once it ships, else the session harness on PYTHONPATH."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_reference as ref  # type: ignore[attr-defined]
+        from tests.experimental.test_helpers import (
+            cake_gdn_det_train_kcp_reference as ref,
+        )  # type: ignore[attr-defined]
 
         return ref
     except ImportError:
@@ -114,7 +119,7 @@ def _reference():
 def _inputs():
     """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``)."""
     try:
-        from tests.test_helpers import cake_gdn_det_train_kcp_inputs as gen
+        from tests.experimental.test_helpers import cake_gdn_det_train_kcp_inputs as gen
     except ImportError as exc:
         pytest.skip(f"the seeded GDN KCP inputs helper is unavailable: {exc}")
     return gen

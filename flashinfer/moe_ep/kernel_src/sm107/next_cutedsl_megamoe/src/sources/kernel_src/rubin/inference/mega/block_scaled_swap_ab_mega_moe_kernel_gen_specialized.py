@@ -271,7 +271,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
         self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
         self._topk_reduce = (
-            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count)
+            None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count, batch_invariant=bool(problem_desc.get("batch_invariant", False)))
         )
 
     # ------------------------------------------------------------------
@@ -530,6 +530,14 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         tile = "x".join(str(dimension) for dimension in self.mma_tiler_mnk)
         cluster = "x".join(str(dimension) for dimension in self.cluster_shape_mn)
         epi_flags = "x".join(str(batch) for batch in self.epi_flag_batches)
+        bi_enabled = bool(getattr(self.epilogue, "batch_invariant", False))
+        bi_variant = getattr(self.epilogue, "batch_invariant_activation", None)
+        bi_suffix = f"_bi{int(bi_enabled)}" if bi_enabled or bi_variant is not None else ""
+        if bi_variant is not None:
+            import hashlib
+            bi_suffix += "_act" + hashlib.sha256(
+                repr(bi_variant.signature).encode()
+            ).hexdigest()[:16]
         return (
             f"sm107_block_scaled_swap_ab_gen_phase_specialized_moe_{self.quant_kind}_"
             f"{dtype_name(self.a_dtype)}_{dtype_name(self.b_dtype)}_{dtype_name(self.acc_dtype)}_"
@@ -550,6 +558,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_reduce' if self.reduce_topk_in_kernel else 'separate_reduce'}_"
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
+            + bi_suffix
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
