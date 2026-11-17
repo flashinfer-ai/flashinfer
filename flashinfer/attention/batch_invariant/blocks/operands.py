@@ -121,13 +121,18 @@ SLOT_KEYS_256 = 128  # keys per ring slot at D = 256: whole tiles (two 64 KB slo
 # issued when its predecessor's MMAs complete, a tile ahead of its use)
 Q_STAGES = 2  # Q tiles in smem: the load warp prefetches the next unit's Q while the MMA finishes this one
 REGS_SOFTMAX, REGS_OTHER = 192, 32
+# the one-warpgroup body at these head dims: 200 per softmax thread and 96 for the correction (16-column pieces). The softmax's
+# exponential stream schedules better with the headroom and the correction's per-tile loop stays spill-free at 96; measured faster at
+# every prefill shape on SM107 (the paired placement keeps 192 / 96: its budget is full)
+REGS_1WG_DIMS = (64,)
+REGS_SOFTMAX_1WG, REGS_CORRECTION_1WG = 200, 96
 
 
 class Roles:
     """Warp layout for ``n_wg`` softmax warpgroups (a placement knob): the softmax warpgroups first (all of
     them work on every tile, warpgroup k holding key slice k of the row: the warps of the warpgroups share
     their TMEM lanes), then the correction warpgroup, then MMA, load and empty warps completing the last
-    warpgroup. Register budget: 65536 = 192 x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
+    warpgroup. Register budget: 65536 >= REGS_SOFTMAX x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
 
     def __init__(self, n_wg: int, D: int = 128, q2: bool = False):
         assert n_wg in (1, 2), n_wg
@@ -150,6 +155,11 @@ class Roles:
             self.regs_correction = REGS_CORRECTION_W2
         elif q2:
             self.regs_correction = 96
+        elif D in REGS_1WG_DIMS:
+            self.regs_softmax, self.regs_correction = (
+                REGS_SOFTMAX_1WG,
+                REGS_CORRECTION_1WG,
+            )
         else:
             self.regs_correction = 208 if not om_in_tmem(D) else 128
         self.n_tmem_users = 32 * (4 * n_wg + 4 + 1)
