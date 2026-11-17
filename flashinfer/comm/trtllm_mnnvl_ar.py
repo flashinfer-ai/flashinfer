@@ -477,7 +477,7 @@ def trtllm_mnnvl_allreduce(
         output: Output tensor to store the result, empty tensor will be created if not provided.
         strategy: MNNVLAllreduceFusionStrategy. Internal heuristics will be used if not provided.
     Returns:
-        output: Reduced tensor [num_tokens, hidden_dim]
+        torch.Tensor: ``output``: Reduced tensor [num_tokens, hidden_dim]
     """
 
     # Check ndims here as the shape check is done in the kernel launch code.
@@ -563,8 +563,9 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm(
             ((1 + gamma) * x * rsqrt(...)).
 
     Returns:
-        output: Add-residual and normalized tensor [num_tokens, hidden_dim]
-        residual_out: Add-residual tensor [num_tokens, hidden_dim]
+        Tuple[torch.Tensor, torch.Tensor]:
+            * ``output``: Add-residual and normalized tensor [num_tokens, hidden_dim]
+            * ``residual_out``: Add-residual tensor [num_tokens, hidden_dim]
     """
 
     if epsilon is None:

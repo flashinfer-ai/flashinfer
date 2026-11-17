@@ -264,6 +264,8 @@ def cake_dsa_sparse_attention_det(
     lse : torch.Tensor
         Only with ``return_lse=True``.
 
+    Notes
+    -----
     Gradients flow to ``q_latent``, ``q_rope``, ``kv_latent`` and ``k_rope``.
     BF16 operands into the tensor cores, FP32 accumulation; the backward
     recomputes the scores from the BF16 inputs and forms the exact ``delta``

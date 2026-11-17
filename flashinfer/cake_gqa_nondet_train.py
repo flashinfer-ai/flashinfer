@@ -179,7 +179,8 @@ def cake_gqa_nondet(
 
     Returns
     -------
-    ``out`` BF16 ``[T_q, H_q, 256]``, or ``(out, lse)``.
+    Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
+        ``out`` BF16 ``[T_q, H_q, 256]``, or ``(out, lse)``.
 
     Notes
     -----
@@ -236,7 +237,8 @@ def cake_gqa_nondet_train_forward(
 
     Returns
     -------
-    ``(out, lse)``.  A row that sees no key gets ``out = 0`` and ``lse = -inf``.
+    tuple[torch.Tensor, torch.Tensor]
+        ``(out, lse)``.  A row that sees no key gets ``out = 0`` and ``lse = -inf``.
 
     Notes
     -----
@@ -320,7 +322,8 @@ def cake_gqa_nondet_train_backward(
 
     Returns
     -------
-    ``(dq, dk, dv)``; with ``row_map``, ``dk`` / ``dv`` are ``dk_acc`` / ``dv_acc``.
+    tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ``(dq, dk, dv)``; with ``row_map``, ``dk`` / ``dv`` are ``dk_acc`` / ``dv_acc``.
 
     Notes
     -----
@@ -378,7 +381,8 @@ def cake_gqa_nondet_train_workspace(
 
     Returns
     -------
-    A ``CakeGQANondetWorkspace``.
+    CakeGQANondetWorkspace
+        A ``CakeGQANondetWorkspace``.
     """
     return _pkg().CakeGQANondetWorkspace(device, budget_bytes=budget_bytes)
 
@@ -422,9 +426,10 @@ def cake_gqa_nondet_train_workspace_bytes(
 
     Returns
     -------
-    The bytes of FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2, rows_pad]`` (the scratch a workspace
-    keeps), with ``rows_pad = round_up(2 T_q + 128 B, 128)``, plus the dS^T chunk and the window gradients when
-    asked.
+    int
+        The bytes of FP32 ``[H_q / 2, rows_pad, 256]`` plus two ``[H_q / 2, rows_pad]`` (the scratch a workspace
+        keeps), with ``rows_pad = round_up(2 T_q + 128 B, 128)``, plus the dS^T chunk and the window gradients when
+        asked.
     """
     return _pkg().cake_gqa_nondet_train_workspace_bytes(
         total_q,

@@ -204,9 +204,10 @@ def cake_rmsnorm_det_train_forward(
 
     Returns
     -------
-    ``(y, rstd)`` or ``(y, rstd, h_new)`` when ``residual`` is given.
-    ``rstd`` is the FP32 per-row ``1 / sqrt(mean(h_new^2) + eps)`` the backward
-    needs; no other ``[T, H]`` temporary is produced.
+    tuple[torch.Tensor, ...]
+        ``(y, rstd)`` or ``(y, rstd, h_new)`` when ``residual`` is given.
+        ``rstd`` is the FP32 per-row ``1 / sqrt(mean(h_new^2) + eps)`` the backward
+        needs; no other ``[T, H]`` temporary is produced.
 
     Notes
     -----
@@ -273,11 +274,12 @@ def cake_rmsnorm_det_train_backward(
 
     Returns
     -------
-    ``(dx, dw)`` with ``dw`` in FP32; the caller decides whether to cast it.
-    For a fixed token count ``dw`` is bitwise reproducible on devices with the
-    same SM count: the rows are split over ``ctas_per_sm`` x SM count CTAs, so
-    devices of one architecture with different SM counts can give different
-    ``dw`` bits.
+    tuple[torch.Tensor, torch.Tensor]
+        ``(dx, dw)`` with ``dw`` in FP32; the caller decides whether to cast it.
+        For a fixed token count ``dw`` is bitwise reproducible on devices with the
+        same SM count: the rows are split over ``ctas_per_sm`` x SM count CTAs, so
+        devices of one architecture with different SM counts can give different
+        ``dw`` bits.
 
     Notes
     -----

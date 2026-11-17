@@ -176,8 +176,9 @@ def cake_kda_nondet_train_forward(
 
     Returns
     -------
-    ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``CakeKDANondetChunkSaved`` (versioned) or ``None``.
-    ``out`` and the saved set are bitwise the deterministic package's (the same forward programs).
+    tuple[torch.Tensor, Optional[Any]]
+        ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``CakeKDANondetChunkSaved`` (versioned) or ``None``.
+        ``out`` and the saved set are bitwise the deterministic package's (the same forward programs).
     """
     from .experimental.cake.cake_kda_nondet_train import cake_backend
 

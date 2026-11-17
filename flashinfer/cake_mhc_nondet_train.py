@@ -155,7 +155,8 @@ def is_cake_mhc_nondet_train_supported(
 
     Returns
     -------
-    ``True`` when the device (at ``hidden``, when given) has the routes.
+    bool
+        ``True`` when the device (at ``hidden``, when given) has the routes.
     """
 
     return _pkg().is_cake_mhc_nondet_train_supported(device, hidden)
@@ -187,7 +188,8 @@ def cake_mhc_nondet_train_forward_workspace_bytes(
 
     Returns
     -------
-    The size of the forward workspace in bytes.
+    int
+        The size of the forward workspace in bytes.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_workspace_bytes(
@@ -226,7 +228,8 @@ def cake_mhc_nondet_train_backward_workspace_bytes(
 
     Returns
     -------
-    The size of the backward workspace in bytes.
+    int
+        The size of the backward workspace in bytes.
     """
 
     return _pkg().cake_mhc_nondet_train_backward_workspace_bytes(
@@ -251,7 +254,8 @@ def cake_mhc_nondet_train_forward_workspace(
 
     Returns
     -------
-    A zero-filled ``uint8`` tensor of that many bytes on ``device``.
+    torch.Tensor
+        A zero-filled ``uint8`` tensor of that many bytes on ``device``.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_workspace(T, device, hidden=hidden)
@@ -274,7 +278,8 @@ def cake_mhc_nondet_train_backward_workspace(
 
     Returns
     -------
-    A zero-filled ``uint8`` tensor of that many bytes on ``device``.
+    torch.Tensor
+        A zero-filled ``uint8`` tensor of that many bytes on ``device``.
     """
 
     return _pkg().cake_mhc_nondet_train_backward_workspace(T, device, hidden=hidden)
@@ -323,8 +328,9 @@ def cake_mhc_nondet_train_forward_prepare(
 
     Returns
     -------
-    ``(U, stats)``: BF16 ``U`` of shape ``[T, H]`` and the FP32 ``[T, 64]``
-    per-token record.
+    tuple[torch.Tensor, torch.Tensor]
+        ``(U, stats)``: BF16 ``U`` of shape ``[T, H]`` and the FP32 ``[T, 64]``
+        per-token record.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_prepare(
@@ -375,8 +381,9 @@ def cake_mhc_nondet_train_forward_stats(
 
     Returns
     -------
-    FP32 ``[T, 64]`` ``stats``, bitwise the record of
-    :func:`cake_mhc_nondet_train_forward_prepare` for the same inputs.
+    torch.Tensor
+        FP32 ``[T, 64]`` ``stats``, bitwise the record of
+        :func:`cake_mhc_nondet_train_forward_prepare` for the same inputs.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_stats(
@@ -421,7 +428,8 @@ def cake_mhc_nondet_train_forward_finish(
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, H]``.
+    torch.Tensor
+        BF16 ``Y`` of shape ``[T, 4, H]``.
     """
 
     return _pkg().cake_mhc_nondet_train_forward_finish(X, B, stats, out=out)
@@ -461,8 +469,9 @@ def cake_mhc_nondet_train_backward_prepare(
 
     Returns
     -------
-    ``(dB, grad_stats)``: BF16 ``dB`` of shape ``[T, H]`` and the FP32
-    ``[T, 32]`` record that :func:`cake_mhc_nondet_train_backward_finish` consumes.
+    tuple[torch.Tensor, torch.Tensor]
+        ``(dB, grad_stats)``: BF16 ``dB`` of shape ``[T, H]`` and the FP32
+        ``[T, 32]`` record that :func:`cake_mhc_nondet_train_backward_finish` consumes.
     """
 
     return _pkg().cake_mhc_nondet_train_backward_prepare(
@@ -544,8 +553,9 @@ def cake_mhc_nondet_train_backward_finish(
 
     Returns
     -------
-    ``(dX, dfn, dscale, dbase)``: the BF16 input gradient and the FP32
-    parameter gradients.
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(dX, dfn, dscale, dbase)``: the BF16 input gradient and the FP32
+        parameter gradients.
     """
 
     return _pkg().cake_mhc_nondet_train_backward_finish(
@@ -612,8 +622,9 @@ def cake_mhc_nondet_train_prepare(
 
     Returns
     -------
-    ``(U, handle)``: BF16 ``U`` of shape ``[T, H]`` and the handle of this
-    prepare node for one :func:`cake_mhc_nondet_train_finish`.
+    tuple
+        ``(U, handle)``: BF16 ``U`` of shape ``[T, H]`` and the handle of this
+        prepare node for one :func:`cake_mhc_nondet_train_finish`.
     """
 
     return _pkg().cake_mhc_nondet_train_prepare(
@@ -655,7 +666,8 @@ def cake_mhc_nondet_train_finish(
 
     Returns
     -------
-    BF16 ``Y`` of shape ``[T, 4, H]``.
+    torch.Tensor
+        BF16 ``Y`` of shape ``[T, 4, H]``.
     """
 
     return _pkg().cake_mhc_nondet_train_finish(X, B, handle)

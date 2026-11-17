@@ -121,8 +121,9 @@ def cake_kda_det_train_kcp_partition(
 
     Returns
     -------
-    ``CakeKDADetKcpPartition``: per rank its fragments (document, token range) of the batch; the input of
-    :func:`cake_kda_det_train_kcp_build_context` on every rank.
+    CakeKDADetKcpPartition
+        ``CakeKDADetKcpPartition``: per rank its fragments (document, token range) of the batch; the input of
+        :func:`cake_kda_det_train_kcp_build_context` on every rank.
     """
     from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
@@ -170,7 +171,8 @@ def cake_kda_det_train_kcp_build_context(
 
     Returns
     -------
-    ``CakeKDADetKcpContext``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
+    CakeKDADetKcpContext
+        ``CakeKDADetKcpContext``: the argument every KCP entry point takes; reusable across calls of the same batch layout.
     """
     from .experimental.cake.cake_kda_det_train_kcp import cake_kcp_plan
 
@@ -251,7 +253,8 @@ def cake_kda_det_train_kcp_forward(
 
     Returns
     -------
-    ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` a ``CakeKDADetKcpSaved`` or ``None``.
+    tuple[torch.Tensor, Optional[Any]]
+        ``(out, saved)``: ``out`` BF16 like ``v`` (this rank's tokens); ``saved`` a ``CakeKDADetKcpSaved`` or ``None``.
     """
     from .experimental.cake.cake_kda_det_train_kcp import cake_kcp
 

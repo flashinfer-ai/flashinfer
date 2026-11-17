@@ -126,11 +126,12 @@ def cake_gdn_nondet(
 
     Returns
     -------
-    ``(o, final_state)``: ``o`` like ``v``; ``final_state`` is ``None`` unless ``output_final_state``.
+    tuple[torch.Tensor, Optional[torch.Tensor]]
+        ``(o, final_state)``: ``o`` like ``v``; ``final_state`` is ``None`` unless ``output_final_state``.
 
-    The inputs are checked before the first launch (``ValueError``).  There is no ``deterministic`` keyword.  Every
-    launch is fixed-order today, so ``torch.use_deterministic_algorithms(True)`` (strict or ``warn_only``) changes
-    nothing; the contract does not promise run-to-run bits.
+        The inputs are checked before the first launch (``ValueError``).  There is no ``deterministic`` keyword.  Every
+        launch is fixed-order today, so ``torch.use_deterministic_algorithms(True)`` (strict or ``warn_only``) changes
+        nothing; the contract does not promise run-to-run bits.
     """
     return _pkg().cake_gdn_nondet(
         q,
