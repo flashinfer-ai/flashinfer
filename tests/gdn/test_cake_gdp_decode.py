@@ -22,7 +22,7 @@ FP64 token-serial reference of the same math (inputs at their BF16 values,
 the state rounded to FP32 after each real token) at ``atol = 1e-2``,
 ``rtol = 5e-3`` with no mismatch allowed; every slot the call must not touch
 is checked bitwise.  The matrix covers ``num_householder`` 1 to 4, the head
-counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 48 decode shapes
+counts 1 to 80, batches 1 to 257 and token counts 1 to 16 (the 144 decode shapes
 of record among them), distinct write slots, padding rows (negative read
 slots, whose output rows keep the caller's values), rows without writeback,
 per-token state scatter with holes, ``disable_state_update``, the scale
@@ -66,11 +66,11 @@ SEED = 760
 NUM_HOUSEHOLDER = (1, 2, 3, 4)
 HEADS = (1, 2, 3, 6, 10, 12, 20, 24, 40, 80)
 BATCHES = (1, 2, 3, 7, 16, 64, 257)
-TOKENS = (1, 2, 3, 4, 5, 8, 16)
-# The 48 decode shapes of record (num_householder = 3): every performance row is a correctness case.
+TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 16)
+# The 144 decode shapes of record (num_householder = 3): every performance row is a correctness case.
 PERF_HEADS = (80, 20, 10, 24)
 PERF_BATCHES = (1, 16, 64, 256)
-PERF_TOKENS = (1, 4, 8)
+PERF_TOKENS = (1, 2, 3, 4, 5, 6, 7, 8, 16)
 SENTINEL = 7.5
 
 
@@ -442,7 +442,7 @@ def test_batch_sizes(B: int) -> None:
     ],
 )
 def test_decode_rows_of_record(H: int, B: int, T: int) -> None:
-    """The 48 decode shapes of record (num_householder = 3), each a full correctness case."""
+    """The 144 decode shapes of record (num_householder = 3), each a full correctness case."""
     _skip_unless_route(3, T)
     c = _make(B, T, H, 3, generator=_generator(4, H, B, T))
     out, _ = _run(c)
@@ -790,7 +790,7 @@ def _program_cases() -> list:
                 }
                 T = next(
                     t
-                    for t in (T, 16, 2, 3, 5, 6, 7)
+                    for t in (T, *range(2, build["max_t_steps"] + 1))
                     if t not in static and t <= build["max_t_steps"]
                 )
             if (
@@ -1244,6 +1244,46 @@ def test_t4_band_follows_the_architecture(sm: int) -> None:
             arch,
             sorted(variants),
         )  # the two-heads-per-CTA program ships nowhere
+
+
+# From T = 5 on, l8r2 serves up to k x SM state heads (one wave of k CTAs per SM).
+L8R2_CTAS_PER_SM = {
+    "sm_90a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 1},
+    "sm_100a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
+    "sm_103a": {5: 2, 6: 2, 7: 2, 8: 2, 16: 2},
+}
+
+
+@pytest.mark.parametrize("sm", (132, 148, 152, 160))
+def test_multi_token_bands_follow_the_architecture(sm: int) -> None:
+    """Three Householder steps at T = 2, 3, 5, 6, 7, 8 and 16: l8r4 serves every
+    state-head count at T = 2 and 3; from T = 5 on, l8r2 serves up to k x `sm` state
+    heads (``L8R2_CTAS_PER_SM``) and l8r4 the counts above."""
+    for arch in loader.ROUTES:
+        for T in (2, 3, 5, 6, 7, 8, 16):
+            k = L8R2_CTAS_PER_SM[arch][T] if T >= 5 else 0
+            for state_heads in (1, 24, k * sm, k * sm + 1, 4 * sm, 20480):
+                if state_heads < 1:
+                    continue
+                want = ("lanerow", "l8r2" if state_heads <= k * sm else "l8r4")
+                assert _static_pick(arch, 3, T, state_heads, sm) == want, (
+                    arch,
+                    T,
+                    state_heads,
+                    sm,
+                )
+
+
+@pytest.mark.parametrize("T", (2, 3, 4, 5, 6, 7, 8, 16))
+def test_static_programs_partition_every_token_count(T: int) -> None:
+    """For every static token count above one, exactly one static program of three
+    Householder steps admits every state-head count on every SM count the kernel may
+    meet, so the runtime program never serves these token counts."""
+    for arch in loader.ROUTES:
+        for sm in (132, 148, 152, 160):
+            for state_heads in (*range(1, 1300), 1536, 4096, 20480):
+                body, variant = _static_pick(arch, 3, T, state_heads, sm)
+                assert body == "lanerow", (arch, T, state_heads, sm, body, variant)
 
 
 def test_t1_static_programs_partition_every_sm_count() -> None:

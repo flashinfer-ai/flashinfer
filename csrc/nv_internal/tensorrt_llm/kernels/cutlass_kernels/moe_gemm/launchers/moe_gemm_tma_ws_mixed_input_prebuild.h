@@ -41,11 +41,22 @@ using PrecomputedWorkTileCodec = cutlass::gemm::kernel::detail::PrecomputedGroup
 static constexpr int kPrecomputedSchedulerThreads = 128;
 static constexpr int kPrecomputedSchedulerMaxSwizzle = 2;
 static constexpr uint64_t kPrecomputedSchedulerSentinelTiles = 4096;
+// Device-specific module variants selected by flashinfer/jit/fused_moe.py. Both prebuild an
+// immutable per-expert D TMA descriptor for every regular (non-single-warpgroup) kernel; they
+// differ only in the epilogue policy chosen by sm90_generic_mixed_moe_gemm_kernelLauncher.
 #if defined(FLASHINFER_SM90_MOE_PREBUILT_D_DESCRIPTOR)
-static constexpr bool kUsePrebuiltDDescriptor = true;
+static constexpr bool kIsH20PrebuiltDModule = true;
 #else
-static constexpr bool kUsePrebuiltDDescriptor = false;
+static constexpr bool kIsH20PrebuiltDModule = false;
 #endif
+#if defined(FLASHINFER_SM90_MOE_H100_PREBUILT_D_DESCRIPTOR)
+static constexpr bool kIsH100PrebuiltDModule = true;
+#else
+static constexpr bool kIsH100PrebuiltDModule = false;
+#endif
+static_assert(!(kIsH20PrebuiltDModule && kIsH100PrebuiltDModule),
+              "The H20 and H100 prebuilt-D modules are mutually exclusive.");
+static constexpr bool kUsePrebuiltDDescriptor = kIsH20PrebuiltDModule || kIsH100PrebuiltDModule;
 
 CUTLASS_HOST_DEVICE uint64_t div_round_up(uint64_t value, uint64_t divisor) {
   return (value + divisor - 1) / divisor;
