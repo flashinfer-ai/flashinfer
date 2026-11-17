@@ -22,7 +22,10 @@ ALLOWLIST (fails closed to the stock cutlass path otherwise): SM90 device,
 DeepSeek-style fp8 [128,128]-block-scale weights (``quant_scales ==
 [fc1_block_scales, fc2_block_scales]``), bf16 unquantized activations, bf16
 output, gated SiLU (Swiglu) activation, no biases / input_sf / swiglu
-parameters / expert parallelism / min-latency mode, and token counts inside the measured won bands **T <= 16 or 256 <= T <= 4096**
+parameters / expert parallelism / min-latency mode, the measured kernel
+geometry per launch class (T == 1: hidden 512-aligned, intermediate 256,
+top_k 9; the grouped band: hidden 256-aligned, intermediate 256, top_k 9,
+at most 288 experts), and token counts inside the measured won bands **T <= 16 or 256 <= T <= 4096**
 — the measured envelope where this kernel beats the serving engines'
 dispatched triton fused-MoE on the captured GLM-class routing. At the
 measured T >= 64 classes the kernel LOSES to that incumbent (0.55-0.81x),
@@ -45,13 +48,13 @@ kept for one release.
 
 The dispatch never allocates on the hot path except the output tensor when
 the caller did not pass one (the stock path allocates it in the same
-place): the fp16 intermediate workspace is cached per device at its T<=16
-capacity and the JIT build happens on the first eligible call outside any
+place): the fp16 intermediate workspace is cached per (device, stream) at
+the serving band's capacity and the JIT build happens on the first eligible call outside any
 CUDA-graph capture (a capture without a built module takes the stock path).
 """
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -99,7 +102,19 @@ _counters: Dict[str, int] = {
 }
 _module: Any = None
 _module_error: Optional[str] = None
-_workspaces: Dict[int, torch.Tensor] = {}
+# Intermediate workspaces keyed by (device index, CUDA stream handle): the
+# native run launches on the caller's current stream, so two streams sharing
+# one buffer would overwrite each other's intermediates. A CUDA-graph
+# capture adopts the device's largest primed workspace instead (the
+# torch.cuda.graph warmup pattern primes the cache on the warmup stream, and
+# a graph's own launches serialize at replay).
+_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
+# Workspaces replaced by larger ones are retained for the life of the
+# process: a CUDA graph captured earlier may still replay into the old
+# tensor's address, so releasing it to the allocator would let unrelated
+# allocations alias a buffer a replay still writes. Bounded by the few
+# distinct plan sizes a process uses.
+_retired_workspaces: List[torch.Tensor] = []
 _announced = False
 
 
@@ -249,6 +264,29 @@ def _eligibility(
         return f"token_selected_experts {ids.dtype} {tuple(ids.shape)}"
     if tw is None or tw.dim() != 2 or tuple(tw.shape) != tuple(ids.shape):
         return "token_final_scales shape"
+    # Per-launch-class geometry of the measured contract (mirrored by the
+    # native validation in the .cu): T == 1 runs the 512-half swizzled fc1
+    # staging and the fixed 256-column / 9-slot fc2 pair; the grouped band
+    # runs the 288-thread prefix scan, 256-column fp16 fc2 tiles, the
+    # 2x128-block fp8 fc2 and the 9-slot reductions. T in [2, 16] keeps the
+    # generic small-path envelope (any top_k / experts, 128-aligned H / I).
+    KTOP = ids.shape[1]
+    if T == 1:
+        if H % 512:
+            return f"H={H} not 512-aligned (T=1 fc1 staging)"
+        if I != 256:
+            return f"I={I} != 256 (T=1 fc2 tile width)"
+        if KTOP != 9:
+            return f"top_k={KTOP} != 9 (T=1 fc2 routing slots)"
+    if T >= _BAND2_LO:
+        if KTOP != 9:
+            return f"top_k={KTOP} != 9 (grouped combine slots)"
+        if E > 288:
+            return f"num_experts={E} > 288 (grouped prefix CTA)"
+        if H % 256:
+            return f"H={H} not 256-aligned (grouped fc2 tiles)"
+        if I != 256:
+            return f"I={I} != 256 (grouped fp8 fc2 K blocks)"
     if output is not None and (
         output.dtype != torch.bfloat16 or tuple(output.shape) != (T, H)
     ):
@@ -361,16 +399,34 @@ def _moe_smallt_sm90_try_dispatch(
     E_sz = fc1_expert_weights.shape[0]
     band_cap = _MAX_TOKENS if T <= _MAX_TOKENS else _BAND2_HI
     need = int(module.plan_workspace_bytes(band_cap, KTOP, I, H_sz, E_sz))
-    ws = _workspaces.get(dev_index)
-    if ws is None or ws.numel() < need or ws.device != input.device:
-        if capturing:
-            # never allocate the cache inside a capture
+    ws_key = (dev_index, torch.cuda.current_stream(input.device).cuda_stream)
+    ws = _workspaces.get(ws_key)
+    if ws is not None and (ws.numel() < need or ws.device != input.device):
+        ws = None
+    if ws is None and capturing:
+        # Never allocate (or cache) inside a capture: adopt the device's
+        # largest primed workspace — the torch.cuda.graph warmup pattern
+        # primes it on the warmup stream, and a graph's own launches
+        # serialize at replay, so reuse inside one graph is safe.
+        for (dev, _stream), cand in _workspaces.items():
+            if (
+                dev == dev_index
+                and cand.numel() >= need
+                and (ws is None or cand.numel() > ws.numel())
+            ):
+                ws = cand
+        if ws is None:
             _counters["runs_capture_unready"] += 1
             _fallback(f"{requested}: workspace alloc under capture")
             _backend_dispatches["stock"] += 1
             return None
+    elif ws is None:
+        old = _workspaces.get(ws_key)
         ws = torch.empty(need, dtype=torch.uint8, device=input.device)
-        _workspaces[dev_index] = ws
+        if old is not None:
+            # a captured graph may still replay into the old buffer
+            _retired_workspaces.append(old)
+        _workspaces[ws_key] = ws
         _counters["workspace_allocs"] += 1
 
     ids = token_selected_experts

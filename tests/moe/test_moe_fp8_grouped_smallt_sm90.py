@@ -218,6 +218,42 @@ def test_allowlist_rejects_large_batches_and_flags():
     assert _eligibility(**_elig_args()) == "device cpu"
 
 
+def test_allowlist_rejects_off_contract_kernel_geometry():
+    # T == 1 runs the 512-half-swizzled fc1 staging and the fixed
+    # 256-column / 9-slot fc2 pair; the grouped band runs the 288-thread
+    # prefix scan, 256-column fp16 fc2 tiles, the 2x128-block fp8 fc2 and
+    # the 9-slot reductions. Off-contract geometry must be rejected by the
+    # Python guard (GPU-free: all of these reject before the device check);
+    # the native validation in the .cu mirrors every one of them.
+    def one(T, e=E, k=K, h=H, i=I):
+        return _eligibility(
+            input=torch.zeros((T, h), dtype=torch.bfloat16),
+            token_selected_experts=torch.zeros((T, k), dtype=torch.int32),
+            token_final_scales=torch.zeros((T, k), dtype=torch.float32),
+            fc1_expert_weights=torch.zeros((e, 2 * i, h), dtype=torch.float8_e4m3fn),
+            fc2_expert_weights=torch.zeros((e, h, i), dtype=torch.float8_e4m3fn),
+            output_dtype=torch.bfloat16,
+            quant_scales=[
+                torch.zeros((e, (2 * i + 127) // 128, (h + 127) // 128)),
+                torch.zeros((e, (h + 127) // 128, (i + 127) // 128)),
+            ],
+            output=None,
+            flags={},
+        )
+
+    assert "512-aligned" in one(1, h=384)
+    assert "I=512 != 256" in one(1, i=512)
+    assert "top_k=8" in one(1, k=8)
+    assert one(1) == "device cpu"  # the contract geometry passes every guard
+    assert "top_k=8" in one(256, k=8)
+    assert "num_experts=512" in one(256, e=512)
+    assert "256-aligned" in one(256, h=384)
+    assert "I=512 != 256" in one(256, i=512)
+    assert one(256) == "device cpu"
+    # T in [2, 16] keeps the generic small-path envelope
+    assert one(4, k=8, e=512, h=384) == "device cpu"
+
+
 def test_stats_report_build_state_and_counters():
     stats = _moe_smallt_sm90_stats()
     for key in (
@@ -354,6 +390,96 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     torch.cuda.synchronize()
     eager2 = _call(b)
     assert torch.equal(out, eager2)
+
+
+@pytest.mark.parametrize("T", [1, 4])
+def test_fc1_half_chunk_headroom_with_activation_outliers(T):
+    # Regression (CodeRabbit): fc1 accumulates each 16-element chunk in
+    # __half against RAW e4m3 mantissas, which the [128,128] block
+    # quantizer drives to ~448 at every block's peak. Without the 1/16
+    # activation prescale, an outlier channel of ~25 against such a peak
+    # overflows the half chunk partial to inf; magnitudes like these occur
+    # in real post-norm hidden states (outlier channels).
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    b = _make(T, device)
+    b["s13"].fill_(0.0625)
+    b["s2"].fill_(0.0625)
+    b["w13"][:, :I, :16] = 448.0  # quantization peaks in the up branch
+    b["x"][:, :16] = 25.0  # outlier activation channels
+    ref = _reference(b)
+    out = _call(b, backend="specialized")
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 1, stats
+    assert torch.isfinite(out.float()).all()
+    ts, l2 = _gate(out, ref)
+    assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+
+
+def test_nvfp4_4over6_pinned_recipe_declines_specialized():
+    # An eligible dsfp8 call with an explicitly pinned nvfp4_4over6 recipe
+    # must raise the stock route's ValueError, not be silently served by
+    # the specialized kernel (which would ignore the recipe). An explicit
+    # None (recipe off) stays eligible.
+    _sm90_or_skip()
+    from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
+
+    device = torch.device("cuda:0")
+    b = _make(4, device)
+    with pytest.raises(ValueError, match="nvfp4_4over6 requires"):
+        _call(b, nvfp4_4over6=NVFP44Over6Config())
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
+    assert any("nvfp4_4over6" in r for r in stats["fallback_reasons"]), stats
+    out = _call(b, nvfp4_4over6=None)
+    assert _moe_smallt_sm90_stats()["runs_dispatched"] == 1
+    ts, l2 = _gate(out, _reference(b))
+    assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+
+
+def test_workspace_is_per_stream_and_replaced_buffers_are_retained():
+    # Regression (CodeRabbit): the native run launches on the caller's
+    # current stream, so two streams must not share one cached workspace;
+    # and a workspace replaced by a larger one must be retained, since a
+    # CUDA graph captured earlier may still replay into its address.
+    _sm90_or_skip()
+    import flashinfer.fused_moe.smallt_sm90 as smallt
+
+    device = torch.device("cuda:0")
+    # start from a clean cache without freeing buffers a captured graph
+    # from an earlier test may still replay into
+    smallt._retired_workspaces.extend(smallt._workspaces.values())
+    smallt._workspaces.clear()
+    _reset_moe_smallt_sm90_stats()
+
+    b = _make(4, device)
+    ref = _reference(b)
+    out_default = _call(b)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        out_side = _call(b)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 2, stats
+    assert stats["workspace_allocs"] == 2, stats  # one per (device, stream)
+    assert len(smallt._workspaces) == 2
+    for y in (out_default, out_side):
+        ts, l2 = _gate(y, ref)
+        assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
+
+    # growing the default stream's workspace (band-2 capacity) retires the
+    # old buffer instead of dropping the only reference to it
+    retired_before = len(smallt._retired_workspaces)
+    big = _make(256, device)
+    out_big = _call(big)
+    stats = _moe_smallt_sm90_stats()
+    assert stats["runs_dispatched"] == 3, stats
+    assert stats["workspace_allocs"] == 3, stats
+    assert len(smallt._retired_workspaces) == retired_before + 1
+    ts, l2 = _gate(out_big, _reference(big))
+    assert ts <= TOKEN_SUM_REL and l2 <= TOKEN_L2_REL, (ts, l2)
 
 
 @pytest.mark.skipif(

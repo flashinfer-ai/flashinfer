@@ -13,6 +13,23 @@ __device__ __forceinline__ void unpack4(uint32_t v, __half2& a, __half2& b) {
   b = rb;
 }
 
+// The small-T fc1 kernels accumulate each 16-element chunk in __half (8
+// products per half lane) against RAW e4m3 weight mantissas — which the
+// [128,128] block quantizer drives to ~448 at every block's peak — folding
+// the fp32 block scale only once per chunk. Staging the bf16 activation
+// row prescaled by 1/16 keeps those chunk partials inside half range for
+// activation magnitudes up to ~2^9 instead of ~2^5 (outlier channels of
+// O(10..100) occur in real post-norm hidden states). The exact power of
+// two is restored in fp32 (FC1_XS_UNSCALE on accU/accG) before the
+// nonlinearity, so in-range results are unchanged up to half rounding.
+#define FC1_XS_PRESCALE 0.0625f
+#define FC1_XS_UNSCALE 16.f
+
+__device__ __forceinline__ __half2 bf2_to_h2_prescaled(__nv_bfloat162 v) {
+  const float2 f = __bfloat1622float2(v);
+  return __floats2half2_rn(f.x * FC1_XS_PRESCALE, f.y * FC1_XS_PRESCALE);
+}
+
 // ------------------------------------------------------------------
 // fc1 for small T: one warp per intermediate column j, one block row
 // per (token,slot) pair.  Weight-streaming GEMV, memory bound.
@@ -33,10 +50,10 @@ extern "C" __global__ void fc1_small(const __nv_bfloat16* __restrict__ X,
   for (int i = tid; i < (H >> 3); i += blockDim.x) {
     uint4 v = xg[i];
     const __nv_bfloat162* bp = (const __nv_bfloat162*)&v;
-    __half2 h0 = __float22half2_rn(__bfloat1622float2(bp[0]));
-    __half2 h1 = __float22half2_rn(__bfloat1622float2(bp[1]));
-    __half2 h2 = __float22half2_rn(__bfloat1622float2(bp[2]));
-    __half2 h3 = __float22half2_rn(__bfloat1622float2(bp[3]));
+    __half2 h0 = bf2_to_h2_prescaled(bp[0]);
+    __half2 h1 = bf2_to_h2_prescaled(bp[1]);
+    __half2 h2 = bf2_to_h2_prescaled(bp[2]);
+    __half2 h3 = bf2_to_h2_prescaled(bp[3]);
     uint4 o;
     o.x = *(const unsigned int*)&h0;
     o.y = *(const unsigned int*)&h1;
@@ -101,8 +118,9 @@ extern "C" __global__ void fc1_small(const __nv_bfloat16* __restrict__ X,
       accG += __shfl_xor_sync(FULLM, accG, o);
     }
     if (lane == 0) {
-      float g = accG;
-      Hb[(size_t)s * I + j] = __float2half_rn(((g / (1.f + __expf(-g))) * accU) * (1.f / 256.f));
+      const float g = accG * FC1_XS_UNSCALE;
+      const float u = accU * FC1_XS_UNSCALE;
+      Hb[(size_t)s * I + j] = __float2half_rn(((g / (1.f + __expf(-g))) * u) * (1.f / 256.f));
     }
   }
 }
@@ -126,10 +144,10 @@ __global__ __launch_bounds__(NT, MINB) void fc1_t1_u4(const __nv_bfloat16* __res
   for (int i = tid; i < (H >> 3); i += blockDim.x) {
     uint4 v = xg[i];
     const __nv_bfloat162* bp = (const __nv_bfloat162*)&v;
-    __half2 h0 = __float22half2_rn(__bfloat1622float2(bp[0]));
-    __half2 h1 = __float22half2_rn(__bfloat1622float2(bp[1]));
-    __half2 h2 = __float22half2_rn(__bfloat1622float2(bp[2]));
-    __half2 h3 = __float22half2_rn(__bfloat1622float2(bp[3]));
+    __half2 h0 = bf2_to_h2_prescaled(bp[0]);
+    __half2 h1 = bf2_to_h2_prescaled(bp[1]);
+    __half2 h2 = bf2_to_h2_prescaled(bp[2]);
+    __half2 h3 = bf2_to_h2_prescaled(bp[3]);
     const int k = i << 3;
     const int chunk = k >> 9;
     const int owner = (k >> 4) & 31;
@@ -246,8 +264,9 @@ __global__ __launch_bounds__(NT, MINB) void fc1_t1_u4(const __nv_bfloat16* __res
       accG += __shfl_xor_sync(FULLM, accG, o);
     }
     if (lane == 0) {
-      float g = accG;
-      Hb[(size_t)s * I + j] = __float2half_rn(((g / (1.f + __expf(-g))) * accU) * (1.f / 256.f));
+      const float g = accG * FC1_XS_UNSCALE;
+      const float u = accU * FC1_XS_UNSCALE;
+      Hb[(size_t)s * I + j] = __float2half_rn(((g / (1.f + __expf(-g))) * u) * (1.f / 256.f));
     }
   }
   // every warp's Hb store must be visible before this CTA declares its
@@ -274,10 +293,10 @@ extern "C" __global__ __launch_bounds__(576) void fc1_t1(const __nv_bfloat16* __
   for (int i = tid; i < (H >> 3); i += blockDim.x) {
     uint4 v = xg[i];
     const __nv_bfloat162* bp = (const __nv_bfloat162*)&v;
-    __half2 h0 = __float22half2_rn(__bfloat1622float2(bp[0]));
-    __half2 h1 = __float22half2_rn(__bfloat1622float2(bp[1]));
-    __half2 h2 = __float22half2_rn(__bfloat1622float2(bp[2]));
-    __half2 h3 = __float22half2_rn(__bfloat1622float2(bp[3]));
+    __half2 h0 = bf2_to_h2_prescaled(bp[0]);
+    __half2 h1 = bf2_to_h2_prescaled(bp[1]);
+    __half2 h2 = bf2_to_h2_prescaled(bp[2]);
+    __half2 h3 = bf2_to_h2_prescaled(bp[3]);
     uint4 o;
     o.x = *(const unsigned int*)&h0;
     o.y = *(const unsigned int*)&h1;
@@ -344,8 +363,9 @@ extern "C" __global__ __launch_bounds__(576) void fc1_t1(const __nv_bfloat16* __
     accG += __shfl_xor_sync(FULLM, accG, o);
   }
   if (lane == 0) {
-    float g = accG;
-    Hb[(size_t)s * I + j] = __float2half_rn(((g / (1.f + __expf(-g))) * accU) * (1.f / 256.f));
+    const float g = accG * FC1_XS_UNSCALE;
+    const float u = accU * FC1_XS_UNSCALE;
+    Hb[(size_t)s * I + j] = __float2half_rn(((g / (1.f + __expf(-g))) * u) * (1.f / 256.f));
   }
 }
 

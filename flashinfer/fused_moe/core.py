@@ -1889,6 +1889,15 @@ def cutlass_fused_moe(
                     activation_type, "name", str(activation_type)
                 )
                 not in ("Swiglu", "SwiGLU", "Silu"),
+                # A pinned 4over6 recipe is unhonorable on a dsfp8 call: the
+                # stock route's validation below raises its ValueError, so
+                # declining here keeps error parity instead of silently
+                # ignoring the recipe (an explicit nvfp4_4over6=None, the
+                # recipe off, stays eligible).
+                "nvfp4_4over6 recipe pinned": (
+                    nvfp4_4over6 is not _UNSET
+                    and resolve_nvfp4_4over6(nvfp4_4over6) is not None
+                ),
             },
             requested=backend,
         )

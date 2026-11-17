@@ -518,6 +518,27 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
   TVM_FFI_ICHECK_EQ(topk_ids.size(0), T);
   TVM_FFI_ICHECK_EQ(topk_weights.size(0), T);
   TVM_FFI_ICHECK_EQ(topk_weights.size(1), KTOP);
+  // Geometry invariants of the specialized launch classes, mirrored by the
+  // Python dispatcher's _eligibility and enforced here so every entry point
+  // is safe. T == 1 uses the 512-half swizzled fc1 staging and the fixed
+  // 256-column / 9-slot fc2_t1_pr pair. T >= 256 uses the expert-binned
+  // grouped path: k_prefix scans in one 288-thread CTA (E <= 288), the fp16
+  // fc2 tiles 256 output columns (H % 256 == 0), the T >= 2048 native-fp8
+  // fc2 consumes exactly two 128-column K blocks (I == 256), and both
+  // reduction kernels combine exactly 9 routing slots.
+  TVM_FFI_ICHECK_EQ(H % 128, 0) << "hidden_size must be 128-aligned (block-scale grid)";
+  TVM_FFI_ICHECK_EQ(I % 128, 0) << "intermediate_size must be 128-aligned (block-scale grid)";
+  if (T == 1) {
+    TVM_FFI_ICHECK_EQ(H % 512, 0) << "T == 1 requires hidden_size % 512 == 0 (fc1 staging)";
+    TVM_FFI_ICHECK_EQ(I, 256) << "T == 1 requires intermediate_size == 256 (fc2 tile width)";
+    TVM_FFI_ICHECK_EQ(KTOP, 9) << "T == 1 requires top_k == 9 (fc2 routing slots)";
+  }
+  if (T >= 256) {
+    TVM_FFI_ICHECK_EQ(KTOP, 9) << "grouped path requires top_k == 9 (combine slots)";
+    TVM_FFI_ICHECK_LE(E, 288) << "grouped path requires num_experts <= 288 (prefix CTA)";
+    TVM_FFI_ICHECK_EQ(H % 256, 0) << "grouped path requires hidden_size % 256 == 0 (fc2 tiles)";
+    TVM_FFI_ICHECK_EQ(I, 256) << "grouped path requires intermediate_size == 256 (fp8 fc2 K)";
+  }
   TVM_FFI_ICHECK_GE((int64_t)workspace.numel(),
                     moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(T, KTOP, I, H, E))
       << "workspace too small: plan with plan_workspace_bytes(" << T << ", " << KTOP << ", " << I
