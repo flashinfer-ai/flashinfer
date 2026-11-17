@@ -70,6 +70,8 @@ def get_act_and_mul_module(act_func_name: str):
 
 
 def _check_act_and_mul_input(input: torch.Tensor) -> None:
+    if not input.is_contiguous():
+        raise ValueError("Input tensor must be contiguous.")
     # The kernel picks a vector width that divides hidden_size, so any even
     # last dimension (2 * hidden_size) is supported; it no longer has to be a
     # multiple of 16 bytes.
@@ -78,6 +80,8 @@ def _check_act_and_mul_input(input: torch.Tensor) -> None:
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
+    if not output.is_contiguous():
+        raise ValueError("Output tensor must be contiguous.")
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert input.shape[:-1] == output.shape[:-1], (
         f"{input.shape[:-1]} != {output.shape[:-1]}"
