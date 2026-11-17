@@ -83,7 +83,12 @@ def test_tiers_and_geometry() -> None:
         cake_plan.validate_geometry(
             hidden=7168, intermediate=3072, num_experts=48, top_k=6, world_size=8
         )
-    assert cake_plan.mega_grid(212) == 212 and cake_plan.mega_grid(211) == 210
+    route, rank = cake_plan.TIERS[0], cake_plan.TIERS[1]
+    assert [tier.mega_grid_multiple for tier in cake_plan.TIERS] == [2, 4, 4]
+    assert cake_plan.mega_grid(212, route) == 212
+    assert cake_plan.mega_grid(211, route) == 210
+    assert cake_plan.mega_grid(212, rank) == 212
+    assert cake_plan.mega_grid(210, rank) == 208
     assert cake_plan.scale_multiplier(1.0) == float(
         torch.tensor(1.0 / 6.0, dtype=torch.float32)
     )

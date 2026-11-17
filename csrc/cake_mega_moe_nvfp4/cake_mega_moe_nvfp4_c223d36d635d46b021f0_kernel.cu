@@ -9283,6 +9283,7 @@ kernel_cake_mega_moe_nvfp4_c223d36d635d46b021f0(const __grid_constant__ CUtensor
                     __syncwarp();
                 }
                 asm volatile("barrier.sync 3, 128;" ::: "memory");
+                asm volatile("griddepcontrol.wait;" ::: "memory");
                 int t0 = dwv * 32 + lane;
                 #pragma unroll 1
                 for (int i = t0; i < block_words; i += 128) {

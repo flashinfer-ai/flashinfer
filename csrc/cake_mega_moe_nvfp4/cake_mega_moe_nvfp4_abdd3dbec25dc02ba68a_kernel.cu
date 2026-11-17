@@ -4830,6 +4830,7 @@ kernel_cake_mega_moe_nvfp4_abdd3dbec25dc02ba68a(const __grid_constant__ CUtensor
                 }
                 __syncwarp();
                 asm volatile("barrier.sync 3, 128;" ::: "memory");
+                asm volatile("griddepcontrol.wait;" ::: "memory");
                 int t0 = lane;
                 #pragma unroll 1
                 for (int i_5 = t0; i_5 < block_words; i_5 += 128) {
@@ -5077,6 +5078,7 @@ kernel_cake_mega_moe_nvfp4_abdd3dbec25dc02ba68a(const __grid_constant__ CUtensor
             asm volatile("barrier.sync 4, 288;" ::: "memory");
             if (bid == 0) {
                 asm volatile("barrier.sync 3, 128;" ::: "memory");
+                asm volatile("griddepcontrol.wait;" ::: "memory");
                 int t0_1 = 32 + lane;
                 #pragma unroll 1
                 for (int i_8 = t0_1; i_8 < block_words; i_8 += 128) {
@@ -5274,6 +5276,7 @@ kernel_cake_mega_moe_nvfp4_abdd3dbec25dc02ba68a(const __grid_constant__ CUtensor
             asm volatile("barrier.sync 4, 288;" ::: "memory");
             if (bid == 0) {
                 asm volatile("barrier.sync 3, 128;" ::: "memory");
+                asm volatile("griddepcontrol.wait;" ::: "memory");
                 int t0_2 = 64 + lane;
                 #pragma unroll 1
                 for (int i_11 = t0_2; i_11 < block_words; i_11 += 128) {
@@ -5471,6 +5474,7 @@ kernel_cake_mega_moe_nvfp4_abdd3dbec25dc02ba68a(const __grid_constant__ CUtensor
             asm volatile("barrier.sync 4, 288;" ::: "memory");
             if (bid == 0) {
                 asm volatile("barrier.sync 3, 128;" ::: "memory");
+                asm volatile("griddepcontrol.wait;" ::: "memory");
                 int t0_3 = 96 + lane;
                 #pragma unroll 1
                 for (int i_14 = t0_3; i_14 < block_words; i_14 += 128) {

@@ -66,7 +66,8 @@ SYNC_WORDS = 16
 #: Rank slots per token of the dedup combine's output.
 RANK_SLOTS = 8
 #: Every program launches one CTA per SM at most; the mega program's CTAs
-#: come in clusters of two.
+#: come in clusters of two, which the rank-major program prefers to pair into
+#: clusters of four.
 MEGA_CLUSTER_CTAS = 2
 #: nvcc has to know ``%locality_domain_id`` (PTX ISA 9.5) for the dedup tiers.
 MIN_CUDA_DEDUP = "13.5"
@@ -116,6 +117,12 @@ class Tier:
     def slots(self) -> int:
         """Slot rows of ``pre_reduced`` per token."""
         return RANK_SLOTS if self.dedup else TOP_K
+
+    @property
+    def mega_grid_multiple(self) -> int:
+        """CTAs the mega grid is a multiple of: its preferred cluster shape,
+        four for the rank-major program, two for the route-major one."""
+        return 2 * MEGA_CLUSTER_CTAS if self.dedup else MEGA_CLUSTER_CTAS
 
 
 TIERS: Tuple[Tier, ...] = (
@@ -241,10 +248,11 @@ def local_buffers(tier: Tier) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype]]:
     return buffers
 
 
-def mega_grid(sm_count: int) -> int:
-    """One CTA per SM in clusters of two: the CTAs wait on one another, so the
-    grid is what the device holds at once beside nothing else."""
-    return MEGA_CLUSTER_CTAS * (sm_count // MEGA_CLUSTER_CTAS)
+def mega_grid(sm_count: int, tier: Tier) -> int:
+    """One CTA per SM, rounded down to whole clusters of the tier's preferred
+    shape (:attr:`Tier.mega_grid_multiple`): the CTAs wait on one another, so
+    the grid is what the device holds at once beside nothing else."""
+    return tier.mega_grid_multiple * (sm_count // tier.mega_grid_multiple)
 
 
 def scale_multiplier(input_norm_const: float) -> float:

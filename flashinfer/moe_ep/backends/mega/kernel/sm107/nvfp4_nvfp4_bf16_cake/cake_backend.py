@@ -312,7 +312,7 @@ class Sm107Nvfp4CakeMegaKernelBackend(MegaKernelBackend):
             output=torch.empty(
                 (tier.tokens, HIDDEN), dtype=torch.bfloat16, device=device
             ),
-            mega_ctas=mega_grid(sm_count),
+            mega_ctas=mega_grid(sm_count, tier),
             ones=torch.ones(EXPERTS_LOCAL, dtype=torch.float32, device=device),
         )
 
@@ -371,8 +371,14 @@ class Sm107Nvfp4CakeMegaKernelBackend(MegaKernelBackend):
                 # as int32 / FP32 words.
                 handle = cake_programs.programs().handle(STAGE, workspace.device)
                 norm = float(self._kernel_config.input_norm_const)
+                x = t.hidden_states.contiguous()
+                if x.data_ptr() % 16:
+                    # STAGE reads each row in 16-byte vectors: a view that
+                    # starts off a 16-byte boundary is copied into storage
+                    # that starts on one.
+                    x = x.clone()
                 values = {
-                    "x": t.hidden_states.contiguous().view(torch.uint32),
+                    "x": x.view(torch.uint32),
                     "data": activation.view(torch.uint32),
                     "sf": activation_sf,
                     "route_ids": t.topk_ids.to(torch.int32)
@@ -418,7 +424,13 @@ class Sm107Nvfp4CakeMegaKernelBackend(MegaKernelBackend):
                 "compute() called before stage_inputs(); no token count is staged."
             )
         tier, device = workspace.tier, workspace.device
-        out = output if output is not None else workspace.output[:tokens]
+        # The reduce stores whole rows in 16-byte vectors. A caller output it
+        # cannot store into (strided, or starting off a 16-byte boundary) takes
+        # a copy of the workspace output, decided before any program launches.
+        direct = output is None or (
+            output.is_contiguous() and output.data_ptr() % 16 == 0
+        )
+        out = output if direct and output is not None else workspace.output[:tokens]
         values = _views(workspace)
         values.update(_weight_views(transformed_weights))
         values.update(
@@ -448,6 +460,9 @@ class Sm107Nvfp4CakeMegaKernelBackend(MegaKernelBackend):
                     },
                     (tokens, 1, 1),
                 )
+        if not direct:
+            output[:tokens].copy_(out)
+            return output
         return out
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Tuple[Any, ...]:

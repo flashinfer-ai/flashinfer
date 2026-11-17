@@ -25,7 +25,8 @@ limitations under the License.
 # own tokens' output against the reference over the full bank, for each token
 # tier (1024 without the dedup combine, 4096 and 8192 with it), with BF16 and
 # prequantized NVFP4 activations, dropped routes whose scores are NaN or inf,
-# an empty rank, and repeated forwards over one workspace.
+# an empty rank, a rank no route reaches, unaligned and strided activation and
+# output views, and repeated forwards over one workspace.
 
 from __future__ import annotations
 
@@ -192,6 +193,121 @@ def test_cake_nvfp4_mega_matches_the_reference(
         torch.cuda.synchronize()
         for layer in layers:
             layer.destroy()
+
+
+def _local_layer(rank, world, max_tokens, w13, w2, scaled):
+    """This rank's experts of the bank ``w13``, ``w2`` in a layer of
+    ``max_tokens`` tokens per rank, with the bank's weight pack and scalars
+    (the reference's) and this rank's scalars (the layer's)."""
+    from tests.moe_ep.sm107_test_utils import weight_pack
+
+    pack, norm, scalars = weight_pack(w13, w2, "nvfp4", scaled=scaled, chunk=1)
+    per_rank = NUM_EXPERTS // world
+    local = slice(rank * per_rank, (rank + 1) * per_rank)
+    layer = MoEEpLayer(
+        bootstrap=BootstrapConfig(rank=rank, world_size=world, auto_bootstrap=False),
+        fleet_params=FleetParams(
+            num_experts=NUM_EXPERTS,
+            max_tokens_per_rank=max_tokens,
+            token_hidden_size=HIDDEN,
+        ),
+        weights=PrequantizedMoEWeights(
+            *(
+                getattr(pack, name)[local]
+                for name in ("w13", "w2", "w13_scale", "w2_scale")
+            )
+        ),
+        backend=MegaConfig(
+            megakernel=Sm107_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig(
+                intermediate_size=INTERMEDIATE, input_norm_const=norm
+            )
+        ),
+    )
+    local_scalars = {name: value[local] for name, value in scalars.items()}
+    return layer, pack, norm, scalars, local_scalars
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize(
+    "max_tokens,tokens", [(1024, 1000), (4096, 4096), (8192, 6000)]
+)
+def test_cake_nvfp4_mega_serves_a_rank_no_route_reaches(
+    runtime, max_tokens, tokens
+) -> None:
+    """Every route picks one of the first three ranks' experts, so the last
+    rank's mega program has no work and finishes ahead of its router: each
+    forward still matches the reference, and repeats it bit for bit."""
+    from tests.moe_ep.sm107_test_utils import (
+        assert_reference,
+        canonical_reference,
+        quantize,
+    )
+
+    rank, world = runtime
+    w13, w2 = _problem(1)[:2]
+    layer, pack, norm, scalars, local_scalars = _local_layer(
+        rank, world, max_tokens, w13, w2, scaled=True
+    )
+    try:
+        gen = torch.Generator(device="cuda").manual_seed(20261117 + rank)
+        reached = NUM_EXPERTS - NUM_EXPERTS // world
+        x = torch.randn(tokens, HIDDEN, device="cuda", generator=gen).bfloat16()
+        ids = (
+            torch.rand(tokens, reached, device="cuda", generator=gen)
+            .argsort(dim=-1)[:, :TOP_K]
+            .to(torch.int32)
+        )
+        scores = torch.softmax(
+            torch.randn(tokens, TOP_K, device="cuda", generator=gen), dim=-1
+        )
+        t = MoEEpTensors(x, ids, scores, **local_scalars)
+        xq, xsf = quantize(x, "nvfp4", norm)
+        reference = canonical_reference(
+            xq, xsf, ids, scores, pack, "nvfp4", scalars=scalars
+        )
+        first = layer.forward(t).clone()
+        assert_reference(first, reference, "nvfp4")
+        for _ in range(20):
+            assert torch.equal(layer.forward(t), first)
+    finally:
+        torch.cuda.synchronize()
+        layer.destroy()
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_rubin
+def test_cake_nvfp4_mega_takes_unaligned_and_strided_views(runtime) -> None:
+    """Activations that start one or two elements into their storage, and
+    caller outputs that are strided or start off a 16-byte boundary, give the
+    bits of the aligned forward."""
+    rank, world = runtime
+    tokens = 1000
+    w13, w2, x, ids, scores = _problem(tokens)
+    x, ids, scores = x[rank], ids[rank], scores[rank]
+    layer, _, _, _, scalars = _local_layer(rank, world, 1024, w13, w2, scaled=False)
+    try:
+        aligned = layer.forward(MoEEpTensors(x, ids, scores, **scalars)).clone()
+        for shift in (1, 2):
+            storage = torch.empty(
+                tokens * HIDDEN + shift, dtype=torch.bfloat16, device="cuda"
+            )
+            shifted = storage[shift:].view(tokens, HIDDEN)
+            shifted.copy_(x)
+            out = layer.forward(MoEEpTensors(shifted, ids, scores, **scalars))
+            assert torch.equal(out, aligned)
+        strided = torch.empty(tokens, 2 * HIDDEN, dtype=torch.bfloat16, device="cuda")[
+            :, ::2
+        ]
+        offset = torch.empty(tokens * HIDDEN + 2, dtype=torch.bfloat16, device="cuda")[
+            2:
+        ].view(tokens, HIDDEN)
+        for output in (strided, offset):
+            layer.forward(MoEEpTensors(x, ids, scores, output=output, **scalars))
+            assert torch.equal(output, aligned)
+    finally:
+        torch.cuda.synchronize()
+        layer.destroy()
 
 
 @pytest.mark.gpu_4
