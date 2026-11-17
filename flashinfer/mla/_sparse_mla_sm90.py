@@ -195,11 +195,14 @@ def _composable_reference(
     acc = torch.zeros((B, QL, H, CKV), dtype=torch.float32, device=query.device)
     for b in range(B):
         for j in range(QL):
+            # Capture-safe: no data-dependent host control flow (boolean
+            # indexing lowers to nonzero(), which synchronizes and breaks
+            # CUDA-graph capture of the kill-switch / fallback path).
+            # Invalid (-1) slots gather row 0 and are masked to -inf in the
+            # logits; a fully -1 row softmaxes to NaN, zeroed below.
             idx = indices[b, j].to(torch.int64)
-            slots = idx[idx >= 0]
-            if slots.numel() == 0:
-                continue  # fully -1 row -> zero output
-            rows = flat[slots]
+            valid = idx >= 0
+            rows = flat[idx.clamp_min(0)]
             nope = (
                 rows[:, :CKV]
                 .contiguous()
@@ -223,7 +226,8 @@ def _composable_reference(
             qn = qf[b, j, :, :CKV]
             qp = qf[b, j, :, CKV:]
             sc = (qn @ ckv.T + qp @ kpe.T) * float(sm_scale)
-            pr = torch.softmax(sc, dim=-1)
+            sc = sc.masked_fill(~valid, float("-inf"))
+            pr = torch.nan_to_num(torch.softmax(sc, dim=-1))
             acc[b, j] = pr @ ckv
     out.copy_(acc.to(torch.bfloat16))
     return out
@@ -237,6 +241,17 @@ def _split_plan(nq: int):
     tps = max(1, (maxt + per - 1) // per)
     nsplits = (maxt + tps - 1) // tps
     return tile, tps, nsplits
+
+
+def _exact_workspace_bytes(nq: int) -> int:
+    """The kernel's exact workspace need for one call of ``nq`` token rows
+    (what the C++ binding enforces per call). Not monotonic in ``nq``: the
+    split plan changes tile size and split count with the row count, so e.g.
+    12 rows need more bytes than 64."""
+    _, _, nsplits = _split_plan(nq)
+    if nsplits <= 1:
+        return 0
+    return nq * nsplits * (_NUM_HEADS * _CKV_DIM) * 2 + nq * nsplits * _NUM_HEADS * 4
 
 
 @flashinfer_api
@@ -255,22 +270,21 @@ def get_sparse_mla_sm90_workspace_size_bytes(
     Returns
     -------
     int
-        Bytes of FP16 partial output plus FP32 partial LSE for the split-K
-        plan the kernel will choose for ``batch_size * q_len_per_req`` token
-        rows. Zero when the plan has a single split. The capacity is a pure
-        function of the token-row count, so a buffer sized at the largest
-        row count a caller will use is valid for every smaller call — size
-        it once, outside CUDA-graph capture.
+        Bytes of FP16 partial output plus FP32 partial LSE covering the
+        split-K plans the kernel chooses for every token-row count up to
+        ``batch_size * q_len_per_req``. The per-call need is a pure function
+        of the row count but is *not* monotonic in it (the plan's tile size
+        and split count change with the row count), so this returns the
+        running maximum over all row counts up to the requested one: a
+        buffer sized at the largest row count a caller will use is valid
+        for every smaller call — size it once, outside CUDA-graph capture.
     """
     nq = batch_size * q_len_per_req
     if nq < 1 or nq > _MAX_NQ:
         raise NotImplementedError(
             f"sparse_mla_decode_sm90 qualifies 1 <= batch*q_len <= {_MAX_NQ}, got {nq}"
         )
-    _, _, nsplits = _split_plan(nq)
-    if nsplits <= 1:
-        return 0
-    return nq * nsplits * (_NUM_HEADS * _CKV_DIM) * 2 + nq * nsplits * _NUM_HEADS * 4
+    return max(_exact_workspace_bytes(k) for k in range(1, nq + 1))
 
 
 @functools.cache
@@ -294,9 +308,28 @@ def _ffi_device(index: int):
 
 @functools.cache
 def _device_supported(device: torch.device) -> bool:
-    return torch.cuda.get_device_capability(device) == (9, 0) and bool(
-        _get_module().device_supported(device.index)
-    )
+    # HW eligibility first (no module build), then the module's own probe.
+    # A failed JIT build (e.g. FLASHINFER_DISABLE_JIT=1 with no cached
+    # module) reports "unsupported" so "auto" and explicit "specialized"
+    # fall back to the composable reference path instead of hard-failing —
+    # except under CUDA-graph capture, where the eager-warmup discipline
+    # stays loud.
+    if torch.cuda.get_device_capability(device) != (9, 0):
+        return False
+    try:
+        module = _get_module()
+    except Exception as exc:
+        if torch.cuda.is_current_stream_capturing():
+            raise
+        logger.warning_once(
+            "sparse_mla_decode_sm90: JIT module unavailable (%s: %s); the "
+            "device probe reports unsupported and the composable reference "
+            "path serves this process",
+            type(exc).__name__,
+            str(exc)[:300],
+        )
+        return False
+    return bool(module.device_supported(device.index))
 
 
 @flashinfer_api
@@ -371,7 +404,7 @@ def _validate(
         or not seq_lens.is_contiguous()
     ):
         raise ValueError("seq_lens must be contiguous CUDA int32 [B]")
-    required = get_sparse_mla_sm90_workspace_size_bytes(b, sq) if fused else 0
+    required = _exact_workspace_bytes(nq) if fused else 0
     if fused and (
         workspace.dtype != torch.uint8
         or workspace.ndim != 1
@@ -411,13 +444,52 @@ def _validate(
         )
 
 
-# Python-side validation runs once per argument signature (below); the C++
-# binding independently re-checks every structural requirement (dtype, dims,
-# contiguity, alignment, workspace capacity, device support) on every call,
-# so the cache only affects which layer raises, never what is enforced.
-# This keeps the eager per-call host path short enough not to starve the
-# GPU at decode-size grids (the kernel runs ~12 us at B1).
+# Structural Python-side validation runs once per argument signature
+# (shapes/dtypes/device/backend, below); the C++ binding independently
+# re-checks every structural requirement (dtype, dims, contiguity,
+# alignment, workspace capacity, device support) on every call, so that
+# cache only affects which layer raises, never what is enforced. Properties
+# the signature cannot establish — storage pointers and scalar values —
+# are re-validated on every call by _validate_per_call. This keeps the
+# eager per-call host path short enough not to starve the GPU at
+# decode-size grids (the kernel runs ~12 us at B1).
 _validated_signatures: set = set()
+
+
+def _validate_per_call(
+    query, kv_cache, indices, seq_lens, workspace, out, sm_scale, fused
+):
+    """Per-call checks of properties the signature cache cannot establish:
+    device placement, contiguity, alignment, writable-buffer overlap, and
+    ``sm_scale`` — all functions of storage pointers or scalar values, which
+    can change between calls that share a signature."""
+    tensors = (query, kv_cache, indices, seq_lens, workspace, out)
+    if any(not t.is_cuda or t.device != query.device for t in tensors):
+        raise ValueError("All tensors must be on the same CUDA device")
+    if any(not t.is_contiguous() for t in tensors):
+        raise NotImplementedError(
+            "query/kv_cache/indices/seq_lens/workspace/out must be contiguous"
+        )
+    if not math.isfinite(sm_scale) or sm_scale <= 0:
+        raise ValueError("sm_scale must be positive finite")
+    if fused and any(t.data_ptr() % 16 for t in (query, kv_cache, workspace, out)):
+        raise ValueError("query/kv_cache/workspace/out require 16-byte alignment")
+
+    # Writable buffers must not alias any other tensor.
+    def extent(t):
+        n = max(t.numel(), 1)
+        return t.data_ptr(), t.data_ptr() + n * t.element_size()
+
+    for target in (workspace, out):
+        lo, hi = extent(target)
+        for source in tensors:
+            if source is target:
+                continue
+            other_lo, other_hi = extent(source)
+            if max(lo, other_lo) < min(hi, other_hi):
+                raise ValueError(
+                    "Writable sparse-MLA buffers must not overlap any other tensor"
+                )
 
 
 @register_custom_op(
@@ -532,10 +604,11 @@ def sparse_mla_decode_sm90(
     **CUDA graphs.** All launches are plain stream launches onto the current
     stream, re-queried on every call; the op performs no allocation, host
     synchronization, or autotuning at call time, so a warmed-up call is
-    capturable. Required discipline: (1) call once eagerly first — JIT
-    module build and the one-time kernel shared-memory attribute setup must
-    not happen under capture (module build raises if attempted while
-    capturing); (2) the split plan is a pure function of ``B * q_len``, so a
+    capturable. Required discipline: (1) call once eagerly first, on each
+    device you will capture on — JIT module build and the once-per-device
+    kernel shared-memory attribute setup must not happen under capture
+    (module build raises if attempted while capturing); (2) the split plan
+    is a pure function of ``B * q_len``, so a
     graph replays correctly for the captured shape; capture each shape
     separately; (3) keep ``query``/``kv_cache``/``indices``/``seq_lens``/
     ``workspace_buffer``/``out`` at stable addresses across replays (update
@@ -654,6 +727,16 @@ def sparse_mla_decode_sm90(
             fused=(chosen == "specialized"),
         )
         _validated_signatures.add(signature)
+    _validate_per_call(
+        query,
+        kv_cache,
+        indices,
+        seq_lens,
+        workspace_buffer,
+        out,
+        scale,
+        fused=(chosen == "specialized"),
+    )
     if chosen == "specialized":
         _run(query, kv_cache, indices, seq_lens, workspace_buffer, out, scale)
         _stats["backend_dispatches"]["specialized"] += 1

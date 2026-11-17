@@ -32,7 +32,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 
 #include "tvm_ffi_utils.h"
 
@@ -533,20 +535,34 @@ bool device_supported(int64_t device) {
 
 int64_t get_workspace_bytes(int64_t nq) {
   TVM_FFI_ICHECK(nq >= 1) << "nq must be positive";
-  return workspace_bytes(static_cast<int>(nq));
+  // The split plan is not monotonic in token rows (e.g. 12 rows need more
+  // bytes than 64), so the sizing surface returns the running maximum over
+  // every row count up to the requested one: a buffer sized at the largest
+  // row count a caller will use is valid for every smaller call. run()
+  // checks the exact per-call need, which never exceeds this.
+  int64_t cap = 0;
+  for (int k = 1; k <= static_cast<int>(nq); ++k) {
+    const int64_t b = workspace_bytes(k);
+    if (b > cap) cap = b;
+  }
+  return cap;
 }
 
-void set_max_smem_attrs() {
+void set_max_smem_attrs(int device) {
   // Opt-in dynamic shared memory: 48-tile path 74688 B, 64-tile path 93568 B.
-  // Host-side function attributes; set once per process, before any launch
-  // (and therefore before any CUDA-graph capture of this op).
-  static bool done = false;
-  if (done) return;
+  // cudaFuncSetAttribute applies to the calling thread's current device, so
+  // the opt-in is tracked per device ordinal (not per process): set once per
+  // device, before any launch there (and therefore before any CUDA-graph
+  // capture of this op on that device). Caller holds the device guard.
+  static std::atomic<uint64_t> done_mask{0};
+  const bool trackable = device >= 0 && device < 64;
+  const uint64_t bit = trackable ? (uint64_t(1) << device) : 0;
+  if (trackable && (done_mask.load(std::memory_order_acquire) & bit)) return;
   cudaFuncSetAttribute(mla_main<48, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 74688);
   cudaFuncSetAttribute(mla_main<48, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 74688);
   cudaFuncSetAttribute(mla_main<64, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, 93568);
   cudaFuncSetAttribute(mla_main<64, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, 93568);
-  done = true;
+  if (trackable) done_mask.fetch_or(bit, std::memory_order_release);
 }
 
 void run(TensorView q, TensorView kv_cache, TensorView indices, TensorView seq_lens,
@@ -602,7 +618,7 @@ void run(TensorView q, TensorView kv_cache, TensorView indices, TensorView seq_l
       << "workspace too small: need " << need << " bytes for nq=" << nq;
 
   ffi::CUDADeviceGuard guard(q.device().device_id);
-  set_max_smem_attrs();
+  set_max_smem_attrs(static_cast<int>(q.device().device_id));
 
   size_t smem = (size_t)tile * CS * 2 + (size_t)8 * QS * 2 + (size_t)tile * 8 * 2 + 64 * 4 +
                 (size_t)tps * tile * 4;
