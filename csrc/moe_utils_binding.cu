@@ -17,12 +17,15 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <tvm/ffi/optional.h>
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
 #endif
+
+#include <limits>
 
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
@@ -369,13 +372,21 @@ void moe_sort(
     int64_t expert_counts_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
-    int64_t cuda_stream_ptr) {
+    int64_t cuda_stream_ptr, ffi::Optional<int64_t> padding) {
   // Set up the routing data structure
   moe::dev::routing::routingDeepSeek::Data routingData;
 
   // Configure dtypes
   routingData.mDtypeOutput = batchedGemm::trtllm::gen::Dtype::Bfloat16;
   routingData.mUsePdl = use_pdl;
+  routingData.mFillExpandedIdxPadding = padding.has_value();
+  if (padding.has_value()) {
+    auto const value = padding.value();
+    TVM_FFI_ICHECK(value >= std::numeric_limits<int32_t>::min() &&
+                   value <= std::numeric_limits<int32_t>::max())
+        << "padding must fit in int32";
+    routingData.mExpandedIdxPadding = static_cast<int32_t>(value);
+  }
   routingData.mUseContiguousRouteWindows = num_tokens >= kContiguousRouteWindowMinTokens;
 
   // Input tensors (pre-computed expert selections)

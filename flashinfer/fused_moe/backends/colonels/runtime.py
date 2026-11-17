@@ -76,12 +76,14 @@ class Workspace:
 
     def _sort_on_device(self, ids, weights, num_experts, block_m):
         buffers = self.routing[block_m]
-        # The TRTLLM sorter leaves padding uninitialized; the fused kernels
-        # gather with the expanded-token sentinel rather than per-tile limits.
-        buffers["out_permuted_idx_to_expanded_idx"].fill_(ids.numel())
-        buffers["out_tile_idx_to_expert_idx"].zero_()
         result = moe_sort(
-            ids, weights, num_experts, ids.shape[1], tile_tokens_dim=block_m, **buffers
+            ids,
+            weights,
+            num_experts,
+            ids.shape[1],
+            tile_tokens_dim=block_m,
+            padding=ids.numel(),
+            **buffers,
         )
         return result[3], result[0], result[4]
 

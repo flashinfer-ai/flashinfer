@@ -246,7 +246,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
       // This warp path reserves remote-expert tiles but writes no live rows to them.
       int32_t paddingBegin =
           isLocalExpert ? min(mnLimit1, mnLimit2) : mnLimit1 - params.mTileTokensDim;
-      initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, paddingBegin, mnLimit1);
+      initRoutingTilePadding(params, paddingBegin, mnLimit1);
     }
     ctaOffsetExp += finalNumCta;
   }

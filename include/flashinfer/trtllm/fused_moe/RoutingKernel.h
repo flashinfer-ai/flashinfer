@@ -130,6 +130,9 @@ struct DataBase {
   int16_t* mPtrRoutingReplayOut{nullptr};
   // optional: final token count for each expert, separate from histogram scratch
   int32_t* mPtrNumTokensPerExpert{nullptr};
+  // Opt-in padding for mPtrPermutedIdxToExpandedIdx; unused capacity is untouched.
+  bool mFillExpandedIdxPadding{false};
+  int32_t mExpandedIdxPadding{0};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -176,6 +179,8 @@ struct KernelParamsBase {
   bool mUseContiguousRouteWindows = false;
   // Optional final token count for each expert, separate from histogram scratch.
   int32_t* mPtrNumTokensPerExpert = nullptr;
+  bool mFillExpandedIdxPadding = false;
+  int32_t mExpandedIdxPadding = 0;
 
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
@@ -196,6 +201,8 @@ struct KernelParamsBase {
     mPtrScores = (InputT const*)data.mPtrScores;
     mPtrRoutingReplayOut = data.mPtrRoutingReplayOut;
     mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
+    mFillExpandedIdxPadding = data.mFillExpandedIdxPadding;
+    mExpandedIdxPadding = data.mExpandedIdxPadding;
 
     mNumTokens = data.mNumTokens;
     mNumExperts = data.mNumExperts;

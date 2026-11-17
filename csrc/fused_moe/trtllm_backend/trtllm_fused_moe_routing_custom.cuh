@@ -270,7 +270,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
               mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
         }
         params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
-        initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2), mnLimit1);
+        initRoutingTilePadding(params, min(mnLimit1, mnLimit2), mnLimit1);
       }
     }
   }
@@ -599,8 +599,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
                 mulTileN<int32_t>(ctaOffsetPerExpert[e], params.mTileTokensDim) + accExpertCount[e];
           }
           params.mPtrCtaIdxXyToMnLimit[ctaOffsetPerExpert[e] + cta] = min(mnLimit1, mnLimit2);
-          initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, min(mnLimit1, mnLimit2),
-                                 mnLimit1);
+          initRoutingTilePadding(params, min(mnLimit1, mnLimit2), mnLimit1);
         }
       }
     }
