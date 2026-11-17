@@ -30,7 +30,9 @@ from ..plan import (
     F_GROUP,
     F_KVHEAD,
     F_KVLEN,
+    F_KVPTR0,
     F_MODE,
+    F_NPAGES,
     F_QBASE,
     F_QLEN,
     F_QTOK0,
@@ -311,6 +313,7 @@ class SwapsKernel:
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if warp_idx == R.load_warp:
             cute.arch.setmaxregister_decrease(R.regs_other)
+            single = num_units <= grid_size  # one unit per CTA (producer.load_loop)
             if cutlass.const_expr(self.pdl):
                 # the preceding grid's stores (Q, the KV cache, the output and workspace it may have produced) are visible from here;
                 # every store of this kernel depends on loads issued after this point. The descriptors are plan constants
@@ -331,6 +334,9 @@ class SwapsKernel:
                     mKvIndptr,
                     mKvIndices,
                     mDesc[(u, F_REQ)],
+                    single,
+                    mDesc[(u, F_KVPTR0)],
+                    mDesc[(u, F_NPAGES)],
                     mDesc[(u, F_QBASE)] + mDesc[(u, F_QTOK0)],
                     mDesc[(u, F_KVHEAD)],
                     mDesc[(u, F_TILE_LO)],

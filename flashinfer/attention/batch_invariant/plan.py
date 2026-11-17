@@ -25,7 +25,9 @@ from .spec import TILE_KEYS, chunk_len
 DESC_FIELDS = 16
 # descriptor fields (int32); F_QBASE = qo_indptr[req], the packed token index of the request's first token;
 # F_TILE_LO / F_TILE_HI are the unit's OWN tiles (the row block's visible range clipped to the unit's chunks): every role
-# of the kernel walks exactly that range and derives the chunk boundaries from the absolute tile index
+# of the kernel walks exactly that range and derives the chunk boundaries from the absolute tile index;
+# F_KVPTR0 / F_NPAGES = kv_indptr[req] and the request's page count (token offset and count under the ragged layout): the Swaps
+# load warp starts its page lookups from the descriptor when every CTA walks one unit (a placement: the same page ids)
 (
     F_REQ,
     F_QTOK0,
@@ -41,7 +43,9 @@ DESC_FIELDS = 16
     F_TILE_HI,
     F_QBASE,
     F_GROUP,
-) = range(14)
+    F_KVPTR0,
+    F_NPAGES,
+) = range(16)
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
@@ -429,8 +433,8 @@ def build_plan(
                     thi,
                     qo_indptr[b],
                     -1,
-                    0,
-                    0,
+                    kv_indptr[b],
+                    kv_indptr[b + 1] - kv_indptr[b],
                 ]
             )
             continue
@@ -465,8 +469,8 @@ def build_plan(
                     th,
                     qo_indptr[b],
                     grp,
-                    0,
-                    0,
+                    kv_indptr[b],
+                    kv_indptr[b + 1] - kv_indptr[b],
                 ]
             )
         plan.ws_rows += n * rows

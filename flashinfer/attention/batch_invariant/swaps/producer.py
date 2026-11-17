@@ -117,6 +117,9 @@ def load_loop(
     mKvIndptr: cute.Tensor,
     mKvIndices: cute.Tensor,
     req: Int32,
+    single,
+    kv_ptr0_d: Int32,
+    n_pages_d: Int32,
     tok_abs: Int32,
     kv_head: Int32,
     tile_lo: Int32,
@@ -127,8 +130,13 @@ def load_loop(
     # ``gate`` (the CTA's first unit): once the first ring slots are issued (K_0, K_1, K_2, V_0: the MMA warp's first needs) the warp
     # waits for slot 0's bytes (its full barrier, first phase) before issuing the rest, so the wave's first tiles are not interleaved
     # with every CTA's whole burst
-    kv_ptr0 = mKvIndptr[req]
-    n_pages = mKvIndptr[req + 1] - kv_ptr0
+    # the request's first page-table entry and page count: from the descriptor when every CTA walks one unit (``single``, the
+    # lookup's two round trips are then on the kernel's critical path), else kv_indptr as the multi-unit walk always did
+    kv_ptr0 = kv_ptr0_d
+    n_pages = n_pages_d
+    if not single:
+        kv_ptr0 = mKvIndptr[req]
+        n_pages = mKvIndptr[req + 1] - kv_ptr0
     # Q: the unit's tokens start at the packed row tok_abs (tokens past the request are padding rows, never stored; past total_q the TMA zero-fills)
     tQ_off = cute.domain_offset((0, 0, tok_abs), tQ)
     gQ = cute.zipped_divide(
