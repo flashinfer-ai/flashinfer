@@ -51,6 +51,14 @@ _M_MAX = 24
 # campaign definition's value, carried by the packaged allowlist too).
 _QUANT_EPS = 1e-4
 
+
+class GraphCaptureJitError(RuntimeError):
+    """The specialized kernel is not built and JIT compilation cannot run
+    under CUDA graph capture; warm the allowlisted shape up eagerly first.
+    Kept distinct from other :class:`RuntimeError`\\ s (e.g. a JIT build
+    failure) so only this error surfaces instead of falling back."""
+
+
 _stats: Dict[str, Any] = {
     "backend_dispatches": {"specialized": 0, "stock": 0},
     "fallback_reasons": {},
@@ -120,6 +128,9 @@ def _eligibility(
         return False, "external_input_scale"
     M, K = input.shape
     N = weight.shape[0]
+    if K == 0:
+        # the stock route owns the K==0 contract (it rejects null inputs)
+        return False, "k_zero"
     if weight_scale is None or weight_scale.shape != (
         (N + 127) // 128,
         K // 128,
@@ -137,8 +148,18 @@ def _eligibility(
         and out.is_contiguous()
     ):
         return False, "layout"
+    # the kernel issues 16-byte vector loads from the activation and weight
+    # base pointers; a contiguous view with a storage offset can break that
+    if input.data_ptr() % 16 != 0 or weight.data_ptr() % 16 != 0:
+        return False, "alignment"
     # device guards
     if not input.is_cuda:
+        return False, "device"
+    if (
+        weight.device != input.device
+        or weight_scale.device != input.device
+        or out.device != input.device
+    ):
         return False, "device"
     major, minor = torch.cuda.get_device_capability(input.device)
     if major != 9:
@@ -151,7 +172,7 @@ def _get_module() -> Any:
     from ..jit.gemm import gen_fp8bs_gemm_decodem_sm90_module
 
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
+        raise GraphCaptureJitError(
             "fp8bs_gemm_decodem_sm90: the specialized kernel is not built "
             "yet and JIT compilation is not allowed under CUDA graph "
             "capture. Call fp8_blockscale_gemm_sm90 once eagerly on an "
@@ -181,7 +202,7 @@ def _fp8bs_decodem_try_dispatch(
         return None
     try:
         module = _get_module()
-    except RuntimeError:
+    except GraphCaptureJitError:
         raise  # the capture-without-warmup error above must surface
     except Exception as e:
         if _stats["jit_build"] == "not attempted":

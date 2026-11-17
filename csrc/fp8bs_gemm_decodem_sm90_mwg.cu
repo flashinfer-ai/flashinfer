@@ -682,13 +682,14 @@ static void launch(dim3 grid, cudaStream_t stream, const __nv_bfloat16* x, const
   constexpr int COMPUTE = NWG * KU * (64 * 128 + ATOMS * 1024 + MT * 4);
   constexpr int REDUCE = (NACC / 2) * NWG * 128 * 4;
   constexpr int SMEM = (COMPUTE > REDUCE ? COMPUTE : REDUCE) + 1024;
-  static bool opted = false;
-  if (!opted) {
-    cudaFuncSetAttribute(mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant,
-                                    PipelineMMA, DenseM>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-    opted = true;
-  }
+  // Set per launch: cudaFuncSetAttribute applies to the current device only,
+  // so a once-per-process flag would skip the opt-in on every later device.
+  // On failure skip the launch; the error is sticky and surfaces through the
+  // entry point's post-dispatch cudaGetLastError check.
+  if (cudaFuncSetAttribute(mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant,
+                                      PipelineMMA, DenseM>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM) != cudaSuccess)
+    return;
   mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant, PipelineMMA, DenseM>
       <<<grid, 128 * NWG, SMEM, stream>>>(x, w, ws, eps, out, M, N, K);
 }

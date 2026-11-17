@@ -10,6 +10,7 @@ from flashinfer.gemm import fp8_blockscale_gemm_sm90
 from flashinfer.gemm.fp8bs_decodem_sm90 import (
     FP8BS_GEMM_BACKENDS,
     SPECIALIZED_KERNEL_DISABLE_ENV,
+    GraphCaptureJitError,
     _dispatch_table,
     _eligibility,
     _fp8bs_decodem_stats,
@@ -159,6 +160,91 @@ def test_off_coverage_specialized_falls_back_recorded():
     st = _fp8bs_decodem_stats()
     assert st["backend_dispatches"]["specialized"] == 0, st
     assert st["fallback_reasons"] == {"specialized: weight_scale_granularity": 1}, st
+
+
+@requires_sm90
+def test_misaligned_offset_views_fall_back():
+    # Contiguous storage-offset views break the kernel's 16-byte vector
+    # loads, so eligibility must refuse them (the stock route faults on such
+    # views too — `misaligned address` — so the full call is not exercised
+    # here; the guard keeps the specialized kernel at behavior parity).
+    M, N, K = 4, 2048, 2048
+    x, wq, ws = _make(M, N, K, seed=21)
+    out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+
+    xbuf = torch.empty(M * K + 8, device="cuda", dtype=torch.bfloat16)
+    x_off = xbuf[1 : 1 + M * K].view(M, K)
+    x_off.copy_(x)
+    assert x_off.is_contiguous() and x_off.data_ptr() % 16 != 0
+    ok, reason = _eligibility(x_off, wq, None, ws, out)
+    assert not ok and reason == "alignment"
+
+    wbuf = torch.empty(N * K + 16, device="cuda", dtype=torch.float8_e4m3fn)
+    w_off = wbuf[1 : 1 + N * K].view(N, K)
+    w_off.copy_(wq)
+    assert w_off.is_contiguous() and w_off.data_ptr() % 16 != 0
+    ok, reason = _eligibility(x, w_off, None, ws, out)
+    assert not ok and reason == "alignment"
+
+    # an aligned call with the same shapes stays eligible
+    ok, reason = _eligibility(x, wq, None, ws, out)
+    assert ok, reason
+
+
+@requires_sm90
+def test_cross_device_tensors_fall_back():
+    x, wq, ws = _make(4, 2048, 2048, seed=15)
+    out = torch.empty((4, 2048), device="cuda", dtype=torch.bfloat16)
+    ok, reason = _eligibility(x, wq.cpu(), None, ws, out)
+    assert not ok and reason == "device"
+    ok, reason = _eligibility(x, wq, None, ws.cpu(), out)
+    assert not ok and reason == "device"
+    ok, reason = _eligibility(x, wq, None, ws, out.cpu())
+    assert not ok and reason == "device"
+
+
+@requires_sm90
+def test_k_zero_stays_on_stock_contract():
+    # the stock route rejects K == 0 (null input); the specialized backend
+    # must not serve it either (several routes would leave `out` unwritten)
+    M, N, K = 4, 2048, 0
+    x = torch.zeros((M, K), device="cuda", dtype=torch.bfloat16)
+    wq = torch.zeros((N, K), device="cuda", dtype=torch.float8_e4m3fn)
+    ws = torch.zeros(((N + G - 1) // G, 0), device="cuda", dtype=torch.float32)
+    out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
+    ok, reason = _eligibility(x, wq, None, ws, out)
+    assert not ok and reason == "k_zero"
+    for backend in ("auto", "specialized", "stock"):
+        with pytest.raises(RuntimeError, match="input is null"):
+            fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+
+
+@requires_sm90
+def test_jit_build_failure_falls_back_to_stock(monkeypatch):
+    import flashinfer.gemm.fp8bs_decodem_sm90 as mod
+
+    x, wq, ws = _make(4, 2048, 2048, seed=13)
+    ref = _reference(x, wq, ws)
+
+    def ninja_boom():
+        raise RuntimeError("Ninja build failed.")
+
+    monkeypatch.setitem(mod._stats, "jit_build", "not attempted")
+    monkeypatch.setattr(mod, "_get_module", ninja_boom)
+    _reset_fp8bs_decodem_stats()
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    st = _fp8bs_decodem_stats()
+    assert st["backend_dispatches"] == {"specialized": 0, "stock": 1}, st
+    assert st["fallback_reasons"] == {"specialized: jit_build_failure": 1}, st
+    assert _rel_fro(out, ref) <= 0.03
+
+    # the capture-without-warmup error keeps surfacing instead of falling back
+    def capture_boom():
+        raise GraphCaptureJitError("not built yet under capture")
+
+    monkeypatch.setattr(mod, "_get_module", capture_boom)
+    with pytest.raises(GraphCaptureJitError):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
 
 
 @requires_sm90

@@ -10,7 +10,6 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "fp8bs_gemm_decodem_sm90.h"
 
@@ -305,11 +304,9 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* 
 
 // ---------------------------------------------------------------------------
 
-static int g_numsm = 0;
-
 template <int MT, int NWARP, int KSHIFT>
-static void launch_mt(const void* x, const void* w, const void* ws, void* out, int M, int N, int K,
-                      int Sk, float eps, int nt, int mb, cudaStream_t stream) {
+static cudaError_t launch_mt(const void* x, const void* w, const void* ws, void* out, int M, int N,
+                             int K, int Sk, float eps, int nt, int mb, cudaStream_t stream) {
   static_assert(KSHIFT >= 0 && KSHIFT <= 3);
   constexpr int MP = MT * 8;
   constexpr int WK = NWARP / WN;
@@ -324,12 +321,11 @@ static void launch_mt(const void* x, const void* w, const void* ws, void* out, i
   constexpr int wdt = BN >> KSHIFT;
   size_t smem = (size_t)nbuf * MP * (XROW + 4) + (size_t)ksplit * WK * (MP / 2) * (wdt + 4) * 4;
 
-  static int smem_set = 0;
-  if (!smem_set) {
-    cudaFuncSetAttribute((const void*)fp8bs_kernel<MT, NWARP, KSHIFT>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BUDGET);
-    smem_set = 1;
-  }
+  // Set per launch: cudaFuncSetAttribute applies to the current device only,
+  // so a once-per-process flag would skip the opt-in on every later device.
+  cudaError_t err = cudaFuncSetAttribute((const void*)fp8bs_kernel<MT, NWARP, KSHIFT>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BUDGET);
+  if (err != cudaSuccess) return err;
 
   cudaLaunchConfig_t cfg = {};
   cfg.gridDim = dim3(ksplit, nt, mb);
@@ -350,41 +346,41 @@ static void launch_mt(const void* x, const void* w, const void* ws, void* out, i
     cfg.attrs = attr;
     cfg.numAttrs = 1;
   }
-  cudaError_t e = cudaLaunchKernelEx(&cfg, fp8bs_kernel<MT, NWARP, KSHIFT>, (const __nv_bfloat16*)x,
-                                     (const uint8_t*)w, (const float*)ws, (__nv_bfloat16*)out, M, N,
-                                     K, Sk, eps, nbuf);
-  if (e != cudaSuccess)
-    fprintf(stderr, "[fp8bs] launch err %d (%s) grid=(%d,%d,%d) smem=%zu\n", (int)e,
-            cudaGetErrorString(e), ksplit, nt, mb, smem);
+  return cudaLaunchKernelEx(&cfg, fp8bs_kernel<MT, NWARP, KSHIFT>, (const __nv_bfloat16*)x,
+                            (const uint8_t*)w, (const float*)ws, (__nv_bfloat16*)out, M, N, K, Sk,
+                            eps, nbuf);
 }
 
 template <int MT, int NWARP>
-static void launch_mt_split(const void* x, const void* w, const void* ws, void* out, int M, int N,
-                            int K, int Sk, float eps, int kshift, int nt, int mb,
-                            cudaStream_t stream) {
+static cudaError_t launch_mt_split(const void* x, const void* w, const void* ws, void* out, int M,
+                                   int N, int K, int Sk, float eps, int kshift, int nt, int mb,
+                                   cudaStream_t stream) {
   if (kshift == 0)
-    launch_mt<MT, NWARP, 0>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
+    return launch_mt<MT, NWARP, 0>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
   else if (kshift == 1)
-    launch_mt<MT, NWARP, 1>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
+    return launch_mt<MT, NWARP, 1>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
   else if (kshift == 2)
-    launch_mt<MT, NWARP, 2>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
+    return launch_mt<MT, NWARP, 2>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
   else
-    launch_mt<MT, NWARP, 3>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
+    return launch_mt<MT, NWARP, 3>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
 }
 
-void fp8bs_launch(void* out, const void* x, const void* w, const void* ws, int M, int N, int K,
-                  float eps, cudaStream_t stream) {
-  if (g_numsm == 0) {
-    int dev = 0;
-    cudaGetDevice(&dev);
-    cudaDeviceGetAttribute(&g_numsm, cudaDevAttrMultiProcessorCount, dev);
-    if (g_numsm <= 0) g_numsm = 132;
-  }
+cudaError_t fp8bs_launch(void* out, const void* x, const void* w, const void* ws, int M, int N,
+                         int K, float eps, cudaStream_t stream) {
+  // Queried per call: the SM count is a per-device quantity and this entry
+  // can serve several devices in one process.
+  int numsm = 0;
+  int dev = 0;
+  cudaError_t err = cudaGetDevice(&dev);
+  if (err != cudaSuccess) return err;
+  err = cudaDeviceGetAttribute(&numsm, cudaDevAttrMultiProcessorCount, dev);
+  if (err != cudaSuccess) return err;
+  if (numsm <= 0) numsm = 132;
   const int Sk = K >> 7;
-  if (Sk <= 0 || M <= 0 || N <= 0) return;
+  if (Sk <= 0 || M <= 0 || N <= 0) return cudaSuccess;
   const int nt = (N + BN - 1) / BN;
 
-  const int target = g_numsm;
+  const int target = numsm;
   int kshift = 0;
   while (kshift < 3 && (nt << (kshift + 1)) <= target && (1 << (kshift + 1)) <= Sk) ++kshift;
   if (N > 2304 && N <= 3072 && K >= 4096 && Sk >= 8) kshift = 3;
@@ -407,12 +403,12 @@ void fp8bs_launch(void* out, const void* x, const void* w, const void* ws, int M
   // to pay off, so fall back to 8 warps.
   const bool wide = (kshift <= 2) && !narrow;
   if (MT == 1)
-    wide ? launch_mt_split<1, 16>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream)
-         : launch_mt_split<1, 8>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream);
+    return wide ? launch_mt_split<1, 16>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream)
+                : launch_mt_split<1, 8>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream);
   else if (MT == 2)
-    wide ? launch_mt_split<2, 16>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream)
-         : launch_mt_split<2, 8>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream);
+    return wide ? launch_mt_split<2, 16>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream)
+                : launch_mt_split<2, 8>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream);
   else
-    wide ? launch_mt_split<3, 16>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream)
-         : launch_mt_split<3, 8>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream);
+    return wide ? launch_mt_split<3, 16>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream)
+                : launch_mt_split<3, 8>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream);
 }

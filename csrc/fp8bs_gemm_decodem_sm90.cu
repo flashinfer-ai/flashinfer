@@ -2216,16 +2216,17 @@ static void launch_ku(dim3 grid, bool lb, cudaStream_t stream, const __nv_bfloat
                       const uint8_t* weight, const float* weight_scale, float eps,
                       __nv_bfloat16* out, int M, int N, int K) {
   if constexpr (SPLIT > 8) {
-    static bool opted = false;
-    if (!opted) {
-      cudaFuncSetAttribute(
-          fp8_blockscale_wgmma_ku_kernel<MT, SPLIT, KU, KeepX, PipeWeights, PackMT8, ExactRound,
-                                         PairPipe, PushDSM, FlatPush, CompactM2, ExplicitSTS,
-                                         DenseTile, DenseOut, PrefetchScale, AsyncPush, DenseN,
-                                         MmaPipe, Quant8, PerWarpMbar, PreWaitScale, SpreadOwners>,
-          cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-      opted = true;
-    }
+    // Set per launch: cudaFuncSetAttribute applies to the current device
+    // only, so a once-per-process flag would skip the opt-in on every later
+    // device.
+    TVM_FFI_ICHECK_EQ(
+        cudaFuncSetAttribute(
+            fp8_blockscale_wgmma_ku_kernel<
+                MT, SPLIT, KU, KeepX, PipeWeights, PackMT8, ExactRound, PairPipe, PushDSM, FlatPush,
+                CompactM2, ExplicitSTS, DenseTile, DenseOut, PrefetchScale, AsyncPush, DenseN,
+                MmaPipe, Quant8, PerWarpMbar, PreWaitScale, SpreadOwners>,
+            cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+        cudaSuccess);
   }
   if (lb) {
     cudaLaunchConfig_t config = {};
@@ -2645,8 +2646,8 @@ static void launch_splitk_load_balanced(dim3 grid, cudaStream_t stream, const __
       x, weight, weight_scale, eps, out, M, N, K);
 }
 
-void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale, float eps,
-         ffi::TensorView out) {
+static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale,
+                    float eps, ffi::TensorView out) {
   const auto dev = x.device();
   TVM_FFI_ICHECK_EQ(dev.device_type, kDLCUDA);
   TVM_FFI_ICHECK_EQ(x.ndim(), 2);
@@ -2658,6 +2659,9 @@ void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale
   const int K = static_cast<int>(x.size(1));
   const int N = static_cast<int>(weight.size(0));
   TVM_FFI_ICHECK_EQ(K & 127, 0);
+  // K == 0 would leave `out` unwritten on several routes; the stock entry
+  // rejects it (null input) and this backend matches that contract.
+  TVM_FFI_ICHECK_GT(K, 0);
 
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(dev.device_type, dev.device_id));
@@ -2695,13 +2699,11 @@ void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale
   // selected row's pull/conventional reduction with c131's flat owner-push
   // mailbox.  Each specialization gets its own cluster-size opt-in.
   if (M == 12 && N == 2624 && K == 6144) {
-    static bool opted_flat_w10 = false;
-    if (!opted_flat_w10) {
-      cudaFuncSetAttribute(fp8_blockscale_wgmma_cpa_kernel<16, 16, false, false, true, true, false,
-                                                           true, true, true, true>,
-                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-      opted_flat_w10 = true;
-    }
+    TVM_FFI_ICHECK_EQ(
+        cudaFuncSetAttribute(fp8_blockscale_wgmma_cpa_kernel<16, 16, false, false, true, true,
+                                                             false, true, true, true, true>,
+                             cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+        cudaSuccess);
     const dim3 grid((N + 63) / 64 * 16, (M + 15) / 16);
     fp8_blockscale_wgmma_cpa_kernel<16, 16, false, false, true, true, false, true, true, true, true>
         <<<grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
@@ -2736,16 +2738,15 @@ void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale
                         (N > 3072 && K >= 2048 && M > 8 && M <= 16) ||
                         (N > 2304 && N <= 3072 && K >= 4096 && M > 16 && M <= 24);
   if (use_hmma) {
-    fp8bs_launch(op, xp, wp, wsp, M, N, K, eps, stream);
+    const cudaError_t err = fp8bs_launch(op, xp, wp, wsp, M, N, K, eps, stream);
+    TVM_FFI_ICHECK_EQ(err, cudaSuccess)
+        << "fp8bs_gemm_decodem_sm90: kernel launch failed: " << cudaGetErrorString(err);
     return;
   }
   if (N > 2304 && N <= 3072 && K >= 4096 && M > 8 && M <= 16 && (K >> 7) >= 16) {
-    static bool opted_mid = false;
-    if (!opted_mid) {
-      cudaFuncSetAttribute(fp8_blockscale_wgmma_cpa_kernel<16, 16, true, true>,
-                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-      opted_mid = true;
-    }
+    TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(fp8_blockscale_wgmma_cpa_kernel<16, 16, true, true>,
+                                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+                      cudaSuccess);
     const dim3 grid((N + 63) / 64 * 16, (M + 15) / 16);
     fp8_blockscale_wgmma_cpa_kernel<16, 16, true, true>
         <<<grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
@@ -2781,12 +2782,9 @@ void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale
     fp8_blockscale_wgmma_splitk_kernel<16, 8>
         <<<grid, 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
   } else if (use_split4 && M <= 8) {
-    static bool opted16 = false;
-    if (!opted16) {
-      cudaFuncSetAttribute(fp8_blockscale_wgmma_splitk_kernel<8, 16>,
-                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-      opted16 = true;
-    }
+    TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(fp8_blockscale_wgmma_splitk_kernel<8, 16>,
+                                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+                      cudaSuccess);
     fp8_blockscale_wgmma_splitk_kernel<8, 16>
         <<<dim3(row8_grid.x * 16, row8_grid.y), 128, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
   } else if (use_split4 && M > 16 && M <= 24) {
@@ -2860,6 +2858,17 @@ void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale
     const dim3 grid((N + 63) / 64, (M + 15) / 16);
     fp8_blockscale_kernel<<<grid, block, 0, stream>>>(xp, wp, wsp, eps, op, M, N, K);
   }
+}
+
+void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale, float eps,
+         ffi::TensorView out) {
+  RunImpl(x, weight, weight_scale, eps, out);
+  // Every route launches asynchronously; a refused launch (bad cluster or
+  // shared-memory configuration) must surface instead of returning an
+  // unwritten `out`.
+  const cudaError_t err = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(err, cudaSuccess)
+      << "fp8bs_gemm_decodem_sm90: kernel launch failed: " << cudaGetErrorString(err);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
