@@ -144,7 +144,11 @@ class StaticPlan:
         n_wg: int = 1,
         q2: bool = False,
         ragged: bool = False,
+        hw_rowmax: bool = False,
     ):
+        """``hw_rowmax``: the softmax takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``, the parts that
+        have it) instead of the register tree -- the same exact maximum; part of the kernel's identity (``compile.kernel_name``)."""
+        self.hw_rowmax = hw_rowmax
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
