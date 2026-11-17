@@ -223,8 +223,9 @@ def swaps_fused_grids(
     waves = -(-num_units // sm_count)
     if tiles < GRID_LONG_TILES and 3 * (num_units - (waves - 1) * sm_count) >= sm_count:
         return grids
-    floor = sm_count * max(GRID_MIN_FRACTION, STREAM_SAT_FRACTION[D])
-    while True:
+    # the floor is at least one CTA: on a part with one or two SMs the integral-wave grid is one CTA, reached at ``num_units`` waves
+    floor = max(1.0, sm_count * max(GRID_MIN_FRACTION, STREAM_SAT_FRACTION[D]))
+    while waves <= num_units:
         g = -(-num_units // waves)
         if g < floor:
             break
