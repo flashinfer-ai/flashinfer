@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import math
+import os
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -2543,6 +2544,183 @@ def _qsa_auto_backend(device: torch.device) -> str:
     return "cake" if arch_for_capability(capability) is not None else "default"
 
 
+# "specialized" backend: the SM107 FP8 serving arm of qsa_sparse_paged_attention
+# (an agent-generated pure-Triton kernel; see
+# flashinfer/triton/kernels/qsa_sparse_attention.py). It serves exactly the
+# form every other backend refuses today: an FP8 (e4m3) cache on SM107 at the
+# Qwen QSA TP4 geometry.
+
+# Kill switch: set FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 to guarantee the
+# specialized kernel is never dispatched. backend="auto" then falls back to
+# "default" (which reports the unsupported device on SM107, since no
+# composable path implements this form); explicit backend="specialized"
+# raises NotImplementedError naming the switch.
+_QSA_SPECIALIZED_KILL_SWITCH = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+_QSA_SPECIALIZED_NUM_QO_HEADS = 6  # TP4 shard of Qwen QSA's 24 query heads
+_QSA_SPECIALIZED_PAGE_SIZE = 64
+# 512 selected blocks * 4 tokens + 3 causal-tail slots + 1 count column.
+_QSA_SPECIALIZED_WIDTH = 2052
+
+# Observability: per-backend dispatch counts, and the reason recorded each
+# time "specialized" declined a call it is scoped for (an FP8 cache on SM107).
+qsa_sparse_paged_attention_dispatch_stats: dict = {"specialized": 0}
+qsa_sparse_paged_attention_fallback_reasons: list = []
+
+
+def _qsa_specialized_unservable_reason(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    k_scale: Optional[float],
+    v_scale: Optional[float],
+    k_sf: Optional[torch.Tensor],
+    v_sf: Optional[torch.Tensor],
+) -> Optional[str]:
+    """Why the "specialized" backend cannot serve this call, or None.
+
+    GPU-free guards first (kill switch, dtype, geometry, layout), then the
+    device-capability guard. These are calls that are valid for the op but
+    outside the specialized kernel's scope; malformed-call errors
+    (``ValueError``) are raised by the runner instead.
+    """
+    if os.environ.get(_QSA_SPECIALIZED_KILL_SWITCH) == "1":
+        return f"{_QSA_SPECIALIZED_KILL_SWITCH}=1 disables the specialized kernel"
+    if k_cache.dtype != torch.float8_e4m3fn or v_cache.dtype != torch.float8_e4m3fn:
+        return "specialized serves float8_e4m3fn caches only"
+    if k_sf is not None or v_sf is not None:
+        return "specialized takes no NVFP4 block scales"
+    if q.ndim != 3 or q.shape[1:] != (_QSA_SPECIALIZED_NUM_QO_HEADS, _QSA_HEAD_DIM):
+        return (
+            f"specialized serves [rows, {_QSA_SPECIALIZED_NUM_QO_HEADS}, "
+            f"{_QSA_HEAD_DIM}] queries only"
+        )
+    if k_cache.ndim != 4 or k_cache.shape[1:] != (
+        _QSA_SPECIALIZED_PAGE_SIZE,
+        1,
+        _QSA_HEAD_DIM,
+    ):
+        return (
+            f"specialized serves [blocks, {_QSA_SPECIALIZED_PAGE_SIZE}, 1, "
+            f"{_QSA_HEAD_DIM}] caches only"
+        )
+    if v_cache.shape != k_cache.shape:
+        return "k_cache and v_cache must have the same shape"
+    for scale in (k_scale, v_scale):
+        if scale is not None and float(scale) != 1.0:
+            return "specialized serves unit k_scale / v_scale only"
+    if logical_indices.ndim != 2 or logical_indices.shape[1] != _QSA_SPECIALIZED_WIDTH:
+        return f"specialized serves [rows, {_QSA_SPECIALIZED_WIDTH}] selections only"
+    for name, t in (
+        ("q", q),
+        ("k_cache", k_cache),
+        ("v_cache", v_cache),
+        ("logical_indices", logical_indices),
+    ):
+        if not t.is_contiguous():
+            return f"specialized requires contiguous {name}"
+    if q.device.type != "cuda":
+        return "specialized requires CUDA tensors"
+    cc = get_compute_capability(q.device)
+    if cc != (10, 7):
+        return f"specialized targets SM107 only; device is sm{cc[0]}{cc[1]}"
+    return None
+
+
+def _qsa_sparse_paged_attention_specialized(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: Optional[torch.Tensor],
+    *,
+    output_gate: torch.Tensor,
+) -> torch.Tensor:
+    """Run the specialized SM107 FP8 kernel; the scope gate already passed.
+
+    Host-side argument adapter: the kernel addresses the caches as one flat
+    slot range per request starting at its first block, so it consumes
+    ``block_table[:, 0]`` (the other columns are never read) and request
+    boundaries derived from ``token_to_req`` — both as device ops with no
+    synchronization, so calls are CUDA-graph capturable: run one same-shape
+    eager warmup call before capturing (it sizes the persistent scratch and
+    compiles the kernels; capture itself then performs no allocation).
+    """
+    device = q.device
+    num_rows = q.shape[0]
+    _qsa_check(q.dtype == torch.bfloat16, "q must be bfloat16")
+    _qsa_check(
+        block_table.ndim == 2
+        and block_table.numel() > 0
+        and block_table.dtype == torch.int32
+        and block_table.stride(1) == 1,
+        "block_table must be a non-empty int32 2D tensor with a contiguous last dim",
+    )
+    _qsa_check(
+        logical_indices.shape[0] == num_rows and logical_indices.dtype == torch.int32,
+        "logical_indices must be int32 [rows, selection_width + 1]",
+    )
+    _qsa_check(
+        token_to_req.shape == (num_rows,)
+        and token_to_req.dtype == torch.int32
+        and token_to_req.is_contiguous(),
+        "token_to_req must be contiguous int32 [rows]",
+    )
+    _qsa_check(
+        output_gate.shape == q.shape
+        and output_gate.dtype == torch.bfloat16
+        and output_gate.is_contiguous(),
+        "output_gate must be contiguous bfloat16 with the shape of q",
+    )
+    if out is None:
+        out = torch.empty_like(q)
+    _qsa_check(
+        out.shape == q.shape and out.dtype == q.dtype and out.is_contiguous(),
+        "out must be contiguous and match q in shape and dtype",
+    )
+    _qsa_check(
+        all(
+            x.device == device
+            for x in (
+                k_cache,
+                v_cache,
+                logical_indices,
+                block_table,
+                token_to_req,
+                output_gate,
+                out,
+            )
+        ),
+        "all tensors must be on the same device",
+    )
+    if num_rows == 0:
+        return out
+    num_requests = block_table.shape[0]
+    # Each request's pages are read as the contiguous range starting at its
+    # first block (a caller contract of this backend; see the API docstring).
+    page_base = block_table[:, 0].contiguous()
+    # cu_seqlens[r] = first row of request r; token_to_req must be
+    # nondecreasing (rows grouped by request), another documented contract.
+    bounds = torch.arange(num_requests + 1, device=device, dtype=token_to_req.dtype)
+    cu_seqlens = torch.searchsorted(token_to_req, bounds, out_int32=True)
+    from .triton.kernels import qsa_sparse_attention as _specialized_impl
+
+    _specialized_impl.run(
+        q,
+        output_gate,
+        k_cache,
+        v_cache,
+        logical_indices,
+        cu_seqlens,
+        page_base,
+        out,
+    )
+    qsa_sparse_paged_attention_dispatch_stats["specialized"] += 1
+    return out
+
+
 @flashinfer_api(trace=qsa_sparse_paged_attention_trace)
 def qsa_sparse_paged_attention(
     q: torch.Tensor,
@@ -2566,7 +2744,9 @@ def qsa_sparse_paged_attention(
     This is vLLM's ``qsa_sparse_paged_attention`` (Qwen QSA) contract: the same arguments in the
     same order, plus the block scales ``k_sf`` / ``v_sf`` of an NVFP4 cache. The default
     implementation runs every cache format on SM80 through SM90. NVFP4 on 10.0, 10.3, 10.7 and
-    12.0 is served by the experimental Cake backend (see ``backend``).
+    12.0 is served by the experimental Cake backend, and an FP8 cache on SM107 at the Qwen QSA
+    TP4 geometry (6 query heads over 1 kv head, page size 64, unit scales, selection width
+    2052) is served by the experimental specialized backend (see ``backend``).
 
     Parameters
     ----------
@@ -2605,15 +2785,43 @@ def qsa_sparse_paged_attention(
         ``"cake"`` runs the experimental Cake kernels of
         :mod:`flashinfer.experimental.cake_qsa_nvfp4` (NVFP4 only, on the capabilities that
         package exports a library for: 12.0 on the ``mma.sync`` programs; 10.0, 10.3 and 10.7
-        on the tcgen05 programs) and emits an ``ExperimentalWarning`` once. ``"auto"`` (the
-        default) selects ``"default"`` for every cache on 8.x and 9.0 and for FP8 and BF16
-        caches anywhere. For an NVFP4 cache on a capability the Cake package exports,
-        ``"auto"`` selects ``"cake"`` only when
+        on the tcgen05 programs) and emits an ``ExperimentalWarning`` once.
+        ``"specialized"`` runs the experimental agent-generated SM107 Triton kernel for FP8
+        caches at the Qwen QSA TP4 geometry (see Notes) and also emits an
+        ``ExperimentalWarning`` once; it is never silently swapped: a call it cannot serve
+        raises ``NotImplementedError`` naming the reason, which is also appended to
+        ``flashinfer.sparse.qsa_sparse_paged_attention_fallback_reasons`` (successful
+        dispatches are counted in
+        ``flashinfer.sparse.qsa_sparse_paged_attention_dispatch_stats``). The kill switch
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` guarantees the specialized kernel is never
+        dispatched, under ``"auto"`` included (the call then reaches ``"default"``, which
+        reports the unsupported device on SM107, since no composable path implements this
+        form). ``"auto"`` (the default) selects ``"specialized"`` exactly when it can serve
+        the call — an FP8 cache on SM107 at the geometry above, the one form every other
+        backend refuses — and otherwise selects ``"default"`` for every cache on 8.x and 9.0
+        and for FP8 and BF16 caches anywhere. For an NVFP4 cache on a capability the Cake
+        package exports, ``"auto"`` selects ``"cake"`` only when
         ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set and raises ``RuntimeError``
         otherwise; anywhere else it selects ``"default"``, which reports the unsupported
         device. The Cake kernels' results agree with the default implementation within the
         test tolerances but are not bit-identical to it. Any other value raises
         ``ValueError``.
+
+    Notes
+    -----
+    The specialized SM107 backend narrows this API's device-value contract (checked nowhere,
+    like the default implementation's own device-value rules): selection entries of a row must
+    be request-local logical token indices sorted ascending with ``-1`` padding after the
+    count, and in range (out-of-range positive entries are not skipped the way the default
+    implementation skips them); rows must be grouped by request (``token_to_req``
+    nondecreasing, matching ``block_table``'s row order); and each request's pages must be the
+    contiguous block range starting at ``block_table[request, 0]`` (only that first column is
+    read). This is the layout vLLM's Qwen QSA serving path produces. The kernel is bitwise
+    deterministic run to run. CUDA graphs: run one eager call at the same shape before
+    capturing — the kernel keeps persistent per-process scratch sized by the input shape, so a
+    warmed-up capture performs no allocation and replay reuses stable pointers; the first
+    specialized call also installs Triton's process-wide launch allocator (importing
+    flashinfer does not).
 
     Returns
     -------
@@ -2621,16 +2829,60 @@ def qsa_sparse_paged_attention(
         ``out`` when given, otherwise a new tensor.
     """
     if backend == "auto":
-        # The Cake package takes NVFP4 caches only.
-        fp8_or_bf16 = k_cache.dtype in (torch.float8_e4m3fn, torch.bfloat16)
-        backend = "default" if fp8_or_bf16 else _qsa_auto_backend(q.device)
-        if backend == "cake":
-            require_experimental_auto_backends("qsa_sparse_paged_attention -> cake")
+        reason = _qsa_specialized_unservable_reason(
+            q, k_cache, v_cache, logical_indices, k_scale, v_scale, k_sf, v_sf
+        )
+        if reason is None:
+            # The one form every other backend refuses: an FP8 cache on
+            # SM107 at the specialized kernel's contract. No opt-in gate:
+            # the alternative is "default"'s unsupported-device error.
+            backend = "specialized"
             warn_experimental_backend_once(
-                "qsa_sparse_paged_attention", "cake", automatic=True
+                "qsa_sparse_paged_attention", "specialized", automatic=True
             )
+        else:
+            if (
+                q.device.type == "cuda"
+                and k_cache.dtype == torch.float8_e4m3fn
+                and get_compute_capability(q.device) == (10, 7)
+            ):
+                # An SM107 FP8 call the specialized backend declined: record
+                # why, because "default" is about to report the device.
+                qsa_sparse_paged_attention_fallback_reasons.append(reason)
+            # The Cake package takes NVFP4 caches only.
+            fp8_or_bf16 = k_cache.dtype in (torch.float8_e4m3fn, torch.bfloat16)
+            backend = "default" if fp8_or_bf16 else _qsa_auto_backend(q.device)
+            if backend == "cake":
+                require_experimental_auto_backends("qsa_sparse_paged_attention -> cake")
+                warn_experimental_backend_once(
+                    "qsa_sparse_paged_attention", "cake", automatic=True
+                )
     elif backend == "cake":
         warn_experimental_backend_once("qsa_sparse_paged_attention", "cake")
+    elif backend == "specialized":
+        warn_experimental_backend_once("qsa_sparse_paged_attention", "specialized")
+        reason = _qsa_specialized_unservable_reason(
+            q, k_cache, v_cache, logical_indices, k_scale, v_scale, k_sf, v_sf
+        )
+        if reason is not None:
+            qsa_sparse_paged_attention_fallback_reasons.append(reason)
+            raise NotImplementedError(
+                "qsa_sparse_paged_attention backend='specialized' cannot serve "
+                f"this call ({reason}), and it is never silently swapped for "
+                "another backend; 'default' serves SM80 through SM90 and "
+                "'cake' serves NVFP4 caches."
+            )
+    if backend == "specialized":
+        return _qsa_sparse_paged_attention_specialized(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            out,
+            output_gate=output_gate,
+        )
     if backend == "cake":
         from .experimental.cake_qsa_nvfp4.cake_backend import (
             qsa_sparse_paged_attention as run_cake,

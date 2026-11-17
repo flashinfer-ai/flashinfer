@@ -329,6 +329,10 @@ extend-exclude = [
   # cuDNN Frontend sources vendored byte-faithfully for the Qwen 3.5 gated attention block (re-vendored as a clean
   # drop; the digests in its VENDOR_MANIFEST.json cover the files as written). The adapter beside it stays linted.
   "flashinfer/experimental/qwen_3_5_block/_cudnn_frost/",
+  # Agent-generated QSA sparse-paged-attention Triton kernel kept faithful to
+  # the validated artifact (dispatch-only integration edits); the backend
+  # wrapper in flashinfer/sparse.py and its tests stay linted.
+  "flashinfer/triton/kernels/qsa_sparse_attention.py",
 ]
 force-exclude = true
 
