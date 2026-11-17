@@ -147,13 +147,21 @@ def _api(inp, out=None, **kw):
     )
 
 
-# The kernel is bitwise deterministic across runs of any given build.
-# Selection exactness vs the fp32 reference holds on the VALIDATED toolchain
-# (nvcc 13.3; strict assertion gated on that literal version below). Under
-# other compiler versions (measured: nvcc 12.9, 13.0) the top-512 set may
-# differ from the reference by at most ONE score-TIED boundary block per
-# row; format, causal tail, ordering and count stay exact everywhere.
-VALIDATED_CUDA_VERSIONS = ("13.3",)
+# The kernel is bitwise deterministic across runs of any given build, and
+# dispatch refuses toolkits it was not validated on (single source of truth:
+# pi.VALIDATED_CUDA_VERSIONS — nvcc 13.3 today). Functional tests therefore
+# run only on validated toolkits, where selection is reference-exact; the
+# refusal itself is asserted everywhere else.
+VALIDATED_CUDA_VERSIONS = pi.VALIDATED_CUDA_VERSIONS
+TOOLKIT_VALIDATED = bool(
+    torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS)
+)
+requires_validated_toolkit = pytest.mark.skipif(
+    not TOOLKIT_VALIDATED,
+    reason="dispatch refuses unvalidated CUDA toolkits "
+    f"(cuda={torch.version.cuda}, validated={VALIDATED_CUDA_VERSIONS}); "
+    "the refusal is covered by test_unvalidated_toolkit_refusal",
+)
 
 
 def _row_scores(inp, r, blocks):
@@ -207,6 +215,7 @@ def _assert_selection_invariants(inp, out, gold):
 
 
 @requires_sm103
+@requires_validated_toolkit
 @pytest.mark.parametrize(
     "T,B",
     [
@@ -220,11 +229,11 @@ def test_selection_contract_and_determinism(T, B):
     inp = _make_inputs(T, B, seed=13)
     gold = _reference(inp)
     out = _api(inp)
-    # cross-toolkit invariants always hold
+    # selection invariants (set/tie/format checks give a sharper failure
+    # message than raw equality)
     _assert_selection_invariants(inp, out, gold)
-    # strict exactness on the validated toolchain (literal version gate)
-    if torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS):
-        assert torch.equal(out, gold)
+    # strict reference exactness (this test only runs on validated toolkits)
+    assert torch.equal(out, gold)
     # bitwise determinism per build, always
     for _ in range(3):
         assert torch.equal(_api(inp), out)
@@ -235,6 +244,16 @@ def test_selection_contract_and_determinism(T, B):
 
 
 @requires_sm103
+def test_unvalidated_toolkit_refusal():
+    if TOOLKIT_VALIDATED:
+        pytest.skip("validated toolkit: dispatch serves; refusal not reachable")
+    inp = _make_inputs(122, 1, seed=3)
+    with pytest.raises(ValueError, match="unvalidated_toolkit"):
+        _api(inp)
+
+
+@requires_sm103
+@requires_validated_toolkit
 def test_rejection_semantics():
     inp = _make_inputs(949, 2, seed=3)
     # off-allowlist raises with the fallback reasons (no stock path exists)
@@ -253,6 +272,7 @@ def test_rejection_semantics():
 
 
 @requires_sm103
+@requires_validated_toolkit
 def test_cuda_graph_replay_matches_eager():
     inp = _make_inputs(949, 2, seed=5)
     buf = torch.empty(949, PW, dtype=torch.int32, device="cuda")

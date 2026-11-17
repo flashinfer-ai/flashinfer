@@ -22,13 +22,19 @@ the contract, not a checker detail), expands each selected block to its 4
 token indices, appends the causal tail of the open block, and emits one
 packed int32 row per query: ascending valid token indices in columns
 0..2050, -1 padding, valid count in column 2051. The output is bitwise
-deterministic across runs of any given build. Selection exactness vs an
-fp32 reference holds on the validated toolchain (nvcc 13.3); under other
-compiler versions (measured: nvcc 12.9 and 13.0) the top-512 set may
-differ from that reference by AT MOST one score-TIED boundary block at the
-selection threshold per row (set difference <= 1 block; the swapped
-blocks' fp32 scores are equal within rounding), with the packed format,
-causal tail, ordering and count columns exact in all cases.
+deterministic across runs of any given build.
+
+The kernel is validated per CUDA toolkit, and dispatch refuses to serve
+when the current toolkit (``torch.version.cuda``) is not in
+``VALIDATED_CUDA_VERSIONS`` (fallback reason ``unvalidated_toolkit``):
+behavior under other compilers is measured to differ and is not
+guaranteed. On the validated toolkit (nvcc 13.3) the selection matches an
+fp32 reference bit-for-bit on every verified row. Measured under nvcc 12.9
+and 13.0, the top-512 set can differ from that reference by a score-TIED
+boundary block at the selection threshold (set difference <= 1 block per
+row, packed format/causal tail/ordering/count exact), and nvcc 13.0
+additionally showed intermittent instability under investigation — hence
+the refusal rather than a weaker contract.
 
 There is no other FlashInfer path serving this fused contract today:
 ``fp8_paged_mqa_logits`` + ``FP8MQATopKWrapper`` cover the decode-side
@@ -58,6 +64,11 @@ _BUILT = {"ready": False}
 
 PACKED_WIDTH = 2052  # 2048 expanded slots + 3 causal-tail slots + count col
 BACKENDS = ("specialized",)
+# CUDA toolkits (torch.version.cuda prefixes) the kernel is validated on.
+# Dispatch refuses off this list; extend it only after re-running the full
+# per-toolkit validation (reference exactness + sanitizers on the scored
+# regime).
+VALIDATED_CUDA_VERSIONS = ("13.3",)
 
 
 @functools.cache
@@ -72,6 +83,15 @@ def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos, visible,
     device. Returns [] when servable, else reasons. No device syncs."""
     if _os.environ.get(KILL_SWITCH_ENV, "0") == "1":
         return ["kill_switch:" + KILL_SWITCH_ENV + "=1"]
+    if not (
+        torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS)
+    ):
+        return [
+            "unvalidated_toolkit:cuda_"
+            + str(torch.version.cuda)
+            + ";validated="
+            + ",".join(VALIDATED_CUDA_VERSIONS)
+        ]
     r = []
     if (
         qi.dim() != 3
