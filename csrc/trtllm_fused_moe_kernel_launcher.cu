@@ -2254,6 +2254,8 @@ class StagedMoeLauncher : public FusedMoeLauncher {
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
             int64_t weight_layout, ActivationType activation_type, int64_t gemm1_bias_type,
             bool norm_topk_prob = true) {
+    TVM_FFI_ICHECK(activation_type != ActivationType::ClampedRelu2)
+        << "Staged MoE does not support ClampedRelu2: no gemm1_clamp_limit input.";
     FusedMoeLauncher::init_common(std::move(args), tile_tokens_dim, routing_method_type,
                                   use_shuffled_weight, weight_layout, activation_type,
                                   gemm1_bias_type, norm_topk_prob);
@@ -3505,6 +3507,8 @@ void trtllm_moe_run_deepseek_fp8_activation(
     TensorView activation_output_scale, TensorView expanded_idx_to_permuted_idx,
     TensorView total_num_padded_tokens, int64_t num_tokens, int64_t top_k,
     int64_t intermediate_size, int64_t activation_type, bool enable_pdl, int64_t sf_block_size) {
+  TVM_FFI_ICHECK(activation_type != static_cast<int64_t>(ActivationType::ClampedRelu2))
+      << "Standalone DeepSeek FP8 activation does not support ClampedRelu2.";
   TVM_FFI_ICHECK(sf_block_size == 128 || sf_block_size == 32)
       << "DeepSeek FP8 activation: sf_block_size must be 128 or 32.";
   TVM_FFI_ICHECK_EQ(intermediate_size % sf_block_size, 0)
