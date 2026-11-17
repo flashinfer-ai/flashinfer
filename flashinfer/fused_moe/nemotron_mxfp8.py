@@ -37,9 +37,10 @@ def prepare_nemotron_mxfp8_local_experts(
 
     Targets SM103, hidden 768, intermediate 4096, top-k 10, 128 local experts.
     `max_tokens` is the gathered bucket capacity, not the rank-local capacity.
-    `local_expert_offset` is 0/128/256/384. Hardware tanh is part of the winning
-    configuration; False is provided only for numerical attribution controls.
-    Experimental numerical and end-to-end performance qualification is pending.
+    `local_expert_offset` is 0/128/256/384. Hardware tanh is enabled by default;
+    `hardware_tanh=False` selects the software numerical attribution control.
+    The two activation choices compile separate plans. See the experimental
+    backend README for quality diagnostics and remaining qualification limits.
     """
     from ..experimental.nemotron_mxfp8.plan import LocalExpertPlan
 

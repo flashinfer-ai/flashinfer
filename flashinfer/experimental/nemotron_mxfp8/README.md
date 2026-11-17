@@ -54,6 +54,42 @@ M128/N256/K128 tiles, one-CTA clusters, lookup scheduling, flag batch 1,
 data padding 64 and scale padding 128. Pipeline stage calculation is unchanged.
 `hardware_tanh=False` is a numerical attribution control.
 
+Hardware tanh is the default within this explicitly selected experimental API;
+it does not change activation defaults in other FlashInfer backends. To select
+the software activation control, prepare a separate plan with
+`hardware_tanh=False` before graph capture. The two plans compile separately.
+
+## Hardware-tanh quality diagnostics
+
+Paired full-model diagnostics compared software `libdevice.tanh` with
+`tanh.approx.f32`, holding checkpoint weights and the surrounding activation
+arithmetic fixed. These used a separate Triton activation implementation and
+BF16 execution of dequantized checkpoint weights, rather than this CuTe MXFP8
+operator. Both diagnostics used software / hardware / software passes; the
+software repeats matched exactly in the recorded scores and predictions.
+
+| Diagnostic | Software tanh | Hardware tanh |
+| --- | --- | --- |
+| PG-19 test perplexity, 131,072 scored tokens | 12.14870 | 12.15157 |
+| MMLU 5-shot accuracy, 100 questions across 57 subjects | 80/100 | 81/100 |
+
+The PG-19 sample used the first 64 books with at least 4,097 tokens in the
+pinned `emozilla/pg19` test-file order. Each opening window scored 2,048 next
+tokens after its context. The relative perplexity change was +0.0236%, with a
+95% book-bootstrap interval of [-0.0409%, +0.0912%]. Next-token argmax changed
+at 3.59% of scored positions; prediction changes are not an error rate.
+
+The MMLU subset used five development examples from the same subject and
+scored the A/B/C/D continuations without generating reasoning or using tools.
+Two answers changed: one wrong-to-correct and one wrong-to-another-wrong.
+There were no correct-to-wrong changes in this small sample.
+
+These results found no statistically established aggregate perplexity
+regression in the tested BF16 setting. They do not establish equivalence,
+production MXFP8 quality, or downstream agent-task accuracy. Independent
+full-checkpoint qualification of this operator remains outstanding; synthetic
+kernel checks and own-eager/graph agreement cover different properties.
+
 ## Validation and provenance
 
 Run `python tests/experimental/nemotron_mxfp8/test_plan_contract.py` for CPU contracts,
