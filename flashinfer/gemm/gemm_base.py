@@ -3974,7 +3974,7 @@ class SegmentGEMMWrapper:
         if seg_lens is None and seg_indptr is None:
             raise ValueError("Either seg_lens or seg_indptr should be provided.")
         if seg_indptr is None:
-            seg_indptr = get_indptr(seg_lens.to(x))
+            seg_indptr = get_indptr(seg_lens.to(device=x.device))
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
@@ -9982,7 +9982,8 @@ def _b12x_gemm_fp4_runner(
 
         Tactics are tuples:
             (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_type, use_tma_store)
-        where kernel_type is always "sm120" and use_tma_store is always None.
+        where kernel_type is always "sm120" and use_tma_store=None selects
+        the store path from the output row alignment.
         """
 
         def get_valid_tactics(
@@ -10076,6 +10077,11 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
             ) = tactic
 
+            # TMA requires 16-byte output rows, also for cached/tuned tactics.
+            use_tma_store = (
+                use_tma_store is not False and n % (128 // c_cutlass_dtype.width) == 0
+            )
+
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
@@ -10104,6 +10110,7 @@ def _b12x_gemm_fp4_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
+                use_tma_store=use_tma_store,
             )
 
             # swap_ab is device-internal (applied in the kernel ctor); public C
@@ -10370,6 +10377,11 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     # Rank the runners from a cold L2.
     use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
+    # As for BF16 (#6360), time a chain of 16 back-to-back launches per cold-L2
+    # sample instead of a single launch, each launch on its own lane of the
+    # weights and their scales.
+    cold_chain_launches=16,
+    profile_arena_input_indices=(1, 3),  # b, b_descale
 )
 
 
@@ -12483,11 +12495,19 @@ def group_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        On SM100 / SM103 / SM107 the DeepGEMM kernels consume UE8M0 scales: each
+        ``torch.float32`` scale is converted by keeping only its exponent, i.e.
+        to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
+        applied up to 2x too small, without an error. Pass power-of-two scales
+        (for example ``2 ** ceil(log2(amax.clamp(min=1e-4) / 448))``, as
+        ``per_token_cast_to_fp8`` and ``per_block_cast_to_fp8`` in
+        ``flashinfer.testing.utils`` produce).
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
-        of the original float32 tensor for each group.
+        of the original float32 tensor for each group. The same power-of-two requirement as
+        `a_scale` applies.
 
     m_indices : torch.Tensor
         Group assignment tensor of shape ``(m,)`` with ``torch.int32`` dtype. Each element
@@ -12517,7 +12537,7 @@ def group_deepgemm_fp8_nt_groupwise(
     --------
     >>> import torch
     >>> from flashinfer.gemm import group_deepgemm_fp8_nt_groupwise
-    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
     >>>
     >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
     >>> m_per_group, n, k = 128, 2048, 4096
@@ -12911,11 +12931,21 @@ def batch_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(batch_size, m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        On SM100 / SM103 / SM107 the default DeepGEMM backend consumes UE8M0 scales: each
+        ``torch.float32`` scale is converted by keeping only its exponent, i.e.
+        to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
+        applied up to 2x too small, without an error. Pass power-of-two scales
+        (for example ``2 ** ceil(log2(amax.clamp(min=1e-4) / 448))``, as
+        ``per_token_cast_to_fp8`` and ``per_block_cast_to_fp8`` in
+        ``flashinfer.testing.utils`` produce).
+        ``backend="cake"`` has the same requirement: its block-scaled routes truncate the
+        scales the same way.
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
-        of the original float32 tensor for each group.
+        of the original float32 tensor for each group. The same power-of-two requirement as
+        `a_scale` applies.
 
     masked_m : torch.Tensor
         Masking tensor of shape ``(batch_size,)`` with ``torch.int32`` dtype. Each element
@@ -12968,7 +12998,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     --------
     >>> import torch
     >>> from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
-    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
     >>>
     >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
     >>> m, n, k = 128, 2048, 4096
@@ -12983,7 +13013,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     >>> b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
     >>> b_scale = torch.empty(
     ...    (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
-    >>> )
+    ... )
     >>> for i in range(group_size):
     ...    a_fp8[i], a_scale[i] = per_token_cast_to_fp8(a[i])
     ...    b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])

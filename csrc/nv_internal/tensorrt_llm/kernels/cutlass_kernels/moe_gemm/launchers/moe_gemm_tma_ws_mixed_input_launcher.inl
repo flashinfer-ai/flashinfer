@@ -388,6 +388,20 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
   TLLM_CHECK_WITH_INFO(hopper_inputs.swap_ab,
                        "swap_ab must be true for mixed dtype WS grouped GEMM");
 
+  {
+    // The kernel's shared memory must fit the active device (99 KiB on SM120 / SM121).
+    int smem_size = static_cast<int>(sizeof(typename GemmKernel::SharedStorage));
+    int device = 0;
+    tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
+    int maxSmem = 0;
+    tensorrt_llm::common::check_cuda_error(
+        cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    TLLM_CHECK_WITH_INFO(
+        smem_size <= maxSmem,
+        "Mixed dtype WS grouped GEMM requires %d bytes shared memory but device supports %d",
+        smem_size, maxSmem);
+  }
+
   auto can_implement = gemm.can_implement(arguments);
   if (can_implement != cutlass::Status::kSuccess) {
     std::string err_msg = "mixed dtype WS grouped cutlass kernel will fail for params. Error: " +
