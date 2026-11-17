@@ -1864,9 +1864,11 @@ class TmemSResource(DecodeGenResourceBase):
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
         local_row_idx = (lane_idx >> Int32(2)) & Int32(0x3)
         # A dense tile inside every row's visible interval needs no score
-        # mask. It takes a separate copy of the load and lane reduction: as
-        # predicated code, the masks would issue on every interior tile even
-        # when they keep every score. The copy only pays where the masked path
+        # mask. It takes a separate copy of the S load only (the inactive-row
+        # mask and lane reduction stay shared below, keeping the loop body
+        # small for the instruction cache): as predicated code, the masks
+        # would issue on every interior tile even when they keep every score.
+        # The copy only pays where the masked path
         # is expensive (per-row causal or inactive-row masks, or 32-row
         # tiles); a full one-token Q8/Q16 tile's single tail mask is cheaper
         # than the extra branch and code, and sliding-window CTAs see mostly
@@ -1890,6 +1892,7 @@ class TmemSResource(DecodeGenResourceBase):
             )
         )
         tile_is_clean = cutlass.Boolean(False)
+        proxy_max_shift = Float32(0.0)
         if cutlass.const_expr(uses_clean_tile_path):
             tile_is_clean = _kv_tile_is_fully_unmasked_for_q_group(
                 cfg,
@@ -1904,25 +1907,6 @@ class TmemSResource(DecodeGenResourceBase):
         if tile_is_clean:
             if cutlass.const_expr(uses_clean_tile_path):
                 self._load_swaps_scores(stage_info, s_vals, q_repeats)
-                if cutlass.const_expr(cfg.q_score_rows_need_mask):
-                    self._mask_inactive_swaps_rows(
-                        s_vals,
-                        lane_idx,
-                        logical_q_group_idx,
-                        num_scale_groups,
-                        q_repeats,
-                    )
-                self._reduce_swaps_lane_max(
-                    s_vals,
-                    old_max_vals,
-                    local_max_vals,
-                    lane_idx,
-                    local_row_idx,
-                    Float32(0.0),
-                    num_scale_groups,
-                    q_repeats,
-                    False,
-                )
         else:
             if cutlass.const_expr(not use_runtime_paged_dense_load):
                 for idx in cutlass.range_constexpr(cfg.num_s_regs_per_thread):
@@ -2180,16 +2164,15 @@ class TmemSResource(DecodeGenResourceBase):
                             if token_idx < causal_start or token_idx >= causal_end:
                                 s_vals[s_idx] = _neg_max_f32()
 
-            if cutlass.const_expr(cfg.q_score_rows_need_mask):
+            if cutlass.const_expr(cfg.q_score_rows_need_mask and use_sparse):
                 # Structural grouped padding and the final partial token/head band
-                # must not enter max/sum or P.
+                # must not enter max/sum or P (before the proxy tail shift).
                 self._mask_inactive_swaps_rows(
                     s_vals, lane_idx, logical_q_group_idx, num_scale_groups, q_repeats
                 )
 
             # Proxy mass (``_proxy_score_shifts``): the ragged final summary's
             # scores shift before the reduction so the P pass sees its true mass.
-            proxy_max_shift = Float32(0.0)
             if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
                 tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
                 route_is_proxy_uniform = cute.arch.make_warp_uniform(route_is_proxy)
@@ -2230,17 +2213,23 @@ class TmemSResource(DecodeGenResourceBase):
                                     s_vals[tail_s_base + 1] = (
                                         s_vals[tail_s_base + 1] + tail_shift
                                     )
-            self._reduce_swaps_lane_max(
-                s_vals,
-                old_max_vals,
-                local_max_vals,
-                lane_idx,
-                local_row_idx,
-                proxy_max_shift,
-                num_scale_groups,
-                q_repeats,
-                use_sparse and cfg.use_block_sparse_proxy_routes,
+        if cutlass.const_expr(cfg.q_score_rows_need_mask and not use_sparse):
+            # Structural grouped padding and the final partial token/head band
+            # must not enter max/sum or P.
+            self._mask_inactive_swaps_rows(
+                s_vals, lane_idx, logical_q_group_idx, num_scale_groups, q_repeats
             )
+        self._reduce_swaps_lane_max(
+            s_vals,
+            old_max_vals,
+            local_max_vals,
+            lane_idx,
+            local_row_idx,
+            proxy_max_shift,
+            num_scale_groups,
+            q_repeats,
+            use_sparse and cfg.use_block_sparse_proxy_routes,
+        )
 
         if stage_info.loop_offset == stage_info.loop_start:
             # Softmax consumes S in the loop stage. Persistent CTAs reuse this
