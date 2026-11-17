@@ -140,7 +140,10 @@ __forceinline__ __device__ float loadScalar(void const* ptr, int idx,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static __device__ inline float sigmoid_accurate(float x) { return 0.5f * tanhf(0.5f * x) + 0.5f; }
+static __device__ inline float sigmoid_accurate(float x) {
+  // Avoid cancellation when the sigmoid is close to zero.
+  return 1.0f / (1.0f + expf(-x));
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
