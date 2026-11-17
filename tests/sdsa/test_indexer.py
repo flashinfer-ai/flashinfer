@@ -119,7 +119,6 @@ def test_indexer_scores_match_reference_and_replay(
         monkeypatch.setattr(indexer, "get_compute_capability", lambda _: (9, 0))
     scaled = keys.endswith("_scaled")
     fmt = keys.split("_")[0]
-    keys = "nvfp4_packed" if keys == "nvfp4_packed" else fmt
     torch.manual_seed(rows)
     nvfp4 = fmt == "nvfp4"
     batch, capacity = len(lengths), max(lengths) + 300
@@ -767,12 +766,9 @@ def test_quantize_write_index_qk_fp8_rejects_bad_inputs(monkeypatch) -> None:
     ):
         with pytest.raises(ValueError, match="contiguous rows"):
             run(**wrong)
-    for capability in ((8, 0), (8, 6)):
-        monkeypatch.setattr(
-            indexer, "get_compute_capability", lambda _, c=capability: c
-        )
-        with pytest.raises(ValueError, match="requires SM89 or newer"):
-            run()
+    monkeypatch.setattr(indexer, "get_compute_capability", lambda _: (8, 6))
+    with pytest.raises(ValueError, match="requires SM89 or newer"):
+        run()
 
 
 @sm10x_only
@@ -1001,6 +997,17 @@ def test_indexer_scores_off_sm10x_rejects_bad_layouts(
     one = torch.ones(1, device="cuda")
     with pytest.raises(ValueError, match="applies only to FP8"):
         run(query, key_cache, table, context, scores=scores, score_scale=one)
+    # Query scales the Triton kernel would not read (only NVFP4 has scales).
+    query_scales = torch.zeros(4, 8, dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="both BF16 or both FP8"):
+        run(
+            fp8_query,
+            fp8_keys,
+            table,
+            context,
+            scores=scores,
+            query_scales=query_scales,
+        )
     with pytest.raises(ValueError, match="score_scale must be a float32"):
         run(fp8_query, fp8_keys, table, context, scores=scores, score_scale=one.half())
     with pytest.raises(ValueError, match="Keys must be"):

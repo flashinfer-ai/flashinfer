@@ -41,7 +41,6 @@ MMA_WARP, LOAD_WARP = STORE_WARPS, STORE_WARPS + 1
 THREADS = 32 * (LOAD_WARP + 1)
 ALIGN = 128  # bytes, of the shared-memory operands TMA writes
 SMEM_RESERVED_PER_CTA = 1024  # bytes the driver keeps per CTA
-MIN_KEY_STAGES = 2  # key stages a CTA needs to overlap a load with an MMA
 # The most key tiles a CTA runs over, since it stages their page indices (8 bytes
 # a tile): 256 in decode, so a run covers 32K keys, and 128 in select.
 TILES_PER_CTA = 256
@@ -263,10 +262,7 @@ class PagedScorer:
         fixed += 4 * PAGES_PER_TILE * self.max_tiles
         fixed += 0 if self.decode else 4 * KEY_GROUP * self.threads
         stage = 2 * 8 + operand(make_key, 1)[2]
-        # Two CTAs per SM only if each keeps MIN_KEY_STAGES key stages, so that it
-        # can load a tile while the MMA reads another (FP8 select would get one).
-        per_cta = fixed + MIN_KEY_STAGES * stage + SMEM_RESERVED_PER_CTA
-        ctas = max(1, min(CTAS_PER_SM, capacity // per_cta))
+        ctas = min(CTAS_PER_SM, capacity // (fixed + stage + SMEM_RESERVED_PER_CTA))
         self.stages = (capacity // ctas - SMEM_RESERVED_PER_CTA - fixed) // stage
         layout_key, scales_key, _ = operand(make_key, self.stages)
         shared_bytes = fixed + self.stages * stage

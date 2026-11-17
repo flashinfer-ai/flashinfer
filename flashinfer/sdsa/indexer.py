@@ -101,6 +101,7 @@ def indexer_scores(
         # BF16 or FP8 keys: one program per request group and 64-key page.
         if (
             key_scales is not None
+            or query_scales is not None
             or query.dtype != key_cache.dtype
             or key_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
         ):
@@ -676,8 +677,7 @@ def quantize_write_index_qk_fp8(
             "Keys, queries, slots, rows, key_cache and fp8_query must have "
             "contiguous rows"
         )
-    major, minor = get_compute_capability(key.device)
-    if (major, minor) < (8, 9):
+    if get_compute_capability(key.device) < (8, 9):
         raise ValueError("quantize_write_index_qk_fp8 requires SM89 or newer")
     rows = key.shape[0] + query.shape[0]
     if rows:

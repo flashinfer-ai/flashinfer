@@ -25,8 +25,9 @@ Off SM10x (Hopper), only decode scoring runs, so it times BF16 and FP8 decode
 (the Triton kernel). FP8 calls pass a ``score_scale`` of 1, as a model does.
 
 Keys and queries are random. The select's thresholds are each row's
-``top_k * (1 + --slack)``-th largest score estimated from a key sample, so a
-few rows miss and get repaired, as with sampled thresholds. Each timed select
+``top_k * (1 + --slack)``-th largest score, estimated from a key sample sized so
+that the threshold is the ``--sample-rank``-th largest sampled score at every
+context. A row rarely misses, so the times are of the select, not the repair. Each timed select
 call first restores the thresholds and zeroes the counters (two small copies).
 
 Times are GPU kernel times from ``bench_gpu_time`` (CUPTI, or CUDA events when
@@ -41,6 +42,7 @@ Usage::
 """
 
 import argparse
+import math
 
 import numpy as np
 import torch
@@ -123,17 +125,24 @@ def bench_select(fmt: str, context: int, args) -> float:
     tile_requests = torch.zeros(tiles, dtype=torch.int32, device="cuda")
     # Thresholds from a key sample: each row's estimated top_k * (1 + slack)-th
     # largest score.
-    sample = torch.randint(first, (args.sample,), device="cuda")
+    target = top_k * (1 + args.slack)
+    count = min(first, math.ceil(args.sample_rank * context / target))
+    sample = torch.randint(first, (count,), device="cuda")
     page, row = table[0, sample // PAGE].long(), sample % PAGE
     # Gathered as bytes: not every indexing op takes FP8.
     sampled = key_cache.view(torch.uint8)[page, row].view(key_cache.dtype)
     sampled = as_float(sampled, None if key_scales is None else key_scales[page, row])
     sample_scores = as_float(query, query_scales) @ sampled.T
-    rank = max(1, round(top_k * (1 + args.slack) * args.sample / context))
-    requested = sample_scores.topk(min(rank, args.sample), 1).values[:, -1]
+    rank = max(1, round(target * count / context))
+    requested = sample_scores.topk(rank, 1).values[:, -1]
     thresholds = requested.clone()
     counters = torch.zeros(rows, 2, dtype=torch.int32, device="cuda")
-    candidates = torch.empty(rows, 2 * top_k, 2, dtype=torch.int32, device="cuda")
+    # Room for twice the targeted top_k * (1 + slack) candidates, so that only
+    # rows the sample misjudges overflow into the repair.
+    capacity = 2 * math.ceil(top_k * (1 + args.slack))
+    candidates = torch.empty(
+        rows, top_k + capacity, 2, dtype=torch.int32, device="cuda"
+    )
     arrivals = torch.zeros(tiles, dtype=torch.int32, device="cuda")
     ranges = torch.empty(2, rows, dtype=torch.int32, device="cuda")
     scale = torch.ones(1, device="cuda") if fmt == "fp8" else None
@@ -172,7 +181,12 @@ def main() -> None:
     parser.add_argument("--formats", nargs="+", default=["bf16", "fp8", "nvfp4"])
     parser.add_argument("--select-rows", type=int, default=1024)
     parser.add_argument("--top-k", type=int, default=2048)
-    parser.add_argument("--sample", type=int, default=16384, help="sampled keys")
+    parser.add_argument(
+        "--sample-rank",
+        type=int,
+        default=1280,
+        help="the threshold's rank among the sampled keys' scores",
+    )
     parser.add_argument("--slack", type=float, default=0.25)
     parser.add_argument("--no-cupti", action="store_true")
     args = parser.parse_args()

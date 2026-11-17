@@ -169,7 +169,7 @@ quantize_write_index_qk_fp8_trace = TraceTemplate(
         "pages": Var(description="Key cache pages."),
         "rows": Var(description="FP8 query rows."),
         "page_size": Const(description="Keys per page."),
-        "one": Const(description="One per-tensor scale.", abbrev=""),
+        "one": Const(description="One per-tensor scale.", abbrev="", value=1),
     },
     inputs={
         "key": Tensor(["tokens", "dim"]),
