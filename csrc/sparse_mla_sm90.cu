@@ -92,12 +92,12 @@ __global__ __launch_bounds__(NTHREAD, 2) void mla_main(
     __nv_bfloat16* __restrict__ outp, int nsplits, int tps, float qscale) {
   static_assert(STATIC_TPS == 0 || STATIC_TPS == 1, "unsupported static TPS");
   extern __shared__ __align__(16) unsigned char smem[];
-  __half* conv = (__half*)smem;              // TILE * CS
-  __half* qs = conv + TILE * CS;             // 8 * QS
-  __half* ps = qs + 8 * QS;                  // TILE * 8
-  float* red0 = (float*)(ps + TILE * 8);     // 32
-  float* red1 = red0 + 32;                   // 32
-  int* sl = (int*)(red1 + 32);               // tps * TILE
+  __half* conv = (__half*)smem;           // TILE * CS
+  __half* qs = conv + TILE * CS;          // 8 * QS
+  __half* ps = qs + 8 * QS;               // TILE * 8
+  float* red0 = (float*)(ps + TILE * 8);  // 32
+  float* red1 = red0 + 32;                // 32
+  int* sl = (int*)(red1 + 32);            // tps * TILE
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int m4 = lane & 3, l4 = lane >> 2;

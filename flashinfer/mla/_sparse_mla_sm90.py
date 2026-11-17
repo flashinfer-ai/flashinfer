@@ -65,7 +65,10 @@ _MAX_NQ = 64
 
 def _disabled() -> bool:
     if os.environ.get(_SPECIALIZED_KERNEL_DISABLE_ENV, "0") not in (
-        "", "0", "false", "False",
+        "",
+        "0",
+        "false",
+        "False",
     ):
         return True
     if os.environ.get(_KILL_SWITCH_ENV, "0") not in ("", "0", "false", "False"):
@@ -143,10 +146,10 @@ def _auto_routes(query: torch.Tensor, nq: int) -> Tuple[bool, Optional[str]]:
         return False, "dispatch allowlist unavailable"
     try:
         op = table["ops"]["sparse_mla_decode"]
-        routed = (
-            tuple(query.shape[-2:]) == (int(op["num_heads"]), int(op["qk_dim"]))
-            and 1 <= nq <= int(op["envelope"]["max_token_rows"])
-        )
+        routed = tuple(query.shape[-2:]) == (
+            int(op["num_heads"]),
+            int(op["qk_dim"]),
+        ) and 1 <= nq <= int(op["envelope"]["max_token_rows"])
     except (KeyError, TypeError, ValueError) as exc:
         return False, f"dispatch allowlist invalid ({type(exc).__name__}: {exc})"
     if not routed:
@@ -312,8 +315,9 @@ def is_sparse_mla_sm90_supported(device: torch.device) -> bool:
     return _device_supported(torch.device(device))
 
 
-def _validate(query, kv_cache, indices, seq_lens, workspace, out, sm_scale, backend,
-              fused=True):
+def _validate(
+    query, kv_cache, indices, seq_lens, workspace, out, sm_scale, backend, fused=True
+):
     if backend not in BACKENDS:
         raise NotImplementedError(
             f"sparse_mla_decode_sm90 supports backend in {BACKENDS}; an "
@@ -433,9 +437,7 @@ def _run(
     # tvm_ffi.use_torch_stream(), with the FFI device object cached: this op
     # runs ~12 us at decode sizes, so per-call host work is kept minimal.
     stream = torch.cuda.current_stream(query.device)
-    with tvm_ffi.use_raw_stream(
-        _ffi_device(query.device.index), stream.cuda_stream
-    ):
+    with tvm_ffi.use_raw_stream(_ffi_device(query.device.index), stream.cuda_stream):
         _get_run_fn()(query, kv_cache, indices, seq_lens, workspace, out, sm_scale)
 
 
