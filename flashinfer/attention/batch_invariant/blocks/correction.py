@@ -787,8 +787,8 @@ def corr_tile_q2(
     nc: Float32,
 ):
     """One KV tile of one Q tile in the paired placement: ``correction_loop``'s tile step verbatim (alpha and the O_c rescale, the
-    statistics chain, the interior chunk merge into O_m in TMEM). The two-stage stats ring holds both tiles' entries interleaved (two
-    per tile per Q tile): this Q tile's two, then the other's two are skipped."""
+    statistics chain, the interior chunk merge into the Q tile's O_m in smem). The two-stage stats ring holds both tiles' entries
+    interleaved (two per tile per Q tile): this Q tile's two, then the other's two are skipped."""
     TPC = st.tpc
     CT = st.ct
     n_pieces = st.D // CT

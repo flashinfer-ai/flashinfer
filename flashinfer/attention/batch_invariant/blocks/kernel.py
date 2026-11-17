@@ -46,8 +46,6 @@ from .operands import (
     BAR_CORRECTION,
     BAR_TMEM_ALLOC,
     Q_ROWS,
-    REGS_OTHER,
-    REGS_SOFTMAX,
     TMEM_COLS,
     StaticPlan,
     TmaSetup,
@@ -362,7 +360,7 @@ class AttentionKernel:
 
         # ---- roles: every role walks the same units in the same order (u = bidx, bidx + grid, ...)
         if warp_idx == R.load_warp:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+            cute.arch.setmaxregister_decrease(R.regs_other)
             if cutlass.const_expr(st.q2):
                 for u in range(bidx, num_units, grid_size):
                     ua = 2 * u
@@ -423,7 +421,7 @@ class AttentionKernel:
                     )
             cute.arch.griddepcontrol_launch_dependents()
         if warp_idx == R.mma_warp:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+            cute.arch.setmaxregister_decrease(R.regs_other)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
@@ -532,7 +530,7 @@ class AttentionKernel:
             warp_idx < R.correction_warps[0]
         ):  # the softmax warpgroups: one code copy, warpgroup k = key slice k (dynamic)
             k = cute.arch.make_warp_uniform(warp_idx // 4)
-            cute.arch.setmaxregister_increase(REGS_SOFTMAX)
+            cute.arch.setmaxregister_increase(R.regs_softmax)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tStS, tOtOc, tOtOm, tOrP = tmem_views(
@@ -725,4 +723,4 @@ class AttentionKernel:
             ).arrive_and_wait()
             tmem.free(tmem_ptr)
         if warp_idx >= R.empty_warps[0]:
-            cute.arch.setmaxregister_decrease(REGS_OTHER)
+            cute.arch.setmaxregister_decrease(R.regs_other)

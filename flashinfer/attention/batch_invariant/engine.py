@@ -161,10 +161,10 @@ Q2_MIN_UNITS_PER_SM = {
 # softmax warpgroups, so smaller batches take the one-warpgroup body with the default ring (a placement rule: same bits); per head dim
 Q2_RING = {
     64: {True: 4, False: 3},
-    128: {True: 2, False: 0},
+    128: {True: 3, False: 0},
 }  # the paired placement's ring depth per head dim, keyed by "a 328 KB part" (SM107) vs a 228 KB part (SM100 / SM103): the two Q
-# tiles and the smem O_m leave room for 4 / 3 slots at D = 64; at D = 128 (two 32 KB Q tiles, a 128 KB O_m) only the larger part
-# fits the placement at all (0: not available)
+# tiles and the smem O_m leave room for 4 / 3 slots at D = 64; at D = 128 (two 32 KB Q tiles, a 128 KB O_m, the replicated
+# placement's payload dropped) 3 slots on the larger part, which alone fits the placement (0: not available)
 
 
 def pair_units(desc: list, grid: int = 0) -> list:

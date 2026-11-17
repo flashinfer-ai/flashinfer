@@ -123,7 +123,7 @@ class Roles:
     their TMEM lanes), then the correction warpgroup, then MMA, load and empty warps completing the last
     warpgroup. Register budget: 65536 = 192 x 128 x n_wg + REGS_CORRECTION x 128 + 32 x 128."""
 
-    def __init__(self, n_wg: int, D: int = 128):
+    def __init__(self, n_wg: int, D: int = 128, q2: bool = False):
         assert n_wg in (1, 2), n_wg
         self.n_wg = n_wg
         self.softmax_warps = tuple(range(4 * n_wg))
@@ -135,12 +135,17 @@ class Roles:
         # the correction warpgroup: 96 with two softmax warpgroups, 128 at D <= 128, 208 when the chunk merge runs through the global scratch
         # (MERGE_DEPTH O_m pieces in flight); the launch allocates 65536 / threads (168 at 384 threads) and the roles move above or below it
         self.regs_correction = 96 if n_wg == 2 else (208 if not om_in_tmem(D) else 128)
+        # the softmax warpgroups and the MMA / load / empty warpgroup (the softmax holds a 128-wide row of S and its exponentials:
+        # fewer than 192 registers spill it; the paired placement's MMA warp keeps both Q tiles' descriptors at 32)
+        self.regs_softmax, self.regs_other = REGS_SOFTMAX, REGS_OTHER
         self.n_tmem_users = 32 * (4 * n_wg + 4 + 1)
         self.regs_launch = (65536 // self.threads) // 8 * 8
         assert (
-            REGS_SOFTMAX * 128 * n_wg + self.regs_correction * 128 + REGS_OTHER * 32 * 4
+            self.regs_softmax * 128 * n_wg
+            + self.regs_correction * 128
+            + self.regs_other * 32 * 4
             <= 65536
-        ), (n_wg, self.regs_correction)
+        ), (n_wg, self.regs_softmax, self.regs_correction, self.regs_other)
 
 
 class StaticPlan:
@@ -189,7 +194,7 @@ class StaticPlan:
             D,
         )  # smem: q_stages(D) Q stages + ring + payloads <= 227 KB
         self.D, self.g, self.page, self.kv_slots = D, g, page, kv_slots
-        self.roles = Roles(n_wg, D)
+        self.roles = Roles(n_wg, D, q2)
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
@@ -208,7 +213,10 @@ class StaticPlan:
         # 0..rep_rows-1 (g <= 32; 30 rows at g = 6, 24 at g = 12). The Q pipeline's transaction count is armed per unit with the
         # bytes its load pattern moves (rows_per_tile or 4 rep_rows rows): with the full-tile count the barrier never completed
         # for g not dividing 128 (24 / 4 and 24 / 2 heads hung)
-        self.rep_ok = g <= REP_ROWS
+        # the replicated-row placement is off under the paired placement at D = 128: its P exchange and four-slice stats payload would
+        # not leave room for the third ring slot next to the two Q tiles and the smem O_m, so units of at most 32 live rows take the
+        # full-row path there (the same thread-per-row term; a placement)
+        self.rep_ok = g <= REP_ROWS and not (q2 and D == 128)
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
         self.n_slices = (
