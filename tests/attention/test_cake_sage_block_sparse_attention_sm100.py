@@ -504,23 +504,32 @@ def test_cake_sage_sm100_cuda_graph_replay_matches_eager():
 
 
 @requires_sm100
-@pytest.mark.parametrize("sel", [12, 24, 32])
-def test_routed_attention_builds_write_the_default_bits(sel, monkeypatch):
+@pytest.mark.parametrize(
+    ("sel", "wide"),
+    [(12, False), (24, False), (32, False), (6, True), (16, True), (23, True)],
+)
+def test_routed_attention_builds_write_the_default_bits(sel, wide, monkeypatch):
     """The builds a call routes to (split QK from 10 blocks a row on SM100, double S from
-    24 on both) write the default build's bits, with and without PDL, uniform and with
-    per-row counts.  A call that takes the tail split (a partial last wave, from the
+    24 on both, and the p3 build in its band of blocks a row once every CTA runs at
+    least two tiles) write the default build's bits, with and without PDL, uniform and
+    with per-row counts.  A call that takes the tail split (a partial last wave, from the
     architecture's ``_TAIL_SPLIT`` threshold) sums its split tiles in another order: it
     holds the kernel's tolerances against the default build instead, the same bits on
     every call."""
     device = torch.device("cuda")
     index = torch.cuda.current_device()
     arch = loader.arch_for_capability(torch.cuda.get_device_capability())
+    sms = loader.sm_count(index)
+    q_blocks = _ceil_div(640, _BLOCK)
+    # A wide case has twice as many tiles as SMs at least: the p3 band's rows.
+    heads = 2 * _ceil_div(sms, q_blocks) if wide else 4
+    tiles = heads * q_blocks
     for per_row in (False, True):
         c = _make_case(
             (
-                f"route_{sel}_{per_row}",
+                f"route_{sel}_{wide}_{per_row}",
                 1,
-                4,
+                heads,
                 2,
                 640,
                 4096,
@@ -538,16 +547,30 @@ def test_routed_attention_builds_write_the_default_bits(sel, monkeypatch):
         assert role == (
             "attention_sd"
             if sel >= 24
-            else ("attention_qs" if arch == "sm_100a" else "attention")
+            else ("attention_qs" if arch == "sm_100a" and sel >= 10 else "attention")
         )
-        tiles = 4 * _ceil_div(640, _BLOCK)
         split = role == "attention_sd" and (
             pkg._tail_split(arch, tiles, sel, index) is not None
         )
+        # The p3 band: 6 to 23 blocks a row on SM100, 16 to 23 on SM103.
+        p3 = wide and {"sm_100a": 6, "sm_103a": 16}[arch] <= sel <= 23
+        assert tiles >= 2 * sms if wide else tiles < 2 * sms
+        if p3:
+            role = "attention_p3"
+        elif split:
+            role = "attention_sd_tsplit"
+        for pdl in (False, True):
+            record = pkg._route(arch, sel, tiles, index, pdl)[0]
+            assert record == (f"{role}_pdl" if pdl else role), record
+        names = cuda_kernel_names(lambda: _run(c, enable_pdl=False))
+        assert names == [loader.MODULES[role]["kernel_symbol"]], names
         routed = [_run(c, enable_pdl=pdl) for pdl in (False, True)]
         with monkeypatch.context() as m:
             m.setattr(pkg, "_ATTENTION_ROUTES", {})
+            m.setattr(pkg, "_P3_BANDS", {})
             m.setattr(pkg, "_ROUTES", {})
+            names = cuda_kernel_names(lambda: _run(c, enable_pdl=False))
+            assert names == [loader.MODULES["attention"]["kernel_symbol"]], names
             out, lse = _run(c, enable_pdl=False)
         torch.cuda.synchronize()
         for o, l in routed:
@@ -1003,7 +1026,7 @@ def test_registry_records_reference_the_build_manifest() -> None:
     assert all(loader.MODULES[name]["arches"] == ["sm_120a"] for name in sm120)
     # The default attention build (and its PDL build) ships on both architectures; the
     # second build of each architecture (split QK on SM100, per tile on SM103) on its own;
-    # the double-S build and its tail-split build on both.
+    # the double-S build, its tail-split build and the p3 build on both.
     assert {
         name: loader.MODULES[name]["arches"]
         for name in loader.records_of_role("attention")
@@ -1018,6 +1041,8 @@ def test_registry_records_reference_the_build_manifest() -> None:
         "attention_sd_pdl": ["sm_100a", "sm_103a"],
         "attention_sd_tsplit": ["sm_100a", "sm_103a"],
         "attention_sd_tsplit_pdl": ["sm_100a", "sm_103a"],
+        "attention_p3": ["sm_100a", "sm_103a"],
+        "attention_p3_pdl": ["sm_100a", "sm_103a"],
     }
     assert all(
         loader.MODULES[name]["launch"]["cluster"] == (2, 1, 1)
