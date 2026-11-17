@@ -35,7 +35,7 @@ except Exception:
     TensorDescriptor = None
     _HTMA = 0
 
-_TMA_SCRATCH = {}
+_TMA_SCRATCH: dict = {}
 
 
 def _tma_alloc(size, alignment, stream):
@@ -2156,7 +2156,7 @@ def _cfg(T, B, split_ok):
     return 2, 16, 16, 64, 8, 3, PV_SML
 
 
-_SCRATCH = {}
+_SCRATCH: dict = {}
 
 
 def _desc(k_cache, v_cache, bn, nslot):
@@ -2337,21 +2337,3 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
                 ws, wlp, wmp, gate, out, nrow,
                 NSP=max_nsp, RB=rb, DC=D,
                 num_warps=8, num_stages=2)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
