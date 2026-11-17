@@ -4985,9 +4985,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     const __grid_constant__ Params params, float* tmp_v) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStoragePaged&>(smem);
-  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage, threadIdx,
-                                                              blockIdx.x, blockIdx.z, gridDim.z,
-                                                              tmp_v);
+  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(
+      params, smem_storage, threadIdx, blockIdx.x, blockIdx.z, gridDim.z, tmp_v);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
