@@ -958,7 +958,7 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
     permutedIdxArrSmem[kChunkIdx] = permutedIdxPacked;
   }
 
-  auto const offset = tokenIdx * params.hiddenDim;
+  int64_t const offset = static_cast<int64_t>(tokenIdx) * params.hiddenDim;
   Type* outputPtr = params.outPtr + offset;
   auto* outElemPtr = reinterpret_cast<OutputElem*>(outputPtr);
   auto const* inElemPtr = reinterpret_cast<InputElem const*>(params.inPtr);
@@ -1123,7 +1123,8 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
         acc[e] += partialSmem[g * blockDim.x + threadIdx.x][e];
       }
     }
-    reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim)[vecIdx] =
+    reinterpret_cast<VecElem*>(params.outPtr +
+                               static_cast<int64_t>(tokenIdx) * params.hiddenDim)[vecIdx] =
         arrayConvert<ComputeElem, VecElem>(acc);
   }
 }
