@@ -1325,6 +1325,14 @@ def test_trtllm_gen_routed_activation_parity(
 
     clamp_limit = None
     if activation_type == ActivationType.ClampedRelu2.value:
+        # Distinct, exactly representable logits avoid ambiguous top-k expert sets.
+        routing_logits = (
+            (
+                torch.arange(num_experts, device=device)[None, :]
+                + torch.arange(num_tokens, device=device)[:, None]
+            )
+            % num_experts
+        ).to(torch.bfloat16) / 16
         # Exact input/weight values isolate activation, per-expert scales, and routing.
         # Each MXFP8 block holds one value, avoiding cancellation or underflow.
         values = torch.tensor([-4, 0, 0.5, 1, 2, 4, 8, 32], device=device)
