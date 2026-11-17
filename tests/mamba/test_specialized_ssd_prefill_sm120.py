@@ -38,11 +38,13 @@ def _is_sm120_exactly():
     return torch.cuda.get_device_capability(0) == (12, 0)
 
 
-def _has_cuda_13_toolkit():
+def _has_min_cuda_toolkit():
     try:
+        from packaging.version import Version
+
         from flashinfer.jit.cpp_ext import get_cuda_version
 
-        return get_cuda_version().major >= 13
+        return get_cuda_version() >= Version("13.3")
     except Exception:
         return False
 
@@ -53,9 +55,9 @@ pytestmark = [
         reason="the specialized SSD prefill backend is SM120-only",
     ),
     pytest.mark.skipif(
-        not _has_cuda_13_toolkit(),
+        not _has_min_cuda_toolkit(),
         reason="the specialized backend JIT-builds an sm_120a module "
-        "(CUDA 13 toolkit required)",
+        "(CUDA >= 13.3 toolkit required)",
     ),
 ]
 

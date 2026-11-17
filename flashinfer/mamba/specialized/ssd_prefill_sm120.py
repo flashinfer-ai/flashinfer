@@ -48,6 +48,10 @@ _DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 _WORKLOAD_FILE = "ssd_prefill_sm120_workload.json"
 
 _warmed: set = set()  # (device_index, nheads) pairs that ran eagerly once
+# The native module binds per-kernel launch state (shared-memory opt-in,
+# cooperative residency) to the first CUDA device that runs it; the guard
+# refuses any other device instead of launching against that state.
+_native_device: Optional[int] = None
 _allowlist_cache: Optional[dict] = None
 
 _stats: Dict[str, Any] = {
@@ -262,12 +266,37 @@ def _guard_call(
         out.shape != (1, T, nheads, headdim)
         or out.dtype != torch.bfloat16
         or not out.is_contiguous()
+        or out.device != x.device
     ):
         return "out_form"
+    # --- GPU-free pointer checks (placement, alignment, aliasing) ---
+    if x.device.type != "cuda":
+        return "device_mismatch"
+    for t in (dt, A, B, C, D, dt_bias):
+        if t.device != x.device:
+            return "device_mismatch"
+    # The kernel uses 16-byte vector memory operations and TMA tensor maps;
+    # a storage-offset view can defeat the allocator's natural alignment.
+    for t in (x, B, C):
+        if t.data_ptr() % 16 != 0:
+            return "alignment"
+    if out is not None:
+        if out.data_ptr() % 16 != 0:
+            return "alignment"
+        # Output stores must never land in memory an input still reads.
+        o0 = out.data_ptr()
+        o1 = o0 + out.numel() * out.element_size()
+        for t in (x, dt, A, B, C, D, dt_bias):
+            t0 = t.data_ptr()
+            t1 = t0 + t.numel() * t.element_size()
+            if o0 < t1 and t0 < o1:
+                return "out_overlap"
     # --- device guards ---
     cc = tuple(get_compute_capability(x.device))
     if not (allow["min_cc"] <= cc <= allow["max_cc"]):
         return "compute_capability"
+    if _native_device is not None and x.device.index != _native_device:
+        return "native_state_other_device"
     # CUDA-graph rule: the first call JIT-compiles and initializes the
     # cooperative-launch state on the host — never under capture.
     if (
@@ -342,6 +371,8 @@ def maybe_run_specialized(
         dt_bias,
         out.view(T, nheads, headdim),
     )
+    global _native_device
+    _native_device = x.device.index
     _warmed.add((x.device.index or 0, nheads))
     _stats["specialized_dispatches"] += 1
     return (out, None), None
@@ -350,10 +381,17 @@ def maybe_run_specialized(
 def warmup(nheads: int, device=None) -> None:
     """Pre-build the module and run one eager call per nheads variant
     (CUDA-graph rule: an unwarmed variant never dispatches under capture)."""
+    global _native_device
     allow = _load_allowlist()
     if allow is None or nheads not in allow["nheads"]:
         return
+    if os.environ.get(_DISABLE_ENV, "0") == "1":
+        return
     device = torch.device(device or "cuda")
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if _native_device is not None and device.index != _native_device:
+        return
     run = _kernel_entry()
     hd, ds, ng = allow["headdim"], allow["dstate"], allow["ngroups"]
     T = allow["chunk_size"]
@@ -367,4 +405,5 @@ def warmup(nheads: int, device=None) -> None:
     y = torch.empty(T, nheads, hd, dtype=torch.bfloat16, device=device)
     run(x, dt, A, B, C, D, db, y)
     torch.cuda.synchronize(device)
+    _native_device = device.index
     _warmed.add((device.index or 0, nheads))
