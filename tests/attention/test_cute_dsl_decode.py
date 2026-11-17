@@ -175,15 +175,22 @@ def _decode_reference_contiguous(
     sm_scale: float,
     sinks: torch.Tensor | None = None,
 ):
-    """Ragged (contiguous KV) GQA decode reference; q has shape [b, 1, h_q, d]."""
+    """Ragged (contiguous KV) GQA decode reference; q has shape [b, q_len, h_q, d].
+
+    Queries are the last ``q_len`` tokens of the KV sequence with a bottom-right causal
+    mask (the wrapper's default ``window_right=0``); for ``q_len == 1`` it is a no-op.
+    """
     batch_size, q_len, num_qo_heads, head_dim = q.shape
-    assert q_len == 1
+    kv_len = k.shape[1]
     num_kv_heads = k.shape[2]
     group = num_qo_heads // num_kv_heads
     keys = k.repeat_interleave(group, dim=2).float()  # [b, s, h_q, d]
     values = v.repeat_interleave(group, dim=2).float()
     q_f32 = q.float()
     logits = torch.einsum("bqhd,bnhd->bhqn", q_f32, keys) * sm_scale
+    query_positions = torch.arange(kv_len - q_len, kv_len, device=q.device)[:, None]
+    key_positions = torch.arange(kv_len, device=q.device)[None, :]
+    logits.masked_fill_((key_positions > query_positions)[None, None], float("-inf"))
     if sinks is not None:
         sink_logits = sinks.float().view(1, num_qo_heads, 1, 1)
         sink_logits = sink_logits.expand(batch_size, -1, q_len, -1)
@@ -1024,6 +1031,384 @@ def test_cute_dsl_decode_paged_sliding_window_skips_full_pages(
     torch.testing.assert_close(out.reshape_as(ref), ref, rtol=5e-3, atol=5e-3)
 
 
+@pytest.mark.parametrize("page_size", [32])
+@pytest.mark.parametrize("window_left", [127])
+@pytest.mark.parametrize("window_right", [0, 3])
+@pytest.mark.parametrize("reduction", ["kernel", "none", "atomic"])
+def test_cute_dsl_decode_paged_sliding_window_multi_q_tile(
+    page_size, window_left, window_right, reduction
+):
+    """Per-Q-tile page skipping and get_tiles_kv end bounds.
+
+    32/4 heads give a grouped-head tile of 8 and a prediction tile of 4, so
+    q_len_per_req=8 splits each request into two Q tiles whose windows start
+    and end at different KV positions. With atomic reduction (4 splits), small
+    windows leave some splits without KV tiles; they must still take part in the
+    cluster reduction."""
+    dtype = torch.bfloat16
+    q_len_per_req = 8
+    seq_lens_host = [130, 515, 1031, 2048]
+    batch_size = len(seq_lens_host)
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size,
+        q_len_per_req,
+        NUM_QO_HEADS,
+        HEAD_DIM,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    kv, kv_indptr, kv_indices, _last_page_len, seq_lens = _make_paged_kv_varlen(
+        seq_lens_host, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        kv_splits={"kernel": 3, "none": 1, "atomic": 4}[reduction],
+        reduction=reduction,
+        q_len_per_req=q_len_per_req,
+        window_left=window_left,
+        window_right=window_right,
+        max_kv_len=max(seq_lens_host),
+    )
+    out = wrapper.run(q, k_cache, v_cache)
+    ref = _decode_reference_paged_window(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        sm_scale,
+        window_left,
+        window_right,
+    )
+    torch.testing.assert_close(out.reshape_as(ref), ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("kv_splits_sequence", [(3, 5, 3)])
+def test_cute_dsl_decode_paged_kernel_reduction_replans_kv_splits(kv_splits_sequence):
+    """The reduction kernel is specialized on kv_splits at compile time, so each
+    new kv_splits must compile a distinct cache entry, a repeated kv_splits must
+    reuse its entry, and every plan must produce the reference output."""
+    from flashinfer.cute_dsl.attention.wrappers import batch_decode as batch_decode_mod
+
+    compile_cache = batch_decode_mod._get_compiled_paged_decode_kernel
+    dtype = torch.bfloat16
+    batch_size, page_size, kv_len = 4, 16, 2048
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len, seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    ref = _decode_reference_paged(
+        q, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    )
+    # Earlier tests may have compiled these exact kernels; start from an empty
+    # cache so new and repeated kv_splits values are distinguishable.
+    compile_cache.cache_clear()
+    compiled_by_splits = {}
+    for kv_splits in kv_splits_sequence:
+        entries = compile_cache.cache_info().currsize
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            seq_lens,
+            num_qo_heads=NUM_QO_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_dim=HEAD_DIM,
+            page_size=page_size,
+            q_data_type=dtype,
+            sm_scale=sm_scale,
+            kv_splits=kv_splits,
+            reduction="kernel",
+            max_kv_len=kv_len,
+        )
+        compiled = wrapper._compiled_fmha_std
+        if kv_splits in compiled_by_splits:
+            assert compile_cache.cache_info().currsize == entries, (
+                f"re-planning kv_splits={kv_splits} recompiled instead of reusing "
+                "its cache entry"
+            )
+            assert compiled is compiled_by_splits[kv_splits]
+        else:
+            assert compile_cache.cache_info().currsize == entries + 1, (
+                f"kv_splits={kv_splits} did not compile a new cache entry; the "
+                "reduction kernel would be specialized for another kv_splits"
+            )
+            assert all(compiled is not c for c in compiled_by_splits.values())
+            compiled_by_splits[kv_splits] = compiled
+
+        out = wrapper.run(q, k_cache, v_cache)
+        torch.testing.assert_close(
+            out.reshape(batch_size, NUM_QO_HEADS, HEAD_DIM),
+            ref,
+            rtol=5e-3,
+            atol=5e-3,
+            msg=lambda m, kv_splits=kv_splits: f"kv_splits={kv_splits}: {m}",
+        )
+
+
+# Each reduction mode, q_len_per_req and window setting appears in at least one case;
+# the windowed cases cover the preload hazard bound on the rebased sequence length.
+@pytest.mark.parametrize(
+    ("reduction", "q_len_per_req", "window_left"),
+    [
+        ("kernel", 1, None),
+        ("kernel", 4, None),
+        ("atomic", 4, 127),
+        ("none", 1, 127),
+    ],
+)
+def test_cute_dsl_decode_paged_pdl_kv_preload(reduction, q_len_per_req, window_left):
+    """plan(pdl_kv_preload=True) matches the reference when q is produced by
+    the kernel launched immediately before decode and run() uses PDL."""
+    dtype = torch.bfloat16
+    batch_size, page_size, kv_len = 4, 16, 1500
+    torch.manual_seed(0)
+    q_src = torch.randn(
+        batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv, kv_indptr, kv_indices, _last_page_len, seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        kv_splits=1 if reduction == "none" else 4,
+        reduction=reduction,
+        q_len_per_req=q_len_per_req,
+        window_left=window_left,
+        max_kv_len=kv_len,
+        pdl_kv_preload=True,
+    )
+    # q is written by the kernel right before decode, which PDL overlaps.
+    q = q_src * 1.0
+    out = wrapper.run(q, k_cache, v_cache, enable_pdl=True)
+    ref = _decode_reference_paged_window(
+        q_src,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        sm_scale,
+        kv_len if window_left is None else window_left,
+    )
+    torch.testing.assert_close(out.reshape_as(ref), ref, rtol=5e-3, atol=5e-3)
+
+
+def _compile_pdl_late_writer(q_src, q_dst, kv_src, kv_dst):
+    """Compile a PDL primary kernel that lets its dependent launch immediately,
+    spins for ``ns`` nanoseconds, then copies ``q_src``/``kv_src`` into
+    ``q_dst``/``kv_dst``. Returns ``launch(ns)`` on the current stream."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cute.typing import Int64
+
+    class _LateWriter:
+        @cute.kernel
+        def kernel(self, ns: Int64, q_s, q_d, kv_s, kv_d):
+            cute.arch.griddepcontrol_launch_dependents()
+            bidx, _, _ = cute.arch.block_idx()
+            tidx, _, _ = cute.arch.thread_idx()
+            t0 = cute.arch.globaltimer()
+            t = cute.arch.globaltimer()
+            while t - t0 < ns:
+                t = cute.arch.globaltimer()
+            for i in cutlass.range(bidx * 128 + tidx, cute.size(q_s), 128 * 64):
+                q_d[i] = q_s[i]
+            for i in cutlass.range(bidx * 128 + tidx, cute.size(kv_s), 128 * 64):
+                kv_d[i] = kv_s[i]
+
+        @cute.jit
+        def __call__(self, ns: Int64, q_s, q_d, kv_s, kv_d, stream):
+            self.kernel(ns, q_s, q_d, kv_s, kv_d).launch(
+                grid=[64, 1, 1], block=[128, 1, 1], stream=stream, use_pdl=True
+            )
+
+    def view(t):
+        return from_dlpack(t.view(-1), assumed_align=16).mark_layout_dynamic()
+
+    stream = cuda.CUstream(torch.cuda.current_stream(DEVICE).cuda_stream)
+    args = (view(q_src), view(q_dst), view(kv_src), view(kv_dst), stream)
+    compiled = cute.compile(_LateWriter(), Int64(0), *args)
+    return lambda ns: compiled(Int64(ns), *args)
+
+
+@pytest.mark.parametrize(
+    ("reduction", "kv_splits", "q_len_per_req"), [("kernel", 4, 4), ("atomic", 4, 1)]
+)
+def test_cute_dsl_decode_paged_pdl_kv_preload_hazard(
+    reduction, kv_splits, q_len_per_req
+):
+    """With pdl_kv_preload, decode may start before its predecessor finishes but
+    must not read q or the newest q_len_per_req tokens' K/V before the PDL wait.
+
+    Those are NaN until a PDL primary kernel, spinning 5 ms after letting decode
+    launch, writes the real values; reading them early makes the output wrong.
+    """
+    dtype = torch.bfloat16
+    batch_size, page_size, kv_len = 4, 16, 1500
+    torch.manual_seed(0)
+    q_true = torch.randn(
+        batch_size, q_len_per_req, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    kv_true, kv_indptr, kv_indices, _last_page_len, seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    q, kv = q_true.clone(), kv_true.clone()
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        kv_splits=kv_splits,
+        reduction=reduction,
+        q_len_per_req=q_len_per_req,
+        max_kv_len=kv_len,
+        pdl_kv_preload=True,
+    )
+    out = torch.zeros_like(q)
+    late_writer = _compile_pdl_late_writer(q_true, q, kv_true, kv)
+    # Load both modules now: a first launch loads its module and blocks the host,
+    # which would delay the decode launch until after the 5 ms spin.
+    late_writer(0)
+    wrapper.run(q, k_cache, v_cache, out=out, enable_pdl=True)
+    torch.cuda.synchronize()
+
+    # Poison what the predecessor owns: q and the newest q_len_per_req tokens' K/V.
+    q.fill_(float("nan"))
+    indptr_host, indices_host = kv_indptr.tolist(), kv_indices.tolist()
+    for b in range(batch_size):
+        for t in range(kv_len - q_len_per_req, kv_len):
+            page = indices_host[indptr_host[b] + t // page_size]
+            kv[page, :, t % page_size] = float("nan")
+    out.zero_()  # atomic reduction accumulates into out
+    torch.cuda.synchronize()
+
+    late_writer(5_000_000)
+    wrapper.run(q, k_cache, v_cache, out=out, enable_pdl=True)
+    torch.cuda.synchronize()
+
+    k_true, v_true = kv_true.unbind(dim=1)
+    ref = _decode_reference_paged_window(
+        q_true, k_true, v_true, kv_indptr, kv_indices, seq_lens, sm_scale, kv_len
+    )
+    assert not torch.isnan(out).any(), "decode read predecessor-owned data early"
+    torch.testing.assert_close(out.reshape_as(ref), ref, rtol=5e-3, atol=5e-3)
+
+
+def test_batch_decode_wrapper_cute_dsl_pdl_kv_preload():
+    """decode.py forwards plan(pdl_kv_preload=True) to the cute-dsl backend."""
+    dtype = torch.bfloat16
+    batch_size, page_size, kv_len = 4, 16, 1024
+    torch.manual_seed(0)
+    q_src = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        kv_layout="NHD",
+        backend="cute-dsl",
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        NUM_QO_HEADS,
+        NUM_KV_HEADS,
+        HEAD_DIM,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        sm_scale=sm_scale,
+        pdl_kv_preload=True,
+    )
+    assert wrapper._cute_dsl_wrapper._compile_args[-1] is True
+    q = q_src * 1.0
+    out = wrapper.run(q, kv, enable_pdl=True)
+    ref = _decode_reference_paged(
+        q_src, k_cache, v_cache, kv_indptr, kv_indices, kv_last_page_len, sm_scale
+    )
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+
+
+def test_batch_decode_wrapper_pdl_kv_preload_requires_cute_dsl():
+    batch_size, page_size, kv_len = 2, 16, 64
+    dtype = torch.bfloat16
+    _kv, kv_indptr, kv_indices, kv_last_page_len, _seq_lens = _make_paged_kv(
+        batch_size, kv_len, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        kv_layout="NHD",
+        backend="fa2",
+    )
+    with pytest.raises(NotImplementedError, match="pdl_kv_preload"):
+        wrapper.plan(
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            pdl_kv_preload=True,
+        )
+
+
 def test_cute_dsl_decode_paged_sliding_window_cuda_graph_runtime_lengths():
     """Graph replay must observe changed lengths without changing page tables."""
     dtype = torch.bfloat16
@@ -1858,9 +2243,8 @@ def test_cute_dsl_decode_paged_wrapper_reduction_none_rejects_split():
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_cute_dsl_decode_paged_wrapper_reuses_workspace(dtype):
     """Workspace tensors come from `float_workspace_buffer`, not fresh allocs.
-    A second run() with different inputs must still produce correct output —
-    confirms m_bsh is re-`-inf`-initialized each call (a missed re-init would
-    corrupt the second run's softmax)."""
+    A second run() with different inputs must still produce correct output, so
+    no state left in the workspace by the first run leaks into the second."""
     batch_size, page_size, kv_len = 8, 16, 1024
     torch.manual_seed(0)
     q1 = torch.randn(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
@@ -2009,11 +2393,11 @@ def test_cute_dsl_decode_paged_wrapper_reduction_none_sinks(dtype):
     )
 
 
-@pytest.mark.parametrize("reduction", ["kernel", "none"])
+@pytest.mark.parametrize("reduction", ["kernel", "none", "atomic"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_cute_dsl_decode_paged_wrapper_lse_padded_head_group(reduction, dtype):
     """6 query heads per KV head pad to an 8-row head tile; padded lanes must not
-    store LSE into the next KV head's rows."""
+    store LSE into the next KV head's rows, nor past the end of ``lse``."""
     num_qo_heads, num_kv_heads = 24, 4
     batch_size, page_size, kv_len = 4, 16, 1024
     torch.manual_seed(0)
@@ -2041,11 +2425,23 @@ def test_cute_dsl_decode_paged_wrapper_lse_padded_head_group(reduction, dtype):
         q_data_type=dtype,
         sm_scale=sm_scale,
         reduction=reduction,
-        kv_splits=1,
+        # Atomic reduction needs several splits to exercise the cluster reduction.
+        kv_splits=4 if reduction == "atomic" else 1,
     )
-    lse = torch.empty(batch_size, 1, num_qo_heads, dtype=torch.float32, device=DEVICE)
+    # Guard band after lse: the last KV head's padded rows point past its end.
+    guard_value = 12345.0
+    lse_buf = torch.full(
+        (batch_size * num_qo_heads + 64,),
+        guard_value,
+        dtype=torch.float32,
+        device=DEVICE,
+    )
+    lse = lse_buf[: batch_size * num_qo_heads].view(batch_size, 1, num_qo_heads)
     wrapper.run(q, k_cache, v_cache, lse=lse)
     torch.testing.assert_close(lse.squeeze(1), lse_ref, rtol=5e-3, atol=5e-3)
+    assert torch.all(lse_buf[batch_size * num_qo_heads :] == guard_value), (
+        "LSE store wrote past the end of the lse tensor"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -2086,6 +2482,93 @@ def test_cute_dsl_decode_ragged_reduction_none_sinks_lse_padded_head_group(dtype
     logits = torch.einsum("bqhd,bnhd->bqhn", q.float(), keys) * sm_scale
     lse_ref = torch.logsumexp(logits, dim=-1) * math.log2(math.e)
     torch.testing.assert_close(lse, lse_ref, rtol=5e-3, atol=5e-3)
+
+
+# (24, 4) covers padded head rows and multi-token tiles together.
+@pytest.mark.parametrize(("num_qo_heads", "q_len_per_req"), [(32, 1), (24, 4)])
+def test_cute_dsl_decode_ragged_reduction_none_persistent_multi_tile(
+    num_qo_heads, q_len_per_req
+):
+    """Ragged `reduction="none"` runs the persistent kernel, which hands CTAs further
+    work tiles through cluster launch control only while tiles remain unlaunched.
+
+    64 requests x 4 KV heads = 256 work tiles (one grouped-head x prediction tile per
+    KV head), more than the GPU runs at once, so CTAs process several tiles and the
+    next-tile path (Q/O double buffering, per-tile LSE and sink slices) is exercised.
+    24 Q heads pad the 6-head group to an 8-row tile, so LSE stores need masking.
+    """
+    from flashinfer.cute_dsl.attention.wrappers.batch_decode import _pick_tile_shape
+
+    dtype = torch.bfloat16
+    num_kv_heads, batch_size, kv_len = 4, 64, 1024
+    group = num_qo_heads // num_kv_heads
+    head_tile, prediction_tile = _pick_tile_shape(
+        num_qo_heads, num_kv_heads, q_len_per_req, dtype.itemsize * 8
+    )
+    work_tiles = (
+        batch_size
+        * num_kv_heads
+        * math.ceil(group / head_tile)
+        * math.ceil(q_len_per_req / prediction_tile)
+    )
+    assert work_tiles == 256
+    num_sms = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+    if work_tiles <= num_sms:
+        pytest.skip(f"{work_tiles} work tiles fit in one wave on {num_sms} SMs")
+
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, q_len_per_req, num_qo_heads, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    k = torch.randn(
+        batch_size, kv_len, num_kv_heads, HEAD_DIM, device=DEVICE, dtype=dtype
+    )
+    v = torch.randn_like(k)
+    sinks = torch.randn(num_qo_heads, device=DEVICE, dtype=torch.float32)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodeCuteDSLWrapper(
+        torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+    )
+    wrapper.plan(
+        batch_size=batch_size,
+        max_kv_len=kv_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=HEAD_DIM,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        reduction="none",
+        kv_splits=1,
+        q_len_per_req=q_len_per_req,
+    )
+
+    out = wrapper.run(q, k, v)
+    ref = _decode_reference_contiguous(q, k, v, sm_scale)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+
+    # Sinks and LSE together; LSE goes into a guarded buffer to catch padded-row stores.
+    guard_value = 12345.0
+    num_lse = batch_size * q_len_per_req * num_qo_heads
+    lse_buf = torch.full((num_lse + 64,), guard_value, device=DEVICE)
+    lse = lse_buf[:num_lse].view(batch_size, q_len_per_req, num_qo_heads)
+    out = wrapper.run(q, k, v, sinks=sinks, lse=lse)
+    ref = _decode_reference_contiguous(q, k, v, sm_scale, sinks=sinks)
+    torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+
+    keys = k.repeat_interleave(group, dim=2).float()
+    logits = torch.einsum("bqhd,bnhd->bqhn", q.float(), keys) * sm_scale
+    query_positions = torch.arange(kv_len - q_len_per_req, kv_len, device=DEVICE)
+    causal = torch.arange(kv_len, device=DEVICE)[None, :] > query_positions[:, None]
+    logits.masked_fill_(causal[None, :, None, :], float("-inf"))
+    sink_logits = sinks.view(1, 1, num_qo_heads, 1).expand(
+        batch_size, q_len_per_req, -1, -1
+    )
+    lse_ref = torch.logsumexp(torch.cat([logits, sink_logits], dim=-1), dim=-1)
+    torch.testing.assert_close(lse, lse_ref * math.log2(math.e), rtol=5e-3, atol=5e-3)
+    assert torch.all(lse_buf[num_lse:] == guard_value), (
+        "LSE store wrote past the end of the lse tensor"
+    )
 
 
 @pytest.mark.parametrize("reduction", ["kernel", "none"])

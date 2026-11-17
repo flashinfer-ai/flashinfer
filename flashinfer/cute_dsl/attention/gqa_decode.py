@@ -10,7 +10,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import (
     Agent,
@@ -18,18 +17,24 @@ from cutlass.pipeline import (
     NamedBarrier as nbar,
 )
 
-import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils as utils
 from cutlass.cute.typing import (
     Float32,
     BFloat16,
     Float16,
     Int32,
     Int64,
+    Int128,
+    Boolean,
     Optional,
 )
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 
+from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
 from flashinfer.cute_dsl.attention.fusion.mask import (
     AttentionMask,
+    NoMask,
     DenseMask,
     CausalMask,
     SlidingWindowMask,
@@ -54,6 +59,51 @@ smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
 gmem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="gpu")
 
 
+def resource_arch_name(arch: Arch) -> str:
+    return f"sm_{arch.major}{arch.minor}"
+
+
+def is_sm107_arch(arch: Arch) -> bool:
+    """Whether ``arch`` is an SM107 (Rubin) compile target."""
+    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+
+
+def make_kq_vp_tiled_mma_fn(mma_dtype, use_sm107_mma: bool):
+    """Tiled-MMA factory for the KQ and VP GEMMs."""
+    if use_sm107_mma and mma_dtype.width == 8:
+        return utils.sm107.make_trivial_tiled_mma
+    return utils.sm100.make_trivial_tiled_mma
+
+
+def lse_tile_coords(
+    mL: cute.Tensor,
+    blk_tile_hp: Tuple[int, int],
+    coord_hp: Tuple[Int32, Int32],
+):
+    """(grouped head, prediction) coordinates of each row of an LSE tile.
+
+    The grouped-head x prediction tile is padded to a power of two, so rows past
+    ``mL.shape[0]`` are padding: their LSE slots alias the next KV head's rows,
+    or lie past the end of the tensor, and must not be stored.
+    """
+    return cute.local_tile(
+        cute.make_identity_tensor(mL.shape[0]), blk_tile_hp, coord_hp
+    )
+
+
+def lse_lane_valid(
+    mL: cute.Tensor,
+    blk_tile_hp: Tuple[int, int],
+    coord_hp: Tuple[Int32, Int32],
+    lane_idx: Int32,
+):
+    """Whether ``lane_idx`` of a grouped-head x prediction tile is a real row
+    (see :func:`lse_tile_coords`)."""
+    idx_hg, idx_p = lse_tile_coords(mL, blk_tile_hp, coord_hp)[lane_idx]
+    grouped_heads, prediction = mL.shape[0]
+    return (idx_hg < grouped_heads) & (idx_p < prediction)
+
+
 class GroupedQueryAttentionDecode:
     def __init__(
         self,
@@ -62,6 +112,13 @@ class GroupedQueryAttentionDecode:
         prediction_tile=1,
         sequence_tile=256,
         reduction_mode: Literal["kernel", "atomic", "none"] = "kernel",
+        *,
+        disable_persistence=False,
+        reduction_splits: Optional[int] = 16,
+        red_vec_bits: int = 64,
+        red_d_ctas: int = 1,
+        red_max_groups: int = 16,
+        kv_stages_cap: int = 0,
     ):
         """
         Parameters
@@ -79,6 +136,19 @@ class GroupedQueryAttentionDecode:
               - ``"kernel"``: deterministic kernel reduction with partial result workspace.
               - ``"atomic"``: cluster reduction with atomic adds, no workspace.
               - ``"none"``: no split-K, flash decoding disabled.
+        reduction_splits
+            ``kv_splits`` as a Python int, for ``"kernel"`` reduction only. The
+            reducer is specialized at compile time.
+        red_vec_bits
+            Width in bits of the reduction kernel's per-thread partial-O vector.
+        red_d_ctas
+            Reduction CTAs per head; splits a head's head-dimension gather
+            across that many CTAs.
+        red_max_groups
+            Upper bound on the reduction kernel's split groups. The group count
+            is the largest divisor of ``reduction_splits`` not exceeding it.
+        kv_stages_cap
+            Maximum KV pipeline depth; zero leaves the depth uncapped.
         """
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
@@ -87,12 +157,24 @@ class GroupedQueryAttentionDecode:
         self.do_kernel_red = reduction_mode == "kernel"
         self.do_atomic_red = reduction_mode == "atomic"
         self.do_none_red = reduction_mode == "none" or reduction_mode is None
+        self.is_persistent = self.do_none_red and not disable_persistence
+        self.reduction_splits = reduction_splits
+        self.red_vec_bits = red_vec_bits
+        self.red_d_ctas = red_d_ctas
+        self.red_max_groups = red_max_groups
+        self.kv_stages_cap = kv_stages_cap
         self.threads_per_cta = 4 * warpgroup_threads
+        # DSL compile target (CUTE_DSL_ARCH or the current device)
+        self.arch = BaseDSL._get_dsl().get_arch_enum()
+        self.resource_arch = resource_arch_name(self.arch)
+        self.use_sm107_mma = is_sm107_arch(self.arch)
 
         assert headdim > 0 and headdim % 64 == 0
         assert grouped_head_tile * prediction_tile in (1, 2, 4, 8, 16, 32)
         assert sequence_tile > 0 and sequence_tile % 128 == 0
         assert self.do_kernel_red ^ self.do_atomic_red ^ self.do_none_red
+        if self.do_kernel_red:
+            assert reduction_splits is not None
 
     ##############################
     # Launch helpers
@@ -121,6 +203,11 @@ class GroupedQueryAttentionDecode:
         if h_q % h_k != 0:
             raise ValueError(f"heads_q({h_q}) must be a multiple of heads_k({h_k})")
 
+        if s_q > self.sequence_tile:
+            raise ValueError(
+                f"seqlen_q({s_q}) must be at most tile_kv({self.sequence_tile}) for decode"
+            )
+
         if 0 < s_k < s_q:
             raise ValueError(
                 f"non-zero seqlen({s_k}) must be at least prediction({s_q})"
@@ -142,6 +229,12 @@ class GroupedQueryAttentionDecode:
 
         if self.do_none_red and kv_splits != 1:
             raise ValueError("KV splits must be 1 if flash decoding is disabled")
+
+        if self.do_kernel_red and kv_splits != self.reduction_splits:
+            raise ValueError(
+                f"kv_splits={kv_splits} must match "
+                f"compiled reduction_splits={self.reduction_splits}"
+            )
 
         mask_config.can_implement(s_q, s_k, self.prediction_tile, self.sequence_tile)
 
@@ -196,7 +289,6 @@ class GroupedQueryAttentionDecode:
         v_bshd: cute.Tensor,
         o_bshd: cute.Tensor,
         l_bsh: Optional[cute.Tensor],
-        m_bsh: Optional[cute.Tensor],
         o_partial_bshd: Optional[cute.Tensor],
         l_partial_bsh: Optional[cute.Tensor],
         m_partial_bsh: Optional[cute.Tensor],
@@ -218,9 +310,6 @@ class GroupedQueryAttentionDecode:
             Output tensor. Must be zero initialized for atomic reduction.
         l_bsh
             Log-sum-exp output (Float32, log2 base). May be None.
-        m_bsh
-            ``colmax_s`` running accumulator. Must be -inf initialized
-            (kernel-red workspace).
         o_partial_bshd
             Partial O per kv split (kernel-red workspace).
         l_partial_bsh
@@ -246,6 +335,7 @@ class GroupedQueryAttentionDecode:
         ##############################
         mma_dtype = q_bshd.dtype
         acc_dtype = Float32
+        o_smem_dtype = o_partial_bshd.dtype if self.do_kernel_red else o_bshd.dtype
         assert k_bshd.dtype == v_bshd.dtype == mma_dtype
 
         # Block tile sets the granularity at which threadblocks consume work (BMM1/BMM2)
@@ -271,8 +361,10 @@ class GroupedQueryAttentionDecode:
         assert blk_tile_s % mma_tile_m == 0
         assert mma_tile_n % blk_tile_n == 0
 
+        make_tiled_mma = make_kq_vp_tiled_mma_fn(mma_dtype, self.use_sm107_mma)
+
         # GEMM1: (S_K, (H_R, S_Q), D, (H_K, B))
-        tiled_mma_kq = sm100_utils.make_trivial_tiled_mma(
+        tiled_mma_kq = make_tiled_mma(
             mma_dtype,
             mma_dtype,
             OperandMajorMode.K,  # K
@@ -283,7 +375,7 @@ class GroupedQueryAttentionDecode:
         )
 
         # GEMM2: (D, (H_R, S_Q), S_K, (H_K, B))
-        tiled_mma_vp = sm100_utils.make_trivial_tiled_mma(
+        tiled_mma_vp = make_tiled_mma(
             mma_dtype,
             mma_dtype,
             OperandMajorMode.MN,  # V
@@ -299,9 +391,10 @@ class GroupedQueryAttentionDecode:
         # Fixed stage counts
         self.p_stages = p_stages = 4  # smem P (BMM2 B)
         self.o_stages = o_stages = 2  # tmem O (BMM2 C)
+        self.q_stages = q_stages = 2 if self.is_persistent else 1  # smem Q + O alias
 
         # Calculate tmem alloc
-        tmem_capacity_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        tmem_capacity_cols = cute.arch.get_max_tmem_alloc_cols(self.resource_arch)
         tmem_s_stage_cols = tiles_sm * mma_tile_n
         tmem_alloc_cols = mma_tile_n * o_stages  # per-thread colsum
         tmem_alloc_cols += tiles_dm * mma_tile_n * o_stages  # O
@@ -318,27 +411,39 @@ class GroupedQueryAttentionDecode:
         mbarrier_bits = Int64.width
         pipe_stage_bits = mbarrier_bits * 2  # producer + consumer
         mk_stage_bits = mma_tile_m * mma_tile_k * mma_dtype.width
-        nk_stage_bits = mma_tile_n * mma_tile_k * mma_dtype.width
         mn_stage_bits = mma_tile_m * mma_tile_n * mma_dtype.width
         # tmem ptr
         smem_alloc_bits += Int32.width
+        # CLC
+        if cutlass.const_expr(self.is_persistent):
+            smem_alloc_bits += mbarrier_bits * 2  # CLC full + empty
+            smem_alloc_bits += Int128.width  # CLC response
         # colmax + colsum
-        smem_alloc_bits += blk_tile_n * acc_dtype.width
+        smem_alloc_bits += q_stages * blk_tile_n * acc_dtype.width
         smem_alloc_bits += blk_tile_n * warpgroup_warps * acc_dtype.width
         if cutlass.const_expr(self.do_atomic_red):
             smem_alloc_bits += max_reduction_iters * blk_tile_n * acc_dtype.width * 2
             smem_alloc_bits += max_reduction_iters * mbarrier_bits * 2
-        # Q, S, P, O
-        smem_alloc_bits += tiles_dk * nk_stage_bits + mbarrier_bits  # 1 mbar for Q
+        # Q, O
+        q_stage_bits = tiles_dk * mma_tile_n * mma_tile_k * mma_dtype.width
+        o_stage_bits = tiles_dm * mma_tile_m * mma_tile_n * o_smem_dtype.width
+        qo_stage_bits = max(q_stage_bits, o_stage_bits)  # alias QO stages
+        smem_alloc_bits += (
+            q_stages * qo_stage_bits + q_stages * 2 * mbarrier_bits
+        )  # producer + consumer mbar per Q stage
+        # S, P
         smem_alloc_bits += s_stages * pipe_stage_bits  # s in tmem
         smem_alloc_bits += p_stages * (tiles_sm * mn_stage_bits + pipe_stage_bits)
         smem_alloc_bits += o_stages * pipe_stage_bits  # o in tmem
         alignment_bits = 1024 - (smem_alloc_bits % 1024)
-        # K, V
-        smem_capacity_bits = utils.get_smem_capacity_in_bytes("sm_100") * 8
-        remaining_bits = smem_capacity_bits - smem_alloc_bits - alignment_bits
+        smem_capacity_bytes = cutlass.memory.get_smem_capacity_in_bytes(
+            self.resource_arch
+        )
+        remaining_bits = (smem_capacity_bytes * 8) - smem_alloc_bits - alignment_bits
         kv_stages = remaining_bits // mk_stage_bits
         kv_stages -= 1 if kv_stages * pipe_stage_bits > alignment_bits else 0
+        if cutlass.const_expr(self.kv_stages_cap > 0):
+            kv_stages = min(kv_stages, self.kv_stages_cap)
 
         ##############################
         # TMA creation
@@ -353,18 +458,18 @@ class GroupedQueryAttentionDecode:
         # (d, (h_g, s_q), (h_k, b_partial))
         mO_mnl = self.gemm_view(self.gqa_pack(o_bshd_, h_k), False)
 
-        # (MMA, MMA_M/N, MMA_K, stages)
-        smem_layout_q = sm100_utils.make_smem_layout_b(
-            tiled_mma_kq, mma_tile_mnk, mma_dtype, tiles_dk
-        )
-        smem_layout_k = sm100_utils.make_smem_layout_a(
+        # (MMA, MMA_M, MMA_K, stages)
+        smem_layout_k = utils.sm100.make_smem_layout_a(
             tiled_mma_kq, mma_tile_mnk, mma_dtype, kv_stages
         )
-        smem_layout_v = sm100_utils.make_smem_layout_a(
+        smem_layout_v = utils.sm100.make_smem_layout_a(
             tiled_mma_vp, mma_tile_mnk, mma_dtype, kv_stages
         )
 
-        o_smem_dtype = mO_mnl.dtype
+        # Construct QO smem stage layout
+        smem_layout_q = utils.sm100.make_smem_layout_b(
+            tiled_mma_kq, mma_tile_mnk, mma_dtype, tiles_dk
+        )
         smem_layout_atom_o = tcgen05.make_smem_layout_atom(
             tcgen05.mma.SmemLayoutAtomKind.MN_SW128, o_smem_dtype
         )
@@ -374,6 +479,28 @@ class GroupedQueryAttentionDecode:
         smem_layout_o = cute.flat_divide(smem_layout_o, (mma_tile_m, mma_tile_n))
         # (MMA_TILE_M, MMA_TILE_N, #TILE_DM)
         smem_layout_o = cute.select(smem_layout_o, (0, 1, 2))
+
+        # Alias QO stages
+        # (MMA, MMA_N, MMA_K, #TILE_DK, q_stages)
+        q_stage_stride = qo_stage_bits // mma_dtype.width
+        smem_layout_q = cute.make_composed_layout(
+            smem_layout_q.inner,
+            smem_layout_q.offset,
+            cute.make_layout(
+                shape=(*smem_layout_q.outer.shape, q_stages),
+                stride=(*smem_layout_q.outer.stride, q_stage_stride),
+            ),
+        )
+        # (MMA_TILE_M, MMA_TILE_N, #TILE_DM, q_stages)
+        o_stage_stride = qo_stage_bits // o_smem_dtype.width
+        smem_layout_o = cute.make_composed_layout(
+            smem_layout_o.inner,
+            smem_layout_o.offset,
+            cute.make_layout(
+                shape=(*smem_layout_o.outer.shape, q_stages),
+                stride=(*smem_layout_o.outer.stride, o_stage_stride),
+            ),
+        )
 
         tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
         tma_store_op = (
@@ -419,18 +546,16 @@ class GroupedQueryAttentionDecode:
         assert l_bsh is None or l_bsh.dtype == acc_dtype
 
         # GEMM views for workspace tensors
-        mM_nl = mM_partial_nl = mL_partial_nl = None
+        mM_partial_nl = mL_partial_nl = None
         if cutlass.const_expr(self.do_kernel_red):
             assert (
-                m_bsh.dtype
-                == m_partial_bsh.dtype
+                m_partial_bsh.dtype
                 == l_partial_bsh.dtype
                 == o_partial_bshd.dtype
                 == acc_dtype
             )
 
             # ((h_g, s_q), (h_k, b), kv_splits)
-            mM_nl = self.gemm_view_bsh(m_bsh, h_k)
             mM_partial_nl = self.gemm_view_bsh(m_partial_bsh, h_k)
             mL_partial_nl = self.gemm_view_bsh(l_partial_bsh, h_k)
 
@@ -456,6 +581,7 @@ class GroupedQueryAttentionDecode:
         grid_x = 1 if self.do_none_red else kv_splits
         grid = (grid_x, grid_y, grid_z)
         cluster_x = kv_splits if self.do_atomic_red else 1
+        cluster = (cluster_x, 1, 1)
 
         self.decode(
             # MMA
@@ -483,7 +609,6 @@ class GroupedQueryAttentionDecode:
             tma_tensor_o,
             # Rest
             mL_nl,
-            mM_nl,
             mL_partial_nl,
             mM_partial_nl,
             mSink,
@@ -493,7 +618,7 @@ class GroupedQueryAttentionDecode:
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=[cluster_x, 1, 1],
+            cluster=cluster,
             stream=stream,
             min_blocks_per_mp=1,
             use_pdl=enable_pdl,
@@ -502,9 +627,12 @@ class GroupedQueryAttentionDecode:
         if cutlass.const_expr(self.do_kernel_red):
             self.launch_reduction(
                 self.headdim,
+                self.reduction_splits,
+                self.red_vec_bits,
+                self.red_d_ctas,
+                self.red_max_groups,
                 o_bshd,
                 l_bsh,
-                m_bsh,
                 o_partial_bshd,
                 l_partial_bsh,
                 m_partial_bsh,
@@ -542,7 +670,6 @@ class GroupedQueryAttentionDecode:
         mO: cute.Tensor,
         # Rest
         mL: Optional[cute.Tensor],  # LSE output (Float32, log2 base)
-        mM: Optional[cute.Tensor],
         mL_partial: Optional[cute.Tensor],
         mM_partial: Optional[cute.Tensor],
         mSink: Optional[cute.Tensor],  # (h_g, h_k)
@@ -552,12 +679,14 @@ class GroupedQueryAttentionDecode:
     ):
         """Warp-specialized GQA decode over contiguous KV.
 
-        Each CTA handles one (KV split, grouped-head x prediction tile, KV head and
+        Each work tile is one (KV split, grouped-head x prediction tile, KV head and
         batch) block. TMA warps load Q, K and V; MMA warps compute ``S = K Q`` and
         accumulate ``O += V P`` in tensor memory; softmax warpgroups produce the
         online-softmax probabilities; the correction warpgroup rescales O as the
         running max changes; and the reduction warp finalizes colmax and colsum for
-        the configured split-K reduction mode.
+        the configured split-K reduction mode. With ``reduction_mode="none"`` the
+        kernel is persistent (unless ``disable_persistence``): CTAs fetch further
+        work tiles through cluster launch control.
         """
         ##############################
         # Static variables
@@ -565,7 +694,7 @@ class GroupedQueryAttentionDecode:
         # Smem alloc helper
         svector_align = 16
         stensor_align = 128
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         # No multicast
         mcast_coord = 0
@@ -592,6 +721,12 @@ class GroupedQueryAttentionDecode:
         do_none_red = self.do_none_red
         store_lse = mL is not None
         use_sink = mSink is not None
+        is_persistent = self.is_persistent
+
+        # Persistence is for multi-wave, split-K is for sub-wave
+        assert not (is_persistent and not do_none_red), (
+            "persistence doesn't support split-KV"
+        )
 
         ##############################
         # Warp specialization
@@ -602,7 +737,7 @@ class GroupedQueryAttentionDecode:
         mma_vp_warp_id = warpgroup_id * warpgroup_warps + 1
         tma_kv_warp_id = warpgroup_id * warpgroup_warps + 2
         tma_qo_warp_id = warpgroup_id * warpgroup_warps + 3
-        reduction_warp_id = tma_kv_warp_id
+        reduction_warp_id = tma_kv_warp_id if not is_persistent else None
         warpgroup_id += 1
 
         softmax_warpgroups = 2
@@ -630,10 +765,14 @@ class GroupedQueryAttentionDecode:
         ) <= max_hw_regs_per_wg_thread
 
         # Read thread indices
-        kv_splits, tiles_hp, tiles_hb = cute.arch.grid_dim()
-        kv_split_idx, coord_hp, coord_hb = cute.arch.block_idx()
+        grid_dim = cute.arch.grid_dim()
+        block_idx = cute.arch.block_idx()
         if cutlass.const_expr(do_none_red):
-            kv_splits, kv_split_idx = (1, 0)
+            kv_splits = 1
+            kv_split_idx = 0
+        else:
+            kv_splits = grid_dim[0]
+            kv_split_idx = block_idx[0]
         tidx, _, _ = cute.arch.thread_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(tidx // warp_threads)
@@ -647,15 +786,30 @@ class GroupedQueryAttentionDecode:
         grouped_heads, prediction = mQ.shape[0]
         heads_k, batches = tiles_hb = mQ.shape[2]
         tiles_hp = cute.ceil_div(mQ.shape[0], blk_tile_hp)
-        coord_hb = cute.idx2crd(coord_hb, tiles_hb)
-        coord_hp = cute.idx2crd(coord_hp, tiles_hp)
+
+        def get_coords(
+            block_idx,
+            tiles_hp=tiles_hp,
+            tiles_hb=tiles_hb,
+        ):
+            kv_split_idx, idx_hp, idx_hb = block_idx
+            coord_hp = cute.idx2crd(idx_hp, tiles_hp)
+            coord_hb = cute.idx2crd(idx_hb, tiles_hb)
+            return coord_hp, coord_hb
+
+        coord_hp, coord_hb = get_coords(block_idx)
         coord_hg, coord_p = coord_hp
         coord_hk, coord_b = coord_hb
 
         # Runtime control flow
-        tiles_s = cute.ceil_div(seqlen, blk_tile_s)
+        coord_kv, tiles_s = mask_config.get_tiles_kv(
+            prediction, seqlen, blk_tile_s, blk_tile_p, coord_p
+        )
         iters_s = cute.ceil_div(tiles_s - kv_split_idx, kv_splits)
         prefetch_iters = min(2, self.s_stages - 1)  # MMA KQ iters to hide first softmax
+        # With a uniform KV length of 0 or at least the query length,
+        # tiles_s is either 0 for every work tile or nonzero for every one,
+        # so safe to exit early even if persistent kernel.
         exit_early = kv_split_idx >= tiles_s
         lane_store_max = blk_tile_n == warp_threads or lane_idx < blk_tile_n
 
@@ -706,6 +860,7 @@ class GroupedQueryAttentionDecode:
         thr_cg = lambda t: CooperativeGroup(Agent.Thread, t)
         elect_one_cooperative = thr_cg(1)
         warpgroup_cooperative = thr_cg(warpgroup_threads)
+        cta_cooperative = thr_cg(self.threads_per_cta)
         mma_group = elect_one_cooperative
         tma_group = elect_one_cooperative
         softmax_group = warpgroup_cooperative
@@ -726,14 +881,19 @@ class GroupedQueryAttentionDecode:
             cute.arch.cluster_arrive_relaxed()
 
         # Initialize Q load mbarrier
-        q_load_mbar = smem.allocate_array(Int64, 1)
-        if warp_idx == init_warp:
-            expect_tx_bytes = cute.size_in_bytes(q_dtype, smem_layout_q)
-            with cute.arch.elect_one():
-                cute.arch.mbarrier_init(q_load_mbar, 1)
-                cute.arch.mbarrier_init_fence()
-                cute.arch.mbarrier_arrive_and_expect_tx(q_load_mbar, expect_tx_bytes)
-        init_warp += 1
+        q_stages = smem_layout_q.shape[-1]
+        q_stage_layout = cute.select(smem_layout_q, (*mma_modes, 3))
+        q_stage_bytes = cute.size_in_bytes(q_dtype, q_stage_layout)
+        q_pipeline_ptr = smem.allocate_array(Int64, q_stages * 2)
+        q_producer, q_consumer = pipeline.PipelineTmaAsync.create(
+            num_stages=q_stages,
+            producer_group=tma_group,
+            consumer_group=mma_group,
+            tx_count=q_stage_bytes,
+            barrier_storage=q_pipeline_ptr,
+            cta_layout_vmnk=mcast_layout,
+            defer_sync=True,
+        ).make_participants()
 
         # Initialize pipelines
         kv_stages = smem_layout_k.shape[-1]
@@ -779,6 +939,41 @@ class GroupedQueryAttentionDecode:
             defer_sync=True,
         ).make_participants()
 
+        clc_response_ptr = None
+        if cutlass.const_expr(is_persistent):
+            clc_mbar_ptr = smem.allocate_array(Int64, 2)
+            clc_response_ptr = smem.allocate_array(Int128)
+            clc_producer, clc_consumer = pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=clc_mbar_ptr,
+                num_stages=1,
+                producer_group=tma_group,
+                consumer_group=cta_cooperative,
+                tx_count=(Int128.width // 8),
+                cta_layout_vmnk=mcast_layout,
+                defer_sync=True,
+            ).make_participants()
+
+        def query_next_work(
+            clc_producer: pipeline.PipelineProducer,
+            clc_response_ptr=clc_response_ptr,
+        ):
+            clc_producer.acquire()
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(
+                    clc_producer.current_handle().barrier,
+                    clc_response_ptr,
+                )
+
+        def get_next_work(
+            clc_consumer: pipeline.PipelineConsumer,
+            clc_response_ptr=clc_response_ptr,
+        ):
+            clc_consumer.wait()
+            bidx, bidy, bidz, valid = cute.arch.clc_response(clc_response_ptr)
+            cute.arch.fence_view_async_shared()
+            clc_consumer.release()
+            return (bidx, bidy, bidz), Boolean(valid)
+
         ##############################
         # Smem Tensor Allocation
         ##############################
@@ -795,7 +990,7 @@ class GroupedQueryAttentionDecode:
         )  # (MMA, #MMA_M, #MMA_K, kv_stages)
         tBsQ = smem.allocate_tensor(
             q_dtype, smem_layout_q.outer, stensor_align, smem_layout_q.inner
-        )  # (MMA, #MMA_N, #MMA_K, q_stages)
+        )  # (MMA, #MMA_N, #MMA_K, #TILE_DK, q_stages)
 
         # S
         # (MMA_MN, #MMA_M=1, #MMA_N=1, #TILE_SM, s_stages)
@@ -807,7 +1002,7 @@ class GroupedQueryAttentionDecode:
         # P - Treat MN C tile of BMM0 as NM B tile of BMM1
         # (MMA_NK, #MMA_N=1, #MMA_K=TILE_S/MMA_K, p_stages)
         blk_tile_nm = (None, mma_tile_n, mma_tile_m * tiles_sm)
-        tBsP_nm_layout = sm100_utils.make_smem_layout_b(
+        tBsP_nm_layout = utils.sm100.make_smem_layout_b(
             tiled_mma_vp, blk_tile_nm, mma_dtype, p_stages
         )
         tBsP_nm = smem.allocate_tensor(
@@ -827,20 +1022,20 @@ class GroupedQueryAttentionDecode:
         tCsP = cute.composition(tBsP_nm, tCsP_tile)
 
         # O
-        # Reuse KV smem for O TMA store
-        sO_iterator = cute.recast_ptr(tAsK.iterator, smem_layout_o.inner, dtype=o_dtype)
-        # (MMA_TILE_M, MMA_TILE_N, #TILE_DM)
+        # Reuse Q smem for O TMA store
+        sO_iterator = cute.recast_ptr(tBsQ.iterator, smem_layout_o.inner, dtype=o_dtype)
+        # (MMA_TILE_M, MMA_TILE_N, #TILE_DM, q_stages)
         sO_mma = cute.make_tensor(sO_iterator, smem_layout_o.outer)
-        # (MMA, #MMA_M, #MMA_N, #TILE_DM, o_stages)
+        # (MMA, #MMA_M, #MMA_N, #TILE_DM, q_stages/o_stages)
         tCsO = thrblk_mma_vp.partition_C(sO_mma)
-        tCtO = thrblk_mma_vp.make_fragment_C((*tCsO.shape, o_stages))
+        tCtO = thrblk_mma_vp.make_fragment_C((*tCsO.shape[:-1], o_stages))
 
         # M - colmax
-        sM_layout = cute.make_layout(blk_tile_n)
+        sM_layout = cute.make_layout((blk_tile_n, q_stages))
         sM = smem.allocate_tensor(acc_dtype, sM_layout, svector_align)
         if warp_idx == init_warp:
             if lane_store_max:
-                sM[lane_idx] = -Float32.inf
+                sM[lane_idx, 0] = -Float32.inf
         init_warp += 1
 
         # L - colsum
@@ -859,12 +1054,13 @@ class GroupedQueryAttentionDecode:
             )
             sSink_layout = cute.make_layout((blk_tile_hp,), stride=((1, 0),))
             sSink = smem.allocate_tensor(acc_dtype, sSink_layout, svector_align)
-            gSink = cute.local_tile(mSink, (blk_tile_h,), (coord_hg, coord_hk))
             sSink_lane = cute.local_tile(sSink[((None, 0),)], (1,), (lane_idx,))
+            gSink = cute.local_tile(mSink, (blk_tile_h,), (coord_hg, coord_hk))
             gSink_lane = cute.local_tile(gSink, (1,), (lane_idx,))
-            if warp_idx == reduction_warp_id and lane_idx < blk_tile_h:
-                cute.copy(cpasync_atom, gSink_lane, sSink_lane)
-            init_warp += 1
+            if cutlass.const_expr(not is_persistent):
+                if warp_idx == reduction_warp_id and lane_idx < blk_tile_h:
+                    cute.copy(cpasync_atom, gSink_lane, sSink_lane)
+                    cute.arch.cp_async_commit_group()
         else:
             sSink = None
 
@@ -920,9 +1116,11 @@ class GroupedQueryAttentionDecode:
         # Exit early
         ##############################
         if exit_early:
-            if warpgroup_idx == correction_warpgroup_id:
-                sM_final_nbar.arrive()
-                sL_final_nbar.arrive()
+            # Only the non-persistent reduction warp waits on these.
+            if cutlass.const_expr(not is_persistent):
+                if warpgroup_idx == correction_warpgroup_id:
+                    sM_final_nbar.arrive()
+                    sL_final_nbar.arrive()
 
         ##############################
         # TMA KV Dispatch
@@ -934,25 +1132,25 @@ class GroupedQueryAttentionDecode:
 
             # Apply block tiler and slice
             gK = cute.local_tile(
-                mK, tiler=(blk_tile_s, blk_tile_d), coord=(None, 0, coord_hb)
-            )  # (TILE_S, TILE_D, #TILE_S)
+                mK, tiler=(blk_tile_s, blk_tile_d), coord=(None, 0, None)
+            )  # (TILE_S, TILE_D, #TILE_S, (h_k, b))
             gV = cute.local_tile(
-                mV, tiler=(blk_tile_d, blk_tile_s), coord=(0, None, coord_hb)
-            )  # (TILE_D, TILE_S, #TILE_S)
+                mV, tiler=(blk_tile_d, blk_tile_s), coord=(0, None, None)
+            )  # (TILE_D, TILE_S, #TILE_S, (h_k, b))
 
             # Apply MMA tiler and MMA partition
             gK_mma = cute.flat_divide(
                 gK, (mma_tile_m, mma_tile_k)
-            )  # (MMA_TILE_M, MMA_TILE_K, #TILE_SM, #TILE_DK, #TILE_S)
+            )  # (MMA_TILE_M, MMA_TILE_K, #TILE_SM, #TILE_DK, #TILE_S, (h_k, b))
             gV_mma = cute.flat_divide(
                 gV, (mma_tile_m, mma_tile_k)
-            )  # (MMA_TILE_M, MMA_TILE_K, #TILE_DM, #TILE_SK, #TILE_S)
+            )  # (MMA_TILE_M, MMA_TILE_K, #TILE_DM, #TILE_SK, #TILE_S, (h_k, b))
             tAgK = thrblk_mma_kq.partition_A(
                 gK_mma
-            )  # (MMA, #MMA_M, #MMA_K, #TILE_SM, #TILE_DK, #TILE_S)
+            )  # (MMA, #MMA_M, #MMA_K, #TILE_SM, #TILE_DK, #TILE_S, (h_k, b))
             tAgV = thrblk_mma_vp.partition_A(
                 gV_mma
-            )  # (MMA, #MMA_M, #MMA_K, #TILE_DM, #TILE_SK, #TILE_S)
+            )  # (MMA, #MMA_M, #MMA_K, #TILE_DM, #TILE_SK, #TILE_S, (h_k, b))
 
             # #TILE_SM=TILE_S/MMA_TILE_M, #TILE_HN=TILE_H/MMA_TILE_N, #TILE_DK=TILE_D/MMA_TILE_K
             # #TILE_DM=TILE_D/MMA_TILE_M, #TILE_HN=TILE_H/MMA_TILE_N, #TILE_SK=TILE_S/MMA_TILE_K
@@ -965,7 +1163,7 @@ class GroupedQueryAttentionDecode:
 
             # TMA partition
             # (MMA, #MMA_M, #MMA_K, Rest...) -> (TMA, Rest...)
-            tGSsK, tGSgK = cute.nvgpu.cpasync.tma_partition(
+            tAsK_tma, tAgK_tma = cute.nvgpu.cpasync.tma_partition(
                 tma_atom_k,
                 mcast_coord,
                 mcast_layout,
@@ -973,7 +1171,7 @@ class GroupedQueryAttentionDecode:
                 gmem_tensor=cute.group_modes(tAgK, 0, 3),
             )
 
-            tGSsV, tGSgV = cute.nvgpu.cpasync.tma_partition(
+            tAsV_tma, tAgV_tma = cute.nvgpu.cpasync.tma_partition(
                 tma_atom_v,
                 mcast_coord,
                 mcast_layout,
@@ -983,37 +1181,66 @@ class GroupedQueryAttentionDecode:
 
             cute.arch.griddepcontrol_wait()
 
-            # Sequence loop
-            prefetch_tiles = prefetch_iters * kv_splits
-            kv_token = True  # Producer always acquires first
-            for s in cutlass.range(kv_split_idx, prefetch_tiles + tiles_s, kv_splits):
-                # Load K
-                if s < tiles_s:
-                    tGSgK_s = tGSgK[None, None, None, s]
-                    for sm in cutlass.range_constexpr(tiles_sm):
-                        for dk in cutlass.range_constexpr(tiles_dk):
-                            kv_handle = kv_producer.acquire_and_advance(kv_token)
-                            kv_token = kv_producer.try_acquire()
-                            cute.copy(
-                                tma_atom_k,
-                                tGSgK_s[None, sm, dk],
-                                tGSsK[None, kv_handle.index],
-                                tma_bar_ptr=kv_handle.barrier,
-                            )
+            next_work_valid = True
+            while next_work_valid:
+                # Work tile slice
+                tAgK_hb = tAgK_tma[None, None, None, None, coord_hb]
+                tAgV_hb = tAgV_tma[None, None, None, None, coord_hb]
+                tAgK_hb = cute.domain_offset((None, None, None, coord_kv), tAgK_hb)
+                tAgV_hb = cute.domain_offset((None, None, None, coord_kv), tAgV_hb)
 
-                # Load V
-                if s >= prefetch_tiles:
-                    tGSgV_s = tGSgV[None, None, None, s - prefetch_tiles]
-                    for sk in cutlass.range_constexpr(tiles_sk):
-                        for dm in cutlass.range_constexpr(tiles_dm):
-                            kv_handle = kv_producer.acquire_and_advance(kv_token)
-                            kv_token = kv_producer.try_acquire()
-                            cute.copy(
-                                tma_atom_v,
-                                tGSgV_s[None, dm, sk],
-                                tGSsV[None, kv_handle.index],
-                                tma_bar_ptr=kv_handle.barrier,
-                            )
+                # Sequence loop
+                prefetch_tiles = prefetch_iters * kv_splits
+                kv_token = kv_producer.try_acquire()
+                for s in cutlass.range(
+                    kv_split_idx, prefetch_tiles + tiles_s, kv_splits
+                ):
+                    # Load K
+                    if s < tiles_s:
+                        tAgK_s = tAgK_hb[None, None, None, s]
+                        for sm in cutlass.range_constexpr(tiles_sm):
+                            for dk in cutlass.range_constexpr(tiles_dk):
+                                kv_handle = kv_producer.acquire_and_advance(kv_token)
+                                kv_token = kv_producer.try_acquire()
+                                cute.copy(
+                                    tma_atom_k,
+                                    tAgK_s[None, sm, dk],
+                                    tAsK_tma[None, kv_handle.index],
+                                    tma_bar_ptr=kv_handle.barrier,
+                                )
+
+                    # Load V
+                    if s >= prefetch_tiles:
+                        tAgV_s = tAgV_hb[None, None, None, s - prefetch_tiles]
+                        for sk in cutlass.range_constexpr(tiles_sk):
+                            for dm in cutlass.range_constexpr(tiles_dm):
+                                kv_handle = kv_producer.acquire_and_advance(kv_token)
+                                kv_token = kv_producer.try_acquire()
+                                cute.copy(
+                                    tma_atom_v,
+                                    tAgV_s[None, dm, sk],
+                                    tAsV_tma[None, kv_handle.index],
+                                    tma_bar_ptr=kv_handle.barrier,
+                                )
+
+                next_work_valid = False
+                if cutlass.const_expr(is_persistent):
+                    # Request next work from CLC
+                    query_next_work(clc_producer)
+                    clc_producer.advance()
+
+                    # Read CLC response from smem
+                    block_idx, next_work_valid = get_next_work(clc_consumer)
+                    clc_consumer.advance()
+
+                    # Update tile coordinates
+                    (_, coord_p), (coord_hk, coord_b) = coord_hp, coord_hb = get_coords(
+                        block_idx
+                    )
+                    coord_kv, tiles_s = mask_config.get_tiles_kv(
+                        prediction, seqlen, blk_tile_s, blk_tile_p, coord_p
+                    )
+                    iters_s = tiles_s
 
         ##############################
         # TMA QO Dispatch
@@ -1024,19 +1251,19 @@ class GroupedQueryAttentionDecode:
                 cute.arch.setmaxregister_decrease(mma_tma_regs)
 
             # Slice and partition Q
-            # (TILE_H, TILE_D)
+            # (TILE_H, TILE_D, tiles_hp, tile_hb)
             gQ = cute.local_tile(
                 mQ,
                 tiler=(blk_tile_hp, blk_tile_d),
-                coord=(coord_hp, 0, coord_hb),
+                coord=(None, 0, None),
             )
             # Apply MMA tiler and MMA partition
-            # (MMA_TILE_N, MMA_TILE_K, #TILE_HN=1, #TILE_DK)
+            # (MMA_TILE_N, MMA_TILE_K, #TILE_HN=1, #TILE_DK, tiles_hp, tiles_hb)
             gQ_mma = cute.flat_divide(gQ, (mma_tile_n, mma_tile_k))
-            gQ_mma = gQ_mma[None, None, 0, None]
-            # (MMA, #MMA_N, #MMA_K, #TILE_DK)
+            gQ_mma = gQ_mma[None, None, 0, None, None, None]
+            # (MMA, #MMA_N, #MMA_K, #TILE_DK, tiles_hp, tiles_hb)
             tBgQ = thrblk_mma_kq.partition_B(gQ_mma)
-            # (TMA, #TILE_DK)
+            # (TMA, #TILE_DK, tiles_hp, tiles_hb)
             tBsQ_tma, tBgQ_tma = cute.nvgpu.cpasync.tma_partition(
                 tma_atom_q,
                 mcast_coord,
@@ -1045,30 +1272,17 @@ class GroupedQueryAttentionDecode:
                 gmem_tensor=cute.group_modes(tBgQ, 0, 3),
             )
 
-            cute.arch.griddepcontrol_wait()
-
-            # Load Q
-            cute.copy(
-                tma_atom_q,
-                tBgQ_tma,
-                tBsQ_tma,
-                tma_bar_ptr=q_load_mbar,
-            )
-
             # Slice and partition O
-            # (TILE_D, TILE_H)
-            coord_b_partial = (
-                kv_split_idx * batches + coord_b if do_kernel_red else coord_b
-            )
+            # (TILE_D, TILE_H, tiles_hp, h_k, b)
             gO = cute.local_tile(
                 mO,
                 tiler=(blk_tile_d, blk_tile_hp),
-                coord=(0, coord_hp, (coord_hk, coord_b_partial)),
+                coord=(0, None, (None, None)),
             )
-            # (MMA_TILE_M, MMA_TILE_N, #TILE_DM, #TILE_HN=1)
+            # (MMA_TILE_M, MMA_TILE_N, #TILE_DM, #TILE_HN=1, tiles_hp, h_k, b)
             gO_mma = cute.flat_divide(gO, (mma_tile_m, mma_tile_n))
-            gO_mma = gO_mma[None, None, None, 0]
-            # (TMA, #TILE_DM)
+            gO_mma = gO_mma[None, None, None, 0, None, None, None]
+            # (TMA, #TILE_DM, tiles_hp, h_k, b)
             sO_tma, gO_tma = cute.nvgpu.cpasync.tma_partition(
                 tma_atom_o,
                 mcast_coord,
@@ -1076,10 +1290,99 @@ class GroupedQueryAttentionDecode:
                 smem_tensor=cute.group_modes(sO_mma, 0, 2),
                 gmem_tensor=cute.group_modes(gO_mma, 0, 2),
             )
+            # Partial mode is coalesced with batches
+            if cutlass.const_expr(do_kernel_red):
+                coord_b = kv_split_idx * batches + coord_b
 
-            # Store O to gmem
-            sO_final_nbar.arrive_and_wait()
-            cute.copy(tma_atom_o, sO_tma, gO_tma)
+            cute.arch.griddepcontrol_wait()
+
+            # Load Q
+            tBgQ_hpb = tBgQ_tma[None, None, coord_hp, coord_hb]
+            q_handle = q_producer.acquire_and_advance()
+            tBsQ_stage = tBsQ_tma[None, None, q_handle.index]
+            cute.copy(tma_atom_q, tBgQ_hpb, tBsQ_stage, tma_bar_ptr=q_handle.barrier)
+
+            next_work_valid = True
+            while next_work_valid:
+                # Slice this work's O
+                gO_hpb = gO_tma[None, None, coord_hp, coord_hk, coord_b]
+                sO_stage = sO_tma[None, None, q_handle.index]
+                sM_stage = sM[None, q_handle.index]
+
+                next_work_valid = False
+                if cutlass.const_expr(is_persistent):
+                    # Slice this work's LSE
+                    if cutlass.const_expr(store_lse):
+                        gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
+                        lane_store_lse = lane_store_max & lse_lane_valid(
+                            mL, blk_tile_hp, coord_hp, lane_idx
+                        )
+
+                    # Load this work's sink
+                    if cutlass.const_expr(use_sink):
+                        gSink = cute.local_tile(
+                            mSink, (blk_tile_h,), (coord_hg, coord_hk)
+                        )
+                        gSink_lane = cute.local_tile(gSink, (1,), (lane_idx,))
+                        if lane_idx < blk_tile_h:
+                            cute.copy(cpasync_atom, gSink_lane, sSink_lane)
+                            cute.arch.cp_async_commit_group()
+
+                    # Read CLC response from smem
+                    block_idx, next_work_valid = get_next_work(clc_consumer)
+                    clc_consumer.advance()
+
+                    # Update tile coordinates
+                    (coord_hg, coord_p), (coord_hk, coord_b) = coord_hp, coord_hb = (
+                        get_coords(block_idx)
+                    )
+
+                    # Next work tile slice
+                    tBgQ_hpb = tBgQ_tma[None, None, coord_hp, coord_hb]
+
+                    if next_work_valid:
+                        # Wait for previous O store to complete (Q/O smem is aliased)
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        with cute.arch.elect_one():
+                            q_consumer.release()  # MMA KQ did wait
+                        q_consumer.advance()
+
+                        # Load next work's Q
+                        skip_acquire = True  # O store wait is an implicit acquire
+                        q_handle = q_producer.acquire_and_advance(skip_acquire)
+                        tBsQ_stage = tBsQ_tma[None, None, q_handle.index]
+                        cute.copy(
+                            tma_atom_q,
+                            tBgQ_hpb,
+                            tBsQ_stage,
+                            tma_bar_ptr=q_handle.barrier,
+                        )
+
+                    # Wait for sink
+                    if cutlass.const_expr(use_sink):
+                        cute.arch.cp_async_wait_group(0)
+                        cute.arch.sync_warp()
+
+                    # Reduce colmax and colsum, maybe store lse
+                    self.reduction_none(
+                        lane_store_max,
+                        lane_idx,
+                        sM_final_nbar,
+                        sL_final_nbar,
+                        sM_stage,
+                        sL,
+                        gL if store_lse else None,
+                        lane_store_lse if store_lse else None,
+                        sSink,
+                        scale_o,
+                    )
+
+                # Store O to gmem
+                sO_final_nbar.arrive_and_wait()
+                cute.copy(tma_atom_o, sO_stage, gO_hpb)
+                cute.arch.cp_async_bulk_commit_group()
+
+            cute.arch.griddepcontrol_launch_dependents()
 
         ##############################
         # MMA KQ (BMM1) Dispatch
@@ -1093,49 +1396,68 @@ class GroupedQueryAttentionDecode:
             tAsK_desc = thrblk_mma_kq.make_fragment_A(tAsK)
             tBsQ_desc = thrblk_mma_kq.make_fragment_B(tBsQ)
 
-            # Wait for Q
-            cute.arch.mbarrier_wait(q_load_mbar, phase=0)
+            next_work_valid = True
+            while next_work_valid:
+                # Wait for Q
+                q_handle = q_consumer.wait_and_advance()
 
-            # Sequence loop
-            for s in cutlass.range(iters_s):
-                s_token = s_producer.try_acquire()
+                # Sequence loop
+                for s in cutlass.range(iters_s):
+                    s_token = s_producer.try_acquire()
 
-                # Advance for MMA VP
-                if s >= prefetch_iters + 1:
-                    for _ in cutlass.range_constexpr(tiles_dm * tiles_sk):
-                        kv_consumer.advance()
-                mma_order_vp_nbar.arrive_and_wait()
-                k_token = kv_consumer.try_wait()
+                    mma_order_vp_nbar.arrive_and_wait()
+                    k_token = kv_consumer.try_wait()
 
-                s_handle = s_producer.acquire_and_advance(s_token)
-                for sm in cutlass.range_constexpr(tiles_sm):
-                    tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, False)
-                    for dk in cutlass.range_constexpr(tiles_dk):
-                        k_handle = kv_consumer.wait_and_advance(k_token)
-                        is_last_iter = sm == tiles_sm - 1 and dk == tiles_dk - 1
-                        if is_last_iter:
-                            mma_order_kq_nbar.arrive()
-                        else:
-                            k_token = kv_consumer.try_wait()
+                    s_handle = s_producer.acquire_and_advance(s_token)
+                    for sm in cutlass.range_constexpr(tiles_sm):
+                        tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, False)
+                        for dk in cutlass.range_constexpr(tiles_dk):
+                            k_handle = kv_consumer.wait_and_advance(k_token)
+                            is_last_iter = sm == tiles_sm - 1 and dk == tiles_dk - 1
+                            if is_last_iter:
+                                mma_order_kq_nbar.arrive()
+                            else:
+                                k_token = kv_consumer.try_wait()
 
-                        mmas_k = cute.size(tAsK.shape[2])
-                        for mma_k in cutlass.range_constexpr(mmas_k):
-                            cute.gemm(
-                                tiled_mma_kq,
-                                tCtS[mma_dice + (sm, s_handle.index)],
-                                tAsK_desc[None, None, mma_k, k_handle.index],
-                                tBsQ_desc[None, None, mma_k, dk],
-                                tCtS[mma_dice + (sm, s_handle.index)],
-                            )
-                            if dk == 0 and mma_k == 0:
-                                tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, True)
-                        k_handle.release()
-                s_handle.commit()
+                            mmas_k = cute.size(tAsK.shape[2])
+                            for mma_k in cutlass.range_constexpr(mmas_k):
+                                cute.gemm(
+                                    tiled_mma_kq,
+                                    tCtS[mma_dice + (sm, s_handle.index)],
+                                    tAsK_desc[None, None, mma_k, k_handle.index],
+                                    tBsQ_desc[None, None, mma_k, dk, q_handle.index],
+                                    tCtS[mma_dice + (sm, s_handle.index)],
+                                )
+                                if dk == 0 and mma_k == 0:
+                                    tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, True)
+                            k_handle.release()
+                    s_handle.commit()
 
-            # Tail loop
-            for _s in cutlass.range_constexpr(prefetch_iters):
-                mma_order_vp_nbar.arrive_and_wait()
-                mma_order_kq_nbar.arrive()
+                    # Advance for MMA VP
+                    if s >= prefetch_iters:
+                        for _ in cutlass.range_constexpr(tiles_dm * tiles_sk):
+                            kv_consumer.advance()
+
+                # Tail loop
+                for s in cutlass.range_constexpr(prefetch_iters):
+                    mma_order_vp_nbar.arrive_and_wait()
+                    mma_order_kq_nbar.arrive()
+                    if is_persistent and s < iters_s:
+                        for _ in cutlass.range_constexpr(tiles_dm * tiles_sk):
+                            kv_consumer.advance()
+
+                next_work_valid = False
+                if cutlass.const_expr(is_persistent):
+                    # Read CLC response from smem
+                    block_idx, next_work_valid = get_next_work(clc_consumer)
+                    clc_consumer.advance()
+
+                    # Persistence has no KV splits; refresh this Q tile's interval.
+                    (_, coord_p), _ = get_coords(block_idx)
+                    coord_kv, tiles_s = mask_config.get_tiles_kv(
+                        prediction, seqlen, blk_tile_s, blk_tile_p, coord_p
+                    )
+                    iters_s = tiles_s
 
         ##############################
         # MMA VP (BMM2) Dispatch
@@ -1145,61 +1467,72 @@ class GroupedQueryAttentionDecode:
             if cutlass.const_expr(use_reg_reconfig):
                 cute.arch.setmaxregister_decrease(mma_tma_regs)
 
-            # Setup mma descriptors
+            # Setup mma descriptors, order barrier
             tiled_mma_vp.set(tcgen05.Field.ACCUMULATE, True)
             tAsV_desc = thrblk_mma_vp.make_fragment_A(tAsV)
             tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
-
-            # Prefetch loop
             mma_order_vp_nbar.arrive()
-            for s in cutlass.range_constexpr(prefetch_iters):
-                if s < iters_s:
-                    for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
-                        kv_consumer.advance()
-                mma_order_kq_nbar.arrive_and_wait()
-                mma_order_vp_nbar.arrive()
 
-            # Sequence loop
-            for s in cutlass.range(iters_s):
-                p_token = p_consumer.try_wait()
-                o_token = o_producer.try_acquire()
+            next_work_valid = True
+            while next_work_valid:
+                # Prefetch loop
+                for s in cutlass.range_constexpr(prefetch_iters):
+                    if s < iters_s:
+                        for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
+                            kv_consumer.advance()
+                    mma_order_kq_nbar.arrive_and_wait()
+                    mma_order_vp_nbar.arrive()
 
-                # Advance for MMA KQ
-                if s < iters_s - prefetch_iters:
-                    for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
-                        kv_consumer.advance()
-                mma_order_kq_nbar.arrive_and_wait()
-                v_token = kv_consumer.try_wait()
+                # Sequence loop
+                for s in cutlass.range(iters_s):
+                    p_token = p_consumer.try_wait()
+                    o_token = o_producer.try_acquire()
 
-                p_handle = p_consumer.wait_and_advance(p_token)
-                o_handle = o_producer.acquire_and_advance(o_token)
-                for sk in cutlass.range_constexpr(tiles_sk):
-                    for dm in cutlass.range_constexpr(tiles_dm):
-                        v_handle = kv_consumer.wait_and_advance(v_token)
-                        is_last_iter = sk == tiles_sk - 1 and dm == tiles_dm - 1
-                        if is_last_iter:
-                            mma_order_vp_nbar.arrive()
-                        else:
-                            v_token = kv_consumer.try_wait()
+                    # Advance for MMA KQ
+                    if s < iters_s - prefetch_iters:
+                        for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
+                            kv_consumer.advance()
+                    mma_order_kq_nbar.arrive_and_wait()
+                    v_token = kv_consumer.try_wait()
 
-                        mmas_k = cute.size(tAsV.shape[2])
-                        for mma_k in cutlass.range_constexpr(mmas_k):
-                            cute.gemm(
-                                tiled_mma_vp,
-                                tCtO[mma_dice + (dm, o_handle.index)],
-                                tAsV_desc[None, None, mma_k, v_handle.index],
-                                tBsP_desc[None, None, mma_k, sk, p_handle.index],
-                                tCtO[mma_dice + (dm, o_handle.index)],
-                            )
-                        v_handle.release()
-                p_handle.release()
-                o_handle.commit()
+                    p_handle = p_consumer.wait_and_advance(p_token)
+                    o_handle = o_producer.acquire_and_advance(o_token)
+                    for sk in cutlass.range_constexpr(tiles_sk):
+                        for dm in cutlass.range_constexpr(tiles_dm):
+                            v_handle = kv_consumer.wait_and_advance(v_token)
+                            is_last_iter = sk == tiles_sk - 1 and dm == tiles_dm - 1
+                            if is_last_iter:
+                                mma_order_vp_nbar.arrive()
+                            else:
+                                v_token = kv_consumer.try_wait()
+
+                            mmas_k = cute.size(tAsV.shape[2])
+                            for mma_k in cutlass.range_constexpr(mmas_k):
+                                cute.gemm(
+                                    tiled_mma_vp,
+                                    tCtO[mma_dice + (dm, o_handle.index)],
+                                    tAsV_desc[None, None, mma_k, v_handle.index],
+                                    tBsP_desc[None, None, mma_k, sk, p_handle.index],
+                                    tCtO[mma_dice + (dm, o_handle.index)],
+                                )
+                            v_handle.release()
+                    p_handle.release()
+                    o_handle.commit()
+
+                next_work_valid = False
+                if cutlass.const_expr(is_persistent):
+                    # Read CLC response from smem
+                    block_idx, next_work_valid = get_next_work(clc_consumer)
+                    clc_consumer.advance()
+
+                    # Persistence has no KV splits; refresh this Q tile's interval.
+                    (_, coord_p), _ = get_coords(block_idx)
+                    coord_kv, tiles_s = mask_config.get_tiles_kv(
+                        prediction, seqlen, blk_tile_s, blk_tile_p, coord_p
+                    )
+                    iters_s = tiles_s
 
             # Wait for signal to dealloc tmem, then dealloc
-            if iters_s == 1:
-                # Epilogue still reads the empty buffer
-                o_producer.commit()
-                o_producer.advance()
             o_producer.tail()
             cute.arch.relinquish_tmem_alloc_permit()
             cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
@@ -1222,8 +1555,7 @@ class GroupedQueryAttentionDecode:
                 s_consumer.advance()
                 p_producer.advance()
                 sM_release_nbar.arrive()
-                if iters_s == 1:
-                    tL_producer_nbar.arrive()
+            sM_stage = sM[None, 0]
 
             # Construct copy atom for S
             tmem_repeat_op_s = blk_tile_n
@@ -1251,147 +1583,178 @@ class GroupedQueryAttentionDecode:
             tmem_load_atom_l = cute.make_copy_atom(tmem_load_op_l, acc_dtype)
             tmem_store_atom_l = cute.make_copy_atom(tmem_store_op_l, acc_dtype)
             # Tile atom and slice
-            tCtL_phase = tCtL[mma_dice + (softmax_phase,)]
-            tmem_load_l = tcgen05.make_tmem_copy(tmem_load_atom_l, tCtL_phase)
+            tCtL_stage = tCtL[mma_dice + (softmax_phase,)]
+            tmem_load_l = tcgen05.make_tmem_copy(tmem_load_atom_l, tCtL_stage)
             thr_load_l = tmem_load_l.get_slice(warpgroup_tidx)
             # Partition L
             # (CPY, #CPY_MMA, #CPY_M, #CPY_N)
-            tStL = thr_load_l.partition_S(tCtL_phase)
-            tSrL_shape = thr_load_l.partition_D(tCtL_phase).shape
+            tStL = thr_load_l.partition_S(tCtL_stage)
+            tSrL_shape = thr_load_l.partition_D(tCtL_stage).shape
             # Slice unused modes
             # (CPY,)
             tStL = tStL[None, 0, 0, 0]
             tSrL_shape = tSrL_shape[:1]
 
-            # Mask configuration loop args
-            range_args = mask_config.get_range_args(
-                prediction,
-                seqlen,
-                blk_tile_p,
-                blk_tile_s,
-                tiles_s,
-                iters_s,
-                kv_splits,
-                kv_split_idx,
-                softmax_warpgroups,
-                softmax_phase,
-            )
-            num_mask_phases = len(range_args)
+            next_work_valid = True
+            while next_work_valid:
+                # Mask configuration loop args
+                range_args = mask_config.get_range_args(
+                    prediction,
+                    seqlen,
+                    blk_tile_p,
+                    blk_tile_s,
+                    coord_p,
+                    coord_kv,
+                    tiles_s,
+                    iters_s,
+                    kv_splits,
+                    kv_split_idx,
+                    softmax_warpgroups,
+                    softmax_phase,
+                )
+                num_mask_phases = len(range_args)
 
-            # Masking phase loop over all sequence tiles
-            for mask_phase in cutlass.range_constexpr(num_mask_phases):
-                # Sequence tile loop per masking phase
-                start, stop, step, is_masked = range_args[mask_phase]
-                for coord_s in cutlass.range(start, stop, step):
-                    s_token = s_consumer.try_wait()
-                    p_token = p_producer.try_acquire()
+                # Masking phase loop over all sequence tiles
+                for mask_phase in cutlass.range_constexpr(num_mask_phases):
+                    # Sequence tile loop per masking phase
+                    start, stop, step, is_masked = range_args[mask_phase]
+                    for coord_s in cutlass.range(start, stop, step):
+                        s_token = s_consumer.try_wait()
+                        p_token = p_producer.try_acquire()
 
-                    # Load S from tmem and notify BMM1
-                    s_handle = s_consumer.wait_and_advance(s_token)
-                    tStS_s = tStS[None, None, s_handle.index]
-                    tSrS_s = cute.make_rmem_tensor(tSsP.shape[:-1], acc_dtype)
-                    cute.copy(tmem_load_atom_s, tStS_s, tSrS_s)
-                    cute.arch.fence_view_async_tmem_load()
-                    s_handle.release()
+                        # Load S from tmem and notify BMM1
+                        s_handle = s_consumer.wait_and_advance(s_token)
+                        tStS_s = tStS[None, None, s_handle.index]
+                        tSrS_s = cute.make_rmem_tensor(tSsP.shape[:-1], acc_dtype)
+                        cute.copy(tmem_load_atom_s, tStS_s, tSrS_s)
+                        cute.arch.fence_view_async_tmem_load()
+                        s_handle.release()
 
-                    # Apply mask
-                    if cutlass.const_expr(is_masked):
-                        masked = cute.make_rmem_tensor(
-                            (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
+                        # Apply mask
+                        if cutlass.const_expr(is_masked):
+                            masked = cute.make_rmem_tensor(
+                                (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
+                            )
+                            masked.store(tSrS_s.load().reshape(masked.shape))
+                            offset_p = coord_p * blk_tile_p
+                            offset_s = coord_s * blk_tile_s + warpgroup_tidx
+                            for sm in cutlass.range_constexpr(tiles_sm):
+                                for p in cutlass.range_constexpr(blk_tile_p):
+                                    idx_q = offset_p + p
+                                    idx_kv = offset_s + sm * mma_tile_m
+                                    is_oob_kv = mask_config.is_oob_kv(
+                                        idx_q, idx_kv, prediction, seqlen
+                                    )
+                                    mask = -Float32.inf if is_oob_kv else Float32(0)
+                                    masked_p = masked[None, p, sm]
+                                    masked_p.store(masked_p.load() + mask)
+                            scores = masked.load().reshape((blk_tile_n, tiles_sm))
+                        else:
+                            scores = tSrS_s.load().reshape((blk_tile_n, tiles_sm))
+
+                        # Reduce colmax in thread RF
+                        rM = cute.make_rmem_tensor_like(sM_stage)
+                        rM.store(
+                            scores.reduce(
+                                cute.ReductionOp.MAX,
+                                # prevent nan accumulations with masking, see explanation below
+                                init_val=min_f32,
+                                reduction_profile=(None, 0),
+                            )
                         )
-                        masked.store(tSrS_s.load().reshape(masked.shape))
-                        offset_p = coord_p * blk_tile_p
-                        offset_s = coord_s * blk_tile_s + warpgroup_tidx
-                        for sm in cutlass.range_constexpr(tiles_sm):
-                            for p in cutlass.range_constexpr(blk_tile_p):
-                                idx_q = offset_p + p
-                                idx_kv = offset_s + sm * mma_tile_m
-                                is_oob_kv = mask_config.is_oob_kv(
-                                    idx_q, idx_kv, prediction, seqlen
-                                )
-                                mask = -Float32.inf if is_oob_kv else Float32(0)
-                                masked_p = masked[None, p, sm]
-                                masked_p.store(masked_p.load() + mask)
-                        scores = masked.load().reshape((blk_tile_n, tiles_sm))
-                    else:
-                        scores = tSrS_s.load().reshape((blk_tile_n, tiles_sm))
+                        """ Why using min finite float32 to prevent nan accumulation works:
 
-                    # Reduce colmax in thread RF
-                    rM = cute.make_rmem_tensor_like(sM)
-                    rM.store(
-                        scores.reduce(
-                            cute.ReductionOp.MAX,
-                            # prevent nan accumulations with masking, see explanation below
-                            init_val=min_f32,
-                            reduction_profile=(None, 0),
-                        )
+                        Assume inputs are well formed, ie. S=QK can only be finite or -inf after mask.
+                        3 cases to consider, -inf S -> -inf S, -inf S -> finite S, finite S -> -inf S.
+                        First iteration suppose S is -inf after mask. Running max goes to min_f32,
+                        P=exp(-inf - min_f32)=exp(-inf)=0, 0 is accumulated into O, O remains 0.
+                        Second iteration suppose S is -inf again. prev_max = cur_max = min_f32,
+                        correction rescale = exp(prev_max-new_max) = exp(0) = 1. O was zero, remains 0.
+                        Third iteration suppose S is finite. Running max goes to S since prev_max is min finite.
+                        Correction=exp(min_f32-S)=exp(-inf)=0 or exp(finite)=finite. O is still 0, so finite * 0 = 0.
+                        P=exp(S - max_S)=positive finite, O accumulates first non-zero result.
+                        Fourth iteration suppose S is -inf again. Running max stays finite and unchanged,
+                        correction rescale is 1, P=exp(-inf-finite)=0, so O is unscaled and accumulates 0.
+                        After we see the first finite S, all subsequent -inf S will not affect O/max/correction.
+                        If finite S is never seen, then partial O remains 0 and will not contribute to final reduced O.
+                        """
+
+                        # Reduce colmax in warp RF
+                        rM_lane = Float32(0)
+                        for n in cutlass.range_constexpr(blk_tile_n):
+                            rM[n] = warp_fmax(rM[n])  # warp reduction
+                            # Avoid dynamic register indexing (creates spills)
+                            if n == lane_idx:
+                                rM_lane = rM[n]
+                        rM_lane *= scale_s_log2_e  # apply scale
+
+                        # Reduce colmax in smem
+                        sM_acquire_nbar.arrive_and_wait()
+                        sM_consumer_nbar.arrive_and_wait()
+                        if lane_store_max:
+                            smem_fmax(
+                                sM_stage.iterator + sM_stage.layout(lane_idx), rM_lane
+                            )
+
+                        # Wait for colmax and load
+                        sM_producer_nbar.arrive_and_wait()
+                        colmax = sM_stage.load()
+                        sM_release_nbar.arrive()
+
+                        # Wait for empty P buffer
+                        # Here so we can interleave ex2 with convert ops
+                        p_handle = p_producer.acquire_and_advance(p_token)
+                        tSsP_s = tSsP[None, None, p_handle.index]
+
+                        # Compute online softmax
+                        probs = exp2(scale_s_log2_e * scores - colmax)
+
+                        # Store P to smem and notify BMM2
+                        tSsP_s.store(probs.to(mma_dtype).reshape(tSsP_s.shape))
+                        cute.arch.fence_view_async_shared()
+                        p_handle.commit()
+
+                        # Accumulate per-thread colsum
+                        colsum = probs[None, 0]
+                        for sm in cutlass.range_constexpr(1, tiles_sm, 1):
+                            colsum += probs[None, sm]
+                        tSrL = cute.make_rmem_tensor(tSrL_shape, acc_dtype)
+                        tSrL.store(colsum.reshape(tSrL.shape))
+
+                        # Store per-thread colsum to tmem
+                        tL_consumer_nbar.arrive_and_wait()
+                        cute.copy(tmem_store_atom_l, tSrL, tStL)
+                        cute.arch.fence_view_async_tmem_store()
+                        tL_producer_nbar.arrive()
+
+                        # Advance again for dual warpgroups
+                        s_consumer.advance()
+                        p_producer.advance()
+
+                next_work_valid = False
+                if cutlass.const_expr(is_persistent):
+                    # Which warpgroup goes first for next work
+                    flip_phase = iters_s % softmax_warpgroups == 1
+                    if flip_phase:
+                        softmax_phase ^= 1
+
+                    # Reset next sM for next work
+                    q_consumer.advance()
+                    qo_index = q_consumer.current_handle().index
+                    sM_stage = sM[None, qo_index]
+                    if softmax_phase == 0 and warpgroup_widx == 0 and lane_store_max:
+                        sM_stage[lane_idx] = -Float32.inf
+
+                    # Read CLC response from smem
+                    block_idx, next_work_valid = get_next_work(clc_consumer)
+                    clc_consumer.advance()
+
+                    # Update tile coordinates
+                    (_, coord_p), _ = coord_hp, _ = get_coords(block_idx)
+                    coord_kv, tiles_s = mask_config.get_tiles_kv(
+                        prediction, seqlen, blk_tile_s, blk_tile_p, coord_p
                     )
-                    """ Why using min finite float32 to prevent nan accumulation works:
-
-                    Assume inputs are well formed, ie. S=QK can only be finite or -inf after mask.
-                    3 cases to consider, -inf S -> -inf S, -inf S -> finite S, finite S -> -inf S.
-                    First iteration suppose S is -inf after mask. Running max goes to min_f32,
-                    P=exp(-inf - min_f32)=exp(-inf)=0, 0 is accumulated into O, O remains 0.
-                    Second iteration suppose S is -inf again. prev_max = cur_max = min_f32,
-                    correction rescale = exp(prev_max-new_max) = exp(0) = 1. O was zero, remains 0.
-                    Third iteration suppose S is finite. Running max goes to S since prev_max is min finite.
-                    Correction=exp(min_f32-S)=exp(-inf)=0 or exp(finite)=finite. O is still 0, so finite * 0 = 0.
-                    P=exp(S - max_S)=positive finite, O accumulates first non-zero result.
-                    Fourth iteration suppose S is -inf again. Running max stays finite and unchanged,
-                    correction rescale is 1, P=exp(-inf-finite)=0, so O is unscaled and accumulates 0.
-                    After we see the first finite S, all subsequent -inf S will not affect O/max/correction.
-                    If finite S is never seen, then partial O remains 0 and will not contribute to final reduced O.
-                    """
-
-                    # Reduce colmax in warp RF
-                    rM_lane = Float32(0)
-                    for n in cutlass.range_constexpr(blk_tile_n):
-                        rM[n] = warp_fmax(rM[n])  # warp reduction
-                        # Avoid dynamic register indexing (creates spills)
-                        if n == lane_idx:
-                            rM_lane = rM[n]
-                    rM_lane *= scale_s_log2_e  # apply scale
-
-                    # Reduce colmax in smem
-                    sM_acquire_nbar.arrive_and_wait()
-                    sM_consumer_nbar.arrive_and_wait()
-                    if lane_store_max:
-                        smem_fmax(sM.iterator + sM.layout(lane_idx), rM_lane)
-
-                    # Wait for colmax and load
-                    sM_producer_nbar.arrive_and_wait()
-                    colmax = sM.load()
-                    sM_release_nbar.arrive()
-
-                    # Wait for empty P buffer
-                    # Here so we can interleave ex2 with convert ops
-                    p_handle = p_producer.acquire_and_advance(p_token)
-                    tSsP_s = tSsP[None, None, p_handle.index]
-
-                    # Compute online softmax
-                    probs = exp2(scale_s_log2_e * scores - colmax)
-
-                    # Store P to smem and notify BMM2
-                    tSsP_s.store(probs.to(mma_dtype).reshape(tSsP_s.shape))
-                    cute.arch.fence_view_async_shared()
-                    p_handle.commit()
-
-                    # Accumulate per-thread colsum
-                    colsum = probs[None, 0]
-                    for sm in cutlass.range_constexpr(1, tiles_sm, 1):
-                        colsum += probs[None, sm]
-                    tSrL = cute.make_rmem_tensor(tSrL_shape, acc_dtype)
-                    tSrL.store(colsum.reshape(tSrL.shape))
-
-                    # Store per-thread colsum to tmem
-                    tL_consumer_nbar.arrive_and_wait()
-                    cute.copy(tmem_store_atom_l, tSrL, tStL)
-                    cute.arch.fence_view_async_tmem_store()
-                    tL_producer_nbar.arrive()
-
-                    # Advance again for dual warpgroups
-                    s_consumer.advance()
-                    p_producer.advance()
+                    iters_s = tiles_s
 
         ##############################
         # Correction Dispatch
@@ -1419,7 +1782,7 @@ class GroupedQueryAttentionDecode:
             tOtL = thr_load_o.partition_S(tCtL)
             # Slice unused modes
             tOtO = tOtO[None, 0, 0, 0, None, None]  # (CPY, #TILE_DM, o_stages)
-            tOsO = tOsO[None, 0, 0, 0, None]  # (CPY, #TILE_DM)
+            tOsO = tOsO[None, 0, 0, 0, None, None]  # (CPY, #TILE_DM, q_stages)
             tOtL = tOtL[None, 0, 0, 0, None]  # (CPY, o_stages)
 
             # colsum load helper
@@ -1441,151 +1804,185 @@ class GroupedQueryAttentionDecode:
                 return tOrL_s.load().reshape(blk_tile_n)
 
             # Initialize O and colsum
-            tOrO = cute.make_rmem_tensor(tOsO.shape, acc_dtype)
-            tOrO.fill(Float32(0))
+            tOrO_zero = cute.make_rmem_tensor(tOsO.shape[:-1], acc_dtype)
+            tOrO_zero.fill(Float32(0))
             for phase in cutlass.range_constexpr(o_stages):
-                cute.copy(tmem_store_atom_o, tOrO, tOtO[None, None, phase])
-            cute.copy(tmem_store_atom_o, tOrO[None, 0], tOtL[None, 1])
+                cute.copy(tmem_store_atom_o, tOrO_zero, tOtO[None, None, phase])
             cute.arch.fence_view_async_tmem_store()
 
             # Initialize consumer barriers
             sM_consumer_nbar.arrive()
             for phase in cutlass.range_constexpr(o_stages):
                 with_phase(tL_consumer_nbar, phase).arrive()
+            sM_stage = sM[None, 0]
 
-            # Initialize colsum in RF
-            colsum_p = cute.make_rmem_tensor((blk_tile_n, o_stages), Float32)
-            colsum_0, colsum_1 = colsum_p[None, 0], colsum_p[None, 1]
-            colsum_p.fill(Float32(0))
+            next_work_valid = True
+            while next_work_valid:
+                # Initialize colsum in RF
+                colsum_total = cute.make_rmem_tensor((blk_tile_n,), Float32)
+                colsum_total.fill(Float32(0))
 
-            # Load colmax of s-2, s-1
-            sM_lane_prev_prev = sM_lane_prev = -Float32.inf
-            for s in cutlass.range_constexpr(o_stages):
-                sM_lane_prev_prev = sM_lane_prev
-                if not (s == 1 and iters_s == 1):
+                # Load colmax of s-2, s-1
+                sM_lane_prev_prev = sM_lane_prev = -Float32.inf
+                for s in cutlass.range_constexpr(o_stages):
+                    sM_lane_prev_prev = sM_lane_prev
+                    if not (s == 1 and iters_s == 1):
+                        sM_producer_nbar.arrive_and_wait()
+                        if lane_store_max:
+                            sM_lane_prev = sM_stage[lane_idx]
+                        sM_consumer_nbar.arrive()
+
+                # Sequence loop
+                for s in cutlass.range(iters_s - o_stages):
+                    # Load colsum of s-2
+                    o_index = o_consumer.current_handle().index
+                    colsum_s = colsum_load(o_index)
+
+                    # Load colmax of s
                     sM_producer_nbar.arrive_and_wait()
+                    if s == iters_s - o_stages - 1:  # Notify for final colmax
+                        sM_final_nbar.arrive()
+                    sM_lane = Float32(0)
                     if lane_store_max:
-                        sM_lane_prev = sM[lane_idx]
+                        sM_lane = sM_stage[lane_idx]
                     sM_consumer_nbar.arrive()
 
-            # Sequence loop
-            phase = 0
-            for s in cutlass.range(iters_s - o_stages, unroll=o_stages):
-                # Load colsum of s-2
-                colsum_s = colsum_load(phase)
+                    # Wait for O of s-2
+                    # Here so we can interleave shuffle_sync with correction muls
+                    o_token = o_consumer.try_wait()
+                    o_handle = o_consumer.wait_and_advance(o_token)
 
-                # Load colmax of s
-                sM_producer_nbar.arrive_and_wait()
-                if s == iters_s - o_stages - 1:  # Notify for final colmax
+                    # Compute correction of s-2
+                    correction_lane = exp2(sM_lane_prev_prev - sM_lane)
+                    correction = cute.make_rmem_tensor_like(sM_stage)
+                    for n in cutlass.range_constexpr(blk_tile_n):
+                        correction[n] = cute.arch.shuffle_sync(correction_lane, n)
+                    correction = correction.load()
+
+                    # Correct O of s-2 and notify MMA VP
+                    correction_o = correction.reshape(tOsO.shape[:1])
+                    for dm in cutlass.range_constexpr(tiles_dm):
+                        tOtO_dm = tOtO[None, dm, o_handle.index]
+                        tOrO_dm = cute.make_rmem_tensor(tOsO.shape[:1], acc_dtype)
+                        cute.copy(tmem_load_atom_o, tOtO_dm, tOrO_dm)
+                        tOrO_dm.store(correction_o * tOrO_dm.load())
+                        cute.copy(tmem_store_atom_o, tOrO_dm, tOtO_dm)
+                    cute.arch.fence_view_async_tmem_store()
+                    o_handle.release()
+
+                    # Correct colsum of s-2
+                    colsum_s *= correction
+
+                    # Compute correction of s-1
+                    correction_lane = exp2(sM_lane_prev - sM_lane)
+                    correction = cute.make_rmem_tensor_like(sM_stage)
+                    for n in cutlass.range_constexpr(blk_tile_n):
+                        correction[n] = cute.arch.shuffle_sync(correction_lane, n)
+                    correction = correction.load()
+
+                    # Correct total colsum and accumulate colsum s-2
+                    colsum_total.store(correction * colsum_total.load() + colsum_s)
+
+                    # Advance loop
+                    sM_lane_prev_prev, sM_lane_prev = sM_lane_prev, sM_lane
+
+                # Notify for final colmax if we didn't enter loop
+                if iters_s <= o_stages:
                     sM_final_nbar.arrive()
-                sM_lane = Float32(0)
-                if lane_store_max:
-                    sM_lane = sM[lane_idx]
-                sM_consumer_nbar.arrive()
 
-                # Wait for O of s-2
-                # Here so we can interleave shuffle_sync with correction muls
-                o_token = o_consumer.try_wait()
-                o_handle = o_consumer.wait_and_advance(o_token)
-
-                # Compute correction of s-2
-                correction_lane = exp2(sM_lane_prev_prev - sM_lane)
-                correction = cute.make_rmem_tensor_like(sM)
+                # Compute correction of s-1
+                correction_lane = exp2(sM_lane_prev_prev - sM_lane_prev)
+                correction = cute.make_rmem_tensor_like(sM_stage)
                 for n in cutlass.range_constexpr(blk_tile_n):
                     correction[n] = cute.arch.shuffle_sync(correction_lane, n)
                 correction = correction.load()
 
-                # Correct O of s-2 and notify MMA VP
-                correction_o = correction.reshape(tOsO.shape[:1])
-                for dm in cutlass.range_constexpr(tiles_dm):
-                    tOtO_dm = tOtO[None, dm, phase]
-                    tOrO_dm = cute.make_rmem_tensor(tOsO.shape[:1], acc_dtype)
-                    cute.copy(tmem_load_atom_o, tOtO_dm, tOrO_dm)
-                    tOrO_dm.store(correction_o * tOrO_dm.load())
-                    cute.copy(tmem_store_atom_o, tOrO_dm, tOtO_dm)
-                cute.arch.fence_view_async_tmem_store()
-                o_handle.release()
+                # region: Correct and accumulate final colsum
+                # Accumulate in thread RF
+                prev_index = o_consumer.current_handle().index
+                if iters_s == 1:
+                    prev_index ^= 1
+                colsum_final = colsum_total.load()
+                colsum_final += colsum_load(prev_index ^ 1)
+                if iters_s > 1:
+                    colsum_final += colsum_load(prev_index) * correction
+                # Reduce colsum in warp RF
+                rL_lane = Float32(0.0)
+                for n in cutlass.range_constexpr(blk_tile_n):
+                    rL_n = cute.arch.warp_reduction_sum(colsum_final[n])
+                    if n == lane_idx:
+                        rL_lane = rL_n
+                # Store partial colsum in smem and notify
+                if lane_store_max:
+                    sL[lane_idx, warpgroup_widx] = rL_lane
+                # Wait to ensure reduction warp has reset sM_final_nbar
+                sL_final_nbar.arrive_and_wait()
+                # endregion: final colsum
 
-                # Correct and accumulate colsum of s-2
-                colsum_s *= correction
-                if phase == 0:
-                    colsum_0.store(correction * colsum_0.load() + colsum_s)
-                elif phase == 1:
-                    colsum_1.store(correction * colsum_1.load() + colsum_s)
+                # region: Correct and accumulate final output
+                # Load O of s-1, s
+                tOrO = cute.make_rmem_tensor((*tOsO.shape[:-1], o_stages), acc_dtype)
+                for s in cutlass.range_constexpr(o_stages):
+                    if not (s == 0 and iters_s == 1):
+                        o_handle = o_consumer.wait_and_advance()
+                        tOtO_s = tOtO[None, None, o_handle.index]
+                        tOrO_s = tOrO[None, None, s]
+                        cute.copy(tmem_load_atom_o, tOtO_s, tOrO_s)
+                        cute.arch.fence_view_async_tmem_load()
+                        # Reset O tmem for next work
+                        if cutlass.const_expr(is_persistent):
+                            cute.copy(tmem_store_atom_o, tOrO_zero, tOtO_s)
+                            cute.arch.fence_view_async_tmem_store()
+                        o_handle.release()  # Final release signals tmem dealloc
+                # reshape and accumulate
+                tOrO_final = tOrO[None, None, 1].load()
+                output_final = tOrO_final.reshape((blk_tile_n, tiles_dm))
+                if iters_s > 1:
+                    tOrO_prev = tOrO[None, None, 0].load()
+                    output_prev = tOrO_prev.reshape((blk_tile_n, tiles_dm))
+                    output_final += correction * output_prev
+                # endregion: final output
 
-                # Advance loop
-                sM_lane_prev_prev, sM_lane_prev = sM_lane_prev, sM_lane
-                phase ^= 1
+                # Apply final normalization
+                if cutlass.const_expr(do_atomic_red or do_none_red):
+                    # final normalization stored in sM
+                    sM_final_nbar.arrive_and_wait()
+                    normalization = sM_stage.load()
+                    output_final *= normalization
 
-            # Notify for final colmax if we didn't enter loop
-            if iters_s <= o_stages:
-                sM_final_nbar.arrive()
+                # Slice smem QO stage corresponding to this work
+                qo_index = q_consumer.current_handle().index
+                tOsO_stage = tOsO[None, None, qo_index]
 
-            # Compute correction of s-1
-            correction_lane = exp2(sM_lane_prev_prev - sM_lane_prev)
-            correction = cute.make_rmem_tensor_like(sM)
-            for n in cutlass.range_constexpr(blk_tile_n):
-                correction[n] = cute.arch.shuffle_sync(correction_lane, n)
-            correction = correction.load()
+                # Store O to smem and notify
+                tOsO_stage.store(output_final.to(o_dtype).reshape(tOsO_stage.shape))
+                cute.arch.fence_view_async_shared()
+                sO_final_nbar.arrive()
 
-            # Correct and accumulate final colsum
-            tail_phase = iters_s % o_stages
-            for phase in cutlass.range_constexpr(o_stages):
-                if tail_phase == phase:
-                    # Accumulate in thread RF
-                    colsum_prev = colsum_load(phase)
-                    colsum_final = colsum_load(phase ^ 1)
-                    colsum_prev += colsum_p[None, phase].load()
-                    colsum_final += colsum_p[None, phase ^ 1].load()
-                    colsum_final += correction * colsum_prev
-                    # Reduce colsum in warp RF
-                    rL_lane = Float32(0.0)
-                    for n in cutlass.range_constexpr(blk_tile_n):
-                        rL_n = cute.arch.warp_reduction_sum(colsum_final[n])
-                        if n == lane_idx:
-                            rL_lane = rL_n
-                    # Store partial colsum in smem and notify
-                    if lane_store_max:
-                        sL[lane_idx, warpgroup_widx] = rL_lane
-                    # Wait to ensure reduction warp has reset sM_final_nbar
-                    sL_final_nbar.arrive_and_wait()
+                next_work_valid = False
+                if cutlass.const_expr(is_persistent):
+                    # Read CLC response from smem
+                    block_idx, next_work_valid = get_next_work(clc_consumer)
+                    clc_consumer.advance()
 
-            # Load O of s-1, s
-            tOrO_tail = cute.make_rmem_tensor((*tOsO.shape, o_stages), acc_dtype)
-            for s in cutlass.range_constexpr(o_stages):
-                phase_s = tail_phase ^ s
-                tOtO_phase = tOtO[None, None, phase_s]
-                tOrO_tail_s = tOrO_tail[None, None, s]
-                o_handle = o_consumer.wait_and_advance()
-                cute.copy(tmem_load_atom_o, tOtO_phase, tOrO_tail_s)
-                cute.arch.fence_view_async_tmem_load()
-                o_handle.release()  # Final release signals tmem dealloc
-            tOrO_prev = tOrO_tail[None, None, 0].load()
-            tOrO_final = tOrO_tail[None, None, 1].load()
+                    # Persistence has no KV splits; refresh this Q tile's interval.
+                    (_, coord_p), _ = get_coords(block_idx)
+                    coord_kv, tiles_s = mask_config.get_tiles_kv(
+                        prediction, seqlen, blk_tile_s, blk_tile_p, coord_p
+                    )
+                    iters_s = tiles_s
 
-            # Correct and accumulate output
-            output_prev = tOrO_prev.reshape((blk_tile_n, tiles_dm))
-            output_final = tOrO_final.reshape((blk_tile_n, tiles_dm))
-            output_final += correction * output_prev
-
-            # Apply final normalization
-            if cutlass.const_expr(do_atomic_red or do_none_red):
-                # final normalization stored in sM
-                sM_final_nbar.arrive_and_wait()
-                normalization = sM.load()
-                output_final *= normalization
-
-            # Store O to smem and notify
-            tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
-            cute.arch.fence_view_async_shared()
-            sO_final_nbar.arrive()
+                    # Update colmax smem stage
+                    q_consumer.advance()
+                    qo_index = q_consumer.current_handle().index
+                    sM_stage = sM[None, qo_index]
 
         ##############################
         # Reduction Dispatch
         ##############################
-        if warp_idx == reduction_warp_id:
+        if not is_persistent and warp_idx == reduction_warp_id:
+            # Wait for sink
             if cutlass.const_expr(sSink is not None):
-                cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.sync_warp()
 
@@ -1598,16 +1995,17 @@ class GroupedQueryAttentionDecode:
                     lane_idx,
                     sM_final_nbar,
                     sL_final_nbar,
-                    sM,
+                    sM[None, 0],
                     sL,
-                    mM,
                     mM_partial,
                     mL_partial,
                 )
             elif cutlass.const_expr(do_atomic_red):
-                gL = None
+                gL = cL = lse_bounds = None
                 if cutlass.const_expr(store_lse):
                     gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
+                    cL = lse_tile_coords(mL, blk_tile_hp, coord_hp)
+                    lse_bounds = mL.shape[0]
                 self.reduction_cluster(
                     blk_tile_n,
                     kv_splits,
@@ -1616,45 +2014,48 @@ class GroupedQueryAttentionDecode:
                     sM_final_nbar,
                     sL_final_nbar,
                     reduction_mbars_ptr,
-                    sM,
+                    sM[None, 0],
                     sL,
                     sR,
                     gL,
+                    cL,
+                    lse_bounds,
                     sSink,
                     scale_o,
                 )
             elif cutlass.const_expr(do_none_red):
+                gL = lane_store_lse = None
+                if cutlass.const_expr(store_lse):
+                    gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
+                    lane_store_lse = lane_store_max & lse_lane_valid(
+                        mL, blk_tile_hp, coord_hp, lane_idx
+                    )
                 self.reduction_none(
-                    blk_tile_hp,
-                    coord_hp,
-                    coord_hb,
                     lane_store_max,
                     lane_idx,
                     sM_final_nbar,
                     sL_final_nbar,
-                    sM,
+                    sM[None, 0],
                     sL,
-                    mL,
+                    gL,
+                    lane_store_lse,
                     sSink,
                     scale_o,
                 )
-            cute.arch.griddepcontrol_launch_dependents()
 
         return
 
     @staticmethod
     @cute.jit
     def reduction_none(
-        blk_tile_hp: Tuple[int, int],
-        coord_hp: Tuple[Int32, Int32],
-        coord_hb: Tuple[Int32, Int32],
         lane_store_max: bool,
         lane_idx: Int32,
         sM_final_nbar: nbar,
         sL_final_nbar: nbar,
         sM: cute.Tensor,
         sL: cute.Tensor,
-        mL: Optional[cute.Tensor],
+        gL: Optional[cute.Tensor],
+        lane_store_lse: Optional[Boolean],
         sSink: Optional[cute.Tensor],
         scale_o: Float32,
     ):
@@ -1662,23 +2063,11 @@ class GroupedQueryAttentionDecode:
 
         Waits for the final colmax and per-warp colsums, adds the attention sink
         term (relative to the final colmax) when ``sSink`` is set, and writes
-        ``scale_o / colsum`` to ``sM`` for the correction warpgroup. When ``mL`` is
-        given, stores the log2-base LSE for lanes inside the grouped-head and
-        prediction bounds.
+        ``scale_o / colsum`` to ``sM`` for the correction warpgroup. When ``gL`` is
+        given, stores the log2-base LSE from lanes where ``lane_store_lse`` is set
+        (see :func:`lse_lane_valid`).
         """
-        store_lse = mL is not None
-        if cutlass.const_expr(store_lse):
-            gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
-            # Padded tile lanes (grouped heads or predictions past the tensor) must not
-            # store: their LSE slots alias the next KV head's rows.
-            cL = cute.local_tile(
-                cute.make_identity_tensor(mL.shape[0]), blk_tile_hp, coord_hp
-            )
-            idx_hg, idx_p = cL[lane_idx]
-            grouped_heads, prediction = mL.shape[0]
-            lane_store_lse = lane_store_max
-            lane_store_lse &= idx_hg < grouped_heads
-            lane_store_lse &= idx_p < prediction
+        store_lse = gL is not None
         colmax = Float32(0)
         colsum = Float32(0)
         sM_final_nbar.arrive_and_wait()
@@ -1694,7 +2083,7 @@ class GroupedQueryAttentionDecode:
                 colsum += exp2(log2_e * sSink[lane_idx] - colmax)
             normalization = cute.arch.rcp_approx(colsum) * scale_o
             sM[lane_idx] = normalization
-        sM_final_nbar.arrive()
+        sM_final_nbar.arrive_and_wait()  # wait in case this is a persistent loop
         if cutlass.const_expr(store_lse):
             if lane_store_lse:
                 gL[lane_idx] = colmax + cute.math.log2(colsum)
@@ -1711,13 +2100,11 @@ class GroupedQueryAttentionDecode:
         sL_final_nbar: nbar,
         sM: cute.Tensor,
         sL: cute.Tensor,
-        mM: cute.Tensor,
         mM_partial: cute.Tensor,
         mL_partial: cute.Tensor,
     ):
         # get gmem colmax + colsum to store to
         coord_h = (coord_hp, coord_hb, kv_split_idx)
-        gM = cute.local_tile(mM, (blk_tile_hp,), coord_h[:-1])
         gM_partial = cute.local_tile(mM_partial, (blk_tile_hp,), coord_h)
         gL_partial = cute.local_tile(mL_partial, (blk_tile_hp,), coord_h)
 
@@ -1727,20 +2114,18 @@ class GroupedQueryAttentionDecode:
         lane_store_max = blk_tile_n == warp_threads or lane_idx < blk_tile_n
 
         # gmem predication
-        grouped_heads, prediction = mM.shape[0]
-        cM = cute.make_identity_tensor(mM.shape[0])
+        grouped_heads, prediction = mM_partial.shape[0]
+        cM = cute.make_identity_tensor(mM_partial.shape[0])
         cM = cute.local_tile(cM, blk_tile_hp, coord_hp)
         idx_hg, idx_p = cM[lane_idx]
         lane_store_max &= idx_hg < grouped_heads
         lane_store_max &= idx_p < prediction
 
-        # Load partial colmax and reduce
+        # Store partial colmax. global colmax is constructed in reduction kernel.
         cute.arch.fence_acq_rel_cta()  # Don't reorder partitioning after barrier
         sM_final_nbar.arrive_and_wait()
         if lane_store_max:
-            sM_lane = sM[lane_idx]
-            gM_partial[lane_idx] = sM_lane
-            gmem_fmax(gM.iterator + gM.layout(lane_idx), sM_lane)
+            gM_partial[lane_idx] = sM[lane_idx]
 
         # Load partial colsum and reduce
         sL_final_nbar.arrive_and_wait()
@@ -1763,10 +2148,21 @@ class GroupedQueryAttentionDecode:
         sL: cute.Tensor,
         sR: cute.Tensor,
         gL: Optional[cute.Tensor],
+        cL: Optional[cute.Tensor],
+        lse_bounds: Optional[Tuple[Int32, Int32]],
         sSink: Optional[cute.Tensor],
         scale_o: Float32,
     ):
+        """Split-K reduction across a cluster of ``kv_splits`` CTAs.
+
+        Butterfly all-reduces colmax, then colsum, through distributed shared
+        memory, and writes the per-split output correction to ``sM``. When
+        ``gL`` is given, split 0 stores the log2-base LSE for the rows whose
+        coordinates in ``cL`` (see :func:`lse_tile_coords`) are below
+        ``lse_bounds`` (grouped heads, predictions); padded rows are skipped.
+        """
         acc_dtype = sM.dtype
+        assert acc_dtype.width == 32, "DSMEM reduction requires 32-bit accumulators"
         colmax_bits = blk_tile_n * acc_dtype.width
         copy_vec_bits = min(colmax_bits, 128)
         dsmem_store_threads = colmax_bits // copy_vec_bits
@@ -1877,10 +2273,54 @@ class GroupedQueryAttentionDecode:
 
         # Compute and store LSE
         if cutlass.const_expr(gL is not None):
+            assert cL is not None and lse_bounds is not None
             tRgL = thr_store_r.partition_D(gL)  # (CPY, #CPY=1)
+            tRcL = thr_store_r.partition_D(cL)  # (CPY, #CPY=1) of (h_g, s_q)
             if kv_split_idx == 0 and is_reduction_lane:
-                lse = tRrM_final.load() + cute.math.log2(tRrL_final.load())
-                tRgL.store(lse)
+                tRrLse = cute.make_rmem_tensor(tRrM_shape, acc_dtype)
+                tRrLse.store(tRrM_final.load() + cute.math.log2(tRrL_final.load()))
+                # Element-wise: one vector can straddle the end of the head group.
+                for j in cutlass.range_constexpr(cute.size(tRgL)):
+                    if cute.elem_less(tRcL[j], lse_bounds):
+                        tRgL[j] = tRrLse[j]
+
+    @staticmethod
+    def setup_reduction_attrs(
+        headdim: int,
+        splits: int,
+        red_vec_bits: int = 64,
+        red_d_ctas: int = 1,
+        red_max_groups: int = 16,
+    ):
+        """Compile-time attributes for the split-K reduction kernel."""
+        assert headdim % red_d_ctas == 0, (headdim, red_d_ctas)
+        assert red_vec_bits == 64 or red_vec_bits == 128
+        d_per_blk = headdim // red_d_ctas
+        d_per_thr = min(max(1, red_vec_bits // Float32.width), d_per_blk)
+        assert d_per_blk % d_per_thr == 0
+        thr_per_grp = d_per_blk // d_per_thr
+
+        # Split-parallel groups. Each group owns a strided slice of the splits and
+        # holds that slice in registers. Pick largest exact divisor of `splits`
+        # so every group has the same static slice length.
+        max_groups = min(red_max_groups, 1024 // thr_per_grp)
+        split_groups = 1
+        for g in range(1, max_groups + 1):
+            if splits % g == 0:
+                split_groups = g
+
+        per_grp = splits // split_groups
+        thr_per_blk = thr_per_grp * split_groups
+        smem_floats = 2 + split_groups * (d_per_blk + 1)
+        return (
+            d_per_blk,  # Number of output d elements per threadblock
+            d_per_thr,  # Number of output d elements per thread
+            thr_per_grp,  # Number of threads per split-parallel group
+            thr_per_blk,  # Threadblock size
+            split_groups,  # Number of split-parallel groups
+            per_grp,  # Number of splits each group reduces
+            smem_floats * Float32.width // 8,  # Smem size in bytes
+        )
 
     ##############################
     # Reduction Kernel launch
@@ -1888,10 +2328,13 @@ class GroupedQueryAttentionDecode:
     @staticmethod
     @cute.jit
     def launch_reduction(
-        d_per_blk: int,
+        headdim: int,  # Head dimension
+        splits: int,  # Number of kv splits
+        red_vec_bits: int,  # Size of each thread's partial O vector
+        red_d_ctas: int,  # Number of CTAs in the head dim
+        red_max_groups: int,  # Maximum number of split-parallel groups
         o_bshd: cute.Tensor,
         l_bsh: Optional[cute.Tensor],  # LSE output (log2 base) or None
-        m_bsh: cute.Tensor,  # colmax_s, already computed
         o_partial_bshd: cute.Tensor,  # partial O per kv split
         l_partial_bsh: cute.Tensor,  # partial colsum_p per kv split
         m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
@@ -1900,7 +2343,18 @@ class GroupedQueryAttentionDecode:
         stream: cuda.CUstream,
         enable_pdl: bool = True,
     ):
-        splits, b, s_q, h_q, d = o_partial_bshd.shape
+        (
+            d_per_blk,
+            d_per_thr,
+            thr_per_grp,
+            thr_per_blk,
+            split_groups,
+            per_grp,
+            smem_bytes,
+        ) = GroupedQueryAttentionDecode.setup_reduction_attrs(
+            headdim, splits, red_vec_bits, red_d_ctas, red_max_groups
+        )
+        _, b, s_q, h_q, d = o_partial_bshd.shape
 
         # Tile in headdim first
         def reverse(t: cute.Tensor):
@@ -1910,28 +2364,25 @@ class GroupedQueryAttentionDecode:
 
         o_dhsb = reverse(o_bshd)
         l_hsb = reverse(l_bsh) if l_bsh is not None else None
-        m_hsb = reverse(m_bsh)
         o_partial_dhsb = reverse(o_partial_bshd)
         l_partial_hsb = reverse(l_partial_bsh)
         m_partial_hsb = reverse(m_partial_bsh)
 
-        d_per_thr = 32 // o_bshd.dtype.width
-        thr_per_blk = d_per_blk // d_per_thr
         d_blks = cute.ceil_div(d, d_per_blk)
-        smem_bytes = (splits * 2 + 2) * Float32.width // 8
 
         GroupedQueryAttentionDecode.reduction_kernel(
-            (thr_per_blk, d_per_thr, d_per_blk),
+            (thr_per_grp, d_per_thr, d_per_blk),
+            split_groups,
+            per_grp,
             o_dhsb,
             l_hsb,
-            m_hsb,
             o_partial_dhsb,
             l_partial_hsb,
             m_partial_hsb,
             sink_h,
             scale_o,
         ).launch(
-            grid=[d_blks, h_q * s_q, b],
+            grid=[s_q, d_blks * h_q, b],
             block=[thr_per_blk, 1, 1],
             cluster=[1, 1, 1],
             stream=stream,
@@ -1944,58 +2395,64 @@ class GroupedQueryAttentionDecode:
     @cute.kernel
     def reduction_kernel(
         tile_d: cute.Tile,
+        split_groups: cutlass.Constexpr,
+        per_grp: cutlass.Constexpr,
         o_dhsb: cute.Tensor,
         l_hsb: Optional[cute.Tensor],
-        m_hsb: cute.Tensor,
         o_partial_dhsb: cute.Tensor,
         l_partial_hsb: cute.Tensor,
         m_partial_hsb: cute.Tensor,
         sink_h: Optional[cute.Tensor],
         scale_o: Float32,
     ):
-        thr_per_blk, d_per_thr, d_per_blk = tile_d
+        thr_per_grp, d_per_thr, d_per_blk = tile_d
         d, h_q, s_q, b, splits = o_partial_dhsb.shape
-        d_blk_idx, coord_hs, coord_b = cute.arch.block_idx()
-        coord_h, coord_s = cute.idx2crd(coord_hs, (h_q, s_q))
+        coord_s, coord_dh, coord_b = cute.arch.block_idx()
+        d_blks = cute.ceil_div(d, d_per_blk)
+        d_blk_idx, coord_h = cute.idx2crd(coord_dh, (d_blks, h_q))
         tidx, _, _ = cute.arch.thread_idx()
+
+        # (d lane, split group) decomposition of the CTA
+        d_tidx = tidx % thr_per_grp
+        grp = tidx // thr_per_grp
 
         not_oob_d = True
         if d % d_per_blk != 0:
-            not_oob_d = d_blk_idx * d_per_blk + tidx * d_per_thr < d
+            not_oob_d = d_blk_idx * d_per_blk + d_tidx * d_per_thr < d
 
         coord_o = (d_blk_idx, coord_h, coord_s, coord_b, None)
         gO = cute.local_tile(o_dhsb, (d_per_blk,), coord_o[:-1])
         gO_partial = cute.local_tile(o_partial_dhsb, (d_per_blk,), coord_o)
 
-        gM = cute.local_tile(m_hsb, (1,), coord_o[1:-1])
         gM_partial = cute.local_tile(m_partial_hsb, (1,), coord_o[1:])
         gL_partial = cute.local_tile(l_partial_hsb, (1,), coord_o[1:])
-        gM_partial_0 = gM_partial[None, tidx]
-        gL_partial_0 = gL_partial[None, tidx]
 
         smem_ptr = cute.arch.get_dyn_smem(Float32)
-        partial_layout = cute.make_layout((1, splits))
-        sM_partial = cute.make_tensor(smem_ptr, partial_layout)
-        sL_partial = cute.make_tensor(smem_ptr + splits, partial_layout)
-        sL_partial_0 = sL_partial[None, tidx]
-        sM_partial_0 = sM_partial[None, tidx]
 
         scalar_layout = cute.make_layout(1)
-        sM = cute.make_tensor(smem_ptr + splits * 2, scalar_layout)
-
         use_sink = sink_h is not None
         if cutlass.const_expr(use_sink):
             gSink = cute.local_tile(sink_h, (1,), (coord_h,))
-            sSink = cute.make_tensor(smem_ptr + splits * 2 + 1, scalar_layout)
+        sSink = cute.make_tensor(smem_ptr, scalar_layout)
+        sMax = cute.make_tensor(smem_ptr + 1, scalar_layout)
 
+        # Per-group staging for the cross-group combine
+        sAcc = cute.make_tensor(
+            smem_ptr + 2,
+            cute.make_layout((d_per_blk, split_groups), stride=(1, d_per_blk)),
+        )
+        sSum = cute.make_tensor(
+            smem_ptr + 2 + d_per_blk * split_groups,
+            cute.make_layout(split_groups),
+        )
         cpasync_atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), Float32, num_bits_per_copy=32
         )
 
         copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32)
-        tv_layout = cute.make_ordered_layout((thr_per_blk, d_per_thr), order=(1, 0))
+        tv_layout = cute.make_ordered_layout((thr_per_grp, d_per_thr), order=(1, 0))
         tiled_copy = cute.make_tiled_copy(copy_atom, tv_layout, (d_per_blk,))
-        thr_copy = tiled_copy.get_slice(tidx)
+        thr_copy = tiled_copy.get_slice(d_tidx)
 
         tCgO_partial = thr_copy.partition_S(gO_partial)  # (CPY, #CPY=1, splits)
         tCgO_partial = tCgO_partial[None, 0, None]  # (CPY, splits)
@@ -2007,49 +2464,82 @@ class GroupedQueryAttentionDecode:
         cute.arch.griddepcontrol_wait()
 
         if tidx == 0:
-            cute.copy(cpasync_atom, gM, sM)
+            sMax[0] = -Float32.inf
             if cutlass.const_expr(use_sink):
                 cute.copy(cpasync_atom, gSink, sSink)
-
-        if tidx < splits:
-            cute.copy(cpasync_atom, gL_partial_0, sL_partial_0)
-            cute.copy(cpasync_atom, gM_partial_0, sM_partial_0)
-
-        for split_idx in cutlass.range(thr_per_blk + tidx, splits, thr_per_blk):
-            gL_partial_n = gL_partial[None, split_idx]
-            sL_partial_n = sL_partial[None, split_idx]
-            cute.copy(cpasync_atom, gL_partial_n, sL_partial_n)
-
-            gM_partial_n = gM_partial[None, split_idx]
-            sM_partial_n = sM_partial[None, split_idx]
-            cute.copy(cpasync_atom, gM_partial_n, sM_partial_n)
-
         cute.arch.cp_async_commit_group()
+
+        # This group's strided slice of the splits axis: elements
+        # grp, grp + split_groups, grp + 2 * split_groups, ...
+        split_slice = cute.make_layout(per_grp, stride=split_groups)
+        gM_grp = cute.composition(
+            cute.domain_offset(grp, gM_partial[0, None]), split_slice
+        )
+        gL_grp = cute.composition(
+            cute.domain_offset(grp, gL_partial[0, None]), split_slice
+        )
+        gO_grp = cute.composition(
+            cute.domain_offset((0, grp), tCgO_partial), (None, split_slice)
+        )
+
+        rM = gM_grp.load()
+        rL = gL_grp.load()
+        rO = gO_grp.load()
+
+        # Compute colmax: per-thread max over its own slice, then one smem atomic
+        # per warp. A serial scan over all splits dominates the kernel otherwise.
+        mx_thr = rM.reduce(cute.ReductionOp.MAX, -Float32.inf, 0)
+        mx_thr = warp_fmax(mx_thr)
+        cute.arch.sync_threads()
+        if tidx % warp_threads == 0:
+            smem_fmax(sMax.iterator, mx_thr)
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_threads()
+        max_final = sMax[0]
 
-        max_final = sM[0]
-        sum_final = Float32(0)
-        if cutlass.const_expr(use_sink):
-            sum_final = exp2(log2_e * sSink[0] - max_final)
+        sum_grp = Float32(0)
+        for j in cutlass.range_constexpr(per_grp):
+            l_j = rL[j]
+            # rM[j] = -inf means that the split is empty
+            if rM[j] > -Float32.inf:
+                correction = exp2(rM[j] - max_final)
+                sum_grp += correction * l_j
+                o_j = rO[None, j]
+                tCrO_final += correction * o_j
 
-        if max_final > -Float32.inf and not_oob_d:
-            for split_idx in cutlass.range(splits, unroll=8):
-                max_partial = sM_partial[0, split_idx]
-                if max_partial > -Float32.inf:
-                    correction = exp2(max_partial - max_final)
-                    sum_final += correction * sL_partial[0, split_idx]
-                    tCrO_final += correction * tCgO_partial[None, split_idx].load()
-            tCrO_final *= cute.arch.rcp_approx(sum_final) * scale_o
+        # Combine the split groups
+        if cutlass.const_expr(split_groups > 1):
+            tCsAcc = thr_copy.partition_D(sAcc[None, grp])[None, 0]
+            tCsAcc.store(tCrO_final)
+            if d_tidx == 0:
+                sSum[grp] = sum_grp
+            cute.arch.sync_threads()
 
         cute.arch.griddepcontrol_launch_dependents()
 
-        if not_oob_d:
-            tCgO.store(tCrO_final.to(o_dhsb.dtype))
+        if grp == 0:
+            sum_final = Float32(0)
+            if cutlass.const_expr(use_sink):
+                sum_final = exp2(log2_e * sSink[0] - max_final)
+            sum_final += sum_grp
+            if cutlass.const_expr(split_groups > 1):
+                for g in cutlass.range_constexpr(1, split_groups):
+                    sum_final += sSum[g]
+                    tCrO_final += thr_copy.partition_D(sAcc[None, g])[None, 0].load()
 
-        if cutlass.const_expr(l_hsb is not None):
-            if d_blk_idx == 0 and tidx == 0:
-                l_hsb[coord_h, coord_s, coord_b] = max_final + cute.math.log2(sum_final)
+            if not_oob_d:
+                # For rows which are fully masked, store 0
+                if sum_final > Float32(0):
+                    tCrO_final *= cute.arch.rcp_approx(sum_final) * scale_o
+                else:
+                    tCrO_final = cute.zeros_like(tCgO, Float32)
+                tCgO.store(tCrO_final.to(o_dhsb.dtype))
+
+            if cutlass.const_expr(l_hsb is not None):
+                if d_blk_idx == 0 and d_tidx == 0:
+                    l_hsb[coord_h, coord_s, coord_b] = max_final + cute.math.log2(
+                        sum_final
+                    )
 
         return
 
@@ -2075,6 +2565,11 @@ def run(
     window_left=None,
     window_right=0,
     sink: bool = False,
+    sequence_tile: int = 0,
+    red_vec_bits: int = 64,
+    red_d_ctas: int = 1,
+    red_max_groups: int = 16,
+    kv_stages_cap: int = 0,
     **kwargs,
 ):
     # Example-only imports deferred here so importing the kernel module
@@ -2142,9 +2637,12 @@ def run(
         else:
             tolerance = 0.1
 
+    if sequence_tile <= 0:
+        sequence_tile = 128 if prediction_tile > 1 and blk_tile_n > 8 else 256
+
     mask_config: AttentionMask
     if window_left is None and window_right is None:
-        mask_config = DenseMask()
+        mask_config = NoMask() if seqlen % sequence_tile == 0 else DenseMask()
         window_cli_args = " --window_left None --window_right None"
         window_summary = "\tmask: dense\n"
     elif window_left is None and window_right == 0:
@@ -2168,6 +2666,9 @@ def run(
         f" --iterations {iterations} --warmups {warmup_iterations}{' --use_warm_l2' if use_warm_l2 else ''}"
         f"{window_cli_args}"
         f"{' --sink' if sink else ''}"
+        f" --tile_s {sequence_tile}"
+        f" --red_vec_bits {red_vec_bits} --red_d_ctas {red_d_ctas}"
+        f" --red_max_groups {red_max_groups} --kv_stages_cap {kv_stages_cap}"
         f"{' --quiet' if quiet else ''}"
     )
 
@@ -2189,10 +2690,6 @@ def run(
     if scale_s == 0:
         scale_s = headdim**-0.5
 
-    sequence_tile = 256
-    if prediction_tile > 1 and blk_tile_n > 8:
-        sequence_tile = 128  # Prevent spills
-
     #
     # Config Kernel
     #
@@ -2202,6 +2699,11 @@ def run(
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
+        reduction_splits=kv_splits if reduction == "kernel" else None,
+        red_vec_bits=red_vec_bits,
+        red_d_ctas=red_d_ctas,
+        red_max_groups=red_max_groups,
+        kv_stages_cap=kv_stages_cap,
     )
 
     seqlen_q = prediction
@@ -2237,12 +2739,16 @@ def run(
                     mean=init[0], std=init[1], scale=init[2]
                 )
 
+        # Generate on the device: the kernel operand is converted from this
+        # reference tensor and the torch reference reads it, so a host round
+        # trip buys nothing.
         ref_torch_tensor = cutlass_torch.create_and_permute_torch_tensor(
             shape,
             torch_ref_dtype,
             permute_order=None,
             init_type=init_type,
             init_config=init_config,
+            device=torch.device("cuda"),
         )
 
         cute_tensor, torch_tensor = cutlass_torch.cute_tensor_like(
@@ -2273,9 +2779,8 @@ def run(
     acc_dtype = Float32
     _, l_cute, l_torch = create_tensor(qo_shape[1:-1], acc_dtype)
     # Workspace tensors
-    m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
+    o_partial_cute = m_partial_cute = l_partial_cute = None
     if do_kernel_red:
-        _, m_cute, m_torch = create_tensor(qo_shape[1:-1], acc_dtype, init=-math.inf)
         _, o_partial_cute, o_partial_torch = create_tensor(qo_shape, acc_dtype)
         _, m_partial_cute, m_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
         _, l_partial_cute, l_partial_torch = create_tensor(qo_shape[:-1], acc_dtype)
@@ -2297,7 +2802,6 @@ def run(
         v_cute,
         o_cute,
         l_cute,  # LSE output (compile-path exercise; not refchecked)
-        m_cute,
         o_partial_cute,
         l_partial_cute,
         m_partial_cute,
@@ -2317,7 +2821,9 @@ def run(
         with sdpa_kernel(
             [SDPBackend.FLASH_ATTENTION, SDPBackend.MATH], set_priority=True
         ):
-            attn_mask = torch.ones(prediction, seqlen, dtype=torch.bool)
+            attn_mask = torch.ones(
+                prediction, seqlen, dtype=torch.bool, device=q_bshd.device
+            )
             if window_right is not None:
                 attn_mask = attn_mask.tril(
                     diagonal=(seqlen - prediction + window_right)
@@ -2346,7 +2852,6 @@ def run(
             v_cute,
             o_cute,
             l_cute,
-            m_cute,
             o_partial_cute,
             l_partial_cute,
             m_partial_cute,
@@ -2358,7 +2863,7 @@ def run(
             True,  # enable_pdl
         )
         print("Verifying results...")
-        o_ref = run_torch_fmha(q_ref, k_ref, v_ref, scale_s).cuda()
+        o_ref = run_torch_fmha(q_ref, k_ref, v_ref, scale_s)
         torch.testing.assert_close(
             o_ref, o_torch.to(torch_ref_dtype), atol=tolerance, rtol=1e-05
         )
@@ -2385,9 +2890,8 @@ def run(
             qo_shape[1:], o_dtype, init=(0 if do_atomic_red else None)
         )
         _, l_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype)
-        m_cute = o_partial_cute = m_partial_cute = l_partial_cute = None
+        o_partial_cute = m_partial_cute = l_partial_cute = None
         if do_kernel_red:
-            _, m_cute, _ = create_tensor(qo_shape[1:-1], acc_dtype, init=-math.inf)
             _, o_partial_cute, _ = create_tensor(qo_shape, acc_dtype)
             _, m_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
             _, l_partial_cute, _ = create_tensor(qo_shape[:-1], acc_dtype)
@@ -2402,7 +2906,6 @@ def run(
             v_cute,
             o_cute,
             l_cute,
-            m_cute,
             o_partial_cute,
             l_partial_cute,
             m_partial_cute,
@@ -2423,10 +2926,7 @@ def run(
         one_workspace_bytes = qkvo_bytes
         if do_kernel_red:
             one_workspace_bytes += (
-                m_torch.nbytes
-                + o_partial_torch.nbytes
-                + m_partial_torch.nbytes
-                + l_partial_torch.nbytes
+                o_partial_torch.nbytes + m_partial_torch.nbytes + l_partial_torch.nbytes
             )
         workspace_count = testing.get_workspace_count(
             one_workspace_bytes, warmup_iterations, iterations
@@ -2483,6 +2983,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prediction",
         "--p",
+        "--s_q",
         type=int,
         default=1,
         help="number of predicted tokens",
@@ -2492,6 +2993,7 @@ if __name__ == "__main__":
         "--seqlen",
         "--seq",
         "--s",
+        "--s_k",
         type=int,
         default=1024,
         help="key/value sequence length",
@@ -2601,6 +3103,44 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="Number of iterations after warmup",
+    )
+
+    parser.add_argument(
+        "--sequence_tile",
+        "--tile_s",
+        type=int,
+        default=0,
+        choices=[0, 128, 256],
+        help="KV tokens per threadblock per loop iteration (0 = auto)",
+    )
+
+    parser.add_argument(
+        "--red_vec_bits",
+        type=int,
+        default=64,
+        choices=[64, 128],
+        help="For --reduction kernel, sets the partial-O load width in the reduction kernel (64 or 128)",
+    )
+
+    parser.add_argument(
+        "--red_d_ctas",
+        type=int,
+        default=1,
+        help="For --reduction kernel, sets the number of CTAs across the head dim in the reduction kernel",
+    )
+
+    parser.add_argument(
+        "--red_max_groups",
+        type=int,
+        default=16,
+        help="For --reduction kernel, caps the number of split groups in the reduction kernel",
+    )
+
+    parser.add_argument(
+        "--kv_stages_cap",
+        type=int,
+        default=0,
+        help="Cap the KV pipeline depth (0 = uncapped)",
     )
 
     parser.add_argument(

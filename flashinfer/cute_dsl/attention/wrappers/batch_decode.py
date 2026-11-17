@@ -207,6 +207,22 @@ def _pick_tile_shape(
     return grouped_head_tile, prediction_tile
 
 
+def _grid_yz(
+    batch_size: int,
+    num_kv_heads: int,
+    grouped_head_tile: int,
+    prediction_tile: int,
+    grouped_heads: int,
+    prediction: int,
+) -> int:
+    """CTAs per KV split: (grouped-head tiles x prediction tiles) x (batch x KV heads)."""
+    ceil_div = lambda a, b: (a + b - 1) // b
+    grid_y = ceil_div(grouped_heads, grouped_head_tile) * ceil_div(
+        prediction, prediction_tile
+    )
+    return grid_y * batch_size * num_kv_heads
+
+
 def _compute_kv_splits(
     batch_size: int,
     num_kv_heads: int,
@@ -218,40 +234,52 @@ def _compute_kv_splits(
     sm_count: int,
     reduction: str,
 ) -> int:
-    """Replicate ``gqa_decode.run`` kv_splits auto-computation."""
+    """Replicate ``gqa_decode.run`` kv_splits auto-computation, rounded down.
+
+    kv_splits is a compile-time value for the kernel reducer, so round down
+    kv_splits to buckets (powers of two capped by SM count) to avoid many
+    recompilations. Callers of BatchDecodeCuteDSLWrapper and
+    BatchDecodePagedCuteDSLWrapper can pass an explicit kv_splits to override
+    this bucketing behaviour.
+    """
     if reduction == "none":
         return 1
     ceil_div = lambda a, b: (a + b - 1) // b
-    grouped_head_tiles = ceil_div(grouped_heads, grouped_head_tile)
-    prediction_tiles = ceil_div(prediction, prediction_tile)
-    grid_z = batch_size * num_kv_heads
-    grid_y = grouped_head_tiles * prediction_tiles
-    grid_yz = grid_y * grid_z
+    grid_yz = _grid_yz(
+        batch_size,
+        num_kv_heads,
+        grouped_head_tile,
+        prediction_tile,
+        grouped_heads,
+        prediction,
+    )
     sm_count = sm_count if sm_count > 0 else 148
     kv_splits = max(1, sm_count // grid_yz)
     if sm_count == 148 and grid_yz == 32:
         kv_splits = 9  # 2 waves
     kv_splits = min(kv_splits, max(1, ceil_div(max_kv_len, 256)))
+    batch1_max_splits = max(1, sm_count // (grid_yz // batch_size))
+    if kv_splits != batch1_max_splits and kv_splits != 9:
+        rounded = 1 << (kv_splits.bit_length() - 1)  # floor to a power of two
+        if kv_splits >= sm_count // 8:
+            rounded = max(rounded, sm_count // 8)
+        kv_splits = rounded
     if reduction == "atomic" and kv_splits not in (1, 2, 4):
         kv_splits = 8
     return kv_splits
 
 
-def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype") -> str:
+def _resolve_reduction(
+    reduction: str, kv_splits: int, o_dtype: "cutlass.dtype", grid_yz: int
+) -> str:
     if reduction != "auto":
         return reduction
     if kv_splits == 1:
         # No split-K — skip flash-decoding entirely (no reduction kernel,
         # no cluster atomics).
         return "none"
-    if o_dtype in (
-        cutlass.Float32,
-        cutlass.Float16,
-        cutlass.BFloat16,
-    ) and kv_splits in (
-        2,
-        4,
-        8,
+    if o_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16) and (
+        kv_splits in (2, 4) or (kv_splits == 8 and grid_yz * kv_splits <= 120)
     ):
         return "atomic"
     return "kernel"
@@ -285,15 +313,11 @@ def _slice_workspace(
         (kv_splits, batch_size, prediction, num_qo_heads, head_dim)
     )
     m_partial_shape = l_partial_shape = o_partial_shape[:-1]
-    m_shape = o_partial_shape[1:-1]
 
     workspace = workspace.view(dtype=torch.float32)
 
     required_elts = (
-        o_partial_shape.numel()
-        + m_partial_shape.numel()
-        + l_partial_shape.numel()
-        + m_shape.numel()
+        o_partial_shape.numel() + m_partial_shape.numel() + l_partial_shape.numel()
     )
     if workspace.numel() < required_elts:
         raise RuntimeError(
@@ -313,10 +337,7 @@ def _slice_workspace(
     start, end = end, end + m_partial_shape.numel()
     m_partial = workspace[start:end].view(m_partial_shape)
 
-    start, end = end, end + m_shape.numel()
-    m = workspace[start:end].view(m_shape)
-
-    return m, o_partial, l_partial, m_partial
+    return o_partial, l_partial, m_partial
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +354,7 @@ def _get_compiled_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
+    reduction_splits: Optional[int],
     window_left: Optional[int],
     window_right: Optional[int],
     use_lse: bool,
@@ -354,6 +376,7 @@ def _get_compiled_decode_kernel(
         prediction_tile=prediction_tile,
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
+        reduction_splits=reduction_splits,
     )
     mask_config = _get_mask_config(window_left, window_right)
     has_workspace = reduction == "kernel"
@@ -406,14 +429,8 @@ def _get_compiled_decode_kernel(
 
     if not has_workspace:
         # atomic / none reduction: no per-split workspace tensors.
-        m_fake = o_partial_fake = m_partial_fake = l_partial_fake = None
+        o_partial_fake = m_partial_fake = l_partial_fake = None
     else:
-        m_fake = cute.runtime.make_fake_compact_tensor(
-            acc_dtype,
-            (sym_batch, sym_prediction, num_qo_heads),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
         o_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
             (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
@@ -449,7 +466,6 @@ def _get_compiled_decode_kernel(
         v_fake,
         o_fake,
         l_fake,
-        m_fake,
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
@@ -473,8 +489,10 @@ def _get_compiled_paged_decode_kernel(
     head_dim: int,
     prediction: int,
     reduction: str,
+    reduction_splits: Optional[int],
     window_left: Optional[int],
     window_right: Optional[int],
+    pdl_kv_preload: bool,
     use_threshold: bool,
     use_lse: bool,
     use_sink: bool,
@@ -508,6 +526,8 @@ def _get_compiled_paged_decode_kernel(
         sequence_tile=sequence_tile,
         reduction_mode=cast(Literal["kernel", "atomic", "none"], reduction),
         softmax_warpgroups=softmax_warpgroups,
+        reduction_splits=reduction_splits,
+        pdl_kv_preload=pdl_kv_preload,
     )
     mask_config = _get_mask_config(window_left, window_right)
     has_workspace = reduction == "kernel"
@@ -574,14 +594,8 @@ def _get_compiled_paged_decode_kernel(
 
     if not has_workspace:
         # atomic / none reduction: no per-split workspace tensors.
-        m_fake = o_partial_fake = m_partial_fake = l_partial_fake = None
+        o_partial_fake = m_partial_fake = l_partial_fake = None
     else:
-        m_fake = cute.runtime.make_fake_compact_tensor(
-            acc_dtype,
-            (sym_batch, sym_prediction, num_qo_heads),
-            stride_order=(2, 1, 0),
-            assumed_align=16,
-        )
         o_partial_fake = cute.runtime.make_fake_compact_tensor(
             acc_dtype,
             (sym_kv_splits, sym_batch, sym_prediction, num_qo_heads, head_dim),
@@ -621,7 +635,6 @@ def _get_compiled_paged_decode_kernel(
         q_fake,
         o_fake,
         l_fake,
-        m_fake,
         o_partial_fake,
         l_partial_fake,
         m_partial_fake,
@@ -831,7 +844,15 @@ class BatchDecodeCuteDSLWrapper:
                 get_num_sm(self.device),
                 reduction,
             )
-        reduction = _resolve_reduction(reduction, kv_splits, out_dtype)
+        grid_yz = _grid_yz(
+            batch_size,
+            num_kv_heads,
+            grouped_head_tile,
+            prediction_tile,
+            num_qo_heads // num_kv_heads,
+            q_len_per_req,
+        )
+        reduction = _resolve_reduction(reduction, kv_splits, out_dtype, grid_yz)
         if reduction == "atomic":
             if kv_splits not in (1, 2, 4, 8, 16):
                 raise ValueError(
@@ -867,7 +888,7 @@ class BatchDecodeCuteDSLWrapper:
 
         # Carve out workspace tensors
         if self._has_workspace:
-            m, o_partial, l_partial, m_partial = _slice_workspace(
+            o_partial, l_partial, m_partial = _slice_workspace(
                 self._float_workspace_buffer,
                 kv_splits,
                 batch_size,
@@ -875,7 +896,6 @@ class BatchDecodeCuteDSLWrapper:
                 num_qo_heads,
                 head_dim,
             )
-            self._m = m
             self._o_partial = o_partial
             self._l_partial = l_partial
             self._m_partial = m_partial
@@ -890,6 +910,7 @@ class BatchDecodeCuteDSLWrapper:
             head_dim,
             q_len_per_req,
             reduction,
+            kv_splits if reduction == "kernel" else None,
             window_left,
             window_right,
         )
@@ -1013,6 +1034,10 @@ class BatchDecodeCuteDSLWrapper:
             raise ValueError(
                 f"k.shape={tuple(k.shape)} must equal v.shape={tuple(v.shape)}"
             )
+        if 0 < s_k < s_q:
+            raise ValueError(
+                f"non-zero K/V seqlen({s_k}) must be at least query seqlen({s_q})"
+            )
 
         device = q.device
         # Atomic reduction accumulates into out via atomic_add and requires
@@ -1022,19 +1047,18 @@ class BatchDecodeCuteDSLWrapper:
             torch_alloc = torch.zeros if atomic else torch.empty
             out = torch_alloc((b, s_q, h_q, d), dtype=self._o_data_type, device=device)
 
-        m = o_partial = l_partial = m_partial = None
+        o_partial = l_partial = m_partial = None
         if self._has_workspace:
             # Kernel expects partial + batch stride to be coalescible
             # So we must reslice workspace if runtime batch doesn't match
             if b == self._batch_size and s_q <= self._q_len_per_req:
                 # Runtime q_len doesnt exceed plantime q_len, return slice
-                m = self._m[:, :s_q, :]
                 o_partial = self._o_partial[:, :, :s_q, :, :]
                 l_partial = self._l_partial[:, :, :s_q, :]
                 m_partial = self._m_partial[:, :, :s_q, :]
             else:
                 # Re-validate workspace size and slice
-                m, o_partial, l_partial, m_partial = _slice_workspace(
+                o_partial, l_partial, m_partial = _slice_workspace(
                     self._float_workspace_buffer,
                     self._kv_splits,
                     b,
@@ -1042,7 +1066,6 @@ class BatchDecodeCuteDSLWrapper:
                     self._num_qo_heads,
                     self._head_dim,
                 )
-            m.fill_(float("-inf"))
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_lse = lse is not None
@@ -1091,7 +1114,6 @@ class BatchDecodeCuteDSLWrapper:
             v,
             out,
             lse,
-            m,
             o_partial,
             l_partial,
             m_partial,
@@ -1198,6 +1220,16 @@ class BatchDecodePagedCuteDSLWrapper:
             If True, also compile the BLASST skip-softmax variant of the
             kernel at plan() time, so the first :meth:`run` call that
             passes ``skip_softmax_threshold_scale_factor`` is fast.
+        pdl_kv_preload : bool
+            Keyword-only, default ``False``. Under Programmatic Dependent
+            Launch, start loading K/V tiles before waiting on the preceding
+            kernel; only ``q`` and the tiles that hold the newest
+            ``q_len_per_req`` tokens of each request wait for it. Use this
+            only when the preceding kernel writes nothing else that the
+            decode reads: the other K/V cache entries, ``seq_lens``,
+            ``indptr`` and ``indices`` must be complete before the decode
+            launches. Has no effect when :meth:`run` is called with
+            ``enable_pdl=False``.
 
         Note
         ----
@@ -1279,6 +1311,7 @@ class BatchDecodePagedCuteDSLWrapper:
         max_kv_len: Optional[int] = None,
         non_blocking: bool = True,
         precompile_skip_softmax_kernel: bool = False,
+        pdl_kv_preload: bool = False,
     ) -> None:
         _require_dsl_arch(self.device)
         if page_size not in (8, 16, 32, 64):
@@ -1342,7 +1375,15 @@ class BatchDecodePagedCuteDSLWrapper:
                 get_num_sm(self.device),
                 reduction,
             )
-        reduction = _resolve_reduction(reduction, kv_splits, out_dtype)
+        grid_yz = _grid_yz(
+            batch_size,
+            num_kv_heads,
+            grouped_head_tile,
+            prediction_tile,
+            num_qo_heads // num_kv_heads,
+            q_len_per_req,
+        )
+        reduction = _resolve_reduction(reduction, kv_splits, out_dtype, grid_yz)
         if reduction == "atomic":
             if kv_splits not in (1, 2, 4, 8, 16):
                 raise ValueError(
@@ -1381,7 +1422,7 @@ class BatchDecodePagedCuteDSLWrapper:
 
         # Carve out workspace tensors
         if self._has_workspace:
-            m, o_partial, l_partial, m_partial = _slice_workspace(
+            o_partial, l_partial, m_partial = _slice_workspace(
                 self._float_workspace_buffer,
                 kv_splits,
                 batch_size,
@@ -1389,7 +1430,6 @@ class BatchDecodePagedCuteDSLWrapper:
                 num_qo_heads,
                 head_dim,
             )
-            self._m = m
             self._o_partial = o_partial
             self._l_partial = l_partial
             self._m_partial = m_partial
@@ -1405,8 +1445,10 @@ class BatchDecodePagedCuteDSLWrapper:
             head_dim,
             q_len_per_req,
             reduction,
+            kv_splits if reduction == "kernel" else None,
             window_left,
             window_right,
+            pdl_kv_preload,
         )
         # Standard (no-BLASST, no-LSE) variant — always compiled at plan().
         # BLASST and LSE variants compile lazily on first use via the cache.
@@ -1599,17 +1641,16 @@ class BatchDecodePagedCuteDSLWrapper:
             else:
                 raise ValueError(f"out must be 3D or 4D; got ndim={out.dim()}")
 
-        m = o_partial = l_partial = m_partial = None
+        o_partial = l_partial = m_partial = None
         if self._has_workspace:
             if q_len_per_req <= self._q_len_per_req:
                 # Runtime q_len doesnt exceed plantime q_len, return slice
-                m = self._m[:, :q_len_per_req, :]
                 o_partial = self._o_partial[:, :, :q_len_per_req, :, :]
                 l_partial = self._l_partial[:, :, :q_len_per_req, :]
                 m_partial = self._m_partial[:, :, :q_len_per_req, :]
             else:
                 # Re-validate workspace size and slice
-                m, o_partial, l_partial, m_partial = _slice_workspace(
+                o_partial, l_partial, m_partial = _slice_workspace(
                     self._float_workspace_buffer,
                     self._kv_splits,
                     self._batch_size,
@@ -1617,7 +1658,6 @@ class BatchDecodePagedCuteDSLWrapper:
                     self._num_qo_heads,
                     self._head_dim,
                 )
-            m.fill_(float("-inf"))
 
         scale_s = self._sm_scale if sm_scale is None else sm_scale
         use_threshold = skip_softmax_threshold_scale_factor is not None
@@ -1695,7 +1735,6 @@ class BatchDecodePagedCuteDSLWrapper:
             q_view,
             out_4d,
             l_view,
-            m,
             o_partial,
             l_partial,
             m_partial,
