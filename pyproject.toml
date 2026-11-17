@@ -99,6 +99,8 @@ exclude = [
 "flashinfer.cake_sage_block_sparse_attention_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_fused_qk_rope_fp8_append_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_vsa_sm90_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_muse_spark_norm_backend" = ["csrc/**", "build.json"]
+"flashinfer.cake_tp_moe_finalize_rmsnorm_backend" = ["csrc/**", "build.json"]
 "flashinfer.cake_gdp_backend" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_mhc_det_train" = ["csrc/**", "build.json"]
 "flashinfer.experimental.cake.cake_mhc_head_det_train" = ["csrc/**", "build.json"]
@@ -137,6 +139,7 @@ exclude = [
 "flashinfer.experimental.cake_msa_icp_indexer" = ["csrc/**", "build.json"]
 "flashinfer.experimental.deepgemm_batched_gemm" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
 "flashinfer.experimental.deepgemm_mega_gate" = ["csrc/**", "build.json", "DEEPGEMM_NOTICE.txt"]
+"flashinfer.experimental.sm12x_mega_gate" = ["DEEPGEMM_NOTICE.txt"]
 # Generated sources and the build manifest (build.json) of the experimental exact-SM100a/SM103a Kimi-K3
 # attention-residual (AttnRes) backend; its cake_build loader compiles them on demand, prebuilt aot/ libraries never ship.
 "flashinfer.experimental.cake_kimi_k3_attn_res" = ["csrc/**", "build.json"]
@@ -219,9 +222,8 @@ exclude = [
 "flashinfer.experimental.qwen_3_5_block" = ["README.md"]
 "flashinfer.experimental.qwen_3_5_block._cudnn_frost" = ["VENDOR.md", "VENDOR_MANIFEST.json"]
 "flashinfer.experimental.qwen_3_8_block" = ["README.md"]
-# CUDA sources for the experimental SM80-SM90 QSA NVFP4 sparse paged attention, and the generated sources and
-# build manifest (build.json) of its Cake backend, the public entry's default route on SM80-SM90.
-"flashinfer.experimental.qsa_nvfp4" = ["csrc/**"]
+# Generated sources and build manifest (build.json) of the experimental Cake backend of
+# flashinfer.sparse.qsa_sparse_paged_attention.
 "flashinfer.experimental.cake_qsa_nvfp4" = ["csrc/**", "build.json"]
 # CUDA sources of the experimental fused MNNVL all-reduce + mHC post-map / pre-norm backend.
 "flashinfer.experimental.allreduce_mhc_post_prenorm" = ["csrc/**"]

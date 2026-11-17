@@ -14,10 +14,11 @@ all. Compute capability 12.0 has no tcgen05 instructions and no tensor memory,
 so the SM80 `mma.sync` program is built for `sm_120a`: the one Blackwell
 architecture that program serves.
 
-Both the API and the backend are experimental: no compatibility guarantee.
+The backend is experimental behind a stable API: no compatibility guarantee.
 The public entry's `backend="auto"` (its default) selects this package on
 every compute capability above 9.0 it exports a library for (capability-exact:
-12.1 is not included); the feature does not participate in autotuning or
+12.1 is not included) when `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is
+set; the feature does not participate in autotuning or
 trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
 ships them and JIT-built by FlashInfer from `build.json` otherwise (see
 "Layout of this package"). Toolkit requirement: CUDA 12.8 or newer
@@ -36,8 +37,10 @@ out = qsa_sparse_paged_attention(
 ```
 
 `backend="auto"` (the default) runs this package on the exported compute
-capabilities above 9.0 (10.0, 10.3, 10.7, 12.0) and the existing implementation on 8.x
-and 9.0 and on any other device, which it then reports as unsupported; `"cake"` selects this package and `"default"` the existing
+capabilities above 9.0 (10.0, 10.3, 10.7, 12.0) when
+`FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is set and raises `RuntimeError`
+there otherwise, and the existing implementation on 8.x
+and 9.0 and on any other device, which it then reports as unsupported; `"cake"` selects this package (with a one-time `ExperimentalWarning`) and `"default"` the existing
 implementation explicitly; any other value raises `ValueError`. This package's
 results agree with the existing implementation within the test suites'
 tolerances but are not bit-identical to it: callers that need the existing

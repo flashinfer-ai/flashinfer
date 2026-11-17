@@ -1,6 +1,6 @@
 # CI workflow using AWS self-hosted runners.
-# Runs AOT build tests and GPU unit tests on PRs to main, and on main itself on
-# a schedule.
+# Runs AOT build tests, GPU unit tests and the CPU-only tests/cpu suite on PRs
+# to main, and on main itself on a schedule.
 # Uses ci/bash.sh for Docker execution (same as Jenkins).
 #
 # Permission Control:
@@ -114,6 +114,8 @@ jobs:
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
       h100_disabled: ${{ steps.matrix.outputs.h100_disabled }}
+      spec_lint_matrix: ${{ steps.matrix.outputs.spec_lint_matrix }}
+      spec_lint_count: ${{ steps.matrix.outputs.spec_lint_count }}
       checkout_sha: ${{ steps.scope.outputs.checkout_sha || github.sha }}
       snapshot_base: ${{ steps.scope.outputs.snapshot_base }}
       snapshot_tree: ${{ steps.scope.outputs.snapshot_tree }}
@@ -280,7 +282,7 @@ jobs:
           # A10G is intersected per shard: each shard whose files overlap the request
           # runs as its own job, so a targeted run keeps the bare run's balancing and
           # -k splits, and shards left with nothing are not scheduled.
-          A10G_SCOPES=(); T4_SCOPE=""
+          A10G_SCOPES=(); T4_SCOPE=""; H100_SCOPE=""
           if [ "$SKIP_GPU" != "true" ] && [ -n "${REQUESTED_TEST_PATH}" ]; then
             for shard in 1 2 3 4 5; do
               A10G_SCOPES[$shard]=$(python3 scripts/pr_checks/targeted_lane_scope.py \
@@ -292,6 +294,13 @@ jobs:
               --scripts scripts/task_jit_run_tests_t4.sh \
               --targets "${REQUESTED_TEST_PATH}")
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
+            # tests/cpu belongs to the CPU Unittest lane, which runs on every run.
+            # The H100 lane ignores it, so drop it from the H100 scope here: a
+            # request naming only tests/cpu then schedules no H100 job instead of
+            # one that collects nothing.
+            H100_SCOPE=$(tr ' ' '\n' <<< "${REQUESTED_TEST_PATH}" \
+              | grep -Ev '^tests/+cpu(/|$)' | paste -sd ' ' - || true)
+            echo "H100 targeted scope: ${H100_SCOPE:-<none: lane not scheduled>}"
           fi
           {
             if [ "$SKIP_AOT" != "true" ]; then
@@ -314,6 +323,27 @@ jobs:
                   }'
                 done
               done
+            fi
+
+            # tests/cpu runs on every run, whatever scope was requested. Its
+            # tests check contracts across modules (package parity, stub
+            # configs, wrapper attributes), so a change in one directory breaks
+            # a CPU test that a scope naming that directory would not select.
+            # It needs no GPU and takes about 5 minutes on a CPU runner, and
+            # through fail-fast it stops the GPU lanes early when it fails.
+            # The GPU lanes leave it out: the H100 lane ignores tests/cpu and
+            # the A10G/T4 shard lists name no file under it.
+            if [ "$SKIP_GPU" != "true" ]; then
+              jq -nc '{
+                name: "CPU Unittest",
+                kind: "cpu",
+                gpu_name: "CPU",
+                runner: ["self-hosted", "linux", "x64", "cpu", "on-demand"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: "tests/cpu",
+                timeout: 60
+              }'
             fi
 
             if [ "$SKIP_GPU" != "true" ] && [ -z "${REQUESTED_TEST_PATH}" ]; then
@@ -391,8 +421,8 @@ jobs:
                   timeout: 360
                 }'
               fi
-              if [ "$RUN_H100" = "true" ]; then
-                jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+              if [ "$RUN_H100" = "true" ] && [ -n "${H100_SCOPE}" ]; then
+                jq -nc --arg test_path "${H100_SCOPE}" '{
                   name: "Targeted Unittest (H100)",
                   kind: "h100",
                   gpu_name: "H100",
@@ -409,6 +439,21 @@ jobs:
           echo "matrix=$(cat matrix.json)" >> $GITHUB_OUTPUT
           echo "count=$(jq '.include | length' matrix.json)" >> $GITHUB_OUTPUT
           jq -r '.include[].name' matrix.json
+
+          # Provider spec lint: one quick lane per published CUDA image, ahead of the
+          # hours-long AOT builds it guards, so a spec naming a CUDA target its
+          # provider cannot carry fails the PR in minutes. Dropped with the AOT lanes.
+          {
+            if [ "$SKIP_AOT" != "true" ]; then
+              for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
+                if grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml; then
+                  jq -nc --arg cuda "$cuda" '{cuda: $cuda}'
+                fi
+              done
+            fi
+          } | jq -sc '{include: .}' > spec-lint-matrix.json
+          echo "spec_lint_matrix=$(cat spec-lint-matrix.json)" >> "$GITHUB_OUTPUT"
+          echo "spec_lint_count=$(jq '.include | length' spec-lint-matrix.json)" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Tests - AOT build imports and GPU unit tests
@@ -456,7 +501,8 @@ jobs:
       # which turns it off for A/B timing without a code change. The `|| '1'`
       # matters: an unset variable is null, and `null != '0'` is false because
       # mismatched types are compared as numbers (null and '0' both become 0).
-      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
+      # The CPU lane compiles nothing, so it skips sccache too.
+      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && matrix.kind != 'cpu' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -553,7 +599,7 @@ jobs:
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
       - name: Configure compile cache
-        if: matrix.kind != 'aot'
+        if: matrix.kind != 'aot' && matrix.kind != 'cpu'
         env:
           S3_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
           S3_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
@@ -625,6 +671,24 @@ jobs:
           TEST_RUNNER_ARGS=()
           if [ "${MATRIX_KIND}" = "h100" ]; then
             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+            # The CPU Unittest lane runs tests/cpu on every run, so the H100
+            # lane's tests/ collection leaves it out. ci/bash.sh appends its own
+            # --ignore and forwards PYTEST_ADDOPTS into GPU containers.
+            export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--ignore=tests/cpu"
+          elif [ "${MATRIX_KIND}" = "cpu" ]; then
+            # No GPU in the container. ci/bash.sh forwards the lane identity
+            # only for GPU containers, so pass it here for summary.py.
+            # tests/cpu peaks near 4 GiB host RSS per file on H100, so 16
+            # workers fit the CPU runners the AOT lanes use (the arm64 one has
+            # 64 vCPU and ~500 GiB). More would not help: the slowest file,
+            # about 250 s, sets the floor.
+            DOCKER_ARGS+=(
+              --no-gpu
+              -e CI_GPU_NAME "${CI_GPU_NAME}"
+              -e CI_TEST_SCRIPT "${TEST_SCRIPT}"
+              -e CI_MATRIX_CUDA "${MATRIX_CUDA}"
+            )
+            TEST_RUNNER_ARGS+=(--workers 16)
           fi
           # Per-build compile times, summarized by the "Summarize JIT build times"
           # step. Appended: DOCKER_ARGS already carries the sccache settings.
@@ -751,7 +815,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # Non-H100 names add the runner SM: A10G and T4 rows can run the same script.
-          name: junit-${{ matrix.kind == 'h100' && 'h100' || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: junit-${{ (matrix.kind == 'h100' || matrix.kind == 'cpu') && matrix.kind || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json
@@ -798,6 +862,49 @@ jobs:
 
 
   # ---------------------------------------------------------------------------
+  # Provider spec lint - quick CUDA-target check ahead of the AOT builds
+  #
+  # The AOT lanes build every provider wheel (hours). The release builds reject a
+  # provider whose modules carry another architecture's CUDA target or PTX, which
+  # a PR used to find out only from the nightly. This generates each provider's
+  # spec list (no compiling, no GPU) and checks the explicit -gencode flags. The
+  # AOT lanes repeat it first thing, so their fail-fast still stops the matrix.
+  # ---------------------------------------------------------------------------
+  spec-lint:
+    name: Provider Spec Lint (${{ matrix.cuda }})
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      needs.setup.outputs.spec_lint_count != '0'
+    runs-on: [self-hosted, linux, x64, cpu, on-demand]
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.spec_lint_matrix) }}
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          docker ps -q | xargs -r docker stop 2>/dev/null || true
+          docker ps -aq | xargs -r docker rm 2>/dev/null || true
+          sudo rm -rf "${GITHUB_WORKSPACE:?}"/* || true
+          sudo rm -rf "${GITHUB_WORKSPACE:?}"/.[!.]* || true
+          docker image prune -f || true
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.setup.outputs.checkout_sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Lint provider spec CUDA targets
+        run: bash ci/bash.sh "${DOCKER_IMAGE}" --no-gpu ./scripts/task_check_jit_spec_gencodes.sh
+
+  # ---------------------------------------------------------------------------
   # Test Results Summary
   # ---------------------------------------------------------------------------
   test-results-summary:
@@ -807,6 +914,7 @@ jobs:
       - gate
       - setup
       - test
+      - spec-lint
     runs-on: ubuntu-latest
     steps:
       - name: Check Authorization
@@ -957,6 +1065,15 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
+      - name: Download CPU JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-cpu-*
+          path: junit-cpu
+          merge-multiple: true
+        continue-on-error: true
+
       - name: Download shard JUnit artifacts (A10G/T4)
         if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
         uses: actions/download-artifact@v4
@@ -976,6 +1093,10 @@ jobs:
           SUMMARY_ARGS=""
           if [ -f junit-h100/run-summary.json ]; then
             SUMMARY_ARGS="--summary junit-h100/run-summary.json"
+          fi
+          # The CPU lane runs the same sharded runner, so it has a run summary.
+          if [ -f junit-cpu/run-summary.json ]; then
+            SUMMARY_ARGS="$SUMMARY_ARGS --summary junit-cpu/run-summary.json --junit-dir junit-cpu"
           fi
 
           # A10G/T4 shard lanes produce raw JUnit XML (no run-summary.json).
@@ -1178,7 +1299,7 @@ jobs:
 
           if [ -n "${TEST_SCOPE:-}" ]; then
             echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
-            echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Tested only: \`${TEST_SCOPE}\`, plus \`tests/cpu\` on the CPU lane" >> $GITHUB_STEP_SUMMARY
             echo "> Comment \`@flashinfer-bot run all\` for full coverage." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
@@ -1195,6 +1316,15 @@ jobs:
             echo "> ⚠️ **Some GDN/KDA trace definitions are missing numerical coverage.**" >> $GITHUB_STEP_SUMMARY
             echo "> See the trace coverage report above for details." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # The provider spec lint is its own job, so the matrix result above does
+          # not cover it; a skipped lint (no published image, skip_aot) is not a failure.
+          SPEC_LINT="${{ needs.spec-lint.result }}"
+          echo "Provider spec lint: $SPEC_LINT" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$SPEC_LINT" == "failure" ] || [ "$SPEC_LINT" == "cancelled" ]; then
+            echo "Result: Tests Failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
 
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then

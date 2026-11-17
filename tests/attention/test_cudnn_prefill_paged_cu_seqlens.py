@@ -1,10 +1,7 @@
-"""cuDNN paged prefill via the direct mixed-form sequence-length path.
+"""cuDNN paged prefill with token offsets and explicit or cumulative Q lengths.
 
-The paged direct path binds the token-unit ``qo_indptr`` as ``cu_seq_len_q``
-(doubling as the Q/O ragged offset) and the per-request KV lengths as
-``seq_len_kv`` -- a *mixed* form (cumulative on Q, per-batch on KV) that cuDNN
-supports from backend 9.25+. KV is addressed through the page tables, so no
-KV-side cumulative prefix sum (and no element-unit offset conversion) is needed.
+Explicit Q and KV lengths support token offsets from cuDNN 9.24. Omitting Q
+lengths uses cumulative Q masks with per-request KV lengths, requiring 9.25.
 
 Each case compares the direct path against the legacy element-conversion paged
 path (already covered against the fa2 reference by ``test_cudnn_prefill``), so a
@@ -20,17 +17,13 @@ from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 from flashinfer.cudnn import prefill as cudnn_prefill
 
 
-@functools.lru_cache(maxsize=1)
-def _mixed_paged_supported() -> bool:
-    """Whether this cuDNN backend + frontend supports the mixed-form paged path.
-
-    Defers to the same production gate the dispatch uses, so the test only runs
-    where the direct path would actually be taken (rather than a separate ad-hoc
-    version/attribute probe that could diverge from production).
-    """
+@functools.lru_cache(maxsize=2)
+def _paged_token_offsets_supported(explicit_q: bool) -> bool:
     if not torch.cuda.is_available():
         return False
-    return cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True)
+    return cudnn_prefill._cudnn_supports_paged_token_offsets(
+        torch.bfloat16, explicit_q=explicit_q, explicit_kv=True
+    )
 
 
 def _make_paged_inputs(
@@ -91,13 +84,16 @@ def _make_paged_inputs(
 @pytest.mark.parametrize("page_size", [16, 64])
 @pytest.mark.parametrize("num_kv_heads", [1, 2])
 @pytest.mark.parametrize("causal", [True, False])
-def test_cudnn_paged_prefill_cu_seqlens_direct_matches_legacy(
-    monkeypatch, batch_size, s_qo, s_kv, page_size, num_kv_heads, causal
+@pytest.mark.parametrize(
+    "explicit_q", [False, True], ids=["cumulative-q", "explicit-q"]
+)
+def test_cudnn_paged_prefill_token_offsets_match_legacy(
+    monkeypatch, batch_size, s_qo, s_kv, page_size, num_kv_heads, causal, explicit_q
 ):
     if not cudnn_prefill.CUDNN_AVAILABLE:
         pytest.skip("cudnn-frontend python package not available")
-    if not _mixed_paged_supported():
-        pytest.skip("cuDNN backend/frontend too old for mixed-form paged seqlens")
+    if not _paged_token_offsets_supported(explicit_q):
+        pytest.skip("cuDNN backend/frontend does not support these paged token offsets")
 
     device = "cuda:0"
     num_qo_heads, head_dim = 8, 128
@@ -110,7 +106,7 @@ def test_cudnn_paged_prefill_cu_seqlens_direct_matches_legacy(
     common = dict(
         max_token_per_sequence=s_qo,
         max_sequence_kv=s_kv,
-        actual_seq_lens_q=inp["actual_seq_lens_q"],
+        actual_seq_lens_q=inp["actual_seq_lens_q"] if explicit_q else None,
         actual_seq_lens_kv=inp["actual_seq_lens_kv"],
         block_tables=inp["block_tables"],
         causal=causal,
@@ -132,22 +128,19 @@ def test_cudnn_paged_prefill_cu_seqlens_direct_matches_legacy(
     )
     out_legacy = run()
 
-    # Direct paged path: force the gate on, but only for the mixed-form request
-    # the paged dispatch must make. `return mixed` yields True iff the caller asks
-    # for mixed=True, so if the paged path ever stops requesting the mixed form it
-    # falls back to legacy and the assertion below fails instead of silently
-    # passing.
+    # Explicit lengths need the ordinary gate; cumulative Q needs the mixed gate.
+    expected_mixed = not explicit_q
     mixed_calls = []
 
     def _gate_direct(dtype, *, mixed=False):
         mixed_calls.append(mixed)
-        return mixed
+        return mixed == expected_mixed
 
     monkeypatch.setattr(cudnn_prefill, "_cudnn_supports_direct_seqlens", _gate_direct)
     out_direct = run()
 
-    assert True in mixed_calls, (
+    assert expected_mixed in mixed_calls, (
         "paged dispatch did not consult _cudnn_supports_direct_seqlens with "
-        "mixed=True, so the direct mixed-form path was not exercised"
+        f"mixed={expected_mixed}, so the direct token-offset path was not exercised"
     )
     torch.testing.assert_close(out_direct, out_legacy, atol=1e-2, rtol=1e-2)

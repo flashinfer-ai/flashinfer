@@ -486,6 +486,8 @@ def cake_dsa_sparse_attention_det_nope(
     lse : torch.Tensor
         Only with ``return_lse=True``.
 
+    Notes
+    -----
     Gradients flow to ``q`` and ``kv``.  ``dkv`` is formed in FP32 from the
     integer sums and handed over in FP32: through ``dkv_acc`` when given,
     otherwise as the ``kv`` gradient -- which the autograd engine casts to the
@@ -495,8 +497,8 @@ def cake_dsa_sparse_attention_det_nope(
     storage of the saved ``o_lo`` as scratch (see
     :func:`cake_dsa_sparse_attention_det`).
 
-    The incoming ``dout`` may be a head-major view (strides ``[512, T * 512,
-    1]``, the layout an output projection hands back) or any strided
+    The incoming ``dout`` may be a head-major view (strides ``[512, T * 512, 1]``,
+    the layout an output projection hands back) or any strided
     ``[T, 64, 512]`` view under the layout rules of ``q``: it is read in place
     with no host copy.
 
