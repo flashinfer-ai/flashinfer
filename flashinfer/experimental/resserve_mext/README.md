@@ -9,6 +9,8 @@ participate in automatic backend selection and provide no compatibility guarante
 Import `nvfp4_quantize_residue` and `mm_nvfp4_residue` from `flashinfer.resserve`.
 The quantizer produces paired base/residue activation rows. Fold GEMM uses shared
 weights and adds the paired accumulators in FP32 before FP16/BF16 conversion.
+Only adjacent base/residue row pairs are supported; no tile8 reordering or
+weight permutation is required.
 
 - FP16/BF16 input; finite inputs and positive finite global multipliers.
 - GEMM requires K divisible by 64 and N divisible by 8.
