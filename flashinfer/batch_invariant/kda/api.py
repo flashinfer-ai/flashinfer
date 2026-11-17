@@ -185,7 +185,8 @@ def _pack(q, k, v, g, beta, H: int, HV: int) -> Tuple[torch.Tensor, ...]:
         g.reshape(-1, HV, HEAD_DIM),
         beta.reshape(-1, HV),
     )
-    return tuple(t.contiguous() if t.data_ptr() % 16 == 0 else t.clone() for t in rows)
+    rows = tuple(t.contiguous() for t in rows)
+    return tuple(t if t.data_ptr() % 16 == 0 else t.clone() for t in rows)
 
 
 def recurrent_kda_batch_invariant(
