@@ -14,24 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import functools
-from pathlib import Path
-from typing import Any
-
-from ...jit.core import JitSpec, current_compilation_context, gen_jit_spec
+from . import env as jit_env
+from .core import JitSpec, current_compilation_context, gen_jit_spec
 
 
-def gen_qsa_nvfp4_module() -> JitSpec:
-    # SM80 instructions only (cp.async, mma.sync m16n8k16); one build serves SM80 through SM90.
+def gen_qsa_sparse_paged_module() -> JitSpec:
+    # SM80 instructions only (cp.async, mma.sync), so one build serves SM80 through SM90.
     return gen_jit_spec(
-        "qsa_nvfp4_attention",
-        [Path(__file__).resolve().parent / "csrc" / "qsa_nvfp4_attention.cu"],
+        "qsa_sparse_paged_attention",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "qsa_sparse_paged.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "qsa_sparse_paged_jit_binding.cu",
+        ],
         extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[8, 9]
         ),
     )
-
-
-@functools.cache
-def get_qsa_nvfp4_module() -> Any:
-    return gen_qsa_nvfp4_module().build_and_load()

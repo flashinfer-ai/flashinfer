@@ -182,6 +182,43 @@ def test_fp8_blockscale_gemm_dtypes(m, n, k, input_dtype, weight_dtype):
     )
 
 
+@pytest.mark.parametrize("n", [1024, 4096])
+@pytest.mark.parametrize("k", [512, 4096])
+def test_fp8_blockscale_gemm_weight_amax_covers_whole_block(n, k):
+    """Internal 128x128 weight quantization must take its amax from every row of the block.
+
+    The weight rows 0-3 of each 128-row block are tiny and the later rows carry values near the
+    FP8 maximum. A reduction that stops after the first rows (scale_128x128_kernel used the row
+    index to bound its column check) underestimates amax, the later rows saturate at 448 and the
+    product drifts from the BF16 reference.
+    """
+    if get_compute_capability(torch.device("cuda"))[0] < 9 or not is_sm90a_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("FP8 block-scale GEMM requires SM90a (Hopper) support")
+
+    device = "cuda"
+    torch.manual_seed(7)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    m = 64
+    input_bf16 = (torch.rand(m, k, dtype=torch.bfloat16, device=device) - 0.5) * 2
+    weight_bf16 = (
+        (torch.rand(n, k, dtype=torch.bfloat16, device=device) - 0.5) * 2 * fp8_max
+    )
+    row_in_block = torch.arange(n, device=device) % 128
+    weight_bf16[row_in_block < 4] *= 1.0 / 64
+
+    reference = torch.matmul(input_bf16, weight_bf16.T)
+    output = fp8_blockscale_gemm_sm90(input_bf16, weight_bf16, None, None)
+
+    cos_sim = F.cosine_similarity(
+        reference.flatten().float(), output.flatten().float(), dim=0
+    )
+    assert cos_sim > 0.99, (
+        f"Cosine similarity {cos_sim:.4f}: the 128x128 weight scale is off"
+    )
+
+
 @pytest.mark.parametrize("m", [7, 32, 128])
 @pytest.mark.parametrize("n", [1024, 4096])
 @pytest.mark.parametrize("k", [512, 4096])
