@@ -1508,8 +1508,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
             requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
-            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
-            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. CUDA graphs: capture
+            non-causal prefill, logits soft cap, custom masks, RoPE, scales) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back. ``return_lse=True`` returns
+            the class's LSE member (fp32; the output bits are the same with and without it). CUDA graphs: capture
             ``run()`` after ``plan()``; a replay reproduces the planned batch, and a new ``plan()`` needs a new capture
             (``use_cuda_graph=True`` raises). ``plan()`` runs a host-side planner whose cost grows with the number of requests
             (of the order of 10 us per request).
@@ -4005,6 +4006,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
         if self._batch_invariant is not None:
+            self._batch_invariant.validate_forward_options(
+                sm_scale=sm_scale,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+                window_left=window_left,
+            )
             return self.run_return_lse(
                 q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
             )

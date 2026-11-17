@@ -6,6 +6,12 @@
 engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim: a token's output bits depend on
 its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token.
 
+``run(..., return_lse=True)`` also returns the class's LSE member (``spec.lse_term``): fp32, ``(total_q, num_qo_heads)``, base 2,
+or -- on the prefill wrappers -- base e (``lse_base="ln"``, the declared in-kernel multiply by ``fp32(ln 2)``) and the
+``(num_qo_heads, total_q)`` layout (``lse_layout="HN"``, a copy of the same bits). It reads the ``(m, l)`` that normalise the
+output: the output bits are the same with and without it, and its receipt is its own
+(``fingerprint(<wrapper>, head_dim=..., lse_base=...)``).
+
 CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
 the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
 metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
@@ -24,7 +30,7 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, LSE_BASES, scale_log2
 
 CLASS = "attention.bf16"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -579,8 +585,12 @@ class BatchInvariantAttention:
         enable_pdl: Optional[bool] = None,
         use_fp16_softmax: Optional[bool] = None,
         uses_spcompress: Optional[bool] = None,
-    ) -> torch.Tensor:
-        """Validate changing run-time inputs once, then launch with the fixed plan."""
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
+    ):
+        """Validate changing run-time inputs once, then launch with the fixed plan. ``return_lse``: ``(out, lse)`` with the LSE
+        member in ``lse_base`` (``"log2"`` | ``"ln"``) and ``lse_layout`` (``"NH"`` | ``"HN"``), written to ``lse`` when given (as
+        on the other backends, an ``lse`` buffer without ``return_lse`` is not used)."""
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
         if use_fp16_softmax or uses_spcompress:
@@ -589,12 +599,15 @@ class BatchInvariantAttention:
                 "use_fp16_softmax / uses_spcompress",
                 "the fp32 softmax of the class",
             )
-        if return_lse or lse is not None:
-            raise unsupported(
-                CLASS,
-                "return_lse",
-                "the attention output alone (the class has no LSE member yet)",
-            )
+        if return_lse:
+            if lse_base not in LSE_BASES:
+                raise unsupported(
+                    CLASS, f"lse_base {lse_base!r}", 'lse_base "log2" or "ln"'
+                )
+            if lse_layout not in ("NH", "HN"):
+                raise unsupported(
+                    CLASS, f"lse_layout {lse_layout!r}", 'lse_layout "NH" or "HN"'
+                )
         if any(s is not None for s in scales):
             raise unsupported(
                 CLASS, "q_scale / k_scale / v_scale / o_scale", "unscaled bf16 operands"
@@ -703,6 +716,24 @@ class BatchInvariantAttention:
                 "an output that aliases the KV cache",
                 "an output byte span disjoint from the KV caches (CTAs store rows while others still read pages)",
             )
+        lse_nh = None
+        if return_lse:
+            nh_shape = (q.shape[0], Hq)
+            if lse is not None:
+                shape = nh_shape if lse_layout == "NH" else nh_shape[::-1]
+                bad = engine.check_lse_buffer(lse, q, out, k, v, shape)
+                if bad is not None:
+                    raise unsupported(
+                        CLASS,
+                        f"an lse buffer {bad}",
+                        f"a contiguous fp32 {shape} buffer on {self.device} that aliases neither q, out nor the KV cache",
+                    )
+            # the kernels write the (total_q, Hq) rows; the HN layout is a copy of them
+            lse_nh = (
+                lse
+                if lse is not None and lse_layout == "NH"
+                else torch.empty(nh_shape, dtype=torch.float32, device=self.device)
+            )
         engine._run_attention_validated(
             self._planned,
             q,
@@ -716,5 +747,14 @@ class BatchInvariantAttention:
             out,
             self._config,
             ragged=self.kind == "ragged",
+            lse=lse_nh,
+            lse_mode=engine.LSE_MODES[lse_base] if return_lse else 0,
         )
-        return out
+        if not return_lse:
+            return out
+        if lse_layout == "NH":
+            return out, lse_nh
+        if lse is None:
+            lse = torch.empty(nh_shape[::-1], dtype=torch.float32, device=self.device)
+        lse.copy_(lse_nh.t())
+        return out, lse
