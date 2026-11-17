@@ -9470,12 +9470,23 @@ class _B12xRunner(MoERunner):
             source_format="modelopt",
         )
 
+    def _weight_view(self, weights: MoEWeightPack) -> dict[str, torch.Tensor]:
+        """The native view under ``backend_key``, or an identical-layout
+        alias (``weight_view_aliases``); the plain lookup's KeyError (listing
+        the available keys) is kept when none is registered."""
+        for key in self.weight_view_aliases:
+            if self.backend_key not in weights.native_views and key in (
+                weights.native_views
+            ):
+                return weights.get_view(key)
+        return weights.get_view(self.backend_key)
+
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
-        v = weights.get_view(self.backend_key)
+        v = self._weight_view(weights)
         self._validate_prepared_weights(v)
         # Only the packed weights are expert-major; SFs are swizzled, alphas may broadcast.
         for key in ("w1_weight", "w2_weight"):
@@ -9592,9 +9603,12 @@ class B12xW4A16Runner(_B12xRunner):
     backend_key = "b12x_w4a16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
-    supported_activation_classes = (SwiGLU, ReLU2)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+        ReLU2,
+    )
     supports_expert_parallelism = True
-    required_weight_keys = (
+    required_weight_keys: ClassVar[tuple[str, ...]] = (
         "w1_weight",
         "w1_weight_sf",
         "w1_alpha",
@@ -9602,6 +9616,237 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
+
+
+# The E2M1 code table of the composable pure-torch fallback of
+# SpecializedW4A16Runner (low nibble first; two codes per packed byte).
+_E2M1_VALUES = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
+
+
+class SpecializedW4A16Runner(B12xW4A16Runner):
+    """Unified SM120 adapter that runs the specialized agent-generated
+    NVFP4-W4A16 MoE kernels deterministically on their allowlisted shapes.
+
+    A first-class autotune candidate: unlike :class:`B12xW4A16Runner`, whose
+    wrapper's auto-gate bails while the autotuner is timing (so the stock
+    path is what gets measured), this runner engages the specialized kernel
+    whenever the per-call guard admits the shape — including under autotune
+    — so MoELayer's cross-backend shootout times exactly what dispatch will
+    later serve. Refusals other than CUDA-graph-capture state fall back to
+    a composable pure-torch path, never another fused backend (the
+    never-swap-explicit rule); dispatching an unwarmed specialized variant
+    during capture raises instead of silently capturing the fallback.
+
+    The ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` kill switch rejects the
+    runner at support-check time, and any later refusal still never serves
+    the specialized kernel. Weights: the ``specialized_w4a16`` view, or the
+    layout-identical ``b12x_w4a16`` view as an alias.
+    """
+
+    backend_key = "specialized_w4a16"
+    weight_view_aliases = ("b12x_w4a16",)
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
+    # The kernels' contract is the non-gated ReLU^2 geometry only.
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        ReLU2,
+    )
+    supports_expert_parallelism = False
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__(config, device)
+        self._moe_output: Optional[torch.Tensor] = None
+
+    def _check_support(self) -> None:
+        # Generic checks only (quant pair, activation class, routing mode,
+        # EP rejection): deliberately skip _B12xRunner's stock-path
+        # requirements — the specialized kernels need neither the CuTe DSL
+        # package nor SM121 support.
+        super(_B12xRunner, self)._check_support()
+
+        from ..utils import get_compute_capability
+        from .specialized_moe_nvfp4_w4a16_sm120 import _C, _disabled
+
+        if _disabled():
+            raise NotImplementedError(
+                "the specialized W4A16 backend is disabled by "
+                "FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1."
+            )
+        routing = self.config.routing
+        intermediate = self.config.experts.intermediate_size
+        if (
+            routing.num_experts != _C["num_experts"]
+            or routing.top_k != _C["top_k"]
+            or intermediate != _C["intermediate_size"]
+        ):
+            raise NotImplementedError(
+                f"the specialized W4A16 kernels serve only the contract "
+                f"E={_C['num_experts']}, top_k={_C['top_k']}, "
+                f"intermediate_size={_C['intermediate_size']}; got "
+                f"E={routing.num_experts}, top_k={routing.top_k}, "
+                f"intermediate_size={intermediate}."
+            )
+        if list(get_compute_capability(self.device)) != _C["compute_capability"]:
+            raise RuntimeError(
+                f"the specialized W4A16 kernels require "
+                f"SM{_C['compute_capability'][0]}{_C['compute_capability'][1]}."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
+        self.activation = "relu2"
+
+    def _build(self) -> None:
+        """No b12x wrapper: forward drives the specialized module (or the
+        composable pure-torch fallback) directly."""
+        self._wrapper_cls = None
+
+    def _ensure_inner(self, hidden_size: int, num_tokens: int) -> None:
+        """Size the output buffer; there is no inner wrapper to build."""
+        self._require_built()
+        if (
+            self._moe_output is None
+            or self._moe_output.shape[0] < num_tokens
+            or self._moe_output.shape[1] != hidden_size
+        ):
+            self._moe_output = torch.empty(
+                (max(1, num_tokens), hidden_size),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError(f"{self.backend_key} supports only tactic -1.")
+        if self._prepared_weights is None or self._moe_output is None:
+            raise RuntimeError(
+                f"pack_inputs must be called before {self.backend_key} forward."
+            )
+        if len(inputs) != 3:
+            raise ValueError(
+                f"{self.backend_key} runner expects [hidden, expert_ids, weights]."
+            )
+        x, expert_ids, routing_weights = inputs
+        v = self._prepared_weights
+        output = self._moe_output[: x.shape[0]]
+
+        from . import specialized_moe_nvfp4_w4a16_sm120 as _spec
+
+        ok, reasons = _spec.specialized_support_reasons(
+            x,
+            v["w1_weight"],
+            v["w1_weight_sf"],
+            v["w2_weight"],
+            v["w2_weight_sf"],
+            expert_ids,
+            routing_weights,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            w1_alpha=v["w1_alpha"],
+            w2_alpha=v["w2_alpha"],
+            output=output,
+            activation=self.activation,
+            quant_mode="w4a16",
+            source_format="modelopt",
+            # First-class candidacy: when this runner is what the autotuner
+            # is timing, the specialized kernel is what must run.
+            allow_autotune=True,
+        )
+        if ok:
+            _spec.dispatch_stats["specialized"] += 1
+            return _spec.run_specialized_moe_nvfp4_w4a16(
+                x,
+                v["w1_weight"],
+                v["w1_weight_sf"],
+                v["w1_alpha"],
+                v["w2_weight"],
+                v["w2_weight_sf"],
+                v["w2_alpha"],
+                expert_ids,
+                routing_weights,
+                output,
+            )
+        if any(reason.startswith("graph_capture") for reason in reasons):
+            # Never dispatch an uncached/unwarmed variant under capture, and
+            # never silently capture the slow fallback in its place.
+            raise RuntimeError(
+                f"{self.backend_key}: cannot serve this call during CUDA-graph "
+                f"capture ({', '.join(reasons)}); run "
+                "flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120."
+                "warmup(...) on the capture stream (largest token count "
+                "first) before capturing."
+            )
+        _spec.fallback_reasons.append(tuple(reasons))
+        return self._forward_torch(x, expert_ids, routing_weights, v, output)
+
+    def _forward_torch(
+        self,
+        x: torch.Tensor,
+        expert_ids: torch.Tensor,
+        routing_weights: torch.Tensor,
+        v: dict,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Composable pure-torch fallback (fp32 dequant + ReLU^2 MoE) for
+        calls the specialized guard refuses — never another fused backend."""
+        if self.activation != "relu2":
+            raise NotImplementedError(
+                f"{self.backend_key} fallback implements only relu2."
+            )
+        lut = torch.tensor(_E2M1_VALUES, device=x.device, dtype=torch.float32)
+
+        def dequant(packed: torch.Tensor, scale: torch.Tensor, alpha):
+            lo = lut[(packed & 0x0F).to(torch.int64)]
+            hi = lut[(packed >> 4).to(torch.int64)]
+            rows, half_cols = packed.shape
+            full = torch.stack((lo, hi), dim=-1).reshape(rows, half_cols * 2)
+            groups = scale.to(torch.float32).repeat_interleave(16, dim=1)
+            return full * groups * alpha
+
+        x32 = x.to(torch.float32)
+        acc = torch.zeros(
+            (x.shape[0], output.shape[1]), dtype=torch.float32, device=x.device
+        )
+        ids64 = expert_ids.to(torch.int64)
+        tw32 = routing_weights.to(torch.float32)
+        for expert in torch.unique(ids64[ids64 >= 0]).tolist():
+            token, slot = (ids64 == expert).nonzero(as_tuple=True)
+            w1 = dequant(
+                v["w1_weight"][expert], v["w1_weight_sf"][expert], v["w1_alpha"][expert]
+            )
+            w2 = dequant(
+                v["w2_weight"][expert], v["w2_weight_sf"][expert], v["w2_alpha"][expert]
+            )
+            inter = torch.clamp(x32[token] @ w1.T, min=0.0)
+            inter = inter * inter
+            acc.index_add_(0, token, (inter @ w2.T) * tw32[token, slot].unsqueeze(1))
+        output.copy_(acc.to(output.dtype))
+        return output
 
 
 # ---------------------------------------------------------------------------

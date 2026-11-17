@@ -324,13 +324,8 @@ class TestWrapperReachability:
 # ---------------------------------------------------------------------------
 
 
-def _make_layer_and_packs(weights, t):
-    from flashinfer.fused_moe import (
-        B12xW4A16Config,
-        MoEActivationPack,
-        MoELayer,
-        MoEWeightPack,
-    )
+def _moe_config(t, backends=None, top_k=TOPK):
+    from flashinfer.fused_moe import B12xW4A16Config
     from flashinfer.fused_moe.api import (
         BackendOptions,
         ExecutionConfig,
@@ -342,16 +337,26 @@ def _make_layer_and_packs(weights, t):
         RoutingConfig,
     )
 
-    config = MoEConfig(
-        routing=RoutingConfig(num_experts=E, top_k=TOPK),
+    if backends is None:
+        backends = (B12xW4A16Config(),)
+    return MoEConfig(
+        routing=RoutingConfig(num_experts=E, top_k=top_k),
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
         activation=ReLU2(),
-        backend=BackendOptions((B12xW4A16Config(),)),
+        backend=BackendOptions(backends),
         execution=ExecutionConfig(tune_max_num_tokens=t),
     )
-    layer = MoELayer(config, device=torch.device("cpu"))
-    assert len(layer.runners) == 1
+
+
+def _make_layer_and_packs(weights, t, backends=None):
+    from flashinfer.fused_moe import (
+        MoEActivationPack,
+        MoELayer,
+        MoEWeightPack,
+    )
+
+    layer = MoELayer(_moe_config(t, backends), device=torch.device("cpu"))
     layer._select_winner = lambda *_: (layer.runners[0], -1)
 
     weight_pack = MoEWeightPack()
@@ -396,3 +401,155 @@ class TestMoELayerReachability:
         assert sm120_env["spec_calls"] == 0
         assert sm120_env["stock_calls"] == 1
         assert any("kill_switch" in reasons for reasons in spec.fallback_reasons)
+
+
+# ---------------------------------------------------------------------------
+# First-class autotune candidacy (SpecializedW4A16Config / -Runner)
+# ---------------------------------------------------------------------------
+
+
+def _specialized_configs():
+    from flashinfer.fused_moe import B12xW4A16Config, SpecializedW4A16Config
+
+    return B12xW4A16Config, SpecializedW4A16Config
+
+
+class TestFirstClassAutotuneCandidate:
+    def test_both_candidates_constructed(self, sm120_env, weights):
+        B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
+        layer, _, _ = _make_layer_and_packs(
+            weights, 16, backends=(B12xW4A16Config(), SpecializedW4A16Config())
+        )
+        assert [r.backend_key for r in layer.runners] == [
+            "b12x_w4a16",
+            "specialized_w4a16",
+        ]
+
+    def test_specialized_runner_serves_specialized_under_autotune(
+        self, sm120_env, weights, monkeypatch
+    ):
+        """When the specialized candidate is the thing being timed, the
+        specialized kernel is what runs (no autotune-mode bail), and the
+        layout-identical b12x_w4a16 weight view serves it as an alias."""
+        _, SpecializedW4A16Config = _specialized_configs()
+        monkeypatch.setattr(spec, "_autotune_active", lambda: True)
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 16, backends=(SpecializedW4A16Config(),)
+        )
+        runner = layer.runners[0]
+        assert runner.backend_key == "specialized_w4a16"
+        out = runner.forward(runner.pack_inputs(act_pack, weight_pack))
+        assert sm120_env["spec_calls"] == 1
+        assert sm120_env["stock_calls"] == 0
+        assert bool((out == 7.0).all())
+
+    def test_b12x_auto_gate_still_bails_under_autotune(
+        self, sm120_env, weights, monkeypatch
+    ):
+        """Negative control: the shipped gate inside the b12x path keeps its
+        autotune-mode bail, so timing the b12x candidate times stock."""
+        monkeypatch.setattr(spec, "_autotune_active", lambda: True)
+        layer, act_pack, weight_pack = _make_layer_and_packs(weights, 16)
+        layer(act_pack, weight_pack)
+        assert sm120_env["spec_calls"] == 0
+        assert sm120_env["stock_calls"] == 1
+        assert any("autotune_capture" in reasons for reasons in spec.fallback_reasons)
+
+    def test_specialized_runner_off_allowlist_falls_back_to_torch(
+        self, sm120_env, weights
+    ):
+        """Off-allowlist calls take the composable pure-torch path — never
+        the specialized kernel, never another fused backend."""
+        _, SpecializedW4A16Config = _specialized_configs()
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 8, backends=(SpecializedW4A16Config(),)
+        )
+        runner = layer.runners[0]
+        out = runner.forward(runner.pack_inputs(act_pack, weight_pack))
+        assert sm120_env["spec_calls"] == 0
+        assert sm120_env["stock_calls"] == 0
+        assert out.shape == (8, H) and out.dtype == torch.bfloat16
+        assert any(
+            any(r.startswith("token_count") for r in reasons)
+            for reasons in spec.fallback_reasons
+        )
+
+    def test_torch_fallback_matches_reference_math(self, sm120_env):
+        """The fallback's dequant+ReLU^2 math on a crafted exact case: one
+        expert, unit scales, constant codes, so the result is closed-form."""
+        from flashinfer.fused_moe import MoEActivationPack, MoELayer, MoEWeightPack
+
+        _, SpecializedW4A16Config = _specialized_configs()
+        v = {
+            # Code 0x22 = E2M1 (1.0, 1.0) in every packed byte.
+            "w1_weight": torch.full((E, I, H // 2), 0x22, dtype=torch.uint8),
+            "w1_weight_sf": torch.ones(E, I, H // 16).to(torch.float8_e4m3fn),
+            "w1_alpha": torch.full((E,), 0.5, dtype=torch.float32),
+            "w2_weight": torch.full((E, H, I // 2), 0x22, dtype=torch.uint8),
+            "w2_weight_sf": torch.ones(E, H, I // 16).to(torch.float8_e4m3fn),
+            "w2_alpha": torch.full((E,), 0.5, dtype=torch.float32),
+        }
+        layer = MoELayer(
+            _moe_config(8, (SpecializedW4A16Config(),)), device=torch.device("cpu")
+        )
+        runner = layer.runners[0]
+        weight_pack = MoEWeightPack()
+        weight_pack.prepare_for("specialized_w4a16", v)
+        t = 8  # off-allowlist -> torch fallback
+        x = torch.full((t, H), 2.0**-11, dtype=torch.bfloat16)
+        ids = torch.zeros(t, TOPK, dtype=torch.int32)
+        tw = torch.full((t, TOPK), 1.0 / TOPK, dtype=torch.float32)
+        act_pack = MoEActivationPack(
+            hidden_states_q=x, hidden_states_scale=None, topk_ids=ids, topk_weights=tw
+        )
+        out = runner.forward(runner.pack_inputs(act_pack, weight_pack))
+        # Every weight element dequants to 1.0 (code) * 1.0 (scale) * 0.5
+        # (alpha) = 0.5: fc1 row = relu(H * x * 0.5)^2; fc2 row multiplies
+        # by 0.5 and sums over I; all top-k slots hit expert 0 with routing
+        # weights summing to 1.
+        expected = (H * 2.0**-11 * 0.5) ** 2 * I * 0.5
+        assert sm120_env["spec_calls"] == 0 and sm120_env["stock_calls"] == 0
+        assert torch.allclose(out.float(), torch.full((t, H), expected), rtol=2e-2), (
+            f"fallback mean {out.float().mean().item()} vs expected {expected}"
+        )
+
+    def test_capture_guard_raises_instead_of_capturing_fallback(
+        self, sm120_env, weights, monkeypatch
+    ):
+        _, SpecializedW4A16Config = _specialized_configs()
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 16, backends=(SpecializedW4A16Config(),)
+        )
+        runner = layer.runners[0]
+        packed = runner.pack_inputs(act_pack, weight_pack)
+        monkeypatch.setattr(spec, "_is_capturing", lambda: True)
+        with pytest.raises(RuntimeError, match="CUDA-graph capture"):
+            runner.forward(packed)
+        assert sm120_env["spec_calls"] == 0
+
+    def test_kill_switch_rejects_candidate_at_construction(
+        self, sm120_env, weights, monkeypatch
+    ):
+        from flashinfer.fused_moe.layer import NoEligibleBackend
+
+        _, SpecializedW4A16Config = _specialized_configs()
+        monkeypatch.setenv(spec.ENV_DISABLE, "1")
+        with pytest.raises(NoEligibleBackend, match="DISABLE"):
+            _make_layer_and_packs(weights, 16, backends=(SpecializedW4A16Config(),))
+
+    def test_off_contract_geometry_rejected_at_construction(self, sm120_env, weights):
+        from flashinfer.fused_moe import MoELayer
+        from flashinfer.fused_moe.layer import NoEligibleBackend
+
+        _, SpecializedW4A16Config = _specialized_configs()
+        with pytest.raises(NoEligibleBackend, match="top_k"):
+            MoELayer(
+                _moe_config(16, (SpecializedW4A16Config(),), top_k=4),
+                device=torch.device("cpu"),
+            )
+
+    def test_not_in_default_backend(self):
+        from flashinfer.fused_moe.api import _DEFAULT_BACKEND
+
+        _, SpecializedW4A16Config = _specialized_configs()
+        assert not any(isinstance(c, SpecializedW4A16Config) for c in _DEFAULT_BACKEND)

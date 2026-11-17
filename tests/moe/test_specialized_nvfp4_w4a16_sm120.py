@@ -268,8 +268,8 @@ def test_kill_switch(weights, monkeypatch):
         _call(x, ids, tw, weights, backend="specialized")
 
 
-def _unified_layer_and_weight_pack(weights, t):
-    """MoELayer over the single opt-in b12x W4A16 backend candidate."""
+def _unified_layer_and_weight_pack(weights, t, backends=None):
+    """MoELayer over the opt-in b12x/specialized W4A16 backend candidates."""
     from flashinfer.fused_moe import (
         B12xW4A16Config,
         MoELayer,
@@ -299,16 +299,18 @@ def _unified_layer_and_weight_pack(weights, t):
     )
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for("b12x_w4a16", prepared)
+    if backends is None:
+        backends = (B12xW4A16Config(),)
     config = MoEConfig(
         routing=RoutingConfig(num_experts=E, top_k=TOPK),
         quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
         activation=ReLU2(),
-        backend=BackendOptions((B12xW4A16Config(),)),
+        backend=BackendOptions(backends),
         execution=ExecutionConfig(tune_max_num_tokens=t),
     )
     layer = MoELayer(config)
-    assert len(layer.runners) == 1
+    assert len(layer.runners) == len(backends)
     layer._select_winner = lambda *_: (layer.runners[0], -1)
     return layer, weight_pack
 
@@ -357,6 +359,53 @@ def test_moe_layer_off_allowlist_keeps_stock_and_matches_reference(weights):
         any(r.startswith("token_count") for r in reasons)
         for reasons in spec.fallback_reasons
     )
+    _assert_close_to_reference(out, ref)
+
+
+def test_specialized_runner_first_class_matches_reference(weights):
+    """The dedicated SpecializedW4A16Config candidate serves the specialized
+    kernel deterministically (it is the arm the autotuner would time) and
+    matches the fp32-dequant reference."""
+    from flashinfer.fused_moe import (
+        B12xW4A16Config,
+        SpecializedW4A16Config,
+        specialized_moe_nvfp4_w4a16_sm120 as spec,
+    )
+
+    t = 16
+    x, ids, tw = _routing(t, seed=310)
+    ref = _reference(x, ids, tw, weights)
+    layer, weight_pack = _unified_layer_and_weight_pack(
+        weights, t, backends=(B12xW4A16Config(), SpecializedW4A16Config())
+    )
+    runner = next(r for r in layer.runners if r.backend_key == "specialized_w4a16")
+    layer._select_winner = lambda *_: (runner, -1)
+    before = spec.dispatch_stats.get("specialized", 0)
+    out = layer(_act_pack(x, ids, tw), weight_pack)
+    torch.cuda.synchronize()
+    assert spec.dispatch_stats.get("specialized", 0) == before + 1
+    assert layer.winner_backend == "specialized_w4a16"
+    _assert_close_to_reference(out, ref)
+
+
+def test_specialized_runner_torch_fallback_matches_reference(weights):
+    """Off-allowlist, the dedicated candidate's composable pure-torch
+    fallback (never another fused backend) matches the reference."""
+    from flashinfer.fused_moe import (
+        SpecializedW4A16Config,
+        specialized_moe_nvfp4_w4a16_sm120 as spec,
+    )
+
+    t = 8  # not an admitted token count
+    x, ids, tw = _routing(t, seed=311)
+    ref = _reference(x, ids, tw, weights)
+    layer, weight_pack = _unified_layer_and_weight_pack(
+        weights, t, backends=(SpecializedW4A16Config(),)
+    )
+    before = spec.dispatch_stats.get("specialized", 0)
+    out = layer(_act_pack(x, ids, tw), weight_pack)
+    torch.cuda.synchronize()
+    assert spec.dispatch_stats.get("specialized", 0) == before
     _assert_close_to_reference(out, ref)
 
 

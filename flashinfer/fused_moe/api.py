@@ -2903,6 +2903,59 @@ class B12xW4A16Config:
 
 
 @dataclass(frozen=True)
+class SpecializedW4A16Config:
+    """SM120 agent-generated shape-specialized W4A16 MoE backend.
+
+    An opt-in autotune candidate over the same checkpoint weight view as
+    :class:`B12xW4A16Config` (its runner also accepts the ``"b12x_w4a16"``
+    view as an alias, so one prepared pack serves both candidates). Unlike
+    the auto-gate inside the b12x entry points — which bails during
+    autotuning so the stock path is what gets timed — this candidate runs
+    the specialized kernels deterministically on their allowlisted
+    shapes/contract when it is the one being timed or dispatched, and falls
+    back to a composable pure-torch path (never another fused backend)
+    off-allowlist. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects the
+    candidate at support-check time.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 120
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_blockscale,
+        w1_global_scale,
+        w2_fp4,
+        w2_blockscale,
+        w2_global_scale,
+        *,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+    ):
+        """Build the ``specialized_w4a16`` weight view (identical layout to
+        ``b12x_w4a16``; a pack prepared for either key serves both runners).
+
+        Register the result with
+        ``MoEWeightPack.prepare_for("specialized_w4a16", ...)``.
+        """
+        return B12xW4A16Config.prepare_weights(
+            w1_fp4,
+            w1_blockscale,
+            w1_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation=activation,
+            source_format=source_format,
+        )
+
+    def __repr__(self) -> str:
+        return "SpecializedW4A16Config()"
+
+
+@dataclass(frozen=True)
 class CudnnFrostBf16Config:
     """Frost BF16 MoE on SM107 and SM120, with packed precomputed routing.
 
@@ -3456,6 +3509,7 @@ BackendConfigType = Union[
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    SpecializedW4A16Config,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -3502,6 +3556,7 @@ ALL_BACKEND_CONFIGS = (
     SM12xNvfp4Config,
     B12xNvfp4Config,
     B12xW4A16Config,
+    SpecializedW4A16Config,
 )
 
 

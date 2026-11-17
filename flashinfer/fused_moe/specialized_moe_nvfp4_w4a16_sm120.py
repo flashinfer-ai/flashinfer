@@ -155,8 +155,16 @@ def specialized_support_reasons(
     activation: str = "relu2",
     quant_mode: Optional[str] = "w4a16",
     source_format: str = "modelopt",
+    allow_autotune: bool = False,
 ) -> Tuple[bool, List[str]]:
-    """Guard, in the required order. Returns (supported, refusal_reasons)."""
+    """Guard, in the required order. Returns (supported, refusal_reasons).
+
+    ``allow_autotune=True`` skips the autotune-mode bail: the unified
+    ``SpecializedW4A16Runner`` is a first-class autotune candidate, so when
+    IT is the thing being timed the specialized kernel must be what runs.
+    The default (``False``) keeps the bail for the auto-gate inside the
+    b12x entry points, where autotuning must time the stock path it would
+    otherwise capture."""
     reasons: List[str] = []
     E = _C["num_experts"]
     TOPK = _C["top_k"]
@@ -272,7 +280,7 @@ def specialized_support_reasons(
             reasons.append(f"cuda_version:{_v.major}.{_v.minor}")
     except Exception:  # noqa: BLE001
         reasons.append("cuda_version:unknown")
-    if _autotune_active():
+    if not allow_autotune and _autotune_active():
         reasons.append("autotune_capture")
     if _is_capturing():
         if not _warmed["done"]:
