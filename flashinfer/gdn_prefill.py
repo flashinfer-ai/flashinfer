@@ -259,7 +259,6 @@ def _cake_gdn_prefill_grid_x(
     )
 
 
-
 # Per-call device-side slot validation, same default as ``gdn_decode.py``: the
 # ``torch._assert_async`` chain expands to four elementwise kernels plus the
 # ``_assert_async_cuda_kernel`` and exposes ~40 us of launch gaps around a
@@ -326,7 +325,6 @@ def _cake_gdn_state_vec_aligned(
         if (tensor.data_ptr() | (slot_stride * tensor.element_size())) & mask:
             return False
     return (checkpoints.data_ptr() & mask) == 0
-
 
 
 def _cake_gdn_assert_state_slots(

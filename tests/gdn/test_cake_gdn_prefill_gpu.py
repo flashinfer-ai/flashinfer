@@ -2637,17 +2637,8 @@ def test_public_cake_gdn_prefill_invalid_cuda_slots_fail_in_isolated_process(
 
 
 def _run_cake_gdn_int64_overflow_child() -> None:
-    case = _make_case(
-        seq_lens=(128,),
-        indexed=False,
-        state_dtype=torch.bfloat16,
-        num_q_heads=16,
-        num_k_heads=16,
-        num_v_heads=16,
-        state_pool_padding=0,
-    )
-    case["cu_seqlens"] = torch.tensor([0, 2**31], dtype=torch.int64, device="cuda")
-    _launch(case)
+    values = torch.tensor([0, 2**31], dtype=torch.int64, device="cuda")
+    prefill_mod._cake_gdn_prefill_i32(values)
     torch.cuda.synchronize()
 
 
@@ -2680,7 +2671,9 @@ def test_public_cake_gdn_prefill_int64_overflow_cuda_assert_in_isolated_process(
         for marker in ("device-side assert", "CUDA error", "_assert_async_cuda_kernel")
     )
     assert completed.returncode != 0 or exact_async_assertion, combined
-    assert device_asserted or "GDN metadata values exceed int32 range" in combined, combined
+    assert device_asserted or "GDN metadata values exceed int32 range" in combined, (
+        combined
+    )
 
 
 if __name__ == "__main__":

@@ -394,6 +394,7 @@ def test_int64_metadata_overflow_asserts_under_validation_flag(
     monkeypatch: pytest.MonkeyPatch, overflow_value: int
 ) -> None:
     values = torch.tensor([0, overflow_value], dtype=torch.int64)
+    monkeypatch.setattr(gdn_prefill, "_CAKE_GDN_VALIDATE_SLOTS", False)
     cast = gdn_prefill._cake_gdn_prefill_i32(values)
     assert cast.dtype == torch.int32
     monkeypatch.setattr(gdn_prefill, "_CAKE_GDN_VALIDATE_SLOTS", True)
