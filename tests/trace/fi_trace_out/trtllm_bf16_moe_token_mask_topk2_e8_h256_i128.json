@@ -1,0 +1,171 @@
+{
+  "name": "trtllm_bf16_moe_token_mask_topk2_e8_h256_i128",
+  "description": "TRT-LLM BF16 MoE (no quantization).",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.core.trtllm_bf16_moe",
+    "status:verified",
+    "backend:trtllm"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of input tokens."
+    },
+    "num_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of local experts."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 256
+    },
+    "intermediate_size": {
+      "type": "const",
+      "value": 128
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 256,
+      "description": "2 * intermediate_size."
+    }
+  },
+  "inputs": {
+    "routing_logits": {
+      "shape": [
+        "seq_len",
+        "num_experts"
+      ],
+      "dtype": "float32",
+      "description": "Routing logits for expert selection."
+    },
+    "routing_bias": {
+      "shape": [
+        "num_experts"
+      ],
+      "dtype": "unknown",
+      "optional": true,
+      "description": "Optional routing bias."
+    },
+    "hidden_states": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "Input hidden states (dtype depends on variant)."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "FC1 weights (gate+up)."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "intermediate_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "FC2 weights (down)."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of experts to route per token."
+    },
+    "n_group": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Expert groups (DeepSeek-V3)."
+    },
+    "topk_group": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Groups to keep (DeepSeek-V3)."
+    },
+    "local_expert_offset": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Offset of local experts in global expert space."
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scaling factor for routing weights."
+    },
+    "routing_method_type": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "0=Default, 1=Renormalize, 2=DeepSeekV3, 3=Llama4, 4=RenormalizeNaive, 5=TopK."
+    },
+    "activation_type": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "3=SwiGLU, 7=SwiGLUStep, 6=ReLU2."
+    },
+    "gemm1_alpha": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional per-expert SwiGLU OA alpha."
+    },
+    "gemm1_beta": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional per-expert SwiGLU OA beta."
+    },
+    "gemm1_clamp_limit": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Optional per-expert SwiGLU OA or SwiGLUStep clamp limit."
+    },
+    "token_mask": {
+      "shape": [
+        "seq_len"
+      ],
+      "dtype": "bool",
+      "optional": true,
+      "description": "True marks padding rows excluded from all expert work; output is undefined."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "MoE output."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n# ----- reference dependencies -----\ndef _trtllm_unshuffle_weight(weight, gated):\n    \"\"\"Restore MajorK rows shuffled for the TRTLLM 128-row epilogue.\"\"\"\n    rows = torch.arange(weight.shape[1], device=weight.device)\n    shuffled_rows = rows // 32 * 32 + rows % 4 * 8 + rows % 32 // 4\n    weight = weight.float().index_select(1, shuffled_rows)\n    if gated:\n        experts, num_rows, hidden = weight.shape\n        weight = (\n            weight.reshape(experts, num_rows // 2, 2, hidden)\n            .transpose(1, 2)\n            .reshape(experts, num_rows, hidden)\n        )\n    return weight\n\ndef _moe_expert_param(value, expert_idx, default, device):\n    if value is None:\n        return default\n    if isinstance(value, torch.Tensor):\n        value = value.reshape(-1)\n        if value.numel() == 1:\n            return value[0].to(device=device, dtype=torch.float32)\n        return value[expert_idx].to(device=device, dtype=torch.float32)\n    return float(value)\n\n@torch.no_grad()\ndef _moe_bf16_run_experts(\n    hidden_states,\n    gemm1_weights,\n    gemm2_weights,\n    weights,\n    topk_idx,\n    local_expert_offset,\n    E_global,\n    gemm1_alpha=None,\n    gemm1_beta=None,\n    gemm1_clamp_limit=None,\n    activation_type=3,\n    situ_beta=None,\n    situ_linear_beta=None,\n    clamped_relu2_limit=None,\n    use_shuffled_weight=True,\n    token_mask=None,\n):\n    \"\"\"Un-quantized (bf16) MoE expert computation.\"\"\"\n    if token_mask is not None:\n        topk_idx = topk_idx.masked_fill(token_mask[:, None], -1)\n    # Keep enum values local so the serialized reference needs only PyTorch.\n    swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2 = 3, 7, 8, 6, 12\n    activation_type = int(activation_type)\n    if situ_beta is not None or situ_linear_beta is not None:\n        from ...fused_moe.cute_dsl.moe_utils import (\n            validate_cute_dsl_moe_situ_config,\n        )\n\n        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)\n    if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2):\n        raise ValueError(\n            f\"Unsupported activation_type {activation_type!r}; \"\n            \"expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), \"\n            \"6 (ReLU2), or 12 (ClampedRelu2)\"\n        )\n    if activation_type == swiglu_step:\n        gemm1_weights = gemm1_weights.transpose(1, 2).flatten(2)\n        gemm2_weights = gemm2_weights.transpose(1, 2).flatten(2)\n        if use_shuffled_weight:\n            gemm1_weights = _trtllm_unshuffle_weight(gemm1_weights, gated=True)\n            gemm2_weights = _trtllm_unshuffle_weight(gemm2_weights, gated=False)\n    T, H = hidden_states.shape\n    E_local, gemm1_out, _ = gemm1_weights.shape\n    I = gemm1_out // 2\n    device = hidden_states.device\n    A = hidden_states.to(torch.float32)\n    W1 = gemm1_weights.to(torch.float32)\n    W2 = gemm2_weights.to(torch.float32)\n    output = torch.zeros((T, H), dtype=torch.float32, device=device)\n    local_start = int(local_expert_offset)\n    for le in range(E_local):\n        ge = local_start + le\n        if ge < 0 or ge >= E_global:\n            continue\n        sel_mask = (topk_idx == ge).any(dim=1)\n        if not sel_mask.any():\n            continue\n        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)\n        A_e = A.index_select(0, token_idx)\n        G1 = A_e.matmul(W1[le].t())\n        if activation_type == clamped_relu2:\n            if clamped_relu2_limit is None:\n                raise ValueError(\"ClampedRelu2 requires clamped_relu2_limit\")\n            limit = clamped_relu2_limit.to(device=device, dtype=torch.float32)\n            act = torch.relu(limit * torch.tanh(G1 / limit)) ** 2\n        elif activation_type == relu2:\n            act = torch.relu(G1) ** 2\n        else:\n            X1, X2 = G1[:, :I], G1[:, I:]\n            if situ_beta is not None:\n                gate = situ_beta * torch.tanh(X2 / situ_beta) * torch.sigmoid(X2)\n                up = X1\n                if situ_linear_beta is not None:\n                    up = situ_linear_beta * torch.tanh(up / situ_linear_beta)\n                act = gate * up\n            elif activation_type == geglu_tanh:\n                act = torch.nn.functional.gelu(X2, approximate=\"tanh\") * X1\n            elif activation_type == swiglu_step:\n                if gemm1_alpha is not None or gemm1_beta is not None:\n                    raise ValueError(\"SwiGLUStep accepts gemm1_clamp_limit only\")\n                limit = _moe_expert_param(gemm1_clamp_limit, le, 7.0, X1.device)\n                up = torch.clamp(X1, min=-limit, max=limit)\n                gate = torch.clamp(torch.nn.functional.silu(X2), max=limit)\n                act = gate * up\n            else:\n                limit = _moe_expert_param(\n                    gemm1_clamp_limit, le, torch.finfo(torch.float32).max, X1.device\n                )\n                alpha = _moe_expert_param(gemm1_alpha, le, 1.0, X2.device)\n                beta = _moe_expert_param(gemm1_beta, le, 0.0, X1.device)\n                up = torch.clamp(X1, min=-limit, max=limit)\n                gate = torch.clamp(X2, max=limit)\n                act = gate * torch.sigmoid(alpha * gate) * (up + beta)\n        expert_out = act.matmul(W2[le].t())\n        w_tok = weights.index_select(0, token_idx)\n        match = (topk_idx.index_select(0, token_idx) == ge).float()\n        w_e = (w_tok * match).sum(dim=1)\n        output.index_add_(0, token_idx, expert_out * w_e.unsqueeze(1))\n    real_output = output if token_mask is None else output[~token_mask]\n    if not torch.isfinite(real_output).all():\n        raise ValueError(\"MoE reference produced non-finite output for a real token\")\n    if token_mask is not None:\n        output = output.masked_fill(token_mask[:, None], float(\"nan\"))\n    return output.to(torch.bfloat16)\n\n@torch.no_grad()\ndef _default_routing_weights(routing_logits, routing_bias, top_k, scale):\n    logits = routing_logits.to(torch.float32)\n    if routing_bias is not None:\n        logits = logits + routing_bias.to(torch.float32).reshape(-1)\n    s = torch.softmax(logits, dim=-1)\n    _, topk_idx = torch.topk(s, k=int(top_k), dim=1, largest=True, sorted=False)\n    return s.gather(1, topk_idx) * float(scale or 1.0), topk_idx\n\n# ----- reference -----\n@torch.no_grad()\ndef _trtllm_bf16_moe_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    gemm1_weights,\n    gemm2_weights,\n    num_experts,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor=None,\n    gemm1_alpha=None,\n    gemm1_beta=None,\n    gemm1_clamp_limit=None,\n    activation_type=3,\n    **_unused,\n):\n    \"\"\"Reference for TRT-LLM BF16 MoE (Default routing).\"\"\"\n    w_topk, topk_idx = _default_routing_weights(\n        routing_logits, routing_bias, top_k, routed_scaling_factor\n    )\n    return _moe_bf16_run_experts(\n        hidden_states,\n        gemm1_weights,\n        gemm2_weights,\n        w_topk,\n        topk_idx,\n        local_expert_offset,\n        int(num_experts),\n        gemm1_alpha=gemm1_alpha,\n        gemm1_beta=gemm1_beta,\n        gemm1_clamp_limit=gemm1_clamp_limit,\n        activation_type=activation_type,\n        use_shuffled_weight=_unused.get(\"use_shuffled_weight\", True),\n        token_mask=_unused.get(\"token_mask\"),\n    )\n",
+  "check": "def _masked_fp8_moe_trace_check(reference_outputs, actual_outputs, **thresholds):\n    \"\"\"Check real rows; references mark undefined padding rows with NaNs.\"\"\"\n    from flashinfer.trace import default_check\n\n    reference = (\n        reference_outputs[0]\n        if isinstance(reference_outputs, (tuple, list))\n        else reference_outputs\n    )\n    actual = (\n        actual_outputs[0]\n        if isinstance(actual_outputs, (tuple, list))\n        else actual_outputs\n    )\n    real = ~torch.isnan(reference).all(dim=-1)\n    if (\n        not torch.isfinite(reference[real]).all()\n        or not torch.isfinite(actual[real]).all()\n    ):\n        return False\n    return default_check(reference[real], actual[real], **thresholds)\n"
+}

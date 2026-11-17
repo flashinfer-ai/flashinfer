@@ -424,6 +424,7 @@ class MoERunner(TunableRunner):
                 list(da_routing_metadata),
                 list(da_body_workspace),
                 prepare_da_body,
+                moe_inputs.token_mask,
                 workspace_buffer,
                 False,  # query_workspace_size
             )
@@ -483,6 +484,7 @@ class MoERunner(TunableRunner):
                     prepare_da_body,
                     kwargs.get("valid_hidden_size"),
                     kwargs.get("valid_intermediate_size"),
+                    moe_inputs.token_mask,
                     workspace_buffer,
                     False,  # query_workspace_size
                 )
@@ -662,6 +664,7 @@ class MoERunner(TunableRunner):
                 prepare_da_body,
                 kwargs.get("valid_hidden_size"),
                 kwargs.get("valid_intermediate_size"),
+                moe_inputs.token_mask,
                 workspace_buffer,
                 False,  # query_workspace_size
                 self.nvfp4_4over6_code,

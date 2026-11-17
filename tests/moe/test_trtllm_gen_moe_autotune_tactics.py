@@ -94,6 +94,7 @@ def _moe_profile_shapes(
         "hidden_states_scale": _bucket(inputs["hidden_states_scale"], dim=scale_dim),
         "gemm1_lora_delta": (0,),
         "per_token_scale": (0,),
+        "token_mask": (0,),
     }
     return tuple(by_name[name] for name in MoEInputs._FIELDS)
 
