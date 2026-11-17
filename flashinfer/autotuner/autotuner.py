@@ -934,7 +934,10 @@ def autotune(
         cache: Optional path to a JSON config file.
             On entry, configs are loaded from this file (if it exists) and
             added to those already loaded in this process; for a key
-            present in several files, the file loaded last wins.
+            present in several files, the file loaded last wins. Entries
+            for the same workload stored under different runner classes
+            are distinct keys, so between them the caller's runner order
+            decides, as with ``load_configs()``.
             On exit, configs are saved back to this file (only when
             ``tune_mode=True``).
         tuning_buckets: Optional sequence of integer measurement points.
