@@ -18,6 +18,7 @@ split units, the fixup.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -80,6 +81,29 @@ def valid_kv_slots(D: int = 128) -> tuple:
     from .blocks.operands import max_kv_slots
 
     return tuple(range(2, max_kv_slots(D) + 1))
+
+
+HW_ROW_MAX_ENV = "FLASHINFER_BI_ATTN_HW_ROWMAX"
+
+
+def hw_row_max_enabled(device=None) -> bool:
+    """Whether the row body on ``device`` takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``: each 32-column
+    piece's maximum in an extra register, the pieces joined by ``max.f32``) instead of the register tree: the parts that have the
+    instruction (sm_103 / sm_107), unless ``FLASHINFER_BI_ATTN_HW_ROWMAX=0``. Either way the same value -- the maximum is exact and
+    order-free -- so the choice is a placement; the kernel's identity carries it."""
+    if os.environ.get(HW_ROW_MAX_ENV, "1") == "0":
+        return False
+    from ...utils import get_compute_capability
+
+    if device is None:
+        if not torch.cuda.is_available():
+            return False
+        device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+    major, minor = get_compute_capability(device)
+    return int(major) == 10 and int(minor) >= 3
 
 
 @dataclass(frozen=True)
@@ -653,15 +677,18 @@ def _run_attention_validated(
         )
     else:
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
+        hwm = hw_row_max_enabled(
+            q.device
+        )  # the row maximum's placement: part of the kernel's identity
         if (
             config.q2 and n_launch is None
         ):  # too few units to pair: the one-warpgroup body (same bits)
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, 1, False, ragged
+                D, g, page, config.kv_slots, 1, False, ragged, hwm
             )
         else:
             kernel = get_compiled_attention(
-                D, g, page, config.kv_slots, config.softmax_wgs, config.q2, ragged
+                D, g, page, config.kv_slots, config.softmax_wgs, config.q2, ragged, hwm
             )
         if n_launch is not None:  # the paired placement walks pairs of units
             grid = max(
