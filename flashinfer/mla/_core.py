@@ -2251,8 +2251,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     """
     if backend not in DSV4_SPARSE_MLA_DECODE_BACKENDS:
         raise ValueError(
-            f"backend must be one of {DSV4_SPARSE_MLA_DECODE_BACKENDS}, "
-            f"got {backend!r}"
+            f"backend must be one of {DSV4_SPARSE_MLA_DECODE_BACKENDS}, got {backend!r}"
         )
     # "specialized" backend: an agent-generated kernel for the SM103
     # bf16-dense-KV DeepSeek-V4.1 sparse decode contract
@@ -2286,9 +2285,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
                 swa_topk_lens=swa_topk_lens,
                 extra_sparse_indices=extra_sparse_indices,
                 extra_sparse_topk_lens=extra_sparse_topk_lens,
-                sparse_indices_are_storage_offsets=(
-                    sparse_indices_are_storage_offsets
-                ),
+                sparse_indices_are_storage_offsets=(sparse_indices_are_storage_offsets),
                 remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
                 dsv4_inv_rope_cos_sin_cache=dsv4_inv_rope_cos_sin_cache,
                 dsv4_output_scale=dsv4_output_scale,
@@ -2303,6 +2300,10 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         if _specialized_out is not None:
             return _specialized_out
 
+    # An explicitly requested "specialized" backend either served the call
+    # above or raised (never silently swapped), so only the stock backend
+    # names reach the resolver.
+    assert backend != "specialized"
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(
         kv_cache_format, backend, sm120_cake=_is_sm120_family(query.device)

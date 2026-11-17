@@ -13,6 +13,5 @@ def gen_sparse_mla_decode_dsv4_module() -> JitSpec:
     return gen_jit_spec(
         "sparse_mla_decode_dsv4_sm103",
         [jit_env.FLASHINFER_CSRC_DIR / s for s in _SOURCES],
-        extra_cuda_cflags=sm103a_nvcc_flags
-        + ["--use_fast_math", "-lineinfo"],
+        extra_cuda_cflags=sm103a_nvcc_flags + ["--use_fast_math", "-lineinfo"],
     )
