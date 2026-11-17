@@ -21,4 +21,5 @@ pytest -s tests/attention/test_deepseek_mla.py
 pytest -s tests/attention/test_mla_paged_attention_fuzz.py
 pytest -s tests/attention/test_rope.py
 pytest -s tests/attention/test_mla_page.py
+pytest -s tests/attention/test_page_append_contract.py
 pytest -s tests/utils/test_quantization.py
