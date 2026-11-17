@@ -881,8 +881,10 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     BF16 handoff, with no automatic reciprocal in ``fc2_alpha``. Omission keeps
     the unnormalized kernel specialization. Runtime overrides can enable the
     normalized specialization during eager warmup, using the same allocation.
-    Later omission retains the last staged normalization. A captured graph
-    retains its normalization mode; enabling it requires warmup and recapture.
+    At the layer API, omitted runtime overrides fall back to configuration
+    values; with no configured norm, a later eager call is unnormalized.
+    A captured graph retains its normalization mode; enabling it requires
+    warmup and recapture.
     A normalized graph observes in-place updates to its captured source tensor.
     ``use_custom_finalize=True`` exposes BF16 per-route rows for caller finalization
     and requires in-kernel FC2 reduction to be disabled.
