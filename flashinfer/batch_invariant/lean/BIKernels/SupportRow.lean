@@ -305,5 +305,38 @@ as `s`. -/
 def renormProb (N kb : Nat) (w : Nat → Term) (keep : Nat → Bool) (j : Nat) : Option Term :=
   (massTree N kb w keep).map (fun m => Sampling.prob (w j) (Sampling.invSum m))
 
+/-! ## The kept-set log-probability of a token: `lse.row`'s `logp` chain over the kept mass -/
+
+/-- The log-probability of token `j` under the kept set -- the drawn token's `kept_logp` and the trainer-side
+`log_probs(logits, ids, top_k / top_p / min_p)` at a given token (`support_spec.kept_logp_term`): `lse.row`'s `logp` chain
+at `j` with the kept mass in place of the row sum, `mul(add(z_j, neg(lg2(mass))), LN2)`, `z` the shifted logits. -/
+def keptLogp (N kb : Nat) (w z : Nat → Term) (keep : Nat → Bool) (j : Nat) : Option Term :=
+  (massTree N kb w keep).map (fun m => Sampling.logp (z j) (Term.neg (Sampling.lg2 m)))
+
+/-- What the kernel's score form computes under placement `ps` at coordinates `cs`: the same chain over its masked pass. -/
+def kernelKeptLogp (N kb : Nat) (w z : Nat → Term) (keep : Nat → Bool) (ps : List (List Factor))
+    (cs : List (List Bool)) (j : Nat) : Option Term :=
+  (kernelMassTree N kb w keep ps cs).map (fun m => Sampling.logp (z j) (Term.neg (Sampling.lg2 m)))
+
+/-- Every valid placement's kept-set log-probability is `Equiv` to the spec's: the chain is a congruence of the mass tree,
+whose invariance is `mass_invariance`. -/
+theorem keptLogp_invariance (N kb : Nat) (w z : Nat → Term) (keep : Nat → Bool) (ps : List (List Factor))
+    (cs : List (List Bool)) (hp : PlacementOK [kb, 5] ps) (hc : CoordsOK (flatten ps) cs) (j : Nat) :
+    OEquiv (kernelKeptLogp N kb w z keep ps cs j) (keptLogp N kb w z keep j) := by
+  have h := mass_invariance N kb w keep ps cs hp hc
+  unfold kernelKeptLogp keptLogp
+  generalize kernelMassTree N kb w keep ps cs = o at h ⊢
+  generalize massTree N kb w keep = p at h ⊢
+  cases h with
+  | absent => exact OEquiv.absent
+  | present he =>
+    exact OEquiv.present (Equiv.mul_congr (Equiv.add_congr (Equiv.refl _) (Equiv.neg_congr (Equiv.opq_congr "lg2" he))) (Equiv.refl _))
+
+/-- With everything kept the mass is the row's own tree, so the kept-set log-probability is `lse.row`'s `logp` over the
+draw's total: `top_p = 1` / `top_k >= N` give `log_probs` (the GPU suite pins the bits). -/
+theorem keptLogp_all (N kb : Nat) (w z : Nat → Term) (j : Nat) :
+    keptLogp N kb w z (fun _ => true) j
+      = (Draw.total N kb w).map (fun m => Sampling.logp (z j) (Term.neg (Sampling.lg2 m))) := rfl
+
 end SupportRow
 end BIK

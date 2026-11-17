@@ -220,6 +220,7 @@ def draw_support(
             seeds,
             offs,
             idx,
+            _dummy(dev, torch.int64),  # token ids: the score form's
             k_t if use_k else _dummy(dev, torch.int32),
             p_t if use_p else _dummy(dev, torch.float32),
             m_t if use_m else _dummy(dev, torch.float32),
@@ -253,6 +254,158 @@ def draw_support(
         res["logp"] = lb if lb is not None else lp.view(lead)
     if return_kept_logprob:
         res["kept_logp"] = kb if kb is not None else lpk.view(lead)
+    return res
+
+
+def kept_log_probs(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    temperature: Optional[Union[float, torch.Tensor]] = None,
+    *,
+    top_k: Optional[Union[int, torch.Tensor]] = None,
+    top_p: Optional[Union[float, torch.Tensor]] = None,
+    min_p: Optional[Union[float, torch.Tensor]] = None,
+    order: str = "top_k_first",
+    return_logprob: bool = False,
+    enable_pdl: bool = False,
+    config: Optional[LSEConfig] = None,
+    sm_count: Optional[int] = None,
+    early_finish: str = "mass",
+    out: Optional[torch.Tensor] = None,
+    logprob_out: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """``log_probs(logits, token_ids, temperature, top_k=, top_p=, min_p=, filter_apply_order=)``: the score form of the
+    composition. One launch computes, per row, ``support.row.v1``'s kept set and mass over ``lse.row``'s weights (the
+    sampler's selection, verbatim) and returns ``{"kept_logp"`` (fp32, ``logits.shape[:-1]``: the log-probability of
+    ``token_ids[r]`` under the kept-set distribution, ``mul(add(z_t, neg(lg2(mass))), LN2)`` -- bit for bit the
+    ``kept_logp`` the truncated samplers return for the token they drew; ``-inf`` for a token outside the kept set, NaN for
+    an id outside ``[0, N)`` or a row whose kept mass is not a positive finite number) ``[, "logp"]`` (with
+    ``return_logprob``: the full distribution's, ``log_probs`` at the token)``}``. One id per row; ``top_k`` / ``top_p`` /
+    ``min_p`` (at least one) and ``order`` as :func:`draw_support` takes them. ``out`` / ``logprob_out`` are caller-owned
+    fp32 buffers of the row shape, written in place and returned as given."""
+    from .draw_support_kernel import get_compiled_kernel
+
+    N = _check_input(logits, "logits")
+    if order not in ORDERS:
+        raise ValueError(f"order={order!r}: one of {ORDERS}")
+    if top_k is None and top_p is None and min_p is None:
+        raise ValueError(
+            "at least one of top_k / top_p / min_p (the plain log-probability is log_probs without them)"
+        )
+    if logprob_out is not None:
+        return_logprob = True
+    try:
+        x2 = _rows(logits, N, "logits")
+    except ValueError:
+        x2 = logits.reshape(
+            -1, N
+        ).contiguous()  # a strided view: copied first, a placement
+    M = x2.shape[0]
+    dev = logits.device
+    lead: Tuple[int, ...] = tuple(logits.shape[:-1])
+    if token_ids.dtype not in (torch.int32, torch.int64):
+        raise unsupported(
+            CLASS, f"token_ids of dtype {token_ids.dtype}", "int32 or int64 ids"
+        )
+    if tuple(token_ids.shape) != lead:
+        raise ValueError(
+            f"one token id per row under a filter (shape {lead}); got {tuple(token_ids.shape)}"
+        )
+    ids = token_ids.to(device=dev, dtype=torch.int64).reshape(-1).contiguous()
+    k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k")
+    p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
+    m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
+    filters = Filters(
+        top_k=1 if use_k else None,
+        top_p=1.0 if use_p else None,
+        min_p=0.0 if use_m else None,
+        order=order,
+    )
+    temp_t, c = _temperature(temperature, M, lead, dev)
+    elem_bytes = logits.element_size()
+    if config is None:
+        config = support_config(N, M, elem_bytes, sm_count or device_sm_count(dev))
+    else:
+        config.validate(N, elem_bytes)
+        if config.rows_per_cta != 1:
+            raise ValueError("the support's score needs a config with one row per CTA")
+        if config.blocks_per_cta(N) * BLOCK * elem_bytes > SMEM_BUDGET:
+            raise ValueError(
+                "the CTA's share of the row exceeds the staging budget: use a config with more CTAs per row"
+            )
+        if config.vec_elems > max_vec_elems(N, elem_bytes):
+            raise ValueError("config vector width exceeds the row alignment")
+    x2 = _aligned_rows(x2, config.vec_elems * elem_bytes)
+    kb = out_buffer(out, "out", lead, torch.float32, logits, 4)
+    lpk = (
+        kb.view(-1)
+        if kb is not None
+        else torch.empty(M, dtype=torch.float32, device=dev)
+    )
+    lb = None
+    lp = _dummy(dev, torch.float32)
+    if return_logprob:
+        lb = out_buffer(logprob_out, "logprob_out", lead, torch.float32, logits, 4)
+        lp = (
+            lb.view(-1)
+            if lb is not None
+            else torch.empty(M, dtype=torch.float32, device=dev)
+        )
+    # the membership word and the kept mass are not returned: the per-device scratch (dead writes)
+    kept = scratch(dev, torch.int32, M)
+    mass = scratch(dev, torch.float32, M)
+    check_no_overlap(
+        [("out", kb), ("logprob_out", lb)],
+        [
+            ("logits", logits),
+            ("token_ids", token_ids),
+            ("temperature", temp_t),
+            ("top_k", k_t if use_k else None),
+            ("top_p", p_t if use_p else None),
+            ("min_p", m_t if use_m else None),
+        ],
+    )
+    if M > 0:
+        kernel = get_compiled_kernel(
+            _DTYPE_STR[logits.dtype],
+            N,
+            config,
+            True,
+            filters,
+            temp_t is not None,
+            False,
+            return_logprob,
+            bool(enable_pdl),
+            early_finish,
+            True,
+            True,
+        )
+        kernel(
+            x2,
+            _dummy(dev, torch.int64),  # seed: no stream in the score form
+            _dummy(dev, torch.int64),  # offset
+            _dummy(dev, torch.int64),  # indices
+            ids,
+            k_t if use_k else _dummy(dev, torch.int32),
+            p_t if use_p else _dummy(dev, torch.float32),
+            m_t if use_m else _dummy(dev, torch.float32),
+            temp_t if temp_t is not None else _dummy(dev, torch.float32),
+            _dummy(
+                dev, torch.int32
+            ),  # tokens: nothing is drawn (the store is compiled out)
+            kept,
+            lp,
+            lpk,
+            mass,
+            float(c),
+            0,
+            M,
+            M,
+            N,
+        )
+    res = {"kept_logp": kb if kb is not None else lpk.view(lead)}
+    if return_logprob:
+        res["logp"] = lb if lb is not None else lp.view(lead)
     return res
 
 

@@ -101,7 +101,7 @@ def test_lean_model_matches_python_engine_and_spec():
         elif tag == "supp":
             _, N, tgt, pat = line.split(" ")
             lean[("supp", int(N), int(tgt))] = int(pat)
-        elif tag in ("supmass", "suprenorm"):
+        elif tag in ("supmass", "suprenorm", "supkeptlogp"):
             _, N, sx = line.split(" ", 2)
             lean[(tag, int(N))] = sx
         else:
@@ -143,7 +143,11 @@ def test_lean_model_matches_python_engine_and_spec():
             checked += 1
         assert lean[("supmass", c["N"])] == c["mass"], ("support mass", c["N"])
         assert lean[("suprenorm", c["N"])] == c["renorm"], ("support renorm", c["N"])
-        checked += 2
+        assert lean[("supkeptlogp", c["N"])] == c["keptlogp"], (
+            "support kept-set log-probability",
+            c["N"],
+        )
+        checked += 3
     # the stream: the Lean model's blocks are the Python specification's words
     for s, o, n, w in lean_cases.stream_cases():
         assert lean[("stream", s, o, n)] == tuple(w), ("stream block", s, o, n)

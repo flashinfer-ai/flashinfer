@@ -144,6 +144,17 @@ def renorm_term(N: int, keep: Sequence[bool], j: int, alg=None) -> Term:
     return prob(a, a.x(0, j), inv_sum(a, mass_term(N, keep, a)))
 
 
+def kept_logp_term(N: int, keep: Sequence[bool], j: int, alg=None) -> Term:
+    """The log-probability of a kept element ``j`` under the kept set as a term: ``lse.row``'s ``logp`` chain at ``j`` over
+    the kept mass tree, ``mul(add(z_j, neg(lg2(mass))), LN2)`` with ``z_j`` the symbol of the token's shifted logit -- the
+    drawn token's ``kept_logp`` and ``log_probs(..., top_k / top_p / min_p)`` at a given token (``SupportRow.keptLogp``)."""
+    from .spec import lg2, logp
+    from .sterm import TermAlgebra
+
+    a = alg or TermAlgebra()
+    return logp(a, a.sym(f"z{j}"), a.neg(lg2(a, mass_term(N, keep, a))))
+
+
 def spec_fingerprint(
     filters: Filters,
     N: int,

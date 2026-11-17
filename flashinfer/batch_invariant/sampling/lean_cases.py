@@ -281,6 +281,7 @@ def support_cases() -> Tuple[Dict, ...]:
                 keep=kept_idx,
                 mass=term.sexpr(SS.mass_term(N, keep)),
                 renorm=term.sexpr(SS.renorm_term(N, keep, kept_idx[0])),
+                keptlogp=term.sexpr(SS.kept_logp_term(N, keep, kept_idx[0])),
             )
         )
     return tuple(out)

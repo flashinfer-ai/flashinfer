@@ -1102,6 +1102,10 @@ def log_probs(
     batch_invariant: bool = False,
     out: Optional[torch.Tensor] = None,
     lse_out: Optional[torch.Tensor] = None,
+    top_k: Optional[Union[int, torch.Tensor]] = None,
+    top_p: Optional[Union[float, torch.Tensor]] = None,
+    min_p: Optional[Union[float, torch.Tensor]] = None,
+    filter_apply_order: str = "top_k_first",
 ):
     r"""The log-probability of one token per row under ``softmax(logits / temperature)``, with a batch-invariant
     dataflow: the teacher-forced score of a sampled token (a trainer re-scoring a rollout) and the returned
@@ -1179,6 +1183,12 @@ def log_probs(
     # batch_invariant=False routes to the operator's regular kernel for this entry, which today is the same class
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
+    filtered = top_k is not None or top_p is not None or min_p is not None
+    if filtered and not batch_invariant:
+        raise ValueError(
+            "top_k / top_p / min_p on log_probs give the log-probability under the sampler's kept set, a batch-invariant "
+            "mode entry: pass batch_invariant=True"
+        )
     from .batch_invariant.sampling.api import log_probs_batch_invariant
 
     return log_probs_batch_invariant(
@@ -1189,6 +1199,10 @@ def log_probs(
         return_lse=return_lse,
         out=out,
         lse_out=lse_out,
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        filter_apply_order=filter_apply_order,
     )
 
 

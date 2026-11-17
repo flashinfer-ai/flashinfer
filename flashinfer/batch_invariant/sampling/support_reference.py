@@ -114,6 +114,42 @@ def support_row(
     }
 
 
+def kept_log_probs_reference(
+    x: torch.Tensor,
+    token_ids: Sequence[int],
+    filters: Sequence[Filters],
+    temperature=None,
+) -> torch.Tensor:
+    """The exact model of ``log_probs(logits, ids, top_k / top_p / min_p)``: per row the kept set and mass of
+    ``support_row`` over ``lse.row``'s weights, then the id's log-probability under the kept set
+    ``mul(add(z_t, neg(lg2(mass))), LN2)``; ``-inf`` for an id outside the kept set; NaN for an id outside ``[0, N)`` or a
+    row whose kept mass is not a positive finite number. fp32 ``(M,)``."""
+    x = x.detach().cpu()
+    M, N = x.shape
+    xf = x.to(torch.float32)
+    cs = _scales(temperature, M)
+    out = []
+    for r in range(M):
+        tid = int(token_ids[r])
+        m = row_max(xf[r])
+        z = torch.mul(
+            torch.add(xf[r], torch.tensor(fp32.neg(m), dtype=torch.float32)),
+            torch.tensor(cs[r], dtype=torch.float32),
+        )
+        w = ex2_device(z)
+        res = support_row(w, N, filters[r], w_max=1.0)
+        mass = float(res["mass"])  # type: ignore[arg-type]
+        mask = res["mask"]
+        if not (0 <= tid < N) or not (mass > 0 and mass < float("inf")):
+            out.append(float("nan"))
+        elif not bool(mask[tid]):  # type: ignore[index]
+            out.append(float("-inf"))
+        else:
+            lg2m = float(lg2_device(torch.tensor([mass], dtype=torch.float32))[0])
+            out.append(fp32.mul(fp32.add(float(z[tid]), fp32.neg(lg2m)), LN2_F32))
+    return torch.tensor(out, dtype=torch.float64).to(torch.float32)
+
+
 def support_reference(
     x: torch.Tensor,
     filters: Sequence[Filters],

@@ -47,3 +47,4 @@ def main : IO Unit := do
     let keepF : Nat → Bool := fun i => keep.contains i
     IO.println s!"supmass {N} {osexpr (SupportRow.massTree N kb lseRow keepF)}"
     IO.println s!"suprenorm {N} {osexpr (SupportRow.renormProb N kb lseRow keepF (keep.headD 0))}"
+    IO.println s!"supkeptlogp {N} {osexpr (SupportRow.keptLogp N kb lseRow (fun j => Term.sym s!"z{j}") keepF (keep.headD 0))}"

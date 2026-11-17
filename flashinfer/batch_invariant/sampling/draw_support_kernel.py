@@ -86,12 +86,19 @@ class DrawSupportKernel:
         return_logprob: bool,
         early_finish: str = "mass",
         return_kept_logprob: bool = False,
+        score: bool = False,
     ):
         N = Kp * BLOCK
         cfg.validate(N)
         assert cfg.rows_per_cta == 1, "the truncated draw holds one row per CTA group"
         assert not (return_logprob or return_kept_logprob) or from_logits
         assert early_finish in ("", "mass", "all")
+        # the score form (``log_probs`` under the sampler's filters): the exact form's selection and kept mass, then the
+        # given token's log-probabilities instead of a draw -- logits only, the kept-set value always, no stream, no gather
+        assert not score or (from_logits and return_kept_logprob and not has_indices), (
+            "the score form takes logits, returns the kept-set log-probability and gathers no source rows"
+        )
+        self.score = score
         self.early_finish, self.study = early_finish, ""
         self.return_kept_logprob = return_kept_logprob
         self.dtype, self.N, self.Kp, self.cfg = dtype, N, Kp, cfg
@@ -167,6 +174,7 @@ class DrawSupportKernel:
         mSeed: cute.Tensor,
         mOff: cute.Tensor,
         mIdx: cute.Tensor,
+        mIds: cute.Tensor,
         mK: cute.Tensor,
         mP: cute.Tensor,
         mMinP: cute.Tensor,
@@ -189,6 +197,7 @@ class DrawSupportKernel:
             mSeed,
             mOff,
             mIdx,
+            mIds,
             mK,
             mP,
             mMinP,
@@ -232,6 +241,7 @@ class DrawSupportKernel:
         mSeed: cute.Tensor,
         mOff: cute.Tensor,
         mIdx: cute.Tensor,
+        mIds: cute.Tensor,
         mK: cute.Tensor,
         mP: cute.Tensor,
         mMinP: cute.Tensor,
@@ -413,12 +423,14 @@ class DrawSupportKernel:
             state, start = canon.init_state(self.plan_sum, fp, leaf)
             S = canon.run(self.plan_sum, state, start, peers, fp)
 
-        # ===== the uniform: the row's key at the draw's block, word 0 ==============================================
-        key = request_key(mSeed[row_c], mOff[row_c])
-        k0 = u64_lo32(key)
-        k1 = u64_lo32(u64_shr(key, Int32(32)))
-        w0, _, _, _ = philox_block(draw, Int32(0), k0, k1)
-        u = uniform32(w0)
+        # ===== the uniform: the row's key at the draw's block, word 0 (the score form gathers the given token: no key) ==
+        u = Float32(0.0)
+        if cutlass.const_expr(not self.score):
+            key = request_key(mSeed[row_c], mOff[row_c])
+            k0 = u64_lo32(key)
+            k1 = u64_lo32(u64_shr(key, Int32(32)))
+            w0, _, _, _ = philox_block(draw, Int32(0), k0, k1)
+            u = uniform32(w0)
 
         token, valid, mass, lp, lpk = _exact_draw(
             self,
@@ -445,12 +457,16 @@ class DrawSupportKernel:
             c,
             u,
             fp,
+            mIds=mIds,
         )
         if t == 0:
             if w == 0:
                 if c_rank == 0:
                     if row_ok:
-                        mTok[row] = token
+                        if cutlass.const_expr(
+                            not self.score
+                        ):  # the score form draws nothing
+                            mTok[row] = token
                         mValid[row] = _select(valid, Int32(1), Int32(0))
                         mMass[row] = mass
                         if cutlass.const_expr(self.return_logprob):
@@ -460,6 +476,31 @@ class DrawSupportKernel:
         peers.finish()
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
+
+
+def _score_token(k, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp):
+    """The score form (``log_probs`` under the sampler's filters): the given token's log-probability under the kept set,
+    ``mul(add(z_t, neg(lg2(mass))), LN2)`` -- the drawn token's ``kept_logprob`` chain at a given token -- and under the full
+    distribution (over ``S``) when requested. A token outside the kept set has probability zero there: ``-inf``; an id outside
+    ``[0, N)``, or a row whose kept mass is not a positive finite number: NaN (the row class's ``logp`` for a bad id, the
+    draw's invalid row). Returns the exact form's tuple ``(token, valid, mass, logprob, kept_logprob)`` with the token ``-1``
+    (nothing is drawn) and ``valid`` the membership."""
+    tid64 = mIds[row_c]
+    in_range = (tid64 >= Int64(0)) & (tid64 < N.to(Int64))
+    tok_c = _select(in_range, tid64, Int64(0)).to(Int32)
+    xt = mX[src_c, tok_c].to(Float32)
+    zt = shifted(fp, xt, nm, c)
+    s_ok = (Float32(0.0) < mass) & (Float32(float("inf")) > mass)
+    kept = in_range & s_ok & (_weight_bits(fp.ex2(zt)) >= thr_bits)
+    lpk = _select(
+        kept,
+        logp(fp, zt, fp.neg(lg2(fp, mass))),
+        _select(in_range & s_ok, Float32(NEG_INF), Float32(NAN)),
+    )
+    lp = Float32(NAN)
+    if k.return_logprob:
+        lp = _select(in_range, logp(fp, zt, fp.neg(lg2(fp, S))), Float32(NAN))
+    return Int32(-1), kept, mass, lp, lpk
 
 
 def _exact_draw(
@@ -487,11 +528,13 @@ def _exact_draw(
     c,
     u,
     fp,
+    mIds=None,
 ):
     """The exact form: the support's thresholds (the support kernel's selection, verbatim), the masked tree with the
     peers recording, the crossing over the masked leaf at the uniform ``u``; returns ``(token, valid, mass, logprob,
     kept_logprob)`` -- the drawn token's log-probability under the full distribution (over ``S``) and under the kept set
-    (over ``mass``), NaN where not requested or the row is invalid (plain Python at trace time: the kernel stores them)."""
+    (over ``mass``), NaN where not requested or the row is invalid (plain Python at trace time: the kernel stores them).
+    In the score form the crossing is replaced by the given token's chains (:func:`_score_token`)."""
     # ===== the support's thresholds ===================================================================================
     thr_bits = Int32(0)
     if cutlass.const_expr(k.use_k):
@@ -536,6 +579,8 @@ def _exact_draw(
     totals = _block_totals(k.plan_sum, state, k.kpw)
     mass = canon.run(k.plan_sum, state, start, peers, fp)
     peers.recording = False
+    if cutlass.const_expr(k.score):
+        return _score_token(k, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp)
     thr = fp.mul(u, mass)
     first, last = _crossing_pass(
         k, loader, masked_leaf, peers, totals, thr, t, w, c_rank
@@ -580,11 +625,12 @@ def kernel_name(
     enable_pdl: bool,
     early_finish: str = "mass",
     return_kept_logprob: bool = False,
+    score: bool = False,
 ) -> str:
     """The cache object's name: one per (dtype, Kp bucket, config, input kind, filter set, temperature form, gather,
-    the two log-probabilities, pdl, the selection's placement)."""
+    the two log-probabilities, pdl, the selection's placement, the score form)."""
     return jit.sanitize_symbol_name(
-        f"drawsup_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_"
+        f"drawsup{'s' if score else ''}_{'logits' if from_logits else 'probs'}_{filters.name}_{dtype_str}_Kp{Kp}_{cfg.describe()}_"
         f"{'trow' if temp_rows else 'tconst'}{'_idx' if has_indices else ''}{'_lp' if return_logprob else ''}"
         f"{'_lpk' if return_kept_logprob else ''}"
         f"_pdl{int(enable_pdl)}{f'_ef{early_finish}' if early_finish else ''}"
@@ -603,10 +649,11 @@ def get_compiled_kernel(
     enable_pdl: bool,
     early_finish: str = "mass",
     return_kept_logprob: bool = False,
+    score: bool = False,
 ):
     """The compiled kernel serving vocabulary ``N``: one per (dtype, Kp bucket, config, input kind, filter set,
-    temperature form, gather, the two log-probabilities, pdl, placement); ``N``, ``M`` and the row strides are runtime
-    arguments."""
+    temperature form, gather, the two log-probabilities, pdl, placement, the score form); ``N``, ``M`` and the row strides
+    are runtime arguments."""
     from .schedule import padded_blocks
 
     return _compile_bucket(
@@ -621,6 +668,7 @@ def get_compiled_kernel(
         enable_pdl,
         early_finish,
         return_kept_logprob,
+        score,
     )
 
 
@@ -637,6 +685,7 @@ def _compile_bucket(
     enable_pdl,
     early_finish,
     return_kept_logprob=False,
+    score=False,
 ):
     """Compile, or load from the cache, the kernel of one Kp bucket and specialisation."""
     from ..fp_interface.cute import get_cutlass_dtype
@@ -654,6 +703,7 @@ def _compile_bucket(
         enable_pdl,
         early_finish,
         return_kept_logprob,
+        score,
     )
 
     def compile_fn():
@@ -668,6 +718,7 @@ def _compile_bucket(
             return_logprob,
             early_finish,
             return_kept_logprob,
+            score,
         )
         sym_m, sym_n = cute.sym_int(64), cute.sym_int(32)
         x = cute.runtime.make_fake_tensor(
@@ -689,6 +740,7 @@ def _compile_bucket(
             vector(Int64, 8),  # seed
             vector(Int64, 8),  # offset
             vector(Int64, 8),  # indices
+            vector(Int64, 8),  # token ids (the score form)
             vector(Int32, 4),  # top_k
             vector(Float32, 4),  # top_p
             vector(Float32, 4),  # min_p

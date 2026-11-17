@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The sampling classes' entries of the mode's registry (:data:`flashinfer.batch_invariant.CLASSES`): the class name and
 the fingerprint behind ``fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])``, ``fingerprint("log_softmax",
-N=, dtype=, temperature=[, out_dtype=])``, ``fingerprint("log_probs", N=, dtype=, temperature=)``,
+N=, dtype=, temperature=[, out_dtype=])``, ``fingerprint("log_probs", N=, dtype=, temperature=[, top_k=, top_p=, min_p=,
+filter_apply_order=])`` (with a filter the kept-set log-probability: the row class's receipt joined with the support
+class's),
 ``fingerprint("sampling_from_probs", N=, dtype=)``, ``fingerprint("sampling_from_logits", N=, dtype=[, temperature=])``,
 and the truncated samplers' ``fingerprint("top_k_sampling_from_probs", N=, dtype=)``,
 ``fingerprint("top_p_sampling_from_probs", ...)``, ``fingerprint("min_p_sampling_from_probs", ...)``,
@@ -103,6 +105,32 @@ def _support_fingerprint(
     )
 
 
+def _log_probs_fingerprint(
+    N: int,
+    dtype,
+    temperature,
+    top_k=None,
+    top_p=None,
+    min_p=None,
+    filter_apply_order: str = "top_k_first",
+) -> str:
+    """``log_probs``'s receipt: the row class's, or with a filter the kept-set log-probability's -- the row class's (the
+    token's chain, the temperature form) joined with the support class's (the filter set and order, the vocabulary's
+    tree); the parameter values move nothing, their presence does."""
+    from .support_spec import Filters
+
+    base = _lse_row_fingerprint(N, dtype, temperature)
+    if top_k is None and top_p is None and min_p is None:
+        return base
+    filters = Filters(
+        top_k=1 if top_k is not None else None,
+        top_p=1.0 if top_p is not None else None,
+        min_p=0.0 if min_p is not None else None,
+        order=filter_apply_order,
+    )
+    return f"{base}+{_support_fingerprint(N, dtype, filters, True, bool(temperature))}"
+
+
 def _draw_support_fingerprint(
     N: int, dtype, filters, from_logits: bool, temperature: bool = False
 ) -> str:
@@ -174,7 +202,8 @@ def register(classes: Dict[str, Any], class_info: Any) -> None:
     ``sampling_from_probs`` and ``sampling_from_logits`` (the draw class) take ``N`` and the input ``dtype``,
     ``sampling_from_logits`` optionally whether a ``temperature`` enters the scale; the five truncated samplers take ``N``
     and ``dtype``, the two top-k + top-p ones optionally ``filter_apply_order``, the logits one optionally whether a
-    ``temperature`` enters the scale."""
+    ``temperature`` enters the scale; ``log_probs`` optionally the filters (``top_k`` / ``top_p`` / ``min_p`` /
+    ``filter_apply_order``: the kept-set log-probability's joined receipt)."""
     dims = ("N", "dtype", "temperature")
     classes["softmax"] = class_info(
         "lse.row", dims, _lse_row_fingerprint, ("out_dtype",)
@@ -182,7 +211,12 @@ def register(classes: Dict[str, Any], class_info: Any) -> None:
     classes["log_softmax"] = class_info(
         "lse.row", dims, _log_softmax_fingerprint, ("out_dtype",)
     )
-    classes["log_probs"] = class_info("lse.row", dims, _lse_row_fingerprint)
+    classes["log_probs"] = class_info(
+        "lse.row",
+        dims,
+        _log_probs_fingerprint,
+        ("top_k", "top_p", "min_p", "filter_apply_order"),
+    )
     # the inverse-CDF draw (draw_api.py): one class with two weight forms (the given probabilities / the lse.row weights
     # of the logits, with or without a temperature in the scale), hence the fingerprints per vocabulary; the input dtype
     # enters nothing

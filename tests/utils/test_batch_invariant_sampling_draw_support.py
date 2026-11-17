@@ -40,6 +40,7 @@ from flashinfer.batch_invariant.sampling.draw_api import (
 from flashinfer.batch_invariant.sampling.draw_support_api import (
     CLASS,
     draw_support,
+    kept_log_probs,
     min_p_sampling_from_probs_batch_invariant,
     top_k_sampling_from_probs_batch_invariant,
     top_k_top_p_sampling_from_logits_batch_invariant,
@@ -51,7 +52,11 @@ from flashinfer.batch_invariant.sampling.support_api import (
     SUPPORT_ARCHS,
     sampling_support,
 )
-from flashinfer.batch_invariant.sampling.support_reference import support_row
+from flashinfer.batch_invariant.sampling.support_reference import (
+    kept_log_probs_reference,
+    support_reference,
+    support_row,
+)
 from flashinfer.batch_invariant.sampling.support_spec import Filters
 
 from .batch_invariant_sampling_common import (
@@ -430,7 +435,17 @@ def _fset(f: Filters):
 
 
 def _spec(
-    ds, N, cfg, from_logits, fset, trow, idx=False, lp=False, pdl=_PDL, lpk=False
+    ds,
+    N,
+    cfg,
+    from_logits,
+    fset,
+    trow,
+    idx=False,
+    lp=False,
+    pdl=_PDL,
+    lpk=False,
+    score=False,
 ):
     return (
         ds,
@@ -444,7 +459,13 @@ def _spec(
         pdl,
         "mass",
         lpk,
+        score,
     )
+
+
+def _score_spec(ds, N, cfg, fset, trow, lp=False):
+    """The score form (``log_probs`` under the filters): logits, the kept-set value, no gather."""
+    return _spec(ds, N, cfg, True, fset, trow, lp=lp, lpk=True, score=True)
 
 
 def _d(N, M, eb, sm):
@@ -464,6 +485,20 @@ def _suite_specs(sm):
                 d12 = _d(N, 12, eb, sm)
                 specs.append(_spec(ds, N, d12, False, fset, False))
                 specs.append(_spec(ds, N, d12, True, fset, True, lp=True, lpk=True))
+    # the score form: every configuration of the exact-model test, the R4 test's defaults, the no-cut test
+    for dtype in DT:
+        ds, eb = _DS[dtype], dtype.itemsize
+        for N in NS:
+            for fset in SETS_BY_N[N]:
+                for c in _configs(N, eb) + [_d(N, 12, eb, sm)]:
+                    specs.append(_score_spec(ds, N, c, fset, False))
+                    specs.append(_score_spec(ds, N, c, fset, True))
+    for N in (1000, 32768):
+        for fset in ("kp", "kpm"):
+            specs.append(_score_spec("bf16", N, _d(N, 12, 2, sm), fset, True))
+            specs.append(_score_spec("bf16", N, _d(N, 12, 2, sm), fset, True, lp=True))
+    for fset in ("p", "k", "kp"):
+        specs.append(_score_spec("bf16", 4097, _d(4097, 8, 2, sm), fset, False))
     # the composition / public-entries test and the degenerate parameters (N = 1000)
     for fset in ("k", "p", "m", "kp", "kpj"):
         specs.append(_spec("f32", 1000, _d(1000, 6, 4, sm), False, fset, False))
@@ -1452,3 +1487,230 @@ def test_shapes_views_and_empty_batches():
                 offset=o[:2],
                 batch_invariant=True,
             )
+
+
+# ===== the score form: log_probs under the sampler's filters (the trainer-side kept-set log-probability) ==================
+def _score_ids(mask: torch.Tensor, N: int, seed: int = 3) -> torch.Tensor:
+    """One id per row: kept and dropped tokens in turn (the exact model's mask), an id outside ``[0, N)`` every fifth row."""
+    g = torch.Generator().manual_seed(seed)
+    M = mask.shape[0]
+    ids = torch.zeros(M, dtype=torch.int64)
+    for r in range(M):
+        kept = mask[r].nonzero().flatten()
+        dropped = (~mask[r]).nonzero().flatten()
+        if r % 5 == 4:
+            ids[r] = N if r % 2 else -1
+        elif (r % 2 == 0 and len(kept)) or not len(dropped):
+            ids[r] = (
+                kept[int(torch.randint(len(kept), (1,), generator=g))]
+                if len(kept)
+                else 0
+            )
+        else:
+            ids[r] = dropped[int(torch.randint(len(dropped), (1,), generator=g))]
+    return ids
+
+
+def _bits_equal_nan(a: torch.Tensor, b: torch.Tensor) -> bool:
+    a, b = a.detach().cpu().float(), b.detach().cpu().float()
+    if not torch.equal(a.isnan(), b.isnan()):
+        return False
+    ok = ~a.isnan()
+    return torch.equal(a[ok].view(torch.int32), b[ok].view(torch.int32))
+
+
+def _lp_kw(kw, sl=None):
+    """The public ``log_probs`` keywords from ``params``' generic ones (``order`` -> ``filter_apply_order``), sliced."""
+    out = {}
+    for k, v in kw.items():
+        if k == "order":
+            out["filter_apply_order"] = v
+        else:
+            out[k] = v[sl] if (sl is not None and isinstance(v, torch.Tensor)) else v
+    return out
+
+
+@needs_device
+@pytest.mark.parametrize("dtype", DT, ids=["f32", "bf16"])
+@pytest.mark.parametrize("N", NS)
+def test_kept_log_probs_match_exact_model_across_configs(dtype, N):
+    """``log_probs(logits, ids, T, batch_invariant=True, top_k / top_p / min_p)``: the given token's log-probability under
+    the kept set equals the exact model bit for bit -- kept tokens, dropped tokens (``-inf``), ids outside ``[0, N)`` (NaN),
+    rows with nothing kept (NaN) -- for both filter sets of the vocabulary, a constant and a per-row temperature, in every
+    configuration of the suite (R3), and a row alone gives the bits it gives in the batch (R2)."""
+    M, eb = 12, dtype.itemsize
+    sm = device_sm_count(torch.device("cuda"))
+    x = tied_logits(M, N, dtype)
+    saw_inf = False  # a dropped token of a valid row: not every filter set has one on tied rows (ties keep everything)
+    for fset in SETS_BY_N[N]:
+        kw, filters = params(fset, M, N)
+        for temp in (
+            None,
+            torch.rand(M, generator=torch.Generator().manual_seed(7)) * 1.5 + 0.5,
+        ):
+            mask = support_reference(x, filters, from_logits=True, temperature=temp)[
+                "mask"
+            ]
+            ids = _score_ids(mask, N)
+            ref = kept_log_probs_reference(x, ids.tolist(), filters, temperature=temp)
+            assert ref.isnan().any() and ref.isfinite().any(), "kept and bad ids"
+            saw_inf = saw_inf or bool(ref.isinf().any())
+            tc = temp.cuda() if temp is not None else None
+            for cfg in _configs(N, eb) + [_d(N, 12, eb, sm)]:
+                got = kept_log_probs(x, ids.cuda(), tc, config=cfg, **kw)["kept_logp"]
+                assert got.shape == (M,) and got.dtype == torch.float32
+                assert _bits_equal_nan(got, ref), (
+                    dtype,
+                    N,
+                    fset,
+                    temp is not None,
+                    cfg.describe(),
+                )
+            got = flashinfer.sampling.log_probs(
+                x, ids.cuda(), tc, batch_invariant=True, **_lp_kw(kw)
+            )
+            assert _bits_equal_nan(got, ref)
+            for r in (0, 1, M - 1):  # a row alone
+                one = flashinfer.sampling.log_probs(
+                    x[r : r + 1],
+                    ids[r : r + 1].cuda(),
+                    tc[r : r + 1] if tc is not None else None,
+                    batch_invariant=True,
+                    **_lp_kw(kw, slice(r, r + 1)),
+                )
+                assert _bits_equal_nan(one, ref[r : r + 1]), ("row alone", r)
+    assert saw_inf, "no filter set of this vocabulary dropped a token of a valid row"
+
+
+@needs_device
+@pytest.mark.parametrize("N", [1000, 32768])
+def test_kept_log_probs_equal_the_sampler_at_the_drawn_token(N):
+    """The trainer's re-score is the engine's value: ``log_probs(logits, tokens, T, top_k / top_p[, min_p])`` at the drawn
+    tokens equals the sampler's ``kept_logp`` bit for bit, and without the filters its ``logp`` (R4); an invalid row is NaN
+    on both sides; the caller-owned ``out=`` is written in place and returned."""
+    M = 12
+    x = tied_logits(M, N, torch.bfloat16)
+    s, o = keys(M)
+    temp = (
+        torch.rand(M, generator=torch.Generator().manual_seed(9)) * 1.5 + 0.5
+    ).cuda()
+    for fset in ("kp", "kpm"):
+        kw, _ = params(fset, M, N)
+        res = draw_support(
+            x,
+            s,
+            o,
+            from_logits=True,
+            temperature=temp,
+            return_logprob=True,
+            return_kept_logprob=True,
+            **kw,
+        )
+        tok, valid = res["samples"], res["valid"]
+        assert valid.any()
+        got_k = flashinfer.sampling.log_probs(
+            x, tok, temp, batch_invariant=True, **_lp_kw(kw)
+        )
+        got_full = flashinfer.sampling.log_probs(x, tok, temp, batch_invariant=True)
+        assert _bits_equal_nan(got_k[valid], res["kept_logp"][valid]), fset
+        assert _bits_equal_nan(got_full[valid], res["logp"][valid]), fset
+        assert got_k[~valid].isnan().all() and res["kept_logp"][~valid].isnan().all()
+        buf = torch.empty(M, dtype=torch.float32, device="cuda")
+        r = flashinfer.sampling.log_probs(
+            x, tok, temp, batch_invariant=True, out=buf, **_lp_kw(kw)
+        )
+        assert r is buf and _bits_equal_nan(buf, got_k)
+
+
+@needs_device
+def test_kept_log_probs_without_a_cut_equal_log_probs():
+    """``top_p = 1`` keeps every positive weight and ``top_k >= N`` everything, so the masked tree is the row's own sum tree
+    and the kept-set value is ``log_probs`` bit for bit; ``top_k = 0`` keeps nothing (NaN); the entry's contract: one id per
+    row, no ``return_lse`` under a filter, int ids only, the filters need ``batch_invariant=True``."""
+    N, M = 4097, 8
+    g = torch.Generator().manual_seed(5)
+    x = (
+        (torch.randn(M, N, generator=g) * 2).to(torch.bfloat16).cuda()
+    )  # dense rows: every weight positive
+    ids = torch.randint(0, N, (M,), generator=g).cuda()
+    plain = flashinfer.sampling.log_probs(x, ids, 0.7, batch_invariant=True)
+    assert plain.isfinite().all()
+    assert _bits_equal_nan(
+        flashinfer.sampling.log_probs(x, ids, 0.7, batch_invariant=True, top_p=1.0),
+        plain,
+    )
+    assert _bits_equal_nan(
+        flashinfer.sampling.log_probs(x, ids, 0.7, batch_invariant=True, top_k=N), plain
+    )
+    assert _bits_equal_nan(
+        flashinfer.sampling.log_probs(
+            x, ids, 0.7, batch_invariant=True, top_k=N + 5, top_p=1.0
+        ),
+        plain,
+    )
+    assert (
+        flashinfer.sampling.log_probs(x, ids, 0.7, batch_invariant=True, top_k=0)
+        .isnan()
+        .all()
+    )
+    # a zero weight (an underflowed logit of the tied / adversarial rows) is never kept by top-p -- ``-inf`` -- while
+    # ``top_k >= N`` keeps it: there the kept-set value is ``log_probs`` at every token
+    xa = tied_logits(M, N, torch.bfloat16)
+    pa = flashinfer.sampling.log_probs(xa, ids, 0.7, batch_invariant=True)
+    sup = support_reference(
+        xa, [Filters(top_p=1.0)] * M, from_logits=True, temperature=0.7
+    )
+    kp = flashinfer.sampling.log_probs(
+        xa, ids, 0.7, batch_invariant=True, top_p=1.0
+    ).cpu()
+    assert _bits_equal_nan(
+        flashinfer.sampling.log_probs(xa, ids, 0.7, batch_invariant=True, top_k=N), pa
+    )
+    for r in range(M):
+        if not (0 < float(sup["mass"][r]) < float("inf")):
+            assert kp[r].isnan() and pa[r].isnan()
+        elif bool(sup["mask"][r, int(ids[r])]):
+            assert kp[r].view(torch.int32) == pa[r].cpu().view(torch.int32)
+        else:
+            assert kp[r] == float("-inf") and pa[r].isfinite()
+    with pytest.raises(ValueError, match="return_lse"):
+        flashinfer.sampling.log_probs(
+            x, ids, batch_invariant=True, top_k=5, return_lse=True
+        )
+    with pytest.raises(ValueError, match="one token id per row"):
+        flashinfer.sampling.log_probs(x, ids.view(M, 1), batch_invariant=True, top_k=5)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        flashinfer.sampling.log_probs(x, ids.float(), batch_invariant=True, top_k=5)
+    with pytest.raises(ValueError, match="batch_invariant=True"):
+        flashinfer.sampling.log_probs(x, ids, top_k=5)
+
+
+def test_kept_log_probs_receipt():
+    """``fingerprint("log_probs", ..., top_k= / top_p= / min_p= / filter_apply_order=)`` is the row class's receipt joined
+    with the support class's for logits; the values move nothing, the filter set, the order and the temperature form do;
+    without a filter it is the plain receipt."""
+    plain = bi.fingerprint("log_probs", N=1000, dtype="bf16", temperature=False)
+    sup = SS.spec_fingerprint(Filters(top_k=1, top_p=1.0), 1000, True, "bf16", False)
+    joined = bi.fingerprint(
+        "log_probs", N=1000, dtype="bf16", temperature=False, top_k=40, top_p=0.9
+    )
+    assert joined == f"{plain}+{sup}"
+    assert joined == bi.fingerprint(
+        "log_probs", N=1000, dtype="bf16", temperature=False, top_k=1, top_p=0.5
+    )
+    assert joined != bi.fingerprint(
+        "log_probs", N=1000, dtype="bf16", temperature=False, top_k=40
+    )
+    assert joined != bi.fingerprint(
+        "log_probs",
+        N=1000,
+        dtype="bf16",
+        temperature=False,
+        top_k=40,
+        top_p=0.9,
+        filter_apply_order="joint",
+    )
+    assert joined != bi.fingerprint(
+        "log_probs", N=1000, dtype="bf16", temperature=True, top_k=40, top_p=0.9
+    )
+    assert "+" not in plain
