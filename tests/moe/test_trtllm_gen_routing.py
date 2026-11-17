@@ -290,6 +290,43 @@ def test_deepseekv3_routing(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 150])
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,top_k",
+    [(256, 8, 4, 8), (128, 4, 2, 4)],
+)
+def test_deepseekv3_grouped_routing_keeps_fp32_bias(
+    num_tokens, num_experts, n_group, topk_group, top_k
+):
+    """The grouped kernel must select with the fp32 bias, not a bf16 copy.
+
+    make_bias above is exactly representable in bfloat16, so it cannot tell the
+    two apart. Here every logit is equal and the bias alone decides: the biases
+    are distinct in float32, grow with the expert index, and all round to 1.0 in
+    bfloat16. Rounding them would turn the selection into a full tie that the
+    kernel breaks toward the lowest groups and experts, while the float32
+    oracle picks the highest ones.
+    """
+    tile_tokens_dim = 8
+    routed_scaling = 2.5
+    logits = torch.zeros(num_tokens, num_experts, dtype=torch.float32, device="cuda")
+    bias = 1.0 + torch.arange(num_experts, device="cuda", dtype=torch.float32) * 2**-16
+    assert torch.equal(bias.to(torch.bfloat16).float(), torch.ones_like(bias))
+    run_and_check(
+        RoutingMethodType.DeepSeekV3,
+        lambda: routing_reference_no_aux(
+            logits, bias, top_k, n_group, topk_group, routed_scaling, tile_tokens_dim
+        ),
+        logits,
+        top_k,
+        tile_tokens_dim,
+        routing_bias=bias,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 8, 150])
 @pytest.mark.parametrize("num_experts,top_k", [(64, 4), (256, 8)])
 @pytest.mark.parametrize("tile_tokens_dim", [8, 32])
 @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
