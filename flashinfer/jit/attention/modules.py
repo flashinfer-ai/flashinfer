@@ -1694,6 +1694,51 @@ def _append_nvfp4_sf_stride_setter(
     return " \\\n".join(stride_setters)
 
 
+def check_cuda_core_decode_head_dim(
+    head_dim_qk: int,
+    head_dim_vo: int,
+    dtype_kv: torch.dtype,
+    pos_encoding_mode: int,
+    dtype_o: torch.dtype,
+) -> None:
+    """Reject a head_dim the CUDA-core decode kernels cannot lay out.
+
+    ``include/flashinfer/attention/decode.cuh`` gives each lane
+    ``vec_size = max(16 / sizeof(DTypeKV), head_dim / 32)`` elements, loaded with
+    128- or 256-bit copies, and pads the lane count to a power of two for its QK
+    reduction. With RoPE a lane must also not straddle ``head_dim / 2``. With KV
+    split, ``include/flashinfer/attention/cascade.cuh`` merges the partial outputs
+    with ``vec_size = max(16 / sizeof(DTypeO), head_dim / 32)`` per lane, under the
+    same copy-width rule.
+    """
+    rope_llama = pos_encoding_mode == 1  # PosEncodingMode.ROPE_LLAMA
+    for head_dim in sorted({head_dim_qk, head_dim_vo}):
+        vec_size = max(16 // dtype_kv.itemsize, head_dim // 32)
+        vec_bits = vec_size * dtype_kv.itemsize * 8
+        if head_dim % vec_size or vec_bits not in (128, 256):
+            reason = (
+                f"each lane loads vec_size = {vec_size} elements ({vec_bits} bits), "
+                "which must be a 128- or 256-bit copy that divides head_dim"
+            )
+        elif rope_llama and (head_dim // 2) % vec_size:
+            reason = f"with ROPE_LLAMA, vec_size = {vec_size} must divide head_dim / 2"
+        else:
+            continue
+        raise ValueError(
+            f"head_dim {head_dim} is not supported by the CUDA-core decode kernels "
+            f"with a {dtype_kv} KV cache: {reason}."
+        )
+    vec_size = max(16 // dtype_o.itemsize, head_dim_vo // 32)
+    vec_bits = vec_size * dtype_o.itemsize * 8
+    if head_dim_vo % vec_size or vec_bits not in (128, 256):
+        raise ValueError(
+            f"head_dim {head_dim_vo} is not supported by the CUDA-core decode kernels "
+            f"with a {dtype_o} output: the KV-split merge gives each lane "
+            f"vec_size = {vec_size} elements ({vec_bits} bits), which must be a 128- "
+            "or 256-bit copy that divides head_dim."
+        )
+
+
 def gen_customize_single_decode_module(
     uri: str,
     dtype_q: torch.dtype,
@@ -1711,6 +1756,9 @@ def gen_customize_single_decode_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
 ) -> JitSpec:
+    check_cuda_core_decode_head_dim(
+        head_dim_qk, head_dim_vo, dtype_kv, pos_encoding_mode, dtype_o
+    )
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
 
     (
@@ -1974,6 +2022,9 @@ def gen_customize_batch_decode_module(
     use_sliding_window: bool = False,
     use_logits_soft_cap: bool = False,
 ) -> JitSpec:
+    check_cuda_core_decode_head_dim(
+        head_dim_qk, head_dim_vo, dtype_kv, pos_encoding_mode, dtype_o
+    )
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, additional_params_setter) = (
         generate_additional_params(
