@@ -140,8 +140,7 @@ def is_specialized_supported(
     if out is None:
         if out_dtype not in (None, torch.bfloat16):
             return _no("layout:out_dtype")
-    elif out.shape != (M, N) or out.dtype != torch.bfloat16 \
-            or not out.is_contiguous():
+    elif out.shape != (M, N) or out.dtype != torch.bfloat16 or not out.is_contiguous():
         return _no("layout:out")
     if not (
         a.is_contiguous()
@@ -194,8 +193,7 @@ def run_composable_fallback(
     N = b.shape[0]
     KB = K // 128
     a32 = (
-        a.to(torch.float32).view(M, KB, 128)
-        * a_scale.to(torch.float32).view(M, KB, 1)
+        a.to(torch.float32).view(M, KB, 128) * a_scale.to(torch.float32).view(M, KB, 1)
     ).view(M, K)
     bs_rows = b_scale.to(torch.float32).repeat_interleave(128, dim=0)[:N]
     b32 = b.to(torch.float32) * bs_rows.repeat_interleave(128, dim=1)
@@ -245,6 +243,12 @@ def check_specialized_requirement(
         # composable torch fallback (never another fused backend).
         return True
     return is_specialized_supported(
-        a, b, a_scale, b_scale, scale_major_mode, scale_granularity_mnk,
-        out, out_dtype,
+        a,
+        b,
+        a_scale,
+        b_scale,
+        scale_major_mode,
+        scale_granularity_mnk,
+        out,
+        out_dtype,
     )

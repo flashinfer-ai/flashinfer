@@ -1,29 +1,32 @@
 // Exact candidate fx config 103 for M=16, N=2048, K=4096.
 // FP32 cross-warp reduction; B fragments are issued before A fragments.
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <cstdint>
-#include <tvm/ffi/tvm_ffi.h>
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <cstdint>
 
 namespace ffi = tvm::ffi;
 
 namespace fx103 {
 
-#define FXMMA(d, a0, a1, a2, a3, b0, b1)                                    \
-  asm volatile(                                                             \
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "                \
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"             \
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])                      \
+#define FXMMA(d, a0, a1, a2, a3, b0, b1)                        \
+  asm volatile(                                                 \
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])          \
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 
-struct F8 { uint32_t v[8]; };
+struct F8 {
+  uint32_t v[8];
+};
 
 __device__ __forceinline__ F8 ldb(const uint8_t* p) {
   F8 r;
   asm("ld.global.nc.L1::evict_first.L2::256B.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -31,8 +34,8 @@ __device__ __forceinline__ F8 ldb(const uint8_t* p) {
 __device__ __forceinline__ F8 lda(const uint8_t* p) {
   F8 r;
   asm("ld.global.nc.L1::evict_last.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -43,23 +46,24 @@ __device__ __forceinline__ float lds(const float* p) {
   return r;
 }
 
-__device__ __forceinline__ void st2(__nv_bfloat16* p, float v0, float v1,
-                                    int col, int N) {
+__device__ __forceinline__ void st2(__nv_bfloat16* p, float v0, float v1, int col, int N) {
   if (col + 1 < N) {
     __nv_bfloat162 v = __floats2bfloat162_rn(v0, v1);
     if ((reinterpret_cast<uintptr_t>(p) & 3u) == 0u)
       *reinterpret_cast<__nv_bfloat162*>(p) = v;
-    else { p[0] = v.x; p[1] = v.y; }
+    else {
+      p[0] = v.x;
+      p[1] = v.y;
+    }
   } else if (col < N) {
     p[0] = __float2bfloat16_rn(v0);
   }
 }
 
 template <int NWN, int NWK, int NT, int MR, int KU, int ITERS, int MINB, bool SBC>
-__global__ void __launch_bounds__(NWN * NWK * 32, MINB) fxk(
-    const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq,
-    const float* __restrict__ As, const float* __restrict__ Bs,
-    __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
+__global__ void __launch_bounds__(NWN* NWK * 32, MINB)
+    fxk(const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq, const float* __restrict__ As,
+        const float* __restrict__ Bs, __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
   constexpr int W = NWN * NWK;
   constexpr int CN = NWN * NT * 8;
   constexpr int MT = (MR + 15) / 16;
@@ -70,8 +74,7 @@ __global__ void __launch_bounds__(NWN * NWK * 32, MINB) fxk(
   constexpr int THREADS = W * 32;
   constexpr int OUTS = NWN * NACC * 32;
   constexpr int RSZ2 = (NWK > 1) ? (W * (NACC / 2) * 32) : 1;
-  static_assert(NWN == 2 && NWK == 16 && NT == 2 && MR == 16 && KU == 1 &&
-                    ITERS == 2,
+  static_assert(NWN == 2 && NWK == 16 && NT == 2 && MR == 16 && KU == 1 && ITERS == 2,
                 "fx103 is fixed to M16 N2048 K4096");
   constexpr int FM = 16;
   constexpr int FN = 2048;
@@ -151,7 +154,10 @@ __global__ void __launch_bounds__(NWN * NWK * 32, MINB) fxk(
 #pragma unroll
     for (int i = 0; i < NT; ++i) bp[i] += kstep;
 #pragma unroll
-    for (int q = 0; q < NR; ++q) { ap[q] += kstep; asp[q] += NWK * KU; }
+    for (int q = 0; q < NR; ++q) {
+      ap[q] += kstep;
+      asp[q] += NWK * KU;
+    }
     bsp += NWK * KU;
 
 #pragma unroll
@@ -198,19 +204,16 @@ __global__ void __launch_bounds__(NWN * NWK * 32, MINB) fxk(
         const int b = (t * NT + i) * ACT;
         const int col = n0 + i * 8 + c * 2;
         const int r0 = mb + t * 16 + g;
-        if (r0 < M)
-          st2(Y + (size_t)r0 * (size_t)N + col, acc[b + 0], acc[b + 1], col, N);
+        if (r0 < M) st2(Y + (size_t)r0 * (size_t)N + col, acc[b + 0], acc[b + 1], col, N);
         if (HH == 2 && r0 + 8 < M)
-          st2(Y + (size_t)(r0 + 8) * (size_t)N + col, acc[b + 2], acc[b + 3],
-              col, N);
+          st2(Y + (size_t)(r0 + 8) * (size_t)N + col, acc[b + 2], acc[b + 3], col, N);
       }
     return;
   }
 
   float2* sw = red + warp * ((NACC / 2) * 32);
 #pragma unroll
-  for (int p = 0; p < NACC / 2; ++p)
-    sw[p * 32 + lane] = make_float2(acc[2 * p], acc[2 * p + 1]);
+  for (int p = 0; p < NACC / 2; ++p) sw[p * 32 + lane] = make_float2(acc[2 * p], acc[2 * p + 1]);
   __syncthreads();
 
   // Accumulator slots come in adjacent-column pairs (sl, sl+1), so reduce and
@@ -228,8 +231,7 @@ __global__ void __launch_bounds__(NWN * NWK * 32, MINB) fxk(
       float s0 = 0.f, s1 = 0.f;
 #pragma unroll
       for (int w = 0; w < NWK; ++w) {
-        const float2 v =
-            red[((w * NWN + ngi) * (NACC / 2) + (a >> 1)) * 32 + l];
+        const float2 v = red[((w * NWN + ngi) * (NACC / 2) + (a >> 1)) * 32 + l];
         s0 += v.x;
         s1 += v.y;
       }
@@ -246,8 +248,8 @@ __global__ void __launch_bounds__(NWN * NWK * 32, MINB) fxk(
 
 }  // namespace fx103
 
-void RunFX103(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
-              ffi::TensorView Bs, ffi::TensorView Y) {
+void RunFX103(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
+              ffi::TensorView Y) {
   const int M = static_cast<int>(A.shape()[0]);
   const int K = static_cast<int>(A.shape()[1]);
   const int N = static_cast<int>(B.shape()[0]);
@@ -257,8 +259,8 @@ void RunFX103(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
   const float* Asp = static_cast<const float*>(As.data_ptr());
   const float* Bsp = static_cast<const float*>(Bs.data_ptr());
   __nv_bfloat16* Yp = static_cast<__nv_bfloat16*>(Y.data_ptr());
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
+  cudaStream_t stream =
+      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
 
   const dim3 grid(64, 1, 1);
   cudaLaunchConfig_t config{};
@@ -272,12 +274,9 @@ void RunFX103(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
   attrs[0].val.clusterDim.y = 1;
   attrs[0].val.clusterDim.z = 1;
   attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
-  attrs[1].val.clusterSchedulingPolicyPreference =
-      cudaClusterSchedulingPolicyLoadBalancing;
+  attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
   config.attrs = attrs;
   config.numAttrs = 2;
-  cudaLaunchKernelEx(&config, fx103::fxk<2, 16, 2, 16, 1, 2, 1, true>, Ap,
-                     Bp, Asp, Bsp, Yp, M, N, K, KB);
+  cudaLaunchKernelEx(&config, fx103::fxk<2, 16, 2, 16, 1, 2, 1, true>, Ap, Bp, Asp, Bsp, Yp, M, N,
+                     K, KB);
 }
-
-

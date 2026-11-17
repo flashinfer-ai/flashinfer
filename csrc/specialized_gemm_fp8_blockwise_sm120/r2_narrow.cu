@@ -11,29 +11,27 @@
 // and dropping the value at store time: an mma output element depends only on
 // its own A row and B column, so garbage never reaches a stored element.  The
 // k loop is therefore completely branch-free.
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <cstdint>
-#include <tvm/ffi/tvm_ffi.h>
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <cstdint>
 
 namespace ffi = tvm::ffi;
 
 namespace r2_narrow {
 
-void LaunchWide(const uint8_t* a, const uint8_t* b, const float* as,
-                const float* bs, __nv_bfloat16* y, int M, int N, int K,
-                int KB, cudaStream_t stream);
-void LaunchAsyncM32N12288(const uint8_t* a, const uint8_t* b,
-                          const float* as, const float* bs,
-                          __nv_bfloat16* y, int M, int N, int K,
-                          cudaStream_t stream);
+void LaunchWide(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
+                __nv_bfloat16* y, int M, int N, int K, int KB, cudaStream_t stream);
+void LaunchAsyncM32N12288(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
+                          __nv_bfloat16* y, int M, int N, int K, cudaStream_t stream);
 
-#define MMA16832(d, a0, a1, a2, a3, b0, b1)                                 \
-  asm volatile(                                                             \
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "                \
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"             \
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])                      \
+#define MMA16832(d, a0, a1, a2, a3, b0, b1)                     \
+  asm volatile(                                                 \
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])          \
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 
 // The weight stream is reused only inside its own 128B line (the two 16B
@@ -51,16 +49,16 @@ struct Frag8 {
 __device__ __forceinline__ Frag8 ld_stream(const void* p) {
   Frag8 r;
   asm("ld.global.nc.L1::no_allocate.L2::256B.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
 __device__ __forceinline__ Frag8 ld_keep(const void* p) {
   Frag8 r;
   asm("ld.global.nc.L1::evict_last.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -70,8 +68,7 @@ __device__ __forceinline__ float ld_keepf(const float* p) {
   return r;
 }
 
-__device__ __forceinline__ void store2(__nv_bfloat16* p, float v0, float v1,
-                                       int col, int N) {
+__device__ __forceinline__ void store2(__nv_bfloat16* p, float v0, float v1, int col, int N) {
   if (col + 1 < N) {
     __nv_bfloat162 v = __floats2bfloat162_rn(v0, v1);
     if ((reinterpret_cast<uintptr_t>(p) & 3u) == 0u) {
@@ -91,12 +88,12 @@ __device__ __forceinline__ void store2(__nv_bfloat16* p, float v0, float v1,
 // few n-tiles to fill the SMs and a small weight stream it is the only way to
 // buy blocks (N=64 has just 8 n-tiles for 188 SMs).  KITER fixes the number of
 // scale groups owned by each warp so the loop control and pointer bumps fold.
-template <int W, int MR, bool MSPLIT, int KITER, int NT = 1,
-          bool PREFETCH2 = false, bool PAIRRED = false>
-__global__ void __launch_bounds__(W * 32) gemm_fp8_bw_kernel(
-    const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq,
-    const float* __restrict__ As, const float* __restrict__ Bs,
-    __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
+template <int W, int MR, bool MSPLIT, int KITER, int NT = 1, bool PREFETCH2 = false,
+          bool PAIRRED = false>
+__global__ void __launch_bounds__(W * 32)
+    gemm_fp8_bw_kernel(const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq,
+                       const float* __restrict__ As, const float* __restrict__ Bs,
+                       __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
   constexpr int MT = (MR + 15) / 16;     // 16-row m-tiles
   constexpr int HH = (MR <= 8) ? 1 : 2;  // 8-row halves actually live
   constexpr int NR = MT * HH;            // A row slots per thread
@@ -122,8 +119,7 @@ __global__ void __launch_bounds__(W * 32) gemm_fp8_bw_kernel(
 #pragma unroll
   for (int i = 0; i < NT; ++i) {
     const int nq = n0 + i * 8 + g;
-    bp[i] = Bq + (size_t)(nq < N ? nq : 0) * (size_t)K +
-            (size_t)(warp * 128 + c * 32);
+    bp[i] = Bq + (size_t)(nq < N ? nq : 0) * (size_t)K + (size_t)(warp * 128 + c * 32);
   }
   const uint8_t* ap[NR];
   const float* asp[NR];
@@ -260,8 +256,7 @@ __global__ void __launch_bounds__(W * 32) gemm_fp8_bw_kernel(
         const int sl = rem - i * ACT;
         const int row = mb + t * 16 + ((sl >= 2) ? 8 : 0) + (l >> 2);
         const int col = n0 + i * 8 + (l & 3) * 2;
-        if (row < M && col + 1 < N)
-          store2(Y + (size_t)row * (size_t)N + col, s.x, s.y, col, N);
+        if (row < M && col + 1 < N) store2(Y + (size_t)row * (size_t)N + col, s.x, s.y, col, N);
       }
       return;
     }
@@ -283,8 +278,7 @@ __global__ void __launch_bounds__(W * 32) gemm_fp8_bw_kernel(
       const int sl = rem - i * ACT;
       const int row = mb + t * 16 + ((sl >= 2) ? 8 : 0) + (l >> 2);
       const int col = n0 + i * 8 + (l & 3) * 2 + (sl & 1);
-      if (row < M && col < N)
-        Y[(size_t)row * (size_t)N + col] = __float2bfloat16_rn(s);
+      if (row < M && col < N) Y[(size_t)row * (size_t)N + col] = __float2bfloat16_rn(s);
     }
     return;
   }
@@ -296,19 +290,17 @@ __global__ void __launch_bounds__(W * 32) gemm_fp8_bw_kernel(
       const int b = (t * NT + i) * ACT;
       const int col = n0 + i * 8 + c * 2;
       const int r0 = mb + t * 16 + g;
-      if (r0 < M)
-        store2(Y + (size_t)r0 * (size_t)N + col, acc[b + 0], acc[b + 1], col, N);
+      if (r0 < M) store2(Y + (size_t)r0 * (size_t)N + col, acc[b + 0], acc[b + 1], col, N);
       if (HH == 2 && r0 + 8 < M)
-        store2(Y + (size_t)(r0 + 8) * (size_t)N + col, acc[b + 2], acc[b + 3],
-               col, N);
+        store2(Y + (size_t)(r0 + 8) * (size_t)N + col, acc[b + 2], acc[b + 3], col, N);
     }
   }
 }
 
 }  // namespace r2_narrow
 
-void RunR2Narrow(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
-                 ffi::TensorView Bs, ffi::TensorView Y) {
+void RunR2Narrow(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
+                 ffi::TensorView Y) {
   const int M = static_cast<int>(A.shape()[0]);
   const int K = static_cast<int>(A.shape()[1]);
   const int N = static_cast<int>(B.shape()[0]);
@@ -318,8 +310,8 @@ void RunR2Narrow(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
   const float* Asp = static_cast<const float*>(As.data_ptr());
   const float* Bsp = static_cast<const float*>(Bs.data_ptr());
   __nv_bfloat16* Yp = static_cast<__nv_bfloat16*>(Y.data_ptr());
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
+  cudaStream_t stream =
+      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
   const dim3 grid((N + 15) / 16, 1, 1);
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
@@ -332,23 +324,16 @@ void RunR2Narrow(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
   attrs[0].val.clusterDim.y = 1;
   attrs[0].val.clusterDim.z = 1;
   attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
-  attrs[1].val.clusterSchedulingPolicyPreference =
-      cudaClusterSchedulingPolicyLoadBalancing;
+  attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
   config.attrs = attrs;
   config.numAttrs = 2;
   // The paired path wins at two and eight live rows; four rows remains on the
   // lean path after an isolated A/B was flat.
   if (M == 2 || M == 4 || M == 8) {
-    cudaLaunchKernelEx(
-        &config,
-        r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2, true, true>, Ap,
-        Bp, Asp, Bsp, Yp, M, N, K, KB);
+    cudaLaunchKernelEx(&config, r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2, true, true>, Ap,
+                       Bp, Asp, Bsp, Yp, M, N, K, KB);
   } else {
-    cudaLaunchKernelEx(
-        &config, r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2>, Ap, Bp,
-        Asp, Bsp, Yp, M, N, K, KB);
+    cudaLaunchKernelEx(&config, r2_narrow::gemm_fp8_bw_kernel<16, 8, false, 2, 2>, Ap, Bp, Asp, Bsp,
+                       Yp, M, N, K, KB);
   }
 }
-
-
-

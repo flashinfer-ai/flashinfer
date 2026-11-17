@@ -2,15 +2,16 @@
 // per CTA leaves too little instruction-level parallelism.  This is a
 // standalone, hand-written raw-MMA kernel; the public TVM-FFI entry remains in
 // kernel.cu.
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
 #include <cstdint>
 
 namespace wide {
 
-__device__ __forceinline__ void mma_e4m3(
-    float& d0, float& d1, float& d2, float& d3, uint32_t a0, uint32_t a1,
-    uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma_e4m3(float& d0, float& d1, float& d2, float& d3, uint32_t a0,
+                                         uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                         uint32_t b1) {
   asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
       : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
@@ -28,8 +29,8 @@ __device__ __forceinline__ Frag8 ld_stream256(const void* p) {
   Frag8 r;
   asm("ld.global.nc.L1::evict_first.L2::256B.v8.b32 "
       "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]),
-        "=r"(r.v[4]), "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -37,8 +38,8 @@ __device__ __forceinline__ Frag8 ld_stream256(const void* p) {
 __device__ __forceinline__ Frag8 ld_keep256(const void* p) {
   Frag8 r;
   asm("ld.global.nc.L1::evict_last.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]),
-        "=r"(r.v[4]), "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -57,8 +58,7 @@ __device__ __forceinline__ Frag8 ld_stream128(const void* p) {
 __device__ __forceinline__ Frag8 ld_pair128(const void* p) {
   Frag8 r;
   const uint4 x0 = *reinterpret_cast<const uint4*>(p);
-  const uint4 x1 = *reinterpret_cast<const uint4*>(
-      static_cast<const uint8_t*>(p) + 64);
+  const uint4 x1 = *reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(p) + 64);
   r.v[0] = x0.x;
   r.v[1] = x0.y;
   r.v[2] = x0.z;
@@ -82,13 +82,11 @@ __device__ __forceinline__ Frag8 ld_keep128(const void* p) {
 }
 
 // NT: n8 tiles per warp; MQ: m16 tiles; NWN: warp groups spread along N.
-template <int NW, int NT, int MQ, int NWN, bool V256, bool HALF,
-          bool SINGLE = false>
+template <int NW, int NT, int MQ, int NWN, bool V256, bool HALF, bool SINGLE = false>
 __global__ void __launch_bounds__(NW * 32, ((NW == 16 || SINGLE) ? 1 : 2))
-gemm_fp8_blk(
-    const uint8_t* __restrict__ Ap, const uint8_t* __restrict__ Bp,
-    const float* __restrict__ Asp, const float* __restrict__ Bsp,
-    __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
+    gemm_fp8_blk(const uint8_t* __restrict__ Ap, const uint8_t* __restrict__ Bp,
+                 const float* __restrict__ Asp, const float* __restrict__ Bsp,
+                 __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
   constexpr int NTHREADS = NW * 32;
   constexpr int NWK = NW / NWN;
   constexpr int WNW = NT * 8;
@@ -197,8 +195,8 @@ gemm_fp8_blk(
 #pragma unroll
         for (int t = 0; t < NT; ++t) {
           const Frag8& v = x.wb[t];
-          mma_e4m3(d[q][t][0], d[q][t][1], d[q][t][2], d[q][t][3],
-                   a0, a1, a2, a3, v.v[2 * ks], v.v[2 * ks + 1]);
+          mma_e4m3(d[q][t][0], d[q][t][1], d[q][t][2], d[q][t][3], a0, a1, a2, a3, v.v[2 * ks],
+                   v.v[2 * ks + 1]);
         }
       }
     }
@@ -242,13 +240,11 @@ gemm_fp8_blk(
         const int mb = ma + 8;
         if (ma < M) {
           Y[(size_t)ma * N + gn] = __float2bfloat16(acc[q][t][0]);
-          if (gn + 1 < N)
-            Y[(size_t)ma * N + gn + 1] = __float2bfloat16(acc[q][t][1]);
+          if (gn + 1 < N) Y[(size_t)ma * N + gn + 1] = __float2bfloat16(acc[q][t][1]);
         }
         if (mb < M) {
           Y[(size_t)mb * N + gn] = __float2bfloat16(acc[q][t][2]);
-          if (gn + 1 < N)
-            Y[(size_t)mb * N + gn + 1] = __float2bfloat16(acc[q][t][3]);
+          if (gn + 1 < N) Y[(size_t)mb * N + gn + 1] = __float2bfloat16(acc[q][t][3]);
         }
       }
     return;
@@ -281,33 +277,27 @@ gemm_fp8_blk(
       const int cc = rest % RW;
       float s = 0.f;
 #pragma unroll
-      for (int i = 0; i < NWK; ++i)
-        s += sR[(eg + i * NWN) * MPE * LD + mm * LD + cc];
+      for (int i = 0; i < NWK; ++i) s += sR[(eg + i * NWN) * MPE * LD + mm * LD + cc];
       const int gm = m0 + mm;
       const int gn = nc + eg * WNW + r * RW + cc;
-      if (gm < M && gn < N)
-        Y[(size_t)gm * N + gn] = __float2bfloat16(s);
+      if (gm < M && gn < N) Y[(size_t)gm * N + gn] = __float2bfloat16(s);
     }
   }
 }
 
-template <int NW, int NT, int MQ, int NWN, bool V256, bool HALF,
-          bool SINGLE = false>
-inline void launch(const uint8_t* a, const uint8_t* b, const float* as,
-                   const float* bs, __nv_bfloat16* y, int M, int N, int K,
-                   int KB, cudaStream_t stream) {
+template <int NW, int NT, int MQ, int NWN, bool V256, bool HALF, bool SINGLE = false>
+inline void launch(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
+                   __nv_bfloat16* y, int M, int N, int K, int KB, cudaStream_t stream) {
   constexpr int CN = NWN * NT * 8;
   constexpr int CM = MQ * (HALF ? 8 : 16);
   dim3 grid((N + CN - 1) / CN, (M + CM - 1) / CM);
   gemm_fp8_blk<NW, NT, MQ, NWN, V256, HALF, SINGLE>
-      <<<grid, NW * 32, 0, stream>>>(
-      a, b, as, bs, y, M, N, K, KB);
+      <<<grid, NW * 32, 0, stream>>>(a, b, as, bs, y, M, N, K, KB);
 }
 
 template <bool V256, bool HALF = false>
-void dispatch(const uint8_t* a, const uint8_t* b, const float* as,
-              const float* bs, __nv_bfloat16* y, int M, int N, int K, int KB,
-              cudaStream_t stream) {
+void dispatch(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
+              __nv_bfloat16* y, int M, int N, int K, int KB, cudaStream_t stream) {
   int cn;
   if (N >= 64 * 188)
     cn = 64;
@@ -327,22 +317,18 @@ void dispatch(const uint8_t* a, const uint8_t* b, const float* as,
       if (KB <= 4) {
         if constexpr (HALF) {
           if (M == 16) {
-            launch<8, 2, 1, 2, V256, HALF, true>(
-                a, b, as, bs, y, M, N, K, KB, stream);
+            launch<8, 2, 1, 2, V256, HALF, true>(a, b, as, bs, y, M, N, K, KB, stream);
             return;
           }
         }
         launch<4, 2, 1, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
-      }
-      else if (M == 16)
+      } else if (M == 16)
         launch<16, 2, 1, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
       else if constexpr (HALF) {
         if (M == 8 && KB == 32)
-          launch<16, 2, 1, 1, V256, HALF>(
-              a, b, as, bs, y, M, N, K, KB, stream);
+          launch<16, 2, 1, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
         else
-          launch<8, 2, 1, 1, V256, HALF>(
-              a, b, as, bs, y, M, N, K, KB, stream);
+          launch<8, 2, 1, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
       } else {
         launch<8, 2, 1, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
       }
@@ -357,13 +343,11 @@ void dispatch(const uint8_t* a, const uint8_t* b, const float* as,
     else if (cn == 16) {
       if (KB <= 4) {
         if (M == 32) {
-          launch<8, 2, 1, 2, V256, HALF, true>(
-              a, b, as, bs, y, M, N, K, KB, stream);
+          launch<8, 2, 1, 2, V256, HALF, true>(a, b, as, bs, y, M, N, K, KB, stream);
           return;
         }
         launch<4, 2, 1, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
-      }
-      else
+      } else
         launch<16, 2, 2, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
     } else {
       launch<8, 1, 2, 1, V256, HALF>(a, b, as, bs, y, M, N, K, KB, stream);
@@ -373,11 +357,9 @@ void dispatch(const uint8_t* a, const uint8_t* b, const float* as,
 
 }  // namespace wide
 
-void LaunchWide(const uint8_t* a, const uint8_t* b, const float* as,
-                const float* bs, __nv_bfloat16* y, int M, int N, int K,
-                int KB, cudaStream_t stream) {
-  if (M <= 16 && N == 2048 &&
-      ((M <= 8 && K == 4096) || (K == 512 && M >= 2)))
+void LaunchWide(const uint8_t* a, const uint8_t* b, const float* as, const float* bs,
+                __nv_bfloat16* y, int M, int N, int K, int KB, cudaStream_t stream) {
+  if (M <= 16 && N == 2048 && ((M <= 8 && K == 4096) || (K == 512 && M >= 2)))
     wide::dispatch<true, true>(a, b, as, bs, y, M, N, K, KB, stream);
   else if (M == 16)
     wide::dispatch<true, false>(a, b, as, bs, y, M, N, K, KB, stream);
@@ -386,8 +368,3 @@ void LaunchWide(const uint8_t* a, const uint8_t* b, const float* as,
   else
     wide::dispatch<false, false>(a, b, as, bs, y, M, N, K, KB, stream);
 }
-
-
-
-
-

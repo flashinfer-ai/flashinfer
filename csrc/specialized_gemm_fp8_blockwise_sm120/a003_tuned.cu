@@ -12,38 +12,41 @@
 // Out-of-range rows/columns are handled by clamping the *address* to a live
 // row and dropping the value at store time: an mma output element depends only
 // on its own A row and B column, so garbage never reaches a stored element.
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <cstdint>
-#include <tvm/ffi/tvm_ffi.h>
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <cstdint>
 
 namespace ffi = tvm::ffi;
 
 namespace a003_tuned_impl {
 
-#define MMA16832(d, a0, a1, a2, a3, b0, b1)                                 \
-  asm volatile(                                                             \
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "                \
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"             \
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])                      \
+#define MMA16832(d, a0, a1, a2, a3, b0, b1)                     \
+  asm volatile(                                                 \
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])          \
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 
-struct Frag8 { uint32_t v[8]; };
+struct Frag8 {
+  uint32_t v[8];
+};
 
 __device__ __forceinline__ Frag8 ld_stream(const void* p) {
   Frag8 r;
   asm("ld.global.nc.L1::evict_first.L2::256B.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
 __device__ __forceinline__ Frag8 ld_keep(const void* p) {
   Frag8 r;
   asm("ld.global.nc.L1::evict_last.v8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -53,8 +56,7 @@ __device__ __forceinline__ float ld_keepf(const float* p) {
   return r;
 }
 
-__device__ __forceinline__ void store2(__nv_bfloat16* p, float v0, float v1,
-                                       int col, int N) {
+__device__ __forceinline__ void store2(__nv_bfloat16* p, float v0, float v1, int col, int N) {
   if (col + 1 < N) {
     __nv_bfloat162 v = __floats2bfloat162_rn(v0, v1);
     if ((reinterpret_cast<uintptr_t>(p) & 3u) == 0u) {
@@ -70,12 +72,11 @@ __device__ __forceinline__ void store2(__nv_bfloat16* p, float v0, float v1,
 
 // NW_N: warp groups along N.  NW_K: warps splitting K.  NT: n8 subtiles per
 // warp.  MR: compile-time row bound (8/16/32).  KU: k-groups in flight.
-template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB = 1,
-          bool ASB = false>
-__global__ void __launch_bounds__(NW_N * NW_K * 32, MINB) gemm_bw(
-    const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq,
-    const float* __restrict__ As, const float* __restrict__ Bs,
-    __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
+template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB = 1, bool ASB = false>
+__global__ void __launch_bounds__(NW_N* NW_K * 32, MINB)
+    gemm_bw(const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq,
+            const float* __restrict__ As, const float* __restrict__ Bs,
+            __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
   constexpr int W = NW_N * NW_K;
   constexpr int CN = NW_N * NT * 8;
   constexpr int MT = (MR + 15) / 16;     // 16-row m-tiles
@@ -101,8 +102,7 @@ __global__ void __launch_bounds__(NW_N * NW_K * 32, MINB) gemm_bw(
 #pragma unroll
   for (int i = 0; i < NT; ++i) {
     const int nq = n0 + i * 8 + g;
-    bp[i] = Bq + (size_t)(nq < N ? nq : 0) * (size_t)K +
-            (size_t)(wk * KU * 128 + c * 32);
+    bp[i] = Bq + (size_t)(nq < N ? nq : 0) * (size_t)K + (size_t)(wk * KU * 128 + c * 32);
   }
   const uint8_t* ap[NR];
   const float* asp[NR];
@@ -152,7 +152,10 @@ __global__ void __launch_bounds__(NW_N * NW_K * 32, MINB) gemm_bw(
 #pragma unroll
     for (int i = 0; i < NT; ++i) bp[i] += kstep;
 #pragma unroll
-    for (int q = 0; q < NR; ++q) { ap[q] += kstep; asp[q] += NW_K * KU; }
+    for (int q = 0; q < NR; ++q) {
+      ap[q] += kstep;
+      asp[q] += NW_K * KU;
+    }
     bsp += NW_K * KU;
 
 #pragma unroll
@@ -182,7 +185,7 @@ __global__ void __launch_bounds__(NW_N * NW_K * 32, MINB) gemm_bw(
         }
       }
     }
-    };
+  };
 
   if constexpr (ITERS > 0) {
 #pragma unroll
@@ -200,11 +203,9 @@ __global__ void __launch_bounds__(NW_N * NW_K * 32, MINB) gemm_bw(
         const int b = (t * NT + i) * ACT;
         const int col = n0 + i * 8 + c * 2;
         const int r0 = mb + t * 16 + g;
-        if (r0 < M)
-          store2(Y + (size_t)r0 * (size_t)N + col, acc[b + 0], acc[b + 1], col, N);
+        if (r0 < M) store2(Y + (size_t)r0 * (size_t)N + col, acc[b + 0], acc[b + 1], col, N);
         if (HH == 2 && r0 + 8 < M)
-          store2(Y + (size_t)(r0 + 8) * (size_t)N + col, acc[b + 2], acc[b + 3],
-                 col, N);
+          store2(Y + (size_t)(r0 + 8) * (size_t)N + col, acc[b + 2], acc[b + 3], col, N);
       }
     return;
   }
@@ -224,8 +225,7 @@ __global__ void __launch_bounds__(NW_N * NW_K * 32, MINB) gemm_bw(
     const int l = rest & 31;
     float s = 0.f;
 #pragma unroll
-    for (int w = 0; w < NW_K; ++w)
-      s += red[((size_t)(w * NW_N + ngi) * NACC + a) * 32 + l];
+    for (int w = 0; w < NW_K; ++w) s += red[((size_t)(w * NW_N + ngi) * NACC + a) * 32 + l];
     const int t = a / (NT * ACT);
     const int rem = a - t * (NT * ACT);
     const int i = rem / ACT;
@@ -238,9 +238,8 @@ __global__ void __launch_bounds__(NW_N * NW_K * 32, MINB) gemm_bw(
 
 // ---------------------------------------------------------------- dispatch
 template <int NW_N, int NW_K, int NT, int KU, int ITERS, int MINB>
-static inline void go2(const uint8_t* A, const uint8_t* B, const float* As,
-                       const float* Bs, __nv_bfloat16* Y, int M, int N, int K,
-                       int KB, int MR, cudaStream_t s) {
+static inline void go2(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
+                       __nv_bfloat16* Y, int M, int N, int K, int KB, int MR, cudaStream_t s) {
   constexpr int CN = NW_N * NT * 8;
   constexpr int TH = NW_N * NW_K * 32;
   const dim3 grid((N + CN - 1) / CN, (unsigned)((M + MR - 1) / MR), 1);
@@ -253,9 +252,8 @@ static inline void go2(const uint8_t* A, const uint8_t* B, const float* As,
 }
 
 template <int NW_N, int NW_K, int NT, int KU, int MINB>
-static inline void go(const uint8_t* A, const uint8_t* B, const float* As,
-                      const float* Bs, __nv_bfloat16* Y, int M, int N, int K,
-                      int KB, int MR, cudaStream_t s) {
+static inline void go(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
+                      __nv_bfloat16* Y, int M, int N, int K, int KB, int MR, cudaStream_t s) {
   const int iters = KB / (NW_K * KU);
   if (iters == 1)
     go2<NW_N, NW_K, NT, KU, 1, MINB>(A, B, As, Bs, Y, M, N, K, KB, MR, s);
@@ -266,75 +264,77 @@ static inline void go(const uint8_t* A, const uint8_t* B, const float* As,
 }
 
 //      id, NW_N, NW_K, NT, KU, MINB
-#define CFG_LIST(X)        \
-  X(0,  1,  1, 1, 1, 1)    \
-  X(1,  1,  2, 1, 1, 1)    \
-  X(2,  1,  4, 1, 1, 1)    \
-  X(3,  1,  8, 1, 1, 1)    \
-  X(4,  1, 16, 1, 1, 1)    \
-  X(5,  1,  8, 1, 2, 1)    \
-  X(8,  1,  8, 2, 1, 1)    \
-  X(9,  1, 16, 2, 1, 1)    \
-  X(12, 1,  8, 2, 2, 1)    \
-  X(16, 1,  2, 1, 2, 1)    \
-  X(17, 4,  4, 1, 1, 1)    \
-  X(19, 1,  4, 2, 1, 1)    \
-  X(20, 2,  8, 2, 1, 1)    \
-  X(21, 1, 16, 4, 1, 1)    \
-  X(22, 1,  4, 4, 1, 1)    \
-  X(23, 1,  2, 2, 1, 1)    \
-  X(24, 1,  1, 2, 1, 1)    \
-  X(25, 2,  4, 2, 1, 1)    \
-  X(26, 1,  4, 1, 2, 1)    \
-  X(27, 1,  2, 4, 1, 1)    \
-  X(28, 1, 32, 1, 1, 1)    \
-  X(29, 2, 16, 1, 1, 1)    \
-  X(30, 1, 16, 1, 2, 1)    \
-  X(32, 2,  8, 2, 2, 1)    \
-  X(33, 1,  8, 1, 4, 1)    \
-  X(34, 4,  8, 1, 1, 1)    \
-  X(35, 1, 16, 2, 2, 1)    \
-  X(36, 1,  8, 2, 1, 3)    \
-  X(37, 1,  2, 1, 1, 12)
+#define CFG_LIST(X)     \
+  X(0, 1, 1, 1, 1, 1)   \
+  X(1, 1, 2, 1, 1, 1)   \
+  X(2, 1, 4, 1, 1, 1)   \
+  X(3, 1, 8, 1, 1, 1)   \
+  X(4, 1, 16, 1, 1, 1)  \
+  X(5, 1, 8, 1, 2, 1)   \
+  X(8, 1, 8, 2, 1, 1)   \
+  X(9, 1, 16, 2, 1, 1)  \
+  X(12, 1, 8, 2, 2, 1)  \
+  X(16, 1, 2, 1, 2, 1)  \
+  X(17, 4, 4, 1, 1, 1)  \
+  X(19, 1, 4, 2, 1, 1)  \
+  X(20, 2, 8, 2, 1, 1)  \
+  X(21, 1, 16, 4, 1, 1) \
+  X(22, 1, 4, 4, 1, 1)  \
+  X(23, 1, 2, 2, 1, 1)  \
+  X(24, 1, 1, 2, 1, 1)  \
+  X(25, 2, 4, 2, 1, 1)  \
+  X(26, 1, 4, 1, 2, 1)  \
+  X(27, 1, 2, 4, 1, 1)  \
+  X(28, 1, 32, 1, 1, 1) \
+  X(29, 2, 16, 1, 1, 1) \
+  X(30, 1, 16, 1, 2, 1) \
+  X(32, 2, 8, 2, 2, 1)  \
+  X(33, 1, 8, 1, 4, 1)  \
+  X(34, 4, 8, 1, 1, 1)  \
+  X(35, 1, 16, 2, 2, 1) \
+  X(36, 1, 8, 2, 1, 3)  \
+  X(37, 1, 2, 1, 1, 12)
 
 #define CFG_MAX 38
-static const unsigned char CFG_NWK[CFG_MAX] = {
-  1,2,4,8,16,8,0,0,8,16,0,0,8,0,0,0,2,4,0,4,8,16,4,2,1,4,4,2,
-  32,16,16,0,8,8,8,16,8,2};
-static const unsigned char CFG_KU[CFG_MAX] = {
-  1,1,1,1,1,2,0,0,1,1,0,0,2,0,0,0,2,1,0,1,1,1,1,1,1,1,2,1,
-  1,1,2,0,2,4,1,2,1,1};
+static const unsigned char CFG_NWK[CFG_MAX] = {1, 2, 4,  8,  16, 8, 0, 0, 8,  16, 0, 0, 8,
+                                               0, 0, 0,  2,  4,  0, 4, 8, 16, 4,  2, 1, 4,
+                                               4, 2, 32, 16, 16, 0, 8, 8, 8,  16, 8, 2};
+static const unsigned char CFG_KU[CFG_MAX] = {1, 1, 1, 1, 1, 2, 0, 0, 1, 1, 0, 0, 2,
+                                              0, 0, 0, 2, 1, 0, 1, 1, 1, 1, 1, 1, 1,
+                                              2, 1, 1, 1, 2, 0, 2, 4, 1, 2, 1, 1};
 
 #ifndef VARIANT
 #define VARIANT 0
 #endif
 
-struct Sel { int id, mr; };
+struct Sel {
+  int id, mr;
+};
 
 // Best known tiling per (shape class, m class): {config id, m-split shift}.
 // A CTA owns CN = NW_N*NT*8 columns and all of K; NW_K warps split the k
 // groups with KU of them in flight.  The m-split shift halves the rows per CTA
 // to buy blocks, which only pays where the weight stream is small.
 static const signed char BEST[7][6][2] = {
-  {{4,1},{4,1},{4,1},{4,1},{5,1},{3,2}},
-  {{4,0},{4,2},{9,0},{9,0},{9,1},{8,1}},
-  {{17,2},{17,0},{17,0},{17,0},{17,1},{17,1}},
-  {{35,0},{35,0},{20,0},{20,0},{9,0},{25,0}},
-  {{0,0},{0,0},{0,0},{37,0},{12,0},{0,0}},
-  {{8,0},{8,0},{8,0},{8,0},{12,0},{24,0}},
-  {{0,0},{0,0},{0,0},{0,0},{0,0},{0,0}},
+    {{4, 1}, {4, 1}, {4, 1}, {4, 1}, {5, 1}, {3, 2}},
+    {{4, 0}, {4, 2}, {9, 0}, {9, 0}, {9, 1}, {8, 1}},
+    {{17, 2}, {17, 0}, {17, 0}, {17, 0}, {17, 1}, {17, 1}},
+    {{35, 0}, {35, 0}, {20, 0}, {20, 0}, {9, 0}, {25, 0}},
+    {{0, 0}, {0, 0}, {0, 0}, {37, 0}, {12, 0}, {0, 0}},
+    {{8, 0}, {8, 0}, {8, 0}, {8, 0}, {12, 0}, {24, 0}},
+    {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}},
 };
 
 #if VARIANT > 0
 // Experiment slots: VARIANT v applies ALT[cls][v-1] to every m class.
 static const signed char ALT[7][8][2] = {
-  /* N=64    */ {{5,1},{4,1},{3,1},{5,2},{3,2},{3,2},{3,2},{3,2}},
-  /* N=1024  */ {{12,1},{19,0},{23,0},{24,0},{9,0},{8,0},{4,1},{12,0}},
-  /* N=2048/512 */ {{22,1},{19,1},{27,0},{25,1},{17,0},{2,1},{23,1},{25,0}},
-  /* N=2048/4096*/ {{35,0},{30,0},{21,0},{3,0},{9,0},{12,0},{5,0},{20,0}},
-  /* N=9216  */ {{5,0},{3,0},{16,0},{19,0},{12,0},{8,0},{1,0},{2,0}},
-  /* N=12288 */ {{5,0},{3,0},{16,0},{19,0},{12,0},{8,0},{1,0},{2,0}},
-  /* generic */ {{0,0},{0,0},{0,0},{0,0},{0,0},{0,0},{0,0},{0,0}},
+    /* N=64    */ {{5, 1}, {4, 1}, {3, 1}, {5, 2}, {3, 2}, {3, 2}, {3, 2}, {3, 2}},
+    /* N=1024  */ {{12, 1}, {19, 0}, {23, 0}, {24, 0}, {9, 0}, {8, 0}, {4, 1}, {12, 0}},
+    /* N=2048/512 */ {{22, 1}, {19, 1}, {27, 0}, {25, 1}, {17, 0}, {2, 1}, {23, 1}, {25, 0}},
+    /* N=2048/4096*/ {{35, 0}, {30, 0}, {21, 0}, {3, 0}, {9, 0}, {12, 0}, {5, 0}, {20, 0}},
+    /* N=9216  */ {{5, 0}, {3, 0}, {16, 0}, {19, 0}, {12, 0}, {8, 0}, {1, 0}, {2, 0}},
+    /* N=12288 */ {{5, 0}, {3, 0}, {16, 0}, {19, 0}, {12, 0}, {8, 0}, {1, 0}, {2, 0}},
+    /* generic */ {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}},
 };
 #endif
 
@@ -355,8 +355,7 @@ static inline int shape_class(int N, int K) {
 static inline Sel pick(int M, int N, int K, int KB) {
   int mr = (M <= 8) ? 8 : ((M <= 16) ? 16 : 32);
   const int cls = shape_class(N, K);
-  const int mc = (M <= 1) ? 0 : (M <= 2) ? 1 : (M <= 4) ? 2
-               : (M <= 8) ? 3 : (M <= 16) ? 4 : 5;
+  const int mc = (M <= 1) ? 0 : (M <= 2) ? 1 : (M <= 4) ? 2 : (M <= 8) ? 3 : (M <= 16) ? 4 : 5;
   int id = BEST[cls][mc][0];
   int shift = BEST[cls][mc][1];
 #if VARIANT > 0
@@ -370,7 +369,10 @@ static inline Sel pick(int M, int N, int K, int KB) {
     id = (nwk == 1) ? 0 : (nwk == 2) ? 1 : (nwk == 4) ? 2 : (nwk == 8) ? 3 : 4;
     shift = 0;
   }
-  while (shift > 0 && mr > 8) { mr >>= 1; --shift; }
+  while (shift > 0 && mr > 8) {
+    mr >>= 1;
+    --shift;
+  }
   const int nwk = CFG_NWK[id], ku = CFG_KU[id];
   // The k loop runs a fixed number of KU-group steps, so the split must
   // divide KB exactly; id 0 (one warp, one group per step) always does.
@@ -378,8 +380,8 @@ static inline Sel pick(int M, int N, int K, int KB) {
   return Sel{id, mr};
 }
 
-void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
-         ffi::TensorView Bs, ffi::TensorView Y) {
+void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
+         ffi::TensorView Y) {
   const int M = static_cast<int>(A.shape()[0]);
   const int K = static_cast<int>(A.shape()[1]);
   const int N = static_cast<int>(B.shape()[0]);
@@ -391,8 +393,8 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
   const float* Asp = static_cast<const float*>(As.data_ptr());
   const float* Bsp = static_cast<const float*>(Bs.data_ptr());
   __nv_bfloat16* Yp = static_cast<__nv_bfloat16*>(Y.data_ptr());
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
+  cudaStream_t stream =
+      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
 
   if (M == 16 && N == 12288 && K == 2048) {
     const dim3 grid(768, 1, 1);
@@ -409,10 +411,9 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
 
   const Sel s = pick(M, N, K, KB);
   switch (s.id) {
-#define X(ID, NWN, NWK, NT, KU, MINB)                                        \
-  case ID:                                                                   \
-    go<NWN, NWK, NT, KU, MINB>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, s.mr,      \
-                               stream);                                      \
+#define X(ID, NWN, NWK, NT, KU, MINB)                                            \
+  case ID:                                                                       \
+    go<NWN, NWK, NT, KU, MINB>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB, s.mr, stream); \
     break;
     CFG_LIST(X)
 #undef X
@@ -424,13 +425,9 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
 
 }  // namespace a003_tuned_impl
 
-void RunTuned(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
-              ffi::TensorView Bs, ffi::TensorView Y) {
+void RunTuned(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
+              ffi::TensorView Y) {
   a003_tuned_impl::Run(A, B, As, Bs, Y);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_tuned, RunTuned);
-
-
-
-

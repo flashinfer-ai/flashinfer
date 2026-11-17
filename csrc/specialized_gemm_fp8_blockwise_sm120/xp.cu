@@ -14,11 +14,12 @@
 //     full 4-byte sectors) whenever N is even;
 //   * all global addressing is mul.wide.s32 (one IMAD.WIDE) instead of a
 //     64x64 multiply.
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include <cstdint>
-#include <tvm/ffi/tvm_ffi.h>
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <cstdint>
 
 namespace ffi = tvm::ffi;
 
@@ -32,8 +33,8 @@ __device__ __forceinline__ F8 ldB(const void* p) {
   F8 r;
   asm("ld.global.v8.b32 "
       "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -41,8 +42,8 @@ __device__ __forceinline__ F8 ldA(const void* p) {
   F8 r;
   asm("ld.global.nc.L1::evict_last.v8.b32 "
       "{%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]),
-        "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3]), "=r"(r.v[4]), "=r"(r.v[5]),
+        "=r"(r.v[6]), "=r"(r.v[7])
       : "l"(p));
   return r;
 }
@@ -75,23 +76,21 @@ __device__ __forceinline__ void stOne(__nv_bfloat16* p, float a) {
     *reinterpret_cast<unsigned short*>(p) = u;
 }
 
-#define MMA(d, a0, a1, a2, a3, b0, b1)                                      \
-  asm volatile(                                                             \
-      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "                \
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"             \
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])                      \
+#define MMA(d, a0, a1, a2, a3, b0, b1)                          \
+  asm volatile(                                                 \
+      "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "    \
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n" \
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])          \
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1))
 
 // NW warps per CTA split NWN ways along n and NWK = NW/NWN ways along k.
 // KI > 0 pins the per-warp k-group trip count so the loop control folds away.
 // SWAPG puts the m chunk on the fast grid axis, so CTAs sharing a weight
 // column launch back to back.
-template <int NW, int NWN, int NT, int MR, int KI, int MINB, bool SWAPG,
-          bool WT>
-__global__ void __launch_bounds__(NW * 32, MINB) xpk(
-    const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq,
-    const float* __restrict__ As, const float* __restrict__ Bs,
-    __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
+template <int NW, int NWN, int NT, int MR, int KI, int MINB, bool SWAPG, bool WT>
+__global__ void __launch_bounds__(NW * 32, MINB)
+    xpk(const uint8_t* __restrict__ A, const uint8_t* __restrict__ Bq, const float* __restrict__ As,
+        const float* __restrict__ Bs, __nv_bfloat16* __restrict__ Y, int M, int N, int K, int KB) {
   constexpr int NWK = NW / NWN;
   constexpr int MT = (MR <= 8) ? 1 : (MR / 16);
   constexpr int HH = (MR <= 8) ? 1 : 2;
@@ -173,8 +172,7 @@ __global__ void __launch_bounds__(NW * 32, MINB) xpk(
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           MMA(d, F0.v[2 * j], (HH == 2) ? F1.v[2 * j] : z, F0.v[2 * j + 1],
-              (HH == 2) ? F1.v[2 * j + 1] : z, bf[i].v[2 * j],
-              bf[i].v[2 * j + 1]);
+              (HH == 2) ? F1.v[2 * j + 1] : z, bf[i].v[2 * j], bf[i].v[2 * j + 1]);
         }
         acc[t][i][0] += sc[t * HH] * d[0];
         acc[t][i][1] += sc[t * HH] * d[1];
@@ -232,8 +230,7 @@ __global__ void __launch_bounds__(NW * 32, MINB) xpk(
       const int pb = ng * (NT * 4) + i * 4 + c;
       const int r0 = t * 16 + g;
       sw[r0 * S2 + pb] = make_float2(acc[t][i][0], acc[t][i][1]);
-      if (HH == 2)
-        sw[(r0 + 8) * S2 + pb] = make_float2(acc[t][i][2], acc[t][i][3]);
+      if (HH == 2) sw[(r0 + 8) * S2 + pb] = make_float2(acc[t][i][2], acc[t][i][3]);
     }
   __syncthreads();
   constexpr int TOT = MR * CP;
@@ -264,30 +261,30 @@ __global__ void __launch_bounds__(NW * 32, MINB) xpk(
   }
 }
 
-#define XLAUNCH(NWv, NWNv, NTv, MRv, KIv, MINBv, SWAPv, WTv)                 \
-  do {                                                                       \
-    constexpr int CNv = (NWNv) * (NTv) * 8;                                  \
-    const unsigned nt = (unsigned)((N + CNv - 1) / CNv);                     \
-    const unsigned mc = (unsigned)((M + (MRv) - 1) / (MRv));                 \
-    const dim3 grid((SWAPv) ? mc : nt, (SWAPv) ? nt : mc, 1);                \
-    xpk<NWv, NWNv, NTv, MRv, KIv, MINBv, SWAPv, WTv>                         \
-        <<<grid, (NWv) * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);\
-    return;                                                                  \
+#define XLAUNCH(NWv, NWNv, NTv, MRv, KIv, MINBv, SWAPv, WTv)                  \
+  do {                                                                        \
+    constexpr int CNv = (NWNv) * (NTv) * 8;                                   \
+    const unsigned nt = (unsigned)((N + CNv - 1) / CNv);                      \
+    const unsigned mc = (unsigned)((M + (MRv) - 1) / (MRv));                  \
+    const dim3 grid((SWAPv) ? mc : nt, (SWAPv) ? nt : mc, 1);                 \
+    xpk<NWv, NWNv, NTv, MRv, KIv, MINBv, SWAPv, WTv>                          \
+        <<<grid, (NWv) * 32, 0, stream>>>(Ap, Bp, Asp, Bsp, Yp, M, N, K, KB); \
+    return;                                                                   \
   } while (0)
 
 // m-chunked launches put the chunk on the fast axis so CTAs that share a
 // weight column issue back to back; a single chunk keeps n there instead.
-#define XAUTO(NWv, NWNv, NTv, MRv, KIv, MINBv, WTv)                          \
-  do {                                                                       \
-    if ((M + (MRv) - 1) / (MRv) > 1) {                                       \
-      XLAUNCH(NWv, NWNv, NTv, MRv, KIv, MINBv, true, WTv);                   \
-    } else {                                                                 \
-      XLAUNCH(NWv, NWNv, NTv, MRv, KIv, MINBv, false, WTv);                  \
-    }                                                                        \
+#define XAUTO(NWv, NWNv, NTv, MRv, KIv, MINBv, WTv)         \
+  do {                                                      \
+    if ((M + (MRv) - 1) / (MRv) > 1) {                      \
+      XLAUNCH(NWv, NWNv, NTv, MRv, KIv, MINBv, true, WTv);  \
+    } else {                                                \
+      XLAUNCH(NWv, NWNv, NTv, MRv, KIv, MINBv, false, WTv); \
+    }                                                       \
   } while (0)
 
-void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
-             ffi::TensorView Bs, ffi::TensorView Y) {
+void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
+             ffi::TensorView Y) {
   const int M = static_cast<int>(A.shape()[0]);
   const int K = static_cast<int>(A.shape()[1]);
   const int N = static_cast<int>(B.shape()[0]);
@@ -299,8 +296,8 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
   const float* Asp = static_cast<const float*>(As.data_ptr());
   const float* Bsp = static_cast<const float*>(Bs.data_ptr());
   __nv_bfloat16* Yp = static_cast<__nv_bfloat16*>(Y.data_ptr());
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
+  cudaStream_t stream =
+      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, A.device().device_id));
 
   if (K == 2048 && N == 1024 && M > 16) {
     const dim3 grid(64, 2, 1);
@@ -315,12 +312,11 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
     attrs[0].val.clusterDim.y = 1;
     attrs[0].val.clusterDim.z = 1;
     attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
-    attrs[1].val.clusterSchedulingPolicyPreference =
-        cudaClusterSchedulingPolicyLoadBalancing;
+    attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, xpk<16, 2, 1, 16, 2, 1, false, false>, Ap,
-                       Bp, Asp, Bsp, Yp, M, N, K, KB);
+    cudaLaunchKernelEx(&config, xpk<16, 2, 1, 16, 2, 1, false, false>, Ap, Bp, Asp, Bsp, Yp, M, N,
+                       K, KB);
     return;
   }
   if (K == 2048) {
@@ -339,9 +335,7 @@ void RunImpl(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
 
 }  // namespace xp_impl
 
-void RunXP(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As,
-           ffi::TensorView Bs, ffi::TensorView Y) {
+void RunXP(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
+           ffi::TensorView Y) {
   xp_impl::RunImpl(A, B, As, Bs, Y);
 }
-
-

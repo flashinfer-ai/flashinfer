@@ -11380,8 +11380,13 @@ def gemm_fp8_nt_groupwise(
         )
 
         if _spec_ok(
-            a, b, a_scale, b_scale, scale_major_mode,
-            scale_granularity_mnk, out,
+            a,
+            b,
+            a_scale,
+            b_scale,
+            scale_major_mode,
+            scale_granularity_mnk,
+            out,
         ):
             _spec_run(a, b, a_scale, b_scale, out)
         else:
