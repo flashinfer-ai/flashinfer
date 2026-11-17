@@ -422,28 +422,36 @@ _NSMID_SRC = b"""extern "C" __global__ void nsmid_probe(unsigned int* out) {
 """
 
 
+# Slots used when the %nsmid probe fails: well above any GPU's SM count today
+# (the largest is 188), at 128 B per slot (64 KB per device). Under MPS,
+# multi_processor_count can be below the %smid bound, so it is not a safe
+# fallback by itself.
+_NSMID_FALLBACK_SLOTS = 512
+
+
 @functools.cache
 def get_device_nsmid(device: torch.device) -> int:
     """Upper bound (exclusive) on ``%smid``, read on the device.
 
     Under CUDA MPS with a reduced thread share, ``multi_processor_count`` shrinks
     but ``%smid`` still spans the physical SM ids, which ``%nsmid`` bounds.
-    If the probe fails, falls back to ``multi_processor_count`` (exact outside
-    MPS) and warns once per device; the fallback is cached, so a failed probe is
-    not recompiled on every call.
+    If the probe fails, falls back to ``max(multi_processor_count,
+    _NSMID_FALLBACK_SLOTS)`` and warns once per device. The fallback is cached,
+    so a failed probe is not recompiled on every call, and it is never below
+    the SM count, so prefill cannot write past the workspace.
     """
     try:
         return probe_device_nsmid(device)
     except Exception as e:  # noqa: BLE001 - any probe failure takes the fallback
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        slots = max(sm_count, _NSMID_FALLBACK_SLOTS)
         warnings.warn(
             f"%nsmid probe failed on {device} ({e}); sizing the GDN prefill "
-            f"tensor-map workspace by multi_processor_count={sm_count}, which "
-            "under-sizes it when CUDA MPS limits the active thread percentage.",
+            f"tensor-map workspace for {slots} SM ids instead.",
             RuntimeWarning,
             stacklevel=2,
         )
-        return sm_count
+        return slots
 
 
 def probe_device_nsmid(device: torch.device) -> int:

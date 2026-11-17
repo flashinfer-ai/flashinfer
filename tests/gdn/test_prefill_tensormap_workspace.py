@@ -10,6 +10,7 @@ import warnings
 import pytest
 import torch
 
+from flashinfer.gdn_kernels.delta_rule_dsl import helpers
 from flashinfer.gdn_kernels.delta_rule_dsl.helpers import (
     get_device_nsmid,
     probe_device_nsmid,
@@ -44,6 +45,29 @@ def test_nsmid_probe_under_capture():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(x, torch.full_like(x, 2))
+
+
+def test_probe_failure_fallback_is_not_undersized(monkeypatch):
+    """A failed probe must not size the workspace below the SM count (#9484)."""
+    _skip_unless_nsmid_backend()
+    device = torch.device("cuda")
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+
+    def broken_probe(_device):
+        raise RuntimeError("simulated probe failure")
+
+    monkeypatch.setattr(helpers, "probe_device_nsmid", broken_probe)
+    get_device_nsmid.cache_clear()
+    try:
+        with pytest.warns(RuntimeWarning, match="probe failed"):
+            slots = get_device_nsmid(device)
+        assert slots >= max(sm_count, helpers._NSMID_FALLBACK_SLOTS)
+        # Cached: the failed probe is not retried (or re-warned) on later calls.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert get_device_nsmid(device) == slots
+    finally:
+        get_device_nsmid.cache_clear()
 
 
 @pytest.mark.parametrize("use_cp", [False, True])
