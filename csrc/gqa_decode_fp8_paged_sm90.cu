@@ -223,9 +223,8 @@ template <bool ASYNC_Q, bool SINGLE>
 __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
     const uint8_t* __restrict__ qg, const uint8_t* __restrict__ kc, const uint8_t* __restrict__ vc,
     const int* __restrict__ bt, const int* __restrict__ sl, const float* __restrict__ qd,
-    const float* __restrict__ kd, const float* __restrict__ vd, __half* __restrict__ po,
-    float* __restrict__ plse, int2* __restrict__ pmeta, float2* __restrict__ carry, int B, int NB,
-    int GSTRIDE) {
+    const float* __restrict__ kd, __half* __restrict__ po, float* __restrict__ plse,
+    int2* __restrict__ pmeta, float2* __restrict__ carry, int B, int NB, int GSTRIDE) {
   __shared__ __align__(128) uint8_t qs[64 * 128];
   // Each stage's raw K/V pair is contiguous.  Once QK has consumed K and
   // the V bytes have been loaded into registers, reuse the same 12 KiB as
@@ -346,8 +345,6 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
   }
 
   const float scale2 = 0.08838834764831845f * qd[r] * kd[r] * 1.4426950408889634f;
-  float vsc;
-  if constexpr (SINGLE) vsc = vd[r];
   __syncthreads();
 
   uint32_t oa[32];
@@ -490,6 +487,12 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
       *reinterpret_cast<uint4*>((char*)kv[stage][0] + sw8(cr, copy_c * 16)) = h0;
       *reinterpret_cast<uint4*>((char*)kv[stage][1] + sw8(cr, copy_c * 16)) = h1;
     }
+    // The f16 V tile above is written through the generic proxy, while the
+    // PV WGMMAs read it through the async proxy via shared-memory
+    // descriptors; wgmma.fence only orders register accesses.  Publish the
+    // generic stores to the async proxy here, before the __syncthreads()
+    // below makes them visible across the warpgroup.
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
     // Scores stay in RAW (unscaled) units through the max reduction:
     // scale2 > 0 so the argmax is unchanged, and folding the scale into
@@ -588,8 +591,11 @@ __global__ __launch_bounds__(NTHREAD, SINGLE ? 4 : 5) void attn_kernel(
   }
   asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
 
-  if constexpr (!SINGLE) vsc = vd[r];
-  vsc *= 16.f;
+  // Undo only the exact power-of-two PV prescale here. The per-sequence V
+  // descale is applied by the reducer in FP32: folding it into this FP16
+  // normalization would overflow the stored partials for a large descale
+  // (448 * 256 > 65504) and underflow them for a small one.
+  const float vsc = 16.f;
   float la = l_a, lb = l_b, inva = 0.f, invb = 0.f;
   if (w < 3) {
     la += __shfl_xor_sync(0xffffffffu, la, 1);
@@ -687,7 +693,8 @@ __device__ __forceinline__ void acc8(float* A, uint4 v, float w) {
 template <int NTH, int NSLICE, bool SGL>
 __global__ __launch_bounds__(NTH, 2) void reduce_u4(
     const __half* __restrict__ po, const float* __restrict__ plse, __nv_bfloat16* __restrict__ out,
-    const int* __restrict__ sl, const int2* __restrict__ pmeta, int B, int GSTRIDE) {
+    const int* __restrict__ sl, const float* __restrict__ vd, const int2* __restrict__ pmeta, int B,
+    int GSTRIDE) {
   constexpr int DPC = 128 / NSLICE;
   constexpr int LANES = DPC / 8;
   constexpr int GROUPS = NTH / LANES;
@@ -700,10 +707,16 @@ __global__ __launch_bounds__(NTH, 2) void reduce_u4(
     ds = gg & (NSLICE - 1);
     g = gg / NSLICE;
   }
+  // pmeta below is written by the producer grid, and under programmatic
+  // dependent launch this grid may start before the producer completes:
+  // synchronize before the first read of producer state. The SGL
+  // specialization derives its split metadata from sl alone and keeps the
+  // full preamble overlap until its own synchronize below.
+  if constexpr (!SGL) cudaGridDependencySynchronize();
   // No producer owns an empty request. Bypass its unwritten split metadata.
   int request = SGL ? 0 : g / MROWS;
   if (sl[request] == 0) {
-    cudaGridDependencySynchronize();
+    if constexpr (SGL) cudaGridDependencySynchronize();
     for (int d = threadIdx.x; d < DPC; d += NTH)
       out[(size_t)g * 128 + ds * DPC + d] = __float2bfloat16(0.f);
     return;
@@ -737,9 +750,10 @@ __global__ __launch_bounds__(NTH, 2) void reduce_u4(
   __shared__ float sMax, sInv;
   __shared__ float sA[NW * DPC];
 
-  // Index setup above overlaps the producer tail.  Wait only at the first
-  // read of partial state written by the attention grid.
-  cudaGridDependencySynchronize();
+  // Single-request index setup above overlaps the producer tail: wait only
+  // at the first read of state written by the attention grid. The
+  // multi-request path already synchronized before loading pmeta.
+  if constexpr (SGL) cudaGridDependencySynchronize();
   // Pull the first eight split vectors into registers before the LSE
   // reduction.  Their memory latency is then hidden by the max/exp/sum
   // chain; for B1 this covers the complete 512-split accumulation loop.
@@ -834,7 +848,9 @@ __global__ __launch_bounds__(NTH, 2) void reduce_u4(
 #pragma unroll
     for (int w2 = 0; w2 < NW; ++w2) acc += sA[w2 * DPC + tid];
     size_t od = (size_t)g * 128 + ds * DPC + tid;
-    out[od] = __float2bfloat16(acc * sInv);
+    // The per-sequence V descale lands here, in FP32, so it can neither
+    // overflow nor underflow the FP16 split partials.
+    out[od] = __float2bfloat16(acc * sInv * vd[r]);
   }
 }
 
@@ -976,10 +992,10 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   __nv_bfloat16* op = static_cast<__nv_bfloat16*>(out.data_ptr());
 
   if (B == 1) {
-    attn_kernel<true, true><<<L.grid, NTHREAD, 0, stream>>>(qd, kd, vd, bt, slp, qds, kds, vds, po,
-                                                            plse, pmeta, carry, B, NB, L.lstride);
+    attn_kernel<true, true><<<L.grid, NTHREAD, 0, stream>>>(qd, kd, vd, bt, slp, qds, kds, po, plse,
+                                                            pmeta, carry, B, NB, L.lstride);
   } else {
-    attn_kernel<true, false><<<L.grid, NTHREAD, 0, stream>>>(qd, kd, vd, bt, slp, qds, kds, vds, po,
+    attn_kernel<true, false><<<L.grid, NTHREAD, 0, stream>>>(qd, kd, vd, bt, slp, qds, kds, po,
                                                              plse, pmeta, carry, B, NB, L.lstride);
   }
   cudaLaunchAttribute attribute[1] = {};
@@ -994,23 +1010,23 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
   if (B >= 6) {
     config.gridDim = B * MROWS;
     config.blockDim = 256;
-    launch_status = cudaLaunchKernelEx(&config, reduce_u4<256, 1, false>, po, plse, op, slp, pmeta,
-                                       B, L.lstride);
+    launch_status = cudaLaunchKernelEx(&config, reduce_u4<256, 1, false>, po, plse, op, slp, vds,
+                                       pmeta, B, L.lstride);
   } else if (B == 1) {
     config.gridDim = MROWS * 2;
     config.blockDim = 512;
-    launch_status = cudaLaunchKernelEx(&config, reduce_u4<512, 2, true>, po, plse, op, slp, pmeta,
-                                       B, L.lstride);
+    launch_status = cudaLaunchKernelEx(&config, reduce_u4<512, 2, true>, po, plse, op, slp, vds,
+                                       pmeta, B, L.lstride);
   } else if (B == 2) {
     config.gridDim = B * MROWS * 2;
     config.blockDim = 512;
-    launch_status = cudaLaunchKernelEx(&config, reduce_u4<512, 2, false>, po, plse, op, slp, pmeta,
-                                       B, L.lstride);
+    launch_status = cudaLaunchKernelEx(&config, reduce_u4<512, 2, false>, po, plse, op, slp, vds,
+                                       pmeta, B, L.lstride);
   } else {
     config.gridDim = B * MROWS;
     config.blockDim = 512;
-    launch_status = cudaLaunchKernelEx(&config, reduce_u4<512, 1, false>, po, plse, op, slp, pmeta,
-                                       B, L.lstride);
+    launch_status = cudaLaunchKernelEx(&config, reduce_u4<512, 1, false>, po, plse, op, slp, vds,
+                                       pmeta, B, L.lstride);
   }
   TVM_FFI_ICHECK(launch_status == cudaSuccess)
       << "gqa_decode_fp8_paged_sm90 reduce launch failed: " << cudaGetErrorString(launch_status);

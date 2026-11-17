@@ -253,9 +253,9 @@ def _make_batch(kv_lens, device, seed=0):
     )
 
 
-def _reference(batch):
+def _reference(batch, q_descale=None, k_descale=None, v_descale=None):
     """fp32 dequant-then-attend verify-decode reference (row pos of request r
-    sees kv_len_r - 6 + pos + 1 keys)."""
+    sees kv_len_r - 6 + pos + 1 keys), with optional per-sequence descales."""
     device = batch["q"].device
     q = batch["q"].float()
     kf = batch["k_cache"].float().reshape(-1, HEAD_DIM)
@@ -274,7 +274,14 @@ def _reference(batch):
         flat = (bt[r, :npages].long().unsqueeze(1) * PAGE + off).reshape(-1)[:kvl]
         k = kf[flat]
         v = vf[flat]
-        sc = torch.einsum("nhd,ld->nhl", q[q0:q1], k) * scale
+        qr = q[q0:q1]
+        if q_descale is not None:
+            qr = qr * float(q_descale.reshape(-1)[r])
+        if k_descale is not None:
+            k = k * float(k_descale.reshape(-1)[r])
+        if v_descale is not None:
+            v = v * float(v_descale.reshape(-1)[r])
+        sc = torch.einsum("nhd,ld->nhl", qr, k) * scale
         vis = (kvl - ql) + torch.arange(ql, device=device) + 1
         mask = torch.arange(kvl, device=device).view(1, 1, kvl) >= vis.view(ql, 1, 1)
         sc = sc.masked_fill(mask, float("-inf"))
@@ -494,3 +501,220 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     torch.cuda.synchronize()
     eager2 = wrapper.run(q, kv)
     assert torch.equal(out, eager2)
+
+
+# --------------------------------------------------------------------------
+# Review regressions: descale placement, fallback robustness, replan safety
+# --------------------------------------------------------------------------
+
+
+def test_per_sequence_v_descale_is_applied_in_fp32():
+    """A large V descale must not overflow the fp16 split partials (448 * 256
+    exceeds fp16 max): the descale lands in the fp32 merge, not the partials."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([6, 640], device)
+    # drive request 0's V to the e4m3 max; its kv fits one page (page id 0)
+    batch["v_cache"][0] = torch.full_like(batch["v_cache"][0].float(), 448.0).to(
+        torch.float8_e4m3fn
+    )
+    qd = torch.tensor([1.25, 0.5], dtype=torch.float32, device=device)
+    kd = torch.tensor([0.75, 1.5], dtype=torch.float32, device=device)
+    vd = torch.tensor([256.0, 2.0**-12], dtype=torch.float32, device=device)
+    wrapper = _plan_wrapper(batch, device)
+    out = wrapper.run(
+        batch["q"],
+        (batch["k_cache"], batch["v_cache"]),
+        q_scale=qd,
+        k_scale=kd,
+        v_scale=vd,
+    )
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 1, stats
+    assert torch.isfinite(out.float()).all()
+    ref = _reference(batch, q_descale=qd, k_descale=kd, v_descale=vd)
+    assert _matched_ratio(out, ref) >= MATCHED
+
+
+def test_kill_switch_still_serves_per_sequence_q_scale(monkeypatch):
+    """The composable path must serve a per-sequence q_scale tensor even when
+    the specialized kernel never prepared (kill switch set at plan time)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    monkeypatch.setenv(DISABLE_ENV, "1")
+    batch = _make_batch([584, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["plans_disabled"] == 1 and stats["plans_prepared"] == 0, stats
+    qd = torch.tensor([1.5, 0.25], dtype=torch.float32, device=device)
+    out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=qd)
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0
+    assert stats["runs_dequant_fallback"] == 1, stats
+    assert _matched_ratio(out, _reference(batch, q_descale=qd)) >= MATCHED
+
+
+def test_positional_scale_args_are_rejected_on_the_fallback():
+    """Positional fp8 scale *args would be silently dropped by the bf16
+    dequant fallback; they must be rejected loudly instead."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([584, 75], device)
+    wrapper = _plan_wrapper(batch, device)
+    s = torch.ones(1, dtype=torch.float32, device=device)
+    with pytest.raises(NotImplementedError, match="positional"):
+        wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), s, s, s)
+
+
+def test_workspace_size_sizes_the_composable_fa2_plan():
+    """workspace_size on an fp8-Q specialized wrapper must size the composable
+    fa2/bf16 plan exactly as plan() builds it (not hit a generator assert)."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([584, 727, 75], device)
+    ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    ws_args = (
+        batch["qo_indptr"],
+        batch["kv_indptr"],
+        batch["kv_indices"],
+        batch["last_page_len"],
+        H_QO,
+        H_KV,
+        HEAD_DIM,
+        PAGE,
+    )
+    spec = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="specialized"
+    )
+    sized = spec.workspace_size(
+        *ws_args,
+        causal=True,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    stock = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="NHD", backend="fa2"
+    ).workspace_size(
+        *ws_args,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+    )
+    assert sized == stock
+    # a contract the specialized backend has no kernel for raises plan()'s
+    # error instead of reaching the stock module generators
+    with pytest.raises(ValueError, match="specialized"):
+        spec.workspace_size(*ws_args, causal=True, q_data_type=torch.bfloat16)
+
+
+def test_graph_mode_replan_with_grown_kv_keeps_buffer_pointers():
+    """A CUDA-graph wrapper re-planned with grown sequences must refresh the
+    same block-table/workspace buffers in place: a retained capture keeps
+    their pointers (and the page-table width) baked into the launch."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    small = _make_batch([20, 35], device)  # 2 + 3 pages
+    grown = _make_batch([100, 85], device)  # 7 + 6 pages
+    ws = torch.empty(160 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws,
+        kv_layout="NHD",
+        backend="specialized",
+        use_cuda_graph=True,
+        qo_indptr_buf=grown["qo_indptr"].clone(),
+        paged_kv_indptr_buf=grown["kv_indptr"].clone(),
+        paged_kv_indices_buf=grown["kv_indices"].clone(),
+        paged_kv_last_page_len_buf=grown["last_page_len"].clone(),
+    )
+
+    def _plan(b):
+        wrapper.plan(
+            b["qo_indptr"],
+            b["kv_indptr"],
+            b["kv_indices"],
+            b["last_page_len"],
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+
+    _plan(small)
+    st1 = wrapper._gqa_dec_fp8q_sm90_state
+    assert st1 is not None
+    out1 = wrapper.run(small["q"], (small["k_cache"], small["v_cache"]))
+    assert _matched_ratio(out1, _reference(small)) >= MATCHED
+
+    _plan(grown)
+    st2 = wrapper._gqa_dec_fp8q_sm90_state
+    assert st2 is not None
+    assert st2.block_table.data_ptr() == st1.block_table.data_ptr()
+    assert st2.block_table.shape == st1.block_table.shape
+    assert st2.workspace.data_ptr() == st1.workspace.data_ptr()
+    assert st2.workspace.numel() == st1.workspace.numel()
+    assert st2.seq_lens.data_ptr() == st1.seq_lens.data_ptr()
+    out2 = wrapper.run(grown["q"], (grown["k_cache"], grown["v_cache"]))
+    assert _matched_ratio(out2, _reference(grown)) >= MATCHED
+
+
+def test_auto_replan_never_arms_over_a_retained_fa3_graph(monkeypatch):
+    """An allowlisted fp8-Q auto re-plan must not swap a retained FA3
+    CUDA-graph capture onto the composable fa2 route: FA2 planning would
+    overwrite the integer workspace the captured FA3 kernels point into.
+    GPU-free: capability and stock resolution are mocked."""
+    import flashinfer.prefill as fp
+
+    class _Sentinel(Exception):
+        pass
+
+    class _Observed(fp.BatchPrefillWithPagedKVCacheWrapper):
+        def __setattr__(self, name, value):
+            if self.__dict__.get("_observe", False):
+                raise _Sentinel(name)
+            super().__setattr__(name, value)
+
+    w = _Observed.__new__(_Observed)
+    w.__dict__.update(
+        _float_workspace_buffer=torch.empty(1024, dtype=torch.uint8),
+        _int_workspace_buffer=torch.empty(1024, dtype=torch.uint8),
+        _batch_invariant=None,
+        _requested_backend="auto",
+        _backend="fa3",
+        _cuda_graph_backend="fa3",
+        _jit_module=None,
+        _use_cuda_graph=True,
+        _custom_mask_buf=None,
+        _plan_info=object(),
+        _variant_owns_mask=False,
+        _kv_layout="NHD",
+        device=torch.device("cuda"),  # never touched: capability is mocked
+        _qo_indptr_buf=torch.tensor([0, QL], dtype=torch.int32),
+        _observe=True,
+    )
+    monkeypatch.setattr(fp, "get_compute_capability", lambda d: (9, 0))
+    monkeypatch.setattr(fp, "determine_attention_backend", lambda *a, **k: "fa2")
+    with pytest.raises(ValueError, match="CUDA graph backend"):
+        w.plan(
+            torch.tensor([0, QL], dtype=torch.int32),
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.arange(1, dtype=torch.int32),
+            torch.tensor([6], dtype=torch.int32),
+            H_QO,
+            H_KV,
+            HEAD_DIM,
+            PAGE,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+    stats = _gqa_dec_fp8q_sm90_stats()
+    assert any("retained CUDA-graph backend" in r for r in stats["fallback_reasons"]), (
+        stats
+    )
