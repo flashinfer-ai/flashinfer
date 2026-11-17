@@ -3583,6 +3583,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
 
+        Under ``batch_invariant=True`` the size is that of the split-KV plan of
+        the mask mode :meth:`plan` will run, so pass the same ``causal`` and
+        ``window_left`` as to :meth:`plan`: ``causal`` defaults to ``False``
+        here as it does there (the non-causal class, which takes no window), a
+        causal plan is sized with ``causal=True``, and an input :meth:`plan`
+        refuses raises the same
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` here.
+
         Parameters
         ----------
         qo_indptr : torch.Tensor
