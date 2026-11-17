@@ -6,10 +6,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .....core.validation.common import MoEEpConfigError
-from .....kernel_src.sm107.next_cutedsl_megamoe import (
-    Sm107SharedExpertConfig as Sm107SharedExpertConfig,
-    validate_feature_config as validate_feature_config,
-)
+from .....config import Sm107SharedExpertConfig as Sm107SharedExpertConfig
+
+
+def validate_feature_config(config):
+    from .....kernel_src.sm107.next_cutedsl_megamoe import validate_feature_config
+
+    validate_feature_config(config)
 
 
 @dataclass(frozen=True)
