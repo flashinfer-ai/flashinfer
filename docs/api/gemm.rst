@@ -84,6 +84,7 @@ FP8 GEMM
     group_gemm_fp8_nt_groupwise_contiguous
     group_deepgemm_fp8_nt_groupwise
     batch_deepgemm_fp8_nt_groupwise
+    fp8_blockscale_gemm
     fp8_blockscale_gemm_sm90
 
 16-bit x FP8 GEMM (FP8 weight, bf16 / fp16 activation)
