@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_dsv4_82ca6fee14338e07ece4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks, int ragged_query, int max_q_len, int batch_size);
+extern "C" __global__ void kernel_cake_dsv4_82ca6fee14338e07ece4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks, int ragged_query, int max_q_len, int batch_size, const __grid_constant__ CUtensorMap tmap_pO);
 
 namespace cake_binding_kernel_cake_dsv4_82ca6fee14338e07ece4 {
 
@@ -192,6 +192,37 @@ CUtensorMap EncodeTma_tmap_compressed_kv(const TensorView& t) {
   return map;
 }
 
+CUtensorMap EncodeTma_tmap_pO(const TensorView& t, int64_t p_num_splits, int64_t p_num_heads) {
+  TVM_FFI_CHECK(t.ndim() >= 1, ValueError)
+      << KERNEL_NAME << ": descriptor 'tmap_pO' takes a source of at least 1 dims, got " << t.ndim();
+  CheckUnitInnerStride(t, "tmap_pO");
+  int64_t outer0 = t.numel();
+  TVM_FFI_CHECK((CMod(outer0, CheckedMul(CheckedMul(static_cast<int64_t>(static_cast<int64_t>(p_num_heads)), static_cast<int64_t>(static_cast<int64_t>(p_num_splits))), 512LL)) == 0LL), ValueError)
+      << KERNEL_NAME << ": descriptor 'tmap_pO' requires (CMod(outer0, ((static_cast<int64_t>(static_cast<int64_t>(p_num_heads)) * static_cast<int64_t>(static_cast<int64_t>(p_num_splits))) * 512)) == 0)";
+  cuuint64_t global_dim[4] = {Extent(512LL, "tmap_pO"), Extent(static_cast<int64_t>(static_cast<int64_t>(p_num_splits)), "tmap_pO"), Extent(static_cast<int64_t>(static_cast<int64_t>(p_num_heads)), "tmap_pO"), Extent(CDiv(outer0, CheckedMul(CheckedMul(static_cast<int64_t>(static_cast<int64_t>(p_num_heads)), static_cast<int64_t>(static_cast<int64_t>(p_num_splits))), 512LL)), "tmap_pO")};
+  cuuint64_t global_strides[3] = {Stride(1024LL, "tmap_pO"), Stride(CheckedMul(static_cast<int64_t>(static_cast<int64_t>(p_num_splits)), 1024LL), "tmap_pO"), Stride(CheckedMul(CheckedMul(static_cast<int64_t>(static_cast<int64_t>(p_num_heads)), static_cast<int64_t>(static_cast<int64_t>(p_num_splits))), 1024LL), "tmap_pO")};
+  cuuint32_t box_dim[4] = {64u, 1u, 16u, 1u};
+  cuuint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
+  const bool allow_oob_box[4] = {false, false, true, false};
+  for (int axis = 0; axis < 4; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'tmap_pO' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
+  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0 && global_strides[2] % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the strides of descriptor 'tmap_pO' must be multiples of 16 bytes";
+  void* address = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the address of descriptor 'tmap_pO' must be 16-byte aligned";
+  CUtensorMap map{};
+  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, address, global_dim, global_strides,
+                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+          "cuTensorMapEncodeTiled of tmap_pO");
+  return map;
+}
+
 void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compressed_kv, TensorView a_partial_O, TensorView a_partial_lse, TensorView a_swa_indices, TensorView a_compressed_indices, TensorView a_sparse_topk_lens, TensorView a_seq_lens, TensorView a_cum_seq_lens_q, TensorView a_sinks, TensorView a_bmm1_scale, TensorView a_bmm2_scale, int64_t a_num_heads, int64_t a_swa_index_stride, int64_t a_compressed_index_stride, int64_t a_sparse_topk_lens_offset, int64_t a_sparse_topk, int64_t a_num_splits, int64_t a_has_sinks, int64_t a_ragged_query, int64_t a_max_q_len, int64_t a_batch_size, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_tmap_q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
@@ -312,7 +343,8 @@ void Run(TensorView a_tmap_q, TensorView a_tmap_swa_kv, TensorView a_tmap_compre
   int32_t v_ragged_query = static_cast<int32_t>(a_ragged_query);
   int32_t v_max_q_len = static_cast<int32_t>(a_max_q_len);
   int32_t v_batch_size = static_cast<int32_t>(a_batch_size);
-  void* kernel_args[] = {&v_tmap_q, &v_tmap_swa_kv, &v_tmap_compressed_kv, &v_partial_O, &v_partial_lse, &v_swa_indices, &v_compressed_indices, &v_sparse_topk_lens, &v_seq_lens, &v_cum_seq_lens_q, &v_sinks, &v_bmm1_scale, &v_bmm2_scale, &v_num_heads, &v_swa_index_stride, &v_compressed_index_stride, &v_sparse_topk_lens_offset, &v_sparse_topk, &v_num_splits, &v_has_sinks, &v_ragged_query, &v_max_q_len, &v_batch_size};
+  CUtensorMap v_tmap_pO = EncodeTma_tmap_pO(a_partial_O, a_num_splits, a_num_heads);
+  void* kernel_args[] = {&v_tmap_q, &v_tmap_swa_kv, &v_tmap_compressed_kv, &v_partial_O, &v_partial_lse, &v_swa_indices, &v_compressed_indices, &v_sparse_topk_lens, &v_seq_lens, &v_cum_seq_lens_q, &v_sinks, &v_bmm1_scale, &v_bmm2_scale, &v_num_heads, &v_swa_index_stride, &v_compressed_index_stride, &v_sparse_topk_lens_offset, &v_sparse_topk, &v_num_splits, &v_has_sinks, &v_ragged_query, &v_max_q_len, &v_batch_size, &v_tmap_pO};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(512, 1, 1);

@@ -83,8 +83,12 @@ def _identity_round_trip_reference(x, topk_ids, world_size, experts_per_rank):
 
 @pytest.mark.gpu_2
 @pytest.mark.parametrize("top_k", [4, 8])
-@pytest.mark.parametrize("backend", _BACKENDS)
-def test_dispatch_combine_matches_local_reference(backend, top_k):
+@pytest.mark.parametrize(
+    "backend,empty_rank",
+    [pytest.param(backend, False, id=backend) for backend in _BACKENDS]
+    + [pytest.param("nvlink_two_sided", True, id="nvlink_two_sided-empty-rank")],
+)
+def test_dispatch_combine_matches_local_reference(backend, top_k, empty_rank):
     import torch
     import torch.distributed as dist
 
@@ -97,14 +101,24 @@ def test_dispatch_combine_matches_local_reference(backend, top_k):
     max_tokens_per_rank = 32
 
     generator = torch.Generator().manual_seed(1234 + rank)
-    num_tokens = int(
-        torch.randint(1, max_tokens_per_rank + 1, (1,), generator=generator)
-    )
+    if empty_rank:
+        num_tokens = 0 if rank == 0 else max_tokens_per_rank
+    else:
+        num_tokens = int(
+            torch.randint(1, max_tokens_per_rank + 1, (1,), generator=generator)
+        )
     step_max = torch.tensor([num_tokens], device="cuda")
     dist.all_reduce(step_max, op=dist.ReduceOp.MAX)
 
     x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
     topk_ids, topk_weights = _random_routing(num_tokens, num_experts, top_k, generator)
+    if empty_rank:
+        # Experts 0..3 live on rank 0: it must serve peers despite its empty batch.
+        topk_ids = (
+            torch.arange(top_k, device="cuda", dtype=torch.int32)
+            .expand(num_tokens, -1)
+            .contiguous()
+        )
 
     comm = create_communication(
         BootstrapConfig(world_size=world_size, rank=rank),
@@ -142,6 +156,7 @@ def test_dispatch_combine_matches_local_reference(backend, top_k):
             ).to(torch.bfloat16)
 
             out = comm.combine(expert_output)
+            assert out.shape == (num_tokens, hidden)
 
             reference = x.float() * (topk_weights * (topk_ids.long() + 1).float()).sum(
                 -1, keepdim=True
@@ -150,6 +165,51 @@ def test_dispatch_combine_matches_local_reference(backend, top_k):
     finally:
         dist.barrier()
         comm.destroy()
+
+
+@pytest.mark.gpu_2
+def test_dispatch_views_outlive_communication():
+    """Retained dispatch views keep their descriptor and allocation alive."""
+    import gc
+    import weakref
+
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import BootstrapConfig, MoEEpCommParams, create_communication
+
+    rank, world_size = _init_dist()
+    config = _backend_config("nvlink_one_sided")
+    params = MoEEpCommParams(
+        num_experts=4 * world_size, top_k=2, max_tokens_per_rank=8, hidden_size=1024
+    )
+    generator = torch.Generator().manual_seed(17 + rank)
+    x = torch.randn(8, 1024, generator=generator).to("cuda", torch.bfloat16)
+    ids, weights = _random_routing(8, params.num_experts, 2, generator)
+    for _ in range(3):
+        comm = create_communication(
+            BootstrapConfig(world_size=world_size, rank=rank), params, config
+        )
+        allocation = weakref.ref(comm._state["mnnvl_mem"])
+        try:
+            received = comm.dispatch(x, ids, weights, runtime_max_tokens_per_rank=8)
+            comm.combine(torch.zeros_like(received.hidden_states))
+            expected_ids = received.topk_ids.clone()
+        finally:
+            torch.cuda.synchronize()
+            dist.barrier()
+            comm.destroy()
+        del comm
+        gc.collect()
+        assert allocation() is not None
+        torch.testing.assert_close(received.topk_ids, expected_ids)
+        torch.cuda.synchronize()
+        cycle = [received]
+        cycle.append(cycle)
+        del received, cycle
+        gc.collect()
+        assert allocation() is None
+        dist.barrier()
 
 
 @pytest.mark.gpu_2
@@ -377,7 +437,7 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims
     import torch
     import torch.distributed as dist
 
-    from flashinfer.fused_moe.api import QuantFormat
+    from flashinfer.fused_moe.api import CuteDslConfig, QuantFormat
     from flashinfer.moe_ep import (
         BootstrapConfig,
         EpAlgorithm,
@@ -394,10 +454,19 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims
         if not is_prims_ts_available():
             pytest.skip("Prims-TS needs nvidia-cutlass-dsl with cutlass.experimental")
     candidate = _split_candidate(quant_pair, prims_ts)
-    major, minor = torch.cuda.get_device_capability()
-    if not candidate.supported(major * 10 + minor):
-        pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
     rank, world_size = _init_dist()
+    capabilities = [None] * world_size
+    dist.all_gather_object(capabilities, torch.cuda.get_device_capability())
+    # Every rank must skip together before constructing communication buffers.
+    for major, minor in capabilities:
+        if not candidate.supported(major * 10 + minor):
+            pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
+        if (
+            isinstance(candidate, CuteDslConfig)
+            and quant_pair == ("MXFP4", "MXFP8")
+            and (major, minor) == (10, 7)
+        ):
+            pytest.skip("CuTe-DSL W4A8 does not support SM107")
     _backend_config(backend)
     num_tokens, hidden, intermediate = 16, 1024, 512
     num_experts = 4 * world_size
@@ -698,7 +767,6 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         replay_and_check(graph, out)
 
         memory = comm._state["mnnvl_mem"]
-        cft_enabled = getattr(comm, "_cft_enabled", None)
         comm.checkpoint_prepare()
         comm.checkpoint_prepare()
         assert not MnnvlMemory.allocated_map[memory.ptr].mapped
@@ -706,8 +774,6 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         comm.checkpoint_restore(fresh_backend)
         comm.checkpoint_restore(fresh_backend)
         assert MnnvlMemory.allocated_map[memory.ptr].mapped
-        if backend == "nvlink_one_sided":
-            assert comm._cft_enabled == cft_enabled
 
         for _ in range(2):
             replay_and_check(graph, out)

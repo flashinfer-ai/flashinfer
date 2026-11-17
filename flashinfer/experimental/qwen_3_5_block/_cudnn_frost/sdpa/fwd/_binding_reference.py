@@ -580,6 +580,11 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
             frame[ix["v_ptr"]] = o.ptr
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
+    if getattr(spec, "origin_specs", None) is not None and "thd_origin_caps" in ix:
+        # Each port's own token capacity, for a host that clips its origins to the buffer. Paged K/V carry no origin.
+        stats = 0 if not spec.has_lse else (lse_cap if lse_cap is not None else (lse_head_stride if spec.lse_head_major and lse_head_stride else t_q))
+        kv = (0, 0) if spec.paged else (_capacity(k, geo.roles["k"], "k"), _capacity(v, geo.roles["v"], "v"))
+        frame[ix["thd_origin_caps"]] = (_capacity(q, geo.roles["q"], "q"), *kv, _capacity(o, geo.roles["o"], "o"), stats)
     if spec.has_lse and spec.lse_head_major:
         frame[ix["lse_ext"]] = lse_head_stride or t_q
     frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)
@@ -838,17 +843,17 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
             raise ValueError("cudnn.sdpa: this specialization was compiled without a sink; construct the API with has_sink")
         frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
-    def lens(name: str) -> int:
+    def lens(name: str, count: int = b) -> int:
         f = facts.get(name)
         if f is None:
             raise ValueError(f"cudnn.sdpa: {name} is required by this compiled specialization")
         _on_plan_device(spec, name, f)
-        if f.dtype != "int32" or not f.contiguous or f.numel < b:
-            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {b} elements; got {f.dtype} x {f.numel}")
+        if f.dtype != "int32" or not f.contiguous or f.numel < count:
+            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {count} elements; got {f.dtype} x {f.numel}")
         if f.ptr % _ALIGN_F32:
             raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
-        if f.span >= 0 and f.span < b:
-            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {b}")
+        if f.span >= 0 and f.span < count:
+            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {count}")
         return f.ptr
 
     # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
@@ -856,7 +861,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     frame[ix["o_desc_ptr"]] = 0
     frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else 0
     if spec.seq_q_present:
-        frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens")
+        frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens", b + (1 if getattr(spec, "ragged_q_lens", 0) == 2 else 0))
 
     if spec.gate_expect is not None:
         g = _dense_role(spec, facts, "gate", spec.qh, spec.d_v, spec.s_q_max, spec.gate_expect)
@@ -910,6 +915,14 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
             raise ValueError("cudnn.sdpa: split output must match the declared (B, S_q)")
         o_ptr, o_strides = o.ptr, (*o.strides, 1)
         lse_ptr, lse_strides = _dense_lse(spec, facts.get("lse"), spec.b, spec.s_q_max, required=combine.has_stats)
+    if spec.quant is None:
+        workspace_end = workspace_ptr + combine.lse_offset + combine.lse.numel * 4
+        for name, fact in facts.items():
+            if fact is None or fact.numel == 0:
+                continue
+            span = fact.span if fact.span >= 0 else 1 + sum((n - 1) * st for n, st in zip(fact.shape, fact.strides, strict=True))
+            if workspace_ptr < fact.ptr + span * _buffers.DTYPE_ITEMSIZE[fact.dtype] and fact.ptr < workspace_end:
+                raise ValueError(f"cudnn.sdpa: split workspace overlaps {name}")
     lse_partial_ptr = workspace_ptr + combine.lse_offset
     partials = dict(facts, o=combine.o._replace(ptr=workspace_ptr), lse=combine.lse._replace(ptr=lse_partial_ptr))
     frame = bind_dense(spec, partials, stream, stream_int)
@@ -923,7 +936,9 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
         o_strides,
         lse_strides,
         *ragged_args,
+        *((frame[spec.index["sinks_ptr"]],) if spec.has_sink else ()),
         stream,
+        *((frame[spec.index["seq_q_lens_addr"]],) if getattr(spec, "ragged_q_lens", 0) else ()),
     )
     return frame, combine_args
 

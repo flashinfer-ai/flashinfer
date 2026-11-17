@@ -1,5 +1,4 @@
 # Manage Ahead-of-Time (AOT) compiled kernels
-import fcntl
 import hashlib
 import logging
 import os
@@ -19,6 +18,8 @@ from pathlib import Path
 from typing import Hashable, TypeAlias
 
 import ctypes
+
+from _flashinfer_filelock import lock, unlock
 
 import cutlass
 import cutlass.cute as cute
@@ -94,7 +95,7 @@ def _compute_source_fingerprint() -> str:
 
 
 class FileLock:
-    """Context manager for advisory file locks using fcntl.flock.
+    """Context manager for native advisory file locks.
 
     Supports exclusive (write) and shared (read) locks.
     Always blocks with polling until the lock is acquired or timeout is reached.
@@ -133,7 +134,7 @@ class FileLock:
         open_flags = (
             os.O_WRONLY | os.O_CREAT if self.exclusive else os.O_RDONLY | os.O_CREAT
         )
-        lock_type = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+        shared = not self.exclusive
 
         self._fd = os.open(str(self.lock_path), open_flags)
 
@@ -141,7 +142,7 @@ class FileLock:
         acquired = False
         while time.monotonic() < deadline:
             try:
-                fcntl.flock(self._fd, lock_type | fcntl.LOCK_NB)
+                lock(self._fd, shared=shared, blocking=False)
                 acquired = True
                 break
             except OSError:
@@ -158,7 +159,7 @@ class FileLock:
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if self._fd is not None:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            unlock(self._fd)
             os.close(self._fd)
             self._fd = None
 

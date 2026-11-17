@@ -81,7 +81,7 @@ def _manifest(module, source: bytes) -> dict:
         )
     return {
         "schema_version": 1,
-        "arch": "sm_100a",
+        "archs": ["sm_100a", "sm_107a"],
         "compile_flags": ["--use_fast_math"],
         "constraints": {
             "activation_dtype": "bfloat16",
@@ -99,6 +99,16 @@ def _manifest(module, source: bytes) -> dict:
         "stages": stages,
         "kernel_symbols": [stage["symbol"] for stage in stages],
         "source_sha256": hashlib.sha256(source).hexdigest(),
+        "arch_stage_overrides": {
+            arch: {
+                name: {
+                    field: list(value) if field == "bindings" else value
+                    for field, value in fields.items()
+                }
+                for name, fields in overrides.items()
+            }
+            for arch, overrides in module._ARCH_STAGE_OVERRIDES.items()
+        },
     }
 
 
@@ -231,7 +241,15 @@ def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
     ("mutation", "message"),
     (
         (lambda manifest: manifest.update(schema_version=2), "schema must be 1"),
-        (lambda manifest: manifest.update(arch="sm_103a"), "arch must be sm_100a"),
+        (lambda manifest: manifest.update(archs=["sm_100a"]), "archs must be"),
+        (
+            lambda manifest: manifest.update(archs=["sm_100a", "sm_103a"]),
+            "archs must be",
+        ),
+        (
+            lambda manifest: manifest.update(arch="sm_100a", archs=None),
+            "archs must be",
+        ),
         (
             lambda manifest: manifest.update(compile_flags=["-lineinfo"]),
             "compile flags",
@@ -273,6 +291,20 @@ def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
         (
             lambda manifest: manifest["stages"][0].update(dynamic_smem_bytes=-1),
             "invalid shared memory",
+        ),
+        (
+            lambda manifest: manifest.pop("arch_stage_overrides"),
+            "per-architecture stage overrides drifted",
+        ),
+        (
+            lambda manifest: manifest["arch_stage_overrides"]["sm_107a"].popitem(),
+            "per-architecture stage overrides drifted",
+        ),
+        (
+            lambda manifest: next(
+                iter(manifest["arch_stage_overrides"]["sm_107a"].values())
+            ).update(symbol="kernel_rank_major_unknown"),
+            "per-architecture stage overrides drifted",
         ),
     ),
 )
@@ -357,6 +389,76 @@ def test_exact_session_coordinate_fails_cleanly_without_cuda(monkeypatch):
             num_experts=256,
             top_k=8,
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("capability", "arch"), (((10, 0), "sm_100a"), ((10, 7), "sm_107a"))
+)
+def test_session_arch_follows_the_device_capability(capability, arch):
+    assert _session_module()._arch_for_capability(capability) == arch
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", ((9, 0), (10, 3), (11, 0), (12, 0)))
+def test_session_rejects_unsupported_capability(capability):
+    with pytest.raises(RuntimeError, match="requires SM100 or SM107"):
+        _session_module()._arch_for_capability(capability)
+
+
+def _patch_compile_env(module, monkeypatch, tmp_path: Path, release: str):
+    """Fake nvcc: ``--version`` prints ``release``; a build writes the -o file."""
+    import flashinfer.jit.env as jit_env
+
+    nvcc = tmp_path / "bin" / "nvcc"
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(list(command))
+        if command[1:] == ["--version"]:
+            stdout = f"Cuda compilation tools, release {release}, V{release}.0\n"
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        Path(command[command.index("-o") + 1]).write_bytes(b"cubin")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    return commands
+
+
+@pytest.mark.cpu_only
+def test_cubin_name_command_and_cache_key_carry_the_arch(tmp_path, monkeypatch):
+    module = _session_module()
+    manifest, source_path = _write_bundle(tmp_path, module)
+    commands = _patch_compile_env(module, monkeypatch, tmp_path, "13.4")
+
+    sm100 = module._compile_cubin(source_path, manifest, "sm_100a")
+    sm107 = module._compile_cubin(source_path, manifest, "sm_107a")
+
+    assert sm100.name == "blackwell_bf16_rank_major_sm_100a.cubin"
+    assert sm107.name == "blackwell_bf16_rank_major_sm_107a.cubin"
+    # A JIT directory shared by B200 and R200 nodes keeps one cubin per arch.
+    assert sm100.parent != sm107.parent
+    builds = [command for command in commands if "-cubin" in command]
+    assert [command[2] for command in builds] == ["-arch=sm_100a", "-arch=sm_107a"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("release", "ok"), (("13.0", False), ("13.4", True)))
+def test_sm107a_build_requires_nvcc_13_4(tmp_path, monkeypatch, release, ok):
+    module = _session_module()
+    manifest, source_path = _write_bundle(tmp_path, module)
+    commands = _patch_compile_env(module, monkeypatch, tmp_path, release)
+
+    if ok:
+        module._compile_cubin(source_path, manifest, "sm_107a")
+    else:
+        with pytest.raises(RuntimeError, match=r"sm_107a needs nvcc 13\.4 or newer"):
+            module._compile_cubin(source_path, manifest, "sm_107a")
+        assert not any("-cubin" in command for command in commands)
+    # sm_100a keeps building with any nvcc that the source already required.
+    module._compile_cubin(source_path, manifest, "sm_100a")
 
 
 @pytest.mark.cpu_only
@@ -561,3 +663,50 @@ def test_workspace_pool_shares_session_and_refcounts_destroy(monkeypatch):
     workspace.destroy.assert_not_called()
     second.destroy(second_workspace)
     workspace.destroy.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_sm100a_stages_are_the_sm107a_stage_overrides():
+    module = _session_module()
+    manifest, _ = module._load_manifest()
+
+    # sm_100a runs the same overridden stages as sm_107a
+    assert (
+        manifest["arch_stage_overrides"]["sm_100a"]
+        == manifest["arch_stage_overrides"]["sm_107a"]
+    )
+    assert module._stages_for_arch(manifest, "sm_100a") == module._stages_for_arch(
+        manifest, "sm_107a"
+    )
+
+
+@pytest.mark.cpu_only
+def test_sm107a_stages_replace_only_the_overridden_fields():
+    module = _session_module()
+    manifest, _ = module._load_manifest()
+    stages = module._stages_for_arch(manifest, "sm_107a")
+    overrides = module._ARCH_STAGE_OVERRIDES["sm_107a"]
+
+    assert [stage["name"] for stage in stages] == list(module._STAGE_NAMES)
+    for stage, base in zip(stages, manifest["stages"], strict=True):
+        fields = overrides.get(stage["name"], {})
+        for field, value in base.items():
+            if field in fields:
+                expected = fields[field]
+                assert stage[field] == (
+                    list(expected) if field == "bindings" else expected
+                )
+            else:
+                assert stage[field] == value
+    assert overrides
+    by_name = {stage["name"]: stage for stage in stages}
+    if "stage_inputs" in overrides:
+        assert by_name["stage_inputs"]["symbol"] == "kernel_rank_major_stage_inputs_v2"
+        assert by_name["stage_inputs"]["bindings"][-1] == "route_codes_out"
+        assert by_name["input_arrive"]["symbol"] == "kernel_rank_major_input_arrive_v3"
+    if "local_unpermute" in overrides:
+        assert (
+            by_name["local_unpermute"]["symbol"]
+            == "kernel_rank_major_exact_unpermute_v11"
+        )
+        assert by_name["local_unpermute"]["bindings"][3] == "local_partials_peers"

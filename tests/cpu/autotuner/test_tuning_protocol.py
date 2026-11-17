@@ -36,6 +36,64 @@ class RecordingProtocol:
 
 
 @pytest.mark.cpu_only
+def test_prepared_execution_generation_tracks_store_changes_and_reload(
+    managed, tmp_path
+):
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    def generation():
+        return managed.protocol_context("test.protocol").execution_generation
+
+    before = generation()
+    managed.clear_cache()
+    assert generation() == before
+    with autotune_v2(mode="replay", persistent_cache=False):
+        assert generation() == before
+        with autotune(False):
+            assert generation() == before
+    with autotune_v2(cache_scope="context", cache_root=tmp_path / "scoped"):
+        assert generation() == before
+    assert generation() == before
+    with autotune_v2(mode="replay", cache_root=tmp_path / "ambient"):
+        assert generation() > before
+        attached = generation()
+    assert generation() == attached
+    with autotune_v2(cache_root=tmp_path / "ambient"):
+        assert generation() == attached
+    before = generation()
+    autotune_v2_reload()
+    assert generation() > before
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("transition", ["context", "attach", "reload"])
+def test_prepared_execution_observes_other_threads(managed, transition, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from flashinfer import autotune_v2
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    context = managed.protocol_context("test.protocol")
+    before = context.execution_generation
+
+    def change():
+        if transition == "reload":
+            autotune_v2_reload()
+        else:
+            with autotune_v2(
+                cache_root=tmp_path / "other",
+                cache_scope="process" if transition == "attach" else "context",
+            ):
+                pass
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(change).result()
+    assert context.execution_generation == before
+    after = managed.protocol_context("test.protocol").execution_generation
+    assert (after > before) == (transition != "context")
+
+
+@pytest.mark.cpu_only
 def test_protocol_uses_shared_controls_and_statistics():
     tuner = reset_autotuner()
     protocol = RecordingProtocol()

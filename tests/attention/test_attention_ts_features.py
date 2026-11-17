@@ -286,7 +286,7 @@ def test_public_attention_disk_cache_in_fresh_processes(tmp_path):
         "test_attention_ts_decode.py::test_attention_ts_decode_compact_variable_k_acceptance[F7-fp8-sq4-q128-separate]",
         "test_attention_ts_decode.py::test_attention_ts_decode_fixed_q_dtype_mask_product[sq2-dense-fp8-bf16]",
         "test_attention_ts_context.py::test_attention_ts_context_bounded_public_correctness_matrix[fixed-fp16-dense-mha-one-shot]",
-        "test_attention_ts_context.py::test_attention_ts_context_paged_supported_page_sizes_accuracy[d128-bf16-32]",
+        "test_attention_ts_context.py::test_attention_ts_context_paged_supported_page_sizes_accuracy[p32-d128-torch.bfloat16-causal]",
         "test_attention_ts_mla_decode.py::test_attention_ts_mla_fp8_fully_masked_split_partials",
         "test_attention_ts_mla_decode.py::test_attention_ts_mla_2cta_graph_reloads_remapped_page_window",
         "test_attention_ts_block_sparse.py::test_public_block_sparse_correctness[q16_kv16_fp16_noncausal_holey_static]",

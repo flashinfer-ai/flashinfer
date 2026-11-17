@@ -22,7 +22,7 @@ from typing import List, Optional, Sequence, Tuple
 import pytest
 import torch
 
-from tests.test_helpers.fuzz_ledger import Finding, FuzzLedger
+from tests.infra.test_helpers.fuzz_ledger import Finding, FuzzLedger
 
 _DEFAULT_NUM_CASES = 240
 NUM_CASES = int(
@@ -938,7 +938,8 @@ def test_sampling_distribution(sc, indices_dtype):
 # ---------------------------------------------------------------------------
 # Chain speculative sampling. The CPU oracle mirrors the kernel's two acceptance
 # passes: the emitted count stops at the first rejection, while the accepted count
-# evaluates that position and every later draft independently with fresh draws.
+# consumes a fresh draw there without counting the already rejected position, then
+# evaluates every later draft independently.
 # GPU cases stay in this fuzzer and reuse its ledger and statistical gate.
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -1032,7 +1033,11 @@ def reference_chain_speculative_sampling(
     accepted = first_rejection
     for pos in range(first_rejection, num_speculative):
         draft_id = draft_token_ids[pos]
-        if next_acceptance_draw() * draft[pos, draft_id] < target[pos, draft_id]:
+        accepted_draw = next_acceptance_draw()
+        if (
+            pos != first_rejection
+            and accepted_draw * draft[pos, draft_id] < target[pos, draft_id]
+        ):
             accepted += 1
 
     if first_rejection == num_speculative:
@@ -1071,8 +1076,21 @@ _CHAIN_DISTRIBUTION_CONFIGS = [
     for deterministic in (True, False)
     for seed, offset in _CHAIN_RNG_CASES
 ]
+_CHAIN_LARGE_VOCAB_CONFIGS = [
+    ChainCfg("large_vocab_correction", deterministic, 0xC0DE, 31337)
+    for deterministic in (True, False)
+]
 _CHAIN_SAMPLE_COUNT = 1 << 15
-_CHAIN_ALPHA_PER = ALPHA_FAMILY / len(_CHAIN_DISTRIBUTION_CONFIGS)
+_CHAIN_LARGE_VOCAB_SAMPLE_COUNT = 256
+_CHAIN_ALPHA_PER = ALPHA_FAMILY / (
+    len(_CHAIN_DISTRIBUTION_CONFIGS) + len(_CHAIN_LARGE_VOCAB_CONFIGS)
+)
+
+
+def _chain_large_vocab_expected() -> torch.Tensor:
+    expected = torch.zeros(32001, dtype=torch.float64)
+    expected[[1, 31800, 32000]] = 1.0 / 3
+    return expected
 
 
 def _chain_forced_inputs(case: str, batch_size: int = 4):
@@ -1266,6 +1284,82 @@ def test_chain_sampling_distribution(cfg: ChainCfg):
     _assert_chain_distribution_fit(counts, expected, cfg.label)
 
 
+@_GPU_ONLY
+@pytest.mark.parametrize(
+    "cfg",
+    _CHAIN_LARGE_VOCAB_CONFIGS,
+    ids=[cfg.label for cfg in _CHAIN_LARGE_VOCAB_CONFIGS],
+)
+def test_chain_sampling_large_vocab_partial_chunk_correction(cfg: ChainCfg):
+    """Correction carries residual mass into the final partial vocab chunk."""
+    _CHAIN_LEDGER.xfail_if_quarantined(cfg)
+    batch_size = _CHAIN_LARGE_VOCAB_SAMPLE_COUNT
+    expected = _chain_large_vocab_expected()
+    vocab = expected.numel()
+    early_token, partial_token, tail_token = 1, 31800, vocab - 1
+
+    draft = torch.zeros(batch_size, 1, vocab, dtype=_DTYPE, device=_DEVICE)
+    draft[:, 0, 0] = 1
+    draft_ids = torch.zeros(batch_size, 1, dtype=torch.int32, device=_DEVICE)
+    target = torch.zeros(batch_size, 2, vocab, dtype=_DTYPE, device=_DEVICE)
+    # The interior tail token distinguishes scan carry from last-index fallback.
+    target[:, 0, [early_token, partial_token, tail_token]] = 1.0 / 3
+    target[:, 1, 0] = 1
+
+    output, accepted, emitted = _flashinfer().sampling.chain_speculative_sampling(
+        draft,
+        draft_ids,
+        target,
+        deterministic=cfg.deterministic,
+        seed=cfg.seed,
+        offset=cfg.offset,
+    )
+    torch.cuda.synchronize()
+
+    assert output.shape == (batch_size, 2), cfg.label
+    assert bool((output[:, 1] == -1).all()), cfg.label
+    assert bool((accepted == 0).all()), cfg.label
+    assert bool((emitted == 0).all()), cfg.label
+    samples = output[:, 0]
+    assert bool(
+        (
+            (samples == early_token)
+            | (samples == partial_token)
+            | (samples == tail_token)
+        ).all()
+    ), cfg.label
+
+    counts = torch.bincount(samples.long(), minlength=vocab).cpu()
+    _assert_chain_distribution_fit(counts, expected, cfg.label)
+
+
+@_GPU_ONLY
+def test_chain_sampling_first_rejection_is_not_counted_twice():
+    batch_size = _CHAIN_SAMPLE_COUNT
+    draft = torch.zeros(batch_size, 1, 2, dtype=_DTYPE, device=_DEVICE)
+    draft[:, 0, 0] = 1
+    draft_ids = torch.zeros(batch_size, 1, dtype=torch.int32, device=_DEVICE)
+    target = torch.zeros(batch_size, 2, 2, dtype=_DTYPE, device=_DEVICE)
+    target[:, 0, :] = 0.5
+    target[:, 1, 0] = 1
+
+    _, accepted, emitted = _flashinfer().sampling.chain_speculative_sampling(
+        draft,
+        draft_ids,
+        target,
+        deterministic=True,
+        seed=0xC0DE,
+        offset=17,
+    )
+    torch.cuda.synchronize()
+
+    # The only draft token has q / p = 0.5. A rejection must remain rejected in
+    # the metric pass, so the accepted and emitted counters are identical.
+    assert torch.equal(accepted, emitted)
+    standard_error = math.sqrt(0.5 * 0.5 / batch_size)
+    assert abs(accepted.float().mean().item() - 0.5) < 6 * standard_error
+
+
 def _cpu_chain_case(case: str) -> ChainReferenceResult:
     if case == "first_rejection":
         draft = torch.tensor([[1.0, 0.0, 0.0], [0.4, 0.3, 0.3], [0.4, 0.3, 0.3]])
@@ -1320,7 +1414,7 @@ def test_chain_reference_first_rejection_separates_counters():
 def test_chain_reference_middle_rejection_keeps_padding():
     result = _cpu_chain_case("middle_rejection")
     assert result.output_token_ids == (0, 1, -1, -1)
-    assert result.accepted_token_num == 2
+    assert result.accepted_token_num == 1
     assert result.emitted_draft_token_num == 1
 
 
@@ -1350,6 +1444,36 @@ def test_chain_distribution_gate_rejects_target_only_correction():
     counts[target_only.argmax()] += _CHAIN_SAMPLE_COUNT - int(counts.sum())
     with pytest.raises(AssertionError, match="chain distribution mismatch"):
         _assert_chain_distribution_fit(counts, residual, "target-only mutant")
+
+
+@pytest.mark.parametrize("collapsed_token", [1, 32000], ids=["early", "partial-tail"])
+def test_chain_large_vocab_gate_rejects_single_chunk_mass(collapsed_token: int):
+    """The gate detects residual mass lost at either end of the vocab scan."""
+    expected = _chain_large_vocab_expected()
+    counts = torch.zeros_like(expected, dtype=torch.int64)
+    counts[collapsed_token] = _CHAIN_LARGE_VOCAB_SAMPLE_COUNT
+    with pytest.raises(AssertionError, match="chain distribution mismatch"):
+        _assert_chain_distribution_fit(
+            counts, expected, f"single-chunk mutant at {collapsed_token}"
+        )
+
+
+def test_chain_large_vocab_gate_accepts_balanced_mass():
+    expected = _chain_large_vocab_expected()
+    counts = torch.zeros_like(expected, dtype=torch.int64)
+    counts[1] = counts[31800] = _CHAIN_LARGE_VOCAB_SAMPLE_COUNT // 3
+    counts[32000] = _CHAIN_LARGE_VOCAB_SAMPLE_COUNT - int(counts.sum())
+    _assert_chain_distribution_fit(counts, expected, "balanced three-token control")
+
+
+def test_chain_large_vocab_gate_rejects_tail_fallback_mass():
+    """Missing carry loses the interior tail mass to the last-valid-index fallback."""
+    expected = _chain_large_vocab_expected()
+    counts = torch.zeros_like(expected, dtype=torch.int64)
+    counts[1] = _CHAIN_LARGE_VOCAB_SAMPLE_COUNT // 3
+    counts[32000] = _CHAIN_LARGE_VOCAB_SAMPLE_COUNT - int(counts.sum())
+    with pytest.raises(AssertionError, match="chain distribution mismatch"):
+        _assert_chain_distribution_fit(counts, expected, "lost-carry fallback mutant")
 
 
 def test_chain_reference_detects_collapsed_counter_mutant():

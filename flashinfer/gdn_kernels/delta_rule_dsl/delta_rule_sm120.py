@@ -6,6 +6,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import warp, warpgroup, cpasync
+from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
 from ...utils import get_device_sm_count, _get_cache_buf
 from .alpha import AlphaProcessor
 from .collective_store_tma import CollectiveStoreTma
@@ -16,7 +17,13 @@ from .custom_compile_cache import (
     sm12x_compile_options,
 )
 from .collective_inverse_hmma import CollectiveInverse
-from .helpers import SM80, round_down, state_dtype_to_cutlass
+from .helpers import (
+    SM80,
+    round_down,
+    smid,
+    state_dtype_to_cutlass,
+    tensormap_replace_global_dim_1,
+)
 from .schedule import WorkDesc
 from .varlen_helper import (
     check_checkpoint_key_range,
@@ -149,6 +156,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         checkpoint_state_indices_dtype: torch.dtype | None = None,
         prefix_lens_dtype: torch.dtype | None = None,
         checkpoint_row_align: int | None = None,
+        state_row_align: int | None = None,
+        init_state_row_align: int | None = None,
     ):
         self.needs_alpha = needs_alpha
         self.needs_beta = needs_beta
@@ -174,6 +183,10 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             prefix_lens_dtype,
             checkpoint_row_align,
         )
+        # Alignment in elements of the dense [H, D, D] rows of the state and
+        # initial state of the slot paths (None: element-wise access).
+        self.state_row_align = state_row_align
+        self.init_state_row_align = init_state_row_align
         self.inverse_dtype = cutlass.Float16
         self.BLK_Q = 64
         self.BLK_KV = 64
@@ -200,6 +213,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             "state_inner_strides",
             "init_state_inner_strides",
             *self.SLOT_KEY_ATTRS,
+            "state_row_align",
+            "init_state_row_align",
             "inverse_dtype",
             "BLK_Q",
             "BLK_KV",
@@ -575,6 +590,70 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         cute.arch.fence_view_async_shared()
 
     # ─── TMA load helpers ────────────────────────────────────────────────────
+    # The last K and V tiles of a sequence whose length is not a multiple of
+    # BLK_KV also cover the rows after the sequence end: the next sequence's
+    # first tokens, or rows past cu_seqlens[-1]. The math warps mask their
+    # scores, but 0 * NaN is NaN in the products with V and K, so a non-finite
+    # value there would reach this sequence's output and final state. Those
+    # two tiles are loaded through tail descriptors: the base descriptors
+    # with the token extent cut to the sequence end, as the O store does for
+    # its tail (CollectiveStoreTma). TMA writes zeros into the rows past the
+    # end and still delivers the full tile, so the expected transaction count
+    # is unchanged. The descriptors live in two 128-byte slots per SM (K, V),
+    # which relies on one CTA per SM, as the O tail slot does.
+
+    @cute.jit
+    def create_load_tail_tensormaps(
+        self,
+        tma_atom_k: cute.CopyAtom,
+        tma_atom_v: cute.CopyAtom,
+        k_tail_ptr: cute.Pointer,
+        v_tail_ptr: cute.Pointer,
+        tok_end: cutlass.Int32,
+    ):
+        # The steps of CollectiveStoreTma.create_tensormap_for_tail, plus the
+        # acquires. As for O, global dimension 1 of the K and V descriptors
+        # is the token: all three are (D, total_seqlen, H) views whose smem
+        # tiles hold a D chunk innermost, then the tokens. One elected lane
+        # copies and edits both descriptors, so one warp sync before the
+        # release suffices. The acquires come after the release and before
+        # the tail loads (tma_load_tile).
+        with cute.arch.elect_one():
+            cpasync.copy_tensormap(tma_atom_k, k_tail_ptr)
+            cpasync.copy_tensormap(tma_atom_v, v_tail_ptr)
+            tensormap_replace_global_dim_1(k_tail_ptr, tok_end)
+            tensormap_replace_global_dim_1(v_tail_ptr, tok_end)
+        cute.arch.sync_warp()
+        cpasync.fence_tma_desc_release()
+        cpasync.fence_tma_desc_acquire(k_tail_ptr)
+        cpasync.fence_tma_desc_acquire(v_tail_ptr)
+
+    @cute.jit
+    def tma_load_tile(
+        self,
+        tma_atom: cute.CopyAtom,
+        src: cute.Tensor,
+        dst: cute.Tensor,
+        tma_bar_ptr: cute.Pointer,
+        is_tail,
+        tail_tensormap_ptr: cute.Pointer,
+    ):
+        # The tail descriptor (a slot from create_load_tail_tensormaps) for
+        # the last block of an unaligned sequence, else the base descriptor.
+        manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+        tail_desc_ptr = manager.get_tensormap_ptr(
+            tail_tensormap_ptr, cute.AddressSpace.generic
+        )
+        if is_tail:
+            cute.copy(
+                tma_atom,
+                src,
+                dst,
+                tma_bar_ptr=tma_bar_ptr,
+                tma_desc_ptr=tail_desc_ptr,
+            )
+        else:
+            cute.copy(tma_atom, src, dst, tma_bar_ptr=tma_bar_ptr)
 
     @cute.jit
     def load_qkv_tma(
@@ -599,8 +678,25 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
+        tok_end: cutlass.Int32,
+        k_tail_tensormap_ptr: cute.Pointer,
+        v_tail_tensormap_ptr: cute.Pointer,
     ):
         blk_tok = tok_start + blk * cutlass.Int32(self.BLK_KV)
+        # Only the last block of a sequence whose length is not a multiple of
+        # BLK_KV ends past tok_end. Its K and V tiles go through the tail
+        # descriptors, written here: with two or more blocks, while the math
+        # warps work on the earlier blocks; with one block, before the only
+        # load.
+        is_tail = cutlass.Int32(blk_tok) > tok_end - cutlass.Int32(self.BLK_KV)
+        if is_tail:
+            self.create_load_tail_tensormaps(
+                tma_atom_k,
+                tma_atom_v,
+                k_tail_tensormap_ptr,
+                v_tail_tensormap_ptr,
+                tok_end,
+            )
 
         sK = sK_DS[None, None, k_producer_state.index]
         mK = cute.domain_offset(
@@ -618,11 +714,13 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             cute.group_modes(gK, 0, 2),
         )
         k_pipeline.producer_acquire(k_producer_state)
-        cute.copy(
+        self.tma_load_tile(
             tma_atom_k,
             tKgK,
             tKsK,
-            tma_bar_ptr=k_pipeline.producer_get_barrier(k_producer_state),
+            k_pipeline.producer_get_barrier(k_producer_state),
+            is_tail,
+            k_tail_tensormap_ptr,
         )
         k_pipeline.producer_commit(k_producer_state)
         k_producer_state.advance()
@@ -668,11 +766,13 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             cute.group_modes(gV, 0, 2),
         )
         v_pipeline.producer_acquire(v_producer_state)
-        cute.copy(
+        self.tma_load_tile(
             tma_atom_v,
             tVgV,
             tVsV,
-            tma_bar_ptr=v_pipeline.producer_get_barrier(v_producer_state),
+            v_pipeline.producer_get_barrier(v_producer_state),
+            is_tail,
+            v_tail_tensormap_ptr,
         )
         v_pipeline.producer_commit(v_producer_state)
         v_producer_state.advance()
@@ -820,6 +920,69 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 v0, k0 = coords[2 * j]
                 v1, k1 = coords[2 * j + 1]
                 assert v1 == v0 and k1 == k0 + 1 and k0 % 2 == 0, (t, j)
+
+    @cute.jit
+    def kv_load_pairs(
+        self,
+        tKVrKV: cute.Tensor,
+        gKV: cute.Tensor,
+        kv_thr_mma,
+    ):
+        """``kv_load`` from a tile with the static layout (D, D):(1, D)
+        whose base is aligned to two elements: each fragment pair (see
+        ``kv_store_pairs``) is one vector load of the same two values."""
+        c_kv = cute.make_identity_tensor((self.D, self.D))
+        tKVcKV = kv_thr_mma.partition_C(c_kv)
+        dtype = gKV.element_type
+        load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=2 * dtype.width
+        )
+        pair = cute.make_rmem_tensor(2, dtype)
+        for j in cutlass.range_constexpr(cute.size(tKVrKV) // 2):
+            v_idx, k_idx = tKVcKV[2 * j]
+            src = cute.make_tensor(
+                cute.domain_offset((k_idx, v_idx), gKV).iterator.align(
+                    2 * dtype.width // 8
+                ),
+                cute.make_layout(2),
+            )
+            cute.copy(load_atom, src, pair)
+            tKVrKV[2 * j] = pair[0].to(self.acc_dtype)
+            tKVrKV[2 * j + 1] = pair[1].to(self.acc_dtype)
+
+    @property
+    def paired_state_rows(self) -> bool:
+        """The final state of the slot paths is written as pairs (dense
+        pool rows aligned to two elements or more)."""
+        return bool(
+            self.slot_mode
+            and self.state_row_align is not None
+            and self.state_row_align > 1
+        )
+
+    @property
+    def paired_init_state_rows(self) -> bool:
+        """The initial state of the slot paths is read as pairs (dense pool
+        rows aligned to two elements or more)."""
+        return bool(
+            self.slot_mode
+            and self.needs_init_state
+            and self.init_state_row_align is not None
+            and self.init_state_row_align > 1
+        )
+
+    def aligned_state_pool(
+        self, g_pool: cute.Tensor, row_align: int, num_sab_heads: cutlass.Int32
+    ):
+        """(D, D, H, rows) view of a pool (or packed state) of dense
+        [H, D, D] rows whose row stride and base are aligned to
+        ``row_align`` elements."""
+        row_stride = cute.assume(g_pool.stride[0], divby=row_align)
+        pool_layout = cute.make_layout(
+            (self.D, self.D, num_sab_heads, g_pool.shape[0]),
+            stride=(1, self.D, self.D * self.D, row_stride),
+        )
+        return cute.make_tensor(g_pool.iterator, pool_layout)
 
     @property
     def paired_row_checkpoints(self) -> bool:
@@ -1515,6 +1678,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         q_head_idx: cutlass.Int32,
         k_head_idx: cutlass.Int32,
         v_head_idx: cutlass.Int32,
+        tok_end,
+        g_load_tensormaps: cute.Tensor,
     ):
         q_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.q_stage
@@ -1525,6 +1690,18 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         v_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.v_stage
         )
+        # This SM's K and V tail descriptor slots (see load_qkv_tma). %smid
+        # is read once, so the writes, the fences and the loads address the
+        # same slots.
+        manager = TensorMapManager(TensorMapUpdateMode.GMEM, 128)
+        slot = smid() * cutlass.Int32(256)
+        k_tail_tensormap_ptr = manager.get_tensormap_ptr(
+            g_load_tensormaps.iterator + slot
+        )
+        v_tail_tensormap_ptr = manager.get_tensormap_ptr(
+            g_load_tensormaps.iterator + (slot + cutlass.Int32(128))
+        )
+        tok_end_i32 = cutlass.Int32(tok_end)
         for blk in cutlass.range(num_blocks, unroll=1):
             (
                 q_producer_state,
@@ -1551,6 +1728,9 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 q_head_idx,
                 k_head_idx,
                 v_head_idx,
+                tok_end_i32,
+                k_tail_tensormap_ptr,
+                v_tail_tensormap_ptr,
             )
 
     @cute.jit
@@ -1692,7 +1872,11 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             permutation_mnk=(self.D, self.D, self.BLK_KV),
         )
         kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
-        if cutlass.const_expr(self.paired_row_checkpoints):
+        if cutlass.const_expr(
+            self.paired_row_checkpoints
+            or self.paired_state_rows
+            or self.paired_init_state_rows
+        ):
             self.check_kv_pairs(kv_tiled_mma)
         tKVrKV = cute.make_rmem_tensor(
             kv_thr_mma.partition_shape_C((self.D, self.D)), self.acc_dtype
@@ -1735,7 +1919,17 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 # reads its state elements here, before it writes any
                 # checkpoint or final state, so read and write rows may alias.
                 if state_idx >= cutlass.Int32(0):
-                    self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
+                    if cutlass.const_expr(self.paired_init_state_rows):
+                        mInitPool = self.aligned_state_pool(
+                            g_init_state, self.init_state_row_align, num_sab_heads
+                        )
+                        self.kv_load_pairs(
+                            tKVrKV,
+                            mInitPool[None, None, o_head_idx, state_idx],
+                            kv_thr_mma,
+                        )
+                    else:
+                        self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
             else:
                 self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
 
@@ -1833,21 +2027,39 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 scale,
                 wg_idx,
             )
-        self.maybe_store_checkpoint(
-            tKVrKV,
-            g_state_checkpoints,
-            checkpoint_cu_starts,
-            checkpoint_every_n_tokens,
-            kv_thr_mma,
-            work_desc.seq_idx,
-            o_head_idx,
-            num_sab_heads,
-            total_checkpoints,
-            cutlass.Int32(self.BLK_KV),
-            work_desc.seq_len,
-            ckpt_key=ckpt_key,
-            row_pref=first_row,
-        )
+        if cutlass.const_expr(self.paired_row_checkpoints):
+            # Pool-row checkpoint of the first block as pairs too.
+            self.store_slot_checkpoint_run(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_thr_mma,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                ckpt_key,
+                first_row,
+            )
+        else:
+            self.maybe_store_checkpoint(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_thr_mma,
+                work_desc.seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                ckpt_key=ckpt_key,
+                row_pref=first_row,
+            )
 
         if cutlass.const_expr(self.chunked_slot_checkpoints):
             # The blocks up to the next checkpoint position run as one inner
@@ -2053,24 +2265,50 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 scale,
                 wg_idx,
             )
-            self.maybe_store_checkpoint(
-                tKVrKV,
-                g_state_checkpoints,
-                checkpoint_cu_starts,
-                checkpoint_every_n_tokens,
-                kv_thr_mma,
-                work_desc.seq_idx,
-                o_head_idx,
-                num_sab_heads,
-                total_checkpoints,
-                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
-                work_desc.seq_len,
-                ckpt_key=ckpt_key,
-                row_pref=last_row,
-            )
+            if cutlass.const_expr(self.paired_row_checkpoints):
+                # Pool-row checkpoint of the last block as pairs too.
+                self.store_slot_checkpoint_run(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    num_sab_heads,
+                    total_checkpoints,
+                    (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    ckpt_key,
+                    last_row,
+                )
+            else:
+                self.maybe_store_checkpoint(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    num_sab_heads,
+                    total_checkpoints,
+                    (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    ckpt_key=ckpt_key,
+                    row_pref=last_row,
+                )
         if cutlass.const_expr(self.slot_mode):
             if write_idx >= cutlass.Int32(0):
-                self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
+                if cutlass.const_expr(self.paired_state_rows):
+                    mPool = self.aligned_state_pool(
+                        g_state, self.state_row_align, num_sab_heads
+                    )
+                    self.kv_store_pairs(
+                        tKVrKV, mPool[None, None, o_head_idx, write_idx], kv_thr_mma
+                    )
+                else:
+                    self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
         else:
             self.kv_store(tKVrKV, gStateKV, kv_thr_mma)
 
@@ -2091,6 +2329,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
+        g_load_tensormaps: cute.Tensor,
         cu_seqlens: cute.Tensor,
         scale: cutlass.Float32,
         num_q_heads: cutlass.Int32,
@@ -2258,6 +2497,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             g_state_checkpoints,
             checkpoint_cu_starts,
             g_tensormaps,
+            g_load_tensormaps,
             cu_seqlens,
             scale,
             num_q_heads,
@@ -2298,6 +2538,7 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         g_state_checkpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         g_tensormaps: cute.Tensor,
+        g_load_tensormaps: cute.Tensor,
         cu_seqlens: cute.Tensor,
         scale: cutlass.Float32,
         num_q_heads: cutlass.Int32,
@@ -2517,6 +2758,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                     work_desc.q_head_idx(),
                     work_desc.k_head_idx(num_q_heads, num_v_heads),
                     work_desc.v_head_idx(),
+                    tok_end,
+                    g_load_tensormaps,
                 )
             elif ldst_warp_role == LoadStoreWarpRole.STORE_O:
                 if cutlass.const_expr(self.use_prefix_lens):
@@ -2639,6 +2882,8 @@ def _get_prefill_kernel(
     checkpoint_state_indices_dtype=None,
     prefix_lens_dtype=None,
     checkpoint_row_align=None,
+    state_row_align=None,
+    init_state_row_align=None,
 ):
     return _FullyFusedDeltaRuleSm120(
         needs_alpha,
@@ -2662,6 +2907,8 @@ def _get_prefill_kernel(
         checkpoint_state_indices_dtype=checkpoint_state_indices_dtype,
         prefix_lens_dtype=prefix_lens_dtype,
         checkpoint_row_align=checkpoint_row_align,
+        state_row_align=state_row_align,
+        init_state_row_align=init_state_row_align,
     )
 
 
@@ -2805,6 +3052,15 @@ def delta_rule_prefill_dsl(
         if use_checkpoint_state_indices
         else None
     )
+    # State rows of the slot paths (pool rows or packed per-sequence states)
+    # that are dense [H, D, D] blocks are read and written as element pairs
+    # when their alignment allows it.
+    state_row_align = init_state_row_align = None
+    if use_output_state_indices or use_checkpoint_state_indices or use_prefix_lens:
+        if tuple(state.stride()[1:]) == (D * D, D, 1):
+            state_row_align = checkpoint_row_align(state)
+        if needs_init_state and tuple(init_state.stride()[1:]) == (D * D, D, 1):
+            init_state_row_align = checkpoint_row_align(init_state)
     if use_checkpoint_state_indices or use_prefix_lens:
         check_checkpoint_key_range(
             checkpoint_state_indices.numel()
@@ -2836,6 +3092,11 @@ def delta_rule_prefill_dsl(
 
     workspace_size = get_device_sm_count(device) * 128
     tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, device)
+    # The K and V tail descriptors of the load warp: two 128-byte slots per
+    # SM (see create_load_tail_tensormaps).
+    load_tensormaps_t = _get_cache_buf(
+        "gdn_prefill_load_tensormaps", 2 * workspace_size, device
+    )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
     delta_rule_kernel = _get_prefill_kernel(
@@ -2869,6 +3130,8 @@ def delta_rule_prefill_dsl(
         ),
         prefix_lens_dtype=prefix_lens.dtype if use_prefix_lens else None,
         checkpoint_row_align=row_align,
+        state_row_align=state_row_align,
+        init_state_row_align=init_state_row_align,
     )
     # A checkpoint pool is addressed by its row stride (which may be padded),
     # so it is passed whole, never flattened through a copy.
@@ -2926,6 +3189,7 @@ def delta_rule_prefill_dsl(
                 else None
             ),
             from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(load_tensormaps_t, assumed_align=128).mark_layout_dynamic(),
             from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
             cutlass.Float32(scale),
             cutlass.Int32(num_q_heads),
@@ -2968,6 +3232,7 @@ def delta_rule_prefill_dsl(
         checkpoints_arg,
         checkpoint_cu_starts if needs_checkpointing else None,
         tensormaps_t,
+        load_tensormaps_t,
         cu_seqlens,
         scale,
         num_q_heads,

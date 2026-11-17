@@ -104,6 +104,7 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
         hidden: int,
         fc2_in_kernel_topk_reduce: bool = False,
         skip_topk_reduce: bool = False,
+        mask_invalid_routes: bool = False,
         token_back_by_dispatch: bool = False,
         token_back_mode: Literal[
             "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -207,6 +208,7 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
         self.hidden = hidden
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.skip_topk_reduce = skip_topk_reduce
+        self.mask_invalid_routes = mask_invalid_routes
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
@@ -300,7 +302,7 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
         self.shared_zero_i32_count = shared_leading // 4
 
     def sched_ext_fc1_peek_threshold(self) -> int:
-        # Peek threshold must match the spin threshold (cluster_tile_tokens = 256)
+        # Peek threshold must match this geometry's cluster_tile_tokens
         # so an early peek hit does not skip the spin and expose stale pool rows.
         return self.cluster_tile_tokens
 
@@ -865,12 +867,18 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
                 self.num_topk,
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
+                num_experts=(self.num_total_experts if self.mask_invalid_routes else None),
             )(
                 combine_target,
                 None,
                 output_activation,
                 score,
                 stream,
+                # Dispatch skips invalid routes without overwriting their
+                # combine cells. BI must ignore stale cells on every replay.
+                topk_indices=(
+                    topk_idx if cutlass.const_expr(self.mask_invalid_routes) else None
+                ),
             )
 
     # =========================================================================

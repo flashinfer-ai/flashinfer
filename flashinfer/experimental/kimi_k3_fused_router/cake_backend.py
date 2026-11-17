@@ -45,11 +45,13 @@ shared memory and Q4SPW_LR the Q4SP_LR kernel selecting one row per warp -- are
 bounded by the driver's co-resident cluster capacity; arm GW, the warp-per-row
 two-join kernel for the largest batches, launches CTA pairs under a
 per-architecture CTAs-per-SM bound and the co-resident pair capacity); arms LC,
-LC1_NC, LCG, LCG_LW and LCG_LW_OWN launch one non-cooperative cluster
+LC1_NC, LC2_CW, LCG, LCG_LW and LCG_LW_OWN launch one non-cooperative cluster
 (``num_tokens`` CTAs for LC; one CTA for LC1_NC, the one-token LC kernel with
 its bias and logits loads in the read-only form, which serves one token at
-block_m 16; 16 CTAs of two row groups for LCG, LCG_LW and LCG_LW_OWN, which
-serve every other count up to 32, LCG_LW being the LCG kernel that waits for its
+block_m 16; two CTAs for LC2_CW, the two-token LC kernel ranking its winners
+from a certified window, which serves two tokens on SM100 at block_m 8; 16
+CTAs of two row groups for LCG, LCG_LW and LCG_LW_OWN, which serve every other
+count up to 32, LCG_LW being the LCG kernel that waits for its
 cluster after the row selection instead of before it and LCG_LW_OWN the LCG_LW
 kernel whose candidate floor comes from the owners of the published bounds, on
 SM100 at block_m 16 from 29 tokens (``CELL_LOW_ROUTES``); a 16-CTA cluster is
@@ -116,6 +118,13 @@ ARM_LC_TOKENS = (1, 2, 4, 8, 16)
 # one) for exactly one token, the same outputs and launch.  Both architectures
 # route the one-token cell at block_m 16 to it (block_m 8 keeps LC).
 ARM_LC1_NC = "LC1_NC"
+# Arm LC2_CW: the two-token LC kernel ranking its winners from a certified
+# window (warp 0 keeps its bound entry with the entry's count; the candidates
+# above the largest entry whose count certifies a top-16 member win at once),
+# a second program of the kernel with the same winners, slots and outputs; one
+# cluster of two CTAs for exactly two tokens.  SM100 routes the two-token cell
+# at block_m 8 to it (block_m 16 and SM103 keep LC).
+ARM_LC2_CW = "LC2_CW"
 # Arms LCG and LCG_LW: one cluster of 16 CTAs of two row groups each (group g of
 # CTA k selects row k + 16 g), serving any num_tokens up to 32; the route sends
 # them the 32-token cell (every count up to 32 that is not an LC row count).
@@ -264,14 +273,15 @@ VECTOR_ACCESSED_TENSORS = (
 # Measured dispatch cells, keyed by (num_tokens, block_m): the 28 shapes the
 # generated program was benchmarked at on each architecture.  Both tables cover
 # the same cells; they differ in exactly three cells of the L family
-# (ARM_L_FAMILY) and in both 32-token cells (ARM_LCG_FAMILY; see
-# _SM103_SHAPE_ROUTE below).  On both architectures the capacity rule
-# (CAPACITY_ROUTES) refines the arms of the 512- to 2048-token cells, and
-# CELL_LOW_ROUTES the arm of the smaller counts of a 32- or 512-token cell.
+# (ARM_L_FAMILY), in both 32-token cells (ARM_LCG_FAMILY) and in the two-token
+# cell at block_m 8 (ARM_LC2_CW on SM100; see _SM103_SHAPE_ROUTE below).  On
+# both architectures the capacity rule (CAPACITY_ROUTES) refines the arms of the
+# 512- to 2048-token cells, and CELL_LOW_ROUTES the arm of the smaller counts of
+# a 32- or 512-token cell.
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (1, 8): "LC",
     (1, 16): "LC1_NC",
-    (2, 8): "LC",
+    (2, 8): "LC2_CW",
     (2, 16): "LC",
     (4, 8): "LC",
     (4, 16): "LC",
@@ -303,9 +313,11 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
 # LP kernel launched with an explicit cluster of one CTA) and keeps L at
 # (128, 8); sm_103a routes (64, 8) and (128, 8) to LP and (64, 16) to L -- and
 # the two 32-token cells (sm_100a LCG_LW at block_m 8 and LCG_LW_OWN at block_m
-# 16, sm_103a LCG and LCG_LW).
+# 16, sm_103a LCG and LCG_LW) -- and the two-token cell at block_m 8 (sm_100a
+# LC2_CW, sm_103a LC).
 _SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     **_SM100_SHAPE_ROUTE,
+    (2, 8): "LC",
     (32, 8): "LCG",
     (32, 16): "LCG_LW",
     (64, 8): "LP",
@@ -513,8 +525,8 @@ def launch_grid(
 
     ``max_active_clusters`` is the driver's co-resident cluster capacity of the
     arm's program: required for the Q4S family and GW, optional for the
-    one-cluster arms LC, LC1_NC, LCG, LCG_LW and LCG_LW_OWN (a capacity below
-    one cluster is refused).
+    one-cluster arms LC, LC1_NC, LC2_CW, LCG, LCG_LW and LCG_LW_OWN (a capacity
+    below one cluster is refused).
     """
     rows = int(num_tokens)
     major, minor = (int(v) for v in compute_capability)
@@ -522,14 +534,16 @@ def launch_grid(
     grid_rows = 8 if rows in (2, 4) else rows
     cap = persistent_grid_cap(compute_capability, sm_count)
     grid_x = max(1, min(grid_rows, cap))
-    if arm in ("LC", ARM_LC1_NC) or arm in ARM_LCG_FAMILY:
+    if arm in ("LC", ARM_LC1_NC, ARM_LC2_CW) or arm in ARM_LCG_FAMILY:
         if arm == "LC" and rows not in ARM_LC_TOKENS:
             raise RuntimeError(f"arm LC serves exactly num_tokens in {ARM_LC_TOKENS}")
         if arm == ARM_LC1_NC and rows != 1:
             raise RuntimeError(f"arm {ARM_LC1_NC} serves exactly one token")
+        if arm == ARM_LC2_CW and rows != 2:
+            raise RuntimeError(f"arm {ARM_LC2_CW} serves exactly two tokens")
         if arm in ARM_LCG_FAMILY and rows > ARM_LCG_MAX_TOKENS:
             raise RuntimeError(f"arm {arm} admits at most {ARM_LCG_MAX_TOKENS} tokens")
-        cluster = rows if arm in ("LC", ARM_LC1_NC) else ARM_LCG_CLUSTER
+        cluster = rows if arm in ("LC", ARM_LC1_NC, ARM_LC2_CW) else ARM_LCG_CLUSTER
         if max_active_clusters is not None and int(max_active_clusters) < 1:
             raise RuntimeError(
                 f"arm {arm} launches one {cluster}-CTA cluster; the driver admits "

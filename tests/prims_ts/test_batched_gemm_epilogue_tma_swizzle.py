@@ -417,13 +417,17 @@ def test_swap_gated_tma_uses_physical_output_m_width(
         "expected_load_regs",
         "expected_load_cols",
         "expected_loads",
+        "use_deepseek_fp8",
     ),
     (
-        (32, 16, 8, 16, 1),
-        (32, 32, 16, 32, 1),
-        (32, 64, 32, 64, 1),
-        (32, 128, 32, 64, 2),
-        (64, 128, 64, 128, 1),
+        (32, 16, 8, 16, 1, 0),
+        (32, 32, 16, 32, 1, 0),
+        (32, 64, 32, 64, 1, 0),
+        (32, 128, 32, 64, 2, 0),
+        (64, 128, 64, 128, 1, 0),
+        # DeepSeek FP8 re-reads the accumulator every K block: one full-width
+        # load per slice regardless of the cap.
+        (32, 128, 64, 128, 1, 1),
     ),
 )
 def test_swap_tmem_load_obeys_register_cap(
@@ -432,10 +436,12 @@ def test_swap_tmem_load_obeys_register_cap(
     expected_load_regs,
     expected_load_cols,
     expected_loads,
+    use_deepseek_fp8,
 ):
     cfg = make_config(
         batch_mode=int(BatchMode.BATCH_N),
         transpose_mma_output=1,
+        use_deepseek_fp8=use_deepseek_fp8,
         epi_tile_n=epi_tile_n,
         tmem_ldst_max_num_regs=max_regs,
     )
