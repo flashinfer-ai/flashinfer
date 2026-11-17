@@ -82,6 +82,8 @@ from typing import Optional
 
 import torch
 
+from ..api_logging import flashinfer_api
+from ..trace.templates.moe import w4a16_mxfp4_latent_routed_moe_trace
 from ..utils import get_compute_capability
 
 _E = 896  # global expert-id space of the measured checkpoint (documentation)
@@ -251,6 +253,7 @@ def _check(cond: bool, msg: str) -> None:
         raise ValueError(f"w4a16_mxfp4_latent_routed_moe: {msg}")
 
 
+@flashinfer_api(trace=w4a16_mxfp4_latent_routed_moe_trace)
 def w4a16_mxfp4_latent_routed_moe(
     x: torch.Tensor,
     w13_packed: torch.Tensor,
@@ -291,7 +294,8 @@ def w4a16_mxfp4_latent_routed_moe(
     w2_packed : torch.Tensor
         ``[56, 3584, 1536]`` uint8, contiguous.  fc2 (down) mxfp4 codes.
     w2_scale : torch.Tensor
-        ``[56, 3584, 112]`` uint8, contiguous.  fc2 ue8m0 group-32 scales.
+        ``[56, 3584, 96]`` uint8, contiguous.  fc2 ue8m0 group-32 scales
+        (96 groups of 32 over the 3072-wide reduction).
     topk_ids : torch.Tensor
         ``[T, 16]`` int32, contiguous.  GLOBAL expert ids; only ids in
         ``[0, 56)`` live on this rank (others, including negative sentinels,
@@ -317,6 +321,14 @@ def w4a16_mxfp4_latent_routed_moe(
     -------
     torch.Tensor
         ``out``.
+
+    Notes
+    -----
+    The specialized kernel's decode path (``T <= 64``) stages bf16
+    activations in fp16 at a ``2**7`` scale and saturates the staged values
+    to the fp16 finite range, so activation magnitudes ``>= 512`` lose
+    accuracy instead of producing inf/NaN.  The reference path has no such
+    saturation.
     """
     _stats["calls"] += 1
     if backend not in BACKENDS:
@@ -351,6 +363,21 @@ def w4a16_mxfp4_latent_routed_moe(
     _check(
         w2_packed.shape[1] == x.shape[1] and w2_scale.shape[1] == x.shape[1],
         "w2 rows must match x's hidden size",
+    )
+    _check(
+        w13_packed.shape[0]
+        == w13_scale.shape[0]
+        == w2_packed.shape[0]
+        == w2_scale.shape[0],
+        "weights/scales must agree on the local expert count",
+    )
+    _check(
+        w13_packed.shape[1] == w13_scale.shape[1] and w13_packed.shape[1] % 2 == 0,
+        "w13 packed/scale rows must match and stack gate|up (even row count)",
+    )
+    _check(
+        w2_packed.shape[2] * 2 == w2_scale.shape[2] * _GROUP,
+        "w2 packing/scales must agree on the reduction width",
     )
     # fixed-geometry ELIGIBILITY of the specialized kernel (a miss is a
     # fallback reason, not an error — the reference serves any consistent
@@ -389,6 +416,12 @@ def w4a16_mxfp4_latent_routed_moe(
     )
     if _spec_reason is None and topk_ids.shape[1] != _TOP_K:
         _spec_reason = f"top_k={topk_ids.shape[1]} != {_TOP_K}"
+    # the specialized kernel loads the packed weights through 16-byte vector
+    # types; a contiguous view with a storage offset can defeat that
+    if _spec_reason is None and (
+        w13_packed.data_ptr() % 16 != 0 or w2_packed.data_ptr() % 16 != 0
+    ):
+        _spec_reason = "packed weights not 16-byte aligned"
     if out is None:
         out = torch.empty(tokens, x.shape[1], dtype=torch.bfloat16, device=x.device)
     _check(

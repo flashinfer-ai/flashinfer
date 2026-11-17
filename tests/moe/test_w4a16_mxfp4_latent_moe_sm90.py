@@ -148,6 +148,79 @@ def test_off_geometry_served_by_reference_only():
     assert _matched(y, ref) >= 0.999
 
 
+def test_prefill_specialized_matches_reference_backend():
+    """Parity on the prefill launch path (T > 64), not just the decode path."""
+    _sm90_or_skip()
+    args = _case(T=128, seed=3)
+    y_spec = w4a16_mxfp4_latent_routed_moe(*args, backend="specialized")
+    stats = _w4a16_mxfp4_latent_moe_stats()
+    assert stats["backend_dispatches"]["specialized"] == 1, stats
+    y_ref = w4a16_mxfp4_latent_routed_moe(*args, backend="reference")
+    assert _matched(y_spec, y_ref) >= 0.99
+
+
+def test_extreme_activations_stay_finite():
+    """|x| >= 512 would overflow the kernel's scaled fp16 staging to inf and
+    poison the combine with NaN (inf * 0-weight); the staging now saturates.
+    Out-of-range magnitudes lose accuracy, so only the clean rows are
+    parity-checked; the poisoned row must still come back finite."""
+    _sm90_or_skip()
+    args = _case(T=8, seed=5)
+    x = args[0].clone()
+    x[0, :8] = 1024.0
+    x[0, 8:16] = -1024.0
+    args = (x,) + args[1:]
+    y_spec = w4a16_mxfp4_latent_routed_moe(*args, backend="specialized")
+    stats = _w4a16_mxfp4_latent_moe_stats()
+    assert stats["backend_dispatches"]["specialized"] == 1, stats
+    assert torch.isfinite(y_spec.float()).all()
+    y_ref = w4a16_mxfp4_latent_routed_moe(*args, backend="reference")
+    assert _matched(y_spec[1:], y_ref[1:]) >= 0.99
+
+
+def test_misaligned_packed_weights_fall_back():
+    """A contiguous uint8 view with a storage offset breaks the 16-byte
+    alignment the kernel's vector loads require; it must be served by the
+    reference path, not faulted through uint4 loads."""
+    _sm90_or_skip()
+    x, w13p, w13s, w2p, w2s, ids, w = _case(T=4, seed=7)
+    buf = torch.empty(w13p.numel() + 8, dtype=torch.uint8, device=w13p.device)
+    buf[8:] = w13p.reshape(-1)
+    w13p_off = buf[8:].view(w13p.shape)
+    assert w13p_off.is_contiguous() and w13p_off.data_ptr() % 16 == 8
+    y = w4a16_mxfp4_latent_routed_moe(
+        x, w13p_off, w13s, w2p, w2s, ids, w, backend="specialized"
+    )
+    stats = _w4a16_mxfp4_latent_moe_stats()
+    assert stats["backend_dispatches"]["specialized"] == 0, stats
+    assert stats["backend_dispatches"]["reference"] == 1, stats
+    assert any("16-byte" in r for r in stats["fallback_reasons"]), stats
+    y_ref = w4a16_mxfp4_latent_routed_moe(
+        x, w13p, w13s, w2p, w2s, ids, w, backend="reference"
+    )
+    assert torch.equal(y, y_ref)
+
+
+def test_inconsistent_weight_structure_raises():
+    _sm90_or_skip()
+    x, w13p, w13s, w2p, w2s, ids, w = _case(T=2, el=8)
+    # mismatched expert counts
+    with pytest.raises(ValueError, match="local expert count"):
+        w4a16_mxfp4_latent_routed_moe(
+            x, w13p[:4], w13s, w2p, w2s, ids, w, backend="reference"
+        )
+    # fc1 packed vs scale row counts
+    with pytest.raises(ValueError, match="w13 packed/scale rows"):
+        w4a16_mxfp4_latent_routed_moe(
+            x, w13p[:, : 2 * I - 2], w13s, w2p, w2s, ids, w, backend="reference"
+        )
+    # fc2 packed vs scale reduction widths
+    with pytest.raises(ValueError, match="reduction width"):
+        w4a16_mxfp4_latent_routed_moe(
+            x, w13p, w13s, w2p[..., : I // 2 - 16], w2s, ids, w, backend="reference"
+        )
+
+
 @pytest.mark.parametrize("env,val", [(DISABLE_ENV, "1"), (DISABLE_ENV_LEGACY, "0")])
 def test_kill_switch_forces_the_reference_path(env, val, monkeypatch):
     _sm90_or_skip()

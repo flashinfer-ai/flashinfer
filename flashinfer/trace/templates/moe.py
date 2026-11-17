@@ -6420,3 +6420,144 @@ alphamoe_fused_router_trace = TraceTemplate(
     tags=["status:experimental", "moe", "sm100", "sm103"],
     init=_alphamoe_fused_router_init,
 )
+
+
+# ---------------------------------------------------------------------------
+# SM90 W4A16 latent-MoE routed-expert block (mxfp4 group-32 weights)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _w4a16_mxfp4_latent_routed_moe_reference(
+    x,
+    w13_packed,
+    w13_scale,
+    w2_packed,
+    w2_scale,
+    topk_ids,
+    topk_weights,
+    **_unused,
+):
+    """Reference for the W4A16 mxfp4-g32 latent routed-expert block.
+
+    Exact mxfp4 dequant, gate/up GEMMs, the gated "situ" activation
+    (``4*tanh(g/4)*sigmoid(g) * 25*tanh(u/25)``) with one bf16 rounding of
+    the activated intermediate, and the weighted combine, all with fp32
+    accumulation.  Only slots with ``topk_ids < E_local`` contribute
+    (rank-partial output).
+    """
+    num_local_experts, gated_rows, _ = w13_packed.shape
+    inter = gated_rows // 2
+    xf = x.to(torch.float32)
+    ids = topk_ids.to(torch.int64)
+    tw = topk_weights.to(torch.float32)
+    acc = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
+    for e in range(num_local_experts):
+        rows, slots = torch.where(ids == e)
+        if rows.numel() == 0:
+            continue
+        w13 = _unpack_fp4_e2m1(w13_packed[e]) * _ue8m0_to_float32(
+            w13_scale[e]
+        ).repeat_interleave(32, dim=-1)
+        w2 = _unpack_fp4_e2m1(w2_packed[e]) * _ue8m0_to_float32(
+            w2_scale[e]
+        ).repeat_interleave(32, dim=-1)
+        xe = xf[rows]
+        g = xe @ w13[:inter].t()
+        u = xe @ w13[inter:].t()
+        h = (4.0 * torch.tanh(g / 4.0) * torch.sigmoid(g)) * (
+            25.0 * torch.tanh(u / 25.0)
+        )
+        h = h.to(torch.bfloat16).to(torch.float32)
+        acc.index_add_(0, rows, (h @ w2.t()) * tw[rows, slots, None])
+    return acc.to(torch.bfloat16)
+
+
+cast(Any, _w4a16_mxfp4_latent_routed_moe_reference)._trace_reference_dependencies = (
+    _unpack_fp4_e2m1,
+    _ue8m0_to_float32,
+)
+
+
+w4a16_mxfp4_latent_routed_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="w4a16_mxfp4_latent_routed_moe",
+    description=(
+        "One EP rank's W4A16 latent-MoE routed-expert block under given "
+        "routing: grouped GEMMs over the local experts with mxfp4 group-32 "
+        "weights, the gated situ activation, and the weighted combine "
+        "(rank-partial output)."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of latent token rows."),
+        "num_local_experts": Const(
+            abbrev="e", description="Local (rank-resident) expert count."
+        ),
+        "latent_size": Const(abbrev="l", description="Latent hidden width."),
+        "latent_packed": Const(
+            abbrev="", description="latent_size / 2 packed uint8 columns."
+        ),
+        "latent_groups": Const(abbrev="", description="latent_size / 32 scale groups."),
+        "gated_size": Const(
+            abbrev="n",
+            description="Stacked gate|up fc1 rows (2 * expert intermediate).",
+        ),
+        "inter_packed": Const(
+            abbrev="", description="intermediate / 2 packed uint8 columns."
+        ),
+        "inter_groups": Const(abbrev="", description="intermediate / 32 scale groups."),
+        "top_k": Const(abbrev="k", description="Routed slots per token."),
+    },
+    inputs={
+        "x": Tensor(
+            ["num_tokens", "latent_size"],
+            dtype="bfloat16",
+            description="Latent activations.",
+        ),
+        "w13_packed": Tensor(
+            ["num_local_experts", "gated_size", "latent_packed"],
+            dtype="uint8",
+            description="fc1 mxfp4 codes, gate rows then up rows.",
+        ),
+        "w13_scale": Tensor(
+            ["num_local_experts", "gated_size", "latent_groups"],
+            dtype="uint8",
+            description="fc1 ue8m0 group-32 scales.",
+        ),
+        "w2_packed": Tensor(
+            ["num_local_experts", "latent_size", "inter_packed"],
+            dtype="uint8",
+            description="fc2 (down) mxfp4 codes.",
+        ),
+        "w2_scale": Tensor(
+            ["num_local_experts", "latent_size", "inter_groups"],
+            dtype="uint8",
+            description="fc2 ue8m0 group-32 scales.",
+        ),
+        "topk_ids": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="GLOBAL expert ids; only ids < num_local_experts hit.",
+        ),
+        "topk_weights": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Combine weights, consumed as-is.",
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["num_tokens", "latent_size"],
+            dtype="bfloat16",
+            description="Rank-partial weighted combine back to latent space.",
+        ),
+    },
+    constraints=[
+        "latent_size == latent_packed * 2",
+        "latent_size == latent_groups * 32",
+        "gated_size == inter_packed * 4",
+        "gated_size == inter_groups * 64",
+    ],
+    reference=_w4a16_mxfp4_latent_routed_moe_reference,
+    tags=["quantization:mxfp4_g32", "weights:w4a16", "routing:given"],
+)
