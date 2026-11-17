@@ -93,7 +93,9 @@ def _ld128(addr: Int64, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _absmax8(a: Uint32, b: Uint32, c: Uint32, d: Uint32, *, loc=None, ip=None) -> Uint32:
+def _absmax8(
+    a: Uint32, b: Uint32, c: Uint32, d: Uint32, *, loc=None, ip=None
+) -> Uint32:
     return Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -204,7 +206,9 @@ def _rcp(a: Float32, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def _quant8(a: Uint32, b: Uint32, c: Uint32, d: Uint32, inv: Float32, *, loc=None, ip=None) -> Uint64:
+def _quant8(
+    a: Uint32, b: Uint32, c: Uint32, d: Uint32, inv: Float32, *, loc=None, ip=None
+) -> Uint64:
     return Uint64(
         llvm.inline_asm(
             T.i64(),
@@ -285,7 +289,9 @@ def _build(lanes_per_group, threads):
     vectors_per_lane = 128 // (lanes_per_group * 8)
 
     @cute.kernel
-    def kernel(x: cute.Tensor, q: cute.Tensor, s: cute.Tensor, num_groups: Int32, eps: Float32):
+    def kernel(
+        x: cute.Tensor, q: cute.Tensor, s: cute.Tensor, num_groups: Int32, eps: Float32
+    ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
         lane = tidx % lanes_per_group

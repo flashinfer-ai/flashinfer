@@ -204,8 +204,7 @@ def _ptgq_specialized_dispatch_table() -> Optional[Dict]:
         import json
 
         data = (
-            importlib.resources.files("flashinfer")
-            / "ptgq_fp8_g128_sm90_dispatch.json"
+            importlib.resources.files("flashinfer") / "ptgq_fp8_g128_sm90_dispatch.json"
         ).read_text()
         table = json.loads(data)
         if not isinstance(table.get("backends"), list):
