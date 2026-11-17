@@ -639,6 +639,80 @@ def test_tail_split_rows_are_deterministic_and_close_to_the_default_build(monkey
 
 
 @requires_sm100
+@pytest.mark.parametrize(
+    ("sel", "wide"),
+    [
+        (6, False),
+        (12, False),
+        (24, False),
+        (40, False),
+        (6, True),
+        (16, True),
+        (23, True),
+    ],
+)
+def test_attention_builds_write_the_same_bits_to_a_16_byte_aligned_out(
+    sel, wide, monkeypatch
+):
+    """``out`` may start on any 16-byte boundary: a contiguous view eight BF16 elements
+    into a buffer (16 bytes past a 32-byte boundary) gets the bits of a fresh, 32-byte
+    aligned ``out`` from every build a call routes to (default, split QK, double S, its
+    tail split, p3), with and without PDL, and from the default build; nothing outside
+    the view is written."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability())
+    sms = loader.sm_count(index)
+    sq = 640
+    q_blocks = _ceil_div(sq, _BLOCK)
+    heads = 2 * _ceil_div(sms, q_blocks) if wide else 4
+    c = _make_case(
+        (
+            f"out16_{sel}_{wide}",
+            1,
+            heads,
+            2,
+            sq,
+            4096,
+            sel,
+            True,
+            True,
+            3,
+            33,
+            True,
+            1.0,
+        ),
+        device,
+    )
+    shape = (1, sq, heads, _HEAD_DIM)
+    numel = math.prod(shape)
+    records = []
+    for routed in (True, False):
+        with monkeypatch.context() as m:
+            if not routed:
+                m.setattr(pkg, "_ATTENTION_ROUTES", {})
+                m.setattr(pkg, "_P3_BANDS", {})
+            m.setattr(pkg, "_ROUTES", {})
+            for pdl in (False, True):
+                records.append(pkg._route(arch, sel, heads * q_blocks, index, pdl)[0])
+                ref, ref_lse = _run(c, enable_pdl=pdl)
+                assert ref.data_ptr() % 32 == 0
+                buf = torch.full(
+                    (numel + 16,), float("nan"), dtype=torch.bfloat16, device=device
+                )
+                out = buf[8 : 8 + numel].view(shape)
+                assert out.data_ptr() % 32 == 16
+                o, lse = _run(c, enable_pdl=pdl, out=out)
+                torch.cuda.synchronize()
+                assert o.data_ptr() == out.data_ptr()
+                assert torch.equal(o, ref) and torch.equal(lse, ref_lse), records[-1]
+                assert bool(buf[:8].isnan().all()) and bool(
+                    buf[8 + numel :].isnan().all()
+                )
+    assert records[2:] == ["attention", "attention_pdl"], records
+
+
+@requires_sm100
 def test_run_module_matches_the_host_api():
     """The generic ``run_module`` (logical names through the record's ``arg_plan``)
     launches what the host API binds positionally: the same bits."""

@@ -2500,6 +2500,8 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
 #else
                     if (my_row_1 < q_valid_1) {
 #endif
+                        bool out32 = ((unsigned long long)out & 31ull) == 0ull;
+                        bool out16 = ((unsigned long long)out & 31ull) != 0ull;
                         unsigned int st_packed_0[8];
                         float st_scaled_0[8];
                         const float2 _scale2_32 = {inv_sum, inv_sum};
@@ -2551,18 +2553,15 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_1[_lp*2 + 6], st_scaled_1[_lp*2+1 + 6]));
                             st_packed_0[_lp + 7] = *(uint32_t*)&_bf2;
                         }
-                        {
-                            const unsigned* _raw_stv8_34 = reinterpret_cast<const unsigned*>(st_packed_0);
-                            asm volatile(
-                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(out + (output_row + col_base + chunk_cols_0))), "r"(_raw_stv8_34[0]), "r"(_raw_stv8_34[1]), "r"(_raw_stv8_34[2]), "r"(_raw_stv8_34[3]), "r"(_raw_stv8_34[4]), "r"(_raw_stv8_34[5]), "r"(_raw_stv8_34[6]), "r"(_raw_stv8_34[7]) : "memory");
-                        }
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %9, 0; @p_ st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8}; }" :: "l"(out + (output_row + col_base + chunk_cols_0)), "r"(st_packed_0[(0) + 0]), "r"(st_packed_0[(0) + 1]), "r"(st_packed_0[(0) + 2]), "r"(st_packed_0[(0) + 3]), "r"(st_packed_0[(0) + 4]), "r"(st_packed_0[(0) + 5]), "r"(st_packed_0[(0) + 6]), "r"(st_packed_0[(0) + 7]), "r"((unsigned int)(out32)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_0)), "r"(st_packed_0[(0) + 0]), "r"(st_packed_0[(0) + 1]), "r"(st_packed_0[(0) + 2]), "r"(st_packed_0[(0) + 3]), "r"((unsigned int)(out16)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_0 + 8)), "r"(st_packed_0[(4) + 0]), "r"(st_packed_0[(4) + 1]), "r"(st_packed_0[(4) + 2]), "r"(st_packed_0[(4) + 3]), "r"((unsigned int)(out16)) : "memory");
                         unsigned int st_packed_1[8];
                         float st_scaled_2[8];
-                        const float2 _scale2_35 = {inv_sum, inv_sum};
+                        const float2 _scale2_34 = {inv_sum, inv_sum};
                         #pragma unroll
                         for (int _ls = 0; _ls < 4; _ls++)
-                            reinterpret_cast<float2*>(st_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_2 + 16))[_ls], _scale2_35);
+                            reinterpret_cast<float2*>(st_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_2 + 16))[_ls], _scale2_34);
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_2[_lp*2 + 0], st_scaled_2[_lp*2+1 + 0]));
@@ -2584,10 +2583,10 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             st_packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                         }
                         float st_scaled_3[8];
-                        const float2 _scale2_36 = {inv_sum, inv_sum};
+                        const float2 _scale2_35 = {inv_sum, inv_sum};
                         #pragma unroll
                         for (int _ls = 0; _ls < 4; _ls++)
-                            reinterpret_cast<float2*>(st_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_2 + 24))[_ls], _scale2_36);
+                            reinterpret_cast<float2*>(st_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_2 + 24))[_ls], _scale2_35);
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_3[_lp*2 + 0], st_scaled_3[_lp*2+1 + 0]));
@@ -2608,12 +2607,9 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_3[_lp*2 + 6], st_scaled_3[_lp*2+1 + 6]));
                             st_packed_1[_lp + 7] = *(uint32_t*)&_bf2;
                         }
-                        {
-                            const unsigned* _raw_stv8_37 = reinterpret_cast<const unsigned*>(st_packed_1);
-                            asm volatile(
-                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(out + (output_row + col_base + chunk_cols_0 + 16))), "r"(_raw_stv8_37[0]), "r"(_raw_stv8_37[1]), "r"(_raw_stv8_37[2]), "r"(_raw_stv8_37[3]), "r"(_raw_stv8_37[4]), "r"(_raw_stv8_37[5]), "r"(_raw_stv8_37[6]), "r"(_raw_stv8_37[7]) : "memory");
-                        }
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %9, 0; @p_ st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8}; }" :: "l"(out + (output_row + col_base + chunk_cols_0 + 16)), "r"(st_packed_1[(0) + 0]), "r"(st_packed_1[(0) + 1]), "r"(st_packed_1[(0) + 2]), "r"(st_packed_1[(0) + 3]), "r"(st_packed_1[(0) + 4]), "r"(st_packed_1[(0) + 5]), "r"(st_packed_1[(0) + 6]), "r"(st_packed_1[(0) + 7]), "r"((unsigned int)(out32)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_0 + 16)), "r"(st_packed_1[(0) + 0]), "r"(st_packed_1[(0) + 1]), "r"(st_packed_1[(0) + 2]), "r"(st_packed_1[(0) + 3]), "r"((unsigned int)(out16)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_0 + 16 + 8)), "r"(st_packed_1[(4) + 0]), "r"(st_packed_1[(4) + 1]), "r"(st_packed_1[(4) + 2]), "r"(st_packed_1[(4) + 3]), "r"((unsigned int)(out16)) : "memory");
                     }
                     const int chunk_cols_1 = 32;
                     float tmem_load_0[32];
@@ -2622,10 +2618,10 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32], 64;"
                         : "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&tmem_load_0[31]))
                         : "r"(taddr + (unsigned int)o0_off + (unsigned int)row_addr + (unsigned int)chunk_cols_1));
-                    const float2 _scale2_38 = {merge_0, merge_0};
+                    const float2 _scale2_36 = {merge_0, merge_0};
                     #pragma unroll
                     for (int _ls = 0; _ls < 16; _ls++)
-                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(tmem_load_0)[_ls], _scale2_38);
+                        mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(tmem_load_0)[_ls], _scale2_36);
 #if __CUDA_ARCH__ == 1030
                     if (pair_count_4 > 1) {
 #else
@@ -2696,12 +2692,14 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
 #else
                     if (my_row_1 < q_valid_1) {
 #endif
+                        bool out32_1 = ((unsigned long long)out & 31ull) == 0ull;
+                        bool out16_1 = ((unsigned long long)out & 31ull) != 0ull;
                         unsigned int st_packed_2[8];
                         float st_scaled_4[8];
-                        const float2 _scale2_39 = {inv_sum, inv_sum};
+                        const float2 _scale2_37 = {inv_sum, inv_sum};
                         #pragma unroll
                         for (int _ls = 0; _ls < 4; _ls++)
-                            reinterpret_cast<float2*>(st_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 0))[_ls], _scale2_39);
+                            reinterpret_cast<float2*>(st_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 0))[_ls], _scale2_37);
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_4[_lp*2 + 0], st_scaled_4[_lp*2+1 + 0]));
@@ -2723,10 +2721,10 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             st_packed_2[_lp + 3] = *(uint32_t*)&_bf2;
                         }
                         float st_scaled_5[8];
-                        const float2 _scale2_40 = {inv_sum, inv_sum};
+                        const float2 _scale2_38 = {inv_sum, inv_sum};
                         #pragma unroll
                         for (int _ls = 0; _ls < 4; _ls++)
-                            reinterpret_cast<float2*>(st_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 8))[_ls], _scale2_40);
+                            reinterpret_cast<float2*>(st_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 8))[_ls], _scale2_38);
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_5[_lp*2 + 0], st_scaled_5[_lp*2+1 + 0]));
@@ -2747,18 +2745,15 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_5[_lp*2 + 6], st_scaled_5[_lp*2+1 + 6]));
                             st_packed_2[_lp + 7] = *(uint32_t*)&_bf2;
                         }
-                        {
-                            const unsigned* _raw_stv8_41 = reinterpret_cast<const unsigned*>(st_packed_2);
-                            asm volatile(
-                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(out + (output_row + col_base + chunk_cols_1))), "r"(_raw_stv8_41[0]), "r"(_raw_stv8_41[1]), "r"(_raw_stv8_41[2]), "r"(_raw_stv8_41[3]), "r"(_raw_stv8_41[4]), "r"(_raw_stv8_41[5]), "r"(_raw_stv8_41[6]), "r"(_raw_stv8_41[7]) : "memory");
-                        }
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %9, 0; @p_ st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8}; }" :: "l"(out + (output_row + col_base + chunk_cols_1)), "r"(st_packed_2[(0) + 0]), "r"(st_packed_2[(0) + 1]), "r"(st_packed_2[(0) + 2]), "r"(st_packed_2[(0) + 3]), "r"(st_packed_2[(0) + 4]), "r"(st_packed_2[(0) + 5]), "r"(st_packed_2[(0) + 6]), "r"(st_packed_2[(0) + 7]), "r"((unsigned int)(out32_1)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_1)), "r"(st_packed_2[(0) + 0]), "r"(st_packed_2[(0) + 1]), "r"(st_packed_2[(0) + 2]), "r"(st_packed_2[(0) + 3]), "r"((unsigned int)(out16_1)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_1 + 8)), "r"(st_packed_2[(4) + 0]), "r"(st_packed_2[(4) + 1]), "r"(st_packed_2[(4) + 2]), "r"(st_packed_2[(4) + 3]), "r"((unsigned int)(out16_1)) : "memory");
                         unsigned int st_packed_3[8];
                         float st_scaled_6[8];
-                        const float2 _scale2_42 = {inv_sum, inv_sum};
+                        const float2 _scale2_39 = {inv_sum, inv_sum};
                         #pragma unroll
                         for (int _ls = 0; _ls < 4; _ls++)
-                            reinterpret_cast<float2*>(st_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 16))[_ls], _scale2_42);
+                            reinterpret_cast<float2*>(st_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 16))[_ls], _scale2_39);
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_6[_lp*2 + 0], st_scaled_6[_lp*2+1 + 0]));
@@ -2780,10 +2775,10 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             st_packed_3[_lp + 3] = *(uint32_t*)&_bf2;
                         }
                         float st_scaled_7[8];
-                        const float2 _scale2_43 = {inv_sum, inv_sum};
+                        const float2 _scale2_40 = {inv_sum, inv_sum};
                         #pragma unroll
                         for (int _ls = 0; _ls < 4; _ls++)
-                            reinterpret_cast<float2*>(st_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 24))[_ls], _scale2_43);
+                            reinterpret_cast<float2*>(st_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((tmem_load_0 + 24))[_ls], _scale2_40);
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_7[_lp*2 + 0], st_scaled_7[_lp*2+1 + 0]));
@@ -2804,12 +2799,9 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(st_scaled_7[_lp*2 + 6], st_scaled_7[_lp*2+1 + 6]));
                             st_packed_3[_lp + 7] = *(uint32_t*)&_bf2;
                         }
-                        {
-                            const unsigned* _raw_stv8_44 = reinterpret_cast<const unsigned*>(st_packed_3);
-                            asm volatile(
-                                "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                :: "l"((void*)(out + (output_row + col_base + chunk_cols_1 + 16))), "r"(_raw_stv8_44[0]), "r"(_raw_stv8_44[1]), "r"(_raw_stv8_44[2]), "r"(_raw_stv8_44[3]), "r"(_raw_stv8_44[4]), "r"(_raw_stv8_44[5]), "r"(_raw_stv8_44[6]), "r"(_raw_stv8_44[7]) : "memory");
-                        }
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %9, 0; @p_ st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8}; }" :: "l"(out + (output_row + col_base + chunk_cols_1 + 16)), "r"(st_packed_3[(0) + 0]), "r"(st_packed_3[(0) + 1]), "r"(st_packed_3[(0) + 2]), "r"(st_packed_3[(0) + 3]), "r"(st_packed_3[(0) + 4]), "r"(st_packed_3[(0) + 5]), "r"(st_packed_3[(0) + 6]), "r"(st_packed_3[(0) + 7]), "r"((unsigned int)(out32_1)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_1 + 16)), "r"(st_packed_3[(0) + 0]), "r"(st_packed_3[(0) + 1]), "r"(st_packed_3[(0) + 2]), "r"(st_packed_3[(0) + 3]), "r"((unsigned int)(out16_1)) : "memory");
+                        asm volatile("{ .reg .pred p_; setp.ne.b32 p_, %5, 0; @p_ st.global.v4.b32 [%0], {%1, %2, %3, %4}; }" :: "l"(out + (output_row + col_base + chunk_cols_1 + 16 + 8)), "r"(st_packed_3[(4) + 0]), "r"(st_packed_3[(4) + 1]), "r"(st_packed_3[(4) + 2]), "r"(st_packed_3[(4) + 3]), "r"((unsigned int)(out16_1)) : "memory");
                     }
 #if __CUDA_ARCH__ == 1030
                     if (my_row_1 < q_valid_4 && col_half_1 == 0 && return_lse != 0) {
@@ -2818,9 +2810,9 @@ kernel_cake_sage_block_sparse_attention_ef25366cb9d28aad7efb(const __grid_consta
                     if (my_row_1 < q_valid_1 && col_half_1 == 0 && return_lse != 0) {
                         int stat_idx = bh * seqlen_q + query;
 #endif
-                        float _log2_45;
-                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_45) : "f"(total_sum));
-                        lse[stat_idx] = ((has_mass != 0) ? (row_max_1 + _log2_45 - 8.0f) * 0.6931472f : -CUDART_INF_F);
+                        float _log2_41;
+                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_41) : "f"(total_sum));
+                        lse[stat_idx] = ((has_mass != 0) ? (row_max_1 + _log2_41 - 8.0f) * 0.6931472f : -CUDART_INF_F);
                     }
                 }
 #if __CUDA_ARCH__ == 1030
