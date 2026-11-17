@@ -13,7 +13,7 @@ import functools
 import json
 import math
 import os
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import tvm_ffi
@@ -84,7 +84,7 @@ def _disabled() -> bool:
 
 
 # Per-backend dispatch census and fallback reasons (#5667-style introspection).
-_stats: Dict[str, object] = {
+_stats: Dict[str, Any] = {
     "calls": 0,
     "backend_dispatches": {"specialized": 0, "reference": 0},
     "fallback_reasons": {},

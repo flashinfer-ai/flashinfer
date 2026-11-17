@@ -19,7 +19,6 @@ import torch
 
 from flashinfer.mla._sparse_mla_sm90 import (
     BACKENDS,
-    _auto_routes,
     _backend_order,
     _dispatch_table,
     _reset_sparse_mla_sm90_stats,
