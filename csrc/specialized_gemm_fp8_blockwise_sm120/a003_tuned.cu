@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
@@ -427,6 +428,9 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
 
 void RunTuned(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
               ffi::TensorView Y) {
+  // run_tuned is a separately exported FFI entry: set the device context
+  // before the impl reads its stream (combo_entry::Run guards its own path).
+  ffi::CUDADeviceGuard device_guard(A.device().device_id);
   a003_tuned_impl::Run(A, B, As, Bs, Y);
 }
 

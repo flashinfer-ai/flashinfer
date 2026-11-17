@@ -41,6 +41,7 @@ import torch
 
 from ..jit.core import JitSpec, gen_jit_spec
 from ..jit import env as jit_env
+from ..jit.cpp_ext import is_cuda_version_at_least
 
 _HERE = Path(__file__).parent
 
@@ -60,7 +61,8 @@ def _allowlist() -> dict:
 fallback_reasons: deque = deque(maxlen=256)
 dispatch_stats: Counter = Counter()
 
-_warmed_nk: Set[Tuple[int, int]] = set()
+# (device_index, N, K) classes warmed on that device (CUDA-graph readiness)
+_warmed_nk: Set[Tuple[int, int, int]] = set()
 
 
 def gen_specialized_gemm_fp8_blockwise_sm120_module() -> JitSpec:
@@ -149,6 +151,22 @@ def is_specialized_supported(
         and b_scale.is_contiguous()
     ):
         return _no("layout:contiguity")
+    # The kernels use 256-bit (v8.b32) operand loads and 32-bit packed bf16
+    # output stores: operand base pointers must be 32B aligned and the output
+    # base 4B aligned (offset storage views can violate this; fresh torch
+    # allocations are always 256B aligned). Scales are read as f32 and are
+    # naturally aligned for any fp32 tensor.
+    if a.data_ptr() % 32 != 0 or b.data_ptr() % 32 != 0:
+        return _no("layout:operand_alignment")
+    if out is not None and out.data_ptr() % 4 != 0:
+        return _no("layout:out_alignment")
+    # 256-bit global loads need PTX ISA 8.8, first shipped with CUDA 12.9;
+    # older toolkits would fail JIT compilation instead of running.
+    try:
+        if not is_cuda_version_at_least("12.9"):
+            return _no("toolkit:cuda_below_12.9")
+    except Exception:  # noqa: BLE001 - no detectable toolkit: cannot JIT
+        return _no("toolkit:version_unknown")
     # --- device guards
     if not _is_sm120_exactly(a.device):  # sm_121 unmeasured -> stock
         return _no("device:not_sm120")
@@ -159,7 +177,10 @@ def is_specialized_supported(
             return _no("autotune_mode")
     except Exception:  # noqa: BLE001 - autotuner surface moved: be safe
         return _no("autotune_probe_failed")
-    if torch.cuda.is_current_stream_capturing() and (N, K) not in _warmed_nk:
+    if (
+        torch.cuda.is_current_stream_capturing()
+        and (a.device.index, N, K) not in _warmed_nk
+    ):
         return _no("capture:unwarmed")
     return True
 
@@ -174,7 +195,7 @@ def run_specialized_gemm_fp8_blockwise(
     """DPS entry: Y = dequant(A) @ dequant(B).T, written into ``out``."""
     module = get_specialized_gemm_fp8_blockwise_sm120_module()
     module.run(a, b, a_scale, b_scale, out)
-    _warmed_nk.add((b.shape[0], a.shape[1]))
+    _warmed_nk.add((a.device.index, b.shape[0], a.shape[1]))
     dispatch_stats["specialized"] += 1
     return out
 
@@ -185,30 +206,39 @@ def run_composable_fallback(
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     out: torch.Tensor,
+    scale_major_mode=None,
+    scale_granularity_mnk=(1, 128, 128),
 ) -> torch.Tensor:
     """Composable torch path (dequant + matmul) for an EXPLICIT
     ``backend="specialized"`` call the kernel cannot serve. Correct for any
-    shape (including 128-unaligned N); not performance-tuned."""
+    shape (including 128-unaligned N), either scale layout, and any scale
+    granularity; not performance-tuned."""
     M, K = a.shape
     N = b.shape[0]
-    KB = K // 128
-    a32 = (
-        a.to(torch.float32).view(M, KB, 128) * a_scale.to(torch.float32).view(M, KB, 1)
-    ).view(M, K)
-    bs_rows = b_scale.to(torch.float32).repeat_interleave(128, dim=0)[:N]
-    b32 = b.to(torch.float32) * bs_rows.repeat_interleave(128, dim=1)
+    gm, gn, gk = (int(x) for x in scale_granularity_mnk)
+    a_s = a_scale.to(torch.float32)
+    b_s = b_scale.to(torch.float32)
+    if scale_major_mode == "MN":  # (k_blocks, *) -> (*, k_blocks)
+        a_s = a_s.transpose(0, 1)
+        b_s = b_s.transpose(0, 1)
+    a_full = a_s.repeat_interleave(gm, dim=0)[:M].repeat_interleave(gk, dim=1)[:, :K]
+    b_full = b_s.repeat_interleave(gn, dim=0)[:N].repeat_interleave(gk, dim=1)[:, :K]
+    a32 = a.to(torch.float32) * a_full
+    b32 = b.to(torch.float32) * b_full
     out.copy_((a32 @ b32.T).to(out.dtype))
     dispatch_stats["specialized_composable_fallback"] += 1
     return out
 
 
 def warmup(device: torch.device = None) -> None:
-    """Build the module and launch every allowlisted (N, K) class once so
-    CUDA-graph capture can dispatch the backend (lazy kernel load happens
-    here, not under capture)."""
+    """Build the module and launch every admitted M of every allowlisted
+    (N, K) class so each dispatched kernel specialization loads before
+    CUDA-graph capture (the per-class dispatcher picks different kernels
+    for different M ranges; lazy kernel load happens here, not under
+    capture). Warmup is per device."""
     dev = device or torch.device("cuda")
     for (N, K), m_max in sorted(_allowlist().items()):
-        for M in (1, m_max):
+        for M in range(1, m_max + 1):
             a = torch.zeros(M, K, dtype=torch.float8_e4m3fn, device=dev)
             b = torch.zeros(N, K, dtype=torch.float8_e4m3fn, device=dev)
             a_s = torch.ones(M, K // 128, dtype=torch.float32, device=dev)

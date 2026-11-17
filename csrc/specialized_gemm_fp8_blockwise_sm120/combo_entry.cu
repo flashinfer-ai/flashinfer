@@ -1,3 +1,4 @@
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 namespace ffi = tvm::ffi;
@@ -31,6 +32,10 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
 
 void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorView Bs,
          ffi::TensorView Y) {
+  // Make A's device current for the whole dispatch: every Run* adapter below
+  // reads its stream via TVMFFIEnvGetStream(kDLCUDA, A.device().device_id)
+  // and launches on it, which requires the matching device context.
+  ffi::CUDADeviceGuard device_guard(A.device().device_id);
   const int M = static_cast<int>(A.shape()[0]);
   const int K = static_cast<int>(A.shape()[1]);
   const int N = static_cast<int>(B.shape()[0]);

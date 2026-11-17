@@ -11390,7 +11390,15 @@ def gemm_fp8_nt_groupwise(
         ):
             _spec_run(a, b, a_scale, b_scale, out)
         else:
-            _spec_composable(a, b, a_scale, b_scale, out)
+            _spec_composable(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                out,
+                scale_major_mode,
+                scale_granularity_mnk,
+            )
         return out
 
     if backend == "cutlass":
