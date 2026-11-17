@@ -1919,7 +1919,7 @@ def cutlass_fused_moe(
 
     if use_deepseek_fp8_block_scale:
         if backend in ("auto", "specialized"):
-            # Specialized backend (agent-generated Triton kernels, SM120):
+            # Specialized backend (agent-generated CUDA kernels, SM120):
             # the only fp8 block-scale MoE path on that arch. "auto" routes
             # here on the allowlisted contract only; off-allowlist it falls
             # through to the stock path below (the explicit refusal —
@@ -1940,6 +1940,15 @@ def cutlass_fused_moe(
                 and not enable_alltoall
                 and not min_latency_mode
                 and int(activation_type) == int(ActivationType.Swiglu)
+                # Parameterized SwiGLU (SwigluBias semantics) is not
+                # implemented by the specialized kernels.
+                and swiglu_alpha is None
+                and swiglu_beta is None
+                and swiglu_limit is None
+                # The specialized kernels accumulate route outputs with
+                # floating-point atomics, so they cannot honor the
+                # deterministic (use_fused_finalize=False) contract.
+                and use_fused_finalize
             )
             out_specialized, fallback_reason = maybe_run_specialized(
                 input,

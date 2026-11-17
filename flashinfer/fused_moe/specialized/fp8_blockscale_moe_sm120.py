@@ -18,9 +18,9 @@ swapped. The dispatch surface lives in
 ``fp8_blockscale_moe_sm120_workload.json`` next to this module.
 ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time) disables the
 backend entirely. Guard order: GPU-free checks (kill switch, dtype,
-geometry, contiguity, token allowlist) -> device guards (compute
-capability, CUDA-graph warm state). Every refusal is counted in
-``fallback_reasons``.
+geometry, contiguity, device placement, pointer alignment, token
+allowlist) -> device guards (compute capability, SM count, CUDA-graph warm
+state). Every refusal is counted in ``fallback_reasons``.
 """
 
 import functools
@@ -46,6 +46,8 @@ _WORKLOAD_FILE = "fp8_blockscale_moe_sm120_workload.json"
 
 _E, _TOPK, _H, _I = 256, 8, 2048, 512
 
+# (device index, num_tokens) pairs already run eagerly in this process:
+# only these variants may be dispatched under CUDA-graph capture.
 _warmed: set = set()
 _allowlist_cache: Optional[dict] = None
 
@@ -74,6 +76,10 @@ def _load_allowlist() -> Optional[dict]:
         _allowlist_cache = {
             "min_cc": tuple(int(v) for v in payload["min_compute_capability"]),
             "max_cc": tuple(int(v) for v in payload["max_compute_capability"]),
+            # The kernels hard-code cooperative grids and barrier arrival
+            # counts for this exact SM count; other SM120 parts (e.g. RTX
+            # 5080/5090) must be refused, not served.
+            "sm_count": int(payload["multi_processor_count"]),
             "tokens": frozenset(int(v) for v in payload["num_tokens_allowlist"]),
         }
     except (
@@ -98,7 +104,7 @@ def specialized_moe_fp8_blockscale_stats() -> dict:
         **_stats,
         "fallback_reasons": dict(_stats["fallback_reasons"]),
         "allowlist": _load_allowlist(),
-        "warmed_num_tokens": sorted(_warmed),
+        "warmed_variants": sorted(_warmed),  # (device index, num_tokens)
         "kill_switch_env": _DISABLE_ENV,
     }
 
@@ -156,6 +162,33 @@ def _guard(
         return "allowlist_unavailable"
     if input.ndim != 2 or input.dtype != torch.bfloat16:
         return "input_dtype_or_rank"
+    # Every operand the kernels dereference must live on the input's CUDA
+    # device; the TensorView entry would otherwise pass a host (or
+    # wrong-device) pointer straight to the GPU.
+    if not input.is_cuda:
+        return "operand_device"
+    for t in (
+        token_selected_experts,
+        token_final_scales,
+        fc1_expert_weights,
+        fc2_expert_weights,
+        *quant_scales,
+    ):
+        if t is not None and t.device != input.device:
+            return "operand_device"
+    # Tensor-map (TMA) descriptors and vectorized loads require 16-byte
+    # base alignment; a contiguous view at an odd storage offset passes the
+    # shape checks but must be refused.
+    for t in (
+        input,
+        token_selected_experts,
+        token_final_scales,
+        fc1_expert_weights,
+        fc2_expert_weights,
+        *quant_scales,
+    ):
+        if t is not None and t.data_ptr() % 16 != 0:
+            return "operand_alignment"
     T = input.shape[0]
     if input.shape[1] != _H or not input.is_contiguous():
         return "input_geometry"
@@ -205,10 +238,21 @@ def _guard(
     cc = get_compute_capability(input.device)
     if not (allow["min_cc"] <= tuple(cc) <= allow["max_cc"]):
         return "compute_capability"
-    # CUDA-graph rule: never dispatch an unwarmed token-count variant under
-    # capture (first call JIT-compiles on the host).
-    if torch.cuda.is_current_stream_capturing() and T not in _warmed:
-        return "capture_unwarmed_variant"
+    # The kernels' cooperative grids and barrier arrival counts are sized
+    # for the validated device profile; a CC match alone (e.g. RTX
+    # 5080/5090, also SM120) is not sufficient.
+    props = torch.cuda.get_device_properties(input.device)
+    if props.multi_processor_count != allow["sm_count"]:
+        return "device_sm_count"
+    # CUDA-graph rule: never dispatch a variant under capture unless it has
+    # been run eagerly on this device (first call JIT-compiles on the
+    # host). Query capture state on the input device's current stream.
+    with torch.cuda.device(input.device):
+        if (
+            torch.cuda.is_current_stream_capturing()
+            and (input.device.index, T) not in _warmed
+        ):
+            return "capture_unwarmed_variant"
     return None
 
 
@@ -244,18 +288,30 @@ def maybe_run_specialized(
     T = input.shape[0]
     if output is None:
         output = torch.empty((T, _H), dtype=torch.bfloat16, device=input.device)
+    elif (
+        output.shape != (T, _H)
+        or output.dtype != torch.bfloat16
+        or output.device != input.device
+        or not output.is_contiguous()
+        or output.data_ptr() % 16 != 0
+    ):
+        # The early specialized return bypasses core.py's output check, so a
+        # bad caller buffer must be refused here (fail closed, never write
+        # through an undersized or misplaced pointer).
+        return None, _bump_fallback("output_form")
     output.zero_()  # kernels may accumulate partials into the output
-    dispatch_run(
-        input,
-        fc1_expert_weights,
-        quant_scales[0],
-        fc2_expert_weights,
-        quant_scales[1],
-        token_selected_experts,
-        token_final_scales,
-        output,
-    )
-    _warmed.add(T)
+    with torch.cuda.device(input.device):
+        dispatch_run(
+            input,
+            fc1_expert_weights,
+            quant_scales[0],
+            fc2_expert_weights,
+            quant_scales[1],
+            token_selected_experts,
+            token_final_scales,
+            output,
+        )
+    _warmed.add((input.device.index, T))
     _stats["specialized_dispatches"] += 1
     return output, None
 
@@ -271,23 +327,27 @@ def warmup(
     allow = _load_allowlist()
     if allow is None:
         return
-    device = device or fc1_expert_weights.device
+    device = torch.device(device or fc1_expert_weights.device)
+    device_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
     dispatch_run = _kernel_entry()
 
-    for T in sorted(t_values or allow["tokens"]):
-        x = torch.zeros((T, _H), dtype=torch.bfloat16, device=device)
-        ids = torch.zeros((T, _TOPK), dtype=torch.int32, device=device)
-        tw = torch.zeros((T, _TOPK), dtype=torch.float32, device=device)
-        out = torch.zeros((T, _H), dtype=torch.bfloat16, device=device)
-        dispatch_run(
-            x,
-            fc1_expert_weights,
-            quant_scales[0],
-            fc2_expert_weights,
-            quant_scales[1],
-            ids,
-            tw,
-            out,
-        )
-        _warmed.add(T)
+    with torch.cuda.device(device_index):
+        for T in sorted(t_values or allow["tokens"]):
+            x = torch.zeros((T, _H), dtype=torch.bfloat16, device=device)
+            ids = torch.zeros((T, _TOPK), dtype=torch.int32, device=device)
+            tw = torch.zeros((T, _TOPK), dtype=torch.float32, device=device)
+            out = torch.zeros((T, _H), dtype=torch.bfloat16, device=device)
+            dispatch_run(
+                x,
+                fc1_expert_weights,
+                quant_scales[0],
+                fc2_expert_weights,
+                quant_scales[1],
+                ids,
+                tw,
+                out,
+            )
+            _warmed.add((device_index, T))
     torch.cuda.synchronize(device)

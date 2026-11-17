@@ -32,30 +32,38 @@ import pytest
 import torch
 
 
-def _is_sm120_exactly():
+def _is_validated_sm120_device():
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability(0) == (12, 0)
+    props = torch.cuda.get_device_properties(0)
+    # The backend's dispatch surface requires the validated device profile
+    # (CC 12.0 and the exact SM count its cooperative grids are sized for),
+    # so other SM120 parts skip rather than exercise the stock refusal.
+    return (props.major, props.minor) == (12, 0) and props.multi_processor_count == 188
 
 
-def _has_cuda_13_toolkit():
+def _has_min_cuda_toolkit():
     try:
         from flashinfer.jit.cpp_ext import get_cuda_version
 
-        return get_cuda_version().major >= 13
+        v = get_cuda_version()
+        # The kernels use cvt.rn.bf16x2.e4m3x2, which ptxas accepts only
+        # from PTX ISA 9.2 (CUDA 13.2); CUDA 13.0/13.1 fail at JIT.
+        return (v.major, v.minor) >= (13, 2)
     except Exception:
         return False
 
 
 pytestmark = [
     pytest.mark.skipif(
-        not _is_sm120_exactly(),
-        reason="the specialized fp8 block-scale MoE backend is SM120-only",
+        not _is_validated_sm120_device(),
+        reason="the specialized fp8 block-scale MoE backend serves only the "
+        "validated SM120 device profile (CC 12.0, 188 SMs)",
     ),
     pytest.mark.skipif(
-        not _has_cuda_13_toolkit(),
+        not _has_min_cuda_toolkit(),
         reason="the specialized backend JIT-builds an sm_120a module "
-        "(CUDA 13 toolkit required)",
+        "(CUDA 13.2+ toolkit required for PTX ISA 9.2)",
     ),
 ]
 
