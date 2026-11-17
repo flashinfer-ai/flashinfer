@@ -420,7 +420,7 @@ class BatchInvariantAttention:
                     "kv_len >= q_len per request (the causal class)",
                 )
         config = engine.default_config(D=D)
-        if D in engine.Q2_RING and self.kind != "decode":
+        if D in engine.Q2_DEFAULT_DIMS and self.kind != "decode":
             from dataclasses import replace
 
             from .swaps.operands import arch_smem_cap

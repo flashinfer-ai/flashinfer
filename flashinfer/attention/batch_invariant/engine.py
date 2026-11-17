@@ -159,6 +159,10 @@ Q2_MIN_UNITS_PER_SM = {
     128: 4,
 }  # the paired placement halves the unit count: below this many units per SM the lost parallelism outweighs the overlap of the two
 # softmax warpgroups, so smaller batches take the one-warpgroup body with the default ring (a placement rule: same bits); per head dim
+Q2_DEFAULT_DIMS = (
+    64,
+)  # head dims whose prefill / ragged default is the paired placement; at D = 128 the placement is implemented (328 KB parts) but measured
+# slower than the one-warpgroup body on SM107, so it stays an explicit configuration (AttnConfig(q2=True))
 Q2_RING = {
     64: {True: 4, False: 3},
     128: {True: 3, False: 0},
