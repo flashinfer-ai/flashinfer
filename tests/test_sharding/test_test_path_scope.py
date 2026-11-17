@@ -129,6 +129,11 @@ def test_sm107_runner_selects_supported_lanes(
     scripts.mkdir()
     for name in ("task_test_multi_gpu_comm_kernels.sh", "test_path_scope.sh"):
         shutil.copy(REPO_ROOT / "scripts" / name, scripts)
+    # A tests/moe_ep scope also selects MegaMoE BI qualification, whose dry run
+    # calls the real qualifier with --plan relative to the working directory.
+    qualifier = Path("tests/moe_ep/qualify_batch_invariant.py")
+    (tmp_path / qualifier).parent.mkdir(parents=True)
+    shutil.copy(REPO_ROOT / qualifier, tmp_path / qualifier)
     # Exercise selection through the real wrapper before package setup or launch.
     (scripts / "test_utils.sh").write_text(
         'source "${SCRIPT_DIR}/test_path_scope.sh"\n'
@@ -155,6 +160,7 @@ def test_sm107_runner_selects_supported_lanes(
         PATH=f"{Path(sys.executable).parent}{os.pathsep}{env['PATH']}",
         TEST_PATH=test_path,
         EP_SETUP_LOG=str(setup_log),
+        JUNIT_DIR=str(tmp_path / "junit"),
     )
     result = subprocess.run(
         ["bash", str(scripts / "task_test_multi_gpu_comm_kernels.sh")],
