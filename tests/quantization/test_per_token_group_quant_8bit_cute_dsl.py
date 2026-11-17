@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the specialized CuTe-DSL sm90 backend of per_token_group_quant_8bit."""
 
+import functools
+
 import pytest
 import torch
 
 from flashinfer.cute_dsl.availability import is_cute_dsl_available
+from flashinfer.cutile import is_cuda_tile_available
 from flashinfer.quantization import per_token_group_quant_8bit
 from flashinfer.quantization.fp8_quantization import (
     PER_TOKEN_GROUP_QUANT_BACKENDS,
@@ -23,6 +26,31 @@ requires_fast_path = pytest.mark.skipif(
     or not is_cute_dsl_available(),
     reason="needs an sm90 device and the nvidia-cutlass-dsl runtime",
 )
+
+
+@functools.cache
+def _stock_cutile_usable() -> bool:
+    """Whether the stock cutile backend can actually serve a call here.
+
+    The cuda.tile JIT needs the ``tileiras`` compiler at run time; CI images
+    without a full CTK (13.1+) or the ``cuda-tile[tileiras]`` extra import
+    ``cuda.tile`` fine (so ``is_cuda_tile_available()`` is True) but fail at
+    the first compile. The tests that exercise the stock cutile route — the
+    same route the upstream cutile test module runs — skip there, exactly
+    like that module does on machines without cuda.tile."""
+    if not torch.cuda.is_available() or not is_cuda_tile_available():
+        return False
+    try:
+        x = torch.ones((1, 128), device="cuda", dtype=torch.bfloat16)
+        per_token_group_quant_8bit(x, 128, backend="cutile")
+        return True
+    except Exception:
+        return False
+
+
+def _skip_unless_stock_cutile_usable() -> None:
+    if not _stock_cutile_usable():
+        pytest.skip("stock cutile backend unavailable (cuda.tile cannot compile here)")
 
 
 def _reference(x: torch.Tensor, eps: float = 1e-10):
@@ -81,18 +109,20 @@ def test_specialized_matches_reference(shape, backend):
 
 
 @requires_fast_path
-def test_explicit_stock_backends_never_swapped():
+@pytest.mark.parametrize("stock", ["cutile", "cuda"])
+def test_explicit_stock_backends_never_swapped(stock):
     """backend='cutile' / 'cuda' never reach the specialized kernel, even
     on a fully on-contract call."""
+    if stock == "cutile":
+        _skip_unless_stock_cutile_usable()
     torch.manual_seed(11)
     x = torch.empty((16, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-2, 2)
     assert _eligible(x)
-    for stock in ("cutile", "cuda"):
-        _reset_per_token_group_quant_stats()
-        q, s = per_token_group_quant_8bit(x, 128, backend=stock)
-        assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
-        assert _ptgq_stats["fallback_reasons"] == {}
-        assert q.dtype == torch.float8_e4m3fn and s.dtype == torch.float32
+    _reset_per_token_group_quant_stats()
+    q, s = per_token_group_quant_8bit(x, 128, backend=stock)
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
+    assert _ptgq_stats["fallback_reasons"] == {}
+    assert q.dtype == torch.float8_e4m3fn and s.dtype == torch.float32
 
 
 @requires_fast_path
@@ -107,6 +137,8 @@ def test_unknown_backend_raises():
     "env", [SPECIALIZED_KERNEL_DISABLE_ENV, PER_TOKEN_GROUP_QUANT_CUTE_DSL_DISABLE_ENV]
 )
 def test_kill_switches_match_stock(monkeypatch, env):
+    # The kill-switch fallback serves the call on the stock cutile route.
+    _skip_unless_stock_cutile_usable()
     torch.manual_seed(7)
     x = torch.empty((64, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-3, 3)
 
@@ -137,6 +169,8 @@ def test_kill_switches_match_stock(monkeypatch, env):
     ],
 )
 def test_option_forms_stay_on_stock_path(kwargs):
+    # Off-contract forms are served by the composable stock cutile route.
+    _skip_unless_stock_cutile_usable()
     x = torch.empty((8, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
     group_size = kwargs.pop("group_size", 128)
     dst_dtype = kwargs.pop("dst_dtype", torch.float8_e4m3fn)
