@@ -79,7 +79,7 @@ RMSNORM_BACKENDS = ("auto", "specialized", "stock")
 _DISPATCH_FILE = "rmsnorm_serve_sm90_dispatch.json"
 
 # Per-backend dispatch census and fallback reasons (#5667-style).
-_stats = {
+_stats: dict = {
     "calls": 0,
     "backend_dispatches": {"specialized": 0, "stock": 0},
     "variant_dispatches": {"cutedsl": 0, "cuda": 0},
@@ -301,7 +301,7 @@ if _HAS_CUTE_DSL:
             stream=stream,
         )
 
-    _COMPILED = {}
+    _COMPILED: dict = {}
 
     def _build(h, torch_dtype):
         dt = _TORCH2CUTE[torch_dtype]
