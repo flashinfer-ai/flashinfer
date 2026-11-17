@@ -736,7 +736,22 @@ def test_misaligned_buffers_are_refused():
     shifted = dict(tok, q=flat[2:].view(1, h, D))
     with pytest.raises(RuntimeError, match="boundary"):
         bi_decode(shifted, new_pool([s], [0]), [0], p)
-    torch.cuda.synchronize()
+    # a prefill copies a misaligned row instead (it reads its lengths back anyway)
+    two = sub(s, 0, 2)
+    flat = torch.zeros(2 * h * D + 2, dtype=torch.bfloat16, device="cuda")
+    flat[2:].copy_(two["q"].flatten())
+    cu = torch.tensor([0, 2], device="cuda")
+    args = [flat[2:].view(1, 2, h, D)] + [
+        two[key][None] for key in ("k", "v", "g", "beta")
+    ]
+    got, _ = recurrent_kda(
+        *args,
+        initial_state=new_pool([s], [0]),
+        cu_seqlens=cu,
+        batch_invariant=True,
+        **_fused(p),
+    )
+    assert same_bits(got[0], bi_prefill([two], new_pool([s], [0]), [0], p))
 
 
 @needs_device
@@ -756,8 +771,11 @@ def test_overlapping_pool_extent_is_refused():
     bi_decode(
         token(s, 0), big[2], [0], p
     )  # a disjoint extent of the same buffer is a pool of its own
-    rows += [bi_decode(token(s, pos), pool, [0], p) for pos in range(5, 20)]
-    assert same_bits(torch.cat(rows, 0), ref[:20])
+    rows += [bi_decode(token(s, pos), pool, [0], p) for pos in range(5, 32)]
+    assert same_bits(torch.cat(rows, 0), ref[:32])
+    # every chunk of the pool is closed: another extent of it takes over
+    rows = [bi_decode(token(s, pos), pool[:1], [0], p) for pos in range(32, 40)]
+    assert same_bits(torch.cat(rows, 0), ref[32:40])
 
 
 @needs_device

@@ -70,14 +70,18 @@ def get_pool(pool: torch.Tensor) -> "ExactPool":
             "a pool whose first element is 16-byte aligned (the kernels load 16 bytes at a time)",
         )
     first, last = key[1], key[1] + pool.numel()
-    for storage, offset, shape in _POOLS:
-        # another extent of a tracked buffer would start with empty rows: its history is under the other key
-        if storage == key[0] and offset < last and first < offset + math.prod(shape):
+    for other in list(_POOLS):
+        storage, offset, shape = other
+        if storage != key[0] or offset >= last or first >= offset + math.prod(shape):
+            continue
+        # another extent of a tracked buffer starts with empty rows: fine only if the tracked one has none open
+        if bool(_POOLS[other][0].cnt.any()):
             raise unsupported(
                 CLASS,
-                "a state pool that overlaps a pool of another shape or offset on the same buffer",
+                "a state pool that overlaps a pool of another shape or offset on the same buffer while that pool has open chunks",
                 "the same pool extent on every call (its open rows are kept per extent)",
             )
+        del _POOLS[other]
     ep = ExactPool(pool)
     _POOLS[key] = (ep, StorageWeakRef(pool.untyped_storage()))
     return ep
