@@ -207,6 +207,22 @@ def _pick_tile_shape(
     return grouped_head_tile, prediction_tile
 
 
+def _grid_yz(
+    batch_size: int,
+    num_kv_heads: int,
+    grouped_head_tile: int,
+    prediction_tile: int,
+    grouped_heads: int,
+    prediction: int,
+) -> int:
+    """CTAs per KV split: (grouped-head tiles x prediction tiles) x (batch x KV heads)."""
+    ceil_div = lambda a, b: (a + b - 1) // b
+    grid_y = ceil_div(grouped_heads, grouped_head_tile) * ceil_div(
+        prediction, prediction_tile
+    )
+    return grid_y * batch_size * num_kv_heads
+
+
 def _compute_kv_splits(
     batch_size: int,
     num_kv_heads: int,
@@ -218,40 +234,52 @@ def _compute_kv_splits(
     sm_count: int,
     reduction: str,
 ) -> int:
-    """Replicate ``gqa_decode.run`` kv_splits auto-computation."""
+    """Replicate ``gqa_decode.run`` kv_splits auto-computation, rounded down.
+
+    kv_splits is a compile-time value for the kernel reducer, so round down
+    kv_splits to buckets (powers of two capped by SM count) to avoid many
+    recompilations. Callers of BatchDecodeCuteDSLWrapper and
+    BatchDecodePagedCuteDSLWrapper can pass an explicit kv_splits to override
+    this bucketing behaviour.
+    """
     if reduction == "none":
         return 1
     ceil_div = lambda a, b: (a + b - 1) // b
-    grouped_head_tiles = ceil_div(grouped_heads, grouped_head_tile)
-    prediction_tiles = ceil_div(prediction, prediction_tile)
-    grid_z = batch_size * num_kv_heads
-    grid_y = grouped_head_tiles * prediction_tiles
-    grid_yz = grid_y * grid_z
+    grid_yz = _grid_yz(
+        batch_size,
+        num_kv_heads,
+        grouped_head_tile,
+        prediction_tile,
+        grouped_heads,
+        prediction,
+    )
     sm_count = sm_count if sm_count > 0 else 148
     kv_splits = max(1, sm_count // grid_yz)
     if sm_count == 148 and grid_yz == 32:
         kv_splits = 9  # 2 waves
     kv_splits = min(kv_splits, max(1, ceil_div(max_kv_len, 256)))
+    batch1_max_splits = max(1, sm_count // (grid_yz // batch_size))
+    if kv_splits != batch1_max_splits and kv_splits != 9:
+        rounded = 1 << (kv_splits.bit_length() - 1)  # floor to a power of two
+        if kv_splits >= sm_count // 8:
+            rounded = max(rounded, sm_count // 8)
+        kv_splits = rounded
     if reduction == "atomic" and kv_splits not in (1, 2, 4):
         kv_splits = 8
     return kv_splits
 
 
-def _resolve_reduction(reduction: str, kv_splits: int, o_dtype: "cutlass.dtype") -> str:
+def _resolve_reduction(
+    reduction: str, kv_splits: int, o_dtype: "cutlass.dtype", grid_yz: int
+) -> str:
     if reduction != "auto":
         return reduction
     if kv_splits == 1:
         # No split-K — skip flash-decoding entirely (no reduction kernel,
         # no cluster atomics).
         return "none"
-    if o_dtype in (
-        cutlass.Float32,
-        cutlass.Float16,
-        cutlass.BFloat16,
-    ) and kv_splits in (
-        2,
-        4,
-        8,
+    if o_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16) and (
+        kv_splits in (2, 4) or (kv_splits == 8 and grid_yz * kv_splits <= 120)
     ):
         return "atomic"
     return "kernel"
@@ -816,7 +844,15 @@ class BatchDecodeCuteDSLWrapper:
                 get_num_sm(self.device),
                 reduction,
             )
-        reduction = _resolve_reduction(reduction, kv_splits, out_dtype)
+        grid_yz = _grid_yz(
+            batch_size,
+            num_kv_heads,
+            grouped_head_tile,
+            prediction_tile,
+            num_qo_heads // num_kv_heads,
+            q_len_per_req,
+        )
+        reduction = _resolve_reduction(reduction, kv_splits, out_dtype, grid_yz)
         if reduction == "atomic":
             if kv_splits not in (1, 2, 4, 8, 16):
                 raise ValueError(
@@ -1339,7 +1375,15 @@ class BatchDecodePagedCuteDSLWrapper:
                 get_num_sm(self.device),
                 reduction,
             )
-        reduction = _resolve_reduction(reduction, kv_splits, out_dtype)
+        grid_yz = _grid_yz(
+            batch_size,
+            num_kv_heads,
+            grouped_head_tile,
+            prediction_tile,
+            num_qo_heads // num_kv_heads,
+            q_len_per_req,
+        )
+        reduction = _resolve_reduction(reduction, kv_splits, out_dtype, grid_yz)
         if reduction == "atomic":
             if kv_splits not in (1, 2, 4, 8, 16):
                 raise ValueError(
