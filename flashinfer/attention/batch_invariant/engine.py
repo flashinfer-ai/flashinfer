@@ -667,7 +667,11 @@ def _run_attention_validated(
     o_view = out.view(total_q * Hq, D)
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
     sm = torch.cuda.get_device_properties(q.device).multi_processor_count
-    grid = config.grid if config.grid else min(plan.num_units, sm)
+    grid = (
+        config.grid
+        if config.grid
+        else (getattr(plan, "grid", 0) or min(plan.num_units, sm))
+    )  # the planner's grid (Swaps batches: plan.swaps_unit_kinds) unless the configuration fixes one
     grid = max(1, min(grid, plan.num_units))
     assert planned.fold_counters is not None and planned.scratch is not None, (
         "plan_attention must be called with the same (FMHA) config"

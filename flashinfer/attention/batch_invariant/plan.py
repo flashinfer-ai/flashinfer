@@ -47,14 +47,30 @@ DESC_FIELDS = 16
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
 INKERNEL_MAX_CHUNKS = 2  # in-kernel (measured faster for small decode batches, within noise at B = 1); wider groups (prefill split
 FUSE2_MIN_ROWS = 8  # D = 256 two-chunk rule (build_plan): fused decode-sized units only from this many live rows (g x q_len) per unit
-SWAPS_FUSE_MAX_CHUNKS = 4  # Swaps-body batches (small_swap): units of at most this many chunks stay FUSED when the batch has at least
-SWAPS_FUSE_MIN_UNITS = 48  # SWAPS_FUSE_MIN_UNITS of them (the split kind's second
-# ramp + fold cost more than 1-3 extra chunks of streaming -- measured fused faster at B = 8 / 64 with short rows, every D;
-# at B = 1 (4-8 units) the split's parallelism wins from 2 chunks up and the batch stays below the unit floor)
-FUSED_FILL_MIN_D64 = 0.9  # D = 64 Swaps-body batches that the 2 x SM rule keeps fused: when the fused units fill their waves of SM
-LONG_SPLIT_MIN_CHUNKS = 16  # CTAs under this fraction (a part-filled last wave) and every unit has at least LONG_SPLIT_MIN_CHUNKS chunks,
-# the units split instead -- the 4-tile units balance the grid and the D = 64 body streams below the HBM rate per CTA, so the
-# split kind's partial rows and fixup cost less than the fused walk's idle CTAs (a placement)
+# ---- the unit kinds and the launch grid of a Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows`` rows): a makespan
+# model decides per batch (``swaps_unit_kinds``); every choice computes the same bits (R3). Costs are in units of one 128-key tile of
+# D = 128 with every SM streaming at the HBM rate; a D-wide tile costs D / 128 of it. Empirical constants of the Swaps body
+STREAM_SAT_FRACTION = {
+    64: 0.78,
+    128: 0.42,
+    256: 0.30,
+}  # per head dim: the fraction of the SMs whose CTAs, each walking one unit, together reach the HBM rate (the HBM rate over a lone
+# CTA's stream rate, over the SM count): a wave of fewer CTAs is bound by the per-CTA rate, a fuller wave by the HBM rate
+GRID_MIN_FRACTION = 0.45  # a multi-wave fused walk keeps at least this fraction of the SMs (and the saturating fraction): above it
+# the HBM rate holds and fewer concurrent streams run the HBM more efficiently
+GRID_LONG_TILES = 16  # units of fewer tiles keep the default grid unless its last wave is under a third full: their boundary
+# pauses outweigh what integral waves save
+FIRST_WAVE_RAMP = 2.0  # the first wave's loads contend (every CTA's opening burst of tiles): a cost growing with the CTAs of the
+# first wave and the tile bytes
+UNIT_BUBBLE = {
+    64: 0.6,
+    128: 2.0,
+    256: 2.0,
+}  # per head dim: a CTA's stream pauses at every unit boundary (the next unit's opening tiles and the epilogue hand-off), a fixed
+# cost per unit on the per-CTA-bound side, hidden while the wave is bound by the HBM rate
+FIXUP_BASE_COST = 2.9  # the fixup kernel's cost on the critical path beyond the attention kernel's end: a fixed part ...
+FIXUP_ROW_COST = 0.0012  # ... plus this per live row of its groups
+INKERNEL_FOLD_COST = 1.4  # the in-kernel last-arriver fold of a group of at most INKERNEL_MAX_CHUNKS chunks, per wave of groups
 WIDE_SPLIT_SM_FRACTION = 4  # merge-agnostic unit-kind rule of ``"auto"`` for units wider than INKERNEL_MAX_ROWS rows (prefill tiles): they
 # split only when the fused units would occupy fewer than 1 / this of the SMs. A wide split unit costs its 128 x D fp32 partial rows
 # and the fixup's fold of them, so a split that merely balances a part-filled machine loses to the fused unit; the narrow (decode)
@@ -115,6 +131,8 @@ class Plan:
     num_launch: Optional[int] = (
         None  # the paired placement's launch count (pairs of units), else None
     )
+    grid: int = 0  # the launch grid the planner chose for a Swaps-body batch (``swaps_unit_kinds``), 0 = min(units, SMs); a launch
+    # parameter (I10): an explicit ``AttnConfig.grid`` overrides it
 
     @property
     def num_units(self) -> int:
@@ -147,6 +165,99 @@ def kv_lengths(
     return out
 
 
+def swaps_kind_cost(
+    units: Sequence[tuple],
+    split: Sequence[bool],
+    grid: int,
+    sm_count: int,
+    D: int,
+    inkernel_max_chunks: int,
+) -> float:
+    """The predicted makespan of a Swaps-body batch whose unit ``i`` -- ``units[i] = (tiles, chunk_tiles, rows)`` with ``chunk_tiles``
+    the tiles of each of its chunks -- is split into one unit per chunk when ``split[i]``, walked by ``grid`` persistent CTAs. The
+    walk takes the units longest first in waves of ``grid``; a wave costs its longest unit's tiles at the rate of its active CTAs (the
+    HBM rate from ``STREAM_SAT_FRACTION`` of the SMs up; below it the per-CTA rate plus the unit boundary's bubble), the first wave
+    adds its opening burst's contention, the split groups add the fixup kernel's cost or the in-kernel fold's per wave of folding
+    units."""
+    scale = D / 128
+    lengths: List[int] = []
+    fixup_rows = 0
+    inkernel_groups = 0
+    for (tiles, chunk_tiles, rows), s in zip(units, split, strict=True):
+        if s and len(chunk_tiles) > 1:
+            lengths.extend(chunk_tiles)
+            if len(chunk_tiles) > inkernel_max_chunks:
+                fixup_rows += rows
+            else:
+                inkernel_groups += 1
+        else:
+            lengths.append(tiles)
+    if not lengths:
+        return 0.0
+    lengths.sort(reverse=True)
+    grid = max(1, min(grid, len(lengths)))
+    sat = STREAM_SAT_FRACTION[D] * sm_count
+    cost = 0.0
+    for w in range(0, len(lengths), grid):
+        wave = lengths[w : w + grid]
+        cost += max(
+            wave[0] * scale * sat / sm_count + UNIT_BUBBLE[D],
+            wave[0] * scale * len(wave) / sm_count,
+        )
+    cost += FIRST_WAVE_RAMP * scale * grid / sm_count
+    if fixup_rows:
+        cost += FIXUP_BASE_COST + FIXUP_ROW_COST * fixup_rows
+    if inkernel_groups:
+        cost += INKERNEL_FOLD_COST * -(-inkernel_groups // grid)
+    return cost
+
+
+def swaps_fused_grids(
+    num_units: int, sm_count: int, D: int, tiles: int = GRID_LONG_TILES
+) -> List[int]:
+    """The launch grids a fused walk of ``num_units`` equal units of ``tiles`` tiles may take: ``min(num_units, sm_count)`` and, for
+    every wave count, the grid that spreads the units over integral waves (``ceil(units / waves)``) while keeping ``GRID_MIN_FRACTION``
+    of the SMs and the saturating CTA count, so that no part-filled last wave of long units streams below the HBM rate; units under
+    ``GRID_LONG_TILES`` tiles get the alternatives only when the default grid's last wave is under a third full."""
+    grids = [min(num_units, sm_count)]
+    waves = -(-num_units // sm_count)
+    if tiles < GRID_LONG_TILES and 3 * (num_units - (waves - 1) * sm_count) >= sm_count:
+        return grids
+    floor = sm_count * max(GRID_MIN_FRACTION, STREAM_SAT_FRACTION[D])
+    while True:
+        g = -(-num_units // waves)
+        if g < floor:
+            break
+        if g <= sm_count and g not in grids:
+            grids.append(g)
+        waves += 1
+    return grids
+
+
+def swaps_unit_kinds(
+    units: Sequence[tuple], sm_count: int, D: int, inkernel_max_chunks: int
+) -> tuple:
+    """The unit kinds and the launch grid of a Swaps-body batch under ``"auto"`` (``units`` as in ``swaps_kind_cost``): ``(split, grid)``
+    with ``split[i]`` whether unit ``i`` splits into its chunks. The candidates are every unit fused on each grid of
+    ``swaps_fused_grids`` and every multi-chunk unit split on the full grid; the cheapest wins (among equal fused grids the one of
+    most waves: the fewest CTAs that still stream at the HBM rate). A placement: every choice computes the same bits."""
+    n = len(units)
+    if n == 0:
+        return [], 0
+    fused = [False] * n
+    best_grid, best_cost = 0, float("inf")
+    for g in swaps_fused_grids(n, sm_count, D, max(u[0] for u in units)):
+        c = swaps_kind_cost(units, fused, g, sm_count, D, inkernel_max_chunks)
+        if c <= best_cost:
+            best_grid, best_cost = g, c
+    split = [len(u[1]) > 1 for u in units]
+    if any(split):
+        c = swaps_kind_cost(units, split, sm_count, sm_count, D, inkernel_max_chunks)
+        if c < best_cost:
+            return split, 0
+    return fused, best_grid
+
+
 def build_plan(
     qo_indptr: Sequence[int],
     kv_indptr: Sequence[int],
@@ -164,21 +275,21 @@ def build_plan(
     swap_max_rows: int = INKERNEL_MAX_ROWS,
     grid: int = 0,
 ) -> Plan:
-    """``split_policy``: ``"auto"`` splits every multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows (a decode unit) when the fused
-    unit count would leave the machine underfilled (``< 2 x SM``) -- and, in a D = 64 Swaps batch, the tiles of at least
-    ``LONG_SPLIT_MIN_CHUNKS`` chunks when the fused units would leave their last wave of CTAs part-filled (``FUSED_FILL_MIN_D64``) --,
-    a wider tile (a prefill unit) only when the fused units would fill
-    under ``1 / WIDE_SPLIT_SM_FRACTION`` of the SMs -- and, at head dims whose merged state is not in TMEM (D = 256), every multi-chunk
-    tile of at most ``INKERNEL_MAX_ROWS`` rows (decode units) whatever the count: a fused decode unit there merges a 128 x 256 fp32
-    state through the global scratch at every chunk end, and the split kind measured faster at long KV lengths
-    -- except the TWO-chunk decode-sized units of at least ``FUSE2_MIN_ROWS`` live rows in a batch whose fused unit count exceeds
-    half the SM count, which stay fused (one in-kernel merge against two unit ramps and the fixup node); ``"split"`` / ``"fused"``
-    force one kind (R3: same bits).
+    """``split_policy``: ``"auto"`` chooses the unit kinds. A Swaps-body batch (``small_swap``: every unit at most ``swap_max_rows``
+    live rows) takes the kinds and the launch grid of ``swaps_unit_kinds`` (a makespan model over the SM count: every unit fused on
+    the grid of integral waves, or every multi-chunk unit split). Otherwise a multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows
+    (a decode unit) splits when the fused unit count would leave the machine underfilled (``< 2 x SM``), a wider tile (a prefill
+    unit) only when the fused units would fill under ``1 / WIDE_SPLIT_SM_FRACTION`` of the SMs -- and, at head dims whose merged state
+    is not in TMEM (D = 256), every multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows (decode units) whatever the count: a fused
+    decode unit there merges a 128 x 256 fp32 state through the global scratch at every chunk end, and the split kind measured
+    faster at long KV lengths -- except the TWO-chunk decode-sized units of at least ``FUSE2_MIN_ROWS`` live rows in a batch whose
+    fused unit count exceeds half the SM count, which stay fused (one in-kernel merge against two unit ramps and the fixup node);
+    ``"split"`` / ``"fused"`` force one kind (R3: same bits).
     ``merge``: where a split group's chunk fold runs -- ``"auto"`` (in-kernel for groups of at most
     ``INKERNEL_MAX_ROWS`` rows, the fixup kernel otherwise), ``"fixup"`` (always the kernel), ``"inkernel"``
     (always in-kernel); the same fold in the same order either way (R3: same bits).
-    ``grid``: the persistent grid the launch will use (0: ``min(units, sm_count)``), so that the unit order's waves
-    (``snake_order``) are the waves the CTAs actually walk."""
+    ``grid``: the persistent grid the launch will use (0: the planner's ``Plan.grid`` if it chose one, else ``min(units, sm_count)``),
+    so that the unit order's waves (``snake_order``) are the waves the CTAs actually walk."""
     assert merge in ("auto", "fixup", "inkernel"), merge
     assert Hq % Hkv == 0, (Hq, Hkv)
     g = Hq // Hkv
@@ -243,30 +354,47 @@ def build_plan(
         split_policy == "auto" and not om_tmem and 2 * len(tiles) > sm_count
     )
     inkernel_max_chunks = INKERNEL_MAX_CHUNKS if om_tmem else INKERNEL_MAX_CHUNKS_OF[D]
-    split_long64 = False  # the D = 64 part-filled-wave rule (see FUSED_FILL_MIN_D64)
-    if split_policy == "auto" and swap_batch and D == 64 and len(tiles) >= 2 * sm_count:
-        waves = -(-len(tiles) // sm_count)
-        split_long64 = len(tiles) < FUSED_FILL_MIN_D64 * waves * sm_count
     plan = Plan(tokens_per_tile=tpt, g=g, ws_row=ws_row(D))
-    swaps_fuse = (
-        swap_batch and split_policy == "auto" and len(tiles) >= SWAPS_FUSE_MIN_UNITS
-    )  # the Swaps body's short-unit rule
-    for b, h, tok0, ntok, clo, chi, tlo, thi, kv_len, q_len in tiles:
-        rows = ntok * g
-        two_chunk_fused = (
-            fuse_two_chunk
-            and chi - clo == 2
-            and FUSE2_MIN_ROWS <= rows <= INKERNEL_MAX_ROWS
+    tpc = C // T
+    swaps_kinds: Optional[List[bool]] = (
+        None  # per tile: split? (Swaps-body batches under "auto")
+    )
+    if split_policy == "auto" and swap_batch:
+        swaps_kinds, plan.grid = swaps_unit_kinds(
+            [
+                (
+                    thi - tlo,
+                    [
+                        min(thi, (j + 1) * tpc) - max(tlo, j * tpc)
+                        for j in range(clo, chi)
+                    ],
+                    ntok * g,
+                )
+                for _, _, _, ntok, clo, chi, tlo, thi, _, _ in tiles
+            ],
+            sm_count,
+            D,
+            inkernel_max_chunks,
         )
-        swaps_fused = swaps_fuse and chi - clo <= SWAPS_FUSE_MAX_CHUNKS
-        do_split = do_split_narrow if rows <= INKERNEL_MAX_ROWS else do_split_wide
-        do_split = do_split or (split_long64 and chi - clo >= LONG_SPLIT_MIN_CHUNKS)
-        if (
-            chi - clo == 1
-            or two_chunk_fused
-            or swaps_fused
-            or not (do_split or (split_small and rows <= INKERNEL_MAX_ROWS))
-        ):
+        if plan.grid == min(len(tiles), sm_count):
+            plan.grid = 0  # the default launch grid
+    for i, (b, h, tok0, ntok, clo, chi, tlo, thi, kv_len, q_len) in enumerate(tiles):
+        rows = ntok * g
+        if swaps_kinds is not None:
+            fused_unit = chi - clo == 1 or not swaps_kinds[i]
+        else:
+            two_chunk_fused = (
+                fuse_two_chunk
+                and chi - clo == 2
+                and FUSE2_MIN_ROWS <= rows <= INKERNEL_MAX_ROWS
+            )
+            do_split = do_split_narrow if rows <= INKERNEL_MAX_ROWS else do_split_wide
+            fused_unit = (
+                chi - clo == 1
+                or two_chunk_fused
+                or not (do_split or (split_small and rows <= INKERNEL_MAX_ROWS))
+            )
+        if fused_unit:
             plan.desc.append(
                 [
                     b,
@@ -298,7 +426,6 @@ def build_plan(
             [base, rows, clo, n, tok0, h, kv_len, q_len, qo_indptr[b], b]
         )
         plan.group_inkernel.append(ik)
-        tpc = C // T
         for j in range(clo, chi):
             tl, th = (
                 max(tlo, j * tpc),
@@ -330,7 +457,8 @@ def build_plan(
     # next wave's short ones. A placement: the order of units reaches no value (every unit restarts its state)
     plan.desc.sort(key=lambda d: -(d[F_TILE_HI] - d[F_TILE_LO]))
     plan.desc = snake_order(
-        plan.desc, min(len(plan.desc), grid if grid > 0 else sm_count)
+        plan.desc,
+        min(len(plan.desc), grid if grid > 0 else (plan.grid or sm_count)),
     )
     return plan
 

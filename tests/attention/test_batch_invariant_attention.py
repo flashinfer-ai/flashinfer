@@ -529,6 +529,69 @@ def test_planner_snake_order():
         assert lengths == ref, (sm, grid)
 
 
+def test_planner_swaps_unit_kinds():
+    """The Swaps-body unit-kind model (``plan.swaps_unit_kinds``; placements: every choice computes the same bits): every unit fused
+    on the grid of integral waves when the fused walk reaches the HBM rate, every multi-chunk unit split when there are too few units;
+    the per-CTA stream rate differs per head dim; non-Swaps batches keep the 2 x SM rule."""
+    from flashinfer.attention.batch_invariant import plan as P
+
+    SM = 212
+
+    def decode(B, L, D, sm=SM, swap=True, page=32):
+        per = -(-L // page)
+        qo = list(range(B + 1))
+        kv = [b * per for b in range(B + 1)]
+        last = [L - (per - 1) * page] * B
+        return P.build_plan(
+            qo, kv, last, 32, 8, D, page, sm_count=sm, small_swap=swap, swap_max_rows=8
+        )
+
+    def kinds(plan):
+        fused = sum(1 for d in plan.desc if d[P.F_MODE] == 0)
+        return fused, plan.num_units - fused, len(plan.groups), plan.grid
+
+    # D = 128, 16-chunk units: 128 units (B = 16) stream at the HBM rate fused on the default grid; 64 (B = 8) do not and split;
+    # 256 (B = 32) take two integral waves of 128 CTAs instead of 1.2 waves of 212; 512 (B = 64) five waves of 103
+    assert kinds(decode(16, 8192, 128)) == (128, 0, 0, 0)
+    assert kinds(decode(8, 8192, 128)) == (0, 1024, 64, 0)
+    assert kinds(decode(32, 8192, 128)) == (256, 0, 0, 128)
+    assert kinds(decode(64, 8192, 128)) == (512, 0, 0, 103)
+    assert kinds(decode(24, 8192, 128)) == (192, 0, 0, 96)
+    assert kinds(decode(1, 8192, 128)) == (0, 128, 8, 0)
+    # short fused units (two chunks) keep the default grid unless its last wave is nearly empty
+    assert kinds(decode(32, 1024, 128)) == (256, 0, 0, 128)
+    assert kinds(decode(64, 1024, 128)) == (512, 0, 0, 0)
+    assert kinds(decode(256, 1024, 128)) == (2048, 0, 0, 0)
+    # two-chunk units: fused from a few units up (the in-kernel fold and the first wave's burst), split at B = 1
+    assert kinds(decode(8, 1024, 128)) == (64, 0, 0, 0)
+    assert kinds(decode(1, 1024, 128)) == (0, 16, 8, 0)
+    # D = 64: a lone CTA streams at about half the D = 128 rate, so 128 units of 16 chunks split, and 512 units take three
+    # integral waves of 171 CTAs (above the D = 64 saturating count) rather than a split
+    assert kinds(decode(16, 8192, 64)) == (0, 2048, 128, 0)
+    assert kinds(decode(8, 1024, 64)) == (64, 0, 0, 0)
+    assert kinds(decode(64, 32768, 64)) == (512, 0, 0, 171)
+    assert kinds(decode(32, 8192, 64)) == (0, 4096, 256, 0)
+    # D = 256: a lone CTA streams faster, so 64 units fuse
+    assert kinds(decode(8, 8192, 256)) == (64, 0, 0, 0)
+    assert kinds(decode(32, 8192, 256)) == (256, 0, 0, 128)
+    # the decision follows the SM count (a launch parameter, never the bits): 128 units on a 1000-SM part split, 512 units on a
+    # 148-SM part take seven waves of 74
+    assert kinds(decode(16, 8192, 128, sm=1000))[0] == 0
+    assert kinds(decode(64, 8192, 128, sm=148)) == (512, 0, 0, 74)
+    # the fused grids: the default and every integral-wave grid above the floor, longest-first waves; the chosen one is the cheapest
+    assert P.swaps_fused_grids(512, SM, 128) == [212, 171, 128, 103]
+    assert P.swaps_fused_grids(128, SM, 128) == [128]
+    units = [(64, [4] * 16, 4)] * 512
+    costs = {
+        g: P.swaps_kind_cost(units, [False] * 512, g, SM, 128, 2)
+        for g in P.swaps_fused_grids(512, SM, 128)
+    }
+    assert min(costs, key=costs.get) == 103 and costs[103] < costs[212]
+    assert P.swaps_unit_kinds([], SM, 128, 2) == ([], 0)
+    # a non-Swaps batch (the row body's replicated placement) keeps the 2 x SM rule: 128 units split
+    assert kinds(decode(16, 8192, 128, swap=False)) == (0, 2048, 128, 0)
+
+
 def test_cache_key_covers_every_kernel_source():
     from flashinfer.batch_invariant.jit import relative_sources
 
