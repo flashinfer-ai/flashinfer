@@ -5,6 +5,8 @@ import torch
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
 from flashinfer.gemm import grouped_gemm_nt_masked
+from flashinfer.quantization.fp4_quantization import scaled_fp4_grouped_quantize
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import get_compute_capability
 
@@ -29,16 +31,21 @@ def _swizzle_sf(sf: torch.Tensor) -> torch.Tensor:
 
 
 def _nvfp4_operand(l: int, rows: int, k: int, device):
-    """Random NVFP4 operand as (packed (rows, k/2, l), SF, dequantized (l, rows, k))."""
-    codes = torch.randint(0, 16, (l, rows, k), dtype=torch.uint8, device=device)
+    """Random NVFP4 operand as (packed (rows, k/2, l), SF, dequantized (l, rows, k)).
+
+    SF rows are padded to a multiple of 128, as the swizzled layout requires.
+    """
+    rows_pad = (rows + 127) // 128 * 128
+    codes = torch.randint(0, 16, (l, rows_pad, k), dtype=torch.uint8, device=device)
     packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
     lut = torch.tensor(E2M1_VALUES, device=device)
     lut = torch.cat([lut, -lut])
-    sf = (torch.rand(l, rows, k // SF_VEC, device=device) * 1.5 + 0.25).to(
+    sf = (torch.rand(l, rows_pad, k // SF_VEC, device=device) * 1.5 + 0.25).to(
         torch.float8_e4m3fn
     )
     dequant = lut[codes.long()] * sf.float().repeat_interleave(SF_VEC, dim=-1)
-    return packed.permute(1, 2, 0), _swizzle_sf(sf), dequant
+    packed = packed[:, :rows].contiguous()
+    return packed.permute(1, 2, 0), _swizzle_sf(sf), dequant[:, :rows]
 
 
 def _swiglu_reference(acc, gate_scale, up_scale, alpha, beta, limit):
@@ -326,3 +333,343 @@ def test_gated_activation_compiled_kernel_allocates_half_width_output():
     )
     assert out.shape == (l, m, n // 2)
     assert torch.equal(out, expected)
+
+
+def test_nvfp4_output_compiled_kernel_requires_output():
+    _skip_unless_sm100()
+    from flashinfer.cute_dsl.blockscaled_gemm import (
+        get_cute_dsl_compiled_masked_gemm_kernel,
+    )
+    from flashinfer.cute_dsl.utils import get_cutlass_dtype, get_num_sm
+
+    device = torch.device("cuda")
+    l, m, n, k = 2, 128, 256, 256
+    a, sfa, _ = _nvfp4_operand(l, m, k, device)
+    b, sfb, _ = _nvfp4_operand(l, n, k, device)
+    major, minor = get_compute_capability(device)
+    tensor_api = get_cute_dsl_compiled_masked_gemm_kernel(
+        m=m,
+        n=n,
+        k=k,
+        l=l,
+        a_major="k",
+        b_major="k",
+        c_major="n",
+        ab_dtype=get_cutlass_dtype("float4_e2m1fn"),
+        sf_dtype=get_cutlass_dtype("float8_e4m3fn"),
+        c_dtype=get_cutlass_dtype("float4_e2m1fn"),
+        alpha_dtype=None,
+        sf_vec_size=SF_VEC,
+        mma_tiler_mn=(128, 128),
+        cluster_shape_mn=(1, 1),
+        sm_count=get_num_sm(device),
+        sm_version=f"sm_{major}{minor}",
+        num_ranks=1,
+        enable_dst_signals=False,
+    )
+    with pytest.raises(ValueError, match="requires c_tensor_gpu"):
+        tensor_api(
+            a_tensor_gpu=a,
+            b_tensor_gpu=b,
+            sfa_tensor_gpu=sfa,
+            sfb_tensor_gpu=sfb,
+            masked_m_tensor_gpu=torch.full((l,), m, dtype=torch.int32, device=device),
+            dst_signals_tensor_gpu=None,
+        )
+
+
+def _unswizzle_sf(sf: torch.Tensor, l: int, rows: int, k_sf: int) -> torch.Tensor:
+    """Swizzled E4M3 bytes of any shape -> (l, rows, k_sf) raw bytes."""
+    phys = sf.contiguous().view(torch.uint8).reshape(-1)
+    if sf.dim() == 6:
+        # The quantizer returns the permuted (32, 4, rm, 4, rk, l) view.
+        phys = sf.permute(5, 2, 4, 0, 1, 3).contiguous().view(torch.uint8)
+    phys = phys.reshape(l, rows // 128, k_sf // 4, 32, 4, 4)
+    return phys.permute(0, 1, 4, 3, 2, 5).reshape(l, rows, k_sf)
+
+
+def _run_gemm(a, sfa, b, sfb, masked_m, out, c_dtype, **kwargs):
+    grouped_gemm_nt_masked(
+        (a, sfa),
+        (b, sfb),
+        out,
+        masked_m,
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype=c_dtype,
+        sf_vec_size=SF_VEC,
+        **kwargs,
+    )
+
+
+def _nvfp4_case(l, m, n, k, gated, mma_tiler_mn, device):
+    a, sfa, a_ref = _nvfp4_operand(l, m, k, device)
+    b, sfb, b_ref = _nvfp4_operand(l, n, k, device)
+    std = torch.bmm(a_ref, b_ref.transpose(1, 2)).std().item()
+    masked_m = torch.randint(1, m + 1, (l,), dtype=torch.int32, device=device)
+    masked_m[0] = m
+    kwargs = dict(
+        mma_tiler_mn=mma_tiler_mn,
+        alpha=torch.rand(l, device=device) * 2 / std + 0.5 / std,
+        alpha_dtype="float32",
+    )
+    if gated:
+        kwargs.update(
+            activation_type=ActivationType.Swiglu,
+            swiglu_alpha=1.702,
+            swiglu_beta=1.0,
+            swiglu_limit=7.0,
+            a_per_token_scale=torch.rand(l, m, device=device) + 0.5,
+        )
+    return (a, sfa, b, sfb, masked_m), kwargs
+
+
+@pytest.mark.parametrize("l,m", [(2, 256), (5, 128), (3, 192)])
+@pytest.mark.parametrize("n,k", [(512, 1024), (1536, 512)])
+@pytest.mark.parametrize("mma_tiler_mn", [(128, 128), (128, 256)])
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("out_scale_view", [False, True], ids=["flat", "6d"])
+def test_nvfp4_output_matches_separate_quantize(
+    l, m, n, k, mma_tiler_mn, gated, out_scale_view
+):
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    operands, kwargs = _nvfp4_case(l, m, n, k, gated, mma_tiler_mn, device)
+    masked_m = operands[4]
+    n_out = n // 2 if gated else n
+
+    out_bf16 = torch.full(
+        (l, m, n_out), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    _run_gemm(*operands, out_bf16.permute(1, 2, 0), "bfloat16", **kwargs)
+    # Rows past masked_m are never written, so they must not feed the scale.
+    amax = torch.stack(
+        [out_bf16[i, : masked_m[i]].float().abs().amax() for i in range(l)]
+    )
+    global_scale = (448.0 * 6.0 / amax).contiguous()
+    assert torch.isfinite(global_scale).all(), global_scale
+    ref_q, ref_sf = scaled_fp4_grouped_quantize(out_bf16, masked_m, global_scale)
+
+    out_q = torch.zeros(l, m, n_out // 2, dtype=torch.uint8, device=device)
+    if out_scale_view:
+        # The permuted (32, 4, rm, 4, rk, l) view the NVFP4 quantizers return.
+        out_sf = torch.zeros_like(ref_sf)
+        assert out_sf.dim() == 6 and not out_sf.is_contiguous()
+    else:
+        out_sf = torch.zeros(
+            l * ((m + 127) // 128) * 128 * (n_out // SF_VEC),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+    _run_gemm(
+        *operands,
+        out_q.permute(1, 2, 0),
+        "float4_e2m1fn",
+        out_scale=out_sf,
+        out_global_scale=global_scale,
+        **kwargs,
+    )
+
+    ref_q = ref_q.view(torch.uint8).permute(2, 0, 1)
+    rows_pad = (m + 127) // 128 * 128
+    ref_sf = _unswizzle_sf(ref_sf, l, rows_pad, n_out // SF_VEC)
+    out_sf = _unswizzle_sf(out_sf, l, rows_pad, n_out // SF_VEC)
+    for i in range(l):
+        rows = masked_m[i].item()
+        assert torch.equal(out_q[i, :rows], ref_q[i, :rows])
+        assert torch.equal(out_sf[i, :rows], ref_sf[i, :rows])
+
+
+@pytest.mark.parametrize(
+    "mma_tiler_mn,cluster_shape_mn,gated",
+    [
+        ((128, 128), (2, 1), False),
+        ((128, 128), (2, 1), True),
+        ((128, 128), (4, 1), False),
+        ((128, 128), (4, 1), True),
+        ((128, 256), (1, 2), False),
+        ((128, 128), (1, 2), True),
+        ((256, 128), (2, 1), False),
+        ((256, 256), (2, 2), False),
+    ],
+)
+def test_nvfp4_output_cluster_stays_in_bounds(mma_tiler_mn, cluster_shape_mn, gated):
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    l, m, n, k = 3, 256, 512, 256
+    operands, kwargs = _nvfp4_case(l, m, n, k, gated, (128, 128), device)
+    masked_m = operands[4]
+    # A full last expert puts cluster padding tiles right past the end of out_scale.
+    masked_m.copy_(torch.tensor([m, 130, m], dtype=torch.int32))
+    n_out = n // 2 if gated else n
+    global_scale = torch.full((l,), 100.0, device=device)
+    sf_bytes = l * m * n_out // SF_VEC
+
+    outs = []
+    for tiler, cluster in [((128, 128), (1, 1)), (mma_tiler_mn, cluster_shape_mn)]:
+        out_q = torch.zeros(l, m, n_out // 2, dtype=torch.uint8, device=device)
+        sf_buf = torch.full((2 * sf_bytes,), 0xAB, dtype=torch.uint8, device=device)
+        _run_gemm(
+            *operands,
+            out_q.permute(1, 2, 0),
+            "float4_e2m1fn",
+            out_scale=sf_buf[:sf_bytes],
+            out_global_scale=global_scale,
+            **dict(kwargs, mma_tiler_mn=tiler, cluster_shape_mn=cluster),
+        )
+        outs.append((out_q, sf_buf))
+    torch.cuda.synchronize()
+
+    (ref_q, ref_buf), (out_q, out_buf) = outs
+    assert (out_buf[sf_bytes:] == 0xAB).all()
+    ref_sf = _unswizzle_sf(ref_buf[:sf_bytes], l, m, n_out // SF_VEC)
+    out_sf = _unswizzle_sf(out_buf[:sf_bytes], l, m, n_out // SF_VEC)
+    for i, rows in enumerate(masked_m.tolist()):
+        assert torch.equal(out_q[i, :rows], ref_q[i, :rows])
+        assert torch.equal(out_sf[i, :rows], ref_sf[i, :rows])
+
+
+def test_nvfp4_output_accepts_unaligned_out_global_scale():
+    """``out_global_scale`` may be a slice of a larger per-expert table."""
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    l, m, n, k = 2, 128, 256, 256
+    operands, kwargs = _nvfp4_case(l, m, n, k, False, (128, 128), device)
+    table = torch.full((16,), 100.0, device=device)
+    outs = []
+    for global_scale in (table[:l], table[1 : 1 + l]):
+        out_q = torch.zeros(l, m, n // 2, dtype=torch.uint8, device=device)
+        out_sf = torch.zeros(l * m * n // SF_VEC, dtype=torch.uint8, device=device)
+        _run_gemm(
+            *operands,
+            out_q.permute(1, 2, 0),
+            "float4_e2m1fn",
+            out_scale=out_sf,
+            out_global_scale=global_scale,
+            **kwargs,
+        )
+        outs.append((out_q, out_sf))
+    assert torch.equal(outs[0][0], outs[1][0])
+    assert torch.equal(outs[0][1], outs[1][1])
+
+
+def test_nvfp4_output_cuda_graph():
+    _skip_unless_sm100()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    l, m, n, k = 4, 256, 1024, 512
+    operands, kwargs = _nvfp4_case(l, m, n, k, True, (128, 256), device)
+    masked_m = operands[4]
+    global_scale = torch.full((l,), 100.0, device=device)
+    outs = []
+    for _ in range(2):
+        outs.append(
+            (
+                torch.zeros(l, m, n // 4, dtype=torch.uint8, device=device),
+                torch.zeros(l * m * n // 32, dtype=torch.uint8, device=device),
+            )
+        )
+
+    def run(out_q, out_sf):
+        _run_gemm(
+            *operands,
+            out_q.permute(1, 2, 0),
+            "float4_e2m1fn",
+            out_scale=out_sf,
+            out_global_scale=global_scale,
+            **kwargs,
+        )
+
+    run(*outs[0])
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(*outs[1])
+    masked_m.copy_(torch.tensor([256, 1, 130, 0], dtype=torch.int32))
+    run(*outs[0])
+    graph.replay()
+    torch.cuda.synchronize()
+    rows_pad = m
+    sf = [_unswizzle_sf(o[1], l, rows_pad, n // 2 // SF_VEC) for o in outs]
+    for i, rows in enumerate(masked_m.tolist()):
+        assert torch.equal(outs[0][0][i, :rows], outs[1][0][i, :rows])
+        assert torch.equal(sf[0][i, :rows], sf[1][i, :rows])
+
+
+def _run_invalid_nvfp4(out_shape=(2, 128, 128), out_dtype=torch.uint8, **overrides):
+    device = torch.device("cuda")
+    l, m, n, k = 2, 128, 256, 256
+    a, sfa, _ = _nvfp4_operand(l, m, k, device)
+    b, sfb, _ = _nvfp4_operand(l, n, k, device)
+    args = dict(
+        c_dtype="float4_e2m1fn",
+        out_scale=torch.empty(l * m * n // 16, dtype=torch.uint8, device=device),
+        out_global_scale=torch.ones(l, device=device),
+    )
+    args.update(overrides)
+    out = torch.empty(out_shape, dtype=out_dtype, device=device).permute(1, 2, 0)
+    _run_gemm(
+        a,
+        sfa,
+        b,
+        sfb,
+        torch.full((l,), m, dtype=torch.int32, device=device),
+        out,
+        args.pop("c_dtype"),
+        **args,
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides,error",
+    [
+        ({"out_scale": None}, ValueError),
+        ({"out_global_scale": torch.ones(1)}, ValueError),
+        ({"out_scale": torch.empty(100, dtype=torch.uint8)}, ValueError),
+        ({"out_shape": (2, 128, 256)}, ValueError),
+        ({"is_swap_ab": True}, NotImplementedError),
+        (
+            {
+                "c_dtype": "bfloat16",
+                "out_shape": (2, 128, 256),
+                "out_dtype": torch.bfloat16,
+            },
+            ValueError,
+        ),
+    ],
+)
+def test_nvfp4_output_rejects_unsupported_arguments(overrides, error):
+    _skip_unless_sm100()
+    overrides = {
+        key: value.cuda() if isinstance(value, torch.Tensor) else value
+        for key, value in overrides.items()
+    }
+    with pytest.raises(error):
+        _run_invalid_nvfp4(**overrides)
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    [
+        "FLASHINFER_NVFP4_4OVER6",
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+    ],
+)
+def test_nvfp4_output_rejects_non_default_recipe(monkeypatch, env_var):
+    _skip_unless_sm100()
+    monkeypatch.setenv(env_var, "1")
+    with pytest.raises(ValueError, match=env_var):
+        _run_invalid_nvfp4()
+
+
+def test_nvfp4_output_4over6_argument_overrides_env(monkeypatch):
+    _skip_unless_sm100()
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    _run_invalid_nvfp4(nvfp4_4over6=None)
+    monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6")
+    with pytest.raises(ValueError, match="4over6"):
+        _run_invalid_nvfp4(nvfp4_4over6=NVFP44Over6Config())
