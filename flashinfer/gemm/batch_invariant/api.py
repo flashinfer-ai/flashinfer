@@ -879,7 +879,46 @@ def bmm_fp8_batch_invariant(
         )
     if config is None:
         config = default_config(M, N, K, C, b_major, *part_of(A.device), in_fmt)
-    out_fmt = OUT_FMT_OF_DTYPE[dtype]
+    return _launch_bmm_fp8(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        in_fmt,
+        b_major,
+        b,
+        M,
+        N,
+        K,
+        C,
+        config,
+        OUT_FMT_OF_DTYPE[dtype],
+        workspace,
+        cls,
+    )
+
+
+def _launch_bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out: torch.Tensor,
+    in_fmt: str,
+    b_major: str,
+    b: int,
+    M: int,
+    N: int,
+    K: int,
+    C: int,
+    config: Knobs,
+    out_fmt: str,
+    workspace: Optional[torch.Tensor],
+    cls: str,
+) -> torch.Tensor:
+    """The batched fp8 classes' launch on prepared operands (:func:`prepare_bmm_fp8_operands`'s): the unsplit class as one
+    launch over the batch, the split classes one launch of the class per element."""
     if C == 1:
         from .blocks.compile import get_compiled_gemm
         from .blocks.operands import can_implement
@@ -1795,20 +1834,11 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     a, b, sfa, sfb, out, M, N, K = prepare_fp8_blockscale_operands(
         a, b, a_scale, b_scale, scale_major_mode, out, out_dtype
     )
-    cls = CLASS_FP8BS
     if M == 0:
         return out  # no rows: nothing to launch
-    from .blocks.compile_fp8bs import get_compiled_fp8bs
-    from .blocks.operands import can_implement
-
-    in_fmt = FP8_BLOCKSCALE_FMTS[0]
     if config is None:
-        config = default_config(M, N, K, 1, "k", *part_of(a.device), in_fmt)
-    if not can_implement(config, M, N, K, "k", 1, in_fmt):
-        raise unsupported(
-            cls,
-            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K})",
-            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        config = default_config(
+            M, N, K, 1, "k", *part_of(a.device), FP8_BLOCKSCALE_FMTS[0]
         )
     # the K layout's staging (a placement: the fold never changes): the K-native ring at a few rows, the tensors read as they
     # are from 16-byte-aligned bases (the four-block copies); the MN-major copy and the per-block ring otherwise
@@ -1822,6 +1852,37 @@ def gemm_fp8_nt_groupwise_batch_invariant(
     )
     if scale_major_mode == "K" and not native_k:
         sfa = sfa.t().contiguous().t()
+    return _launch_fp8bs(
+        a, b, sfa, sfb, out, M, N, K, config, native_k, OUT_FMT_OF_DTYPE[out_dtype]
+    )
+
+
+def _launch_fp8bs(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    out: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
+    config: Knobs,
+    native_k: bool,
+    out_fmt: str,
+) -> torch.Tensor:
+    """The block-scale class's launch on prepared operands: ``sfa`` (M, K / 128) and ``sfb`` (ceil(N / 128), K / 128) views
+    in the layout the staging reads (``native_k``: the caller's K-layout tensors as they are; else M-major views of the
+    MN-layout copies)."""
+    from .blocks.compile_fp8bs import get_compiled_fp8bs
+    from .blocks.operands import can_implement
+
+    cls = CLASS_FP8BS
+    if not can_implement(config, M, N, K, "k", 1, FP8_BLOCKSCALE_FMTS[0]):
+        raise unsupported(
+            cls,
+            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K})",
+            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        )
     _require_disjoint(
         cls,
         [(out, "the output")],
@@ -1836,7 +1897,7 @@ def gemm_fp8_nt_groupwise_batch_invariant(
         kernel = get_compiled_fp8bs(
             config,
             persistent_clusters(a.device, config),
-            OUT_FMT_OF_DTYPE[out_dtype],
+            out_fmt,
             family=part_of(a.device)[1],
             native_k=native_k,
         )
