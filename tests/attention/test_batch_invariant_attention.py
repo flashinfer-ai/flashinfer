@@ -1184,16 +1184,23 @@ def test_paired_d128_ragged_window_and_pages():
 
 
 @needs_device
-def test_wrapper_default_pairs_only_at_d64():
-    """The wrappers' default: the paired placement for prefill and ragged batches at D = 64 only, never for decode; at D = 128 the
-    placement is an explicit configuration, so the wrappers run the one-warpgroup body on every part."""
+def test_wrapper_default_pairs_by_group_at_d64():
+    """The wrappers' default: the paired placement for prefill and ragged batches at D = 64 whose GQA group reaches
+    ``engine.Q2_DEFAULT_MIN_GROUP``; the one-warpgroup body for smaller groups, decode, and every batch at D = 128 (where the placement is
+    an explicit configuration). The table is the measured-faster body per (layout, group) on SM107."""
     from flashinfer.attention.batch_invariant import engine
 
     assert engine.Q2_DEFAULT_DIMS == (64,)
+    assert engine.Q2_DEFAULT_MIN_GROUP == {64: 4}
     ws = workspace(torch.device("cuda"))
     kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
-    for D, expect in ((64, True), (128, False)):
-        pr = Problem([300, 1], [1000, 600], 32, 8, D, 16, seed=22)
+    for D, Hq, expect in (
+        (64, 32, True),
+        (64, 16, False),
+        (64, 8, False),
+        (128, 32, False),
+    ):
+        pr = Problem([300, 1], [1000, 600], Hq, 8, D, 16, seed=22)
         paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             ws, "NHD", batch_invariant=True
         )
@@ -1202,7 +1209,7 @@ def test_wrapper_default_pairs_only_at_d64():
             pr.kv_indptr,
             pr.kv_indices,
             pr.kv_last,
-            32,
+            Hq,
             8,
             D,
             16,
@@ -1212,14 +1219,14 @@ def test_wrapper_default_pairs_only_at_d64():
         ragged = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             ws, "NHD", batch_invariant=True
         )
-        ragged.plan(pr.qo_indptr, pr.kv_indptr_rag, 32, 8, D, causal=True, **kw)
+        ragged.plan(pr.qo_indptr, pr.kv_indptr_rag, Hq, 8, D, causal=True, **kw)
         dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             ws, "NHD", batch_invariant=True
         )
-        dec.plan(pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, D, 16, **kw)
-        assert paged._batch_invariant._config.q2 == expect
-        assert ragged._batch_invariant._config.q2 == expect
-        assert not dec._batch_invariant._config.q2
+        dec.plan(pr.kv_indptr, pr.kv_indices, pr.kv_last, Hq, 8, D, 16, **kw)
+        assert paged._batch_invariant._config.q2 == expect, (D, Hq)
+        assert ragged._batch_invariant._config.q2 == expect, (D, Hq)
+        assert not dec._batch_invariant._config.q2, (D, Hq)
 
 
 @needs_device

@@ -187,8 +187,13 @@ Q2_MIN_UNITS_PER_SM = {
 # softmax warpgroups, so smaller batches take the one-warpgroup body with the default ring (a placement rule: same bits); per head dim
 Q2_DEFAULT_DIMS = (
     64,
-)  # head dims whose prefill / ragged default is the paired placement; at D = 128 the placement is implemented (328 KB parts) but measured
+)  # head dims whose prefill / ragged default is the paired placement (from Q2_DEFAULT_MIN_GROUP); at D = 128 the placement is implemented (328 KB parts) but measured
 # slower than the one-warpgroup body on SM107, so it stays an explicit configuration (AttnConfig(q2=True))
+Q2_DEFAULT_MIN_GROUP = {
+    64: 4,
+}  # the wrappers take the paired placement for prefill and ragged batches whose GQA group reaches this (per head dim); smaller groups take
+# the one-warpgroup body, measured as fast or faster there (single-group units pair rarely); an explicit AttnConfig(q2=True) runs the
+# placement anywhere it is implemented (same bits)
 Q2_RING = {
     64: {True: 4, False: 3},
     128: {True: 3, False: 0},
