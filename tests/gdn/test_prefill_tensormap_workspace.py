@@ -68,25 +68,57 @@ def test_nsmid_probe_under_capture():
     assert torch.equal(x, torch.full_like(x, 2))
 
 
-def test_probe_failure_raises_once_compiled(monkeypatch):
+@pytest.fixture
+def fresh_nsmid_cache():
+    helpers.clear_nsmid_cache()
+    yield
+    helpers.clear_nsmid_cache()
+
+
+def test_compile_failure_raises_and_is_not_recompiled(monkeypatch, fresh_nsmid_cache):
     """A failed probe raises instead of sizing the workspace from a guess (#9484)."""
     _skip_unless_nsmid_backend()
     device = torch.device("cuda")
-    calls = []
+    builds = []
 
-    def broken_probe(_device):
-        calls.append(_device)
-        raise RuntimeError("simulated probe failure")
+    def broken_build(major, minor):
+        builds.append((major, minor))
+        raise RuntimeError("simulated NVRTC failure")
 
-    monkeypatch.setattr(helpers, "probe_device_nsmid", broken_probe)
-    helpers._cached_nsmid_probe.cache_clear()
-    try:
-        for _ in range(3):
-            with pytest.raises(RuntimeError, match="cannot size the GDN prefill"):
-                get_device_nsmid(device)
-        assert len(calls) == 1  # the failure is cached, not re-probed per call
-    finally:
-        helpers._cached_nsmid_probe.cache_clear()
+    monkeypatch.setattr(helpers, "_build_nsmid_cubin", broken_build)
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="cannot size the GDN prefill"):
+            get_device_nsmid(device)
+    assert len(builds) == 1  # deterministic failure: compiled once, not per call
+
+
+def test_transient_launch_failure_is_retried(monkeypatch, fresh_nsmid_cache):
+    _skip_unless_nsmid_backend()
+    device = torch.device("cuda")
+    real_launch = helpers._launch_nsmid_probe
+    launches = []
+
+    def flaky_launch(index, cubin):
+        launches.append(index)
+        if len(launches) == 1:
+            raise RuntimeError("simulated CUDA_ERROR_OUT_OF_MEMORY")
+        return real_launch(index, cubin)
+
+    monkeypatch.setattr(helpers, "_launch_nsmid_probe", flaky_launch)
+    with pytest.raises(RuntimeError, match="cannot size the GDN prefill"):
+        get_device_nsmid(device)
+    nsmid = get_device_nsmid(device)  # retried after the transient failure
+    assert nsmid >= torch.cuda.get_device_properties(device).multi_processor_count
+    assert get_device_nsmid(device) == nsmid
+    assert len(launches) == 2  # the success is cached
+
+
+def test_indexless_device_is_keyed_by_index(fresh_nsmid_cache):
+    _skip_unless_nsmid_backend()
+    index = torch.cuda.current_device()
+    nsmid = get_device_nsmid(torch.device("cuda"))
+    assert helpers._nsmid_by_device == {index: nsmid}
+    assert get_device_nsmid(torch.device("cuda", index)) == nsmid
 
 
 @pytest.mark.parametrize("use_cp", [False, True])
@@ -143,7 +175,7 @@ def test_first_prefill_call_under_capture(qkv_factory, dtype, use_cp):
         return o, state
 
     graph_o, graph_state = outputs()
-    helpers._cached_nsmid_probe.cache_clear()
+    helpers.clear_nsmid_cache()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run(graph_o, graph_state)

@@ -421,17 +421,61 @@ _NSMID_SRC = b"""extern "C" __global__ void nsmid_probe(unsigned int* out) {
 """
 
 
-@functools.cache
-def _cached_nsmid_probe(device: torch.device) -> tuple[int, Exception | None]:
-    # Caches a failure too, so a broken probe is not recompiled on every call.
+def _check_cuda(res):
+    if res[0].value != 0:
+        raise RuntimeError(f"%nsmid probe failed: {res[0]}")
+    return res[1] if len(res) == 2 else None
+
+
+def _cuda_device_index(device: torch.device) -> int:
+    # An index-less torch.device("cuda") follows set_device(), so never key on it.
+    if device.type != "cuda":
+        raise ValueError(f"%nsmid probe needs a CUDA device, got {device}")
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def _build_nsmid_cubin(major: int, minor: int) -> bytes:
+    # A CUBIN rather than PTX: PTX from an nvrtc newer than the driver fails to
+    # JIT (CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
+    from cuda.bindings import nvrtc
+
+    prog = _check_cuda(
+        nvrtc.nvrtcCreateProgram(_NSMID_SRC, b"nsmid_probe.cu", 0, [], [])
+    )
     try:
-        return probe_device_nsmid(device), None
-    except Exception as e:  # noqa: BLE001 - re-raised by get_device_nsmid
-        return 0, e
+        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+        _check_cuda(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+        cubin = b" " * _check_cuda(nvrtc.nvrtcGetCUBINSize(prog))
+        _check_cuda(nvrtc.nvrtcGetCUBIN(prog, cubin))
+    finally:
+        nvrtc.nvrtcDestroyProgram(prog)
+    return cubin
+
+
+@functools.cache
+def _compile_nsmid_probe(major: int, minor: int) -> tuple[bytes, Exception | None]:
+    # Compilation failures are deterministic, so they are cached as well and a
+    # broken toolchain is not recompiled on every prefill call.
+    try:
+        return _build_nsmid_cubin(major, minor), None
+    except Exception as e:  # noqa: BLE001 - re-raised by probe_device_nsmid
+        return b"", e
+
+
+# Successful probes only, by device index. Launch-time failures (for example
+# CUDA_ERROR_OUT_OF_MEMORY on the probe's allocation) may be transient and are
+# retried on the next call.
+_nsmid_by_device: dict[int, int] = {}
+
+
+def clear_nsmid_cache() -> None:
+    """Forget probed ``%nsmid`` values and compiled probes (tests only)."""
+    _nsmid_by_device.clear()
+    _compile_nsmid_probe.cache_clear()
 
 
 def get_device_nsmid(device: torch.device) -> int:
-    """Upper bound (exclusive) on ``%smid``, read on the device.
+    """Upper bound (exclusive) on ``%smid``, read on the device and cached.
 
     Under CUDA MPS with a reduced thread share, ``multi_processor_count`` shrinks
     but ``%smid`` still spans the physical SM ids, which ``%nsmid`` bounds.
@@ -439,12 +483,17 @@ def get_device_nsmid(device: torch.device) -> int:
     and SM ids need not be contiguous), so a failed probe raises before prefill
     launches rather than sizing the workspace from a guess.
     """
-    nsmid, error = _cached_nsmid_probe(device)
-    if error is not None:
-        raise RuntimeError(
-            f"%nsmid probe failed on {device}; cannot size the GDN prefill "
-            "tensor-map workspace safely"
-        ) from error
+    index = _cuda_device_index(device)
+    nsmid = _nsmid_by_device.get(index)
+    if nsmid is None:
+        try:
+            nsmid = probe_device_nsmid(torch.device("cuda", index))
+        except Exception as e:
+            raise RuntimeError(
+                f"%nsmid probe failed on cuda:{index}; cannot size the GDN prefill "
+                "tensor-map workspace safely"
+            ) from e
+        _nsmid_by_device[index] = nsmid
     return nsmid
 
 
@@ -453,30 +502,20 @@ def probe_device_nsmid(device: torch.device) -> int:
 
     The first prefill call may run inside ``torch.cuda.graph(...)``. The probe
     switches this thread to relaxed capture mode (as PyTorch's allocator does
-    for ``cudaMalloc`` during capture) and uses only its own non-blocking
-    stream and allocation, so it never touches the capturing stream.
+    for ``cudaMalloc`` during capture), launches and copies on its own
+    non-blocking stream, and explicitly synchronizes only that stream.
     """
-    from cuda.bindings import driver, nvrtc
+    index = _cuda_device_index(device)
+    cubin, error = _compile_nsmid_probe(*torch.cuda.get_device_capability(index))
+    if error is not None:
+        raise RuntimeError("%nsmid probe compilation failed") from error
+    return _launch_nsmid_probe(index, cubin)
 
-    def check(res):
-        if res[0].value != 0:
-            raise RuntimeError(f"%nsmid probe failed: {res[0]}")
-        return res[1] if len(res) == 2 else None
 
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(index)
+def _launch_nsmid_probe(index: int, cubin: bytes) -> int:
+    from cuda.bindings import driver
 
-    # A CUBIN rather than PTX: PTX from an nvrtc newer than the driver fails to
-    # JIT (CUDA_ERROR_UNSUPPORTED_PTX_VERSION).
-    prog = check(nvrtc.nvrtcCreateProgram(_NSMID_SRC, b"nsmid_probe.cu", 0, [], []))
-    try:
-        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
-        check(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
-        cubin = b" " * check(nvrtc.nvrtcGetCUBINSize(prog))
-        check(nvrtc.nvrtcGetCUBIN(prog, cubin))
-    finally:
-        nvrtc.nvrtcDestroyProgram(prog)
-
+    check = _check_cuda
     host = ctypes.c_uint32(0)
     with contextlib.ExitStack() as cleanup:
         check(driver.cuInit(0))
