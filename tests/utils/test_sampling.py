@@ -2594,12 +2594,17 @@ def test_top_k_mask_logits_strided_top_k_arr():
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("use_top_p", [False, True])
-def test_top_k_sampling_strided_top_k_arr(use_top_p):
+@pytest.mark.parametrize(
+    "use_top_p,filter_apply_order",
+    [(False, None), (True, "top_k_first"), (True, "joint")],
+)
+def test_top_k_sampling_strided_top_k_arr(use_top_p, filter_apply_order):
     """Sampling must draw the same tokens from a strided and a packed top_k.
 
     The same seed and offset are passed to both calls, so the RNG stream is
-    identical and the sampled indices have to match exactly.
+    identical and the sampled indices have to match exactly. The joint order
+    reaches top_k_top_p_sampling_from_probs' own wrapper; top_k_first takes the
+    renormalize-then-top_p path instead.
     """
     torch.manual_seed(42)
     probs = torch.softmax(torch.randn(8, 128, device="cuda:0"), dim=-1)
@@ -2608,7 +2613,12 @@ def test_top_k_sampling_strided_top_k_arr(use_top_p):
     def sample(k):
         if use_top_p:
             return flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, k, 0.9, seed=7, offset=0
+                probs,
+                k,
+                0.9,
+                filter_apply_order=filter_apply_order,
+                seed=7,
+                offset=0,
             )
         return flashinfer.sampling.top_k_sampling_from_probs(probs, k, seed=7, offset=0)
 
