@@ -382,7 +382,7 @@ def fold_row_coop(
                 rg = r_hi - 1
             if rg < r_lo:
                 rg = r_lo
-            og = cute.assume((slot + rg * rows + r).to(Int64) * WS + d0, divby=4)
+            og = cute.assume((slot + rg * rows + r).to(Int64) * WS + d0, divby=V)
             cute.autovec_copy(
                 cute.make_tensor(mWs.iterator + og, cute.make_layout((V,))),
                 cute.make_tensor(po.iterator + i * V, cute.make_layout((V,))),
@@ -445,7 +445,7 @@ class SplitKVFixup:
         max_rows: Int32,
         stream,
     ):
-        # grid: (row blocks of a group, min(groups, MAX_GRID_Y)); a block handles 128 / (D / V) rows (4 / 4 / 2 at D = 64 / 128 / 256),
+        # grid: (row blocks of a group, min(groups, MAX_GRID_Y)); a block handles 128 / (D / V) rows (2 / 2 / 1 at D = 64 / 128 / 256),
         # V = wide_vec(D) output columns per thread, and strides over the groups beyond grid.y
         rows_per_block = THREADS // (self.D // wide_vec(self.D))
         self.kernel(mWs, mO, mGroups, c, nc, window_left, Hq, num_groups).launch(

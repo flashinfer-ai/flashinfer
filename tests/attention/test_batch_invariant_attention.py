@@ -570,6 +570,15 @@ def test_planner_swaps_unit_kinds():
     assert kinds(decode(16, 8192, 64)) == (0, 2048, 128, 0)
     assert kinds(decode(8, 1024, 64)) == (64, 0, 0, 0)
     assert kinds(decode(64, 32768, 64)) == (512, 0, 0, 171)
+    # the grid search terminates on parts of one or two SMs (the integral-wave grid is one CTA there) and never names a grid
+    # below one CTA or above the part
+    for sm in (1, 2, 3):
+        for D in (64, 128, 256):
+            for n in (1, 5, 64, 1000):
+                grids = P.swaps_fused_grids(n, sm, D)
+                assert grids and all(1 <= g <= sm for g in grids), (sm, D, n, grids)
+            assert decode(4, 32768, D, sm=sm).num_units > 0
+            assert decode(1, 8192, D, sm=sm).num_units > 0
     assert kinds(decode(32, 8192, 64)) == (0, 4096, 256, 0)
     # D = 256: a lone CTA streams faster, so 64 units fuse
     assert kinds(decode(8, 8192, 256)) == (64, 0, 0, 0)
@@ -716,6 +725,72 @@ def test_determinism_and_graph_replay(D):
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_dependent_launch_chain_reads_the_predecessor(D):
+    """R1 under programmatic dependent launch: four decode steps whose query is the previous step's output, enqueued back to back
+    on one stream and captured as one CUDA graph, give the bits of the same steps run one at a time with a device synchronisation
+    between them. The attention kernel issues its loads only after the preceding grid has completed, so a dependent that is
+    scheduled early never reads a predecessor's unfinished output."""
+    from flashinfer.utils import device_support_pdl
+
+    pr = Problem([1, 1, 1, 1], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=21)
+    if not device_support_pdl(pr.device):
+        pytest.skip("this part has no programmatic dependent launch")
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    cache = pr.cache("NHD")
+    steps = 4
+    # one step at a time, no dependent launch, a synchronisation after each: the yardstick
+    q, ref = pr.q.clone(), []
+    for _ in range(steps):
+        q = w.run(q, cache, enable_pdl=False)
+        torch.cuda.synchronize()
+        ref.append(bits(q).clone())
+    # the same chain back to back as programmatic dependents
+    q, got = pr.q.clone(), []
+    for _ in range(steps):
+        q = w.run(q, cache, enable_pdl=True)
+        got.append(q)
+    torch.cuda.synchronize()
+    for t in range(steps):
+        assert torch.equal(bits(got[t]), ref[t]), t
+    # and captured as one CUDA graph over fixed buffers (the dependent-launch edges are captured with the kernels)
+    bufs = [torch.empty_like(pr.q) for _ in range(steps)]
+
+    def chain():
+        for t in range(steps):
+            w.run(pr.q if t == 0 else bufs[t - 1], cache, out=bufs[t], enable_pdl=True)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        chain()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            chain()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        for b in bufs:
+            b.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        for t in range(steps):
+            assert torch.equal(bits(bufs[t]), ref[t]), t
 
 
 @needs_device
