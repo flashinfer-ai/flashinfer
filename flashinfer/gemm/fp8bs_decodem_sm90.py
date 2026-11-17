@@ -88,9 +88,7 @@ def _dispatch_table() -> Optional[Dict[str, Any]]:
         import importlib.resources
         import json
 
-        data = (
-            importlib.resources.files("flashinfer") / _DISPATCH_FILE
-        ).read_text()
+        data = (importlib.resources.files("flashinfer") / _DISPATCH_FILE).read_text()
         table = json.loads(data)
         if not isinstance(table.get("backends"), list):
             return None

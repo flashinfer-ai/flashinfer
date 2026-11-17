@@ -17,8 +17,7 @@ from flashinfer.gemm.fp8bs_decodem_sm90 import (
 )
 
 requires_sm90 = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] != 9,
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
     reason="needs an SM90 device",
 )
 
@@ -27,13 +26,20 @@ G = 128
 
 def _make(M, N, K, seed=0, device="cuda"):
     g = torch.Generator(device=device).manual_seed(seed)
-    x = torch.randn((M, K), generator=g, device=device,
-                    dtype=torch.float32).to(torch.bfloat16)
-    wq = torch.randn((N, K), generator=g, device=device,
-                     dtype=torch.float32).to(torch.float8_e4m3fn)
+    x = torch.randn((M, K), generator=g, device=device, dtype=torch.float32).to(
+        torch.bfloat16
+    )
+    wq = torch.randn((N, K), generator=g, device=device, dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
     pow2 = torch.tensor([0.0625, 0.125, 0.25], device=device)
-    ws = pow2[torch.randint(0, 3, ((N + G - 1) // G, K // G),
-                            generator=g, device=device)].float().contiguous()
+    ws = (
+        pow2[
+            torch.randint(0, 3, ((N + G - 1) // G, K // G), generator=g, device=device)
+        ]
+        .float()
+        .contiguous()
+    )
     return x, wq, ws
 
 
@@ -79,8 +85,8 @@ def test_unknown_backend_raises():
 @pytest.mark.parametrize(
     "shape",
     [
-        (1, 8192, 1536),   # captured qbproj class
-        (2, 2048, 7168),   # captured qkva class
+        (1, 8192, 1536),  # captured qbproj class
+        (2, 2048, 7168),  # captured qkva class
         (16, 7168, 2048),  # captured oproj class
         (24, 2624, 6144),  # captured glm qkva class
         (13, 2048, 2048),  # interior (band-interpolated) point
@@ -147,14 +153,12 @@ def test_off_coverage_specialized_falls_back_recorded():
 
     # per-token (1x128) weight-scale granularity stays on the stock route
     x2, wq2, _ = _make(4, 2048, 2048, seed=6)
-    ws_pt = torch.full((2048, 2048 // G), 0.125, device="cuda",
-                       dtype=torch.float32)
+    ws_pt = torch.full((2048, 2048 // G), 0.125, device="cuda", dtype=torch.float32)
     _reset_fp8bs_decodem_stats()
     fp8_blockscale_gemm_sm90(x2, wq2, None, ws_pt, backend="specialized")
     st = _fp8bs_decodem_stats()
     assert st["backend_dispatches"]["specialized"] == 0, st
-    assert st["fallback_reasons"] == {
-        "specialized: weight_scale_granularity": 1}, st
+    assert st["fallback_reasons"] == {"specialized: weight_scale_granularity": 1}, st
 
 
 @requires_sm90
@@ -179,12 +183,10 @@ def test_graph_capture_replays_bitwise_equal_to_eager():
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        fp8_blockscale_gemm_sm90(x, wq, None, ws, out=out,
-                                 backend="specialized")
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, out=out, backend="specialized")
     torch.cuda.current_stream().wait_stream(stream)
     with torch.cuda.graph(g):
-        fp8_blockscale_gemm_sm90(x, wq, None, ws, out=out,
-                                 backend="specialized")
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, out=out, backend="specialized")
     out.zero_()
     g.replay()
     torch.cuda.synchronize()

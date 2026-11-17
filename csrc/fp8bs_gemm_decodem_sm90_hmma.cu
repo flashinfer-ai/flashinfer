@@ -5,20 +5,21 @@
 // operands are widened to f16 explicitly - exactly, and with the A-side widening
 // shared across all M sub-tiles - and fed to native m16n8k16 HMMA.  Split-K
 // partials are pushed straight into the owning CTA through cluster DSMEM.
-#include <cuda_runtime.h>
-#include <cuda_fp8.h>
-#include <cuda_bf16.h>
 #include <cooperative_groups.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
+
 #include "fp8bs_gemm_decodem_sm90.h"
 
 namespace cg = cooperative_groups;
 
 #define BN 128
-#define WN 8   // warps along n (16 rows each) -> BN = 128
+#define WN 8  // warps along n (16 rows each) -> BN = 128
 #define SMEM_BUDGET (128 * 1024)
-#define XROW 256   // bytes per (row, k-group) of f16 activations
+#define XROW 256  // bytes per (row, k-group) of f16 activations
 
 __device__ __forceinline__ void cluster_arrive_relaxed() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
@@ -27,9 +28,9 @@ __device__ __forceinline__ void cluster_wait_acquire() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 }
 
-__device__ __forceinline__ void mma_f16(float &d0, float &d1, float &d2, float &d3,
-                                        uint32_t a0, uint32_t a1, uint32_t a2,
-                                        uint32_t a3, uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma_f16(float& d0, float& d1, float& d2, float& d3, uint32_t a0,
+                                        uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                        uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -45,13 +46,10 @@ __device__ __forceinline__ uint32_t e4m3x2_f16x2(uint16_t e) {
 __device__ __forceinline__ uint32_t cvt_lo(uint32_t a) {
   return e4m3x2_f16x2((uint16_t)(a & 0xffffu));
 }
-__device__ __forceinline__ uint32_t cvt_hi(uint32_t a) {
-  return e4m3x2_f16x2((uint16_t)(a >> 16));
-}
+__device__ __forceinline__ uint32_t cvt_hi(uint32_t a) { return e4m3x2_f16x2((uint16_t)(a >> 16)); }
 // quantize two fp32 to e4m3 (RN, saturating) and widen back to an f16 pair
 __device__ __forceinline__ uint32_t q2(float a, float b) {
-  __nv_fp8x2_storage_t e =
-      __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+  __nv_fp8x2_storage_t e = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
   return e4m3x2_f16x2((uint16_t)e);
 }
 __device__ __forceinline__ float blo(uint32_t v) { return __uint_as_float(v << 16); }
@@ -67,18 +65,20 @@ __device__ __forceinline__ float2 unpack_partial_bf16x2(uint32_t u) {
 }
 
 template <int MT, int NWARP, int KSHIFT>
-__global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
-    const __nv_bfloat16* __restrict__ X, const uint8_t* __restrict__ W,
-    const float* __restrict__ WS, __nv_bfloat16* __restrict__ OUT,
-    int M, int N, int K, int Sk, float eps, int nbuf) {
+__global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* __restrict__ X,
+                                                           const uint8_t* __restrict__ W,
+                                                           const float* __restrict__ WS,
+                                                           __nv_bfloat16* __restrict__ OUT, int M,
+                                                           int N, int K, int Sk, float eps,
+                                                           int nbuf) {
   static_assert(KSHIFT >= 0 && KSHIFT <= 3);
   constexpr int MP = MT * 8;
   constexpr int WK = NWARP / WN;
   constexpr int NTHREAD = NWARP * 32;
   constexpr int ksplit = 1 << KSHIFT;
   extern __shared__ __align__(16) char smem_raw[];
-  uint8_t* xqb = (uint8_t*)smem_raw;                        // [nbuf][MP][128] f16
-  float* xsb = (float*)(smem_raw + nbuf * MP * XROW);       // [nbuf][MP]
+  uint8_t* xqb = (uint8_t*)smem_raw;                   // [nbuf][MP][128] f16
+  float* xsb = (float*)(smem_raw + nbuf * MP * XROW);  // [nbuf][MP]
   uint32_t* rcv = (uint32_t*)(smem_raw + nbuf * MP * (XROW + 4));
 
   const int tid = threadIdx.x;
@@ -110,7 +110,7 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
   const int qt = tid & 7;
   const int qg = tid >> 3;
   const int qs = qg & 7;
-  const int qq = warp >> 1;   // 0..NWARP/2-1, warp-uniform
+  const int qq = warp >> 1;  // 0..NWARP/2-1, warp-uniform
 
   float acc[MT][4];
 #pragma unroll
@@ -129,8 +129,14 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
     d2 = __ldg((const uint4*)(pa_ + 64));         \
     d3 = __ldg((const uint4*)(pb_ + 64));         \
   }
-  if (pf < kg_end) { LOADW(c0, c1, c2, c3, pf); pf += WK; }
-  if (pf < kg_end) { LOADW(n0, n1, n2, n3, pf); pf += WK; }
+  if (pf < kg_end) {
+    LOADW(c0, c1, c2, c3, pf);
+    pf += WK;
+  }
+  if (pf < kg_end) {
+    LOADW(n0, n1, n2, n3, pf);
+    pf += WK;
+  }
 
   for (int cb = kg_beg; cb < kg_end; cb += nbuf) {
     const int cn = min(nbuf, kg_end - cb);
@@ -147,8 +153,7 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
         h0[r] = make_uint4(0, 0, 0, 0);
         h1[r] = make_uint4(0, 0, 0, 0);
         if (m < Mloc) {
-          const __nv_bfloat16* xp =
-              X + (size_t)(m0 + m) * (size_t)K + (size_t)kg * 128 + 8 * qt;
+          const __nv_bfloat16* xp = X + (size_t)(m0 + m) * (size_t)K + (size_t)kg * 128 + 8 * qt;
           h0[r] = __ldg((const uint4*)xp);
           h1[r] = __ldg((const uint4*)(xp + 64));
         }
@@ -228,8 +233,14 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
         }
       }
 
-      c0 = n0; c1 = n1; c2 = n2; c3 = n3;
-      if (pf < kg_end) { LOADW(n0, n1, n2, n3, pf); pf += WK; }
+      c0 = n0;
+      c1 = n1;
+      c2 = n2;
+      c3 = n3;
+      if (pf < kg_end) {
+        LOADW(n0, n1, n2, n3, pf);
+        pf += WK;
+      }
 
       const float wsc = __ldg(wsp + (cb + i));
 #pragma unroll
@@ -255,10 +266,11 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
   const int ncol = wn * 16 - (peer << wsh);
   if constexpr (KSHIFT != 0) cluster_wait_acquire();
   uint32_t* dstb;
-  if constexpr (KSHIFT != 0) dstb = cluster.map_shared_rank(rcv, peer);
-  else dstb = rcv;
-  uint32_t* slot =
-      dstb + (size_t)(krank * WK + wk) * (MP / 2) * rsv;
+  if constexpr (KSHIFT != 0)
+    dstb = cluster.map_shared_rank(rcv, peer);
+  else
+    dstb = rcv;
+  uint32_t* slot = dstb + (size_t)(krank * WK + wk) * (MP / 2) * rsv;
 #pragma unroll
   for (int j = 0; j < MT; ++j) {
     const int mr = tig * 2 + 8 * j;
@@ -267,8 +279,10 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
     slot[pr * rsv + nn] = pack_partial_bf16x2(acc[j][0], acc[j][1]);
     slot[pr * rsv + nn + 8] = pack_partial_bf16x2(acc[j][2], acc[j][3]);
   }
-  if constexpr (KSHIFT != 0) cluster.sync();
-  else __syncthreads();
+  if constexpr (KSHIFT != 0)
+    cluster.sync();
+  else
+    __syncthreads();
 
   const int lo = krank * wdt;
   const int tot = ((Mloc + 1) >> 1) << wsh;
@@ -278,17 +292,14 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
     float2 sum = unpack_partial_bf16x2(rcv[mpair * rsv + nn]);
 #pragma unroll
     for (int c = 1; c < ksplit * WK; ++c) {
-      const float2 v = unpack_partial_bf16x2(
-          rcv[(c * (MP / 2) + mpair) * rsv + nn]);
+      const float2 v = unpack_partial_bf16x2(rcv[(c * (MP / 2) + mpair) * rsv + nn]);
       sum.x += v.x;
       sum.y += v.y;
     }
     const int ng = nbase + lo + nn;
     const int mm = m0 + 2 * mpair;
-    if (ng < N && mm < M)
-      OUT[(size_t)mm * (size_t)N + ng] = __float2bfloat16(sum.x);
-    if (ng < N && mm + 1 < M)
-      OUT[(size_t)(mm + 1) * (size_t)N + ng] = __float2bfloat16(sum.y);
+    if (ng < N && mm < M) OUT[(size_t)mm * (size_t)N + ng] = __float2bfloat16(sum.x);
+    if (ng < N && mm + 1 < M) OUT[(size_t)(mm + 1) * (size_t)N + ng] = __float2bfloat16(sum.y);
   }
 }
 
@@ -297,9 +308,8 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(
 static int g_numsm = 0;
 
 template <int MT, int NWARP, int KSHIFT>
-static void launch_mt(const void* x, const void* w, const void* ws, void* out,
-                      int M, int N, int K, int Sk, float eps, int nt, int mb,
-                      cudaStream_t stream) {
+static void launch_mt(const void* x, const void* w, const void* ws, void* out, int M, int N, int K,
+                      int Sk, float eps, int nt, int mb, cudaStream_t stream) {
   static_assert(KSHIFT >= 0 && KSHIFT <= 3);
   constexpr int MP = MT * 8;
   constexpr int WK = NWARP / WN;
@@ -309,11 +319,10 @@ static void launch_mt(const void* x, const void* w, const void* ws, void* out,
   int cap = (SMEM_BUDGET - 32 * 1024) / (MP * (XROW + 4));
   if (cap < 1) cap = 1;
   int nbuf = ntotal < cap ? ntotal : cap;
-  if (nbuf < ntotal) nbuf &= ~1;   // k-groups alternate between warp groups
+  if (nbuf < ntotal) nbuf &= ~1;  // k-groups alternate between warp groups
   if (nbuf < 2) nbuf = 2;
   constexpr int wdt = BN >> KSHIFT;
-  size_t smem = (size_t)nbuf * MP * (XROW + 4) +
-                (size_t)ksplit * WK * (MP / 2) * (wdt + 4) * 4;
+  size_t smem = (size_t)nbuf * MP * (XROW + 4) + (size_t)ksplit * WK * (MP / 2) * (wdt + 4) * 4;
 
   static int smem_set = 0;
   if (!smem_set) {
@@ -334,8 +343,7 @@ static void launch_mt(const void* x, const void* w, const void* ws, void* out,
   attr[0].val.clusterDim.z = 1;
   if constexpr (MT == 3 && NWARP == 16 && KSHIFT == 1) {
     attr[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
-    attr[1].val.clusterSchedulingPolicyPreference =
-        cudaClusterSchedulingPolicyLoadBalancing;
+    attr[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     cfg.attrs = attr;
     cfg.numAttrs = 2;
   } else if constexpr (KSHIFT != 0) {
@@ -343,17 +351,17 @@ static void launch_mt(const void* x, const void* w, const void* ws, void* out,
     cfg.numAttrs = 1;
   }
   cudaError_t e = cudaLaunchKernelEx(&cfg, fp8bs_kernel<MT, NWARP, KSHIFT>, (const __nv_bfloat16*)x,
-                                     (const uint8_t*)w, (const float*)ws,
-                                     (__nv_bfloat16*)out, M, N, K, Sk, eps, nbuf);
+                                     (const uint8_t*)w, (const float*)ws, (__nv_bfloat16*)out, M, N,
+                                     K, Sk, eps, nbuf);
   if (e != cudaSuccess)
     fprintf(stderr, "[fp8bs] launch err %d (%s) grid=(%d,%d,%d) smem=%zu\n", (int)e,
             cudaGetErrorString(e), ksplit, nt, mb, smem);
 }
 
 template <int MT, int NWARP>
-static void launch_mt_split(const void* x, const void* w, const void* ws,
-                            void* out, int M, int N, int K, int Sk, float eps,
-                            int kshift, int nt, int mb, cudaStream_t stream) {
+static void launch_mt_split(const void* x, const void* w, const void* ws, void* out, int M, int N,
+                            int K, int Sk, float eps, int kshift, int nt, int mb,
+                            cudaStream_t stream) {
   if (kshift == 0)
     launch_mt<MT, NWARP, 0>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
   else if (kshift == 1)
@@ -364,8 +372,8 @@ static void launch_mt_split(const void* x, const void* w, const void* ws,
     launch_mt<MT, NWARP, 3>(x, w, ws, out, M, N, K, Sk, eps, nt, mb, stream);
 }
 
-void fp8bs_launch(void* out, const void* x, const void* w, const void* ws,
-                  int M, int N, int K, float eps, cudaStream_t stream) {
+void fp8bs_launch(void* out, const void* x, const void* w, const void* ws, int M, int N, int K,
+                  float eps, cudaStream_t stream) {
   if (g_numsm == 0) {
     int dev = 0;
     cudaGetDevice(&dev);
@@ -378,15 +386,13 @@ void fp8bs_launch(void* out, const void* x, const void* w, const void* ws,
 
   const int target = g_numsm;
   int kshift = 0;
-  while (kshift < 3 && (nt << (kshift + 1)) <= target && (1 << (kshift + 1)) <= Sk)
-    ++kshift;
+  while (kshift < 3 && (nt << (kshift + 1)) <= target && (1 << (kshift + 1)) <= Sk) ++kshift;
   if (N > 2304 && N <= 3072 && K >= 4096 && Sk >= 8) kshift = 3;
   bool narrow = false;
   // If a split-2 launch leaves at least one eighth of the SMs idle, double
   // the cluster count while halving the block warps.  Total warp work and
   // partial contributors are unchanged, but the grid fills the chip.
-  if (kshift == 1 && (nt << 1) <= (7 * target) / 8 &&
-      (nt << 2) <= 2 * target && Sk >= 4) {
+  if (kshift == 1 && (nt << 1) <= (7 * target) / 8 && (nt << 2) <= 2 * target && Sk >= 4) {
     ++kshift;
     narrow = true;
   }
@@ -410,17 +416,3 @@ void fp8bs_launch(void* out, const void* x, const void* w, const void* ws,
     wide ? launch_mt_split<3, 16>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream)
          : launch_mt_split<3, 8>(x, w, ws, out, M, N, K, Sk, eps, kshift, nt, mb, stream);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-

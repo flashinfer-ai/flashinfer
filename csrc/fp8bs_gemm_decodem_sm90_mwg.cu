@@ -8,18 +8,19 @@
 // weight tile, and the cross-split reduction becomes a plain __syncthreads()
 // over shared memory.  That removes the cluster barrier entirely and raises
 // the per-SM warp count from 8 to 24-32.
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
 #include <cstdint>
+
 #include "fp8bs_gemm_decodem_sm90.h"
 
 namespace mwg {
 
 __device__ __forceinline__ uint16_t fp8x2(float x0, float x1) {
   uint16_t result;
-  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;"
-               : "=h"(result) : "f"(x0), "f"(x1));
+  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;" : "=h"(result) : "f"(x0), "f"(x1));
   return result;
 }
 
@@ -39,8 +40,7 @@ __device__ __forceinline__ uint64_t wgmma_desc(const uint8_t* ptr) {
 }
 
 template <bool Add>
-__device__ __forceinline__ void wgmma_ss_m64n8(float (&d)[4],
-                                               uint64_t a, uint64_t b) {
+__device__ __forceinline__ void wgmma_ss_m64n8(float (&d)[4], uint64_t a, uint64_t b) {
   if constexpr (Add) {
     asm volatile(
         "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 "
@@ -57,37 +57,31 @@ __device__ __forceinline__ void wgmma_ss_m64n8(float (&d)[4],
 }
 
 template <bool Add>
-__device__ __forceinline__ void wgmma_ss_m64n16(float (&d)[8],
-                                                uint64_t a, uint64_t b) {
+__device__ __forceinline__ void wgmma_ss_m64n16(float (&d)[8], uint64_t a, uint64_t b) {
   asm volatile(
       "wgmma.mma_async.sync.aligned.m64n16k32.f32.e4m3.e4m3 "
       "{%0,%1,%2,%3,%4,%5,%6,%7}, %8, %9, %10, 1, 1;"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-        "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7])
       : "l"(a), "l"(b), "n"(Add ? 1 : 0));
 }
 
 template <bool Add>
-__device__ __forceinline__ void wgmma_ss_m64n24(float (&d)[12],
-                                                uint64_t a, uint64_t b) {
+__device__ __forceinline__ void wgmma_ss_m64n24(float (&d)[12], uint64_t a, uint64_t b) {
   asm volatile(
       "wgmma.mma_async.sync.aligned.m64n24k32.f32.e4m3.e4m3 "
       "{%0,%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11}, %12, %13, %14, 1, 1;"
-      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]),
-        "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]),
-        "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11])
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]),
+        "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11])
       : "l"(a), "l"(b), "n"(Add ? 1 : 0));
 }
 
-__device__ __forceinline__ void cp_async16(void* dst, const void* src,
-                                           bool valid) {
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, bool valid) {
   const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   if (valid) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
-                 :: "r"(smem), "l"(src) : "memory");
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(src) : "memory");
   } else {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;"
-                 :: "r"(smem), "l"(src) : "memory");
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;" ::"r"(smem), "l"(src) : "memory");
   }
 }
 
@@ -101,11 +95,12 @@ __device__ __forceinline__ uint32_t warp_max_u32(uint32_t v) {
 // amax collapses to a single `redux.sync` instead of a five-deep shuffle
 // chain, and every lane already holds the result so no broadcast is needed.
 template <bool SparseM1 = false>
-__device__ __forceinline__ void quantize_row_warp(uint2 raw, uint8_t* bq,
-                                                  float* ascale, float eps,
-                                                  int row, int lane,
-                                                  bool valid = true) {
-  union Bf16Pair { uint32_t u32; __nv_bfloat162 bf16x2; };
+__device__ __forceinline__ void quantize_row_warp(uint2 raw, uint8_t* bq, float* ascale, float eps,
+                                                  int row, int lane, bool valid = true) {
+  union Bf16Pair {
+    uint32_t u32;
+    __nv_bfloat162 bf16x2;
+  };
   const int logical = (row & 7) * 128 + lane * 4;
   const int physical = logical ^ ((logical & 0x380) >> 3);
   if constexpr (SparseM1) {
@@ -117,21 +112,24 @@ __device__ __forceinline__ void quantize_row_warp(uint2 raw, uint8_t* bq,
   }
   const uint32_t w0 = raw.x, w1 = raw.y;
   uint32_t m = w0 & 0x7fffu;
-  uint32_t o = (w0 >> 16) & 0x7fffu;  m = m > o ? m : o;
-  o = w1 & 0x7fffu;                   m = m > o ? m : o;
-  o = (w1 >> 16) & 0x7fffu;           m = m > o ? m : o;
+  uint32_t o = (w0 >> 16) & 0x7fffu;
+  m = m > o ? m : o;
+  o = w1 & 0x7fffu;
+  m = m > o ? m : o;
+  o = (w1 >> 16) & 0x7fffu;
+  m = m > o ? m : o;
   m = warp_max_u32(m);
   const float gmax = __uint_as_float(m << 16);
   const float scale = fmaxf(gmax, eps) * (1.0f / 448.0f);
   const float inv_scale = 1.0f / scale;
   if (lane == 0) ascale[row] = scale;
   Bf16Pair p0, p1;
-  p0.u32 = w0; p1.u32 = w1;
+  p0.u32 = w0;
+  p1.u32 = w1;
   const float2 v0 = __bfloat1622float2(p0.bf16x2);
   const float2 v1 = __bfloat1622float2(p1.bf16x2);
-  const uint32_t packed =
-      static_cast<uint32_t>(fp8x2(v0.x * inv_scale, v0.y * inv_scale)) |
-      (static_cast<uint32_t>(fp8x2(v1.x * inv_scale, v1.y * inv_scale)) << 16);
+  const uint32_t packed = static_cast<uint32_t>(fp8x2(v0.x * inv_scale, v0.y * inv_scale)) |
+                          (static_cast<uint32_t>(fp8x2(v1.x * inv_scale, v1.y * inv_scale)) << 16);
   *reinterpret_cast<uint32_t*>(bq + (row >> 3) * 1024 + physical) = packed;
 }
 
@@ -141,11 +139,9 @@ __device__ __forceinline__ unsigned half_warp_mask() {
   return 0x0000ffffu << (laneid & 16u);
 }
 
-__device__ __forceinline__ uint32_t redux_max_u32(uint32_t v,
-                                                   unsigned mask) {
+__device__ __forceinline__ uint32_t redux_max_u32(uint32_t v, unsigned mask) {
   uint32_t r;
-  asm("redux.sync.max.u32 %0, %1, %2;"
-      : "=r"(r) : "r"(v), "r"(mask));
+  asm("redux.sync.max.u32 %0, %1, %2;" : "=r"(r) : "r"(v), "r"(mask));
   return r;
 }
 
@@ -153,9 +149,8 @@ __device__ __forceinline__ uint32_t redux_max_u32(uint32_t v,
 // only by the 1024-thread MT24/NWG8 route, where the extra live values do not
 // reduce residency and two independent groups retire per warp instruction.
 template <bool BitAmax = false, bool FixedHalf = false>
-__device__ __forceinline__ void quantize_row_half(
-    uint4 raw, uint8_t* bq, float* ascale, float eps,
-    int row, int sublane) {
+__device__ __forceinline__ void quantize_row_half(uint4 raw, uint8_t* bq, float* ascale, float eps,
+                                                  int row, int sublane) {
   float f[8];
   f[0] = __uint_as_float(raw.x << 16);
   f[1] = __uint_as_float(raw.x & 0xffff0000u);
@@ -186,8 +181,7 @@ __device__ __forceinline__ void quantize_row_half(
     if constexpr (FixedHalf) {
 #pragma unroll
       for (int delta = 8; delta > 0; delta >>= 1) {
-        const uint32_t other =
-            __shfl_xor_sync(0xffffffffu, m_bits, delta, 16);
+        const uint32_t other = __shfl_xor_sync(0xffffffffu, m_bits, delta, 16);
         m_bits = m_bits > other ? m_bits : other;
       }
     } else {
@@ -199,22 +193,19 @@ __device__ __forceinline__ void quantize_row_half(
   const float scale = clamped * (1.0f / 448.0f);
   if (sublane == 0) ascale[row] = scale;
   const float inv_scale = FixedHalf ? (448.0f / clamped) : (1.0f / scale);
-  const uint2 result = make_uint2(
-      static_cast<uint32_t>(fp8x2(f[0] * inv_scale, f[1] * inv_scale)) |
-          (static_cast<uint32_t>(fp8x2(f[2] * inv_scale,
-                                      f[3] * inv_scale)) << 16),
-      static_cast<uint32_t>(fp8x2(f[4] * inv_scale, f[5] * inv_scale)) |
-          (static_cast<uint32_t>(fp8x2(f[6] * inv_scale,
-                                      f[7] * inv_scale)) << 16));
+  const uint2 result =
+      make_uint2(static_cast<uint32_t>(fp8x2(f[0] * inv_scale, f[1] * inv_scale)) |
+                     (static_cast<uint32_t>(fp8x2(f[2] * inv_scale, f[3] * inv_scale)) << 16),
+                 static_cast<uint32_t>(fp8x2(f[4] * inv_scale, f[5] * inv_scale)) |
+                     (static_cast<uint32_t>(fp8x2(f[6] * inv_scale, f[7] * inv_scale)) << 16));
   const int logical = (row & 7) * 128 + sublane * 8;
   const int physical = logical ^ ((logical & 0x380) >> 3);
   *reinterpret_cast<uint2*>(bq + (row >> 3) * 1024 + physical) = result;
 }
 
 template <int MT, bool HoistDesc = false>
-__device__ __forceinline__ void issue_mwg_wgmma(
-    float (&partial)[MT / 2], const uint8_t* wtile,
-    const uint8_t* qtile) {
+__device__ __forceinline__ void issue_mwg_wgmma(float (&partial)[MT / 2], const uint8_t* wtile,
+                                                const uint8_t* qtile) {
   asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
   uint64_t da = 0;
   uint64_t db = 0;
@@ -229,14 +220,20 @@ __device__ __forceinline__ void issue_mwg_wgmma(
       db = wgmma_desc(qtile + ks * 32);
     }
     if constexpr (MT == 8) {
-      if (ks == 0) wgmma_ss_m64n8<false>(partial, da, db);
-      else wgmma_ss_m64n8<true>(partial, da, db);
+      if (ks == 0)
+        wgmma_ss_m64n8<false>(partial, da, db);
+      else
+        wgmma_ss_m64n8<true>(partial, da, db);
     } else if constexpr (MT == 16) {
-      if (ks == 0) wgmma_ss_m64n16<false>(partial, da, db);
-      else wgmma_ss_m64n16<true>(partial, da, db);
+      if (ks == 0)
+        wgmma_ss_m64n16<false>(partial, da, db);
+      else
+        wgmma_ss_m64n16<true>(partial, da, db);
     } else {
-      if (ks == 0) wgmma_ss_m64n24<false>(partial, da, db);
-      else wgmma_ss_m64n24<true>(partial, da, db);
+      if (ks == 0)
+        wgmma_ss_m64n24<false>(partial, da, db);
+      else
+        wgmma_ss_m64n24<true>(partial, da, db);
     }
     if constexpr (HoistDesc) {
       da += 2;
@@ -246,52 +243,39 @@ __device__ __forceinline__ void issue_mwg_wgmma(
   asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
 }
 
-template <int MT, int NWG, int KU, bool ExactOneRound = false,
-          bool StaggerMT8 = false, bool SparseM1 = false,
-          bool HalfQuant = false, bool PipelineMMA = false,
+template <int MT, int NWG, int KU, bool ExactOneRound = false, bool StaggerMT8 = false,
+          bool SparseM1 = false, bool HalfQuant = false, bool PipelineMMA = false,
           bool DenseM = false>
-__global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const uint8_t* __restrict__ weight,
-    const float* __restrict__ weight_scale,
-    float eps,
-    __nv_bfloat16* __restrict__ out,
-    int M, int N, int K) {
+__global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* __restrict__ x,
+                                                           const uint8_t* __restrict__ weight,
+                                                           const float* __restrict__ weight_scale,
+                                                           float eps,
+                                                           __nv_bfloat16* __restrict__ out, int M,
+                                                           int N, int K) {
   static_assert(MT == 8 || MT == 16 || MT == 24, "token tile");
-  static_assert(!StaggerMT8 ||
-                ((MT == 8 && NWG == 6 && KU == 2 && ExactOneRound) ||
-                 (MT == 16 && NWG == 8 && KU == 2 && ExactOneRound)));
-  static_assert(!SparseM1 ||
-                (MT == 8 && NWG == 6 && KU == 2 && ExactOneRound));
-  static_assert(!HalfQuant ||
-                (KU == 2 && ExactOneRound &&
-                 ((MT == 24 && (NWG == 6 || NWG == 8)) ||
-                  (MT == 16 && NWG == 8))));
-  static_assert(!PipelineMMA ||
-                (KU == 2 && ExactOneRound && NWG == 6 && MT == 8));
-  static_assert(!DenseM || (ExactOneRound && HalfQuant &&
-                            (MT == 16 || MT == 24)));
+  static_assert(!StaggerMT8 || ((MT == 8 && NWG == 6 && KU == 2 && ExactOneRound) ||
+                                (MT == 16 && NWG == 8 && KU == 2 && ExactOneRound)));
+  static_assert(!SparseM1 || (MT == 8 && NWG == 6 && KU == 2 && ExactOneRound));
+  static_assert(!HalfQuant || (KU == 2 && ExactOneRound &&
+                               ((MT == 24 && (NWG == 6 || NWG == 8)) || (MT == 16 && NWG == 8))));
+  static_assert(!PipelineMMA || (KU == 2 && ExactOneRound && NWG == 6 && MT == 8));
+  static_assert(!DenseM || (ExactOneRound && HalfQuant && (MT == 16 || MT == 24)));
   constexpr int NACC = MT / 2;
   constexpr int ATOMS = MT / 8;
-  constexpr bool WeightPipeW1 =
-      MT == 24 && (NWG == 6 || NWG == 8) && KU == 2 && ExactOneRound;
-  constexpr bool FixedHalfW1 =
-      MT == 24 && NWG == 6 && KU == 2 && ExactOneRound;
+  constexpr bool WeightPipeW1 = MT == 24 && (NWG == 6 || NWG == 8) && KU == 2 && ExactOneRound;
+  constexpr bool FixedHalfW1 = MT == 24 && NWG == 6 && KU == 2 && ExactOneRound;
   constexpr bool LateAccumInitW1 = FixedHalfW1 && DenseM;
-  constexpr bool HoistPipelineDesc =
-      MT == 8 && NWG == 6 && KU == 2 && ExactOneRound && !SparseM1;
-  constexpr bool PrefetchScaleW6 =
-      MT == 16 && NWG == 8 && KU == 2 && ExactOneRound;
-  constexpr int WBYTES = 64 * 128;          // one 64x128 fp8 weight tile
-  constexpr int QBYTES = ATOMS * 1024;      // one MTx128 fp8 activation tile
+  constexpr bool HoistPipelineDesc = MT == 8 && NWG == 6 && KU == 2 && ExactOneRound && !SparseM1;
+  constexpr bool PrefetchScaleW6 = MT == 16 && NWG == 8 && KU == 2 && ExactOneRound;
+  constexpr int WBYTES = 64 * 128;      // one 64x128 fp8 weight tile
+  constexpr int QBYTES = ATOMS * 1024;  // one MTx128 fp8 activation tile
   constexpr int REDUCE_BYTES = (NACC / 2) * 128 * sizeof(uint32_t);
   static_assert(MT != 24 || REDUCE_BYTES <= KU * WBYTES,
                 "MT24 reduction exceeds per-warpgroup weight scratch");
 
   extern __shared__ uint8_t dyn_smem[];
-  uint8_t* const base = reinterpret_cast<uint8_t*>(
-      (reinterpret_cast<uintptr_t>(dyn_smem) + 1023u) &
-      ~static_cast<uintptr_t>(1023u));
+  uint8_t* const base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(dyn_smem) + 1023u) &
+                                                   ~static_cast<uintptr_t>(1023u));
   uint8_t* const wsmem = base;
   uint8_t* const qsmem = base + NWG * KU * WBYTES;
   float* const ssmem = reinterpret_cast<float*>(qsmem + NWG * KU * QBYTES);
@@ -326,14 +310,13 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
     const int logical = (row & 7) * 128 + kseg * 16;
     wsoff[it] = (row >> 3) * 1024 + (logical ^ ((logical & 0x380) >> 3));
   }
-  constexpr int RPW = MT / 4;   // activation rows handled by each warp
-  constexpr int RPH = MT / 8;   // activation rows handled by each half-warp
+  constexpr int RPW = MT / 4;  // activation rows handled by each warp
+  constexpr int RPH = MT / 8;  // activation rows handled by each half-warp
   const int sublane = t & 15;
   const int arow0 = t >> 4;
   const int nrow = tile_n + wrow0;
   const float* const wsp = weight_scale + (tile_n >> 7) * Sk;
-  const uint8_t* const wbase =
-      weight + static_cast<int64_t>(nrow) * K + kseg * 16;
+  const uint8_t* const wbase = weight + static_cast<int64_t>(nrow) * K + kseg * 16;
   const int64_t wrowstep = static_cast<int64_t>(16) * K;
 
   float accum[NACC];
@@ -349,8 +332,7 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
     if constexpr (StaggerMT8) {
       // Spread the independent global-memory issue streams.  MT8 alternates
       // by warpgroup; W6 reverses only its last two non-owner warpgroups.
-      const bool weight_first =
-          MT == 8 ? ((wg & 1) != 0) : (wg >= NWG - 2);
+      const bool weight_first = MT == 8 ? ((wg & 1) != 0) : (wg >= NWG - 2);
       if (weight_first) {
 #pragma unroll
         for (int u = 0; u < KU; ++u) {
@@ -358,8 +340,8 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
 #pragma unroll
           for (int it = 0; it < 4; ++it) {
             const bool valid = live && (nrow + 16 * it) < N;
-            cp_async16(my_w + u * WBYTES + wsoff[it],
-                       wbase + it * wrowstep + (kc + u) * 128, valid);
+            cp_async16(my_w + u * WBYTES + wsoff[it], wbase + it * wrowstep + (kc + u) * 128,
+                       valid);
           }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
@@ -372,14 +354,12 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
               const int row = arow0 + 8 * a;
               if constexpr (DenseM) {
                 araw4[u][a] = *reinterpret_cast<const uint4*>(
-                    tile_x + static_cast<int64_t>(row) * K +
-                    (kc + u) * 128 + sublane * 8);
+                    tile_x + static_cast<int64_t>(row) * K + (kc + u) * 128 + sublane * 8);
               } else {
                 araw4[u][a] = make_uint4(0, 0, 0, 0);
                 if (live && row < tile_rows)
                   araw4[u][a] = *reinterpret_cast<const uint4*>(
-                      tile_x + static_cast<int64_t>(row) * K +
-                      (kc + u) * 128 + sublane * 8);
+                      tile_x + static_cast<int64_t>(row) * K + (kc + u) * 128 + sublane * 8);
               }
             }
           } else {
@@ -389,8 +369,7 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
               araw[u][a] = make_uint2(0, 0);
               if (live && row < tile_rows)
                 araw[u][a] = *reinterpret_cast<const uint2*>(
-                    tile_x + static_cast<int64_t>(row) * K +
-                    (kc + u) * 128 + lane * 4);
+                    tile_x + static_cast<int64_t>(row) * K + (kc + u) * 128 + lane * 4);
             }
           }
         }
@@ -404,14 +383,12 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
               const int row = arow0 + 8 * a;
               if constexpr (DenseM) {
                 araw4[u][a] = *reinterpret_cast<const uint4*>(
-                    tile_x + static_cast<int64_t>(row) * K +
-                    (kc + u) * 128 + sublane * 8);
+                    tile_x + static_cast<int64_t>(row) * K + (kc + u) * 128 + sublane * 8);
               } else {
                 araw4[u][a] = make_uint4(0, 0, 0, 0);
                 if (live && row < tile_rows)
                   araw4[u][a] = *reinterpret_cast<const uint4*>(
-                      tile_x + static_cast<int64_t>(row) * K +
-                      (kc + u) * 128 + sublane * 8);
+                      tile_x + static_cast<int64_t>(row) * K + (kc + u) * 128 + sublane * 8);
               }
             }
           } else {
@@ -421,8 +398,7 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
               araw[u][a] = make_uint2(0, 0);
               if (live && row < tile_rows)
                 araw[u][a] = *reinterpret_cast<const uint2*>(
-                    tile_x + static_cast<int64_t>(row) * K +
-                    (kc + u) * 128 + lane * 4);
+                    tile_x + static_cast<int64_t>(row) * K + (kc + u) * 128 + lane * 4);
             }
           }
         }
@@ -432,8 +408,8 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
 #pragma unroll
           for (int it = 0; it < 4; ++it) {
             const bool valid = live && (nrow + 16 * it) < N;
-            cp_async16(my_w + u * WBYTES + wsoff[it],
-                       wbase + it * wrowstep + (kc + u) * 128, valid);
+            cp_async16(my_w + u * WBYTES + wsoff[it], wbase + it * wrowstep + (kc + u) * 128,
+                       valid);
           }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
@@ -449,15 +425,13 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
           for (int a = 0; a < RPH; ++a) {
             const int row = arow0 + 8 * a;
             if constexpr (DenseM) {
-              araw4[u][a] = *reinterpret_cast<const uint4*>(
-                  tile_x + static_cast<int64_t>(row) * K +
-                  (kc + u) * 128 + sublane * 8);
+              araw4[u][a] = *reinterpret_cast<const uint4*>(tile_x + static_cast<int64_t>(row) * K +
+                                                            (kc + u) * 128 + sublane * 8);
             } else {
               araw4[u][a] = make_uint4(0, 0, 0, 0);
               if (live && row < tile_rows)
                 araw4[u][a] = *reinterpret_cast<const uint4*>(
-                    tile_x + static_cast<int64_t>(row) * K +
-                    (kc + u) * 128 + sublane * 8);
+                    tile_x + static_cast<int64_t>(row) * K + (kc + u) * 128 + sublane * 8);
             }
           }
         } else {
@@ -466,9 +440,8 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
             const int row = warp + 4 * a;
             araw[u][a] = make_uint2(0, 0);
             if (live && row < tile_rows)
-              araw[u][a] = *reinterpret_cast<const uint2*>(
-                  tile_x + static_cast<int64_t>(row) * K +
-                  (kc + u) * 128 + lane * 4);
+              araw[u][a] = *reinterpret_cast<const uint2*>(tile_x + static_cast<int64_t>(row) * K +
+                                                           (kc + u) * 128 + lane * 4);
           }
         }
       }
@@ -478,14 +451,11 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
 #pragma unroll
         for (int it = 0; it < 4; ++it) {
           const bool valid = live && (nrow + 16 * it) < N;
-          cp_async16(my_w + u * WBYTES + wsoff[it],
-                     wbase + it * wrowstep + (kc + u) * 128, valid);
+          cp_async16(my_w + u * WBYTES + wsoff[it], wbase + it * wrowstep + (kc + u) * 128, valid);
         }
-        if constexpr (WeightPipeW1)
-          asm volatile("cp.async.commit_group;" ::: "memory");
+        if constexpr (WeightPipeW1) asm volatile("cp.async.commit_group;" ::: "memory");
       }
-      if constexpr (!WeightPipeW1)
-        asm volatile("cp.async.commit_group;" ::: "memory");
+      if constexpr (!WeightPipeW1) asm volatile("cp.async.commit_group;" ::: "memory");
     }
 
     if constexpr (LateAccumInitW1) {
@@ -498,29 +468,24 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
       if constexpr (HalfQuant) {
 #pragma unroll
         for (int a = 0; a < RPH; ++a)
-          quantize_row_half<false, FixedHalfW1>(
-              araw4[u][a], my_q + u * QBYTES, my_s + u * MT, eps,
-              arow0 + 8 * a, sublane);
+          quantize_row_half<false, FixedHalfW1>(araw4[u][a], my_q + u * QBYTES, my_s + u * MT, eps,
+                                                arow0 + 8 * a, sublane);
       } else {
 #pragma unroll
         for (int a = 0; a < RPW; ++a)
-          quantize_row_warp<SparseM1>(
-              araw[u][a], my_q + u * QBYTES, my_s + u * MT, eps,
-              warp + 4 * a, lane, (warp + 4 * a) < tile_rows);
+          quantize_row_warp<SparseM1>(araw[u][a], my_q + u * QBYTES, my_s + u * MT, eps,
+                                      warp + 4 * a, lane, (warp + 4 * a) < tile_rows);
       }
     }
 
-
     if constexpr (WeightPipeW1) {
-      asm volatile(
-          "fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;"
-          ::: "memory");
+      asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::
+                       : "memory");
       asm volatile("cp.async.wait_group 1;" ::: "memory");
     } else if constexpr (MT == 16 && NWG == 8 && KU == 2 && ExactOneRound) {
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       asm volatile("cp.async.wait_group 0;" ::: "memory");
-    } else if constexpr (MT == 8 && NWG == 6 && KU == 2 && ExactOneRound &&
-                         PipelineMMA) {
+    } else if constexpr (MT == 8 && NWG == 6 && KU == 2 && ExactOneRound && PipelineMMA) {
       // Activation stores are independent of the cp.async weight stream.
       // Start their proxy-ordering fence while those copies are still
       // draining, then join both paths at the named warpgroup barrier below.
@@ -533,7 +498,7 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
       asm volatile("cp.async.wait_group 0;" ::: "memory");
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
-    asm volatile("bar.sync %0, 128;" :: "r"(bar) : "memory");
+    asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
 
     if constexpr (PipelineMMA) {
       float partial0[NACC];
@@ -544,8 +509,7 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
         partial1[i] = 0.0f;
       }
       issue_mwg_wgmma<MT, HoistPipelineDesc>(partial0, my_w, my_q);
-      issue_mwg_wgmma<MT, HoistPipelineDesc>(
-          partial1, my_w + WBYTES, my_q + QBYTES);
+      issue_mwg_wgmma<MT, HoistPipelineDesc>(partial1, my_w + WBYTES, my_q + QBYTES);
       // Form both rescale vectors while the tensor groups are in flight;
       // the WGMMA drains otherwise hold these shared-scale loads behind the
       // wait instruction's memory clobber.
@@ -565,42 +529,37 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
       asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
 #pragma unroll
       for (int i = 0; i < NACC; ++i)
-        accum[i] =
-            fmaf(partial0[i], sc0[2 * (i >> 2) + (i & 1)], accum[i]);
+        accum[i] = fmaf(partial0[i], sc0[2 * (i >> 2) + (i & 1)], accum[i]);
       asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
 #pragma unroll
       for (int i = 0; i < NACC; ++i)
-        accum[i] =
-            fmaf(partial1[i], sc1[2 * (i >> 2) + (i & 1)], accum[i]);
+        accum[i] = fmaf(partial1[i], sc1[2 * (i >> 2) + (i & 1)], accum[i]);
     } else {
 #pragma unroll
       for (int u = 0; u < KU; ++u) {
         if constexpr (WeightPipeW1) {
           if (u > 0) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");
-            asm volatile("bar.sync %0, 128;" :: "r"(bar) : "memory");
+            asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
           }
         }
         float partial[NACC];
 #pragma unroll
         for (int i = 0; i < NACC; ++i) partial[i] = 0.0f;
-        issue_mwg_wgmma<
-            MT, FixedHalfW1 || SparseM1 || (MT == 16 && NWG == 8)>(
+        issue_mwg_wgmma<MT, FixedHalfW1 || SparseM1 || (MT == 16 && NWG == 8)>(
             partial, my_w + u * WBYTES, my_q + u * QBYTES);
         const int kk = kc + u;
         float prefetched_ws = 0.0f;
-        if constexpr (WeightPipeW1 || PrefetchScaleW6)
-          prefetched_ws = wsp[kk];
+        if constexpr (WeightPipeW1 || PrefetchScaleW6) prefetched_ws = wsp[kk];
         if constexpr (SparseM1) {
           // M=1 only observes the row-zero fragments.  Compile out the padded
           // row scale reads and FMAs instead of guarding each fragment at run
           // time; WGMMA still sees the required zero-padded 8-row tile.  The
           // single scale read is cheap, so keep the original drain ordering.
           asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
-          const float ws =
-              (WeightPipeW1 || PrefetchScaleW6)
-                  ? prefetched_ws
-                  : wsp[ExactOneRound ? kk : (kk < Sk ? kk : Sk - 1)];
+          const float ws = (WeightPipeW1 || PrefetchScaleW6)
+                               ? prefetched_ws
+                               : wsp[ExactOneRound ? kk : (kk < Sk ? kk : Sk - 1)];
           if (lane_in_group == 0) {
             const float scale = my_s[u * MT] * ws;
             accum[0] = fmaf(partial[0], scale, accum[0]);
@@ -609,29 +568,24 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
         } else {
           // Pre-drain rescale hoist: the drain's memory clobber would hold
           // these shared activation-scale loads behind the tensor-core wait.
-          const float ws =
-              (WeightPipeW1 || PrefetchScaleW6)
-                  ? prefetched_ws
-                  : wsp[ExactOneRound ? kk : (kk < Sk ? kk : Sk - 1)];
+          const float ws = (WeightPipeW1 || PrefetchScaleW6)
+                               ? prefetched_ws
+                               : wsp[ExactOneRound ? kk : (kk < Sk ? kk : Sk - 1)];
           const float* const cs = my_s + u * MT;
           float sc_e[ATOMS * 2];
 #pragma unroll
           for (int j = 0; j < ATOMS; ++j)
 #pragma unroll
-            for (int r = 0; r < 2; ++r)
-              sc_e[2 * j + r] =
-                  cs[8 * j + 2 * lane_in_group + r] * ws;
+            for (int r = 0; r < 2; ++r) sc_e[2 * j + r] = cs[8 * j + 2 * lane_in_group + r] * ws;
           asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
 #pragma unroll
           for (int i = 0; i < NACC; ++i)
-            accum[i] =
-                fmaf(partial[i], sc_e[2 * (i >> 2) + (i & 1)], accum[i]);
+            accum[i] = fmaf(partial[i], sc_e[2 * (i >> 2) + (i & 1)], accum[i]);
         }
       }
     }
     if constexpr (!ExactOneRound) {
-      if (kc + KU < kb_end)
-        asm volatile("bar.sync %0, 128;" :: "r"(bar) : "memory");
+      if (kc + KU < kb_end) asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
     }
   }
 
@@ -656,21 +610,17 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
       float sum = 0.0f;
 #pragma unroll
       for (int r = 0; r < NWG; ++r) {
-        const uint32_t* const peer = reinterpret_cast<const uint32_t*>(
-            wsmem + r * KU * WBYTES);
+        const uint32_t* const peer = reinterpret_cast<const uint32_t*>(wsmem + r * KU * WBYTES);
         sum += unpack_bf16x2(peer[p * 128 + t]).x;
       }
       const int n = tile_n + warp * 16 + lane_group + 8 * p;
-      if (n < N)
-        out[static_cast<int64_t>(tile_m) * N + n] =
-            __float2bfloat16_rn(sum);
+      if (n < N) out[static_cast<int64_t>(tile_m) * N + n] = __float2bfloat16_rn(sum);
     }
     return;
   }
 #pragma unroll
   for (int i = 0; i < NACC / 2; ++i)
-    reinterpret_cast<uint32_t*>(my_w)[i * 128 + t] =
-        pack_bf16x2(accum[2 * i], accum[2 * i + 1]);
+    reinterpret_cast<uint32_t*>(my_w)[i * 128 + t] = pack_bf16x2(accum[2 * i], accum[2 * i + 1]);
   if constexpr (MT == 8 && NWG == 6 && KU == 2 && PipelineMMA) {
     if (wg < 2)
       asm volatile("bar.sync 15, 768;" ::: "memory");
@@ -683,31 +633,33 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
     float s0, s1;
     if constexpr (NWG == 6 && !SparseM1) {
       const uint32_t* const peer0 = reinterpret_cast<const uint32_t*>(wsmem);
-      const uint32_t* const peer1 = reinterpret_cast<const uint32_t*>(
-          wsmem + KU * WBYTES);
+      const uint32_t* const peer1 = reinterpret_cast<const uint32_t*>(wsmem + KU * WBYTES);
       float2 sum0 = unpack_bf16x2(peer0[p * 128 + t]);
       float2 sum1 = unpack_bf16x2(peer1[p * 128 + t]);
 #pragma unroll
       for (int r = 2; r < NWG; r += 2) {
-        const uint32_t* const peer_even = reinterpret_cast<const uint32_t*>(
-            wsmem + r * KU * WBYTES);
-        const uint32_t* const peer_odd = reinterpret_cast<const uint32_t*>(
-            wsmem + (r + 1) * KU * WBYTES);
+        const uint32_t* const peer_even =
+            reinterpret_cast<const uint32_t*>(wsmem + r * KU * WBYTES);
+        const uint32_t* const peer_odd =
+            reinterpret_cast<const uint32_t*>(wsmem + (r + 1) * KU * WBYTES);
         const float2 v0 = unpack_bf16x2(peer_even[p * 128 + t]);
         const float2 v1 = unpack_bf16x2(peer_odd[p * 128 + t]);
-        sum0.x += v0.x; sum0.y += v0.y;
-        sum1.x += v1.x; sum1.y += v1.y;
+        sum0.x += v0.x;
+        sum0.y += v0.y;
+        sum1.x += v1.x;
+        sum1.y += v1.y;
       }
       s0 = sum0.x + sum1.x;
       s1 = sum0.y + sum1.y;
     } else {
-      s0 = 0.0f; s1 = 0.0f;
+      s0 = 0.0f;
+      s1 = 0.0f;
 #pragma unroll
       for (int r = 0; r < NWG; ++r) {
-        const uint32_t* const peer_red = reinterpret_cast<const uint32_t*>(
-            wsmem + r * KU * WBYTES);
+        const uint32_t* const peer_red = reinterpret_cast<const uint32_t*>(wsmem + r * KU * WBYTES);
         const float2 v = unpack_bf16x2(peer_red[p * 128 + t]);
-        s0 += v.x; s1 += v.y;
+        s0 += v.x;
+        s1 += v.y;
       }
     }
     const int n = tile_n + warp * 16 + lane_group + 8 * (p & 1);
@@ -715,19 +667,16 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(
     if (DenseM || n < N) {
       const int64_t bo = static_cast<int64_t>(tile_m + token) * N + n;
       if (DenseM || token < tile_rows) out[bo] = __float2bfloat16_rn(s0);
-      if (DenseM || token + 1 < tile_rows)
-        out[bo + N] = __float2bfloat16_rn(s1);
+      if (DenseM || token + 1 < tile_rows) out[bo + N] = __float2bfloat16_rn(s1);
     }
   }
 }
 
-template <int MT, int NWG, int KU, bool ExactOneRound = false,
-          bool StaggerMT8 = false, bool SparseM1 = false,
-          bool HalfQuant = false, bool PipelineMMA = false,
+template <int MT, int NWG, int KU, bool ExactOneRound = false, bool StaggerMT8 = false,
+          bool SparseM1 = false, bool HalfQuant = false, bool PipelineMMA = false,
           bool DenseM = false>
-static void launch(dim3 grid, cudaStream_t stream, const __nv_bfloat16* x,
-                   const uint8_t* w, const float* ws, float eps,
-                   __nv_bfloat16* out, int M, int N, int K) {
+static void launch(dim3 grid, cudaStream_t stream, const __nv_bfloat16* x, const uint8_t* w,
+                   const float* ws, float eps, __nv_bfloat16* out, int M, int N, int K) {
   constexpr int ATOMS = MT / 8;
   constexpr int NACC = MT / 2;
   constexpr int COMPUTE = NWG * KU * (64 * 128 + ATOMS * 1024 + MT * 4);
@@ -735,35 +684,47 @@ static void launch(dim3 grid, cudaStream_t stream, const __nv_bfloat16* x,
   constexpr int SMEM = (COMPUTE > REDUCE ? COMPUTE : REDUCE) + 1024;
   static bool opted = false;
   if (!opted) {
-    cudaFuncSetAttribute(
-                         mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8,
-                                    SparseM1, HalfQuant, PipelineMMA, DenseM>,
+    cudaFuncSetAttribute(mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant,
+                                    PipelineMMA, DenseM>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
     opted = true;
   }
-  mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant,
-             PipelineMMA, DenseM>
+  mwg_kernel<MT, NWG, KU, ExactOneRound, StaggerMT8, SparseM1, HalfQuant, PipelineMMA, DenseM>
       <<<grid, 128 * NWG, SMEM, stream>>>(x, w, ws, eps, out, M, N, K);
 }
 
 template <int MT>
-static bool launch_cfg(int nwg, int ku, dim3 grid, cudaStream_t stream,
-                       const __nv_bfloat16* x, const uint8_t* w,
-                       const float* ws, float eps, __nv_bfloat16* out,
-                       int M, int N, int K) {
-  if (nwg == 8 && ku == 2) { launch<MT, 8, 2>(grid, stream, x, w, ws, eps, out, M, N, K); return true; }
-  if (nwg == 6 && ku == 2) { launch<MT, 6, 2>(grid, stream, x, w, ws, eps, out, M, N, K); return true; }
-  if (nwg == 4 && ku == 4) { launch<MT, 4, 4>(grid, stream, x, w, ws, eps, out, M, N, K); return true; }
-  if (nwg == 4 && ku == 2) { launch<MT, 4, 2>(grid, stream, x, w, ws, eps, out, M, N, K); return true; }
-  if (nwg == 8 && ku == 1) { launch<MT, 8, 1>(grid, stream, x, w, ws, eps, out, M, N, K); return true; }
+static bool launch_cfg(int nwg, int ku, dim3 grid, cudaStream_t stream, const __nv_bfloat16* x,
+                       const uint8_t* w, const float* ws, float eps, __nv_bfloat16* out, int M,
+                       int N, int K) {
+  if (nwg == 8 && ku == 2) {
+    launch<MT, 8, 2>(grid, stream, x, w, ws, eps, out, M, N, K);
+    return true;
+  }
+  if (nwg == 6 && ku == 2) {
+    launch<MT, 6, 2>(grid, stream, x, w, ws, eps, out, M, N, K);
+    return true;
+  }
+  if (nwg == 4 && ku == 4) {
+    launch<MT, 4, 4>(grid, stream, x, w, ws, eps, out, M, N, K);
+    return true;
+  }
+  if (nwg == 4 && ku == 2) {
+    launch<MT, 4, 2>(grid, stream, x, w, ws, eps, out, M, N, K);
+    return true;
+  }
+  if (nwg == 8 && ku == 1) {
+    launch<MT, 8, 1>(grid, stream, x, w, ws, eps, out, M, N, K);
+    return true;
+  }
   return false;
 }
 
 }  // namespace mwg
 
 // Returns false when the shape is not a good fit for this kernel.
-bool fp8bs_mwg_launch(void* out, const void* x, const void* w, const void* ws,
-                      int M, int N, int K, float eps, cudaStream_t stream) {
+bool fp8bs_mwg_launch(void* out, const void* x, const void* w, const void* ws, int M, int N, int K,
+                      float eps, cudaStream_t stream) {
   const int ntiles = (N + 63) / 64;
   if (ntiles < 80 || M > 24 || M < 1) return false;
   const int Sk = K >> 7;
@@ -777,7 +738,9 @@ bool fp8bs_mwg_launch(void* out, const void* x, const void* w, const void* ws,
     for (int k = 4; k >= 1; --k) {
       if (per % k != 0) continue;
       if (c * k > 16) continue;
-      nwg = c; ku = k; break;
+      nwg = c;
+      ku = k;
+      break;
     }
   }
   if (nwg == 0) return false;
@@ -792,58 +755,41 @@ bool fp8bs_mwg_launch(void* out, const void* x, const void* w, const void* ws,
   // division, live/padding predicates, scale clamping, and loop-back.
   if (Sk == 16) {
     if (mt == 8) {
-      mwg::launch<8, 8, 2, true>(
-          grid, stream, xp, wp, wsp, eps, op, M, N, K);
+      mwg::launch<8, 8, 2, true>(grid, stream, xp, wp, wsp, eps, op, M, N, K);
     } else if (mt == 16) {
-      mwg::launch<16, 8, 2, true, true, false, true, false, true>(
-          grid, stream, xp, wp, wsp, eps, op, M, N, K);
+      mwg::launch<16, 8, 2, true, true, false, true, false, true>(grid, stream, xp, wp, wsp, eps,
+                                                                  op, M, N, K);
     } else {
       if (M % 24 == 0 && (N & 63) == 0)
-        mwg::launch<24, 8, 2, true, false, false, true, false, true>(
-            grid, stream, xp, wp, wsp, eps, op, M, N, K);
+        mwg::launch<24, 8, 2, true, false, false, true, false, true>(grid, stream, xp, wp, wsp, eps,
+                                                                     op, M, N, K);
       else
-        mwg::launch<24, 8, 2, true, false, false, true>(
-            grid, stream, xp, wp, wsp, eps, op, M, N, K);
+        mwg::launch<24, 8, 2, true, false, false, true>(grid, stream, xp, wp, wsp, eps, op, M, N,
+                                                        K);
     }
     return true;
   }
   // The two MT8 serving rows have exactly one KU2 round per warpgroup.
   if (Sk == 12 && mt == 8) {
     if (N == 8192 && K == 1536 && M == 1) {
-      mwg::launch<8, 6, 2, true, true, true>(
-          grid, stream, xp, wp, wsp, eps, op, M, N, K);
+      mwg::launch<8, 6, 2, true, true, true>(grid, stream, xp, wp, wsp, eps, op, M, N, K);
     } else if (N == 8192 && K == 1536 && M == 8) {
-      mwg::launch<8, 6, 2, true, true, false, false, true>(
-          grid, stream, xp, wp, wsp, eps, op, M, N, K);
+      mwg::launch<8, 6, 2, true, true, false, false, true>(grid, stream, xp, wp, wsp, eps, op, M, N,
+                                                           K);
     } else {
-      mwg::launch<8, 6, 2, true>(
-          grid, stream, xp, wp, wsp, eps, op, M, N, K);
+      mwg::launch<8, 6, 2, true>(grid, stream, xp, wp, wsp, eps, op, M, N, K);
     }
     return true;
   }
   if (Sk == 12 && mt == 24) {
     if (M % 24 == 0 && (N & 63) == 0)
-        mwg::launch<24, 6, 2, true, false, false, true, false, true>(
-          grid, stream, xp, wp, wsp, eps, op, M, N, K);
+      mwg::launch<24, 6, 2, true, false, false, true, false, true>(grid, stream, xp, wp, wsp, eps,
+                                                                   op, M, N, K);
     else
-      mwg::launch<24, 6, 2, true, false, false, true>(
-          grid, stream, xp, wp, wsp, eps, op, M, N, K);
+      mwg::launch<24, 6, 2, true, false, false, true>(grid, stream, xp, wp, wsp, eps, op, M, N, K);
     return true;
   }
-  if (mt == 8)
-    return mwg::launch_cfg<8>(nwg, ku, grid, stream, xp, wp, wsp, eps, op, M, N, K);
-  if (mt == 16)
-    return mwg::launch_cfg<16>(nwg, ku, grid, stream, xp, wp, wsp, eps, op, M, N, K);
+  if (mt == 8) return mwg::launch_cfg<8>(nwg, ku, grid, stream, xp, wp, wsp, eps, op, M, N, K);
+  if (mt == 16) return mwg::launch_cfg<16>(nwg, ku, grid, stream, xp, wp, wsp, eps, op, M, N, K);
   return mwg::launch_cfg<24>(nwg, ku, grid, stream, xp, wp, wsp, eps, op, M, N, K);
 }
-
-
-
-
-
-
-
-
-
-
-
