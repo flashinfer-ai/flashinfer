@@ -307,6 +307,102 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
     )
 
 
+@torch.inference_mode()
+@pytest.mark.parametrize("checkpoint_every_n_tokens", [0, 64])
+@pytest.mark.parametrize("seq_lens", [[100, 128], [36, 128]])
+@pytest.mark.parametrize("nonfinite_input", ["q", "k", "v", "g", "beta"])
+@pytest.mark.parametrize("nonfinite_value", ["nan", "inf"])
+def test_sm12x_next_sequence_nan_stays_out_of_partial_tail(
+    qkv_factory,
+    nonfinite_value: str,
+    nonfinite_input: str,
+    seq_lens: list[int],
+    checkpoint_every_n_tokens: int,
+    seed: int = 0,
+):
+    """The last, partial chunk of a packed sequence also covers the next
+    sequence's first rows. A NaN or Inf there must not change the sequence's
+    output, final state or checkpoints."""
+    _skip_if_not_sm12x()
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    num_q_heads, num_k_heads, num_v_heads = 2, 2, 4
+    head_size = 128
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    total_seqlen = sum(seq_lens)
+    first_len = seq_lens[0]
+    every = checkpoint_every_n_tokens
+    counts = [n // every if every else 0 for n in seq_lens]
+    device = torch.device("cuda")
+
+    with device:
+        q, k, v = qkv_factory(
+            seq_lens, num_q_heads, num_k_heads, num_v_heads, head_size, torch.bfloat16
+        )
+        q = torch.nn.functional.normalize(q, p=2.0, dim=-1)
+        k = torch.nn.functional.normalize(k, p=2.0, dim=-1)
+        alpha = 0.9 + 0.1 * torch.rand(total_seqlen, num_sab_heads)
+        beta = torch.rand(total_seqlen, num_sab_heads)
+        initial_state = 0.1 * torch.randn(
+            len(seq_lens), num_sab_heads, head_size, head_size
+        )
+        cu_seqlens = torch.tensor(exclusive_cumsum(seq_lens), dtype=torch.int64)
+        checkpoint_cu_starts = torch.tensor(exclusive_cumsum(counts), dtype=torch.int64)
+
+    def run(inputs):
+        kwargs = {}
+        if every:
+            kwargs = dict(
+                # NaN-filled, so a checkpoint the kernel skips fails the
+                # comparison below.
+                state_checkpoints=torch.full(
+                    (sum(counts), num_sab_heads, head_size, head_size),
+                    float("nan"),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=every,
+            )
+        o, state = chunk_gated_delta_rule(
+            **inputs,
+            scale=None,
+            initial_state=initial_state.clone(),
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            use_cp=False,
+            **kwargs,
+        )
+        checkpoints = kwargs.get("state_checkpoints")
+        if checkpoints is not None:
+            checkpoints = checkpoints[: counts[0]]
+        return o[:first_len], state[0], checkpoints
+
+    inputs = dict(q=q, k=k, v=v, g=alpha, beta=beta)
+    ref_o, ref_state, ref_checkpoints = run(inputs)
+
+    poisoned = inputs[nonfinite_input].clone()
+    poisoned[first_len] = float(nonfinite_value)  # the second sequence's first token
+    o, state, checkpoints = run({**inputs, nonfinite_input: poisoned})
+    torch.cuda.synchronize()
+
+    # Rows past a sequence's end must not enter its arithmetic at all, so the
+    # first sequence's results match the unpoisoned run bit for bit.
+    # assert_close does not treat NaN as equal, so a leaked NaN or Inf fails.
+    torch.testing.assert_close(o, ref_o, atol=0, rtol=0)
+    torch.testing.assert_close(state, ref_state, atol=0, rtol=0)
+    if every:
+        # A partial final block stores no checkpoint, so all of the first
+        # sequence's checkpoints come before its tail: token 64 for
+        # [100, 128], none for [36, 128]. The tail only reaches the output
+        # and the final state; this guards the checkpoint stores of the same
+        # kernel.
+        torch.testing.assert_close(checkpoints, ref_checkpoints, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("beta", [False, True])
 @pytest.mark.parametrize("alpha", [False, True])
 @pytest.mark.parametrize("scale", [1.0, "auto"])
