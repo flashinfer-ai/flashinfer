@@ -63,6 +63,7 @@ from ...jit import cake_gdn_affine_split as _programs
 __all__ = [
     "C_MIN",
     "P_MAX",
+    "SPLIT_MIN_TOKENS",
     "SplitPlan",
     "chunk_gated_delta_rule_gdn_affine_split_sm100",
     "clear_affine_split_plans",
@@ -83,6 +84,9 @@ _TMAP_BYTES = 512
 P_MAX: dict[int, int] = {4: 8, 8: 5, 16: 2, 32: 1}
 #: The fewest chunks per segment per value-head count.
 C_MIN: dict[int, int] = {4: 8, 8: 8, 16: 16, 32: 16}
+#: A call whose longest possible sequence has at most this many tokens runs
+#: the unsplit kernel: on SM103 two segments do not beat it there.
+SPLIT_MIN_TOKENS = 1024
 #: The pass-2 program of each value-head count (its compose slice width).
 _PASS2: dict[int, Any] = {
     4: _programs.PASS2_W4,
@@ -191,9 +195,15 @@ def plan_split(
     sm_count: int,
     split_count: Optional[int] = None,
 ) -> SplitPlan:
-    """The plan constants and the host bound on the segment count."""
+    """The plan constants and the host bound on the segment count.
+
+    Without ``split_count``, ``max_seqlen <= SPLIT_MIN_TOKENS`` gives
+    ``p_bound = 1``. A larger bound keeps the device segment rule for every
+    live length, so a shorter live sequence of that call may still split."""
 
     p_cap, c_min = plan_constants(num_heads, sm_count, split_count)
+    if split_count is None and max_seqlen <= SPLIT_MIN_TOKENS:
+        return SplitPlan(p_cap, c_min, 1)
     return SplitPlan(p_cap, c_min, segment_count(max_seqlen, p_cap, c_min))
 
 

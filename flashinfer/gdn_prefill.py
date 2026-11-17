@@ -1830,9 +1830,9 @@ def chunk_gated_delta_rule(
         summation order (not bitwise equal to the default route when
         ``P > 1``), run-to-run deterministic. ``P`` depends only on the
         sequence length, the value-head count and the device; when the
-        longest possible sequence gets ``P = 1`` the call runs the default
-        Cake kernel and its output is bitwise equal to
-        ``use_affine_split=False``. Supported: SM103, BF16 Q/K/V/output, head
+        longest possible sequence has at most 1024 tokens or gets ``P = 1``
+        the call runs the default Cake kernel and its output is bitwise equal
+        to ``use_affine_split=False``. Supported: SM103, BF16 Q/K/V/output, head
         size 128, ``num_v_heads`` in (4, 8, 16, 32) with ``num_k_heads ==
         num_q_heads`` dividing it, one sequence, FP32 ``initial_state`` /
         ``output_state`` with dense ``[H, V, K]`` rows on 16-byte aligned

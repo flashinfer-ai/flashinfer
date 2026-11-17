@@ -190,7 +190,7 @@ def _accuracy_case(hq, hv, t, kind):
 
 
 @pytest.mark.parametrize("hq,hv", HEADS)
-@pytest.mark.parametrize("t", [1024, 2048, 4096])
+@pytest.mark.parametrize("t", [1024, 1152, 2048, 4096])
 @pytest.mark.parametrize("kind", ["real", "stress"])
 def test_split_accuracy_against_fp64(hq, hv, t, kind):
     _accuracy_case(hq, hv, t, kind)
@@ -230,7 +230,9 @@ def test_split_is_run_to_run_deterministic():
     "hq,hv,t,split_count",
     [
         (2, 4, 512, None),
+        (2, 4, 1024, None),
         (4, 8, 384, None),
+        (4, 8, 1024, None),
         (8, 16, 1024, None),
         (16, 32, 4096, None),
         (4, 8, 4096, 1),
@@ -472,7 +474,7 @@ def test_graph_replay_with_new_contents_and_lengths(hq, hv):
         )
     # Eager traffic over more geometries than the LRU holds, then replay on
     # another stream: the pinned workspaces stay alive.
-    for tt in (1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600):
+    for tt in (1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536, 1600, 1664):
         _call(_problem(hq, hv, tt, "real"), use_affine_split=True)
     assert len(split._EAGER) == 8
     cu.copy_(torch.tensor([0, t], dtype=torch.int32))

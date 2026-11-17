@@ -243,13 +243,17 @@ def test_plan_constants_on_152_sms():
     "heads,tokens,expected",
     [
         (4, 512, 1),
-        (4, 1024, 2),
+        (4, 1024, 1),
+        (4, 1025, 2),
+        (4, 1152, 2),
         (4, 2048, 4),
         (4, 4096, 8),
         (4, 8192, 8),
         (8, 512, 1),
-        (8, 1024, 2),
+        (8, 1024, 1),
+        (8, 1025, 2),
         (8, 4096, 5),
+        (16, 1024, 1),
         (16, 1984, 1),
         (16, 2048, 2),
         (16, 8192, 2),
@@ -259,6 +263,13 @@ def test_plan_constants_on_152_sms():
 def test_segment_count_of_the_planner(heads, tokens, expected):
     plan = split.plan_split(num_heads=heads, max_seqlen=tokens, sm_count=152)
     assert plan.p_bound == expected
+
+
+def test_forced_split_count_ignores_the_minimum_length():
+    assert split.SPLIT_MIN_TOKENS == 1024
+    assert split.plan_split(
+        num_heads=4, max_seqlen=1000, sm_count=152, split_count=3
+    ) == (3, 1, 3)
 
 
 def test_segment_count_edges():
