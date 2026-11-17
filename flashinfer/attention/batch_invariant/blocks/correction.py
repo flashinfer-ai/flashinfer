@@ -17,8 +17,8 @@ row's statistics chain**. Per tile it receives from the softmax warpgroups ``alp
   output rows (mode 0), or the raw fp32 ``O_c`` rows and ``(m, l)`` to the workspace slot (mode 1, folded
   by ``fixup.py``).
 
-TMEM traffic goes through ``tcgen05.copy.Ld32x32bOp`` / ``St32x32bOp`` in ``CT``-column pieces (16: the
-warpgroup runs at 96 registers when there are two softmax warpgroups).
+TMEM traffic goes through ``tcgen05.copy.Ld32x32bOp`` / ``St32x32bOp`` in ``CT``-column pieces (``StaticPlan.ct``: 32 at
+128 registers, 16 below, 8 under the paired placement whose warpgroup carries two Q tiles' chains at 96).
 
 The running merged state ``O_m`` lives in TMEM at D <= 128 (``S | P | O_c | O_m`` <= 448 columns) and in a per-CTA
 global scratch at D = 256 (``st.om_tmem`` False: TMEM holds ``S | P | O_c`` = 448; the scratch row of this CTA and
@@ -50,8 +50,9 @@ from ..spec import chunk_len
 from .operands import ACC_DTYPE, BAR_FOLD, IN_DTYPE, OM_VEC, Q_ROWS, om_scratch_blocks
 
 
-CT = 16  # TMEM columns per load / store with two softmax warpgroups (96 registers); 32 with one (StaticPlan.ct)
+CT = 16  # TMEM columns per load / store with two softmax warpgroups (96 registers); 32 with one, 8 under the paired placement (StaticPlan.ct)
 PIECE_BUFS = {
+    80: 2,
     96: 2,
     128: 2,
     160: 3,

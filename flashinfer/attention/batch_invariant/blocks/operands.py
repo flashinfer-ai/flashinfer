@@ -216,8 +216,9 @@ class StaticPlan:
         self.n_wg = n_wg
         self.softmax_threads = 128 * n_wg
         self.ct = (
-            32 if self.roles.regs_correction >= 128 else 16
-        )  # the correction's TMEM piece (columns): 32 from 128 registers up, 16 below
+            32 if self.roles.regs_correction >= 128 else (8 if q2 else 16)
+        )  # the correction's TMEM piece (columns): 32 from 128 registers up, 16 below; 8 under the paired placement, whose correction
+        # carries two Q tiles' chains and smem O_m pointers at 96 registers (16-column pieces spilled its tile loop in the ragged build)
         self.T = TILE_KEYS
         self.tokens_per_tile = (
             Q_ROWS // g
@@ -231,10 +232,12 @@ class StaticPlan:
         # 0..rep_rows-1 (g <= 32; 30 rows at g = 6, 24 at g = 12). The Q pipeline's transaction count is armed per unit with the
         # bytes its load pattern moves (rows_per_tile or 4 rep_rows rows): with the full-tile count the barrier never completed
         # for g not dividing 128 (24 / 4 and 24 / 2 heads hung)
-        # the replicated-row placement is off under the paired placement at D = 128: its P exchange and four-slice stats payload would
-        # not leave room for the third ring slot next to the two Q tiles and the smem O_m, so units of at most 32 live rows take the
-        # full-row path there (the same thread-per-row term; a placement)
-        self.rep_ok = g <= REP_ROWS and not (q2 and D == 128)
+        # the replicated-row placement is off under the paired placement: units of at most 32 live rows take the full-row path there
+        # (the same thread-per-row term; a placement). Its instantiation next to the full-row loop in the same softmax code region made
+        # ptxas schedule the full-row exponential stream with its MUFU issue stalls exposed, which cost the paired softmax a fifth of its
+        # tile whenever one warpgroup worked alone; at D = 128 its P exchange and four-slice stats payload would also not leave room for
+        # the third ring slot next to the two Q tiles and the smem O_m
+        self.rep_ok = g <= REP_ROWS and not q2
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
         self.n_slices = (
