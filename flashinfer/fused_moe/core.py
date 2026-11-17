@@ -7245,7 +7245,8 @@ def trtllm_fp4_block_scale_moe(
         outputs and batched-GEMM workspaces) from it instead of allocating
         per call, so MoE layers that run sequentially on one stream can share
         a single buffer. Requires ``do_finalize=True`` and no
-        ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
+        ``gemm1_lora_delta``. Autotuning profiles from the same buffer (below SM100,
+        from its own);
         scratch that does not fit (a larger token count) is allocated per call.
         Default ``None`` (allocate per call).
 
@@ -7304,6 +7305,7 @@ def trtllm_fp4_block_scale_moe(
             valid_hidden_size=valid_hidden_size, valid_intermediate_size=valid_intermediate_size,
             num_fused_shared_experts=num_fused_shared_experts,
             hidden_states_scale_layout=hidden_states_scale_layout, nvfp4_4over6=nvfp4_4over6,
+            workspace_buffer=workspace_buffer,
         )  # fmt: skip
     return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
         RoutingInputMode.FromLogits,
@@ -7568,7 +7570,8 @@ def trtllm_fp4_block_scale_routed_moe(
         outputs and batched-GEMM workspaces) from it instead of allocating
         per call, so MoE layers that run sequentially on one stream can share
         a single buffer. Requires ``do_finalize=True`` and no
-        ``gemm1_lora_delta``. Autotuning profiles from the same buffer;
+        ``gemm1_lora_delta``. Autotuning profiles from the same buffer (below SM100,
+        from its own);
         scratch that does not fit (a larger token count) is allocated per call.
         Default ``None`` (allocate per call).
 
@@ -7595,7 +7598,7 @@ def trtllm_fp4_block_scale_routed_moe(
         routing included; the autotuned config is used only when the tuner chose
         the slot's tile, otherwise that tile's default config runs. The body
         allocates its own buffers. Not supported with ``gemm1_lora_delta``,
-        fused shared experts or ``workspace_buffer`` (``ValueError``).
+        fused shared experts or ``workspace_buffer`` (``ValueError``), nor below SM100.
         Default ``None`` (route inside the call).
 
     Returns
@@ -7663,10 +7666,11 @@ def trtllm_fp4_block_scale_routed_moe(
             or (sf_vec == 32 and per_token_scale is not None)
             or (hidden_states_scale is None and dtype != torch.bfloat16)
             or (gemm1_lora_delta is not None and not gated)
+            or routing_metadata is not None  # built only by the SM100 routing kernels
         ):
             raise NotImplementedError(
                 "Below SM100 TRT-LLM FP4 MoE runs NVFP4 (with per-token scales too), MXFP4xMXFP8 "
-                "and MXFP4xBF16, with LoRA on gated activations."
+                "and MXFP4xBF16, with LoRA on gated activations, without routing_metadata."
             )
         if hidden_states_scale is not None:  # the linear layout, as above SM100
             resolve_moe_act_sf_layout(hidden_states_scale_layout)
@@ -7718,7 +7722,7 @@ def trtllm_fp4_block_scale_routed_moe(
             gemm1_alpha, gemm1_beta, gemm1_clamp_limit, num_experts, local_expert_offset,
             local_num_experts, activation_type, enable_pdl, output, tune_max_num_tokens,
             gemm1_bias if gemm1_lora_delta is None else None, gemm2_bias, fc1_rows, do_finalize,
-            gemm1_lora_delta, nvfp4_4over6,
+            gemm1_lora_delta, nvfp4_4over6, workspace_buffer,
         )  # fmt: skip
 
     # The kernel folds dequantScaleAb into scaleC and applies it to the bias
@@ -7817,6 +7821,7 @@ def _trtllm_fp4_routed_moe_sm80(
     gemm1_alpha, gemm1_beta, gemm1_clamp_limit, num_experts, local_expert_offset,
     local_num_experts, activation_type, enable_pdl, output, tune_max_num_tokens, gemm1_bias=None,
     gemm2_bias=None, fc1_rows=None, do_finalize=True, fc1_deltas=None, nvfp4_4over6=_UNSET,
+    workspace_buffer=None,
 ) -> List[torch.Tensor]:  # fmt: skip
     """TRT-LLM FP4 MoE on the CUTLASS SM80 kernels with SM80 operands ``sm80_weights`` cut to
     ``fc1_rows`` (biases too). The gate scalar dequantizes GEMM1; the FC1 output scalar is the
@@ -7911,15 +7916,34 @@ def _trtllm_fp4_routed_moe_sm80(
     if not do_finalize:  # as above SM100, the unfinalized rows are allocated
         output = ones.new_empty((rows.numel(), w2.shape[1]), dtype=torch.bfloat16)
     major, minor = get_compute_capability(hidden_states.device)
+    module = get_cutlass_fused_moe_module(f"{major * 10 + minor}")
+    ep_size = 1 if local_num_experts == num_experts else 2
+    if workspace_buffer is not None:
+        if not do_finalize or fc1_deltas is not None:
+            raise RuntimeError(
+                "workspace_buffer requires do_finalize=True and is incompatible with "
+                "gemm1_lora_delta, because returned intermediates cannot live in a shared "
+                "workspace."
+            )
+        # As above SM100, scratch that does not fit is allocated per call.
+        need = module.cutlass_fused_moe_workspace_size(
+            hidden_states.shape[0], w2.shape[1], w1.shape[1] // (2 if act.is_gated else 1),
+            w2.shape[0] * ep_size, local.shape[1], x_dtype=hidden_states.dtype,
+            weight_dtype=w1.dtype, activation_type=act, ep_size=ep_size,
+            use_mxfp8_act_scaling=mxfp8,
+        )  # fmt: skip
+        workspace_buffer = (
+            workspace_buffer if workspace_buffer.numel() >= need else None
+        )
     with torch.cuda.device(hidden_states.device):
-        get_cutlass_fused_moe_module(f"{major * 10 + minor}").cutlass_fused_moe(
+        module.cutlass_fused_moe(
             output, hidden_states, local.int().contiguous(), topk_weights.float().contiguous(), w1,
             biases[0], w2, biases[1], torch.bfloat16, quant_scales, x_sf, *swiglu, None, *situ,
-            False, ep_size=1 if local_num_experts == num_experts else 2, ep_rank=0,
-            enable_pdl=enable_pdl, activation_type=act, tune_max_num_tokens=tune_max_num_tokens,
-            use_mxfp8_act_scaling=mxfp8, nvfp4_4over6_code=nvfp4_4over6_code(recipe),
-            permuted_rows=rows, do_finalize=do_finalize, fc1_deltas=fc1_deltas,
-            fc2_inputs=fc2_inputs,
+            False, ep_size=ep_size, ep_rank=0, enable_pdl=enable_pdl, activation_type=act,
+            tune_max_num_tokens=tune_max_num_tokens, use_mxfp8_act_scaling=mxfp8,
+            nvfp4_4over6_code=nvfp4_4over6_code(recipe), permuted_rows=rows,
+            do_finalize=do_finalize, fc1_deltas=fc1_deltas, fc2_inputs=fc2_inputs,
+            workspace_buffer=workspace_buffer,
         )  # fmt: skip
     if rows is None:
         return [output]
@@ -8360,6 +8384,9 @@ def trtllm_fused_moe_workspace_size(
     token count used by the launch. This size does not cover other tactics
     selected for other tuning buckets or during subsequent autotuning.
 
+    Below SM100 the FP4 modes return the CUTLASS SM80 kernels' scratch, which depends on
+    neither the tactic nor the weights.
+
     Parameters
     ----------
     max_num_tokens : int
@@ -8509,6 +8536,21 @@ def trtllm_fused_moe_workspace_size(
     for name, tensor in given.items():
         if tensor.device != device:
             raise ValueError(f"{name} is on {tensor.device}, expected {device}")
+    fp4 = dict(nvfp4=torch.uint8, mxfp4_mxfp8=torch.float8_e4m3fn, mxfp4_bf16=torch.bfloat16)  # fmt: skip
+    if quant_mode in fp4 and get_compute_capability(device)[0] < 10:
+        # The CUTLASS SM80 kernels' scratch, at the shapes the FP4 APIs run them.
+        inter = intermediate_size
+        if valid_intermediate_size is not None:
+            inter = min(_round_up(valid_intermediate_size, 128), intermediate_size)
+        ep_size = 1 if local_num_experts == num_experts else 2
+        return cutlass_fused_moe_workspace_size(
+            max_num_tokens, _infer_trtllm_moe_output_hidden_size(hidden_size, valid_hidden_size),
+            inter, (local_num_experts + num_fused_shared_experts) * ep_size,
+            top_k + num_fused_shared_experts, x_dtype=fp4[quant_mode], weight_dtype=torch.int64,
+            activation_type=ActivationType(activation_type), ep_size=ep_size,
+            use_mxfp8_act_scaling=quant_mode == "mxfp4_mxfp8", use_fused_finalize=True,
+            device=device,
+        )  # fmt: skip
 
     with torch.cuda.device(device):
         return _trtllm_fused_moe_workspace_size_impl(

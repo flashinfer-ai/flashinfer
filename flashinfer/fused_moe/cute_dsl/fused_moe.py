@@ -1720,6 +1720,14 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
+        if torch.cuda.get_device_capability(self.device)[0] < 10:
+            # Below SM100 only the W4A16 records take tactics.
+            records = self.quant_mode == "w4a16" and cute_dsl_w4a16_sm80_supported(
+                self.num_experts, self.num_local_experts, self.local_expert_offset,
+                self.output_dtype, self.activation_type, self.swiglu_alpha, self.swiglu_beta,
+                self.swiglu_limit, self.situ_beta,
+            )  # fmt: skip
+            return list(W4A16_SM80_TACTICS) if records else []
         if self.routing_weights_before_fc2:
             return [DEFAULT_BLACKWELL_MOE_TACTIC]
         if self.swap_ab and self.quant_mode != "w4a16":

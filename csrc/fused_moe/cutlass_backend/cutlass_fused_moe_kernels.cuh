@@ -5376,6 +5376,8 @@ void CutlassMoeFCRunner<
                                         hidden_size % 64 == 0 && inter_size % 64 == 0),
                              "NVFP4 W4A16 takes 16-bit activations, hidden and inter sizes "
                              "divisible by 64");
+        TLLM_CHECK_WITH_INFO((!std::is_same_v<InputType, Fp4Type> || input_sf),
+                             "Packed NVFP4 activations take their block scales");
         int64_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
         void const* codes = input_activations;
         auto const* sf = w4a16 ? nullptr : input_sf;
