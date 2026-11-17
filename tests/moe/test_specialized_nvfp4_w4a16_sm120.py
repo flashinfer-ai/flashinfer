@@ -21,7 +21,12 @@ top_k=6, hidden=2688, intermediate=1856, non-gated ReLU^2).
 Covers the backend-dispatch semantics (auto routing on the shipped
 token-count allowlist, never-swap-explicit, explicit "specialized"
 off-allowlist raises, kill switch), numeric correctness against an
-fp32-dequant reference MoE, and CUDA-graph capture/replay.
+fp32-dequant reference MoE, CUDA-graph capture/replay, and the unified
+MoELayer path (``BackendOptions((B12xW4A16Config(),))`` ->
+``B12xW4A16Runner`` -> ``B12xMoEWrapper``), which must reach the same
+specialized dispatch as the flat entry. CPU-side dispatch-logic tests
+(mocked kernels, no sm120 needed) live in
+``test_specialized_nvfp4_w4a16_sm120_dispatch.py``.
 """
 
 import pytest
@@ -261,6 +266,114 @@ def test_kill_switch(weights, monkeypatch):
     assert spec.dispatch_stats.get("specialized", 0) == before
     with pytest.raises(ValueError, match="kill_switch"):
         _call(x, ids, tw, weights, backend="specialized")
+
+
+def _unified_layer_and_weight_pack(weights, t):
+    """MoELayer over the single opt-in b12x W4A16 backend candidate."""
+    from flashinfer.fused_moe import (
+        B12xW4A16Config,
+        MoELayer,
+        MoEWeightPack,
+    )
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEConfig,
+        QuantConfig,
+        QuantFormat,
+        ReLU2,
+        RoutingConfig,
+    )
+
+    w1, w1_sf, w1_alpha, w2, w2_sf, w2_alpha = weights
+    prepared = B12xW4A16Config.prepare_weights(
+        w1,
+        w1_sf,
+        w1_alpha,
+        w2,
+        w2_sf,
+        w2_alpha,
+        activation=ReLU2(),
+        source_format="modelopt",
+    )
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for("b12x_w4a16", prepared)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=E, top_k=TOPK),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
+        activation=ReLU2(),
+        backend=BackendOptions((B12xW4A16Config(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=t),
+    )
+    layer = MoELayer(config)
+    assert len(layer.runners) == 1
+    layer._select_winner = lambda *_: (layer.runners[0], -1)
+    return layer, weight_pack
+
+
+def _act_pack(x, ids, tw):
+    from flashinfer.fused_moe import MoEActivationPack
+
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=torch.empty(0, device=DEVICE),
+        topk_ids=ids,
+        topk_weights=tw,
+    )
+
+
+@pytest.mark.parametrize("t", [4, 16])
+def test_moe_layer_reaches_specialized_and_matches_reference(weights, t):
+    """The unified MoELayer path (B12xW4A16Runner -> B12xMoEWrapper) must
+    reach the specialized kernels on allowlisted shapes, not just the flat
+    b12x_fused_moe entry."""
+    from flashinfer.fused_moe import specialized_moe_nvfp4_w4a16_sm120 as spec
+
+    x, ids, tw = _routing(t, seed=300 + t)
+    ref = _reference(x, ids, tw, weights)
+    layer, weight_pack = _unified_layer_and_weight_pack(weights, t)
+    before = spec.dispatch_stats.get("specialized", 0)
+    out = layer(_act_pack(x, ids, tw), weight_pack)
+    torch.cuda.synchronize()
+    assert spec.dispatch_stats.get("specialized", 0) == before + 1
+    assert layer.winner_backend == "b12x_w4a16"
+    _assert_close_to_reference(out, ref)
+
+
+def test_moe_layer_off_allowlist_keeps_stock_and_matches_reference(weights):
+    from flashinfer.fused_moe import specialized_moe_nvfp4_w4a16_sm120 as spec
+
+    t = 8  # not an admitted token count
+    x, ids, tw = _routing(t, seed=301)
+    ref = _reference(x, ids, tw, weights)
+    layer, weight_pack = _unified_layer_and_weight_pack(weights, t)
+    before = spec.dispatch_stats.get("specialized", 0)
+    out = layer(_act_pack(x, ids, tw), weight_pack)
+    torch.cuda.synchronize()
+    assert spec.dispatch_stats.get("specialized", 0) == before
+    assert any(
+        any(r.startswith("token_count") for r in reasons)
+        for reasons in spec.fallback_reasons
+    )
+    _assert_close_to_reference(out, ref)
+
+
+def test_moe_layer_kill_switch_keeps_stock(weights, monkeypatch):
+    from flashinfer.fused_moe import specialized_moe_nvfp4_w4a16_sm120 as spec
+
+    monkeypatch.setenv(spec.ENV_DISABLE, "1")
+    t = 16
+    x, ids, tw = _routing(t, seed=302)
+    ref = _reference(x, ids, tw, weights)
+    layer, weight_pack = _unified_layer_and_weight_pack(weights, t)
+    before = spec.dispatch_stats.get("specialized", 0)
+    out = layer(_act_pack(x, ids, tw), weight_pack)
+    torch.cuda.synchronize()
+    assert spec.dispatch_stats.get("specialized", 0) == before
+    assert any("kill_switch" in reasons for reasons in spec.fallback_reasons)
+    _assert_close_to_reference(out, ref)
 
 
 def test_cuda_graph_replay_matches_eager(weights):
