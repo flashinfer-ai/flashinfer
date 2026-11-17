@@ -475,9 +475,17 @@ def recurrent_kda(
             open rows), and a call with one token per sequence is a decode step
             (one launch of a step kernel that reads nothing back to the host:
             its ``cu_seqlens`` are taken as ``arange(N + 1)`` and its slots as
-            unique and in range, unchecked). A slot whose state the
-            caller replaced starts a new chunk; a slot reset after a request
-            shorter than 16 tokens must be prefilled with more than one token.
+            unique, unchecked; a sequence whose slot is outside the pool gets
+            NaN rows). A slot whose state the caller replaced starts a new
+            chunk. A slot recycled after a request shorter than 16 tokens
+            still holds that request's open rows and an unchanged state (for
+            example zeros written over zeros), which the class cannot see:
+            call ``flashinfer.batch_invariant.kda.api.recurrent_kda_batch_invariant_reset(pool, slots)``
+            before the new request, or prefill it with more than one token;
+            otherwise its decode rows are wrong without an error. The
+            guarantee is stated for finite inputs: a non-finite value inside
+            a 16-token chunk shows from the chunk's first row in a prefill
+            and from its own row in a decode step.
             Requires ``backend="auto"``, bf16 activations, head dim 128,
             ``HV == H`` (a multiple of 8, or 1 to 10 or 12), ``A_log`` / ``dt_bias`` with
             ``use_gate_in_kernel``, ``use_qk_l2norm_in_kernel`` and
