@@ -633,7 +633,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
 }
 
 // ---------------------------------------------------------------------------
-static bool g_f16_attr = false;
+static bool g_f16_attr[64] = {};  // per-device one-time attribute opt-in
 
 template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1>
 static void launch(int B, const void* qp, const void* kp, const void* vp, const void* tkp,
@@ -671,7 +671,9 @@ void F16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::Tens
   const int pages = (int)ptab.shape()[1];
   const int nblk = pages < TOPKC ? pages : TOPKC;
 
-  if (!g_f16_attr) {
+  int attr_di = 0;
+  cudaGetDevice(&attr_di);
+  if (!g_f16_attr[attr_di & 63]) {
     setattr<1, 16, 1>();
     setattr<1, 16, 1, 4>();
     setattr<1, 16, 1, 2>();
@@ -694,7 +696,7 @@ void F16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::Tens
     setattr<2, 8, 2>();
     setattr<1, 4, 4>();
     setattr<1, 8, 4>();
-    g_f16_attr = true;
+    g_f16_attr[attr_di & 63] = true;
   }
 
   const void* qp = q.data_ptr();

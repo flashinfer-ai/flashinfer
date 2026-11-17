@@ -628,7 +628,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(HALFPAGE64 ? 128 :
   }
 }
 
-static bool g_attrf = false;
+static bool g_attrf[64] = {};  // per-device one-time attribute opt-in
 
 template <int NSTAGE, int CLU, int OCC, int OSPLIT = 1, bool HALFPAGE64 = false,
           bool EARLY_TOPK = false>
@@ -672,7 +672,9 @@ void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc
   const int B = (int)q.shape()[0];
   const int pages = (int)ptab.shape()[1];
   const int nblk = pages < TOPKC ? pages : TOPKC;
-  if (!g_attrf) {
+  int attr_di = 0;
+  cudaGetDevice(&attr_di);
+  if (!g_attrf[attr_di & 63]) {
     setattrf<1, 16, 2>();
     setattrf<1, 16, 2, 2>();
     setattrf<1, 16, 2, 4>();
@@ -696,7 +698,7 @@ void DirectKShortB8Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc
     setattrf<1, 6, 2, 4, true>();
     setattrf<1, 6, 1, 2, true>();
     setattrf<1, 6, 1, 2, true, true>();
-    g_attrf = true;
+    g_attrf[attr_di & 63] = true;
   }
   const void* qp = q.data_ptr();
   const void* kp = kc.data_ptr();

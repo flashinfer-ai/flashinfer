@@ -904,7 +904,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 }
 
 // ---------------------------------------------------------------------------
-static bool g_attr_set = false;
+static bool g_attr_set[64] = {};  // per-device one-time attribute opt-in
 
 template <int NSTAGE, int CLU, bool HALFOUT = false, bool QUARTER = false, bool HALFPAGE = false,
           int CTA_THREADS = 256, bool BF16_Q_F16_P = false>
@@ -958,7 +958,9 @@ void C12Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::Tens
   while (splits < cap && B * splits * 2 <= 304) splits *= 2;
   int bpc = (nblk + splits - 1) / splits;
 
-  if (!g_attr_set) {
+  int attr_di = 0;
+  cudaGetDevice(&attr_di);
+  if (!g_attr_set[attr_di & 63]) {
     cudaFuncSetAttribute(msa_kernel<4, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(4));
     cudaFuncSetAttribute(msa_kernel<1, 16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(1));
     cudaFuncSetAttribute(msa_kernel<1, 16>, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
@@ -987,7 +989,7 @@ void C12Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::Tens
     cudaFuncSetAttribute(msa_kernel<2, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(2));
     cudaFuncSetAttribute(msa_kernel<2, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(2));
     cudaFuncSetAttribute(msa_kernel<2, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_N(2));
-    g_attr_set = true;
+    g_attr_set[attr_di & 63] = true;
   }
 
   const void* qp = q.data_ptr();

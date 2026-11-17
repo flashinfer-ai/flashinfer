@@ -58,7 +58,8 @@ def _make_inputs(B, SEQ, seed=0):
         ]
         last = torch.full((B, 1), pages - 1, dtype=torch.int64, device=dev)
         topk[0] = torch.cat([picks, last], 1).sort(1).values.to(torch.int32)
-    pt = torch.arange(total, dtype=torch.int32, device=dev).reshape(B, pages)
+    gp = torch.Generator().manual_seed(seed + 7)
+    pt = torch.randperm(total, generator=gp).to(torch.int32).to(dev).reshape(B, pages)
     seq_lens = torch.full((B,), SEQ, dtype=torch.int32, device=dev)
     return dict(q=q, k=k, v=v, topk=topk, pt=pt.contiguous(), seq_lens=seq_lens)
 
@@ -119,6 +120,7 @@ def _assert_close(out, gold):
         (8, 8192),  # full top-16 selection
         (64, 384),  # large batch, small kv
         (4, 300),  # partial final page (position mask live)
+        (8, 512),  # 4-page regime (general route family)
     ],
 )
 def test_specialized_correct_and_routed(B, SEQ):
@@ -180,6 +182,7 @@ def test_cuda_graph_replay_matches_eager():
     eager = buf.clone()
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         _api(inp, out=buf)
     torch.cuda.current_stream().wait_stream(stream)

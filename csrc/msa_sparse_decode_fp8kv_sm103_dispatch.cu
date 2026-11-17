@@ -1,3 +1,4 @@
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 void C12Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache, tvm::ffi::TensorView v_cache,
@@ -22,6 +23,7 @@ void DirectKShortRun(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache,
 void Run(tvm::ffi::TensorView q, tvm::ffi::TensorView k_cache, tvm::ffi::TensorView v_cache,
          tvm::ffi::TensorView topk, tvm::ffi::TensorView page_table, tvm::ffi::TensorView seq_lens,
          tvm::ffi::TensorView out) {
+  tvm::ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const int B = static_cast<int>(q.shape()[0]);
   const int pages = static_cast<int>(page_table.shape()[1]);
   // Three visible blocks: every top-k entry is one of them.

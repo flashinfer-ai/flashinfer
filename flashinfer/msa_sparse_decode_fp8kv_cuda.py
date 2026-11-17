@@ -19,6 +19,7 @@ fp8-Q fused) and a vendored Triton baseline.
 """
 
 import functools
+import math
 import os as _os
 
 import torch
@@ -121,9 +122,12 @@ def supported_with_reasons(
         seqused_k.dim() != 1
         or seqused_k.shape[0] != q.shape[0]
         or seqused_k.dtype != torch.int32
+        or not seqused_k.is_contiguous()
     ):
         r.append("seqused_k_geometry")
-    if softmax_scale is not None and abs(softmax_scale - _SCALE) > 1e-7:
+    if softmax_scale is not None and (
+        not math.isfinite(softmax_scale) or abs(softmax_scale - _SCALE) > 1e-7
+    ):
         r.append("scale_mismatch")
     if out is not None and (
         out.dtype != torch.bfloat16
@@ -132,6 +136,29 @@ def supported_with_reasons(
         or out.device != q.device
     ):
         r.append("out_not_bf16_q_shaped_contiguous")
+    if q.device.type != "cuda":
+        return ["q_not_cuda"]
+    for _name, _t in (
+        ("k", k),
+        ("v", v),
+        ("q2k_indices", q2k_indices),
+        ("page_table", page_table),
+        ("seqused_k", seqused_k),
+    ):
+        if _t.device != q.device:
+            r.append(_name + "_device_mismatch")
+    for _name, _t, _align in (("q", q, 16), ("k", k, 32), ("v", v, 32)):
+        if _t.data_ptr() % _align:
+            r.append(_name + "_not_%dB_aligned" % _align)
+    if out is not None:
+        if out.data_ptr() % 16:
+            r.append("out_not_16B_aligned")
+        _q0 = q.data_ptr()
+        _q1 = _q0 + q.numel() * q.element_size()
+        _o0 = out.data_ptr()
+        _o1 = _o0 + out.numel() * out.element_size()
+        if out.device == q.device and _o0 < _q1 and _q0 < _o1:
+            r.append("out_overlaps_q")
     if r:
         return r
     if torch.cuda.get_device_capability(q.device) != (10, 3):
@@ -153,6 +180,16 @@ def maybe_dispatch_specialized(
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
+        try:
+            get_msa_sparse_decode_fp8kv_module()
+        except Exception as e:  # pragma: no cover - environment-dependent
+            if backend == "specialized":
+                raise
+            LAST_FALLBACK_REASONS[:] = [
+                "specialized_module_unavailable:" + type(e).__name__
+            ]
+            DISPATCH_STATS["fallback"] += 1
+            return None
         DISPATCH_STATS["specialized"] += 1
         return _run_specialized(q, k, v, q2k_indices, page_table, seqused_k, out)
     if backend == "specialized":

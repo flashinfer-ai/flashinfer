@@ -643,7 +643,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   }
 }
 
-static bool g_attrf = false;
+static bool g_attrf[64] = {};  // per-device one-time attribute opt-in
 
 template <int NSTAGE, int CLU, int OCC, bool HALFOUT = false>
 static void setattrf() {
@@ -683,7 +683,9 @@ void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ff
   const int B = (int)q.shape()[0];
   const int pages = (int)ptab.shape()[1];
   const int nblk = pages < TOPKC ? pages : TOPKC;
-  if (!g_attrf) {
+  int attr_di = 0;
+  cudaGetDevice(&attr_di);
+  if (!g_attrf[attr_di & 63]) {
     setattrf<1, 16, 2>();
     setattrf<1, 8, 2, true>();
     setattrf<2, 8, 2, true>();
@@ -696,7 +698,7 @@ void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ff
     setattrf<1, 1, 2>();
     setattrf<2, 1, 2>();
     setattrf<1, 3, 2>();
-    g_attrf = true;
+    g_attrf[attr_di & 63] = true;
   }
   const void* qp = q.data_ptr();
   const void* kp = kc.data_ptr();
@@ -715,13 +717,17 @@ void DirectKF16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ff
                              vstrides, vbox, vsteps, CU_TENSOR_MAP_INTERLEAVE_NONE,
                              CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
-    return;
+    TVM_FFI_THROW(RuntimeError)
+        << "msa_sparse_decode: cuTensorMapEncodeTiled failed for the V pool; "
+           "refusing to return stale output";
   const uint32_t vhbox[3] = {64, BLKT, 1};
   if (cuTensorMapEncodeTiled(&vhmap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(vp), vdims,
                              vstrides, vhbox, vsteps, CU_TENSOR_MAP_INTERLEAVE_NONE,
                              CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
                              CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
-    return;
+    TVM_FFI_THROW(RuntimeError)
+        << "msa_sparse_decode: cuTensorMapEncodeTiled failed for the V pool; "
+           "refusing to return stale output";
 #define LF(NS, C, O, BPC)                                                                \
   do {                                                                                   \
     launchf<NS, C, O>(B, qp, kp, vp, tkp, ptp, slp, op, pages, BPC, nblk, vmap, stream); \
