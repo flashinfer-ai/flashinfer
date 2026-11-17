@@ -11,7 +11,7 @@ properties (top-k an upward-closed cut with ties, top-p reaching its fixed-point
 the row maximum, the exact fixed point, the renormalisation term, the tiny-sum / ``p >= 1`` / NaN rules), the support
 dispatcher's membership over the grid and four SM counts, the error contract, the kernel's PTX (only the declared forms). On an SM100 / SM103 / SM107 device with the CuTe DSL: tokens, validity and the kept mass bitwise
 against the exact model for probability and logits inputs (with the drawn token's log-probability under the full
-distribution and under the kept set), f32 / bf16, every filter set and both orders, across single-CTA / cluster / staged
+distribution and under the kept set), f32 / bf16 (and f16 in the exact-model tests), every filter set and both orders, across single-CTA / cluster / staged
 members and the dispatcher's picks; the composition equals the support's mask then the plain draw over the masked weights,
 the five public entries equal the generic entry (the logits entry with its temperature and its two log-probabilities), the
 token's full-distribution log-probability is ``log_probs`` at the token and the kept one the support's renormalised
@@ -77,6 +77,9 @@ from .batch_invariant_sampling_common import (
 )
 
 DT = [torch.float32, torch.bfloat16]
+#: The exact-model tests run the third input dtype too; the rest of the suite covers f32 / bf16.
+DT_MODEL = DT + [torch.float16]
+DT_MODEL_IDS = ["f32", "bf16", "f16"]
 #: One block, a partial block (an odd vocabulary), an odd long one, a long one.
 NS = [64, 1000, 4097, 32768]
 N_BIG = 152064
@@ -220,7 +223,7 @@ def _same_nan(a, b, what):
 def _same(r, ref, lp=False, label="", lpk=False):
     assert torch.equal(r["samples"].cpu().long(), ref["samples"]), f"{label} token"
     assert torch.equal(r["valid"].cpu(), ref["valid"]), f"{label} valid"
-    assert torch.equal(_bits(r["mass"]), _bits(ref["mass"])), f"{label} mass"
+    _same_nan(r["mass"], ref["mass"], f"{label} mass")
     if lp:
         _same_nan(r["logp"], ref["logprobs"], f"{label} logprob (full distribution)")
     if lpk:
@@ -555,6 +558,19 @@ def test_model_tiny_sum_p_ge_1_and_nan_rows():
     DS.support_config(1 << 20, 1, 2, 148)  # the bf16 row of the same vocabulary fits
 
 
+def test_model_empty_selection_gives_shaped_empties():
+    """``support_reference`` on no rows (``rows=[]`` or a ``(0, N)`` input) returns shaped empty outputs; the kept
+    log-probability model of no rows is an empty fp32 vector."""
+    N = 64
+    for x, kw in ((torch.rand(3, N), dict(rows=[])), (torch.rand(0, N), {})):
+        r = support_reference(x, [], **kw)
+        assert r["mask"].shape == (0, N) and r["probs"].shape == (0, N)
+        assert r["mass"].shape == (0,) and r["count"].shape == (0,)
+    r = support_reference(torch.randn(0, N), [], from_logits=True)
+    assert r["logprobs"].shape == (0, N) and r["masked_logits"].shape == (0, N)
+    assert kept_log_probs_reference(torch.randn(0, N), [], []).shape == (0,)
+
+
 def test_dispatcher_picks_are_members_of_the_space():
     """R3 membership: every pick of the support's closed-form dispatcher, over the grid, both element widths and the
     SM counts of the SM100 / SM103 / SM107 parts, is a member of the enumerated space at one row per CTA whose staged
@@ -708,7 +724,7 @@ def _d(N, M, eb, sm):
 def _suite_specs(sm):
     """Every kernel the device tests below may ask for."""
     specs = []
-    for dtype in DT:
+    for dtype in DT_MODEL:
         ds, eb = _DS[dtype], dtype.itemsize
         for N in NS:
             for fset in SETS_BY_N[N]:
@@ -719,7 +735,7 @@ def _suite_specs(sm):
                 specs.append(_spec(ds, N, d12, False, fset, False))
                 specs.append(_spec(ds, N, d12, True, fset, True, lp=True, lpk=True))
     # the score form: every configuration of the exact-model test, the R4 test's defaults, the no-cut test
-    for dtype in DT:
+    for dtype in DT_MODEL:
         ds, eb = _DS[dtype], dtype.itemsize
         for N in NS:
             for fset in SETS_BY_N[N]:
@@ -826,7 +842,7 @@ def _precompile_draw_support_kernels(request):
 
 # ------------------------------------------------------------------------------------------------ device
 @needs_device
-@pytest.mark.parametrize("dtype", DT, ids=["f32", "bf16"])
+@pytest.mark.parametrize("dtype", DT_MODEL, ids=DT_MODEL_IDS)
 @pytest.mark.parametrize("N", NS)
 def test_probs_match_exact_model_across_configs(dtype, N):
     """Token, validity and the kept mass equal the exact model bit for bit for every filter set of the vocabulary, across
@@ -844,7 +860,7 @@ def test_probs_match_exact_model_across_configs(dtype, N):
 
 
 @needs_device
-@pytest.mark.parametrize("dtype", DT, ids=["f32", "bf16"])
+@pytest.mark.parametrize("dtype", DT_MODEL, ids=DT_MODEL_IDS)
 @pytest.mark.parametrize("N", NS)
 def test_logits_match_exact_model_and_logprob(dtype, N):
     """Logits with per-row temperatures and ties: token, validity, the kept mass and the drawn token's two
@@ -902,7 +918,7 @@ def test_support_then_draw_and_the_public_entries():
     )
     r = probs_draw(w, s, o, top_k=ks)
     assert torch.equal(r["samples"], tok3) and torch.equal(r["valid"], ok3)
-    assert torch.equal(_bits(r["mass"]), _bits(sup["mass"]))
+    _same_nan(r["mass"], sup["mass"], "mass")
     assert not bool(r["valid"][2]) and int(r["samples"][2]) == -1  # k = 0 keeps nothing
     assert bool(r["valid"][0]) and bool(r["valid"][3])  # k = 1 / k = N draw
     assert not bool(r["valid"][5])  # the all-zero row
@@ -969,7 +985,7 @@ def test_support_then_draw_and_the_public_entries():
                 for k, pp in zip(ks.tolist(), ps.tolist(), strict=False)
             ],
         )
-        assert torch.equal(_bits(r2["mass"]), _bits(sup2["mass"]))
+        _same_nan(r2["mass"], sup2["mass"], "mass")
         for i in range(M):
             if bool(r2["valid"][i]):
                 assert bool(sup2["mask"][i, int(r2["samples"][i])])
@@ -1047,7 +1063,7 @@ def test_support_then_draw_and_the_public_entries():
             ],
             from_logits=True,
         )
-        assert torch.equal(_bits(rl["mass"]), _bits(supl["mass"]))
+        _same_nan(rl["mass"], supl["mass"], "mass")
         full = flashinfer.sampling.log_probs(x, rl["samples"].clamp(min=0))
         for i in range(M):
             if bool(rl["valid"][i]):
@@ -1373,6 +1389,24 @@ def test_degenerate_parameters_and_invalid_rows():
         w, ks, seed=s, offset=o, return_valid=True, batch_invariant=True
     )
     assert torch.equal(vk, want) and torch.equal(tk, r["samples"])
+    # an int64 top_k past the int32 range never wraps: clamped to [0, N] before the cast (>= N everything, <= 0 nothing)
+    ks64 = torch.tensor(
+        [2**31 + 3, 2**32 + 40, -5, N, 2**40, 0, 5, 5, 5, 5],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    r64 = probs_draw(w, s, o, top_k=ks64)
+    _same(
+        r64,
+        DR.draw_support_reference(
+            w, s.tolist(), o.tolist(), [Filters(top_k=int(k)) for k in ks64.tolist()]
+        ),
+    )
+    assert torch.equal(
+        r64["samples"][:2],
+        sampling_from_probs_batch_invariant(w[:2], seed=s[:2], offset=o[:2]),
+    )
+    assert not bool(r64["valid"][2]) and not bool(r64["valid"][5])
     ps = torch.tensor(
         [0.0, 1.0, 1.5, 0.5, 0.999, 0.5, 0.5, 1e-9, 0.5, 0.5], device="cuda"
     )
@@ -1932,7 +1966,7 @@ def _lp_kw(kw, sl=None):
 
 
 @needs_device
-@pytest.mark.parametrize("dtype", DT, ids=["f32", "bf16"])
+@pytest.mark.parametrize("dtype", DT_MODEL, ids=DT_MODEL_IDS)
 @pytest.mark.parametrize("N", NS)
 def test_kept_log_probs_match_exact_model_across_configs(dtype, N):
     """``log_probs(logits, ids, T, batch_invariant=True, top_k / top_p / min_p)``: the given token's log-probability under

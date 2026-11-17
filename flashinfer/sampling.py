@@ -1270,7 +1270,7 @@ def log_softmax(
         out_dtype=)``. Any other dtype raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`.
     out : Optional[torch.Tensor]
         A caller-owned output buffer of the output dtype and ``logits.shape`` (contiguous, 16-byte aligned), written
-        in place and returned, so nothing is allocated: a trainer re-scoring rows in chunks reuses one buffer instead
+        in place and returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it): a trainer re-scoring rows in chunks reuses one buffer instead
         of allocating batch x vocabulary floats per chunk. A buffer that does not fit is refused, never copied.
 
     Returns
@@ -1404,7 +1404,7 @@ def sampling_from_logits(
     out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
         (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
-        the dtype contract above) -- written in place and returned, so nothing is allocated. Refused, never copied, when
+        the dtype contract above) -- written in place and returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it). Refused, never copied, when
         it does not fit.
     logprob_out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned float32 buffer of shape ``(batch_size,)`` for the
@@ -1566,7 +1566,7 @@ def sampling_from_probs(
     out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``,
         or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens) -- written in place and
-        returned, so nothing is allocated. Refused, never copied, when it does not fit.
+        returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it). Refused, never copied, when it does not fit.
 
     Returns
     -------
@@ -1718,14 +1718,16 @@ def top_p_sampling_from_probs(
         tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
         for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
         drawn from the kept set's renormalised distribution at the row's key, ``-1`` (and ``valid`` False) for a row whose kept
-        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row; ``top_k <= 0``
+        keeps nothing under the flag where the operator's kernel treats it as no filter -- the engines map their disabled
+        sentinels to the vocabulary size (vLLM, Megatron-LM) or ``1 << 30`` (SGLang) before the call) or whose
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
     out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
         (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
-        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        the dtype contract) -- written in place and returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it) (CUDA graphs on caller-owned
         buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
 
     Returns
@@ -2362,14 +2364,18 @@ def top_k_top_p_sampling_from_logits(
         tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
         for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
         drawn from the kept set's renormalised distribution at the row's key, ``-1`` (the row invalid) for a row whose kept
-        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row; ``top_k <= 0``
+        keeps nothing under the flag where the operator's kernel treats it as no filter -- the engines map their disabled
+        sentinels to the vocabulary size (vLLM, Megatron-LM) or ``1 << 30`` (SGLang) before the call) or whose
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction), and so is ``top_k_max`` (one kernel, no fast path). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
     temperature : Optional[Union[torch.Tensor, float]]
         Only with ``batch_invariant=True`` (``ValueError`` otherwise: the operator's kernel takes none). ``None`` (no
         scaling), a positive scalar, or a tensor with one positive value per row (float16 / bfloat16 / float32 / float64,
-        the last rounded to float32) of shape ``logits.shape[:-1]`` or ``(rows,)``, applied inside the class's chain
+        the last rounded to float32) of shape ``logits.shape[:-1]`` or ``(rows,)`` -- one value per OUTPUT row, so
+        ``indices.shape`` when ``indices`` is given (the filters, by contrast, are one per source row there) -- applied
+        inside the class's chain
         (``c = log2(e) / temperature``) exactly as :func:`softmax` and :func:`log_probs` apply it: the kept set, the draw
         and the returned log-probability are those of ``softmax(logits / temperature)``. A scalar is validated on the
         host; a tensor's values are not (a ``0`` yields an invalid row).
@@ -2385,7 +2391,7 @@ def top_k_top_p_sampling_from_logits(
     out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
         (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
-        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        the dtype contract) -- written in place and returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it) (CUDA graphs on caller-owned
         buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
     logprob_out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned float32 buffer of shape ``(batch_size,)`` for the
@@ -2631,14 +2637,16 @@ def top_k_top_p_sampling_from_probs(
         tensors of length ``batch_size``, or a scalar, a length-one tensor or the pair reserved from ``generator``
         for a single row (a key shared by several rows raises ``ValueError``); SM100 / SM103 / SM107): the token is
         drawn from the kept set's renormalised distribution at the row's key, ``-1`` (and ``valid`` False) for a row whose kept
-        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row) or whose
+        weights do not sum to a positive finite number (nothing kept, no positive weight, a non-finite row; ``top_k <= 0``
+        keeps nothing under the flag where the operator's kernel treats it as no filter -- the engines map their disabled
+        sentinels to the vocabulary size (vLLM, Megatron-LM) or ``1 << 30`` (SGLang) before the call) or whose
         index lies outside the source rows. ``deterministic`` is ignored (the classes are deterministic by
         construction), and so is ``top_k_max`` (one kernel, no fast path). Anything the classes do not cover raises
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` instead of falling back.
     out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
         (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
-        the dtype contract) -- written in place and returned, so nothing is allocated (CUDA graphs on caller-owned
+        the dtype contract) -- written in place and returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it) (CUDA graphs on caller-owned
         buffers, a framework's persistent structures). Refused with ``ValueError``, never copied, when it does not fit.
 
     Returns

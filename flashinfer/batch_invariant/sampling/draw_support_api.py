@@ -64,14 +64,25 @@ def _row_param(
     dtype: torch.dtype,
     name: str,
     lo: float = 0.0,
+    hi: Optional[int] = None,
 ) -> Tuple[Optional[torch.Tensor], bool]:
     """``None`` -> ``(None, False)``; a scalar or a tensor of one value, of shape ``(M,)`` or of the input's leading
     shape -> ``((M,) tensor of dtype, True)``. The parameters are exact in their dtype (``top_k`` int32, ``top_p`` /
-    ``min_p`` the binary32 values the class compares with)."""
+    ``min_p`` the binary32 values the class compares with); an integer ``top_k`` tensor of another width is clamped to
+    ``[0, hi]`` (``hi = N``) in its own dtype before the int32 cast, so a value past the int32 range never wraps
+    (``k <= 0`` keeps nothing and ``k >= N`` everything: the boundaries are preserved)."""
     if value is None:
         return None, False
     if isinstance(value, torch.Tensor):
-        t = value.to(device=device, dtype=dtype).reshape(-1)
+        t = value.to(device=device)
+        if (
+            dtype == torch.int32
+            and t.dtype != torch.int32
+            and not t.dtype.is_floating_point
+            and hi is not None
+        ):
+            t = t.clamp(0, hi)
+        t = t.to(dtype=dtype).reshape(-1)
         if t.numel() == 1 and M != 1:
             t = t.expand(M)
         if t.shape != (M,):
@@ -200,7 +211,7 @@ def draw_support(
     top_k = _source_row_param(top_k, indices, idx, Msrc, "top_k")
     top_p = _source_row_param(top_p, indices, idx, Msrc, "top_p")
     min_p = _source_row_param(min_p, indices, idx, Msrc, "min_p")
-    k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k")
+    k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k", hi=N)
     p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
     m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
     filters = Filters(
@@ -237,6 +248,7 @@ def draw_support(
     )
     # the kernel's validity word is never read (validity is the token's sign: an invalid row draws -1) and the kept mass
     # only when asked for: the two go to a per-device scratch otherwise, and the call allocates nothing it does not return
+    # (a Python-scalar filter is broadcast into a per-row tensor each call; per-row tensors avoid even that)
     valid = scratch(dev, torch.int32, M)
     mass = (
         torch.empty(M, dtype=torch.float32, device=dev)
@@ -392,7 +404,7 @@ def kept_log_probs(
             f"one token id per row under a filter (shape {lead}); got {tuple(token_ids.shape)}"
         )
     ids = token_ids.to(device=dev, dtype=torch.int64).reshape(-1).contiguous()
-    k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k")
+    k_t, use_k = _row_param(top_k, M, lead, dev, torch.int32, "top_k", hi=N)
     p_t, use_p = _row_param(top_p, M, lead, dev, torch.float32, "top_p")
     m_t, use_m = _row_param(min_p, M, lead, dev, torch.float32, "min_p")
     filters = Filters(

@@ -176,6 +176,19 @@ def support_reference(
     x = x.detach().cpu()
     M, N = x.shape
     rows = list(range(M)) if rows is None else list(rows)
+    if not rows:  # an empty selection or a (0, N) input: shaped empty outputs instead of a stack of nothing
+        empty: Dict[str, torch.Tensor] = {
+            "mask": torch.zeros(0, N, dtype=torch.bool),
+            "count": torch.zeros(0, dtype=torch.int64),
+            "probs": torch.zeros(0, N, dtype=x.dtype),
+            "threshold": torch.zeros(0, dtype=torch.float32),
+            "mass": torch.zeros(0, dtype=torch.float32),
+            "S": torch.zeros(0, dtype=torch.float32),
+        }
+        if from_logits:
+            empty["logprobs"] = torch.zeros(0, N, dtype=torch.float32)
+            empty["masked_logits"] = torch.zeros(0, N, dtype=x.dtype)
+        return empty
     xf = x.to(torch.float32)
     cs = _scales(temperature, len(rows)) if from_logits else None
     out: Dict[str, list] = {
