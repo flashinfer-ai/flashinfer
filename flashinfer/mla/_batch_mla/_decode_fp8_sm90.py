@@ -418,12 +418,12 @@ def _packed_fp8_view(
     # identical strides equal to the packed-contiguous strides, and the PE
     # view starting exactly w0 fp8 elements (bytes) after the no-PE view
     shape = tuple(a.shape[:-1]) + (w0 + w1,)
-    exp_strides = []
+    rev_strides = []
     acc = 1
     for s in reversed(shape):
-        exp_strides.append(acc)
+        rev_strides.append(acc)
         acc *= s
-    exp_strides = tuple(reversed(exp_strides))
+    exp_strides = tuple(reversed(rev_strides))
     if tuple(a.stride()) != exp_strides or tuple(b.stride()) != exp_strides:
         return None
     if b.data_ptr() != a.data_ptr() + w0:  # fp8 elements are 1 byte

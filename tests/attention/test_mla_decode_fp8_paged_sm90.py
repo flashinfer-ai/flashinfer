@@ -17,7 +17,6 @@ limitations under the License.
 import pytest
 import torch
 
-import flashinfer
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.mla._batch_mla._decode_fp8_sm90 import (
     _mla_dec_fp8q_sm90_stats,
