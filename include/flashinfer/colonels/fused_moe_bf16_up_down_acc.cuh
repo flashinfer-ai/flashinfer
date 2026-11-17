@@ -61,9 +61,9 @@ __launch_bounds__(WN * 32 + PRODUCER_THREADS, 1) void fused_moe_bf16_wgmma_up_do
   constexpr int UP_FACTOR = Activation::GATED ? 2 : 1;
   constexpr int CONSUMER_THREADS = WN * 32;
   constexpr int WARPGROUPS = WN / 4;
-  const int32_t warpM = blockIdx.y;
+  const int32_t warpM = blockIdx.y + blockIdx.z * gridDim.y;
+  if (warpM >= num_tokens_post_padded[0] / BM) return;
   const int exp_idx = expert_ids[warpM];
-  if (warpM * BM >= num_tokens_post_padded[0]) return;
 
   // TODO should not be hardcoded
   constexpr uint32_t S_BITS_UP = 3;
@@ -424,7 +424,11 @@ bool launch_fused_moe_kernel_up_down_acc(
   constexpr int PRODUCER_THREADS = 128;
   if (K <= 0 || K % (2 * BK) || N <= 0 || N % 256 || N % (BN * WN)) return false;
   dim3 dimBlock(32 * WN + PRODUCER_THREADS, 1, 1);
-  dim3 dimGrid(std::ceil((float)N / (BN * WN)), std::ceil((float)sorted_num / (block_m)), 1);
+  // Split token tiles across Y/Z to respect CUDA's 65535-block limit per axis.
+  const int token_tiles = sorted_num / block_m + (sorted_num % block_m != 0);
+  const int grid_z = (token_tiles + 65534) / 65535;
+  const int grid_y = (token_tiles + grid_z - 1) / grid_z;
+  dim3 dimGrid(N / (BN * WN), grid_y, grid_z);
 
   // TODO we could calculate this to the byte
   constexpr size_t OVERLAY_OFF = smem_overlay_offset<STAGES, BM, BK, BN, WN>();
@@ -517,6 +521,7 @@ bool launch_fused_moe_kernel_up_down_acc(
                                             ACTIVATION><<<dimGrid, dimBlock, sMemSize, stream>>>(
         x, tensor_map_w, tensor_map_w2, out, sorted_token_ids, expert_ids, num_tokens_post_padded,
         topk_weights, top_k, M, N, K, scaling_factor, activation_params);
+    gpuErrchk(cudaGetLastError());
     return true;
   }
   return false;
