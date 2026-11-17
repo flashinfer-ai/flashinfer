@@ -4476,8 +4476,10 @@ void CutlassMoeFCRunner<
     int64_t* gemm_expert_first_token_offset = expert_first_token_offset_;
     // Grouped FP8 block-scale GEMMs need at least one local row. For an empty EP
     // rank, pad a zero row using separate GEMM offsets. Preserve routing metadata
-    // so the all-gather/reduce-scatter finalizer discards the dummy row.
-    if (use_deepseek_fp8_block_scale && parallelism_config.ep_size > 1 && !enable_alltoall) {
+    // so the all-gather/reduce-scatter finalizer discards the dummy row. A call
+    // with no tokens has no permuted buffer to pad.
+    if (use_deepseek_fp8_block_scale && parallelism_config.ep_size > 1 && !enable_alltoall &&
+        num_rows > 0) {
       TLLM_CHECK(gemm_expert_first_token_offset_ != nullptr);
       padEmptyFp8BlockScaleMoeInput(gemm1_input_expand, expert_first_token_offset_,
                                     gemm_expert_first_token_offset_, num_experts_per_node,
