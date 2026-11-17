@@ -120,6 +120,7 @@ class AttentionKernel:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
         mWs: cute.Tensor,
         mScratch: cute.Tensor,
         mGroups: cute.Tensor,
@@ -132,6 +133,7 @@ class AttentionKernel:
         window_left: Int32,
         num_units: Int32,
         grid: Int32,
+        lse_mode: Int32,
         stream: cuda.CUstream,
     ):
         """``grid`` CTAs walk the ``num_units`` work units persistently (unit ``u`` on CTA ``u % grid``): a launch
@@ -187,6 +189,7 @@ class AttentionKernel:
             tma.atom_v,
             tma.tensor_v,
             mO,
+            mLse,
             mWs,
             mScratch,
             mGroups,
@@ -198,6 +201,7 @@ class AttentionKernel:
             nc,
             window_left,
             num_units,
+            lse_mode,
             st.qk_tiled_mma,
             st.qks_tiled_mma,
             st.pv_tiled_mma,
@@ -229,6 +233,7 @@ class AttentionKernel:
         atom_v: cute.CopyAtom,
         tV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
         mWs: cute.Tensor,
         mScratch: cute.Tensor,
         mGroups: cute.Tensor,
@@ -240,6 +245,7 @@ class AttentionKernel:
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
+        lse_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         qks_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
@@ -678,6 +684,8 @@ class AttentionKernel:
                         mDesc[(ub, F_TILE_HI)],
                         mDesc[(ub, F_MODE)],
                         mDesc[(ub, F_SLOT)],
+                        mLse,
+                        lse_mode,
                     )
                     fold_group(
                         st,
@@ -691,6 +699,8 @@ class AttentionKernel:
                         nc,
                         window_left,
                         Hq,
+                        mLse,
+                        lse_mode,
                     )
                     if mDesc[(ub, F_TILE_HI)] > mDesc[(ub, F_TILE_LO)]:
                         fold_group(
@@ -705,6 +715,8 @@ class AttentionKernel:
                             nc,
                             window_left,
                             Hq,
+                            mLse,
+                            lse_mode,
                         )
             if cutlass.const_expr(not st.q2):
                 for u in range(bidx, num_units, grid_size):
@@ -735,6 +747,8 @@ class AttentionKernel:
                         mDesc[(u, F_TILE_HI)],
                         mDesc[(u, F_MODE)],
                         mDesc[(u, F_SLOT)],
+                        mLse,
+                        lse_mode,
                     )
                     fold_group(
                         st,
@@ -748,6 +762,8 @@ class AttentionKernel:
                         nc,
                         window_left,
                         Hq,
+                        mLse,
+                        lse_mode,
                     )
             cute.arch.griddepcontrol_launch_dependents()
             tmem.relinquish_alloc_permit()

@@ -10,7 +10,8 @@ one class per head dim, ``spec.HEAD_DIMS``).
   plan / run call shapes on top of it.
 
 Q is ``(total_q, Hq, D)`` bf16, K/V caches ``(num_pages, page, Hkv, D)`` (NHD) or ``(num_pages, Hkv, page, D)``
-(HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16. The planner runs on
+(HND) bf16, metadata int32 on the device; the output is ``(total_q, Hq, D)`` bf16 and, with ``return_lse``, the LSE member
+``(total_q, Hq)`` fp32 (``spec.lse_term``; base 2, or base e with ``lse_base="ln"``). The planner runs on
 host copies of the indptr arrays (as FlashInfer's ``plan`` does); ``run`` launches the kernel and, for
 split units, the fixup.
 """
@@ -24,7 +25,9 @@ from typing import Dict, List, Optional
 import torch
 
 from .plan import DESC_FIELDS, GROUP_FIELDS, build_plan, snake_order, ws_row
-from .spec import HEAD_DIMS, scale_log2
+from .spec import HEAD_DIMS, LSE_BASES, scale_log2
+
+LSE_MODES = {"log2": 1, "ln": 2}  # the kernels' ``lse_mode`` (0: no LSE store)
 
 
 PAGE_SIZES = (
@@ -290,6 +293,9 @@ class _Planned:
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
         self.n_fixup_groups = len(getattr(plan, "fixup_groups", plan.groups))
         self.fold_counters = fold_counters  # the FMHA body's per-group arrival counters (in-kernel fold); zero between launches
+        self.lse_unused = torch.empty(
+            1, dtype=torch.float32, device=desc.device
+        )  # the kernels' LSE operand of a launch without LSE (never written)
 
 
 def plan_attention(
@@ -449,6 +455,32 @@ def workspace_bytes(
     return plan.ws_rows * ws_row(D) * 4
 
 
+def check_lse_buffer(
+    lse: torch.Tensor,
+    q: torch.Tensor,
+    out: Optional[torch.Tensor],
+    k: torch.Tensor,
+    v: torch.Tensor,
+    shape: tuple,
+) -> Optional[str]:
+    """What is wrong with a caller's LSE buffer (``None`` when it can be written): a contiguous fp32 tensor of ``shape`` on
+    the queries' device whose bytes are disjoint from the output, the queries and the K / V caches (CTAs store LSE rows
+    while others still read their operands)."""
+    if lse.dtype != torch.float32:
+        return f"of dtype {lse.dtype}"
+    if tuple(lse.shape) != tuple(shape):
+        return f"of shape {tuple(lse.shape)}"
+    if lse.device != q.device:
+        return f"on {lse.device}"
+    if not lse.is_contiguous():
+        return "that is not contiguous"
+    if _output_overlaps_kv(lse, k, v):
+        return "that shares bytes with the KV cache"
+    if _output_overlaps_kv(lse, q, q if out is None else out):
+        return "that shares bytes with the queries or the output"
+    return None
+
+
 def _output_overlaps_kv(out: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     """Conservative byte-span overlap for a contiguous output and nonnegative-strided caches.
 
@@ -489,7 +521,12 @@ def run_attention(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     ragged: bool = False,
-) -> torch.Tensor:
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    lse_base: str = "log2",
+):
+    """``return_lse``: also return the LSE member ``(total_q, Hq)`` fp32 in ``lse_base`` (``"log2"`` | ``"ln"``), written to
+    ``lse`` when given; the output bits are the same with and without it."""
     total_q, Hq, D = q.shape
     if config is None:
         config = planned.config or default_config(D=D)
@@ -567,7 +604,20 @@ def run_attention(
             "out must not alias the K / V cache: CTAs store output rows while others still read pages"
         )
     c = check_sm_scale(sm_scale)
-    return _run_attention_validated(
+    lse_mode = 0
+    if return_lse:
+        if lse_base not in LSE_BASES:
+            raise ValueError(f"lse_base must be one of {LSE_BASES}, got {lse_base!r}")
+        lse_mode = LSE_MODES[lse_base]
+        if lse is None:
+            lse = torch.empty(total_q, Hq, dtype=torch.float32, device=q.device)
+        else:
+            bad = check_lse_buffer(lse, q, out, k_cache, v_cache, (total_q, Hq))
+            if bad is not None:
+                raise ValueError(
+                    f"lse must be a contiguous fp32 ({total_q}, {Hq}) tensor on {q.device} that aliases no operand; got one {bad}"
+                )
+    _run_attention_validated(
         planned,
         q,
         k_cache,
@@ -580,7 +630,10 @@ def run_attention(
         out,
         config,
         ragged,
+        lse if lse_mode else None,
+        lse_mode,
     )
+    return (out, lse) if return_lse else out
 
 
 def _run_attention_validated(
@@ -596,8 +649,12 @@ def _run_attention_validated(
     out: torch.Tensor,
     config: AttnConfig,
     ragged: bool,
+    lse: Optional[torch.Tensor] = None,
+    lse_mode: int = 0,
 ) -> torch.Tensor:
-    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale."""
+    """Launch after the public engine or wrapper has checked inputs; ``c`` is the binary32 log2 scale. ``lse_mode`` 1 / 2
+    stores the base-2 / base-e LSE member of every row into ``lse`` (contiguous fp32, ``total_q * Hq`` elements); every kernel
+    takes it as a run-time argument, so the launch and the output bits are those of ``lse_mode`` 0."""
     from .blocks.compile import get_compiled_attention
     from .fixup import MAX_GRID_Y, get_fixup
     from .spec import TILE_KEYS
@@ -620,6 +677,7 @@ def _run_attention_validated(
     assert plan.g == g
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)
     o_view = out.view(total_q * Hq, D)
+    lse_view = lse.view(-1) if lse_mode else planned.lse_unused
     # the TVM-FFI object takes torch tensors (views with their strides) and Python scalars
     sm = torch.cuda.get_device_properties(q.device).multi_processor_count
     grid = config.grid if config.grid else min(plan.num_units, sm)
@@ -640,6 +698,7 @@ def _run_attention_validated(
             kv_k,
             kv_v,
             o_view,
+            lse_view,
             planned.ws,
             planned.groups,
             planned.fold_counters,
@@ -651,6 +710,7 @@ def _run_attention_validated(
             int(window_left),
             int(plan.num_units),
             int(grid),
+            int(lse_mode),
         )
     else:
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
@@ -682,6 +742,7 @@ def _run_attention_validated(
             kv_k,
             kv_v,
             o_view,
+            lse_view,
             planned.ws,
             planned.scratch,
             planned.groups,
@@ -694,6 +755,7 @@ def _run_attention_validated(
             int(window_left),
             int(n_launch if n_launch is not None else plan.num_units),
             int(grid),
+            int(lse_mode),
         )
     fx = getattr(plan, "fixup_groups", plan.groups)
     if fx:
@@ -701,6 +763,7 @@ def _run_attention_validated(
         get_fixup(D, g)(
             planned.ws,
             o_view,
+            lse_view,
             planned.fixup_groups,
             float(c),
             float(-c),
@@ -709,6 +772,7 @@ def _run_attention_validated(
             int(len(fx)),
             int(min(len(fx), MAX_GRID_Y)),
             int(max_rows),
+            int(lse_mode),
         )
     return out
 
@@ -727,8 +791,12 @@ def attention_paged(
     out: Optional[torch.Tensor] = None,
     config: Optional[AttnConfig] = None,
     workspace: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned)."""
+    lse: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    lse_base: str = "log2",
+):
+    """Single-call paged attention (prefill and decode alike; causal, bottom-right aligned); ``(out, lse)`` with
+    ``return_lse``."""
     total_q, Hq, D = q.shape
     page = k_cache.shape[1] if kv_layout == "NHD" else k_cache.shape[2]
     Hkv = k_cache.shape[2] if kv_layout == "NHD" else k_cache.shape[1]
@@ -758,4 +826,7 @@ def attention_paged(
         kv_layout,
         out,
         config,
+        lse=lse,
+        return_lse=return_lse,
+        lse_base=lse_base,
     )

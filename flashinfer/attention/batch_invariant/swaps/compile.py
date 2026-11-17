@@ -82,6 +82,9 @@ def get_compiled_swaps(
             (cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
+        lse_fake = cute.runtime.make_fake_tensor(
+            f32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         ws_fake = cute.runtime.make_fake_tensor(f32, (s_ws,), (1,), assumed_align=16)
         groups_fake = cute.runtime.make_fake_tensor(
             i32, (cute.sym_int(32), GROUP_FIELDS), (GROUP_FIELDS, 1), assumed_align=4
@@ -106,6 +109,7 @@ def get_compiled_swaps(
             k_fake,
             v_fake,
             o_fake,
+            lse_fake,
             ws_fake,
             groups_fake,
             counters_fake,
@@ -117,6 +121,7 @@ def get_compiled_swaps(
             cutlass.Int32(-1),
             cutlass.Int32(1),
             cutlass.Int32(1),
+            cutlass.Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )

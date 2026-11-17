@@ -5,7 +5,8 @@ kv_slots, n_wg, q2)`` with dynamic shapes, strides, page table, work units and s
 
 Operand views the kernel expects (all built by ``engine.py`` from the FlashInfer-shaped tensors):
 Q as ``(D, Hq, total_q)`` (strides ``(1, D, Hq*D)`` for a packed ``(total_q, Hq, D)`` tensor), K and V as
-``(D, page, Hkv, num_pages)`` (NHD or HND pools: runtime strides), O as ``(total_q * Hq, D)``, the fp32
+``(D, page, Hkv, num_pages)`` (NHD or HND pools: runtime strides), O as ``(total_q * Hq, D)``, the fp32 LSE as
+``(total_q * Hq,)`` (written under a nonzero ``lse_mode``: 1 base 2, 2 base e; any one-element tensor otherwise), the fp32
 workspace flat, the fp32 per-CTA ``O_m`` scratch flat (``grid x 128 x D`` at D = 256, one element otherwise), the int32 split-group table ``(num_groups, GROUP_FIELDS)`` and the per-group arrival
 counters (the in-kernel chunk fold), the int32 descriptor table ``(num_units, 16)``, ``kv_indptr`` and ``kv_indices``.
 """
@@ -96,6 +97,9 @@ def get_compiled_attention(
             (cute.sym_int64(divisibility=8), 1),
             assumed_align=16,
         )
+        lse_fake = cute.runtime.make_fake_tensor(
+            f32, (cute.sym_int(32),), (1,), assumed_align=4
+        )
         ws_fake = cute.runtime.make_fake_tensor(f32, (s_ws,), (1,), assumed_align=16)
         scratch_fake = cute.runtime.make_fake_tensor(
             f32, (cute.sym_int(32),), (1,), assumed_align=16
@@ -123,6 +127,7 @@ def get_compiled_attention(
             k_fake,
             v_fake,
             o_fake,
+            lse_fake,
             ws_fake,
             scratch_fake,
             groups_fake,
@@ -135,6 +140,7 @@ def get_compiled_attention(
             cutlass.Int32(-1),
             cutlass.Int32(1),
             cutlass.Int32(1),
+            cutlass.Int32(0),
             stream_fake,
             options="--enable-tvm-ffi",
         )

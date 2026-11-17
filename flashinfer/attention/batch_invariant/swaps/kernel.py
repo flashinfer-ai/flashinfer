@@ -78,6 +78,7 @@ class SwapsKernel:
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
         mWs: cute.Tensor,
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
@@ -89,6 +90,7 @@ class SwapsKernel:
         window_left: Int32,
         num_units: Int32,
         grid: Int32,
+        lse_mode: Int32,
         stream: cuda.CUstream,
     ):
         st = SwapsPlan(self.D, self.g, self.page, self.n_pad, self.ragged, self.cap)
@@ -112,6 +114,7 @@ class SwapsKernel:
             tma.atom_v,
             tma.tensor_v,
             mO,
+            mLse,
             mWs,
             mGroups,
             mCounters,
@@ -122,6 +125,7 @@ class SwapsKernel:
             nc,
             window_left,
             num_units,
+            lse_mode,
             st.qk_tiled_mma,
             st.pv_tiled_mma,
             st.q_smem_layout,
@@ -148,6 +152,7 @@ class SwapsKernel:
         atom_v: cute.CopyAtom,
         tV: cute.Tensor,
         mO: cute.Tensor,
+        mLse: cute.Tensor,
         mWs: cute.Tensor,
         mGroups: cute.Tensor,
         mCounters: cute.Tensor,
@@ -158,6 +163,7 @@ class SwapsKernel:
         nc: Float32,
         window_left: Int32,
         num_units: Int32,
+        lse_mode: Int32,
         qk_tiled_mma: cute.TiledMma,
         pv_tiled_mma: cute.TiledMma,
         q_smem_layout: cute.ComposedLayout,
@@ -451,6 +457,8 @@ class SwapsKernel:
                     mDesc[(u, F_TILE_HI)],
                     mDesc[(u, F_MODE)],
                     mDesc[(u, F_SLOT)],
+                    mLse,
+                    lse_mode,
                 )
                 fold_group(
                     st,
@@ -464,6 +472,8 @@ class SwapsKernel:
                     nc,
                     window_left,
                     Hq,
+                    mLse,
+                    lse_mode,
                 )
             cute.arch.griddepcontrol_launch_dependents()
             tmem.relinquish_alloc_permit()
