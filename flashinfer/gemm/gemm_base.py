@@ -3974,7 +3974,7 @@ class SegmentGEMMWrapper:
         if seg_lens is None and seg_indptr is None:
             raise ValueError("Either seg_lens or seg_indptr should be provided.")
         if seg_indptr is None:
-            seg_indptr = get_indptr(seg_lens.to(x))
+            seg_indptr = get_indptr(seg_lens.to(device=x.device))
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
@@ -8001,23 +8001,28 @@ def _cudnn_mm_mxfp8_runner():
             profile: OptimizationProfile,
         ) -> List[tuple]:
             a, b, _, _, _, out, _ = inputs
-            if self._use_override_shape:
-                graph = self._get_override_graph(a, b, out, tactic=0)
-            else:
-                a3 = a.unsqueeze(0)
-                b3 = b.unsqueeze(0)
-                graph = build_cudnn_gemm_mxfp8_graph(
-                    a_shape=a3.shape,
-                    a_stride=a3.stride(),
-                    a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
-                    b_shape=b3.shape,
-                    b_stride=b3.stride(),
-                    b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
-                    o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
-                    block_size=32,
-                    device=a.device,
-                    tactic=0,
-                )
+            try:
+                if self._use_override_shape:
+                    graph = self._get_override_graph(a, b, out, tactic=0)
+                else:
+                    a3 = a.unsqueeze(0)
+                    b3 = b.unsqueeze(0)
+                    graph = build_cudnn_gemm_mxfp8_graph(
+                        a_shape=a3.shape,
+                        a_stride=a3.stride(),
+                        a_type=_torch_data_type_to_cudnn_data_type(a.dtype),
+                        b_shape=b3.shape,
+                        b_stride=b3.stride(),
+                        b_type=_torch_data_type_to_cudnn_data_type(b.dtype),
+                        o_type=_torch_data_type_to_cudnn_data_type(out.dtype),
+                        block_size=32,
+                        device=a.device,
+                        tactic=0,
+                    )
+            except (cudnn.cudnnGraphNotSupportedError, RuntimeError) as exc:
+                # A declined graph leaves the other auto candidates to the tuner.
+                logger.debug("cuDNN mm_mxfp8 graph unsupported, no tactics: %s", exc)
+                return []
             return _cudnn_graph_engine_knob_tactics(graph)
 
         def forward(
@@ -8106,7 +8111,11 @@ def _heuristic_func_mm_mxfp8(
         return [c for c in order if c in suitable_backends]
     # don't select trtllm since it requires weight shuffling
     if "cutlass" in suitable_backends:
-        return ["cutlass"]
+        major, minor = get_compute_capability(a.device)
+        if (major, minor) != (10, 7):
+            return ["cutlass"]
+        # On SM107 untuned calls run CUTLASS; the autotuner also ranks CuTe-DSL and cuDNN.
+        return [c for c in ("cutlass", "cute-dsl", "cudnn") if c in suitable_backends]
     # fall back to cudnn (e.g. on SM12x when CUTLASS scale-layout
     # requirements are not met) when it is available.
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
@@ -8184,7 +8193,9 @@ def mm_mxfp8(
     backend: Literal["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         ``"auto"`` selects the CUTLASS backend when available and otherwise
-        falls back to the cuDNN backend. On SM120/SM121 it prefers the b12x
+        falls back to the cuDNN backend. On SM107, with CUTLASS available, the
+        autotuner also ranks the CuTe-DSL and cuDNN backends where they are
+        suitable; untuned calls run CUTLASS. On SM120/SM121 it prefers the b12x
         backend when its requirements are met. Eligible ``"cutedsl_low_latency"``
         problems include it as the last heuristic candidate.
         - The ``"b12x"`` backend (SM120/SM121) is a warp-level MMA kernel with
@@ -8201,7 +8212,7 @@ def mm_mxfp8(
           Passing 2D linear scales raises ValueError. Use
           ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
         - The ``"cudnn"`` backend consumes block scales in the F8_128x4 swizzled
-          layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/110/120/121.
+          layout (``use_8x4_sf_layout=False``) and is supported on SM100/103/107/110/120/121.
 
     batch_invariant: bool
         ``True`` runs the batch-invariant MXFP8 GEMM class in place of the
@@ -8325,7 +8336,7 @@ def mm_mxfp8(
 
     tuning_config = (
         _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
+        if "cute-dsl" in backends or backends == ["cutedsl_low_latency"]
         else _MM_MXFP8_TUNING_CONFIG
     )
 
@@ -9971,7 +9982,8 @@ def _b12x_gemm_fp4_runner(
 
         Tactics are tuples:
             (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch, kernel_type, use_tma_store)
-        where kernel_type is always "sm120" and use_tma_store is always None.
+        where kernel_type is always "sm120" and use_tma_store=None selects
+        the store path from the output row alignment.
         """
 
         def get_valid_tactics(
@@ -10065,6 +10077,11 @@ def _b12x_gemm_fp4_runner(
                 use_tma_store,
             ) = tactic
 
+            # TMA requires 16-byte output rows, also for cached/tuned tactics.
+            use_tma_store = (
+                use_tma_store is not False and n % (128 // c_cutlass_dtype.width) == 0
+            )
+
             kernel_a, kernel_b = a, b.T
             kernel_a_sf, kernel_b_sf = a_descale, b_descale.T
 
@@ -10093,6 +10110,7 @@ def _b12x_gemm_fp4_runner(
                 use_prefetch=use_prefetch,
                 enable_pdl=enable_pdl,
                 swap_ab=swap_ab,
+                use_tma_store=use_tma_store,
             )
 
             # swap_ab is device-internal (applied in the kernel ctor); public C
@@ -10359,6 +10377,11 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     # Rank the runners from a cold L2.
     use_cold_l2_graph_replay=True,
     use_cold_l2_cache=True,
+    # As for BF16 (#6360), time a chain of 16 back-to-back launches per cold-L2
+    # sample instead of a single launch, each launch on its own lane of the
+    # weights and their scales.
+    cold_chain_launches=16,
+    profile_arena_input_indices=(1, 3),  # b, b_descale
 )
 
 
@@ -12472,11 +12495,19 @@ def group_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        On SM100 / SM103 / SM107 the DeepGEMM kernels consume UE8M0 scales: each
+        ``torch.float32`` scale is converted by keeping only its exponent, i.e.
+        to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
+        applied up to 2x too small, without an error. Pass power-of-two scales
+        (for example ``2 ** ceil(log2(amax.clamp(min=1e-4) / 448))``, as
+        ``per_token_cast_to_fp8`` and ``per_block_cast_to_fp8`` in
+        ``flashinfer.testing.utils`` produce).
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
-        of the original float32 tensor for each group.
+        of the original float32 tensor for each group. The same power-of-two requirement as
+        `a_scale` applies.
 
     m_indices : torch.Tensor
         Group assignment tensor of shape ``(m,)`` with ``torch.int32`` dtype. Each element
@@ -12506,7 +12537,7 @@ def group_deepgemm_fp8_nt_groupwise(
     --------
     >>> import torch
     >>> from flashinfer.gemm import group_deepgemm_fp8_nt_groupwise
-    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
     >>>
     >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
     >>> m_per_group, n, k = 128, 2048, 4096
@@ -12900,11 +12931,21 @@ def batch_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(batch_size, m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        On SM100 / SM103 / SM107 the default DeepGEMM backend consumes UE8M0 scales: each
+        ``torch.float32`` scale is converted by keeping only its exponent, i.e.
+        to ``2 ** floor(log2(scale))``, so a scale that is not a power of two is
+        applied up to 2x too small, without an error. Pass power-of-two scales
+        (for example ``2 ** ceil(log2(amax.clamp(min=1e-4) / 448))``, as
+        ``per_token_cast_to_fp8`` and ``per_block_cast_to_fp8`` in
+        ``flashinfer.testing.utils`` produce).
+        ``backend="cake"`` has the same requirement: its block-scaled routes truncate the
+        scales the same way.
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
-        of the original float32 tensor for each group.
+        of the original float32 tensor for each group. The same power-of-two requirement as
+        `a_scale` applies.
 
     masked_m : torch.Tensor
         Masking tensor of shape ``(batch_size,)`` with ``torch.int32`` dtype. Each element
@@ -12957,7 +12998,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     --------
     >>> import torch
     >>> from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
-    >>> from flashinfer.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
+    >>> from flashinfer.testing.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
     >>>
     >>> # Setup: 2 groups, 128 tokens per group, 4096 hidden size, 2048 expert size
     >>> m, n, k = 128, 2048, 4096
@@ -12972,7 +13013,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     >>> b_fp8 = torch.empty_like(b, device="cuda", dtype=torch.float8_e4m3fn)
     >>> b_scale = torch.empty(
     ...    (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
-    >>> )
+    ... )
     >>> for i in range(group_size):
     ...    a_fp8[i], a_scale[i] = per_token_cast_to_fp8(a[i])
     ...    b_fp8[i], b_scale[i] = per_block_cast_to_fp8(b[i])

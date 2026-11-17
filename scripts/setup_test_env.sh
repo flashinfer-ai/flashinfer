@@ -71,6 +71,21 @@ install_flashinfer_editable() {
     pip install --no-build-isolation --no-deps -e "${1:-.}" -v
 }
 
+setup_moe_ep_test_env() {
+  local test_paths="${1:-${TEST_PATH:-}}"
+  [[ " ${test_paths} " == *[[:space:]/]tests/moe_ep[[:space:]/]* ]] || return 0
+  local cuda_major nccl_wheel_lib
+  cuda_major=$(python -c \
+    'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
+    2>/dev/null || echo 0)
+  [ "${cuda_major}" -ge 13 ] || return 0
+  FI_SRC="${REPO_ROOT}" bash "${REPO_ROOT}/docker/install/build_flashinfer_ep_pytorch.sh"
+  # The installer runs in a child shell; export its NCCL choice here too.
+  nccl_wheel_lib=$(python -c \
+    'import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], "lib"))')
+  export LD_LIBRARY_PATH="${nccl_wheel_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+}
+
 # Source the environment override file if it exists
 if [ -f "${REPO_ROOT}/ci/setup_python.env" ]; then
   source "${REPO_ROOT}/ci/setup_python.env"

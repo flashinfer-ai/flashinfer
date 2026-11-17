@@ -447,6 +447,39 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
 
 
 @pytest.mark.parametrize("backend", ["default", "cake"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_dsv3_fused_routing_normalizes_negative_logits(backend, dtype, use_cuda_graph):
+    if backend == "cake" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ):
+        pytest.skip("Cake fused routing requires SM100, SM103 or SM107")
+    scores = torch.full((128, 256), -20.0, device="cuda", dtype=dtype)
+    bias = -torch.arange(256, device="cuda", dtype=torch.float32) / 8
+    weights = torch.empty((128, 8), device="cuda", dtype=dtype)
+    ids = torch.empty((128, 8), device="cuda", dtype=torch.int32)
+
+    def run():
+        fused_topk_deepseek(scores, bias, 8, 4, 8, 2.5, weights, ids, backend=backend)
+
+    run()
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+    expected_ids = torch.arange(8, device="cuda").expand(128, 8)
+    torch.testing.assert_close(ids.long().sort(dim=1).values, expected_ids)
+    # The Cake kernels normalise with an FP32 reciprocal: within one ulp of 0.3125.
+    atol = 2.0**-25 if backend == "cake" else 0.0
+    torch.testing.assert_close(
+        weights, torch.full_like(weights, 0.3125), rtol=0, atol=atol
+    )
+
+
+@pytest.mark.parametrize("backend", ["default", "cake"])
 @pytest.mark.parametrize(
     "num_experts,n_group,topk_group,topk",
     [
@@ -1174,3 +1207,55 @@ def test_dsv3_fused_routing_cake_many_tokens(num_tokens, data_type, bias_type):
     sorted_default, _ = torch.sort(default_values.float(), dim=-1, descending=True)
     # Ties between candidate experts may be broken differently; the selected values must agree.
     torch.testing.assert_close(sorted_cake, sorted_default, atol=2e-3, rtol=2e-3)
+
+
+# Every logit in (-25, -18]: the selected sigmoids are 1e-11 to 2e-8, so the weights are their
+# ratios; a sigmoid that rounds to zero would make every weight zero. The bias alone orders the
+# experts. The token counts cover the multi-token CTA bands on compute capability 10.7, each with
+# a partial last window.
+@pytest.mark.parametrize("num_tokens", [37, 849, 3393, 4241])
+@pytest.mark.parametrize("data_type", [torch.float32, torch.bfloat16])
+def test_dsv3_fused_routing_cake_many_tokens_negative_logits(num_tokens, data_type):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake fused routing requires SM100, SM103 or SM107")
+
+    num_experts, n_group, topk_group, topk = 256, 8, 4, 8
+    gen = torch.Generator(device="cuda").manual_seed(7928 + num_tokens)
+    scores = (
+        -18.0 - 7.0 * torch.rand(num_tokens, num_experts, device="cuda", generator=gen)
+    ).to(data_type)
+    bias = torch.randperm(num_experts, device="cuda", generator=gen).float() / 64
+    routed_scaling_factor = 2.5
+
+    def run(backend):
+        topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
+        topk_indices = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+        fused_topk_deepseek(
+            scores,
+            bias,
+            n_group,
+            topk_group,
+            topk,
+            routed_scaling_factor,
+            topk_values,
+            topk_indices,
+            backend=backend,
+        )
+        return topk_values, topk_indices
+
+    cake_values, cake_indices = run("cake")
+    default_values, default_indices = run("default")
+    # Distinct biases: both backends select the same experts.
+    torch.testing.assert_close(
+        cake_indices.sort(dim=-1).values, default_indices.sort(dim=-1).values
+    )
+    torch.testing.assert_close(
+        cake_values.float().sum(dim=-1),
+        torch.full((num_tokens,), routed_scaling_factor, device="cuda"),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    selected = torch.gather(scores.float(), 1, cake_indices.long()).sigmoid().double()
+    reference = selected / selected.sum(dim=-1, keepdim=True) * routed_scaling_factor
+    torch.testing.assert_close(cake_values.double(), reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(default_values.double(), reference, atol=1e-2, rtol=1e-2)
