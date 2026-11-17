@@ -168,6 +168,16 @@ CPU cost from 7.4 to about 0.3 CPU-s. Host C++ stays uncached because the fork
 fails on `g++ -MMD` for files including `<vector>`. Use
 `FLASHINFER_SCCACHE_NVCC_IMPL=upstream` for comparisons.
 
+Fork pull requests get no AWS credentials, so their AOT lanes read the cache
+without writing it. `.github/workflows/aot-cache-seed.yml` writes it: after each
+push to `main` that can change compile inputs, it runs the same script on the same
+lanes with credentials and `AOT_SKIP_SPEC_LINT=1`. Seeds never cancel each other;
+one runs and the newest waits. sccache uploads each object when it compiles, so
+pull requests benefit before a seed finishes. A seed takes 13-19 minutes per lane
+when little changed; after a widely included header changes, it takes about
+1.75 hours on x64 and 2-3.5 hours on arm64. Scheduled PR Test runs and pull
+requests from branches in this repository also write the cache.
+
 ## Adding a new operation
 
 For stable CUDA operations, use the
