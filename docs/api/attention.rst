@@ -240,6 +240,21 @@ Attends only the tokens named by a per-query top-k index list over an
 .. autofunction:: get_sparse_mla_sm90_workspace_size_bytes
 .. autofunction:: is_sparse_mla_sm90_supported
 
+Sparse MLA decode (generalized front)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+One routing surface over the per-arch sparse-MLA decode entries:
+``backend="specialized"`` (:func:`sparse_mla_decode_sm90`, SM90),
+``backend="trtllm_dsv4"`` (:func:`trtllm_batch_decode_sparse_mla_dsv4`,
+SM100/SM103/SM107 and SM120/SM121), ``backend="sm120"``
+(:class:`SparseMLASm120Wrapper` as a single call), and ``backend="auto"``
+routing by compute capability. The backends keep their own tensor formats
+and contracts; backend-specific arguments pass through ``backend_args``
+under the underlying entry's own names.
+
+.. autofunction:: sparse_mla_decode
+.. autofunction:: is_sparse_mla_decode_supported
+
 PageAttention for MLA
 ---------------------
 
