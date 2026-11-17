@@ -56,7 +56,13 @@ SUM_NS = (8, 64, 100, 300)
 PIN_NS = (8, 64, 100, 300)
 #: The vocabularies whose sum and output terms are pinned in Lean by ``decide +kernel``.
 PIN_SUM_NS = (8,)
-LSE_OUT_WHICH = ("probs0", "probsL", "logp0", "lse")
+LSE_OUT_WHICH = (
+    "probs0",
+    "probsL",
+    "logp0",
+    "logp0c",
+    "lse",
+)  # logp0c: the 16-bit output member's converted element
 LSE_KINDS = ("maxkernel", "maxspec", "sumkernel", "sumspec")
 #: The draw's toy vocabularies: one block (8, 40), two blocks (300: a block bit), four blocks (1000).
 DRAW_NS = [8, 40, 300, 1000]
@@ -188,6 +194,7 @@ def lse_out_cases() -> Tuple[Dict, ...]:
                     probs0=term.sexpr(o["probs"][0]),
                     probsL=term.sexpr(o["probs"][N - 1]),
                     logp0=term.sexpr(o["logprobs"][0]),
+                    logp0c=term.sexpr(o["logprobs_cvt"][0]),
                     lse=term.sexpr(o["lse"]),
                 )
             )
@@ -382,6 +389,9 @@ def render() -> str:
         )
         L.append(
             f'theorem {tag}_logp0 : osexpr (Sampling.specLogp "bf16" {N} {kb} lseRow ({T}) 0) = {_with_refs(c["logp0"], refs)} := by decide +kernel'
+        )
+        L.append(
+            f'theorem {tag}_logp0c : osexpr (Sampling.specLogpCvt "bf16" {N} {kb} lseRow ({T}) 0) = {_with_refs(c["logp0c"], refs)} := by decide +kernel'
         )
         L.append(
             f'theorem {tag}_lse : osexpr (Sampling.specLse "bf16" {N} {kb} lseRow ({T})) = {_with_refs(c["lse"], refs)} := by decide +kernel'
