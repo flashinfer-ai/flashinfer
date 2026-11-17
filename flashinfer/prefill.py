@@ -9284,6 +9284,29 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
+# Backends for the generalized ragged DeepSeek-attention entry: the same
+# enum as the specific entry it connects to. New backends are added here.
+RAGGED_DEEPSEEK_BACKENDS = TRTLLM_RAGGED_DEEPSEEK_BACKENDS
+
+
+def ragged_attention_deepseek(*args, **kwargs):
+    """Generalized ragged (varlen, non-paged) DeepSeek MLA prefill attention.
+
+    Vendor-neutral front for the ragged DeepSeek-attention contract.
+    Identical signature, defaults and semantics to
+    :func:`trtllm_ragged_attention_deepseek` — including ``return_lse=True``
+    returning the base-2 log-sum-exp with the bmm1 scale folded in — which
+    stays unchanged and is one of this entry's backends: ``backend``
+    selects among ``RAGGED_DEEPSEEK_BACKENDS`` — ``"auto"`` (default)
+    behaves as ``"trtllm-gen"`` except that strictly allowlisted calls
+    route to the agent-generated ``"specialized"`` kernel; an explicitly
+    selected backend is never silently swapped, and ``"specialized"``
+    raises a ``ValueError`` listing ``fallback_reasons`` for calls it
+    cannot serve.
+    """
+    return trtllm_ragged_attention_deepseek(*args, **kwargs)
+
+
 def _validate_trtllm_variable_window_bounds(
     starts: torch.Tensor,
     ends: torch.Tensor,
