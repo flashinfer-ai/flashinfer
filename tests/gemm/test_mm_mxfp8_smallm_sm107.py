@@ -162,6 +162,20 @@ def _assert_close_to_reference(reference, result, context):
         reference.float().reshape(-1), result.float().reshape(-1), dim=0
     ).item()
     assert cos_sim > _MIN_COS_SIM, f"{context}: cosine similarity {cos_sim:.4f}"
+    # Cosine similarity is scale-blind: also pin the magnitude, so a result
+    # that is a correctly-directed multiple of the reference fails.
+    norm_ratio = (
+        result.float().norm() / reference.float().norm().clamp_min(1e-20)
+    ).item()
+    assert 0.9 < norm_ratio < 1.1, f"{context}: norm ratio {norm_ratio:.4f}"
+
+
+def test_reference_gate_rejects_scaled_output():
+    """The acceptance gate itself must fail a magnitude error that cosine
+    similarity alone would accept."""
+    reference = torch.randn(64, 64)
+    with pytest.raises(AssertionError, match="norm ratio"):
+        _assert_close_to_reference(reference, reference * 2.0, "doubled")
 
 
 @requires_sm107

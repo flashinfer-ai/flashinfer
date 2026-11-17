@@ -184,6 +184,14 @@ def _common_supported(
         return "geometry"
     if not a.is_contiguous() or not b.t().is_contiguous() or not out.is_contiguous():
         return "non_contiguous"
+    # Vector-access alignment. Contiguity does not establish it: a contiguous
+    # view into offset storage keeps the offset address. The kernel issues
+    # 32-byte operand loads (ldg256) and relies on 8-byte-aligned output rows
+    # for its vector stores, so misaligned pointers would be undefined
+    # behavior. Fresh torch allocations are 256-byte aligned; only offset
+    # storage views fail these, and the stock path serves them.
+    if a.data_ptr() % 32 or b.data_ptr() % 32 or out.data_ptr() % 16:
+        return "pointer_alignment"
     allowlist = _load_allowlist()
     if allowlist is None:
         return "allowlist_unavailable"
@@ -206,6 +214,13 @@ def _layout_supported(
         return "scale_layout"
     if a_descale.dtype != torch.uint8 or b_descale.dtype != torch.uint8:
         return "scale_layout"
+    # The kernel reads the raw scale bytes with 16-byte vector loads: the
+    # buffers must be dense (a strided 1D view passes the ndim/dtype/numel
+    # checks but interleaves foreign bytes) and 16-byte aligned.
+    if not a_descale.is_contiguous() or not b_descale.is_contiguous():
+        return "scale_layout"
+    if a_descale.data_ptr() % 16 or b_descale.data_ptr() % 16:
+        return "pointer_alignment"
     m, k = a.shape[0], a.shape[1]
     n = b.shape[1]
     if a_descale.numel() < _swizzled_sf_numel(m, k) or b_descale.numel() < (
