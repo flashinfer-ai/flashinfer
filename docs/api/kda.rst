@@ -307,10 +307,11 @@ Host copy of ``cu_seqlens`` for serving
 
 The packed prefill routes that schedule on the host (small-BH, Cake, and the
 CuTe DSL decomposed variant) read ``cu_seqlens`` back from the device, which
-synchronizes the stream, so the call waits for every kernel queued before it. The
-read is cached per offsets tensor only when the tensor has a version counter,
-never under ``torch.inference_mode``, and a serving step that changes the
-offsets every call cannot reuse it anyway. A framework that already holds the
+synchronizes the stream, so the call waits for every kernel queued before it.
+A serving step that changes the offsets every call cannot reuse a cached read
+anyway. On the small-BH, Cake, PTX, TIRx and persistent routes the read is
+cached per offsets tensor only when the tensor has a version counter, so it is
+never cached under ``torch.inference_mode``. A framework that already holds the
 batch offsets on the host (for example vLLM's ``query_start_loc_cpu``) should
 pass them as ``recurrent_kda(..., cu_seqlens_host=...)``, a 1-D CPU tensor or
 a sequence of ints with the same values as ``cu_seqlens``. The values are
@@ -319,9 +320,11 @@ must describe the same batch. The hint is honoured by the small-BH, Cake,
 CuTe DSL (including persistent), PTX and TIRx routes; the SM120 and cuDNN
 routes ignore it.
 Without the hint, the CuTe DSL decomposed and engine routes memoize the
-offsets contents per tensor object, also under ``torch.inference_mode``; an
-int64 offsets buffer refilled in place with a different segmentation is then
-not detected. Pass ``cu_seqlens_host`` (always honoured) or use a new tensor.
+offsets contents per int64 tensor object. Under ``torch.inference_mode`` there
+is no version counter, so an int64 offsets buffer refilled in place with a
+different segmentation is not detected; offsets of another dtype are cast and
+re-read on every call. Pass ``cu_seqlens_host`` (always honoured) or use a new
+tensor.
 
 Frozen / speculative-verify mode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

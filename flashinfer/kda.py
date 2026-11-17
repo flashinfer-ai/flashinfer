@@ -360,8 +360,10 @@ def recurrent_kda(
             ints, same values and length). Packed prefill routes that need the
             sequence lengths on the host (small-BH, CuTe DSL decomp, Cake) use
             it instead of reading ``cu_seqlens`` back from the device, which
-            costs a stream synchronization per call and cannot be cached for
-            inference tensors. Serving frameworks that already hold the batch
+            costs a stream synchronization per call and is not cached for
+            inference tensors, except that the CuTe DSL routes memoize an
+            int64 inference tensor per object and miss in-place refills.
+            Serving frameworks that already hold the batch
             offsets on the host should pass them. The values are trusted, not
             checked against the device tensor. Keyword-only. Default: ``None``.
         seq_order (Optional[torch.Tensor]):

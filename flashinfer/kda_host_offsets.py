@@ -50,10 +50,14 @@ _CAST_SOURCES: dict = {}
 def register_cu_seqlens_cast(converted: torch.Tensor, source: torch.Tensor) -> None:
     """Record that ``converted`` is a fresh cast of ``source`` so its contents can be read from ``source``."""
 
-    _CAST_SOURCES[converted.data_ptr()] = (
-        weakref.ref(converted),
-        weakref.ref(source),
-    )
+    key = converted.data_ptr()
+
+    def _drop(dead_ref, key=key):
+        entry = _CAST_SOURCES.get(key)
+        if entry is not None and entry[0] is dead_ref:
+            del _CAST_SOURCES[key]
+
+    _CAST_SOURCES[key] = (weakref.ref(converted, _drop), weakref.ref(source))
 
 
 def cast_source_of(converted: torch.Tensor) -> Optional[torch.Tensor]:

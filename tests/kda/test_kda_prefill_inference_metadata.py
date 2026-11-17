@@ -146,6 +146,25 @@ def test_host_offsets_replace_device_read_and_are_cached(workspace, monkeypatch)
             packed_metadata(workspace, placeholder)
 
 
+def test_cast_source_registry_drops_dead_entries():
+    import gc
+
+    from flashinfer.kda_host_offsets import (
+        _CAST_SOURCES,
+        cast_source_of,
+        register_cu_seqlens_cast,
+    )
+
+    source = torch.tensor([0, 2, 6], dtype=torch.int32)
+    converted = source.to(torch.int64)
+    key = converted.data_ptr()
+    register_cu_seqlens_cast(converted, source)
+    assert cast_source_of(converted) is source
+    del converted
+    gc.collect()
+    assert key not in _CAST_SOURCES
+
+
 def test_cu_seqlens_to_list_uses_host_hint_only_when_active():
     from flashinfer.kda_host_offsets import cu_seqlens_to_list, host_cu_seqlens_scope
 
@@ -158,6 +177,41 @@ def test_cu_seqlens_to_list_uses_host_hint_only_when_active():
         host_cu_seqlens_scope(torch.zeros(3).reshape(1, 3)),
     ):
         cu_seqlens_to_list(device_side)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_ptx_wrong_length_hint_rejected_on_warm_call(monkeypatch):
+    from flashinfer.kda_host_offsets import host_cu_seqlens_scope
+    from flashinfer.kda_kernels.ptx import kda_fwd_fused
+    from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
+    from flashinfer.kda_prefill_ptx import _launch_ptx_kda
+
+    launches = []
+    plan = SimpleNamespace(launch=lambda: launches.append(1))
+    monkeypatch.setattr(kda_fwd_fused, "prepare_kda_forward", lambda *a, **k: plan)
+
+    dev = "cuda"
+    T, H, D = 6, 1, 128
+    q = torch.zeros(1, T, H, D, dtype=torch.bfloat16, device=dev)
+    beta = torch.zeros(1, T, H, dtype=torch.bfloat16, device=dev)
+    a_log = torch.zeros(H, dtype=torch.float32, device=dev)
+    cu = torch.tensor([0, 2, 6], dtype=torch.int32, device=dev)
+    workspace = RecurrentKDAPrefillWorkspace(q.device)
+
+    def launch(hint):
+        with host_cu_seqlens_scope(hint):
+            return _launch_ptx_kda(
+                q, q, q, q, beta, a_log, a_log, 1.0, None, False, -5.0, cu, None, workspace
+            )
+
+    with pytest.raises(ValueError, match="cu_seqlens_host has 4 entries"):
+        launch([0, 2, 4, 6])
+    launch([0, 2, 6])
+    assert len(launches) == 1
+    with pytest.raises(ValueError, match="cu_seqlens_host has 4 entries"):
+        launch([0, 2, 4, 6])
+    launch([0, 2, 6])
+    assert len(launches) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
