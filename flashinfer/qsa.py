@@ -271,6 +271,13 @@ def _check_qsa_topk_indexer_inputs(
     ):
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous.")
+    # Contiguity does not establish pointer alignment: a contiguous view into
+    # offset storage keeps the offset address, and the kernels use 8- and
+    # 16-byte vector accesses on these buffers. Fresh torch allocations are
+    # 256-byte aligned; only offset storage views can fail this.
+    for name, t in (("qi", qi), ("ck_cache", ck_cache)):
+        if t.data_ptr() % 16:
+            raise ValueError(f"{name} must be 16-byte aligned (storage-offset view).")
     if out is not None:
         if out.device != device or out.dtype != torch.int32:
             raise ValueError("out must be an int32 tensor on the input device.")
@@ -282,6 +289,8 @@ def _check_qsa_topk_indexer_inputs(
                 f"out must be contiguous with shape [T, {QSA_INDEXER_PACKED_WIDTH}], "
                 f"got {tuple(out.shape)}."
             )
+        if out.data_ptr() % 16:
+            raise ValueError("out must be 16-byte aligned (storage-offset view).")
 
 
 def _qsa_topk_indexer_unservable_reason(qi: torch.Tensor) -> Optional[str]:
@@ -371,9 +380,16 @@ def qsa_topk_indexer(
     Returns
     -------
     packed : torch.Tensor
-        int32 ``[T, 2052]``: the selected token ids of each row sorted
-        ascending, then ``-1`` padding; the last column holds the row's valid
-        count. Directly consumable by :func:`qsa_indexed_forward`.
+        int32 ``[T, 2052]``: the selected token ids of each row —
+        **request-local** logical positions, ``0`` naming the row's request's
+        first token — sorted ascending, then ``-1`` padding; the last column
+        holds the row's valid count. This is the packed-selection layout the
+        SM107 QSA stage-2 sparse-attention path consumes (and the layout
+        vLLM's Qwen QSA serving path exchanges between the stages).
+        :func:`qsa_indexed_forward` is NOT a direct consumer: it takes
+        absolute packed token ids and no count column, so feeding it requires
+        adding each row's request start (``cu_seqlens[req]``) to the valid
+        ids and overwriting the final count column with ``-1``.
     """
     if backend not in QSA_TOPK_INDEXER_BACKENDS:
         raise ValueError(

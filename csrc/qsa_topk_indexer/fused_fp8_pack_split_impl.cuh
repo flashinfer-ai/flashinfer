@@ -169,16 +169,23 @@ __device__ float scoreG(const u8* __restrict__ qp, const u8* __restrict__ kp) {
   for (int d0 = 0; d0 < IDXD; d0 += 8) {
     uint2 kr = *reinterpret_cast<const uint2*>(kp + d0);
     float kf[8];
-    const unsigned short* kw = reinterpret_cast<const unsigned short*>(&kr);
+    // Extract the halfwords by shift/mask instead of an unsigned short view
+    // of the uint2 (not type-accessible under the aliasing rules); the
+    // little-endian halfword order is unchanged.
 #pragma unroll
-    for (int i = 0; i < 4; ++i) dec2(kw[i], kf[2 * i], kf[2 * i + 1]);
+    for (int i = 0; i < 4; ++i) {
+      const unsigned int kword = (i < 2) ? kr.x : kr.y;
+      dec2(static_cast<unsigned short>(kword >> (16 * (i & 1))), kf[2 * i], kf[2 * i + 1]);
+    }
 #pragma unroll
     for (int h = 0; h < 4; ++h) {
       uint2 qr = *reinterpret_cast<const uint2*>(qp + h * IDXD + d0);
       float qf[8];
-      const unsigned short* qw = reinterpret_cast<const unsigned short*>(&qr);
 #pragma unroll
-      for (int i = 0; i < 4; ++i) dec2(qw[i], qf[2 * i], qf[2 * i + 1]);
+      for (int i = 0; i < 4; ++i) {
+        const unsigned int qword = (i < 2) ? qr.x : qr.y;
+        dec2(static_cast<unsigned short>(qword >> (16 * (i & 1))), qf[2 * i], qf[2 * i + 1]);
+      }
       float s = (h == 0) ? a0 : (h == 1) ? a1 : (h == 2) ? a2 : a3;
 #pragma unroll
       for (int j = 0; j < 8; ++j) s = __fmaf_rn(qf[j], kf[j], s);

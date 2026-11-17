@@ -456,10 +456,17 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(const uint8_t* __restrict__ 
               uint4 kv = make_uint4(0u, 0u, 0u, 0u);
               if (q < n4) kv = e4[q];
               const int v0 = q << 2;
-              const bool b0 = (v0 < vis) && ((kv.x & tmask) >= tau);
-              const bool b1 = (v0 + 1 < vis) && ((kv.y & tmask) >= tau);
-              const bool b2 = (v0 + 2 < vis) && ((kv.z & tmask) >= tau);
-              const bool b3 = (v0 + 3 < vis) && ((kv.w & tmask) >= tau);
+              // tau/tmask live in selection-key space (qsa_score_key_exact),
+              // like the histogram that produced them and the non-exact
+              // branch below: convert each raw score before comparing.
+              const bool b0 =
+                  (v0 < vis) && ((qsa_score_key_exact(__uint_as_float(kv.x)) & tmask) >= tau);
+              const bool b1 =
+                  (v0 + 1 < vis) && ((qsa_score_key_exact(__uint_as_float(kv.y)) & tmask) >= tau);
+              const bool b2 =
+                  (v0 + 2 < vis) && ((qsa_score_key_exact(__uint_as_float(kv.z)) & tmask) >= tau);
+              const bool b3 =
+                  (v0 + 3 < vis) && ((qsa_score_key_exact(__uint_as_float(kv.w)) & tmask) >= tau);
               const int c = (int)b0 + (int)b1 + (int)b2 + (int)b3;
               int inc = c;
 #pragma unroll

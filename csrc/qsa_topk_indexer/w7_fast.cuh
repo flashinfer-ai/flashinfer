@@ -797,7 +797,12 @@ __global__ __launch_bounds__(W7_NTHR, 2) void w7_score(const uint8_t* __restrict
               int d = -1, above = 0, cntd = 0, acc = x - s;
 #pragma unroll
               for (int i = 7; i >= 0; --i) {
-                if (d < 0 && acc + hv[i] >= k) {
+                // acc < k makes the threshold bin unique across the warp: a
+                // bin whose preceding count already exhausts the budget must
+                // not record a candidate (its `above` can exceed the 9-bit
+                // field and forge a higher-bin record under redux.max,
+                // selecting a wrong threshold).
+                if (d < 0 && acc < k && acc + hv[i] >= k) {
                   d = (lane << 3) | i;
                   above = acc;
                   cntd = hv[i];
