@@ -27,22 +27,19 @@
 namespace ffi = tvm::ffi;
 
 namespace c64_regbuf_impl {
-void Run(ffi::TensorView qi, ffi::TensorView ki,
-         ffi::TensorView cu_seqlens, ffi::TensorView kv_base,
-         ffi::TensorView seq_lens, ffi::TensorView prefix_lens,
+void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
+         ffi::TensorView kv_base, ffi::TensorView seq_lens, ffi::TensorView prefix_lens,
          ffi::TensorView sel);
 }
 
 namespace msa_fused {
-void Run(ffi::TensorView qi, ffi::TensorView ki,
-         ffi::TensorView cu_seqlens, ffi::TensorView kv_base,
-         ffi::TensorView seq_lens, ffi::TensorView prefix_lens,
+void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
+         ffi::TensorView kv_base, ffi::TensorView seq_lens, ffi::TensorView prefix_lens,
          ffi::TensorView sel);
 }
 
-void Run(ffi::TensorView qi, ffi::TensorView ki,
-         ffi::TensorView cu_seqlens, ffi::TensorView kv_base,
-         ffi::TensorView seq_lens, ffi::TensorView prefix_lens,
+void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
+         ffi::TensorView kv_base, ffi::TensorView seq_lens, ffi::TensorView prefix_lens,
          ffi::TensorView sel) {
   const int tq = (int)qi.shape()[0];
   const int tkpad = (int)ki.shape()[0];
