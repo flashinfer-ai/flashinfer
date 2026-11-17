@@ -16,10 +16,10 @@ limitations under the License.
 
 import logging
 import os
-from typing import Optional
 
 import torch
 
+from ..jit.cpp_ext import _available_host_memory_bytes
 from ..utils import get_device_index
 
 logger = logging.getLogger(__name__)
@@ -419,54 +419,6 @@ def _mm_fp4_precompile_worker(payload):
 _MM_FP4_PRECOMPILE_WORKER_RAM_BYTES = 1 << 30
 
 
-def _cgroup_available_memory_bytes() -> Optional[int]:
-    """Headroom under the current cgroup memory limit, or None if
-    unlimited/unreadable.
-
-    Inside containers /proc/meminfo reports *host* memory, so the cgroup
-    limit is what actually prevents an OOM kill.
-    cgroup's memory.current is profiled here to estimate the headroom.
-    """
-    try:
-        with open("/sys/fs/cgroup/memory.max") as f:
-            limit = f.read().strip()
-        if limit != "max":
-            with open("/sys/fs/cgroup/memory.current") as f:
-                current = int(f.read())
-            return max(0, int(limit) - current)
-    except (OSError, ValueError):
-        pass
-    # cgroup v1
-    try:
-        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
-            limit_v1 = int(f.read())
-        if limit_v1 < 1 << 60:  # values near 2**63 mean "unlimited"
-            with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as f:
-                usage = int(f.read())
-            return max(0, limit_v1 - usage)
-    except (OSError, ValueError):
-        pass
-    return None
-
-
-def _available_host_memory_bytes() -> Optional[int]:
-    """Best-effort available memory: the tighter of host MemAvailable and
-    the cgroup limit headroom, or None if neither is readable."""
-    candidates = []
-    try:
-        with open("/proc/meminfo") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    candidates.append(int(line.split()[1]) * 1024)
-                    break
-    except OSError:
-        pass
-    cgroup = _cgroup_available_memory_bytes()
-    if cgroup is not None:
-        candidates.append(cgroup)
-    return min(candidates) if candidates else None
-
-
 def _get_mm_fp4_cute_dsl_compile_workers() -> int:
     """How many subprocesses to use for precompiling mm_fp4 cute-dsl tactics.
 
@@ -482,7 +434,7 @@ def _get_mm_fp4_cute_dsl_compile_workers() -> int:
         if mem_cap < workers:
             logger.warning(
                 f"[mm_fp4 cute-dsl] capping tactic precompile workers "
-                f"{workers} -> {mem_cap} (host MemAvailable = "
+                f"{workers} -> {mem_cap} (available memory = "
                 f"{available / (1 << 30):.1f} GiB)."
             )
             workers = mem_cap

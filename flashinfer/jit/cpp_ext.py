@@ -93,8 +93,8 @@ def is_cuda_version_at_least(version_str: str) -> bool:
     return get_cuda_version() >= Version(version_str)
 
 
-def get_nvcc_parallelism_flags() -> List[str]:
-    """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
+def _nvcc_threads() -> int:
+    """FLASHINFER_NVCC_THREADS, or 1 when it is unset or invalid."""
     env_var_name = "FLASHINFER_NVCC_THREADS"
     default = 1
     value = os.environ.get(env_var_name, str(default))
@@ -110,8 +110,12 @@ def get_nvcc_parallelism_flags() -> List[str]:
     if threads < 1:
         logger.warning("Ignoring %s=%r; value must be >= 1.", env_var_name, value)
         threads = default
+    return threads
 
-    return [f"--threads={threads}"]
+
+def get_nvcc_parallelism_flags() -> List[str]:
+    """Build nvcc flags controlled by FlashInfer parallelism environment variables."""
+    return [f"--threads={_nvcc_threads()}"]
 
 
 @functools.lru_cache(maxsize=1)
@@ -437,11 +441,206 @@ def generate_ninja_build_for_op(
     return "\n".join(lines)
 
 
+def _cgroup_inactive_file_bytes(stat_path: str, key: str) -> int:
+    """Inactive page cache in a cgroup ``memory.stat``, or 0 if unreadable."""
+    try:
+        with open(stat_path) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name == key:
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def _cgroup_v2_dirs(root: str, proc_cgroup: str) -> List[str]:
+    """This process's cgroup v2 directory and its ancestors up to ``root``,
+    innermost first; every level's limit applies. ``proc_cgroup`` gives the
+    path relative to the cgroup namespace root that ``root`` shows: a systemd
+    unit or a Slurm job sits below ``root``, and a container's own cgroup is
+    usually ``root`` itself. A path outside that root ("..") is not visible
+    under ``root``, so no directory is returned for it."""
+    try:
+        with open(proc_cgroup) as f:
+            rel = next((ln[3:].strip() for ln in f if ln.startswith("0::")), "/")
+    except OSError:
+        rel = "/"
+    parts = [p for p in rel.split("/") if p]
+    if ".." in parts:
+        return []
+    dirs = [os.path.join(root, *parts[:i]) for i in range(len(parts), 0, -1)]
+    return [d for d in dirs if os.path.isdir(d)] + [str(root)]
+
+
+def _cgroup_available_memory_bytes(
+    root: str = "/sys/fs/cgroup", proc_cgroup: str = "/proc/self/cgroup"
+) -> Optional[int]:
+    """Bytes left under the tightest cgroup memory limit on this process's
+    path, or None if unlimited/unreadable.
+
+    Inside containers /proc/meminfo reports *host* memory, so the cgroup
+    limit is what actually prevents an OOM kill.
+    cgroup's memory.current is profiled here to estimate the headroom, less
+    the inactive page cache the kernel reclaims before an OOM kill (the
+    working set kubelet uses), since reading weights fills that cache.
+    """
+    headroom = None
+    for d in _cgroup_v2_dirs(root, proc_cgroup):
+        try:
+            with open(f"{d}/memory.max") as f:
+                limit = f.read().strip()
+            if limit == "max":
+                continue
+            with open(f"{d}/memory.current") as f:
+                current = int(f.read()) - _cgroup_inactive_file_bytes(
+                    f"{d}/memory.stat", "inactive_file"
+                )
+            left = max(0, int(limit) - current)
+        except (OSError, ValueError):
+            continue
+        headroom = left if headroom is None else min(headroom, left)
+    if headroom is not None:
+        return headroom
+    # cgroup v1: the mount root only, which is the container's own memory
+    # cgroup under Docker; nested v1 hierarchies are not walked.
+    try:
+        with open(f"{root}/memory/memory.limit_in_bytes") as f:
+            limit_v1 = int(f.read())
+        if limit_v1 < 1 << 60:  # values near 2**63 mean "unlimited"
+            with open(f"{root}/memory/memory.usage_in_bytes") as f:
+                usage = int(f.read()) - _cgroup_inactive_file_bytes(
+                    f"{root}/memory/memory.stat", "total_inactive_file"
+                )
+            return max(0, limit_v1 - usage)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _available_host_memory_bytes() -> Optional[int]:
+    """Best-effort available memory: the tighter of host MemAvailable and
+    the cgroup limit headroom, or None if neither is readable."""
+    candidates = []
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    candidates.append(int(line.split()[1]) * 1024)
+                    break
+    except OSError:
+        pass
+    cgroup = _cgroup_available_memory_bytes()
+    if cgroup is not None:
+        candidates.append(cgroup)
+    return min(candidates) if candidates else None
+
+
+def _read_mem_available_gb() -> Optional[int]:
+    """Available memory in whole GiB, or ``None`` when it cannot be read."""
+    available = _available_host_memory_bytes()
+    return None if available is None else available // (1 << 30)
+
+
+def _cgroup_cpu_quota(
+    root: str = "/sys/fs/cgroup", proc_cgroup: str = "/proc/self/cgroup"
+) -> Optional[int]:
+    """Whole CPUs the tightest cgroup CPU quota on this process's path allows,
+    or ``None`` without a quota.
+
+    ninja lowers its default parallelism to its own cgroup's quota
+    (``GetProcessorCount``): the cgroup v1 quota since 1.11, the v2 ``cpu.max``
+    since 1.13. An ancestor's tighter quota only lowers this further.
+    """
+    quotas, read_v2 = [], False
+    for d in _cgroup_v2_dirs(root, proc_cgroup):
+        try:
+            with open(f"{d}/cpu.max") as f:
+                quota, period = f.read().split()
+            read_v2 = True
+            if quota != "max" and int(quota) > 0:
+                quotas.append(int(quota) // int(period))
+        except (OSError, ValueError, ZeroDivisionError):
+            continue
+    if read_v2:
+        return min(quotas) if quotas else None
+    # cgroup v1: the mount root only, as for memory above.
+    try:
+        with open(f"{root}/cpu/cpu.cfs_quota_us") as f:
+            quota_v1 = int(f.read())
+        with open(f"{root}/cpu/cpu.cfs_period_us") as f:
+            period_v1 = int(f.read())
+        if quota_v1 > 0 and period_v1 > 0:
+            return quota_v1 // period_v1
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _ninja_default_jobs(cpu_count: int) -> int:
+    """ninja's GuessParallelism: 2 for <=1 core, 3 for 2 cores, else N + 2."""
+    if cpu_count <= 1:
+        return 2
+    if cpu_count == 2:
+        return 3
+    return cpu_count + 2
+
+
+def _mem_per_job_gb() -> int:
+    return max(8, _nvcc_threads() * 2)
+
+
+@functools.cache
+def _warn_job_cap(cap: int, mem_per_job_gb: int) -> None:
+    """Log the cap once per distinct value, not once per compiled module."""
+    logger.warning(
+        "Capped ninja parallelism at %d job(s) because MAX_JOBS is not set to a "
+        "number (%d GiB of available memory per job, and never above ninja's own "
+        "default under a cgroup CPU quota); set MAX_JOBS to override.",
+        cap,
+        mem_per_job_gb,
+    )
+
+
+def _memory_aware_job_cap() -> Optional[int]:
+    """Parallel-ninja-job cap from available memory, or ``None`` to keep ninja's
+    default. Read on every build, since memory can drop after the first one."""
+    # With MAX_JOBS unset, ninja runs ~nproc + 2 nvcc processes; each CUTLASS /
+    # FP4 compile can peak at several GiB, so on memory-constrained or
+    # unified-memory systems (e.g. DGX Spark GB10 / SM121a) the default
+    # OOM-kills nvcc (exit 137) and crashes the caller. Use the AOT script's
+    # per-job memory budget (scripts/jit_cache_build_common.sh: max(8,
+    # FLASHINFER_NVCC_THREADS * 2) GiB/job, without its thread and job-count
+    # clamps) and only ever lower below ninja's default.
+    mem_available_gb = _read_mem_available_gb()
+    if mem_available_gb is None:
+        return None
+
+    # ninja counts the CPUs this process may run on (sched_getaffinity).
+    if hasattr(os, "sched_getaffinity"):
+        cpu_count = len(os.sched_getaffinity(0))
+    else:
+        cpu_count = os.cpu_count() or 1
+
+    mem_cap = max(1, mem_available_gb // _mem_per_job_gb())
+    if mem_cap >= _ninja_default_jobs(cpu_count):
+        # No ninja version runs more jobs than fit; don't intervene.
+        return None
+    # Newer ninja also lowers its default to the cgroup CPU quota (v1 since
+    # 1.11, v2 since 1.13). Never pass more than that default as far as the
+    # quota is visible here (v1 only at the mount root), while a ninja that
+    # ignores the quota still gets a -j that fits memory.
+    cpu_quota = _cgroup_cpu_quota()
+    if cpu_quota is not None:
+        mem_cap = min(mem_cap, _ninja_default_jobs(min(cpu_count, cpu_quota)))
+    return mem_cap
+
+
 def _get_num_workers() -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
         return int(max_jobs)
-    return None
+    return _memory_aware_job_cap()
 
 
 def run_ninja(
@@ -462,11 +661,17 @@ def run_ninja(
     num_workers = max_jobs if max_jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
+    # _get_num_workers returns MAX_JOBS when it is a number, else the cap.
+    capped = (
+        max_jobs is None
+        and num_workers is not None
+        and not os.environ.get("MAX_JOBS", "").isdigit()
+    )
 
     sys.stdout.flush()
     sys.stderr.flush()
     try:
-        subprocess.run(
+        result = subprocess.run(
             command,
             stdout=None if verbose else subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -479,3 +684,6 @@ def run_ninja(
         if e.output:
             msg += " Ninja output:\n" + e.output
         raise RuntimeError(msg) from e
+    # Every module load runs ninja; name the cap only when something was built.
+    if capped and "ninja: no work to do." not in (result.stdout or ""):
+        _warn_job_cap(num_workers, _mem_per_job_gb())
