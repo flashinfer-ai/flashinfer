@@ -46,8 +46,6 @@ try:
         warmup as specialized_ssd_prefill_warmup,
     )
 
-    __all__.extend(
-        ("specialized_ssd_prefill_stats", "specialized_ssd_prefill_warmup")
-    )
+    __all__.extend(("specialized_ssd_prefill_stats", "specialized_ssd_prefill_warmup"))
 except ImportError:
     pass

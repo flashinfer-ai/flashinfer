@@ -327,8 +327,7 @@ class SSDCombined:
         major, minor = get_compute_capability(torch.device("cuda"))
         if backend not in SSD_BACKENDS:
             raise ValueError(
-                f"SSDCombined backend must be one of {SSD_BACKENDS}, "
-                f"got {backend!r}"
+                f"SSDCombined backend must be one of {SSD_BACKENDS}, got {backend!r}"
             )
         if backend == "auto":
             # "auto" behaves exactly like "cute" (today's default) except
@@ -341,11 +340,20 @@ class SSDCombined:
                     construction_supported,
                 )
 
-                if construction_supported(
-                    chunk_size=chunk_size, nheads=nheads, headdim=headdim,
-                    dstate=dstate, ngroups=ngroups, io_dtype=io_dtype,
-                    has_d=has_d, d_has_hdim=d_has_hdim, has_z=has_z,
-                ) is None:
+                if (
+                    construction_supported(
+                        chunk_size=chunk_size,
+                        nheads=nheads,
+                        headdim=headdim,
+                        dstate=dstate,
+                        ngroups=ngroups,
+                        io_dtype=io_dtype,
+                        has_d=has_d,
+                        d_has_hdim=d_has_hdim,
+                        has_z=has_z,
+                    )
+                    is None
+                ):
                     backend = "specialized"
             if backend == "auto":
                 backend = "cute"
@@ -353,9 +361,15 @@ class SSDCombined:
             from .specialized.ssd_prefill_sm120 import construction_supported
 
             reason = construction_supported(
-                chunk_size=chunk_size, nheads=nheads, headdim=headdim,
-                dstate=dstate, ngroups=ngroups, io_dtype=io_dtype,
-                has_d=has_d, d_has_hdim=d_has_hdim, has_z=has_z,
+                chunk_size=chunk_size,
+                nheads=nheads,
+                headdim=headdim,
+                dstate=dstate,
+                ngroups=ngroups,
+                io_dtype=io_dtype,
+                has_d=has_d,
+                d_has_hdim=d_has_hdim,
+                has_z=has_z,
             )
             if reason is None and (major, minor) != (12, 0):
                 reason = "compute_capability"
@@ -797,11 +811,22 @@ class SSDCombined:
                 and checkpoint_states is None
             )
             served, fallback_reason = maybe_run_specialized(
-                x=x, dt=dt, A=A, B=B, C=C, D=D, z=z, dt_bias=dt_bias,
-                dt_softplus=dt_softplus, dt_limit=dt_limit,
-                initial_states=initial_states, out=out,
-                return_final_states=return_final_states, num_seqs=num_seqs,
-                cu_seqlens=cu_seqlens, extras_none=extras_none,
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                out=out,
+                return_final_states=return_final_states,
+                num_seqs=num_seqs,
+                cu_seqlens=cu_seqlens,
+                extras_none=extras_none,
                 geo=(self.chunk_size, self.nheads, self.headdim, self.dstate),
             )
             if served is not None:

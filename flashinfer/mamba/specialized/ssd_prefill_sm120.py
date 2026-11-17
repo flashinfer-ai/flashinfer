@@ -71,9 +71,7 @@ def _load_allowlist() -> Optional[dict]:
     if _allowlist_cache is not None:
         return _allowlist_cache
     try:
-        payload = json.loads(
-            (Path(__file__).parent / _WORKLOAD_FILE).read_text()
-        )
+        payload = json.loads((Path(__file__).parent / _WORKLOAD_FILE).read_text())
         geo = payload["geometry"]
         _allowlist_cache = {
             "min_cc": tuple(int(v) for v in payload["min_compute_capability"]),
@@ -84,11 +82,17 @@ def _load_allowlist() -> Optional[dict]:
             "ngroups": int(geo["ngroups"]),
             "nheads": frozenset(int(v) for v in geo["nheads_allowlist"]),
         }
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError,
-            ValueError) as exc:
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
         logger.warning(
             "flashinfer.mamba specialized SSD prefill: workload allowlist "
-            "unavailable, backend disabled: %s", exc
+            "unavailable, backend disabled: %s",
+            exc,
         )
         _allowlist_cache = None
     return _allowlist_cache
@@ -225,28 +229,40 @@ def _guard_call(
         return "x_geometry"
     if x.dtype != torch.bfloat16 or not x.is_contiguous():
         return "x_form"
-    if dt.shape != (1, T, nheads) or dt.dtype != torch.bfloat16 \
-            or not dt.is_contiguous():
+    if (
+        dt.shape != (1, T, nheads)
+        or dt.dtype != torch.bfloat16
+        or not dt.is_contiguous()
+    ):
         return "dt_form"
-    if A.shape != (nheads,) or A.dtype != torch.float32 \
-            or not A.is_contiguous():
+    if A.shape != (nheads,) or A.dtype != torch.float32 or not A.is_contiguous():
         return "a_form"
     ng = allow["ngroups"]
-    if B.shape != (1, T, ng, dstate) or B.dtype != torch.bfloat16 \
-            or not B.is_contiguous():
+    if (
+        B.shape != (1, T, ng, dstate)
+        or B.dtype != torch.bfloat16
+        or not B.is_contiguous()
+    ):
         return "b_form"
-    if C.shape != (1, T, ng, dstate) or C.dtype != torch.bfloat16 \
-            or not C.is_contiguous():
+    if (
+        C.shape != (1, T, ng, dstate)
+        or C.dtype != torch.bfloat16
+        or not C.is_contiguous()
+    ):
         return "c_form"
-    if D.shape != (nheads,) or D.dtype != torch.bfloat16 \
-            or not D.is_contiguous():
+    if D.shape != (nheads,) or D.dtype != torch.bfloat16 or not D.is_contiguous():
         return "d_form"
-    if dt_bias.shape != (nheads,) or dt_bias.dtype != torch.bfloat16 \
-            or not dt_bias.is_contiguous():
+    if (
+        dt_bias.shape != (nheads,)
+        or dt_bias.dtype != torch.bfloat16
+        or not dt_bias.is_contiguous()
+    ):
         return "dt_bias_form"
     if out is not None and (
-            out.shape != (1, T, nheads, headdim)
-            or out.dtype != torch.bfloat16 or not out.is_contiguous()):
+        out.shape != (1, T, nheads, headdim)
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+    ):
         return "out_form"
     # --- device guards ---
     cc = tuple(get_compute_capability(x.device))
@@ -254,8 +270,10 @@ def _guard_call(
         return "compute_capability"
     # CUDA-graph rule: the first call JIT-compiles and initializes the
     # cooperative-launch state on the host — never under capture.
-    if torch.cuda.is_current_stream_capturing() \
-            and (x.device.index or 0, nheads) not in _warmed:
+    if (
+        torch.cuda.is_current_stream_capturing()
+        and (x.device.index or 0, nheads) not in _warmed
+    ):
         return "capture_unwarmed"
     return None
 
@@ -287,19 +305,43 @@ def maybe_run_specialized(
     ``(None, reason)`` with the reason recorded in ``fallback_reasons``.
     """
     _stats["calls"] += 1
-    reason = _guard_call(x, dt, A, B, C, D, z, dt_bias, dt_softplus,
-                         dt_limit, initial_states, out, return_final_states,
-                         num_seqs, cu_seqlens, extras_none, geo)
+    reason = _guard_call(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        z,
+        dt_bias,
+        dt_softplus,
+        dt_limit,
+        initial_states,
+        out,
+        return_final_states,
+        num_seqs,
+        cu_seqlens,
+        extras_none,
+        geo,
+    )
     if reason is not None:
         return None, _bump_fallback(reason)
     run = _kernel_entry()
     T, nheads, headdim = x.shape[1], x.shape[2], x.shape[3]
     if out is None:
-        out = torch.empty((1, T, nheads, headdim), dtype=torch.bfloat16,
-                          device=x.device)
-    run(x.view(T, nheads, headdim), dt.view(T, nheads), A,
-        B.view(T, B.shape[2], B.shape[3]), C.view(T, C.shape[2], C.shape[3]),
-        D, dt_bias, out.view(T, nheads, headdim))
+        out = torch.empty(
+            (1, T, nheads, headdim), dtype=torch.bfloat16, device=x.device
+        )
+    run(
+        x.view(T, nheads, headdim),
+        dt.view(T, nheads),
+        A,
+        B.view(T, B.shape[2], B.shape[3]),
+        C.view(T, C.shape[2], C.shape[3]),
+        D,
+        dt_bias,
+        out.view(T, nheads, headdim),
+    )
     _warmed.add((x.device.index or 0, nheads))
     _stats["specialized_dispatches"] += 1
     return (out, None), None
