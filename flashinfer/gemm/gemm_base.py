@@ -3227,42 +3227,54 @@ def _sm120_fp4_gemm_tactic_is_stream_k(tactic: int) -> bool:
 
 
 def _create_cutlass_fp4_gemm_module(
-    module,
+    module: Any,
     op_name: str,
     tuner_name: str,
     is_stream_k_tactic: Optional[Callable[[int], bool]] = None,
 ):
-    """Helper function to create cutlass FP4 GEMM module."""
+    """Helper function to create cutlass FP4 GEMM module.
+
+    Args:
+        is_stream_k_tactic: Tells whether a tactic index is a stream-K config. When
+            given, FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 leaves those tactics out
+            of tuning and rejects them when read back from an autotune cache.
+    """
 
     def _stream_k_disabled() -> bool:
         # A stream-K tactic sums a tile's K range in more than one CTA, so its result
         # can differ in the last bits from the data-parallel tactics. When the
         # autotuner picks by timing, the output then depends on which tactic won;
         # this option limits the choice to data-parallel tactics.
-        return is_stream_k_tactic is not None and os.environ.get(
-            "FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "0"
-        ) not in ("0", "", "false", "False")
+        return (
+            is_stream_k_tactic is not None
+            and os.environ.get("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "0") == "1"
+        )
 
     def cutlass_fp4_gemm_runner():
         class CutlassFp4GemmRunner(TunableRunner):
             def __init__(self):
                 self._fp4_gemm_runner = module.fp4_gemm
+                # validate_tactic runs on every cache hit; count the configs once.
+                self._tactic_num = module.fp4_gemm_tactic_num()
 
             def get_valid_tactics(
                 self,
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
-                tactics = list(range(module.fp4_gemm_tactic_num()))
+                tactics = list(range(self._tactic_num))
                 if _stream_k_disabled():
                     tactics = [t for t in tactics if not is_stream_k_tactic(t)]
                 return tactics
 
             def validate_tactic(self, inputs: List[torch.Tensor], tactic: int) -> bool:
-                # Also rejects a stream-K tactic read back from a saved autotune cache.
-                return not (
-                    _stream_k_disabled() and tactic >= 0 and is_stream_k_tactic(tactic)
-                )
+                # Checks a tactic read back from a saved autotune cache: it must be
+                # one of this module's configs, and not stream-K when that is off.
+                if tactic == -1:
+                    return True
+                if not 0 <= tactic < self._tactic_num:
+                    return False
+                return not (_stream_k_disabled() and is_stream_k_tactic(tactic))
 
             def forward(
                 self,
