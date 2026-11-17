@@ -3305,8 +3305,12 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
          !::WorkspaceIsUnusedAfterOOM(T, B, max_nblk, p_cu, p_pos, p_vis, stream, true)))
       throw std::runtime_error(cudaGetErrorString(alloc_err));
   }
-  const bool compact_hot = B == 1 && MAXCP == 64 && T == 16384 && chunk == T;
-  const bool w8_hybrid = T == 2930 && B == 1 && MAXCP == 12 && chunk == T && output_workspace;
+  // The compact-hot cover produced compiler-version-dependent threshold
+  // selections (verified: nvcc 12.9/13.0 vs 13.3); the generic route is
+  // toolkit-stable, so the cover is permanently disabled.
+  const bool compact_hot = false;
+  // Disabled for the same compiler-version sensitivity as compact_hot.
+  const bool w8_hybrid = false;
   const int smem = QTILE_B + ((compact_hot || per_cta >= 3) ? 3 : 2) * KTILE_B;
   // The attribute belongs to the function, not the invocation.  All callers
   // publish the same upper bound; actual per-launch shared memory is unchanged.
@@ -6646,8 +6650,12 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
          !::WorkspaceIsUnusedAfterOOM(T, B, max_nblk, p_cu, p_pos, p_vis, stream, false)))
       throw std::runtime_error(cudaGetErrorString(alloc_err));
   }
-  const bool compact_hot = B == 1 && MAXCP == 64 && T == 16384 && chunk == T;
-  const bool w8_hybrid = T == 2930 && B == 1 && MAXCP == 12 && chunk == T && output_workspace;
+  // The compact-hot cover produced compiler-version-dependent threshold
+  // selections (verified: nvcc 12.9/13.0 vs 13.3); the generic route is
+  // toolkit-stable, so the cover is permanently disabled.
+  const bool compact_hot = false;
+  // Disabled for the same compiler-version sensitivity as compact_hot.
+  const bool w8_hybrid = false;
   const int smem = QTILE_B + ((compact_hot || per_cta >= 3) ? 3 : 2) * KTILE_B;
   // Keep the same invariant per-function configuration on this compatibility
   // path. Actual per-launch shared-memory requirements are unchanged.

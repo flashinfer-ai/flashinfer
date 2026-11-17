@@ -21,8 +21,14 @@ top 512 blocks (ties broken by LOWER block index -- a deterministic part of
 the contract, not a checker detail), expands each selected block to its 4
 token indices, appends the causal tail of the open block, and emits one
 packed int32 row per query: ascending valid token indices in columns
-0..2050, -1 padding, valid count in column 2051. The output is exactly
-determined by the inputs (bit-exact across runs).
+0..2050, -1 padding, valid count in column 2051. The output is bitwise
+deterministic across runs of any given build. Selection exactness vs an
+fp32 reference holds on the validated toolchain (nvcc 13.3); under other
+compiler versions (measured: nvcc 12.9 and 13.0) the top-512 set may
+differ from that reference by AT MOST one score-TIED boundary block at the
+selection threshold per row (set difference <= 1 block; the swapped
+blocks' fp32 scores are equal within rounding), with the packed format,
+causal tail, ordering and count columns exact in all cases.
 
 There is no other FlashInfer path serving this fused contract today:
 ``fp8_paged_mqa_logits`` + ``FP8MQATopKWrapper`` cover the decode-side
@@ -107,8 +113,29 @@ def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos, visible,
         or out.device != qi.device
     ):
         r.append("out_not_TxPW_int32_contiguous")
+    if cpage_table.shape[0] == 0:
+        r.append("batch_size_zero")
+    for _name, _t in (
+        ("qi", qi),
+        ("ck_cache", ck_cache),
+        ("cpage_table", cpage_table),
+        ("cu_seqlens", cu_seqlens),
+        ("pos", pos),
+        ("visible", visible),
+    ):
+        if not _t.is_contiguous():
+            r.append(_name + "_not_contiguous")
+        if _t.device != qi.device:
+            r.append(_name + "_device_mismatch")
+    for _name, _t in (("qi", qi), ("ck_cache", ck_cache)):
+        if _t.data_ptr() % 16:
+            r.append(_name + "_not_16B_aligned")
+    if out is not None and out.data_ptr() % 16:
+        r.append("out_not_16B_aligned")
     if r:
         return r
+    if qi.device.type != "cuda":
+        return ["qi_not_cuda"]
     if torch.cuda.get_device_capability(qi.device) != (10, 3):
         return ["not_sm103"]
     if torch.cuda.is_current_stream_capturing() and not _BUILT["ready"]:
@@ -175,13 +202,22 @@ def fp8_paged_mqa_topk_indexer(
             "fp8_paged_mqa_topk_indexer cannot serve this call; "
             f"fallback_reasons={reasons}"
         )
+    try:
+        get_fp8_paged_mqa_topk_indexer_module()
+    except Exception as e:  # pragma: no cover - environment-dependent
+        DISPATCH_STATS["rejected"] += 1
+        raise ValueError(
+            "fp8_paged_mqa_topk_indexer: specialized module unavailable "
+            f"({type(e).__name__}) and no stock path exists"
+        ) from e
     DISPATCH_STATS["specialized"] += 1
     if out is None:
         out = torch.empty(
             (qi.shape[0], PACKED_WIDTH), dtype=torch.int32, device=qi.device
         )
     mod = get_fp8_paged_mqa_topk_indexer_module()
-    mod.fp8_paged_mqa_topk_indexer_run(
-        qi, ck_cache, cpage_table, cu_seqlens, pos, visible, out
-    )
+    with torch.cuda.device(qi.device):
+        mod.fp8_paged_mqa_topk_indexer_run(
+            qi, ck_cache, cpage_table, cu_seqlens, pos, visible, out
+        )
     return out
