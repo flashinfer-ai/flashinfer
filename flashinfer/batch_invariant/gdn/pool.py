@@ -268,20 +268,18 @@ class GdnPool:
             _raise_if_misaligned(e)
             raise
 
-    def extend_whole_chunks(self, pool, slots, offs, cu, packed, scale, out) -> bool:
-        """A prefill of whole chunks from the slots' states: the caller's tensors as they are, nothing read back before
-        the kernel and the bookkeeping after it (the slots are read only to drop the tails a pool still has pending).
-        False (nothing done) when a sequence leaves an open tail."""
-        if any((b - a) % CHUNK for a, b in zip(offs, offs[1:], strict=False)):
-            return False
+    def extend_whole_chunks(
+        self, pool, slots, slot_list, offs, cu, packed, scale, out
+    ) -> None:
+        """A prefill of whole chunks from the slots' states, over the caller's tensors as they are; it drops the
+        pending tails of ``slot_list`` (None inside a graph capture, where the slots are not read)."""
         if cu is None:
             cu = self._idx(offs)
         _pinned(packed, cu, list(offs), pool, slots, slots, scale, output=out)
         self.cnt.index_fill_(0, slots.long(), STALE)
-        if self.pending and not torch.cuda.is_current_stream_capturing():
-            for s in slots.tolist():
+        if self.pending and slot_list is not None:
+            for s in slot_list:
                 self.pending.pop(s, None)
-        return True
 
     def extend(
         self,

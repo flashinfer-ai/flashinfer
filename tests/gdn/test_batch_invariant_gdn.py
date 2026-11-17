@@ -926,6 +926,18 @@ def test_first_call_on_a_pool_inside_a_capture_raises():
 
 
 @needs_device
+def test_whole_chunk_prefill_checks_its_slots():
+    HQ, HV = 4, 8
+    x, _ = _inputs(128, HQ, HV, 6)
+    buf = _pool(HV, 4)
+    before = buf.clone()
+    for slots in ([0, 3], [0, 2], [1, 1], [0, -1]):
+        with pytest.raises(BatchInvariantUnsupportedError):
+            _bi(buf[:2], slots, x, cu=[0, 64, 128])
+    assert torch.equal(buf, before)
+
+
+@needs_device
 def test_restarted_slot_drops_its_pending_tail():
     """A whole-chunk prefill that restarts a slot ends the wait of the tail an earlier prefill left there."""
     HQ, HV = 4, 8

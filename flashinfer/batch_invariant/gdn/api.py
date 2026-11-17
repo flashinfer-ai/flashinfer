@@ -25,9 +25,8 @@ the first step after a prefill eagerly). A new sequence loaded into a slot must 
 ``prefix_lens``; a one-token
 call without it always continues what the slot holds. As for the operator's other state-pool routes, every slot index
 must be unique and in range, and ``cu_seqlens_cpu`` must agree with ``cu_seqlens``; a decode call's ``cu_seqlens`` are
-taken to be ``arange(N + 1)``. Only the calls that bring whole chunks together with open chunks or tails read the
-slots on the host and check them there; a prefill of whole chunks from chunk boundaries trusts them, and an
-out-of-range slot there writes outside the pool. A call of fewer than 64 tokens without
+taken to be ``arange(N + 1)``. The calls that bring whole chunks read the slots on the host and check them there
+(not inside a CUDA graph capture, where a whole-chunk prefill trusts them). A call of fewer than 64 tokens without
 ``cu_seqlens_cpu`` does not check a device ``cu_seqlens``: rows that no sequence covers are left unwritten.
 ``output`` must not partly overlap an input (not checked). ``output_final_state=True`` returns the pool, whose slots
 hold the states at the last chunk boundaries.
@@ -305,21 +304,25 @@ def chunk_gated_delta_rule_batch_invariant(
         gp.rebuild(pool)
         gp.span(pool, slots, cu[:-1], cu[1:], prefix, rows, scale_f, out)
         return (out, pool) if output_final_state else out
-    if prefix_lens is None and gp.extend_whole_chunks(
-        pool, slots, offs, cu, rows, scale_f, out
-    ):
+    whole = prefix_lens is None and not any(
+        (b - a) % CHUNK for a, b in zip(offs, offs[1:], strict=False)
+    )
+    slot_list = None
+    if not (whole and torch.cuda.is_current_stream_capturing()):
+        slot_list = slots.tolist()
+        if (
+            len(set(slot_list)) != N
+            or min(slot_list) < 0
+            or max(slot_list) >= int(pool.shape[0])
+        ):
+            raise unsupported(
+                CLASS,
+                "state_indices that repeat a slot or leave the pool",
+                "one distinct in-range slot per sequence",
+            )
+    if whole:
+        gp.extend_whole_chunks(pool, slots, slot_list, offs, cu, rows, scale_f, out)
         return (out, pool) if output_final_state else out
-    slot_list = slots.tolist()
-    if (
-        len(set(slot_list)) != N
-        or min(slot_list) < 0
-        or max(slot_list) >= int(pool.shape[0])
-    ):
-        raise unsupported(
-            CLASS,
-            "state_indices that repeat a slot or leave the pool",
-            "one distinct in-range slot per sequence",
-        )
     if prefix_lens is None:
         counts = [0] * N
     else:

@@ -285,7 +285,9 @@ the call, pass `cu_seqlens_cpu`: without it the offsets are read from the device
 `prefix_lens` is not where its slot's open chunk ends gets NaN rows and its slot is left as it was, as for a slot index
 outside the pool: never another sequence's bits. A call that brings whole chunks runs them through the prefill kernel:
 from chunk boundaries it is one prefill call in place over the caller's tensors, which also returns the rows of the
-open tails and stores each sequence's last boundary state as a checkpoint in its pool slot. One more launch keeps the
+open tails and stores each sequence's last boundary state as a checkpoint in its pool slot. Such a call reads its slot
+indices on the host and refuses a repeated or out-of-range slot before anything is written (inside a CUDA graph
+capture a whole-chunk prefill does not read them and trusts the caller). One more launch keeps the
 tails' raw rows next to the pool; their cached rows are built by one span launch before the slot's next step. Until
 then the slot's count cell is negative and a step launched without that rebuild (a captured graph) returns NaN rows
 for the slot. While any slot of the pool waits for its rebuild, the pool's next step or span call starts with that
@@ -310,11 +312,9 @@ What the caller owes the class:
   so a copy of the fp32 state does not continue the sequence.
 * Every call on a pool passes a view that starts at the pool's first slot (a view that starts at another slot is
   another pool, with its own open rows).
-* Slot indices are unique and inside the pool. A call that brings whole chunks together with open chunks or tails
-  checks them on the host, and a call of fewer than 64 tokens per sequence checks the range on the device (NaN rows)
-  and does not detect a repeated slot. A prefill of whole chunks from chunk boundaries trusts them, like the
-  operator's other state-pool routes: an out-of-range slot there writes outside the pool (reading the slots back
-  would stop the host at every such call).
+* Slot indices are unique and inside the pool. The calls that bring whole chunks check them on the host (except a
+  whole-chunk prefill inside a CUDA graph capture); a call of fewer than 64 tokens per sequence checks the range on
+  the device (NaN rows) and does not detect a repeated slot.
 * `cu_seqlens_cpu` agrees with `cu_seqlens` and spares a call of 64 tokens or more the read of `cu_seqlens`; a decode
   call's `cu_seqlens` are `arange(N + 1)`. A call of fewer than 64 tokens without `cu_seqlens_cpu` does not check a
   device `cu_seqlens`: it stays inside its buffers, and rows that no sequence covers are left unwritten.
