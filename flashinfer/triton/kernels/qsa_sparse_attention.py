@@ -35,6 +35,13 @@ except Exception:
     TensorDescriptor = None
     _HTMA = 0
 
+try:
+    from triton.runtime.errors import OutOfResources as _TritonOOR
+except Exception:  # pragma: no cover - very old Triton without the error class
+
+    class _TritonOOR(Exception):  # type: ignore[no-redef]
+        pass
+
 _TMA_SCRATCH: dict = {}
 
 
@@ -2158,6 +2165,16 @@ def _cfg(T, B, split_ok):
 
 _SCRATCH: dict = {}
 
+# Routes whose warp-specialized form exceeded this toolchain's tensor-memory
+# budget at compile time. Warp specialization here only pipelines the K/V
+# copies (same tl.range iteration order, same accumulation order, bitwise
+# identical results); some Triton builds double-buffer the MMA accumulators in
+# tensor memory under warp_specialize=True, which can overflow the per-CTA
+# budget (seen as "out of resource: tensor memory" on SM107 with the CUDA 13.4
+# toolchain). Each failing route is remembered so later calls go straight to
+# the non-warp-specialized schedule instead of re-attempting a failing compile.
+_NO_WSPEC: dict = {}
+
 
 def _desc(k_cache, v_cache, bn, nslot):
     """Build host-side TMA descriptors and avoid per-CTA tensormap setup."""
@@ -2209,17 +2226,23 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
             num_stages=(2 if T == 256 else
                         (3 if short_bn == 32 else SR_STAGES)))
         return
-    if T == 16382 and B == 2:
+    if T == 16382 and B == 2 and "w7" not in _NO_WSPEC:
         w7_bt = 21
         w7_nprog = (T + w7_bt - 1) // w7_bt + 1
         kd, vd = _desc(k_cache, v_cache, 128, nslot)
-        _qsa_w7_tma[(w7_nprog,)](
-            q, gate, k_cache, v_cache, kd, vd,
-            packed, cu_seqlens, page_base, out,
-            T, nslot, BT=w7_bt, RW=128, MK=32, BN=128,
-            NHC=NH, DC=D, PWC=PW, SC=SCL,
-            num_warps=8, num_stages=2)
-        return
+        try:
+            _qsa_w7_tma[(w7_nprog,)](
+                q, gate, k_cache, v_cache, kd, vd,
+                packed, cu_seqlens, page_base, out,
+                T, nslot, BT=w7_bt, RW=128, MK=32, BN=128,
+                NHC=NH, DC=D, PWC=PW, SC=SCL,
+                num_warps=8, num_stages=2)
+            return
+        except _TritonOOR:
+            # This toolchain cannot fit the warp-specialized descriptor
+            # sweep's tensor-memory footprint; the general path below serves
+            # the shape (its T >= 12000 configuration is not warp-specialized).
+            _NO_WSPEC["w7"] = True
     single = B == 1
     mid = single and 512 <= T <= 1024
     dn_mid = mid and DN_MODE == 1 and T >= DN_TMIN
@@ -2248,20 +2271,29 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         nwarps = BIG_WARPS
     ntiles = (T + bt - 1) // bt
     nprog = ntiles if single else ntiles + B - 1
-    if (T == 4057 and B == 2) or (T == 8181 and B == 4):
+    if ((T == 4057 and B == 2) or (T == 8181 and B == 4)) and (
+        "w6" not in _NO_WSPEC
+    ):
         w6_bt = 21
         w6_nprog = (T + w6_bt - 1) // w6_bt + B - 1
         wbn = 128 if T == 4057 else bn
         kd, vd = _desc(k_cache, v_cache, wbn, nslot)
-        _qsa_w6[(w6_nprog,)](
-            q, gate, k_cache, v_cache, kd, vd, packed, cu_seqlens, page_base,
-            out, T, nslot, BT=w6_bt, RW=128, MK=32, BN=wbn, NR=B,
-            HTMA=_HTMA,
-            CAPQ=False, FASTEX2=(T < 6000), GATEPTX=(T >= 6000),
-            PEEL=(T < 6000), DEN16=(T == 4057),
-            NHC=NH, DC=D, PWC=PW, SC=SCL,
-            num_warps=nwarps, num_stages=2)
-        return
+        try:
+            _qsa_w6[(w6_nprog,)](
+                q, gate, k_cache, v_cache, kd, vd, packed, cu_seqlens,
+                page_base,
+                out, T, nslot, BT=w6_bt, RW=128, MK=32, BN=wbn, NR=B,
+                HTMA=_HTMA,
+                CAPQ=False, FASTEX2=(T < 6000), GATEPTX=(T >= 6000),
+                PEEL=(T < 6000), DEN16=(T == 4057),
+                NHC=NH, DC=D, PWC=PW, SC=SCL,
+                num_warps=nwarps, num_stages=2)
+            return
+        except _TritonOOR:
+            # Same tensor-memory overflow class as the w7 route: fall through
+            # to the general path, whose own warp-specialization fallback
+            # below covers it.
+            _NO_WSPEC["w6"] = True
     nsp = 1
     if mid and not dn_mid:
         nsp = max(1, min(MID_NSP, (T + bn - 1) // bn))
@@ -2300,31 +2332,53 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
         kd, vd = _desc(k_cache, v_cache, bn, nslot)
     else:
         kd, vd = k_cache, v_cache
-    _qsa[grid](q, gate, k_cache, v_cache, kd, vd,
-               packed, cu_seqlens, page_base, out,
-               ws, wlp, wmp,
-               T, B, nslot, nrow,
-               BT=bt, RW=rw, MK=mk, BN=bn, NSUB=max(1, bn // 64),
-               NB=max(4, triton.next_power_of_2(B)), SINGLE=single,
-               PAIRREQ=(B == 2),
-               PVB=pvb, NSP=max_nsp, USEQL=(QRES == 1 and not mid),
-               MASKFP8=(T >= 12000),
-               RSC=RSC_MODE,
-               SKIPD=skipd, TPD=(TPD_MODE == 1 and not skipd),
-               SPV=(SPV_MODE == 1 and T >= 12000), W32=(W32_MASK == 1),
-               EX2B=(EX2_BF16 == 1), EX2H=(T < 6000),
-               ZERO=True,
-               PEEL=(3000 <= T < 6000 or T >= 12000),
-               DEN16=(T == 4057),
-               CAPQ=False,  # fixed-scale fast path excluded (see _qsa note)
-               FAST_CAUSAL=(mid or (not single and 6000 <= T < 12000)),
-               TMA=((2 if _HTMA else 1) if use_tma else 0),
-               WSPEC=(USE_WS == 1 and TMA_TMIN <= T < 12000 and not mid),
-               GATEPTX=(T >= 6000),
-               CSPL=mid, VSPL=vsplit,
-               NHC=NH, DC=D, PWC=PW, SC=SCL,
-               num_warps=nwarps,
-               num_stages=(2 if 3000 <= T < 6000 and not mid else nstages))
+    wspec_key = ("qsa", bt, rw, mk, bn)
+    wspec = (
+        USE_WS == 1
+        and TMA_TMIN <= T < 12000
+        and not mid
+        and wspec_key not in _NO_WSPEC
+    )
+    qsa_kw = dict(
+        BT=bt, RW=rw, MK=mk, BN=bn, NSUB=max(1, bn // 64),
+        NB=max(4, triton.next_power_of_2(B)), SINGLE=single,
+        PAIRREQ=(B == 2),
+        PVB=pvb, NSP=max_nsp, USEQL=(QRES == 1 and not mid),
+        MASKFP8=(T >= 12000),
+        RSC=RSC_MODE,
+        SKIPD=skipd, TPD=(TPD_MODE == 1 and not skipd),
+        SPV=(SPV_MODE == 1 and T >= 12000), W32=(W32_MASK == 1),
+        EX2B=(EX2_BF16 == 1), EX2H=(T < 6000),
+        ZERO=True,
+        PEEL=(3000 <= T < 6000 or T >= 12000),
+        DEN16=(T == 4057),
+        CAPQ=False,  # fixed-scale fast path excluded (see _qsa note)
+        FAST_CAUSAL=(mid or (not single and 6000 <= T < 12000)),
+        TMA=((2 if _HTMA else 1) if use_tma else 0),
+        WSPEC=wspec,
+        GATEPTX=(T >= 6000),
+        CSPL=mid, VSPL=vsplit,
+        NHC=NH, DC=D, PWC=PW, SC=SCL,
+        num_warps=nwarps,
+        num_stages=(2 if 3000 <= T < 6000 and not mid else nstages),
+    )
+    try:
+        _qsa[grid](q, gate, k_cache, v_cache, kd, vd,
+                   packed, cu_seqlens, page_base, out,
+                   ws, wlp, wmp,
+                   T, B, nslot, nrow, **qsa_kw)
+    except _TritonOOR:
+        if not wspec:
+            raise
+        # The warp-specialized schedule overflowed this toolchain's
+        # tensor-memory budget at compile time (no launch happened). Retry
+        # without warp specialization: same loops, same accumulation order.
+        _NO_WSPEC[wspec_key] = True
+        qsa_kw["WSPEC"] = False
+        _qsa[grid](q, gate, k_cache, v_cache, kd, vd,
+                   packed, cu_seqlens, page_base, out,
+                   ws, wlp, wmp,
+                   T, B, nslot, nrow, **qsa_kw)
     if max_nsp > 1:
         rb = 8
         if vsplit:
