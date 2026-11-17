@@ -46,6 +46,11 @@ def sm100():
         (7, 128, 8),
         (7, 128, 24),
         (65, 256, 136),
+        (8, 256, 136),
+        (9, 256, 136),
+        (16, 256, 136),
+        (17, 256, 136),
+        (256, 256, 264),
     ],
 )
 def test_residue_and_fold(dtype, m, k, n):
@@ -181,8 +186,7 @@ def _launch_args(m2, n=128, k_packed=32):
 
 
 @pytest.mark.parametrize("fp4_format", ["nvfp4", "mxfp4"])
-@pytest.mark.parametrize("store_mode", ["tma", "tma_mext", "direct_mext"])
-def test_reject_narrow_tile_spanning_rows(fp4_format, store_mode):
+def test_reject_narrow_tile_spanning_rows(fp4_format):
     """80 activation rows span a second width-32 tile, which has no SFB addressing."""
     from flashinfer.experimental.resserve_mext.host import mext_fold_gemm
 
@@ -190,7 +194,6 @@ def test_reject_narrow_tile_spanning_rows(fp4_format, store_mode):
         mext_fold_gemm(
             *_launch_args(80),
             mma_tiler_mn=(128, 32),
-            store_mode=store_mode,
             fp4_format=fp4_format,
         )
 
@@ -227,72 +230,3 @@ def test_narrow_tma_tile_matches_reference():
     )
     reference = (base + residue) @ _decode(weight, weight_scale).T
     torch.testing.assert_close(result.float(), reference, atol=0.08, rtol=0.02)
-
-
-@pytest.mark.parametrize("store_mode", ["tma_mext", "direct_mext"])
-def test_reject_mfold_narrow_tile(store_mode):
-    from flashinfer.experimental.resserve_mext.host import mext_fold_gemm
-
-    # 16 physical rows fit in one width-32 tile, but M-fold keeps the addressed widths.
-    with pytest.raises(ValueError, match="narrow tma tiles"):
-        mext_fold_gemm(*_launch_args(16), mma_tiler_mn=(128, 32), store_mode=store_mode)
-
-
-@pytest.mark.parametrize("m,n", [(64, 32), (64, 160), (72, 160)])
-def test_direct_store_tails(m, n, monkeypatch):
-    from flashinfer.experimental.resserve_mext import host
-
-    k = 256
-    a = torch.full((2 * m, k // 2), 0x22, device="cuda", dtype=torch.uint8)
-    w = torch.full((n, k // 2), 0x22, device="cuda", dtype=torch.uint8)
-    sa = torch.full(
-        (((2 * m + 127) // 128) * 4 * 512,), 56, device="cuda", dtype=torch.uint8
-    )
-    sb = torch.full(
-        (((n + 127) // 128) * 4 * 512,), 56, device="cuda", dtype=torch.uint8
-    )
-    rows = torch.arange(n, device="cuda")[:, None]
-    cols = torch.arange(k // 16, device="cuda")[None, :]
-    offsets = (
-        (rows // 128) * 4 * 512
-        + (cols // 4) * 512
-        + (rows % 32) * 16
-        + ((rows % 128) // 32) * 4
-        + cols % 4
-    )
-    # Vary scales within each tile and across the output-tile boundary.
-    sb[offsets] = (56 + 8 * (rows % 2)).expand_as(offsets).to(torch.uint8)
-    alpha = torch.ones(1, device="cuda")
-    storage = torch.full((m * n + 4096,), -123, device="cuda", dtype=torch.bfloat16)
-    out = storage[2048:-2048].view(m, n)
-    original_empty = torch.empty
-
-    def guarded_empty(*shape, **kwargs):
-        if shape == (m, n):
-            return out
-        return original_empty(*shape, **kwargs)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(host.torch, "empty", guarded_empty)
-        for packed, value in [(0x22, 1.0), (0x11, 0.5)]:
-            a.fill_(packed)
-            result = host.mext_fold_gemm(w, a, sb, sa, alpha, store_mode="direct_mext")
-            torch.cuda.synchronize()
-            expected = (
-                2 * k * value * (1 + torch.arange(n, device="cuda") % 2)
-            ).expand(m, n)
-            torch.testing.assert_close(result.float(), expected.float(), atol=0, rtol=0)
-            assert (storage[:2048] == -123).all()
-            assert (storage[-2048:] == -123).all()
-
-
-@pytest.mark.parametrize("store_mode", ["tma_mext", "direct_mext"])
-def test_reject_unpadded_tile8(store_mode):
-    from flashinfer.experimental.resserve_mext.host import mext_fold_gemm
-
-    a = torch.zeros(130, 128, device="cuda", dtype=torch.uint8)
-    w = torch.zeros(128, 128, device="cuda", dtype=torch.uint8)
-    scale = torch.empty(0, device="cuda", dtype=torch.uint8)
-    alpha = torch.ones(1, device="cuda")
-    with pytest.raises(ValueError, match="padded to a multiple of 8"):
-        mext_fold_gemm(w, a, scale, scale, alpha, store_mode=store_mode)
