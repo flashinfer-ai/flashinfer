@@ -990,6 +990,12 @@ def _launch_bmm_fp8(
                 f"{'K' if b_major == 'k' else 'N'}-major weight",
                 "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
             )
+        if not out_fresh:  # the one launch over the batch reads every operand while it writes a caller's output
+            _require_disjoint(
+                cls,
+                [(out, "the output")],
+                [(A, "A"), (B, "B"), (A_scale, "a scale"), (B_scale, "a scale")],
+            )
         kernel = _kernel(
             A.device,
             config,

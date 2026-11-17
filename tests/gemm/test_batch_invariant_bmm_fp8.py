@@ -655,15 +655,15 @@ def test_public_path_equals_the_class_entry_and_checks_caller_buffers(b, M, N, K
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(bits(out), ref)
-    if (
-        chunks_for(N, K, "e4m3") > 1
-    ):  # the split classes launch per element through the checked path
-        buf = adv_fp8(b, M, K, seed=183)
-        alias = buf.view(torch.bfloat16).view(-1)[: b * M * N].view(b, M, N)
-        with pytest.raises(
-            bi.BatchInvariantUnsupportedError, match="A overlapping the output"
-        ):
-            bi_bmm(buf, B, sa, sb, out=alias)
+    # a caller's output over an operand's bytes is refused on both paths: the unsplit class's one launch over the batch
+    # and the split classes' launch per element (one byte buffer sized for the larger of the two views)
+    buf = torch.empty(max(b * M * K, 2 * b * M * N), dtype=torch.uint8, device="cuda")
+    a_alias = buf[: b * M * K].view(torch.float8_e4m3fn).view(b, M, K)
+    out_alias = buf[: 2 * b * M * N].view(torch.bfloat16).view(b, M, N)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="A overlapping the output"
+    ):
+        bi_bmm(a_alias, B, sa, sb, out=out_alias)
 
 
 @needs_device
