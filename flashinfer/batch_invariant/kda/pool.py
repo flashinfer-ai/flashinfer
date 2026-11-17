@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import functools
 import math
+import weakref
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -31,7 +32,10 @@ from ..support import unsupported
 from .spec import CHUNK, CLASS, GATE_LOG2_E, HEAD_DIM, STAMP
 
 _IO = torch.bfloat16
-_POOLS: Dict[Tuple[int, int, Tuple[int, ...]], Tuple["ExactPool", Any]] = {}
+_Key = Tuple[int, int, Tuple[int, ...]]
+_POOLS: Dict[_Key, Tuple["ExactPool", Any]] = {}
+#: Side states an overlapping extent took over from: kept with the buffer, since a captured graph may still write them.
+_RETIRED: Dict[_Key, "ExactPool"] = {}
 
 
 @functools.cache
@@ -41,14 +45,20 @@ def _module():
     return gen_kda_batch_invariant_module().build_and_load()
 
 
-def pool_key(pool: torch.Tensor) -> Tuple[int, int, Tuple[int, ...]]:
+def _release(storage: int) -> None:
+    for table in (_POOLS, _RETIRED):
+        for key in [k for k in table if k[0] == storage]:
+            del table[key]
+
+
+def pool_key(pool: torch.Tensor) -> _Key:
     """The identity of a pool: its storage, its offset in it and its shape, so every alias of the same extent of one
     buffer (a full view, a ``detach()``) is the same pool."""
     return (pool.untyped_storage()._cdata, pool.storage_offset(), tuple(pool.shape))
 
 
 def get_pool(pool: torch.Tensor) -> "ExactPool":
-    """The class's state next to ``pool``: created on first use, kept while the pool's storage is alive."""
+    """The class's state next to ``pool``: created on first use, released when the pool's storage is freed."""
     key = pool_key(pool)
     entry = _POOLS.get(key)
     if entry is not None and not entry[1].expired():
@@ -61,8 +71,8 @@ def get_pool(pool: torch.Tensor) -> "ExactPool":
         )
     from torch.multiprocessing.reductions import StorageWeakRef
 
-    for dead in [k for k, (_, ref) in _POOLS.items() if ref.expired()]:
-        del _POOLS[dead]
+    for dead in {k[0] for k, (_, ref) in _POOLS.items() if ref.expired()}:
+        _release(dead)
     if pool.data_ptr() % 16:
         raise unsupported(
             CLASS,
@@ -75,15 +85,22 @@ def get_pool(pool: torch.Tensor) -> "ExactPool":
         if storage != key[0] or offset >= last or first >= offset + math.prod(shape):
             continue
         # another extent of a tracked buffer starts with empty rows: fine only if the tracked one has none open
-        if bool(_POOLS[other][0].cnt.any()):
+        if bool((_POOLS[other][0].cnt > 0).any()):
             raise unsupported(
                 CLASS,
                 "a state pool that overlaps a pool of another shape or offset on the same buffer while that pool has open chunks",
                 "the same pool extent on every call (its open rows are kept per extent)",
             )
-        del _POOLS[other]
-    ep = ExactPool(pool)
-    _POOLS[key] = (ep, StorageWeakRef(pool.untyped_storage()))
+        _RETIRED[other] = _POOLS.pop(other)[0]
+    ep = _RETIRED.pop(key, None)
+    if ep is None:
+        ep = ExactPool(pool)
+    else:
+        ep.cnt.fill_(-1)
+    storage = pool.untyped_storage()
+    if not any(k[0] == key[0] for k in (*_POOLS, *_RETIRED)):
+        weakref.finalize(storage, _release, key[0])
+    _POOLS[key] = (ep, StorageWeakRef(storage))
     return ep
 
 
@@ -96,11 +113,9 @@ class ExactPool:
         def zeros(*shape, dtype=_IO):
             return torch.zeros(shape, dtype=dtype, device=dev)
 
-        self.cnt = zeros(S, HV, dtype=torch.int32)
-        # NaN matches no state: every (slot, head) builds its bf16 copy at its first step
-        self.stamp = torch.full(
-            (S, HV, STAMP), float("nan"), dtype=torch.float32, device=dev
-        )
+        # a negative count: never begun, so every (slot, head) builds its bf16 copy at its first step
+        self.cnt = torch.full((S, HV), -1, dtype=torch.int32, device=dev)
+        self.stamp = zeros(S, HV, STAMP, dtype=torch.float32)
         self.state_bf16 = zeros(S, HV, HEAD_DIM, HEAD_DIM)
         self.prefix = zeros(S, HV, HEAD_DIM, dtype=torch.float32)
         self.k_inv_rows = zeros(S, HV, CHUNK, HEAD_DIM)
@@ -169,7 +184,8 @@ class ExactPool:
         idx = torch.as_tensor(list(slot_list), dtype=torch.int64, device=self.device)
         cur = pool[:, :, 0, :STAMP].index_select(0, idx).view(torch.int32)
         old = self.stamp.index_select(0, idx).view(torch.int32)
-        moved = (cur != old).flatten(1).any(1).tolist()
+        fresh = self.cnt.index_select(0, idx) < 0
+        moved = ((cur != old).flatten(1).any(1) | fresh.any(1)).tolist()
         self.begin(
             pool,
             torch.tensor(

@@ -204,12 +204,17 @@ __global__ void __launch_bounds__(NTHR, MINB)
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
   const int h = blockIdx.x % H, b = blockIdx.x / H;
   const int slot = idx[b];
-  if (slot < 0 || slot >= S) return;
   const int n = SPAN ? (starts ? lens[b] : stride) : 1;
   if (n <= 0) return;
   const size_t row0 = SPAN ? (starts ? (size_t)starts[b] : (size_t)b * stride) : (size_t)b;
-  const size_t sh = (size_t)slot * H + h;
   size_t bh = row0 * H + h;
+  if (slot < 0 || slot >= S) {
+    // a slot outside the pool: NaN rows for this sequence, nothing else written
+    if (tid < D)
+      for (int r = 0; r < n; ++r) out[(bh + (size_t)r * H) * D + tid] = 0x7fc0;
+    return;
+  }
+  const size_t sh = (size_t)slot * H + h;
   int* cnt_cell = cnt + sh;
 
   size_t off = 0;
@@ -291,16 +296,17 @@ __global__ void __launch_bounds__(NTHR, MINB)
   if (tid < D) pprev = Ppool[tid];
   const uint16_t lraw = Lpool[tid];
 
-  // a state whose first values differ from the stamp was replaced by the caller: new chunk
+  // a state whose first values differ from the stamp was replaced by the caller: new chunk (count <
+  // 0: never begun)
   const int c0 = *cnt_cell;
   float* Stamp = stamp + sh * STAMP;
   const uint4 cur0 = *reinterpret_cast<const uint4*>(S32),
               cur1 = *reinterpret_cast<const uint4*>(S32 + 4);
   const uint4 old0 = *reinterpret_cast<const uint4*>(Stamp),
               old1 = *reinterpret_cast<const uint4*>(Stamp + 4);
-  const bool moved =
-      ((cur0.x ^ old0.x) | (cur0.y ^ old0.y) | (cur0.z ^ old0.z) | (cur0.w ^ old0.w) |
-       (cur1.x ^ old1.x) | (cur1.y ^ old1.y) | (cur1.z ^ old1.z) | (cur1.w ^ old1.w)) != 0u;
+  const bool moved = c0 < 0 || ((cur0.x ^ old0.x) | (cur0.y ^ old0.y) | (cur0.z ^ old0.z) |
+                                (cur0.w ^ old0.w) | (cur1.x ^ old1.x) | (cur1.y ^ old1.y) |
+                                (cur1.z ^ old1.z) | (cur1.w ^ old1.w)) != 0u;
   int p = moved ? 0 : (c0 & (CH - 1));
   if (warp == NTHR / 32 - 1)
     for (int u = lane; u < p * 16; u += 32) {

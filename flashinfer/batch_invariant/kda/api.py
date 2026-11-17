@@ -27,8 +27,8 @@ cannot see is a state replaced by one with the same first eight values per head 
 reset after a request shorter than 16 tokens, which never moved its boundary state, or a saved boundary state loaded
 back): such a slot's next request must be prefilled with more than one token, since a one-token call is a decode step.
 Every slot index must be unique and in range: a prefill checks it, a decode step (which reads nothing back to the
-host) does not: its kernel skips a slot outside the pool (that row of the output is left unwritten), and its
-``cu_seqlens`` are taken to be ``arange(N + 1)`` without being read. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
+host) does not: its kernel returns NaN rows for a sequence whose slot is outside the pool and writes nothing else for
+it, two sequences that name one slot in a step share its state (undefined rows for both), and its ``cu_seqlens`` are taken to be ``arange(N + 1)`` without being read. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -53,6 +53,8 @@ from .spec import (
 )
 
 _IO = torch.bfloat16
+#: The step binding's message for a pointer the kernel cannot load from (``csrc/kda_batch_invariant.cu``).
+_MISALIGNED = "does not start at such a boundary"
 
 
 def _check_params(A_log, dt_bias, lower_bound, HV: int) -> None:
@@ -285,6 +287,13 @@ def recurrent_kda_batch_invariant(
             raise unsupported(
                 CLASS, "an output on another device", "the inputs' device"
             )
+        lo, hi = output.data_ptr(), initial_state.data_ptr()
+        if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
+            raise unsupported(
+                CLASS,
+                "an output that shares memory with the state pool",
+                "an output buffer of its own",
+            )
     ep = get_pool(initial_state)
 
     if decode:
@@ -292,31 +301,31 @@ def recurrent_kda_batch_invariant(
         if out is None:
             out = torch.empty_like(v, memory_format=torch.contiguous_format)
         rows = out.view(N, HV, HEAD_DIM)
-        ep.step(
-            initial_state,
-            slot_ids,
-            q.reshape(N, H, HEAD_DIM).contiguous(),
-            k.reshape(N, H, HEAD_DIM).contiguous(),
-            v.reshape(N, HV, HEAD_DIM).contiguous(),
-            g.reshape(N, HV, HEAD_DIM).contiguous(),
-            beta.reshape(N, HV).contiguous(),
-            A_log,
-            dt_bias,
-            lower_bound,
-            scale_f,
-            rows,
-        )
-        return out, (initial_state if output_final_state else None)
-
-    if output is not None:
-        # a prefill writes its rows after the kernels: an output inside the pool would overwrite boundary states
-        lo, hi = output.data_ptr(), initial_state.data_ptr()
-        if lo < hi + initial_state.numel() * 4 and hi < lo + output.numel() * 2:
+        try:
+            ep.step(
+                initial_state,
+                slot_ids,
+                q.reshape(N, H, HEAD_DIM).contiguous(),
+                k.reshape(N, H, HEAD_DIM).contiguous(),
+                v.reshape(N, HV, HEAD_DIM).contiguous(),
+                g.reshape(N, HV, HEAD_DIM).contiguous(),
+                beta.reshape(N, HV).contiguous(),
+                A_log,
+                dt_bias,
+                lower_bound,
+                scale_f,
+                rows,
+            )
+        except RuntimeError as e:
+            if _MISALIGNED not in str(e):
+                raise
             raise unsupported(
                 CLASS,
-                "a prefill output that shares memory with the state pool",
-                "an output buffer of its own",
-            )
+                "a decode input that does not start at a 16-byte boundary (4 bytes for v)",
+                "aligned q / k / v rows (the step loads them 16 and 4 bytes at a time, without a copy)",
+            ) from e
+        return out, (initial_state if output_final_state else None)
+
     if cu_seqlens is not None:
         cu = [int(x) for x in cu_seqlens.tolist()]
         lens = [cu[i + 1] - cu[i] for i in range(N)]
@@ -541,17 +550,17 @@ def _gathers_tokens(splits, HV: int) -> bool:
 
 
 def recurrent_kda_batch_invariant_reset(
-    initial_state: torch.Tensor, ssm_state_indices: torch.Tensor
+    initial_state: torch.Tensor, ssm_state_indices: Optional[torch.Tensor] = None
 ) -> None:
     """Take the pool states of the listed slots as chunk boundaries and drop their open rows: the explicit form of
-    what the stamp detects, for a caller that recycles a slot (required after a request shorter than 16 tokens)."""
+    what the stamp detects, for a caller that recycles a slot (required after a request shorter than 16 tokens).
+    ``None`` lists every slot of the pool."""
     check_device(initial_state.device, CLASS, KDA_ARCHS)
     heads = int(initial_state.shape[1]) if initial_state.ndim == 4 else 0
     _check_pool(initial_state, heads, initial_state.device)
     S = int(initial_state.shape[0])
-    slot_ids = _slot_ids(
-        ssm_state_indices, ssm_state_indices.numel(), initial_state.device, S
-    )
+    n = S if ssm_state_indices is None else ssm_state_indices.numel()
+    slot_ids = _slot_ids(ssm_state_indices, n, initial_state.device, S)
     _host_slots(slot_ids, S)
     get_pool(initial_state).begin(initial_state, slot_ids)
 

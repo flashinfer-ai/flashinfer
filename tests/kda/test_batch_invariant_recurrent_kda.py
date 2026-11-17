@@ -4,13 +4,17 @@
 
 Every comparison is bitwise (``same_bits``); nothing uses a tolerance. The reference term is the pinned chunked prefill of the
 whole sequence in one call. Set ``FLASHINFER_KDA_BI_HASH_DIR`` to a directory to record the output hashes in one process
-and assert them in another.
+and assert them in another (across builds or devices); ``--digest`` prints the hashes of a small case set, which
+``test_outputs_repeat_across_fresh_processes`` compares between two fresh interpreters.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -734,7 +738,7 @@ def test_misaligned_buffers_are_refused():
     flat = torch.zeros(h * D + 2, dtype=torch.bfloat16, device="cuda")
     flat[2:].copy_(tok["q"].flatten())
     shifted = dict(tok, q=flat[2:].view(1, h, D))
-    with pytest.raises(RuntimeError, match="boundary"):
+    with pytest.raises(BatchInvariantUnsupportedError, match="16-byte"):
         bi_decode(shifted, new_pool([s], [0]), [0], p)
     # a prefill copies a misaligned row instead (it reads its lengths back anyway)
     two = sub(s, 0, 2)
@@ -791,20 +795,99 @@ def test_output_inside_the_pool_is_refused():
         recurrent_kda(
             *args, initial_state=pool, output=alias, batch_invariant=True, **_fused(p)
         )
+    row = pool.view(torch.bfloat16).flatten()[-h * D :].view(1, 1, h, D)
+    with pytest.raises(BatchInvariantUnsupportedError, match="shares memory"):
+        bi_decode(token(s, 0), pool, [0], p, output=row)
     assert same_bits(pool, before)
 
 
 @needs_device
-def test_decode_skips_a_slot_outside_the_pool():
-    """A decode step does not read its slots back; a slot past the pool is skipped on the device, like a negative one."""
+@pytest.mark.parametrize("bad", [6, 100000, -1])
+def test_decode_slot_outside_the_pool_gives_nan_rows(bad):
+    """A decode step does not read its slots back: a sequence whose slot is outside the pool gets NaN rows, its
+    neighbours stay exact and nothing next to the pool is written."""
     h = 16
     p = params(h)
-    seqs = [make_seq(4, h, SEED + 91 + i, GATES["steep"]) for i in range(2)]
-    ref, _ = one_shot(seqs[0], p)
-    pool = new_pool(seqs, [0, 1])
-    rows = bi_decode(tokens(seqs, [0, 0]), pool, [0, pool.shape[0] + 5], p)
-    assert same_bits(rows[0], ref[0]) and same_bits(pool[1], seqs[1]["s0"])
-    assert bi_pool.get_pool(pool).cnt[1].sum().item() == 0
+    seqs = [make_seq(17, h, SEED + 91 + i, GATES["steep"]) for i in range(3)]
+    refs = [one_shot(s, p)[0] for s in seqs]
+    big = torch.zeros(8, h, D, D, dtype=torch.float32, device="cuda")
+    pool = big[:6]
+    pool[0].copy_(seqs[0]["s0"])
+    pool[2].copy_(seqs[2]["s0"])
+    for pos in range(17):
+        rows = bi_decode(tokens(seqs, [pos] * 3), pool, [0, bad, 2], p)
+        assert same_bits(rows[0], refs[0][pos]) and same_bits(rows[2], refs[2][pos])
+        assert bool(rows[1].isnan().all())
+    assert not bool(big[6:].any()) and not bool(pool[1].any())
+
+
+@needs_device
+def test_all_nan_state_on_a_fresh_pool():
+    """A fresh pool tells "never begun" by its count, not by a stamp value a state could hold."""
+    h = 16
+    p = params(h)
+    s = make_seq(3, h, SEED + 95, GATES["steep"])
+    s["s0"] = torch.full_like(s["s0"], float("nan"))
+    ref, _ = one_shot(s, p)
+    assert same_bits(decode_all(s, new_pool([s], [0]), 0, p, 0, 3), ref)
+
+
+@needs_device
+def test_taken_over_extent_keeps_its_side_state_until_the_buffer_is_freed():
+    """An extent with no open chunk gives way to an overlapping one, but its side state stays allocated (a captured
+    graph may still write it) and is reused when the extent comes back; everything goes with the storage."""
+    import gc
+
+    from flashinfer.batch_invariant.kda.api import recurrent_kda_batch_invariant_reset
+
+    h = 16
+    p = params(h)
+    s = make_seq(18, h, SEED + 96, GATES["steep"])
+    ref, _ = one_shot(s, p)
+    pool = torch.zeros(4, h, D, D, dtype=torch.float32, device="cuda")
+    pool[0].copy_(s["s0"])
+    bi_prefill([sub(s, 0, 16)], pool, [0], p)
+    key = bi_pool.pool_key(pool)
+    ep = bi_pool._POOLS[key][0]
+    recurrent_kda_batch_invariant_reset(pool[:1])
+    assert bi_pool._RETIRED[key] is ep and key not in bi_pool._POOLS
+    assert int(bi_pool.get_pool(pool[:1]).cnt.abs().sum()) == 0
+    rows = decode_all(s, pool, 0, p, 16, 18)
+    assert same_bits(rows, ref[16:18]) and bi_pool._POOLS[key][0] is ep
+    del ep, pool
+    gc.collect()
+    assert not any(k[0] == key[0] for k in (*bi_pool._POOLS, *bi_pool._RETIRED))
+
+
+def _digest_cases():
+    h = 16
+    p = params(h)
+    out = {}
+    for gate, offset in GATES.items():
+        s = make_seq(50, h, SEED + 97, offset)
+        pool = new_pool([s], [0])
+        out[f"prefill_{gate}"] = _hash(bi_prefill([s], pool, [0], p))
+        out[f"prefill_state_{gate}"] = _hash(pool)
+        pool = new_pool([s], [0])
+        out[f"decode_{gate}"] = _hash(decode_all(s, pool, 0, p, 0, 50))
+        out[f"decode_state_{gate}"] = _hash(pool)
+    return out
+
+
+@needs_device
+def test_outputs_repeat_across_fresh_processes():
+    """R1 across processes: two fresh interpreters give the same case set and the same hashes as this one."""
+    runs = []
+    for _ in range(2):
+        done = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "--digest"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        runs.append(json.loads(done.stdout.strip().splitlines()[-1]))
+    here = _digest_cases()
+    assert len(here) == 8 and runs[0] == here and runs[1] == here
 
 
 @needs_device
@@ -1030,9 +1113,8 @@ def test_unsupported_inputs_raise_and_nothing_runs():
             *(a.to(torch.float16) for a in args), cu_seqlens=cu, **_fused(p), **base
         )
     assert same_bits(pool, before)
-    assert (
-        bi_pool.pool_key(pool) not in bi_pool._POOLS
-        or bi_pool._POOLS[bi_pool.pool_key(pool)][0].cnt.sum().item() == 0
+    assert bi_pool.pool_key(pool) not in bi_pool._POOLS or not bool(
+        (bi_pool._POOLS[bi_pool.pool_key(pool)][0].cnt > 0).any()
     )
 
 
@@ -1160,3 +1242,7 @@ def test_multi_token_step_staged_on_per_segment_states():
     assert same_bits(out[0], ref[n0 : n0 + T])
     rows = decode_all(s, pool, 0, p, n0 + T, n0 + T + 4)
     assert same_bits(rows, ref[n0 + T :])
+
+
+if __name__ == "__main__" and "--digest" in sys.argv:
+    print(json.dumps(_digest_cases(), sort_keys=True))
