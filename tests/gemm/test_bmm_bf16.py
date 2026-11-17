@@ -105,6 +105,27 @@ def test_bmm_bf16_unaligned_n(monkeypatch):
     torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("k", [2049, 2052])
+def test_bmm_bf16_tgv_unaligned_k(k):
+    """TGV needs K % 8 == 0 (TMA strides): reject it, auto still gets the right answer."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not bmm_bf16.is_backend_supported("tgv", cc_num):
+        pytest.skip("tgv backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn([2, 16, k], device="cuda", dtype=torch.bfloat16)
+    mat2 = torch.randn([2, 12, k], device="cuda", dtype=torch.bfloat16).transpose(
+        -2, -1
+    )
+    with pytest.raises(ValueError, match="TGV backend requires K divisible by 8"):
+        bmm_bf16(a, mat2, backend="tgv")
+
+    out = bmm_bf16(a, mat2, backend="auto")
+    reference = torch.bmm(a.float(), mat2.float()).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
 def _cake_bmm_case(b, m, n, k, res_dtype, seed):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     a = torch.randn((b, m, k), device="cuda", dtype=torch.bfloat16, generator=generator)
