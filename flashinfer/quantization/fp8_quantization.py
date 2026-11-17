@@ -228,8 +228,9 @@ def use_per_token_group_quant_specialized(
     handles this call; returns ``(eligible, reason)``.
 
     The specialized kernel covers exactly the default form of
-    :func:`per_token_group_quant_8bit` — 2D contiguous bf16 CUDA input,
-    ``group_size=128``, ``float8_e4m3fn`` output, row-major fp32 scales —
+    :func:`per_token_group_quant_8bit` — 2D contiguous, 16-byte-aligned
+    bf16 CUDA input, ``group_size=128``, ``float8_e4m3fn`` output,
+    row-major fp32 scales —
     on sm90 devices with the optional ``nvidia-cutlass-dsl`` runtime
     installed. The option-bearing forms (``column_major_scales``,
     ``scale_tma_aligned``, ``scale_ue8m0``), other dtypes, group sizes and
@@ -254,6 +255,11 @@ def use_per_token_group_quant_specialized(
         or x.shape[-1] % 128 != 0
     ):
         return False, "layout"
+    # The kernel reads x from its base address with 16-byte vectorized
+    # loads (ld.global.nc.v4); a contiguous offset view whose data pointer
+    # is not 16-byte aligned would fault with a misaligned address.
+    if x.data_ptr() % 16 != 0:
+        return False, "alignment"
     if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] != 9:
         return False, "device"
     if not is_cute_dsl_available():

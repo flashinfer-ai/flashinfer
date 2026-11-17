@@ -401,7 +401,8 @@ def per_token_group_quant_fp8_g128_cute_dsl(
     """Quantize ``x`` per 128-element group with row-major fp32 scales.
 
     ``x`` must be a contiguous CUDA bf16 tensor whose last dimension is a
-    multiple of 128, on an sm90 device. Returns ``(x_q, x_s)`` with
+    multiple of 128 and whose data pointer is 16-byte aligned (the kernel
+    reads it with 16-byte vectorized loads), on an sm90 device. Returns ``(x_q, x_s)`` with
     ``x_q = float8_e4m3fn`` of ``x.shape`` and ``x_s = float32`` of shape
     ``(*x.shape[:-1], x.shape[-1] // 128)``. Callers are expected to have
     checked the contract via

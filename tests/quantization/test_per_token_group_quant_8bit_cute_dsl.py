@@ -194,6 +194,33 @@ def test_option_forms_stay_on_stock_path(kwargs):
     assert q.shape == x.shape
 
 
+@requires_fast_path
+def test_misaligned_input_stays_on_stock_path():
+    """A contiguous offset view with a non-16-byte-aligned data pointer is
+    off-contract (the kernel's 128-bit vectorized loads require 16-byte
+    alignment) and is declined like any other off-contract form."""
+    torch.manual_seed(5)
+    buf = torch.empty(16 * 2560 + 1, device="cuda", dtype=torch.bfloat16)
+    buf.uniform_(-2, 2)
+    x = buf[1:].view(16, 2560)
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+    ok, reason = use_per_token_group_quant_specialized(
+        x, 128, torch.float8_e4m3fn, False, False, False
+    )
+    assert not ok and reason == "alignment"
+
+    _skip_unless_stock_cutile_usable()
+    for backend in ("auto", "specialized"):
+        _reset_per_token_group_quant_stats()
+        q, s = per_token_group_quant_8bit(x, 128, backend=backend)
+        assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
+        assert _ptgq_stats["fallback_reasons"] == {"alignment": 1}
+        expected_q, expected_s = _reference(x)
+        torch.testing.assert_close(s, expected_s, rtol=2e-7, atol=0)
+        exact = (q.view(torch.uint8) == expected_q.view(torch.uint8)).float()
+        assert exact.mean().item() >= 0.999
+
+
 def test_dispatch_table_present_and_well_formed():
     table = _ptgq_specialized_dispatch_table()
     assert table is not None, "packaged allowlist must load"
@@ -209,16 +236,26 @@ def test_specialized_cuda_graph_matches_eager():
     torch.manual_seed(3)
     x = torch.empty((256, 6144), device="cuda", dtype=torch.bfloat16).uniform_(-2, 2)
 
-    # Warm up (JIT compile) before capture, as documented.
-    eager_q, eager_s = per_token_group_quant_8bit(x, 128, backend="specialized")
+    # Warm up (JIT compile) before capture, as documented, and assert the
+    # warmup itself ran on the specialized kernel.
+    _reset_per_token_group_quant_stats()
+    per_token_group_quant_8bit(x, 128, backend="specialized")
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 1, "stock": 0}
     torch.cuda.synchronize()
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         graph_q, graph_s = per_token_group_quant_8bit(x, 128, backend="specialized")
+    # The captured call must also have taken the specialized route.
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 2, "stock": 0}
+
+    # Mutate the input in place after capture; the replay must read the new
+    # values, not bytes baked in at capture time.
+    x.uniform_(-5.0, 5.0)
     g.replay()
     torch.cuda.synchronize()
 
+    eager_q, eager_s = per_token_group_quant_8bit(x, 128, backend="specialized")
     torch.testing.assert_close(graph_s, eager_s, rtol=0, atol=0)
     torch.testing.assert_close(
         graph_q.view(torch.uint8), eager_q.view(torch.uint8), rtol=0, atol=0
