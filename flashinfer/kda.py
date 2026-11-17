@@ -473,7 +473,9 @@ def recurrent_kda(
             next to the pool, so a chunked prefill cuts at multiples of 16
             tokens except for its last piece (a prefill discards the slot's
             open rows), and a call with one token per sequence is a decode step
-            (one launch of a step kernel). A slot whose state the
+            (one launch of a step kernel that reads nothing back to the host:
+            its ``cu_seqlens`` are taken as ``arange(N + 1)`` and its slots as
+            unique and in range, unchecked). A slot whose state the
             caller replaced starts a new chunk; a slot reset after a request
             shorter than 16 tokens must be prefilled with more than one token.
             Requires ``backend="auto"``, bf16 activations, head dim 128,

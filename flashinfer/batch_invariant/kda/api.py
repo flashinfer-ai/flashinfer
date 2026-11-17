@@ -27,8 +27,7 @@ cannot see is a state replaced by one with the same first eight values per head 
 reset after a request shorter than 16 tokens, which never moved its boundary state, or a saved boundary state loaded
 back): such a slot's next request must be prefilled with more than one token, since a one-token call is a decode step.
 Every slot index must be unique and in range: a prefill checks it, a decode step (which reads nothing back to the
-host) does not, as for the operator's other state-pool routes, and its ``cu_seqlens`` are taken to be
-``arange(N + 1)``. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
+host) does not, and its ``cu_seqlens`` are taken to be ``arange(N + 1)`` without being read. :func:`recurrent_kda_batch_invariant_reset` is the explicit reset of a recycled slot.
 
 Every unsupported argument raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 """
@@ -176,6 +175,19 @@ def _host_slots(slot_ids: torch.Tensor, S: int) -> List[int]:
     return slot_list
 
 
+def _pack(q, k, v, g, beta, H: int, HV: int) -> Tuple[torch.Tensor, ...]:
+    """The token rows packed ``[tokens, heads, 128]`` / ``[tokens, HV]``, contiguous and 16-byte aligned: both kernels
+    load them 16 bytes at a time (a beta view at an odd token offset is not aligned off a multiple of 8 heads)."""
+    rows = (
+        q.reshape(-1, H, HEAD_DIM),
+        k.reshape(-1, H, HEAD_DIM),
+        v.reshape(-1, HV, HEAD_DIM),
+        g.reshape(-1, HV, HEAD_DIM),
+        beta.reshape(-1, HV),
+    )
+    return tuple(t.contiguous() if t.data_ptr() % 16 == 0 else t.clone() for t in rows)
+
+
 def recurrent_kda_batch_invariant(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -312,13 +324,7 @@ def recurrent_kda_batch_invariant(
             )
     else:
         lens = [T] * N
-    packed = (
-        q.reshape(-1, H, HEAD_DIM).contiguous(),
-        k.reshape(-1, H, HEAD_DIM).contiguous(),
-        v.reshape(-1, HV, HEAD_DIM).contiguous(),
-        g.reshape(-1, HV, HEAD_DIM).contiguous(),
-        beta.reshape(-1, HV).contiguous(),
-    )
+    packed = _pack(q, k, v, g, beta, H, HV)
     rows = _append(
         ep,
         initial_state,
@@ -354,8 +360,7 @@ def _pinned(
     from ... import kda_prefill_cute
     from ...kda import recurrent_kda
 
-    # the route takes 16-byte aligned operands (a beta view at an odd token offset is not, off a multiple of 8 heads)
-    q, k, v, g, beta = (t if t.data_ptr() % 16 == 0 else t.clone() for t in packed)
+    q, k, v, g, beta = packed
     dt_bias = dt_bias.reshape(-1, HEAD_DIM)
     with kda_prefill_cute.force_route(ROUTE):
         out, final = recurrent_kda(
@@ -585,13 +590,7 @@ def recurrent_kda_batch_invariant_extend(
         list(range(N)) if ssm_state_indices is None else _host_slots(slot_ids, S)
     )
     ep = get_pool(initial_state)
-    packed = (
-        q.reshape(-1, H, HEAD_DIM).contiguous(),
-        k.reshape(-1, H, HEAD_DIM).contiguous(),
-        v.reshape(-1, HV, HEAD_DIM).contiguous(),
-        g.reshape(-1, HV, HEAD_DIM).contiguous(),
-        beta.reshape(-1, HV).contiguous(),
-    )
+    packed = _pack(q, k, v, g, beta, H, HV)
     if T < 2 * CHUNK:
         # fewer rows than two chunks: the step kernel alone, one launch, the open-row count read on the device
         rows = torch.empty_like(packed[2])
