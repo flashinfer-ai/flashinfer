@@ -56,8 +56,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-with open(pathlib.Path(__file__).with_name(
-        "specialized_moe_nvfp4_w4a16_sm120_allowlist.json")) as _f:
+with open(
+    pathlib.Path(__file__).with_name("specialized_moe_nvfp4_w4a16_sm120_allowlist.json")
+) as _f:
     _ALLOWLIST = json.load(_f)
 
 _C = _ALLOWLIST["contract"]
@@ -67,7 +68,7 @@ _T_MIN_LARGE = int(_ALLOWLIST["token_counts_min_large"])
 ENV_DISABLE = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 
 # Observability: per-backend dispatch counts and recent refusal reasons.
-dispatch_stats = collections.Counter()
+dispatch_stats: collections.Counter = collections.Counter()
 fallback_reasons: collections.deque = collections.deque(maxlen=64)
 
 _warmed = {"done": False}
@@ -148,29 +149,45 @@ def specialized_support_reasons(
         reasons.append("w1_layout")
     if w2_weight.shape != (E, H, I // 2) or w2_weight.dtype != torch.uint8:
         reasons.append("w2_layout")
-    if (w1_weight_sf.shape != (E, I, H // 16)
-            or w1_weight_sf.dtype != torch.float8_e4m3fn):
+    if (
+        w1_weight_sf.shape != (E, I, H // 16)
+        or w1_weight_sf.dtype != torch.float8_e4m3fn
+    ):
         reasons.append("w1_scale_layout_rowmajor_required")
-    if (w2_weight_sf.shape != (E, H, I // 16)
-            or w2_weight_sf.dtype != torch.float8_e4m3fn):
+    if (
+        w2_weight_sf.shape != (E, H, I // 16)
+        or w2_weight_sf.dtype != torch.float8_e4m3fn
+    ):
         reasons.append("w2_scale_layout_rowmajor_required")
-    if (token_selected_experts.shape != (T, TOPK)
-            or token_selected_experts.dtype != torch.int32):
+    if (
+        token_selected_experts.shape != (T, TOPK)
+        or token_selected_experts.dtype != torch.int32
+    ):
         reasons.append("topk_ids_layout")
     if token_final_scales.shape != (T, TOPK):
         reasons.append("topk_weights_layout")
-    if not all(t.is_contiguous() for t in
-               (x, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf,
-                token_selected_experts, token_final_scales)):
+    if not all(
+        t.is_contiguous()
+        for t in (
+            x,
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            token_selected_experts,
+            token_final_scales,
+        )
+    ):
         reasons.append("non_contiguous")
-    if not all(t.data_ptr() % 16 == 0 for t in
-               (x, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf)):
+    if not all(
+        t.data_ptr() % 16 == 0
+        for t in (x, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf)
+    ):
         reasons.append("alignment")
     if reasons:
         return False, reasons
     # --- device checks
-    if list(torch.cuda.get_device_capability(x.device)) != \
-            _C["compute_capability"]:
+    if list(torch.cuda.get_device_capability(x.device)) != _C["compute_capability"]:
         reasons.append("compute_capability")
     if _autotune_active():
         reasons.append("autotune_capture")
@@ -197,9 +214,18 @@ def run_specialized_moe_nvfp4_w4a16(
     if tw.dtype != torch.float32:
         tw = tw.float()
     output.zero_()
-    _module().run(x, w1_weight, w1_weight_sf, w1_alpha,
-                  w2_weight, w2_weight_sf, w2_alpha,
-                  token_selected_experts, tw, output)
+    _module().run(
+        x,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        token_selected_experts,
+        tw,
+        output,
+    )
     return output
 
 
@@ -217,17 +243,25 @@ def warmup(
     each admitted shape once. Call BEFORE CUDA graph capture, on the
     stream that will be captured (largest T first keeps the workspace
     monotone)."""
-    E, TOPK, H = _C["num_experts"], _C["top_k"], _C["hidden_size"]
+    TOPK, H = _C["top_k"], _C["hidden_size"]
     for T in token_counts:
         if T not in _T_EXACT and T < _T_MIN_LARGE:
             continue
         x = torch.zeros(T, H, dtype=torch.bfloat16, device=device)
         ids = torch.zeros(T, TOPK, dtype=torch.int32, device=device)
-        tw = torch.full((T, TOPK), 1.0 / TOPK, dtype=torch.float32,
-                        device=device)
+        tw = torch.full((T, TOPK), 1.0 / TOPK, dtype=torch.float32, device=device)
         out = torch.empty(T, H, dtype=torch.bfloat16, device=device)
         run_specialized_moe_nvfp4_w4a16(
-            x, w1_weight, w1_weight_sf, w1_alpha, w2_weight, w2_weight_sf,
-            w2_alpha, ids, tw, out)
+            x,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            ids,
+            tw,
+            out,
+        )
     torch.cuda.synchronize()
     _warmed["done"] = True

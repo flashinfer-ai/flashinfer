@@ -12,12 +12,10 @@
 namespace ffi = tvm::ffi;
 namespace wmma = nvcuda::wmma;
 
-void RunFastDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
-                   ffi::TensorView w1_gs, ffi::TensorView w1_alpha,
-                   ffi::TensorView w2_packed, ffi::TensorView w2_gs,
-                   ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-                   ffi::TensorView topk_weights, ffi::TensorView out,
-                   cudaStream_t stream);
+void RunFastDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
+                   ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
+                   ffi::TensorView w2_alpha, ffi::TensorView topk_ids, ffi::TensorView topk_weights,
+                   ffi::TensorView out, cudaStream_t stream);
 
 namespace {
 
@@ -53,15 +51,12 @@ struct Workspace {
 
 Workspace g_workspace;
 
-inline size_t align_up(size_t x, size_t a = 256) {
-  return (x + a - 1) & ~(a - 1);
-}
+inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
 bool g_ws_fresh = false;
 
 void* ensure_workspace(size_t bytes, int device) {
-  if (g_workspace.ptr != nullptr &&
-      (g_workspace.bytes < bytes || g_workspace.device != device)) {
+  if (g_workspace.ptr != nullptr && (g_workspace.bytes < bytes || g_workspace.device != device)) {
     cudaFree(g_workspace.ptr);
     g_workspace.ptr = nullptr;
     g_workspace.bytes = 0;
@@ -92,9 +87,7 @@ __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t x) {
 
 __device__ __forceinline__ float2 fp8_e4m3fnx2_to_float2(uint16_t x) {
   uint32_t bits;
-  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n"
-               : "=r"(bits)
-               : "h"(x));
+  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(bits) : "h"(x));
   union {
     uint32_t u;
     __half2 h;
@@ -126,13 +119,14 @@ __device__ __forceinline__ float e2m1_bits_to_float(uint32_t q) {
 __device__ __forceinline__ __half2 e2m1x2_to_half2(uint8_t q) {
   uint32_t bits;
   const uint32_t src = q;
-  asm volatile("{\n"
-               ".reg .b8 b0, b1, b2, b3;\n"
-               "mov.b32 {b0, b1, b2, b3}, %1;\n"
-               "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
-               "}\n"
-               : "=r"(bits)
-               : "r"(src));
+  asm volatile(
+      "{\n"
+      ".reg .b8 b0, b1, b2, b3;\n"
+      "mov.b32 {b0, b1, b2, b3}, %1;\n"
+      "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
+      "}\n"
+      : "=r"(bits)
+      : "r"(src));
   union {
     uint32_t u;
     __half2 h;
@@ -144,13 +138,14 @@ __device__ __forceinline__ __half2 e2m1x2_to_half2(uint8_t q) {
 __device__ __forceinline__ uint32_t e2m1x2_to_bf16x2(uint8_t q) {
   uint32_t bits;
   const uint32_t src = q;
-  asm volatile("{\n"
-               ".reg .b8 b0, b1, b2, b3;\n"
-               "mov.b32 {b0, b1, b2, b3}, %1;\n"
-               "cvt.rn.bf16x2.e2m1x2 %0, b0;\n"
-               "}\n"
-               : "=r"(bits)
-               : "r"(src));
+  asm volatile(
+      "{\n"
+      ".reg .b8 b0, b1, b2, b3;\n"
+      "mov.b32 {b0, b1, b2, b3}, %1;\n"
+      "cvt.rn.bf16x2.e2m1x2 %0, b0;\n"
+      "}\n"
+      : "=r"(bits)
+      : "r"(src));
   return bits;
 }
 
@@ -170,10 +165,9 @@ __device__ __forceinline__ uint32_t fp4_byte_to_bf16x2(uint8_t q) {
   return cvt.u;
 }
 
-__device__ __forceinline__ void mma_m16n8k16_bf16(
-    float& d0, float& d1, float& d2, float& d3,
-    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-    uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma_m16n8k16_bf16(float& d0, float& d1, float& d2, float& d3,
+                                                  uint32_t a0, uint32_t a1, uint32_t a2,
+                                                  uint32_t a3, uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -182,11 +176,9 @@ __device__ __forceinline__ void mma_m16n8k16_bf16(
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void ldmatrix_m8n8x4_b16(
-    uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3,
-    const void* smem_ptr) {
-  const uint32_t smem =
-      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+__device__ __forceinline__ void ldmatrix_m8n8x4_b16(uint32_t& a0, uint32_t& a1, uint32_t& a2,
+                                                    uint32_t& a3, const void* smem_ptr) {
+  const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
       "ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
       "{%0, %1, %2, %3}, [%4];\n"
@@ -194,29 +186,23 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_b16(
       : "r"(smem));
 }
 
-__device__ __forceinline__ void cp_async_16(void* dst, const void* src,
-                                            int src_bytes) {
+__device__ __forceinline__ void cp_async_16(void* dst, const void* src, int src_bytes) {
   const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16, %2;\n"
                :
                : "r"(smem), "l"(src), "r"(src_bytes));
 }
 
-__device__ __forceinline__ void cp_async_16_l2_256(void* dst, const void* src,
-                                                   int src_bytes) {
+__device__ __forceinline__ void cp_async_16_l2_256(void* dst, const void* src, int src_bytes) {
   const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16, %2;\n"
                :
                : "r"(smem), "l"(src), "r"(src_bytes));
 }
 
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n");
-}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
 
-__device__ __forceinline__ void cp_async_wait() {
-  asm volatile("cp.async.wait_group 0;\n");
-}
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group 0;\n"); }
 
 __global__ void count_routes_kernel(const int32_t* __restrict__ ids, int routes,
                                     int32_t* __restrict__ counts) {
@@ -226,16 +212,13 @@ __global__ void count_routes_kernel(const int32_t* __restrict__ ids, int routes,
     const unsigned active = __activemask();
     const unsigned peers = __match_any_sync(active, e);
     const int leader = __ffs(peers) - 1;
-    if (unsigned(e) < E && (threadIdx.x & 31) == leader)
-      atomicAdd(counts + e, __popc(peers));
+    if (unsigned(e) < E && (threadIdx.x & 31) == leader) atomicAdd(counts + e, __popc(peers));
   }
 }
 
 __global__ void prefix_routes_kernel(const int32_t* __restrict__ counts,
-                                     int32_t* __restrict__ offsets,
-                                     int32_t* __restrict__ cursor,
-                                     int32_t* __restrict__ tiles1,
-                                     int32_t* __restrict__ tiles2) {
+                                     int32_t* __restrict__ offsets, int32_t* __restrict__ cursor,
+                                     int32_t* __restrict__ tiles1, int32_t* __restrict__ tiles2) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   int route_sum = 0;
   int tile1_sum = 0;
@@ -258,9 +241,8 @@ __global__ void prefix_routes_kernel(const int32_t* __restrict__ counts,
 
 template <int MM>
 __global__ __launch_bounds__(128) void prefix_mma_routes_parallel_kernel(
-    const int32_t* __restrict__ counts, int32_t* __restrict__ offsets,
-    int32_t* __restrict__ cursor, int32_t* __restrict__ tiles1,
-    int32_t* __restrict__ tiles2) {
+    const int32_t* __restrict__ counts, int32_t* __restrict__ offsets, int32_t* __restrict__ cursor,
+    int32_t* __restrict__ tiles1, int32_t* __restrict__ tiles2) {
   const int e = threadIdx.x;
   const int lane = e & 31;
   const int warp = e >> 5;
@@ -312,8 +294,7 @@ __global__ __launch_bounds__(128) void prefix_mma_routes_parallel_kernel(
 template <int MM>
 __global__ void prefix_mma_routes_kernel(const int32_t* __restrict__ counts,
                                          int32_t* __restrict__ offsets,
-                                         int32_t* __restrict__ cursor,
-                                         int32_t* __restrict__ tiles1,
+                                         int32_t* __restrict__ cursor, int32_t* __restrict__ tiles1,
                                          int32_t* __restrict__ tiles2) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   int route_sum = 0;
@@ -359,8 +340,7 @@ __global__ void scatter_routes_kernel(const int32_t* __restrict__ ids, int route
 // Count and scatter in one pass. Each expert owns a fixed-capacity bin, so
 // the compact prefix is not needed before routes can be written.
 __global__ void bin_routes_kernel(const int32_t* __restrict__ ids, int routes,
-                                  int32_t* __restrict__ counts,
-                                  int32_t* __restrict__ route_list) {
+                                  int32_t* __restrict__ counts, int32_t* __restrict__ route_list) {
   for (int r = int(blockIdx.x) * blockDim.x + threadIdx.x; r < routes;
        r += int(gridDim.x) * blockDim.x) {
     const int e = ids[r];
@@ -380,13 +360,9 @@ __global__ void bin_routes_kernel(const int32_t* __restrict__ ids, int routes,
 
 template <int K, int N, int KG>
 __global__ __launch_bounds__(32, 16) void decode_fc1_mma_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    int routes,
-    __nv_bfloat16* __restrict__ intermediate) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, int routes, __nv_bfloat16* __restrict__ intermediate) {
   const int lane = threadIdx.x;
   const int g = lane >> 2;
   const int q = lane & 3;
@@ -442,13 +418,9 @@ __global__ __launch_bounds__(32, 16) void decode_fc1_mma_kernel(
 
 template <int K, int N, int KG>
 __global__ __launch_bounds__(32, 16) void decode_fc2_combine_mma_kernel(
-    const __nv_bfloat16* __restrict__ intermediate,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    const float* __restrict__ topk_weights,
-    int tokens,
+    const __nv_bfloat16* __restrict__ intermediate, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, const float* __restrict__ topk_weights, int tokens,
     __nv_bfloat16* __restrict__ output) {
   const int lane = threadIdx.x;
   const int g = lane >> 2;
@@ -510,19 +482,13 @@ __global__ __launch_bounds__(32, 16) void decode_fc2_combine_mma_kernel(
   }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST,
-          bool ORDERED = false, bool ROUTE_OUTPUT = false,
-          bool GRID_2D = false>
+template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST, bool ORDERED = false,
+          bool ROUTE_OUTPUT = false, bool GRID_2D = false>
 __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    const int32_t* __restrict__ route_order,
-    const float* __restrict__ topk_weights,
-    int routes,
-    __nv_bfloat16* __restrict__ intermediate,
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, const int32_t* __restrict__ route_order,
+    const float* __restrict__ topk_weights, int routes, __nv_bfloat16* __restrict__ intermediate,
     float* __restrict__ output_acc) {
   constexpr int STAGE_K = 4096;
   constexpr int OPW = TILE_N / 8;
@@ -542,8 +508,7 @@ __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
   if (unsigned(e) >= E) {
     if constexpr (FIRST) {
       for (int j = threadIdx.x; j < TILE_N; j += blockDim.x) {
-        intermediate[size_t(r) * N + ntile * TILE_N + j] =
-            __float2bfloat16_rn(0.0f);
+        intermediate[size_t(r) * N + ntile * TILE_N + j] = __float2bfloat16_rn(0.0f);
       }
     }
     return;
@@ -561,15 +526,14 @@ __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
   for (int kt = 0; kt < K; kt += STAGE_K) {
     const int this_k = min(STAGE_K, K - kt);
     for (int p = threadIdx.x; p < this_k / 2; p += blockDim.x) {
-      const __nv_bfloat162 xb = *reinterpret_cast<const __nv_bfloat162*>(
-          input + size_t(input_row) * K + kt + p * 2);
+      const __nv_bfloat162 xb =
+          *reinterpret_cast<const __nv_bfloat162*>(input + size_t(input_row) * K + kt + p * 2);
       const int group = p >> 3;
       const int in_group = p & 7;
       const int logical_segment = group * 2 + (in_group >> 2);
       const int physical_segment = logical_segment ^ (group & 7);
       const int physical_pair = physical_segment * 4 + (in_group & 3);
-      reinterpret_cast<__half2*>(sx)[physical_pair] =
-          __float22half2_rn(__bfloat1622float2(xb));
+      reinterpret_cast<__half2*>(sx)[physical_pair] = __float22half2_rn(__bfloat1622float2(xb));
     }
     __syncthreads();
 
@@ -577,34 +541,30 @@ __global__ __launch_bounds__(256, 2) void decode_group16_half_kernel(
     for (int group_base = 0; group_base < groups; group_base += 32) {
       const int group = group_base + lane;
       if (group < groups) {
-      __half2 xv[8];
-#pragma unroll
-      for (int p = 0; p < 8; ++p) {
-        const int logical_segment = group * 2 + (p >> 2);
-        const int physical_segment = logical_segment ^ (group & 7);
-        xv[p] = reinterpret_cast<const __half2*>(sx)[physical_segment * 4 +
-                                                      (p & 3)];
-      }
-
-#pragma unroll
-      for (int j = 0; j < OPW; ++j) {
-        const int n = nbase + j;
-        const size_t row = size_t(e) * N + n;
-        const int kg = (kt >> 4) + group;
-        const uint64_t q8 = *reinterpret_cast<const uint64_t*>(
-            packed + row * KHALF + size_t(kg) * 8);
-        __half2 hsum = __float2half2_rn(0.0f);
+        __half2 xv[8];
 #pragma unroll
         for (int p = 0; p < 8; ++p) {
-          hsum = __hfma2(xv[p], e2m1x2_to_half2(uint8_t(q8 >> (p * 8))),
-                          hsum);
+          const int logical_segment = group * 2 + (p >> 2);
+          const int physical_segment = logical_segment ^ (group & 7);
+          xv[p] = reinterpret_cast<const __half2*>(sx)[physical_segment * 4 + (p & 3)];
         }
-        const float2 pair = __half22float2(hsum);
-        const float sf = fp8_e4m3fnx2_to_float2(
-                             uint16_t(scales[row * KG + kg]))
-                             .x;
-        acc[j] = fmaf(pair.x + pair.y, sf, acc[j]);
-      }
+
+#pragma unroll
+        for (int j = 0; j < OPW; ++j) {
+          const int n = nbase + j;
+          const size_t row = size_t(e) * N + n;
+          const int kg = (kt >> 4) + group;
+          const uint64_t q8 =
+              *reinterpret_cast<const uint64_t*>(packed + row * KHALF + size_t(kg) * 8);
+          __half2 hsum = __float2half2_rn(0.0f);
+#pragma unroll
+          for (int p = 0; p < 8; ++p) {
+            hsum = __hfma2(xv[p], e2m1x2_to_half2(uint8_t(q8 >> (p * 8))), hsum);
+          }
+          const float2 pair = __half22float2(hsum);
+          const float sf = fp8_e4m3fnx2_to_float2(uint16_t(scales[row * KG + kg])).x;
+          acc[j] = fmaf(pair.x + pair.y, sf, acc[j]);
+        }
       }
     }
     __syncthreads();
@@ -648,14 +608,10 @@ __device__ __forceinline__ int find_expert(int block, const int32_t* tiles) {
 
 template <int K, int N, int KG, int NTILES, bool FIRST>
 __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    __nv_bfloat16* __restrict__ output) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, __nv_bfloat16* __restrict__ output) {
   if (int(blockIdx.x) >= tiles[E]) return;
   const int e = find_expert<NTILES>(int(blockIdx.x), tiles);
   const int local = int(blockIdx.x) - tiles[e];
@@ -684,12 +640,8 @@ __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
   }
   __syncthreads();
 
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
-                 wmma::row_major>
-      af;
-  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
-                 wmma::col_major>
-      bf;
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
   wmma::fill_fragment(cf, 0.0f);
 
@@ -723,8 +675,7 @@ __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
         sf = __shfl_sync(0xffffffffu, sf, lane & ~7);
         const int dst = nl * MMA_K + sg * 16 + pair * 2;
         bs[dst] = __float2bfloat16_rn(e2m1_bits_to_float(q & 15) * sf);
-        bs[dst + 1] =
-            __float2bfloat16_rn(e2m1_bits_to_float(q >> 4) * sf);
+        bs[dst + 1] = __float2bfloat16_rn(e2m1_bits_to_float(q >> 4) * sf);
       }
     }
     __syncthreads();
@@ -752,25 +703,18 @@ __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
             __float2bfloat16_rn(v * v);
       } else {
         const int r = sroutes[m];
-        output[size_t(r) * N + ntile * MMA_N + warp * 16 + n] =
-            __float2bfloat16_rn(v);
+        output[size_t(r) * N + ntile * MMA_N + warp * 16 + n] = __float2bfloat16_rn(v);
       }
     }
   }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N,
-          int BLOCK_THREADS, bool FIRST>
-__global__ __launch_bounds__(BLOCK_THREADS, 1536 / BLOCK_THREADS)
-void grouped_mma_bf16_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    __nv_bfloat16* __restrict__ output) {
+template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS, bool FIRST>
+__global__ __launch_bounds__(BLOCK_THREADS, 1536 / BLOCK_THREADS) void grouped_mma_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, __nv_bfloat16* __restrict__ output) {
   if (int(blockIdx.x) >= tiles[E]) return;
   const int e = find_expert<NTILES>(int(blockIdx.x), tiles);
   const int local = int(blockIdx.x) - tiles[e];
@@ -836,16 +780,14 @@ void grouped_mma_bf16_kernel(
       cp_async_16_l2_256(&bs[nr][physical_segment * 4], src, src_bytes);
     }
     cp_async_commit();
-    for (int idx = tid; idx < TILE_N * (GMMA_K / 64);
-         idx += blockDim.x) {
+    for (int idx = tid; idx < TILE_N * (GMMA_K / 64); idx += blockDim.x) {
       const int nr = idx / (GMMA_K / 64);
       const int word = idx - nr * (GMMA_K / 64);
       const int n = ntile * TILE_N + nr;
       const size_t row = size_t(e) * N + n;
       uint32_t sv = 0;
       if (word * 64 < stage_k) {
-        sv = *reinterpret_cast<const uint32_t*>(
-            scales + row * KG + (k0 >> 4) + word * 4);
+        sv = *reinterpret_cast<const uint32_t*>(scales + row * KG + (k0 >> 4) + word * 4);
       }
       ss[nr][word] = sv;
     }
@@ -871,14 +813,12 @@ void grouped_mma_bf16_kernel(
         const uint32_t b0 = e2m1x2_to_bf16x2(uint8_t(p0 >> (q * 8)));
         const uint32_t b1 = e2m1x2_to_bf16x2(uint8_t(p1 >> (q * 8)));
         float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
-        mma_m16n8k16_bf16(t0, t1, t2, t3, a0, a1, a2, a3, b0,
-                           b1);
+        mma_m16n8k16_bf16(t0, t1, t2, t3, a0, a1, a2, a3, b0, b1);
 
         const int nr0 = warp * 16 + atom * 8 + q * 2;
         const int shift = (sk & 3) * 8;
-        const uint16_t sp =
-            uint16_t(uint8_t(ss[nr0][sk >> 2] >> shift)) |
-            (uint16_t(uint8_t(ss[nr0 + 1][sk >> 2] >> shift)) << 8);
+        const uint16_t sp = uint16_t(uint8_t(ss[nr0][sk >> 2] >> shift)) |
+                            (uint16_t(uint8_t(ss[nr0 + 1][sk >> 2] >> shift)) << 8);
         const float2 sf = fp8_e4m3fnx2_to_float2(sp);
         acc[atom][0] = fmaf(t0, sf.x, acc[atom][0]);
         acc[atom][1] = fmaf(t1, sf.y, acc[atom][1]);
@@ -905,8 +845,7 @@ void grouped_mma_bf16_kernel(
         if constexpr (FIRST) {
           v0 = fmaxf(v0, 0.0f);
           v1 = fmaxf(v1, 0.0f);
-          *reinterpret_cast<__nv_bfloat162*>(
-              output + size_t(grouped_row) * N + n0) =
+          *reinterpret_cast<__nv_bfloat162*>(output + size_t(grouped_row) * N + n0) =
               __floats2bfloat162_rn(v0 * v0, v1 * v1);
         } else {
           *reinterpret_cast<__nv_bfloat162*>(output + size_t(r) * N + n0) =
@@ -917,19 +856,13 @@ void grouped_mma_bf16_kernel(
   }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST,
-          bool ROUTE_OUTPUT = false>
+template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST, bool ROUTE_OUTPUT = false>
 __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    const float* __restrict__ topk_weights,
-    __nv_bfloat16* __restrict__ intermediate,
-    float* __restrict__ output_acc) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, const float* __restrict__ topk_weights,
+    __nv_bfloat16* __restrict__ intermediate, float* __restrict__ output_acc) {
   constexpr int STAGE_K = 512;
   constexpr int OPW = TILE_N / 8;
   if (int(blockIdx.x) >= tiles[E]) return;
@@ -944,8 +877,7 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
   __shared__ __align__(16) __half sx[MT][STAGE_K];
   __shared__ int sroutes[MT];
   if (threadIdx.x < MT) {
-    sroutes[threadIdx.x] =
-        threadIdx.x < valid_m ? route_list[offsets[e] + m0 + threadIdx.x] : -1;
+    sroutes[threadIdx.x] = threadIdx.x < valid_m ? route_list[offsets[e] + m0 + threadIdx.x] : -1;
   }
   __syncthreads();
 
@@ -967,8 +899,8 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
       __half2 xh = __float2half2_rn(0.0f);
       if (r >= 0) {
         const int input_row = FIRST ? (r / TOPK) : r;
-        const __nv_bfloat162 xb = *reinterpret_cast<const __nv_bfloat162*>(
-            input + size_t(input_row) * K + kt + p * 2);
+        const __nv_bfloat162 xb =
+            *reinterpret_cast<const __nv_bfloat162*>(input + size_t(input_row) * K + kt + p * 2);
         xh = __float22half2_rn(__bfloat1622float2(xb));
       }
       reinterpret_cast<__half2*>(sx[m])[p] = xh;
@@ -982,8 +914,8 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
         const int n = nbase + j;
         const size_t row = size_t(e) * N + n;
         const int kg = (kt >> 4) + lane;
-        const uint64_t q8 = *reinterpret_cast<const uint64_t*>(
-            packed + row * KHALF + size_t(kg) * 8);
+        const uint64_t q8 =
+            *reinterpret_cast<const uint64_t*>(packed + row * KHALF + size_t(kg) * 8);
         __half2 hsum[MT];
 #pragma unroll
         for (int m = 0; m < MT; ++m) hsum[m] = __float2half2_rn(0.0f);
@@ -992,8 +924,7 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
           const __half2 qh = e2m1x2_to_half2(uint8_t(q8 >> (p * 8)));
 #pragma unroll
           for (int m = 0; m < MT; ++m) {
-            hsum[m] = __hfma2(reinterpret_cast<const __half2*>(sx[m])[lane * 8 + p],
-                              qh, hsum[m]);
+            hsum[m] = __hfma2(reinterpret_cast<const __half2*>(sx[m])[lane * 8 + p], qh, hsum[m]);
           }
         }
         const float sf = fp8_e4m3fn_to_float(scales[row * KG + kg]);
@@ -1030,20 +961,14 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
   }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS,
-          bool GROUPED, bool SECOND>
+template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS, bool GROUPED,
+          bool SECOND>
 __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    const float* __restrict__ topk_weights,
-    int routes,
-    __nv_bfloat16* __restrict__ intermediate,
-    float* __restrict__ output_acc) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, const float* __restrict__ topk_weights, int routes,
+    __nv_bfloat16* __restrict__ intermediate, float* __restrict__ output_acc) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   int e;
@@ -1071,8 +996,7 @@ __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
 
   if (threadIdx.x < MVAL) {
     if (threadIdx.x < valid_m) {
-      sroutes[threadIdx.x] = GROUPED ? route_list[offsets[e] + m0 + threadIdx.x]
-                                      : m0;
+      sroutes[threadIdx.x] = GROUPED ? route_list[offsets[e] + m0 + threadIdx.x] : m0;
     } else {
       sroutes[threadIdx.x] = -1;
     }
@@ -1113,8 +1037,7 @@ __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
       float2 xv[MVAL];
 #pragma unroll
       for (int m = 0; m < MVAL; ++m) {
-        xv[m] = __bfloat1622float2(
-            *reinterpret_cast<const __nv_bfloat162*>(&sx[m][klocal]));
+        xv[m] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sx[m][klocal]));
       }
 
 #pragma unroll
@@ -1166,18 +1089,18 @@ __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
   }
 }
 
-__global__ void convert_output_kernel(const float* __restrict__ x,
-                                      __nv_bfloat16* __restrict__ out, int n) {
+__global__ void convert_output_kernel(const float* __restrict__ x, __nv_bfloat16* __restrict__ out,
+                                      int n) {
   for (int i = int(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int(gridDim.x) * blockDim.x) {
     out[i] = __float2bfloat16_rn(x[i]);
   }
 }
 
-__global__ void combine_route_output_kernel(
-    const __nv_bfloat16* __restrict__ route_out,
-    const int32_t* __restrict__ ids, const float* __restrict__ weights,
-    __nv_bfloat16* __restrict__ out, int tokens) {
+__global__ void combine_route_output_kernel(const __nv_bfloat16* __restrict__ route_out,
+                                            const int32_t* __restrict__ ids,
+                                            const float* __restrict__ weights,
+                                            __nv_bfloat16* __restrict__ out, int tokens) {
   constexpr int H2 = H / 2;
   const int total = tokens * H2;
   for (int x = int(blockIdx.x) * blockDim.x + threadIdx.x; x < total;
@@ -1190,19 +1113,15 @@ __global__ void combine_route_output_kernel(
       const int r = tok * TOPK + slot;
       if (unsigned(ids[r]) < E) {
         const float2 v = __bfloat1622float2(
-            reinterpret_cast<const __nv_bfloat162*>(route_out)[size_t(r) * H2 +
-                                                                pair_col]);
+            reinterpret_cast<const __nv_bfloat162*>(route_out)[size_t(r) * H2 + pair_col]);
         const float w = weights[r];
         sum.x = fmaf(v.x, w, sum.x);
         sum.y = fmaf(v.y, w, sum.y);
       }
     }
-    reinterpret_cast<__nv_bfloat162*>(out)[x] =
-        __floats2bfloat162_rn(sum.x, sum.y);
+    reinterpret_cast<__nv_bfloat162*>(out)[x] = __floats2bfloat162_rn(sum.x, sum.y);
   }
 }
-
-
 
 __device__ __forceinline__ uint32_t e4m3_bcast_bf16x2(uint32_t b) {
   uint32_t bits;
@@ -1217,8 +1136,7 @@ __device__ __forceinline__ uint32_t mul_bf16x2(uint32_t a, uint32_t b) {
   return d;
 }
 
-__device__ __forceinline__ void red_bf16x2_v2(
-    __nv_bfloat162* dst, uint32_t a, uint32_t b) {
+__device__ __forceinline__ void red_bf16x2_v2(__nv_bfloat162* dst, uint32_t a, uint32_t b) {
   asm volatile("red.global.add.noftz.v2.bf16x2 [%0], {%1, %2};\n"
                :
                : "l"(dst), "r"(a), "r"(b)
@@ -1228,27 +1146,22 @@ __device__ __forceinline__ void red_bf16x2_v2(
 // Grouped BF16 mma.sync GEMM with on-the-fly NVFP4 dequant.  The group scale is
 // folded into the B fragment (exact: 2-bit e2m1 x 4-bit e4m3 fits bf16's mantissa),
 // so one accumulator chain spans the whole K loop and MM rows share each B tile.
-template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS,
-          bool FIRST, int MM, int STAGE_K, bool ATOMIC_COMBINE = false>
+template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS, bool FIRST, int MM,
+          int STAGE_K, bool ATOMIC_COMBINE = false>
 __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    const float* __restrict__ topk_weights,
-    __nv_bfloat16* __restrict__ zero_output, int zero_vecs,
-    __nv_bfloat16* __restrict__ output, int route_stride) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, const float* __restrict__ topk_weights,
+    __nv_bfloat16* __restrict__ zero_output, int zero_vecs, __nv_bfloat16* __restrict__ output,
+    int route_stride) {
   const int actual_tiles = tiles[E];
   if constexpr (FIRST) {
     const int pad_blocks = int(gridDim.x) - actual_tiles;
     if (int(blockIdx.x) >= actual_tiles) {
       auto* zero4 = reinterpret_cast<uint4*>(zero_output);
       const int worker = int(blockIdx.x) - actual_tiles;
-      for (int x = worker * blockDim.x + threadIdx.x; x < zero_vecs;
-           x += pad_blocks * blockDim.x)
+      for (int x = worker * blockDim.x + threadIdx.x; x < zero_vecs; x += pad_blocks * blockDim.x)
         zero4[x] = make_uint4(0u, 0u, 0u, 0u);
     }
   }
@@ -1270,8 +1183,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
   constexpr int KHALF = K / 2;
   constexpr int SCALE_WORDS = STAGE_K / 64;
   constexpr int SCALE_ITEMS = TILE_N * SCALE_WORDS;
-  constexpr int SCALE_TASKS =
-      (SCALE_ITEMS + BLOCK_THREADS - 1) / BLOCK_THREADS;
+  constexpr int SCALE_TASKS = (SCALE_ITEMS + BLOCK_THREADS - 1) / BLOCK_THREADS;
   static_assert(TILE_N % (NWARPS * 8) == 0);
   uint32_t scale_prefetch[SCALE_TASKS] = {};
 
@@ -1284,8 +1196,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
 
   for (int i = tid; i < MM; i += BLOCK_THREADS) {
     const int grouped_row = offsets[e] + m0 + i;
-    const int route_index = route_stride ? e * route_stride + m0 + i
-                                         : grouped_row;
+    const int route_index = route_stride ? e * route_stride + m0 + i : grouped_row;
     sroutes[i] = i < valid_m ? route_list[route_index] : -1;
   }
   __syncthreads();
@@ -1314,8 +1225,7 @@ __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
       const int pair = chunk * 4;
       cp_async_16(&as[m][pair ^ ((m & 7) << 2)], src, src_bytes);
     }
-    for (int idx = tid; idx < TILE_N * (STAGE_K / 32);
-         idx += BLOCK_THREADS) {
+    for (int idx = tid; idx < TILE_N * (STAGE_K / 32); idx += BLOCK_THREADS) {
       const int nr = idx / (STAGE_K / 32);
       const int chunk = idx - nr * (STAGE_K / 32);
       const int n = ntile * TILE_N + nr;
@@ -1336,18 +1246,15 @@ __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
       if (scale_idx < SCALE_ITEMS) {
         const int scale_nr = scale_idx / SCALE_WORDS;
         const int scale_word = scale_idx - scale_nr * SCALE_WORDS;
-        const uint8_t* scale_row =
-            scales + (size_t(e) * N + ntile * TILE_N + scale_nr) * KG;
+        const uint8_t* scale_row = scales + (size_t(e) * N + ntile * TILE_N + scale_nr) * KG;
         uint32_t sv = 0;
         if constexpr (!FIRST) sv = scale_prefetch[si];
         if ((FIRST || k0 == 0) && scale_word * 64 < stage_k) {
-          sv = *reinterpret_cast<const uint32_t*>(
-              scale_row + (k0 >> 4) + scale_word * 4);
+          sv = *reinterpret_cast<const uint32_t*>(scale_row + (k0 >> 4) + scale_word * 4);
         }
 #pragma unroll
         for (int b = 0; b < 4; ++b)
-          sbf[scale_word * 4 + b][scale_nr] = uint16_t(
-              e4m3_bcast_bf16x2(sv >> (b * 8)));
+          sbf[scale_word * 4 + b][scale_nr] = uint16_t(e4m3_bcast_bf16x2(sv >> (b * 8)));
 
         if constexpr (!FIRST) {
           scale_prefetch[si] = 0;
@@ -1355,8 +1262,8 @@ __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
           if (next_k0 < K) {
             const int next_stage_k = min(STAGE_K, K - next_k0);
             if (scale_word * 64 < next_stage_k) {
-              scale_prefetch[si] = *reinterpret_cast<const uint32_t*>(
-                  scale_row + (next_k0 >> 4) + scale_word * 4);
+              scale_prefetch[si] =
+                  *reinterpret_cast<const uint32_t*>(scale_row + (next_k0 >> 4) + scale_word * 4);
             }
           }
         }
@@ -1387,16 +1294,13 @@ __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
         const uint32_t p1 = bs[nr][word + 1];
         const uint32_t sf16 = sbf[sk][nr];
         const uint32_t sfb = sf16 | (sf16 << 16);
-        const uint32_t b0 =
-            mul_bf16x2(e2m1x2_to_bf16x2(uint8_t(p0 >> (q * 8))), sfb);
-        const uint32_t b1 =
-            mul_bf16x2(e2m1x2_to_bf16x2(uint8_t(p1 >> (q * 8))), sfb);
+        const uint32_t b0 = mul_bf16x2(e2m1x2_to_bf16x2(uint8_t(p0 >> (q * 8))), sfb);
+        const uint32_t b1 = mul_bf16x2(e2m1x2_to_bf16x2(uint8_t(p1 >> (q * 8))), sfb);
 #pragma unroll
         for (int ma = 0; ma < MATOM; ++ma) {
           if (ma < active_atoms)
-            mma_m16n8k16_bf16(acc[ma][atom][0], acc[ma][atom][1],
-                              acc[ma][atom][2], acc[ma][atom][3], af[ma][0],
-                              af[ma][1], af[ma][2], af[ma][3], b0, b1);
+            mma_m16n8k16_bf16(acc[ma][atom][0], acc[ma][atom][1], acc[ma][atom][2],
+                              acc[ma][atom][3], af[ma][0], af[ma][1], af[ma][2], af[ma][3], b0, b1);
         }
       }
     }
@@ -1416,26 +1320,22 @@ __global__ __launch_bounds__(BLOCK_THREADS) void grouped_mma2_kernel(
         if constexpr (!FIRST && ATOMIC_COMBINE) w = topk_weights[r];
 #pragma unroll
         for (int atom = 0; atom < NATOM; ++atom) {
-          const int n0 =
-              ntile * TILE_N + warp * (NATOM * 8) + atom * 8 + q * 2;
+          const int n0 = ntile * TILE_N + warp * (NATOM * 8) + atom * 8 + q * 2;
           float v0 = acc[ma][atom][rr * 2] * al;
           float v1 = acc[ma][atom][rr * 2 + 1] * al;
           if constexpr (FIRST) {
             v0 = fmaxf(v0, 0.0f);
             v1 = fmaxf(v1, 0.0f);
-            *reinterpret_cast<__nv_bfloat162*>(output +
-                                               size_t(grouped_row) * N + n0) =
+            *reinterpret_cast<__nv_bfloat162*>(output + size_t(grouped_row) * N + n0) =
                 __floats2bfloat162_rn(v0 * v0, v1 * v1);
           } else {
             if constexpr (ATOMIC_COMBINE) {
-              const __nv_bfloat162 pair =
-                  __floats2bfloat162_rn(v0 * w, v1 * w);
+              const __nv_bfloat162 pair = __floats2bfloat162_rn(v0 * w, v1 * w);
               const uint32_t bits = *reinterpret_cast<const uint32_t*>(&pair);
               const unsigned mask = __activemask();
               const uint32_t next = __shfl_down_sync(mask, bits, 1);
               if ((q & 1) == 0) {
-                auto* dst = reinterpret_cast<__nv_bfloat162*>(
-                    output + size_t(r / TOPK) * N + n0);
+                auto* dst = reinterpret_cast<__nv_bfloat162*>(output + size_t(r / TOPK) * N + n0);
                 red_bf16x2_v2(dst, bits, next);
               }
             } else {
@@ -1493,11 +1393,12 @@ __device__ __forceinline__ __half2 e4m3_bcast_half2(uint32_t b) {
 // One (route, n-tile) of a decode GEMV: MT=1, activations straight from L1,
 // every weight/scale load of the warp hoisted up front.
 template <int KK, int NN, int RPW, bool FIRST>
-__device__ __forceinline__ void dec_tile_direct(
-    const __nv_bfloat16* __restrict__ xin, const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales, float alph, const float* __restrict__ tw,
-    int e, int route, int tile, __nv_bfloat16* __restrict__ interm,
-    __nv_bfloat16* __restrict__ outp) {
+__device__ __forceinline__ void dec_tile_direct(const __nv_bfloat16* __restrict__ xin,
+                                                const uint8_t* __restrict__ packed,
+                                                const uint8_t* __restrict__ scales, float alph,
+                                                const float* __restrict__ tw, int e, int route,
+                                                int tile, __nv_bfloat16* __restrict__ interm,
+                                                __nv_bfloat16* __restrict__ outp) {
   constexpr int GK = KK / 16;
   constexpr int KHALF = KK / 2;
   constexpr int NT = DEC_WARPS * RPW;
@@ -1531,16 +1432,14 @@ __device__ __forceinline__ void dec_tile_direct(
 
   __half2 acc[RPW];
 #pragma unroll
-  for (int r = 0; r < RPW; ++r)
-    acc[r] = __halves2half2(__float2half(0.f), __float2half(0.f));
+  for (int r = 0; r < RPW; ++r) acc[r] = __halves2half2(__float2half(0.f), __float2half(0.f));
 
 #pragma unroll
   for (int it = 0; it < NIT; ++it) {
     const int st = min(it * 32 + lane, GK - 1);
     __half2 xv[8];
     {
-      const uint4* xg =
-          reinterpret_cast<const uint4*>(xin + size_t(xrow) * KK + st * 16);
+      const uint4* xg = reinterpret_cast<const uint4*>(xin + size_t(xrow) * KK + st * 16);
       const uint4 g0 = __ldg(xg);
       const uint4 g1 = __ldg(xg + 1);
       const uint32_t gw[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
@@ -1578,20 +1477,17 @@ __device__ __forceinline__ void dec_tile_direct(
       }
     } else {
       const float w = tw[route];
-      __nv_bfloat162* op =
-          reinterpret_cast<__nv_bfloat162*>(outp + size_t(route / TOPK) * NN + nb);
+      __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(outp + size_t(route / TOPK) * NN + nb);
 #pragma unroll
       for (int r = 0; r < RPW; r += 2)
-        atomicAdd(op + (r >> 1),
-                  __floats2bfloat162_rn(red[r] * w, red[r + 1] * w));
+        atomicAdd(op + (r >> 1), __floats2bfloat162_rn(red[r] * w, red[r + 1] * w));
     }
   }
 }
 
 // Device-wide barrier over a persistent grid; the counter is monotonic so it
 // needs no reset between launches as long as the grid size is fixed.
-__device__ __forceinline__ void dec_grid_barrier(unsigned int* bar,
-                                                 unsigned int gsz) {
+__device__ __forceinline__ void dec_grid_barrier(unsigned int* bar, unsigned int gsz) {
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();
@@ -1608,12 +1504,10 @@ __device__ __forceinline__ void dec_grid_barrier(unsigned int* bar,
 template <int RPW, int MINB>
 __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_direct_kernel(
     const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ p1,
-    const uint8_t* __restrict__ s1, const float* __restrict__ a1,
-    const uint8_t* __restrict__ p2, const uint8_t* __restrict__ s2,
-    const float* __restrict__ a2, const int32_t* __restrict__ ids,
+    const uint8_t* __restrict__ s1, const float* __restrict__ a1, const uint8_t* __restrict__ p2,
+    const uint8_t* __restrict__ s2, const float* __restrict__ a2, const int32_t* __restrict__ ids,
     const float* __restrict__ tw, int R, __nv_bfloat16* __restrict__ inter,
-    __nv_bfloat16* __restrict__ outp, int out_pairs,
-    unsigned int* __restrict__ bar) {
+    __nv_bfloat16* __restrict__ outp, int out_pairs, unsigned int* __restrict__ bar) {
   constexpr int NT = DEC_WARPS * RPW;
   constexpr int NTILES1 = I / NT;
   constexpr int NTILES2 = H / NT;
@@ -1622,8 +1516,7 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_direct_kernel(
   {
     auto* o2 = reinterpret_cast<__nv_bfloat162*>(outp);
     const __nv_bfloat162 z = __floats2bfloat162_rn(0.f, 0.f);
-    for (int i = blockIdx.x * DEC_THREADS + tid; i < out_pairs;
-         i += gridDim.x * DEC_THREADS)
+    for (int i = blockIdx.x * DEC_THREADS + tid; i < out_pairs; i += gridDim.x * DEC_THREADS)
       o2[i] = z;
   }
 
@@ -1633,8 +1526,7 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_direct_kernel(
     const int tile = item - route * NTILES1;
     const int e = ids[route];
     if (unsigned(e) < unsigned(E))
-      dec_tile_direct<H, I, RPW, true>(x, p1, s1, a1[e], tw, e, route, tile,
-                                       inter, outp);
+      dec_tile_direct<H, I, RPW, true>(x, p1, s1, a1[e], tw, e, route, tile, inter, outp);
   }
 
   dec_grid_barrier(bar, gridDim.x);
@@ -1645,18 +1537,18 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_direct_kernel(
     const int tile = item - route * NTILES2;
     const int e = ids[route];
     if (unsigned(e) < unsigned(E))
-      dec_tile_direct<I, H, RPW, false>(inter, p2, s2, a2[e], tw, e, route, tile,
-                                        inter, outp);
+      dec_tile_direct<I, H, RPW, false>(inter, p2, s2, a2[e], tw, e, route, tile, inter, outp);
   }
 }
 
 // One (expert token-group, n-tile) of a decode GEMV with MT grouped tokens.
 template <int KK, int NN, int MT, int RPW, bool FIRST>
-__device__ __forceinline__ void dec_tile_grp(
-    const __nv_bfloat16* __restrict__ xin, const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales, float alph, const float* __restrict__ tw,
-    int e, const int* rt, int mt, int tile, __nv_bfloat16* __restrict__ interm,
-    __nv_bfloat16* __restrict__ outp) {
+__device__ __forceinline__ void dec_tile_grp(const __nv_bfloat16* __restrict__ xin,
+                                             const uint8_t* __restrict__ packed,
+                                             const uint8_t* __restrict__ scales, float alph,
+                                             const float* __restrict__ tw, int e, const int* rt,
+                                             int mt, int tile, __nv_bfloat16* __restrict__ interm,
+                                             __nv_bfloat16* __restrict__ outp) {
   constexpr int GK = KK / 16;
   constexpr int KHALF = KK / 2;
   constexpr int NT = DEC_WARPS * RPW;
@@ -1674,8 +1566,7 @@ __device__ __forceinline__ void dec_tile_grp(
 #pragma unroll
   for (int r = 0; r < RPW; ++r)
 #pragma unroll
-    for (int j = 0; j < MT; ++j)
-      acc[r][j] = __halves2half2(__float2half(0.f), __float2half(0.f));
+    for (int j = 0; j < MT; ++j) acc[r][j] = __halves2half2(__float2half(0.f), __float2half(0.f));
 
 #pragma unroll 1
   for (int it = 0; it < NIT; ++it) {
@@ -1698,8 +1589,7 @@ __device__ __forceinline__ void dec_tile_grp(
     __half2 xv[MT][8];
 #pragma unroll
     for (int j = 0; j < MT; ++j) {
-      const uint4* xg =
-          reinterpret_cast<const uint4*>(xin + size_t(xrow[j]) * KK + st * 16);
+      const uint4* xg = reinterpret_cast<const uint4*>(xin + size_t(xrow[j]) * KK + st * 16);
       const uint4 g0 = __ldg(xg);
       const uint4 g1 = __ldg(xg + 1);
       const uint32_t gw[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
@@ -1746,12 +1636,10 @@ __device__ __forceinline__ void dec_tile_grp(
         }
       } else {
         const float w = tw[rr];
-        __nv_bfloat162* op =
-            reinterpret_cast<__nv_bfloat162*>(outp + size_t(rr / TOPK) * NN + nb);
+        __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(outp + size_t(rr / TOPK) * NN + nb);
 #pragma unroll
         for (int r = 0; r < RPW; r += 2)
-          atomicAdd(op + (r >> 1),
-                    __floats2bfloat162_rn(red[r][j] * w, red[r + 1][j] * w));
+          atomicAdd(op + (r >> 1), __floats2bfloat162_rn(red[r][j] * w, red[r + 1][j] * w));
       }
     }
   }
@@ -1761,13 +1649,12 @@ __device__ __forceinline__ void dec_tile_grp(
 template <int MT, int RPW, int MINB>
 __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_grp_kernel(
     const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ p1,
-    const uint8_t* __restrict__ s1, const float* __restrict__ a1,
-    const uint8_t* __restrict__ p2, const uint8_t* __restrict__ s2,
-    const float* __restrict__ a2, const float* __restrict__ tw,
+    const uint8_t* __restrict__ s1, const float* __restrict__ a1, const uint8_t* __restrict__ p2,
+    const uint8_t* __restrict__ s2, const float* __restrict__ a2, const float* __restrict__ tw,
     const int32_t* __restrict__ g_gpre, const int32_t* __restrict__ g_cnt,
     const int32_t* __restrict__ g_off, const int32_t* __restrict__ g_sorted,
-    __nv_bfloat16* __restrict__ inter, __nv_bfloat16* __restrict__ outp,
-    int out_pairs, unsigned int* __restrict__ bar) {
+    __nv_bfloat16* __restrict__ inter, __nv_bfloat16* __restrict__ outp, int out_pairs,
+    unsigned int* __restrict__ bar) {
   constexpr int NT = DEC_WARPS * RPW;
   constexpr int NTILES1 = I / NT;
   constexpr int NTILES2 = H / NT;
@@ -1777,8 +1664,7 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_grp_kernel(
   {
     auto* o2 = reinterpret_cast<__nv_bfloat162*>(outp);
     const __nv_bfloat162 z = __floats2bfloat162_rn(0.f, 0.f);
-    for (int i = blockIdx.x * DEC_THREADS + tid; i < out_pairs;
-         i += gridDim.x * DEC_THREADS)
+    for (int i = blockIdx.x * DEC_THREADS + tid; i < out_pairs; i += gridDim.x * DEC_THREADS)
       o2[i] = z;
   }
   if (tid <= E) s_gpre[tid] = g_gpre[tid];
@@ -1793,7 +1679,10 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_grp_kernel(
 #pragma unroll
     for (int b = 0; b < 8; ++b) {
       const int mid = (lo + hi) >> 1;
-      if (s_gpre[mid] <= gidx) lo = mid + 1; else hi = mid;
+      if (s_gpre[mid] <= gidx)
+        lo = mid + 1;
+      else
+        hi = mid;
     }
     const int e = max(0, lo - 1);
     const int rlo = (gidx - s_gpre[e]) * MT;
@@ -1803,8 +1692,7 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_grp_kernel(
     const int base_ = g_off[e] + rlo;
 #pragma unroll
     for (int j = 0; j < MT; ++j) rt[j] = g_sorted[base_ + (j < mt ? j : 0)];
-    dec_tile_grp<H, I, MT, RPW, true>(x, p1, s1, a1[e], tw, e, rt, mt, tile,
-                                      inter, outp);
+    dec_tile_grp<H, I, MT, RPW, true>(x, p1, s1, a1[e], tw, e, rt, mt, tile, inter, outp);
   }
 
   dec_grid_barrier(bar, gridDim.x);
@@ -1817,7 +1705,10 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_grp_kernel(
 #pragma unroll
     for (int b = 0; b < 8; ++b) {
       const int mid = (lo + hi) >> 1;
-      if (s_gpre[mid] <= gidx) lo = mid + 1; else hi = mid;
+      if (s_gpre[mid] <= gidx)
+        lo = mid + 1;
+      else
+        hi = mid;
     }
     const int e = max(0, lo - 1);
     const int rlo = (gidx - s_gpre[e]) * MT;
@@ -1827,18 +1718,18 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_fused_grp_kernel(
     const int base_ = g_off[e] + rlo;
 #pragma unroll
     for (int j = 0; j < MT; ++j) rt[j] = g_sorted[base_ + (j < mt ? j : 0)];
-    dec_tile_grp<I, H, MT, RPW, false>(inter, p2, s2, a2[e], tw, e, rt, mt, tile,
-                                       inter, outp);
+    dec_tile_grp<I, H, MT, RPW, false>(inter, p2, s2, a2[e], tw, e, rt, mt, tile, inter, outp);
   }
 }
 
 // Builds the decode routing table once per call (counts, offsets, group prefix,
 // routes bucketed by expert) so decode CTAs do not each redo the routing scan.
 template <int MT>
-__global__ __launch_bounds__(256) void dec_route_kernel(
-    const int32_t* __restrict__ ids, int R, int32_t* __restrict__ gpre,
-    int32_t* __restrict__ cnt_out, int32_t* __restrict__ off_out,
-    int32_t* __restrict__ sorted) {
+__global__ __launch_bounds__(256) void dec_route_kernel(const int32_t* __restrict__ ids, int R,
+                                                        int32_t* __restrict__ gpre,
+                                                        int32_t* __restrict__ cnt_out,
+                                                        int32_t* __restrict__ off_out,
+                                                        int32_t* __restrict__ sorted) {
   __shared__ int s_cnt[E];
   __shared__ int s_off[E];
   __shared__ int s_cur[E];
@@ -1867,7 +1758,10 @@ __global__ __launch_bounds__(256) void dec_route_kernel(
       for (int d = 1; d < 32; d <<= 1) {
         const int y = __shfl_up_sync(0xffffffffu, xc, d);
         const int z = __shfl_up_sync(0xffffffffu, xg, d);
-        if (lane >= d) { xc += y; xg += z; }
+        if (lane >= d) {
+          xc += y;
+          xg += z;
+        }
       }
       s_off[base + lane] = tot + xc - c;
       s_gp[base + lane] = gtot + xg - g;
@@ -1895,18 +1789,12 @@ __global__ __launch_bounds__(256) void dec_route_kernel(
 // so the staged activations are reused across many output rows.
 template <int KK, int NN, int MT, int RPW, bool FIRST, int MINB, int RMODE, bool HOIST, bool XGLOB>
 __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
-    const __nv_bfloat16* __restrict__ xin,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    const float* __restrict__ tw,
-    int R, int splitn,
+    const __nv_bfloat16* __restrict__ xin, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, const float* __restrict__ tw, int R, int splitn,
     const int32_t* __restrict__ g_gpre, const int32_t* __restrict__ g_cnt,
     const int32_t* __restrict__ g_off, const int32_t* __restrict__ g_sorted,
-    __nv_bfloat16* __restrict__ interm,
-    __nv_bfloat16* __restrict__ outp,
-    int out_pairs) {
+    __nv_bfloat16* __restrict__ interm, __nv_bfloat16* __restrict__ outp, int out_pairs) {
   constexpr int GK = KK / 16;
   constexpr int KHALF = KK / 2;
   constexpr int NSTEP = KK / 16;
@@ -1928,8 +1816,7 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
   if (FIRST) {
     auto* o2 = reinterpret_cast<__nv_bfloat162*>(outp);
     const __nv_bfloat162 z = __floats2bfloat162_rn(0.f, 0.f);
-    for (int i = blockIdx.x * DEC_THREADS + tid; i < out_pairs;
-         i += gridDim.x * DEC_THREADS)
+    for (int i = blockIdx.x * DEC_THREADS + tid; i < out_pairs; i += gridDim.x * DEC_THREADS)
       o2[i] = z;
   }
 
@@ -1955,7 +1842,10 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
 #pragma unroll
     for (int b = 0; b < 8; ++b) {
       const int mid = (lo + hi) >> 1;
-      if (s_gpre[mid] <= gidx) lo = mid + 1; else hi = mid;
+      if (s_gpre[mid] <= gidx)
+        lo = mid + 1;
+      else
+        hi = mid;
     }
     e = max(0, lo - 1);
     rlo = (gidx - s_gpre[e]) * MT;
@@ -1998,7 +1888,10 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
 #pragma unroll
     for (int b = 0; b < 8; ++b) {
       const int mid = (lo + hi) >> 1;
-      if (s_gpre[mid] <= gidx) lo = mid + 1; else hi = mid;
+      if (s_gpre[mid] <= gidx)
+        lo = mid + 1;
+      else
+        hi = mid;
     }
     e = max(0, lo - 1);
     rlo = (gidx - s_gpre[e]) * MT;
@@ -2028,24 +1921,24 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
   for (int j = 0; j < MT; ++j) xrow[j] = FIRST ? (rt[j] / TOPK) : rt[j];
   if constexpr (!XGLOB) {
 #pragma unroll
-  for (int j = 0; j < MT; ++j) {
-    const int rr = rt[j];
-    const int row = FIRST ? (rr / TOPK) : rr;
-    const uint4* src = reinterpret_cast<const uint4*>(xin + size_t(row) * KK);
-    __half* dst = sx + j * KK;
-    for (int i = tid; i < KK / 8; i += DEC_THREADS) {
-      const uint4 v = src[i];
-      const uint32_t vw[4] = {v.x, v.y, v.z, v.w};
-      __half2 h[4];
+    for (int j = 0; j < MT; ++j) {
+      const int rr = rt[j];
+      const int row = FIRST ? (rr / TOPK) : rr;
+      const uint4* src = reinterpret_cast<const uint4*>(xin + size_t(row) * KK);
+      __half* dst = sx + j * KK;
+      for (int i = tid; i < KK / 8; i += DEC_THREADS) {
+        const uint4 v = src[i];
+        const uint32_t vw[4] = {v.x, v.y, v.z, v.w};
+        __half2 h[4];
 #pragma unroll
-      for (int c = 0; c < 4; ++c) {
-        const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&vw[c]);
-        h[c] = __float22half2_rn(__bfloat1622float2(b));
+        for (int c = 0; c < 4; ++c) {
+          const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&vw[c]);
+          h[c] = __float22half2_rn(__bfloat1622float2(b));
+        }
+        *reinterpret_cast<uint4*>(dst + (i & 1) * SUB + (i >> 1) * 8) =
+            *reinterpret_cast<const uint4*>(h);
       }
-      *reinterpret_cast<uint4*>(dst + (i & 1) * SUB + (i >> 1) * 8) =
-          *reinterpret_cast<const uint4*>(h);
     }
-  }
   }
   if constexpr (!XGLOB) __syncthreads();
   if constexpr (DIRECT) {
@@ -2065,8 +1958,7 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
 #pragma unroll
     for (int r = 0; r < RPW; ++r)
 #pragma unroll
-      for (int j = 0; j < MT; ++j)
-        acc[r][j] = __halves2half2(__float2half(0.f), __float2half(0.f));
+      for (int j = 0; j < MT; ++j) acc[r][j] = __halves2half2(__float2half(0.f), __float2half(0.f));
 
     constexpr int HB = HOIST ? NIT : 1;
     uint2 qb[HB][RPW];
@@ -2115,8 +2007,7 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
       if constexpr (XGLOB) {
 #pragma unroll
         for (int j = 0; j < MT; ++j) {
-          const uint4* xg =
-              reinterpret_cast<const uint4*>(xin + size_t(xrow[j]) * KK + st * 16);
+          const uint4* xg = reinterpret_cast<const uint4*>(xin + size_t(xrow[j]) * KK + st * 16);
           const uint4 g0 = __ldg(xg);
           const uint4 g1 = __ldg(xg + 1);
           const uint32_t gw[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
@@ -2177,15 +2068,13 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
         } else {
           const float w = tw[rr];
           if constexpr (RPW >= 2) {
-            __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(
-                outp + size_t(rr / TOPK) * NN + nb);
+            __nv_bfloat162* op =
+                reinterpret_cast<__nv_bfloat162*>(outp + size_t(rr / TOPK) * NN + nb);
 #pragma unroll
             for (int r = 0; r < RPW; r += 2)
-              atomicAdd(op + (r >> 1),
-                        __floats2bfloat162_rn(red[r][j] * w, red[r + 1][j] * w));
+              atomicAdd(op + (r >> 1), __floats2bfloat162_rn(red[r][j] * w, red[r + 1][j] * w));
           } else {
-            atomicAdd(outp + size_t(rr / TOPK) * NN + nb,
-                      __float2bfloat16_rn(red[0][j] * w));
+            atomicAdd(outp + size_t(rr / TOPK) * NN + nb, __float2bfloat16_rn(red[0][j] * w));
           }
         }
       }
@@ -2195,13 +2084,11 @@ __global__ __launch_bounds__(DEC_THREADS, MINB) void dec_gemv_kernel(
 
 }  // namespace
 
-void RunFixedM64Prefill(ffi::TensorView hidden_states,
-         ffi::TensorView w1_packed,
-         ffi::TensorView w1_gs, ffi::TensorView w1_alpha,
-         ffi::TensorView w2_packed, ffi::TensorView w2_gs,
-         ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-         ffi::TensorView topk_weights, ffi::TensorView out,
-         int device, cudaStream_t stream) {
+void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
+                        ffi::TensorView w1_gs, ffi::TensorView w1_alpha, ffi::TensorView w2_packed,
+                        ffi::TensorView w2_gs, ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
+                        ffi::TensorView topk_weights, ffi::TensorView out, int device,
+                        cudaStream_t stream) {
   const int T = int(hidden_states.size(0));
   const int routes = T * TOPK;
   size_t bytes = 0;
@@ -2210,8 +2097,7 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states,
   const size_t output_scratch_off = bytes;
   bytes += align_up(size_t(routes) * H * sizeof(__nv_bfloat16));
   const size_t routes_off = bytes;
-  const size_t route_capacity =
-      T == 1024 ? size_t(E) * routes : size_t(routes);
+  const size_t route_capacity = T == 1024 ? size_t(E) * routes : size_t(routes);
   bytes += align_up(route_capacity * sizeof(int32_t));
   const size_t counts_off = bytes;
   bytes += align_up((E + 1) * sizeof(int32_t));
@@ -2231,8 +2117,7 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states,
   char* workspace = static_cast<char*>(ensure_workspace(bytes, device));
   auto* inter = reinterpret_cast<__nv_bfloat16*>(workspace + inter_off);
   auto* output_acc = reinterpret_cast<float*>(workspace + output_scratch_off);
-  auto* route_out =
-      reinterpret_cast<__nv_bfloat16*>(workspace + output_scratch_off);
+  auto* route_out = reinterpret_cast<__nv_bfloat16*>(workspace + output_scratch_off);
   auto* route_list = reinterpret_cast<int32_t*>(workspace + routes_off);
   auto* counts = reinterpret_cast<int32_t*>(workspace + counts_off);
   auto* cursor = reinterpret_cast<int32_t*>(workspace + cursor_off);
@@ -2240,8 +2125,7 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states,
   auto* tiles1 = reinterpret_cast<int32_t*>(workspace + tiles1_off);
   auto* tiles2 = reinterpret_cast<int32_t*>(workspace + tiles2_off);
   auto* bars = reinterpret_cast<unsigned int*>(workspace + bar_off);
-  if (g_ws_fresh)
-    cudaMemsetAsync(bars, 0, 5 * sizeof(unsigned int), stream);
+  if (g_ws_fresh) cudaMemsetAsync(bars, 0, 5 * sizeof(unsigned int), stream);
 
   const auto* x = static_cast<const __nv_bfloat16*>(hidden_states.data_ptr());
   const auto* p1 = static_cast<const uint8_t*>(w1_packed.data_ptr());
@@ -2255,49 +2139,46 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states,
   auto* y = static_cast<__nv_bfloat16*>(out.data_ptr());
 
   if (T == 64) {
-    RunFastDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed,
-                  w2_gs, w2_alpha, topk_ids, topk_weights, out, stream);
+    RunFastDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha, topk_ids,
+                  topk_weights, out, stream);
     return;
   }
   if (T == 16) {
     decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT, DECODE_NT, true>
-        <<<routes * (I / DECODE_NT), THREADS, 0, stream>>>(
-            x, p1, s1, a1, ids, nullptr, tw, routes, inter, output_acc);
-    decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT,
-                               false, false, true>
-        <<<routes * (H / DECODE_NT), THREADS, 0, stream>>>(
-            inter, p2, s2, a2, ids, nullptr, tw, routes, route_out,
-            output_acc);
+        <<<routes*(I / DECODE_NT), THREADS, 0, stream>>>(x, p1, s1, a1, ids, nullptr, tw, routes,
+                                                         inter, output_acc);
+    decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT, false, false, true>
+        <<<routes*(H / DECODE_NT), THREADS, 0, stream>>>(inter, p2, s2, a2, ids, nullptr, tw,
+                                                         routes, route_out, output_acc);
     const int out_elems = T * (H / 2);
     const int out_blocks = (out_elems + THREADS - 1) / THREADS;
-    combine_route_output_kernel<<<out_blocks, THREADS, 0, stream>>>(
-        route_out, ids, tw, y, T);
+    combine_route_output_kernel<<<out_blocks, THREADS, 0, stream>>>(route_out, ids, tw, y, T);
     return;
   }
 
   if (T <= 64) {
     const int out_pairs = T * (H / 2);
-#define DEC_LAUNCH(MTV, RPW1, RPW2, MB, RMD, HST, XG)                                  \
-    {                                                                          \
-      constexpr int MT_ = MTV;                                                 \
-      const int act = routes < E ? routes : E;                                 \
-      const int nb_ = act + (routes - act + MT_ - 1) / MT_;                    \
-      int numg = routes < nb_ ? routes : nb_;                                  \
-      if ((RMD) == 2) numg = routes;                                           \
-      constexpr int NTIL1 = I / (DEC_WARPS * RPW1);                            \
-      constexpr int NTIL2 = H / (DEC_WARPS * RPW2);                            \
-      if ((RMD) == 1)                                                                 \
-        dec_route_kernel<MT_><<<1, 256, 0, stream>>>(                          \
-            ids, routes, tiles1, counts, offsets, route_list);                 \
-      dec_gemv_kernel<H, I, MT_, RPW1, true, MB, RMD, HST, XG>                          \
-          <<<numg * NTIL1, DEC_THREADS, 0, stream>>>(                          \
-              x, p1, s1, a1, ids, tw, routes, NTIL1, tiles1, counts, offsets,  \
-              route_list, inter, y, out_pairs);                                \
-      dec_gemv_kernel<I, H, MT_, RPW2, false, MB, RMD, HST, XG>                         \
-          <<<numg * NTIL2, DEC_THREADS, 0, stream>>>(                          \
-              inter, p2, s2, a2, ids, tw, routes, NTIL2, tiles1, counts,       \
-              offsets, route_list, inter, y, out_pairs);                       \
-    }
+#define DEC_LAUNCH(MTV, RPW1, RPW2, MB, RMD, HST, XG)                                             \
+  {                                                                                               \
+    constexpr int MT_ = MTV;                                                                      \
+    const int act = routes < E ? routes : E;                                                      \
+    const int nb_ = act + (routes - act + MT_ - 1) / MT_;                                         \
+    int numg = routes < nb_ ? routes : nb_;                                                       \
+    if ((RMD) == 2) numg = routes;                                                                \
+    constexpr int NTIL1 = I / (DEC_WARPS * RPW1);                                                 \
+    constexpr int NTIL2 = H / (DEC_WARPS * RPW2);                                                 \
+    if ((RMD) == 1)                                                                               \
+      dec_route_kernel<MT_>                                                                       \
+          <<<1, 256, 0, stream>>>(ids, routes, tiles1, counts, offsets, route_list);              \
+    dec_gemv_kernel<H, I, MT_, RPW1, true, MB, RMD, HST, XG>                                      \
+        <<<numg * NTIL1, DEC_THREADS, 0, stream>>>(x, p1, s1, a1, ids, tw, routes, NTIL1, tiles1, \
+                                                   counts, offsets, route_list, inter, y,         \
+                                                   out_pairs);                                    \
+    dec_gemv_kernel<I, H, MT_, RPW2, false, MB, RMD, HST, XG>                                     \
+        <<<numg * NTIL2, DEC_THREADS, 0, stream>>>(inter, p2, s2, a2, ids, tw, routes, NTIL2,     \
+                                                   tiles1, counts, offsets, route_list, inter, y, \
+                                                   out_pairs);                                    \
+  }
     if (T <= 4) {
       constexpr int FRPW = 4;
       static int fused_grid = 0;
@@ -2320,26 +2201,25 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states,
       // All grouped fallback shapes use the same occupancy-capped grid, but
       // must not share epochs with any of the four direct-decode grids.
       unsigned int* bar = bars + 4;
-#define FUSED_GRP(MTV)                                                        \
-      {                                                                        \
-        constexpr int MT_ = MTV;                                               \
-        static int fg = 0;                                                     \
-        if (fg == 0) {                                                         \
-          int nb = 0;                                                          \
-          cudaOccupancyMaxActiveBlocksPerMultiprocessor(                       \
-              &nb, (const void*)dec_fused_grp_kernel<MT_, 4, 3>, DEC_THREADS,  \
-              0);                                                              \
-          int sms = 1;                                                         \
-          cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);\
-          fg = nb * sms;                                                       \
-          if (fg < 1) fg = 1;                                                  \
-        }                                                                      \
-        dec_route_kernel<MT_><<<1, 256, 0, stream>>>(                          \
-            ids, routes, tiles1, counts, offsets, route_list);                 \
-        dec_fused_grp_kernel<MT_, 4, 3><<<fg, DEC_THREADS, 0, stream>>>(       \
-            x, p1, s1, a1, p2, s2, a2, tw, tiles1, counts, offsets,            \
-            route_list, inter, y, out_pairs, bar);                             \
-      }
+#define FUSED_GRP(MTV)                                                                           \
+  {                                                                                              \
+    constexpr int MT_ = MTV;                                                                     \
+    static int fg = 0;                                                                           \
+    if (fg == 0) {                                                                               \
+      int nb = 0;                                                                                \
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(                                             \
+          &nb, (const void*)dec_fused_grp_kernel<MT_, 4, 3>, DEC_THREADS, 0);                    \
+      int sms = 1;                                                                               \
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);                      \
+      fg = nb * sms;                                                                             \
+      if (fg < 1) fg = 1;                                                                        \
+    }                                                                                            \
+    dec_route_kernel<MT_>                                                                        \
+        <<<1, 256, 0, stream>>>(ids, routes, tiles1, counts, offsets, route_list);               \
+    dec_fused_grp_kernel<MT_, 4, 3>                                                              \
+        <<<fg, DEC_THREADS, 0, stream>>>(x, p1, s1, a1, p2, s2, a2, tw, tiles1, counts, offsets, \
+                                         route_list, inter, y, out_pairs, bar);                  \
+  }
       if (T <= 16) {
         FUSED_GRP(2)
       } else {
@@ -2350,85 +2230,59 @@ void RunFixedM64Prefill(ffi::TensorView hidden_states,
 #undef DEC_LAUNCH
   } else {
     cudaMemsetAsync(counts, 0, E * sizeof(int32_t), stream);
-    const int route_blocks = ((routes + THREADS - 1) / THREADS < 256)
-                                 ? (routes + THREADS - 1) / THREADS
-                                 : 256;
-    if (T != 1024)
-      count_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(ids, routes,
-                                                                counts);
+    const int route_blocks =
+        ((routes + THREADS - 1) / THREADS < 256) ? (routes + THREADS - 1) / THREADS : 256;
+    if (T != 1024) count_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(ids, routes, counts);
     if (T >= 8192) {
       constexpr int PM = 128;
-      prefix_mma_routes_kernel<PM><<<1, 1, 0, stream>>>(
-          counts, offsets, cursor, tiles1, tiles2);
-      scatter_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(
-          ids, routes, offsets, cursor, route_list);
+      prefix_mma_routes_kernel<PM><<<1, 1, 0, stream>>>(counts, offsets, cursor, tiles1, tiles2);
+      scatter_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(ids, routes, offsets, cursor,
+                                                                  route_list);
       const int max_mtiles = (routes + PM - 1) / PM + E;
-      grouped_mma2_kernel<H, I, H / 16, I / GMMA_N1, GMMA_N1, 128, true, PM,
-                          128>
-          <<<max_mtiles * (I / GMMA_N1), 128, 0, stream>>>(
-              x, p1, s1, a1, offsets, tiles1, route_list, tw, nullptr, 0,
-              inter, 0);
-      grouped_mma2_kernel<I, H, I / 16, H / GMMA_N2, GMMA_N2, 256, false, PM,
-                          128>
-          <<<max_mtiles * (H / GMMA_N2), 256, 0, stream>>>(
-              inter, p2, s2, a2, offsets, tiles2, route_list, tw, nullptr, 0,
-              route_out, 0);
+      grouped_mma2_kernel<H, I, H / 16, I / GMMA_N1, GMMA_N1, 128, true, PM, 128>
+          <<<max_mtiles*(I / GMMA_N1), 128, 0, stream>>>(x, p1, s1, a1, offsets, tiles1, route_list,
+                                                         tw, nullptr, 0, inter, 0);
+      grouped_mma2_kernel<I, H, I / 16, H / GMMA_N2, GMMA_N2, 256, false, PM, 128>
+          <<<max_mtiles*(H / GMMA_N2), 256, 0, stream>>>(inter, p2, s2, a2, offsets, tiles2,
+                                                         route_list, tw, nullptr, 0, route_out, 0);
     } else {
-#define LAUNCH_FIXED_PREFILL(PFV, SK1V, SK2V)                                 \
-      do {                                                                    \
-        constexpr int PM = PFV;                                               \
-        constexpr int SK1 = SK1V;                                             \
-        constexpr int SK2 = SK2V;                                             \
-        prefix_mma_routes_kernel<PM><<<1, 1, 0, stream>>>(                   \
-            counts, offsets, cursor, tiles1, tiles2);                         \
-        scatter_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(         \
-            ids, routes, offsets, cursor, route_list);                        \
-        const int max_mtiles = (routes + PM - 1) / PM + E;                   \
-        grouped_mma2_kernel<H, I, H / 16, I / GMMA_N1, GMMA_N1, 128, true,  \
-                            PM, SK1>                                          \
-            <<<max_mtiles * (I / GMMA_N1), 128, 0, stream>>>(                \
-                x, p1, s1, a1, offsets, tiles1, route_list, tw, nullptr, 0,  \
-                inter, 0);                                                   \
-        grouped_mma2_kernel<I, H, I / 16, H / GMMA_N2, GMMA_N2, 256, false, \
-                            PM, SK2>                                          \
-            <<<max_mtiles * (H / GMMA_N2), 256, 0, stream>>>(                \
-                inter, p2, s2, a2, offsets, tiles2, route_list, tw, nullptr, \
-                0, route_out, 0);                                            \
-      } while (0)
+#define LAUNCH_FIXED_PREFILL(PFV, SK1V, SK2V)                                                      \
+  do {                                                                                             \
+    constexpr int PM = PFV;                                                                        \
+    constexpr int SK1 = SK1V;                                                                      \
+    constexpr int SK2 = SK2V;                                                                      \
+    prefix_mma_routes_kernel<PM><<<1, 1, 0, stream>>>(counts, offsets, cursor, tiles1, tiles2);    \
+    scatter_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(ids, routes, offsets, cursor,      \
+                                                                route_list);                       \
+    const int max_mtiles = (routes + PM - 1) / PM + E;                                             \
+    grouped_mma2_kernel<H, I, H / 16, I / GMMA_N1, GMMA_N1, 128, true, PM, SK1>                    \
+        <<<max_mtiles*(I / GMMA_N1), 128, 0, stream>>>(x, p1, s1, a1, offsets, tiles1, route_list, \
+                                                       tw, nullptr, 0, inter, 0);                  \
+    grouped_mma2_kernel<I, H, I / 16, H / GMMA_N2, GMMA_N2, 256, false, PM, SK2>                   \
+        <<<max_mtiles*(H / GMMA_N2), 256, 0, stream>>>(inter, p2, s2, a2, offsets, tiles2,         \
+                                                       route_list, tw, nullptr, 0, route_out, 0);  \
+  } while (0)
       if (T == 1024) {
         constexpr int PM = 32;
-        bin_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(
-            ids, routes, counts, route_list);
-        prefix_mma_routes_parallel_kernel<PM><<<1, E, 0, stream>>>(
-            counts, offsets, cursor, tiles1, tiles2);
+        bin_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(ids, routes, counts, route_list);
+        prefix_mma_routes_parallel_kernel<PM>
+            <<<1, E, 0, stream>>>(counts, offsets, cursor, tiles1, tiles2);
         const int max_mtiles = (routes + PM - 1) / PM + E;
-        grouped_mma2_kernel<H, I, H / 16, I / GMMA_N1, GMMA_N1, 128, true,
-                            PM, 128>
-            <<<max_mtiles * (I / GMMA_N1), 128, 0, stream>>>(
-                x, p1, s1, a1, offsets, tiles1, route_list, tw, y,
-                (T * H) / 8, inter, routes);
-        grouped_mma2_kernel<I, H, I / 16, H / GMMA_N2, GMMA_N2, 128, false,
-                            PM, 128, true>
-            <<<max_mtiles * (H / GMMA_N2), 128, 0, stream>>>(
-                inter, p2, s2, a2, offsets, tiles2, route_list, tw, nullptr,
-                0, y, routes);
+        grouped_mma2_kernel<H, I, H / 16, I / GMMA_N1, GMMA_N1, 128, true, PM, 128>
+            <<<max_mtiles*(I / GMMA_N1), 128, 0, stream>>>(
+                x, p1, s1, a1, offsets, tiles1, route_list, tw, y, (T * H) / 8, inter, routes);
+        grouped_mma2_kernel<I, H, I / 16, H / GMMA_N2, GMMA_N2, 128, false, PM, 128, true>
+            <<<max_mtiles*(H / GMMA_N2), 128, 0, stream>>>(inter, p2, s2, a2, offsets, tiles2,
+                                                           route_list, tw, nullptr, 0, y, routes);
       } else {
         LAUNCH_FIXED_PREFILL(64, 128, 128);
       }
 #undef LAUNCH_FIXED_PREFILL
     }
     const int out_elems = T * (H / 2);
-    const int out_blocks = ((out_elems + THREADS - 1) / THREADS < 4096)
-                               ? (out_elems + THREADS - 1) / THREADS
-                               : 4096;
+    const int out_blocks =
+        ((out_elems + THREADS - 1) / THREADS < 4096) ? (out_elems + THREADS - 1) / THREADS : 4096;
     if (T != 1024)
-      combine_route_output_kernel<<<out_blocks, THREADS, 0, stream>>>(
-          route_out, ids, tw, y, T);
+      combine_route_output_kernel<<<out_blocks, THREADS, 0, stream>>>(route_out, ids, tw, y, T);
   }
 }
-
-
-
-
-
-

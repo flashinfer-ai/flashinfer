@@ -12,44 +12,24 @@
 namespace ffi = tvm::ffi;
 namespace wmma = nvcuda::wmma;
 
-void RunFastDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
-                   ffi::TensorView w1_gs, ffi::TensorView w1_alpha,
-                   ffi::TensorView w2_packed, ffi::TensorView w2_gs,
-                   ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-                   ffi::TensorView topk_weights, ffi::TensorView out,
-                   cudaStream_t stream);
-void RunPersistentDirect(ffi::TensorView hidden_states,
-                         ffi::TensorView w1_packed,
-                         ffi::TensorView w1_gs,
-                         ffi::TensorView w1_alpha,
-                         ffi::TensorView w2_packed,
-                         ffi::TensorView w2_gs,
-                         ffi::TensorView w2_alpha,
-                         ffi::TensorView topk_ids,
-                         ffi::TensorView topk_weights,
-                         ffi::TensorView out, int device,
+void RunFastDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
+                   ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
+                   ffi::TensorView w2_alpha, ffi::TensorView topk_ids, ffi::TensorView topk_weights,
+                   ffi::TensorView out, cudaStream_t stream);
+void RunPersistentDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
+                         ffi::TensorView w1_gs, ffi::TensorView w1_alpha, ffi::TensorView w2_packed,
+                         ffi::TensorView w2_gs, ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
+                         ffi::TensorView topk_weights, ffi::TensorView out, int device,
                          cudaStream_t stream);
-void RunFixedM64Prefill(ffi::TensorView hidden_states,
-                        ffi::TensorView w1_packed,
-                        ffi::TensorView w1_gs,
-                        ffi::TensorView w1_alpha,
-                        ffi::TensorView w2_packed,
-                        ffi::TensorView w2_gs,
-                        ffi::TensorView w2_alpha,
-                        ffi::TensorView topk_ids,
-                        ffi::TensorView topk_weights,
-                        ffi::TensorView out, int device,
+void RunFixedM64Prefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
+                        ffi::TensorView w1_gs, ffi::TensorView w1_alpha, ffi::TensorView w2_packed,
+                        ffi::TensorView w2_gs, ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
+                        ffi::TensorView topk_weights, ffi::TensorView out, int device,
                         cudaStream_t stream);
-void RunWidePrefill(ffi::TensorView hidden_states,
-                    ffi::TensorView w1_packed,
-                    ffi::TensorView w1_gs,
-                    ffi::TensorView w1_alpha,
-                    ffi::TensorView w2_packed,
-                    ffi::TensorView w2_gs,
-                    ffi::TensorView w2_alpha,
-                    ffi::TensorView topk_ids,
-                    ffi::TensorView topk_weights,
-                    ffi::TensorView out, int device,
+void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
+                    ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
+                    ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
+                    ffi::TensorView topk_weights, ffi::TensorView out, int device,
                     cudaStream_t stream);
 
 namespace {
@@ -91,13 +71,10 @@ std::mutex g_run_mutex;
 cudaStream_t g_last_stream = nullptr;
 int g_last_stream_device = -1;
 
-inline size_t align_up(size_t x, size_t a = 256) {
-  return (x + a - 1) & ~(a - 1);
-}
+inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
 void* ensure_workspace(size_t bytes, int device) {
-  if (g_workspace.ptr != nullptr &&
-      (g_workspace.bytes < bytes || g_workspace.device != device)) {
+  if (g_workspace.ptr != nullptr && (g_workspace.bytes < bytes || g_workspace.device != device)) {
     cudaFree(g_workspace.ptr);
     g_workspace.ptr = nullptr;
     g_workspace.bytes = 0;
@@ -126,9 +103,7 @@ __device__ __forceinline__ float fp8_e4m3fn_to_float(uint8_t x) {
 
 __device__ __forceinline__ float2 fp8_e4m3fnx2_to_float2(uint16_t x) {
   uint32_t bits;
-  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n"
-               : "=r"(bits)
-               : "h"(x));
+  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;\n" : "=r"(bits) : "h"(x));
   union {
     uint32_t u;
     __half2 h;
@@ -140,9 +115,7 @@ __device__ __forceinline__ float2 fp8_e4m3fnx2_to_float2(uint16_t x) {
 __device__ __forceinline__ uint32_t fp8_e4m3fn_broadcast_bf16x2(uint8_t x) {
   const uint16_t packed = uint16_t(x) | (uint16_t(x) << 8);
   uint32_t bits;
-  asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;\n"
-               : "=r"(bits)
-               : "h"(packed));
+  asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;\n" : "=r"(bits) : "h"(packed));
   return bits;
 }
 
@@ -169,13 +142,14 @@ __device__ __forceinline__ float e2m1_bits_to_float(uint32_t q) {
 __device__ __forceinline__ __half2 e2m1x2_to_half2(uint8_t q) {
   uint32_t bits;
   const uint32_t src = q;
-  asm volatile("{\n"
-               ".reg .b8 b0, b1, b2, b3;\n"
-               "mov.b32 {b0, b1, b2, b3}, %1;\n"
-               "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
-               "}\n"
-               : "=r"(bits)
-               : "r"(src));
+  asm volatile(
+      "{\n"
+      ".reg .b8 b0, b1, b2, b3;\n"
+      "mov.b32 {b0, b1, b2, b3}, %1;\n"
+      "cvt.rn.f16x2.e2m1x2 %0, b0;\n"
+      "}\n"
+      : "=r"(bits)
+      : "r"(src));
   union {
     uint32_t u;
     __half2 h;
@@ -184,8 +158,7 @@ __device__ __forceinline__ __half2 e2m1x2_to_half2(uint8_t q) {
   return cvt.h;
 }
 
-__device__ __forceinline__ void e2m1x8_to_half2x4(uint32_t q,
-                                                  __half2 (&out)[4]) {
+__device__ __forceinline__ void e2m1x8_to_half2x4(uint32_t q, __half2 (&out)[4]) {
   uint32_t r0, r1, r2, r3;
   asm volatile(
       "{\n"
@@ -207,13 +180,14 @@ __device__ __forceinline__ void e2m1x8_to_half2x4(uint32_t q,
 __device__ __forceinline__ uint32_t e2m1x2_to_bf16x2(uint8_t q) {
   uint32_t bits;
   const uint32_t src = q;
-  asm volatile("{\n"
-               ".reg .b8 b0, b1, b2, b3;\n"
-               "mov.b32 {b0, b1, b2, b3}, %1;\n"
-               "cvt.rn.bf16x2.e2m1x2 %0, b0;\n"
-               "}\n"
-               : "=r"(bits)
-               : "r"(src));
+  asm volatile(
+      "{\n"
+      ".reg .b8 b0, b1, b2, b3;\n"
+      "mov.b32 {b0, b1, b2, b3}, %1;\n"
+      "cvt.rn.bf16x2.e2m1x2 %0, b0;\n"
+      "}\n"
+      : "=r"(bits)
+      : "r"(src));
   return bits;
 }
 
@@ -223,8 +197,8 @@ __device__ __forceinline__ float warp_sum(float x) {
   return x;
 }
 
-__device__ __forceinline__ void red_bf16x2_v2(
-    __nv_bfloat162* dst, __nv_bfloat162 v0, __nv_bfloat162 v1) {
+__device__ __forceinline__ void red_bf16x2_v2(__nv_bfloat162* dst, __nv_bfloat162 v0,
+                                              __nv_bfloat162 v1) {
   const uint32_t a = *reinterpret_cast<const uint32_t*>(&v0);
   const uint32_t b = *reinterpret_cast<const uint32_t*>(&v1);
   asm volatile("red.global.add.noftz.v2.bf16x2 [%0], {%1, %2};\n"
@@ -243,10 +217,9 @@ __device__ __forceinline__ uint32_t fp4_byte_to_bf16x2(uint8_t q) {
   return cvt.u;
 }
 
-__device__ __forceinline__ void mma_m16n8k16_bf16(
-    float& d0, float& d1, float& d2, float& d3,
-    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
-    uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma_m16n8k16_bf16(float& d0, float& d1, float& d2, float& d3,
+                                                  uint32_t a0, uint32_t a1, uint32_t a2,
+                                                  uint32_t a3, uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
@@ -255,11 +228,9 @@ __device__ __forceinline__ void mma_m16n8k16_bf16(
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void ldmatrix_m8n8x4_b16(
-    uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3,
-    const void* smem_ptr) {
-  const uint32_t smem =
-      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+__device__ __forceinline__ void ldmatrix_m8n8x4_b16(uint32_t& a0, uint32_t& a1, uint32_t& a2,
+                                                    uint32_t& a3, const void* smem_ptr) {
+  const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
       "ldmatrix.sync.aligned.m8n8.x4.shared::cta.b16 "
       "{%0, %1, %2, %3}, [%4];\n"
@@ -267,26 +238,20 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_b16(
       : "r"(smem));
 }
 
-__device__ __forceinline__ void cp_async_16(void* dst, const void* src,
-                                            int src_bytes) {
+__device__ __forceinline__ void cp_async_16(void* dst, const void* src, int src_bytes) {
   const uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                :
                : "r"(smem), "l"(src), "r"(src_bytes));
 }
 
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n");
-}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n"); }
 
-__device__ __forceinline__ void cp_async_wait() {
-  asm volatile("cp.async.wait_group 0;\n");
-}
+__device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group 0;\n"); }
 
 __device__ __forceinline__ uint64_t load_cg_l2_256_u64(const void* p) {
   uint64_t v;
-  asm volatile("ld.global.cg.L2::256B.u64 %0, [%1];"
-               : "=l"(v) : "l"(p));
+  asm volatile("ld.global.cg.L2::256B.u64 %0, [%1];" : "=l"(v) : "l"(p));
   return v;
 }
 
@@ -305,44 +270,37 @@ struct U64x2 {
 
 __device__ __forceinline__ U64x2 load_cg_u128(const void* p) {
   U64x2 v;
-  asm volatile("ld.global.cg.v2.u64 {%0, %1}, [%2];"
-               : "=l"(v.x), "=l"(v.y)
-               : "l"(p));
+  asm volatile("ld.global.cg.v2.u64 {%0, %1}, [%2];" : "=l"(v.x), "=l"(v.y) : "l"(p));
   return v;
 }
 
-__device__ __forceinline__ void load_bf16x16_as_half2x8(
-    const __nv_bfloat16* p, __half2* out) {
+__device__ __forceinline__ void load_bf16x16_as_half2x8(const __nv_bfloat16* p, __half2* out) {
   uint32_t w[8];
   asm volatile(
       "ld.global.L1::evict_last.v8.u32 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8];\n"
-      : "=r"(w[0]), "=r"(w[1]), "=r"(w[2]), "=r"(w[3]),
-        "=r"(w[4]), "=r"(w[5]), "=r"(w[6]), "=r"(w[7])
+      : "=r"(w[0]), "=r"(w[1]), "=r"(w[2]), "=r"(w[3]), "=r"(w[4]), "=r"(w[5]), "=r"(w[6]),
+        "=r"(w[7])
       : "l"(p));
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    const __nv_bfloat162 b =
-        *reinterpret_cast<const __nv_bfloat162*>(&w[i]);
+    const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&w[i]);
     out[i] = __float22half2_rn(__bfloat1622float2(b));
   }
 }
 
-__device__ __forceinline__ void load_bf16x16_u32x8(
-    const __nv_bfloat16* p, uint32_t* out) {
+__device__ __forceinline__ void load_bf16x16_u32x8(const __nv_bfloat16* p, uint32_t* out) {
   asm volatile(
       "ld.global.L1::evict_last.v8.u32 "
       "{%0, %1, %2, %3, %4, %5, %6, %7}, [%8];\n"
-      : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
-        "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7])
+      : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]), "=r"(out[4]), "=r"(out[5]),
+        "=r"(out[6]), "=r"(out[7])
       : "l"(p));
 }
 
-__device__ __forceinline__ uint32_t fma_bf16x2(uint32_t a, uint32_t b,
-                                               uint32_t c) {
+__device__ __forceinline__ uint32_t fma_bf16x2(uint32_t a, uint32_t b, uint32_t c) {
   uint32_t d;
-  asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n"
-               : "=r"(d) : "r"(a), "r"(b), "r"(c));
+  asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;\n" : "=r"(d) : "r"(a), "r"(b), "r"(c));
   return d;
 }
 
@@ -350,8 +308,7 @@ __device__ __forceinline__ float sum_bf16x2(uint32_t v) {
   return __uint_as_float(v << 16) + __uint_as_float(v & 0xffff0000u);
 }
 
-__device__ __forceinline__ void e2m1x8_to_bf16x2x4(uint32_t q,
-                                                    uint32_t* out) {
+__device__ __forceinline__ void e2m1x8_to_bf16x2x4(uint32_t q, uint32_t* out) {
   asm volatile(
       "{\n"
       ".reg .b8 b0, b1, b2, b3;\n"
@@ -375,10 +332,8 @@ __global__ void count_routes_kernel(const int32_t* __restrict__ ids, int routes,
 }
 
 __global__ void prefix_routes_kernel(const int32_t* __restrict__ counts,
-                                     int32_t* __restrict__ offsets,
-                                     int32_t* __restrict__ cursor,
-                                     int32_t* __restrict__ tiles1,
-                                     int32_t* __restrict__ tiles2) {
+                                     int32_t* __restrict__ offsets, int32_t* __restrict__ cursor,
+                                     int32_t* __restrict__ tiles1, int32_t* __restrict__ tiles2) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   int route_sum = 0;
   int tile1_sum = 0;
@@ -402,8 +357,7 @@ __global__ void prefix_routes_kernel(const int32_t* __restrict__ counts,
 template <int MM, int NT1, int NT2>
 __global__ void prefix_mma_routes_kernel(const int32_t* __restrict__ counts,
                                          int32_t* __restrict__ offsets,
-                                         int32_t* __restrict__ cursor,
-                                         int32_t* __restrict__ tiles1,
+                                         int32_t* __restrict__ cursor, int32_t* __restrict__ tiles1,
                                          int32_t* __restrict__ tiles2) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
   int route_sum = 0;
@@ -441,13 +395,9 @@ __global__ void scatter_routes_kernel(const int32_t* __restrict__ ids, int route
 
 template <int K, int N, int KG>
 __global__ __launch_bounds__(32, 16) void decode_fc1_mma_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    int routes,
-    __nv_bfloat16* __restrict__ intermediate) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, int routes, __nv_bfloat16* __restrict__ intermediate) {
   const int lane = threadIdx.x;
   const int g = lane >> 2;
   const int q = lane & 3;
@@ -503,13 +453,9 @@ __global__ __launch_bounds__(32, 16) void decode_fc1_mma_kernel(
 
 template <int K, int N, int KG>
 __global__ __launch_bounds__(32, 16) void decode_fc2_combine_mma_kernel(
-    const __nv_bfloat16* __restrict__ intermediate,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    const float* __restrict__ topk_weights,
-    int tokens,
+    const __nv_bfloat16* __restrict__ intermediate, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, const float* __restrict__ topk_weights, int tokens,
     __nv_bfloat16* __restrict__ output) {
   const int lane = threadIdx.x;
   const int g = lane >> 2;
@@ -571,23 +517,16 @@ __global__ __launch_bounds__(32, 16) void decode_fc2_combine_mma_kernel(
   }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST,
-          bool ORDERED = false, bool ROUTE_OUTPUT = false,
-          bool GRID_2D = false, bool BF16_ATOMIC = false, bool WIDE = false,
-          bool PDL_WAIT = false, bool PDL_SIGNAL = false,
+template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST, bool ORDERED = false,
+          bool ROUTE_OUTPUT = false, bool GRID_2D = false, bool BF16_ATOMIC = false,
+          bool WIDE = false, bool PDL_WAIT = false, bool PDL_SIGNAL = false,
           int PDL_WARM_BLOCKS = 752>
 __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const uint8_t* __restrict__ next_packed,
-    const uint8_t* __restrict__ next_scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    const int32_t* __restrict__ route_order,
-    const float* __restrict__ topk_weights,
-    int routes,
-    __nv_bfloat16* __restrict__ intermediate,
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const uint8_t* __restrict__ next_packed,
+    const uint8_t* __restrict__ next_scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, const int32_t* __restrict__ route_order,
+    const float* __restrict__ topk_weights, int routes, __nv_bfloat16* __restrict__ intermediate,
     float* __restrict__ output_acc) {
   constexpr int STAGE_K = 4096;
   constexpr int OPW = TILE_N / 8;
@@ -613,11 +552,9 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
     if (unsigned(e) < E) {
       const int blk = int(blockIdx.x) + int(gridDim.x) * int(blockIdx.y);
       if (blk < PDL_WARM_BLOCKS) {
-        const uint8_t* wp =
-            packed + (size_t(e) * N + size_t(ntile) * TILE_N) * (K / 2);
+        const uint8_t* wp = packed + (size_t(e) * N + size_t(ntile) * TILE_N) * (K / 2);
         constexpr int WB = TILE_N * (K / 2);
-        for (int o = int(threadIdx.x) * 128; o < WB;
-             o += int(blockDim.x) * 128)
+        for (int o = int(threadIdx.x) * 128; o < WB; o += int(blockDim.x) * 128)
           asm volatile("prefetch.global.L2 [%0];" : : "l"(wp + o));
       }
     }
@@ -628,16 +565,14 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
     const int blocks = int(gridDim.x) * int(gridDim.y);
     const int total = (routes / TOPK) * (H / 2);
     auto* out32 = reinterpret_cast<uint32_t*>(output_acc);
-    for (int x = block * blockDim.x + threadIdx.x; x < total;
-         x += blocks * blockDim.x) {
+    for (int x = block * blockDim.x + threadIdx.x; x < total; x += blocks * blockDim.x) {
       out32[x] = 0u;
     }
   }
   if (unsigned(e) >= E) {
     if constexpr (FIRST) {
       for (int j = threadIdx.x; j < TILE_N; j += blockDim.x) {
-        intermediate[size_t(r) * N + ntile * TILE_N + j] =
-            __float2bfloat16_rn(0.0f);
+        intermediate[size_t(r) * N + ntile * TILE_N + j] = __float2bfloat16_rn(0.0f);
       }
     }
     return;
@@ -656,15 +591,14 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
     const int this_k = min(STAGE_K, K - kt);
     if constexpr (!WIDE) {
       for (int p = threadIdx.x; p < this_k / 2; p += blockDim.x) {
-        const __nv_bfloat162 xb = *reinterpret_cast<const __nv_bfloat162*>(
-            input + size_t(input_row) * K + kt + p * 2);
+        const __nv_bfloat162 xb =
+            *reinterpret_cast<const __nv_bfloat162*>(input + size_t(input_row) * K + kt + p * 2);
         const int group = p >> 3;
         const int in_group = p & 7;
         const int logical_segment = group * 2 + (in_group >> 2);
         const int physical_segment = logical_segment ^ (group & 7);
         const int physical_pair = physical_segment * 4 + (in_group & 3);
-        reinterpret_cast<__half2*>(sx)[physical_pair] =
-            __float22half2_rn(__bfloat1622float2(xb));
+        reinterpret_cast<__half2*>(sx)[physical_pair] = __float22half2_rn(__bfloat1622float2(xb));
       }
       __syncthreads();
     }
@@ -676,8 +610,7 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
         if (group + 1 < groups) {
           uint32_t xv0[8];
           uint32_t xv1[8];
-          const __nv_bfloat16* xg =
-              input + size_t(input_row) * K + kt + group * 16;
+          const __nv_bfloat16* xg = input + size_t(input_row) * K + kt + group * 16;
           load_bf16x16_u32x8(xg, xv0);
           load_bf16x16_u32x8(xg + 16, xv1);
 #pragma unroll
@@ -685,8 +618,7 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
             const int n = nbase + j;
             const size_t row = size_t(e) * N + n;
             const int kg = (kt >> 4) + group;
-            const U64x2 q16 = load_cg_u128(
-                packed + row * KHALF + size_t(kg) * 8);
+            const U64x2 q16 = load_cg_u128(packed + row * KHALF + size_t(kg) * 8);
             const uint64_t qlo = q16.x;
             const uint64_t qhi = q16.y;
             uint32_t hsum0 = 0u;
@@ -694,22 +626,18 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
             uint32_t wv[4];
             e2m1x8_to_bf16x2x4(uint32_t(qlo), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum0 = fma_bf16x2(xv0[p], wv[p], hsum0);
+            for (int p = 0; p < 4; ++p) hsum0 = fma_bf16x2(xv0[p], wv[p], hsum0);
             e2m1x8_to_bf16x2x4(uint32_t(qlo >> 32), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum0 = fma_bf16x2(xv0[p + 4], wv[p], hsum0);
+            for (int p = 0; p < 4; ++p) hsum0 = fma_bf16x2(xv0[p + 4], wv[p], hsum0);
             e2m1x8_to_bf16x2x4(uint32_t(qhi), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum1 = fma_bf16x2(xv1[p], wv[p], hsum1);
+            for (int p = 0; p < 4; ++p) hsum1 = fma_bf16x2(xv1[p], wv[p], hsum1);
             e2m1x8_to_bf16x2x4(uint32_t(qhi >> 32), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum1 = fma_bf16x2(xv1[p + 4], wv[p], hsum1);
-            const float2 sf = fp8_e4m3fnx2_to_float2(
-                *reinterpret_cast<const uint16_t*>(scales + row * KG + kg));
+            for (int p = 0; p < 4; ++p) hsum1 = fma_bf16x2(xv1[p + 4], wv[p], hsum1);
+            const float2 sf =
+                fp8_e4m3fnx2_to_float2(*reinterpret_cast<const uint16_t*>(scales + row * KG + kg));
             acc[j] = fmaf(sum_bf16x2(hsum0), sf.x, acc[j]);
             acc[j] = fmaf(sum_bf16x2(hsum1), sf.y, acc[j]);
           }
@@ -719,36 +647,31 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
       for (int group_base = 0; group_base < groups; group_base += 32) {
         const int group = group_base + lane;
         if (group < groups) {
-      __half2 xv[8];
+          __half2 xv[8];
 #pragma unroll
-      for (int p = 0; p < 8; ++p) {
-        const int logical_segment = group * 2 + (p >> 2);
-        const int physical_segment = logical_segment ^ (group & 7);
-        xv[p] = reinterpret_cast<const __half2*>(sx)[physical_segment * 4 +
-                                                      (p & 3)];
-      }
+          for (int p = 0; p < 8; ++p) {
+            const int logical_segment = group * 2 + (p >> 2);
+            const int physical_segment = logical_segment ^ (group & 7);
+            xv[p] = reinterpret_cast<const __half2*>(sx)[physical_segment * 4 + (p & 3)];
+          }
 
 #pragma unroll
-      for (int j = 0; j < OPW; ++j) {
-        const int n = nbase + j;
-        const size_t row = size_t(e) * N + n;
-        const int kg = (kt >> 4) + group;
-        const void* qptr = packed + row * KHALF + size_t(kg) * 8;
-        const uint64_t q8 = TILE_N >= 32
-                                ? load_cg_l2_256_u64(qptr)
-                                : *reinterpret_cast<const uint64_t*>(qptr);
-        __half2 hsum = __float2half2_rn(0.0f);
+          for (int j = 0; j < OPW; ++j) {
+            const int n = nbase + j;
+            const size_t row = size_t(e) * N + n;
+            const int kg = (kt >> 4) + group;
+            const void* qptr = packed + row * KHALF + size_t(kg) * 8;
+            const uint64_t q8 =
+                TILE_N >= 32 ? load_cg_l2_256_u64(qptr) : *reinterpret_cast<const uint64_t*>(qptr);
+            __half2 hsum = __float2half2_rn(0.0f);
 #pragma unroll
-        for (int p = 0; p < 8; ++p) {
-          hsum = __hfma2(xv[p], e2m1x2_to_half2(uint8_t(q8 >> (p * 8))),
-                          hsum);
-        }
-        const float2 pair = __half22float2(hsum);
-        const float sf = fp8_e4m3fnx2_to_float2(
-                             uint16_t(scales[row * KG + kg]))
-                             .x;
-        acc[j] = fmaf(pair.x + pair.y, sf, acc[j]);
-      }
+            for (int p = 0; p < 8; ++p) {
+              hsum = __hfma2(xv[p], e2m1x2_to_half2(uint8_t(q8 >> (p * 8))), hsum);
+            }
+            const float2 pair = __half22float2(hsum);
+            const float sf = fp8_e4m3fnx2_to_float2(uint16_t(scales[row * KG + kg])).x;
+            acc[j] = fmaf(pair.x + pair.y, sf, acc[j]);
+          }
         }
       }
     }
@@ -761,14 +684,12 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
     for (int j = 0; j < OPW; ++j) red[j] = warp_sum(acc[j]);
     if (lane == 0) {
       const float scale = alpha[e] * topk_weights[r];
-      auto* dst = reinterpret_cast<__nv_bfloat162*>(output_acc) +
-                  size_t(r / TOPK) * (H / 2) + nbase / 2;
+      auto* dst =
+          reinterpret_cast<__nv_bfloat162*>(output_acc) + size_t(r / TOPK) * (H / 2) + nbase / 2;
 #pragma unroll
       for (int j = 0; j < OPW; j += 4) {
-        const __nv_bfloat162 v0 =
-            __floats2bfloat162_rn(red[j] * scale, red[j + 1] * scale);
-        const __nv_bfloat162 v1 =
-            __floats2bfloat162_rn(red[j + 2] * scale, red[j + 3] * scale);
+        const __nv_bfloat162 v0 = __floats2bfloat162_rn(red[j] * scale, red[j + 1] * scale);
+        const __nv_bfloat162 v1 = __floats2bfloat162_rn(red[j + 2] * scale, red[j + 3] * scale);
         red_bf16x2_v2(dst + j / 2, v0, v1);
       }
     }
@@ -789,8 +710,7 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
         } p01, p23;
         p01.bf = __floats2bfloat162_rn(v0 * v0, v1 * v1);
         p23.bf = __floats2bfloat162_rn(v2 * v2, v3 * v3);
-        *reinterpret_cast<uint2*>(intermediate + size_t(r) * N + nbase) =
-            make_uint2(p01.u, p23.u);
+        *reinterpret_cast<uint2*>(intermediate + size_t(r) * N + nbase) = make_uint2(p01.u, p23.u);
         // Release this warp's intermediate tile to device scope as soon as it
         // is written, so the PDL completion signal below is ordered after it
         // without a block-wide fence on the critical path.
@@ -802,8 +722,7 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
         } p01, p23;
         p01.bf = __floats2bfloat162_rn(red[0] * al, red[1] * al);
         p23.bf = __floats2bfloat162_rn(red[2] * al, red[3] * al);
-        *reinterpret_cast<uint2*>(intermediate + size_t(r) * N + nbase) =
-            make_uint2(p01.u, p23.u);
+        *reinterpret_cast<uint2*>(intermediate + size_t(r) * N + nbase) = make_uint2(p01.u, p23.u);
       } else {
 #pragma unroll
         for (int j = 0; j < OPW; ++j) {
@@ -835,17 +754,13 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
       const int ptile = item / routes;
       const int pe = ids[proute];
       if (unsigned(pe) < E && ptile < H / TILE_N) {
-        const uint8_t* wp =
-            next_packed + (size_t(pe) * H + size_t(ptile) * TILE_N) * (I / 2);
+        const uint8_t* wp = next_packed + (size_t(pe) * H + size_t(ptile) * TILE_N) * (I / 2);
         constexpr int WB = TILE_N * (I / 2);
-        for (int o = int(threadIdx.x) * 128; o < WB;
-             o += int(blockDim.x) * 128)
+        for (int o = int(threadIdx.x) * 128; o < WB; o += int(blockDim.x) * 128)
           asm volatile("prefetch.global.L2 [%0];" : : "l"(wp + o));
-        const uint8_t* sp = next_scales +
-            (size_t(pe) * H + size_t(ptile) * TILE_N) * (I / 16);
+        const uint8_t* sp = next_scales + (size_t(pe) * H + size_t(ptile) * TILE_N) * (I / 16);
         constexpr int SB = TILE_N * (I / 16);
-        for (int o = int(threadIdx.x) * 128; o < SB;
-             o += int(blockDim.x) * 128)
+        for (int o = int(threadIdx.x) * 128; o < SB; o += int(blockDim.x) * 128)
           asm volatile("prefetch.global.L2 [%0];" : : "l"(sp + o));
       }
     }
@@ -855,17 +770,13 @@ __global__ __launch_bounds__(256, 4) void decode_group16_half_kernel(
     __syncthreads();
     if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
   }
-
 }
 
 template <int K, int N, int KG, int TILE_N>
 __global__ __launch_bounds__(256, 2) void decode_fc1_pair_half_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    __nv_bfloat16* __restrict__ intermediate,
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, __nv_bfloat16* __restrict__ intermediate,
     __nv_bfloat16* __restrict__ output) {
   constexpr int OPW = TILE_N / 8;
   constexpr int KHALF = K / 2;
@@ -881,8 +792,7 @@ __global__ __launch_bounds__(256, 2) void decode_fc1_pair_half_kernel(
   const int block = int(blockIdx.x) + int(gridDim.x) * int(blockIdx.y);
   const int blocks = int(gridDim.x) * int(gridDim.y);
   auto* out32 = reinterpret_cast<uint32_t*>(output);
-  for (int i = block * blockDim.x + threadIdx.x;
-       i < 16 * (H / 2); i += blocks * blockDim.x) {
+  for (int i = block * blockDim.x + threadIdx.x; i < 16 * (H / 2); i += blocks * blockDim.x) {
     out32[i] = 0u;
   }
   float acc0[OPW];
@@ -911,31 +821,26 @@ __global__ __launch_bounds__(256, 2) void decode_fc1_pair_half_kernel(
           if (unsigned(e) < E) {
             const size_t row = size_t(e) * N + n;
             const int kg = group;
-            const U64x2 q16 =
-                load_cg_u128(packed + row * KHALF + size_t(kg) * 8);
+            const U64x2 q16 = load_cg_u128(packed + row * KHALF + size_t(kg) * 8);
             __half2 hsum0 = __float2half2_rn(0.0f);
             __half2 hsum1 = __float2half2_rn(0.0f);
             __half2 wv[4];
             e2m1x8_to_half2x4(uint32_t(q16.x), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum0 = __hfma2(xv0[p], wv[p], hsum0);
+            for (int p = 0; p < 4; ++p) hsum0 = __hfma2(xv0[p], wv[p], hsum0);
             e2m1x8_to_half2x4(uint32_t(q16.x >> 32), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum0 = __hfma2(xv0[p + 4], wv[p], hsum0);
+            for (int p = 0; p < 4; ++p) hsum0 = __hfma2(xv0[p + 4], wv[p], hsum0);
             e2m1x8_to_half2x4(uint32_t(q16.y), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum1 = __hfma2(xv1[p], wv[p], hsum1);
+            for (int p = 0; p < 4; ++p) hsum1 = __hfma2(xv1[p], wv[p], hsum1);
             e2m1x8_to_half2x4(uint32_t(q16.y >> 32), wv);
 #pragma unroll
-            for (int p = 0; p < 4; ++p)
-              hsum1 = __hfma2(xv1[p + 4], wv[p], hsum1);
+            for (int p = 0; p < 4; ++p) hsum1 = __hfma2(xv1[p + 4], wv[p], hsum1);
             const float2 pair0 = __half22float2(hsum0);
             const float2 pair1 = __half22float2(hsum1);
-            const float2 sf = fp8_e4m3fnx2_to_float2(
-                *reinterpret_cast<const uint16_t*>(scales + row * KG + kg));
+            const float2 sf =
+                fp8_e4m3fnx2_to_float2(*reinterpret_cast<const uint16_t*>(scales + row * KG + kg));
             float& dst = rr == 0 ? acc0[j] : acc1[j];
             dst = fmaf(pair0.x + pair0.y, sf.x, dst);
             dst = fmaf(pair1.x + pair1.y, sf.y, dst);
@@ -972,21 +877,16 @@ __global__ __launch_bounds__(256, 2) void decode_fc1_pair_half_kernel(
       } p01, p23;
       p01.bf = __floats2bfloat162_rn(v0 * v0, v1 * v1);
       p23.bf = __floats2bfloat162_rn(v2 * v2, v3 * v3);
-      *reinterpret_cast<uint2*>(intermediate + size_t(r) * N + nbase) =
-          make_uint2(p01.u, p23.u);
+      *reinterpret_cast<uint2*>(intermediate + size_t(r) * N + nbase) = make_uint2(p01.u, p23.u);
     }
   }
 }
 
 template <int K, int N, int KG, int NTILES, int TILE_N>
 __global__ __launch_bounds__(256, 2) void decode_fc2_token_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ ids,
-    const float* __restrict__ topk_weights,
-    int tokens,
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ ids, const float* __restrict__ topk_weights, int tokens,
     __nv_bfloat16* __restrict__ output) {
   constexpr int OPW = TILE_N / 8;
   constexpr int KHALF = K / 2;
@@ -1006,15 +906,14 @@ __global__ __launch_bounds__(256, 2) void decode_fc2_token_kernel(
     const int e = ids[r];
     if (unsigned(e) < E) {
       for (int p = threadIdx.x; p < K / 2; p += blockDim.x) {
-        const __nv_bfloat162 xb = *reinterpret_cast<const __nv_bfloat162*>(
-            input + size_t(r) * K + p * 2);
+        const __nv_bfloat162 xb =
+            *reinterpret_cast<const __nv_bfloat162*>(input + size_t(r) * K + p * 2);
         const int group = p >> 3;
         const int in_group = p & 7;
         const int logical_segment = group * 2 + (in_group >> 2);
         const int physical_segment = logical_segment ^ (group & 7);
         const int physical_pair = physical_segment * 4 + (in_group & 3);
-        reinterpret_cast<__half2*>(sx)[physical_pair] =
-            __float22half2_rn(__bfloat1622float2(xb));
+        reinterpret_cast<__half2*>(sx)[physical_pair] = __float22half2_rn(__bfloat1622float2(xb));
       }
       __syncthreads();
 
@@ -1030,26 +929,21 @@ __global__ __launch_bounds__(256, 2) void decode_fc2_token_kernel(
           for (int p = 0; p < 8; ++p) {
             const int logical_segment = group * 2 + (p >> 2);
             const int physical_segment = logical_segment ^ (group & 7);
-            xv[p] = reinterpret_cast<const __half2*>(sx)[
-                physical_segment * 4 + (p & 3)];
+            xv[p] = reinterpret_cast<const __half2*>(sx)[physical_segment * 4 + (p & 3)];
           }
 #pragma unroll
           for (int j = 0; j < OPW; ++j) {
             const int n = nbase + j;
             const size_t row = size_t(e) * N + n;
-            const uint64_t q8 = *reinterpret_cast<const uint64_t*>(
-                packed + row * KHALF + size_t(group) * 8);
+            const uint64_t q8 =
+                *reinterpret_cast<const uint64_t*>(packed + row * KHALF + size_t(group) * 8);
             __half2 hsum = __float2half2_rn(0.0f);
 #pragma unroll
             for (int p = 0; p < 8; ++p) {
-              hsum = __hfma2(xv[p],
-                              e2m1x2_to_half2(uint8_t(q8 >> (p * 8))),
-                              hsum);
+              hsum = __hfma2(xv[p], e2m1x2_to_half2(uint8_t(q8 >> (p * 8))), hsum);
             }
             const float2 pair = __half22float2(hsum);
-            const float sf = fp8_e4m3fnx2_to_float2(
-                                 uint16_t(scales[row * KG + group]))
-                                 .x;
+            const float sf = fp8_e4m3fnx2_to_float2(uint16_t(scales[row * KG + group])).x;
             acc[j] = fmaf(pair.x + pair.y, sf, acc[j]);
           }
         }
@@ -1067,8 +961,7 @@ __global__ __launch_bounds__(256, 2) void decode_fc2_token_kernel(
   if (lane == 0) {
 #pragma unroll
     for (int j = 0; j < OPW; j += 2) {
-      *reinterpret_cast<__nv_bfloat162*>(
-          output + size_t(tok) * N + nbase + j) =
+      *reinterpret_cast<__nv_bfloat162*>(output + size_t(tok) * N + nbase + j) =
           __floats2bfloat162_rn(total[j], total[j + 1]);
     }
   }
@@ -1091,14 +984,10 @@ __device__ __forceinline__ int find_expert(int block, const int32_t* tiles) {
 
 template <int K, int N, int KG, int NTILES, bool FIRST>
 __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    __nv_bfloat16* __restrict__ output) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, __nv_bfloat16* __restrict__ output) {
   if (int(blockIdx.x) >= tiles[E]) return;
   const int e = find_expert<NTILES>(int(blockIdx.x), tiles);
   const int local = int(blockIdx.x) - tiles[e];
@@ -1127,12 +1016,8 @@ __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
   }
   __syncthreads();
 
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
-                 wmma::row_major>
-      af;
-  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
-                 wmma::col_major>
-      bf;
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> af;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> bf;
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
   wmma::fill_fragment(cf, 0.0f);
 
@@ -1166,8 +1051,7 @@ __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
         sf = __shfl_sync(0xffffffffu, sf, lane & ~7);
         const int dst = nl * MMA_K + sg * 16 + pair * 2;
         bs[dst] = __float2bfloat16_rn(e2m1_bits_to_float(q & 15) * sf);
-        bs[dst + 1] =
-            __float2bfloat16_rn(e2m1_bits_to_float(q >> 4) * sf);
+        bs[dst + 1] = __float2bfloat16_rn(e2m1_bits_to_float(q >> 4) * sf);
       }
     }
     __syncthreads();
@@ -1195,26 +1079,19 @@ __global__ __launch_bounds__(128) void grouped_wmma64_kernel(
             __float2bfloat16_rn(v * v);
       } else {
         const int r = sroutes[m];
-        output[size_t(r) * N + ntile * MMA_N + warp * 16 + n] =
-            __float2bfloat16_rn(v);
+        output[size_t(r) * N + ntile * MMA_N + warp * 16 + n] = __float2bfloat16_rn(v);
       }
     }
   }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N,
-          int BLOCK_THREADS, int MM, int NS, bool FOLD_SCALE, bool FIRST,
-          bool ATOMIC_COMBINE>
-__global__ __launch_bounds__(BLOCK_THREADS, 2)
-void grouped_mma_bf16_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    const float* __restrict__ topk_weights,
+template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS, int MM, int NS,
+          bool FOLD_SCALE, bool FIRST, bool ATOMIC_COMBINE>
+__global__ __launch_bounds__(BLOCK_THREADS, 2) void grouped_mma_bf16_kernel(
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, const float* __restrict__ topk_weights,
     __nv_bfloat16* __restrict__ output) {
   if (int(blockIdx.x) >= tiles[E]) return;
   const int e = find_expert<NTILES>(int(blockIdx.x), tiles);
@@ -1252,51 +1129,50 @@ void grouped_mma_bf16_kernel(
   constexpr int KHALF = K / 2;
   constexpr int NKS = (K + GMMA_K - 1) / GMMA_K;
 
-#define STAGE_KCHUNK(KI, BUF)                                                 \
-  {                                                                           \
-    const int k0 = (KI) * GMMA_K;                                             \
-    const int stage_k = min(GMMA_K, K - k0);                                  \
-    for (int idx = tid; idx < MM * (GMMA_K / 8); idx += BLOCK_THREADS) {      \
-      const int m = idx / (GMMA_K / 8);                                       \
-      const int chunk = idx - m * (GMMA_K / 8);                               \
-      const int r = sroutes[m];                                               \
-      const void* src = input;                                                \
-      int src_bytes = 0;                                                      \
-      if (r >= 0 && chunk * 8 < stage_k) {                                    \
-        const int input_row = FIRST ? (r / TOPK) : (offsets[e] + m0 + m);     \
-        src = input + size_t(input_row) * K + k0 + chunk * 8;                 \
-        src_bytes = 16;                                                       \
-      }                                                                       \
-      const int pair = chunk * 4;                                             \
-      cp_async_16(&as[BUF][m][pair ^ ((m & 7) << 2)], src, src_bytes);        \
-    }                                                                         \
-    for (int idx = tid; idx < TILE_N * (GMMA_K / 32); idx += BLOCK_THREADS) { \
-      const int nr = idx / (GMMA_K / 32);                                     \
-      const int chunk = idx - nr * (GMMA_K / 32);                             \
-      const int n = ntile * TILE_N + nr;                                      \
-      const size_t row = size_t(e) * N + (n < N ? n : (N - 1));               \
-      const void* src = packed;                                               \
-      int src_bytes = 0;                                                      \
-      if (chunk * 32 < stage_k && n < N) {                                    \
-        src = packed + row * KHALF + (k0 >> 1) + chunk * 16;                  \
-        src_bytes = 16;                                                       \
-      }                                                                       \
-      const int physical_segment = chunk ^ ((nr >> 1) & 3);                   \
-      cp_async_16(&bs[BUF][nr][physical_segment * 4], src, src_bytes);        \
-    }                                                                         \
-    cp_async_commit();                                                        \
-    for (int idx = tid; idx < TILE_N * (GMMA_K / 64); idx += BLOCK_THREADS) { \
-      const int nr = idx / (GMMA_K / 64);                                     \
-      const int word = idx - nr * (GMMA_K / 64);                              \
-      const int n = ntile * TILE_N + nr;                                      \
-      const size_t row = size_t(e) * N + (n < N ? n : (N - 1));               \
-      uint32_t sv = 0;                                                        \
-      if (word * 64 < stage_k && n < N) {                                     \
-        sv = *reinterpret_cast<const uint32_t*>(scales + row * KG +           \
-                                                (k0 >> 4) + word * 4);        \
-      }                                                                       \
-      ss[BUF][nr][word] = sv;                                                 \
-    }                                                                         \
+#define STAGE_KCHUNK(KI, BUF)                                                              \
+  {                                                                                        \
+    const int k0 = (KI) * GMMA_K;                                                          \
+    const int stage_k = min(GMMA_K, K - k0);                                               \
+    for (int idx = tid; idx < MM * (GMMA_K / 8); idx += BLOCK_THREADS) {                   \
+      const int m = idx / (GMMA_K / 8);                                                    \
+      const int chunk = idx - m * (GMMA_K / 8);                                            \
+      const int r = sroutes[m];                                                            \
+      const void* src = input;                                                             \
+      int src_bytes = 0;                                                                   \
+      if (r >= 0 && chunk * 8 < stage_k) {                                                 \
+        const int input_row = FIRST ? (r / TOPK) : (offsets[e] + m0 + m);                  \
+        src = input + size_t(input_row) * K + k0 + chunk * 8;                              \
+        src_bytes = 16;                                                                    \
+      }                                                                                    \
+      const int pair = chunk * 4;                                                          \
+      cp_async_16(&as[BUF][m][pair ^ ((m & 7) << 2)], src, src_bytes);                     \
+    }                                                                                      \
+    for (int idx = tid; idx < TILE_N * (GMMA_K / 32); idx += BLOCK_THREADS) {              \
+      const int nr = idx / (GMMA_K / 32);                                                  \
+      const int chunk = idx - nr * (GMMA_K / 32);                                          \
+      const int n = ntile * TILE_N + nr;                                                   \
+      const size_t row = size_t(e) * N + (n < N ? n : (N - 1));                            \
+      const void* src = packed;                                                            \
+      int src_bytes = 0;                                                                   \
+      if (chunk * 32 < stage_k && n < N) {                                                 \
+        src = packed + row * KHALF + (k0 >> 1) + chunk * 16;                               \
+        src_bytes = 16;                                                                    \
+      }                                                                                    \
+      const int physical_segment = chunk ^ ((nr >> 1) & 3);                                \
+      cp_async_16(&bs[BUF][nr][physical_segment * 4], src, src_bytes);                     \
+    }                                                                                      \
+    cp_async_commit();                                                                     \
+    for (int idx = tid; idx < TILE_N * (GMMA_K / 64); idx += BLOCK_THREADS) {              \
+      const int nr = idx / (GMMA_K / 64);                                                  \
+      const int word = idx - nr * (GMMA_K / 64);                                           \
+      const int n = ntile * TILE_N + nr;                                                   \
+      const size_t row = size_t(e) * N + (n < N ? n : (N - 1));                            \
+      uint32_t sv = 0;                                                                     \
+      if (word * 64 < stage_k && n < N) {                                                  \
+        sv = *reinterpret_cast<const uint32_t*>(scales + row * KG + (k0 >> 4) + word * 4); \
+      }                                                                                    \
+      ss[BUF][nr][word] = sv;                                                              \
+    }                                                                                      \
   }
 
   STAGE_KCHUNK(0, 0)
@@ -1314,41 +1190,38 @@ void grouped_mma_bf16_kernel(
 #pragma unroll 1
     for (int sk = 0; sk < GMMA_K / 16; ++sk) {
       if constexpr (FOLD_SCALE) {
-      uint32_t bb0[2], bb1[2];
+        uint32_t bb0[2], bb1[2];
 #pragma unroll
-      for (int atom = 0; atom < 2; ++atom) {
-        const int nr = warp * 16 + atom * 8 + g;
-        const int physical_segment = (sk >> 1) ^ ((nr >> 1) & 3);
-        const int word = physical_segment * 4 + (sk & 1) * 2;
-        const uint32_t p0 = bs[buf][nr][word];
-        const uint32_t p1 = bs[buf][nr][word + 1];
-        uint32_t b0 = e2m1x2_to_bf16x2(uint8_t(p0 >> (q * 8)));
-        uint32_t b1 = e2m1x2_to_bf16x2(uint8_t(p1 >> (q * 8)));
-        const uint8_t sbyte =
-            uint8_t(ss[buf][nr][sk >> 2] >> ((sk & 3) * 8));
-        const uint32_t sbits = fp8_e4m3fn_broadcast_bf16x2(sbyte);
-        asm("mul.rn.bf16x2 %0, %0, %1;" : "+r"(b0) : "r"(sbits));
-        asm("mul.rn.bf16x2 %0, %0, %1;" : "+r"(b1) : "r"(sbits));
-        bb0[atom] = b0;
-        bb1[atom] = b1;
-      }
+        for (int atom = 0; atom < 2; ++atom) {
+          const int nr = warp * 16 + atom * 8 + g;
+          const int physical_segment = (sk >> 1) ^ ((nr >> 1) & 3);
+          const int word = physical_segment * 4 + (sk & 1) * 2;
+          const uint32_t p0 = bs[buf][nr][word];
+          const uint32_t p1 = bs[buf][nr][word + 1];
+          uint32_t b0 = e2m1x2_to_bf16x2(uint8_t(p0 >> (q * 8)));
+          uint32_t b1 = e2m1x2_to_bf16x2(uint8_t(p1 >> (q * 8)));
+          const uint8_t sbyte = uint8_t(ss[buf][nr][sk >> 2] >> ((sk & 3) * 8));
+          const uint32_t sbits = fp8_e4m3fn_broadcast_bf16x2(sbyte);
+          asm("mul.rn.bf16x2 %0, %0, %1;" : "+r"(b0) : "r"(sbits));
+          asm("mul.rn.bf16x2 %0, %0, %1;" : "+r"(b1) : "r"(sbits));
+          bb0[atom] = b0;
+          bb1[atom] = b1;
+        }
 #pragma unroll
-      for (int mi = 0; mi < MA; ++mi) {
-        if (mi < active_atoms) {
-          const int row = mi * 16 + (lane & 15);
-          const int logical_segment = sk * 2 + (lane >> 4);
-          const int physical_segment = logical_segment ^ (row & 7);
-          uint32_t a0, a1, a2, a3;
-          ldmatrix_m8n8x4_b16(a0, a1, a2, a3,
-                              &as[buf][row][physical_segment * 4]);
+        for (int mi = 0; mi < MA; ++mi) {
+          if (mi < active_atoms) {
+            const int row = mi * 16 + (lane & 15);
+            const int logical_segment = sk * 2 + (lane >> 4);
+            const int physical_segment = logical_segment ^ (row & 7);
+            uint32_t a0, a1, a2, a3;
+            ldmatrix_m8n8x4_b16(a0, a1, a2, a3, &as[buf][row][physical_segment * 4]);
 #pragma unroll
-          for (int atom = 0; atom < 2; ++atom) {
-            mma_m16n8k16_bf16(acc[mi][atom][0], acc[mi][atom][1],
-                              acc[mi][atom][2], acc[mi][atom][3],
-                              a0, a1, a2, a3, bb0[atom], bb1[atom]);
+            for (int atom = 0; atom < 2; ++atom) {
+              mma_m16n8k16_bf16(acc[mi][atom][0], acc[mi][atom][1], acc[mi][atom][2],
+                                acc[mi][atom][3], a0, a1, a2, a3, bb0[atom], bb1[atom]);
+            }
           }
         }
-      }
       } else {
 #pragma unroll
         for (int atom = 0; atom < 2; ++atom) {
@@ -1357,15 +1230,12 @@ void grouped_mma_bf16_kernel(
           const int word = physical_segment * 4 + (sk & 1) * 2;
           const uint32_t p0 = bs[buf][nr][word];
           const uint32_t p1 = bs[buf][nr][word + 1];
-          const uint32_t b0 =
-              e2m1x2_to_bf16x2(uint8_t(p0 >> (q * 8)));
-          const uint32_t b1 =
-              e2m1x2_to_bf16x2(uint8_t(p1 >> (q * 8)));
+          const uint32_t b0 = e2m1x2_to_bf16x2(uint8_t(p0 >> (q * 8)));
+          const uint32_t b1 = e2m1x2_to_bf16x2(uint8_t(p1 >> (q * 8)));
           const int nr0 = warp * 16 + atom * 8 + q * 2;
           const int shift = (sk & 3) * 8;
-          const uint16_t sps =
-              uint16_t(uint8_t(ss[buf][nr0][sk >> 2] >> shift)) |
-              (uint16_t(uint8_t(ss[buf][nr0 + 1][sk >> 2] >> shift)) << 8);
+          const uint16_t sps = uint16_t(uint8_t(ss[buf][nr0][sk >> 2] >> shift)) |
+                               (uint16_t(uint8_t(ss[buf][nr0 + 1][sk >> 2] >> shift)) << 8);
           const float2 sf = fp8_e4m3fnx2_to_float2(sps);
 #pragma unroll
           for (int mi = 0; mi < MA; ++mi) {
@@ -1374,8 +1244,7 @@ void grouped_mma_bf16_kernel(
               const int logical_segment = sk * 2 + (lane >> 4);
               const int physical_segment = logical_segment ^ (row & 7);
               uint32_t a0, a1, a2, a3;
-              ldmatrix_m8n8x4_b16(a0, a1, a2, a3,
-                                  &as[buf][row][physical_segment * 4]);
+              ldmatrix_m8n8x4_b16(a0, a1, a2, a3, &as[buf][row][physical_segment * 4]);
               float t0 = 0.0f, t1 = 0.0f, t2 = 0.0f, t3 = 0.0f;
               mma_m16n8k16_bf16(t0, t1, t2, t3, a0, a1, a2, a3, b0, b1);
               acc[mi][atom][0] = fmaf(t0, sf.x, acc[mi][atom][0]);
@@ -1398,52 +1267,44 @@ void grouped_mma_bf16_kernel(
 #pragma unroll
   for (int mi = 0; mi < MA; ++mi)
 #pragma unroll
-  for (int atom = 0; atom < 2; ++atom) {
-    const int n0 = ntile * TILE_N + warp * 16 + atom * 8 + q * 2;
-    const int rows[2] = {mi * 16 + g, mi * 16 + g + 8};
+    for (int atom = 0; atom < 2; ++atom) {
+      const int n0 = ntile * TILE_N + warp * 16 + atom * 8 + q * 2;
+      const int rows[2] = {mi * 16 + g, mi * 16 + g + 8};
 #pragma unroll
-    for (int rr = 0; rr < 2; ++rr) {
-      const int m = rows[rr];
-      if (m < valid_m && n0 < N) {
-        const int grouped_row = offsets[e] + m0 + m;
-        const int r = sroutes[m];
-        float v0 = acc[mi][atom][rr * 2] * al;
-        float v1 = acc[mi][atom][rr * 2 + 1] * al;
-        if constexpr (FIRST) {
-          v0 = fmaxf(v0, 0.0f);
-          v1 = fmaxf(v1, 0.0f);
-          *reinterpret_cast<__nv_bfloat162*>(
-              output + size_t(grouped_row) * N + n0) =
-              __floats2bfloat162_rn(v0 * v0, v1 * v1);
-        } else {
-          if constexpr (ATOMIC_COMBINE) {
-            const float w = topk_weights[r];
-            atomicAdd(reinterpret_cast<__nv_bfloat162*>(
-                          output + size_t(r / TOPK) * N + n0),
-                      __floats2bfloat162_rn(v0 * w, v1 * w));
+      for (int rr = 0; rr < 2; ++rr) {
+        const int m = rows[rr];
+        if (m < valid_m && n0 < N) {
+          const int grouped_row = offsets[e] + m0 + m;
+          const int r = sroutes[m];
+          float v0 = acc[mi][atom][rr * 2] * al;
+          float v1 = acc[mi][atom][rr * 2 + 1] * al;
+          if constexpr (FIRST) {
+            v0 = fmaxf(v0, 0.0f);
+            v1 = fmaxf(v1, 0.0f);
+            *reinterpret_cast<__nv_bfloat162*>(output + size_t(grouped_row) * N + n0) =
+                __floats2bfloat162_rn(v0 * v0, v1 * v1);
           } else {
-            *reinterpret_cast<__nv_bfloat162*>(output + size_t(r) * N + n0) =
-                __floats2bfloat162_rn(v0, v1);
+            if constexpr (ATOMIC_COMBINE) {
+              const float w = topk_weights[r];
+              atomicAdd(reinterpret_cast<__nv_bfloat162*>(output + size_t(r / TOPK) * N + n0),
+                        __floats2bfloat162_rn(v0 * w, v1 * w));
+            } else {
+              *reinterpret_cast<__nv_bfloat162*>(output + size_t(r) * N + n0) =
+                  __floats2bfloat162_rn(v0, v1);
+            }
           }
         }
       }
     }
-  }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST,
-          bool ROUTE_OUTPUT = false>
+template <int K, int N, int KG, int NTILES, int TILE_N, bool FIRST, bool ROUTE_OUTPUT = false>
 __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    const float* __restrict__ topk_weights,
-    __nv_bfloat16* __restrict__ intermediate,
-    float* __restrict__ output_acc) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, const float* __restrict__ topk_weights,
+    __nv_bfloat16* __restrict__ intermediate, float* __restrict__ output_acc) {
   constexpr int STAGE_K = 512;
   constexpr int OPW = TILE_N / 8;
   if (int(blockIdx.x) >= tiles[E]) return;
@@ -1458,8 +1319,7 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
   __shared__ __align__(16) __half sx[MT][STAGE_K];
   __shared__ int sroutes[MT];
   if (threadIdx.x < MT) {
-    sroutes[threadIdx.x] =
-        threadIdx.x < valid_m ? route_list[offsets[e] + m0 + threadIdx.x] : -1;
+    sroutes[threadIdx.x] = threadIdx.x < valid_m ? route_list[offsets[e] + m0 + threadIdx.x] : -1;
   }
   __syncthreads();
 
@@ -1481,8 +1341,8 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
       __half2 xh = __float2half2_rn(0.0f);
       if (r >= 0) {
         const int input_row = FIRST ? (r / TOPK) : r;
-        const __nv_bfloat162 xb = *reinterpret_cast<const __nv_bfloat162*>(
-            input + size_t(input_row) * K + kt + p * 2);
+        const __nv_bfloat162 xb =
+            *reinterpret_cast<const __nv_bfloat162*>(input + size_t(input_row) * K + kt + p * 2);
         xh = __float22half2_rn(__bfloat1622float2(xb));
       }
       reinterpret_cast<__half2*>(sx[m])[p] = xh;
@@ -1496,8 +1356,8 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
         const int n = nbase + j;
         const size_t row = size_t(e) * N + n;
         const int kg = (kt >> 4) + lane;
-        const uint64_t q8 = *reinterpret_cast<const uint64_t*>(
-            packed + row * KHALF + size_t(kg) * 8);
+        const uint64_t q8 =
+            *reinterpret_cast<const uint64_t*>(packed + row * KHALF + size_t(kg) * 8);
         __half2 hsum[MT];
 #pragma unroll
         for (int m = 0; m < MT; ++m) hsum[m] = __float2half2_rn(0.0f);
@@ -1506,8 +1366,7 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
           const __half2 qh = e2m1x2_to_half2(uint8_t(q8 >> (p * 8)));
 #pragma unroll
           for (int m = 0; m < MT; ++m) {
-            hsum[m] = __hfma2(reinterpret_cast<const __half2*>(sx[m])[lane * 8 + p],
-                              qh, hsum[m]);
+            hsum[m] = __hfma2(reinterpret_cast<const __half2*>(sx[m])[lane * 8 + p], qh, hsum[m]);
           }
         }
         const float sf = fp8_e4m3fn_to_float(scales[row * KG + kg]);
@@ -1544,20 +1403,14 @@ __global__ __launch_bounds__(256, 2) void grouped_group16_half_kernel(
   }
 }
 
-template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS,
-          bool GROUPED, bool SECOND>
+template <int K, int N, int KG, int NTILES, int TILE_N, int BLOCK_THREADS, bool GROUPED,
+          bool SECOND>
 __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
-    const __nv_bfloat16* __restrict__ input,
-    const uint8_t* __restrict__ packed,
-    const uint8_t* __restrict__ scales,
-    const float* __restrict__ alpha,
-    const int32_t* __restrict__ offsets,
-    const int32_t* __restrict__ tiles,
-    const int32_t* __restrict__ route_list,
-    const float* __restrict__ topk_weights,
-    int routes,
-    __nv_bfloat16* __restrict__ intermediate,
-    float* __restrict__ output_acc) {
+    const __nv_bfloat16* __restrict__ input, const uint8_t* __restrict__ packed,
+    const uint8_t* __restrict__ scales, const float* __restrict__ alpha,
+    const int32_t* __restrict__ offsets, const int32_t* __restrict__ tiles,
+    const int32_t* __restrict__ route_list, const float* __restrict__ topk_weights, int routes,
+    __nv_bfloat16* __restrict__ intermediate, float* __restrict__ output_acc) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   int e;
@@ -1585,8 +1438,7 @@ __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
 
   if (threadIdx.x < MVAL) {
     if (threadIdx.x < valid_m) {
-      sroutes[threadIdx.x] = GROUPED ? route_list[offsets[e] + m0 + threadIdx.x]
-                                      : m0;
+      sroutes[threadIdx.x] = GROUPED ? route_list[offsets[e] + m0 + threadIdx.x] : m0;
     } else {
       sroutes[threadIdx.x] = -1;
     }
@@ -1627,8 +1479,7 @@ __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
       float2 xv[MVAL];
 #pragma unroll
       for (int m = 0; m < MVAL; ++m) {
-        xv[m] = __bfloat1622float2(
-            *reinterpret_cast<const __nv_bfloat162*>(&sx[m][klocal]));
+        xv[m] = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&sx[m][klocal]));
       }
 
 #pragma unroll
@@ -1680,18 +1531,18 @@ __global__ __launch_bounds__(BLOCK_THREADS, 2) void moe_fc_kernel(
   }
 }
 
-__global__ void convert_output_kernel(const float* __restrict__ x,
-                                      __nv_bfloat16* __restrict__ out, int n) {
+__global__ void convert_output_kernel(const float* __restrict__ x, __nv_bfloat16* __restrict__ out,
+                                      int n) {
   for (int i = int(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
        i += int(gridDim.x) * blockDim.x) {
     out[i] = __float2bfloat16_rn(x[i]);
   }
 }
 
-__global__ void combine_route_output_kernel(
-    const __nv_bfloat16* __restrict__ route_out,
-    const int32_t* __restrict__ ids, const float* __restrict__ weights,
-    __nv_bfloat16* __restrict__ out, int tokens) {
+__global__ void combine_route_output_kernel(const __nv_bfloat16* __restrict__ route_out,
+                                            const int32_t* __restrict__ ids,
+                                            const float* __restrict__ weights,
+                                            __nv_bfloat16* __restrict__ out, int tokens) {
   constexpr int H2 = H / 2;
   const int total = tokens * H2;
   for (int x = int(blockIdx.x) * blockDim.x + threadIdx.x; x < total;
@@ -1704,33 +1555,28 @@ __global__ void combine_route_output_kernel(
       const int r = tok * TOPK + slot;
       if (unsigned(ids[r]) < E) {
         const float2 v = __bfloat1622float2(
-            reinterpret_cast<const __nv_bfloat162*>(route_out)[size_t(r) * H2 +
-                                                                pair_col]);
+            reinterpret_cast<const __nv_bfloat162*>(route_out)[size_t(r) * H2 + pair_col]);
         const float w = weights[r];
         sum.x = fmaf(v.x, w, sum.x);
         sum.y = fmaf(v.y, w, sum.y);
       }
     }
-    reinterpret_cast<__nv_bfloat162*>(out)[x] =
-        __floats2bfloat162_rn(sum.x, sum.y);
+    reinterpret_cast<__nv_bfloat162*>(out)[x] = __floats2bfloat162_rn(sum.x, sum.y);
   }
 }
 
 }  // namespace
 
-void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
-         ffi::TensorView w1_gs, ffi::TensorView w1_alpha,
-         ffi::TensorView w2_packed, ffi::TensorView w2_gs,
-         ffi::TensorView w2_alpha, ffi::TensorView topk_ids,
-         ffi::TensorView topk_weights, ffi::TensorView out) {
+void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorView w1_gs,
+         ffi::TensorView w1_alpha, ffi::TensorView w2_packed, ffi::TensorView w2_gs,
+         ffi::TensorView w2_alpha, ffi::TensorView topk_ids, ffi::TensorView topk_weights,
+         ffi::TensorView out) {
   const int device = hidden_states.device().device_id;
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, device));
+  cudaStream_t stream = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, device));
   // All specialized paths reuse process-global scratch. Serialize their host
   // launch sequences and order transitions between current CUDA streams.
   std::lock_guard<std::mutex> run_lock(g_run_mutex);
-  if (g_last_stream != nullptr &&
-      (g_last_stream != stream || g_last_stream_device != device)) {
+  if (g_last_stream != nullptr && (g_last_stream != stream || g_last_stream_device != device)) {
     cudaSetDevice(g_last_stream_device);
     cudaStreamSynchronize(g_last_stream);
     cudaSetDevice(device);
@@ -1740,26 +1586,23 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
 
   const int T = int(hidden_states.size(0));
   if (T == 1) {
-    RunPersistentDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed,
-                        w2_gs, w2_alpha, topk_ids, topk_weights, out, device,
-                        stream);
+    RunPersistentDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha,
+                        topk_ids, topk_weights, out, device, stream);
     return;
   }
   if (T == 64) {
-    RunFastDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs,
-                  w2_alpha, topk_ids, topk_weights, out, stream);
+    RunFastDirect(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha, topk_ids,
+                  topk_weights, out, stream);
     return;
   }
   if (T == 1024) {
-    RunFixedM64Prefill(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed,
-                       w2_gs, w2_alpha, topk_ids, topk_weights, out, device,
-                       stream);
+    RunFixedM64Prefill(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha,
+                       topk_ids, topk_weights, out, device, stream);
     return;
   }
   if (T > 64) {
-    RunWidePrefill(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed,
-                   w2_gs, w2_alpha, topk_ids, topk_weights, out, device,
-                   stream);
+    RunWidePrefill(hidden_states, w1_packed, w1_gs, w1_alpha, w2_packed, w2_gs, w2_alpha, topk_ids,
+                   topk_weights, out, device, stream);
     return;
   }
   const int routes = T * TOPK;
@@ -1785,8 +1628,7 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
   char* workspace = static_cast<char*>(ensure_workspace(bytes, device));
   auto* inter = reinterpret_cast<__nv_bfloat16*>(workspace + inter_off);
   auto* output_acc = reinterpret_cast<float*>(workspace + output_scratch_off);
-  auto* route_out =
-      reinterpret_cast<__nv_bfloat16*>(workspace + output_scratch_off);
+  auto* route_out = reinterpret_cast<__nv_bfloat16*>(workspace + output_scratch_off);
   auto* route_list = reinterpret_cast<int32_t*>(workspace + routes_off);
   auto* counts = reinterpret_cast<int32_t*>(workspace + counts_off);
   auto* cursor = reinterpret_cast<int32_t*>(workspace + cursor_off);
@@ -1810,18 +1652,15 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
     // path compiled but unselected.
     constexpr bool kDecodeT4Legacy = false;
     if (kDecodeT4Legacy && T == 4) {
-      decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT_SMALL,
-                                 DECODE_NT_SMALL, true, false, false, false,
-                                 true>
-          <<<routes * (I / DECODE_NT_SMALL), THREADS, 0, stream>>>(
-              x, p1, s1, nullptr, nullptr, a1, ids, nullptr, tw, routes, inter,
-              reinterpret_cast<float*>(y));
-      decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT_SMALL,
-                                 DECODE_NT_SMALL, false, false, false, false,
-                                 true>
-          <<<routes * (H / DECODE_NT_SMALL), THREADS, 0, stream>>>(
-              inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes,
-              route_out,
+      decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT_SMALL, DECODE_NT_SMALL, true, false,
+                                 false, false, true>
+          <<<routes*(I / DECODE_NT_SMALL), THREADS, 0, stream>>>(x, p1, s1, nullptr, nullptr, a1,
+                                                                 ids, nullptr, tw, routes, inter,
+                                                                 reinterpret_cast<float*>(y));
+      decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT_SMALL, DECODE_NT_SMALL, false, false,
+                                 false, false, true>
+          <<<routes*(H / DECODE_NT_SMALL), THREADS, 0, stream>>>(
+              inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes, route_out,
               reinterpret_cast<float*>(y));
     } else if (T == 16 || T == 4) {
       cudaLaunchAttribute attr{};
@@ -1834,81 +1673,63 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
       cfg.attrs = &attr;
       cfg.numAttrs = 1;
       cfg.gridDim = dim3(routes, I / DECODE_NT);
-      cudaLaunchKernelEx(
-          &cfg,
-      decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT, DECODE_NT,
-                                 true, false, false, true, true, true, false,
-                                 true>,
-              x, p1, s1, p2, s2, a1, ids, nullptr, tw, routes, inter,
-              reinterpret_cast<float*>(y));
+      cudaLaunchKernelEx(&cfg,
+                         decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT, DECODE_NT, true,
+                                                    false, false, true, true, true, false, true>,
+                         x, p1, s1, p2, s2, a1, ids, nullptr, tw, routes, inter,
+                         reinterpret_cast<float*>(y));
       cfg.gridDim = dim3(routes, H / DECODE_NT);
-      cudaLaunchKernelEx(
-          &cfg,
-      decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT,
-                                 false, false, false, true, true, true, true,
-                                 false>,
-              inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes,
-              route_out,
-              reinterpret_cast<float*>(y));
+      cudaLaunchKernelEx(&cfg,
+                         decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT, false,
+                                                    false, false, true, true, true, true, false>,
+                         inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes, route_out,
+                         reinterpret_cast<float*>(y));
     } else if (T == 64) {
-      decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT_LARGE,
-                                 DECODE_NT_LARGE, true, false, false, true>
+      decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT_LARGE, DECODE_NT_LARGE, true, false,
+                                 false, true>
           <<<dim3(routes, I / DECODE_NT_LARGE), THREADS, 0, stream>>>(
-              x, p1, s1, nullptr, nullptr, a1, ids, nullptr, tw, routes, inter,
-              output_acc);
-      decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT_LARGE,
-                                 DECODE_NT_LARGE, false, false, true, true>
+              x, p1, s1, nullptr, nullptr, a1, ids, nullptr, tw, routes, inter, output_acc);
+      decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT_LARGE, DECODE_NT_LARGE, false, false,
+                                 true, true>
           <<<dim3(routes, H / DECODE_NT_LARGE), THREADS, 0, stream>>>(
-              inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes,
-              route_out,
-              output_acc);
+              inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes, route_out, output_acc);
     } else {
-      decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT, DECODE_NT,
-                                 true, false, false, false, false, true>
-          <<<routes * (I / DECODE_NT), THREADS, 0, stream>>>(
-              x, p1, s1, p2, s2, a1, ids, nullptr, tw, routes, inter,
-              output_acc);
-      decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT,
-                                 false, false, true, false, false, true>
-          <<<routes * (H / DECODE_NT), THREADS, 0, stream>>>(
-              inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes,
-              route_out,
-              output_acc);
+      decode_group16_half_kernel<H, I, H / 16, I / DECODE_NT, DECODE_NT, true, false, false, false,
+                                 false, true><<<routes*(I / DECODE_NT), THREADS, 0, stream>>>(
+          x, p1, s1, p2, s2, a1, ids, nullptr, tw, routes, inter, output_acc);
+      decode_group16_half_kernel<I, H, I / 16, H / DECODE_NT, DECODE_NT, false, false, true, false,
+                                 false, true><<<routes*(H / DECODE_NT), THREADS, 0, stream>>>(
+          inter, p2, s2, nullptr, nullptr, a2, ids, nullptr, tw, routes, route_out, output_acc);
     }
     if (T != 4 && T != 16) {
       const int out_elems = T * (H / 2);
       const int out_blocks = (out_elems + THREADS - 1) / THREADS;
-      combine_route_output_kernel<<<out_blocks, THREADS, 0, stream>>>(
-          route_out, ids, tw, y, T);
+      combine_route_output_kernel<<<out_blocks, THREADS, 0, stream>>>(route_out, ids, tw, y, T);
     }
   } else {
     cudaMemsetAsync(counts, 0, E * sizeof(int32_t), stream);
     cudaMemsetAsync(y, 0, size_t(T) * H * sizeof(__nv_bfloat16), stream);
-    const int route_blocks = ((routes + THREADS - 1) / THREADS < 256)
-                                 ? (routes + THREADS - 1) / THREADS
-                                 : 256;
+    const int route_blocks =
+        ((routes + THREADS - 1) / THREADS < 256) ? (routes + THREADS - 1) / THREADS : 256;
     count_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(ids, routes, counts);
-#define PREFILL_LAUNCH(GMM, GN1, GN2, FOLD)                                   \
-    do {                                                                      \
-      prefix_mma_routes_kernel<GMM, (I + GN1 - 1) / GN1,                      \
-                               (H + GN2 - 1) / GN2>                           \
-          <<<1, 1, 0, stream>>>(counts, offsets, cursor, tiles1, tiles2);     \
-      scatter_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(            \
-          ids, routes, offsets, cursor, route_list);                          \
-      const int max_mtiles = (routes + GMM - 1) / GMM + E;                    \
-      constexpr int NT1C = (I + GN1 - 1) / GN1;                               \
-      constexpr int BT1C = (GN1 == 64 ? 128 : 256);                           \
-      grouped_mma_bf16_kernel<H, I, H / 16, NT1C, GN1, BT1C, GMM,             \
-                              1, FOLD, true, false>                           \
-          <<<max_mtiles * NT1C, BT1C, 0, stream>>>(                           \
-              x, p1, s1, a1, offsets, tiles1, route_list, nullptr, inter);    \
-      constexpr int NT2C = (H + GN2 - 1) / GN2;                               \
-      constexpr int BT2C = (GN2 == 64 ? 128 : 256);                           \
-      grouped_mma_bf16_kernel<I, H, I / 16, NT2C, GN2, BT2C, GMM,             \
-                              1, FOLD, false, true>                           \
-          <<<max_mtiles * NT2C, BT2C, 0, stream>>>(                           \
-              inter, p2, s2, a2, offsets, tiles2, route_list, tw, y);         \
-    } while (0)
+#define PREFILL_LAUNCH(GMM, GN1, GN2, FOLD)                                                      \
+  do {                                                                                           \
+    prefix_mma_routes_kernel<GMM, (I + GN1 - 1) / GN1, (H + GN2 - 1) / GN2>                      \
+        <<<1, 1, 0, stream>>>(counts, offsets, cursor, tiles1, tiles2);                          \
+    scatter_routes_kernel<<<route_blocks, THREADS, 0, stream>>>(ids, routes, offsets, cursor,    \
+                                                                route_list);                     \
+    const int max_mtiles = (routes + GMM - 1) / GMM + E;                                         \
+    constexpr int NT1C = (I + GN1 - 1) / GN1;                                                    \
+    constexpr int BT1C = (GN1 == 64 ? 128 : 256);                                                \
+    grouped_mma_bf16_kernel<H, I, H / 16, NT1C, GN1, BT1C, GMM, 1, FOLD, true, false>            \
+        <<<max_mtiles * NT1C, BT1C, 0, stream>>>(x, p1, s1, a1, offsets, tiles1, route_list,     \
+                                                 nullptr, inter);                                \
+    constexpr int NT2C = (H + GN2 - 1) / GN2;                                                    \
+    constexpr int BT2C = (GN2 == 64 ? 128 : 256);                                                \
+    grouped_mma_bf16_kernel<I, H, I / 16, NT2C, GN2, BT2C, GMM, 1, FOLD, false, true>            \
+        <<<max_mtiles * NT2C, BT2C, 0, stream>>>(inter, p2, s2, a2, offsets, tiles2, route_list, \
+                                                 tw, y);                                         \
+  } while (0)
 
     if (T < 2048) {
       PREFILL_LAUNCH(32, GMMA_N1_SMALL, GMMA_N2_LARGE, false);
@@ -1921,11 +1742,3 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed,
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
-
-
-
-
-
-
-
-

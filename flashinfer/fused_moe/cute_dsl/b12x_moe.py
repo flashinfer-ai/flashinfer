@@ -319,19 +319,24 @@ def b12x_fused_moe(
         )
 
     if backend not in BACKENDS:
-        raise ValueError(
-            f"backend must be one of {BACKENDS}, got {backend!r}")
+        raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
     if backend in ("auto", "specialized"):
         from .blackwell_sm12x.moe_dispatch import _normalize_quant_mode
         from .. import specialized_moe_nvfp4_w4a16_sm120 as _spec
 
         if num_local_experts == num_experts and expert_map is None:
             ok, reasons = _spec.specialized_support_reasons(
-                x, w1_weight, w1_weight_sf, w2_weight, w2_weight_sf,
-                token_selected_experts, token_final_scales, num_experts,
-                top_k, activation=activation,
-                quant_mode=_normalize_quant_mode(quant_mode,
-                                                 activation_precision),
+                x,
+                w1_weight,
+                w1_weight_sf,
+                w2_weight,
+                w2_weight_sf,
+                token_selected_experts,
+                token_final_scales,
+                num_experts,
+                top_k,
+                activation=activation,
+                quant_mode=_normalize_quant_mode(quant_mode, activation_precision),
                 source_format=source_format,
             )
         else:
@@ -339,17 +344,24 @@ def b12x_fused_moe(
         if ok:
             _spec.dispatch_stats["specialized"] += 1
             return _spec.run_specialized_moe_nvfp4_w4a16(
-                x, w1_weight, w1_weight_sf, w1_alpha,
-                w2_weight, w2_weight_sf, w2_alpha,
-                token_selected_experts, token_final_scales, output,
+                x,
+                w1_weight,
+                w1_weight_sf,
+                w1_alpha,
+                w2_weight,
+                w2_weight_sf,
+                w2_alpha,
+                token_selected_experts,
+                token_final_scales,
+                output,
             )
         _spec.fallback_reasons.append(tuple(reasons))
         if backend == "specialized":
             # never silently swapped to another fused backend; this module
             # has no composable fallback of its own
             raise ValueError(
-                "backend='specialized' cannot serve this call: "
-                + ", ".join(reasons))
+                "backend='specialized' cannot serve this call: " + ", ".join(reasons)
+            )
         _spec.dispatch_stats["b12x"] += 1
 
     from .blackwell_sm12x.moe_dispatch import launch_sm120_moe
