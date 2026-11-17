@@ -84,14 +84,16 @@ def valid_kv_slots(D: int = 128) -> tuple:
 
 
 HW_ROW_MAX_ENV = "FLASHINFER_BI_ATTN_HW_ROWMAX"
+HW_ROW_MAX_MAX_D = 128  # the hardware row maximum serves the one-stage TMEM plan (D <= 128); the two-stage plan at D = 256 streams
+# its exponentials off the slice copies and gains nothing from it
 
 
-def hw_row_max_enabled(device=None) -> bool:
-    """Whether the row body on ``device`` takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``: each 32-column
-    piece's maximum in an extra register, the pieces joined by ``max.f32``) instead of the register tree: the parts that have the
-    instruction (sm_103 / sm_107), unless ``FLASHINFER_BI_ATTN_HW_ROWMAX=0``. Either way the same value -- the maximum is exact and
-    order-free -- so the choice is a placement; the kernel's identity carries it."""
-    if os.environ.get(HW_ROW_MAX_ENV, "1") == "0":
+def hw_row_max_enabled(device=None, D: int = 128) -> bool:
+    """Whether the row body on ``device`` at head dim ``D`` takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``:
+    each 32-column piece's maximum in an extra register, the pieces joined by ``max.f32``) instead of the register tree: the parts
+    that have the instruction (sm_103 / sm_107) at ``D <= HW_ROW_MAX_MAX_D``, unless ``FLASHINFER_BI_ATTN_HW_ROWMAX=0``. Either way
+    the same value -- the maximum is exact and order-free -- so the choice is a placement; the kernel's identity carries it."""
+    if os.environ.get(HW_ROW_MAX_ENV, "1") == "0" or D > HW_ROW_MAX_MAX_D:
         return False
     from ...utils import get_compute_capability
 
@@ -679,7 +681,7 @@ def _run_attention_validated(
     else:
         n_launch = getattr(plan, "num_launch", None) if config.q2 else None
         hwm = hw_row_max_enabled(
-            q.device
+            q.device, D
         )  # the row maximum's placement: part of the kernel's identity
         if (
             config.q2 and n_launch is None
