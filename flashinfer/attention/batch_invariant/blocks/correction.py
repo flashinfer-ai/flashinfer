@@ -329,7 +329,9 @@ def merge_global_to_output(
         for i in cutlass.range_constexpr(n_pieces):
             cur = rMs[i % depth]
             if cutlass.const_expr(i + depth - 1 < n_pieces):
-                cute.autovec_copy(om_piece(gOm, i + depth - 1, CT), rMs[(i + depth - 1) % depth])
+                cute.autovec_copy(
+                    om_piece(gOm, i + depth - 1, CT), rMs[(i + depth - 1) % depth]
+                )
             cute.copy(
                 tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
             )
@@ -428,11 +430,23 @@ def epilogue(
             if warp_active:
                 for i in cutlass.range_constexpr(n_pieces):
                     cute.copy(
-                        tiled_ld, cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout), rO
+                        tiled_ld,
+                        cute.make_tensor(tLDc.iterator + i * CT, tLDc.layout),
+                        rO,
                     )
                     if multi:  # the last chunk's merge, as merge_chunk's
                         merge_piece(
-                            i, first_merge, a1, a2, om_tmem, tiled_ld, tLDm, gOm, rO, rM, CT
+                            i,
+                            first_merge,
+                            a1,
+                            a2,
+                            om_tmem,
+                            tiled_ld,
+                            tLDm,
+                            gOm,
+                            rO,
+                            rM,
+                            CT,
                         )
                         store_om_piece(i, om_tmem, tiled_st, tSTm, gOm, rM, CT)
                     else:
@@ -443,7 +457,9 @@ def epilogue(
             if warp_active:
                 for i in cutlass.range_constexpr(n_pieces):
                     cute.copy(
-                        tiled_ld, cute.make_tensor(tLDm.iterator + i * CT, tLDm.layout), rM
+                        tiled_ld,
+                        cute.make_tensor(tLDm.iterator + i * CT, tLDm.layout),
+                        rM,
                     )
                     normalize_elems(rM, inv, rOut)
                     if row_valid:

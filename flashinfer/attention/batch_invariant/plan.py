@@ -318,7 +318,9 @@ def build_plan(
     # u = bidx, bidx + grid, ..., so CTA j takes the j-th unit of every wave and the alternation pairs a wave's long units with the
     # next wave's short ones. A placement: the order of units reaches no value (every unit restarts its state)
     plan.desc.sort(key=lambda d: -(d[F_TILE_HI] - d[F_TILE_LO]))
-    plan.desc = snake_order(plan.desc, min(len(plan.desc), grid if grid > 0 else sm_count))
+    plan.desc = snake_order(
+        plan.desc, min(len(plan.desc), grid if grid > 0 else sm_count)
+    )
     return plan
 
 

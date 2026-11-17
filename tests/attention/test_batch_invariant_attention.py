@@ -490,9 +490,15 @@ def test_planner_unit_kind_rules():
     wide = lambda sm: P.build_plan(qo, kv, last, 32, 8, 128, 16, sm_count=sm)  # noqa: E731
     n_tiles = 4 * 128 * 8
     assert wide(148).num_units == n_tiles
-    assert all(d[P.F_MODE] == 0 for d in wide(n_tiles).desc)  # the tiles fill the SMs once: fused
-    assert all(d[P.F_MODE] == 0 for d in wide(4 * n_tiles).desc)  # exactly 1 / 4 of the SMs: still fused
-    assert any(d[P.F_MODE] == 1 for d in wide(4 * n_tiles + 1).desc)  # under 1 / 4: split
+    assert all(
+        d[P.F_MODE] == 0 for d in wide(n_tiles).desc
+    )  # the tiles fill the SMs once: fused
+    assert all(
+        d[P.F_MODE] == 0 for d in wide(4 * n_tiles).desc
+    )  # exactly 1 / 4 of the SMs: still fused
+    assert any(
+        d[P.F_MODE] == 1 for d in wide(4 * n_tiles + 1).desc
+    )  # under 1 / 4: split
     # decode-sized tiles (one token per request, g = 4 -> 4 rows): split under 2 x SM
     qo_d = list(range(0, 5))
     narrow = lambda sm: P.build_plan(qo_d, kv, last, 32, 8, 128, 16, sm_count=sm)  # noqa: E731

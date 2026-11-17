@@ -79,7 +79,9 @@ def streamed_tile_probs(ss, rP_e, c, nms, fp, in_dtype):
         v = fp.add(p0, p1)
         level = 1
         while stack and stack[-1][0] == level:
-            v = fp.add(stack.pop()[1], v)  # the lower keys' subtree first (the tree's operand order)
+            v = fp.add(
+                stack.pop()[1], v
+            )  # the lower keys' subtree first (the tree's operand order)
             level += 1
         stack.append((level, v))
     assert len(stack) == 1, [lv for lv, _ in stack]
@@ -232,8 +234,8 @@ def unit_loop(
         tScS.iterator,
         cute.composition(tScS.layout, cute.make_layout((Q_ROWS, p_words))),
     )
-    # one tcgen05.st for the warpgroup's P columns (Repetition(p_words), 64 at the full tile): the packed bf16 pairs are
-    # written from one register block instead of two 32-column pieces
+    # one tcgen05.st covers the warpgroup's P columns (Repetition(p_words), 64 at the full tile): the packed bf16 pairs are
+    # written from a single register block
     st_atom = cute.make_copy_atom(
         tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(p_words)), ACC_DTYPE
     )
