@@ -88,6 +88,8 @@ ATTN_CASES = [
     ("a9", 64, 32, 64, 40, -1, 0, 0),  # two PV slices per tile (T = 2 x MMA_K)
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
+# the toy cases whose LSE member (bases 2 and e) is checked too: one chunk, a window across chunks, every head dim
+ATTN_LSE_CASES = ("a2", "a3", "a5", "a7", "a8")
 
 GEMM_CASES = [
     (64, 1),
@@ -473,6 +475,7 @@ DECIDED_THEOREMS = (
     tuple(n for F in FORMATS for n in F.decided)
     + ("gemm_fp8bs_space_ok", "gemm_fp8bs_dispatch_in_space")
     + tuple(f"attn_{n}_spec" for n, *_ in ATTN_CASES)
+    + tuple(f"attn_{n}_{m}" for n in ATTN_LSE_CASES for m in ("lse2", "lseE"))
     + tuple(
         f"attn_space_d{D}_{what}" for D in ATTN_HEAD_DIMS for what in ("size", "ok")
     )
@@ -543,6 +546,20 @@ def attn_cases() -> List[Tuple[str, int, int, int, int, int, int, int, str]]:
             AttentionSpec(D, T=T, C=C).output(RowSpec(p=p, window_left=win, row=rid), d)
         )
         out.append((name, D, T, C, p, win, rid, d, sx))
+    return out
+
+
+def attn_lse_cases() -> List[Tuple[str, str, str]]:
+    """``(name, base-2 S-expression, base-e S-expression)`` of the LSE member of the toy cases in ``ATTN_LSE_CASES``."""
+    from ..attention.batch_invariant.spec import AttentionSpec, RowSpec
+    from .fp_interface.term import sexpr
+
+    out = []
+    for name, D, T, C, p, win, rid, _d in ATTN_CASES:
+        if name not in ATTN_LSE_CASES:
+            continue
+        spec, row = AttentionSpec(D, T=T, C=C), RowSpec(p=p, window_left=win, row=rid)
+        out.append((name, sexpr(spec.lse(row, "log2")), sexpr(spec.lse(row, "ln"))))
     return out
 
 
@@ -1034,6 +1051,27 @@ def _render_attention(L: List[str]) -> None:
     )
     L.append("")
     L.append(
+        "/-! The LSE member (`spec.lse_term`, bases 2 and e) of the toy rows, node for node, and the split kernel's equality to "
+        "it. -/"
+    )
+    for name, sx2, sxe in attn_lse_cases():
+        L.append(
+            f"theorem attn_{name}_lse2 : Attn.lse2 attnP_{name} = {lean_str(sx2)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_{name}_lseE : Attn.lseE attnP_{name} = {lean_str(sxe)} := by native_decide"
+        )
+        L.append(
+            f"theorem attn_{name}_lse_split : ∀ σ : Nat → Nat, Attn.splitLse2 attnP_{name} σ = Attn.lse2 attnP_{name} ∧ "
+            f"Attn.splitLseE attnP_{name} σ = Attn.lseE attnP_{name} := fun σ => Attn.splitLse_eq_fused _ σ"
+        )
+    L.append(
+        "def attnLseCases : List (String × Attn.Params) := ["
+        + ", ".join(f'("{n}", attnP_{n})' for n in ATTN_LSE_CASES)
+        + "]"
+    )
+    L.append("")
+    L.append(
         "/-! The attention kernel's configuration space per head dim (`engine.all_valid_configs(D)`): every knob record checked "
         "against the static constraints (`ConfigOKD`), counted, and `space_invariant` instantiated on it (R3). -/"
     )
@@ -1100,7 +1138,7 @@ def summary() -> str:
         + f"; {FP8BS_FMT}: specs={2 * len(GEMM_FP8BS_OUT_CASES)} loops={len(GEMM_FP8BS_LOOP_CASES)} "
         f"space={len(fp8bs_space())} dispatch={len(fp8bs_dispatch_cases())}"
         + f"; native_decide theorems={len(DECIDED_THEOREMS)}"
-        + f"; attention cases={len(ATTN_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
+        + f"; attention cases={len(ATTN_CASES)} attention LSE cases={len(ATTN_LSE_CASES)} attention spaces={[len(v) for v in attn_spaces().values()]}"
     )
 
 

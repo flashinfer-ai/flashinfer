@@ -93,3 +93,6 @@ def main : IO Unit := do
     IO.println s!"gemmmx4k128out {steps} {fmt} {(outputKfoldMX4K128 fmt ⟨0⟩ ⟨0⟩ steps).sexpr}"
   for (name, P) in attnCases do
     IO.println s!"attn {name} {(Attn.output P).sexpr}"
+  for (name, P) in attnLseCases do
+    IO.println s!"attnlse2 {name} {Attn.lse2 P}"
+    IO.println s!"attnlseE {name} {Attn.lseE P}"

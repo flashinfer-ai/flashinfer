@@ -111,6 +111,7 @@ def test_lean_model_matches_python_engine_and_spec():
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
     kinds = {"gemmbias": "spec", "fp4class": "fp4class", "attn": "attn"}
+    kinds.update({"attnlse2": "attnlse", "attnlseE": "attnlse"})
     # the block-scale fp8 class: the output at (0, 0) and at (3, 129) per (blocks, format), the promotion loop per block count
     kinds.update({"gemmfp8bs": "out", "gemmfp8bs2": "out", "gemmfp8bsloop": "loop"})
     for F in lean_cases.FORMATS:
@@ -141,6 +142,9 @@ def test_lean_model_matches_python_engine_and_spec():
         elif kind == "attn":
             _, name, sx = line.split(" ", 2)
             lean[("attn", name)] = sx
+        elif kind == "attnlse":
+            _, name, sx = line.split(" ", 2)
+            lean[(tag, name)] = sx
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -181,6 +185,10 @@ def test_lean_model_matches_python_engine_and_spec():
     for name, *_, sx in lean_cases.attn_cases():
         assert lean[("attn", name)] == sx, name
         checked += 1
+    for name, sx2, sxe in lean_cases.attn_lse_cases():
+        assert lean[("attnlse2", name)] == sx2, name
+        assert lean[("attnlseE", name)] == sxe, name
+        checked += 2
     assert MMA_K_OF["bf16"] == MMA_K
     assert checked == len(lean) >= 80
 

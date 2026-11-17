@@ -18,7 +18,9 @@ column `d` the dataflow is
   bf16 `P` slices with `V` from `mul(O, alpha)` (one opaque `mma16` per 16 keys);
 * a **chunk**: the tile steps of its present tiles, ascending, from the init `(-inf, +0, +0)`;
 * the **row**: the present chunks merged in index order from the init state (`merge`);
-* the epilogue `cvt_bf16(add(mul(O, div(1, l)), +0))`.
+* the epilogue `cvt_bf16(add(mul(O, div(1, l)), +0))`;
+* the LSE member, a second output of the row's final `(m, l)`: `add(mul(m, c), lg2(l))` in base 2, its `mul` by
+  `fp32(ln 2)` in base e (`lg2` opaque, like `ex2`).
 
 Tile and chunk boundaries are absolute multiples of `T` and `C`, functions of `D` only: the term of
 a token depends on its position `p`, the window and the head, never on the batch, the page table
@@ -172,6 +174,92 @@ def epilogue (st : State) : ATerm := .cvt "bf16" (.add (.mul st.o (.div (.const 
 
 def output (P : Params) : ATerm := epilogue (fused P)
 
+/-! ## The LSE member (`spec.lse_term`) -/
+
+/-- `lse2 = add(mul(m, c), lg2(l))` as `term.sexpr` prints it (`lg2` is the opaque primitive `(op:lg2 l)`; the commutative
+`add` sorts its operands). -/
+def lse2Sexpr (st : State) : String :=
+  let (p, q) := sortPair (ATerm.mul st.m c).sexpr s!"(op:lg2 {st.l.sexpr})"
+  s!"(add {p} {q})"
+
+/-- `fp32(ln 2)` as the Python printer spells the constant. -/
+def ln2Const : String := "(const 0.6931471824645996)"
+
+/-- `lse_e = mul(lse2, LN2)`. -/
+def lseESexpr (st : State) : String :=
+  let (p, q) := sortPair (lse2Sexpr st) ln2Const
+  s!"(mul {p} {q})"
+
+def lse2 (P : Params) : String := lse2Sexpr (fused P)
+def lseE (P : Params) : String := lseESexpr (fused P)
+
+/-! ## One `(m, l)` for every output column and the LSE
+
+The statistics of the fold never read the output column: `tileStep` forms `m'` and `l'` from the scores (functions of
+`steps`, `T`, `p`, `win`, `row`) and the previous `(m, l)`, and `merge` forms them from the two states' `(m, l)`. So the
+output columns of a row and its LSE are normalised by one pair whatever the column, the LSE is the same string for every
+column's parameters, and `output` -- which has no LSE parameter -- is the same term whether or not the LSE is requested. -/
+
+/-- `P` with another output column. -/
+def Params.withD (P : Params) (d : Nat) : Params := { P with d := d }
+
+theorem tileStep_ml (P : Params) (d : Nat) (st st' : State) (hm : st.m = st'.m) (hl : st.l = st'.l) (t : Nat) :
+    (tileStep (P.withD d) st t).m = (tileStep P st' t).m ∧ (tileStep (P.withD d) st t).l = (tileStep P st' t).l := by
+  simp only [tileStep, Params.withD, Params.T, Params.visible, hm, hl, and_self]
+
+theorem tiles_ml (P : Params) (d : Nat) (ts : List Nat) (st st' : State) (hm : st.m = st'.m) (hl : st.l = st'.l) :
+    (ts.foldl (tileStep (P.withD d)) st).m = (ts.foldl (tileStep P) st').m ∧
+    (ts.foldl (tileStep (P.withD d)) st).l = (ts.foldl (tileStep P) st').l := by
+  induction ts generalizing st st' with
+  | nil => exact ⟨hm, hl⟩
+  | cons t ts ih =>
+    simp only [List.foldl]
+    have h := tileStep_ml P d st st' hm hl t
+    exact ih _ _ h.1 h.2
+
+theorem chunkState_ml (P : Params) (d j : Nat) :
+    (chunkState (P.withD d) j).m = (chunkState P j).m ∧ (chunkState (P.withD d) j).l = (chunkState P j).l := by
+  unfold chunkState
+  have ht : (P.withD d).tilesOfChunk j = P.tilesOfChunk j := rfl
+  rw [ht]
+  exact tiles_ml P d _ initState initState rfl rfl
+
+theorem merge_ml (a a' b b' : State) (ham : a.m = a'.m) (hal : a.l = a'.l) (hbm : b.m = b'.m) (hbl : b.l = b'.l) :
+    (merge a b).m = (merge a' b').m ∧ (merge a b).l = (merge a' b').l := by
+  simp only [merge, ham, hal, hbm, hbl, and_self]
+
+theorem chunks_ml (P : Params) (d : Nat) (js : List Nat) (acc acc' : State) (hm : acc.m = acc'.m) (hl : acc.l = acc'.l) :
+    (js.foldl (fun a j => merge a (chunkState (P.withD d) j)) acc).m = (js.foldl (fun a j => merge a (chunkState P j)) acc').m ∧
+    (js.foldl (fun a j => merge a (chunkState (P.withD d) j)) acc).l = (js.foldl (fun a j => merge a (chunkState P j)) acc').l := by
+  induction js generalizing acc acc' with
+  | nil => exact ⟨hm, hl⟩
+  | cons j js ih =>
+    simp only [List.foldl]
+    have hc := chunkState_ml P d j
+    have h := merge_ml acc acc' (chunkState (P.withD d) j) (chunkState P j) hm hl hc.1 hc.2
+    exact ih _ _ h.1 h.2
+
+/-- **One pair `(m, l)` for the whole row**: the final statistics do not depend on the output column. -/
+theorem stats_independent_of_column (P : Params) (d : Nat) :
+    (fused (P.withD d)).m = (fused P).m ∧ (fused (P.withD d)).l = (fused P).l := by
+  unfold fused
+  have hc : (P.withD d).presentChunks = P.presentChunks := rfl
+  rw [hc]
+  exact chunks_ml P d _ initState initState rfl rfl
+
+/-- The LSE member of every column's parameters is the same string: it reads the row's one `(m, l)`. -/
+theorem lse_independent_of_column (P : Params) (d : Nat) : lse2 (P.withD d) = lse2 P := by
+  unfold lse2 lse2Sexpr
+  rw [(stats_independent_of_column P d).1, (stats_independent_of_column P d).2]
+
+theorem lseE_independent_of_column (P : Params) (d : Nat) : lseE (P.withD d) = lseE P := by
+  unfold lseE lseESexpr lse2Sexpr
+  rw [(stats_independent_of_column P d).1, (stats_independent_of_column P d).2]
+
+/-- The LSE of the init state: `mul(-inf, c)` and `lg2(+0)`, both `-inf` on the device for the class's `c > 0`. No row of
+the class is empty (the planner requires `kv_len >= q_len`), so this is the term's value at the fold's start only. -/
+theorem lse_init : lse2Sexpr initState = "(add (mul (const -inf) (sym c)) (op:lg2 (const 0.0)))" := by decide
+
 /-! ## The split kernel: one chunk per CTA, an index-addressed workspace, the fixup fold -/
 
 /-- Slot `j` of the workspace holds chunk `j`'s state, whatever CTA `σ` computed it on. -/
@@ -188,6 +276,13 @@ for every unit kind, ring depth and grid the planner may choose). -/
 theorem splitKernel_eq_fused (P : Params) (σ : Nat → Nat) : splitKernel P σ = output P := rfl
 
 theorem splitKernel_assignment_irrelevant (P : Params) (σ τ : Nat → Nat) : splitKernel P σ = splitKernel P τ := rfl
+
+/-- The split kernel's LSE: the member of the state the fixup folds (the fixup kernel and the in-kernel fold alike). -/
+def splitLse2 (P : Params) (σ : Nat → Nat) : String := lse2Sexpr (fixup (workspace P σ) P.presentChunks)
+def splitLseE (P : Params) (σ : Nat → Nat) : String := lseESexpr (fixup (workspace P σ) P.presentChunks)
+
+/-- **The split kernel's LSE is the fused one**, for every assignment of chunks to CTAs. -/
+theorem splitLse_eq_fused (P : Params) (σ : Nat → Nat) : splitLse2 P σ = lse2 P ∧ splitLseE P σ = lseE P := ⟨rfl, rfl⟩
 
 /-- The merge is not associative as a dataflow: a CTA may hold exactly one chunk or all of them. A
 unit covering a proper prefix merged with a later state would compute a different term. -/
@@ -226,6 +321,23 @@ theorem prefill_decode_agree (steps tbits C : Nat) (win : Int) (d : Nat) (kv_len
       = rowOutput steps tbits C win d (decodeRow (kv_len - q_len + i + 1) h row) := by
   unfold prefillRow decodeRow
   simp only [Nat.add_sub_cancel]
+
+/-- The LSE member of a launch row (base 2; the base-e member is its `mul` by the constant). -/
+def rowLse (steps tbits C : Nat) (win : Int) (r : Row) : String := lse2 ⟨steps, tbits, C, r.p, win, r.row, 0⟩
+
+/-- **Prefill == decode for the LSE (R4)**, as for the output. -/
+theorem lse_prefill_decode_agree (steps tbits C : Nat) (win : Int) (kv_len q_len i h row : Nat)
+    (hi : i < q_len) (hq : q_len ≤ kv_len) :
+    rowLse steps tbits C win (prefillRow kv_len q_len i h row)
+      = rowLse steps tbits C win (decodeRow (kv_len - q_len + i + 1) h row) := by
+  unfold prefillRow decodeRow
+  simp only [Nat.add_sub_cancel]
+
+/-- **Batch invariance of the LSE (R2)**: equal rows give equal LSE terms whatever the batch. -/
+theorem lse_batch_invariance (steps tbits C : Nat) (win : Int) {M₁ M₂ : Nat}
+    (rows₁ : Fin M₁ → Row) (rows₂ : Fin M₂ → Row) (r₁ : Fin M₁) (r₂ : Fin M₂) (h : rows₁ r₁ = rows₂ r₂) :
+    rowLse steps tbits C win (rows₁ r₁) = rowLse steps tbits C win (rows₂ r₂) := by
+  rw [h]
 
 /-- The launch applies the per-row term to every row; there is no batch parameter inside. -/
 def launch (M : Nat) (rows : Fin M → Row) (steps tbits C : Nat) (win : Int) (d : Nat) (r : Fin M) : ATerm :=
