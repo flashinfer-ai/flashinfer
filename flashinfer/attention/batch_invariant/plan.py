@@ -51,6 +51,10 @@ SWAPS_FUSE_MAX_CHUNKS = 4  # Swaps-body batches (small_swap): units of at most t
 SWAPS_FUSE_MIN_UNITS = 48  # SWAPS_FUSE_MIN_UNITS of them (the split kind's second
 # ramp + fold cost more than 1-3 extra chunks of streaming -- measured fused faster at B = 8 / 64 with short rows, every D;
 # at B = 1 (4-8 units) the split's parallelism wins from 2 chunks up and the batch stays below the unit floor)
+FUSED_FILL_MIN_D64 = 0.9  # D = 64 Swaps-body batches that the 2 x SM rule keeps fused: when the fused units fill their waves of SM
+LONG_SPLIT_MIN_CHUNKS = 16  # CTAs under this fraction (a part-filled last wave) and every unit has at least LONG_SPLIT_MIN_CHUNKS chunks,
+# the units split instead -- the 4-tile units balance the grid and the D = 64 body streams below the HBM rate per CTA, so the
+# split kind's partial rows and fixup cost less than the fused walk's idle CTAs (a placement)
 WIDE_SPLIT_SM_FRACTION = 4  # merge-agnostic unit-kind rule of ``"auto"`` for units wider than INKERNEL_MAX_ROWS rows (prefill tiles): they
 # split only when the fused units would occupy fewer than 1 / this of the SMs. A wide split unit costs its 128 x D fp32 partial rows
 # and the fixup's fold of them, so a split that merely balances a part-filled machine loses to the fused unit; the narrow (decode)
@@ -160,7 +164,9 @@ def build_plan(
     swap_max_rows: int = INKERNEL_MAX_ROWS,
 ) -> Plan:
     """``split_policy``: ``"auto"`` splits every multi-chunk tile of at most ``INKERNEL_MAX_ROWS`` rows (a decode unit) when the fused
-    unit count would leave the machine underfilled (``< 2 x SM``), a wider tile (a prefill unit) only when the fused units would fill
+    unit count would leave the machine underfilled (``< 2 x SM``) -- and, in a D = 64 Swaps batch, the tiles of at least
+    ``LONG_SPLIT_MIN_CHUNKS`` chunks when the fused units would leave their last wave of CTAs part-filled (``FUSED_FILL_MIN_D64``) --,
+    a wider tile (a prefill unit) only when the fused units would fill
     under ``1 / WIDE_SPLIT_SM_FRACTION`` of the SMs -- and, at head dims whose merged state is not in TMEM (D = 256), every multi-chunk
     tile of at most ``INKERNEL_MAX_ROWS`` rows (decode units) whatever the count: a fused decode unit there merges a 128 x 256 fp32
     state through the global scratch at every chunk end, and the split kind measured faster at long KV lengths
@@ -234,6 +240,10 @@ def build_plan(
         split_policy == "auto" and not om_tmem and 2 * len(tiles) > sm_count
     )
     inkernel_max_chunks = INKERNEL_MAX_CHUNKS if om_tmem else INKERNEL_MAX_CHUNKS_OF[D]
+    split_long64 = False  # the D = 64 part-filled-wave rule (see FUSED_FILL_MIN_D64)
+    if split_policy == "auto" and swap_batch and D == 64 and len(tiles) >= 2 * sm_count:
+        waves = -(-len(tiles) // sm_count)
+        split_long64 = len(tiles) < FUSED_FILL_MIN_D64 * waves * sm_count
     plan = Plan(tokens_per_tile=tpt, g=g, ws_row=ws_row(D))
     swaps_fuse = (
         swap_batch and split_policy == "auto" and len(tiles) >= SWAPS_FUSE_MIN_UNITS
@@ -247,6 +257,7 @@ def build_plan(
         )
         swaps_fused = swaps_fuse and chi - clo <= SWAPS_FUSE_MAX_CHUNKS
         do_split = do_split_narrow if rows <= INKERNEL_MAX_ROWS else do_split_wide
+        do_split = do_split or (split_long64 and chi - clo >= LONG_SPLIT_MIN_CHUNKS)
         if (
             chi - clo == 1
             or two_chunk_fused
