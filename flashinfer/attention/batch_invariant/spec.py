@@ -17,7 +17,10 @@ symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical
 * a **chunk** (``C`` keys at an absolute multiple of ``C``) is the tile fold from the init state; the
   chunks are folded in index order with ``merge`` from the same init state (the first present chunk
   is merged with it; absent chunks are dropped);
-* the epilogue is ``cvt_bf16(add(mul(O, div(1, l)), +0))``.
+* the epilogue is ``cvt_bf16(add(mul(O, div(1, l)), +0))``;
+* the LSE member (``lse_term``), a second output of the same row state: ``lse2 = add(mul(m, c), LG2(l))`` in base 2 and
+  ``mul(lse2, LN2)`` in base e, with ``LG2 = lg2.approx.ftz.f32`` (opaque, like ``EX2``). It reads the ``(m, l)`` that
+  normalise the output and has its own fingerprints (``lse_fingerprint``); the output terms do not contain it.
 
 Tile and chunk boundaries are absolute, ``T`` and ``C`` are functions of ``D`` only, so decode at
 position ``p`` and prefill of the token at position ``p`` build the same term (R4), and nothing in
@@ -50,6 +53,8 @@ HEAD_DIMS = (
     256,
 )  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
 NEG_INF = float("-inf")
+LN2 = to_f32(math.log(2.0))  # fp32(ln 2): the constant of the base-e LSE member
+LSE_BASES = ("log2", "ln")
 
 
 CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- a class constant (another C would be a different class)
@@ -293,6 +298,23 @@ def output_elem(fp, st: State, out_fmt: str = "bf16"):
     return fp.cvt_out(fp.add(fp.mul(st.o, inv), fp.const(0.0)), out_fmt)
 
 
+def lg2(fp, x):
+    """``LG2(x) = lg2.approx.ftz.f32``: ``fp.lg2`` on the backends that name it, the opaque ``op`` on the term algebra
+    (printed ``(op:lg2 x)``)."""
+    if hasattr(fp, "lg2"):
+        return fp.lg2(x)
+    return fp.op("lg2", x)
+
+
+def lse_term(fp, st: State, c, base: str = "log2"):
+    """The LSE member from the row's final statistics: ``lse2 = add(mul(m, c), LG2(l))`` (``m`` is in raw score units,
+    ``c = fp32(sm_scale * log2 e)``) for ``base="log2"``, ``mul(lse2, LN2)`` for ``base="ln"``. At the init state
+    ``(-inf, +0)`` both are ``-inf`` (``mul(-inf, c) = -inf`` for the class's ``c > 0``, ``LG2(+0) = -inf``)."""
+    assert base in LSE_BASES, base
+    lse2 = fp.add(fp.mul(st.m, c), lg2(fp, st.l))
+    return lse2 if base == "log2" else fp.mul(lse2, fp.const(LN2))
+
+
 # ----------------------------------------------------------------------------- the reduction object
 
 
@@ -353,7 +375,7 @@ def verify_plan(red: Reduction, fp) -> Any:
 
 
 class AttentionSpec:
-    """Symbolic view: ``output(row, d)`` is the term of one output element."""
+    """Symbolic view: ``output(row, d)`` is the term of one output element, ``lse(row, base)`` the LSE member."""
 
     def __init__(
         self,
@@ -376,6 +398,9 @@ class AttentionSpec:
 
     def output(self, row: RowSpec, d: int) -> Term:
         return output_elem(self.alg, self.state(row, d), self.out_fmt)
+
+    def lse(self, row: RowSpec, base: str = "log2") -> Term:
+        return lse_term(self.alg, self.state(row, 0), self.c, base)
 
 
 _FINGERPRINTS: Dict[tuple, str] = {}
@@ -414,3 +439,41 @@ def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
             + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
         )
     return _FINGERPRINTS[key]
+
+
+_LSE_FINGERPRINTS: Dict[tuple, str] = {}
+# the recorded fingerprints of the LSE member per (head dim, base); pinned by tests/attention/test_batch_invariant_attention.py
+LSE_FINGERPRINTS = {
+    (64, "log2"): "attn-bf16-d64-lse-log2-a8c548ec287e23bd",
+    (64, "ln"): "attn-bf16-d64-lse-ln-d94f46b73185b273",
+    (128, "log2"): "attn-bf16-d128-lse-log2-c9084818e797cacf",
+    (128, "ln"): "attn-bf16-d128-lse-ln-8e4f2608bce73f6c",
+    (256, "log2"): "attn-bf16-d256-lse-log2-ad95fa9071f86c5c",
+    (256, "ln"): "attn-bf16-d256-lse-ln-54b51dc083581fce",
+}
+
+
+def lse_fingerprint(D: int = 128, base: str = "log2") -> str:
+    """Identifier of the LSE member of the class at head dim ``D`` in ``base`` (``"log2"`` | ``"ln"``): hashes the LSE term of
+    ``spec_fingerprint``'s sample row together with ``D``, ``T``, ``C`` and the base. A receipt of its own: the class
+    fingerprints (``spec_fingerprint``) hash the output terms alone and do not move with it."""
+    if base not in LSE_BASES:
+        raise ValueError(f"lse_base must be one of {LSE_BASES}, got {base!r}")
+    key = (D, base)
+    if key not in _LSE_FINGERPRINTS:
+        from ...batch_invariant.fp_interface.term import fingerprint
+
+        spec = AttentionSpec(D)
+        row = RowSpec(p=spec.C + spec.T // 2)
+        parts = [
+            f"D={D}",
+            f"T={spec.T}",
+            f"C={spec.C}",
+            f"base={base}",
+            fingerprint(spec.lse(row, base)),
+        ]
+        _LSE_FINGERPRINTS[key] = (
+            f"attn-bf16-d{D}-lse-{base}-"
+            + hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+        )
+    return _LSE_FINGERPRINTS[key]

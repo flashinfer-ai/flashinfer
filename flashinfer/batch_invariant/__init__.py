@@ -90,9 +90,11 @@ def _gemm_fp8_nt_groupwise_fingerprint(
     )
 
 
-def _attention_fingerprint(head_dim: int) -> str:
-    from ..attention.batch_invariant.spec import spec_fingerprint
+def _attention_fingerprint(head_dim: int, lse_base: Optional[str] = None) -> str:
+    from ..attention.batch_invariant.spec import lse_fingerprint, spec_fingerprint
 
+    if lse_base is not None:
+        return lse_fingerprint(head_dim, lse_base)
     return spec_fingerprint(head_dim)
 
 
@@ -576,15 +578,16 @@ CLASSES: Dict[str, ClassInfo] = {
         ("use_nvfp4", "arch"),
     ),
     # the three attention wrappers compute one class per head dim: a token's output depends on its KV position, its head and the
-    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class
+    # window alone, so prefill and decode (and the paged and ragged KV layouts) are one class; `lse_base` names the class's LSE
+    # member (`return_lse=True`), a receipt of its own per head dim and base
     "BatchDecodeWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("lse_base",)
     ),
     "BatchPrefillWithPagedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("lse_base",)
     ),
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
-        "attention.bf16", ("head_dim",), _attention_fingerprint
+        "attention.bf16", ("head_dim",), _attention_fingerprint, ("lse_base",)
     ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
@@ -672,7 +675,10 @@ def fingerprint(op: str, **dims) -> str:
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
     ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
     sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
-    class's no-window sample row and covers windowed calls too.
+    class's no-window sample row and covers windowed calls too. The optional ``lse_base`` (``"log2"`` or ``"ln"``) names the
+    LSE member the wrappers return with ``return_lse=True`` -- ``add.rn(mul.rn(m, c), lg2.approx.ftz(l))`` of the row's final
+    maximum and sum, times ``fp32(ln 2)`` in base e -- with its own receipt per head dim and base; the receipt without it is
+    the attention output's and does not depend on whether the LSE is requested.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -688,6 +694,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-nvfp4-kfold-...'
     >>> fingerprint("fused_moe_fp8", H=2048, I=768, top_k=8, num_experts=128)  # doctest: +SKIP
     'moe-...'
+    >>> fingerprint("BatchPrefillWithPagedKVCacheWrapper", head_dim=128, lse_base="ln")  # doctest: +SKIP
+    'attn-bf16-d128-lse-ln-...'
 
     ``fused_moe_fp8`` takes the dimensions of ``fused_moe`` for the fp8 per-tensor classes ``moe.e4m3.<act>`` behind
     ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
