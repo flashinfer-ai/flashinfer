@@ -19,7 +19,7 @@ must not require a GPU; GPU lanes exclude them. Docs-only PRs run no tests, and
 
 ## Sharded test runner
 
-Run `pytest --confcutdir=tests/test_sharding tests/test_sharding/` for the
+Run `pytest --confcutdir=tests/infra/test_sharding tests/infra/test_sharding/` for the
 CPU-only coordinator suite.
 
 The default is one worker per visible GPU. H100 PR CI uses
