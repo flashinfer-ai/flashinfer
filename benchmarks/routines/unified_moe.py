@@ -586,7 +586,7 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
         backend=BackendOptions((backend_config,)),
         finalize=MoEFinalizeConfig(do_finalize=True, use_fused_finalize=True),
         execution=ExecutionConfig(
-            enable_pdl=False,
+            enable_pdl=args.enable_pdl,
             tune_max_num_tokens=args.num_tokens,
         ),
     )
@@ -660,9 +660,6 @@ def run_unified_moe_test(args):
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
     if args.generate_repro_command:
         print(f"[INFO] To reproduce this test case, run: {args.repro_command}")
-    if args.enable_pdl:
-        raise ValueError("unified_moe requires PDL disabled for backend parity")
-
     device = get_device(args)
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
     if input_dtype is not torch.bfloat16:

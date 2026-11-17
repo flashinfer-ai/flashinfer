@@ -1,6 +1,7 @@
 from dataclasses import asdict
 from functools import partial
 from typing import ClassVar
+import warnings
 
 from ...api import ActivationConfig
 
@@ -80,7 +81,10 @@ class ColonelsBf16Runner(MoERunner):
                 "Colonels kernels always finalize the weighted output"
             )
         if self.config.execution.enable_pdl is True:
-            raise NotImplementedError("Colonels does not implement PDL")
+            warnings.warn(
+                "Colonels ignores enable_pdl=True and uses standard kernel launches.",
+                stacklevel=2,
+            )
         if self.config.quant.swizzled_scale_factors:
             raise NotImplementedError("Colonels requires linear block scales")
         if (
@@ -301,6 +305,9 @@ class ColonelsBf16Runner(MoERunner):
 
     def _routes(self, ids, weights, expert_map):
         offset = self.config.experts.local_expert_offset
+        if not offset and not expert_map.numel() and not self.shared_experts:
+            # The sorter and GEMV already discard IDs outside the local expert range.
+            return ids, weights
         if expert_map.numel():
             valid = (ids >= 0) & (ids < expert_map.numel())
             local = expert_map[ids.clamp(0, expert_map.numel() - 1).long()]
@@ -390,7 +397,7 @@ class ColonelsBf16Runner(MoERunner):
 
     def precompile_tactics(self, inputs, tactics, profile, **kwargs):
         # get_valid_tactics also checks runtime resource limits outside capture.
-        # therefore we need to have it compiled there and at this point we just 
+        # therefore we need to have it compiled there and at this point we just
         # return that compilatinon is done
         return True
 

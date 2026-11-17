@@ -80,7 +80,9 @@ them exactly as supplied. The direct launch API also exposes `scaling_factor`.
 Use Colonels-only candidates for precomputed shared experts;
 other backends retain their existing DeepSeekV3 shared-expert contract.
 The sorter supports at most 32 combined routes per token and 2048 local plus
-shared experts. FromLogits routing, PDL, and unfinalized output are rejected.
+shared experts. FromLogits routing and unfinalized output are rejected.
+`enable_pdl=True` emits a warning and is ignored; Colonels uses standard kernel
+launches regardless of this hint.
 
 ## Tuning, graphs, and direct launches
 
