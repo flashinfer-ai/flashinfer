@@ -225,3 +225,52 @@ def test_cuda_graph_replay_matches_eager():
     gold2 = _reference(inp).float()
     diff2 = (out.float() - gold2).abs()
     assert float((diff2 <= 0.005 + 0.05 * gold2.abs()).float().mean()) == 1.0
+
+
+@requires_sm103
+def test_generalized_entry_parity_and_dispatch():
+    """batch_context_with_kv_cache is the vendor-neutral front: same enum,
+    same dispatch semantics, bitwise parity with the direct entry."""
+    from flashinfer.prefill import (
+        BATCH_CONTEXT_BACKENDS,
+        TRTLLM_BATCH_CONTEXT_BACKENDS,
+        batch_context_with_kv_cache,
+    )
+
+    assert BATCH_CONTEXT_BACKENDS == TRTLLM_BATCH_CONTEXT_BACKENDS
+    inp = _make_inputs([2] * 8, [2] * 8, seed=11)
+    kv = inp["kv_buf"]
+    kwargs = dict(
+        query=inp["q"],
+        kv_cache=(kv[:, :, 0, :].unsqueeze(1), kv[:, :, 1, :].unsqueeze(1)),
+        workspace_buffer=_ws(),
+        block_tables=inp["bt"],
+        seq_lens=inp["seq_lens"],
+        max_q_len=inp["max_q"],
+        max_kv_len=inp["max_kv"],
+        bmm1_scale=SCALE,
+        bmm2_scale=1.0,
+        batch_size=int(inp["seq_lens"].shape[0]),
+        cum_seq_lens_q=inp["cu_q"],
+        cum_seq_lens_kv=inp["cu_kv"],
+        window_left=-1,
+    )
+    # auto on the allowlist routes to specialized, same as the direct entry
+    before = dict(spec_mod.DISPATCH_STATS)
+    gen_out = batch_context_with_kv_cache(out=_out_like(inp), **kwargs)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1
+    direct_out = _api(inp, _out_like(inp))
+    assert torch.equal(gen_out, direct_out)
+    # explicit backends behave identically through the front
+    gen_spec = batch_context_with_kv_cache(
+        out=_out_like(inp), backend="specialized", **kwargs
+    )
+    assert torch.equal(gen_spec, gen_out)
+    gen_stock = batch_context_with_kv_cache(
+        out=_out_like(inp), backend="trtllm-gen", **kwargs
+    )
+    direct_stock = _api(inp, _out_like(inp), backend="trtllm-gen")
+    assert torch.equal(gen_stock, direct_stock)
+    # invalid backend raises through the front too
+    with pytest.raises(ValueError):
+        batch_context_with_kv_cache(out=_out_like(inp), backend="bogus", **kwargs)

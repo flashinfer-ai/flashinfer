@@ -9851,6 +9851,27 @@ def trtllm_batch_context_with_kv_cache(
     return result_out
 
 
+# Backends for the generalized batch-context entry: the same enum as the
+# specific entry it connects to. New backends are added here.
+BATCH_CONTEXT_BACKENDS = TRTLLM_BATCH_CONTEXT_BACKENDS
+
+
+def batch_context_with_kv_cache(*args, **kwargs):
+    """Generalized batch-context (chunked-prefill) attention over paged KV.
+
+    Vendor-neutral front for the batch-context contract. Identical
+    signature, defaults and semantics to
+    :func:`trtllm_batch_context_with_kv_cache`, which stays unchanged and
+    is one of this entry's backends: ``backend`` selects among
+    ``BATCH_CONTEXT_BACKENDS`` — ``"auto"`` (default) behaves as
+    ``"trtllm-gen"`` except that strictly allowlisted calls route to the
+    agent-generated ``"specialized"`` kernel; an explicitly selected
+    backend is never silently swapped, and ``"specialized"`` raises a
+    ``ValueError`` listing ``fallback_reasons`` for calls it cannot serve.
+    """
+    return trtllm_batch_context_with_kv_cache(*args, **kwargs)
+
+
 @functools.cache
 def get_trtllm_fmha_v2_sm120_module():
     return gen_trtllm_fmha_v2_sm120_module().build_and_load()
