@@ -203,6 +203,8 @@ def get_cccl_include_overlay() -> Optional[Path]:
         )
 
     overlay_dir = jit_env.FLASHINFER_GEN_SRC_DIR / "_cccl_include_overlay"
+    if not (overlay_dir / _CCCL_TCGEN05_HEADER).is_file():
+        _get_cccl_include_overlay.cache_clear()
     return _get_cccl_include_overlay(source_header.resolve(), overlay_dir.resolve())
 
 
@@ -487,18 +489,17 @@ def generate_ninja_build_for_op(
     }
 
     if is_windows:
-        python_path = os.path.dirname(sys.executable)
-        if python_path.endswith("\\Scripts"):
-            python_path = os.path.dirname(python_path)
         python_lib_path = os.path.join(sys.base_exec_prefix, "libs")
+        tvm_ffi_lib_path = Path(tvm_ffi.__file__).parent / "lib"
+        torch_lib_path = Path(torch.__file__).parent / "lib"
         cuda_lib_arch = (
             "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
         )
         ldflags = [
             f'"/LIBPATH:{python_lib_path}"',
             f'"/LIBPATH:$cuda_home\\lib\\{cuda_lib_arch}"',
-            f'"/LIBPATH:{python_path}\\Lib\\site-packages\\tvm_ffi\\lib"',
-            f'"/LIBPATH:{python_path}\\Lib\\site-packages\\torch\\lib"',
+            f'"/LIBPATH:{tvm_ffi_lib_path}"',
+            f'"/LIBPATH:{torch_lib_path}"',
             "c10.lib",
             "c10_cuda.lib",
             "torch.lib",
@@ -710,6 +711,21 @@ def generate_ninja_build_for_op(
     link_rule = "nvcc_link" if needs_device_linking else "link"
     output_so = ninja_path((output_dir / jit_env.jit_library_name(name)).resolve())
     lines.append(f"build {output_so}: {link_rule} " + " ".join(objects))
+    if needs_device_linking and is_windows:
+        # nvcc takes a bare /LIBPATH: entry for an input file; -Xlinker
+        # forwards it to link.exe. The override binds to this build
+        # statement only, so the link rule keeps the bare entries.
+        lines.append(
+            "  ldflags = "
+            + join_multiline(
+                [
+                    f"-Xlinker {flag}"
+                    if flag.lstrip('"').startswith("/LIBPATH:")
+                    else flag
+                    for flag in ldflags
+                ]
+            )
+        )
     lines.append(f"default {output_so}")
     lines.append("")
 
