@@ -40,8 +40,10 @@ the correctness gates are exercisable without a GPU):
   ``(batch_size, vocab_size)``, 16-byte aligned ``probs``;
 - CUDA tensors on one device of compute capability exactly 10.3;
 - never built inside a CUDA-graph capture: a capture before the first eager dispatch takes the
-  (capture-safe) stock path. After it, the kernel is capture-safe (no host sync, no allocation
-  besides the output, launches on the current stream).
+  (capture-safe) stock path. The capture state is read for the current stream of ``probs``'s
+  device (the stream the kernel launches on), not of the current device, which may differ.
+  After the first eager dispatch the kernel is capture-safe (no host sync, no allocation besides
+  the output, launches on the current stream of ``probs``'s device).
 
 A failed JIT build or a rejected launch falls back to the stock path (the launch failure
 disables the kernel on that device for the process) and is reported by
@@ -148,6 +150,14 @@ def _emit_once(key: str, line: str) -> None:
     logger.info(line)
 
 
+def _is_capturing(device: torch.device) -> bool:
+    """Whether the current stream of CUDA ``device`` is capturing a CUDA graph.
+    ``torch.cuda.is_current_stream_capturing()`` alone reads the current device's stream, which
+    misses a capture on ``device`` when another device is current."""
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
 def _is_target_device(device: Optional[torch.device]) -> bool:
     """Whether ``device`` is a CUDA device of compute capability 10.3 (the device whose calls
     write markers to stderr). Inside a CUDA-graph capture only a capability recorded before is
@@ -157,7 +167,7 @@ def _is_target_device(device: Optional[torch.device]) -> bool:
             return False
         capability = _device_capability.get(device.index)
         if capability is None:
-            if torch.cuda.is_current_stream_capturing():
+            if _is_capturing(device):
                 return False
             capability = get_compute_capability(device)
             _device_capability[device.index] = capability
@@ -272,8 +282,8 @@ def _reject_reason(
         return "compute_capability"
     if probs.device.index in _launch_failed_devices:
         return "launch_error"
-    if _module is None and torch.cuda.is_current_stream_capturing():
-        # Never build/load inside a capture; the stock path is capture-safe.
+    if _module is None and _is_capturing(probs.device):
+        # Never build/load inside a capture on the launch stream; the stock path is capture-safe.
         return "capturing_before_jit"
     return None
 

@@ -2793,32 +2793,111 @@ def top_p_specialized_on_target(monkeypatch):
     )
 
 
+class _TopPSpecializedFakeCudaDevices:
+    """Stand-in for torch.cuda's current device and per-device stream capture (no GPU needed):
+    ``is_current_stream_capturing()`` reports the current device's stream, as torch does."""
+
+    def __init__(self, monkeypatch, current=0, capturing=()):
+        self.current = current
+        self.capturing = set(capturing)
+        fake = self
+
+        class _Device:
+            def __init__(self, device):
+                self.index = (
+                    device if isinstance(device, int) else torch.device(device).index
+                )
+
+            def __enter__(self):
+                self.previous, fake.current = fake.current, self.index
+
+            def __exit__(self, *exc):
+                fake.current = self.previous
+                return False
+
+        monkeypatch.setattr(torch.cuda, "device", _Device)
+        monkeypatch.setattr(
+            torch.cuda,
+            "is_current_stream_capturing",
+            lambda: fake.current in fake.capturing,
+        )
+
+
+class _TopPSpecializedFakeCudaTensor(torch.Tensor):
+    """A CPU tensor that reports a CUDA device, for the guard's device gates without a GPU."""
+
+    @property
+    def device(self):
+        return self._fake_device
+
+
+def _top_p_specialized_fake_cuda_call(index):
+    batch_size, vocab_size = _TOP_P_SPECIALIZED_SHAPES[0]
+    probs = torch.rand(batch_size, vocab_size).as_subclass(
+        _TopPSpecializedFakeCudaTensor
+    )
+    top_p = torch.full((batch_size,), 0.95).as_subclass(_TopPSpecializedFakeCudaTensor)
+    probs._fake_device = top_p._fake_device = torch.device("cuda", index)
+    return probs, top_p
+
+
 def test_top_p_renorm_probs_specialized_target_device_gate(monkeypatch):
     # stderr is reserved for calls on a CUDA device of compute capability 10.3, read from a
-    # per-device cache that is never filled inside a CUDA-graph capture.
-    capabilities = {0: (10, 3), 1: (10, 0), 2: (10, 3)}
+    # per-device cache that is never filled while that device's stream is capturing a CUDA graph.
+    capabilities = {0: (10, 3), 1: (10, 0), 2: (10, 3), 3: (10, 3)}
     queried = []
 
     def get_compute_capability(device):
         queried.append(device.index)
         return capabilities[device.index]
 
-    capturing = [False]
+    devices = _TopPSpecializedFakeCudaDevices(monkeypatch, current=0)
     monkeypatch.setattr(
         _top_p_renorm_specialized, "get_compute_capability", get_compute_capability
     )
     monkeypatch.setattr(_top_p_renorm_specialized, "_device_capability", {})
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
     gate = _top_p_renorm_specialized._is_target_device
     assert gate(torch.device("cuda", 0)) and gate(torch.device("cuda", 0))
     assert not gate(torch.device("cuda", 1))
     assert queried == [0, 1]
-    capturing[0] = True
+    devices.capturing = {0, 2}
     assert gate(torch.device("cuda", 0))
     # a device not seen before the capture counts as another device, without a query
     assert not gate(torch.device("cuda", 2))
+    # ... also while another device (not capturing) is current
+    devices.capturing = {2}
+    assert not gate(torch.device("cuda", 2))
     assert queried == [0, 1]
+    # a capture on the current device does not hide a device whose stream is not capturing
+    devices.capturing = {0}
+    assert gate(torch.device("cuda", 3))
+    assert queried == [0, 1, 3]
+    assert devices.current == 0
     assert not gate(torch.device("cpu")) and not gate(None)
+
+
+def test_top_p_renorm_probs_specialized_capture_check_reads_the_tensor_device(
+    top_p_specialized_enabled, monkeypatch
+):
+    # Before the module is built, a capture on the stream of probs' device keeps the
+    # (capture-safe) stock path, also while another device is current:
+    # torch.cuda.is_current_stream_capturing() alone reads the current device's stream.
+    probs, top_p = _top_p_specialized_fake_cuda_call(1)
+    devices = _TopPSpecializedFakeCudaDevices(monkeypatch, current=0, capturing={1})
+    monkeypatch.setattr(
+        _top_p_renorm_specialized, "get_compute_capability", lambda device: (10, 3)
+    )
+    monkeypatch.setattr(_top_p_renorm_specialized, "_device_capability", {})
+    monkeypatch.setattr(_top_p_renorm_specialized, "_launch_failed_devices", set())
+    monkeypatch.setattr(_top_p_renorm_specialized, "_module", None)
+    reject = _top_p_renorm_specialized._reject_reason
+    assert reject(probs, top_p, False) == "capturing_before_jit"
+    assert devices.current == 0
+    devices.current = 1
+    assert reject(probs, top_p, False) == "capturing_before_jit"
+    devices.current = 0
+    devices.capturing = set()
+    assert reject(probs, top_p, False) is None
 
 
 def test_top_p_renorm_probs_specialized_fallback_lines_are_silent_off_target(
@@ -3351,6 +3430,51 @@ def test_top_p_renorm_probs_specialized_capture_before_jit(
     torch.cuda.synchronize()
     torch.testing.assert_close(
         out, _top_p_specialized_reference(probs, top_p).cuda(), atol=1e-3, rtol=1e-3
+    )
+
+
+def test_top_p_renorm_probs_specialized_capture_on_another_device(
+    top_p_specialized_enabled, monkeypatch
+):
+    # A graph captured on cuda:1 while cuda:0 is current, before the module is built: the call
+    # on cuda:1 takes the (capture-safe) stock path instead of building inside the capture.
+    _skip_unless_sm103()
+    if torch.cuda.device_count() < 2 or torch.cuda.get_device_capability(1) != (10, 3):
+        pytest.skip("needs two SM103 GPUs")
+    probs, top_p = _top_p_specialized_inputs(6, 154880, seed=13)
+    probs, top_p = probs.to("cuda:1"), top_p.to("cuda:1")
+    # warm the AIR path on cuda:1 eagerly so its module is loaded outside the capture
+    monkeypatch.setenv(_TOP_P_SPECIALIZED_KILL_SWITCH, "1")
+    flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+    monkeypatch.delenv(_TOP_P_SPECIALIZED_KILL_SWITCH)
+    monkeypatch.setattr(_top_p_renorm_specialized, "_module", None)
+
+    def _must_not_build():
+        raise AssertionError("the specialized module was built inside a capture")
+
+    monkeypatch.setattr(_top_p_renorm_specialized, "_get_module", _must_not_build)
+    before = _top_p_specialized_stats()
+    with torch.cuda.device(1):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=s), torch.cuda.device(0):
+            assert not torch.cuda.is_current_stream_capturing()
+            out = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
+        torch.cuda.current_stream().wait_stream(s)
+    after = _top_p_specialized_stats()
+    assert after["dispatch_count"] == before["dispatch_count"]
+    assert (
+        after["fallback_reasons"]["capturing_before_jit"]
+        == before["fallback_reasons"].get("capturing_before_jit", 0) + 1
+    )
+    graph.replay()
+    torch.cuda.synchronize(1)
+    torch.testing.assert_close(
+        out,
+        _top_p_specialized_reference(probs, top_p).to(out.device),
+        atol=1e-3,
+        rtol=1e-3,
     )
 
 
