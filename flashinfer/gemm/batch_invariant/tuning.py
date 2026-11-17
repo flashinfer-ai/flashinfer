@@ -493,7 +493,7 @@ def mm_bf16_batch_invariant_auto(
     )
     return _run(
         a,
-        b.t(),
+        b,
         out,
         b_major,
         M,
@@ -615,7 +615,7 @@ def mm_mxfp8_batch_invariant_auto(
     )
     return _run_mx(
         a,
-        b.t(),
+        b,
         sfa,
         sfb,
         out,
@@ -697,7 +697,7 @@ def mm_fp4_batch_invariant_auto(
     )
     return _run_mx(
         a,
-        b.t(),
+        b,
         sfa,
         sfb,
         out,

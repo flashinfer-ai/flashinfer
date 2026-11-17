@@ -26,6 +26,7 @@ import flashinfer
 from flashinfer import batch_invariant as bi
 from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.batch_invariant.fp_interface import exact
+from flashinfer.gemm.batch_invariant import api as bi_api
 from flashinfer.gemm.batch_invariant import tuning
 from flashinfer.gemm.batch_invariant.api import (
     GEMM_FP8BS_ARCHS,
@@ -529,6 +530,7 @@ def test_k_native_scale_staging_is_a_placement():
         for M, mode, want in ((16, "K", True), (128, "K", False), (16, "MN", False)):
             a, w, sa, sb = operands(M, 2048, 1024, seed=85)
             seen.clear()
+            bi_api._KERNELS.clear()  # the launch asks the compile again (its handle cache is per record and staging)
             api(a, w, sa, sb, mode)
             assert seen and all(v == want for v in seen), (M, mode, seen)
     finally:
