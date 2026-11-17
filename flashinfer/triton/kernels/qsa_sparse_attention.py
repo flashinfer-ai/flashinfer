@@ -22,6 +22,10 @@ Launch-state notes (kept out of import time on purpose):
   call first so that no allocation happens during capture (replay then reuses
   stable pointers). Retention is bounded by the largest shape seen
   (roughly ``4 * T * 6 * 256`` BF16 + ``8 * T * 6`` FP32 elements + 256 KiB).
+- The scratch caches are shared process-wide, not per stream: concurrent
+  calls of this op on different CUDA streams are not supported (documented in
+  the public docstring); all calls, captures and replays included, must be
+  serialized on one stream at a time.
 """
 
 import torch
@@ -620,6 +624,7 @@ def _qsa_short2(Q, G, KC, VC, PK, PB, O, T, NSLOT,
                 BN: tl.constexpr, NSUB: tl.constexpr, FP8: tl.constexpr,
                 GEARLY: tl.constexpr, PV8: tl.constexpr,
                 FASTRCP: tl.constexpr,
+                OVH: tl.constexpr,
                 NHC: tl.constexpr, DC: tl.constexpr,
                 PWC: tl.constexpr, SC: tl.constexpr):
     """Two tokens per warp-MMA tile for short single-request rows.
@@ -688,11 +693,23 @@ def _qsa_short2(Q, G, KC, VC, PK, PB, O, T, NSLOT,
     koff0 = ii[:, None] * DC + dd[None, :]
     for kw in range(0, nwd):
         w0 = kw * BN
-        ws = tl.maximum(tl.minimum(w0, NSLOT - BN), 0)
-        acc, mi, li = _sblk(q, qlo, emat, mz, rcnt - w0,
-                            KC + ws * DC, VC + ws * DC, koff0,
-                            acc, mi, li, cc, True, BN, FP8, True, True,
-                            PV8)
+        if OVH:
+            # The last window overhangs the cache (NSLOT is not a multiple of
+            # BN up to T): keep the LOGICAL origin at w0 and clamp per slot,
+            # like every other route. The clamped (duplicate) slots are
+            # columns ii >= NSLOT - w0 >= rcnt - w0, which the rcw mask in
+            # _sblk already excludes from the softmax.
+            sl = tl.minimum(w0 + ii, NSLOT - 1)
+            acc, mi, li = _sblk(q, qlo, emat, mz, rcnt - w0,
+                                KC, VC, sl[:, None] * DC + dd[None, :],
+                                acc, mi, li, cc, True, BN, FP8, True, True,
+                                PV8)
+        else:
+            # No window can overhang (checked at launch): w0 is in bounds.
+            acc, mi, li = _sblk(q, qlo, emat, mz, rcnt - w0,
+                                KC + w0 * DC, VC + w0 * DC, koff0,
+                                acc, mi, li, cc, True, BN, FP8, True, True,
+                                PV8)
 
     proof = tl.reduce(tl.where(tv, (cnt - 1 - toks) | (vid - toks), 0),
                       0, _or_comb)
@@ -2221,6 +2238,9 @@ def run(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base, out):
             FP8=(SR_FP8 == 1), GEARLY=(srw <= 16),
             PV8=(SR_PV8 == 1),
             FASTRCP=(T == 256),
+            # A KV window overhangs an exactly-sized cache when the slot
+            # count is not a multiple of the window up to T's last window.
+            OVH=(nslot < ((T + short_bn - 1) // short_bn) * short_bn),
             NHC=NH, DC=D, PWC=PW, SC=SCL,
             num_warps=(4 if T == 96 else SR_WARPS),
             num_stages=(2 if T == 256 else

@@ -2798,8 +2798,11 @@ def qsa_sparse_paged_attention(
         reports the unsupported device on SM107, since no composable path implements this
         form). ``"auto"`` (the default) selects ``"specialized"`` exactly when it can serve
         the call — an FP8 cache on SM107 at the geometry above, the one form every other
-        backend refuses — and otherwise selects ``"default"`` for every cache on 8.x and 9.0
-        and for FP8 and BF16 caches anywhere. For an NVFP4 cache on a capability the Cake
+        backend refuses — and, like every automatic route to an experimental backend,
+        only when ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set; without the
+        opt-in it raises ``RuntimeError`` naming that variable and the explicit
+        ``backend="specialized"`` alternative. Otherwise ``"auto"`` selects ``"default"``
+        for every cache on 8.x and 9.0 and for FP8 and BF16 caches anywhere. For an NVFP4 cache on a capability the Cake
         package exports, ``"auto"`` selects ``"cake"`` only when
         ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set and raises ``RuntimeError``
         otherwise; anywhere else it selects ``"default"``, which reports the unsupported
@@ -2817,7 +2820,10 @@ def qsa_sparse_paged_attention(
     nondecreasing, matching ``block_table``'s row order); and each request's pages must be the
     contiguous block range starting at ``block_table[request, 0]`` (only that first column is
     read). This is the layout vLLM's Qwen QSA serving path produces. The kernel is bitwise
-    deterministic run to run. CUDA graphs: run one eager call at the same shape before
+    deterministic run to run. The specialized backend's persistent scratch (split-K
+    partials and TMA-descriptor staging) is process-wide, so concurrent specialized calls
+    on different CUDA streams are not supported: issue all specialized calls (captures and
+    replays included) on one stream at a time. CUDA graphs: run one eager call at the same shape before
     capturing — the kernel keeps persistent per-process scratch sized by the input shape, so a
     warmed-up capture performs no allocation and replay reuses stable pointers; the first
     specialized call also installs Triton's process-wide launch allocator (importing
@@ -2834,8 +2840,13 @@ def qsa_sparse_paged_attention(
         )
         if reason is None:
             # The one form every other backend refuses: an FP8 cache on
-            # SM107 at the specialized kernel's contract. No opt-in gate:
-            # the alternative is "default"'s unsupported-device error.
+            # SM107 at the specialized kernel's contract. Automatic routing
+            # to an experimental backend still takes the opt-in gate; its
+            # error names the opt-in and the explicit backend, which beats
+            # "default"'s bare unsupported-device report.
+            require_experimental_auto_backends(
+                "qsa_sparse_paged_attention -> specialized"
+            )
             backend = "specialized"
             warn_experimental_backend_once(
                 "qsa_sparse_paged_attention", "specialized", automatic=True

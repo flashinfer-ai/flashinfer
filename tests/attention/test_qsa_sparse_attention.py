@@ -34,6 +34,13 @@ SM107 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (10,
 pytestmark = pytest.mark.skipif(not SM107, reason="requires SM107 (Rubin)")
 
 
+@pytest.fixture(autouse=True)
+def _allow_experimental_auto_backends(monkeypatch):
+    """backend="auto" routes to the experimental specialized backend only
+    under the documented opt-in; these tests exercise that route."""
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
+
+
 def ref_qsa_sparse_attention(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base):
     """Chunked exact reference: per-token gather of the selected K/V slots,
     FP32 softmax at scale 256**-0.5, BF16 rounding, then the sigmoid gate."""
@@ -110,15 +117,16 @@ def build_selection(pos, seed, dev):
     return packed
 
 
-def make_inputs(lengths, seed=0, device="cuda", q_scale=0.5):
+def make_inputs(lengths, seed=0, device="cuda", q_scale=0.5, spare_pages=1):
     """Packed requests of the given lengths over contiguous paged FP8 K/V
-    caches (one spare page per request); synthetic seeded values. Returns the
-    qsa_sparse_paged_attention argument dict plus the reference-side views
-    (cu_seqlens / page_base, which the block table encodes)."""
+    caches (``spare_pages`` spare pages per request; 0 sizes the cache
+    exactly); synthetic seeded values. Returns the qsa_sparse_paged_attention
+    argument dict plus the reference-side views (cu_seqlens / page_base,
+    which the block table encodes)."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     cu = torch.tensor([0] + list(itertools.accumulate(lengths)), dtype=torch.int32)
     T = int(cu[-1])
-    npages = [(length + PAGE - 1) // PAGE + 1 for length in lengths]
+    npages = [(length + PAGE - 1) // PAGE + spare_pages for length in lengths]
     page_base = torch.tensor(
         [0] + list(itertools.accumulate(npages))[:-1], dtype=torch.int32
     )
@@ -213,6 +221,30 @@ def test_correctness(lengths):
     out = run_api(inputs)
     ref = run_ref(inputs)
     assert_close_at_gate(out, ref)
+
+
+@pytest.mark.parametrize("lengths", [(192,), (130,), (250, 190)])
+def test_exact_capacity_cache(lengths):
+    """A cache with no spare pages: the short-row KV windows must keep their
+    logical origin when the last window overhangs the slot count (origin
+    clamping read the wrong slots), and every route must stay in bounds."""
+    inputs = make_inputs(lengths, seed=sum(lengths) + 1, spare_pages=0)
+    out = run_api(inputs)
+    ref = run_ref(inputs)
+    assert_close_at_gate(out, ref)
+
+
+def test_auto_requires_experimental_opt_in(monkeypatch):
+    """Without FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1, backend="auto"
+    must not silently route to the experimental specialized backend; the
+    gate's error names the opt-in. Explicit selection stays available."""
+    inputs = make_inputs((64,), seed=21)
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "0")
+    with pytest.raises(RuntimeError, match="EXPERIMENTAL_AUTO_BACKENDS"):
+        run_api(inputs, backend="auto")
+    spec = run_api(inputs, backend="specialized")
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
+    assert torch.equal(run_api(inputs, backend="auto"), spec)
 
 
 def test_wider_query_magnitude_stays_at_gate():
