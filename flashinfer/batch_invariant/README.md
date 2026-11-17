@@ -189,10 +189,10 @@ depend on the batch; the class is what the mode promises instead.
 | API | Class and fingerprint | Numerics | Supported inputs |
 |---|---|---|---|
 | `softmax(..., batch_invariant=True, out_dtype=)` | `lse.row`; `fingerprint("softmax", N=, dtype=, temperature=[, out_dtype=])` (the vocabulary, the input dtype and whether a temperature enters the scale are the specification's dimensions; `out_dtype=torch.float32` names the fp32 input's specification: the leaves of a 16-bit input are its exact widenings, so only the output conversion differs) | `c = log2(e)` or `div.rn(log2(e), T)`; `z_j = mul.rn(add.rn(x_j, neg(m)), c)`; `e_j = ex2.approx.ftz(z_j)`; `s` the `add.rn` tree over the `e_j`; `p_j = cvt.rn(mul.rn(e_j, div.rn(1, s)))` in the input dtype, or `mul.rn(e_j, div.rn(1, s))` itself with `out_dtype=torch.float32`. `m` is the `max.f32` tree (a NaN operand yields the other; a NaN logit then propagates through the sum), a `-inf` logit weighs `+0` | bf16 / f16 / fp32 logits `(..., N)`, any `N` up to 2^21 (beyond it where the row's alignment admits a configuration; an odd fp32 row of 2^21 + 1 has none); temperature `None`, a positive scalar, or one per row (f16 / bf16 / f32 / f64, the last rounded to f32); same-dtype or fp32 output; `enable_pdl`; SM100 / SM103 / SM107 |
-| `log_softmax(logits, temperature)` | the same class and fingerprint (`fingerprint("log_softmax", ...)`) | the row `logp_j = mul.rn(add.rn(z_j, neg(lg2.approx.ftz(s))), ln 2)` in fp32, shape `logits.shape` | as above; `batch_invariant=True` is the pinned contract, `batch_invariant=False` (the default) is the operator's regular kernel for this entry, today the same class (a future release may route it elsewhere) |
+| `log_softmax(logits, temperature[, out_dtype=])` | the same class; `fingerprint("log_softmax", N=, dtype=, temperature=[, out_dtype=])` -- the class fingerprint, or with `out_dtype` the input's 16-bit dtype the 16-bit output member's (the converted element is a different output, so a different receipt) | the row `logp_j = mul.rn(add.rn(z_j, neg(lg2.approx.ftz(s))), ln 2)` in fp32, shape `logits.shape`; with `out_dtype` the input's 16-bit dtype the same row converted once, `cvt.rn(logp_j)` (bit for bit torch's `.to(dtype)` of the fp32 row: the `aten::_log_softmax(bf16) -> bf16` shape the trainers override) | as above; `out_dtype` `None` / `torch.float32` (the fp32 row) or the input dtype (16-bit inputs); `batch_invariant=True` is the pinned contract, `batch_invariant=False` (the default) is the operator's regular kernel for this entry, today the same class (a future release may route it elsewhere) |
 | `log_probs(logits, token_ids, temperature, return_lse=)` | the same class and fingerprint (`fingerprint("log_probs", ...)`) | the log-softmax row above gathered at the row's token ids (NaN for an id outside `[0, N)`), and with `return_lse` the row's `lse = mul.rn(add.rn(mul.rn(m, c), lg2.approx.ftz(s)), ln 2)`; fp32 outputs of the ids' shape / `logits.shape[:-1]` | as above; `token_ids` int32 / int64 of shape `logits.shape[:-1]` (one id per row) or `logits.shape[:-1] + (K,)` (`K` ids per row in one launch); the `batch_invariant` flag as for `log_softmax` |
 | `sampling_from_probs(probs, indices, generator, seed, offset, return_valid, batch_invariant=True)` | `sample.icdf.v1`; `fingerprint("sampling_from_probs", N=, dtype=)` (the vocabulary is the dimension; the dtype is validated and enters nothing: the leaves of a 16-bit input are its exact widenings and the draw converts no output) | the inverse CDF read off the row class's canonical sum tree `S` of the given weights (the same `add.rn` tree as `lse.row`'s `s`): the threshold `t = mul.rn(u, S)` with `u` the fp32 uniform of the row's stream; the vocabulary walked in the tree's order (lane-major, then block, then element), the inclusive prefix of an element `add.rn(outer, fold_e)` where `fold_e` is the slot fold's running value and `outer` the `add.rn` chain, in ascending bit order from `+0`, of the left-sibling nodes of the tree the element's address names (every one a value the kernel's placement already holds: no new reduction, no division); the token is the first present element with a positive weight whose prefix is `>= t` (the positivity is part of the rule: the last prefix of a slot and the `outer` of the next are different `add.rn` chains over the same nodes, so a zero-weight slot head could otherwise be the first crossing), else the last with a positive weight; a row whose `S` is not a positive finite number is invalid (token `-1`, `valid` False) | bf16 / f16 / fp32 weights `>= 0` of shape `(..., N)`, any `N` as for `softmax`; `indices` int32 / int64 (the gather; the output takes its dtype; an index outside the source rows makes its output row invalid: token `-1`); `seed` / `offset` as the operator takes them, one key per output row (int64 / uint64 tensors of length M; a scalar, a length-one tensor or the pair reserved from `generator` exactly as the operator's path reserves it serves a single row -- shared by several rows it is refused, since every row would draw at the same uniform); `deterministic` ignored (deterministic by construction), `check_nan` the same host check; int32 tokens; SM100 / SM103 / SM107 |
-| `sampling_from_logits(logits, indices, generator, seed, offset, batch_invariant=True)` | `sample.icdf.v1`; `fingerprint("sampling_from_logits", N=, dtype=)` (the logits form embeds `lse.row`'s trees: a different fingerprint per vocabulary from the probabilities form) | the same draw over the `lse.row` weights `e_j = ex2.approx.ftz(mul.rn(add.rn(x_j, neg(m)), log2(e)))` of the row (no temperature: the entry has none), without materialising the probabilities; `S` is `lse.row`'s `s`, so the drawn token's log-probability under `log_probs` is the probability it was drawn with (R4, stated in Lean: `Draw.total_logits_eq_specSum`) | as above for logits (a row of `-inf` logits, or with a NaN, is invalid) |
+| `sampling_from_logits(logits, indices, generator, seed, offset, batch_invariant=True[, temperature=, return_logprob=])` | `sample.icdf.v1`; `fingerprint("sampling_from_logits", N=, dtype=[, temperature=])` (the logits form embeds `lse.row`'s trees: a different fingerprint per vocabulary from the probabilities form, and another with a temperature in the scale); the returned log-probability carries `lse.row`'s receipt (`fingerprint("log_probs", N=, dtype=, temperature=)`) | the same draw over the `lse.row` weights `e_j = ex2.approx.ftz(mul.rn(add.rn(x_j, neg(m)), c))` of the row, `c = log2(e)` or `div.rn(log2(e), T)`, without materialising the probabilities; `S` is `lse.row`'s `s`, so the drawn token's log-probability under `log_probs` is the probability it was drawn with (R4, stated in Lean: `Draw.total_logits_eq_specSum`); with `return_logprob` that log-probability is returned from the same launch, `mul.rn(add.rn(z_t, neg(lg2.approx.ftz(S))), ln 2)` = `log_probs(logits, samples, temperature)` bit for bit | as above for logits (a row of `-inf` logits, or with a NaN, is invalid, its log-probability NaN); `temperature` `None`, a positive scalar or one per row as for `softmax`; the outputs `samples` or `(samples, logp)` |
 
 **The stream.** Under the flag the uniform of a row comes from `stream.philox4x32-10.splitmix-key.v1` (`sampling/stream.py`,
 `lean/BIKernels/Stream.lean`): the key `K = mix64(seed ^ mix64(offset))` (SplitMix64's finalizer), Philox4x32-10 on the
@@ -213,6 +213,66 @@ sampler and a trainer to agree bit for bit they must call with the same argument
 class scales inside its chain), or identically pre-scaled logits and `temperature=None`; a greedy row's temperature of 0
 (vLLM, SGLang carry it in the tensor) must be replaced by `1.0` or `None` before the call: the greedy log-probabilities are
 read from the unscaled row.
+
+**The training forward.** The RL trainers (verl, Miles, NeMo RL, Megatron-Core's batch-invariant mode) re-score the
+rollout's tokens with a forward pass whose log-softmax must give the engine's bits; none of them needs a backward kernel
+from this mode (verl and Megatron-Core override `aten::_log_softmax` forward only, Miles takes `torch.log_softmax` after
+its all-gather, NeMo RL re-runs its own autograd function on the saved logits for the gradient), so the mode provides the
+forward alone and the frameworks own the adapter -- the one they already have, pointed at the class:
+
+```python
+def _log_softmax_bi(input, dim, half_to_float):            # the aten::_log_softmax override of the trainers' modes
+    assert dim in (-1, input.dim() - 1)
+    out_dtype = torch.float32 if half_to_float else input.dtype
+    return flashinfer.sampling.log_softmax(input, batch_invariant=True, out_dtype=out_dtype)
+```
+
+The contract both sides must call with, written down because the frameworks disagree today (vLLM's `raw_logprobs` are
+before the temperature and every processor, its `processed_logprobs` after temperature and filters over the kept
+support, SGLang's default after the temperature over the full vocabulary, Miles divides by the rollout temperature and
+casts to bf16, NeMo RL's zero-mismatch mode takes raw logits at temperature 1): the temperature is applied inside the
+chain (`c = log2(e) / T`, a scalar or one per row), the normaliser is over the full vocabulary (the row as given: a
+padded lm_head's rows must be sliced to the vocabulary, or padded with `-inf` on both sides, since `N` is in the receipt),
+the value is fp32 (or its one conversion to the input's 16-bit dtype), and two callers agree bit for bit exactly when both
+pass the same logits bits with the same temperature (or identically pre-scaled logits and `temperature=None`) on the same
+architecture (the two MUFU tables are identical on SM100 and SM107, measured over every input); a greedy row's temperature
+of 0 is replaced by `1.0` or `None` before the call. The draw's `return_logprob` is this value -- the full
+distribution's, never renormalised over a filtered support (the truncated samplers' companion PR, `bi/09-sampling-support`,
+gives `top_k_top_p_sampling_from_logits` the same `return_logprob`, and the renormalised value the engines' `processed_logprobs`
+of a filtered mode report as a separate named output, `return_kept_logprob`) -- so
+the engine's returned log-probability and the trainer's `log_probs` / `log_softmax` of the same row are one definition.
+Nothing is stored and no RNG state crosses to the trainer: the draw is a function of the row, its `(seed, offset)` key
+and the temperature, and the trainer never re-draws.
+
+A vocabulary-parallel trainer (Megatron's `--tensor-model-parallel-size` with the lm_head split over the ranks) uses
+the class after an all-gather of the shards into full rows (the `_use_full_vocab_log_softmax` path of NeMo RL, Miles's
+`_calculate_log_probs_and_entropy_true_on_policy`): the per-rank max / sum-exp exchange of the distributed log-softmax
+is a different rounding from the full row's and is not this class. Where it plugs in: vLLM's sampler log-probabilities
+(`vllm/v1/worker/gpu/sample/logprob.py`) and the FlashInfer samplers it already calls; SGLang's deterministic sampler
+(`python/sglang/srt/layers/sampler.py`) and `layers/logprob_processor.py`; verl's `logprobs_from_logits` /
+`_sampler_chunk_logprobs` (`verl/utils/torch_functional.py`) and its aten override installer
+(`verl/workers/engine/utils.py`); Miles's `math_utils` log-probability path; NeMo RL's `_GenAlignedLogprob` and
+Megatron-Core's `batch_invariant_kernels.py` registration of `aten::_log_softmax`.
+
+**Caller-owned outputs.** Every sampling entry under the flag takes its outputs as optional caller-owned buffers --
+`softmax(..., out=)`, `log_softmax(..., out=)`, `log_probs(..., out=, lse_out=)`, `sampling_from_probs(..., out=)`,
+`sampling_from_logits(..., out=, logprob_out=)` -- written in place and returned as given, so a step allocates nothing
+(the kernels' validity word, which the draws do not return unless asked, goes to a per-device scratch grown to the largest
+batch seen and never freed once handed out: a graph that captured it, or a kernel still pending on another stream, keeps
+writing to its address after the cache has grown): CUDA graphs captured on the caller's buffers replay into them, and a framework's persistent structures (a decode step's
+token and log-probability buffers, a trainer's chunk buffer for the batch x vocabulary log-softmax row) take the kernel's
+stores directly. A buffer must have the output dtype and shape, be contiguous and (the row outputs) 16-byte aligned; one
+that does not fit is refused with `ValueError`, never copied. The row output may be the logits tensor itself
+(`softmax(x, out=x)`, `log_softmax(x, out_dtype=x.dtype, out=x)`: every thread writes the elements it read, after reading
+them, so the in-place call gives the out-of-place bits -- tested over the register, re-read and staged members); any other
+overlap between an output and an input, or between two outputs (a dtype view included), is refused. The samples buffer is int32 (the kernel's output), or int64
+with int64 `indices` (filled by a cast from the kernel's int32 tokens, the operator's dtype contract). Without the buffers
+the entries allocate their outputs as the operator's own kernels do (graph-safe through torch's private pools). The
+inputs are read in place when they are in the kernels' form -- int64 or uint64 keys, an fp32 per-row temperature, int64
+indices, contiguous rows -- and conditioned (a cast or a copy) otherwise; the validity mask is formed only when asked
+for (`return_valid`). `softmax`, `sampling_from_probs` and `sampling_from_logits` refuse the buffers on their default path
+(`batch_invariant=False`: the operator's kernels allocate their own outputs) rather than copying into them; `log_softmax`
+and `log_probs` run the class under either flag value and take them.
 
 `ex2.approx.ftz.f32` and `lg2.approx.ftz.f32` are the class's two opaque primitives: deterministic per architecture,
 pinned as inline PTX in the kernel, and tabulated on the device for the exact CPU model (`sampling/mufu_device.py`).
