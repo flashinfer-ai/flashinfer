@@ -507,6 +507,17 @@ def test_swaps_kernel_identity_carries_its_capacity():
     assert a != b and a.endswith("_c228") and b.endswith("_c328")
 
 
+def test_row_body_kernel_identity_carries_its_capacity():
+    """The row body's name carries the shared-memory capacity its smem plan is checked against (the paired placement at D = 128 fits
+    the 328 KB parts only), so a kernel compiled for one part is never loaded for another."""
+    from flashinfer.attention.batch_invariant.blocks.compile import kernel_name
+
+    a = kernel_name(128, 4, 16, 3, 2, True, False, cap=228 << 10)
+    b = kernel_name(128, 4, 16, 3, 2, True, False, cap=328 << 10)
+    assert a != b and a.endswith("_q2_c228") and b.endswith("_q2_c328")
+    assert kernel_name(128, 4, 16, 4) == "attn_d128_g4_p16_s4_w1"
+
+
 def test_unsupported_device_raises_before_any_kernel():
     ws = torch.empty(1 << 20, dtype=torch.uint8)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
@@ -887,8 +898,9 @@ def test_sm_count_and_grid_do_not_change_bits():
 def test_config_agreement(D):
     """R3: every member of the configuration space (ring depth, unit kind, softmax warpgroups, fold placement, small-unit body)
     gives the same bits as the wrapper's pick; at D = 64 the paired placement too (two Q tiles per CTA), on a batch large enough
-    to be paired. The whole space at D = 128 / 256 (108 / 36 points); every 7th point of the 252 at D = 64 (each distinct kernel
-    is a compile)."""
+    to be paired, and at D = 128 on 328 KB parts (pairing forced with an SM count of one: the problem's units would not fill four
+    per SM; its rings, the split kind with both fold placements). The whole space at D = 128 / 256 (108 / 36 points); every 7th
+    point of the 252 at D = 64 (each distinct kernel is a compile)."""
     from dataclasses import replace
 
     from flashinfer.attention.batch_invariant import engine
@@ -901,10 +913,21 @@ def test_config_agreement(D):
     ref = bits(run_paged_prefill(pr))
     space = engine.all_valid_configs(D)
     cfgs = list(space[::7] if D == 64 else space)
+    q2_sm = (
+        None  # the SM count the paired configurations plan with (None: the device's)
+    )
     if D == 64:
         two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
         rings = (2, 3) + ((4,) if arch_smem_cap(pr.device) >= (300 << 10) else ())
         cfgs += [replace(two, kv_slots=s) for s in rings]
+    elif D == 128 and arch_smem_cap(pr.device) >= (300 << 10):
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        q2_sm = 1
+        cfgs += [
+            replace(two, kv_slots=s, split_policy=p, merge=m)
+            for s in (2, 3)
+            for p, m in (("auto", "auto"), ("split", "auto"), ("split", "inkernel"))
+        ]
     for cfg in cfgs:
         planned = engine.plan_attention(
             pr.qo_indptr,
@@ -918,6 +941,7 @@ def test_config_agreement(D):
             cfg,
             None,
             pr.device,
+            sm_count=q2_sm if cfg.q2 else None,
         )
         if cfg.q2:
             assert planned.plan.num_launch is not None, (cfg, planned.plan.num_units)
@@ -944,6 +968,206 @@ def test_sliding_window_prefill_equals_decode():
     dec, last = run_decode(pr, window_left=600)
     assert torch.equal(bits(pre[last]), bits(dec))
     assert torch.equal(bits(pre), bits(run_ragged_prefill(pr, window_left=600)))
+
+
+def _paired_d128(engine):
+    """The paired placement's configuration at D = 128 (the wrapper's pick on 328 KB parts)."""
+    from dataclasses import replace
+
+    return replace(
+        engine.default_config(D=128),
+        softmax_wgs=2,
+        q2=True,
+        kv_slots=engine.Q2_RING[128][True],
+    )
+
+
+@needs_device
+def test_paired_d128_sm_count_and_grid_do_not_change_bits():
+    """R3 for the paired placement at D = 128: the SM count decides whether the batch pairs at all (below four units per SM the
+    one-warpgroup body runs) and the unit kind, the grid how many CTAs walk the pairs; none of it reaches the bits."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    pr = Problem([256, 1000, 1], [3000, 2500, 8192], 32, 8, 128, 16, seed=7)
+    if arch_smem_cap(pr.device) < (300 << 10):
+        pytest.skip("the paired placement at D = 128 needs a 328 KB part")
+    ref = bits(run_paged_prefill(pr))
+    cfg = _paired_d128(engine)
+    paired = set()
+    for sm in (1, 8, 148, 1000):
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            sm_count=sm,
+        )
+        paired.add(planned.plan.num_launch is not None)
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
+        assert torch.equal(bits(out), ref), sm
+    assert paired == {True, False}  # both the paired kernel and the fallback body ran
+    for grid in (1, 3, 64):
+        c = replace(cfg, grid=grid)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            -1,
+            c,
+            None,
+            pr.device,
+            sm_count=1,
+        )
+        assert planned.plan.num_launch is not None
+        out = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            -1,
+            "NHD",
+            None,
+            c,
+        )
+        assert torch.equal(bits(out), ref), grid
+
+
+@needs_device
+def test_paired_d128_ragged_window_and_pages():
+    """The paired placement at D = 128 over the ragged layout, a sliding window (the union of the two tiles' key ranges) and page
+    sizes 1 and 128 gives the one-warpgroup body's bits; tail tiles of at most 32 live rows take the full-row path there."""
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    if arch_smem_cap(torch.device("cuda")) < (300 << 10):
+        pytest.skip("the paired placement at D = 128 needs a 328 KB part")
+    cfg = _paired_d128(engine)
+
+    def paired(pr, ragged=False, window_left=-1):
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr_rag if ragged else pr.kv_indptr,
+            pr.kv_last,
+            pr.Hq,
+            pr.Hkv,
+            128,
+            pr.page,
+            window_left,
+            cfg,
+            None,
+            pr.device,
+            sm_count=1,
+            ragged=ragged,
+        )
+        assert planned.plan.num_launch is not None
+        if ragged:
+            k, v = pr.ragged("NHD")
+            return engine.run_attention(
+                planned,
+                pr.q,
+                k,
+                v,
+                pr.kv_indptr_rag,
+                torch.zeros(1, dtype=torch.int32, device=pr.device),
+                1.0 / math.sqrt(128),
+                window_left,
+                "NHD",
+                None,
+                cfg,
+                ragged=True,
+            )
+        return engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+            window_left,
+            "NHD",
+            None,
+            cfg,
+        )
+
+    pr = Problem([264, 33, 1, 129], [3000, 2500, 1000, 5000], 32, 8, 128, 16, seed=15)
+    ref = bits(run_paged_prefill(pr))
+    assert torch.equal(bits(paired(pr)), ref)
+    assert torch.equal(bits(paired(pr, ragged=True)), ref)
+    pr = Problem([256, 1, 2000], [1500, 2500, 5000], 32, 8, 128, 16, seed=9)
+    ref = bits(run_paged_prefill(pr, window_left=600))
+    assert torch.equal(bits(paired(pr, window_left=600)), ref)
+    for page in (1, 128):
+        pr = Problem([256, 1, 700], [3000, 2500, 1000], 32, 8, 128, page, seed=14)
+        assert torch.equal(bits(paired(pr)), bits(run_paged_prefill(pr)))
+
+
+@needs_device
+def test_wrapper_default_pairs_only_at_d64():
+    """The wrappers' default: the paired placement for prefill and ragged batches at D = 64 only, never for decode; at D = 128 the
+    placement is an explicit configuration, so the wrappers run the one-warpgroup body on every part."""
+    from flashinfer.attention.batch_invariant import engine
+
+    assert engine.Q2_DEFAULT_DIMS == (64,)
+    ws = workspace(torch.device("cuda"))
+    kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    for D, expect in ((64, True), (128, False)):
+        pr = Problem([300, 1], [1000, 600], 32, 8, D, 16, seed=22)
+        paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        paged.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            D,
+            16,
+            causal=True,
+            **kw,
+        )
+        ragged = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        ragged.plan(pr.qo_indptr, pr.kv_indptr_rag, 32, 8, D, causal=True, **kw)
+        dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", batch_invariant=True
+        )
+        dec.plan(pr.kv_indptr, pr.kv_indices, pr.kv_last, 32, 8, D, 16, **kw)
+        assert paged._batch_invariant._config.q2 == expect
+        assert ragged._batch_invariant._config.q2 == expect
+        assert not dec._batch_invariant._config.q2
 
 
 @needs_device
