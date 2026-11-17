@@ -15,6 +15,7 @@ from flashinfer.sdsa import (
     gather_key_sample,
     indexer_scores,
     indexer_threshold_select,
+    quantize_write_index_qk_fp8,
     quantize_write_index_qk_nvfp4,
     thresholds_from_sample,
     top_k_from_candidates,
@@ -618,6 +619,160 @@ def test_quantize_write_index_qk_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="requires SM10x"):
         run()
+
+
+sm89_or_newer = pytest.mark.skipif(not FP8, reason="requires SM89 or newer")
+
+
+def fp8_reference(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """x over its scale in FP32, saturated and rounded to E4M3. The scale stays
+    a CUDA tensor: PyTorch divides by it exactly rounded, but multiplies by the
+    reciprocal of a CPU scalar."""
+    return (x.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+
+@sm89_or_newer
+@pytest.mark.parametrize(
+    ("tokens", "queries"), [(1, 9), (9, 300), (300, 1), (0, 5), (5, 0)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_quantize_write_index_qk_fp8_matches_reference(
+    tokens: int, queries: int, dtype: torch.dtype
+) -> None:
+    """Each written key and query is its values over its tensor's scale in FP32,
+    saturated to +-448 and rounded to E4M3, bit for bit. Slots and rows are
+    shuffled, negative ones are skipped, and nothing else is written. A CUDA
+    graph replay sees new keys, queries, slots, rows and scales."""
+    torch.manual_seed(tokens + queries)
+    pages, rows = -(-tokens // 64) + 2, queries + 7
+    key = torch.empty(tokens, 128, dtype=dtype, device="cuda")
+    query = torch.empty(queries, 128, dtype=dtype, device="cuda")
+    slots = torch.empty(tokens, dtype=torch.int64, device="cuda")
+    query_rows = torch.empty(queries, dtype=torch.int64, device="cuda")
+    key_scale = torch.empty(1, device="cuda")
+    query_scale = torch.empty(1, device="cuda")
+    fp8 = partial(torch.empty, dtype=torch.float8_e4m3fn, device="cuda")
+    key_cache, fp8_query = fp8(pages, 64, 128), fp8(rows, 128)
+
+    def prepare(scales: tuple[float, float]) -> None:
+        spread = 2.0 ** torch.randint(-12, 8, (tokens + queries, 1), device="cuda")
+        x = torch.randn(tokens + queries, 128, device="cuda") * spread
+        x[:, :2] = torch.tensor([2000.0, -2000.0], device="cuda")  # saturate
+        key.copy_(x[:tokens])
+        query.copy_(x[tokens:])
+        at = torch.randperm(64 * pages, device="cuda")[:tokens]
+        at[1::5] = -1
+        slots.copy_(at)
+        at = torch.randperm(rows, device="cuda")[:queries]
+        at[1::4] = -1
+        query_rows.copy_(at)
+        key_scale.fill_(scales[0])
+        query_scale.fill_(scales[1])
+        for written in (key_cache, fp8_query):
+            written.view(torch.uint8).fill_(0x7F)  # E4M3 NaN, never written
+
+    def check() -> None:
+        for values, at, written, scale in (
+            (key, slots, key_cache.view(-1, 128), key_scale),
+            (query, query_rows, fp8_query, query_scale),
+        ):
+            live, written = at >= 0, written.view(torch.uint8)
+            expected = fp8_reference(values[live], scale).view(torch.uint8)
+            assert torch.equal(written[at[live]], expected)
+            untouched = torch.ones(len(written), dtype=torch.bool, device="cuda")
+            untouched[at[live]] = False
+            assert bool((written[untouched] == 0x7F).all())
+
+    def run() -> None:
+        quantize_write_index_qk_fp8(
+            key,
+            slots,
+            query,
+            query_rows,
+            key_cache=key_cache,
+            key_scale=key_scale,
+            fp8_query=fp8_query,
+            query_scale=query_scale,
+        )
+
+    prepare((0.37, 3.1))
+    run()  # warm-up compiles
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    prepare((1.7, 1 / 3))
+    graph.replay()
+    check()
+
+
+@sm89_or_newer
+@torch.inference_mode()
+def test_quantize_write_index_qk_fp8_rejects_bad_inputs(monkeypatch) -> None:
+    zeros = partial(torch.zeros, device="cuda")
+    key = zeros(1, 128, dtype=torch.bfloat16)
+    slots = zeros(1, dtype=torch.int64)
+    outputs = dict(
+        key_cache=zeros(4, 64, 128, dtype=torch.float8_e4m3fn),
+        key_scale=torch.ones(1, device="cuda"),
+        fp8_query=zeros(4, 128, dtype=torch.float8_e4m3fn),
+        query_scale=torch.ones(1, device="cuda"),
+    )
+
+    def run(key=key, slots=slots, query=key, query_rows=slots, **changed):
+        quantize_write_index_qk_fp8(
+            key, slots, query, query_rows, **(outputs | changed)
+        )
+
+    run()
+    for wrong in (
+        dict(key=key[:, :64]),
+        dict(query=key[:, :64]),
+        dict(slots=slots[:0]),
+        dict(query_rows=slots[:0]),
+    ):
+        with pytest.raises(ValueError, match="Keys and queries must be"):
+            run(**wrong)
+    for wrong in (
+        dict(key_cache=outputs["key_cache"][:, :32]),
+        dict(key_cache=outputs["key_cache"][..., :64]),
+        dict(fp8_query=outputs["fp8_query"][:, :64]),
+        dict(key_scale=torch.ones(2, device="cuda")),
+        dict(query_scale=torch.ones(0, device="cuda")),
+    ):
+        with pytest.raises(ValueError, match="key_cache must be"):
+            run(**wrong)
+    for wrong in (
+        dict(key=key.float()),
+        dict(query=key.float()),
+        dict(slots=slots.int()),
+        dict(query_rows=slots.int()),
+        dict(key_cache=outputs["key_cache"].bfloat16()),
+        dict(fp8_query=outputs["fp8_query"].view(torch.uint8)),
+        dict(key_scale=outputs["key_scale"].double()),
+        dict(query_scale=outputs["query_scale"].half()),
+    ):
+        with pytest.raises(ValueError, match="key and query must be BF16 or FP16"):
+            run(**wrong)
+    with pytest.raises(ValueError, match="on one device"):
+        run(key_scale=outputs["key_scale"].cpu())
+    for wrong in (
+        dict(key=zeros(1, 256, dtype=torch.bfloat16)[:, ::2]),
+        dict(query=zeros(1, 256, dtype=torch.bfloat16)[:, ::2]),
+        dict(slots=zeros(2, dtype=torch.int64)[::2]),
+        dict(query_rows=zeros(2, dtype=torch.int64)[::2]),
+        dict(key_cache=zeros(4, 64, 256, dtype=torch.float8_e4m3fn)[..., ::2]),
+        dict(fp8_query=zeros(4, 256, dtype=torch.float8_e4m3fn)[:, ::2]),
+    ):
+        with pytest.raises(ValueError, match="contiguous rows"):
+            run(**wrong)
+    for capability in ((8, 0), (8, 6)):
+        monkeypatch.setattr(
+            indexer, "get_compute_capability", lambda _, c=capability: c
+        )
+        with pytest.raises(ValueError, match="requires SM89 or newer"):
+            run()
 
 
 @sm10x_only

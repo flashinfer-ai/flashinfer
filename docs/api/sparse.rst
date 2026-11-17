@@ -86,6 +86,7 @@ has one query head and no head weights.
     gather_key_sample
     thresholds_from_sample
     quantize_write_index_qk_nvfp4
+    quantize_write_index_qk_fp8
 
 
 .. currentmodule:: flashinfer.sparse

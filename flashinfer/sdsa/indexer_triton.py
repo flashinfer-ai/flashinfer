@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""The BF16 and FP8 scorer of the SDSA (Simplified DSA) indexer off SM10x, such as
-on Hopper."""
+"""The SDSA (Simplified DSA) indexer's Triton kernels: the BF16 and FP8 scorer off
+SM10x, such as on Hopper, and the FP8 write of keys and queries."""
 
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
@@ -60,3 +60,47 @@ def sdsa_scorer_kernel(
         scores,
         mask=used & (key[None, :] < length),
     )
+
+
+@triton.jit
+def index_qk_fp8_write_kernel(
+    key_ptr,
+    key_stride,
+    slots_ptr,
+    keys,
+    query_ptr,
+    query_stride,
+    query_rows_ptr,
+    key_cache_ptr,
+    key_page_stride,
+    key_row_stride,
+    key_scale_ptr,
+    fp8_query_ptr,
+    fp8_query_stride,
+    query_scale_ptr,
+):
+    """Quantize row i to E4M3 at its tensor's scale: key i at slot s = slots[i]
+    of the key cache (page s // 64, row s % 64), then query j = i - keys at row
+    query_rows[j] of fp8_query. Negative slots and rows are not written. Values
+    are divided by the scale in FP32 (rounded to nearest), saturated to +-448 and
+    rounded to nearest even (Triton's default for FP32 to FP8). The scale is read
+    here, as a block like the row, so a CUDA graph replay sees a scale written
+    after capture."""
+    i = tl.program_id(0)
+    dim = tl.arange(0, 128)
+    if i < keys:
+        slot = tl.load(slots_ptr + i)
+        values = tl.load(key_ptr + i.to(tl.int64) * key_stride + dim).to(tl.float32)
+        scale = tl.load(key_scale_ptr + dim * 0)
+        out = key_cache_ptr + slot // 64 * key_page_stride + slot % 64 * key_row_stride
+    else:
+        slot = tl.load(query_rows_ptr + i - keys)
+        row = (i - keys).to(tl.int64)
+        values = tl.load(query_ptr + row * query_stride + dim).to(tl.float32)
+        scale = tl.load(query_scale_ptr + dim * 0)
+        out = fp8_query_ptr + slot * fp8_query_stride
+    if slot >= 0:
+        values = tl.clamp(
+            tl.div_rn(values, scale), -448.0, 448.0, propagate_nan=tl.PropagateNan.ALL
+        )
+        tl.store(out + dim, values.to(tl.float8e4nv))

@@ -4,7 +4,7 @@
 """APIs of the SDSA (Simplified DSA) indexer, which scores keys with one query
 head and no head weights. These APIs score its keys, select the keys that score
 above a threshold, set the thresholds from a key sample, write the Top-K keys of
-the selection, and quantize its keys and queries to NVFP4."""
+the selection, and quantize its keys and queries to NVFP4 or FP8."""
 
 from typing import Optional
 
@@ -16,6 +16,7 @@ from ..trace.templates.sdsa import (
     gather_key_sample_trace,
     indexer_scores_trace,
     indexer_threshold_select_trace,
+    quantize_write_index_qk_fp8_trace,
     quantize_write_index_qk_nvfp4_trace,
     thresholds_from_sample_trace,
     top_k_from_candidates_trace,
@@ -576,6 +577,127 @@ def quantize_write_index_qk_nvfp4(
             (),
             module="sdsa_indexer",
             key_files=(indexer_sm100.__file__,),
+        )
+
+
+@flashinfer_api(trace=quantize_write_index_qk_fp8_trace)
+def quantize_write_index_qk_fp8(
+    key: torch.Tensor,
+    slots: torch.Tensor,
+    query: torch.Tensor,
+    query_rows: torch.Tensor,
+    *,
+    key_cache: torch.Tensor,
+    key_scale: torch.Tensor,
+    fp8_query: torch.Tensor,
+    query_scale: torch.Tensor,
+) -> None:
+    """Quantize indexer keys and queries to FP8 E4M3 in one launch: the keys into
+    a paged key cache and the queries into rows.
+
+    Keys and queries each have one per-tensor scale. A value ``x`` is stored as
+    ``x / scale`` (FP32 division), saturated to +-448 and rounded to the nearest
+    E4M3 value, ties to even, so values above ``448 * scale`` in magnitude
+    saturate. A score of the stored values times ``query_scale * key_scale`` is
+    then in the units of the original keys and queries. Write all keys of a
+    cache at the same ``key_scale``: do not change it between calls, or their
+    scores stop being comparable.
+
+    The scales are read on the device, so it runs as one launch without host
+    synchronization, and a CUDA graph replay sees scales written after capture.
+    It runs on SM89 and newer, such as SM90 and SM10x.
+
+    Parameters
+    ----------
+    key : torch.Tensor
+        BF16 or FP16 ``[tokens, 128]``.
+    slots : torch.Tensor
+        int64 ``[tokens]``: each key's cache slot ``s``. Negative slots are
+        skipped.
+    query : torch.Tensor
+        BF16 or FP16 ``[queries, 128]``.
+    query_rows : torch.Tensor
+        int64 ``[queries]``: each query's row ``r``. Negative rows are skipped.
+    key_cache : torch.Tensor
+        float8_e4m3fn ``[pages, 64, 128]``, output: a key goes to
+        ``key_cache[s // 64, s % 64]``.
+    key_scale : torch.Tensor
+        float32, one element: the keys' positive scale.
+    fp8_query : torch.Tensor
+        float8_e4m3fn ``[rows, 128]``, output: a query goes to row ``r``.
+    query_scale : torch.Tensor
+        float32, one element: the queries' positive scale.
+    """
+    from .shapes import DIM, PAGE
+
+    if (
+        key.shape[1:] != (DIM,)
+        or query.shape[1:] != (DIM,)
+        or slots.shape[0] < key.shape[0]
+        or query_rows.shape[0] < query.shape[0]
+    ):
+        raise ValueError(
+            f"Keys and queries must be [tokens, {DIM}], with a slot or row each"
+        )
+    if (
+        key_cache.shape[1:] != (PAGE, DIM)
+        or fp8_query.shape[1:] != (DIM,)
+        or key_scale.numel() != 1
+        or query_scale.numel() != 1
+    ):
+        raise ValueError(
+            f"key_cache must be [pages, {PAGE}, {DIM}] and fp8_query [rows, {DIM}], "
+            "and key_scale and query_scale one value each"
+        )
+    if (
+        key.dtype not in (torch.bfloat16, torch.float16)
+        or query.dtype not in (torch.bfloat16, torch.float16)
+        or {slots.dtype, query_rows.dtype} != {torch.int64}
+        or {key_cache.dtype, fp8_query.dtype} != {torch.float8_e4m3fn}
+        or {key_scale.dtype, query_scale.dtype} != {torch.float32}
+    ):
+        raise ValueError(
+            "key and query must be BF16 or FP16, slots and query_rows int64, "
+            "key_cache and fp8_query float8_e4m3fn, and the scales float32"
+        )
+    tensors = (key, slots, query, query_rows, key_cache, key_scale, fp8_query)
+    if any(t.device != query_scale.device for t in tensors):
+        raise ValueError("All tensors must be on one device")
+    strides = (
+        key.stride(1),
+        slots.stride(0),
+        query.stride(1),
+        query_rows.stride(0),
+        key_cache.stride(2),
+        fp8_query.stride(1),
+    )
+    if strides != (1,) * len(strides):
+        raise ValueError(
+            "Keys, queries, slots, rows, key_cache and fp8_query must have "
+            "contiguous rows"
+        )
+    major, minor = get_compute_capability(key.device)
+    if (major, minor) < (8, 9):
+        raise ValueError("quantize_write_index_qk_fp8 requires SM89 or newer")
+    rows = key.shape[0] + query.shape[0]
+    if rows:
+        from .indexer_triton import index_qk_fp8_write_kernel
+
+        index_qk_fp8_write_kernel[(rows,)](
+            key,
+            key.stride(0),
+            slots,
+            key.shape[0],
+            query,
+            query.stride(0),
+            query_rows,
+            key_cache,
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_scale,
+            fp8_query,
+            fp8_query.stride(0),
+            query_scale,
         )
 
 

@@ -164,6 +164,7 @@ prims_ts_fp4_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 prims_ts_fp8_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 prims_ts_fp8_per_tensor_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 quantize_nvfp4_smooth_N3072.json
+sdsa_quantize_write_index_qk_fp8_dim128_page_size64.json
 sdsa_quantize_write_index_qk_nvfp4_dim128_page_size64_packed_dim64_scales8.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
@@ -3819,6 +3820,7 @@ from flashinfer.sdsa import (
     gather_key_sample,
     indexer_scores,
     indexer_threshold_select,
+    quantize_write_index_qk_fp8,
     quantize_write_index_qk_nvfp4,
     thresholds_from_sample,
     top_k_from_candidates,
@@ -3856,6 +3858,18 @@ quantize_write_index_qk_nvfp4.fi_trace(
     key_scales=torch.empty(4, 64, 8, dtype=torch.float8_e4m3fn),
     packed_query=torch.empty(16, 64, dtype=torch.uint8),
     query_scales=torch.empty(16, 8, dtype=torch.float8_e4m3fn),
+)
+
+quantize_write_index_qk_fp8.fi_trace(
+    save_dir=SAVE_DIR,
+    key=torch.empty(16, 128, dtype=torch.bfloat16),
+    slots=torch.arange(16, dtype=torch.int64),
+    query=torch.empty(16, 128, dtype=torch.bfloat16),
+    query_rows=torch.arange(16, dtype=torch.int64),
+    key_cache=torch.empty(4, 64, 128, dtype=torch.float8_e4m3fn),
+    key_scale=torch.ones(1),
+    fp8_query=torch.empty(16, 128, dtype=torch.float8_e4m3fn),
+    query_scale=torch.ones(1),
 )
 
 indexer_threshold_select.fi_trace(

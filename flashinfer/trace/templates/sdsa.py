@@ -153,6 +153,44 @@ quantize_write_index_qk_nvfp4_trace = TraceTemplate(
 )
 
 
+quantize_write_index_qk_fp8_trace = TraceTemplate(
+    op_type="sdsa_quantize_write_index_qk_fp8",
+    description=(
+        "Indexer keys and queries quantized to FP8 E4M3 at per-tensor scales in one "
+        "launch: keys at their slots of a 64-key paged cache, queries at their "
+        "rows. SM89 and newer."
+    ),
+    axes={
+        "tokens": Var(description="Keys to write."),
+        "queries": Var(description="Queries to write."),
+        "dim": Const(description="Key and query dimension."),
+        "slots": Var(description="Slot mapping entries, one or more per key."),
+        "query_slots": Var(description="Query row entries, one or more per query."),
+        "pages": Var(description="Key cache pages."),
+        "rows": Var(description="FP8 query rows."),
+        "page_size": Const(description="Keys per page."),
+        "one": Const(description="One per-tensor scale.", abbrev=""),
+    },
+    inputs={
+        "key": Tensor(["tokens", "dim"]),
+        "slots": Tensor(["slots"]),
+        "query": Tensor(["queries", "dim"]),
+        "query_rows": Tensor(["query_slots"]),
+        "key_cache": Tensor(["pages", "page_size", "dim"]),
+        "key_scale": Tensor(["one"], dtype="float32"),
+        "fp8_query": Tensor(["rows", "dim"]),
+        "query_scale": Tensor(["one"], dtype="float32"),
+    },
+    outputs={
+        "key_cache": Tensor(
+            ["pages", "page_size", "dim"], dtype="float8_e4m3fn", param="key_cache"
+        ),
+        "fp8_query": Tensor(["rows", "dim"], dtype="float8_e4m3fn", param="fp8_query"),
+    },
+    tags=["arch:sm90", "arch:sm100", "arch:sm103"],
+)
+
+
 gather_key_sample_trace = TraceTemplate(
     op_type="sdsa_gather_key_sample",
     description=(
