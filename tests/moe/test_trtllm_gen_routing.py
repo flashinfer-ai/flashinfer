@@ -316,20 +316,30 @@ def test_deepseekv3_routing_preserves_bias_precision(
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
-def test_deepseekv3_routing_normalizes_negative_logits(use_cuda_graph):
+@pytest.mark.parametrize(
+    "routing_method,num_experts,n_group,topk_group,scale",
+    [
+        (RoutingMethodType.DeepSeekV3, 256, 8, 4, 2.5),
+        (RoutingMethodType.DeepSeekV3, 384, 1, 1, 2.5),
+        (RoutingMethodType.MiniMax2, 256, 1, 1, 1.0),
+    ],
+)
+def test_sigmoid_routing_normalizes_negative_logits(
+    use_cuda_graph, routing_method, num_experts, n_group, topk_group, scale
+):
     """Logits of -20 must keep nonzero sigmoid scores, so the weights normalize."""
-    logits = torch.full((128, 256), -20.0, device="cuda")
-    bias = -torch.arange(256, device="cuda", dtype=torch.float32) / 8
+    logits = torch.full((128, num_experts), -20.0, device="cuda")
+    bias = -torch.arange(num_experts, device="cuda", dtype=torch.float32) / 8
 
     def run():
         return trtllm_gen_routing(
             logits,
             bias,
-            RoutingMethodType.DeepSeekV3,
+            routing_method,
             8,
-            n_group=8,
-            topk_group=4,
-            routed_scaling_factor=2.5,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=scale,
         )
 
     result = run()
@@ -342,7 +352,7 @@ def test_deepseekv3_routing_normalizes_negative_logits(use_cuda_graph):
     torch.testing.assert_close(result.topk_ids.long().sort(dim=1).values, expected_ids)
     torch.testing.assert_close(
         result.topk_weights,
-        torch.full_like(result.topk_weights, 0.3125),
+        torch.full_like(result.topk_weights, scale / 8),
         rtol=0,
         atol=0,
     )

@@ -187,8 +187,7 @@ __global__ void routingMainKernel(KernelParams params) {
     // get the sigmoid score
     // note that for invalid values, we simply use a negative value:
     // sigmoid scores are always strictly positive
-    // The tanh form loses small positive probabilities for negative logits.
-    auto scoreSigmoid = 1.0f / (1.0f + expf(-score));
+    auto scoreSigmoid = sigmoid_accurate(score);
     // write the sigmoid score to shared for later use
     if (expertSelected) {
       smemScoreSigmoid[threadExpert] = scoreSigmoid;
