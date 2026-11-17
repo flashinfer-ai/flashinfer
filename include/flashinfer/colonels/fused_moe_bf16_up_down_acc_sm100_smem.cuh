@@ -150,8 +150,8 @@ __global__ __cluster_dims__(C::CLUSTERS, 1, 1)
   const int n_stages_up = K / C::BK;
   const int n_stages_down = N2 / C::BN2;
   const int32_t warpM = blockIdx.y;
-  const int exp_idx = expert_ids[warpM];
   if (warpM * C::BM >= num_tokens_post_padded[0]) return;
+  const int exp_idx = expert_ids[warpM];
   int cta_rank = 0;
   if constexpr (C::CLUSTERS > 1) {
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
