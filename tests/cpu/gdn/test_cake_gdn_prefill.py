@@ -390,9 +390,14 @@ def test_int32_metadata_is_passed_through_and_int64_is_cast_per_call() -> None:
     ),
     ids=("int32-max-plus-one", "int32-large-overflow", "int32-min-minus-one"),
 )
-def test_int64_metadata_overflow_raises_value_error(overflow_value: int) -> None:
+def test_int64_metadata_overflow_asserts_under_validation_flag(
+    monkeypatch: pytest.MonkeyPatch, overflow_value: int
+) -> None:
     values = torch.tensor([0, overflow_value], dtype=torch.int64)
-    with pytest.raises(ValueError, match="GDN metadata values exceed int32 range"):
+    cast = gdn_prefill._cake_gdn_prefill_i32(values)
+    assert cast.dtype == torch.int32
+    monkeypatch.setattr(gdn_prefill, "_CAKE_GDN_VALIDATE_SLOTS", True)
+    with pytest.raises(RuntimeError, match="GDN metadata values exceed int32 range"):
         gdn_prefill._cake_gdn_prefill_i32(values)
 
 
@@ -405,7 +410,9 @@ def test_int64_metadata_empty_tensor() -> None:
 
 
 @pytest.mark.cpu_only
-def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records() -> None:
+def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     launch = gdn_prefill._cake_gdn_prefill_launch_metadata
     i32 = torch.tensor([0, 64, 128], dtype=torch.int32)
     i64 = torch.tensor([0, 64, 128], dtype=torch.int64)
@@ -417,11 +424,13 @@ def test_launch_metadata_is_passed_as_given_only_for_metadata_i64_records() -> N
     cast = launch(i64, metadata_i64=False)
     assert cast.dtype == torch.int32
     assert torch.equal(cast, i32)
-    # Out-of-range int64 metadata is rejected on int32 routes, preserved on metadata_i64
+    # Out-of-range int64 metadata is passed through unchanged on metadata_i64
     overflow = torch.tensor([0, 2**31], dtype=torch.int64)
-    with pytest.raises(ValueError, match="GDN metadata values exceed int32 range"):
-        launch(overflow, metadata_i64=False)
     assert launch(overflow, metadata_i64=True) is overflow
+    # Under slot validation, out-of-range int64 metadata asserts on int32 routes
+    monkeypatch.setattr(gdn_prefill, "_CAKE_GDN_VALIDATE_SLOTS", True)
+    with pytest.raises(RuntimeError, match="GDN metadata values exceed int32 range"):
+        launch(overflow, metadata_i64=False)
     # The route carries the contract and defaults to the int32-only ABI.
     assert cake_gdn.CakeGDNRoute._fields == (
         "route_id",

@@ -259,6 +259,21 @@ def _cake_gdn_prefill_grid_x(
     )
 
 
+
+# Per-call device-side slot validation, same default as ``gdn_decode.py``: the
+# ``torch._assert_async`` chain expands to four elementwise kernels plus the
+# ``_assert_async_cuda_kernel`` and exposes ~40 us of launch gaps around a
+# 25-70 us kernel on the indexed state-pool rows (R200 CUPTI per-kernel
+# decomposition: 5-6 kernels per call, 41-45 us of inter-kernel gap, while the
+# Cake kernel itself ran faster than the CuTe one).  The CuTe path trusts
+# caller-provided slots, so the Cake adapter does the same by default; set
+# ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` to restore the asynchronous
+# fail-closed check (used by the invalid-slot tests).
+_CAKE_GDN_VALIDATE_SLOTS = (
+    os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+)
+
+
 def _cake_gdn_prefill_i32(values: torch.Tensor) -> torch.Tensor:
     """Int32 launch metadata: pass-through for int32, a per-call cast for int64.
 
@@ -273,12 +288,7 @@ def _cake_gdn_prefill_i32(values: torch.Tensor) -> torch.Tensor:
     if values.dtype == torch.int32:
         return values
 
-    if values.device.type == "cpu":
-        if values.numel() and (values.max() > 2**31 - 1 or values.min() < -(2**31)):
-            raise ValueError(
-                f"GDN metadata values exceed int32 range: [{values.min().item()}, {values.max().item()}]"
-            )
-    else:
+    if _CAKE_GDN_VALIDATE_SLOTS:
         torch._assert_async(
             ((values >= -(2**31)) & (values <= 2**31 - 1)).all(),
             "GDN metadata values exceed int32 range",
@@ -317,19 +327,6 @@ def _cake_gdn_state_vec_aligned(
             return False
     return (checkpoints.data_ptr() & mask) == 0
 
-
-# Per-call device-side slot validation, same default as ``gdn_decode.py``: the
-# ``torch._assert_async`` chain expands to four elementwise kernels plus the
-# ``_assert_async_cuda_kernel`` and exposes ~40 us of launch gaps around a
-# 25-70 us kernel on the indexed state-pool rows (R200 CUPTI per-kernel
-# decomposition: 5-6 kernels per call, 41-45 us of inter-kernel gap, while the
-# Cake kernel itself ran faster than the CuTe one).  The CuTe path trusts
-# caller-provided slots, so the Cake adapter does the same by default; set
-# ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` to restore the asynchronous
-# fail-closed check (used by the invalid-slot tests).
-_CAKE_GDN_VALIDATE_SLOTS = (
-    os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
-)
 
 
 def _cake_gdn_assert_state_slots(

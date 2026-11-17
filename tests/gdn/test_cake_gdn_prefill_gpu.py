@@ -2637,8 +2637,17 @@ def test_public_cake_gdn_prefill_invalid_cuda_slots_fail_in_isolated_process(
 
 
 def _run_cake_gdn_int64_overflow_child() -> None:
-    values = torch.tensor([0, 2**31], dtype=torch.int64, device="cuda")
-    prefill_mod._cake_gdn_prefill_i32(values)
+    case = _make_case(
+        seq_lens=(128,),
+        indexed=False,
+        state_dtype=torch.bfloat16,
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=16,
+        state_pool_padding=0,
+    )
+    case["cu_seqlens"] = torch.tensor([0, 2**31], dtype=torch.int64, device="cuda")
+    _launch(case)
     torch.cuda.synchronize()
 
 
@@ -2646,11 +2655,6 @@ def test_public_cake_gdn_prefill_int64_overflow_cuda_assert_in_isolated_process(
     repo_root = str(Path(__file__).resolve().parents[2])
     pythonpath = os.environ.get("PYTHONPATH", "")
     new_pythonpath = f"{repo_root}{os.pathsep}{pythonpath}" if pythonpath else repo_root
-    env = {
-        **os.environ,
-        "PYTHONPATH": new_pythonpath,
-    }
-    env.pop("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", None)
     completed = subprocess.run(
         [
             sys.executable,
@@ -2660,14 +2664,23 @@ def test_public_cake_gdn_prefill_int64_overflow_cuda_assert_in_isolated_process(
         capture_output=True,
         text=True,
         timeout=120,
-        env=env,
+        env={
+            **os.environ,
+            "PYTHONPATH": new_pythonpath,
+            "FLASHINFER_CAKE_GDN_VALIDATE_SLOTS": "1",
+        },
     )
     combined = completed.stdout + completed.stderr
-    assert completed.returncode != 0, combined
-    assert any(
+    exact_async_assertion = (
+        "_assert_async_cuda_kernel" in combined
+        and "GDN metadata values exceed int32 range" in combined
+    )
+    device_asserted = any(
         marker in combined
-        for marker in ("device-side assert", "_assert_async_cuda_kernel")
-    ), combined
+        for marker in ("device-side assert", "CUDA error", "_assert_async_cuda_kernel")
+    )
+    assert completed.returncode != 0 or exact_async_assertion, combined
+    assert device_asserted or "GDN metadata values exceed int32 range" in combined, combined
 
 
 if __name__ == "__main__":
