@@ -3304,6 +3304,9 @@ class ColonelsBf16Config:
     Empty ``tactics`` searches the complete configuration catalogue. Pass entries
     from ``get_colonels_tactics(...)`` to restrict the search explicitly.
     The default search includes GEMV only for batches of at most 16 tokens.
+    Prepare weights on the target device: SM103 uses K64-blocked storage for all
+    activations; SM90 retains row-major storage. On SM103, narrow GEMV-only widths
+    use the largest divisor of 64 that divides the width.
     """
 
     tactics: Tuple[ColonelsTactic, ...] = ()

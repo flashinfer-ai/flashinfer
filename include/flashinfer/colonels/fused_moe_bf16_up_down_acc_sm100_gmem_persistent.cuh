@@ -95,7 +95,6 @@ struct constants {
   static constexpr uint32_t idesc_up = build_idesc<BM, MMA_N_UP, CTA_GROUP>();
   static constexpr uint32_t idesc_down = build_idesc<BM, MMA_N_DOWN, CTA_GROUP>();
   static constexpr int GATHERS_PER_CTA = LOCAL_M / (4 * N_GROUPS);
-  static constexpr uint32_t TMA_RANK_W = 3;
   static constexpr uint32_t TMA_RANK_X = 2;
   static constexpr uint32_t TMA_RANK_S = 2;
   static constexpr int SCRATCH_ROWS_PER_SM = std::min(ROUTING_BM, 128);
@@ -381,9 +380,9 @@ __device__ __forceinline__ void fused_moe_bf16_wgmma_up_down_acc_body(
             if (group_rank == 0)
               expect_bytes(bar + smem_stage,
                            C::CTA_GROUP * (C::WS + (load_x ? C::XS : 0)) * sizeof(bf16));
-            load_async_3d<C::CTA_GROUP, C::EVICT_WEIGHTS>(
-                s.w + smem_stage * C::WS, &tensor_map_w, bar + smem_stage, off,
-                n_off + group_rank * C::TILE_COLS_UP, exp_idx);
+            load_async_4d<C::CTA_GROUP, C::EVICT_WEIGHTS>(
+                s.w + smem_stage * C::WS, &tensor_map_w, bar + smem_stage, 0,
+                n_off + group_rank * C::TILE_COLS_UP, off / 64, exp_idx);
           }
 
           if (load_x && gather_local < C::GATHERS_PER_CTA) {
@@ -454,16 +453,15 @@ __device__ __forceinline__ void fused_moe_bf16_wgmma_up_down_acc_body(
             const bool is_x_loader = load_x && n_group == scratch_tile % C::N_GROUPS;
             wait<C::CLUSTERS>(bar + C::STAGES + smem_stage, p);
             const int w_row_down = k_off;
-            const int w_col_down =
-                exp_idx * N2 + col * C::BN2 + group_rank * (C::BN2 / C::CTA_GROUP);
+            const int w_col_down = col * C::BN2 + group_rank * (C::BN2 / C::CTA_GROUP);
 
             if (group_rank == 0)
               expect_bytes(bar + smem_stage, (C::CTA_GROUP * C::WS +
                                               (load_x ? x_blocks * C::X_BLOCK_SIZE * C::BK2 : 0)) *
                                                  sizeof(bf16));
-            load_async_3d<C::CTA_GROUP, C::EVICT_WEIGHTS>(
+            load_async_4d<C::CTA_GROUP, C::EVICT_WEIGHTS>(
                 s_d.w + smem_stage * C::WS, &tensor_map_w2, bar + smem_stage, 0, w_col_down,
-                w_row_down / C::TILE_INNER_DN);
+                w_row_down / C::TILE_INNER_DN, exp_idx);
             // The publishing CTA loads X and multicasts it to every peer.
             if (is_x_loader) {
               // Issue weights before waiting for SwiGLU. The first sweep
@@ -902,24 +900,9 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
       gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
     }
 
-    // A separate expert axis lets TMA zero-fill partial tiles without reading the next expert.
     CUtensorMap tensor_map_w{};
-    {
-      uint64_t size[C::TMA_RANK_W] = {static_cast<uint64_t>(K), static_cast<uint64_t>(N),
-                                      static_cast<uint64_t>(num_experts)};
-      uint64_t stride[C::TMA_RANK_W - 1] = {static_cast<uint64_t>(K) * sizeof(bf16),
-                                            static_cast<uint64_t>(N) * K * sizeof(bf16)};
-      uint32_t box_size[C::TMA_RANK_W] = {C::BK, C::TILE_COLS_UP, 1};
-      uint32_t elem_stride[C::TMA_RANK_W] = {1, 1, 1};
-      auto cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
-      CUresult res = cuTensorMapEncodeTiled(
-          &tensor_map_w, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, C::TMA_RANK_W, w,
-          size, stride, box_size, elem_stride, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-          CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-          CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-          CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (res != CUDA_SUCCESS) return false;
-    }
+    if (!encode_bf16_weight_map(&tensor_map_w, w, num_experts, N, K, C::TILE_COLS_UP, C::BK))
+      return false;
 
     CUtensorMap tensor_map_x{};
     {
@@ -949,27 +932,9 @@ bool launch_fused_moe_kernel_up_down_acc_impl(
       return false;
     }
     CUtensorMap tensor_map_w2{};
-    {
-      // Reshape (K2, N2*E) into (TILE_INNER_DN, N2*E, K2/TILE_INNER_DN)
-      // so that tile chunks end up in dim2 (outermost, varies slowest in smem fill)
-      // producing contiguous per-tile regions in shared memory.
-      uint64_t size[C::TMA_RANK_W] = {static_cast<uint64_t>(C::TILE_INNER_DN),
-                                      static_cast<uint64_t>(N2 * num_experts),
-                                      static_cast<uint64_t>(K2 / C::TILE_INNER_DN)};
-      uint64_t stride[C::TMA_RANK_W - 1] = {static_cast<uint64_t>(K2) * sizeof(bf16),
-                                            static_cast<uint64_t>(C::TILE_INNER_DN) * sizeof(bf16)};
-      uint32_t box_size[C::TMA_RANK_W] = {C::TILE_INNER_DN, C::BN2 / C::CTA_GROUP,
-                                          static_cast<uint32_t>(C::TMA_TILES_DOWN)};
-      uint32_t elem_stride[C::TMA_RANK_W] = {1, 1, 1};
-      auto cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
-      CUresult res = cuTensorMapEncodeTiled(
-          &tensor_map_w2, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, C::TMA_RANK_W, w2,
-          size, stride, box_size, elem_stride, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-          CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-          CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-          CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (res != CUDA_SUCCESS) return false;
-    }
+    if (!encode_bf16_weight_map(&tensor_map_w2, w2, num_experts, N2, K2, C::BN2 / C::CTA_GROUP,
+                                C::BK2))
+      return false;
 
     static_assert(C::TMEM_COLS == 512);
     static_assert(C::SCRATCH_ROWS_PER_SM == F::SCRATCH_ROWS_PER_SM);

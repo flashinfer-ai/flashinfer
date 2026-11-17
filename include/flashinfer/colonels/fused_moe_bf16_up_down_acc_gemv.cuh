@@ -61,7 +61,8 @@ __device__ __forceinline__ float reduce_sum_bfly(float sum) {
   return sum;
 }
 
-template <int BN, int WARPS, int Z_SPLIT, moe_activation::Kind ACTIVATION>
+template <int BN, int WARPS, int Z_SPLIT, moe_activation::Kind ACTIVATION,
+          bool BLOCKED_WEIGHTS = false, int DOWN_WEIGHT_BLOCK_K = 64>
 __global__ __launch_bounds__(WARPS * 32, 1) void fused_moe_bf16_wgmma_up_down_acc_gemv_kernel(
     const bf16* x, const bf16* w13, const bf16* w2, bf16* __restrict__ out,
     const int* __restrict__ topk_ids, const float* __restrict__ topk_weights, const int top_k,
@@ -120,11 +121,17 @@ __global__ __launch_bounds__(WARPS * 32, 1) void fused_moe_bf16_wgmma_up_down_ac
 
   const float4* x_local_vec = reinterpret_cast<const float4*>(x + token * K);
   // The full expert bank can contain more than INT_MAX elements.
-  const float4* w13_local_vec =
-      reinterpret_cast<const float4*>(w13 + size_t(expert_id) * N * K + warpN * WN * K);
-
-  const bf16* w2_local_vec = w2 + size_t(expert_id) * N2 * K2 + blockIdx.z * (N2 / Z_SPLIT) * K2 +
-                             blockIdx.x * K2_PER_BLOCK;
+  const float4* w13_local_vec;
+  const bf16* w2_local_vec;
+  if constexpr (BLOCKED_WEIGHTS) {
+    w13_local_vec = reinterpret_cast<const float4*>(w13 + size_t(expert_id) * N * K);
+    w2_local_vec = w2 + size_t(expert_id) * N2 * K2;
+  } else {
+    w13_local_vec =
+        reinterpret_cast<const float4*>(w13 + size_t(expert_id) * N * K + warpN * WN * K);
+    w2_local_vec = w2 + size_t(expert_id) * N2 * K2 + blockIdx.z * (N2 / Z_SPLIT) * K2 +
+                   blockIdx.x * K2_PER_BLOCK;
+  }
 
   // lane_id is decomposed as
   //   group_id     = lane_id / LANES_K_DOWN   in [0, N_SPLIT_LANES)
@@ -150,21 +157,44 @@ __global__ __launch_bounds__(WARPS * 32, 1) void fused_moe_bf16_wgmma_up_down_ac
   const float2* w2_local_smem = reinterpret_cast<float2*>(w2_smem + warp_id * SMEM_WARP_OFF);
   int load_stage = 0;
   int smem_stage = 0;
+  constexpr int COPY_ELEMENTS = WARPS * 32 * F4_TO_BF16_RATIO;
+  static_assert(SMEM_SIZE % COPY_ELEMENTS == 0);
+  int weight_base = 0;
+  if constexpr (BLOCKED_WEIGHTS) {
+    const int first_k = (threadIdx.x * F4_TO_BF16_RATIO) % SMEM_COLS;
+    const int first_row = (threadIdx.x * F4_TO_BF16_RATIO) / SMEM_COLS;
+    const int weight_row = blockIdx.z * (N2 / Z_SPLIT) + first_row;
+    const int weight_col = blockIdx.x * K2_PER_BLOCK + first_k;
+    weight_base = (weight_col / DOWN_WEIGHT_BLOCK_K * N2 + weight_row) * DOWN_WEIGHT_BLOCK_K +
+                  weight_col % DOWN_WEIGHT_BLOCK_K;
+  }
   auto load_w2 = [&](int acc_idx) {
-    for (int i = threadIdx.x * F4_TO_BF16_RATIO; i < SMEM_SIZE;
-         i += blockDim.x * F4_TO_BF16_RATIO) {
-      int k_off = i % SMEM_COLS;
-      int r = i / SMEM_COLS;
-      int n_off = (r + acc_idx) * K2;
-      int n_off_smem = r * SMEM_COLS;
+    if constexpr (BLOCKED_WEIGHTS) {
+      // Hoist the blocked address calculation; each iteration adds whole rows or K blocks.
+#pragma unroll
+      for (int j = 0; j < SMEM_SIZE / COPY_ELEMENTS; ++j) {
+        int row_offset = j * COPY_ELEMENTS / SMEM_COLS;
+        int col_offset = j * COPY_ELEMENTS % SMEM_COLS;
+        int smem_off = load_stage * SMEM_SIZE + threadIdx.x * F4_TO_BF16_RATIO + j * COPY_ELEMENTS;
+        int gmem_off = weight_base + (acc_idx + row_offset) * DOWN_WEIGHT_BLOCK_K + col_offset * N2;
+        uint32_t smem = __cvta_generic_to_shared(w2_smem + smem_off);
+        CP_ASYNC_CG(smem, w2_local_vec + gmem_off, 16);
+      }
+    } else {
+      for (int i = threadIdx.x * F4_TO_BF16_RATIO; i < SMEM_SIZE;
+           i += blockDim.x * F4_TO_BF16_RATIO) {
+        int k_off = i % SMEM_COLS;
+        int r = i / SMEM_COLS;
+        int n_off = (r + acc_idx) * K2;
+        int n_off_smem = r * SMEM_COLS;
 
-      int smem_off = (load_stage * SMEM_SIZE + n_off_smem + k_off);
-      int gmem_off = n_off + k_off;
-      uint32_t smem = __cvta_generic_to_shared(w2_smem + smem_off);
-      CP_ASYNC_CG(smem, w2_local_vec + gmem_off, 16);
+        int smem_off = (load_stage * SMEM_SIZE + n_off_smem + k_off);
+        int gmem_off = n_off + k_off;
+        uint32_t smem = __cvta_generic_to_shared(w2_smem + smem_off);
+        CP_ASYNC_CG(smem, w2_local_vec + gmem_off, 16);
+      }
     }
     load_stage ^= 1;
-
     CP_ASYNC_COMMIT_GROUP();
   };
   // W2 is prescheduled so that we have more bytes in flight
@@ -178,8 +208,15 @@ __global__ __launch_bounds__(WARPS * 32, 1) void fused_moe_bf16_wgmma_up_down_ac
       const float4 x_val = x_local_vec[k_off];
       for (int n = 0; n < MAX_ACC_UP; n++) {
         // K is vector-aligned; divide the stride before forming each row offset.
-        int n_off = (acc_idx + n) * (K / F4_TO_BF16_RATIO);
-        const float4 w13_val = w13_local_vec[n_off + k_off];
+        int offset;
+        if constexpr (BLOCKED_WEIGHTS) {
+          int row = warpN * WN + acc_idx + n;
+          constexpr int BLOCK_VECS = 64 / F4_TO_BF16_RATIO;
+          offset = (k_off / BLOCK_VECS * N + row) * BLOCK_VECS + k_off % BLOCK_VECS;
+        } else {
+          offset = (acc_idx + n) * (K / F4_TO_BF16_RATIO) + k_off;
+        }
+        const float4 w13_val = w13_local_vec[offset];
         acc[n] += vec_fma_bf16_bf16(x_val, w13_val);
       }
     }
@@ -278,7 +315,8 @@ __global__ __launch_bounds__(WARPS * 32, 1) void fused_moe_bf16_wgmma_up_down_ac
   }
 }
 
-template <int BN, int WARPS, int Z_SPLIT, moe_activation::Kind ACTIVATION>
+template <int BN, int WARPS, int Z_SPLIT, moe_activation::Kind ACTIVATION,
+          bool BLOCKED_WEIGHTS = false>
 bool launch_fused_moe_kernel_up_down_acc_gemv(
     const bf16* x, bf16* w, bf16* w2, bf16* out, const int* topk_ids, const float* topk_weights,
     const int top_k, int M, int N, int K, int num_experts, float scaling_factor,
@@ -306,7 +344,24 @@ bool launch_fused_moe_kernel_up_down_acc_gemv(
   if (K > 0 && K % 256 == 0 && BN <= N && N % BN == 0 && K % (Z_SPLIT * SMEM_ROWS) == 0) {
     dim3 dimBlock(32 * WARPS, 1, 1);
     dim3 dimGrid(std::ceil((float)N / (BN)), M * top_k, Z_SPLIT);
-    auto kernel = fused_moe_bf16_wgmma_up_down_acc_gemv_kernel<BN, WARPS, Z_SPLIT, ACTIVATION>;
+    auto kernel = fused_moe_bf16_wgmma_up_down_acc_gemv_kernel<BN, WARPS, Z_SPLIT, ACTIVATION,
+                                                               BLOCKED_WEIGHTS>;
+    // N must be divisible by BN, so only narrow tactics need smaller K blocks.
+    if constexpr (BLOCKED_WEIGHTS && K2_PER_BLOCK < 64) {
+      if ((N / UP_FACTOR) % 64 != 0)
+        kernel =
+            fused_moe_bf16_wgmma_up_down_acc_gemv_kernel<BN, WARPS, Z_SPLIT, ACTIVATION, true, 32>;
+    }
+    if constexpr (BLOCKED_WEIGHTS && K2_PER_BLOCK < 32) {
+      if ((N / UP_FACTOR) % 32 != 0)
+        kernel =
+            fused_moe_bf16_wgmma_up_down_acc_gemv_kernel<BN, WARPS, Z_SPLIT, ACTIVATION, true, 16>;
+    }
+    if constexpr (BLOCKED_WEIGHTS && K2_PER_BLOCK < 16) {
+      if ((N / UP_FACTOR) % 16 != 0)
+        kernel =
+            fused_moe_bf16_wgmma_up_down_acc_gemv_kernel<BN, WARPS, Z_SPLIT, ACTIVATION, true, 8>;
+    }
     gpuErrchk(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     kernel<<<dimGrid, dimBlock, smem_size, stream>>>(x, w, w2, out, topk_ids, topk_weights, top_k,
                                                      M, N, K, num_experts, scaling_factor,

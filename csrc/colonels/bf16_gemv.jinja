@@ -4,7 +4,8 @@ launch_fused_moe_kernel_up_down_acc_gemv<
         {{ config.BN }},
         {{ config.WN }},
         {{ config.Z_SPLIT }},
-        moe_activation::Kind::{{ config.ACTIVATION }}
+        moe_activation::Kind::{{ config.ACTIVATION }},
+        {{ "true" if arch == 103 else "false" }}
     >(
         x,
         w,

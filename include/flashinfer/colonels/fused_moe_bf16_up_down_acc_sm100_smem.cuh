@@ -74,7 +74,6 @@ struct constants {
   static constexpr int LAST_UP_K = LAST_UP_TILE * (MMA_N_UP / UD_RATIO);
   static constexpr int LAST_UP_SLOT = LAST_UP_TILE % EP_BUFFERS;
   static constexpr int LAST_UP_RELEASE_PHASE = (LAST_UP_TILE / EP_BUFFERS + 1) % 2;
-  static constexpr uint32_t TMA_RANK_W = 3;
   static constexpr uint32_t TMA_RANK_X = 2;
 
   struct smem_up {
@@ -230,9 +229,10 @@ __global__ __cluster_dims__(C::CLUSTERS, 1, 1)
           } else {
             expect_bytes(bar + smem_stage, C::WS * sizeof(bf16));
           }
-          load_async_3d<C::CTA_GROUP>(
-              s.w + smem_stage * C::WS, &tensor_map_w, bar + smem_stage, off,
-              (blockIdx.x / C::CTA_GROUP) * C::BLN + n_off + cta_rank * C::TILE_COLS_UP, exp_idx);
+          load_async_4d<C::CTA_GROUP>(
+              s.w + smem_stage * C::WS, &tensor_map_w, bar + smem_stage, 0,
+              (blockIdx.x / C::CTA_GROUP) * C::BLN + n_off + cta_rank * C::TILE_COLS_UP, off / 64,
+              exp_idx);
         }
 
         if (producer_tid % 32 < C::LOADS_PER_WARP) {
@@ -256,11 +256,11 @@ __global__ __cluster_dims__(C::CLUSTERS, 1, 1)
           }
           wait<C::CLUSTERS>(bar + C::STAGES + smem_stage, p);
           const int w_row_down = (blockIdx.x / C::CTA_GROUP) * (C::BLN / C::UD_RATIO) + k_off;
-          const int w_col_down = exp_idx * N2 + col * C::BN2 + cta_rank * (C::BN2 / C::CTA_GROUP);
+          const int w_col_down = col * C::BN2 + cta_rank * (C::BN2 / C::CTA_GROUP);
 
           if (cta_rank == 0) expect_bytes(bar + smem_stage, C::CTA_GROUP * C::WS * sizeof(bf16));
-          load_async_3d<C::CTA_GROUP>(s_d.w + smem_stage * C::WS, &tensor_map_w2, bar + smem_stage,
-                                      0, w_col_down, w_row_down / C::TILE_INNER_DN);
+          load_async_4d<C::CTA_GROUP>(s_d.w + smem_stage * C::WS, &tensor_map_w2, bar + smem_stage,
+                                      0, w_col_down, w_row_down / C::TILE_INNER_DN, exp_idx);
           if constexpr (C::CTA_GROUP == 1) arrive(bar + smem_stage, C::LOCAL_M / 4);
           smem_stage++;
         }
@@ -579,24 +579,9 @@ bool launch_fused_moe_kernel_up_down_acc(
     gpuErrchk(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, C::sMemSize));
 
-    // A separate expert axis lets TMA zero-fill partial tiles without reading the next expert.
     CUtensorMap tensor_map_w{};
-    {
-      uint64_t size[C::TMA_RANK_W] = {static_cast<uint64_t>(K), static_cast<uint64_t>(N),
-                                      static_cast<uint64_t>(num_experts)};
-      uint64_t stride[C::TMA_RANK_W - 1] = {static_cast<uint64_t>(K) * sizeof(bf16),
-                                            static_cast<uint64_t>(N) * K * sizeof(bf16)};
-      uint32_t box_size[C::TMA_RANK_W] = {C::BK, C::TILE_COLS_UP, 1};
-      uint32_t elem_stride[C::TMA_RANK_W] = {1, 1, 1};
-      auto cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
-      CUresult res = cuTensorMapEncodeTiled(
-          &tensor_map_w, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, C::TMA_RANK_W, w,
-          size, stride, box_size, elem_stride, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-          CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-          CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-          CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (res != CUDA_SUCCESS) return false;
-    }
+    if (!encode_bf16_weight_map(&tensor_map_w, w, num_experts, N, K, C::TILE_COLS_UP, C::BK))
+      return false;
 
     CUtensorMap tensor_map_x{};
     {
@@ -628,27 +613,9 @@ bool launch_fused_moe_kernel_up_down_acc(
       return false;
     }
     CUtensorMap tensor_map_w2{};
-    {
-      // Reshape (K2, N2*E) into (TILE_INNER_DN, N2*E, K2/TILE_INNER_DN)
-      // so that tile chunks end up in dim2 (outermost, varies slowest in smem fill)
-      // producing contiguous per-tile regions in shared memory.
-      uint64_t size[C::TMA_RANK_W] = {static_cast<uint64_t>(C::TILE_INNER_DN),
-                                      static_cast<uint64_t>(N2 * num_experts),
-                                      static_cast<uint64_t>(K2 / C::TILE_INNER_DN)};
-      uint64_t stride[C::TMA_RANK_W - 1] = {static_cast<uint64_t>(K2) * sizeof(bf16),
-                                            static_cast<uint64_t>(C::TILE_INNER_DN) * sizeof(bf16)};
-      uint32_t box_size[C::TMA_RANK_W] = {C::TILE_INNER_DN, C::BN2 / C::CTA_GROUP,
-                                          static_cast<uint32_t>(C::TMA_TILES_DOWN)};
-      uint32_t elem_stride[C::TMA_RANK_W] = {1, 1, 1};
-      auto cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
-      CUresult res = cuTensorMapEncodeTiled(
-          &tensor_map_w2, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, C::TMA_RANK_W, w2,
-          size, stride, box_size, elem_stride, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-          CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-          CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-          CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      if (res != CUDA_SUCCESS) return false;
-    }
+    if (!encode_bf16_weight_map(&tensor_map_w2, w2, num_experts, N2, K2, C::BN2 / C::CTA_GROUP,
+                                C::BK2))
+      return false;
 
     kernel<<<dimGrid, dimBlock, C::sMemSize, stream>>>(
         tensor_map_x, tensor_map_w, tensor_map_w2, out, sorted_token_ids, expert_ids,

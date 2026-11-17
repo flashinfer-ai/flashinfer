@@ -39,6 +39,7 @@ def gen_colonels_module(variant, parameters, activation, arch):
     config["ACTIVATION"] = ("SWIGLU", "RELU_SQ", "RELU_CLAMP_SQ")[activation]
     source = template.render(
         variant=variant,
+        arch=arch,
         config=config,
         fp8=variant.startswith("w8a8"),
         ratio=2 if activation == 0 else 1,

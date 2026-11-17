@@ -1,3 +1,5 @@
+from math import gcd
+
 import torch
 
 from ...api import SwiGLU
@@ -18,6 +20,18 @@ def interleave_gate_up(tensor, rep):
         )
         .reshape(e, n, k)
         .contiguous()
+    )
+
+
+def block_weights(weight):
+    e, n, k = weight.shape
+    # Narrow GEMV-only shapes use the largest K block that divides the width.
+    block_k = gcd(k, 64)
+    return (
+        weight.reshape(e, n, k // block_k, block_k)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(e, n, k)
     )
 
 
@@ -109,10 +123,21 @@ def prepare_weights(
             "expert_map": expert_map.to(w1.device).contiguous(),
             "expert_map_max": int(local_ids.max()) if local_ids.numel() else -1,
         }
+    w1 = interleave_gate_up(w1, 8) if activation == SwiGLU() else w1.contiguous()
+    w2 = w2.contiguous()
+    blocked = (
+        not fp8
+        and w1.device.type == "cuda"
+        and torch.cuda.get_device_capability(w1.device) == (10, 3)
+    )
+    if blocked:
+        # K64 blocking makes each TMA weight tile contiguous.
+        w1, w2 = block_weights(w1), block_weights(w2)
     return {
         **mapping,
-        "w1": interleave_gate_up(w1, 8) if activation == SwiGLU() else w1.contiguous(),
-        "w2": w2.contiguous(),
+        "w1": w1,
+        "w2": w2,
+        "blocked_weights": blocked,
         "activation": activation,
         **({"w1_scale": w1_scale, "w2_scale": w2_scale} if fp8 else {}),
     }

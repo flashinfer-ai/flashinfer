@@ -226,6 +226,8 @@ class ColonelsBf16Runner(MoERunner):
         if v.get("activation") != self.config.activation:
             raise ValueError("Prepared weights and layer activation must match")
         i = self.config.experts.intermediate_size
+        if v.get("blocked_weights", False) != (not self.fp8 and self.arch == 103):
+            raise ValueError("Prepare Colonels weights on the layer's target device")
         expected = (
             (self.total_experts, i * (2 if self.config.activation.is_gated else 1), h),
             (self.total_experts, h, i),

@@ -1033,6 +1033,52 @@ __device__ inline void load_async_3d(void* dst, void const* const src_tma_map, u
   }
 }
 
+template <int CTA_GROUP = 1, bool EVICT_FIRST = false>
+__device__ inline void load_async_4d(void* dst, void const* const src_tma_map, uint64_t* bar,
+                                     int global_dim0_idx, int global_dim1_idx, int global_dim2_idx,
+                                     int global_dim3_idx) {
+  uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
+  uint32_t mbar_ptr = tma_barrier_address<CTA_GROUP>(bar);
+  uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+  if constexpr (EVICT_FIRST) {
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    if constexpr (CTA_GROUP == 2) {
+      asm volatile(
+          "cp.async.bulk.tensor.4d.cta_group::2.shared::cluster.global."
+          "mbarrier::complete_tx::bytes.L2::cache_hint "
+          "[%0], [%1, {%3, %4, %5, %6}], [%2], %7;" ::"r"(dst_ptr),
+          "l"(tma_ptr), "r"(mbar_ptr), "r"(global_dim0_idx), "r"(global_dim1_idx),
+          "r"(global_dim2_idx), "r"(global_dim3_idx), "l"(policy)
+          : "memory");
+    } else {
+      asm volatile(
+          "cp.async.bulk.tensor.4d.shared::cta.global.tile."
+          "mbarrier::complete_tx::bytes.L2::cache_hint "
+          "[%0], [%1, {%3, %4, %5, %6}], [%2], %7;" ::"r"(dst_ptr),
+          "l"(tma_ptr), "r"(mbar_ptr), "r"(global_dim0_idx), "r"(global_dim1_idx),
+          "r"(global_dim2_idx), "r"(global_dim3_idx), "l"(policy)
+          : "memory");
+    }
+  } else if constexpr (CTA_GROUP == 2) {
+    asm volatile(
+        "cp.async.bulk.tensor.4d.cta_group::2.shared::cluster.global."
+        "mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5, %6}], [%2];" ::"r"(dst_ptr),
+        "l"(tma_ptr), "r"(mbar_ptr), "r"(global_dim0_idx), "r"(global_dim1_idx),
+        "r"(global_dim2_idx), "r"(global_dim3_idx)
+        : "memory");
+  } else {
+    asm volatile(
+        "cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5, %6}], [%2];"
+        :
+        : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "r"(global_dim0_idx), "r"(global_dim1_idx),
+          "r"(global_dim2_idx), "r"(global_dim3_idx)
+        : "memory");
+  }
+}
+
 __device__ inline void load_async_3d_evict_first(void* dst, const void* tensor_map, uint64_t* bar,
                                                  int dim0, int dim1, int dim2) {
   uint64_t policy;
@@ -1360,4 +1406,21 @@ __device__ __forceinline__ void clc_query_response(const int4* response, uint32_
       : "memory");
   // Finish generic-proxy reads before the scheduler reuses this response via the async proxy.
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
+inline bool encode_bf16_weight_map(CUtensorMap* map, bf16* weights, int experts, int rows, int cols,
+                                   uint32_t tile_rows, uint32_t tile_k) {
+  // Keep experts separate so partial tiles zero-fill instead of reading the next expert.
+  uint64_t size[4] = {64, static_cast<uint64_t>(rows), static_cast<uint64_t>(cols / 64),
+                      static_cast<uint64_t>(experts)};
+  uint64_t stride[3] = {64 * sizeof(bf16), static_cast<uint64_t>(rows) * 64 * sizeof(bf16),
+                        static_cast<uint64_t>(rows) * cols * sizeof(bf16)};
+  uint32_t box[4] = {64, tile_rows, tile_k / 64, 1};
+  uint32_t elem_stride[4] = {1, 1, 1, 1};
+  return get_cuTensorMapEncodeTiled()(
+             map, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, weights, size, stride,
+             box, elem_stride, CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+             CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+             CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+             CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
