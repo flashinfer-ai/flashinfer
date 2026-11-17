@@ -1929,9 +1929,10 @@ void expandInputRowsKernelLauncher(
 }
 
 template <class T>
-__global__ void padEmptyFp8BlockScaleMoeInputKernel(
-    T* permuted_input, int64_t const* expert_first_token_offset,
-    int64_t* gemm_expert_first_token_offset, int num_experts_per_node, int64_t hidden_size) {
+__global__ void padEmptyFp8BlockScaleMoeInputKernel(T* permuted_input,
+                                                    int64_t const* expert_first_token_offset,
+                                                    int64_t* gemm_expert_first_token_offset,
+                                                    int num_experts_per_node, int64_t hidden_size) {
   for (int index = threadIdx.x; index <= num_experts_per_node; index += blockDim.x) {
     gemm_expert_first_token_offset[index] = expert_first_token_offset[index];
   }
