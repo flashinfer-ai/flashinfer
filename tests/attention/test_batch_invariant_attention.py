@@ -2128,3 +2128,175 @@ def test_workspace_size_raises_the_typed_errors_of_plan():
         dec.workspace_size(
             *dargs, q_len_per_req=4, is_causal=False, window_left=8, **kw
         )
+
+
+# ------------------------------------------------------------------------------------------------------ non-causal placements
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_multi_token_decode_on_the_swaps_body(D):
+    """Non-causal multi-token decode whose units all have at most ``SWAPS_MAX_ROWS`` live rows (``g x q_len = 2 x 4``) runs the
+    Swaps-AB kernel of the non-causal class: the bits of the non-causal prefill rows (the row body) for the same tokens, of the
+    row body's replicated placement of the same decode batch, and the fp32 reference within the class's tolerance. Requests of
+    one and of several chunks, and one with fewer keys than query tokens."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    assert D in engine.SWAPS_DIMS
+    q_len, Hq, Hkv = 4, 16, 8
+    assert (Hq // Hkv) * q_len <= engine.SWAPS_MAX_ROWS
+    pr = Problem(
+        [256, 33, 1024, 7, 4], [1500, 2500, 1024, 4096, 3], Hq, Hkv, D, 16, seed=51
+    )
+    rows = torch.cat(
+        [
+            torch.arange(
+                int(pr.qo_indptr[i + 1]) - q_len,
+                int(pr.qo_indptr[i + 1]),
+                device=pr.device,
+            )
+            for i in range(len(pr.q_lens))
+        ]
+    )
+    q = pr.q[rows].contiguous()
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        Hq,
+        Hkv,
+        D,
+        16,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+        is_causal=False,
+    )
+    delegate = w._batch_invariant
+    plan = delegate._planned.plan
+    assert delegate._planned.causal is False
+    assert delegate._config.small == "swap"
+    assert max(d[2] for d in plan.desc) <= engine.SWAPS_MAX_ROWS
+    assert engine.swaps_n_pad(plan) > 0  # the plan runs the Swaps-AB kernel
+    assert plan.groups  # the multi-chunk requests are split
+    dec = w.run(q, pr.cache("NHD"))
+    pre = run_paged_prefill(pr, causal=False)
+    assert torch.equal(bits(dec), bits(pre)[rows])
+    ref = reference_noncausal(pr)[rows]
+    err = (dec.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    # the same decode batch through the engine on the row body (small = "rep": the replicated-row placement of small units)
+    # and on the Swaps body again: the same bits
+    qo = torch.arange(len(pr.q_lens) + 1, dtype=torch.int32, device=pr.device) * q_len
+    for small in ("rep", "swap"):
+        cfg = replace(engine.default_config(D=D), small=small)
+        planned = engine.plan_attention(
+            qo,
+            pr.kv_indptr,
+            pr.kv_last,
+            Hq,
+            Hkv,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            causal=False,
+        )
+        out = engine.run_attention(
+            planned,
+            q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
+        assert torch.equal(bits(out), bits(dec)), small
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_noncausal_more_queries_than_keys_split_under_both_merges(D):
+    """Non-causal requests of several chunks with more query tokens than keys (and one short query block over more chunks), with
+    every multi-chunk unit split and the chunk fold placed in the fixup kernel, in-kernel, or by the planner's rule, and with
+    fused units: the bits of the wrapper's own plan, and the fp32 reference within the class's tolerance."""
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.spec import chunk_len
+
+    C = chunk_len(D)
+    q_lens = [1500, 700, 20]
+    kv_lens = [2 * C + 37, C + 150, 3 * C + 5]
+    assert q_lens[0] > kv_lens[0] > 2 * C and q_lens[1] > kv_lens[1] > C
+    Hq = Hkv = 8
+    pr = Problem(q_lens, kv_lens, Hq, Hkv, D, 16, seed=52)
+    out = run_paged_prefill(pr, causal=False)
+    ref = reference_noncausal(pr)
+    err = (out.float() - ref).abs().max().item()
+    assert err < 2e-2 + 1e-2 * ref.abs().max().item(), err
+    assert torch.equal(bits(out), bits(run_ragged_prefill(pr, causal=False)))
+    for policy, merge in (
+        ("split", "fixup"),
+        ("split", "inkernel"),
+        ("split", "auto"),
+        ("fused", "auto"),
+    ):
+        cfg = replace(engine.default_config(D=D), split_policy=policy, merge=merge)
+        assert cfg.well_formed(D)
+        planned = engine.plan_attention(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_last,
+            Hq,
+            Hkv,
+            D,
+            16,
+            -1,
+            cfg,
+            None,
+            pr.device,
+            causal=False,
+        )
+        plan = planned.plan
+        if policy == "fused":
+            assert not plan.groups and plan.ws_rows == 0
+        else:
+            # every (Q tile, KV head) of the three requests is a multi-chunk unit: one split group each
+            tiles = sum(-(-ql // plan.tokens_per_tile) for ql in q_lens) * Hkv
+            assert len(plan.groups) == tiles and plan.ws_rows > 0
+            assert (
+                max(gr[3] for gr in plan.groups) == 4
+            )  # the short block's four chunks
+            assert (
+                min(gr[1] for gr in plan.groups)
+                <= 32
+                < max(gr[1] for gr in plan.groups)
+            )
+            if merge == "fixup":
+                assert len(plan.fixup_groups) == len(plan.groups)
+            elif merge == "inkernel":
+                assert all(plan.group_inkernel) and not plan.fixup_groups
+        got = engine.run_attention(
+            planned,
+            pr.q,
+            pr.k_nhd,
+            pr.v_nhd,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(D),
+            -1,
+            "NHD",
+            None,
+            cfg,
+        )
+        assert torch.equal(bits(got), bits(out)), (policy, merge)
