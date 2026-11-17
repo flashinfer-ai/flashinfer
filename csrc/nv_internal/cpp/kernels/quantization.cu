@@ -255,6 +255,9 @@ template <typename T>
 void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, int64_t* output,
                              int32_t* SFOutput, QuantizationSFLayout layout,
                              int multiProcessorCount, bool enable_pdl, cudaStream_t stream) {
+  if (b == 0 || m == 0 || n == 0) {
+    return;  // a zero-sized grid or block is a launch error, not a no-op
+  }
   // Fixed SF_VEC_SIZE as 32
   // TODO: TMA quantization for MXFP8 is not supported yet because of SF_VEC_SIZE = 32.
   static constexpr int SF_VEC_SIZE = 32;
@@ -283,9 +286,9 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
   config.numAttrs = 1;
   config.attrs = attrs;
   auto launch = [&](auto kernel) {
-    cudaLaunchKernelEx(&config, kernel, b, m, n, padded_n, input, nullptr,
-                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                       layout);
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, b, m, n, padded_n, input, nullptr,
+                                       reinterpret_cast<uint32_t*>(output),
+                                       reinterpret_cast<uint32_t*>(SFOutput), layout));
   };
   if (twoLoads) {
     launch(quantize_with_block_size<BlockScaleQuantizationType::FP16_TO_MXFP8, T, SF_VEC_SIZE, true,
@@ -601,7 +604,7 @@ int64_t tmaWorkTiles(int b, int m, QuantizationSFLayout layout) {
 
 // Filling and draining the TMA pipeline costs ~2 us more than the vectorized kernel's launch, which
 // its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2). Its
-// grid spans the work tiles, which must also give every SM one. SM107 breaks even by row count.
+// grid spans the work tiles, which must also give every SM one. SM107 breaks even by total rows.
 template <typename T>
 bool useTmaQuantization(int b, int m, int n, QuantizationSFLayout layout, int multiProcessorCount) {
   if (m < 1024 || n % TmaKernelTraits<T>::TMA_COL_CHUNK != 0) {
@@ -609,7 +612,8 @@ bool useTmaQuantization(int b, int m, int n, QuantizationSFLayout layout, int mu
   }
   thread_local int const smVersion = tensorrt_llm::common::getSMVersion();
   if (smVersion == 107) {
-    return m >= (layout == QuantizationSFLayout::SWIZZLED_128x4 ? 2048 : 3072);
+    return static_cast<int64_t>(b) * m >=
+           (layout == QuantizationSFLayout::SWIZZLED_128x4 ? 2048 : 3072);
   }
   constexpr int64_t kMinTmaInputBytes = 32ll << 20;
   return tmaWorkTiles<T>(b, m, layout) >= multiProcessorCount &&
@@ -639,9 +643,9 @@ struct FP4QuantizationTmaLauncher {
                                       UseRowWiseScaleTag::value, UseInverseScaleTag::value,
                                       DisableFP4QuantFastMathTag::value, NVFP4ConfigTag>;
     cudaFuncSetAttribute(kernel_instance, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    cudaLaunchKernelEx(config, kernel_instance, b, m, n, n, input, SFScale,
-                       reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                       layout, tensor_map);
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(config, kernel_instance, b, m, n, n, input, SFScale,
+                                       reinterpret_cast<uint32_t*>(output),
+                                       reinterpret_cast<uint32_t*>(SFOutput), layout, tensor_map));
   }
 };
 
@@ -678,9 +682,9 @@ struct FP4QuantizationLauncher {
                                         DisableFP4QuantFastMathTag::value, NVFP4ConfigTag, 2>;
         }
       }
-      cudaLaunchKernelEx(config, kernel_instance, b, m, n, n, input, SFScale,
-                         reinterpret_cast<uint32_t*>(output), reinterpret_cast<uint32_t*>(SFOutput),
-                         layout);
+      TLLM_CUDA_CHECK(cudaLaunchKernelEx(config, kernel_instance, b, m, n, n, input, SFScale,
+                                         reinterpret_cast<uint32_t*>(output),
+                                         reinterpret_cast<uint32_t*>(SFOutput), layout));
     } else {
       kernel_instance<<<grid, block, 0, stream>>>(b, m, n, n, input, SFScale,
                                                   reinterpret_cast<uint32_t*>(output),
@@ -767,6 +771,9 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
                            QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
                            bool use_row_wise_scale, bool inverse_scale,
                            NVFP4RecipeSpec const& recipe, cudaStream_t stream) {
+  if (b == 0 || m == 0 || n == 0) {
+    return;  // a zero-sized grid or block is a launch error, not a no-op
+  }
   // The FP8 branch ignores `recipe`: FP8->FP4 has no 4over6 kernel, and an env-driven
   // recipe was always silently ignored there. Python rejects an explicit one.
 #ifdef ENABLE_FP8
