@@ -31,6 +31,50 @@ def test_candidate_deduplication_preserves_order_and_normalizes_json():
     assert autotune._unique_candidates([]) == []
 
 
+def test_default_sweep_grid_uses_dedup_return_contract(monkeypatch):
+    cfg = Sm107BlockScaledMoeConfig(
+        num_total_experts=32,
+        max_tokens_per_rank=4,
+        num_topk=4,
+        hidden=512,
+        intermediate=256,
+        rank=0,
+        world_size=1,
+        combine_dedup=True,
+        fc2_use_bulk=True,
+        token_back_mode="reuse_dispatch_warps",
+    )
+    generate = autotune.sm107_candidates
+    grid = mock.Mock(wraps=generate)
+    monkeypatch.setattr(autotune, "sm107_candidates", grid)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    class OracleReached(Exception):
+        pass
+
+    def oracle(*args, **kwargs):
+        raise OracleReached
+
+    monkeypatch.setattr(correctness, "sampled_reference", oracle)
+    with pytest.raises(OracleReached):
+        autotune._sweep_sm107_block_scaled_mega_moe(
+            object(),
+            None,
+            None,
+            SimpleNamespace(config=cfg),
+            num_tokens=1,
+        )
+    grid.assert_called_once_with(
+        cfg.quant_kind,
+        kernel_variant="inference",
+        batch_invariant=False,
+        combine_dedup=True,
+        token_back_mode="reuse_dispatch_warps",
+    )
+    selected = generate(*grid.call_args.args, **grid.call_args.kwargs)
+    assert selected and all(autotune.is_valid_sm107(c, cfg) for c in selected)
+
+
 @pytest.mark.parametrize("variant", ["inference", "genphase"])
 @pytest.mark.parametrize("limit", [2, 16])
 def test_cli_deduplicates_before_limiting_candidates(monkeypatch, variant, limit):

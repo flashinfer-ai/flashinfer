@@ -434,7 +434,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(SharedExpertKernelMixin, KernelClass):
                 num_experts=self.expert_count,
                 batch_invariant=bool(problem_desc.get("batch_invariant", False)),
                 shared_term=self.reduce_shared_output,
-                outlive_producer=self.shared_expert,
+                outlive_producer=self.shared_expert and self.epilogue.combine_ll_encoded,
             )
         )
 

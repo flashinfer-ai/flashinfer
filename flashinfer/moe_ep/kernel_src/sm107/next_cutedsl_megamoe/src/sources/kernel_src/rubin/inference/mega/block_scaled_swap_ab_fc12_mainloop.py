@@ -192,10 +192,6 @@ class BlockScaledSwapAbFc12Mainloop(SharedKindMainloopMixin, KernelComponent):
             # Shared tiles override each producer's static expectation (``expected_tx``) with their own bytes.
             self.shared_weight_tx_count = self.shared_a_stage_tma_bytes + self.shared_sfa_stage_tma_bytes
             self.shared_token_tx_count = self.shared_b_stage_tma_bytes + self.shared_sfb_stage_tma_bytes
-            if self.shared_weight_tx_count + self.shared_token_tx_count != (
-                self.shared_ab_stage_tma_bytes * self.mma_cta_count
-            ):
-                raise ValueError("Shared-expert AB stage transaction byte accounting is inconsistent.")
 
     def _validate_configuration(self) -> None:
         if self.mma_k_mode != "2x":

@@ -17,7 +17,7 @@ next_cutedsl_megamoe/
 
 - Source revision: `70a6878de7852ed837d6a4dfc1572728226fbbc4`.
 - Shared-runtime revision: `1695115c1fb703f4f1d2ad9076944e4876a3ae01`.
-- Source with retained patches: `9bcb9455ad0ec296f6b13b948251db0527e84a97`,
+- Source with retained patches: `b4de2eefce3aeb02f107829bd6257e72b23aa5a6`,
   recorded as `patch_revision` in `export_manifest.json`.
 - Exporter: `export_src.py` at the retained-patch revision above,
   SHA-256 `d71f28ed0d4028758e8024e831c049726923f112d30d33447be2db74149e89b5`.
@@ -77,6 +77,9 @@ for separate reduction. GenPhase uses the provider's self-validating combine
 and tail protocol, masking invalid scores before reduction. Top-k counts above
 the polled reducer's 31-slot limit use the static reducer and wait for peer
 stores at the tail barrier.
+Shared GenPhase uses the same static reduction for top-k counts above 31.
+Multi-stage communication validates dispatch scale groups and uses the registered
+per-stage chunk size for token-back copies.
 
 GenPhase includes native N64 gather support for NVFP4, MXFP8 E4M3 and
 MXFP4/MXFP8, retaining the MXFP8 two-CTA cluster option.

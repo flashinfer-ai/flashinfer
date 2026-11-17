@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import contextlib
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,6 +26,37 @@ from tests.moe_ep.test_sm107_block_scaled_config import _BACKENDS
 
 
 _KINDS = ["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
+
+
+@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("raw_scales", [False, True])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_prequantized_shared_input_accepts_e8m0_bytes(kind, raw_scales, explicit):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.shared_expert import (
+        validate_shared_inputs,
+    )
+
+    dtype = torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
+    x = torch.zeros(3, 512).to(dtype)
+    scales = torch.full((3, 16), 127, dtype=torch.uint8)
+    if not raw_scales:
+        scales = scales.view(torch.float8_e8m0fnu)
+    tensors = MoEEpTensors(
+        x,
+        torch.zeros(3, 4, dtype=torch.int32),
+        torch.ones(3, 4),
+        scales=scales,
+        shared_hidden_states=x if explicit else None,
+        shared_scales=scales if explicit else None,
+    )
+    validate_shared_inputs(
+        SimpleNamespace(
+            kind=kind, shared_expert=Sm107SharedExpertConfig(128, kind=kind)
+        ),
+        tensors,
+        FleetParams(num_experts=32, max_tokens_per_rank=32, token_hidden_size=512),
+        quantize_input=False,
+    )
 
 
 def _native_config(**overrides):
@@ -218,6 +250,28 @@ def test_exported_native_feature_construction(
     assert bool(kernel.name())
 
 
+@pytest.mark.parametrize("topk", [31, 32, 33])
+@pytest.mark.parametrize("shared", [False, True])
+def test_genphase_shared_reducer_crosses_polled_limit(topk, shared, monkeypatch):
+    pytest.importorskip("cutlass")
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        block_scaled,
+    )
+
+    monkeypatch.setattr(block_scaled, "_max_active_clusters", lambda n: 8)
+    cfg = _native_config(
+        num_total_experts=64,
+        num_topk=topk,
+        kernel_variant="genphase",
+        fc2_use_bulk=True,
+        cluster_shape_mn=(4, 1),
+        shared_expert=Sm107SharedExpertConfig(128) if shared else None,
+    )
+    kernel = pkg.Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+    assert kernel._topk_reduce.ll_encoded is (topk < 32)
+    assert kernel._topk_reduce.outlive_producer is (shared and topk < 32)
+
+
 def test_dedup_candidate_grid_preserves_tiles_and_satisfies_return_contract():
     cfg = _native_config(
         combine_dedup=True, fc2_use_bulk=True, token_back_mode="reuse_dispatch_warps"
@@ -366,6 +420,8 @@ def test_public_shared_and_dedup_graph(
     shared_settings=None,
     native_defaults=False,
     zero_rank=False,
+    reuse_routed_shared_input=False,
+    raw_scales=False,
 ):
     """Compare captured public forwards after route and shared-weight changes."""
     bootstrap = ep_runtime
@@ -448,11 +504,18 @@ def test_public_shared_and_dedup_graph(
         .reshape(count, topk)
         .remainder(max(experts // world, topk))
         .add(owner * (experts // world))
+        .remainder(experts)
     )
     scores = torch.linspace(0.1, 0.7, count * topk, device="cuda").reshape(count, topk)
     qx, sx = _quantized_input(kind, x) if prequantized else (x, None)
+    if raw_scales and sx is not None:
+        sx = sx.view(torch.uint8)
     tensors = MoEEpTensors(qx, ids, scores, scales=sx)
-    if shared and (prequantized or shared_prequantized):
+    if (
+        shared
+        and (prequantized or shared_prequantized)
+        and not reuse_routed_shared_input
+    ):
         if shared_prequantized:
             tensors.shared_hidden_states, tensors.shared_scales = _quantized_input(
                 shared_kind, x
@@ -558,6 +621,45 @@ def test_public_shared_and_dedup_graph(
         torch.cuda.synchronize()
     finally:
         layer.destroy()
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("raw_scales", [False, True])
+def test_public_shared_reuses_routed_scales(ep_runtime, kind, variant, raw_scales):
+    test_public_shared_and_dedup_graph(
+        ep_runtime,
+        kind,
+        variant,
+        True,
+        False,
+        True,
+        False,
+        kind,
+        "swiglu",
+        reuse_routed_shared_input=True,
+        raw_scales=raw_scales,
+    )
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("topk", [31, 32, 33])
+def test_public_shared_genphase_static_reduce_graph(ep_runtime, topk):
+    test_public_shared_and_dedup_graph(
+        ep_runtime,
+        "mxfp8_e4m3",
+        "genphase",
+        True,
+        False,
+        False,
+        False,
+        "mxfp8_e4m3",
+        "swiglu",
+        geometry=(512, 256, 64, 32, topk, 128),
+    )
 
 
 @pytest.mark.arch_rubin

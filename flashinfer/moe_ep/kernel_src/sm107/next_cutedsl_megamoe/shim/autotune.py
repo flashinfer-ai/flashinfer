@@ -388,6 +388,8 @@ def _sweep_sm107_block_scaled_mega_moe(
             cfg.quant_kind,
             kernel_variant=cfg.kernel_variant,
             batch_invariant=getattr(cfg, "batch_invariant", False),
+            combine_dedup=getattr(cfg, "combine_dedup", False),
+            token_back_mode=cfg.token_back_mode,
         )
         if candidates is None
         else candidates

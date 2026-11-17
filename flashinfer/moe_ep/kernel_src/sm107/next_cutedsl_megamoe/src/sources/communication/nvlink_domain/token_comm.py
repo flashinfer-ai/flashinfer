@@ -1544,6 +1544,10 @@ class TokenCommNonDeterministic(KernelComponent):
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("In-kernel top-k reduction requires BF16 combine data.")
         if self.activation_is_quantized:
+            if self.dispatch_stage_depth > 1 and (
+                self.dispatch_sf_group != 4 or self.dispatch_stage_depth % self.dispatch_sf_group != 0
+            ):
+                raise ValueError("Multi-stage quantized dispatch requires dispatch_sf_group=4 and a stage depth divisible by 4.")
             # Scale storage is padded for vector copies; the logical row needs 64-element alignment.
             element_block = max(64, self.activation_sf_vector_size)
             if self.hidden_size % element_block != 0:
@@ -2107,6 +2111,19 @@ class TokenCommNonDeterministic(KernelComponent):
                 byte_alignment=16,
             )
 
+    @property
+    def token_back_staging_bytes(self) -> int:
+        """Chunk size shared by token-back storage and its bulk copies."""
+        if self.token_back_mode == "standalone_warps":
+            return self.token_back_chunk_bytes
+        sf_bytes = (
+            self.activation_sf_hidden_padded * int(self.activation_sf_dtype.width) // 8
+            if self.activation_is_quantized else 0
+        )
+        if self.bytes_per_token + sf_bytes < self.combine_output_token_bytes:
+            return self.bytes_per_token
+        return self.combine_output_token_bytes
+
     def _register_token_back_staging(self, staging_lifetime) -> None:
         """Declare output tensors in the caller-selected lifetime."""
         if not self.token_back_enabled:
@@ -2122,12 +2139,7 @@ class TokenCommNonDeterministic(KernelComponent):
 
         if self.token_back_push_data:
             bytes_per_output_token = self.hidden_size * int(self.combine_format.act_dtype.width) // 8
-            if self.token_back_mode == "standalone_warps":
-                chunk_bytes = self.token_back_chunk_bytes
-            elif available_bytes_per_warp < bytes_per_output_token:
-                chunk_bytes = self.bytes_per_token
-            else:
-                chunk_bytes = bytes_per_output_token
+            chunk_bytes = self.token_back_staging_bytes
             if self.token_back_mode != "standalone_warps" and bytes_per_output_token % chunk_bytes != 0:
                 raise ValueError("Token-back data chunk bytes must divide one row.")
             chunk_elements = chunk_bytes * 8 // int(self.combine_format.act_dtype.width)
@@ -2885,7 +2897,7 @@ class TokenCommNonDeterministic(KernelComponent):
         destination that needs ``TokenSrcMetadata``, and that stays on the drain side where the wait for this
         read has already been paid.
         """
-        chunk_bytes = self.token_back_chunk_bytes
+        chunk_bytes = self.token_back_staging_bytes
         chunk_count = ceil_div(self.combine_output_token_bytes, chunk_bytes)
         stage = smem_workspace.tensor(self.token_back_activation_smem_region, smem_base)
         stage_mbarrier = (
@@ -2929,7 +2941,7 @@ class TokenCommNonDeterministic(KernelComponent):
     ) -> None:
         """Push output chunks with the local read running the whole ring ahead of the outbound store."""
         depth = self.combine_stage_depth
-        chunk_bytes = self.token_back_chunk_bytes
+        chunk_bytes = self.token_back_staging_bytes
         chunk_count = ceil_div(self.combine_output_token_bytes, chunk_bytes)
 
         stage = smem_workspace.tensor(self.token_back_activation_smem_region, smem_base)

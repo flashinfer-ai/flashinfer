@@ -130,7 +130,7 @@ def validate_shared_inputs(config, tensors, fleet, *, quantize_input):
     elif (
         x.dtype != dtype
         or sf is None
-        or sf.dtype != torch.float8_e8m0fnu
+        or sf.dtype not in (torch.float8_e8m0fnu, torch.uint8)
         or sf.shape != (tensors.num_tokens, fleet.token_hidden_size // 32)
         or sf.device != x.device
     ):
