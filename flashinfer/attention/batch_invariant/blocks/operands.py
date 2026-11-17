@@ -147,8 +147,8 @@ class StaticPlan:
         causal: bool = True,
     ):
         assert D % HALF == 0 and D in HEAD_DIMS_BODY, D
-        # the mask mode (a class dimension): causal rows see [max(0, p - window_left), p], non-causal rows see every key of the request,
-        # [0, kv_len). A compile-time constant: the softmax masks and the fold's present chunks read it, the causal code is unchanged
+        # the mask mode (a class dimension): causal rows see [0, p], or [max(0, p - window_left), p] with a window (window_left >= 0),
+        # non-causal rows see every key of the request, [0, kv_len). A compile-time constant: the softmax masks and the fold's present chunks read it, the causal code is unchanged
         self.causal = causal
         # q2: the paired placement -- a unit is TWO Q tiles (A, B) of one request and KV head over one chunk range; softmax warpgroup k owns
         # Q tile k whole (every key of its rows, the one-warpgroup tile step), so the two tiles' softmax chains are independent and overlap on
