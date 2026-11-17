@@ -76,3 +76,46 @@ def test_normalize_sm121_requires_cuda_12_9(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"SM 12.1\+ requires CUDA >= 12.9"):
         CompilationContext._normalize_cuda_arch(12, 1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "arch_list",
+    ["8.0 9.0a 12.0f", " 8.0 9.0a 12.0f ", "8.0  9.0a\t12.0f\n"],
+)
+def test_parse_cuda_arch_list_ignores_extra_whitespace(arch_list):
+    assert CompilationContext._parse_cuda_arch_list(arch_list) == {
+        (8, "0"),
+        (9, "0a"),
+        (12, "0f"),
+    }
+
+
+@pytest.mark.cpu_only
+def test_parse_cuda_arch_list_normalizes_entries_without_suffix():
+    assert CompilationContext._parse_cuda_arch_list("9.0 10.3") == {
+        (9, "0a"),
+        (10, "3a"),
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("entry", ["8.0,9.0", "90", "sm90", "9.", ".0", "9.0ab", "9.a"])
+def test_parse_cuda_arch_list_rejects_malformed_entry(entry):
+    with pytest.raises(ValueError, match="FLASHINFER_CUDA_ARCH_LIST") as excinfo:
+        CompilationContext._parse_cuda_arch_list(f"8.0 {entry}")
+    assert repr(entry) in str(excinfo.value)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch_list", ["", "   "])
+def test_parse_cuda_arch_list_rejects_empty_value(arch_list):
+    with pytest.raises(ValueError, match="FLASHINFER_CUDA_ARCH_LIST is set but empty"):
+        CompilationContext._parse_cuda_arch_list(arch_list)
+
+
+@pytest.mark.cpu_only
+def test_compilation_context_reads_arch_list_with_trailing_space(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.0 9.0a ")
+
+    assert {(8, "0"), (9, "0a")} == CompilationContext().TARGET_CUDA_ARCHS
