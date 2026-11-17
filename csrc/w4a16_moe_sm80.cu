@@ -28,6 +28,10 @@
 // kQ12 in 12 row parts, not 6. One CTA per output tile. sm_80 and sm_90 builds (cp.async, ldmatrix,
 // bf16 mma.sync); sm_86/87/89 run sm_80 code. All configs but R 96 at 3 stages (133632 B, only
 // where a block has that much) fit sm_86/89's 99 KB per-block shared memory (at most 89088 B).
+// NVFP4 activations (W4A4) run the same records: prep also restores the E2M1 x E4M3 input to
+// BF16, and GEMM1 with FQ quantizes its activation to NVFP4 (16-column blocks, E4M3 scales under
+// the FC2 global scale, as the CUTLASS SM80 path's doActivation) and writes code x scale in BF16.
+// Both restores are exact; the global scales go to the GEMM alphas.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -39,6 +43,8 @@
 #include "cutlass/fast_math.h"
 #include "flashinfer/cp_async.cuh"
 #include "flashinfer/math.cuh"
+#include "flashinfer/vec_dtypes.cuh"
+#include "tensorrt_llm/kernels/quantization_utils.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer::w4a16_moe_sm80 {
@@ -186,6 +192,30 @@ struct GemmParams {
   cutlass::FastDivmod topk_dm;  // f / top_k (G1 only); appended to preserve layout
 };
 
+// FQ GEMM1: GemmParams and the FC2 global scale num / den (den null or zero: num), each [E]
+// (stride 1) or one value. Its own type, so the other kernels keep their parameters.
+struct GemmParamsFq : GemmParams {
+  const float* fq_num;
+  const float* fq_den;
+  int fq_num_stride, fq_den_stride;
+};
+template <bool FQ>
+using GemmParamsT = std::conditional_t<FQ, GemmParamsFq, GemmParams>;
+
+// 8 E2M1 codes (cvt_warp_fp16_to_fp4 order) times the E4M3 scale sf, as 8 BF16 (4 words): the
+// CUTLASS path's restoreNvfp4x8. Every product is exact in BF16.
+__device__ __forceinline__ void restore_nvfp4x8(uint32_t codes, uint8_t sf, uint32_t* out) {
+  __nv_fp8_e4m3 scale;
+  scale.__x = sf;
+  const __nv_bfloat162 s2 = __float2bfloat162_rn(static_cast<float>(scale));
+  flashinfer::e2m1x8_to_16bx8<__nv_bfloat16>(codes, out);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    __nv_bfloat162& v = reinterpret_cast<__nv_bfloat162&>(out[i]);
+    v = __hmul2(v, s2);
+  }
+}
+
 // bf16 pair (lo in the low 16 bits) and an 8 x 8 b16 transpose across the warp
 // (movmatrix, sm_75+): lane l reads row l / 4, columns 2 (l % 4) and + 1 of the
 // piece and gets the same positions of the transposed piece.
@@ -202,10 +232,12 @@ __device__ __forceinline__ uint32_t movm_trans(uint32_t x) {
 
 // ACT: 0 none (GEMM2), 1 silu(gate) * up (GEMM1, gated), 2 relu(x)^2 (GEMM1,
 // not gated) KT: K % 128 != 0 (a tail k-step per chunk). G1E, Q12F: the R 96
-// 2-stage paths of kX96 and kQ12. VS: the scale load of kG2W64v.
+// 2-stage paths of kX96 and kQ12. VS: the scale load of kG2W64v. FQ (GEMM1): the
+// activation quantized to NVFP4 and written as BF16 code x scale.
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
-          bool Q12F = false, bool VS = false>
-__device__ __forceinline__ void gemm_body(GemmParams const& p) {
+          bool Q12F = false, bool VS = false, bool FQ = false>
+__device__ __forceinline__ void gemm_body(GemmParamsT<FQ> const& p) {
+  static_assert(!FQ || ACT != 0, "FQ is a GEMM1 epilogue");
   using C = Cfg<R, NC>;
   constexpr int NT = NW * 32;
   constexpr int SC = 8 * NC / WC, WT = NW / WC, TW = R / WT, G = TW / 8;
@@ -471,6 +503,73 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
     }
   };
 
+  // FQ: the tile's activation (write_tile's values, zero past Nout) staged as BF16 in the ring,
+  // free once every warp is past its last step; then two threads per 16-column block quantize it
+  // with cvt_warp_fp16_to_fp4 (the CUTLASS path's NVFP4 recipe and fast-math default) and store
+  // code x scale. Rows past the block's count are not stored (GEMM2 zero-fills them on load).
+  [[maybe_unused]] auto write_tile_fq = [&](int b, int c, float(*v)[G][4]) {
+    if constexpr (FQ) {
+      constexpr int FC = ACT == 1 ? 64 * NC : kTileN * NC;  // the tile's output columns
+      constexpr int YP = FC * 2 + 16;                         // staging row pitch (bytes)
+      constexpr int UPR = FC / 8, U = R * UPR;                // 16 B units: per row, per tile
+      static_assert(R * YP <= static_cast<int>(kRing) && U % 32 == 0 && UPR % 2 == 0, "FQ tile");
+      const int e = p.block_expert[b];
+      const float a = p.alpha[e] * 128.f;  // products carry 2^-7
+      const int Nout = p.Nout, col0 = c * FC;
+      flashinfer::cp_async::wait_group<0>();
+      __syncthreads();
+      __nv_bfloat16* ys = reinterpret_cast<__nv_bfloat16*>(smem);
+  #pragma unroll
+      for (int s = 0; s < SC; ++s) {
+        const int ws = wc * SC + s;
+  #pragma unroll
+        for (int gi = 0; gi < G; ++gi) {
+          const int r0 = wt * TW + gi * 8 + 2 * tq;
+          if constexpr (ACT == 1) {
+            const int i = ws * 8 + g8;
+  #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+              const float gt = v[s][gi][h] * a, up = v[s][gi][2 + h] * a;
+              float y;
+              if constexpr (SC == 4 || (G1E && R == 96 && STAGES == 2 && !KT))
+                y = silu_div(gt, 1.f + __expf(-gt)) * up;
+              else
+                y = gt / (1.f + __expf(-gt)) * up;
+              ys[(r0 + h) * (YP / 2) + i] = __float2bfloat16_rn(col0 + i < Nout ? y : 0.f);
+            }
+          } else {
+  #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+              const int n = ws * 16 + g8 + (q >> 1) * 8;
+              const float x = fmaxf(v[s][gi][q] * a, 0.f);
+              ys[(r0 + (q & 1)) * (YP / 2) + n] = __float2bfloat16_rn(col0 + n < Nout ? x * x : 0.f);
+            }
+          }
+        }
+      }
+      __syncthreads();
+      const float num = p.fq_num[e * p.fq_num_stride];
+      const float den = p.fq_den ? p.fq_den[e * p.fq_den_stride] : 1.f;
+      const float gs = den == 0.f ? num : num / den;
+      const int rows = p.block_rows[b];
+      // U and NT are multiples of 32: every lane of a warp reaches the shuffles of a block pair
+      for (int u = tid; u < U; u += NT) {
+        const int r = u / UPR, q8 = u % UPR;
+        tensorrt_llm::kernels::PackedVec<__nv_bfloat16, 8> vec;
+        lds128(reinterpret_cast<uint32_t*>(&vec), sbase + r * YP + q8 * 16);
+        uint8_t sf = 0;
+        const uint32_t codes =
+            tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, 16, 8, false>(
+                vec, gs, nullptr, 0.f, &sf);
+        uint4 o;
+        restore_nvfp4x8(codes, sf, reinterpret_cast<uint32_t*>(&o));
+        const int n = col0 + q8 * 8;
+        if (r < rows && n < Nout)
+          *reinterpret_cast<uint4*>(p.out + (static_cast<long>(b) * R + r) * Nout + n) = o;
+      }
+    }
+  };
+
   const uint32_t sw_c = sbase + (wc * SC / 8) * kRec + (wc * SC % 8) * 512 + lane * 16;
   const uint32_t ss_c = sbase + (wc * SC / 8) * kRec + kWBytes + (wc * SC % 8) * 128 + g8 * 16;
   const uint32_t sa_c = sbase + NC * kRec + (wt * TW + (lane & 7)) * kActPitch + (lane >> 3) * 16;
@@ -645,20 +744,55 @@ __device__ __forceinline__ void gemm_body(GemmParams const& p) {
 #undef W4A16_STEP
     // clang-format on
   }
-  write_tile(tile / chunks, tile % chunks, acc);
+  if constexpr (FQ) {
+    write_tile_fq(tile / chunks, tile % chunks, acc);
+  } else {
+    write_tile(tile / chunks, tile % chunks, acc);
+  }
 }
 
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
-          bool Q12F = false, bool VS = false>
-__global__ void __launch_bounds__(NW * 32) gemm(GemmParams p) {
-  gemm_body<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS>(p);
+          bool Q12F = false, bool VS = false, bool FQ = false>
+__global__ void __launch_bounds__(NW * 32) gemm(GemmParamsT<FQ> p) {
+  gemm_body<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS, FQ>(p);
+}
+
+// NVFP4 input restored to BF16 for GEMM1 (W4A4): CTAs from cta0 on, each thread one 16-value
+// block of x [tokens][K / 2] (E2M1 pairs) with its E4M3 scale sf [tokens][sf_pitch].
+struct DqArgs {
+  const uint8_t* x;
+  const uint8_t* sf;
+  __nv_bfloat16* out;  // [tokens][K]
+  int blocks, kb, sf_pitch, cta0;  // tokens x K / 16, K / 16
+};
+
+__device__ __forceinline__ void dequant_input(DqArgs const& d) {
+  const int stride = (gridDim.x - d.cta0) * blockDim.x;
+  for (int i = (blockIdx.x - d.cta0) * blockDim.x + threadIdx.x; i < d.blocks; i += stride) {
+    const int t = i / d.kb, j = i % d.kb;
+    const uint2 c = __ldg(reinterpret_cast<const uint2*>(d.x) + i);
+    const uint8_t s = d.sf[static_cast<long>(t) * d.sf_pitch + j];
+    uint4 o[2];
+    restore_nvfp4x8(c.x, s, reinterpret_cast<uint32_t*>(o));
+    restore_nvfp4x8(c.y, s, reinterpret_cast<uint32_t*>(o + 1));
+    uint4* dst = reinterpret_cast<uint4*>(d.out) + 2 * static_cast<long>(i);
+    dst[0] = o[0];
+    dst[1] = o[1];
+  }
 }
 
 // One-CTA prep: warp w < W counts entries [w Q, (w + 1) Q) per expert in its own table row.
-template <int R>
+// DQ: CTAs past the first restore the NVFP4 input instead.
+template <int R, bool DQ = false>
 __global__ void __launch_bounds__(1024)
     prep(const int* __restrict__ ids, int M, int E, int W, int Q, int* nblocks, int* block_expert,
-         int* block_rows, int* rowmap) {
+         int* block_rows, int* rowmap, DqArgs dq) {
+  if constexpr (DQ) {
+    if (blockIdx.x >= dq.cta0) {
+      dequant_input(dq);
+      return;
+    }
+  }
   extern __shared__ int sh[];
   int* tab = sh;          // [W][E]: warp w's entries of expert e, then its next rank
   int* cnt = sh + W * E;  // [E]
@@ -748,8 +882,16 @@ __global__ void __launch_bounds__(1024)
 // rank within its expert, blocks as in prep, off[e] = the expert's first block.
 // prepx_place: prep's two passes over the chunk (warp w owns [f0 + w Q, f0 + (w
 // + 1) Q)), ranks offset by the chunk's base.
+template <bool DQ = false>
 __global__ void __launch_bounds__(1024)
-    prepx_count(const int* __restrict__ ids, int M, int E, int CH, int* __restrict__ pc) {
+    prepx_count(const int* __restrict__ ids, int M, int E, int CH, int* __restrict__ pc,
+                DqArgs dq) {
+  if constexpr (DQ) {
+    if (blockIdx.x >= dq.cta0) {
+      dequant_input(dq);
+      return;
+    }
+  }
   extern __shared__ int hist[];
   const int tid = threadIdx.x, nt = blockDim.x;
   for (int i = tid; i < E; i += nt) hist[i] = 0;
@@ -870,7 +1012,9 @@ __global__ void __launch_bounds__(1024)
 }
 
 // out[t] = sum_j w[t][j] y[t top_k + j], fp32 in slot order over ids >= 0; 8 columns a thread.
-__global__ void finalize(const __nv_bfloat16* __restrict__ y, const float* __restrict__ w,
+// WT: the routing weights' type, float or BF16 (read as fp32).
+template <typename WT>
+__global__ void finalize(const __nv_bfloat16* __restrict__ y, const WT* __restrict__ w,
                          const int* __restrict__ ids, __nv_bfloat16* __restrict__ out, int tokens,
                          int top_k, int H) {
   const int h8 = H / 8;
@@ -880,7 +1024,7 @@ __global__ void finalize(const __nv_bfloat16* __restrict__ y, const float* __res
   float a[8] = {};
   for (int j = 0; j < top_k; ++j) {
     if (ids[t * top_k + j] < 0) continue;
-    const float wj = w[t * top_k + j];
+    const float wj = static_cast<float>(w[t * top_k + j]);
     const uint4 v =
         __ldg(reinterpret_cast<const uint4*>(y + (static_cast<long>(t) * top_k + j) * H + c * 8));
     const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&v);
@@ -910,35 +1054,37 @@ int max_smem_optin() { return dev_attr<cudaDevAttrMaxSharedMemoryPerBlockOptin>(
 int max_smem_per_sm() { return dev_attr<cudaDevAttrMaxSharedMemoryPerMultiprocessor>(); }
 
 template <int R, int WC, int NW, int ACT, int STAGES, bool KT, int NC = 1, bool G1E = false,
-          bool Q12F = false, bool VS = false>
-void launch_gemm(GemmParams const& p, int grid, cudaStream_t st) {
+          bool Q12F = false, bool VS = false, bool FQ = false>
+void launch_gemm(GemmParamsT<FQ> const& p, int grid, cudaStream_t st) {
   static_assert(NC > 1 || STAGES * Cfg<R, NC>::kStageBytes <= kSmemLimit);
   const int smem = STAGES * Cfg<R, NC>::kStageBytes;
   TVM_FFI_ICHECK(smem <= max_smem_optin()) << "W4A16 MoE GEMM: tile exceeds device shared memory";
-  cudaFuncSetAttribute(gemm<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS>,
+  cudaFuncSetAttribute(gemm<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS, FQ>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  gemm<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS><<<grid, NW * 32, smem, st>>>(p);
+  gemm<R, WC, NW, ACT, STAGES, KT, NC, G1E, Q12F, VS, FQ><<<grid, NW * 32, smem, st>>>(p);
 }
 
 // R 32 at 2 stages where an SM has at most 100 KiB; R 64 at 3 stages fits two CTAs per SM.
-template <int ACT, bool KT, bool G1S2 = false, bool G1E = false, bool Q12F = false>
-void launch_tile(int R, GemmParams const& p, int grid, cudaStream_t st) {
+template <int ACT, bool KT, bool G1S2 = false, bool G1E = false, bool Q12F = false,
+          bool FQ = false>
+void launch_tile(int R, GemmParamsT<FQ> const& p, int grid, cudaStream_t st) {
   if (R == 8)
-    launch_gemm<8, 8, 8, ACT, 4, KT>(p, grid, st);
+    launch_gemm<8, 8, 8, ACT, 4, KT, 1, false, false, false, FQ>(p, grid, st);
   else if (R == 16)
-    launch_gemm<16, 8, 8, ACT, 2, KT>(p, grid, st);
+    launch_gemm<16, 8, 8, ACT, 2, KT, 1, false, false, false, FQ>(p, grid, st);
   else if (R == 32) {
     if (max_smem_per_sm() <= 100 * 1024)
-      launch_gemm<32, 8, 8, ACT, 2, KT>(p, grid, st);
+      launch_gemm<32, 8, 8, ACT, 2, KT, 1, false, false, false, FQ>(p, grid, st);
     else
-      launch_gemm<32, 8, 8, ACT, 4, KT>(p, grid, st);
+      launch_gemm<32, 8, 8, ACT, 4, KT, 1, false, false, false, FQ>(p, grid, st);
   } else if (R == 96) {
     if (max_smem_optin() >= 3 * Cfg<96, 2>::kStageBytes)
-      launch_gemm<96, 8, 8, ACT, 3, KT, 2, G1E, Q12F>(p, grid, st);
+      launch_gemm<96, 8, 8, ACT, 3, KT, 2, G1E, Q12F, false, FQ>(p, grid, st);
     else
-      launch_gemm<96, 8, 8, ACT, 2, KT, 2, G1E, Q12F>(p, grid, st);
+      launch_gemm<96, 8, 8, ACT, 2, KT, 2, G1E, Q12F, false, FQ>(p, grid, st);
   } else
-    launch_gemm<64, 4, 4, ACT, G1S2 && ACT != 0 ? 2 : 3, KT>(p, grid, st);
+    launch_gemm<64, 4, 4, ACT, G1S2 && ACT != 0 ? 2 : 3, KT, 1, false, false, false, FQ>(p, grid,
+                                                                                        st);
 }
 
 template <int R>
@@ -974,9 +1120,12 @@ using namespace flashinfer::w4a16_moe_sm80;
 // [max_blocks x row_tile]: each block row's entry (token * top_k + slot) or -1.
 // Row tiles 64 and 96 take the multi-CTA prep, whose per-chunk expert counts and
 // bases live in workspace (at least (ceil(M / 2048) + 1) x num_experts int32).
+// NVFP4 input (W4A4): x [tokens][K / 2] uint8 E2M1 pairs and x_sf [tokens][>= K / 16] E4M3 in
+// row-major order are restored into x_out [tokens][K] BF16 by extra CTAs of the first prep kernel.
 void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap,
                          TensorView workspace, int64_t num_experts, int64_t row_tile,
-                         int64_t max_blocks) {
+                         int64_t max_blocks, tvm::ffi::Optional<TensorView> x, tvm::ffi::Optional<TensorView> x_sf,
+                         tvm::ffi::Optional<TensorView> x_out) {
   CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
   CHECK_INPUT_AND_TYPE(meta, dl_int32);
   CHECK_INPUT_AND_TYPE(rowmap, dl_int32);
@@ -998,6 +1147,36 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
   const int* ids = static_cast<const int*>(topk_ids.data_ptr());
   int* m = static_cast<int*>(meta.data_ptr());
   int* rm = static_cast<int*>(rowmap.data_ptr());
+  const bool dq = x.has_value();
+  TVM_FFI_ICHECK(dq == x_sf.has_value() && dq == x_out.has_value())
+      << "x, x_sf and x_out go together";
+  DqArgs d{};
+  int dq_ctas = 0;
+  if (dq) {
+    TensorView xv = x.value(), sv = x_sf.value(), ov = x_out.value();
+    CHECK_INPUT_AND_TYPE(xv, dl_uint8);
+    CHECK_INPUT_AND_TYPE(ov, dl_bfloat16);
+    CHECK_INPUT(sv);
+    CHECK_DIM(2, xv);
+    CHECK_DIM(2, sv);
+    CHECK_DIM(2, ov);
+    TVM_FFI_ICHECK(sv.dtype().bits == 8) << "x_sf must hold one byte per scale";
+    const int64_t tokens = ov.size(0), K = ov.size(1);
+    TVM_FFI_ICHECK(K % 16 == 0 && xv.size(0) == tokens && xv.size(1) == K / 2 &&
+                   sv.size(0) == tokens && sv.size(1) >= K / 16)
+        << "NVFP4 input: x [tokens, K / 2], x_sf [tokens, >= K / 16], x_out [tokens, K]";
+    TVM_FFI_ICHECK(tokens * (K / 16) <= INT32_MAX) << "NVFP4 input is too large";
+    d.x = static_cast<const uint8_t*>(xv.data_ptr());
+    d.sf = static_cast<const uint8_t*>(sv.data_ptr());
+    d.out = static_cast<__nv_bfloat16*>(ov.data_ptr());
+    d.blocks = static_cast<int>(tokens * (K / 16));
+    d.kb = static_cast<int>(K / 16);
+    d.sf_pitch = static_cast<int>(sv.size(1));
+    TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(d.x) & 7) == 0 &&
+                   (reinterpret_cast<uintptr_t>(d.out) & 15) == 0)
+        << "NVFP4 input: x must be 8 B and x_out 16 B aligned";
+    dq_ctas = std::max(1, (d.blocks + 4095) / 4096);  // four blocks a thread
+  }
 
   if (R < 64) {
     const int stat = R == 8    ? prep_static_smem<8>()
@@ -1012,14 +1191,15 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
       // the 48 KB default bounds dynamic plus static shared memory
       if (smem + stat > 48 * 1024)
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      kern<<<1, 1024, smem, st>>>(ids, M, e, W, Q, m, m + 1, m + 1 + nb, rm);
+      d.cta0 = 1;
+      kern<<<1 + dq_ctas, 1024, smem, st>>>(ids, M, e, W, Q, m, m + 1, m + 1 + nb, rm, d);
     };
     if (R == 8)
-      run(prep<8>);
+      dq ? run(prep<8, true>) : run(prep<8>);
     else if (R == 16)
-      run(prep<16>);
+      dq ? run(prep<16, true>) : run(prep<16>);
     else
-      run(prep<32>);
+      dq ? run(prep<32, true>) : run(prep<32>);
     return;
   }
 
@@ -1037,12 +1217,17 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
     if (smem > 48 * 1024 - 256)
       cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   };
-  big(prepx_count, sm_e);
+  big(prepx_count<false>, sm_e);
+  if (dq) big(prepx_count<true>, sm_e);
+  d.cta0 = nC;
   auto route = [&](auto tile) {
     constexpr int RT = decltype(tile)::value;
     big(prepx_scan<RT>, sm_e);
     big(prepx_place<RT>, sm_p);
-    prepx_count<<<nC, 1024, sm_e, st>>>(ids, M, e, ch, pc);
+    if (dq)
+      prepx_count<true><<<nC + dq_ctas, 1024, sm_e, st>>>(ids, M, e, ch, pc, d);
+    else
+      prepx_count<<<nC, 1024, sm_e, st>>>(ids, M, e, ch, pc, d);
     prepx_scan<RT><<<1, 1024, sm_e, st>>>(e, nC, pc, off, m, m + 1, m + 1 + nb, rm);
     prepx_place<RT><<<nC, 1024, sm_p, st>>>(ids, M, e, ch, W, Q, pc, off, rm);
   };
@@ -1057,11 +1242,14 @@ void w4a16_moe_sm80_prep(TensorView topk_ids, TensorView meta, TensorView rowmap
 // intermediate [max_blocks x row_tile][Nout]; GEMM2 (activation 0) reads that
 // and writes [tokens * top_k][Nout]. records: [E][N / 128 chunks][k steps]; N
 // is the record column count, a multiple of 128 (gated: gate and up each padded
-// to 64). alpha: [E] per-expert global scales. variant: a Variant.
+// to 64). alpha: [E] per-expert global scales. variant: a Variant. fc2_num (GEMM1 only): the
+// activation is quantized to NVFP4 under the global scale fc2_num / fc2_den (den absent or zero:
+// fc2_num), each float32 [E] or [1], and written as BF16 code x scale.
 void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, TensorView meta,
                          TensorView rowmap, TensorView out, int64_t row_tile, int64_t activation,
                          int64_t top_k, int64_t N, int64_t K, int64_t Nout, int64_t max_blocks,
-                         int64_t variant) {
+                         int64_t variant, tvm::ffi::Optional<TensorView> fc2_num,
+                         tvm::ffi::Optional<TensorView> fc2_den) {
   CHECK_INPUT_AND_TYPE(records, dl_uint8);
   CHECK_INPUT_AND_TYPE(alpha, dl_float32);
   CHECK_INPUT_AND_TYPE(act, dl_bfloat16);
@@ -1083,7 +1271,8 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
   ffi::CUDADeviceGuard device_guard(act.device().device_id);
   const cudaStream_t st = get_stream(act.device());
   const int* m = static_cast<const int*>(meta.data_ptr());
-  GemmParams p{};
+  GemmParamsFq q{};
+  GemmParams& p = q;
   p.w = static_cast<const uint8_t*>(records.data_ptr());
   p.alpha = static_cast<const float*>(alpha.data_ptr());
   p.act = static_cast<const __nv_bfloat16*>(act.data_ptr());
@@ -1096,22 +1285,41 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
   p.N = static_cast<int>(N);
   p.K = static_cast<int>(K);
   p.Nout = static_cast<int>(Nout);
+  const bool fq = fc2_num.has_value();
+  TVM_FFI_ICHECK(fq || !fc2_den.has_value()) << "fc2_den needs fc2_num";
+  if (fq) {
+    TVM_FFI_ICHECK(g1) << "NVFP4 activation output is a GEMM1 epilogue";
+    TVM_FFI_ICHECK((reinterpret_cast<uintptr_t>(p.out) & 15) == 0) << "out must be 16 B aligned";
+    const int64_t E = alpha.numel();
+    auto scale = [&](TensorView t, const float*& ptr, int& stride) {
+      CHECK_INPUT_AND_TYPE(t, dl_float32);
+      TVM_FFI_ICHECK(t.numel() == 1 || t.numel() == E) << "FC2 global scale must be [1] or [E]";
+      ptr = static_cast<const float*>(t.data_ptr());
+      stride = t.numel() == 1 ? 0 : 1;
+    };
+    scale(fc2_num.value(), q.fq_num, q.fq_num_stride);
+    if (fc2_den.has_value()) scale(fc2_den.value(), q.fq_den, q.fq_den_stride);
+  }
   const int columns = static_cast<int>(N / kTileN);
   const bool nc2 = row_tile == 96 || variant == kW64s || variant == kG2W64x || variant == kG2W64v;
   const int grid = static_cast<int>(max_blocks) * (nc2 ? (columns + 1) / 2 : columns);
   const int R = static_cast<int>(row_tile);
   const bool kt = K % kTileK != 0;
-  auto run = [&](auto act_c, auto kt_c) {
+  auto run = [&](auto act_c, auto kt_c, auto fq_c) {
     constexpr int A = decltype(act_c)::value;
     constexpr bool T = decltype(kt_c)::value;
-    if (variant == kBase)
-      launch_tile<A, T>(R, p, grid, st);
+    constexpr bool F = decltype(fq_c)::value;
+    GemmParamsT<F> const& pt = q;
+    if constexpr (F && A == 0) {
+      return;  // rejected above
+    } else if (variant == kBase)
+      launch_tile<A, T, false, false, false, F>(R, pt, grid, st);
     else if (variant == kStage2)
-      launch_tile<A, T, true>(R, p, grid, st);
+      launch_tile<A, T, true, false, false, F>(R, pt, grid, st);
     else if (variant == kX96)
-      launch_tile<A, T, false, true>(R, p, grid, st);
+      launch_tile<A, T, false, true, false, F>(R, pt, grid, st);
     else if (variant == kQ12)
-      launch_tile<A, T, false, true, true>(R, p, grid, st);
+      launch_tile<A, T, false, true, true, F>(R, pt, grid, st);
     else if constexpr (A == 0) {
       if (variant == kG2Lin)
         launch_gemm<64, 4, 4, 0, 2, T>(p, grid, st);
@@ -1120,11 +1328,16 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
       else
         launch_gemm<64, 4, 4, 0, 2, T, 2>(p, grid, st);
     } else {
-      launch_gemm<64, 4, 4, A, 2, T, 2>(p, grid, st);
+      launch_gemm<64, 4, 4, A, 2, T, 2, false, false, false, F>(pt, grid, st);
     }
   };
   auto run_kt = [&](auto act_c) {
-    kt ? run(act_c, std::true_type{}) : run(act_c, std::false_type{});
+    if (fq)
+      kt ? run(act_c, std::true_type{}, std::true_type{})
+         : run(act_c, std::false_type{}, std::true_type{});
+    else
+      kt ? run(act_c, std::true_type{}, std::false_type{})
+         : run(act_c, std::false_type{}, std::false_type{});
   };
   if (activation == 0)
     run_kt(std::integral_constant<int, 0>{});
@@ -1134,11 +1347,14 @@ void w4a16_moe_sm80_gemm(TensorView records, TensorView alpha, TensorView act, T
     run_kt(std::integral_constant<int, 2>{});
 }
 
-// out = the top-k weighted sum of y: see the finalize kernel.
+// out = the top-k weighted sum of y: see the finalize kernel. topk_weights: float32 or bfloat16.
 void w4a16_moe_sm80_finalize(TensorView y, TensorView topk_weights, TensorView topk_ids,
                              TensorView out, int64_t top_k) {
   CHECK_INPUT_AND_TYPE(y, dl_bfloat16);
-  CHECK_INPUT_AND_TYPE(topk_weights, dl_float32);
+  CHECK_INPUT(topk_weights);
+  const bool bf16_w = topk_weights.dtype() == dl_bfloat16;
+  TVM_FFI_ICHECK(bf16_w || topk_weights.dtype() == dl_float32)
+      << "topk_weights must be float32 or bfloat16";
   CHECK_INPUT_AND_TYPE(topk_ids, dl_int32);
   CHECK_INPUT_AND_TYPE(out, dl_bfloat16);
   CHECK_DIM(2, out);
@@ -1148,11 +1364,16 @@ void w4a16_moe_sm80_finalize(TensorView y, TensorView topk_weights, TensorView t
   const cudaStream_t st = get_stream(out.device());
   const int n = tokens * (H / 8);
   if (n == 0) return;
-  finalize<<<(n + 255) / 256, 256, 0, st>>>(static_cast<const __nv_bfloat16*>(y.data_ptr()),
-                                            static_cast<const float*>(topk_weights.data_ptr()),
-                                            static_cast<const int*>(topk_ids.data_ptr()),
-                                            static_cast<__nv_bfloat16*>(out.data_ptr()), tokens,
-                                            static_cast<int>(top_k), H);
+  auto run = [&](auto w) {
+    finalize<<<(n + 255) / 256, 256, 0, st>>>(static_cast<const __nv_bfloat16*>(y.data_ptr()), w,
+                                              static_cast<const int*>(topk_ids.data_ptr()),
+                                              static_cast<__nv_bfloat16*>(out.data_ptr()), tokens,
+                                              static_cast<int>(top_k), H);
+  };
+  if (bf16_w)
+    run(static_cast<const __nv_bfloat16*>(topk_weights.data_ptr()));
+  else
+    run(static_cast<const float*>(topk_weights.data_ptr()));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(prep, w4a16_moe_sm80_prep);

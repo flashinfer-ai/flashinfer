@@ -1921,14 +1921,16 @@ def _w4a16_moe_sm80(runner, inputs, tactic, gated, runnable):
     blocked = x.new_empty(max_blocks * row_tile, inter)
     y = x.new_empty(m, hidden)
     module = _w4a16_sm80_module()
-    module.prep(ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks)  # fmt: skip
+    module.prep(
+        ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks, None, None, None
+    )  # fmt: skip
     module.gemm(
         r1, alpha1.float().contiguous(), x.contiguous(), meta, rowmap, blocked, row_tile,
-        1 if gated else 2, top_k, n1, hidden, inter, max_blocks, gemm1,
+        1 if gated else 2, top_k, n1, hidden, inter, max_blocks, gemm1, None, None,
     )  # fmt: skip
     module.gemm(
         r2, alpha2.float().contiguous(), blocked, meta, rowmap, y, row_tile, 0, top_k, n2,
-        inter, hidden, max_blocks, gemm2,
+        inter, hidden, max_blocks, gemm2, None, None,
     )  # fmt: skip
     module.finalize(y, scales.float().contiguous(), ids, out, top_k)
     return out

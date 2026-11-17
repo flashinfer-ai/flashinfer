@@ -209,7 +209,8 @@ def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_w4a16_moe_sm80_module() -> JitSpec:
-    """BF16 x NVFP4 MoE records kernels: sm_80 code for SM80 to SM89, sm_90 for SM90."""
+    """NVFP4 MoE records kernels (BF16 or NVFP4 activations): sm_80 code for SM80 to SM89,
+    sm_90 for SM90. The NVFP4 activation quantizer runs in software (FLASHINFER_FP4_SW_CVT)."""
     majors = {major for major, _ in current_compilation_context.TARGET_CUDA_ARCHS}
     flags = [f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors]
     if not flags:
@@ -217,7 +218,12 @@ def gen_w4a16_moe_sm80_module() -> JitSpec:
     return gen_jit_spec(
         "w4a16_moe_sm80",
         [jit_env.FLASHINFER_CSRC_DIR / "w4a16_moe_sm80.cu"],
-        extra_cuda_cflags=flags,
+        extra_cuda_cflags=flags
+        + ["-DENABLE_BF16", "-DENABLE_FP8", "-DENABLE_FP4", "-DFLASHINFER_FP4_SW_CVT"],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+        ],
         use_fast_math=False,
     )
 
