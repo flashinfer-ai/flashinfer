@@ -4842,7 +4842,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # for the exact bf16-dequantised query (bf16 holds every e4m3 value
         # exactly) on the stock fa2 route — the composable path run() falls
         # back to.
-        self._gqa_dec_fp8q_sm90_requested = False
+        #
+        # The dormant path must not write any wrapper state before
+        # _validate_paged_query_lengths rejects an incompatible plan, so the
+        # arming decision is tracked in a local and only committed to the
+        # wrapper after validation (or immediately on the armed SM90 fp8-Q
+        # path, which the validated contract below explicitly requested).
+        _gqa_dec_fp8q_sm90_armed = False
         _gqa_fp8q_contract_ok = (
             q_data_type == torch.float8_e4m3fn
             and kv_data_type == torch.float8_e4m3fn
@@ -4866,6 +4872,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     f"{GQA_DEC_FP8Q_SM90_BACKENDS}; use backend='auto' or a "
                     "stock backend for other contracts."
                 )
+            _gqa_dec_fp8q_sm90_armed = True
             self._gqa_dec_fp8q_sm90_requested = True
             q_data_type = torch.bfloat16
             # the composable fallback is planned on the stock fa2 route
@@ -4881,6 +4888,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 causal,
             )
             if _auto_routed:
+                _gqa_dec_fp8q_sm90_armed = True
                 self._gqa_dec_fp8q_sm90_requested = True
                 q_data_type = torch.bfloat16
                 self._backend = "fa2"
@@ -4965,7 +4973,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         auto_backend = None
         # an armed specialized fp8-Q plan already fixed the stock fa2 route
         # for its composable fallback; auto resolution must not override it
-        if self._requested_backend == "auto" and not self._gqa_dec_fp8q_sm90_requested:
+        if self._requested_backend == "auto" and not _gqa_dec_fp8q_sm90_armed:
             if use_token_head_sf:
                 if self._cuda_graph_backend == "fa3":
                     raise ValueError(
@@ -5065,6 +5073,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _validate_paged_query_lengths(planned_backend, seq_lens_q, qo_indptr_host)
 
         # Reset the specialized kernels only after checking backend compatibility.
+        if not _gqa_dec_fp8q_sm90_armed:
+            self._gqa_dec_fp8q_sm90_requested = False
         self._eagle_verify_fp8kv_sm90_state = None
         self._gqa_dec_fp8q_sm90_state = None
         self._gqa_dec_fp8q_sm90_row_seq = None
