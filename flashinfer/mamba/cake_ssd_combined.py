@@ -1286,6 +1286,15 @@ def _chunk_parallel_mode() -> str:
     return mode
 
 
+def _storage_overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether the byte extents of two contiguous tensors intersect."""
+
+    a_start, b_start = a.data_ptr(), b.data_ptr()
+    a_end = a_start + a.numel() * a.element_size()
+    b_end = b_start + b.numel() * b.element_size()
+    return a_start < b_end and b_start < a_end
+
+
 def _stream_capturing(device: torch.device) -> bool:
     """Whether the current CUDA stream of ``device`` -- the stream ``run``
     launches on -- is recording a CUDA graph.
@@ -3268,7 +3277,9 @@ class CakeSSDCombined:
     allocation, program build and environment read a call shape needs
     ahead of time, so :meth:`run` for that shape with a static ``out=`` is
     a pure launch (``_allocations_in_last_run`` stays 0); the prepared
-    workspace is pinned like a captured one.  A captured call refuses with
+    workspace is pinned like a captured one.  Final states go to a caller
+    ``final_states`` in place when one is given; without final states
+    (``return_final_states=False``) no state storage is allocated.  A captured call refuses with
     :class:`CakeSSDCombinedCaptureError` only when its call shape has never
     run or been prepared on this runner (the workspace would be built by
     recorded, not executed, kernels) or when its program has not been
@@ -3939,11 +3950,6 @@ class CakeSSDCombined:
                 dtype=torch.bfloat16,
                 device=device,
             ),
-            "final": torch.empty(
-                (num_sequences, self.nheads, _HEADDIM, _DSTATE),
-                dtype=self.state_dtype,
-                device=device,
-            ),
             # Packed copies of strided public inputs (``_contiguous_input``).
             "contiguous": {},
         }
@@ -4076,6 +4082,7 @@ class CakeSSDCombined:
         return_final_states: bool = True,
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        final_states: Optional[torch.Tensor] = None,
     ):
         """Run one forward: plan every host-side decision, then issue only
         device work (the packed-input copies, then the single launcher call).
@@ -4114,6 +4121,7 @@ class CakeSSDCombined:
             return_final_states=return_final_states,
             num_seqs=num_seqs,
             cu_seqlens=cu_seqlens,
+            final_states=final_states,
             capturing=capturing,
             preparing=False,
         )
@@ -4171,6 +4179,7 @@ class CakeSSDCombined:
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        final_states: Optional[torch.Tensor] = None,
     ) -> PreparedSSDCombined:
         """Prepare a call shape eagerly so that :meth:`run` on it is a pure
         launch, in particular inside CUDA-graph capture.
@@ -4183,8 +4192,9 @@ class CakeSSDCombined:
         the dummy operands, the program build and load.  It reads
         ``FLASHINFER_CAKE_SSD_CHUNK_PARALLEL`` once and freezes the family
         choice for the shape: later :meth:`run` calls on it never consult the
-        environment.  With ``return_final_states`` it allocates the shape's
-        static final-states buffer, which such :meth:`run` calls then return
+        environment.  With ``return_final_states`` and no caller
+        ``final_states`` it allocates the shape's static final-states buffer,
+        which such :meth:`run` calls without ``final_states`` then return
         (the same tensor every call, overwritten by each launch) instead of
         fresh storage.  The prepared shape's workspace is pinned: never
         evicted for the lifetime of the runner.  A caller-owned
@@ -4238,6 +4248,7 @@ class CakeSSDCombined:
             return_final_states=return_final_states,
             num_seqs=num_seqs,
             cu_seqlens=cu_seqlens,
+            final_states=final_states,
             capturing=False,
             preparing=True,
         )
@@ -4293,6 +4304,7 @@ class CakeSSDCombined:
         return_final_states: bool,
         num_seqs: Optional[int],
         cu_seqlens: Optional[torch.Tensor],
+        final_states: Optional[torch.Tensor],
         capturing: bool,
         preparing: bool,
     ) -> _LaunchPlan:
@@ -4489,6 +4501,17 @@ class CakeSSDCombined:
                     f"{self.nheads}, 64, 128] with state dtype"
                 )
             checkpoint_state_count = int(checkpoint_states.shape[0])
+        # The kernels address a state element with a 32-bit offset
+        # ``(row * nheads + head) * 64 * 128 + element``.
+        for name, rows in (
+            ("the sequence count", num_sequences),
+            ("checkpoint_states", checkpoint_state_count),
+        ):
+            if rows * self.nheads * _HEADDIM * _DSTATE > 2**31:
+                raise ValueError(
+                    f"{name} ({rows}) times nheads ({self.nheads}) exceeds the "
+                    f"{2**31 // (_HEADDIM * _DSTATE)} state rows the kernels address"
+                )
         if D is not None:
             valid_d_shapes = ((self.nheads,), (self.nheads, _HEADDIM))
             if tuple(D.shape) not in valid_d_shapes or D.dtype != torch.bfloat16:
@@ -4507,6 +4530,31 @@ class CakeSSDCombined:
             )
             if tuple(initial_states.shape) != expected_states:
                 raise ValueError(f"initial_states must have shape {expected_states}")
+        if final_states is not None:
+            if not return_final_states:
+                raise ValueError("final_states requires return_final_states=True")
+            expected_states = (
+                num_sequences,
+                self.nheads,
+                _HEADDIM,
+                _DSTATE,
+            )
+            if (
+                tuple(final_states.shape) != expected_states
+                or final_states.dtype != self.state_dtype
+                or not final_states.is_contiguous()
+                or final_states.device != x.device
+            ):
+                raise ValueError(
+                    f"final_states must be a contiguous {list(expected_states)} "
+                    "tensor with the state dtype on the device of x"
+                )
+            for name, other in (
+                ("initial_states", initial_states),
+                ("checkpoint_states", checkpoint_states),
+            ):
+                if other is not None and _storage_overlaps(final_states, other):
+                    raise ValueError(f"final_states must not overlap {name}")
         if seq_idx is not None:
             if (
                 tuple(seq_idx.shape) != (batch, seqlen)
@@ -4715,21 +4763,29 @@ class CakeSSDCombined:
                 f"Cake SSDCombined program {program_name} ({arch}) has not been "
                 f"launched in this process: {advice}"
             )
-        # The kernel needs valid storage even when final states are disabled.
-        # Returned final states live in fresh caller-owned storage per eager
+        # A caller ``final_states`` is written in place.  Without final
+        # states the kernels store nothing to the bound pointer (every store
+        # is under ``write_final_states``), so a one-element dummy is bound.
+        # Otherwise returned final states live in fresh storage per eager
         # call (repeated cached-runner calls do not alias and no post-kernel
         # device copy adds another GPU activity to the measured route) unless
         # the shape was prepared with return_final_states: then the static
         # buffer ``prepare`` allocated is bound (the address a captured graph
         # replays into); a captured call without it allocates them from the
         # graph pool.
-        if not return_final_states:
-            final_states_arg = workspace["final"]
+        if final_states is not None:
+            final_states_arg = final_states
+        elif not return_final_states:
+            final_states_arg = self._dummy(x.device, self.state_dtype)
         else:
             final_states_arg = workspace.get("final_static")
             if final_states_arg is None:
                 self._allocating("the final states")
-                final_states_arg = torch.empty_like(workspace["final"])
+                final_states_arg = torch.empty(
+                    (num_sequences, self.nheads, _HEADDIM, _DSTATE),
+                    dtype=self.state_dtype,
+                    device=x.device,
+                )
                 if preparing:
                     workspace["final_static"] = final_states_arg
         # The TMA descriptors preserve the physical strides of x/B/C,
