@@ -18,7 +18,6 @@ split units, the fixup.
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -83,7 +82,6 @@ def valid_kv_slots(D: int = 128) -> tuple:
     return tuple(range(2, max_kv_slots(D) + 1))
 
 
-HW_ROW_MAX_ENV = "FLASHINFER_BI_ATTN_HW_ROWMAX"
 HW_ROW_MAX_MAX_D = 128  # the hardware row maximum serves the one-stage TMEM plan (D <= 128); the two-stage plan at D = 256 streams
 # its exponentials off the slice copies and gains nothing from it
 
@@ -91,9 +89,10 @@ HW_ROW_MAX_MAX_D = 128  # the hardware row maximum serves the one-stage TMEM pla
 def hw_row_max_enabled(device=None, D: int = 128) -> bool:
     """Whether the row body on ``device`` at head dim ``D`` takes a tile's row maximum from the TMEM load itself (``tcgen05.ld.red``:
     each 32-column piece's maximum in an extra register, the pieces joined by ``max.f32``) instead of the register tree: the parts
-    that have the instruction (sm_103 / sm_107) at ``D <= HW_ROW_MAX_MAX_D``, unless ``FLASHINFER_BI_ATTN_HW_ROWMAX=0``. Either way
-    the same value -- the maximum is exact and order-free -- so the choice is a placement; the kernel's identity carries it."""
-    if os.environ.get(HW_ROW_MAX_ENV, "1") == "0" or D > HW_ROW_MAX_MAX_D:
+    that have the instruction (sm_103 / sm_107) at ``D <= HW_ROW_MAX_MAX_D``. Either way the same value -- the maximum is exact and
+    order-free -- so the choice is a placement; the kernel's identity carries it (tests select the tree kernel by patching this
+    function)."""
+    if D > HW_ROW_MAX_MAX_D:
         return False
     from ...utils import get_compute_capability
 

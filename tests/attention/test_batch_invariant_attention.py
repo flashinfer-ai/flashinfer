@@ -1849,7 +1849,7 @@ def test_fixup_beyond_grid_y_limit():
 def test_hardware_row_max_equals_the_register_tree(D, monkeypatch):
     """The tile row maximum taken from the TMEM load (the parts that have the instruction) gives the bits of the register
     tree, on finite rows and on rows whose scores hold NaN, +-inf and signed zeros: the maximum is exact and order-free, so
-    the placement reaches no value. The kill switch selects the tree kernel for the comparison."""
+    the placement reaches no value. Patching the gate selects the tree kernel for the comparison."""
     from flashinfer.attention.batch_invariant import engine
 
     dev = torch.device("cuda")
@@ -1861,7 +1861,7 @@ def test_hardware_row_max_equals_the_register_tree(D, monkeypatch):
     pr.q[311, 2, 1] = float("-inf")
     pr.q[1300] = 0.0
     hw = bits(run_paged_prefill(pr))
-    monkeypatch.setenv(engine.HW_ROW_MAX_ENV, "0")
+    monkeypatch.setattr(engine, "hw_row_max_enabled", lambda device=None, D=128: False)
     assert not engine.hw_row_max_enabled(dev)
     tree = bits(run_paged_prefill(pr))
     assert torch.equal(hw, tree)
@@ -1869,9 +1869,9 @@ def test_hardware_row_max_equals_the_register_tree(D, monkeypatch):
 
 
 @needs_device
-def test_hardware_row_max_is_a_head_dim_placement(monkeypatch):
-    """The hardware row maximum is taken at D <= 128 only (the two-stage TMEM plan at D = 256 keeps the register tree); the kill
-    switch turns it off everywhere. The D = 256 kernels are the same either way, so the switch reaches no kernel there."""
+def test_hardware_row_max_is_a_head_dim_placement():
+    """The hardware row maximum is taken at D <= 128 only (the two-stage TMEM plan at D = 256 keeps the register tree), on the
+    parts that have the instruction; the D = 256 kernels are the tree kernels on every part, and a non-CUDA device never takes it."""
     from flashinfer.attention.batch_invariant import engine
 
     dev = torch.device("cuda")
@@ -1881,7 +1881,4 @@ def test_hardware_row_max_is_a_head_dim_placement(monkeypatch):
         == engine.hw_row_max_enabled(dev, 64)
         == engine.hw_row_max_enabled(dev)
     )
-    monkeypatch.setenv(engine.HW_ROW_MAX_ENV, "0")
-    assert not engine.hw_row_max_enabled(dev, 64) and not engine.hw_row_max_enabled(
-        dev, 128
-    )
+    assert engine.hw_row_max_enabled(torch.device("cpu"), 64) is False
