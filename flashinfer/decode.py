@@ -4516,6 +4516,12 @@ def trtllm_batch_decode_with_kv_cache(
         When set to ``auto``, the backend will be chosen based on the device architecture and kernel availability.
         For sm_100 and sm_103 (blackwell architecture), ``auto`` will choose ``trtllm-gen`` backend.
         For sm_90 (hopper architecture) and sm_120/sm_121 (blackwell architecture), ``auto`` will choose ``xqa`` backend.
+        ``nm35-nvfp4`` is an explicit backend for Nemotron 3.5 Super with an
+        NVFP4 KV cache on sm_100: FP8 query and output, 32 query heads, 2 KV heads,
+        head dimension 128 and 128-token pages. It runs each call on a kernel
+        written for that geometry, or on ``trtllm-gen`` where that is faster or the
+        call is outside the geometry. It never participates in automatic backend
+        selection. See :mod:`flashinfer.nm35_nvfp4`.
 
     q_len_per_req : Optional[int] = 1
         Number of query tokens per request (i.e. speculative-decoding / MTP depth).
@@ -4681,6 +4687,11 @@ def trtllm_batch_decode_with_kv_cache(
         Only returned when ``return_lse`` is True. Shape ``[num_tokens, num_qo_heads]``
         with dtype ``torch.float32``.
     """
+    # The Nemotron 3.5 Super NVFP4 kernels serve one attention geometry. Every
+    # other call, and every shape where trtllm-gen is faster, runs on trtllm-gen.
+    use_nm35_nvfp4 = backend == "nm35-nvfp4"
+    if use_nm35_nvfp4:
+        backend = "trtllm-gen"
     if request_order is not None and backend != "cake":
         raise ValueError("request_order requires the explicit backend='cake'")
     if request_order_plan is not None and request_order is None:
@@ -5437,7 +5448,41 @@ def trtllm_batch_decode_with_kv_cache(
                     None,  # use_fp16_softmax
                 )
             )
-        run_func(*run_args)
+        ran_nm35_nvfp4 = False
+        if use_nm35_nvfp4:
+            from .nm35_nvfp4 import try_decode as try_nm35_nvfp4_decode
+
+            ran_nm35_nvfp4 = try_nm35_nvfp4_decode(
+                out=out,
+                query=query,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                k_block_scales=k_block_scales,
+                v_block_scales=v_block_scales,
+                workspace_buffer=workspace_buffer,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                batch_size=batch_size,
+                max_q_len=max_q_len,
+                max_kv_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                enable_pdl=enable_pdl,
+                cum_seq_lens_q=cum_seq_lens_q,
+                plain=(
+                    out_dtype != "nvfp4"
+                    and sinks is None
+                    and lse is None
+                    and mask is None
+                    and window_left == -1
+                    and not sparse_top_k
+                    and not enable_block_sparse_attention
+                    and not skip_softmax_threshold_scale_factor
+                    and uses_shared_paged_kv_idx
+                ),
+            )
+        if not ran_nm35_nvfp4:
+            run_func(*run_args)
 
         result_out = (
             out

@@ -9431,7 +9431,13 @@ def trtllm_batch_context_with_kv_cache(
     backend : str = "trtllm-gen"
         The implementation backend, either ``trtllm-gen`` or ``cake``. ``cake``
         selects the separately versioned Cake FMHA product. The default remains
-        the conventional TRTLLM implementation.
+        the conventional TRTLLM implementation. ``nm35-nvfp4`` is an
+        explicit backend for Nemotron 3.5 Super with an NVFP4 KV cache on sm_100
+        (FP8 query and output, 32 query heads, 2 KV heads, head dimension 128,
+        128-token pages): a single-request call with a KV longer than 8192 tokens
+        and a large enough ``workspace_buffer`` runs on a kernel written for that
+        geometry, and every other call on ``trtllm-gen``. Size the workspace with
+        :func:`flashinfer.nm35_nvfp4.prefill_workspace_bytes`.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -9449,9 +9455,15 @@ def trtllm_batch_context_with_kv_cache(
     )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    # The Nemotron 3.5 Super NVFP4 kernel serves one attention geometry. Every
+    # other call runs on trtllm-gen.
+    use_nm35_nvfp4 = backend == "nm35-nvfp4"
+    if use_nm35_nvfp4:
+        backend = "trtllm-gen"
     if backend not in ("trtllm-gen", "cake"):
         raise ValueError(
-            "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen' or 'cake'"
+            "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen', "
+            "'cake' or 'nm35-nvfp4'"
         )
     if isinstance(window_left, bool) or not isinstance(window_left, int):
         raise TypeError("window_left must be an integer")
@@ -9791,7 +9803,42 @@ def trtllm_batch_context_with_kv_cache(
     if backend != "cake":
         run_args.append(1.0)  # lse_scale
     run_args.extend((lse_stride_tokens, lse_stride_heads))
-    run_func(*run_args)
+    ran_nm35_nvfp4 = False
+    if use_nm35_nvfp4:
+        from .nm35_nvfp4 import try_prefill as try_nm35_nvfp4_prefill
+
+        ran_nm35_nvfp4 = try_nm35_nvfp4_prefill(
+            out=out,
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            k_block_scales=key_block_scales,
+            v_block_scales=value_block_scales,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            cum_seq_lens_q=cum_seq_lens_q,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            plain=(
+                out_dtype != "nvfp4"
+                and causal
+                and sinks is None
+                and lse is None
+                and window_left == -1
+                and window_right == -1
+                and variable_window_token_starts is None
+                and not skip_softmax_threshold_scale_factor
+                and uses_shared_paged_kv_idx
+                and not use_fp16_softmax
+                and not uses_spcompress
+            ),
+        )
+    if not ran_nm35_nvfp4:
+        run_func(*run_args)
     result_out = (
         out
         if out_dtype != "nvfp4"
