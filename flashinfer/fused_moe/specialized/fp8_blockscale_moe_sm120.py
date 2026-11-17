@@ -22,6 +22,7 @@ geometry, contiguity, token allowlist) -> device guards (compute
 capability, CUDA-graph warm state). Every refusal is counted in
 ``fallback_reasons``.
 """
+
 import functools
 import json
 import logging
@@ -69,21 +70,23 @@ def _load_allowlist() -> Optional[dict]:
     if _allowlist_cache is not None:
         return _allowlist_cache
     try:
-        payload = json.loads(
-            (Path(__file__).parent / _WORKLOAD_FILE).read_text()
-        )
+        payload = json.loads((Path(__file__).parent / _WORKLOAD_FILE).read_text())
         _allowlist_cache = {
             "min_cc": tuple(int(v) for v in payload["min_compute_capability"]),
             "max_cc": tuple(int(v) for v in payload["max_compute_capability"]),
-            "tokens": frozenset(
-                int(v) for v in payload["num_tokens_allowlist"]
-            ),
+            "tokens": frozenset(int(v) for v in payload["num_tokens_allowlist"]),
         }
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError,
-            ValueError) as exc:
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
         logger.warning(
             "flashinfer.fused_moe specialized fp8-block-scale: workload "
-            "allowlist unavailable, backend disabled: %s", exc
+            "allowlist unavailable, backend disabled: %s",
+            exc,
         )
         _allowlist_cache = None
     return _allowlist_cache
@@ -101,8 +104,7 @@ def specialized_moe_fp8_blockscale_stats() -> dict:
 
 
 def gen_specialized_fused_moe_fp8_blockscale_sm120_module() -> JitSpec:
-    src_dir = (jit_env.FLASHINFER_CSRC_DIR
-               / "specialized_fused_moe_fp8_blockscale_sm120")
+    src_dir = jit_env.FLASHINFER_CSRC_DIR / "specialized_fused_moe_fp8_blockscale_sm120"
     sources = sorted(Path(src_dir).glob("*.cu"))
     return gen_jit_spec(
         "specialized_fused_moe_fp8_blockscale_sm120",
@@ -123,8 +125,7 @@ def gen_specialized_fused_moe_fp8_blockscale_sm120_module() -> JitSpec:
 
 @functools.cache
 def _get_cuda_module():
-    return gen_specialized_fused_moe_fp8_blockscale_sm120_module() \
-        .build_and_load()
+    return gen_specialized_fused_moe_fp8_blockscale_sm120_module().build_and_load()
 
 
 def _kernel_entry():
@@ -160,31 +161,45 @@ def _guard(
         return "input_geometry"
     if T not in allow["tokens"]:
         return "num_tokens_off_allowlist"
-    if (token_selected_experts.shape != (T, _TOPK)
-            or token_selected_experts.dtype != torch.int32
-            or not token_selected_experts.is_contiguous()):
+    if (
+        token_selected_experts.shape != (T, _TOPK)
+        or token_selected_experts.dtype != torch.int32
+        or not token_selected_experts.is_contiguous()
+    ):
         return "topk_ids_form"
-    if (token_final_scales is None
-            or token_final_scales.shape != (T, _TOPK)
-            or token_final_scales.dtype != torch.float32
-            or not token_final_scales.is_contiguous()):
+    if (
+        token_final_scales is None
+        or token_final_scales.shape != (T, _TOPK)
+        or token_final_scales.dtype != torch.float32
+        or not token_final_scales.is_contiguous()
+    ):
         return "topk_scales_form"
-    if (fc1_expert_weights.shape != (_E, 2 * _I, _H)
-            or fc1_expert_weights.dtype != torch.float8_e4m3fn
-            or not fc1_expert_weights.is_contiguous()):
+    if (
+        fc1_expert_weights.shape != (_E, 2 * _I, _H)
+        or fc1_expert_weights.dtype != torch.float8_e4m3fn
+        or not fc1_expert_weights.is_contiguous()
+    ):
         return "fc1_weights_form"
-    if (fc2_expert_weights.shape != (_E, _H, _I)
-            or fc2_expert_weights.dtype != torch.float8_e4m3fn
-            or not fc2_expert_weights.is_contiguous()):
+    if (
+        fc2_expert_weights.shape != (_E, _H, _I)
+        or fc2_expert_weights.dtype != torch.float8_e4m3fn
+        or not fc2_expert_weights.is_contiguous()
+    ):
         return "fc2_weights_form"
     if len(quant_scales) != 2:
         return "quant_scales_count"
     w13_s, w2_s = quant_scales
-    if (w13_s.shape != (_E, (2 * _I) // 128, _H // 128)
-            or w13_s.dtype != torch.float32 or not w13_s.is_contiguous()):
+    if (
+        w13_s.shape != (_E, (2 * _I) // 128, _H // 128)
+        or w13_s.dtype != torch.float32
+        or not w13_s.is_contiguous()
+    ):
         return "fc1_scales_form"
-    if (w2_s.shape != (_E, _H // 128, _I // 128)
-            or w2_s.dtype != torch.float32 or not w2_s.is_contiguous()):
+    if (
+        w2_s.shape != (_E, _H // 128, _I // 128)
+        or w2_s.dtype != torch.float32
+        or not w2_s.is_contiguous()
+    ):
         return "fc2_scales_form"
     # --- device guards ---
     cc = get_compute_capability(input.device)
@@ -213,21 +228,33 @@ def maybe_run_specialized(
     reason recorded in ``fallback_reasons``.
     """
     _stats["calls"] += 1
-    reason = _guard(input, token_selected_experts, token_final_scales,
-                    fc1_expert_weights, fc2_expert_weights, quant_scales,
-                    context_ok)
+    reason = _guard(
+        input,
+        token_selected_experts,
+        token_final_scales,
+        fc1_expert_weights,
+        fc2_expert_weights,
+        quant_scales,
+        context_ok,
+    )
     if reason is not None:
         return None, _bump_fallback(reason)
     dispatch_run = _kernel_entry()
 
     T = input.shape[0]
     if output is None:
-        output = torch.empty((T, _H), dtype=torch.bfloat16,
-                             device=input.device)
+        output = torch.empty((T, _H), dtype=torch.bfloat16, device=input.device)
     output.zero_()  # kernels may accumulate partials into the output
-    dispatch_run(input, fc1_expert_weights, quant_scales[0],
-                 fc2_expert_weights, quant_scales[1],
-                 token_selected_experts, token_final_scales, output)
+    dispatch_run(
+        input,
+        fc1_expert_weights,
+        quant_scales[0],
+        fc2_expert_weights,
+        quant_scales[1],
+        token_selected_experts,
+        token_final_scales,
+        output,
+    )
     _warmed.add(T)
     _stats["specialized_dispatches"] += 1
     return output, None
@@ -252,7 +279,15 @@ def warmup(
         ids = torch.zeros((T, _TOPK), dtype=torch.int32, device=device)
         tw = torch.zeros((T, _TOPK), dtype=torch.float32, device=device)
         out = torch.zeros((T, _H), dtype=torch.bfloat16, device=device)
-        dispatch_run(x, fc1_expert_weights, quant_scales[0],
-                     fc2_expert_weights, quant_scales[1], ids, tw, out)
+        dispatch_run(
+            x,
+            fc1_expert_weights,
+            quant_scales[0],
+            fc2_expert_weights,
+            quant_scales[1],
+            ids,
+            tw,
+            out,
+        )
         _warmed.add(T)
     torch.cuda.synchronize(device)

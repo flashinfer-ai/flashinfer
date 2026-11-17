@@ -1,11 +1,12 @@
-#include <cstdint>
+#include <cooperative_groups.h>
 #include <cuda.h>
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
-#include <cooperative_groups.h>
-#include <tvm/ffi/tvm_ffi.h>
+#include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
+
+#include <cstdint>
 
 namespace ffi = tvm::ffi;
 namespace cg = cooperative_groups;
@@ -27,10 +28,8 @@ __device__ __forceinline__ uint8_t to_fp8(float x) {
   return q.__x;
 }
 
-__device__ __forceinline__ void mma_f8(float d[4],
-                                        uint32_t a0, uint32_t a1,
-                                        uint32_t a2, uint32_t a3,
-                                        uint32_t b0, uint32_t b1) {
+__device__ __forceinline__ void mma_f8(float d[4], uint32_t a0, uint32_t a1, uint32_t a2,
+                                       uint32_t a3, uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
       "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
@@ -38,18 +37,15 @@ __device__ __forceinline__ void mma_f8(float d[4],
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void mma_bf16(float d[4], const uint32_t a[4],
-                                         const uint32_t b[2]) {
+__device__ __forceinline__ void mma_bf16(float d[4], const uint32_t a[4], const uint32_t b[2]) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-        "r"(b[0]), "r"(b[1]));
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-__device__ __forceinline__ void fp8x4_to_bf16x4(uint32_t u, uint32_t& lo,
-                                                uint32_t& hi) {
+__device__ __forceinline__ void fp8x4_to_bf16x4(uint32_t u, uint32_t& lo, uint32_t& hi) {
   uint32_t t0, t1;
   asm("prmt.b32 %0, %1, 0, 0x4140;" : "=r"(t0) : "r"(u));
   asm("prmt.b32 %0, %1, 0, 0x4342;" : "=r"(t1) : "r"(u));
@@ -63,68 +59,54 @@ __device__ __forceinline__ uint32_t fp8x2_to_bf16x2(uint16_t u) {
   return r;
 }
 
-__device__ __forceinline__ void stage_fp8x16_as_bf16(
-    __nv_bfloat16* dst, const uint4& packed) {
+__device__ __forceinline__ void stage_fp8x16_as_bf16(__nv_bfloat16* dst, const uint4& packed) {
   uint32_t widened[8];
   const uint32_t* src = reinterpret_cast<const uint32_t*>(&packed);
 #pragma unroll
-  for (int q = 0; q < 4; ++q)
-    fp8x4_to_bf16x4(src[q], widened[2 * q], widened[2 * q + 1]);
-  *reinterpret_cast<uint4*>(dst) =
-      *reinterpret_cast<const uint4*>(&widened[0]);
-  *reinterpret_cast<uint4*>(dst + 8) =
-      *reinterpret_cast<const uint4*>(&widened[4]);
+  for (int q = 0; q < 4; ++q) fp8x4_to_bf16x4(src[q], widened[2 * q], widened[2 * q + 1]);
+  *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(&widened[0]);
+  *reinterpret_cast<uint4*>(dst + 8) = *reinterpret_cast<const uint4*>(&widened[4]);
 }
 
-__device__ __forceinline__ void ldm_bf16_a4(
-    uint32_t r[4], const __nv_bfloat16* base, int stride,
-    int row0, int kbase) {
+__device__ __forceinline__ void ldm_bf16_a4(uint32_t r[4], const __nv_bfloat16* base, int stride,
+                                            int row0, int kbase) {
   const int lane = threadIdx.x & 31;
   const int matrix = lane >> 3;
   const int row = row0 + (lane & 7) + ((matrix & 1) << 3);
   const int col = kbase + (matrix >> 1) * 8;
-  const uint32_t addr = static_cast<uint32_t>(
-      __cvta_generic_to_shared(base + row * stride + col));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-      : "r"(addr));
+  const uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(base + row * stride + col));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
 }
 
-__device__ __forceinline__ void cp_async16(void* dst, const void* src,
-                                            int src_size = 16) {
+__device__ __forceinline__ void cp_async16(void* dst, const void* src, int src_size = 16) {
   const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-  asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n"
-               :: "r"(smem_addr), "l"(src), "r"(src_size));
+  asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16, %2;\n" ::"r"(smem_addr),
+               "l"(src), "r"(src_size));
 }
 
-__device__ __forceinline__ void cp_async_commit() {
-  asm volatile("cp.async.commit_group;\n" ::);
-}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 
-__device__ __forceinline__ void cp_async_wait_all() {
-  asm volatile("cp.async.wait_group 0;\n" ::);
-}
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
 __device__ __forceinline__ void mbarrier_init(uint64_t* bar) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n"
-               :: "r"(smem_u32(bar)) : "memory");
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(smem_u32(bar)) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_expect(uint64_t* bar,
-                                                uint32_t bytes) {
+__device__ __forceinline__ void mbarrier_expect(uint64_t* bar, uint32_t bytes) {
   asm volatile(
       "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 "
-      "_, [%0], %1;\n"
-      :: "r"(smem_u32(bar)), "r"(bytes) : "memory");
+      "_, [%0], %1;\n" ::"r"(smem_u32(bar)),
+      "r"(bytes)
+      : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_wait(uint64_t* bar,
-                                              uint32_t phase) {
+__device__ __forceinline__ void mbarrier_wait(uint64_t* bar, uint32_t phase) {
   uint32_t done;
   do {
     asm volatile(
@@ -139,24 +121,21 @@ __device__ __forceinline__ void mbarrier_wait(uint64_t* bar,
   } while (!done);
 }
 
-__device__ __forceinline__ void tma_load_2d(
-    void* dst, const CUtensorMap* map, int x, int y, uint64_t* bar) {
+__device__ __forceinline__ void tma_load_2d(void* dst, const CUtensorMap* map, int x, int y,
+                                            uint64_t* bar) {
   const uint64_t map_addr = reinterpret_cast<uint64_t>(map);
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cta.global.tile."
       "mbarrier::complete_tx::bytes "
       "[%0], [%1, {%2, %3}], [%4];\n"
       :
-      : "r"(smem_u32(dst)), "l"(map_addr), "r"(x), "r"(y),
-        "r"(smem_u32(bar))
+      : "r"(smem_u32(dst)), "l"(map_addr), "r"(x), "r"(y), "r"(smem_u32(bar))
       : "memory");
 }
 
-__global__ __launch_bounds__(128) void quantize_x_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    uint8_t* __restrict__ xq,
-    float* __restrict__ xs,
-    int tokens) {
+__global__ __launch_bounds__(128) void quantize_x_kernel(const __nv_bfloat16* __restrict__ x,
+                                                         uint8_t* __restrict__ xq,
+                                                         float* __restrict__ xs, int tokens) {
   const int group = blockIdx.x;
   if (group >= tokens * 16) return;
   const int tid = threadIdx.x;
@@ -180,14 +159,9 @@ __global__ __launch_bounds__(128) void quantize_x_kernel(
 // One CTA computes and quantizes one 128-wide intermediate group for a routed
 // token. Sixteen warps each produce 8 columns using native SM120 FP8 MMA.
 __global__ __launch_bounds__(512, 1) void fc1_swiglu_quant_kernel(
-    const uint8_t* __restrict__ xq,
-    const float* __restrict__ xs,
-    const uint8_t* __restrict__ w13,
-    const float* __restrict__ w13s,
-    const int32_t* __restrict__ ids,
-    uint8_t* __restrict__ zq,
-    float* __restrict__ zs,
-    int routes) {
+    const uint8_t* __restrict__ xq, const float* __restrict__ xs, const uint8_t* __restrict__ w13,
+    const float* __restrict__ w13s, const int32_t* __restrict__ ids, uint8_t* __restrict__ zq,
+    float* __restrict__ zs, int routes) {
   const int route = blockIdx.x >> 2;
   const int group = blockIdx.x & 3;
   if (route >= routes) return;
@@ -269,14 +243,9 @@ __global__ __launch_bounds__(512, 1) void fc1_swiglu_quant_kernel(
 // A warp owns 8 final output columns. It retains FP32 totals while walking all
 // eight routed experts, then writes BF16 exactly once.
 __global__ __launch_bounds__(256) void fc2_reduce_kernel(
-    const uint8_t* __restrict__ zq,
-    const float* __restrict__ zs,
-    const uint8_t* __restrict__ w2,
-    const float* __restrict__ w2s,
-    const int32_t* __restrict__ ids,
-    const float* __restrict__ routing_weight,
-    __nv_bfloat16* __restrict__ out,
-    int tokens) {
+    const uint8_t* __restrict__ zq, const float* __restrict__ zs, const uint8_t* __restrict__ w2,
+    const float* __restrict__ w2s, const int32_t* __restrict__ ids,
+    const float* __restrict__ routing_weight, __nv_bfloat16* __restrict__ out, int tokens) {
   const int token = blockIdx.x >> 5;
   const int block_tile = blockIdx.x & 31;
   if (token >= tokens) return;
@@ -305,14 +274,13 @@ __global__ __launch_bounds__(256) void fc2_reduce_kernel(
           a2 = a32[k32 * 8 + lane_quad + 4];
         }
         const int row = n0 + lane_group;
-        const uint8_t* b = w2 + static_cast<int64_t>(expert) * H * I +
-                           static_cast<int64_t>(row) * I + k32 * 32;
+        const uint8_t* b =
+            w2 + static_cast<int64_t>(expert) * H * I + static_cast<int64_t>(row) * I + k32 * 32;
         const uint32_t b0 = *reinterpret_cast<const uint32_t*>(b + lane_quad * 4);
         const uint32_t b1 = *reinterpret_cast<const uint32_t*>(b + lane_quad * 4 + 16);
         mma_f8(tmp, a0, a1, a2, a3, b0, b1);
       }
-      const float scale = zs[route * 4 + kb] *
-                          w2s[expert * 16 * 4 + (n0 >> 7) * 4 + kb];
+      const float scale = zs[route * 4 + kb] * w2s[expert * 16 * 4 + (n0 >> 7) * 4 + kb];
 #pragma unroll
       for (int j = 0; j < 4; ++j) acc[j] = fmaf(tmp[j], scale, acc[j]);
     }
@@ -351,21 +319,12 @@ __device__ __forceinline__ void grid_barrier(int* count, int* sense) {
 // three software grid barriers safe. All arithmetic remains input-dependent on
 // every call; the barriers only fuse genuine per-call kernel phases.
 __global__ __launch_bounds__(256, 1) void fused_decode_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const uint8_t* __restrict__ w13,
-    const float* __restrict__ w13s,
-    const uint8_t* __restrict__ w2,
-    const float* __restrict__ w2s,
-    const int32_t* __restrict__ ids,
-    const float* __restrict__ routing_weight,
-    __nv_bfloat16* __restrict__ out,
-    uint8_t* __restrict__ xq,
-    float* __restrict__ xs,
-    float* __restrict__ zfloat,
-    uint8_t* __restrict__ zq,
-    float* __restrict__ zs,
-    int* __restrict__ barriers,
-    int tokens) {
+    const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w13,
+    const float* __restrict__ w13s, const uint8_t* __restrict__ w2, const float* __restrict__ w2s,
+    const int32_t* __restrict__ ids, const float* __restrict__ routing_weight,
+    __nv_bfloat16* __restrict__ out, uint8_t* __restrict__ xq, float* __restrict__ xs,
+    float* __restrict__ zfloat, uint8_t* __restrict__ zq, float* __restrict__ zs,
+    int* __restrict__ barriers, int tokens) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -410,8 +369,7 @@ __global__ __launch_bounds__(256, 1) void fused_decode_kernel(
     const int n0 = tile * 8;
     const int group = tile >> 4;
     const int64_t ew = static_cast<int64_t>(expert) * 2 * I * H;
-    const uint32_t* x32 = reinterpret_cast<const uint32_t*>(
-        xq + static_cast<int64_t>(token) * H);
+    const uint32_t* x32 = reinterpret_cast<const uint32_t*>(xq + static_cast<int64_t>(token) * H);
     float gate[4] = {0.f, 0.f, 0.f, 0.f};
     float up[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll 1
@@ -449,10 +407,8 @@ __global__ __launch_bounds__(256, 1) void fused_decode_kernel(
       const int col = n0 + lane_quad * 2;
       const float g0 = gate[0];
       const float g1 = gate[1];
-      zfloat[static_cast<int64_t>(route) * I + col] =
-          (g0 / (1.0f + expf(-g0))) * up[0];
-      zfloat[static_cast<int64_t>(route) * I + col + 1] =
-          (g1 / (1.0f + expf(-g1))) * up[1];
+      zfloat[static_cast<int64_t>(route) * I + col] = (g0 / (1.0f + expf(-g0))) * up[0];
+      zfloat[static_cast<int64_t>(route) * I + col + 1] = (g1 / (1.0f + expf(-g1))) * up[1];
     }
   }
   cg::this_grid().sync();
@@ -490,8 +446,7 @@ __global__ __launch_bounds__(256, 1) void fused_decode_kernel(
       const int route = slot;
       const int expert = ids[route] & 255;
       const int n0 = tile * 8;
-      const uint32_t* a32 = reinterpret_cast<const uint32_t*>(
-          zq + static_cast<int64_t>(route) * I);
+      const uint32_t* a32 = reinterpret_cast<const uint32_t*>(zq + static_cast<int64_t>(route) * I);
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int kb = 0; kb < 4; ++kb) {
@@ -505,16 +460,13 @@ __global__ __launch_bounds__(256, 1) void fused_decode_kernel(
             a2 = a32[k32 * 8 + lane_quad + 4];
           }
           const int row = n0 + lane_group;
-          const uint8_t* b = w2 + static_cast<int64_t>(expert) * H * I +
-                             static_cast<int64_t>(row) * I + k32 * 32;
-          const uint32_t b0 = *reinterpret_cast<const uint32_t*>(
-              b + lane_quad * 4);
-          const uint32_t b1 = *reinterpret_cast<const uint32_t*>(
-              b + lane_quad * 4 + 16);
+          const uint8_t* b =
+              w2 + static_cast<int64_t>(expert) * H * I + static_cast<int64_t>(row) * I + k32 * 32;
+          const uint32_t b0 = *reinterpret_cast<const uint32_t*>(b + lane_quad * 4);
+          const uint32_t b1 = *reinterpret_cast<const uint32_t*>(b + lane_quad * 4 + 16);
           mma_f8(tmp, a0, a1, a2, a3, b0, b1);
         }
-        const float scale = zs[route * 4 + kb] *
-                            w2s[expert * 16 * 4 + (n0 >> 7) * 4 + kb];
+        const float scale = zs[route * 4 + kb] * w2s[expert * 16 * 4 + (n0 >> 7) * 4 + kb];
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[j] = fmaf(tmp[j], scale, acc[j]);
       }
@@ -545,8 +497,7 @@ __global__ __launch_bounds__(256, 1) void fused_decode_kernel(
     for (int slot = 0; slot < TOPK; ++slot) {
       const int route = token * TOPK + slot;
       const int expert = ids[route] & 255;
-      const uint32_t* a32 = reinterpret_cast<const uint32_t*>(
-          zq + static_cast<int64_t>(route) * I);
+      const uint32_t* a32 = reinterpret_cast<const uint32_t*>(zq + static_cast<int64_t>(route) * I);
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int kb = 0; kb < 4; ++kb) {
@@ -560,14 +511,13 @@ __global__ __launch_bounds__(256, 1) void fused_decode_kernel(
             a2 = a32[k32 * 8 + lane_quad + 4];
           }
           const int row = n0 + lane_group;
-          const uint8_t* b = w2 + static_cast<int64_t>(expert) * H * I +
-                             static_cast<int64_t>(row) * I + k32 * 32;
+          const uint8_t* b =
+              w2 + static_cast<int64_t>(expert) * H * I + static_cast<int64_t>(row) * I + k32 * 32;
           const uint32_t b0 = *reinterpret_cast<const uint32_t*>(b + lane_quad * 4);
           const uint32_t b1 = *reinterpret_cast<const uint32_t*>(b + lane_quad * 4 + 16);
           mma_f8(tmp, a0, a1, a2, a3, b0, b1);
         }
-        const float scale = zs[route * 4 + kb] *
-                            w2s[expert * 16 * 4 + (n0 >> 7) * 4 + kb];
+        const float scale = zs[route * 4 + kb] * w2s[expert * 16 * 4 + (n0 >> 7) * 4 + kb];
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[j] = fmaf(tmp[j], scale, acc[j]);
       }
@@ -599,54 +549,37 @@ constexpr int PREFILL_FC2_B_BYTES = 128 * 128;
 constexpr int PREFILL_DATA_SMEM = 2 * PREFILL_FC1_STAGE_BYTES;
 constexpr int PREFILL_ROUTE_SMEM = PREFILL_M * sizeof(int);
 constexpr int PREFILL_SCALE_STRIDE = 17;
-constexpr int PREFILL_SCALE_SMEM =
-    (PREFILL_M * PREFILL_SCALE_STRIDE + 32) * sizeof(float);
-constexpr int PREFILL_SMEM =
-    PREFILL_DATA_SMEM + PREFILL_ROUTE_SMEM + PREFILL_SCALE_SMEM;
+constexpr int PREFILL_SCALE_SMEM = (PREFILL_M * PREFILL_SCALE_STRIDE + 32) * sizeof(float);
+constexpr int PREFILL_SMEM = PREFILL_DATA_SMEM + PREFILL_ROUTE_SMEM + PREFILL_SCALE_SMEM;
 constexpr int PREFILL_M48_A_BYTES = PREFILL_M48 * 128;
-constexpr int PREFILL_M48_STAGE_BYTES =
-    PREFILL_M48_A_BYTES + PREFILL_FC1_B_BYTES;
-constexpr int PREFILL_M48_SMEM =
-    2 * PREFILL_M48_STAGE_BYTES + PREFILL_M48 * sizeof(int) +
-    (PREFILL_M48 * PREFILL_SCALE_STRIDE + 32) * sizeof(float);
+constexpr int PREFILL_M48_STAGE_BYTES = PREFILL_M48_A_BYTES + PREFILL_FC1_B_BYTES;
+constexpr int PREFILL_M48_SMEM = 2 * PREFILL_M48_STAGE_BYTES + PREFILL_M48 * sizeof(int) +
+                                 (PREFILL_M48 * PREFILL_SCALE_STRIDE + 32) * sizeof(float);
 constexpr int PREFILL_M96_A_BYTES = PREFILL_M96 * 128;
-constexpr int PREFILL_M96_STAGE_BYTES =
-    PREFILL_M96_A_BYTES + PREFILL_FC1_B_BYTES;
-constexpr int PREFILL_M96_SMEM =
-    2 * PREFILL_M96_STAGE_BYTES + PREFILL_M96 * sizeof(int) +
-    (PREFILL_M96 * PREFILL_SCALE_STRIDE + 32) * sizeof(float);
+constexpr int PREFILL_M96_STAGE_BYTES = PREFILL_M96_A_BYTES + PREFILL_FC1_B_BYTES;
+constexpr int PREFILL_M96_SMEM = 2 * PREFILL_M96_STAGE_BYTES + PREFILL_M96 * sizeof(int) +
+                                 (PREFILL_M96 * PREFILL_SCALE_STRIDE + 32) * sizeof(float);
 constexpr int BF16_FC2_THREADS = 512;
 constexpr int BF16_FC2_M48_THREADS = 384;
 constexpr int BF16_FC2_A_STRIDE = I + 8;
 constexpr int BF16_FC2_B_STRIDE = 72;
 constexpr int BF16_FC2_A_ELEMS = PREFILL_M * BF16_FC2_A_STRIDE;
 constexpr int BF16_FC2_B_ELEMS = 128 * BF16_FC2_B_STRIDE;
-constexpr int BF16_FC2_SMEM =
-    BF16_FC2_A_ELEMS * sizeof(__nv_bfloat16) + 2 * 64 * 256;
-constexpr int BF16_FC2_M48_A_BYTES =
-    PREFILL_M48 * BF16_FC2_A_STRIDE * sizeof(__nv_bfloat16);
+constexpr int BF16_FC2_SMEM = BF16_FC2_A_ELEMS * sizeof(__nv_bfloat16) + 2 * 64 * 256;
+constexpr int BF16_FC2_M48_A_BYTES = PREFILL_M48 * BF16_FC2_A_STRIDE * sizeof(__nv_bfloat16);
 constexpr int BF16_FC2_M48_A_ELEMS =
-    ((BF16_FC2_M48_A_BYTES + 1023) / 1024) *
-    (1024 / sizeof(__nv_bfloat16));
-constexpr int BF16_FC2_M48_SMEM =
-    BF16_FC2_M48_A_ELEMS * sizeof(__nv_bfloat16) + 2 * 64 * 256;
+    ((BF16_FC2_M48_A_BYTES + 1023) / 1024) * (1024 / sizeof(__nv_bfloat16));
+constexpr int BF16_FC2_M48_SMEM = BF16_FC2_M48_A_ELEMS * sizeof(__nv_bfloat16) + 2 * 64 * 256;
 
-__device__ __forceinline__ uint64_t* bf16_fc2_barrier(
-    __nv_bfloat16* as, int stage) {
-  return reinterpret_cast<uint64_t*>(
-      as + stage * BF16_FC2_A_STRIDE + I + 4);
+__device__ __forceinline__ uint64_t* bf16_fc2_barrier(__nv_bfloat16* as, int stage) {
+  return reinterpret_cast<uint64_t*>(as + stage * BF16_FC2_A_STRIDE + I + 4);
 }
 
 template <int PM>
-__device__ __forceinline__ void prefetch_fc1_a(
-    uint8_t* dst,
-    const uint8_t* xq,
-    const int* sroutes,
-    int valid,
-    int kb) {
+__device__ __forceinline__ void prefetch_fc1_a(uint8_t* dst, const uint8_t* xq, const int* sroutes,
+                                               int valid, int kb) {
   const int tid = threadIdx.x;
-  for (int byte = tid * 16; byte < PM * 128;
-       byte += PREFILL_THREADS * 16) {
+  for (int byte = tid * 16; byte < PM * 128; byte += PREFILL_THREADS * 16) {
     const int row = byte >> 7;
     const int col = byte & 127;
     const bool pred = row < valid;
@@ -657,75 +590,54 @@ __device__ __forceinline__ void prefetch_fc1_a(
   }
 }
 
-__device__ __forceinline__ void prefetch_fc2_b(
-    uint8_t* dst,
-    const uint8_t* w2,
-    int64_t expert_w,
-    int group,
-    int kb) {
+__device__ __forceinline__ void prefetch_fc2_b(uint8_t* dst, const uint8_t* w2, int64_t expert_w,
+                                               int group, int kb) {
   const int tid = threadIdx.x;
-  for (int byte = tid * 16; byte < PREFILL_FC2_B_BYTES;
-       byte += PREFILL_THREADS * 16) {
+  for (int byte = tid * 16; byte < PREFILL_FC2_B_BYTES; byte += PREFILL_THREADS * 16) {
     const int row = byte >> 7;
     const int col = byte & 127;
-    const uint8_t* src = w2 + expert_w +
-                         static_cast<int64_t>(group * 128 + row) * I +
-                         kb * 128 + col;
+    const uint8_t* src =
+        w2 + expert_w + static_cast<int64_t>(group * 128 + row) * I + kb * 128 + col;
     const int physical_col = ((col >> 4) ^ (row & 7)) << 4;
     cp_async16(dst + row * 128 + physical_col, src);
   }
 }
 
 // Fetch four m16n8k32 A registers from the existing XOR-swizzled FP8 tile.
-__device__ __forceinline__ void ldm_a4(uint32_t r[4], const uint8_t* base,
-                                       int stride, int row0, int kbase,
-                                       int kk) {
+__device__ __forceinline__ void ldm_a4(uint32_t r[4], const uint8_t* base, int stride, int row0,
+                                       int kbase, int kk) {
   const int lane = threadIdx.x & 31;
   const int m = lane >> 3;
   const int row = row0 + (lane & 7) + ((m & 1) << 3);
   const int seg = (kk << 1) + (m >> 1);
-  const uint8_t* p =
-      base + row * stride + kbase + ((seg ^ (row & 7)) << 4);
+  const uint8_t* p = base + row * stride + kbase + ((seg ^ (row & 7)) << 4);
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-      : "r"(a));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
 }
 
 // Fetch the B fragments for two consecutive k steps in one instruction.
-__device__ __forceinline__ void ldm_b4(uint32_t r[4], const uint8_t* base,
-                                       int row0, int kk0) {
+__device__ __forceinline__ void ldm_b4(uint32_t r[4], const uint8_t* base, int row0, int kk0) {
   const int lane = threadIdx.x & 31;
   const int row = row0 + (lane & 7);
   const int seg = (kk0 << 2) + (lane >> 3);
   const uint8_t* p = base + row * 128 + ((seg ^ (row & 7)) << 4);
   const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-      : "r"(a));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
 }
 
 // Build an expert-major route list and quantize the input in one cooperative
 // launch.  Only the compact route metadata is sorted; activations remain in
 // their original token-major layout and are gathered by the grouped GEMMs.
 __global__ __launch_bounds__(1024, 1) void prepare_prefill_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const int32_t* __restrict__ ids,
-    uint8_t* __restrict__ xq,
-    float* __restrict__ xs,
-    int* __restrict__ counts,
-    int* __restrict__ starts,
-    int* __restrict__ cursors,
-    int* __restrict__ sorted_routes,
-    int* __restrict__ tile_expert,
-    int* __restrict__ tile_base,
-    int* __restrict__ tile_valid,
-    int* __restrict__ total_tiles,
-    int* __restrict__ fc2_counter,
-    float* __restrict__ accum_out,
-    int tokens) {
+    const __nv_bfloat16* __restrict__ x, const int32_t* __restrict__ ids, uint8_t* __restrict__ xq,
+    float* __restrict__ xs, int* __restrict__ counts, int* __restrict__ starts,
+    int* __restrict__ cursors, int* __restrict__ sorted_routes, int* __restrict__ tile_expert,
+    int* __restrict__ tile_base, int* __restrict__ tile_valid, int* __restrict__ total_tiles,
+    int* __restrict__ fc2_counter, float* __restrict__ accum_out, int tokens) {
   const int tid = threadIdx.x;
   const int gtid = blockIdx.x * blockDim.x + tid;
   const int lane = tid & 31;
@@ -739,8 +651,7 @@ __global__ __launch_bounds__(1024, 1) void prepare_prefill_kernel(
   grid.sync();
   if (tid < 256) hist[tid] = 0;
   __syncthreads();
-  for (int base = warp_global * 32; base < routes;
-       base += warp_stride * 32) {
+  for (int base = warp_global * 32; base < routes; base += warp_stride * 32) {
     const int route = base + lane;
     const unsigned active = __ballot_sync(0xffffffffu, route < routes);
     if (route < routes) {
@@ -776,8 +687,7 @@ __global__ __launch_bounds__(1024, 1) void prepare_prefill_kernel(
   }
   grid.sync();
 
-  for (int base = warp_global * 32; base < routes;
-       base += warp_stride * 32) {
+  for (int base = warp_global * 32; base < routes; base += warp_stride * 32) {
     const int route = base + lane;
     const unsigned active = __ballot_sync(0xffffffffu, route < routes);
     if (route < routes) {
@@ -793,18 +703,15 @@ __global__ __launch_bounds__(1024, 1) void prepare_prefill_kernel(
   }
 
   const int warp = tid >> 5;
-  for (int group = blockIdx.x * 32 + warp; group < tokens * 16;
-       group += gridDim.x * 32) {
+  for (int group = blockIdx.x * 32 + warp; group < tokens * 16; group += gridDim.x * 32) {
     const int64_t off = static_cast<int64_t>(group) * 128 + lane * 4;
     const __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(x + off);
     const __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(x + off + 2);
     const float2 f0 = __bfloat1622float2(p0);
     const float2 f1 = __bfloat1622float2(p1);
-    float m = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)),
-                    fmaxf(fabsf(f1.x), fabsf(f1.y)));
+    float m = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y)));
     m = warp_max(m);
-    const float scale = __shfl_sync(
-        0xffffffffu, fmaxf(m, 1.0e-4f) * (1.0f / 448.0f), 0);
+    const float scale = __shfl_sync(0xffffffffu, fmaxf(m, 1.0e-4f) * (1.0f / 448.0f), 0);
     const uint32_t q = static_cast<uint32_t>(to_fp8(f0.x / scale)) |
                        (static_cast<uint32_t>(to_fp8(f0.y / scale)) << 8) |
                        (static_cast<uint32_t>(to_fp8(f1.x / scale)) << 16) |
@@ -815,31 +722,20 @@ __global__ __launch_bounds__(1024, 1) void prepare_prefill_kernel(
 }
 
 __global__ __launch_bounds__(256) void sanitize_routing_weights_kernel(
-    const int32_t* __restrict__ ids, const float* __restrict__ rw,
-    float* __restrict__ rw_safe, int routes) {
-  for (int route = blockIdx.x * 256 + threadIdx.x; route < routes;
-       route += gridDim.x * 256) {
+    const int32_t* __restrict__ ids, const float* __restrict__ rw, float* __restrict__ rw_safe,
+    int routes) {
+  for (int route = blockIdx.x * 256 + threadIdx.x; route < routes; route += gridDim.x * 256) {
     const int expert = ids[route];
     rw_safe[route] = (unsigned)expert < 256u ? rw[route] : 0.0f;
   }
 }
 
 __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_m48_fused_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const int32_t* __restrict__ ids,
-    uint8_t* __restrict__ xq,
-    float* __restrict__ xs,
-    int* __restrict__ counts,
-    const float* __restrict__ rw,
-    float* __restrict__ rw_safe,
-    int* __restrict__ starts,
-    int* __restrict__ cursors,
-    int* __restrict__ sorted_routes,
-    int* __restrict__ tile_expert,
-    int* __restrict__ tile_base,
-    int* __restrict__ tile_valid,
-    int* __restrict__ total_tiles,
-    int* __restrict__ fc2_counter,
+    const __nv_bfloat16* __restrict__ x, const int32_t* __restrict__ ids, uint8_t* __restrict__ xq,
+    float* __restrict__ xs, int* __restrict__ counts, const float* __restrict__ rw,
+    float* __restrict__ rw_safe, int* __restrict__ starts, int* __restrict__ cursors,
+    int* __restrict__ sorted_routes, int* __restrict__ tile_expert, int* __restrict__ tile_base,
+    int* __restrict__ tile_valid, int* __restrict__ total_tiles, int* __restrict__ fc2_counter,
     int tokens) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -852,8 +748,7 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_m48_fused_kernel(
   grid.sync();
   if (tid < 256) hist[tid] = 0;
   __syncthreads();
-  for (int base = warp_global * 32; base < routes;
-       base += warp_stride * 32) {
+  for (int base = warp_global * 32; base < routes; base += warp_stride * 32) {
     const int route = base + lane;
     const unsigned active = __ballot_sync(0xffffffffu, route < routes);
     if (route < routes) {
@@ -869,18 +764,15 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_m48_fused_kernel(
   if (tid < 256 && hist[tid]) atomicAdd(counts + tid, hist[tid]);
 
   const int warp = tid >> 5;
-  for (int group = blockIdx.x * 32 + warp; group < tokens * 16;
-       group += gridDim.x * 32) {
+  for (int group = blockIdx.x * 32 + warp; group < tokens * 16; group += gridDim.x * 32) {
     const int64_t off = static_cast<int64_t>(group) * 128 + lane * 4;
     const __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(x + off);
     const __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(x + off + 2);
     const float2 f0 = __bfloat1622float2(p0);
     const float2 f1 = __bfloat1622float2(p1);
-    float m = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)),
-                    fmaxf(fabsf(f1.x), fabsf(f1.y)));
+    float m = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y)));
     m = warp_max(m);
-    const float scale = __shfl_sync(
-        0xffffffffu, fmaxf(m, 1.0e-4f) * (1.0f / 448.0f), 0);
+    const float scale = __shfl_sync(0xffffffffu, fmaxf(m, 1.0e-4f) * (1.0f / 448.0f), 0);
     const uint32_t q = static_cast<uint32_t>(to_fp8(f0.x / scale)) |
                        (static_cast<uint32_t>(to_fp8(f0.y / scale)) << 8) |
                        (static_cast<uint32_t>(to_fp8(f1.x / scale)) << 16) |
@@ -903,7 +795,10 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_m48_fused_kernel(
       for (int d = 1; d < 32; d <<= 1) {
         const int r = __shfl_up_sync(0xffffffffu, rinc, d);
         const int t = __shfl_up_sync(0xffffffffu, tinc, d);
-        if (lane >= d) { rinc += r; tinc += t; }
+        if (lane >= d) {
+          rinc += r;
+          tinc += t;
+        }
       }
       if (scan_warp < 8 && lane == 31) {
         route_sum[scan_warp] = rinc;
@@ -918,7 +813,10 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_m48_fused_kernel(
         for (int d = 1; d < 8; d <<= 1) {
           const int r = __shfl_up_sync(0xffffffffu, rv, d);
           const int t = __shfl_up_sync(0xffffffffu, tv, d);
-          if (lane >= d) { rv += r; tv += t; }
+          if (lane >= d) {
+            rv += r;
+            tv += t;
+          }
         }
         if (lane < 8) {
           route_off[lane] = rv - rv0;
@@ -946,8 +844,7 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_m48_fused_kernel(
     }
     grid.sync();
 
-    for (int base = warp_global * 32; base < routes;
-         base += warp_stride * 32) {
+    for (int base = warp_global * 32; base < routes; base += warp_stride * 32) {
       const int route = base + lane;
       const unsigned active = __ballot_sync(0xffffffffu, route < routes);
       if (route < routes) {
@@ -965,14 +862,9 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_m48_fused_kernel(
 }
 
 __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_kernel(
-    const __nv_bfloat16* __restrict__ x,
-    const int32_t* __restrict__ ids,
-    uint8_t* __restrict__ xq,
-    float* __restrict__ xs,
-    int* __restrict__ counts,
-    const float* __restrict__ rw,
-    float* __restrict__ rw_safe,
-    int tokens) {
+    const __nv_bfloat16* __restrict__ x, const int32_t* __restrict__ ids, uint8_t* __restrict__ xq,
+    float* __restrict__ xs, int* __restrict__ counts, const float* __restrict__ rw,
+    float* __restrict__ rw_safe, int tokens) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp_global = blockIdx.x * 32 + (tid >> 5);
@@ -984,8 +876,7 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_kernel(
   grid.sync();
   if (tid < 256) hist[tid] = 0;
   __syncthreads();
-  for (int base = warp_global * 32; base < routes;
-       base += warp_stride * 32) {
+  for (int base = warp_global * 32; base < routes; base += warp_stride * 32) {
     const int route = base + lane;
     const unsigned active = __ballot_sync(0xffffffffu, route < routes);
     if (route < routes) {
@@ -1001,20 +892,15 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_kernel(
   if (tid < 256 && hist[tid]) atomicAdd(counts + tid, hist[tid]);
 
   const int warp = tid >> 5;
-  for (int group = blockIdx.x * 32 + warp; group < tokens * 16;
-       group += gridDim.x * 32) {
+  for (int group = blockIdx.x * 32 + warp; group < tokens * 16; group += gridDim.x * 32) {
     const int64_t off = static_cast<int64_t>(group) * 128 + lane * 4;
-    const __nv_bfloat162 p0 =
-        *reinterpret_cast<const __nv_bfloat162*>(x + off);
-    const __nv_bfloat162 p1 =
-        *reinterpret_cast<const __nv_bfloat162*>(x + off + 2);
+    const __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(x + off);
+    const __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(x + off + 2);
     const float2 f0 = __bfloat1622float2(p0);
     const float2 f1 = __bfloat1622float2(p1);
-    float m = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)),
-                    fmaxf(fabsf(f1.x), fabsf(f1.y)));
+    float m = fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)), fmaxf(fabsf(f1.x), fabsf(f1.y)));
     m = warp_max(m);
-    const float scale = __shfl_sync(
-        0xffffffffu, fmaxf(m, 1.0e-4f) * (1.0f / 448.0f), 0);
+    const float scale = __shfl_sync(0xffffffffu, fmaxf(m, 1.0e-4f) * (1.0f / 448.0f), 0);
     const uint32_t q = static_cast<uint32_t>(to_fp8(f0.x / scale)) |
                        (static_cast<uint32_t>(to_fp8(f0.y / scale)) << 8) |
                        (static_cast<uint32_t>(to_fp8(f1.x / scale)) << 16) |
@@ -1025,14 +911,9 @@ __global__ __launch_bounds__(1024, 1) void prepare_hist_quant_kernel(
 }
 
 __global__ __launch_bounds__(256) void prepare_prefix_kernel(
-    const int* __restrict__ counts,
-    int* __restrict__ starts,
-    int* __restrict__ cursors,
-    int* __restrict__ tile_expert,
-    int* __restrict__ tile_base,
-    int* __restrict__ tile_valid,
-    int* __restrict__ total_tiles,
-    int* __restrict__ fc2_counter) {
+    const int* __restrict__ counts, int* __restrict__ starts, int* __restrict__ cursors,
+    int* __restrict__ tile_expert, int* __restrict__ tile_base, int* __restrict__ tile_valid,
+    int* __restrict__ total_tiles, int* __restrict__ fc2_counter) {
   __shared__ int route_sum[8], route_off[8];
   __shared__ int tile_sum[8], tile_off[8];
   const int expert = threadIdx.x;
@@ -1045,7 +926,10 @@ __global__ __launch_bounds__(256) void prepare_prefix_kernel(
   for (int d = 1; d < 32; d <<= 1) {
     const int r = __shfl_up_sync(0xffffffffu, rinc, d);
     const int t = __shfl_up_sync(0xffffffffu, tinc, d);
-    if (lane >= d) { rinc += r; tinc += t; }
+    if (lane >= d) {
+      rinc += r;
+      tinc += t;
+    }
   }
   if (lane == 31) {
     route_sum[warp] = rinc;
@@ -1060,7 +944,10 @@ __global__ __launch_bounds__(256) void prepare_prefix_kernel(
     for (int d = 1; d < 8; d <<= 1) {
       const int r = __shfl_up_sync(0xffffffffu, rv, d);
       const int t = __shfl_up_sync(0xffffffffu, tv, d);
-      if (lane >= d) { rv += r; tv += t; }
+      if (lane >= d) {
+        rv += r;
+        tv += t;
+      }
     }
     if (lane < 8) {
       route_off[lane] = rv - rv0;
@@ -1085,16 +972,14 @@ __global__ __launch_bounds__(256) void prepare_prefix_kernel(
   if (expert == 0) *fc2_counter = 0;
 }
 
-__global__ __launch_bounds__(256) void prepare_scatter_kernel(
-    const int32_t* __restrict__ ids,
-    int* __restrict__ cursors,
-    int* __restrict__ sorted_routes,
-    int routes) {
+__global__ __launch_bounds__(256) void prepare_scatter_kernel(const int32_t* __restrict__ ids,
+                                                              int* __restrict__ cursors,
+                                                              int* __restrict__ sorted_routes,
+                                                              int routes) {
   const int lane = threadIdx.x & 31;
   const int warp_global = blockIdx.x * 8 + (threadIdx.x >> 5);
   const int warp_stride = gridDim.x * 8;
-  for (int base = warp_global * 32; base < routes;
-       base += warp_stride * 32) {
+  for (int base = warp_global * 32; base < routes; base += warp_stride * 32) {
     const int route = base + lane;
     const unsigned active = __ballot_sync(0xffffffffu, route < routes);
     if (route < routes) {
@@ -1112,17 +997,10 @@ __global__ __launch_bounds__(256) void prepare_scatter_kernel(
 
 template <int PM>
 __global__ __launch_bounds__(256) void prepare_prefix_scatter_kernel(
-    const int32_t* __restrict__ ids,
-    const int* __restrict__ counts,
-    int* __restrict__ starts,
-    int* __restrict__ cursors,
-    int* __restrict__ sorted_routes,
-    int* __restrict__ tile_expert,
-    int* __restrict__ tile_base,
-    int* __restrict__ tile_valid,
-    int* __restrict__ total_tiles,
-    int* __restrict__ fc2_counter,
-    int routes) {
+    const int32_t* __restrict__ ids, const int* __restrict__ counts, int* __restrict__ starts,
+    int* __restrict__ cursors, int* __restrict__ sorted_routes, int* __restrict__ tile_expert,
+    int* __restrict__ tile_base, int* __restrict__ tile_valid, int* __restrict__ total_tiles,
+    int* __restrict__ fc2_counter, int routes) {
   cg::grid_group grid = cg::this_grid();
   if (blockIdx.x == 0) {
     __shared__ int route_sum[8], route_off[8];
@@ -1137,7 +1015,10 @@ __global__ __launch_bounds__(256) void prepare_prefix_scatter_kernel(
     for (int d = 1; d < 32; d <<= 1) {
       const int r = __shfl_up_sync(0xffffffffu, rinc, d);
       const int t = __shfl_up_sync(0xffffffffu, tinc, d);
-      if (lane >= d) { rinc += r; tinc += t; }
+      if (lane >= d) {
+        rinc += r;
+        tinc += t;
+      }
     }
     if (lane == 31) {
       route_sum[warp] = rinc;
@@ -1152,7 +1033,10 @@ __global__ __launch_bounds__(256) void prepare_prefix_scatter_kernel(
       for (int d = 1; d < 8; d <<= 1) {
         const int r = __shfl_up_sync(0xffffffffu, rv, d);
         const int t = __shfl_up_sync(0xffffffffu, tv, d);
-        if (lane >= d) { rv += r; tv += t; }
+        if (lane >= d) {
+          rv += r;
+          tv += t;
+        }
       }
       if (lane < 8) {
         route_off[lane] = rv - rv0;
@@ -1181,8 +1065,7 @@ __global__ __launch_bounds__(256) void prepare_prefix_scatter_kernel(
   const int lane = threadIdx.x & 31;
   const int warp_global = blockIdx.x * 8 + (threadIdx.x >> 5);
   const int warp_stride = gridDim.x * 8;
-  for (int base = warp_global * 32; base < routes;
-       base += warp_stride * 32) {
+  for (int base = warp_global * 32; base < routes; base += warp_stride * 32) {
     const int route = base + lane;
     const unsigned active = __ballot_sync(0xffffffffu, route < routes);
     if (route < routes) {
@@ -1204,18 +1087,12 @@ __global__ __launch_bounds__(256) void prepare_prefix_scatter_kernel(
 // then reused for the exact SiLU result and per-row E4M3 quantization.
 template <int PM>
 __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
-    const uint8_t* __restrict__ xq,
-    const float* __restrict__ xs,
-    const __grid_constant__ CUtensorMap w13_map,
-    const float* __restrict__ w13s,
-    const int* __restrict__ sorted_routes,
-    const int* __restrict__ tile_expert,
-    const int* __restrict__ tile_base,
-    const int* __restrict__ tile_valid,
-    const int* __restrict__ total_tiles_ptr,
-    __nv_bfloat16* __restrict__ zbf,
-    float* __restrict__ accum_out,
-    int tokens) {
+    const uint8_t* __restrict__ xq, const float* __restrict__ xs,
+    const __grid_constant__ CUtensorMap w13_map, const float* __restrict__ w13s,
+    const int* __restrict__ sorted_routes, const int* __restrict__ tile_expert,
+    const int* __restrict__ tile_base, const int* __restrict__ tile_valid,
+    const int* __restrict__ total_tiles_ptr, __nv_bfloat16* __restrict__ zbf,
+    float* __restrict__ accum_out, int tokens) {
   constexpr int PM_ATOMS = PM / 16;
   constexpr int PM_A_BYTES = PM * 128;
   constexpr int PM_STAGE_BYTES = PM_A_BYTES + PREFILL_FC1_B_BYTES;
@@ -1224,8 +1101,7 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
   extern __shared__ __align__(1024) uint8_t smem[];
   __shared__ __align__(8) uint64_t full[2];
   int* sroutes = reinterpret_cast<int*>(smem + PM_DATA_SMEM);
-  float* route_scales = reinterpret_cast<float*>(
-      smem + PM_DATA_SMEM + PM_ROUTE_SMEM);
+  float* route_scales = reinterpret_cast<float*>(smem + PM_DATA_SMEM + PM_ROUTE_SMEM);
   float* swscale = route_scales + PM * PREFILL_SCALE_STRIDE;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -1239,8 +1115,7 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
 
   for (int task = blockIdx.x; task < total_tiles * 4; task += gridDim.x) {
     const int group = PM == PREFILL_M96 ? (task & 3) : task / total_tiles;
-    const int tile = PM == PREFILL_M96 ? (task >> 2)
-                                       : task - group * total_tiles;
+    const int tile = PM == PREFILL_M96 ? (task >> 2) : task - group * total_tiles;
     const int expert = tile_expert[tile];
     const int base = tile_base[tile];
     const int valid = tile_valid[tile];
@@ -1252,10 +1127,9 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
     prefetch_fc1_a<PM>(smem, xq, sroutes, valid, 0);
     if (tid == 0) {
       mbarrier_expect(&full[0], PREFILL_FC1_B_BYTES);
-      tma_load_2d(smem + PM_A_BYTES, &w13_map,
-                  0, expert * (2 * I) + group * 128, &full[0]);
-      tma_load_2d(smem + PM_A_BYTES + 128 * 128, &w13_map,
-                  0, expert * (2 * I) + I + group * 128, &full[0]);
+      tma_load_2d(smem + PM_A_BYTES, &w13_map, 0, expert * (2 * I) + group * 128, &full[0]);
+      tma_load_2d(smem + PM_A_BYTES + 128 * 128, &w13_map, 0, expert * (2 * I) + I + group * 128,
+                  &full[0]);
     }
     cp_async_commit();
 
@@ -1285,11 +1159,9 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
         if (tid == 0) {
           uint64_t* bar = &full[(kb + 1) & 1];
           mbarrier_expect(bar, PREFILL_FC1_B_BYTES);
-          tma_load_2d(next_stage + PM_A_BYTES, &w13_map,
-                      (kb + 1) * 128,
+          tma_load_2d(next_stage + PM_A_BYTES, &w13_map, (kb + 1) * 128,
                       expert * (2 * I) + group * 128, bar);
-          tma_load_2d(next_stage + PM_A_BYTES + 128 * 128,
-                      &w13_map, (kb + 1) * 128,
+          tma_load_2d(next_stage + PM_A_BYTES + 128 * 128, &w13_map, (kb + 1) * 128,
                       expert * (2 * I) + I + group * 128, bar);
         }
         cp_async_commit();
@@ -1315,11 +1187,9 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
         for (int kk = 0; kk < 4; ++kk) {
           uint32_t af[4];
           ldm_a4(af, sa, 128, mg * 16, 0, kk);
-          mma_f8(tg, af[0], af[1], af[2], af[3],
-                 bg[kk >> 1][(kk & 1) * 2],
+          mma_f8(tg, af[0], af[1], af[2], af[3], bg[kk >> 1][(kk & 1) * 2],
                  bg[kk >> 1][(kk & 1) * 2 + 1]);
-          mma_f8(tu, af[0], af[1], af[2], af[3],
-                 bu[kk >> 1][(kk & 1) * 2],
+          mma_f8(tu, af[0], af[1], af[2], af[3], bu[kk >> 1][(kk & 1) * 2],
                  bu[kk >> 1][(kk & 1) * 2 + 1]);
         }
         const int route0 = sroutes[r0];
@@ -1348,20 +1218,16 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
       const float g2 = gate[mg][2], g3 = gate[mg][3];
       if (r0 < valid) {
         const int route = sroutes[r0];
-        const __nv_bfloat162 v = __floats2bfloat162_rn(
-            (g0 / (1.0f + expf(-g0))) * up[mg][0],
-            (g1 / (1.0f + expf(-g1))) * up[mg][1]);
-        *reinterpret_cast<uint32_t*>(zbf + static_cast<int64_t>(route) * I +
-                                     group * 128 + c) =
+        const __nv_bfloat162 v = __floats2bfloat162_rn((g0 / (1.0f + expf(-g0))) * up[mg][0],
+                                                       (g1 / (1.0f + expf(-g1))) * up[mg][1]);
+        *reinterpret_cast<uint32_t*>(zbf + static_cast<int64_t>(route) * I + group * 128 + c) =
             *reinterpret_cast<const uint32_t*>(&v);
       }
       if (r1 < valid) {
         const int route = sroutes[r1];
-        const __nv_bfloat162 v = __floats2bfloat162_rn(
-            (g2 / (1.0f + expf(-g2))) * up[mg][2],
-            (g3 / (1.0f + expf(-g3))) * up[mg][3]);
-        *reinterpret_cast<uint32_t*>(zbf + static_cast<int64_t>(route) * I +
-                                     group * 128 + c) =
+        const __nv_bfloat162 v = __floats2bfloat162_rn((g2 / (1.0f + expf(-g2))) * up[mg][2],
+                                                       (g3 / (1.0f + expf(-g3))) * up[mg][3]);
+        *reinterpret_cast<uint32_t*>(zbf + static_cast<int64_t>(route) * I + group * 128 + c) =
             *reinterpret_cast<const uint32_t*>(&v);
       }
     }
@@ -1375,31 +1241,24 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc1_kernel(
   const int gtid = blockIdx.x * blockDim.x + tid;
   const int stride = gridDim.x * blockDim.x;
   const int nvec = tokens * (H / 4);
-  for (int idx = gtid; idx < nvec; idx += stride)
-    accum4[idx] = make_uint4(0u, 0u, 0u, 0u);
+  for (int idx = gtid; idx < nvec; idx += stride) accum4[idx] = make_uint4(0u, 0u, 0u, 0u);
 }
 
 // Expert-grouped FC2.  The full 64x512 activation tile is staged once, then
 // reused by sixteen N128 tasks.  Route contributions remain FP32 until the
 // final ordered top-8 reduction, preserving the required precision class.
 __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc2_kernel(
-    const uint8_t* __restrict__ zq,
-    const float* __restrict__ zs,
-    const __grid_constant__ CUtensorMap w2_map,
-    const float* __restrict__ w2s,
-    const float* __restrict__ routing_weight,
-    const int* __restrict__ sorted_routes,
-    const int* __restrict__ tile_expert,
-    const int* __restrict__ tile_base,
-    const int* __restrict__ tile_valid,
-    const int* __restrict__ total_tiles_ptr,
+    const uint8_t* __restrict__ zq, const float* __restrict__ zs,
+    const __grid_constant__ CUtensorMap w2_map, const float* __restrict__ w2s,
+    const float* __restrict__ routing_weight, const int* __restrict__ sorted_routes,
+    const int* __restrict__ tile_expert, const int* __restrict__ tile_base,
+    const int* __restrict__ tile_valid, const int* __restrict__ total_tiles_ptr,
     float* __restrict__ accum_out) {
   extern __shared__ __align__(1024) uint8_t smem[];
   __shared__ __align__(8) uint64_t full[2];
   uint8_t* sa = smem;
   int* sroutes = reinterpret_cast<int*>(smem + PREFILL_DATA_SMEM);
-  float* route_scales = reinterpret_cast<float*>(
-      smem + PREFILL_DATA_SMEM + PREFILL_ROUTE_SMEM);
+  float* route_scales = reinterpret_cast<float*>(smem + PREFILL_DATA_SMEM + PREFILL_ROUTE_SMEM);
   float* swscale = route_scales + PREFILL_M * PREFILL_SCALE_STRIDE;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
@@ -1422,22 +1281,19 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc2_kernel(
       const int row = tid >> 2;
       const int kb = tid & 3;
       const int route = row < valid ? sorted_routes[base + row] : -1;
-      route_scales[row * PREFILL_SCALE_STRIDE + kb] =
-          route >= 0 ? zs[route * 4 + kb] : 0.0f;
+      route_scales[row * PREFILL_SCALE_STRIDE + kb] = route >= 0 ? zs[route * 4 + kb] : 0.0f;
     }
     __syncthreads();
 
     // The activation tile is shared by all sixteen output-column groups.
-    for (int byte = tid * 16; byte < PREFILL_M * I;
-         byte += PREFILL_THREADS * 16) {
+    for (int byte = tid * 16; byte < PREFILL_M * I; byte += PREFILL_THREADS * 16) {
       const int row = byte >> 9;
       const int col = byte & 511;
       const bool pred = row < valid;
       const int route = pred ? sroutes[row] : 0;
       const uint8_t* src = zq + static_cast<int64_t>(route) * I + col;
       const int kbase = col & ~127;
-      const int physical_col = kbase + ((((col & 127) >> 4) ^
-                                          (row & 7)) << 4);
+      const int physical_col = kbase + ((((col & 127) >> 4) ^ (row & 7)) << 4);
       cp_async16(sa + row * I + physical_col, src, pred ? 16 : 0);
     }
     cp_async_commit();
@@ -1455,25 +1311,21 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc2_kernel(
       const int n0 = group * 128 + warp * 8;
       if (tid == 0) {
         mbarrier_expect(&full[0], PREFILL_FC2_B_BYTES);
-        tma_load_2d(smem + PREFILL_FC2_A_BYTES, &w2_map,
-                    0, expert * H + group * 128, &full[0]);
+        tma_load_2d(smem + PREFILL_FC2_A_BYTES, &w2_map, 0, expert * H + group * 128, &full[0]);
       }
 #pragma unroll
       for (int kb = 0; kb < 4; ++kb) {
         if (tid == 0) mbarrier_wait(&full[kb & 1], (kb >> 1) & 1);
         __syncthreads();
         if (kb + 1 < 4) {
-          uint8_t* next_b = smem + PREFILL_FC2_A_BYTES +
-                            ((kb + 1) & 1) * PREFILL_FC2_B_BYTES;
+          uint8_t* next_b = smem + PREFILL_FC2_A_BYTES + ((kb + 1) & 1) * PREFILL_FC2_B_BYTES;
           if (tid == 0) {
             uint64_t* bar = &full[(kb + 1) & 1];
             mbarrier_expect(bar, PREFILL_FC2_B_BYTES);
-            tma_load_2d(next_b, &w2_map, (kb + 1) * 128,
-                        expert * H + group * 128, bar);
+            tma_load_2d(next_b, &w2_map, (kb + 1) * 128, expert * H + group * 128, bar);
           }
         }
-        uint8_t* sb = smem + PREFILL_FC2_A_BYTES +
-                      (kb & 1) * PREFILL_FC2_B_BYTES;
+        uint8_t* sb = smem + PREFILL_FC2_A_BYTES + (kb & 1) * PREFILL_FC2_B_BYTES;
         uint32_t b0[4], b1[4];
 #pragma unroll
         for (int kk = 0; kk < 4; ++kk) {
@@ -1481,10 +1333,8 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc2_kernel(
           const int seg0 = kk * 2;
           const int p0 = (seg0 ^ (brow & 7)) * 16;
           const int p1 = ((seg0 + 1) ^ (brow & 7)) * 16;
-          b0[kk] = *reinterpret_cast<const uint32_t*>(
-              sb + brow * 128 + p0 + lane_quad * 4);
-          b1[kk] = *reinterpret_cast<const uint32_t*>(
-              sb + brow * 128 + p1 + lane_quad * 4);
+          b0[kk] = *reinterpret_cast<const uint32_t*>(sb + brow * 128 + p0 + lane_quad * 4);
+          b1[kk] = *reinterpret_cast<const uint32_t*>(sb + brow * 128 + p1 + lane_quad * 4);
         }
 #pragma unroll
         for (int mg = 0; mg < PREFILL_M_ATOMS; ++mg) {
@@ -1498,22 +1348,20 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc2_kernel(
             const int p01 = kb * 128 + ((seg0 + 1) ^ (r0 & 7)) * 16;
             const int p10 = kb * 128 + (seg0 ^ (r1 & 7)) * 16;
             const int p11 = kb * 128 + ((seg0 + 1) ^ (r1 & 7)) * 16;
-            const uint32_t a0 = *reinterpret_cast<const uint32_t*>(
-                sa + r0 * I + p00 + lane_quad * 4);
-            const uint32_t a1 = *reinterpret_cast<const uint32_t*>(
-                sa + r1 * I + p10 + lane_quad * 4);
-            const uint32_t a2 = *reinterpret_cast<const uint32_t*>(
-                sa + r0 * I + p01 + lane_quad * 4);
-            const uint32_t a3 = *reinterpret_cast<const uint32_t*>(
-                sa + r1 * I + p11 + lane_quad * 4);
+            const uint32_t a0 =
+                *reinterpret_cast<const uint32_t*>(sa + r0 * I + p00 + lane_quad * 4);
+            const uint32_t a1 =
+                *reinterpret_cast<const uint32_t*>(sa + r1 * I + p10 + lane_quad * 4);
+            const uint32_t a2 =
+                *reinterpret_cast<const uint32_t*>(sa + r0 * I + p01 + lane_quad * 4);
+            const uint32_t a3 =
+                *reinterpret_cast<const uint32_t*>(sa + r1 * I + p11 + lane_quad * 4);
             mma_f8(tmp, a0, a1, a2, a3, b0[kk], b1[kk]);
           }
           const int route0 = sroutes[r0];
           const int route1 = sroutes[r1];
-          const float scale0 =
-              route_scales[r0 * PREFILL_SCALE_STRIDE + kb] * swscale[kb];
-          const float scale1 =
-              route_scales[r1 * PREFILL_SCALE_STRIDE + kb] * swscale[kb];
+          const float scale0 = route_scales[r0 * PREFILL_SCALE_STRIDE + kb] * swscale[kb];
+          const float scale1 = route_scales[r1 * PREFILL_SCALE_STRIDE + kb] * swscale[kb];
           acc[mg][0] = fmaf(tmp[0], scale0, acc[mg][0]);
           acc[mg][1] = fmaf(tmp[1], scale0, acc[mg][1]);
           acc[mg][2] = fmaf(tmp[2], scale1, acc[mg][2]);
@@ -1530,14 +1378,14 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc2_kernel(
         const int col = n0 + lane_quad * 2;
         if (route0 >= 0) {
           const float rw = routing_weight[route0];
-          float2* dst = reinterpret_cast<float2*>(
-              accum_out + static_cast<int64_t>(route0 >> 3) * H + col);
+          float2* dst =
+              reinterpret_cast<float2*>(accum_out + static_cast<int64_t>(route0 >> 3) * H + col);
           atomicAdd(dst, make_float2(acc[mg][0] * rw, acc[mg][1] * rw));
         }
         if (route1 >= 0) {
           const float rw = routing_weight[route1];
-          float2* dst = reinterpret_cast<float2*>(
-              accum_out + static_cast<int64_t>(route1 >> 3) * H + col);
+          float2* dst =
+              reinterpret_cast<float2*>(accum_out + static_cast<int64_t>(route1 >> 3) * H + col);
           atomicAdd(dst, make_float2(acc[mg][2] * rw, acc[mg][3] * rw));
         }
       }
@@ -1552,23 +1400,14 @@ __global__ __launch_bounds__(PREFILL_THREADS, 1) void grouped_fc2_kernel(
 // partial is rescaled in FP32 before the next block is accumulated.
 template <int PM, int THREADS>
 __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
-    const __nv_bfloat16* __restrict__ zbf,
-    const __grid_constant__ CUtensorMap w2_map,
-    const float* __restrict__ w2s,
-    const float* __restrict__ routing_weight,
-    const int* __restrict__ sorted_routes,
-    const int* __restrict__ tile_expert,
-    const int* __restrict__ tile_base,
-    const int* __restrict__ tile_valid,
-    const int* __restrict__ total_tiles_ptr,
-    int* __restrict__ task_counter,
-    float* __restrict__ accum_out,
-    __nv_bfloat16* __restrict__ out,
-    int tokens) {
-  constexpr int PM_A_BYTES =
-      PM * BF16_FC2_A_STRIDE * sizeof(__nv_bfloat16);
-  constexpr int PM_A_ELEMS =
-      ((PM_A_BYTES + 1023) / 1024) * (1024 / sizeof(__nv_bfloat16));
+    const __nv_bfloat16* __restrict__ zbf, const __grid_constant__ CUtensorMap w2_map,
+    const float* __restrict__ w2s, const float* __restrict__ routing_weight,
+    const int* __restrict__ sorted_routes, const int* __restrict__ tile_expert,
+    const int* __restrict__ tile_base, const int* __restrict__ tile_valid,
+    const int* __restrict__ total_tiles_ptr, int* __restrict__ task_counter,
+    float* __restrict__ accum_out, __nv_bfloat16* __restrict__ out, int tokens) {
+  constexpr int PM_A_BYTES = PM * BF16_FC2_A_STRIDE * sizeof(__nv_bfloat16);
+  constexpr int PM_A_ELEMS = ((PM_A_BYTES + 1023) / 1024) * (1024 / sizeof(__nv_bfloat16));
   extern __shared__ __align__(1024) uint8_t storage[];
   __nv_bfloat16* as = reinterpret_cast<__nv_bfloat16*>(storage);
   uint8_t* raw_b = reinterpret_cast<uint8_t*>(as + PM_A_ELEMS);
@@ -1595,8 +1434,7 @@ __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
     const int base = tile_base[tile];
     const int valid = tile_valid[tile];
     if (tid < PM) {
-      int* route_slot = reinterpret_cast<int*>(
-          as + tid * BF16_FC2_A_STRIDE + I);
+      int* route_slot = reinterpret_cast<int*>(as + tid * BF16_FC2_A_STRIDE + I);
       *route_slot = tid < valid ? sorted_routes[base + tid] : -1;
     }
     __syncthreads();
@@ -1604,20 +1442,16 @@ __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
     if (tid == 0) {
       uint64_t* bar = bf16_fc2_barrier(as, 0);
       mbarrier_expect(bar, 64 * 256);
-      tma_load_2d(raw_b, &w2_map, 0,
-                  expert * H + (expert & 7) * 256, bar);
+      tma_load_2d(raw_b, &w2_map, 0, expert * H + (expert & 7) * 256, bar);
     }
 
-    for (int idx = tid * 8; idx < PM * I;
-         idx += THREADS * 8) {
+    for (int idx = tid * 8; idx < PM * I; idx += THREADS * 8) {
       const int row = idx / I;
       const int col = idx - row * I;
-      const int route = *reinterpret_cast<const int*>(
-          as + row * BF16_FC2_A_STRIDE + I);
+      const int route = *reinterpret_cast<const int*>(as + row * BF16_FC2_A_STRIDE + I);
       uint4 v = make_uint4(0, 0, 0, 0);
       if (route >= 0)
-        v = *reinterpret_cast<const uint4*>(
-            zbf + static_cast<int64_t>(route) * I + col);
+        v = *reinterpret_cast<const uint4*>(zbf + static_cast<int64_t>(route) * I + col);
       *reinterpret_cast<uint4*>(as + row * BF16_FC2_A_STRIDE + col) = v;
     }
     __syncthreads();
@@ -1638,29 +1472,24 @@ __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
           const int next = stage ^ 1;
           uint64_t* bar = bf16_fc2_barrier(as, next);
           mbarrier_expect(bar, 64 * 256);
-          tma_load_2d(raw_b + next * 64 * 256, &w2_map,
-                      (chunk + 1) * 64,
-                      expert * H + group * 256, bar);
+          tma_load_2d(raw_b + next * 64 * 256, &w2_map, (chunk + 1) * 64, expert * H + group * 256,
+                      bar);
         }
 
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
           const int kbase = chunk * 64;
           uint32_t af[4];
-          ldm_bf16_a4(af, as, BF16_FC2_A_STRIDE, wm * 16,
-                      kbase + ks * 16);
+          ldm_bf16_a4(af, as, BF16_FC2_A_STRIDE, wm * 16, kbase + ks * 16);
 #pragma unroll
           for (int sub = 0; sub < 8; ++sub) {
             const int nb = wn * 64 + sub * 8;
             const int nrow = nb + lane_group;
-            const int physical_col =
-                (ks ^ ((nrow >> 1) & 3)) * 16 + lane_quad * 2;
-            const uint8_t* bp = raw_b + stage * 64 * 256 +
-                                nrow * 64 + physical_col;
+            const int physical_col = (ks ^ ((nrow >> 1) & 3)) * 16 + lane_quad * 2;
+            const uint8_t* bp = raw_b + stage * 64 * 256 + nrow * 64 + physical_col;
             uint32_t bf[2];
             bf[0] = fp8x2_to_bf16x2(*reinterpret_cast<const uint16_t*>(bp));
-            bf[1] = fp8x2_to_bf16x2(
-                *reinterpret_cast<const uint16_t*>(bp + 8));
+            bf[1] = fp8x2_to_bf16x2(*reinterpret_cast<const uint16_t*>(bp + 8));
             mma_bf16(partial[sub], af, bf);
           }
         }
@@ -1668,14 +1497,12 @@ __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
         if (chunk == 7 && group_iter + 1 < 8 && tid == 0) {
           uint64_t* bar = bf16_fc2_barrier(as, 0);
           mbarrier_expect(bar, 64 * 256);
-          tma_load_2d(raw_b, &w2_map, 0,
-                      expert * H + ((group + 1) & 7) * 256, bar);
+          tma_load_2d(raw_b, &w2_map, 0, expert * H + ((group + 1) & 7) * 256, bar);
         }
 
         if (chunk & 1) {
           const float scale =
-              w2s[expert * 16 * 4 + (group * 2 + (wn >> 1)) * 4 +
-                   (chunk >> 1)] * FP8_UNSCALE;
+              w2s[expert * 16 * 4 + (group * 2 + (wn >> 1)) * 4 + (chunk >> 1)] * FP8_UNSCALE;
 #pragma unroll
           for (int sub = 0; sub < 8; ++sub) {
 #pragma unroll
@@ -1689,10 +1516,8 @@ __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
 
       const int row0 = wm * 16 + lane_group;
       const int row1 = row0 + 8;
-      const int route0 = *reinterpret_cast<const int*>(
-          as + row0 * BF16_FC2_A_STRIDE + I);
-      const int route1 = *reinterpret_cast<const int*>(
-          as + row1 * BF16_FC2_A_STRIDE + I);
+      const int route0 = *reinterpret_cast<const int*>(as + row0 * BF16_FC2_A_STRIDE + I);
+      const int route1 = *reinterpret_cast<const int*>(as + row1 * BF16_FC2_A_STRIDE + I);
       const float rw0 = route0 >= 0 ? routing_weight[route0] : 0.0f;
       const float rw1 = route1 >= 0 ? routing_weight[route1] : 0.0f;
 #pragma unroll
@@ -1704,15 +1529,13 @@ __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
         if ((lane_quad & 1) == 0) {
           const int col = group * 256 + wn * 64 + sub * 8 + lane_quad * 2;
           if (route0 >= 0)
-            atomicAdd(reinterpret_cast<float4*>(
-                          accum_out + static_cast<int64_t>(route0 >> 3) * H + col),
-                      make_float4(acc[sub][0] * rw0, acc[sub][1] * rw0,
-                                  r0x * rw0, r0y * rw0));
+            atomicAdd(
+                reinterpret_cast<float4*>(accum_out + static_cast<int64_t>(route0 >> 3) * H + col),
+                make_float4(acc[sub][0] * rw0, acc[sub][1] * rw0, r0x * rw0, r0y * rw0));
           if (route1 >= 0)
-            atomicAdd(reinterpret_cast<float4*>(
-                          accum_out + static_cast<int64_t>(route1 >> 3) * H + col),
-                      make_float4(acc[sub][2] * rw1, acc[sub][3] * rw1,
-                                  r1x * rw1, r1y * rw1));
+            atomicAdd(
+                reinterpret_cast<float4*>(accum_out + static_cast<int64_t>(route1 >> 3) * H + col),
+                make_float4(acc[sub][2] * rw1, acc[sub][3] * rw1, r1x * rw1, r1y * rw1));
         }
       }
     }
@@ -1738,10 +1561,9 @@ __global__ __launch_bounds__(THREADS, 1) void grouped_fc2_bf16_kernel(
   }
 }
 
-__global__ __launch_bounds__(512) void cast_output_kernel(
-    const float* __restrict__ accum_out,
-    __nv_bfloat16* __restrict__ out,
-    int tokens) {
+__global__ __launch_bounds__(512) void cast_output_kernel(const float* __restrict__ accum_out,
+                                                          __nv_bfloat16* __restrict__ out,
+                                                          int tokens) {
   const int token = blockIdx.x;
   if (token >= tokens) return;
   const int idx = token * (H / 4) + threadIdx.x;
@@ -1754,53 +1576,45 @@ __global__ __launch_bounds__(512) void cast_output_kernel(
   reinterpret_cast<uint2*>(out)[idx] = packed;
 }
 
-CUtensorMap make_u8_map(const uint8_t* base, uint64_t width,
-                        uint64_t height) {
+CUtensorMap make_u8_map(const uint8_t* base, uint64_t width, uint64_t height) {
   alignas(64) CUtensorMap map{};
   const cuuint64_t dims[2] = {width, height};
   const cuuint64_t strides[1] = {width};
   const cuuint32_t box[2] = {128, 128};
   const cuuint32_t elem_stride[2] = {1, 1};
   const CUresult status = cuTensorMapEncodeTiled(
-      &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-      const_cast<uint8_t*>(base), dims, strides, box, elem_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(base), dims, strides, box,
+      elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   (void)status;
   return map;
 }
 
-CUtensorMap make_u8_map64(const uint8_t* base, uint64_t width,
-                          uint64_t height) {
+CUtensorMap make_u8_map64(const uint8_t* base, uint64_t width, uint64_t height) {
   alignas(64) CUtensorMap map{};
   const cuuint64_t dims[2] = {width, height};
   const cuuint64_t strides[1] = {width};
   const cuuint32_t box[2] = {64, 128};
   const cuuint32_t elem_stride[2] = {1, 1};
   const CUresult status = cuTensorMapEncodeTiled(
-      &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-      const_cast<uint8_t*>(base), dims, strides, box, elem_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
-      CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(base), dims, strides, box,
+      elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   (void)status;
   return map;
 }
 
-CUtensorMap make_u8_map64x256(const uint8_t* base, uint64_t width,
-                              uint64_t height, bool promote_256b) {
+CUtensorMap make_u8_map64x256(const uint8_t* base, uint64_t width, uint64_t height,
+                              bool promote_256b) {
   alignas(64) CUtensorMap map{};
   const cuuint64_t dims[2] = {width, height};
   const cuuint64_t strides[1] = {width};
   const cuuint32_t box[2] = {64, 256};
   const cuuint32_t elem_stride[2] = {1, 1};
   const CUresult status = cuTensorMapEncodeTiled(
-      &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-      const_cast<uint8_t*>(base), dims, strides, box, elem_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
-      promote_256b ? CU_TENSOR_MAP_L2_PROMOTION_L2_256B
-                   : CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+      &map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<uint8_t*>(base), dims, strides, box,
+      elem_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_64B,
+      promote_256b ? CU_TENSOR_MAP_L2_PROMOTION_L2_256B : CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   (void)status;
   return map;
@@ -1823,18 +1637,13 @@ static void* get_scratch(size_t bytes) {
   return g_scratch;
 }
 
-void RunOurs(ffi::TensorView hidden_states,
-         ffi::TensorView w13,
-         ffi::TensorView w13_scale,
-         ffi::TensorView w2,
-         ffi::TensorView w2_scale,
-         ffi::TensorView topk_ids,
-         ffi::TensorView topk_weights,
-         ffi::TensorView out) {
+void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
+             ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
+             ffi::TensorView topk_weights, ffi::TensorView out) {
   const int tokens = static_cast<int>(hidden_states.size(0));
   const int routes = tokens * TOPK;
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, hidden_states.device().device_id));
+  cudaStream_t stream =
+      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, hidden_states.device().device_id));
   auto* xp = static_cast<const __nv_bfloat16*>(hidden_states.data_ptr());
   auto* w13p = static_cast<const uint8_t*>(w13.data_ptr());
   auto* w13sp = static_cast<const float*>(w13_scale.data_ptr());
@@ -1848,33 +1657,30 @@ void RunOurs(ffi::TensorView hidden_states,
   const size_t xs_bytes = static_cast<size_t>(tokens) * 16 * sizeof(float);
   const size_t zq_bytes = static_cast<size_t>(routes) * I;
   const size_t zs_bytes = static_cast<size_t>(routes) * 4 * sizeof(float);
-  const size_t zbf_bytes =
-      static_cast<size_t>(routes) * I * sizeof(__nv_bfloat16);
+  const size_t zbf_bytes = static_cast<size_t>(routes) * I * sizeof(__nv_bfloat16);
 
   if (tokens <= 64) {
     const size_t zf_bytes = static_cast<size_t>(routes) * I * sizeof(float);
-    uint8_t* scratch = static_cast<uint8_t*>(get_scratch(
-        xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8));
+    uint8_t* scratch = static_cast<uint8_t*>(
+        get_scratch(xq_bytes + xs_bytes + zf_bytes + zq_bytes + zs_bytes + 8));
     uint8_t* xq = scratch;
     float* xs = reinterpret_cast<float*>(xq + xq_bytes);
     float* zfloat = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(xs) + xs_bytes);
     uint8_t* zq = reinterpret_cast<uint8_t*>(zfloat) + zf_bytes;
     float* zs = reinterpret_cast<float*>(zq + zq_bytes);
     int* barriers = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(zs) + zs_bytes);
-    const int blocks = tokens == 1 ? 175 : (tokens <= 4 ? 128 :
-                       (tokens <= 16 ? 160 : 175));
+    const int blocks = tokens == 1 ? 175 : (tokens <= 4 ? 128 : (tokens <= 16 ? 160 : 175));
     const int threads = 256;
     int token_arg = tokens;
-    void* args[] = {&xp, &w13p, &w13sp, &w2p, &w2sp, &idp, &rwp, &outp,
-                    &xq, &xs, &zfloat, &zq, &zs, &barriers, &token_arg};
-    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(fused_decode_kernel),
-                                dim3(blocks), dim3(threads), args, 0, stream);
+    void* args[] = {&xp, &w13p, &w13sp,  &w2p, &w2sp, &idp,      &rwp,      &outp,
+                    &xq, &xs,   &zfloat, &zq,  &zs,   &barriers, &token_arg};
+    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(fused_decode_kernel), dim3(blocks),
+                                dim3(threads), args, 0, stream);
     return;
   }
 
   const CUtensorMap w13_map = make_u8_map(w13p, H, 256ull * (2 * I));
-  const CUtensorMap w2_map =
-      make_u8_map64x256(w2p, I, 256ull * H, tokens >= 4096);
+  const CUtensorMap w2_map = make_u8_map64x256(w2p, I, 256ull * H, tokens >= 4096);
   void* w2_map_arg = const_cast<CUtensorMap*>(&w2_map);
 
   const size_t accum_out_bytes = static_cast<size_t>(tokens) * H * sizeof(float);
@@ -1883,195 +1689,173 @@ void RunOurs(ffi::TensorView hidden_states,
   const int tile_m = use_m48 ? PREFILL_M48 : PREFILL_M;
   const int max_tiles = (routes + tile_m - 1) / tile_m + 256;
   const int max_tiles96 = use_m96 ? (routes + PREFILL_M96 - 1) / PREFILL_M96 + 256 : 0;
-  const size_t metadata_bytes =
-      256 * sizeof(int) + 257 * sizeof(int) + 256 * sizeof(int) +
-      static_cast<size_t>(routes) * sizeof(int) +
-      static_cast<size_t>(max_tiles) * 3 * sizeof(int) + 2 * sizeof(int) +
-      static_cast<size_t>(max_tiles96) * 3 * sizeof(int) +
-      (use_m96 ? sizeof(int) : 0) + 256;
-  const size_t scratch_bytes = xq_bytes + xs_bytes + zbf_bytes +
-                               accum_out_bytes + metadata_bytes +
-                               static_cast<size_t>(routes) * sizeof(float) +
-                               256;
+  const size_t metadata_bytes = 256 * sizeof(int) + 257 * sizeof(int) + 256 * sizeof(int) +
+                                static_cast<size_t>(routes) * sizeof(int) +
+                                static_cast<size_t>(max_tiles) * 3 * sizeof(int) + 2 * sizeof(int) +
+                                static_cast<size_t>(max_tiles96) * 3 * sizeof(int) +
+                                (use_m96 ? sizeof(int) : 0) + 256;
+  const size_t scratch_bytes = xq_bytes + xs_bytes + zbf_bytes + accum_out_bytes + metadata_bytes +
+                               static_cast<size_t>(routes) * sizeof(float) + 256;
   uint8_t* scratch = static_cast<uint8_t*>(get_scratch(scratch_bytes));
   uint8_t* ptr = scratch;
-  uint8_t* xq = ptr; ptr += xq_bytes;
-  float* xs = reinterpret_cast<float*>(ptr); ptr += xs_bytes;
+  uint8_t* xq = ptr;
+  ptr += xq_bytes;
+  float* xs = reinterpret_cast<float*>(ptr);
+  ptr += xs_bytes;
   __nv_bfloat16* zbf = reinterpret_cast<__nv_bfloat16*>(ptr);
   ptr += zbf_bytes;
-  float* accum_out = reinterpret_cast<float*>(ptr); ptr += accum_out_bytes;
+  float* accum_out = reinterpret_cast<float*>(ptr);
+  ptr += accum_out_bytes;
   uintptr_t aligned = (reinterpret_cast<uintptr_t>(ptr) + 255u) & ~uintptr_t(255u);
   ptr = reinterpret_cast<uint8_t*>(aligned);
-  int* counts = reinterpret_cast<int*>(ptr); ptr += 256 * sizeof(int);
-  int* starts = reinterpret_cast<int*>(ptr); ptr += 257 * sizeof(int);
-  int* cursors = reinterpret_cast<int*>(ptr); ptr += 256 * sizeof(int);
-  int* sorted_routes = reinterpret_cast<int*>(ptr); ptr += static_cast<size_t>(routes) * sizeof(int);
-  int* tile_expert = reinterpret_cast<int*>(ptr); ptr += static_cast<size_t>(max_tiles) * sizeof(int);
-  int* tile_base = reinterpret_cast<int*>(ptr); ptr += static_cast<size_t>(max_tiles) * sizeof(int);
-  int* tile_valid = reinterpret_cast<int*>(ptr); ptr += static_cast<size_t>(max_tiles) * sizeof(int);
-  int* total_tiles = reinterpret_cast<int*>(ptr); ptr += sizeof(int);
-  int* fc2_counter = reinterpret_cast<int*>(ptr); ptr += sizeof(int);
-  int* tile96_expert = reinterpret_cast<int*>(ptr); ptr += static_cast<size_t>(max_tiles96) * sizeof(int);
-  int* tile96_base = reinterpret_cast<int*>(ptr); ptr += static_cast<size_t>(max_tiles96) * sizeof(int);
-  int* tile96_valid = reinterpret_cast<int*>(ptr); ptr += static_cast<size_t>(max_tiles96) * sizeof(int);
+  int* counts = reinterpret_cast<int*>(ptr);
+  ptr += 256 * sizeof(int);
+  int* starts = reinterpret_cast<int*>(ptr);
+  ptr += 257 * sizeof(int);
+  int* cursors = reinterpret_cast<int*>(ptr);
+  ptr += 256 * sizeof(int);
+  int* sorted_routes = reinterpret_cast<int*>(ptr);
+  ptr += static_cast<size_t>(routes) * sizeof(int);
+  int* tile_expert = reinterpret_cast<int*>(ptr);
+  ptr += static_cast<size_t>(max_tiles) * sizeof(int);
+  int* tile_base = reinterpret_cast<int*>(ptr);
+  ptr += static_cast<size_t>(max_tiles) * sizeof(int);
+  int* tile_valid = reinterpret_cast<int*>(ptr);
+  ptr += static_cast<size_t>(max_tiles) * sizeof(int);
+  int* total_tiles = reinterpret_cast<int*>(ptr);
+  ptr += sizeof(int);
+  int* fc2_counter = reinterpret_cast<int*>(ptr);
+  ptr += sizeof(int);
+  int* tile96_expert = reinterpret_cast<int*>(ptr);
+  ptr += static_cast<size_t>(max_tiles96) * sizeof(int);
+  int* tile96_base = reinterpret_cast<int*>(ptr);
+  ptr += static_cast<size_t>(max_tiles96) * sizeof(int);
+  int* tile96_valid = reinterpret_cast<int*>(ptr);
+  ptr += static_cast<size_t>(max_tiles96) * sizeof(int);
   int* total_tiles96 = use_m96 ? reinterpret_cast<int*>(ptr) : nullptr;
   ptr += use_m96 ? sizeof(int) : 0;
-  float* rw_safe = reinterpret_cast<float*>(
-      (reinterpret_cast<uintptr_t>(ptr) + 255u) & ~uintptr_t(255u));
+  float* rw_safe =
+      reinterpret_cast<float*>((reinterpret_cast<uintptr_t>(ptr) + 255u) & ~uintptr_t(255u));
   const float* rwp_in = rwp;
   if (tokens < 256) {
     int sanitize_blocks = (routes + 255) / 256;
     if (sanitize_blocks > 256) sanitize_blocks = 256;
-    sanitize_routing_weights_kernel<<<sanitize_blocks, 256, 0, stream>>>(
-        idp, rwp_in, rw_safe, routes);
+    sanitize_routing_weights_kernel<<<sanitize_blocks, 256, 0, stream>>>(idp, rwp_in, rw_safe,
+                                                                         routes);
     rwp = rw_safe;
   }
 
   int token_arg = tokens;
   if (tokens >= 256) {
     if (tokens == 256) {
-      void* hist_fused_args[] = {
-          &xp,          &idp,           &xq,          &xs,
-          &counts,      &rwp_in,        &rw_safe,     &starts,
-          &cursors,     &sorted_routes, &tile_expert, &tile_base,
-          &tile_valid,  &total_tiles,   &fc2_counter, &token_arg};
-      cudaLaunchCooperativeKernel(
-          reinterpret_cast<void*>(prepare_hist_quant_m48_fused_kernel),
-          dim3(96), dim3(1024), hist_fused_args, 0, stream);
+      void* hist_fused_args[] = {&xp,         &idp,           &xq,          &xs,
+                                 &counts,     &rwp_in,        &rw_safe,     &starts,
+                                 &cursors,    &sorted_routes, &tile_expert, &tile_base,
+                                 &tile_valid, &total_tiles,   &fc2_counter, &token_arg};
+      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_hist_quant_m48_fused_kernel),
+                                  dim3(96), dim3(1024), hist_fused_args, 0, stream);
     } else {
-      void* hist_args[] = {&xp, &idp, &xq, &xs, &counts,
-                           &rwp_in, &rw_safe, &token_arg};
-      cudaLaunchCooperativeKernel(
-          reinterpret_cast<void*>(prepare_hist_quant_kernel),
-          dim3(188), dim3(1024), hist_args, 0, stream);
+      void* hist_args[] = {&xp, &idp, &xq, &xs, &counts, &rwp_in, &rw_safe, &token_arg};
+      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_hist_quant_kernel), dim3(188),
+                                  dim3(1024), hist_args, 0, stream);
     }
     rwp = rw_safe;
     void* route_args[] = {
-        &idp,         &counts,       &starts,       &cursors,
-        &sorted_routes, &tile_expert, &tile_base,    &tile_valid,
-        &total_tiles, &fc2_counter,  const_cast<int*>(&routes)};
+        &idp,       &counts,     &starts,      &cursors,     &sorted_routes,           &tile_expert,
+        &tile_base, &tile_valid, &total_tiles, &fc2_counter, const_cast<int*>(&routes)};
     if (use_m96) {
-      void* route96_args[] = {
-          &idp,           &counts,        &starts,        &cursors,
-          &sorted_routes, &tile96_expert, &tile96_base,   &tile96_valid,
-          &total_tiles96, &fc2_counter,   const_cast<int*>(&routes)};
+      void* route96_args[] = {&idp,
+                              &counts,
+                              &starts,
+                              &cursors,
+                              &sorted_routes,
+                              &tile96_expert,
+                              &tile96_base,
+                              &tile96_valid,
+                              &total_tiles96,
+                              &fc2_counter,
+                              const_cast<int*>(&routes)};
       cudaLaunchCooperativeKernel(
-          reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M96>),
-          dim3(94), dim3(256), route96_args, 0, stream);
-      prepare_prefix_kernel<<<1, 256, 0, stream>>>(
-          counts, starts, cursors, tile_expert, tile_base, tile_valid,
-          total_tiles, fc2_counter);
+          reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M96>), dim3(94), dim3(256),
+          route96_args, 0, stream);
+      prepare_prefix_kernel<<<1, 256, 0, stream>>>(counts, starts, cursors, tile_expert, tile_base,
+                                                   tile_valid, total_tiles, fc2_counter);
     } else if (use_m48) {
       if (tokens != 256) {
         // Eight warps per CTA scatter 256 routes. Use exactly one wave over
         // the route list instead of sending idle CTAs through the grid barrier.
         const int route_blocks = tokens / 32;
         cudaLaunchCooperativeKernel(
-            reinterpret_cast<void*>(
-                prepare_prefix_scatter_kernel<PREFILL_M48>),
-            dim3(route_blocks), dim3(256), route_args, 0, stream);
+            reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M48>), dim3(route_blocks),
+            dim3(256), route_args, 0, stream);
       }
     } else {
-      cudaLaunchCooperativeKernel(
-          reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M>),
-          dim3(94), dim3(256), route_args, 0, stream);
+      cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefix_scatter_kernel<PREFILL_M>),
+                                  dim3(94), dim3(256), route_args, 0, stream);
     }
   } else {
-    void* prep_args[] = {&xp, &idp, &xq, &xs, &counts, &starts, &cursors,
-                         &sorted_routes, &tile_expert, &tile_base, &tile_valid,
-                         &total_tiles, &fc2_counter, &accum_out, &token_arg};
-    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefill_kernel),
-                                dim3(188), dim3(1024), prep_args, 0, stream);
+    void* prep_args[] = {&xp,          &idp,       &xq,         &xs,
+                         &counts,      &starts,    &cursors,    &sorted_routes,
+                         &tile_expert, &tile_base, &tile_valid, &total_tiles,
+                         &fc2_counter, &accum_out, &token_arg};
+    cudaLaunchCooperativeKernel(reinterpret_cast<void*>(prepare_prefill_kernel), dim3(188),
+                                dim3(1024), prep_args, 0, stream);
   }
 
   if (use_m96) {
     static bool m96_attrs_set = false;
     if (!m96_attrs_set) {
       cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M96>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           PREFILL_M96_SMEM);
-      cudaFuncSetAttribute(
-          grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_M96_SMEM);
+      cudaFuncSetAttribute(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
       m96_attrs_set = true;
     }
-    grouped_fc1_kernel<PREFILL_M96>
-        <<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_M96_SMEM, stream>>>(
-            xq, xs, w13_map, w13sp, sorted_routes, tile96_expert, tile96_base,
-            tile96_valid, total_tiles96, zbf, accum_out, tokens);
-    void* fc2_args[] = {
-        &zbf,         w2_map_arg,    &w2sp,        &rwp,
-        &sorted_routes, &tile_expert, &tile_base,   &tile_valid,
-        &total_tiles, &fc2_counter,  &accum_out,   &outp,
-        &token_arg};
+    grouped_fc1_kernel<PREFILL_M96><<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_M96_SMEM, stream>>>(
+        xq, xs, w13_map, w13sp, sorted_routes, tile96_expert, tile96_base, tile96_valid,
+        total_tiles96, zbf, accum_out, tokens);
+    void* fc2_args[] = {&zbf,         w2_map_arg, &w2sp,       &rwp,         &sorted_routes,
+                        &tile_expert, &tile_base, &tile_valid, &total_tiles, &fc2_counter,
+                        &accum_out,   &outp,      &token_arg};
     cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(
-            grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>),
-        dim3(PREFILL_BLOCKS), dim3(BF16_FC2_THREADS), fc2_args,
-        BF16_FC2_SMEM, stream);
+        reinterpret_cast<void*>(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>),
+        dim3(PREFILL_BLOCKS), dim3(BF16_FC2_THREADS), fc2_args, BF16_FC2_SMEM, stream);
   } else if (use_m48) {
     static bool m48_attrs_set = false;
     if (!m48_attrs_set) {
       cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M48>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           PREFILL_M48_SMEM);
-      cudaFuncSetAttribute(
-          grouped_fc2_bf16_kernel<PREFILL_M48, BF16_FC2_M48_THREADS>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_M48_SMEM);
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_M48_SMEM);
+      cudaFuncSetAttribute(grouped_fc2_bf16_kernel<PREFILL_M48, BF16_FC2_M48_THREADS>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_M48_SMEM);
       m48_attrs_set = true;
     }
     const int m48_blocks = tokens == 256 ? 175 : PREFILL_BLOCKS;
-    grouped_fc1_kernel<PREFILL_M48>
-        <<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_M48_SMEM, stream>>>(
-            xq, xs, w13_map, w13sp, sorted_routes, tile_expert, tile_base,
-            tile_valid, total_tiles, zbf, accum_out, tokens);
-    void* fc2_args[] = {
-        &zbf,         w2_map_arg,    &w2sp,        &rwp,
-        &sorted_routes, &tile_expert, &tile_base,   &tile_valid,
-        &total_tiles, &fc2_counter,  &accum_out,   &outp,
-        &token_arg};
+    grouped_fc1_kernel<PREFILL_M48><<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_M48_SMEM, stream>>>(
+        xq, xs, w13_map, w13sp, sorted_routes, tile_expert, tile_base, tile_valid, total_tiles, zbf,
+        accum_out, tokens);
+    void* fc2_args[] = {&zbf,         w2_map_arg, &w2sp,       &rwp,         &sorted_routes,
+                        &tile_expert, &tile_base, &tile_valid, &total_tiles, &fc2_counter,
+                        &accum_out,   &outp,      &token_arg};
     cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(
-            grouped_fc2_bf16_kernel<PREFILL_M48, BF16_FC2_M48_THREADS>),
-        dim3(m48_blocks),
-        dim3(BF16_FC2_M48_THREADS), fc2_args,
-        BF16_FC2_M48_SMEM, stream);
+        reinterpret_cast<void*>(grouped_fc2_bf16_kernel<PREFILL_M48, BF16_FC2_M48_THREADS>),
+        dim3(m48_blocks), dim3(BF16_FC2_M48_THREADS), fc2_args, BF16_FC2_M48_SMEM, stream);
   } else {
     static bool m64_attrs_set = false;
     if (!m64_attrs_set) {
       cudaFuncSetAttribute(grouped_fc1_kernel<PREFILL_M>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           PREFILL_SMEM);
-      cudaFuncSetAttribute(
-          grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM);
+      cudaFuncSetAttribute(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, BF16_FC2_SMEM);
       m64_attrs_set = true;
     }
-    grouped_fc1_kernel<PREFILL_M>
-        <<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_SMEM, stream>>>(
-            xq, xs, w13_map, w13sp, sorted_routes, tile_expert, tile_base,
-            tile_valid, total_tiles, zbf, accum_out, tokens);
-    void* fc2_args[] = {
-        &zbf,         w2_map_arg,    &w2sp,        &rwp,
-        &sorted_routes, &tile_expert, &tile_base,   &tile_valid,
-        &total_tiles, &fc2_counter,  &accum_out,   &outp,
-        &token_arg};
+    grouped_fc1_kernel<PREFILL_M><<<PREFILL_BLOCKS, PREFILL_THREADS, PREFILL_SMEM, stream>>>(
+        xq, xs, w13_map, w13sp, sorted_routes, tile_expert, tile_base, tile_valid, total_tiles, zbf,
+        accum_out, tokens);
+    void* fc2_args[] = {&zbf,         w2_map_arg, &w2sp,       &rwp,         &sorted_routes,
+                        &tile_expert, &tile_base, &tile_valid, &total_tiles, &fc2_counter,
+                        &accum_out,   &outp,      &token_arg};
     cudaLaunchCooperativeKernel(
-        reinterpret_cast<void*>(
-            grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>),
-        dim3(PREFILL_BLOCKS), dim3(BF16_FC2_THREADS), fc2_args,
-        BF16_FC2_SMEM, stream);
+        reinterpret_cast<void*>(grouped_fc2_bf16_kernel<PREFILL_M, BF16_FC2_THREADS>),
+        dim3(PREFILL_BLOCKS), dim3(BF16_FC2_THREADS), fc2_args, BF16_FC2_SMEM, stream);
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-

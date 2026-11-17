@@ -11,28 +11,24 @@
 // mma A-fragments are then gathered from smem.  Reading only 64 B per row
 // directly into registers costs ~1/3 of DRAM bandwidth on this part.
 
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <stdint.h>
-#include <tvm/ffi/tvm_ffi.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/tvm_ffi.h>
 
 namespace ffi = tvm::ffi;
 
-void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13,
-             ffi::TensorView w13_scale, ffi::TensorView w2,
-             ffi::TensorView w2_scale, ffi::TensorView topk_ids,
+void RunOurs(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
+             ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
              ffi::TensorView topk_weights, ffi::TensorView out);
-void RunOursFlat(ffi::TensorView hidden_states, ffi::TensorView w13,
-                 ffi::TensorView w13_scale, ffi::TensorView w2,
-                 ffi::TensorView w2_scale, ffi::TensorView topk_ids,
+void RunOursFlat(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
+                 ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
                  ffi::TensorView topk_weights, ffi::TensorView out);
-void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13,
-             ffi::TensorView w13_scale, ffi::TensorView w2,
-             ffi::TensorView w2_scale, ffi::TensorView topk_ids,
-             ffi::TensorView topk_weights, ffi::TensorView out,
-             cudaStream_t stream);
+void RunGemv(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
+             ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
+             ffi::TensorView topk_weights, ffi::TensorView out, cudaStream_t stream);
 
 #define H_DIM 2048
 #define I_DIM 512
@@ -52,7 +48,7 @@ __device__ __forceinline__ uint32_t cvt_e4m3x2_to_f16x2(uint32_t v16) {
   return r;
 }
 
-__device__ __forceinline__ void unpack16(const uint4 &w, uint32_t h[8]) {
+__device__ __forceinline__ void unpack16(const uint4& w, uint32_t h[8]) {
   h[0] = cvt_e4m3x2_to_f16x2(w.x & 0xffffu);
   h[1] = cvt_e4m3x2_to_f16x2(w.x >> 16);
   h[2] = cvt_e4m3x2_to_f16x2(w.y & 0xffffu);
@@ -63,9 +59,8 @@ __device__ __forceinline__ void unpack16(const uint4 &w, uint32_t h[8]) {
   h[7] = cvt_e4m3x2_to_f16x2(w.w >> 16);
 }
 
-__device__ __forceinline__ void mma16816(float d[4], uint32_t a0, uint32_t a1,
-                                         uint32_t a2, uint32_t a3, uint32_t b0,
-                                         uint32_t b1) {
+__device__ __forceinline__ void mma16816(float d[4], uint32_t a0, uint32_t a1, uint32_t a2,
+                                         uint32_t a3, uint32_t b0, uint32_t b1) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
       "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
@@ -73,27 +68,29 @@ __device__ __forceinline__ void mma16816(float d[4], uint32_t a0, uint32_t a1,
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ void tile64(float acc[4], const uint4 &w0,
-                                       const uint4 &w1, const uint4 &x0,
-                                       const uint4 &x1) {
+__device__ __forceinline__ void tile64(float acc[4], const uint4& w0, const uint4& w1,
+                                       const uint4& x0, const uint4& x1) {
   uint32_t h0[8], h1[8], xq[8];
   unpack16(w0, h0);
   unpack16(w1, h1);
-  xq[0] = x0.x; xq[1] = x0.y; xq[2] = x0.z; xq[3] = x0.w;
-  xq[4] = x1.x; xq[5] = x1.y; xq[6] = x1.z; xq[7] = x1.w;
+  xq[0] = x0.x;
+  xq[1] = x0.y;
+  xq[2] = x0.z;
+  xq[3] = x0.w;
+  xq[4] = x1.x;
+  xq[5] = x1.y;
+  xq[6] = x1.z;
+  xq[7] = x1.w;
 #pragma unroll
   for (int s = 0; s < 4; ++s)
-    mma16816(acc, h0[2 * s], h1[2 * s], h0[2 * s + 1], h1[2 * s + 1], xq[2 * s],
-             xq[2 * s + 1]);
+    mma16816(acc, h0[2 * s], h1[2 * s], h0[2 * s + 1], h1[2 * s + 1], xq[2 * s], xq[2 * s + 1]);
 }
 
-__device__ __forceinline__ void cp_async16(void *dst, const void *src) {
+__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
   unsigned s = (unsigned)__cvta_generic_to_shared(dst);
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src));
 }
-__device__ __forceinline__ void cp_commit() {
-  asm volatile("cp.async.commit_group;\n" ::);
-}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
 __device__ __forceinline__ void cp_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
@@ -103,7 +100,7 @@ __device__ __forceinline__ float silu_mul(float g, float u) {
   return g * __frcp_rn(1.f + __expf(-g)) * u;
 }
 
-__device__ __forceinline__ int blk_escan(int v, int *sw, int tid) {
+__device__ __forceinline__ int blk_escan(int v, int* sw, int tid) {
   const int lane = tid & 31, warp = tid >> 5;
   int x = v;
 #pragma unroll
@@ -126,15 +123,12 @@ __device__ __forceinline__ int blk_escan(int v, int *sw, int tid) {
   return ((warp > 0) ? sw[warp - 1] : 0) + x - v;
 }
 
-
 // In-block deterministic tile routing for the decode path (P <= 1024).
 // Fills s_pair[0..n-1] with the pair indices of tile `tileIdx`; returns false
 // when the tile is empty.  All blocks derive the same assignment because the
 // pair order inside an expert is the natural topk_ids order.
-__device__ __forceinline__ bool route_tile(const int *__restrict__ topk_ids,
-                                           int P, int tileIdx, int tid,
-                                           int *cnt, int *sw, int *sh,
-                                           int *s_pair) {
+__device__ __forceinline__ bool route_tile(const int* __restrict__ topk_ids, int P, int tileIdx,
+                                           int tid, int* cnt, int* sw, int* sh, int* s_pair) {
   cnt[tid] = 0;
   if (tid == 0) sh[0] = -1;
   __syncthreads();
@@ -171,8 +165,7 @@ __device__ __forceinline__ bool route_tile(const int *__restrict__ topk_ids,
   return true;
 }
 
-
-__device__ __forceinline__ void grid_barrier(unsigned *bar, unsigned G) {
+__device__ __forceinline__ void grid_barrier(unsigned* bar, unsigned G) {
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();
@@ -199,30 +192,29 @@ __device__ __forceinline__ float2 p_bf2f(uint32_t v) {
   return r;
 }
 
-__device__ __forceinline__ uint4 p_ld_inter_l1_evict_last(const void *ptr) {
+__device__ __forceinline__ uint4 p_ld_inter_l1_evict_last(const void* ptr) {
   uint4 v;
-  asm volatile(
-      "ld.global.L1::evict_last.v4.b32 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-      : "l"(ptr)
-      : "memory");
+  asm volatile("ld.global.L1::evict_last.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+               : "l"(ptr)
+               : "memory");
   return v;
 }
 
-__device__ __forceinline__ void p_cvt_fp8x4(uint32_t v, float *o) {
+__device__ __forceinline__ void p_cvt_fp8x4(uint32_t v, float* o) {
   uint32_t b01, b23;
-  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(b01)
-      : "h"(static_cast<unsigned short>(v)));
-  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(b23)
-      : "h"(static_cast<unsigned short>(v >> 16)));
+  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(b01) : "h"(static_cast<unsigned short>(v)));
+  asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(b23) : "h"(static_cast<unsigned short>(v >> 16)));
   const float2 f01 = p_bf2f(b01);
   const float2 f23 = p_bf2f(b23);
-  o[0] = f01.x; o[1] = f01.y; o[2] = f23.x; o[3] = f23.y;
+  o[0] = f01.x;
+  o[1] = f01.y;
+  o[2] = f23.x;
+  o[3] = f23.y;
 }
 
-__device__ __forceinline__ float p_dot16(const uint4 &w,
-                                          const float *__restrict__ x) {
-  const uint32_t *wu = reinterpret_cast<const uint32_t *>(&w);
+__device__ __forceinline__ float p_dot16(const uint4& w, const float* __restrict__ x) {
+  const uint32_t* wu = reinterpret_cast<const uint32_t*>(&w);
   float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
   float v[4];
 #pragma unroll
@@ -236,10 +228,10 @@ __device__ __forceinline__ float p_dot16(const uint4 &w,
   return (a0 + a1) + (a2 + a3);
 }
 
-__device__ __forceinline__ float2 p_dot16_pair(
-    const uint4 &wa, const uint4 &wb, const float *__restrict__ x) {
-  const uint32_t *au = reinterpret_cast<const uint32_t *>(&wa);
-  const uint32_t *bu = reinterpret_cast<const uint32_t *>(&wb);
+__device__ __forceinline__ float2 p_dot16_pair(const uint4& wa, const uint4& wb,
+                                               const float* __restrict__ x) {
+  const uint32_t* au = reinterpret_cast<const uint32_t*>(&wa);
+  const uint32_t* bu = reinterpret_cast<const uint32_t*>(&wb);
   float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
   float b0 = 0.f, b1 = 0.f, b2 = 0.f, b3 = 0.f;
   float av[4], bv[4];
@@ -256,8 +248,7 @@ __device__ __forceinline__ float2 p_dot16_pair(
     a3 = fmaf(av[3], x[4 * i + 3], a3);
     b3 = fmaf(bv[3], x[4 * i + 3], b3);
   }
-  return make_float2((a0 + a1) + (a2 + a3),
-                     (b0 + b1) + (b2 + b3));
+  return make_float2((a0 + a1) + (a2 + a3), (b0 + b1) + (b2 + b3));
 }
 
 __device__ __forceinline__ float p_warp_sum(float v) {
@@ -291,13 +282,12 @@ __device__ __forceinline__ void p_t16_release_barrier() {
   __syncthreads();
   if (threadIdx.x == 0) {
     __threadfence();
-    const unsigned generation =
-        *reinterpret_cast<volatile unsigned *>(&p_t16_bar_generation);
+    const unsigned generation = *reinterpret_cast<volatile unsigned*>(&p_t16_bar_generation);
     if (atomicAdd(&p_t16_bar_count, 1u) == gridDim.x - 1u) {
       atomicAdd(&p_t16_bar_generation, 1u);
       atomicExch(&p_t16_bar_count, 0u);
     } else {
-      volatile unsigned *observed = &p_t16_bar_generation;
+      volatile unsigned* observed = &p_t16_bar_generation;
       int spin = 0;
       while (*observed == generation) {
         if (++spin > 4) __nanosleep(192);
@@ -314,13 +304,17 @@ __device__ __forceinline__ void p_t4_token_barrier(int token) {
     unsigned* counter = &p_t4_bar_count[token * 8];
     unsigned old;
     asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;\n"
-                 : "=r"(old) : "l"(counter) : "memory");
+                 : "=r"(old)
+                 : "l"(counter)
+                 : "memory");
     const unsigned target = (old / ARRIVALS + 1u) * ARRIVALS;
     if (old + 1u != target) {
       unsigned observed;
       do {
         asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n"
-                     : "=r"(observed) : "l"(counter) : "memory");
+                     : "=r"(observed)
+                     : "l"(counter)
+                     : "memory");
         if (observed < target) __nanosleep(32);
       } while (observed < target);
     }
@@ -328,20 +322,23 @@ __device__ __forceinline__ void p_t4_token_barrier(int token) {
   __syncthreads();
 }
 
-__device__ __forceinline__ void p_t16_token_barrier(int token,
-                                                     unsigned arrivals) {
+__device__ __forceinline__ void p_t16_token_barrier(int token, unsigned arrivals) {
   __syncthreads();
   if (threadIdx.x == 0) {
-    unsigned *counter = &p_t16_token_bar_count[token * 8];
+    unsigned* counter = &p_t16_token_bar_count[token * 8];
     unsigned old;
     asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;\n"
-                 : "=r"(old) : "l"(counter) : "memory");
+                 : "=r"(old)
+                 : "l"(counter)
+                 : "memory");
     const unsigned target = (old / arrivals + 1u) * arrivals;
     if (old + 1u != target) {
       unsigned observed;
       do {
         asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n"
-                     : "=r"(observed) : "l"(counter) : "memory");
+                     : "=r"(observed)
+                     : "l"(counter)
+                     : "memory");
         if (observed < target) __nanosleep(32);
       } while (observed < target);
     }
@@ -349,8 +346,7 @@ __device__ __forceinline__ void p_t16_token_barrier(int token,
   __syncthreads();
 }
 
-__device__ __forceinline__ void p_t16_dependency_barrier(int token0,
-                                                          int token1) {
+__device__ __forceinline__ void p_t16_dependency_barrier(int token0, int token1) {
   __syncthreads();
   if (threadIdx.x == 0) {
     unsigned targets[2], old[2];
@@ -359,11 +355,12 @@ __device__ __forceinline__ void p_t16_dependency_barrier(int token0,
     for (int i = 0; i < 2; ++i) {
       if (i < nt) {
         const int token = i == 0 ? token0 : token1;
-        const unsigned arrivals =
-            (token == 0 || (token & 3) == 3) ? 12u : 13u;
-        unsigned *counter = &p_t16_dep_bar_count[token * 8];
+        const unsigned arrivals = (token == 0 || (token & 3) == 3) ? 12u : 13u;
+        unsigned* counter = &p_t16_dep_bar_count[token * 8];
         asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;\n"
-                     : "=r"(old[i]) : "l"(counter) : "memory");
+                     : "=r"(old[i])
+                     : "l"(counter)
+                     : "memory");
         targets[i] = (old[i] / arrivals + 1u) * arrivals;
       }
     }
@@ -371,11 +368,13 @@ __device__ __forceinline__ void p_t16_dependency_barrier(int token0,
     for (int i = 0; i < 2; ++i) {
       if (i < nt && old[i] + 1u != targets[i]) {
         const int token = i == 0 ? token0 : token1;
-        const unsigned *counter = &p_t16_dep_bar_count[token * 8];
+        const unsigned* counter = &p_t16_dep_bar_count[token * 8];
         unsigned observed;
         do {
           asm volatile("ld.acquire.gpu.global.u32 %0, [%1];\n"
-                       : "=r"(observed) : "l"(counter) : "memory");
+                       : "=r"(observed)
+                       : "l"(counter)
+                       : "memory");
           if (observed < targets[i]) __nanosleep(32);
         } while (observed < targets[i]);
       }
@@ -385,13 +384,11 @@ __device__ __forceinline__ void p_t16_dependency_barrier(int token0,
 }
 
 template <int NWARP, int TOKEN_LOCAL = 0, bool T4_PAIR_CLUSTER = false>
-__global__ __launch_bounds__(NWARP * 32, NWARP == 13 ? 2 : 1)
-void k_persistent_decode(
-    const __nv_bfloat16 *__restrict__ x, const uint8_t *__restrict__ w13,
-    const float *__restrict__ w13s, const uint8_t *__restrict__ w2,
-    const float *__restrict__ w2s, const int *__restrict__ ids,
-    const float *__restrict__ tws, __nv_bfloat16 *__restrict__ out, int T,
-    int q1, int r1, int q2, int r2) {
+__global__ __launch_bounds__(NWARP * 32, NWARP == 13 ? 2 : 1) void k_persistent_decode(
+    const __nv_bfloat16* __restrict__ x, const uint8_t* __restrict__ w13,
+    const float* __restrict__ w13s, const uint8_t* __restrict__ w2, const float* __restrict__ w2s,
+    const int* __restrict__ ids, const float* __restrict__ tws, __nv_bfloat16* __restrict__ out,
+    int T, int q1, int r1, int q2, int r2) {
   __shared__ unsigned char s_t4_route_perm[T4_PAIR_CLUSTER ? TOPK : 1];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int P = T * TOPK;
@@ -403,13 +400,14 @@ void k_persistent_decode(
   const int t4_cluster = T4_PAIR_CLUSTER ? (bx >> 1) : 0;
   const int t4_pair = T4_PAIR_CLUSTER ? t4_cluster / 94 : 0;
   const int t4_rank = T4_PAIR_CLUSTER ? (bx & 1) : 0;
-  const int token_slot =
-      TOKEN_LOCAL == 2 ? (bx < 144 ? bx / 12 : 12 + (bx - 144) / 11) : 0;
+  const int token_slot = TOKEN_LOCAL == 2 ? (bx < 144 ? bx / 12 : 12 + (bx - 144) / 11) : 0;
   const int token_group =
       TOKEN_LOCAL == 1
-          ? (T4_PAIR_CLUSTER
-                 ? int((T4_PAIR_TOKENS >> (4 * (2 * t4_pair + t4_rank))) & 15u)
-                 : (bx >= 282 ? 3 : bx >= 188 ? 2 : bx >= 94 ? 1 : 0))
+          ? (T4_PAIR_CLUSTER ? int((T4_PAIR_TOKENS >> (4 * (2 * t4_pair + t4_rank))) & 15u)
+                             : (bx >= 282   ? 3
+                                : bx >= 188 ? 2
+                                : bx >= 94  ? 1
+                                            : 0))
           : (TOKEN_LOCAL == 2
                  ? (token_slot < 5
                         ? token_slot
@@ -421,24 +419,17 @@ void k_persistent_decode(
                                              ? token_slot + 4
                                              : (token_slot == 12
                                                     ? 5
-                                                    : (token_slot == 13
-                                                           ? 9
-                                                           : token_slot - 2))))))
+                                                    : (token_slot == 13 ? 9 : token_slot - 2))))))
                  : 0);
   const int token_blocks =
-      TOKEN_LOCAL == 1 ? 94 : (TOKEN_LOCAL == 2 ? (token_slot < 12 ? 12 : 11)
-                                                : gridDim.x);
+      TOKEN_LOCAL == 1 ? 94 : (TOKEN_LOCAL == 2 ? (token_slot < 12 ? 12 : 11) : gridDim.x);
   const int local_block =
       TOKEN_LOCAL == 1
-          ? (T4_PAIR_CLUSTER ? t4_cluster - t4_pair * 94
-                             : bx - token_group * 94)
+          ? (T4_PAIR_CLUSTER ? t4_cluster - t4_pair * 94 : bx - token_group * 94)
           : (TOKEN_LOCAL == 2
-                 ? (token_slot < 12 ? bx - token_slot * 12
-                                    : bx - 144 - (token_slot - 12) * 11)
+                 ? (token_slot < 12 ? bx - token_slot * 12 : bx - 144 - (token_slot - 12) * 11)
                  : bx);
-  const int fc1_base = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2)
-                           ? token_group * 2048
-                           : 0;
+  const int fc1_base = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2) ? token_group * 2048 : 0;
 
   if constexpr (T4_PAIR_CLUSTER) {
     if (threadIdx.x == 0) {
@@ -446,8 +437,7 @@ void k_persistent_decode(
 #pragma unroll
         for (int r = 0; r < TOPK; ++r) s_t4_route_perm[r] = r;
       } else {
-        const int token_a =
-            int((T4_PAIR_TOKENS >> (8 * t4_pair)) & 15u);
+        const int token_a = int((T4_PAIR_TOKENS >> (8 * t4_pair)) & 15u);
         unsigned used = 0;
 #pragma unroll
         for (int r = 0; r < TOPK; ++r) s_t4_route_perm[r] = 0xffu;
@@ -485,40 +475,40 @@ void k_persistent_decode(
   const int u10 = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2)
                       ? fc1_base + tq1 * local_block + min(local_block, tr1)
                       : q1 * local_block + min(local_block, r1);
-  const int u11 = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2)
-                      ? u10 + tq1 + (local_block < tr1)
-                      : u10 + q1 + (local_block < r1);
+  const int u11 = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2) ? u10 + tq1 + (local_block < tr1)
+                                                         : u10 + q1 + (local_block < r1);
   for (int u = u10 + warp; u < u11; u += NWARP) {
     const int logical_p = u >> 8;
     const int n = (u & (I_DIM / 2 - 1)) * 2;
     int p = logical_p;
-    if constexpr (T4_PAIR_CLUSTER)
-      p = token_group * TOPK + s_t4_route_perm[logical_p & (TOPK - 1)];
+    if constexpr (T4_PAIR_CLUSTER) p = token_group * TOPK + s_t4_route_perm[logical_p & (TOPK - 1)];
     const int rp = ids[p];
     const int t = p >> 3, e = rp & 255;
-    const __nv_bfloat16 *xp = x + (size_t)t * H_DIM + lane * 16;
-    const uint8_t *gp = w13 + ((size_t)e * TWO_I + n) * H_DIM + lane * 16;
-    const uint8_t *up = gp + (size_t)I_DIM * H_DIM;
-    const float *sg = w13s + ((size_t)e * 8 + (n >> 7)) * 16;
-    const float *su = sg + 4 * 16;
+    const __nv_bfloat16* xp = x + (size_t)t * H_DIM + lane * 16;
+    const uint8_t* gp = w13 + ((size_t)e * TWO_I + n) * H_DIM + lane * 16;
+    const uint8_t* up = gp + (size_t)I_DIM * H_DIM;
+    const float* sg = w13s + ((size_t)e * 8 + (n >> 7)) * 16;
+    const float* su = sg + 4 * 16;
     float ag0 = 0.f, ag1 = 0.f, au0 = 0.f, au1 = 0.f;
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       float xr[16];
-      const uint4 *src = reinterpret_cast<const uint4 *>(xp + c * 512);
+      const uint4* src = reinterpret_cast<const uint4*>(xp + c * 512);
       uint4 xa = src[0], xb = src[1];
-      const uint32_t *av = reinterpret_cast<const uint32_t *>(&xa);
-      const uint32_t *bv = reinterpret_cast<const uint32_t *>(&xb);
+      const uint32_t* av = reinterpret_cast<const uint32_t*>(&xa);
+      const uint32_t* bv = reinterpret_cast<const uint32_t*>(&xb);
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         float2 f = p_bf2f(av[j]), g = p_bf2f(bv[j]);
-        xr[2 * j] = f.x; xr[2 * j + 1] = f.y;
-        xr[8 + 2 * j] = g.x; xr[8 + 2 * j + 1] = g.y;
+        xr[2 * j] = f.x;
+        xr[2 * j + 1] = f.y;
+        xr[8 + 2 * j] = g.x;
+        xr[8 + 2 * j + 1] = g.y;
       }
-      const uint4 wg0 = *reinterpret_cast<const uint4 *>(gp + c * 512);
-      const uint4 wg1 = *reinterpret_cast<const uint4 *>(gp + H_DIM + c * 512);
-      const uint4 wu0 = *reinterpret_cast<const uint4 *>(up + c * 512);
-      const uint4 wu1 = *reinterpret_cast<const uint4 *>(up + H_DIM + c * 512);
+      const uint4 wg0 = *reinterpret_cast<const uint4*>(gp + c * 512);
+      const uint4 wg1 = *reinterpret_cast<const uint4*>(gp + H_DIM + c * 512);
+      const uint4 wu0 = *reinterpret_cast<const uint4*>(up + c * 512);
+      const uint4 wu1 = *reinterpret_cast<const uint4*>(up + H_DIM + c * 512);
       const float scg = sg[c * 4 + lg], scu = su[c * 4 + lg];
       if constexpr (TOKEN_LOCAL == 2) {
         const float2 dg = p_dot16_pair(wg0, wg1, xr);
@@ -534,13 +524,15 @@ void k_persistent_decode(
         au1 = fmaf(p_dot16(wu1, xr), scu, au1);
       }
     }
-    ag0 = p_warp_sum(ag0); ag1 = p_warp_sum(ag1);
-    au0 = p_warp_sum(au0); au1 = p_warp_sum(au1);
+    ag0 = p_warp_sum(ag0);
+    ag1 = p_warp_sum(ag1);
+    au0 = p_warp_sum(au0);
+    au1 = p_warp_sum(au1);
     if (lane == 0) {
       const float okf = (unsigned)rp < (unsigned)E_NUM ? 1.f : 0.f;
       const float z0 = (ag0 / (1.f + expf(-ag0))) * au0 * okf;
       const float z1 = (ag1 / (1.f + expf(-ag1))) * au1 * okf;
-      *reinterpret_cast<__nv_bfloat162 *>(p_inter + (size_t)p * I_DIM + n) =
+      *reinterpret_cast<__nv_bfloat162*>(p_inter + (size_t)p * I_DIM + n) =
           __floats2bfloat162_rn(z0, z1);
     }
   }
@@ -555,56 +547,49 @@ void k_persistent_decode(
     p_t16_release_barrier();
 
   constexpr int FC2_UNITS = TOKEN_LOCAL == 1 ? H_DIM / 4 : H_DIM / 2;
-  const int fc2_base = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2)
-                           ? token_group * FC2_UNITS
-                           : 0;
-  const int tq2 = TOKEN_LOCAL == 1
-                      ? FC2_UNITS / token_blocks
-                      : (TOKEN_LOCAL == 2 ? 1024 / token_blocks : 10);
-  const int tr2 = TOKEN_LOCAL == 1
-                      ? FC2_UNITS % token_blocks
-                      : (TOKEN_LOCAL == 2 ? 1024 % token_blocks : 84);
-  const int u20 = TOKEN_LOCAL == 3
-                      ? (u10 >> 1)
-                      : ((TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2)
-                             ? fc2_base + tq2 * local_block + min(local_block, tr2)
-                             : q2 * local_block + min(local_block, r2));
+  const int fc2_base = (TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2) ? token_group * FC2_UNITS : 0;
+  const int tq2 =
+      TOKEN_LOCAL == 1 ? FC2_UNITS / token_blocks : (TOKEN_LOCAL == 2 ? 1024 / token_blocks : 10);
+  const int tr2 =
+      TOKEN_LOCAL == 1 ? FC2_UNITS % token_blocks : (TOKEN_LOCAL == 2 ? 1024 % token_blocks : 84);
+  const int u20 = TOKEN_LOCAL == 3 ? (u10 >> 1)
+                                   : ((TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2)
+                                          ? fc2_base + tq2 * local_block + min(local_block, tr2)
+                                          : q2 * local_block + min(local_block, r2));
   const int u21 = TOKEN_LOCAL == 3
                       ? (u11 >> 1)
-                      : ((TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2)
-                             ? u20 + tq2 + (local_block < tr2)
-                             : u20 + q2 + (local_block < r2));
+                      : ((TOKEN_LOCAL == 1 || TOKEN_LOCAL == 2) ? u20 + tq2 + (local_block < tr2)
+                                                                : u20 + q2 + (local_block < r2));
   for (int u = u20 + warp; u < u21; u += NWARP) {
     const int t = u / FC2_UNITS;
     const int h = (u - t * FC2_UNITS) * (TOKEN_LOCAL == 1 ? 4 : 2);
-    const int *idp = ids + t * TOPK;
-    const float *twp = tws + t * TOPK;
+    const int* idp = ids + t * TOPK;
+    const float* twp = tws + t * TOPK;
     if constexpr (TOKEN_LOCAL == 1) {
       float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) {
         const int e = idp[k] & 255;
-        const __nv_bfloat16 *ip =
-            p_inter + (size_t)(t * TOPK + k) * I_DIM + lane * 16;
+        const __nv_bfloat16* ip = p_inter + (size_t)(t * TOPK + k) * I_DIM + lane * 16;
         float ir[16];
         const uint4 ia = p_ld_inter_l1_evict_last(ip);
         const uint4 ib = p_ld_inter_l1_evict_last(ip + 8);
-        const uint32_t *av = reinterpret_cast<const uint32_t *>(&ia);
-        const uint32_t *bv = reinterpret_cast<const uint32_t *>(&ib);
+        const uint32_t* av = reinterpret_cast<const uint32_t*>(&ia);
+        const uint32_t* bv = reinterpret_cast<const uint32_t*>(&ib);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float2 f = p_bf2f(av[j]), g = p_bf2f(bv[j]);
-          ir[2 * j] = f.x; ir[2 * j + 1] = f.y;
-          ir[8 + 2 * j] = g.x; ir[8 + 2 * j + 1] = g.y;
+          ir[2 * j] = f.x;
+          ir[2 * j + 1] = f.y;
+          ir[8 + 2 * j] = g.x;
+          ir[8 + 2 * j + 1] = g.y;
         }
-        const uint8_t *wp =
-            w2 + ((size_t)e * H_DIM + h) * I_DIM + lane * 16;
-        const float sc =
-            w2s[((size_t)e * 16 + (h >> 7)) * 4 + lg] * twp[k];
-        const uint4 w0 = *reinterpret_cast<const uint4 *>(wp);
-        const uint4 w1 = *reinterpret_cast<const uint4 *>(wp + I_DIM);
-        const uint4 w2v = *reinterpret_cast<const uint4 *>(wp + 2 * I_DIM);
-        const uint4 w3 = *reinterpret_cast<const uint4 *>(wp + 3 * I_DIM);
+        const uint8_t* wp = w2 + ((size_t)e * H_DIM + h) * I_DIM + lane * 16;
+        const float sc = w2s[((size_t)e * 16 + (h >> 7)) * 4 + lg] * twp[k];
+        const uint4 w0 = *reinterpret_cast<const uint4*>(wp);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(wp + I_DIM);
+        const uint4 w2v = *reinterpret_cast<const uint4*>(wp + 2 * I_DIM);
+        const uint4 w3 = *reinterpret_cast<const uint4*>(wp + 3 * I_DIM);
         const float2 d01 = p_dot16_pair(w0, w1, ir);
         const float2 d23 = p_dot16_pair(w2v, w3, ir);
         acc0 = fmaf(d01.x, sc, acc0);
@@ -617,9 +602,9 @@ void k_persistent_decode(
       acc2 = p_warp_sum(acc2);
       acc3 = p_warp_sum(acc3);
       if (lane == 0) {
-        *reinterpret_cast<__nv_bfloat162 *>(out + (size_t)t * H_DIM + h) =
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)t * H_DIM + h) =
             __floats2bfloat162_rn(acc0, acc1);
-        *reinterpret_cast<__nv_bfloat162 *>(out + (size_t)t * H_DIM + h + 2) =
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)t * H_DIM + h + 2) =
             __floats2bfloat162_rn(acc2, acc3);
       }
       continue;
@@ -628,34 +613,33 @@ void k_persistent_decode(
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) {
       const int e = idp[k] & 255;
-      const __nv_bfloat16 *ip =
-          p_inter + (size_t)(t * TOPK + k) * I_DIM + lane * 16;
+      const __nv_bfloat16* ip = p_inter + (size_t)(t * TOPK + k) * I_DIM + lane * 16;
       float ir[16];
-      const uint4 ia = reinterpret_cast<const uint4 *>(ip)[0];
-      const uint4 ib = reinterpret_cast<const uint4 *>(ip)[1];
-      const uint32_t *av = reinterpret_cast<const uint32_t *>(&ia);
-      const uint32_t *bv = reinterpret_cast<const uint32_t *>(&ib);
+      const uint4 ia = reinterpret_cast<const uint4*>(ip)[0];
+      const uint4 ib = reinterpret_cast<const uint4*>(ip)[1];
+      const uint32_t* av = reinterpret_cast<const uint32_t*>(&ia);
+      const uint32_t* bv = reinterpret_cast<const uint32_t*>(&ib);
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         float2 f = p_bf2f(av[j]), g = p_bf2f(bv[j]);
-        ir[2 * j] = f.x; ir[2 * j + 1] = f.y;
-        ir[8 + 2 * j] = g.x; ir[8 + 2 * j + 1] = g.y;
+        ir[2 * j] = f.x;
+        ir[2 * j + 1] = f.y;
+        ir[8 + 2 * j] = g.x;
+        ir[8 + 2 * j + 1] = g.y;
       }
-      const uint8_t *wp = w2 + ((size_t)e * H_DIM + h) * I_DIM + lane * 16;
+      const uint8_t* wp = w2 + ((size_t)e * H_DIM + h) * I_DIM + lane * 16;
       if constexpr (TOKEN_LOCAL == 1) {
         // At T=4, issue the tiny independent scale before the row payload so
         // its latency overlaps the two 16-byte weight loads.
-        const float sc =
-            w2s[((size_t)e * 16 + (h >> 7)) * 4 + lg] * twp[k];
-        const uint4 w0 = *reinterpret_cast<const uint4 *>(wp);
-        const uint4 w1 = *reinterpret_cast<const uint4 *>(wp + I_DIM);
+        const float sc = w2s[((size_t)e * 16 + (h >> 7)) * 4 + lg] * twp[k];
+        const uint4 w0 = *reinterpret_cast<const uint4*>(wp);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(wp + I_DIM);
         acc0 = fmaf(p_dot16(w0, ir), sc, acc0);
         acc1 = fmaf(p_dot16(w1, ir), sc, acc1);
       } else {
-        const uint4 w0 = *reinterpret_cast<const uint4 *>(wp);
-        const uint4 w1 = *reinterpret_cast<const uint4 *>(wp + I_DIM);
-        const float sc =
-            w2s[((size_t)e * 16 + (h >> 7)) * 4 + lg] * twp[k];
+        const uint4 w0 = *reinterpret_cast<const uint4*>(wp);
+        const uint4 w1 = *reinterpret_cast<const uint4*>(wp + I_DIM);
+        const float sc = w2s[((size_t)e * 16 + (h >> 7)) * 4 + lg] * twp[k];
         acc0 = fmaf(p_dot16(w0, ir), sc, acc0);
         acc1 = fmaf(p_dot16(w1, ir), sc, acc1);
       }
@@ -663,7 +647,7 @@ void k_persistent_decode(
     acc0 = p_warp_sum(acc0);
     acc1 = p_warp_sum(acc1);
     if (lane == 0) {
-      *reinterpret_cast<__nv_bfloat162 *>(out + (size_t)t * H_DIM + h) =
+      *reinterpret_cast<__nv_bfloat162*>(out + (size_t)t * H_DIM + h) =
           __floats2bfloat162_rn(acc0, acc1);
     }
   }
@@ -671,12 +655,10 @@ void k_persistent_decode(
 
 // ---------------------------------------------------------------- routing
 
-__global__ __launch_bounds__(256) void k_route(const int *__restrict__ topk_ids,
-                                               int P, int *__restrict__ sorted,
-                                               int *__restrict__ tile_e,
-                                               int *__restrict__ tile_base,
-                                               int *__restrict__ tile_n,
-                                               int max_tiles, int ntk) {
+__global__ __launch_bounds__(256) void k_route(const int* __restrict__ topk_ids, int P,
+                                               int* __restrict__ sorted, int* __restrict__ tile_e,
+                                               int* __restrict__ tile_base,
+                                               int* __restrict__ tile_n, int max_tiles, int ntk) {
   __shared__ int cnt[256], off[256], cur[256], sw[8];
   const int tid = threadIdx.x;
   for (int i = tid; i < max_tiles; i += 256) tile_n[i] = 0;
@@ -710,30 +692,26 @@ __global__ __launch_bounds__(256) void k_route(const int *__restrict__ topk_ids,
 
 // grid (64 row tiles of 16, n_tiles); 256 threads = 8 warps, warp = k slice.
 __global__ __launch_bounds__(256) void k_gemm1(
-    const __nv_bfloat16 *__restrict__ hs, const uint8_t *__restrict__ w13,
-    const float *__restrict__ w13_scale, const int *__restrict__ topk_ids,
-    int P, __half *__restrict__ gu, __nv_bfloat16 *__restrict__ out,
-    int nout4, int *__restrict__ tinfo) {
+    const __nv_bfloat16* __restrict__ hs, const uint8_t* __restrict__ w13,
+    const float* __restrict__ w13_scale, const int* __restrict__ topk_ids, int P,
+    __half* __restrict__ gu, __nv_bfloat16* __restrict__ out, int nout4, int* __restrict__ tinfo) {
   const int tid = threadIdx.x;
   // clear the destination (FC2 accumulates into it atomically)
   {
     const int flat = blockIdx.y * gridDim.x + blockIdx.x;
     const int stride = gridDim.x * gridDim.y * 256;
     uint4 z = make_uint4(0u, 0u, 0u, 0u);
-    for (int i = flat * 256 + tid; i < nout4; i += stride)
-      ((uint4 *)out)[i] = z;
+    for (int i = flat * 256 + tid; i < nout4; i += stride) ((uint4*)out)[i] = z;
   }
   extern __shared__ char smem[];
-  uint8_t *wb = (uint8_t *)smem;                 // [2][16][WPITCH]
-  __half *xs = (__half *)(smem + 2 * 16 * WPITCH);
+  uint8_t* wb = (uint8_t*)smem;  // [2][16][WPITCH]
+  __half* xs = (__half*)(smem + 2 * 16 * WPITCH);
   __shared__ float red[8 * 128];
   __shared__ int s_pair[NT];
   __shared__ int s_cnt[256], s_sw[8], s_sh[4];
-  const bool has = route_tile(topk_ids, P, blockIdx.y, tid, s_cnt, s_sw, s_sh,
-                              s_pair);
+  const bool has = route_tile(topk_ids, P, blockIdx.y, tid, s_cnt, s_sw, s_sh, s_pair);
   if (blockIdx.x == 0) {
-    if (tid == 0)
-      tinfo[blockIdx.y * 16] = has ? (s_sh[0] | (s_sh[2] << 16)) : 0;
+    if (tid == 0) tinfo[blockIdx.y * 16] = has ? (s_sh[0] | (s_sh[2] << 16)) : 0;
     if (has && tid < s_sh[2]) tinfo[blockIdx.y * 16 + 1 + tid] = s_pair[tid];
   }
   if (!has) return;
@@ -741,34 +719,33 @@ __global__ __launch_bounds__(256) void k_gemm1(
   const int e = s_sh[0];
   const int r0 = blockIdx.x * 16;
 
-  const uint8_t *wptr = w13 + ((size_t)e * TWO_I + r0) * H_DIM;
+  const uint8_t* wptr = w13 + ((size_t)e * TWO_I + r0) * H_DIM;
   // chunk 0
   {
     const int row = tid >> 5, off = (tid & 31) * 16;
     cp_async16(wb + row * WPITCH + off, wptr + (size_t)row * H_DIM + off);
-    cp_async16(wb + (row + 8) * WPITCH + off,
-               wptr + (size_t)(row + 8) * H_DIM + off);
+    cp_async16(wb + (row + 8) * WPITCH + off, wptr + (size_t)(row + 8) * H_DIM + off);
     cp_commit();
   }
 
   for (int rr = 0; rr < n; ++rr) {
-    const uint4 b = ((const uint4 *)(hs + (size_t)(s_pair[rr] >> 3) * H_DIM))[tid];
-    __half2 c0 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.x));
-    __half2 c1 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.y));
-    __half2 c2 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.z));
-    __half2 c3 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.w));
+    const uint4 b = ((const uint4*)(hs + (size_t)(s_pair[rr] >> 3) * H_DIM))[tid];
+    __half2 c0 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.x));
+    __half2 c1 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.y));
+    __half2 c2 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.z));
+    __half2 c3 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.w));
     uint4 o;
-    o.x = *(const uint32_t *)&c0;
-    o.y = *(const uint32_t *)&c1;
-    o.z = *(const uint32_t *)&c2;
-    o.w = *(const uint32_t *)&c3;
-    *(uint4 *)(xs + (size_t)rr * XSTRIDE + tid * 8) = o;
+    o.x = *(const uint32_t*)&c0;
+    o.y = *(const uint32_t*)&c1;
+    o.z = *(const uint32_t*)&c2;
+    o.w = *(const uint32_t*)&c3;
+    *(uint4*)(xs + (size_t)rr * XSTRIDE + tid * 8) = o;
   }
 
   const int warp = tid >> 5, lane = tid & 31;
   const int r = lane >> 2, c = lane & 3;
-  const float *wsc = w13_scale + ((size_t)e * 8 + (r0 >> 7)) * 16;
-  const __half *xptr = xs + (size_t)((r < n) ? r : 0) * XSTRIDE + warp * 64 + c * 16;
+  const float* wsc = w13_scale + ((size_t)e * 8 + (r0 >> 7)) * 16;
+  const __half* xptr = xs + (size_t)((r < n) ? r : 0) * XSTRIDE + warp * 64 + c * 16;
   const int wo = warp * 64 + c * 16;
 
   float facc[4] = {0.f, 0.f, 0.f, 0.f};
@@ -787,19 +764,17 @@ __global__ __launch_bounds__(256) void k_gemm1(
       cp_wait<0>();
     }
     __syncthreads();
-    const uint8_t *wc = wb + (ch % 2) * (16 * WPITCH) + wo;
+    const uint8_t* wc = wb + (ch % 2) * (16 * WPITCH) + wo;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    tile64(acc, *(const uint4 *)(wc + r * WPITCH),
-           *(const uint4 *)(wc + (r + 8) * WPITCH),
-           *(const uint4 *)(xptr + ch * 512),
-           *(const uint4 *)(xptr + ch * 512 + 8));
+    tile64(acc, *(const uint4*)(wc + r * WPITCH), *(const uint4*)(wc + (r + 8) * WPITCH),
+           *(const uint4*)(xptr + ch * 512), *(const uint4*)(xptr + ch * 512 + 8));
     const float sc = wsc[ch * 4 + (warp >> 1)];
 #pragma unroll
     for (int i = 0; i < 4; ++i) facc[i] += acc[i] * sc;
     __syncthreads();
   }
 
-  float *rb = red + warp * 128;
+  float* rb = red + warp * 128;
   rb[r * 8 + c * 2 + 0] = facc[0];
   rb[r * 8 + c * 2 + 1] = facc[1];
   rb[(r + 8) * 8 + c * 2 + 0] = facc[2];
@@ -819,10 +794,12 @@ __global__ __launch_bounds__(256) void k_gemm1(
 // ---------------------------------------------------------------- FC2
 
 // grid (64 h tiles of 32, n_tiles); 256 threads = 8 warps = 2 row tiles x 4 k.
-__global__ __launch_bounds__(256) void k_gemm2(
-    const __half *__restrict__ gu, const uint8_t *__restrict__ w2,
-    const float *__restrict__ w2_scale, const float *__restrict__ topk_weights,
-    const int *__restrict__ tinfo, __nv_bfloat16 *__restrict__ out) {
+__global__ __launch_bounds__(256) void k_gemm2(const __half* __restrict__ gu,
+                                               const uint8_t* __restrict__ w2,
+                                               const float* __restrict__ w2_scale,
+                                               const float* __restrict__ topk_weights,
+                                               const int* __restrict__ tinfo,
+                                               __nv_bfloat16* __restrict__ out) {
   const int tid = threadIdx.x;
   __shared__ uint8_t wb[32 * WPITCH];
   __shared__ __half si[NT * 520];
@@ -835,7 +812,7 @@ __global__ __launch_bounds__(256) void k_gemm2(
   const int e = s_inf[0] & 0xffff;
   const int h0 = blockIdx.x * 32;
 
-  const uint8_t *wptr = w2 + ((size_t)e * H_DIM + h0) * I_DIM;
+  const uint8_t* wptr = w2 + ((size_t)e * H_DIM + h0) * I_DIM;
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
     const int g = q * 4096 + tid * 16;
@@ -846,22 +823,21 @@ __global__ __launch_bounds__(256) void k_gemm2(
 
   for (int i = tid; i < n * 64; i += 256) {
     const int j = i >> 6, o = (i & 63) * 8;
-    const __half *gp = gu + (size_t)s_inf[1 + j] * TWO_I;
-    uint4 ga = *(const uint4 *)(gp + o);
-    uint4 ub = *(const uint4 *)(gp + I_DIM + o);
-    const __half2 *ha = (const __half2 *)&ga;
-    const __half2 *hb = (const __half2 *)&ub;
+    const __half* gp = gu + (size_t)s_inf[1 + j] * TWO_I;
+    uint4 ga = *(const uint4*)(gp + o);
+    uint4 ub = *(const uint4*)(gp + I_DIM + o);
+    const __half2* ha = (const __half2*)&ga;
+    const __half2* hb = (const __half2*)&ub;
     uint4 ov;
-    uint32_t *op = (uint32_t *)&ov;
+    uint32_t* op = (uint32_t*)&ov;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       float2 g = __half22float2(ha[q]);
       float2 u = __half22float2(hb[q]);
-      __half2 hv = __float22half2_rn(
-          make_float2(silu_mul(g.x, u.x), silu_mul(g.y, u.y)));
-      op[q] = *(const uint32_t *)&hv;
+      __half2 hv = __float22half2_rn(make_float2(silu_mul(g.x, u.x), silu_mul(g.y, u.y)));
+      op[q] = *(const uint32_t*)&hv;
     }
-    *(uint4 *)(si + j * 520 + o) = ov;
+    *(uint4*)(si + j * 520 + o) = ov;
   }
   cp_wait<0>();
   __syncthreads();
@@ -869,20 +845,19 @@ __global__ __launch_bounds__(256) void k_gemm2(
   const int warp = tid >> 5, lane = tid & 31;
   const int rt = warp >> 2, kc = warp & 3;
   const int r = lane >> 2, c = lane & 3;
-  const float sc =
-      w2_scale[((size_t)e * 16 + ((h0 + rt * 16) >> 7)) * 4 + kc];
-  const uint8_t *wbase = wb + rt * (16 * WPITCH) + c * 16;
-  const __half *xptr = si + (size_t)((r < n) ? r : 0) * 520 + kc * 128 + c * 16;
+  const float sc = w2_scale[((size_t)e * 16 + ((h0 + rt * 16) >> 7)) * 4 + kc];
+  const uint8_t* wbase = wb + rt * (16 * WPITCH) + c * 16;
+  const __half* xptr = si + (size_t)((r < n) ? r : 0) * 520 + kc * 128 + c * 16;
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int it = 0; it < 2; ++it) {
     const int k = it * 64;
-    tile64(acc, *(const uint4 *)(wbase + r * WPITCH + kc * 128 + k),
-           *(const uint4 *)(wbase + (r + 8) * WPITCH + kc * 128 + k),
-           *(const uint4 *)(xptr + k), *(const uint4 *)(xptr + k + 8));
+    tile64(acc, *(const uint4*)(wbase + r * WPITCH + kc * 128 + k),
+           *(const uint4*)(wbase + (r + 8) * WPITCH + kc * 128 + k), *(const uint4*)(xptr + k),
+           *(const uint4*)(xptr + k + 8));
   }
 
-  float *rb = red + warp * 128;
+  float* rb = red + warp * 128;
   rb[r * 8 + c * 2 + 0] = acc[0] * sc;
   rb[r * 8 + c * 2 + 1] = acc[1] * sc;
   rb[(r + 8) * 8 + c * 2 + 0] = acc[2] * sc;
@@ -901,42 +876,36 @@ __global__ __launch_bounds__(256) void k_gemm2(
     const int p = s_inf[1 + tok];
     const float tw = topk_weights[p];
     __nv_bfloat162 v = __floats2bfloat162_rn(a * tw, b * tw);
-    atomicAdd((__nv_bfloat162 *)(out + (size_t)(p >> 3) * H_DIM + h0 +
-                                 rtt * 16 + rr0),
-              v);
+    atomicAdd((__nv_bfloat162*)(out + (size_t)(p >> 3) * H_DIM + h0 + rtt * 16 + rr0), v);
   }
 }
-
 
 // ------------------------------------------------- fused decode kernel
 // grid (64, n_tiles) -- blockIdx.x indexes a 16-row FC1 tile in phase 1 and a
 // 32-row FC2 tile in phase 2, so one routing pass serves both phases and the
 // two GEMMs cost a single launch and a single ramp.
 __global__ __launch_bounds__(256) void k_fused(
-    const __nv_bfloat16 *__restrict__ hs, const uint8_t *__restrict__ w13,
-    const float *__restrict__ w13_scale, const uint8_t *__restrict__ w2,
-    const float *__restrict__ w2_scale, const int *__restrict__ topk_ids,
-    const float *__restrict__ topk_weights, int P, __half *__restrict__ gu,
-    __nv_bfloat16 *__restrict__ out, int nout4, unsigned *__restrict__ bar,
-    int xrows) {
+    const __nv_bfloat16* __restrict__ hs, const uint8_t* __restrict__ w13,
+    const float* __restrict__ w13_scale, const uint8_t* __restrict__ w2,
+    const float* __restrict__ w2_scale, const int* __restrict__ topk_ids,
+    const float* __restrict__ topk_weights, int P, __half* __restrict__ gu,
+    __nv_bfloat16* __restrict__ out, int nout4, unsigned* __restrict__ bar, int xrows) {
   const int tid = threadIdx.x;
   {
     const int flat = blockIdx.y * gridDim.x + blockIdx.x;
     const int stride = gridDim.x * gridDim.y * 256;
     uint4 z = make_uint4(0u, 0u, 0u, 0u);
-    for (int i = flat * 256 + tid; i < nout4; i += stride)
-      ((uint4 *)out)[i] = z;
+    for (int i = flat * 256 + tid; i < nout4; i += stride) ((uint4*)out)[i] = z;
   }
   extern __shared__ char smem[];
-  uint8_t *wb = (uint8_t *)smem;
-  __half *xs = (__half *)(smem + 2 * 16 * WPITCH);
-  __half *si = (__half *)(smem + 2 * 16 * WPITCH);
+  uint8_t* wb = (uint8_t*)smem;
+  __half* xs = (__half*)(smem + 2 * 16 * WPITCH);
+  __half* si = (__half*)(smem + 2 * 16 * WPITCH);
   __shared__ float red[8 * 128];
   __shared__ int s_pair[NT];
   __shared__ int s_cnt[256], s_sw[8], s_sh[4];
 
-  const bool has = route_tile(topk_ids, P, blockIdx.y, tid, s_cnt, s_sw, s_sh,
-                              s_pair);
+  const bool has = route_tile(topk_ids, P, blockIdx.y, tid, s_cnt, s_sw, s_sh, s_pair);
   const int n = has ? s_sh[2] : 0;
   const int e = has ? s_sh[0] : 0;
   const int warp = tid >> 5, lane = tid & 31;
@@ -944,30 +913,28 @@ __global__ __launch_bounds__(256) void k_fused(
 
   if (has) {
     const int r0 = blockIdx.x * 16;
-    const uint8_t *wptr = w13 + ((size_t)e * TWO_I + r0) * H_DIM;
+    const uint8_t* wptr = w13 + ((size_t)e * TWO_I + r0) * H_DIM;
     {
       const int row = tid >> 5, off = (tid & 31) * 16;
       cp_async16(wb + row * WPITCH + off, wptr + (size_t)row * H_DIM + off);
-      cp_async16(wb + (row + 8) * WPITCH + off,
-                 wptr + (size_t)(row + 8) * H_DIM + off);
+      cp_async16(wb + (row + 8) * WPITCH + off, wptr + (size_t)(row + 8) * H_DIM + off);
       cp_commit();
     }
     for (int rr = 0; rr < n; ++rr) {
-      const uint4 b = ((const uint4 *)(hs + (size_t)(s_pair[rr] >> 3) * H_DIM))[tid];
-      __half2 c0 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.x));
-      __half2 c1 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.y));
-      __half2 c2 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.z));
-      __half2 c3 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.w));
+      const uint4 b = ((const uint4*)(hs + (size_t)(s_pair[rr] >> 3) * H_DIM))[tid];
+      __half2 c0 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.x));
+      __half2 c1 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.y));
+      __half2 c2 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.z));
+      __half2 c3 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.w));
       uint4 o;
-      o.x = *(const uint32_t *)&c0;
-      o.y = *(const uint32_t *)&c1;
-      o.z = *(const uint32_t *)&c2;
-      o.w = *(const uint32_t *)&c3;
-      *(uint4 *)(xs + (size_t)rr * XSTRIDE + tid * 8) = o;
+      o.x = *(const uint32_t*)&c0;
+      o.y = *(const uint32_t*)&c1;
+      o.z = *(const uint32_t*)&c2;
+      o.w = *(const uint32_t*)&c3;
+      *(uint4*)(xs + (size_t)rr * XSTRIDE + tid * 8) = o;
     }
-    const float *wsc = w13_scale + ((size_t)e * 8 + (r0 >> 7)) * 16;
-    const __half *xptr =
-        xs + (size_t)((r < n) ? r : 0) * XSTRIDE + warp * 64 + c * 16;
+    const float* wsc = w13_scale + ((size_t)e * 8 + (r0 >> 7)) * 16;
+    const __half* xptr = xs + (size_t)((r < n) ? r : 0) * XSTRIDE + warp * 64 + c * 16;
     const int wo = warp * 64 + c * 16;
     float facc[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -985,18 +952,16 @@ __global__ __launch_bounds__(256) void k_fused(
         cp_wait<0>();
       }
       __syncthreads();
-      const uint8_t *wc = wb + (ch % 2) * (16 * WPITCH) + wo;
+      const uint8_t* wc = wb + (ch % 2) * (16 * WPITCH) + wo;
       float acc[4] = {0.f, 0.f, 0.f, 0.f};
-      tile64(acc, *(const uint4 *)(wc + r * WPITCH),
-             *(const uint4 *)(wc + (r + 8) * WPITCH),
-             *(const uint4 *)(xptr + ch * 512),
-             *(const uint4 *)(xptr + ch * 512 + 8));
+      tile64(acc, *(const uint4*)(wc + r * WPITCH), *(const uint4*)(wc + (r + 8) * WPITCH),
+             *(const uint4*)(xptr + ch * 512), *(const uint4*)(xptr + ch * 512 + 8));
       const float sc = wsc[ch * 4 + (warp >> 1)];
 #pragma unroll
       for (int i = 0; i < 4; ++i) facc[i] += acc[i] * sc;
       __syncthreads();
     }
-    float *rb = red + warp * 128;
+    float* rb = red + warp * 128;
     rb[r * 8 + c * 2 + 0] = facc[0];
     rb[r * 8 + c * 2 + 1] = facc[1];
     rb[(r + 8) * 8 + c * 2 + 0] = facc[2];
@@ -1018,7 +983,7 @@ __global__ __launch_bounds__(256) void k_fused(
 
   // ---- phase 2: 32 output rows of w2[e]
   const int h0 = blockIdx.x * 32;
-  const uint8_t *w2p = w2 + ((size_t)e * H_DIM + h0) * I_DIM;
+  const uint8_t* w2p = w2 + ((size_t)e * H_DIM + h0) * I_DIM;
   __syncthreads();
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
@@ -1029,40 +994,38 @@ __global__ __launch_bounds__(256) void k_fused(
   cp_commit();
   for (int i = tid; i < n * 64; i += 256) {
     const int j = i >> 6, o = (i & 63) * 8;
-    const __half *gp = gu + (size_t)s_pair[j] * TWO_I;
-    uint4 ga = *(const uint4 *)(gp + o);
-    uint4 ub = *(const uint4 *)(gp + I_DIM + o);
-    const __half2 *ha = (const __half2 *)&ga;
-    const __half2 *hb = (const __half2 *)&ub;
+    const __half* gp = gu + (size_t)s_pair[j] * TWO_I;
+    uint4 ga = *(const uint4*)(gp + o);
+    uint4 ub = *(const uint4*)(gp + I_DIM + o);
+    const __half2* ha = (const __half2*)&ga;
+    const __half2* hb = (const __half2*)&ub;
     uint4 ov;
-    uint32_t *op = (uint32_t *)&ov;
+    uint32_t* op = (uint32_t*)&ov;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       float2 g = __half22float2(ha[q]);
       float2 u = __half22float2(hb[q]);
-      __half2 hv = __float22half2_rn(
-          make_float2(silu_mul(g.x, u.x), silu_mul(g.y, u.y)));
-      op[q] = *(const uint32_t *)&hv;
+      __half2 hv = __float22half2_rn(make_float2(silu_mul(g.x, u.x), silu_mul(g.y, u.y)));
+      op[q] = *(const uint32_t*)&hv;
     }
-    *(uint4 *)(si + j * 520 + o) = ov;
+    *(uint4*)(si + j * 520 + o) = ov;
   }
   cp_wait<0>();
   __syncthreads();
 
   const int rt = warp >> 2, kc = warp & 3;
-  const float sc2 =
-      w2_scale[((size_t)e * 16 + ((h0 + rt * 16) >> 7)) * 4 + kc];
-  const uint8_t *wbase = wb + rt * (16 * WPITCH) + c * 16;
-  const __half *xp2 = si + (size_t)((r < n) ? r : 0) * 520 + kc * 128 + c * 16;
+  const float sc2 = w2_scale[((size_t)e * 16 + ((h0 + rt * 16) >> 7)) * 4 + kc];
+  const uint8_t* wbase = wb + rt * (16 * WPITCH) + c * 16;
+  const __half* xp2 = si + (size_t)((r < n) ? r : 0) * 520 + kc * 128 + c * 16;
   float acc2[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int it = 0; it < 2; ++it) {
     const int k = it * 64;
-    tile64(acc2, *(const uint4 *)(wbase + r * WPITCH + kc * 128 + k),
-           *(const uint4 *)(wbase + (r + 8) * WPITCH + kc * 128 + k),
-           *(const uint4 *)(xp2 + k), *(const uint4 *)(xp2 + k + 8));
+    tile64(acc2, *(const uint4*)(wbase + r * WPITCH + kc * 128 + k),
+           *(const uint4*)(wbase + (r + 8) * WPITCH + kc * 128 + k), *(const uint4*)(xp2 + k),
+           *(const uint4*)(xp2 + k + 8));
   }
-  float *rb2 = red + warp * 128;
+  float* rb2 = red + warp * 128;
   rb2[r * 8 + c * 2 + 0] = acc2[0] * sc2;
   rb2[r * 8 + c * 2 + 1] = acc2[1] * sc2;
   rb2[(r + 8) * 8 + c * 2 + 0] = acc2[2] * sc2;
@@ -1080,57 +1043,52 @@ __global__ __launch_bounds__(256) void k_fused(
     const int p = s_pair[tok];
     const float tw = topk_weights[p];
     __nv_bfloat162 v = __floats2bfloat162_rn(a * tw, b * tw);
-    atomicAdd((__nv_bfloat162 *)(out + (size_t)(p >> 3) * H_DIM + h0 +
-                                 rtt * 16 + rr0),
-              v);
+    atomicAdd((__nv_bfloat162*)(out + (size_t)(p >> 3) * H_DIM + h0 + rtt * 16 + rr0), v);
   }
 }
 
 // ---------------------------------------------------------------- big-T path
 
-__global__ __launch_bounds__(256) void k_cvt_x(const __nv_bfloat16 *__restrict__ hs,
-                                               __half *__restrict__ hsf,
-                                               __nv_bfloat16 *__restrict__ out,
-                                               int nvec) {
+__global__ __launch_bounds__(256) void k_cvt_x(const __nv_bfloat16* __restrict__ hs,
+                                               __half* __restrict__ hsf,
+                                               __nv_bfloat16* __restrict__ out, int nvec) {
   const int stride = gridDim.x * 256;
   for (int i = blockIdx.x * 256 + threadIdx.x; i < nvec; i += stride) {
-    const uint4 b = ((const uint4 *)hs)[i];
-    __half2 c0 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.x));
-    __half2 c1 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.y));
-    __half2 c2 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.z));
-    __half2 c3 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162 *)&b.w));
+    const uint4 b = ((const uint4*)hs)[i];
+    __half2 c0 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.x));
+    __half2 c1 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.y));
+    __half2 c2 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.z));
+    __half2 c3 = __float22half2_rn(__bfloat1622float2(*(const __nv_bfloat162*)&b.w));
     uint4 o;
-    o.x = *(const uint32_t *)&c0;
-    o.y = *(const uint32_t *)&c1;
-    o.z = *(const uint32_t *)&c2;
-    o.w = *(const uint32_t *)&c3;
-    ((uint4 *)hsf)[i] = o;
-    ((uint4 *)out)[i] = make_uint4(0u, 0u, 0u, 0u);
+    o.x = *(const uint32_t*)&c0;
+    o.y = *(const uint32_t*)&c1;
+    o.z = *(const uint32_t*)&c2;
+    o.w = *(const uint32_t*)&c3;
+    ((uint4*)hsf)[i] = o;
+    ((uint4*)out)[i] = make_uint4(0u, 0u, 0u, 0u);
   }
 }
 
-__global__ __launch_bounds__(256) void k_silu(const __half *__restrict__ gu,
-                                              __half *__restrict__ inter,
-                                              int nvec) {
+__global__ __launch_bounds__(256) void k_silu(const __half* __restrict__ gu,
+                                              __half* __restrict__ inter, int nvec) {
   const int stride = gridDim.x * 256;
   for (int i = blockIdx.x * 256 + threadIdx.x; i < nvec; i += stride) {
     const int p = i >> 6, o = (i & 63) * 8;
-    const __half *gp = gu + (size_t)p * TWO_I;
-    uint4 ga = *(const uint4 *)(gp + o);
-    uint4 ub = *(const uint4 *)(gp + I_DIM + o);
-    const __half2 *ha = (const __half2 *)&ga;
-    const __half2 *hb = (const __half2 *)&ub;
+    const __half* gp = gu + (size_t)p * TWO_I;
+    uint4 ga = *(const uint4*)(gp + o);
+    uint4 ub = *(const uint4*)(gp + I_DIM + o);
+    const __half2* ha = (const __half2*)&ga;
+    const __half2* hb = (const __half2*)&ub;
     uint4 ov;
-    uint32_t *op = (uint32_t *)&ov;
+    uint32_t* op = (uint32_t*)&ov;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
       float2 g = __half22float2(ha[q]);
       float2 u = __half22float2(hb[q]);
-      __half2 hv = __float22half2_rn(
-          make_float2(silu_mul(g.x, u.x), silu_mul(g.y, u.y)));
-      op[q] = *(const uint32_t *)&hv;
+      __half2 hv = __float22half2_rn(make_float2(silu_mul(g.x, u.x), silu_mul(g.y, u.y)));
+      op[q] = *(const uint32_t*)&hv;
     }
-    *(uint4 *)(inter + (size_t)p * I_DIM + o) = ov;
+    *(uint4*)(inter + (size_t)p * I_DIM + o) = ov;
   }
 }
 
@@ -1139,10 +1097,10 @@ __global__ __launch_bounds__(256) void k_silu(const __half *__restrict__ gu,
 
 // FC1 for large T: block = 128 weight rows x NTOK tokens, warp = 16 rows.
 __global__ __launch_bounds__(256) void k_gemm1_big(
-    const __half *__restrict__ hsf, const uint8_t *__restrict__ w13,
-    const float *__restrict__ w13_scale, const int *__restrict__ sorted,
-    const int *__restrict__ tile_e, const int *__restrict__ tile_base,
-    const int *__restrict__ tile_n, __half *__restrict__ gu) {
+    const __half* __restrict__ hsf, const uint8_t* __restrict__ w13,
+    const float* __restrict__ w13_scale, const int* __restrict__ sorted,
+    const int* __restrict__ tile_e, const int* __restrict__ tile_base,
+    const int* __restrict__ tile_n, __half* __restrict__ gu) {
   const int tile = blockIdx.y;
   const int n = tile_n[tile];
   if (n == 0) return;
@@ -1157,8 +1115,8 @@ __global__ __launch_bounds__(256) void k_gemm1_big(
   __syncthreads();
 
   const int rowbase = rb * 128 + warp * 16;
-  const uint8_t *wptr = w13 + ((size_t)e * TWO_I + rowbase) * H_DIM + c * 16;
-  const float *wsc = w13_scale + ((size_t)e * 8 + (rowbase >> 7)) * 16;
+  const uint8_t* wptr = w13 + ((size_t)e * TWO_I + rowbase) * H_DIM + c * 16;
+  const float* wsc = w13_scale + ((size_t)e * 8 + (rowbase >> 7)) * 16;
   int xoff[NTILES];
 #pragma unroll
   for (int t = 0; t < NTILES; ++t) xoff[t] = s_tok[8 * t + r] * H_DIM + c * 16;
@@ -1174,30 +1132,36 @@ __global__ __launch_bounds__(256) void k_gemm1_big(
   for (int ks = 0; ks < 32; ++ks) {
     const int k = ks * 64;
     const __half2 sc2 = __float2half2_rn(wsc[ks >> 1]);
-    uint4 w0 = *(const uint4 *)(wptr + (size_t)r * H_DIM + k);
-    uint4 w1 = *(const uint4 *)(wptr + (size_t)(r + 8) * H_DIM + k);
+    uint4 w0 = *(const uint4*)(wptr + (size_t)r * H_DIM + k);
+    uint4 w1 = *(const uint4*)(wptr + (size_t)(r + 8) * H_DIM + k);
     uint32_t h0[8], h1[8];
     unpack16(w0, h0);
     unpack16(w1, h1);
 #pragma unroll
     for (int q = 0; q < 8; ++q) {
-      __half2 a = __hmul2(*(const __half2 *)&h0[q], sc2);
-      __half2 b = __hmul2(*(const __half2 *)&h1[q], sc2);
-      h0[q] = *(const uint32_t *)&a;
-      h1[q] = *(const uint32_t *)&b;
+      __half2 a = __hmul2(*(const __half2*)&h0[q], sc2);
+      __half2 b = __hmul2(*(const __half2*)&h1[q], sc2);
+      h0[q] = *(const uint32_t*)&a;
+      h1[q] = *(const uint32_t*)&b;
     }
 #pragma unroll
     for (int t = 0; t < NTILES; ++t) {
       if (t >= ntl) continue;
-      uint4 x0 = *(const uint4 *)(hsf + xoff[t] + k);
-      uint4 x1 = *(const uint4 *)(hsf + xoff[t] + k + 8);
+      uint4 x0 = *(const uint4*)(hsf + xoff[t] + k);
+      uint4 x1 = *(const uint4*)(hsf + xoff[t] + k + 8);
       uint32_t xq[8];
-      xq[0] = x0.x; xq[1] = x0.y; xq[2] = x0.z; xq[3] = x0.w;
-      xq[4] = x1.x; xq[5] = x1.y; xq[6] = x1.z; xq[7] = x1.w;
+      xq[0] = x0.x;
+      xq[1] = x0.y;
+      xq[2] = x0.z;
+      xq[3] = x0.w;
+      xq[4] = x1.x;
+      xq[5] = x1.y;
+      xq[6] = x1.z;
+      xq[7] = x1.w;
 #pragma unroll
       for (int sx = 0; sx < 4; ++sx)
-        mma16816(facc[t], h0[2 * sx], h1[2 * sx], h0[2 * sx + 1], h1[2 * sx + 1],
-                 xq[2 * sx], xq[2 * sx + 1]);
+        mma16816(facc[t], h0[2 * sx], h1[2 * sx], h0[2 * sx + 1], h1[2 * sx + 1], xq[2 * sx],
+                 xq[2 * sx + 1]);
     }
   }
 
@@ -1214,24 +1178,24 @@ __global__ __launch_bounds__(256) void k_gemm1_big(
     const int j = i % n, cch = i / n;
     const int row0 = cch * 8;
     uint4 ov;
-    uint32_t *op = (uint32_t *)&ov;
+    uint32_t* op = (uint32_t*)&ov;
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
-      __half2 hv = __float22half2_rn(make_float2(xf[(row0 + 2 * q) * NTOK + j],
-                                                 xf[(row0 + 2 * q + 1) * NTOK + j]));
-      op[q] = *(const uint32_t *)&hv;
+      __half2 hv = __float22half2_rn(
+          make_float2(xf[(row0 + 2 * q) * NTOK + j], xf[(row0 + 2 * q + 1) * NTOK + j]));
+      op[q] = *(const uint32_t*)&hv;
     }
-    *(uint4 *)(gu + (size_t)sorted[tb + j] * TWO_I + rb * 128 + row0) = ov;
+    *(uint4*)(gu + (size_t)sorted[tb + j] * TWO_I + rb * 128 + row0) = ov;
   }
 }
 
 // FC2 for large T: block = 128 output rows x NTOK tokens, warp = 16 rows.
 __global__ __launch_bounds__(256) void k_gemm2_big(
-    const __half *__restrict__ inter, const uint8_t *__restrict__ w2,
-    const float *__restrict__ w2_scale, const float *__restrict__ topk_weights,
-    const int *__restrict__ sorted, const int *__restrict__ tile_e,
-    const int *__restrict__ tile_base, const int *__restrict__ tile_n,
-    __nv_bfloat16 *__restrict__ out) {
+    const __half* __restrict__ inter, const uint8_t* __restrict__ w2,
+    const float* __restrict__ w2_scale, const float* __restrict__ topk_weights,
+    const int* __restrict__ sorted, const int* __restrict__ tile_e,
+    const int* __restrict__ tile_base, const int* __restrict__ tile_n,
+    __nv_bfloat16* __restrict__ out) {
   const int tile = blockIdx.y;
   const int n = tile_n[tile];
   if (n == 0) return;
@@ -1246,8 +1210,8 @@ __global__ __launch_bounds__(256) void k_gemm2_big(
   __syncthreads();
 
   const int rowbase = hb * 128 + warp * 16;
-  const uint8_t *wptr = w2 + ((size_t)e * H_DIM + rowbase) * I_DIM + c * 16;
-  const float *wsc = w2_scale + ((size_t)e * 16 + (rowbase >> 7)) * 4;
+  const uint8_t* wptr = w2 + ((size_t)e * H_DIM + rowbase) * I_DIM + c * 16;
+  const float* wsc = w2_scale + ((size_t)e * 16 + (rowbase >> 7)) * 4;
   int xoff[NTILES];
 #pragma unroll
   for (int t = 0; t < NTILES; ++t) xoff[t] = s_pair[8 * t + r] * I_DIM + c * 16;
@@ -1263,30 +1227,36 @@ __global__ __launch_bounds__(256) void k_gemm2_big(
   for (int ks = 0; ks < 8; ++ks) {
     const int k = ks * 64;
     const __half2 sc2 = __float2half2_rn(wsc[ks >> 1]);
-    uint4 w0 = *(const uint4 *)(wptr + (size_t)r * I_DIM + k);
-    uint4 w1 = *(const uint4 *)(wptr + (size_t)(r + 8) * I_DIM + k);
+    uint4 w0 = *(const uint4*)(wptr + (size_t)r * I_DIM + k);
+    uint4 w1 = *(const uint4*)(wptr + (size_t)(r + 8) * I_DIM + k);
     uint32_t h0[8], h1[8];
     unpack16(w0, h0);
     unpack16(w1, h1);
 #pragma unroll
     for (int q = 0; q < 8; ++q) {
-      __half2 a = __hmul2(*(const __half2 *)&h0[q], sc2);
-      __half2 b = __hmul2(*(const __half2 *)&h1[q], sc2);
-      h0[q] = *(const uint32_t *)&a;
-      h1[q] = *(const uint32_t *)&b;
+      __half2 a = __hmul2(*(const __half2*)&h0[q], sc2);
+      __half2 b = __hmul2(*(const __half2*)&h1[q], sc2);
+      h0[q] = *(const uint32_t*)&a;
+      h1[q] = *(const uint32_t*)&b;
     }
 #pragma unroll
     for (int t = 0; t < NTILES; ++t) {
       if (t >= ntl) continue;
-      uint4 x0 = *(const uint4 *)(inter + xoff[t] + k);
-      uint4 x1 = *(const uint4 *)(inter + xoff[t] + k + 8);
+      uint4 x0 = *(const uint4*)(inter + xoff[t] + k);
+      uint4 x1 = *(const uint4*)(inter + xoff[t] + k + 8);
       uint32_t xq[8];
-      xq[0] = x0.x; xq[1] = x0.y; xq[2] = x0.z; xq[3] = x0.w;
-      xq[4] = x1.x; xq[5] = x1.y; xq[6] = x1.z; xq[7] = x1.w;
+      xq[0] = x0.x;
+      xq[1] = x0.y;
+      xq[2] = x0.z;
+      xq[3] = x0.w;
+      xq[4] = x1.x;
+      xq[5] = x1.y;
+      xq[6] = x1.z;
+      xq[7] = x1.w;
 #pragma unroll
       for (int sx = 0; sx < 4; ++sx)
-        mma16816(facc[t], h0[2 * sx], h1[2 * sx], h0[2 * sx + 1], h1[2 * sx + 1],
-                 xq[2 * sx], xq[2 * sx + 1]);
+        mma16816(facc[t], h0[2 * sx], h1[2 * sx], h0[2 * sx + 1], h1[2 * sx + 1], xq[2 * sx],
+                 xq[2 * sx + 1]);
     }
   }
 
@@ -1302,16 +1272,15 @@ __global__ __launch_bounds__(256) void k_gemm2_big(
     const int j = i % n, rp = i / n;
     const int p = s_pair[j];
     const float tw = topk_weights[p];
-    __nv_bfloat162 v = __floats2bfloat162_rn(xf[(2 * rp) * NTOK + j] * tw,
-                                             xf[(2 * rp + 1) * NTOK + j] * tw);
-    atomicAdd((__nv_bfloat162 *)(out + (size_t)(p >> 3) * H_DIM + hb * 128 + 2 * rp),
-              v);
+    __nv_bfloat162 v =
+        __floats2bfloat162_rn(xf[(2 * rp) * NTOK + j] * tw, xf[(2 * rp + 1) * NTOK + j] * tw);
+    atomicAdd((__nv_bfloat162*)(out + (size_t)(p >> 3) * H_DIM + hb * 128 + 2 * rp), v);
   }
 }
 
 // ---------------------------------------------------------------- host
 
-static void *g_ptr = nullptr;
+static void* g_ptr = nullptr;
 static size_t g_bytes = 0;
 static int g_init = 0;
 
@@ -1320,7 +1289,7 @@ static int g_persistent_sms = 0;
 static int g_persistent_13_ok = -1;
 static int g_t4_pair_cluster_ok = -1;
 
-static void *get_scratch(size_t need) {
+static void* get_scratch(size_t need) {
   if (g_bytes < need) {
     if (g_ptr) cudaFree(g_ptr);
     cudaMalloc(&g_ptr, need);
@@ -1330,42 +1299,36 @@ static void *get_scratch(size_t need) {
   return g_ptr;
 }
 
-void Run(ffi::TensorView hidden_states, ffi::TensorView w13,
-         ffi::TensorView w13_scale, ffi::TensorView w2,
-         ffi::TensorView w2_scale, ffi::TensorView topk_ids,
+void Run(ffi::TensorView hidden_states, ffi::TensorView w13, ffi::TensorView w13_scale,
+         ffi::TensorView w2, ffi::TensorView w2_scale, ffi::TensorView topk_ids,
          ffi::TensorView topk_weights, ffi::TensorView out) {
-  cudaStream_t stream = static_cast<cudaStream_t>(
-      TVMFFIEnvGetStream(kDLCUDA, hidden_states.device().device_id));
+  cudaStream_t stream =
+      static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, hidden_states.device().device_id));
   if (!g_init) {
-    cudaFuncSetAttribute(k_gemm1, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         64 * 1024);
-    cudaFuncSetAttribute(k_fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         64 * 1024);
+    cudaFuncSetAttribute(k_gemm1, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
+    cudaFuncSetAttribute(k_fused, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024);
     g_init = 1;
   }
   const int T = (int)hidden_states.shape()[0];
   if (T == 1) {
-    RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids,
-            topk_weights, out, stream);
+    RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, stream);
     return;
   }
   if (T >= 128) {
     if (T >= 16384)
-      RunOursFlat(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids,
-                  topk_weights, out);
+      RunOursFlat(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out);
     else
-      RunOurs(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids,
-              topk_weights, out);
+      RunOurs(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out);
     return;
   }
   const int P = T * TOPK;
-  const uint8_t *pw13 = (const uint8_t *)w13.data_ptr();
-  const uint8_t *pw2 = (const uint8_t *)w2.data_ptr();
-  const float *ps13 = (const float *)w13_scale.data_ptr();
-  const float *ps2 = (const float *)w2_scale.data_ptr();
-  const int *pids = (const int *)topk_ids.data_ptr();
-  const float *ptw = (const float *)topk_weights.data_ptr();
-  __nv_bfloat16 *pout = (__nv_bfloat16 *)out.data_ptr();
+  const uint8_t* pw13 = (const uint8_t*)w13.data_ptr();
+  const uint8_t* pw2 = (const uint8_t*)w2.data_ptr();
+  const float* ps13 = (const float*)w13_scale.data_ptr();
+  const float* ps2 = (const float*)w2_scale.data_ptr();
+  const int* pids = (const int*)topk_ids.data_ptr();
+  const float* ptw = (const float*)topk_weights.data_ptr();
+  __nv_bfloat16* pout = (__nv_bfloat16*)out.data_ptr();
 
   if (T <= 16) {
     if (g_persistent_sms == 0)
@@ -1373,8 +1336,7 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13,
                              hidden_states.device().device_id);
     if (g_persistent_13_ok < 0) {
       int occ = 0;
-      cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &occ, k_persistent_decode<13, true>, 416, 0);
+      cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, k_persistent_decode<13, true>, 416, 0);
       g_persistent_13_ok = occ >= 2;
     }
     const bool use_two = T == 4 && g_persistent_13_ok;
@@ -1402,12 +1364,9 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13,
           probe.numAttrs = 1;
           cudaOccupancyMaxActiveClusters(
               &max_active_clusters,
-              reinterpret_cast<const void *>(
-                  k_persistent_decode<13, true, true>),
-              &probe);
+              reinterpret_cast<const void*>(k_persistent_decode<13, true, true>), &probe);
         }
-        g_t4_pair_cluster_ok =
-            cluster_launch && max_active_clusters >= 188 ? 1 : 0;
+        g_t4_pair_cluster_ok = cluster_launch && max_active_clusters >= 188 ? 1 : 0;
       }
       if (g_t4_pair_cluster_ok) {
         cudaLaunchConfig_t cfg = {};
@@ -1424,29 +1383,27 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13,
         attrs[1].val.cooperative = 1;
         cfg.attrs = attrs;
         cfg.numAttrs = 2;
-        if (cudaLaunchKernelEx(
-                &cfg, k_persistent_decode<13, true, true>,
-                (const __nv_bfloat16 *)hidden_states.data_ptr(), pw13, ps13,
-                pw2, ps2, pids, ptw, pout, T, q1, r1, q2, r2) == cudaSuccess)
+        if (cudaLaunchKernelEx(&cfg, k_persistent_decode<13, true, true>,
+                               (const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13, pw2, ps2,
+                               pids, ptw, pout, T, q1, r1, q2, r2) == cudaSuccess)
           return;
         g_t4_pair_cluster_ok = 0;
       }
-      k_persistent_decode<13, true><<<blocks, 416, 0, stream>>>(
-          (const __nv_bfloat16 *)hidden_states.data_ptr(), pw13, ps13, pw2,
-          ps2, pids, ptw, pout, T, q1, r1, q2, r2);
+      k_persistent_decode<13, true>
+          <<<blocks, 416, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13,
+                                       pw2, ps2, pids, ptw, pout, T, q1, r1, q2, r2);
     } else if (T == 16) {
-      k_persistent_decode<22, 2><<<blocks, 704, 0, stream>>>(
-          (const __nv_bfloat16 *)hidden_states.data_ptr(), pw13, ps13, pw2,
-          ps2, pids, ptw, pout, T, q1, r1, q2, r2);
+      k_persistent_decode<22, 2>
+          <<<blocks, 704, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13,
+                                       pw2, ps2, pids, ptw, pout, T, q1, r1, q2, r2);
     } else {
-      k_persistent_decode<22><<<blocks, 704, 0, stream>>>(
-          (const __nv_bfloat16 *)hidden_states.data_ptr(), pw13, ps13, pw2,
-          ps2, pids, ptw, pout, T, q1, r1, q2, r2);
+      k_persistent_decode<22>
+          <<<blocks, 704, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13,
+                                       pw2, ps2, pids, ptw, pout, T, q1, r1, q2, r2);
     }
     return;
   }
-  RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids,
-          topk_weights, out, stream);
+  RunGemv(hidden_states, w13, w13_scale, w2, w2_scale, topk_ids, topk_weights, out, stream);
   return;
 
   const int big = (T >= 128);
@@ -1461,15 +1418,15 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13,
   size_t off_inter = off_gu + (size_t)P * TWO_I * 2;
   size_t off_hsf = off_inter + (big ? (size_t)P * I_DIM * 2 : 0);
   size_t total = off_hsf + (big ? (size_t)T * H_DIM * 2 : 0);
-  char *sc = (char *)get_scratch(total);
-  unsigned *bar = (unsigned *)sc;
-  int *sorted = (int *)(sc + off_sorted);
-  int *tile_e = (int *)(sc + off_tiles);
-  int *tile_base = tile_e + max_tiles;
-  int *tile_n = tile_base + max_tiles;
-  __half *gu = (__half *)(sc + off_gu);
-  __half *inter = (__half *)(sc + off_inter);
-  __half *hsf = (__half *)(sc + off_hsf);
+  char* sc = (char*)get_scratch(total);
+  unsigned* bar = (unsigned*)sc;
+  int* sorted = (int*)(sc + off_sorted);
+  int* tile_e = (int*)(sc + off_tiles);
+  int* tile_base = tile_e + max_tiles;
+  int* tile_n = tile_base + max_tiles;
+  __half* gu = (__half*)(sc + off_gu);
+  __half* inter = (__half*)(sc + off_inter);
+  __half* hsf = (__half*)(sc + off_hsf);
 
   if (!big) {
     const int nxr = T < NT ? T : NT;
@@ -1482,49 +1439,29 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w13,
     const int grid_f = (TWO_I / 16) * max_tiles;
     if (occ > 0 && nsm > 0 && grid_f <= occ * nsm) {
       k_fused<<<dim3(TWO_I / 16, max_tiles), 256, smemf, stream>>>(
-          (const __nv_bfloat16 *)hidden_states.data_ptr(), pw13, ps13, pw2, ps2,
-          pids, ptw, P, gu, pout, T * H_DIM / 8, bar, nxr);
+          (const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13, pw2, ps2, pids, ptw, P, gu,
+          pout, T * H_DIM / 8, bar, nxr);
       return;
     }
     k_gemm1<<<dim3(TWO_I / 16, max_tiles), 256, smem1, stream>>>(
-        (const __nv_bfloat16 *)hidden_states.data_ptr(), pw13, ps13, pids, P,
-        gu, pout, T * H_DIM / 8, tile_e);
-    k_gemm2<<<dim3(H_DIM / 32, max_tiles), 256, 0, stream>>>(
-        gu, pw2, ps2, ptw, tile_e, pout);
+        (const __nv_bfloat16*)hidden_states.data_ptr(), pw13, ps13, pids, P, gu, pout,
+        T * H_DIM / 8, tile_e);
+    k_gemm2<<<dim3(H_DIM / 32, max_tiles), 256, 0, stream>>>(gu, pw2, ps2, ptw, tile_e, pout);
   } else {
-    k_route<<<1, 256, 0, stream>>>(pids, P, sorted, tile_e, tile_base, tile_n,
-                                   max_tiles, ntk);
+    k_route<<<1, 256, 0, stream>>>(pids, P, sorted, tile_e, tile_base, tile_n, max_tiles, ntk);
     const int nv = T * H_DIM / 8;
     int gcv = (nv + 255) / 256;
     if (gcv > 2048) gcv = 2048;
-    k_cvt_x<<<gcv, 256, 0, stream>>>(
-        (const __nv_bfloat16 *)hidden_states.data_ptr(), hsf, pout, nv);
-    k_gemm1_big<<<dim3(TWO_I / 128, max_tiles), 256, 0, stream>>>(
-        hsf, pw13, ps13, sorted, tile_e, tile_base, tile_n, gu);
+    k_cvt_x<<<gcv, 256, 0, stream>>>((const __nv_bfloat16*)hidden_states.data_ptr(), hsf, pout, nv);
+    k_gemm1_big<<<dim3(TWO_I / 128, max_tiles), 256, 0, stream>>>(hsf, pw13, ps13, sorted, tile_e,
+                                                                  tile_base, tile_n, gu);
     const int nvs = P * (I_DIM / 8);
     int gs = (nvs + 255) / 256;
     if (gs > 2048) gs = 2048;
     k_silu<<<gs, 256, 0, stream>>>(gu, inter, nvs);
-    k_gemm2_big<<<dim3(H_DIM / 128, max_tiles), 256, 0, stream>>>(
-        inter, pw2, ps2, ptw, sorted, tile_e, tile_base, tile_n, pout);
+    k_gemm2_big<<<dim3(H_DIM / 128, max_tiles), 256, 0, stream>>>(inter, pw2, ps2, ptw, sorted,
+                                                                  tile_e, tile_base, tile_n, pout);
   }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
