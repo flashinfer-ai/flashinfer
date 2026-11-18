@@ -76,7 +76,11 @@ def sampled_reference(
             quant_kind=cfg.quant_kind,
             combine_dtype=cfg.combine_dtype,
             local_expert_offset=cfg.rank * cfg.experts_per_rank,
-            gate_up_clamp=cfg.gate_up_clamp,
+            gate_up_clamp=(
+                abs(cfg.gate_up_clamp)
+                if cfg.batch_invariant and cfg.gate_up_clamp is not None
+                else cfg.gate_up_clamp
+            ),
             apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
             weight_scales_are_swizzled=True,
             return_fp32=True,

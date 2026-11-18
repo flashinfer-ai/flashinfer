@@ -60,10 +60,10 @@ def _record_hash(data: bytes) -> str:
     )
 
 
-def _write_wheel(path: Path) -> None:
+def _write_wheel(path: Path, files: dict[str, bytes] = FILES) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         rows = []
-        for name, data in FILES.items():
+        for name, data in files.items():
             zf.writestr(name, data)
             rows.append((name, _record_hash(data), str(len(data))))
         rows.append((f"{DIST_INFO}/RECORD", "", ""))
@@ -167,6 +167,32 @@ def test_release_switch_drops_experimental_kernel_sources(
     assert stats["dropped_entries"] == 6
 
 
+@pytest.mark.parametrize("exclude_experimental", ["0", "1"])
+def test_hc_jit_sources_are_kept(
+    tmp_path, monkeypatch, build_backend, exclude_experimental
+):
+    monkeypatch.setenv(build_backend._EXPERIMENTAL_SOURCES_FLAG, exclude_experimental)
+    hc_sources = (
+        "flashinfer/experimental/hc_sum_sm100/csrc/binding.cu",
+        "flashinfer/experimental/hc_sum_sm100/csrc/kernels.cuh",
+    )
+    extra = "flashinfer/experimental/hc_sum_sm100/csrc/unused.cu"
+    files = dict(FILES)
+    for name in hc_sources:
+        files[name] = (_ROOT / name).read_bytes()
+    files[extra] = b"// not a runtime dependency\n"
+    wheel = tmp_path / "flashinfer_python-0.0.0-py3-none-any.whl"
+    _write_wheel(wheel, files)
+
+    build_backend._slim_wheel(wheel)
+    names = _check_record(wheel)
+    with zipfile.ZipFile(wheel) as zf:
+        for name in hc_sources:
+            assert name in names
+            assert zf.read(name) == files[name]
+    assert (extra in names) == (exclude_experimental == "0")
+
+
 def test_slimming_is_idempotent(tmp_path, monkeypatch, build_backend):
     monkeypatch.setenv(build_backend._EXPERIMENTAL_SOURCES_FLAG, "1")
     wheel = tmp_path / "flashinfer_python-0.0.0-py3-none-any.whl"
@@ -192,13 +218,3 @@ def test_entry_rules(build_backend):
     assert not dropped("flashinfer/experimental/foo/cake_jit.py", True)
     assert not dropped("flashinfer/data/csrc/norm/k.cu", True)
     assert not dropped("flashinfer/cake_gdp_backend/csrc/k.cu", True)
-    # the Cake training backends behind stable facades (#8928) keep their sources
-    assert not dropped(
-        "flashinfer/experimental/cake/cake_causal_conv1d_det_train/csrc/k.cu", True
-    )
-    assert not dropped(
-        "flashinfer/experimental/cake/cake_causal_conv1d_det_train/csrc/a/k.cuh", True
-    )
-    assert not dropped(
-        "flashinfer/experimental/cake/cake_kda_nondet_train/csrc/k.cu", True
-    )

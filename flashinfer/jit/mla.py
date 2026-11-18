@@ -33,7 +33,7 @@ def gen_mla_module() -> JitSpec:
 
 
 def gen_mla_swa_sm90_module() -> JitSpec:
-    """BF16 Page64 DOTS-style sliding-window MLA, six frozen SM90 tactics."""
+    """BF16 Page64 DOTS-style sliding-window MLA, seven qualified SM90 tactics."""
     return gen_jit_spec(
         "mla_swa_sm90",
         [jit_env.FLASHINFER_CSRC_DIR / "mla_swa_sm90.cu"],
@@ -89,6 +89,7 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv32_decode_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/legacy_decode_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_dispatch.cu",
             jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv41_fp4_cache_ops.cu",
             jit_env.FLASHINFER_CSRC_DIR

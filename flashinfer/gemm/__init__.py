@@ -31,6 +31,14 @@ from .gemm_base import (
     group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .gemm_bf16_fp8 import mm_bf16_fp8 as mm_bf16_fp8
+from .gemm_bf16_fp8 import (
+    mm_bf16_fp8_workspace_bytes as mm_bf16_fp8_workspace_bytes,
+)
+from .gemm_bf16_fp8 import mm_fp16_fp8 as mm_fp16_fp8
+from .gemm_bf16_fp8 import (
+    mm_fp16_fp8_workspace_bytes as mm_fp16_fp8_workspace_bytes,
+)
 from .cake_grouped_fp8_gemm import (
     PreparedGroupGemmFp8NtGroupwiseContiguous as PreparedGroupGemmFp8NtGroupwiseContiguous,
 )
@@ -67,6 +75,7 @@ from .gemm_bf16_fp4 import (
     mm_bf16_fp4 as mm_bf16_fp4,
     prepare_bf16_fp4_weights as prepare_bf16_fp4_weights,
 )
+from .gemm_mxfp8_mxfp4 import mm_mxfp8_mxfp4 as mm_mxfp8_mxfp4
 
 from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
@@ -213,6 +222,7 @@ __all__ = (
         "prepare_nvfp4_lora_adapter",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "mm_mxfp8_mxfp4",
         "fp8_linear",
         "fp8_linear_swiglu",
         "fp8_qkv_qknorm_rope",
@@ -228,6 +238,10 @@ __all__ = (
         "mm_M1_16_K7168_N896",
         "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
+        "mm_bf16_fp8",
+        "mm_bf16_fp8_workspace_bytes",
+        "mm_fp16_fp8",
+        "mm_fp16_fp8_workspace_bytes",
     ]
     + _cute_dsl_kernels
     + _cuda_tile_kernels

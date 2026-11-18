@@ -1477,7 +1477,7 @@ def gated_delta_rule_mtp(
         deprecation warning - the default will change to ``False`` in
         FlashInfer 0.8.0.
 
-        .. deprecated::
+        .. deprecated:: 0.6.7
             The implicit default of ``True`` is deprecated and will change
             to ``False`` in version 0.8.0.  Pass
             ``disable_state_update=True`` or ``disable_state_update=False``
@@ -1917,8 +1917,8 @@ def gated_delta_rule_replayssm_commit(
         Contiguous int32 ``[B, T]`` cache rows to replay, in order. Row ``j``
         of request ``i`` is replayed only when ``j < accept_lens[i]``; later
         entries are padding and may hold any value. Lets tree speculation
-        commit a root-to-node path that is not a contiguous prefix. Rows must
-        lie in [0, T) and must not repeat within a request. Default ``None``
+        commit a root-to-node path that is not a contiguous prefix. Replayed rows
+        must lie in [0, T) and must not repeat within a request. Default ``None``
         replays rows ``0..accept_lens[i]-1`` and compiles a variant with no
         gather.
     track_state_indices : torch.Tensor, optional

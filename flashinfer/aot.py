@@ -218,6 +218,7 @@ from .jit.rmsnorm_silu import (
 )
 from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
+from .jit.qsa_sparse_paged import gen_qsa_sparse_paged_module
 from .jit.rope import gen_rope_module
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
@@ -759,6 +760,9 @@ def gen_all_modules(
         jit_specs.append(gen_mla_kv_pack_fp8_module())
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    # QSA sparse paged attention: one build (SM80 instructions) over the 8.x and 9.x targets.
+    if has_sm80 or has_sm90:
+        jit_specs.append(gen_qsa_sparse_paged_module())
     # Cake SM120 block-64 block-sparse attention (backend="vsa_sm120_blk64" of
     # BlockSparseAttentionWrapper): the bfloat16 and float16 programs, one
     # library each per exact target.
@@ -973,7 +977,9 @@ def gen_all_modules(
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            # The generic module only: the device-specific prebuilt-D variants are
+            # selected at JIT time and must not follow the build host's GPU.
+            jit_specs.append(gen_cutlass_fused_moe_sm90_module(enable_prebuilt_d=False))
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
             # the fixed E=256/N=512/K=2048 shape (BS8).
@@ -1361,30 +1367,34 @@ def copy_built_kernels(
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
     for jit_spec in jit_specs:
-        src = jit_env.FLASHINFER_JIT_DIR / jit_spec.name / f"{jit_spec.name}.so"
-        dst = out_dir / jit_spec.name / f"{jit_spec.name}.so"
+        # module.dll on Windows and <name>.so elsewhere: the file the loader opens.
+        library_name = jit_env.jit_library_name(jit_spec.name)
+        src = jit_env.FLASHINFER_JIT_DIR / jit_spec.name / library_name
+        dst = out_dir / jit_spec.name / library_name
         dst.parent.mkdir(exist_ok=False, parents=False)
         shutil.copy2(src, dst)
 
 
-def compile_and_package_modules(
-    out_dir: Optional[Path],
-    build_dir: Path,
+def generate_jit_specs(
     project_root: Path,
+    build_dir: Path,
     config: dict = None,
     verbose: bool = False,
-    skip_prebuilt: bool = True,
-) -> None:
+) -> List[JitSpec]:
     """
-    Compile and package modules based on the provided configuration.
+    Generate the AOT JIT specs without compiling them.
+
+    Points the JIT environment at ``project_root`` and ``build_dir`` (generated
+    sources are written below ``build_dir``) and returns every spec the build
+    would compile for ``FLASHINFER_CUDA_ARCH_LIST``. That variable must be set
+    before ``flashinfer`` is first imported, since the compilation context reads
+    it at import.
 
     Args:
-        out_dir: Output directory for packaged modules
-        build_dir: Build directory for compilation
         project_root: Project root directory
+        build_dir: Build directory for generated sources
         config: Configuration dictionary to override defaults (optional)
-        verbose: Whether to print verbose build output
-        skip_prebuilt: Whether to skip pre-built modules
+        verbose: Whether to print a build summary
     """
     # Start with default config and override with user config
     final_config = get_default_config()
@@ -1416,8 +1426,6 @@ def compile_and_package_modules(
     # Print summary
     if verbose:
         print("AOT build summary:")
-        if out_dir is not None:
-            print("  out_dir:", out_dir)
         print("  build_dir:", build_dir)
         print("  fa2_head_dim:", config["fa2_head_dim"])
         print("  fa3_head_dim:", config["fa3_head_dim"])
@@ -1462,6 +1470,33 @@ def compile_and_package_modules(
     )
     if verbose:
         print("Total ops:", len(jit_specs))
+    return jit_specs
+
+
+def compile_and_package_modules(
+    out_dir: Optional[Path],
+    build_dir: Path,
+    project_root: Path,
+    config: dict = None,
+    verbose: bool = False,
+    skip_prebuilt: bool = True,
+) -> None:
+    """
+    Compile and package modules based on the provided configuration.
+
+    Args:
+        out_dir: Output directory for packaged modules
+        build_dir: Build directory for compilation
+        project_root: Project root directory
+        config: Configuration dictionary to override defaults (optional)
+        verbose: Whether to print verbose build output
+        skip_prebuilt: Whether to skip pre-built modules
+    """
+    if verbose and out_dir is not None:
+        print("AOT output directory:", out_dir)
+    jit_specs = generate_jit_specs(
+        project_root, build_dir, config=config, verbose=verbose
+    )
 
     # Build
     build_jit_specs(jit_specs, verbose=verbose, skip_prebuilt=skip_prebuilt)
@@ -1720,8 +1755,6 @@ def main():
     config = get_default_config()
     build_dir = jit_env.FLASHINFER_WORKSPACE_DIR
     out_dir: Optional[Path] = None
-
-    # Override with command line arguments
     if args.out_dir:
         out_dir = Path(args.out_dir)
     if args.build_dir:

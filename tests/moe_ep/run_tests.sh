@@ -7,13 +7,14 @@
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh comm          # MoEEpCommunication backends (NVLink one-sided, Cake, two-sided)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
-#   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8-rank B200/R200 BF16 rank-major GPU regression
+#   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8-rank SM100/SM107 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90 pull FP8 + BF16 mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4 # 4-GPU Hopper MXFP4 accuracy
 #   bash tests/moe_ep/run_tests.sh mega_sm90_nvfp4 # 4-GPU Hopper NVFP4 accuracy + graph replay
 #   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
+#   bash tests/moe_ep/run_tests.sh qualify_bi    # strict MegaMoE BI + Lean + EP2/4/8; rejects skips
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
 #   bash tests/moe_ep/run_tests.sh sm90_bf16_push_cake # 2-GPU Hopper sm90_bf16_bf16_bf16_push_cake (native BF16) backend
 #   bash tests/moe_ep/run_tests.sh split_path_correctness_bf16   # 4-GPU bf16 split-path numerics
@@ -37,8 +38,8 @@
 #   - mega: Blackwell (sm_100+), nvshmem, deep_gemm, triton
 #   - mega_sm120_cake: >=4 sm_120 GPUs (NPROC_CAKE_SM120), NCCL 2.30.7 with the
 #     Device API (NCCL_HOME or the nvidia-nccl-cu13==2.30.7 wheel), CUDA 13 nvcc
-#   - bf16-rank-major: eight B200 (SM100) or R200 (SM107) GPUs in one NVLink
-#     domain, CUDA 12.8+ nvcc (13.4+ for R200), cuda-bindings, and PyTorch
+#   - bf16-rank-major: eight SM100 or SM107 GPUs in one NVLink
+#     domain, CUDA 12.8+ nvcc (13.4+ for SM107), cuda-bindings, and PyTorch
 #     NVSHMEM symmetric-memory support; NNODES>1 needs RDZV_ENDPOINT
 #   - optional NIXL smoke: BUILD_NIXL_EP=1 install
 
@@ -196,10 +197,10 @@ run_comm() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_communication_multirank.py -v || return 1
-  # NVLink one-sided's Lamport transport against its fence transport.
+  # NVLink one-sided's sentinel protocol against its fence protocol.
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_nvlink_one_sided_lamport.py -v || return 1
+    tests/moe_ep/test_nvlink_one_sided_sentinel.py -v || return 1
   # Spawns one process per EP rank itself; cases needing more GPUs skip.
   "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" tests/moe_ep/test_nvlink_one_sided.py -v
 }
@@ -368,7 +369,7 @@ run_mega() {
 # The rank-major source bundle has an exact eight-rank contract. Keep this
 # separate from the four-rank mega/all targets and do not honor NPROC_MULTIRANK.
 # See docs/design_docs/moe_ep_bf16_rank_major_gpu_tests.md for requirements.
-# One node runs all eight ranks. With NNODES=2 (for example two 4-GPU R200
+# One node runs all eight ranks. With NNODES=2 (for example two 4-GPU SM107
 # nodes in one NVLink domain), run this target on every node with the same
 # RDZV_ENDPOINT=host:port.
 run_bf16_rank_major() {
@@ -388,7 +389,7 @@ if torch.cuda.device_count() != nproc:
 for device in range(nproc):
     props = torch.cuda.get_device_properties(device)
     if (props.major, props.minor) not in ((10, 0), (10, 7)):
-        raise SystemExit(f"BF16 rank-major regression requires B200 or R200; GPU {device}: {props.name}")
+        raise SystemExit(f"BF16 rank-major regression requires SM100 or SM107; GPU {device}: capability {(props.major, props.minor)}")
 ' "${nproc}" || return 1
   local launch=(--standalone)
   if (( nnodes > 1 )); then
@@ -459,6 +460,7 @@ run_mega_sm107() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
     tests/moe_ep/test_sm107_routing_graph_multirank.py \
+    tests/moe_ep/test_sm107_shared_expert.py \
     -m "gpu_2 and arch_rubin"
 }
 
@@ -618,6 +620,7 @@ run_all() {
 # Single-target runs must still propagate failure (print_summary returns
 # non-zero if any section failed) so CI callers see a real exit code.
 case "${1:-all}" in
+  qualify_bi) "${PY}" tests/moe_ep/qualify_batch_invariant.py --suite all --world-size "${NPROC_MULTIRANK}" --output-dir "${BI_QUALIFICATION_OUTPUT:-${TMPDIR:-/tmp}/flashinfer-bi-$$}" ;;
   qualify_sm107) "${PY}" tests/moe_ep/qualify_sm107.py --suite all --world-size "${NPROC_MULTIRANK}" --output-dir "${SM107_RESULTS_DIR:-/tmp/flashinfer-sm107-qualification}" ;;
   unit) run_section "unit + mock (no multirank)" run_unit; print_summary ;;
   oracle) run_section "torch-oracle correctness (1 GPU)" run_oracle; print_summary ;;
@@ -630,7 +633,7 @@ case "${1:-all}" in
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
-  bf16-rank-major) run_section "BF16 rank-major GPU regression (8 B200/R200 GPUs)" run_bf16_rank_major; print_summary ;;
+  bf16-rank-major) run_section "BF16 rank-major GPU regression (8 SM100/SM107 GPUs)" run_bf16_rank_major; print_summary ;;
   mega_sm120_cake) run_section "sm120_mxfp4_mxfp8_bf16_cake mega multirank (Blackwell-consumer, NCCL LSA + GIN)" run_mega_sm120_cake; print_summary ;;
   mega_sm90) run_section "sm90 pull FP8 + BF16 mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   mega_sm90_nvfp4) run_section "sm90_fp8_nvfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_nvfp4; print_summary ;;
@@ -643,7 +646,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|qualify_bi|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac
