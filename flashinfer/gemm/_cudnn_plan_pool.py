@@ -314,6 +314,18 @@ _pool = None
 _pool_resolved = False
 
 
+def _reset_after_fork() -> None:
+    # The workers and pipes belong to the parent; a forked child starts over
+    # (and re-reads the environment variable) on its first tuning call.
+    global _pool, _pool_resolved
+    _pool = None
+    _pool_resolved = False
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
+
+
 def get_cudnn_plan_build_pool():
     """The process-wide pool, or ``None`` when ``FLASHINFER_CUDNN_PLAN_BUILD_WORKERS`` is 0/unset."""
     global _pool, _pool_resolved

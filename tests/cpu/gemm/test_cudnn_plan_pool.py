@@ -1,5 +1,6 @@
 """CPU tests for the cuDNN plan-build worker pool, driven by fake workers."""
 
+import os
 import pathlib
 import sys
 import textwrap
@@ -303,3 +304,32 @@ def test_worker_stderr_tail_is_logged(fake_cmd, caplog):
         pool.shutdown()
     assert "No module named 'cudnn'" in caplog.text
     assert "x" * 4096 not in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_forked_child_gets_a_fresh_pool_and_leaves_parent_workers(
+    fake_cmd, monkeypatch
+):
+    # A child forked while the pool is alive inherits its pipes; it must not
+    # talk to, or (through the inherited atexit hook) stop, the parent's workers.
+    pool = pool_mod.CudnnPlanBuildPool(
+        2, timeout_s=10.0, worker_cmd=fake_cmd("ok"), idle_s=600
+    )
+    monkeypatch.setattr(pool_mod, "_pool", pool)
+    monkeypatch.setattr(pool_mod, "_pool_resolved", True)
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+        procs = pool._all_processes()
+        pid = os.fork()
+        if pid == 0:
+            ok = pool_mod._pool is None and pool_mod._pool_resolved is False
+            # What a stale reference or the inherited atexit hook would do.
+            pool.disable("child")
+            pool.shutdown()
+            os._exit(0 if ok else 1)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        assert all(p.poll() is None for p in procs)
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+    finally:
+        pool.shutdown()
