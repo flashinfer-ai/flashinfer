@@ -59,20 +59,40 @@ __device__ int g_overflow_done;
 
 __global__ void acquire_workspace() {
   if (threadIdx.x == 0) {
-    while (atomicCAS(&g_overflow_lock, 0, 1) != 0) __nanosleep(64);
+    // Acquire CAS: pairs with the release store in finish_workspace(), so
+    // taking the lock makes every write the previous overflow call published
+    // before its release (its relaxed per-tile counter resets included)
+    // visible here; kernel completion then orders this grid before the
+    // stream-ordered consumer kernels that use the slot.
+    int got;
+    do {
+      asm volatile("atom.acquire.gpu.global.cas.b32 %0, [%1], %2, %3;"
+                   : "=r"(got)
+                   : "l"(&g_overflow_lock), "r"(0), "r"(1)
+                   : "memory");
+      if (got != 0) __nanosleep(64);
+    } while (got != 0);
     g_overflow_done = 0;
-    __threadfence();
   }
 }
 
 __device__ __forceinline__ void finish_workspace() {
   __syncthreads();
   if (threadIdx.x == 0) {
-    const int old = atomicAdd(&g_overflow_done, 1);
+    // acq_rel completion increment: the release half publishes this CTA's
+    // overflow-slot writes (a merger's relaxed counter reset included); the
+    // increments form a release sequence on g_overflow_done, so the last
+    // arrival's acquire half sees every earlier CTA's writes before the
+    // release below hands the slot to the next call's acquire CAS.
+    int old;
+    asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;"
+                 : "=r"(old)
+                 : "l"(&g_overflow_done)
+                 : "memory");
     if (old == (int)gridDim.x - 1) {
       g_overflow_done = 0;
-      __threadfence();
-      atomicExch(&g_overflow_lock, 0);
+      asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(&g_overflow_lock), "r"(0)
+                   : "memory");
     }
   }
 }
