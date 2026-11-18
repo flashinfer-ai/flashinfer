@@ -17,8 +17,8 @@ that fails to launch is reported as failed and does not stop the rest.
 That kernel accepts only head_dim 128, so N must be divisible by 384.
 
 ``--enable_pdl`` tunes and times the kernels launched with programmatic
-dependent launch (PDL), the API default on supporting devices. Without it
-they launch in plain stream order, as in flashinfer_benchmark.
+dependent launch (PDL). Without it they keep the API default (PDL on
+supporting devices), as before the GEMMs took the flag.
 
 Run from the repository root: python -m benchmarks.bench_prims_ts_gemm
 """
@@ -47,7 +47,7 @@ from flashinfer.prims_ts.gemm.runner import (
 from flashinfer.prims_ts.gemm.support import nvfp4_128x4_numel
 from flashinfer.prims_ts.gemm.tactics import legal_tactics
 from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import get_compute_capability, resolve_enable_pdl
 
 # The fused QKV kernel accepts only head_dim 128 and is_neox=False.
 _QKV_HEAD_DIM = 128
@@ -300,11 +300,19 @@ def main() -> None:
         "--enable_pdl",
         "--enable-pdl",
         action="store_true",
-        help="Launch with programmatic dependent launch (PDL). Off unless given.",
+        help=(
+            "Launch with programmatic dependent launch (PDL). Without it the GEMMs "
+            "keep their API default (on where the device supports PDL)."
+        ),
     )
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("this benchmark requires a CUDA GPU")
+    # Without --enable_pdl the GEMMs keep their API default, resolved here so the
+    # printed mode and the autotune identity name the mode that actually runs.
+    args.enable_pdl = resolve_enable_pdl(
+        True if args.enable_pdl else None, torch.device("cuda")
+    )
     if any(m <= 0 for m in args.m):
         raise ValueError("M must be positive")
     if args.tuning_buckets is not None and any(
