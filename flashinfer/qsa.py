@@ -291,6 +291,23 @@ def _check_qsa_topk_indexer_inputs(
             )
         if out.data_ptr() % 16:
             raise ValueError("out must be 16-byte aligned (storage-offset view).")
+        # The kernel reads cu_seqlens/cpage_base boundaries per CTA while
+        # other CTAs are already writing packed output rows, so an out
+        # buffer aliasing any input can be corrupted mid-launch. All five
+        # tensors are contiguous here, so the view's byte range is
+        # [data_ptr, data_ptr + numel * element_size).
+        out_lo = out.data_ptr()
+        out_hi = out_lo + out.numel() * out.element_size()
+        for name, t in (
+            ("qi", qi),
+            ("ck_cache", ck_cache),
+            ("cu_seqlens", cu_seqlens),
+            ("cpage_base", cpage_base),
+        ):
+            t_lo = t.data_ptr()
+            t_hi = t_lo + t.numel() * t.element_size()
+            if out_lo < t_hi and t_lo < out_hi:
+                raise ValueError(f"out must not share storage with {name}.")
 
 
 def _qsa_topk_indexer_unservable_reason(qi: torch.Tensor) -> Optional[str]:

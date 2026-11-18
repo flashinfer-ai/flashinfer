@@ -151,6 +151,22 @@ def test_preallocated_out_and_determinism():
     assert torch.equal(out, again)  # bitwise repeatable
 
 
+def test_out_overlapping_an_input_is_rejected():
+    """The kernel reads cu_seqlens while CTAs write out rows, so an out
+    buffer sharing storage with an input must be refused up front."""
+    qi, ck, cu, cpage_base = make_inputs((2600,), seed=11)
+    T = qi.shape[0]
+    backing = torch.zeros(T * PWIDTH + 8, dtype=torch.int32, device=qi.device)
+    out = backing[: T * PWIDTH].view(T, PWIDTH)
+    aliased_cu = backing[: cu.numel()]
+    aliased_cu.copy_(cu)
+    with pytest.raises(ValueError, match="share storage"):
+        qsa_topk_indexer(qi, ck, aliased_cu, cpage_base, out=out)
+    # Disjoint storage stays accepted.
+    ok = qsa_topk_indexer(qi, ck, cu, cpage_base, out=torch.empty_like(out))
+    assert ok.shape == (T, PWIDTH)
+
+
 def test_tie_break_lower_block_wins():
     """All keys identical: every visible block of a row scores the same, so
     the deterministic tie-break must select the lowest block indices."""
