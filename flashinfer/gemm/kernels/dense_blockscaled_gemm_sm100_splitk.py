@@ -46,6 +46,7 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
 from .dense_blockscaled_gemm_sm100 import _per_token_fragment_plan
 from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
+from flashinfer.cute_dsl.utils import mbarrier_wait_acquire_cluster
 
 from cutlass.cutlass_dsl import (
     T,
@@ -684,16 +685,6 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
-        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
-        # before multiplication could cause overflow when acc values are large.
-        if cutlass.const_expr(self.per_token_alpha is not None):
-            # Per-token mode: the scale is folded per subtile (or per tile)
-            # in the epilogue; the scalar multiply below must be the identity.
-            alpha_value = cutlass.Float32(1.0)
-        else:
-            alpha_value = alpha[0].to(cutlass.Float32)
-
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -984,6 +975,16 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         # instructions are effectively no-ops when PDL is not enabled at
         # the driver level.
         griddepcontrol_wait()
+
+        # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
+        # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
+        # before multiplication could cause overflow when acc values are large.
+        if cutlass.const_expr(self.per_token_alpha is not None):
+            # Per-token mode: the scale is folded per subtile (or per tile)
+            # in the epilogue; the scalar multiply below must be the identity.
+            alpha_value = cutlass.Float32(1.0)
+        else:
+            alpha_value = alpha[0].to(cutlass.Float32)
 
         #
         # Specialized TMA load warp
@@ -1614,7 +1615,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     * (cute.size(epi_tile[0]) * cute.size(epi_tile[1]))
                                     * 4,
                                 )
-                        cute.arch.mbarrier_wait(reduce_mbar_ptr, phase=0)
+                        mbarrier_wait_acquire_cluster(reduce_mbar_ptr, Int32(0))
 
                         local_thread_base = (
                             subtile_mailbox_base + epi_tidx * values_per_thread

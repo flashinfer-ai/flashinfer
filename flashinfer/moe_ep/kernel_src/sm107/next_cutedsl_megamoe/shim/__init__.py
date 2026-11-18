@@ -41,6 +41,7 @@ from .knob_cache import (
 __all__ = [
     "KNOB_KEYS",
     "Sm107BlockScaledMoeConfig",
+    "Sm107SharedExpertConfig",
     "Sm107BlockScaledSymmBuffer",
     "Sm107QuantKind",
     "TransformedBlockScaledWeights",
@@ -64,3 +65,5 @@ __all__ = [
     "sm107_schedule_candidates",
     "sym_zeros",
 ]
+
+from .shared_expert import Sm107SharedExpertConfig, validate_feature_config

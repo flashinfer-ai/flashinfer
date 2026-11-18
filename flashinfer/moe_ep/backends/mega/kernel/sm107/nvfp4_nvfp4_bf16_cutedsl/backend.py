@@ -25,6 +25,13 @@ from ..validation import (
     validate_nvfp4_scalars,
     validate_routing_values,
 )
+from ..shared_expert import (
+    bind_shared_weights,
+    prepare_shared_weights,
+    validate_shared_weights,
+    stage_shared_inputs,
+    validate_shared_inputs,
+)
 from .config import Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .staging import stage_mega_moe_inputs, validate_sm107_nvfp4_forward_inputs
 from .weights import (
@@ -45,12 +52,14 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     """Fused Rubin nvfp4 block-scaled inference MoE over the NVLink symmetric heap."""
 
     # compute(output=None) returns a view into the workspace.
+    supports_shared_expert = True
     supports_output_view = True
     supports_auto_workspaces = True
 
     def __init__(self, config: Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self._arithmetic_arch = "sm_107"
 
     def ep_weight_pack(self, weights):
         from ..automatic import ep_weight_pack
@@ -63,6 +72,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         return ep_selected_config(self, workspace)
 
     def ep_prepare_fixed(self, workspace, weights):
+        bind_shared_weights(workspace, weights)
         workspace.prepare(*weights)
 
     def ep_force_tune(self, workspace, tensors, weights, output):
@@ -108,6 +118,12 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, bootstrap: BootstrapConfig, fleet_params: FleetParams
     ) -> None:
         validate_mega_arch_sm107()
+        if self._kernel_config.batch_invariant:
+            from ...sm100.common.nvfp4_batch_invariant import (
+                validate_nvfp4_batch_invariant,
+            )
+
+            validate_nvfp4_batch_invariant(self._kernel_config, arch="sm_107")
         from ......kernel_src.sm107.next_cutedsl_megamoe import require_sm107_dsl
 
         self._ensure_ep_bootstrap(bootstrap)
@@ -132,10 +148,13 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
     ) -> TransformedMegaWeights:
-        return preprocess_mega_weights(
+        routed = preprocess_mega_weights(
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+        )
+        return prepare_shared_weights(
+            self._kernel_config, weights, routed, fleet_params
         )
 
     def validate_transformed_weights(
@@ -144,6 +163,9 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
+        transformed_weights = validate_shared_weights(
+            self._kernel_config, transformed_weights, fleet_params
+        )
         validate_transformed_mega_weights(
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
@@ -173,6 +195,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
 
     def _tuning_key(self, fleet_params: FleetParams) -> dict:
         k = self._kernel_config
+        from ...sm100.common.nvfp4_batch_invariant import NVFP4_BATCH_INVARIANT_VERSION
+
         return dict(
             dtype="nvfp4",
             world_size=self.ep_world_size,
@@ -188,7 +212,29 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             combine_dtype=k.combine_dtype,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            swiglu_alpha=getattr(k, "swiglu_alpha", None),
+            swiglu_beta=getattr(k, "swiglu_beta", None),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
+            shared_expert=k.shared_expert,
+            combine_dedup=k.combine_dedup,
             gate_up_clamp=k.gate_up_clamp,
+            batch_invariant=k.batch_invariant,
+            batch_invariant_version=NVFP4_BATCH_INVARIANT_VERSION
+            if k.batch_invariant
+            else None,
+            input_norm_const=k.input_norm_const,
+        )
+
+    def batch_invariant_fingerprint(self, fleet_params):
+        if not self._kernel_config.batch_invariant:
+            return None
+        from ...sm100.common.nvfp4_batch_invariant import (
+            nvfp4_batch_invariant_fingerprint,
+        )
+
+        return nvfp4_batch_invariant_fingerprint(
+            self._resolved_config(fleet_params), arch="sm_107"
         )
 
     def live_token_buckets(self, fleet_params: FleetParams) -> list[int]:
@@ -201,13 +247,40 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             Sm107BlockScaledSymmBuffer,
         )
 
-        return Sm107BlockScaledSymmBuffer(self._resolved_config(fleet_params))
+        return Sm107BlockScaledSymmBuffer(
+            self._resolved_config(fleet_params),
+            process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
+        )
 
     def _knob_overrides(self, fleet_params: FleetParams) -> dict:
         """Resolve fixed overrides or the automatic workspace's initial heuristic."""
         from ......kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
 
         k = self._kernel_config
+        if k.batch_invariant:
+            from ...sm100.common.nvfp4_batch_invariant import (
+                nvfp4_batch_invariant_default_knobs,
+                nvfp4_batch_invariant_implementation,
+                validate_nvfp4_batch_invariant,
+            )
+
+            selected = nvfp4_batch_invariant_default_knobs(
+                nvfp4_batch_invariant_implementation(k), arch="sm_107"
+            )
+            for name in selected:
+                configured = getattr(k, name, None)
+                if configured is not None:
+                    selected[name] = configured
+            if isinstance(k.knobs, dict):
+                selected.update(k.knobs)
+            elif k.knobs == "cache":
+                selected.update(self._workspace_knobs(fleet_params))
+            elif k.knobs not in (None, "auto"):
+                raise MoEEpConfigError(
+                    "knobs must be None, 'cache', 'auto', or a dictionary"
+                )
+            validate_nvfp4_batch_invariant(k, selected, arch="sm_107")
+            return selected
         if k.knobs is None:
             return {}
         if isinstance(k.knobs, dict):
@@ -222,12 +295,19 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             from ......kernel_src.sm107.next_cutedsl_megamoe import default_knobs
 
             # Cache selection must be collective before it affects allocation.
-            return default_knobs(
+            selected = default_knobs(
                 fleet_params.max_tokens_per_rank,
                 quant_kind="nvfp4",
                 kernel_variant=k.kernel_variant,
                 combine_dtype=k.combine_dtype,
             )
+            if k.combine_dedup:
+                selected.update(
+                    fc2_use_bulk=True,
+                    token_back_mode=k.token_back_mode,
+                    reduce_topk_in_kernel=False,
+                )
+            return selected
         if k.knobs == "cache":
             knobs = self._workspace_knobs(fleet_params)
             assert knobs is not None
@@ -248,6 +328,9 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
+        validate_shared_inputs(
+            self._kernel_config, t, fleet_params, quantize_input=quantize_input
+        )
         validate_nvfp4_scalars(
             self._scalar_values(t),
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
@@ -277,6 +360,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         """Stage NVFP4 inputs, fusing eligible route checks with quantization."""
+        stage_shared_inputs(t, workspace, quantize_input=quantize_input)
         if self._kernel_config.knobs == "auto":
             workspace._tuning_inputs = (t, quantize_input)
         self._stage_scalars(t, workspace)
@@ -290,6 +374,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 input_norm_const=self._kernel_config.input_norm_const,
+                batch_invariant=self._kernel_config.batch_invariant,
                 num_experts=workspace.config.num_total_experts,
                 workspace=workspace,
             )
@@ -384,6 +469,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
 
         from ..automatic import prepare_auto_configuration
 
+        bind_shared_weights(workspace, transformed_weights)
         prepare_auto_configuration(
             self, workspace, transformed_weights, output, num_tokens
         )
@@ -406,6 +492,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         fp = fleet_params
         return (
             "sm107_nvfp4_nvfp4_bf16_cutedsl",
+            k.batch_invariant,
+            self.batch_invariant_fingerprint(fleet_params),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,
@@ -434,6 +522,10 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mn,
             k.fallback_cluster_shape_mn,
             k.max_sm_count,
+            k.use_tanh_sigmoid,
+            k.epilogue_warpgroups,
+            k.shared_expert,
+            k.combine_dedup,
             knobs_pool_key(self._knob_overrides(fleet_params)),
         )
 

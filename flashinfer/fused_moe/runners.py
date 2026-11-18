@@ -8646,6 +8646,7 @@ class SM12xFp8Runner(MoERunner):
             topk_weights,
             self.config.routing.num_experts,
             workspace=workspace,
+            token_only=True,
         )
         self._fc1(
             a_q,
@@ -8656,6 +8657,7 @@ class SM12xFp8Runner(MoERunner):
             enable_pdl=enable_pdl,
             out_q=q1,
             out_sf=sf1,
+            token_map=token_map,
             **act_kwargs,
         )
         self._fc2(
@@ -8892,6 +8894,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             self.config.routing.num_experts,
             workspace=workspace,
             enable_pdl=enable_pdl,
+            token_only=True,
         )
         self._fc1(
             a_q,
@@ -8903,6 +8906,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
             enable_pdl=enable_pdl,
             out_q=q1,
             out_sf=sf1,
+            token_map=token_map,
             **act_kwargs,
         )
         self._fc2(

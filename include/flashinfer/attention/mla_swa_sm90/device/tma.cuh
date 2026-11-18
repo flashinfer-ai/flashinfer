@@ -1,17 +1,25 @@
 #pragma once
 
-template <int Start, int End, typename TMAK, typename TensorG, typename TensorS>
+template <class T>
+__host__ __device__ constexpr auto kv_cache_hint() {
+  // Preserve the qualified M5b S1 baseline; other tactics use FIRST.
+  return T::BLOCK_M == 32 && T::Config::S == 1 ? cute::TMA::CacheHintSm90::EVICT_NORMAL
+                                               : cute::TMA::CacheHintSm90::EVICT_FIRST;
+}
+
+template <int Start, int End, auto Hint = cute::TMA::CacheHintSm90::EVICT_FIRST, typename TMAK,
+          typename TensorG, typename TensorS>
 __forceinline__ __device__ void launch_kv_tma(TensorG const& gkv, TensorS& skv, TMAK const& tma_k,
                                               TMABarrier* barriers, int thread_idx) {
   if (thread_idx == 0) {
     auto thr_tma = tma_k.get_slice(_0{});
     Tensor src = thr_tma.partition_S(gkv)(_, _0{}, Int<Start>{});
     Tensor dst = thr_tma.partition_D(skv)(_, _0{}, Int<Start>{});
-    cute::copy(tma_k.with(reinterpret_cast<typename TMABarrier::ValueType&>(barriers[Start]), 0,
-                          cute::TMA::CacheHintSm90::EVICT_FIRST),
-               src, dst);
+    cute::copy(
+        tma_k.with(reinterpret_cast<typename TMABarrier::ValueType&>(barriers[Start]), 0, Hint),
+        src, dst);
     if constexpr (Start + 1 < End) {
-      launch_kv_tma<Start + 1, End>(gkv, skv, tma_k, barriers, thread_idx);
+      launch_kv_tma<Start + 1, End, Hint>(gkv, skv, tma_k, barriers, thread_idx);
     }
   }
 }
@@ -33,7 +41,8 @@ __forceinline__ __device__ void issue_kv_tma_async(TensorSKV& sKV, Plan& plan, i
     return;
   }
   Tensor gkv = tma_params.tma_k.get_tma_tensor(tma_params.shape_k)(_, _, physical_page);
-  launch_kv_tma<Tile, Tile + 1>(gkv, sKV, tma_params.tma_k, plan.kv_barriers, 0);
+  launch_kv_tma<Tile, Tile + 1, kv_cache_hint<T>()>(gkv, sKV, tma_params.tma_k, plan.kv_barriers,
+                                                    0);
   plan.kv_barriers[Tile].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K * sizeof(typename T::InputT));
 }
 
@@ -61,7 +70,7 @@ __forceinline__ __device__ void issue_base_kv_tma_dynamic(TensorSKV& sKV, Plan& 
   Tensor dst = thr_tma.partition_D(sKV)(_, _0{}, tile);
   cute::copy(tma_params.tma_k.with(
                  reinterpret_cast<typename TMABarrier::ValueType&>(plan.kv_barriers[tile]), 0,
-                 cute::TMA::CacheHintSm90::EVICT_FIRST),
+                 kv_cache_hint<T>()),
              src, dst);
   plan.kv_barriers[tile].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K * sizeof(typename T::InputT));
 }
@@ -81,7 +90,7 @@ __forceinline__ __device__ void issue_aux_kv_tma_dynamic(Plan& plan, int physica
   Tensor dst = thr_tma.partition_D(sAux)(_, _0{}, _0{});
   cute::copy(tma_params.tma_k.with(
                  reinterpret_cast<typename TMABarrier::ValueType&>(plan.aux_kv_barriers[slot]), 0,
-                 cute::TMA::CacheHintSm90::EVICT_FIRST),
+                 kv_cache_hint<T>()),
              src, dst);
   plan.aux_kv_barriers[slot].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K *
                                                   sizeof(typename T::InputT));
@@ -145,7 +154,7 @@ __forceinline__ __device__ void issue_aux_kv_tma_async(Plan& plan, int physical_
   Tensor dst = thr_tma.partition_D(sAux)(_, _0{}, _0{});
   cute::copy(tma_params.tma_k.with(reinterpret_cast<typename TMABarrier::ValueType&>(
                                        plan.aux_kv_barriers[Slot + T::AUX_GUARD_SLICES]),
-                                   0, cute::TMA::CacheHintSm90::EVICT_FIRST),
+                                   0, kv_cache_hint<T>()),
              src, dst);
   plan.aux_kv_barriers[Slot + T::AUX_GUARD_SLICES].arrive_and_expect_tx(T::BLOCK_N * T::TILE_K *
                                                                         sizeof(typename T::InputT));
@@ -173,6 +182,6 @@ __forceinline__ __device__ void issue_lookahead_prologue(TensorSKV& sKV, Plan& p
                                                tma_params);
   issue_base_kv_range_async<0, T::NUM_V_TILES - T::LOOKAHEAD_K, T>(sKV, plan, first_physical_page,
                                                                    lane, tma_params);
-  issue_prologue_selected_aux_descending<T::LOOKAHEAD_K - 1, T>(plan, second_physical_page, lane,
-                                                                tma_params);
+  // The last PV WG issues the next-page aux prefetch after bootstrap's CTA
+  // rendezvous. Preserve all first-page TMA issue ordering in this producer.
 }
