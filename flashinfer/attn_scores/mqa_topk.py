@@ -67,6 +67,20 @@ class FP8MQATopKWrapper:
     Native modes have their own rounding, underflow and overflow behavior;
     they differ from FP32 head accumulation in ``relu_strict``/``relu_fast``.
 
+    ``backend="auto"`` routes between the named backends and preserves this
+    common contract: the "specialized" backend's narrower numerical
+    contract (unit ``k_scale``, positive per-row-constant ``weights``) is
+    verified on every eager call, and a violating eager call falls back to
+    "cutedsl" (when the configuration permits) instead of raising. Because
+    those value checks cannot make host decisions inside a captured graph,
+    auto REFUSES to capture a specialized run unless the wrapper was
+    constructed with ``declare_specialized_contract=True`` — the caller's
+    documented assertion that every graph's ``weights``/``k_scale`` satisfy
+    the specialized contract for the graphs' lifetime. Declared captures
+    still record device-side checks: a replay whose live values break the
+    declaration returns all ``-1`` rows and sets ``repair_error`` bit 16
+    rather than a selection computed from stale values.
+
     Construct outside capture, plan once per step, and run once per layer.
     Prepare every K/scale binding before capture. Keep this wrapper and all
     capture inputs alive until the caller discards its graphs. Calls on a
@@ -96,11 +110,17 @@ class FP8MQATopKWrapper:
         logits_dtype=torch.float32,
         weights_dtype=torch.float32,
         model_config=None,
+        declare_specialized_contract=False,
     ):
         if strategy != "selective":
             raise ValueError("continuous TopK supports selective only")
         if backend not in ("auto", "cutedsl", "specialized"):
             raise ValueError("backend must be 'auto', 'cutedsl' or 'specialized'")
+        if declare_specialized_contract and backend == "cutedsl":
+            raise ValueError(
+                "declare_specialized_contract applies to backend='auto' "
+                "(and is implicit for backend='specialized')"
+            )
 
         options = dict(
             max_context_length=max_context_length,
@@ -133,9 +153,15 @@ class FP8MQATopKWrapper:
         elif backend == "auto":
             # "auto" is purely a router over the named backends (cutedsl,
             # specialized): it prefers "specialized" when the static
-            # configuration and toolkit allow and demotes to "cutedsl" on
-            # the first rejected prepare/plan, replaying prepared bindings.
-            self._capacity_plan = _AutoTopKPlan(options)
+            # configuration and toolkit allow, demotes to "cutedsl" on the
+            # first rejected prepare/plan (replaying prepared bindings),
+            # falls back to "cutedsl" when an eager run supplies values
+            # outside the specialized numerical contract, and refuses to
+            # CAPTURE the specialized backend unless the caller declared
+            # that contract (see _AutoTopKPlan).
+            self._capacity_plan = _AutoTopKPlan(
+                options, declared_contract=declare_specialized_contract
+            )
         else:
             from ..experimental.attn_scores import _continuous_plan_type
 
@@ -289,14 +315,38 @@ class _AutoTopKPlan:
     """Router plan for ``backend="auto"``: prefers the "specialized"
     backend when the static configuration and CUDA toolkit allow, and
     demotes to "cutedsl" on the first rejected ``prepare_pool``/``plan``
-    (replaying already-prepared bindings). Once a plan succeeds the
-    resolution is sticky for the wrapper's lifetime (capture safety).
-    "auto" carries no behavior of its own — every call is served by one of
-    the named backends."""
+    (replaying already-prepared bindings). "auto" carries no behavior of
+    its own — every call is served by one of the named backends.
 
-    def __init__(self, options):
+    Admission facts for the specialized resolution, which is narrower than
+    the common wrapper contract (unit ``k_scale``, positive per-row-constant
+    ``weights``) in values only ``run`` supplies:
+
+    - ``prepare_pool`` verifies each binding's ``k_scale`` is all-ones at
+      prepare time (a non-unit binding demotes or falls back to cutedsl);
+    - every EAGER ``run`` re-verifies both value conditions, and a
+      violation falls back to cutedsl (``_demote_active``) instead of
+      raising — the common contract serves those values;
+    - a CAPTURED ``run`` cannot fall back (cutedsl prepare/plan are not
+      capturable), so capture of the specialized backend is REFUSED unless
+      the caller declared the contract for the graphs' lifetime
+      (``declare_specialized_contract=True``). Declared captures rely on
+      the specialized plan's device-side replay checks, which fail closed
+      (-1 rows, ``repair_error`` bit 16) on violation.
+
+    While the specialized backend is active the router keeps the binding
+    log and the latest plan arguments so a run-time fallback can rebuild
+    cutedsl state; a retired specialized plan is kept alive because
+    captured graphs may hold raw addresses into its plan-owned tensors.
+    Once cutedsl is active the resolution is terminal and the logs are
+    dropped."""
+
+    def __init__(self, options, declared_contract=False):
         self._options = dict(options)
+        self._declared = bool(declared_contract)
         self._bindings = []
+        self._last_plan = None
+        self._retired = []
         self._active = None
         self._cand = None
         self._demote_reason = None
@@ -342,9 +392,47 @@ class _AutoTopKPlan:
         self._cand = cand
         self._cand_name = "cutedsl"
 
+    def _demote_active(self, reason):
+        """Run-time fallback: the active specialized backend rejected
+        VALUES the common wrapper contract serves (ContractViolation).
+        Rebuild cutedsl, replay the recorded bindings and the latest plan,
+        and retire the specialized plan without freeing it (captured
+        graphs may hold raw addresses into its plan-owned tensors)."""
+        try:
+            cand = self._make_cutedsl()
+        except ValueError as e:
+            raise ValueError(
+                "auto: the specialized backend rejected runtime values "
+                f"outside its contract ({reason}) and cutedsl cannot serve "
+                f"this configuration ({e})"
+            ) from e
+        for bk, bk_scale in self._bindings:
+            cand.prepare_pool(bk, k_scale=bk_scale)
+        if self._last_plan is not None:
+            qo, kv, kw = self._last_plan
+            cand.plan(qo, kv, **kw)
+        self._retired.append(self._active)
+        self._demote_reason = reason
+        self._cand = cand
+        self._active = cand
+        self._cand_name = "cutedsl"
+        self._active_name = "cutedsl"
+        self._bindings = []
+        self._last_plan = None
+
     def prepare_pool(self, k, *, k_scale):
         if self._active is not None:
-            return self._active.prepare_pool(k, k_scale=k_scale)
+            if self._active_name != "specialized":
+                return self._active.prepare_pool(k, k_scale=k_scale)
+            from .mqa_topk_specialized import ContractViolation
+
+            try:
+                out = self._active.prepare_pool(k, k_scale=k_scale)
+            except ContractViolation as e:
+                self._demote_active(str(e))
+                return self._active.prepare_pool(k, k_scale=k_scale)
+            self._bindings.append((k, k_scale))
+            return out
         try:
             out = self._cand.prepare_pool(k, k_scale=k_scale)
         except ValueError as e:
@@ -358,19 +446,26 @@ class _AutoTopKPlan:
         return out
 
     def plan(self, qo_indptr, kv_indptr, **kw):
-        if self._active is not None:
-            return self._active.plan(qo_indptr, kv_indptr, **kw)
-        try:
-            out = self._cand.plan(qo_indptr, kv_indptr, **kw)
-        except ValueError as e:
-            self._demote(str(e))
-            out = self._cand.plan(qo_indptr, kv_indptr, **kw)
-        self._active = self._cand
-        self._active_name = self._cand_name
-        # the binding log exists only to replay bindings on demotion; once
-        # a backend is active no demotion can follow, so stop pinning the
-        # recorded tensors
-        self._bindings = []
+        if self._active is None:
+            try:
+                out = self._cand.plan(qo_indptr, kv_indptr, **kw)
+            except ValueError as e:
+                self._demote(str(e))
+                out = self._cand.plan(qo_indptr, kv_indptr, **kw)
+            self._active = self._cand
+            self._active_name = self._cand_name
+        else:
+            out = self._active.plan(qo_indptr, kv_indptr, **kw)
+        if self._active_name == "specialized":
+            # a run-time ContractViolation can still fall back to cutedsl,
+            # which must replay the bindings and this plan: keep both logs
+            # (the pinned tensors are the caller's long-lived pools and
+            # small prefix arrays)
+            self._last_plan = (qo_indptr, kv_indptr, dict(kw))
+        else:
+            # cutedsl is terminal: no fallback can follow, stop pinning
+            self._bindings = []
+            self._last_plan = None
         return out
 
     def _resolved(self):
@@ -378,8 +473,33 @@ class _AutoTopKPlan:
             raise RuntimeError("auto: plan must run before this call")
         return self._active
 
-    def run(self, *args, **kw):
-        return self._resolved().run(*args, **kw)
+    def run(self, q, weights, k, *, k_scale, out=None, q_scale=None):
+        plan_ = self._resolved()
+        if self._active_name != "specialized":
+            return plan_.run(q, weights, k, k_scale=k_scale, out=out, q_scale=q_scale)
+        if torch.cuda.is_current_stream_capturing() and not self._declared:
+            raise RuntimeError(
+                "auto: refusing to capture the specialized backend. Its "
+                "kernel reads neither weights nor k_scale, and a captured "
+                "graph cannot fall back to cutedsl, so runtime updates to "
+                "those tensors could not change the replayed selection. "
+                "Construct the wrapper with declare_specialized_contract="
+                "True to assert unit k_scale and positive per-row-constant "
+                "weights for the graphs' lifetime, or use backend='cutedsl' "
+                "for captured runs."
+            )
+        from .mqa_topk_specialized import ContractViolation
+
+        try:
+            return plan_.run(q, weights, k, k_scale=k_scale, out=out, q_scale=q_scale)
+        except ContractViolation as e:
+            # an eager call with values the common contract serves: fall
+            # back to cutedsl and serve the call (ContractViolation is only
+            # raised outside capture)
+            self._demote_active(str(e))
+            return self._active.run(
+                q, weights, k, k_scale=k_scale, out=out, q_scale=q_scale
+            )
 
     def clear_pools(self):
         backend = self._cand if self._active is None else self._active

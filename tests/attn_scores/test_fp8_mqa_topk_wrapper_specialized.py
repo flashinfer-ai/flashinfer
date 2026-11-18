@@ -230,6 +230,177 @@ def test_auto_routes_to_specialized_for_multi_request_full_prefill():
     assert torch.equal(out, _reference_rows(inp))
 
 
+def test_packed_to_topk_conversion_matches_sort_reference():
+    """The every-4th-column + lane-mask conversion equals the sort-based
+    conversion it replaced, on synthetic packed rows built per the packed
+    contract (ascending tokens, 4 per complete block, open-block tail,
+    -1 padding, count column). CPU-only; no kernel involved."""
+    from flashinfer.attn_scores.mqa_topk_specialized import _packed_rows_to_topk
+    from flashinfer.attn_scores.prefill_indexer import PACKED_WIDTH
+
+    g = torch.Generator().manual_seed(3)
+    rows, visibles = [], []
+    for pos in [0, 1, 2, 3, 7, 515, 2047, 2051, 4096, 16383]:
+        vis = (pos + 1) // RATIO
+        n = min(vis, TOPK)
+        sel = (
+            torch.sort(torch.randperm(vis, generator=g)[:n]).values
+            if n
+            else torch.empty(0, dtype=torch.int64)
+        )
+        toks = (sel.unsqueeze(1) * RATIO + torch.arange(RATIO)).reshape(-1)
+        tail = torch.arange(vis * RATIO, pos + 1)
+        row = torch.full((PACKED_WIDTH,), -1, dtype=torch.int32)
+        valid = torch.cat([toks, tail]).to(torch.int32)
+        row[: valid.numel()] = valid
+        row[-1] = valid.numel()
+        rows.append(row)
+        visibles.append(vis)
+    packed = torch.stack(rows)
+    visible = torch.tensor(visibles, dtype=torch.int32)
+    sel_mask = torch.arange(TOPK, dtype=torch.int32).unsqueeze(0) < visible.clamp(
+        max=TOPK
+    ).unsqueeze(1)
+    got = _packed_rows_to_topk(packed, sel_mask)
+    # the previous implementation: mask every candidate column, full sort
+    toks = packed[:, : PACKED_WIDTH - 1]
+    ids = toks >> 2
+    sent = torch.iinfo(torch.int32).max
+    mask = (toks >= 0) & ((toks & 3) == 0) & (ids < visible.unsqueeze(1))
+    cand = torch.where(mask, ids, torch.full_like(ids, sent))
+    ref = cand.sort(dim=1).values[:, :TOPK]
+    ref = torch.where(ref != sent, ref, torch.full_like(ref, -1))
+    assert torch.equal(got, ref)
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_auto_nonuniform_weights_eager_falls_back():
+    """A valid common-contract eager call (nonuniform weights) on an
+    auto-resolved specialized backend falls back to cutedsl and returns
+    cutedsl's result instead of raising."""
+    inp = _mk([2304], [2304], seed=81)
+    cfg = dict(
+        max_context_length=4096,
+        max_chunk_size=4096,
+        max_batch_size=1,
+        device="cuda",
+        num_heads=H,
+        compression_ratio=RATIO,
+        num_keys=inp["k"].shape[0],
+    )
+    w = FP8MQATopKWrapper(backend="auto", **cfg)
+    w.prepare_pool(inp["k"], k_scale=inp["k_scale"])
+    w.plan(inp["qo"], inp["kv"], num_query_rows=2304)
+    assert w.resolved_backend == "specialized"
+    bad_w = inp["weights"].clone()
+    bad_w[:, 0] = 100.0  # positive but not per-row-constant
+    out = w.run(inp["q"], bad_w, inp["k"], k_scale=inp["k_scale"]).clone()
+    assert w.resolved_backend == "cutedsl"
+    # the fallback served the call with cutedsl's semantics
+    wc = FP8MQATopKWrapper(backend="cutedsl", **cfg)
+    wc.prepare_pool(inp["k"], k_scale=inp["k_scale"])
+    wc.plan(inp["qo"], inp["kv"], num_query_rows=2304)
+    ref = wc.run(inp["q"], bad_w, inp["k"], k_scale=inp["k_scale"])
+    assert torch.equal(out, ref[: out.shape[0]])
+    # the demoted wrapper keeps serving later calls
+    out2 = w.run(inp["q"], bad_w, inp["k"], k_scale=inp["k_scale"])
+    assert torch.equal(out2[: out.shape[0]], out)
+
+
+@requires_sm103
+@requires_validated_toolkit
+def test_auto_refuses_capture_without_declaration():
+    """Without declare_specialized_contract, auto refuses to capture the
+    specialized backend (a captured graph could not re-check or fall back
+    on runtime weights/k_scale updates) and stays usable eagerly."""
+    inp = _mk([2304], [2304], seed=81)
+    w = FP8MQATopKWrapper(
+        backend="auto",
+        max_context_length=4096,
+        max_chunk_size=4096,
+        max_batch_size=1,
+        device="cuda",
+        num_heads=H,
+        compression_ratio=RATIO,
+        num_keys=inp["k"].shape[0],
+    )
+    w.prepare_pool(inp["k"], k_scale=inp["k_scale"])
+    w.plan(inp["qo"], inp["kv"], num_query_rows=2304)
+    assert w.resolved_backend == "specialized"
+    gold = _reference_rows(inp)
+    out = torch.empty_like(gold)
+    w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out)
+    assert torch.equal(out, gold)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="refusing to capture"),
+        torch.cuda.graph(graph),
+    ):
+        w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"], out=out)
+    # the refusal is a clean error, not a corrupted router
+    out2 = w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
+    assert torch.equal(out2, gold)
+
+
+@requires_sm103
+@requires_validated_toolkit
+@pytest.mark.parametrize(
+    "backend_kw",
+    [
+        dict(backend="specialized"),
+        dict(backend="auto", declare_specialized_contract=True),
+    ],
+)
+def test_captured_replay_enforces_contract_on_live_values(backend_kw):
+    """A declared (or explicitly specialized) captured graph re-reads the
+    live weights/k_scale on every replay: runtime updates that break the
+    contract return -1 rows and set repair_error bit 16 instead of the
+    stale selection the reviewer reproduced."""
+    inp = _mk([2304], [2304], seed=81)
+    w = FP8MQATopKWrapper(
+        max_context_length=4096,
+        max_chunk_size=4096,
+        max_batch_size=1,
+        device="cuda",
+        num_heads=H,
+        compression_ratio=RATIO,
+        num_keys=inp["k"].shape[0],
+        **backend_kw,
+    )
+    w.prepare_pool(inp["k"], k_scale=inp["k_scale"])
+    w.plan(inp["qo"], inp["kv"], num_query_rows=2304)
+    assert w.resolved_backend == "specialized"
+    gold = _reference_rows(inp)
+    out = torch.empty_like(gold)
+    weights, k_scale = inp["weights"], inp["k_scale"]
+    w.run(inp["q"], weights, inp["k"], k_scale=k_scale, out=out)  # warmup
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        w.run(inp["q"], weights, inp["k"], k_scale=k_scale, out=out)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, gold)
+    assert w.repair_error.item() == 0
+    # reviewer repro 1: mutate weights after capture, replay
+    weights[:, 0] = 100.0
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool((out == -1).all()), "violating replay must not keep a selection"
+    assert w.repair_error.item() & 16
+    # restoring the contract restores the selection on the same graph
+    weights.fill_(0.0883883)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, gold)
+    # reviewer repro 2: mutate k_scale after capture, replay
+    k_scale[:100] = 100.0
+    graph.replay()
+    torch.cuda.synchronize()
+    assert bool((out == -1).all())
+    assert w.repair_error.item() & 16
+
+
 @requires_sm103
 def test_auto_exhausted_configuration_raises():
     """auto with a configuration neither backend can serve raises, naming

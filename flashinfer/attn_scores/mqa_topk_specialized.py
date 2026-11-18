@@ -32,8 +32,15 @@ Contract and restrictions (validated eagerly, never silently relaxed):
 - ``k_scale`` must be all-ones and per-row head ``weights`` must be a
   positive per-row constant: the kernel scores ``sum_h relu(q_h . k)``,
   and a per-row positive constant scales every candidate's score equally,
-  leaving the top-k selection identical. Checked eagerly (outside
-  capture); captured replays assume the precondition holds.
+  leaving the top-k selection identical. The kernel reads NEITHER tensor,
+  so the condition is enforced on EVERY run. Eager calls make one host
+  sync and raise :class:`ContractViolation` (a ``ValueError`` the
+  ``auto`` router treats as "fall back to cutedsl", since the common
+  wrapper contract serves those values). Captured runs record device-side
+  checks that re-read the live ``weights``/``k_scale`` on every replay:
+  a violation fails closed — the replay returns all ``-1`` rows and sets
+  ``repair_error`` bit 16 — instead of silently keeping a selection
+  computed from stale values.
 - Key storage must hold a multiple of 64 rows (the kernel's page size in
   compressed keys), and every request's KV segment must start at a
   multiple of 256 original tokens — prefixes are PACKED, so every
@@ -83,12 +90,43 @@ from .prefill_indexer import (
 _RATIO = 4
 _PAGE_BLOCKS = 64
 _TOPK = 512
-_SENTINEL = torch.iinfo(torch.int32).max
 
 
 def _require(cond, msg):
     if not cond:
         raise ValueError(msg)
+
+
+class ContractViolation(ValueError):
+    """A value-level violation of the specialized numerical contract
+    (non-unit ``k_scale`` or non-per-row-constant ``weights``).
+
+    These are values the COMMON wrapper contract serves, so
+    ``backend="auto"`` catches this subclass and falls back to the
+    ``cutedsl`` backend instead of failing the call. Structural errors
+    (shapes, dtypes, unprepared bindings) stay plain ``ValueError``: no
+    backend serves those, and demoting on them would mask caller bugs.
+    """
+
+
+def _packed_rows_to_topk(packed, sel_mask):
+    """Convert packed ascending token rows into ``[t, top_k]`` ascending
+    compressed-key indices with ``-1`` padding.
+
+    The packed contract (see ``prefill_indexer``): every selected COMPLETE
+    block contributes its 4 consecutive token indices, all smaller than any
+    open-block causal-tail token, and the row is ascending with ``-1``
+    padding after the valid entries. Selected blocks therefore occupy
+    4-aligned column groups at the front of the row: column ``4*j`` holds
+    the j-th selected block's first token, and row ``r`` selects exactly
+    ``sel_mask[r].sum() == min(visible[r], top_k)`` complete blocks. Taking
+    every fourth column and masking lanes past that count replaces the
+    previous full per-row sort of all 2051 candidate columns; the result is
+    identical and already ascending.
+    """
+    first = packed[:, 0 : 4 * _TOPK : 4]
+    ids = first >> 2
+    return torch.where(sel_mask, ids, torch.full_like(ids, -1))
 
 
 class SpecializedTopKPlan:
@@ -160,8 +198,13 @@ class SpecializedTopKPlan:
             else self._max_context_length // _RATIO
         )
         self.math_mode = "relu_strict"
-        self.error = 0
-        self.repair_error = 0
+        # device-backed error words, matching the cutedsl backend's API
+        # (read with .item() outside capture). repair_error bit 16 is the
+        # numerical-contract-violation bit: captured replays set it on
+        # device when the live weights/k_scale leave the specialized
+        # contract (eager calls raise ContractViolation instead).
+        self.error = torch.zeros(1, dtype=torch.int32, device=self._device)
+        self.repair_error = torch.zeros(1, dtype=torch.int32, device=self._device)
         self.active_shape = None
         # prepared K bindings keyed by data_ptr: padded paged views
         # (NCP, 64, 1, 128). data_ptr is host metadata, so run's binding
@@ -188,10 +231,10 @@ class SpecializedTopKPlan:
             not torch.cuda.is_current_stream_capturing(),
             "prepare_pool is not capturable",
         )
-        _require(
-            bool(torch.all(k_scale == 1.0).item()),
-            "backend='specialized' requires unit k_scale (raw fp8 scoring)",
-        )
+        if not bool(torch.all(k_scale == 1.0).item()):
+            raise ContractViolation(
+                "backend='specialized' requires unit k_scale (raw fp8 scoring)"
+            )
         _require(
             k.shape[0] % _PAGE_BLOCKS == 0,
             "backend='specialized' requires key storage in multiples of 64 "
@@ -302,16 +345,25 @@ class SpecializedTopKPlan:
         t = cu[-1]
         if num_query_rows is not None:
             _require(t <= int(num_query_rows), "live rows exceed num_query_rows")
+        visible = torch.cat(vis_rows)
         self._state = dict(
             T=t,
             B=b,
             pos=torch.cat(pos_rows).to(dev),
-            visible=torch.cat(vis_rows).to(dev),
+            visible=visible.to(dev),
             cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=dev),
             page_table=table.to(dev),
             scratch=torch.empty(t, PACKED_WIDTH, dtype=torch.int32, device=dev),
+            # row r of the packed output holds exactly min(visible[r], 512)
+            # selected complete blocks; precompute the lane mask the
+            # packed-to-compressed conversion applies at run
+            sel_mask=(
+                torch.arange(_TOPK, dtype=torch.int32).unsqueeze(0)
+                < visible.clamp(max=_TOPK).unsqueeze(1)
+            ).to(dev),
         )
         self.active_shape = (t, b)
+        self.repair_error.zero_()
         return None
 
     def run(self, q, weights, k, *, k_scale, out=None, q_scale=None):
@@ -329,22 +381,42 @@ class SpecializedTopKPlan:
         # in captured runs too, instead of recording another binding's keys
         pool = self._pools.get(k.data_ptr())
         _require(pool is not None, "run must use a prepared K binding")
+        _require(
+            weights.is_cuda
+            and weights.dtype == torch.float32
+            and weights.dim() == 2
+            and weights.shape[0] >= t
+            and weights.shape[1] == 4,
+            "weights must be CUDA fp32 [Q, 4]",
+        )
+        _require(
+            k_scale.is_cuda and k_scale.dtype == torch.float32,
+            "k_scale must be CUDA fp32",
+        )
+        # The kernel consumes neither weights nor k_scale, so the values
+        # under which its selection equals the wrapper contract are checked
+        # on EVERY run. One device-side predicate serves both execution
+        # modes: eager runs read it with a single host sync and raise
+        # ContractViolation (backend="auto" falls back to cutedsl on it);
+        # captured runs record these ops so every replay re-reads the LIVE
+        # weights/k_scale and, on violation, fails closed below (-1 rows,
+        # repair_error bit 16) instead of returning a selection computed
+        # from stale values.
+        contract_ok = (
+            torch.all(k_scale == 1.0)
+            & torch.all(weights[:t] == weights[:t, :1])
+            & torch.all(weights[:t, 0] > 0)
+        )
         if not torch.cuda.is_current_stream_capturing():
-            _require(
-                bool(torch.all(k_scale == 1.0).item()),
-                "backend='specialized' requires unit k_scale at run as well",
-            )
-            _require(
-                weights.is_cuda
-                and weights.dtype == torch.float32
-                and weights.shape[0] >= t
-                and bool(
-                    torch.all(weights[:t] == weights[:t, :1]).item()
-                    and torch.all(weights[:t, 0] > 0).item()
-                ),
-                "backend='specialized' requires a positive per-row-constant "
-                "weights matrix (selection is then weight-invariant)",
-            )
+            if not bool(contract_ok.item()):
+                if not bool(torch.all(k_scale == 1.0).item()):
+                    raise ContractViolation(
+                        "backend='specialized' requires unit k_scale at run as well"
+                    )
+                raise ContractViolation(
+                    "backend='specialized' requires a positive per-row-constant "
+                    "weights matrix (selection is then weight-invariant)"
+                )
         packed = fp8_paged_mqa_topk_indexer(
             q[:t],
             pool,
@@ -354,13 +426,14 @@ class SpecializedTopKPlan:
             st["visible"],
             out=st["scratch"],
         )
-        # derive ascending compressed-key indices: one per selected complete
-        # block (its first expanded token), excluding the open-block tail
-        toks = packed[:, : PACKED_WIDTH - 1]
-        ids = toks >> 2
-        mask = (toks >= 0) & ((toks & 3) == 0) & (ids < st["visible"].unsqueeze(1))
-        cand = torch.where(mask, ids, torch.full_like(ids, _SENTINEL))
-        sel = cand.sort(dim=1).values[:, :_TOPK]
+        sel = _packed_rows_to_topk(packed, st["sel_mask"])
+        # fail closed when a captured replay's live values violate the
+        # contract: poison the selection and raise the numerical-contract
+        # bit (eager runs raised above, so this only fires on replays)
+        sel = torch.where(contract_ok, sel, torch.full_like(sel, -1))
+        self.repair_error.bitwise_or_(
+            torch.logical_not(contract_ok).to(torch.int32) * 16
+        )
         if out is None:
             # the wrapper contract returns the full supplied Q extent
             # ([Q, top_k] with -1 in the inactive rows), not just the
@@ -374,7 +447,6 @@ class SpecializedTopKPlan:
         # out may carry more rows than the plan's t live rows (the wrapper
         # contract allows a [Q, top_k] destination with Q >= t): write the
         # live rows and pad the rest, instead of a shape-mismatched copy_.
-        live = torch.where(sel != _SENTINEL, sel, torch.full_like(sel, -1))
-        out[:t].copy_(live)
+        out[:t].copy_(sel)
         out[t:].fill_(-1)
         return out
