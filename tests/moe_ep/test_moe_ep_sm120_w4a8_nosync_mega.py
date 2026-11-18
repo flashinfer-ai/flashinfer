@@ -2,7 +2,8 @@
 small-batch option of ``MoEEpLayer``: the configured backend (cake, or cutedsl) is built as
 usual, ``nosync=NosyncOptions(...)`` adds the nosync kernel.
 
-Calls of up to ``NosyncOptions.max_tokens_per_rank`` tokens per rank run the nosync kernel and are checked
+Calls within ``NosyncOptions.max_tokens_per_rank`` tokens per rank and
+``NosyncOptions.max_tokens_per_expert`` tokens per expert run the nosync kernel and are checked
 against a dense reference with its numerics: ``stage_inputs`` quantizes the BF16 activations to
 MXFP8 (E4M3, one power-of-two scale per 32 channels, 2**ceil(log2(amax / 448))); the kernel
 quantizes the clamped SwiGLU output the same way and applies the routing weight to each expert's
@@ -169,6 +170,7 @@ def _layer(args, rank, experts, raw1, raw2, nosync=True, quantize_input=True):
         ),
         nosync=NosyncOptions(
             max_tokens_per_rank=args.threshold,
+            max_tokens_per_expert=args.tokens_per_expert,
             transport=args.transport,
             tokens_per_item=args.tokens_per_item,
         )
@@ -205,6 +207,7 @@ def _routing(args, m, experts, topk, generator):
 
 def _worker(rank, args):
     from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.modes.nosync_layer import nosync_token_limit
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake.cake_staging import (
         quantize_activations_k32,
     )
@@ -249,10 +252,17 @@ def _worker(rank, args):
     transformed = layer.base._transformed
     base_w13 = transformed.w1_fp4 if args.fallback == "cake" else transformed[0][0]
     assert layer.nosync.get_transformed_weights().w13.data_ptr() == base_w13.data_ptr()
+    limit = nosync_token_limit(
+        min(args.capacity, args.threshold),
+        args.tokens_per_expert,
+        experts,
+        args.ep,
+        topk,
+    )
     for m_all in args.tokens:
         # uneven: ranks stage different row counts in the same call, one rank none
         m = (m_all, 0, max(m_all // 2, 1), 1)[rank % 4] if args.uneven else m_all
-        nosync = m_all <= args.threshold  # m_all is the largest row count of any rank
+        nosync = m_all <= limit  # m_all is the largest row count of any rank
         x = torch.randn(m, h, device="cuda", generator=generator, dtype=torch.bfloat16)
         idx, routing = _routing(args, m, experts, topk, generator)
         ref_idx = _effective_routes(idx, experts)
@@ -369,6 +379,7 @@ def _args(**overrides):
         topk=6,
         capacity=128,
         threshold=128,
+        tokens_per_expert=16,
         tokens=[1, 8, 20, 64, 128],
         routing="random",
         repeats=2,
@@ -434,6 +445,31 @@ def test_sm120_nosync_threshold():
     _run(_args(threshold=16, tokens=[16, 17, 64], capacity=128))
 
 
+def test_nosync_token_limit():
+    """Per-rank bound: the per-rank cap and 16 tokens per expert over all ranks' routes."""
+    from flashinfer.moe_ep.modes.nosync_layer import nosync_token_limit
+
+    assert nosync_token_limit(128, 16, 256, 8, 6) == 85
+    assert nosync_token_limit(128, 16, 288, 8, 8) == 72
+    assert nosync_token_limit(128, 16, 384, 8, 6) == 128
+    assert nosync_token_limit(128, 16, 256, 4, 6) == 128
+    assert nosync_token_limit(64, 16, 384, 4, 6) == 64
+    assert nosync_token_limit(128, 16, 64, 8, 8) == 16
+
+
+@pytest.mark.parametrize(
+    "experts,topk,tokens",
+    [(256, 6, [85, 86]), (288, 8, [72, 73]), (384, 6, [128])],
+    ids=["dsv4_flash", "glm53_flash", "dsv41_flash"],
+)
+def test_sm120_nosync_tokens_per_expert(experts, topk, tokens):
+    """EP8 with the default 16 tokens per expert: DeepSeek-V4-Flash switches at 85 tokens per
+    rank, GLM-5.3-Flash at 72, DeepSeek-V4.1-Flash keeps the 128 cap."""
+    if not _sm120_gpus(8):
+        pytest.skip("requires 8 SM120 GPUs")
+    _run(_args(ep=8, experts=experts, topk=topk, tokens=tokens))
+
+
 @pytest.mark.parametrize("ep", [4, 8])
 @pytest.mark.parametrize(
     "hidden,intermediate,experts,topk",
@@ -452,6 +488,7 @@ def test_sm120_nosync_model_shapes(ep, hidden, intermediate, experts, topk):
             experts=experts,
             topk=topk,
             tokens=[1, 16, 64, 128],
+            tokens_per_expert=32,  # keep 128 tokens per rank on the kernel at EP8
         )
     )
 
@@ -491,7 +528,9 @@ def test_sm120_nosync_nic_transport(ep, routing):
         pytest.skip("set FLASHINFER_TEST_MEGAMOE_SM120_NIC=1 on a GIN-capable host")
     if not _sm120_gpus(ep):
         pytest.skip(f"requires {ep} SM120 GPUs")
-    _run(_args(ep=ep, routing=routing, repeats=3, transport="nic"))
+    _run(
+        _args(ep=ep, routing=routing, repeats=3, transport="nic", tokens_per_expert=32)
+    )
 
 
 def test_sm120_nosync_auto_transport():
@@ -510,6 +549,7 @@ def test_sm120_nosync_auto_transport():
             tokens=[1, 20, 128, 256],
             transport="auto",
             uneven=True,
+            tokens_per_expert=32,
         )
     )
 
@@ -751,6 +791,7 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--threshold", type=int, default=128)
+    parser.add_argument("--tokens-per-expert", type=int, default=16)
     parser.add_argument("--fallback", choices=["cake", "cutedsl"], default="cake")
     parser.add_argument(
         "--routing", choices=["random", "hot", "empty", "invalid"], default="random"
