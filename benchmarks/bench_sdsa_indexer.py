@@ -126,14 +126,15 @@ def bench_select(fmt: str, context: int, args) -> float:
     # Thresholds from a key sample: each row's estimated top_k * (1 + slack)-th
     # largest score.
     target = top_k * (1 + args.slack)
-    count = min(first, math.ceil(args.sample_rank * context / target))
+    count = max(1, min(first, math.ceil(args.sample_rank * context / target)))
     sample = torch.randint(first, (count,), device="cuda")
     page, row = table[0, sample // PAGE].long(), sample % PAGE
     # Gathered as bytes: not every indexing op takes FP8.
     sampled = key_cache.view(torch.uint8)[page, row].view(key_cache.dtype)
     sampled = as_float(sampled, None if key_scales is None else key_scales[page, row])
     sample_scores = as_float(query, query_scales) @ sampled.T
-    rank = max(1, round(target * count / context))
+    # Short contexts have fewer sampled keys than the target rank.
+    rank = min(count, max(1, round(target * count / context)))
     requested = sample_scores.topk(rank, 1).values[:, -1]
     thresholds = requested.clone()
     counters = torch.zeros(rows, 2, dtype=torch.int32, device="cuda")
