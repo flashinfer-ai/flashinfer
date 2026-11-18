@@ -30,16 +30,19 @@
 // PDL-serialized split pair, T == 4 and larger a per-token tiling). Two to
 // three kernel launches total, no host round trips, no atomics.
 //
-// The grouped (expert-binned wgmma) large-T path of the measured kernel is
-// carried verbatim below for completeness but is NOT exported: the
-// dispatcher's allowlist is the measured small-T envelope (T <= 16), where
-// this kernel wins against the serve's dispatched triton fused-MoE; at
-// T >= 64 the measured numbers LOSE to that incumbent, so larger batches
-// keep the stock path.
+// The grouped (expert-binned wgmma) large-T path of the measured kernel IS
+// exported: `run` below dispatches to it at T >= 256 (the native launch
+// threshold — distinct from the Python dispatcher's eligibility bands).
+// The dispatcher's allowlist is the measured won BANDS: the small-T
+// envelope (T <= 16), where this kernel wins against the serve's
+// dispatched triton fused-MoE, and the grouped band 256 <= T <= 4096. The
+// 17..255 gap — containing the measured FI-held T=64 class — stays on the
+// stock path.
 //
 // Host contract (asserted by the Python dispatcher and by `run` below):
-//  * hidden_states / out are contiguous [T, H] bf16, 1 <= T < 256
-//    (dispatcher allowlist: T <= 16);
+//  * hidden_states / out are contiguous [T, H] bf16, 1 <= T < 256 on the
+//    small path, 256 <= T on the grouped path (dispatcher allowlist:
+//    T <= 16 and 256 <= T <= 4096);
 //  * fc1 weights [E, 2*I, H] e4m3 with [128,128] block scales
 //    [E, ceil(2I/128), ceil(H/128)] f32; fc2 [E, H, I] e4m3 with scales
 //    [E, ceil(H/128), ceil(I/128)] f32 (contiguous);
@@ -47,7 +50,9 @@
 //    as-is (the serve's routing math, including any fused shared-expert
 //    slot, is baked into the capture);
 //  * the caller-owned uint8 workspace holds at least
-//    `plan_workspace_bytes(T, K, I)` bytes (the fp16 intermediate).
+//    `plan_workspace_bytes(T, K, I, H, E)` bytes (T < 256: the fp16 fc1
+//    intermediate; T >= 256: the grouped layout's five buffers, which need
+//    H and E).
 //
 // `run` performs no allocation, no synchronisation and no attribute
 // queries: it launches on the caller's current stream and is CUDA-graph

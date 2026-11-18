@@ -2816,7 +2816,21 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
                 hidden_size % 512 == 0 and intermediate == 256 and routing.top_k == 9
             ):
                 return False
-            return hidden_size % 128 == 0
+            if hidden_size % 128:
+                return False
+            # The dispatch's shared-memory predicate, verbatim: without it the
+            # runner accepts small-band geometries (e.g. H=4096, I=14336,
+            # top_k=2 at T=4) whose dispatch declines, and forward then raises
+            # out of the auto shootout instead of letting the stock backend
+            # serve the call.
+            from .smallt_sm90 import _smallt_smem_reason
+
+            return (
+                _smallt_smem_reason(
+                    num_tokens, hidden_size, intermediate, routing.top_k
+                )
+                is None
+            )
         if _BAND2_LO <= num_tokens <= _BAND2_HI:
             return (
                 routing.top_k == 9

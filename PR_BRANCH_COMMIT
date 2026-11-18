@@ -1,0 +1,1 @@
+branch moe-fp8-grouped-smallt-sm90 @ 9a299065 (v3: MoELayer-direct restructure — flat cutlass_fused_moe hook REMOVED, runner calls smallt_sm90 module directly, SpecializedFp8BlockSmallTConfig in _DEFAULT_BACKEND; replaces f15753af tip). Replacement PR body: publish_staging/remediation/9579_body_full.md in the fca repo.

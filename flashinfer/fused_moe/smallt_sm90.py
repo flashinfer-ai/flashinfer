@@ -197,6 +197,24 @@ def _get_module() -> Any:
     return _module
 
 
+def _smallt_smem_reason(T: int, H: int, I: int, KTOP: int) -> Optional[str]:
+    """Dynamic shared-memory capacity of the small-path launches; ``None``
+    when the geometry fits. The SINGLE predicate used by both ``_eligibility``
+    (dispatch) and ``SpecializedFp8BlockSmallTRunner._band_geometry_ok``
+    (acceptance), so the two checks cannot drift apart: a runner that accepts
+    a call its dispatch declines would raise out of the auto shootout."""
+    if T == 1:
+        if 2 * H > _SMEM_LIMIT:
+            return f"fc1 staging smem {2 * H}B > {_SMEM_LIMIT}B (H={H})"
+    elif T <= _MAX_TOKENS:
+        fc1_smem = 2 * H + 4 * ((2 * I + 127) // 128) * ((H + 127) // 128)
+        if fc1_smem > _SMEM_LIMIT:
+            return f"fc1 smem {fc1_smem}B > {_SMEM_LIMIT}B (H={H}, I={I})"
+        if 2 * KTOP * I > _SMEM_LIMIT:
+            return f"fc2 smem {2 * KTOP * I}B > {_SMEM_LIMIT}B (top_k={KTOP}, I={I})"
+    return None
+
+
 def _eligibility(
     input: torch.Tensor,
     token_selected_experts: torch.Tensor,
@@ -285,16 +303,12 @@ def _eligibility(
             return f"I={I} != 256 (grouped fp8 fc2 K blocks)"
     # Dynamic shared-memory capacity of the small-path launches (mirrored by
     # the native validation; the grouped band's kernels use launch-class
-    # constants and opt in where they exceed the default limit).
-    if T == 1:
-        if 2 * H > _SMEM_LIMIT:
-            return f"fc1 staging smem {2 * H}B > {_SMEM_LIMIT}B (H={H})"
-    elif T <= _MAX_TOKENS:
-        fc1_smem = 2 * H + 4 * ((2 * I + 127) // 128) * ((H + 127) // 128)
-        if fc1_smem > _SMEM_LIMIT:
-            return f"fc1 smem {fc1_smem}B > {_SMEM_LIMIT}B (H={H}, I={I})"
-        if 2 * KTOP * I > _SMEM_LIMIT:
-            return f"fc2 smem {2 * KTOP * I}B > {_SMEM_LIMIT}B (top_k={KTOP}, I={I})"
+    # constants and opt in where they exceed the default limit). Shared with
+    # the unified runner's _band_geometry_ok so acceptance cannot admit a
+    # geometry the dispatch declines.
+    smem_reason = _smallt_smem_reason(T, H, I, KTOP)
+    if smem_reason is not None:
+        return smem_reason
     if output is not None and (
         output.dtype != torch.bfloat16 or tuple(output.shape) != (T, H)
     ):
@@ -421,6 +435,18 @@ def _moe_smallt_sm90_dispatch(
             # the buffer leaves the eager cache so no eager call or capture
             # on another stream can race the graph's replays over it (see
             # the _graph_workspaces comment).
+            #
+            # ORDERING CONTRACT: adoption covers only work queued AFTER it;
+            # work already queued on the donor stream must have completed
+            # before capture begins. No ordering can be established from
+            # inside an active capture (a stream/device synchronize here
+            # would invalidate the capture, and a wait on an event recorded
+            # outside the capture cannot be recorded into it), so the caller
+            # owns it: torch.cuda.graph's capture entry synchronizes after
+            # its warmup iterations, which quiesces the donor stream and is
+            # the pattern that primes this cache. A capture started while an
+            # eager small-T call is still in flight on another stream is
+            # outside this contract.
             adopt_key = None
             for key, cand in _workspaces.items():
                 if (
