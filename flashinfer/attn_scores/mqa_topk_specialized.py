@@ -120,8 +120,7 @@ class SpecializedTopKPlan:
             _dev.type == "cuda"
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability(_dev) == (10, 3),
-            "backend='specialized' requires an SM103 CUDA device "
-            f"(device={device})",
+            f"backend='specialized' requires an SM103 CUDA device (device={device})",
         )
         _require(qkv_dtype == "fp8", "backend='specialized' supports qkv_dtype='fp8'")
         _require(num_heads == 4, "backend='specialized' supports num_heads=4")
