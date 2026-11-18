@@ -37,11 +37,16 @@ callers must gate on
 compiler is needed at runtime (no ``tileiras``, no ``nvcc``).
 
 Compilation is JIT on first use, cached in-process per
-``(lanes_per_group, threads)`` variant (two variants in total; shapes and
-layouts are dynamic). The launch is stream-ordered on the caller's current
-CUDA stream via the TVM-FFI environment stream; nothing touches process-wide
+``(lanes_per_group, threads, device_index)`` variant (two variants per
+device; shapes and layouts are dynamic). The launch runs with the input's
+device current and is stream-ordered on that device's current CUDA stream
+via the TVM-FFI environment stream; nothing else touches process-wide
 device state. Under CUDA-graph capture a not-yet-compiled variant raises
-instead of JIT-compiling; warm the op up once before capture.
+instead of JIT-compiling; warm the op up once before capture (the public
+``per_token_group_quant_8bit`` dispatcher turns that raise into a stock
+``cutile`` fallback with reason ``capturing_before_jit`` for
+``backend="auto"`` and propagates it as ``NotImplementedError`` for
+``backend="specialized"``).
 """
 
 from typing import Tuple
@@ -354,7 +359,9 @@ _CACHE: dict = {}
 
 
 def _compiled(lanes_per_group, threads, x, q_bytes, s):
-    key = (lanes_per_group, threads)
+    # Keyed by device index as well: the compiled function binds the module
+    # for the device it was compiled on, so a second GPU gets its own entry.
+    key = (lanes_per_group, threads, x.device.index)
     fn = _CACHE.get(key)
     if fn is None:
         if torch.cuda.is_current_stream_capturing():
@@ -416,7 +423,10 @@ def per_token_group_quant_fp8_g128_cute_dsl(
     lanes_per_group = 8 if num_groups >= 16384 else 16
     threads = 256
     q_bytes = x_q.view(torch.uint8)
-    _compiled(lanes_per_group, threads, x, q_bytes, x_s)(
-        x, q_bytes, x_s, num_groups, float(eps)
-    )
+    # Make the input's device current around compile and launch so the
+    # module and the TVM-FFI environment stream match the tensor's device.
+    with torch.cuda.device(x.device):
+        _compiled(lanes_per_group, threads, x, q_bytes, x_s)(
+            x, q_bytes, x_s, num_groups, float(eps)
+        )
     return x_q, x_s
