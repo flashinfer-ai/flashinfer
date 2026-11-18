@@ -13141,7 +13141,11 @@ def fp8_blockscale_gemm_sm90(
         ``"deepgemm"`` pins the stock DeepGEMM-backed route: an explicitly selected backend is
         never silently swapped. Unknown names raise ``ValueError``.
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) keeps
-        every call on the stock route.
+        ``backend="auto"`` on the stock route; an explicit
+        ``backend="specialized"`` call under the switch raises
+        ``NotImplementedError`` (reason ``kill_switch``) rather than being
+        rerouted — the switch disables the kernel, it does not swap an
+        explicitly selected backend.
     """
     from .fp8bs_decodem_sm90 import (
         FP8BS_GEMM_BACKENDS,

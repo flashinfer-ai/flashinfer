@@ -35,6 +35,7 @@ raises.
 import functools
 import logging
 import os
+import threading
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -67,6 +68,12 @@ _stats: Dict[str, Any] = {
     "fallback_reasons": {},
     "jit_build": "not attempted",
 }
+
+# Serializes the cold JIT build and its `_stats["jit_build"]` bookkeeping:
+# `functools.cache` does not prevent two concurrent cold calls, and a failing
+# call racing a succeeding one must not record `"failed"` over `"built"`
+# (which would strand the already-cached module behind the failure guard).
+_jit_lock = threading.Lock()
 
 
 def _fp8bs_decodem_stats() -> Dict[str, Any]:
@@ -134,6 +141,10 @@ def _eligibility(
     if K == 0:
         # the stock route owns the K==0 contract (it rejects null inputs)
         return False, "k_zero"
+    if N == 0:
+        # a zero-width grid is not launchable; the stock route owns the
+        # N==0 contract too (it rejects a null weight pointer)
+        return False, "n_zero"
     if weight_scale is None or weight_scale.shape != (
         (N + 127) // 128,
         K // 128,
@@ -236,7 +247,14 @@ def _fp8bs_decodem_try_dispatch(
             )
         return None
     try:
-        module = _get_module()
+        # The capture guard inside `_get_module` reads the CURRENT device's
+        # current stream; the native RunImpl launches on the OPERAND
+        # device's stream. Scope the check (and the build) to the operand's
+        # device so a capture on `input.device` is seen even when the
+        # thread's current device differs. The lock serializes cold builds
+        # (see `_jit_lock`).
+        with _jit_lock, torch.cuda.device(input.device):
+            module = _get_module()
     except GraphCaptureJitError:
         raise  # the capture-without-warmup error above must surface
     except Exception as e:
@@ -248,7 +266,9 @@ def _fp8bs_decodem_try_dispatch(
                 else "; explicit backend='specialized' raises",
                 exc_info=True,
             )
-        _stats["jit_build"] = f"failed ({str(e)[:120]})"
+        if _stats["jit_build"] != "built":
+            # never record a failure over a concurrently cached module
+            _stats["jit_build"] = f"failed ({str(e)[:120]})"
         _fallback(f"{requested}: jit_build_failure")
         if requested == "specialized":
             raise NotImplementedError(

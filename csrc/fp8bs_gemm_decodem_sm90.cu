@@ -2866,6 +2866,11 @@ static void RunImpl(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView w
 
 void Run(ffi::TensorView x, ffi::TensorView weight, ffi::TensorView weight_scale, float eps,
          ffi::TensorView out) {
+  // Scope the post-launch check to THIS call: an earlier, already-handled
+  // runtime error left in the host thread's error slot must not be reported
+  // as this GEMM's launch failure (sticky device-fault errors re-report on
+  // every call either way and are unaffected by this clear).
+  (void)cudaGetLastError();
   RunImpl(x, weight, weight_scale, eps, out);
   // Every route launches asynchronously; a refused launch (bad cluster or
   // shared-memory configuration) must surface instead of returning an
