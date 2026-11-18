@@ -19,6 +19,7 @@
 #include <cutlass/arch/barrier.h>
 
 #include <cute/swizzle_layout.hpp>
+#include <cute/tensor.hpp>
 
 #include "../../compute/mega.cuh"
 #include "../../compute/nvfp4_quantization.cuh"
@@ -34,18 +35,19 @@ using CutePrefillQRopeLayout = decltype(cute::composition(
 
 static_assert(Dsv4Nvfp4Layout::SCALE_GROUP_SIZE == SF_VEC_SIZE);
 
-// Public Q views need only BF16-pair (4-byte) alignment. Preserve wide loads
-// for the usual allocation and use word loads for offset tensor views.
-__device__ __forceinline__ uint4 load_q_group8(const bf16* input) {
-  if ((reinterpret_cast<uintptr_t>(input) & 15) == 0) return *reinterpret_cast<const uint4*>(input);
-  const auto* words = reinterpret_cast<const uint32_t*>(input);
-  return make_uint4(words[0], words[1], words[2], words[3]);
-}
-
-__device__ __forceinline__ uint2 load_q_group4(const bf16* input) {
-  if ((reinterpret_cast<uintptr_t>(input) & 7) == 0) return *reinterpret_cast<const uint2*>(input);
-  const auto* words = reinterpret_cast<const uint32_t*>(input);
-  return make_uint2(words[0], words[1]);
+// Offset Q views guarantee only 4-byte alignment. Select copy width without
+// changing the BF16 tensor view; aligned Q and shared P retain vector loads.
+template <int N>
+__device__ __forceinline__ auto load_q_values(const bf16* input) {
+  using namespace cute;
+  auto mQ = make_tensor(input, make_layout(Int<N>{}));
+  auto rQ = make_tensor<bf16>(make_layout(Int<N>{}));
+  if ((reinterpret_cast<uintptr_t>(input) & 15) == 0) {
+    copy(AutoVectorizingCopyWithAssumedAlignment<128>{}, mQ, rQ);
+  } else {
+    copy(AutoVectorizingCopyWithAssumedAlignment<32>{}, mQ, rQ);
+  }
+  return rQ;
 }
 
 // P rows are aligned; global Q may be an offset tensor view.
@@ -54,11 +56,11 @@ __device__ __forceinline__ void cute_quantize_prefill_group16(const bf16* input,
   float values[16];
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
-    uint4 packed = load_q_group8(input + i * 8);
-    const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
+    auto rQ = load_q_values<8>(input + i * 8);
+    auto rPairs = cute::recast<__nv_bfloat162>(rQ);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      float2 v = __bfloat1622float2(pairs[j]);
+      float2 v = __bfloat1622float2(rPairs(j));
       values[i * 8 + j * 2] = v.x;
       values[i * 8 + j * 2 + 1] = v.y;
     }
@@ -91,20 +93,21 @@ __device__ __forceinline__ void cute_quantize_prefill_q_nvfp4_to_smem(
   for (int i = threadIdx.x * 4; i < HPB * KV::D_ROPE; i += MATH_THREADS * 4) {
     const int head = i / KV::D_ROPE;
     const int dim = i % KV::D_ROPE;
-    uint2 packed = head < valid_hpb ? load_q_group4(q_base + head * KV::D_QK + KV::D_NOPE + dim)
-                                    : make_uint2(0, 0);
-    bf16 result[4];
-    const bf16* values = reinterpret_cast<const bf16*>(&packed);
+    auto rQ = cute::make_tensor<bf16>(cute::make_layout(cute::_4{}));
+    cute::clear(rQ);
+    if (head < valid_hpb) rQ = load_q_values<4>(q_base + head * KV::D_QK + KV::D_NOPE + dim);
+    auto rRotated = cute::make_tensor_like(rQ);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      result[j] = head < valid_hpb
-                      ? __float2bfloat16_rn(mega_rotate(__bfloat162float(values[j]),
-                                                        __bfloat162float(values[j ^ 1]),
-                                                        KV::D_NOPE + dim + j, mega_cs))
-                      : __float2bfloat16(0.f);
+      rRotated(j) = head < valid_hpb ? __float2bfloat16_rn(mega_rotate(
+                                           __bfloat162float(rQ(j)), __bfloat162float(rQ(j ^ 1)),
+                                           KV::D_NOPE + dim + j, mega_cs))
+                                     : __float2bfloat16(0.f);
     }
-    *reinterpret_cast<uint2*>(q_rope + CutePrefillQRopeLayout{}(head, dim)) =
-        *reinterpret_cast<const uint2*>(result);
+    auto sQ = cute::make_tensor(cute::make_smem_ptr(q_rope), CutePrefillQRopeLayout{});
+    auto sVector =
+        cute::make_tensor(sQ.data() + sQ.layout()(head, dim), cute::make_layout(cute::_4{}));
+    cute::copy(cute::AutoVectorizingCopyWithAssumedAlignment<64>{}, rRotated, sVector);
   }
   cutlass::arch::NamedBarrier::sync(
       MATH_THREADS, static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::Q_STAGE));

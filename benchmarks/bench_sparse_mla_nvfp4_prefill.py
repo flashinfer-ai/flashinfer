@@ -88,12 +88,6 @@ def main() -> None:
         action="store_true",
         help="Include separate Q RoPE and inverse-RoPE/FP8 output kernels",
     )
-    parser.add_argument(
-        "--customer-q",
-        type=int,
-        nargs="+",
-        help="Run only CP=4 full-pipeline customer cases; KV=4*Q, H=64",
-    )
     args = parser.parse_args()
     print("Timing: warm-L2 CUDA Graph" if args.cuda_graph else "Timing: eager, cold L2")
 
@@ -108,30 +102,9 @@ def main() -> None:
     if args.profile_once and len(args.topk) != 1:
         raise SystemExit("--profile-once requires exactly one --topk value")
 
-    if args.customer_q:
-        from tests.attention.sparse_mla_prefill_utils import (
-            prefill_fixture,
-            native_prefill_calls,
-        )
-
-        print("Q,KV,H,full_pipeline_us")
-        for qlen in args.customer_q:
-            f = prefill_fixture(
-                1,
-                "nvfp4",
-                heads=64,
-                prefill_tokens=qlen,
-                prefill_cp_size=4,
-                keep_decoded=False,
-            )
-            fn = native_prefill_calls(f)[0 if args.mega else 1]
-            us = _median_us(fn, args.warmup_ms, args.measure_ms, args.cuda_graph)
-            print(f"{qlen},{4 * qlen},64,{us:.4f}")
-        return
-
     if args.num_tokens <= 64:
         raise SystemExit(
-            "Paired attention benchmarks require Q > 64; use --customer-q for forced prefill"
+            "Paired attention benchmarks require Q > 64 to select prefill on both paths"
         )
 
     torch.manual_seed(args.seed)

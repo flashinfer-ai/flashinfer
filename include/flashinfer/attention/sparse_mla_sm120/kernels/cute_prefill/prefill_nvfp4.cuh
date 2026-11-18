@@ -28,10 +28,35 @@
 
 namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
-// One CTA per query/head tile consumes the full sparse selection.
-// Non-RoPE features use block-scaled FP4 MMA; the RoPE tail uses BF16.
-// Mega=false accepts rotated Q and returns BF16 context; Mega=true also
-// applies Q RoPE, inverse output RoPE, and FP8 output quantization.
+// CTA tile: one query token, H=min(NUM_HEADS,64) heads, N=64 selected
+// candidates, D=448 non-RoPE + 64 RoPE features. Main-cache tiles precede
+// extra-cache tiles; the final tile of each cache may be partial.
+//
+// Role assignment (warp IDs below are local to each 4-warp WG):
+//   WG0 + WG1: math. Let w=4*wg+warp, in [0,8).
+//     QK: warp w owns candidates [8*w,8*w+8), all H heads and all D.
+//         It traverses H in 16-head groups; Q is staged once in shared
+//         memory and loaded into MMA fragments as needed, not kept in regs.
+//     Softmax: these same warps reduce max/sum across their candidate slices
+//         through shared scratch, update online statistics and rescale O.
+//         They publish BF16 P[H,64], then quantize P in 16-candidate groups.
+//     PV: ownership switches from candidates to output features. Warp w owns
+//         non-RoPE groups g=w+8*s (g<28), each covering [16*g,16*g+16),
+//         plus RoPE features [448+8*w,448+8*w+8). Every warp consumes all
+//         64 candidates and retains its O[H,owned_features] in FP32 regs.
+//   WG2 + WG3: IO. WG2 warps 0/1 gather raw KV[64,512] and scales.
+//     All eight IO warps transpose and requantize the non-RoPE V operand
+//     from feature-axis cache scales to candidate-axis PV scales.
+//
+// Handoffs: two raw-KV slots feed both QK and the BF16 PV tail; one Vt slot
+// feeds non-RoPE PV. IO publishes raw KV after async gather completion and
+// Vt after cooperative conversion. Math releases Vt after non-RoPE PV and
+// raw KV only after the RoPE PV tail. QK/softmax/PV are sequential phases
+// of the same math warps, not independent producer/consumer roles.
+//
+// Mega=false accepts rotated Q and writes BF16 context. Mega=true applies
+// Q RoPE during staging, then inverse output RoPE and FP8 quantization in
+// the epilogue. Neither specialization splits the selection across CTAs.
 
 __device__ __forceinline__ float2 prefill_sink_normalization(float lse, float sink) {
   if (sink == INFINITY) return make_float2(0.f, INFINITY);
@@ -96,6 +121,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
   auto sm = StreamingNVFP4Smem::init(smem_raw);
   const int32_t* idx_base = indices + (size_t)token_idx * TOPK;
 
+  // Phase 0 — Initialize handoffs and handle an empty selection.
   // Raw KV: two slots. One transactional arrival publishes each gathered tile;
   // every math thread releases it after its last read. V-transpose slots use
   // all IO threads as producers and all math threads as consumers.
@@ -146,8 +172,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
         extra_page_block_size, extra_page_stride_bytes);
   };
 
-  // IO role: warps 8:16. Warps 8:10 gather the 64 sparse candidates;
-  // all eight IO warps convert the gathered values to the PV operand layout.
+  // Phase 1 — IO role: WG2/WG3. Only WG2 warps 0/1 issue the gather;
+  // all eight IO warps prepare Vt. Each slot is acquired before overwrite.
+  // Raw KV may advance into the second slot while math consumes the first.
   if (is_io) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(STREAMING_IO_MAX_REGS));
     // Double-buffer raw KV so gathering the next tile can overlap PV.
@@ -183,8 +210,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     return;
   }
 
-  // Math role: warps 0:8. Each warp owns eight candidates for QK and
-  // distributed feature groups for PV, across up to four 16-head groups.
+  // Phase 2 — Math prologue: WG0/WG1 stage Q once, including optional RoPE.
+  // Reserve registers for FP32 O and online max/sum across every KV tile.
   asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(STREAMING_MATH_MAX_REGS));
 
   const int gid = lane >> 2;
@@ -232,6 +259,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     bf16* sm_kv_rope = sm.kv_rope(buf);
     const int warp_first_cand = warp_id * STREAMING_ENTRIES_PER_WARP;
 
+    // Phase 3 — QK: each math warp computes S[H,8] for its candidates,
+    // accumulating the seven FP4 K=64 steps and four BF16 RoPE K=16 steps.
     float qk[STREAMING_HEAD_GROUPS][STREAMING_QK_N_TILES][4] = {0};
     cute_qk_nvfp4<VALID_HEAD_GROUPS, STREAMING_Q_FP4_STRIDE, STREAMING_Q_SCALE_STRIDE,
                   STREAMING_KV_SMEM_STRIDE, STREAMING_SCALE_BYTES_PER_TOKEN, NUM_K64_TILES>(
@@ -241,23 +270,23 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     for (int ks = 0; ks < D_ROPE / 16; ++ks) {
       const int cand_row_base = warp_first_cand;
       const bf16* rope_row = sm_kv_rope + (size_t)(cand_row_base + gid) * D_ROPE + ks * 16;
-      const uint32_t b0 = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2);
-      const uint32_t b1 = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2 + 8);
+      auto rB = cute::make_tensor<uint32_t>(cute::make_layout(cute::_2{}));
+      rB(0) = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2);
+      rB(1) = *reinterpret_cast<const uint32_t*>(rope_row + tid * 2 + 8);
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-        uint32_t a0, a1, a2, a3;
+        auto rA = cute::make_tensor<uint32_t>(cute::make_layout(cute::_4{}));
         const int row = (lane & 7) + ((lane >> 3) & 1) * 8;
         const int col = ks * 16 + (lane >> 4) * 8;
-        cute_ldsm4(a0, a1, a2, a3, sm.q_rope(group) + CutePrefillQRopeLayout{}(row, col));
-        CuteMmaResult r = cute_mma_rope(a0, a1, a2, a3, b0, b1, qk[group][0][0], qk[group][0][1],
-                                        qk[group][0][2], qk[group][0][3]);
-        qk[group][0][0] = r.d0;
-        qk[group][0][1] = r.d1;
-        qk[group][0][2] = r.d2;
-        qk[group][0][3] = r.d3;
+        cute_ldsm4(sm.q_rope(group) + CutePrefillQRopeLayout{}(row, col), rA);
+        auto rC = cute::make_tensor(&qk[group][0][0], cute::make_layout(cute::_4{}));
+        cute::MMA_Atom<RopeMma>{}.call(rA, rB, rC);
       }
     }
 
+    // Phase 4 — Mask and online softmax. Tail/negative indices contribute
+    // zero probability. Reduce across all eight candidate-owning warps
+    // before rescaling the persistent O and publishing this tile's P.
     float local_max[STREAMING_HEAD_GROUPS][2];
     float local_sum[STREAMING_HEAD_GROUPS][2];
     float p[STREAMING_HEAD_GROUPS][STREAMING_QK_N_TILES][4];
@@ -427,6 +456,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
         STREAMING_MATH_THREADS,
         static_cast<cutlass::arch::ReservedNamedBarriers>(Dsv4Nvfp4Sync::MATH));
 
+    // Phase 5 — PV: quantize P along candidates, then reuse each head group
+    // across the feature-split warps. Keep BF16 P for the RoPE-value tail.
     for (int task = threadIdx.x; task < HEADS_PER_CTA * NVFP4_VT_SCALE_GROUPS;
          task += STREAMING_MATH_THREADS) {
       const int head = task / NVFP4_VT_SCALE_GROUPS;
@@ -457,12 +488,12 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     const int rope_dim_base = warp_id * ROPE_DIMS_PER_WARP;
 #pragma unroll
     for (int ks = 0; ks < ROPE_K_ITERS; ++ks) {
-      uint32_t rope_a0[STREAMING_HEAD_GROUPS], rope_a1[STREAMING_HEAD_GROUPS];
-      uint32_t rope_a2[STREAMING_HEAD_GROUPS], rope_a3[STREAMING_HEAD_GROUPS];
+      auto rA = cute::make_tensor<uint32_t>(
+          cute::make_layout(cute::make_shape(cute::_4{}, cute::Int<STREAMING_HEAD_GROUPS>{})));
 #pragma unroll
       for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-        cute_load_rope_a(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group],
-                         sm.p_full(group) + ks * 16, STREAMING_P_STRIDE, lane);
+        auto rAg = rA(cute::_, group);
+        cute_load_rope_a(sm.p_full(group) + ks * 16, STREAMING_P_STRIDE, lane, rAg);
       }
 #pragma unroll
       for (int nt = 0; nt < ROPE_N_TILES; ++nt) {
@@ -481,18 +512,13 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
             *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent8 * D_ROPE + col);
         const uint16_t v9 =
             *reinterpret_cast<const uint16_t*>(sm_kv_rope + (size_t)ent9 * D_ROPE + col);
-        const uint32_t b0 = (uint32_t)v0 | ((uint32_t)v1 << 16);
-        const uint32_t b1 = (uint32_t)v8 | ((uint32_t)v9 << 16);
+        auto rB = cute::make_tensor<uint32_t>(cute::make_layout(cute::_2{}));
+        rB(0) = (uint32_t)v0 | ((uint32_t)v1 << 16);
+        rB(1) = (uint32_t)v8 | ((uint32_t)v9 << 16);
 #pragma unroll
         for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-          CuteMmaResult r =
-              cute_mma_rope(rope_a0[group], rope_a1[group], rope_a2[group], rope_a3[group], b0, b1,
-                            acc_rope[group][nt][0], acc_rope[group][nt][1], acc_rope[group][nt][2],
-                            acc_rope[group][nt][3]);
-          acc_rope[group][nt][0] = r.d0;
-          acc_rope[group][nt][1] = r.d1;
-          acc_rope[group][nt][2] = r.d2;
-          acc_rope[group][nt][3] = r.d3;
+          auto rC = cute::make_tensor(&acc_rope[group][nt][0], cute::make_layout(cute::_4{}));
+          cute::MMA_Atom<RopeMma>{}.call(rA(cute::_, group), rB, rC);
         }
       }
     }
@@ -507,6 +533,9 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1) sparse_mla_prefill
     }
   }
 
+  // Phase 6 — Epilogue. WG0 warp 0 writes LSE and sink normalization;
+  // all math warps normalize their O fragments. Mega reuses dead raw-KV
+  // storage for one BF16 [16,512] context group before inverse RoPE/casting.
   float* final_output_scale = reinterpret_cast<float*>(sm.p_full(0));
   if (warp_id == 0 && tid == 0) {
 #pragma unroll

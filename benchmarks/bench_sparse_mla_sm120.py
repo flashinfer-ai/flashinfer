@@ -490,7 +490,7 @@ def bench_sparse_mla_sm120_dsv41(
     """
     if mega and (compute_precision == "bf16"):
         return float("nan"), float("nan")
-    if prefill_impl == "swapab" and not (mega or force_prefill):
+    if prefill_impl == "swapab" and not force_prefill:
         return float("nan"), float("nan")  # No DSv4.1 swapAB instantiation.
     device = torch.device("cuda")
     torch.manual_seed(seed)
