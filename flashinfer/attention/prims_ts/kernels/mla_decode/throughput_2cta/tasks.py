@@ -616,25 +616,25 @@ def create_load_combined_task(
     @schedule
     def combined_schedule(smem_q, smem_k, smem_v, page_offsets, work_queue=None):
         """Acquire paired K/V stages, convert once, and publish V after peer DSMEM completion."""
-        smem_q.init_load_state()
-        smem_k.init_load_state()
-        smem_v.init_load_state()
-        smem_k.bind_sparse_request()
-        smem_q.acquire()
-        smem_q.tma_load()
-        smem_q.commit()
-        with domain_loop(loop_start, loop_end, loop_step):
-            page_offsets.wait()
-            page_stage = page_offsets.sparse_stage()
-            smem_k.acquire()
-            smem_v.acquire()
-            smem_v.combined_stage()
-            smem_k.tma_load_shared(page_offset_stage=page_stage)
-            smem_k.commit()
-            smem_v.tma_load_shared(page_offset_stage=page_stage)
-            smem_v.commit()
-            page_offsets.release()
-        work_queue_tail(work_queue, advance_label="advance_tile")
+        with _work_tile_region(work_queue):
+            smem_q.init_load_state()
+            smem_k.init_load_state()
+            smem_v.init_load_state()
+            smem_k.bind_sparse_request()
+            smem_q.acquire()
+            smem_q.tma_load()
+            smem_q.commit()
+            with domain_loop(loop_start, loop_end, loop_step):
+                page_offsets.wait()
+                page_stage = page_offsets.sparse_stage()
+                smem_k.acquire()
+                smem_v.acquire()
+                smem_v.combined_stage()
+                smem_k.tma_load_shared(page_offset_stage=page_stage)
+                smem_k.commit()
+                smem_v.tma_load_shared(page_offset_stage=page_stage)
+                smem_v.commit()
+                page_offsets.release()
 
     captured = combined_schedule(smem_q, smem_k, smem_v, page_offsets, work_queue)
     return task_class(
@@ -1604,6 +1604,13 @@ def create_scheduler_task(
 
 class MlaStagedOutputTask(MlaTask):
     """Correction task that drains its per-warp output TMA stores at exit."""
+
+    if TS_TREE_WALKING_TASK:
+
+        @cute.jit
+        def _drain(self) -> None:
+            super()._drain()
+            prims.cp_async_bulk_wait_group(0)
 
     @cute.jit
     def _drain_mla_work_tile_tails(self):
