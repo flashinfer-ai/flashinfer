@@ -389,9 +389,12 @@ def mhc_pre(
     backend : str
         One of ``"auto"`` (default), ``"specialized"`` or ``"big-fuse"``.
 
-        - ``"big-fuse"``: the composable path — projection GEMM and square
-          sum computed here (fp32, at the ambient matmul precision), then
-          :func:`mhc_pre_big_fuse`. Serves every shape this entry accepts.
+        - ``"big-fuse"``: the composable stock path — the projection GEMM
+          is computed here (fp32, at the ambient matmul precision), then
+          :func:`mhc_pre_big_fuse_with_prenorm`, the big-fuse kernel
+          variant that also fuses the RMS square-sum (the fastest existing
+          FlashInfer composition for the full op, measured per row).
+          Serves every shape this entry accepts.
         - ``"specialized"``: a fused single-launch-sequence CUDA kernel for
           the GLM-5.3 geometry (``residual`` of shape ``(T, 4, 4096)``,
           ``1 <= T <= 16384``, default scalar parameters) on SM103.
@@ -445,15 +448,13 @@ def mhc_pre(
                 layer_input.reshape(outer_shape + (hidden_size,)),
             )
 
-    k = _MHC_HC * hidden_size
-    x = residual.reshape(total_tokens, k).to(torch.float32)
-    return mhc_pre_big_fuse(
-        x @ fn.t().to(torch.float32),
-        x.square().sum(-1),
+    x = residual.reshape(total_tokens, _MHC_HC * hidden_size).to(torch.float32)
+    dot_mix = (x @ fn.t().to(torch.float32)).reshape(outer_shape + (_MHC_MIX,))
+    return mhc_pre_big_fuse_with_prenorm(
+        dot_mix,
         residual,
         hc_scale,
         hc_base,
-        k=k,
         rms_eps=rms_eps,
         mhc_pre_eps=mhc_pre_eps,
         mhc_sinkhorn_eps=mhc_sinkhorn_eps,
