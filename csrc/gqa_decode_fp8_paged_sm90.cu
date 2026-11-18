@@ -946,6 +946,13 @@ void gqa_decode_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView 
     TVM_FFI_ICHECK_EQ(cache->stride(1), DD);
     TVM_FFI_ICHECK_EQ(cache->stride(0), PAGE * DD) << "KV pages must be 2048 contiguous bytes";
   }
+  // The kernel issues 16-byte cp.async loads from the Q/K/V base pointers;
+  // PTX requires natural alignment, and contiguity alone does not establish
+  // it (a view can start mid-storage).
+  for (const TensorView* t : {&q, &k_cache, &v_cache}) {
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16, 0)
+        << "q/k_cache/v_cache base pointers must be 16-byte aligned";
+  }
   CHECK_INPUT_AND_TYPE(block_table, dl_int32);
   CHECK_INPUT_AND_TYPE(seq_lens, dl_int32);
   CHECK_INPUT_AND_TYPE(q_descale, dl_float32);

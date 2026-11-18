@@ -3076,6 +3076,29 @@ def _gqa_dec_fp8q_sm90_run_eligibility(
         return "skip_softmax_threshold_scale_factor"
     if window_left is not None and window_left >= 0:
         return f"window_left={window_left}"
+    # Effective wrapper options can drift after plan(): the deprecated
+    # forward()/forward_return_lse() entrypoints overwrite _causal,
+    # _pos_encoding_mode, _sm_scale and friends before calling run().
+    # Revalidate the ones the specialized kernel's contract fixes, so a
+    # post-plan change routes to the stock path instead of silently
+    # computing the planned (causal, unscaled-RoPE-free) attention.
+    if not getattr(wrapper, "_causal", True):
+        return "causal=False (changed after plan)"
+    if getattr(wrapper, "_pos_encoding_mode", "NONE") not in (None, "NONE"):
+        return f"pos_encoding_mode={wrapper._pos_encoding_mode} (changed after plan)"
+    if getattr(wrapper, "_use_fp16_qk_reduction", False):
+        return "use_fp16_qk_reduction (changed after plan)"
+    _eff_window = getattr(wrapper, "_window_left", -1)
+    if _eff_window is not None and _eff_window >= 0:
+        return f"window_left={_eff_window} (changed after plan)"
+    _eff_cap = getattr(wrapper, "_logits_soft_cap", 0.0)
+    if _eff_cap is not None and _eff_cap != 0.0:
+        return f"logits_soft_cap={_eff_cap} (changed after plan)"
+    _eff_scale = getattr(wrapper, "_sm_scale", None)
+    if _eff_scale is not None and not (
+        abs(float(_eff_scale) - _GQA_DEC_FP8Q_SM90_SM_SCALE) < 1e-8
+    ):
+        return f"sm_scale={_eff_scale} (changed after plan)"
     expected_shape = (
         state.total_q,
         _GQA_DEC_FP8Q_SM90_NUM_QO_HEADS,
@@ -3085,6 +3108,10 @@ def _gqa_dec_fp8q_sm90_run_eligibility(
         return f"q shape/dtype {tuple(q.shape)} {q.dtype}"
     if not q.is_contiguous():
         return "q not contiguous"
+    # The kernel issues 16-byte cp.async loads from the Q/K/V base pointers;
+    # contiguity does not imply base alignment (a view can start mid-storage).
+    if q.data_ptr() % 16 or k_cache.data_ptr() % 16 or v_cache.data_ptr() % 16:
+        return "q/k_cache/v_cache base pointers must be 16-byte aligned"
     if out is not None:
         if out.dtype != torch.bfloat16 or tuple(out.shape) != expected_shape:
             return f"out shape/dtype {tuple(out.shape)} {out.dtype}"
@@ -6205,6 +6232,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 enable_pdl=enable_pdl,
                 use_fp16_softmax=use_fp16_softmax,
                 uses_spcompress=uses_spcompress,
+            )
+        if getattr(self, "_gqa_dec_fp8q_sm90_explicit", False) and not is_float8(q):
+            # The explicit backend="specialized" contract is fp8 (e4m3)
+            # queries. A non-fp8 q would skip the gate below and silently
+            # pass the cached-BF16 dtype check into stock fa2 (bypassing the
+            # explicit-route kill-switch error too); an explicitly selected
+            # backend never falls back.
+            raise NotImplementedError(
+                "backend='specialized' (SM90 fp8-Q paged verify-decode "
+                f"kernel) was planned for fp8 e4m3 queries; got q.dtype="
+                f"{q.dtype}. An explicitly selected backend never falls back "
+                "— pass an fp8 query or re-plan with backend='auto'"
             )
         if getattr(self, "_gqa_dec_fp8q_sm90_requested", False) and is_float8(q):
             # fp8 Q on the SM90 paged route, armed by backend="specialized"
