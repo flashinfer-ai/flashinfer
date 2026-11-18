@@ -16,7 +16,7 @@ workspace work, not an apples-to-apples kernel speedup.
 
 ``--baseline rubin-cutedsl-matched`` selects the vendored SM107 (Rubin) MegaMoE
 reducer at
-``flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/topk_reduce.py``
+``flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/helpers/topk_reduce.py``
 on the same live ``T x 6 x 4096`` elements, called without routing scores or
 indices (an unweighted sum in increasing K, rounded once, as the native
 reducer). It needs a CuTe DSL that targets sm_107a natively and
@@ -67,11 +67,11 @@ _ATOL = 1e-2
 _RTOL = 1e-2
 _CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
 _CUTEDSL_SOURCE_SHA256 = (
-    "6b8f55a222511281daa7694779ee96c23276d31f39754552cec97c36dd7b0b95"
+    "12727bab233ce4fc57d2f84adca1bbd1adaf150ccaf0d30f3dbb019048cd0c5a"
 )
-_RUBIN_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/kernel_src/rubin/inference/mega/topk_reduce.py"
+_RUBIN_CUTEDSL_SOURCE = "flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/src/sources/helpers/topk_reduce.py"
 _RUBIN_CUTEDSL_SOURCE_SHA256 = (
-    "b38d2733da0ed35bd25cca88a589471806b7316b8fe91f8021618e3eacabb644"
+    "07deecdd74d9c3319b5833594c2dd0494640c8cb0508e0bfa323ce44d54fc6f1"
 )
 
 
@@ -266,13 +266,12 @@ def _make_rubin_cutedsl_runner(
         import cutlass.cute as cute
         import cutlass.torch as cutlass_torch
 
-        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-            bootstrap_paths,
+        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+            TopkReduce,
         )
-
-        bootstrap_paths()
-        from sources.kernel_src.rubin.inference.mega.topk_reduce import TopkReduce
-        from sources.quant_def import CombineFormat
+        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+            CombineFormat,
+        )
     except Exception as error:
         raise RuntimeError(
             f"vendored CuTeDSL baseline {_RUBIN_CUTEDSL_SOURCE} is unavailable; "
