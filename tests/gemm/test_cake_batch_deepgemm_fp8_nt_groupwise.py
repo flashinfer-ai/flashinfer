@@ -1365,13 +1365,17 @@ def test_domain_counters_must_not_overlap():
     )
     assert plan.route == DOMAIN_SERVING_ROUTE
     device = torch.device("cuda", torch.cuda.current_device())
-    words = torch.zeros(4, dtype=torch.int32, device=device)
-    for first, second in ((words[0:2], words[0:2]), (words[0:2], words[1:3])):
-        with pytest.raises(ValueError, match="overlap"):
+    # Counters are 16-byte aligned, so two counter pairs overlap only when they
+    # start at the same address; a partly overlapping pair is misaligned.
+    words = torch.zeros(8, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match="overlap"):
+        _check_workspace(
+            plan, {"counters0": words[0:2], "counters1": words[0:2]}, device
+        )
+    for first, second in ((words[0:2], words[1:3]), (words[1:3], words[0:2])):
+        with pytest.raises(ValueError, match="16-byte aligned"):
             _check_workspace(plan, {"counters0": first, "counters1": second}, device)
-        with pytest.raises(ValueError, match="overlap"):
-            _check_workspace(plan, {"counters0": second, "counters1": first}, device)
-    _check_workspace(plan, {"counters0": words[2:4], "counters1": words[0:2]}, device)
+    _check_workspace(plan, {"counters0": words[4:6], "counters1": words[0:2]}, device)
 
 
 @_host_only
