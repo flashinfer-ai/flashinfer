@@ -26,6 +26,7 @@ from .trace.templates.mhc import (
     mhc_post_trace,
     mhc_pre_big_fuse_trace,
     mhc_pre_big_fuse_with_prenorm_trace,
+    mhc_pre_trace,
 )
 from .utils import register_custom_op, register_fake_op
 
@@ -331,7 +332,7 @@ def mhc_pre_big_fuse(
     )
 
 
-@flashinfer_api
+@flashinfer_api(trace=mhc_pre_trace)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,

@@ -134,8 +134,22 @@ def supported_with_reasons(
         return r
     if torch.cuda.get_device_capability(residual.device) != (10, 3):
         return ["not_sm103"]
-    if torch.cuda.is_current_stream_capturing() and not _BUILT["ready"]:
-        return ["module_not_built_before_graph_capture"]
+    # The module load (and the launch) happen on residual's device, but the
+    # capture query reads the CURRENT device's stream: check both, so a call
+    # with residual on a non-current device cannot slip a module load into
+    # that device's active capture (and a capture on the current device is
+    # still refused even though the launch targets another GPU).
+    if not _BUILT["ready"]:
+        capturing = torch.cuda.is_current_stream_capturing()
+        if (
+            not capturing
+            and residual.device.index is not None
+            and (residual.device.index != torch.cuda.current_device())
+        ):
+            with torch.cuda.device(residual.device):
+                capturing = torch.cuda.is_current_stream_capturing()
+        if capturing:
+            return ["module_not_built_before_graph_capture"]
     return []
 
 
