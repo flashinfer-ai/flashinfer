@@ -22,21 +22,21 @@
 // normalisation).
 //
 // Algorithm: a Hopper warpgroup kernel. QK^T runs as fp8 wgmma
-// (m64n64k32 e4m3 x e4m3, fp32 accumulate) over K-major staged Q and K tiles
+// (m64n64k32 e4m3 x e4m3, packed f16 accumulate — see OPERAND RANGE below)
+// over K-major staged Q and K tiles
 // (register-resident Q, cp.async two-stage K/V pipeline through dynamic
 // shared memory, BN=96 key tiles); softmax statistics are fp32 online-softmax
 // with a deferred-renormalisation cap; P is quantised once to e4m3 and the
 // P.V product runs as fp8 wgmma (m64n128k32) against a keys-contiguous V^T
 // scratch that a small pass (`vt_build`) builds from the paged V cache (every
 // covered physical page exactly once per call, also emitting the exact
-// long-query tile list); the fp32 O accumulator is renormalised and rounded
-// once to bf16. Short-query (decode-like, q_len <= 16) requests run split-KV
-// with an fp32 partial-state merge (`combine_kernel`) — packed q_len <= 8
-// rows in a 128-thread kernel, the rest at full width; long-query requests
-// run one CTA per 16-token query tile, optionally split over the KV axis for
-// wave balance (plan-time `psplit`, compiled as a static specialisation, with
-// fp16 partial states merged by `combine_prefill`). A single-request prefill
-// step skips the decode-side kernels entirely.
+// long-query tile list); the packed f16 O accumulator (wgmma_pv8_h) is
+// renormalised in fp32 and rounded once to bf16. Short-query (decode-like, q_len <= 16) requests
+// run split-KV with an fp32 partial-state merge (`combine_kernel`) — packed q_len <= 8 rows in a
+// 128-thread kernel, the rest at full width; long-query requests run one CTA per 16-token query
+// tile, optionally split over the KV axis for wave balance (plan-time `psplit`, compiled as a
+// static specialisation, with fp16 partial states merged by `combine_prefill`). A single-request
+// prefill step skips the decode-side kernels entirely.
 //
 // OUTPUT PRECISION (disclosed in the Python dispatcher's docstring): the P.V
 // product accumulates the e4m3-quantised P against the e4m3 V — an in-class
@@ -487,6 +487,29 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
     if (kbi >= KSTAGE) kbi = 0;
 
     asm volatile("cp.async.wait_group 0;\n");
+    /* Scrub the V^T slots of keys at/beyond kvlen in the tail tile: the
+       causal mask zeroes their P, but f16 0 * NaN = NaN, so a NaN e4m3 bit
+       pattern in an unwritten slot of a partly filled cache page (or in a
+       clamp-restaged page) would otherwise reach the PV accumulator for
+       valid rows. The K side needs no scrub (the mask overwrites the score
+       bits). Each thread rewrites only the chunks it staged itself, before
+       the barrier publishes the tile. */
+    if (kv0 + BN > kvlen) {
+#pragma unroll
+      for (int i = 0; i < (PACK ? BN / 16 : BN / 32); ++i) {
+        const int vc = PACK ? i : vpg + 2 * i;
+        uint8_t* chunk = Vb + vsh0 + ((vc ^ vx) << 4);
+        const int lim = kvlen - kv0 - vc * 16; /* slots < lim hold live keys */
+#pragma unroll
+        for (int ss = 0; ss < 16; ++ss)
+          if (ss >= lim) chunk[ss] = 0;
+      }
+    }
+    /* cp.async completion and the scrub above are generic-proxy writes; the
+       WGMMA shared-memory operand reads are async-proxy. Order them with an
+       async-proxy fence before the CTA barrier (wgmma.fence only covers the
+       accumulator registers). */
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     __syncthreads();
 
     /* ---- QK: Hopper FP8 WGMMA, packed f16 accumulator ---- */
@@ -955,6 +978,20 @@ void gqa_context_fp8_paged_sm90_run(TensorView q, TensorView k_cache, TensorView
   TVM_FFI_ICHECK_GE(q_descale.numel(), B);
   TVM_FFI_ICHECK_GE(k_descale.numel(), B);
   TVM_FFI_ICHECK_GE(v_descale.numel(), B);
+
+  // Base-pointer alignment: the paged caches are read with 16-byte cp.async /
+  // uint4 accesses and q/out with 4-byte packed accesses. A contiguous view at
+  // an odd element offset passes every stride check above but would fault on
+  // the device, so reject it here before any launch (the Python dispatcher
+  // applies the same guard and serves such calls through the stock path).
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(k_cache.data_ptr()) % 16, 0)
+      << "k_cache base pointer must be 16-byte aligned";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(v_cache.data_ptr()) % 16, 0)
+      << "v_cache base pointer must be 16-byte aligned";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(q.data_ptr()) % 4, 0)
+      << "q base pointer must be 4-byte aligned";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(out.data_ptr()) % 4, 0)
+      << "out base pointer must be 4-byte aligned";
 
   const int64_t vt_pages = vt.numel() / 2048;
   TVM_FFI_ICHECK_GT(vt_pages, 0);

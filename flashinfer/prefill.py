@@ -3036,6 +3036,18 @@ def _gqa_ctx_fp8q_sm90_prepare(
         # kernel derives its V^T coverage (and its v_cache size requirement)
         # from vt.numel(), so handing it the whole retained buffer after a
         # smaller replan would demand cache pages the plan never references.
+        # In CUDA-graph mode the coverage must be capture-stable instead: a
+        # captured run bakes the vt_build CTA count of its plan, and a later
+        # accepted replan that fits the retained buffers but references more
+        # pages would replay with stale V^T for the extra pages. Pin the
+        # graph-mode coverage to the wrapper's high-water mark (any growth
+        # past the retained buffer is already declined and documented to
+        # invalidate captures), and let the run-time guard keep requiring the
+        # caches to cover it.
+        if graph_mode:
+            prev_vt = bufs.get("vt")
+            if prev_vt is not None:
+                vt_pages = max(vt_pages, prev_vt.numel() // 2048)
         vt = _buf("vt", vt_pages * 2048, torch.uint8)[: vt_pages * 2048]
         tasks = _buf("tasks", 2 * npt, torch.int32)
         seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
@@ -3217,6 +3229,13 @@ def _gqa_ctx_fp8q_sm90_run_eligibility(
             != _GQA_CTX_FP8Q_SM90_PAGE_SIZE * _GQA_CTX_FP8Q_SM90_HEAD_DIM
         ):
             return f"{name} strides {tuple(cache.stride())}"
+    # base-pointer alignment: the kernel issues 16-byte accesses on the paged
+    # caches and 4-byte packed accesses on q/out; a contiguous view at an odd
+    # element offset passes the stride checks but would fault on the device
+    if q.data_ptr() % 4 != 0 or (out is not None and out.data_ptr() % 4 != 0):
+        return "q/out base pointer alignment"
+    if k_cache.data_ptr() % 16 != 0 or v_cache.data_ptr() % 16 != 0:
+        return "kv cache base pointer alignment"
     # the kernel reads K and V at the same physical page ids, so both caches
     # must hold every page the plan references (vt_pages = max page id + 1)
     if k_cache.shape[0] < state.vt_pages:
@@ -3402,7 +3421,26 @@ def _gqa_ctx_fp8q_sm90_dequant_q(
                 "gqa_context_fp8_paged_sm90: a per-sequence q_scale tensor "
                 "requires the plan-time row->request map; re-plan this wrapper"
             )
-        scale_rows = q_scale.reshape(-1)[row_seq].view(-1, 1, 1)
+        flat = q_scale.reshape(-1)
+        if flat.numel() == 1:
+            # per-tensor convention (0-d or 1-element): broadcast across rows
+            scale_rows = flat.view(1, 1, 1)
+        else:
+            state = getattr(wrapper, "_gqa_ctx_fp8q_sm90_state", None)
+            batch_size = (
+                int(state.batch_size)
+                if state is not None
+                else int(row_seq.max().item()) + 1
+            )
+            if flat.numel() != batch_size:
+                # indexing a short tensor with row_seq would be an
+                # out-of-bounds CUDA gather (device-side assert, context
+                # lost); a longer tensor would silently apply wrong values
+                raise ValueError(
+                    "gqa_context_fp8_paged_sm90: q_scale tensor must have 1 "
+                    f"or batch_size={batch_size} elements, got {flat.numel()}"
+                )
+            scale_rows = flat[row_seq].view(-1, 1, 1)
         return (q.to(torch.float32) * scale_rows).to(torch.bfloat16), None
     return q.to(torch.bfloat16), q_scale
 
