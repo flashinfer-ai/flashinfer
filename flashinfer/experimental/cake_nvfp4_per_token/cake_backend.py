@@ -2389,7 +2389,9 @@ def prepare_mm_fp4_per_token(
     JIT module is built and loaded here, so prepare outside CUDA Graph capture.  A
     stream-K binding holds the stream-K scratch of the stream current at prepare time
     (:func:`_stream_k_workspace`), shared with the other stream-K bindings and eager
-    launches prepared on that stream: their launches must not run concurrently."""
+    launches prepared on that stream: their launches must not run concurrently.  The
+    first prepare on a stream enqueues the zero fill of its flags there, so a launch on
+    another stream must first wait for the prepare stream (``wait_stream``)."""
     if a_fp4.dim() != 2 or a_fp4.dtype != torch.uint8 or not a_fp4.is_contiguous():
         raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
     if b_fp4.dim() != 2 or b_fp4.dtype != torch.uint8 or not b_fp4.is_contiguous():
