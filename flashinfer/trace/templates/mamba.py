@@ -180,6 +180,8 @@ class _SSDCombinedTraceTemplate(TraceTemplate):
             kwargs = dict(kwargs)
             state_dtype_source = kwargs.get("initial_states")
             if state_dtype_source is None:
+                state_dtype_source = kwargs.get("final_states")
+            if state_dtype_source is None:
                 state_dtype_source = kwargs.get("checkpoint_states")
             kwargs["_ssd_state_dtype_source"] = state_dtype_source
             return build_definition(save_dir=save_dir, name=name, **kwargs)
@@ -281,6 +283,11 @@ def _make_ssd_combined_trace(
                 ["num_checkpoints", "nheads", "headdim", "dstate"],
                 optional=True,
             ),
+            "final_states": Tensor(
+                [state_batch_axis, "nheads", "headdim", "dstate"],
+                optional=True,
+                description="Optional caller-owned final-state storage.",
+            ),
             "out": Tensor(
                 [
                     "batch_size",
@@ -294,6 +301,7 @@ def _make_ssd_combined_trace(
                 description="Optional caller-owned physical output storage.",
             ),
             "return_final_states": Scalar("bool", optional=True),
+            "state_dtype": Scalar("dtype", optional=True),
         }
     )
 
@@ -329,6 +337,7 @@ def _make_ssd_combined_trace(
             [state_batch_axis, "nheads", "headdim", "dstate"],
             dtype="bfloat16",
             dtype_from="_ssd_state_dtype_source",
+            dtype_from_scalar="state_dtype",
         )
 
     final_suffix = "final" if return_final_states else "no_final"

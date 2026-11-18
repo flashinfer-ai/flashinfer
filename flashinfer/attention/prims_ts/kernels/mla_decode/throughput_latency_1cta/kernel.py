@@ -481,6 +481,7 @@ def build_throughput_latency_mla_task_manager(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -549,6 +550,7 @@ def build_throughput_latency_mla_task_manager(
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            kv_bounds=kv_bounds,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,
@@ -779,6 +781,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s0 = TmemSResource(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
@@ -794,6 +797,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s1 = TmemSResource(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         pipeline_config=tmem_s1_cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
@@ -1213,6 +1217,7 @@ def _make_single_kv_pipe_task_graph(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -1454,6 +1459,7 @@ def _make_single_kv_pipe_task_graph(
         smem_page_offsets.nv_target = smem_kv
     tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         page_offsets=page_offsets,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
@@ -1812,6 +1818,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         reduction_policy_splits: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        use_kv_bounds: bool = False,
+        zero_empty_rows: bool = True,
         sparse_profile=None,
         finalize_output: bool = False,
         softmax_rescale_threshold_log2: float = 0.0,
@@ -1852,6 +1860,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.split_kv_capacity = split_kv_capacity
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
+        self.use_kv_bounds = use_kv_bounds
+        self.zero_empty_rows = zero_empty_rows
         self.sparse_profile = sparse_profile
         self.kv_cache_format = kv_cache_format
         self.extra_kv_cache_format = extra_kv_cache_format
@@ -2007,6 +2017,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.acc_dtype,
             self.lse_dtype,
             self.runtime_split_kv,
+            self.zero_empty_rows,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
             self.parallel_reduction_elements_per_slice,
@@ -2054,6 +2065,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             kv_cache_format=self.kv_cache_format,
             extra_kv_cache_format=self.extra_kv_cache_format,
         )
+        cfg = dataclass_replace(cfg, use_kv_bounds=self.use_kv_bounds)
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
                 cfg,
@@ -2188,6 +2200,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
+        kv_bounds=None,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self.runtime_config(max_q_len)
@@ -2629,6 +2642,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
             softmax_scale_operand = softmax_scale * LOG2_E
 
+        if cutlass.const_expr(self.use_kv_bounds and self.zero_empty_rows):
+            from ..helpers.kv_bounds import initialize_empty_rows
+
+            initialize_empty_rows(o, lse, kv_bounds, stream)
         self.dense_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -2657,6 +2674,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             max_q_len=max_q_len,
             kv_producer_args=kv_producer_args,
             tma_desc_o=tma_desc_o,
+            kv_bounds=kv_bounds,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2789,6 +2807,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         max_q_len: cutlass.Int32 = 0,
         kv_producer_args=None,
         tma_desc_o: cutlass.GridConstant[cuda.TensorMap] = None,
+        kv_bounds: cute.Tensor | None = None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
@@ -2994,6 +3013,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            kv_bounds=kv_bounds,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,

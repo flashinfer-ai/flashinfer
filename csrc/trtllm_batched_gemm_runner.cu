@@ -427,7 +427,8 @@ void TrtllmGenBatchedGemmRunner::run(
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
     int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-    int32_t configIndex, bool enable_pdl, int32_t validM, int32_t validN, int32_t validK) {
+    int32_t configIndex, bool enable_pdl, int32_t validM, int32_t validN, int32_t validK,
+    TrtllmGenBatchedGemmPartition const& partition) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData{};
@@ -543,9 +544,19 @@ void TrtllmGenBatchedGemmRunner::run(
   // Outputs
   gemmData.mOutputBuffers.mPtrC = c;
   gemmData.mOutputBuffers.mPtrSfC = outSfC;
+  // A non-zero row width makes the kernel store its columns at mColumnOffsetC of a wider buffer;
+  // the interface rejects slices the config cannot store (see supportsPartition).
+  gemmData.mOutputBuffers.mRowWidthC = partition.outputRowWidth;
+  gemmData.mOutputBuffers.mColumnOffsetC = partition.outputColumnOffset;
 
   int32_t multiProcessorCount;
   cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
+  if (partition.smCount > 0) {
+    FLASHINFER_CHECK(partition.smCount <= multiProcessorCount, "Partition SM count ",
+                     partition.smCount, " exceeds the device's ", multiProcessorCount, " SMs");
+    // Persistent kernels size their grid from this count; a domain stream only has its own SMs.
+    multiProcessorCount = partition.smCount;
+  }
 
   // Resolve valid dimensions in the caller's logical m/n/k space, then remap M/N into the
   // internal coordinate space used above when transposeMmaOutput swaps m and n.
@@ -834,6 +845,20 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const& config = configs[configIndex];
 
   return bmm.isValidConfig(config, gemmData);
+}
+
+bool TrtllmGenBatchedGemmRunner::supportsPartition(int32_t configIndex, int32_t smCount) const {
+  auto const bmm = BatchedGemmInterface();
+  if (configIndex < 0 || configIndex >= static_cast<int32_t>(bmm.getNumBatchedGemmConfigs()) ||
+      smCount <= 0) {
+    return false;
+  }
+  auto const& options = bmm.getBatchedGemmConfigs()[configIndex].mOptions;
+  int32_t const clusterSize = options.mClusterDimX * options.mClusterDimY * options.mClusterDimZ;
+  // The same conditions setKernelParams enforces for an output slice, plus enough SMs in one
+  // domain for a cluster and for every split-K slice of it.
+  return options.mUseTmaStore && !options.mUseCMultiCast && !options.mUseDeepSeekFp8 &&
+         clusterSize <= smCount && options.mNumSlicesForSplitK <= smCount / clusterSize;
 }
 
 }  // namespace kernels

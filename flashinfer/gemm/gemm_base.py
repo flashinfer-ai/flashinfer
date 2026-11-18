@@ -684,6 +684,12 @@ def _cute_dsl_mm_bf16_requirement(
         # call still tunes the M <= 32 buckets; they offer no tactics above.
         return True
 
+    if a.shape[1] <= 0 or a.shape[1] % 128:
+        raise ValueError(
+            "The CuTeDSL low-M backend requires K to be a positive multiple of "
+            f"128 for M <= {_CUTE_DSL_BF16_MAX_M}, got K={a.shape[1]}."
+        )
+
     from .kernels.dense_bf16_gemm_sm100_splitk import default_tactic
 
     default_tactic(a.shape[0], b.shape[1], a.shape[1])
@@ -944,6 +950,7 @@ def mm_bf16(
         profiled only for M <= 3 or M * N <= 4096, and never with bias.
         Direct and warp Split-K reuse compiled kernels across M for matching
         tactics, while each M bucket still tunes independently.
+        M <= 32 requires K to be a positive multiple of 128.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
 
     batch_invariant: bool
@@ -7102,7 +7109,8 @@ def _cute_dsl_gemm_mxfp8_runner(
     class CuteDSLMxfp8GemmRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
             _, _, _, _, _, out, _ = inputs
-            return (str(out.dtype), enable_pdl)
+            extras = (str(out.dtype), enable_pdl)
+            return (*extras, "low_m_only") if low_m_only else extras
 
         def get_valid_tactics(
             self,
@@ -7966,6 +7974,9 @@ def _cudnn_mm_mxfp8_runner():
     """
 
     class CudnnMmMxfp8GemmRunner(TunableRunner):
+        # Plan enumeration can fail even when the backend is eligible.
+        _retry_empty_tactics = True
+
         def __init__(self):
             super().__init__()
             self._tuning_config = _MM_MXFP8_TUNING_CONFIG
@@ -11034,6 +11045,13 @@ def _trtllm_gemm_fp8_nt_groupwise_requirement(
         raise ValueError("scale_granularity_mnk must be (1, 128, 128) in TRTLLM")
     if a.shape[1] < 256:
         raise ValueError("a.shape[1] must be >= 256 in TRTLLM")
+    # The block-scaled FP8 trtllm-gen kernels use TileK=128 with
+    # UnrollLoop2xForMma, so K must be a multiple of 2 * TileK = 256.
+    if a.shape[1] % 256 != 0:
+        raise ValueError(
+            f"a.shape[1] must be a multiple of 256 in TRTLLM, got {a.shape[1]}; "
+            "use backend='cutlass' for this K"
+        )
 
     return True
 
