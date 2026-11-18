@@ -243,14 +243,16 @@ Attends only the tokens named by a per-query top-k index list over an
 Sparse MLA decode (generalized front)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-One routing surface over the per-arch sparse-MLA decode entries:
-``backend="specialized"`` (:func:`sparse_mla_decode_sm90`, SM90),
-``backend="trtllm_dsv4"`` (:func:`trtllm_batch_decode_sparse_mla_dsv4`,
-SM100/SM103/SM107 and SM120/SM121), ``backend="sm120"``
-(:class:`SparseMLASm120Wrapper` as a single call), and ``backend="auto"``
-routing by compute capability. The backends keep their own tensor formats
-and contracts; backend-specific arguments pass through ``backend_args``
-under the underlying entry's own names.
+One routing surface over the same-op (selection-only) per-arch sparse-MLA
+decode entries: ``backend="specialized"`` (:func:`sparse_mla_decode_sm90`,
+SM90), ``backend="sm120"`` (:class:`SparseMLASm120Wrapper` as a single
+call, SM120/SM121), and ``backend="auto"`` routing by compute capability.
+The backends keep their own tensor formats and contracts; backend-specific
+arguments pass through ``backend_args`` under the underlying entry's own
+names. :func:`trtllm_batch_decode_sparse_mla_dsv4` is intentionally not a
+backend: the DeepSeek-V4 contract derives a sliding-window validity mask
+from ``seq_lens`` over a partitioned dual-pool index table — a different
+op, reachable under its own entry.
 
 .. autofunction:: sparse_mla_decode
 .. autofunction:: is_sparse_mla_decode_supported

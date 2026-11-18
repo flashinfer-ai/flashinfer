@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Generalized sparse-MLA decode front over the per-arch entries.
+"""Generalized sparse-MLA decode front over the same-op per-arch entries.
 
-``sparse_mla_decode`` is one routing surface for the sparse-MLA decode op
-family (attend only the KV tokens named by a per-query top-k index list).
-It owns NO kernels: every backend is an existing public FlashInfer entry,
-called through its own public API with its own contract. The front routes,
-validates the routing-level arguments, and refuses — loudly — whatever it
-cannot map without changing semantics.
+``sparse_mla_decode`` is one routing surface for the *selection-only*
+sparse-MLA decode op: attend exactly the KV tokens named by a precomputed
+per-query top-k index list — ``softmax(scale * q @ K_sel^T) @ V_sel`` in the
+latent space, with validity coming solely from the index metadata (invalid
+slots / per-token active lengths). The kernel applies no positional masking
+of its own: no causal structure, no sliding-window validity, no
+kernel-derived windows. The front owns NO kernels: every backend is an
+existing public FlashInfer entry, called through its own public API with its
+own contract. The front routes, validates the routing-level arguments, and
+refuses — loudly — whatever it cannot map without changing semantics.
 
 Backends
 --------
@@ -14,29 +18,49 @@ Backends
     :func:`flashinfer.mla.sparse_mla_decode_sm90` (SM90). BF16
     ``[B, q_len, 8, 576]`` query, uint8 ``fp8_ds_mla`` Page64
     ``[num_pages, 64, 656]`` paged cache, int32 ``[B, q_len, 2048]``
-    flattened-storage-slot indices.
-``"trtllm_dsv4"``
-    :func:`flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4`
-    (SM100/SM103/SM107, and SM120/SM121 through that entry's own packed
-    sparse route). Head-dim-512 query over SWA + compressed pools with
-    flattened per-token top-k lengths; that entry's many layout / format /
-    nested-backend knobs pass through ``backend_args`` verbatim.
+    flattened-storage-slot indices (``-1`` = invalid). Same math contract:
+    softmax over exactly the valid indexed rows, latent (512-dim) value, no
+    positional masking, no sink, no LSE output.
 ``"sm120"``
     :class:`flashinfer.mla.SparseMLASm120Wrapper` (SM120/SM121), run as a
-    single call on a front-cached runner. Packed uint8 FP8/NVFP4 caches,
-    per-token ``topk_length`` metadata.
+    single call on a front-cached runner. Same math contract for every
+    storage family the wrapper serves (DSv3.2 / GLM-NSA at d_qk 576,
+    GLM-5.3-NoPE / DSV4 / DSV4.1 at d_qk 512): selection is purely
+    caller-provided (``indices`` bounded by per-token
+    ``backend_args['topk_length']``), there is no ``seq_lens`` and no
+    positional masking anywhere in its contract. The wrapper's optional
+    extras are supersets of the same contract and are reachable through
+    ``backend_args``: a second indexed pool (``extra_kv_cache`` /
+    ``extra_indices`` / ``extra_topk_length`` — more rows in the SAME
+    softmax), an ``attn_sink`` (extra denominator mass), and a base-2 LSE
+    output (``return_lse`` / ``lse_scale``).
 
-The experimental ``flashinfer.attention.prims_ts``
-``batch_sparse_mla_decode_with_paged_kv_cache`` entry is deliberately NOT a
-backend here: it lives in an experimental namespace with a plan/run wrapper
-lifecycle and remains directly reachable under its own name.
+Deliberately NOT backends (different op, or different lifecycle)
+----------------------------------------------------------------
+:func:`flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4`
+    The DeepSeek-V4 sparse-MLA decode contract is a DIFFERENT op, not just a
+    different ABI: the kernel itself derives a per-token sliding-window
+    validity mask from ``seq_lens`` (only the first
+    ``clamp(seq_lens[b] - (q_len_b - 1 - q_off), 0, 128)`` SWA columns of a
+    row are attended), the index table is semantically partitioned (a fixed
+    128-entry SWA prefix addressing ``swa_kv_cache``, then compressed
+    entries addressing ``compressed_kv_cache``), and the head geometry is
+    the DSV4 512-wide QK with fused ``bmm1_scale``/``bmm2_scale``
+    quantization semantics. Selection there is NOT purely caller-provided —
+    the kernel imposes positional (causal/local) structure this op does not
+    have — so routing it under this front would umbrella two different math
+    contracts under one name. It remains directly reachable under its own
+    name.
+``flashinfer.attention.prims_ts`` ``batch_sparse_mla_decode_with_paged_kv_cache``
+    Same op family, but an experimental namespace with a plan/run wrapper
+    lifecycle; it remains directly reachable under its own name.
 
-The three wired contracts do NOT share an ABI, and this front does not
-pretend they do: the positional core (``query``, ``kv_cache``, ``indices``)
-is common in spirit only, each backend's tensor formats are its own, and
-backend-specific arguments travel in ``backend_args`` under the underlying
-entry's own parameter names. See :func:`sparse_mla_decode` for the exact
-per-backend mapping and the documented refusals.
+The two wired contracts share the math but NOT an ABI, and this front does
+not pretend they do: the positional core (``query``, ``kv_cache``,
+``indices``) is common in spirit only, each backend's tensor formats are its
+own, and backend-specific arguments travel in ``backend_args`` under the
+underlying entry's own parameter names. See :func:`sparse_mla_decode` for the
+exact per-backend mapping and the documented refusals.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -46,21 +70,17 @@ import torch
 from ..api_logging import flashinfer_api
 
 # Backends behind the one public API (#5667 pattern; plain strings).
-SPARSE_MLA_DECODE_BACKENDS = ("auto", "specialized", "trtllm_dsv4", "sm120")
+SPARSE_MLA_DECODE_BACKENDS = ("auto", "specialized", "sm120")
 
 # ``backend="auto"`` device routing: compute capability -> backend.
+# SM100/SM103/SM107 have no selection-only sparse-MLA decode entry in-tree
+# (their trtllm_batch_decode_sparse_mla_dsv4 cubins implement the DSV4
+# windowed dual-pool op — see the module docstring), so "auto" has no route
+# there and raises.
 _AUTO_ROUTE: Dict[Tuple[int, int], str] = {
     (9, 0): "specialized",
-    (10, 0): "trtllm_dsv4",
-    (10, 3): "trtllm_dsv4",
-    (10, 7): "trtllm_dsv4",
-    # trtllm_batch_decode_sparse_mla_dsv4's own arch default on SM120/SM121
-    # is its packed sparse backend (the SparseMLASm120Wrapper machinery);
-    # routing auto through it keeps one seam instead of re-deriving that
-    # entry's constructor knobs here. ``backend="sm120"`` gives the wrapper's
-    # native run contract directly.
-    (12, 0): "trtllm_dsv4",
-    (12, 1): "trtllm_dsv4",
+    (12, 0): "sm120",
+    (12, 1): "sm120",
 }
 
 # Per-backend dispatch census (#5667-style introspection).
@@ -117,10 +137,12 @@ def _resolve_backend(backend: str, device: torch.device) -> str:
     routed = _AUTO_ROUTE.get(cc)
     if routed is None:
         raise ValueError(
-            f"sparse_mla_decode backend='auto' has no sparse-MLA decode "
-            f"route for compute capability {cc[0]}.{cc[1]}; supported: "
-            "SM90 ('specialized'), SM100/SM103/SM107 ('trtllm_dsv4'), "
-            "SM120/SM121 ('trtllm_dsv4' or 'sm120')"
+            f"sparse_mla_decode backend='auto' has no selection-only "
+            f"sparse-MLA decode route for compute capability "
+            f"{cc[0]}.{cc[1]}; supported: SM90 ('specialized') and "
+            "SM120/SM121 ('sm120'). The DeepSeek-V4 windowed dual-pool op "
+            "(trtllm_batch_decode_sparse_mla_dsv4) is a different op and "
+            "keeps its own entry"
         )
     key = f"{cc[0]}.{cc[1]}->{routed}"
     _stats["auto_routes"][key] = _stats["auto_routes"].get(key, 0) + 1
@@ -137,38 +159,6 @@ def _check_backend_args(
             f"backend_args keys {unknown}; allowed: {sorted(allowed)}"
         )
 
-
-# Keys forwarded verbatim to trtllm_batch_decode_sparse_mla_dsv4, under that
-# entry's own public parameter names. The front already binds query,
-# swa_kv_cache, workspace_buffer, sparse_indices, seq_lens and out.
-_TRTLLM_DSV4_PASSTHROUGH = (
-    "compressed_kv_cache",
-    "sparse_topk_lens",
-    "bmm1_scale",
-    "bmm2_scale",
-    "sinks",
-    "kv_layout",
-    "cum_seq_lens_q",
-    "max_q_len",
-    "enable_pdl",
-    "swa_topk_lens",
-    "extra_sparse_indices",
-    "extra_sparse_topk_lens",
-    "backend",
-    "hca_swa_indices",
-    "hca_compressed_block_tables",
-    "hca_seq_lens",
-    "hca_is_causal",
-    "hca_use_persistent",
-    "hca_sparse_indices_format",
-    "remapped_sparse_indices_buffer",
-    "sparse_indices_are_storage_offsets",
-    "dsv4_inv_rope_cos_sin_cache",
-    "dsv4_output_scale",
-    "sparse_topk_lens_offset",
-    "multi_ctas_kv_counter_buffer",
-    "kv_cache_format",
-)
 
 # SparseMLASm120Wrapper constructor knobs (cached per device + knob set) and
 # run() keywords, both under the wrapper's own public names.
@@ -242,54 +232,6 @@ def _run_specialized(
     )
 
 
-def _run_trtllm_dsv4(
-    query: torch.Tensor,
-    kv_cache: torch.Tensor,
-    indices: torch.Tensor,
-    seq_lens: Optional[torch.Tensor],
-    workspace_buffer: Optional[torch.Tensor],
-    sm_scale: Optional[float],
-    out: Optional[torch.Tensor],
-    backend_args: Dict[str, Any],
-):
-    _check_backend_args("trtllm_dsv4", backend_args, _TRTLLM_DSV4_PASSTHROUGH)
-    if workspace_buffer is None:
-        raise ValueError(
-            "sparse_mla_decode backend='trtllm_dsv4' requires "
-            "workspace_buffer (byte workspace; see "
-            "trtllm_batch_decode_sparse_mla_dsv4)"
-        )
-    kwargs = dict(backend_args)
-    if sm_scale is not None:
-        if "bmm1_scale" in kwargs:
-            raise ValueError(
-                "sparse_mla_decode: pass either sm_scale or "
-                "backend_args['bmm1_scale'], not both"
-            )
-        if query.dtype not in (torch.bfloat16, torch.float16):
-            # For FP8 queries the fused QK scale must fold the Q/K descales;
-            # a bare softmax scale cannot express it. Refuse rather than
-            # guess: the caller passes bmm1_scale explicitly.
-            raise ValueError(
-                "sparse_mla_decode backend='trtllm_dsv4': sm_scale maps to "
-                "bmm1_scale only for bf16/fp16 queries; FP8 queries must "
-                "pass backend_args['bmm1_scale'] (softmax scale with the "
-                "Q/K descales folded in)"
-            )
-        kwargs["bmm1_scale"] = sm_scale
-    from ._core import trtllm_batch_decode_sparse_mla_dsv4
-
-    return trtllm_batch_decode_sparse_mla_dsv4(
-        query,
-        kv_cache,
-        workspace_buffer,
-        sparse_indices=indices,
-        seq_lens=seq_lens,
-        out=out,
-        **kwargs,
-    )
-
-
 def _run_sm120(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -309,7 +251,7 @@ def _run_sm120(
             "sparse_mla_decode backend='sm120' does not read seq_lens: "
             "SparseMLASm120Wrapper takes per-token active lengths as "
             "backend_args['topk_length'] (and "
-            "backend_args['extra_topk_length'] for the compressed segment)"
+            "backend_args['extra_topk_length'] for the second indexed pool)"
         )
     if workspace_buffer is not None:
         raise ValueError(
@@ -355,95 +297,94 @@ def sparse_mla_decode(
     backend: str = "auto",
     backend_args: Optional[Dict[str, Any]] = None,
 ):
-    """Sparse-MLA decode over precomputed top-k indices (all architectures).
+    """Selection-only sparse-MLA decode over precomputed top-k indices.
 
-    One generalized front for the sparse-MLA decode op family. It routes to
-    the existing public per-arch entries and adds no kernels of its own:
+    One generalized front for the selection-only sparse-MLA decode op:
+    attend exactly the KV tokens named by the caller's index metadata, with
+    no positional masking in the kernel (no causal structure, no
+    kernel-derived sliding-window validity). It routes to the existing
+    public same-op per-arch entries and adds no kernels of its own:
 
     - ``backend="specialized"`` calls
       :func:`sparse_mla_decode_sm90` (SM90 fused kernel, with that entry's
       own composable-reference fallback and kill switch).
-    - ``backend="trtllm_dsv4"`` calls
-      :func:`trtllm_batch_decode_sparse_mla_dsv4` (SM100/SM103/SM107
-      prebuilt cubins; SM120/SM121 packed sparse; plus that entry's own
-      nested cute-dsl / cake backends via ``backend_args``).
     - ``backend="sm120"`` runs a front-cached
       :class:`SparseMLASm120Wrapper` (SM120/SM121) as a single call.
     - ``backend="auto"`` routes by the query device's compute capability:
       SM90 to ``"specialized"`` (that entry's own allowlist then decides
-      fused vs composable), SM100/SM103/SM107 and SM120/SM121 to
-      ``"trtllm_dsv4"`` (whose own arch default on SM120/SM121 is the
-      packed sparse backend). Other devices raise. An explicitly selected
+      fused vs composable) and SM120/SM121 to ``"sm120"``. Other devices
+      raise — in particular SM100/SM103/SM107, whose in-tree sparse-MLA
+      decode entry (:func:`trtllm_batch_decode_sparse_mla_dsv4`) implements
+      the DeepSeek-V4 op, not this one (see Notes). An explicitly selected
       backend is never silently swapped.
 
-    The backends implement the same op but NOT the same ABI, and this front
-    does not unify what the kernels do not: ``query`` / ``kv_cache`` /
-    ``indices`` follow the selected backend's documented formats
-    (``specialized``: bf16 ``[B, q_len, 8, 576]`` over a uint8
+    The backends implement the same math contract but NOT the same ABI, and
+    this front does not unify what the kernels do not: ``query`` /
+    ``kv_cache`` / ``indices`` follow the selected backend's documented
+    formats (``specialized``: bf16 ``[B, q_len, 8, 576]`` over a uint8
     ``fp8_ds_mla`` Page64 ``[num_pages, 64, 656]`` cache with flattened
-    storage-slot indices; ``trtllm_dsv4``: head-dim-512 query over SWA +
-    compressed pools; ``sm120``: packed uint8 FP8/NVFP4 records). Everything
-    beyond the shared routing core travels in ``backend_args`` under the
-    underlying entry's OWN parameter names and is forwarded verbatim;
-    unknown keys raise.
+    storage-slot indices; ``sm120``: packed uint8 FP8/NVFP4 records with
+    per-token ``topk_length`` metadata). Everything beyond the shared
+    routing core travels in ``backend_args`` under the underlying entry's
+    OWN parameter names and is forwarded verbatim; unknown keys raise.
 
     Parameters
     ----------
     query : torch.Tensor
         Query tensor in the selected backend's documented format.
     kv_cache : torch.Tensor
-        Main KV pool. For ``trtllm_dsv4`` this is ``swa_kv_cache``; the
-        compressed pool goes in ``backend_args['compressed_kv_cache']``
-        (``'extra_kv_cache'`` for ``sm120``).
+        Main KV pool. For ``sm120`` a second indexed pool may go in
+        ``backend_args['extra_kv_cache']`` (more rows in the same softmax).
     indices : torch.Tensor
-        Top-k index table in the backend's documented convention
-        (``sparse_indices`` for ``trtllm_dsv4``). Index SEMANTICS differ by
-        backend (flattened storage slots vs per-pool tables) and are not
-        translated here.
+        Top-k index table in the backend's documented convention. Index
+        ENCODING differs by backend (``-1``-padded fixed-width rows for
+        ``specialized`` vs per-token active lengths for ``sm120``) and is
+        not translated here; the semantics — attend exactly the named rows —
+        are the op.
     seq_lens : torch.Tensor, optional
         Per-request original KV lengths, int32 ``[B]``. Required by
-        ``specialized``; consumed by ``trtllm_dsv4`` where its contract
-        requires it. REFUSED by ``sm120`` (that wrapper takes per-token
+        ``specialized`` (scheduling metadata only; it does not mask).
+        REFUSED by ``sm120`` (that wrapper takes per-token
         ``backend_args['topk_length']`` instead — a documented contract
         difference, not a silent remap).
     workspace_buffer : torch.Tensor, optional
         Byte workspace. Required by ``specialized`` (size with
-        :func:`get_sparse_mla_sm90_workspace_size_bytes`) and
-        ``trtllm_dsv4`` (that entry's workspace contract). REFUSED by
+        :func:`get_sparse_mla_sm90_workspace_size_bytes`). REFUSED by
         ``sm120`` (the wrapper manages its own scratch).
     sm_scale : float, optional
-        Softmax scale. Required by ``specialized`` and ``sm120``. For
-        ``trtllm_dsv4`` it is forwarded as ``bmm1_scale`` for bf16/fp16
-        queries only; FP8 queries must pass
-        ``backend_args['bmm1_scale']`` with the Q/K descales folded in
-        (the front refuses to guess a fused scale).
+        Softmax scale. Required by both backends.
     out : torch.Tensor, optional
         Preallocated output in the backend's documented format. For
         ``sm120`` the front allocates a bf16 latent-space output when
         omitted.
     backend : str
         One of ``SPARSE_MLA_DECODE_BACKENDS = ("auto", "specialized",
-        "trtllm_dsv4", "sm120")``. Unknown names raise.
+        "sm120")``. Unknown names raise.
     backend_args : dict, optional
         Backend-specific keyword arguments under the underlying entry's own
-        names (e.g. ``sparse_topk_lens`` / ``kv_cache_format`` / nested
-        ``backend`` for ``trtllm_dsv4``; constructor knobs such as
-        ``kv_cache_format`` / ``kv_scale_format`` and run keywords such as
-        ``topk_length`` / ``return_lse`` for ``sm120``). Keys the selected
-        backend does not accept raise ``ValueError``.
+        names (for ``sm120``: constructor knobs such as ``kv_cache_format``
+        / ``kv_scale_format`` and run keywords such as ``topk_length`` /
+        ``attn_sink`` / ``return_lse``). Keys the selected backend does not
+        accept raise ``ValueError``.
 
     Returns
     -------
     torch.Tensor or tuple
-        The selected backend's documented return value (a tuple where that
-        backend returns an LSE alongside the output).
+        The selected backend's documented return value (``(out, lse)`` for
+        ``sm120`` with ``backend_args['return_lse']=True``).
 
     Notes
     -----
-    The experimental ``flashinfer.attention.prims_ts`` sparse-MLA decode
-    entry is intentionally not wired as a backend (experimental namespace,
-    plan/run lifecycle); use it directly. Per-backend dispatch counts are
-    visible through
+    :func:`trtllm_batch_decode_sparse_mla_dsv4` is intentionally NOT a
+    backend: the DeepSeek-V4 contract it implements derives a per-token
+    sliding-window validity mask from ``seq_lens``, partitions its index
+    table into a fixed 128-entry SWA prefix plus compressed entries over two
+    mandatory pools, and uses the DSV4 512-wide QK geometry with fused
+    ``bmm1_scale``/``bmm2_scale`` quantization semantics — a different math
+    contract, not a different ABI for this one. The experimental
+    ``flashinfer.attention.prims_ts`` sparse-MLA decode entry is same-op but
+    not wired (experimental namespace, plan/run lifecycle); use it directly.
+    Per-backend dispatch counts are visible through
     ``flashinfer.mla._sparse_decode._sparse_mla_decode_stats()``.
     """
     args = dict(backend_args) if backend_args else {}
@@ -461,10 +402,6 @@ def sparse_mla_decode(
             out,
             backend,
             args,
-        )
-    if resolved == "trtllm_dsv4":
-        return _run_trtllm_dsv4(
-            query, kv_cache, indices, seq_lens, workspace_buffer, sm_scale, out, args
         )
     return _run_sm120(
         query, kv_cache, indices, seq_lens, workspace_buffer, sm_scale, out, args

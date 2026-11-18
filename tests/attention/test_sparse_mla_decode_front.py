@@ -17,7 +17,7 @@ Dispatch / structure tests for the generalized sparse-MLA decode front.
 Everything here is GPU-free: the underlying backends are stubbed and only
 the front's routing, refusal, and pass-through contracts are exercised.
 The per-backend numerics live with each backend's own test suite
-(test_sparse_mla_sm90.py and the dsv4 / SM120 suites) and need silicon.
+(test_sparse_mla_sm90.py and the SM120 suites) and need silicon.
 """
 
 import pytest
@@ -51,7 +51,6 @@ def test_backends_tuple_is_plain_strings():
     assert SPARSE_MLA_DECODE_BACKENDS == (
         "auto",
         "specialized",
-        "trtllm_dsv4",
         "sm120",
     )
     assert all(isinstance(b, str) for b in SPARSE_MLA_DECODE_BACKENDS)
@@ -68,6 +67,16 @@ def test_unknown_backend_raises_and_never_swaps():
     q, kv, idx = _cpu_call_args()
     with pytest.raises(ValueError, match="never silently swapped"):
         sparse_mla_decode(q, kv, idx, backend="fa2")
+
+
+def test_dsv4_is_not_a_backend():
+    # The DeepSeek-V4 windowed dual-pool contract is a different op (the
+    # kernel derives SWA validity from seq_lens and partitions the index
+    # table); it must not be reachable through this front.
+    q, kv, idx = _cpu_call_args()
+    with pytest.raises(ValueError, match="never silently swapped"):
+        sparse_mla_decode(q, kv, idx, backend="trtllm_dsv4")
+    assert "trtllm_dsv4" not in SPARSE_MLA_DECODE_BACKENDS
 
 
 def test_supported_false_without_cuda():
@@ -92,11 +101,8 @@ def test_auto_on_cpu_tensor_raises():
     "cc,expected",
     [
         ((9, 0), "specialized"),
-        ((10, 0), "trtllm_dsv4"),
-        ((10, 3), "trtllm_dsv4"),
-        ((10, 7), "trtllm_dsv4"),
-        ((12, 0), "trtllm_dsv4"),
-        ((12, 1), "trtllm_dsv4"),
+        ((12, 0), "sm120"),
+        ((12, 1), "sm120"),
     ],
 )
 def test_auto_routes_by_capability(monkeypatch, cc, expected):
@@ -106,9 +112,12 @@ def test_auto_routes_by_capability(monkeypatch, cc, expected):
     assert stats["auto_routes"] == {f"{cc[0]}.{cc[1]}->{expected}": 1}
 
 
-def test_auto_refuses_unrouted_capability(monkeypatch):
-    monkeypatch.setattr(front, "_capability", lambda device: (8, 0))
-    with pytest.raises(ValueError, match="no sparse-MLA decode"):
+@pytest.mark.parametrize("cc", [(8, 0), (10, 0), (10, 3), (10, 7)])
+def test_auto_refuses_unrouted_capability(monkeypatch, cc):
+    # SM100/SM103/SM107 deliberately have NO route: their in-tree
+    # sparse-MLA decode entry is the DeepSeek-V4 op, not this one.
+    monkeypatch.setattr(front, "_capability", lambda device: cc)
+    with pytest.raises(ValueError, match="no selection-only"):
         front._resolve_backend("auto", torch.device("cpu"))
 
 
@@ -117,7 +126,7 @@ def test_explicit_backend_skips_capability_probe(monkeypatch):
         raise AssertionError("capability probed for an explicit backend")
 
     monkeypatch.setattr(front, "_capability", _boom)
-    for name in ("specialized", "trtllm_dsv4", "sm120"):
+    for name in ("specialized", "sm120"):
         assert front._resolve_backend(name, torch.device("cpu")) == name
 
 
@@ -132,19 +141,14 @@ def test_dispatch_reaches_selected_adapter_only(monkeypatch):
     monkeypatch.setattr(
         front, "_run_specialized", lambda *a, **k: calls.append("specialized")
     )
-    monkeypatch.setattr(
-        front, "_run_trtllm_dsv4", lambda *a, **k: calls.append("trtllm_dsv4")
-    )
     monkeypatch.setattr(front, "_run_sm120", lambda *a, **k: calls.append("sm120"))
     sparse_mla_decode(q, kv, idx, backend="specialized")
-    sparse_mla_decode(q, kv, idx, backend="trtllm_dsv4")
     sparse_mla_decode(q, kv, idx, backend="sm120")
-    assert calls == ["specialized", "trtllm_dsv4", "sm120"]
+    assert calls == ["specialized", "sm120"]
     stats = front._sparse_mla_decode_stats()
-    assert stats["calls"] == 3
+    assert stats["calls"] == 2
     assert stats["backend_dispatches"] == {
         "specialized": 1,
-        "trtllm_dsv4": 1,
         "sm120": 1,
     }
 
@@ -195,47 +199,6 @@ def test_specialized_rejects_backend_args():
         )
 
 
-def test_trtllm_dsv4_requires_workspace_and_rejects_unknown_args():
-    q, kv, idx = _cpu_call_args()
-    with pytest.raises(ValueError, match="requires\\s+workspace_buffer"):
-        sparse_mla_decode(q, kv, idx, backend="trtllm_dsv4")
-    with pytest.raises(ValueError, match="does not accept"):
-        sparse_mla_decode(
-            q,
-            kv,
-            idx,
-            workspace_buffer=torch.zeros(8, dtype=torch.uint8),
-            backend="trtllm_dsv4",
-            backend_args={"topk_length": torch.zeros(2)},
-        )
-
-
-def test_trtllm_dsv4_sm_scale_and_bmm1_scale_are_exclusive():
-    q, kv, idx = _cpu_call_args()
-    ws = torch.zeros(8, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="not both"):
-        sparse_mla_decode(
-            q,
-            kv,
-            idx,
-            workspace_buffer=ws,
-            sm_scale=0.0625,
-            backend="trtllm_dsv4",
-            backend_args={"bmm1_scale": 0.0625},
-        )
-
-
-def test_trtllm_dsv4_refuses_sm_scale_for_fp8_query():
-    q = torch.zeros(2, 1, 8, 512, dtype=torch.float8_e4m3fn)
-    kv = torch.zeros(4, 64, 656, dtype=torch.uint8)
-    idx = torch.full((2, 1, 2048), -1, dtype=torch.int32)
-    ws = torch.zeros(8, dtype=torch.uint8)
-    with pytest.raises(ValueError, match="descales folded"):
-        sparse_mla_decode(
-            q, kv, idx, workspace_buffer=ws, sm_scale=0.0625, backend="trtllm_dsv4"
-        )
-
-
 def test_sm120_refuses_seq_lens_workspace_and_requires_sm_scale():
     q, kv, idx = _cpu_call_args()
     with pytest.raises(ValueError, match="topk_length"):
@@ -266,43 +229,6 @@ def test_sm120_refuses_seq_lens_workspace_and_requires_sm_scale():
 # --------------------------------------------------------------------------
 # Pass-through fidelity (underlying entries stubbed)
 # --------------------------------------------------------------------------
-
-
-def test_trtllm_dsv4_passthrough_binds_core_and_forwards_args(monkeypatch):
-    q, kv, idx = _cpu_call_args()
-    ws = torch.zeros(8, dtype=torch.uint8)
-    seq = torch.zeros(2, dtype=torch.int32)
-    seen = {}
-
-    def fake_dsv4(query, swa_kv_cache, workspace_buffer, **kw):
-        seen["query"] = query
-        seen["swa_kv_cache"] = swa_kv_cache
-        seen["workspace_buffer"] = workspace_buffer
-        seen.update(kw)
-        return query
-
-    import flashinfer.mla._core as core
-
-    monkeypatch.setattr(core, "trtllm_batch_decode_sparse_mla_dsv4", fake_dsv4)
-    extra = torch.zeros(2, dtype=torch.int32)
-    sparse_mla_decode(
-        q,
-        kv,
-        idx,
-        seq,
-        ws,
-        sm_scale=0.0625,
-        backend="trtllm_dsv4",
-        backend_args={"sparse_topk_lens": extra, "kv_layout": "NHD"},
-    )
-    assert seen["query"] is q
-    assert seen["swa_kv_cache"] is kv
-    assert seen["workspace_buffer"] is ws
-    assert seen["sparse_indices"] is idx
-    assert seen["seq_lens"] is seq
-    assert seen["sparse_topk_lens"] is extra
-    assert seen["kv_layout"] == "NHD"
-    assert seen["bmm1_scale"] == 0.0625
 
 
 def test_sm120_passthrough_caches_runner_and_allocates_out(monkeypatch):
