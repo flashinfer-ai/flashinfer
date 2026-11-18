@@ -22,13 +22,16 @@ On SM10x it times, with BF16, FP8 and NVFP4 keys and queries:
   request at the end of its context, with ``--top-k`` tie slots and the repair.
 
 Off SM10x (Hopper), only decode scoring runs, so it times BF16 and FP8 decode
-(the Triton kernel). FP8 calls pass a ``score_scale`` of 1, as a model does.
+(the Triton kernel); FP8 needs SM89 or newer. FP8 calls pass a ``score_scale``
+of 1, as a model does.
 
 Keys and queries are random. The select's thresholds are each row's
 ``top_k * (1 + --slack)``-th largest score, estimated from a key sample sized so
 that the threshold is the ``--sample-rank``-th largest sampled score at every
-context. A row rarely misses, so the times are of the select, not the repair. Each timed select
-call first restores the thresholds and zeroes the counters (two small copies).
+context. A row rarely misses, so the times are of the select, not the repair.
+Each timed select call first restores the thresholds and zeroes the counters,
+and the select times include these two small copies. Contexts shorter than
+``--select-rows`` skip the select.
 
 Times are GPU kernel times from ``bench_gpu_time`` (CUPTI, or CUDA events when
 CUPTI is missing; ``--no-cupti`` forces events), with a cold L2, after a
@@ -126,7 +129,7 @@ def bench_select(fmt: str, context: int, args) -> float:
     # Thresholds from a key sample: each row's estimated top_k * (1 + slack)-th
     # largest score.
     target = top_k * (1 + args.slack)
-    count = max(1, min(first, math.ceil(args.sample_rank * context / target)))
+    count = min(first, math.ceil(args.sample_rank * context / target))
     sample = torch.randint(first, (count,), device="cuda")
     page, row = table[0, sample // PAGE].long(), sample % PAGE
     # Gathered as bytes: not every indexing op takes FP8.
@@ -198,6 +201,9 @@ def main() -> None:
     major, minor = torch.cuda.get_device_capability()
     sm10x = major == 10
     formats = [f for f in args.formats if sm10x or f != "nvfp4"]
+    if (major, minor) < (8, 9) and "fp8" in formats:
+        formats.remove("fp8")
+        print("FP8 needs SM89 or newer: skipped")
     print(f"{torch.cuda.get_device_name()} (SM{major}{minor})")
     print(f"{'op':<8} {'format':<6} {'rows':>5} {'context':>8} {'us':>10} {'GB/s':>8}")
 
@@ -214,7 +220,11 @@ def main() -> None:
     if not sm10x:
         print("Threshold select needs SM10x: skipped")
         return
+    print("select times include restoring the thresholds and zeroing the counters")
     for context in args.contexts:
+        if context < args.select_rows:
+            print(f"select at context {context}: skipped, shorter than --select-rows")
+            continue
         for fmt in formats:
             us = bench_select(fmt, context, args)
             report("select", fmt, args.select_rows, context, us, 1)
