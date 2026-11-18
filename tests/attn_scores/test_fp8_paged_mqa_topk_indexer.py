@@ -149,13 +149,12 @@ def _api(inp, out=None, **kw):
 
 # The kernel is bitwise deterministic across runs of any given build, and
 # dispatch refuses toolkits it was not validated on (single source of truth:
-# pi.VALIDATED_CUDA_VERSIONS — nvcc 13.3 today). Functional tests therefore
-# run only on validated toolkits, where selection is reference-exact; the
-# refusal itself is asserted everywhere else.
+# pi.VALIDATED_CUDA_VERSIONS, applied through pi._toolkit_validation_reasons,
+# which also gates on the nvcc the JIT build selects). Functional tests
+# therefore run only on validated toolkits, where selection is
+# reference-exact; the refusal itself is asserted everywhere else.
 VALIDATED_CUDA_VERSIONS = pi.VALIDATED_CUDA_VERSIONS
-TOOLKIT_VALIDATED = bool(
-    torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS)
-)
+TOOLKIT_VALIDATED = not pi._toolkit_validation_reasons()
 requires_validated_toolkit = pytest.mark.skipif(
     not TOOLKIT_VALIDATED,
     reason="dispatch refuses unvalidated CUDA toolkits "

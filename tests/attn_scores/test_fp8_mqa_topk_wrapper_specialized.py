@@ -17,15 +17,19 @@ import torch
 
 from flashinfer.attn_scores import fp8_paged_mqa_topk_indexer as _functional  # noqa: F401
 from flashinfer.attn_scores.mqa_topk import FP8MQATopKWrapper
-from flashinfer.attn_scores.prefill_indexer import VALIDATED_CUDA_VERSIONS
+from flashinfer.attn_scores.prefill_indexer import (
+    VALIDATED_CUDA_VERSIONS,  # noqa: F401 - re-exported for debugging
+    _toolkit_validation_reasons,
+)
 
 requires_sm103 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
     reason="specialized backend is SM103-only",
 )
 requires_validated_toolkit = pytest.mark.skipif(
-    not (torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS)),
-    reason="specialized backend refuses unvalidated CUDA toolkits",
+    bool(_toolkit_validation_reasons()),
+    reason="specialized backend refuses unvalidated CUDA toolkits "
+    "(same gate as dispatch, torch build + JIT nvcc)",
 )
 
 H, D, TOPK, RATIO = 4, 128, 512, 4
@@ -188,7 +192,7 @@ def test_rejection_semantics():
 
 @requires_sm103
 def test_unvalidated_toolkit_refusal():
-    if torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS):
+    if not _toolkit_validation_reasons():
         pytest.skip("validated toolkit: constructor serves")
     with pytest.raises(ValueError, match="validated CUDA toolkit"):
         FP8MQATopKWrapper(
@@ -230,7 +234,7 @@ def test_auto_routes_to_specialized_for_multi_request_full_prefill():
 def test_auto_exhausted_configuration_raises():
     """auto with a configuration neither backend can serve raises, naming
     both reasons (specialized: wrong head count; cutedsl: multi-request)."""
-    if torch.version.cuda and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS):
+    if not _toolkit_validation_reasons():
         match = "single-request|auto: no backend"
     else:
         match = "auto: no backend|single-request"
