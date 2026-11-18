@@ -8,25 +8,16 @@ holes and tail padding masked via ``sparse_topk_lens``), fp32 sinks
 
 Scope: this exact geometry, scale and encoding on SM103, for the captured
 MTP/verify decode classes (``max_q_len == 6``, ``T == 6 * batch_size``,
-``batch_size`` 1-13 — the allowlist JSON next to this package). Kill
+``batch_size`` 1-13 — the allowlist JSON next to this package); everything
+else stays on the stock trtllm_batch_decode_sparse_mla_dsv4 dispatch. Kill
 switch: FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1.
 
-FRONT REGISTRATION: this module is the ``"specialized"`` backend of the
-generic masked/SWA sparse-MLA decode front
-:func:`flashinfer.mla.batch_decode_sparse_mla_dsv4` (the dsv4-contract
-op; distinct from pure-selection sparse-MLA decode, which is a different
-op with its own front). It is NOT exposed through the vendor-named
-``trtllm_batch_decode_sparse_mla_dsv4`` entry (that entry stays stock).
-This backend REQUIRES the dense-pool dsv4 argument set (the combined
-storage-offset ``sparse_indices`` with
-``sparse_indices_are_storage_offsets=True``, ``sparse_topk_lens``, fp32
-``sinks``, the baked scales) and accepts ``seq_lens`` /
-``cum_seq_lens_q`` / ``max_q_len`` as scheduling metadata. Front hooks:
-``supported_with_reasons(...)`` (the applicability gate — the front's
-``auto`` may route around a non-empty result) and
-``maybe_dispatch_specialized(backend=..., ...)`` (serves the call, or —
-for an explicitly forced ``backend="specialized"`` — RAISES with the
-exact ``fallback_reasons``; explicit selection never falls back).
+Surface note: the "specialized" value lives on the vendor-named entry's
+backend enum as a codified special-case exception to the
+no-specialized-on-vendor-entries rule, because the backend-neutral public
+name ``batch_decode_sparse_mla_dsv4`` is a true object-identity alias of
+that entry (pinned by an upstream compatibility test), so both names
+carry the backend set unchanged.
 
 CUDA graphs: the kernel launches on the current stream re-queried per call
 and allocates nothing (no workspace: every route is a single fused launch;

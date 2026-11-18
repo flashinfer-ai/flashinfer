@@ -26,10 +26,7 @@ import pytest
 import torch
 
 import flashinfer.sparse_mla_decode_dsv4_cuda as spec_mod
-from flashinfer.mla import (
-    batch_decode_sparse_mla_dsv4,
-    trtllm_batch_decode_sparse_mla_dsv4,
-)
+from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 
 requires_sm103 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
@@ -170,9 +167,7 @@ def _ws():
 
 
 def _api(inp, out=None, backend="auto"):
-    # the generic front is the ONLY surface exposing the specialized
-    # backend (the vendor-named entry stays stock)
-    return batch_decode_sparse_mla_dsv4(
+    return trtllm_batch_decode_sparse_mla_dsv4(
         query=inp["q"],
         swa_kv_cache=inp["swa_kv_cache"],
         workspace_buffer=_ws(),
@@ -224,24 +219,6 @@ def test_off_allowlist_stays_stock_and_explicit_raises():
     _assert_close(out, _reference(inp).float())
     with pytest.raises(ValueError, match="fallback_reasons"):
         _api(inp, backend="specialized")
-    # the vendor-named entry stays STOCK: it has no "specialized" value
-    with pytest.raises(ValueError, match="backend"):
-        trtllm_batch_decode_sparse_mla_dsv4(
-            query=inp["q"],
-            swa_kv_cache=inp["swa_kv_cache"],
-            workspace_buffer=_ws(),
-            sparse_indices=inp["sparse_indices"],
-            compressed_kv_cache=inp["compressed_kv_cache"],
-            sparse_topk_lens=inp["sparse_topk_lens"],
-            seq_lens=inp["seq_lens"],
-            bmm1_scale=SCALE,
-            bmm2_scale=1.0,
-            sinks=inp["sinks"],
-            cum_seq_lens_q=inp["cum_seq_lens_q"],
-            max_q_len=int(inp["max_q_len"]),
-            backend="specialized",
-            sparse_indices_are_storage_offsets=True,
-        )
 
 
 @requires_sm103
@@ -276,41 +253,3 @@ def test_cuda_graph_replay_matches_eager():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, eager)
-
-
-@requires_sm103
-def test_front_backend_names_and_trtllm_parity():
-    """The front (upstream's backend-neutral alias name, taken over) keeps
-    every pre-existing backend value working, adds "specialized", and
-    rejects invalid names."""
-    from flashinfer.mla import BATCH_DECODE_SPARSE_MLA_DSV4_BACKENDS
-
-    assert BATCH_DECODE_SPARSE_MLA_DSV4_BACKENDS == (
-        "auto",
-        "specialized",
-        "trtllm-gen",
-        "cute-dsl",
-        "sparse",
-        "cake",
-    )
-    inp = _make_inputs(1, 6, 32768, seed=37)
-    front_stock = _api(inp, backend="trtllm-gen")
-    entry_stock = trtllm_batch_decode_sparse_mla_dsv4(
-        query=inp["q"],
-        swa_kv_cache=inp["swa_kv_cache"],
-        workspace_buffer=_ws(),
-        sparse_indices=inp["sparse_indices"],
-        compressed_kv_cache=inp["compressed_kv_cache"],
-        sparse_topk_lens=inp["sparse_topk_lens"],
-        seq_lens=inp["seq_lens"],
-        bmm1_scale=SCALE,
-        bmm2_scale=1.0,
-        sinks=inp["sinks"],
-        cum_seq_lens_q=inp["cum_seq_lens_q"],
-        max_q_len=int(inp["max_q_len"]),
-        backend="trtllm-gen",
-        sparse_indices_are_storage_offsets=True,
-    )
-    assert torch.equal(front_stock, entry_stock)
-    with pytest.raises(ValueError, match="backend must be one of"):
-        _api(inp, backend="bogus")
