@@ -22,15 +22,12 @@ from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry point of the SM120 serving form; validation of the
 # backend contract, launch binding and JIT registration live in
-# flashinfer.experimental.sm120_dsa_indexer (backend="sm120").  The
-# deterministic Cake training form (SM100 / SM103 / SM107) is
-# flashinfer.cake_dsa_indexer_det_train (flashinfer-ai/flashinfer#8928).
+# flashinfer.experimental.sm120_dsa_indexer (backend="sm120").
 
 _FEATURE = "DSA indexer top-k selection (sm120: FP8 / MXFP4 32/64x128 on SM120)"
 
-_CAKE_MOVED = (
-    "the deterministic Cake DSA indexer (BF16 / FP8 on SM100 / SM103 / SM107) is "
-    "flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk; "
+_CAKE_REMOVED = (
+    "the Cake DSA indexer training form was removed from FlashInfer; "
     "flashinfer.dsa_indexer.dsa_indexer_det_topk takes backend='sm120' only"
 )
 
@@ -59,15 +56,16 @@ def dsa_indexer_det_topk(
     block_table: Optional[torch.Tensor] = None,
     context_lens: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
+    candidate_blocks: Optional[torch.Tensor] = None,
+    candidate_block_size: int = 8,
+    candidate_out: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Fused DSA indexer scoring and exact top-k selection (DeepSeek Sparse
     Attention indexer), the experimental FP8 / MXFP4 serving form on SM120:
     ``backend="sm120"``, the only backend.
 
-    The deterministic Cake training form (BF16 / FP8 on SM100 / SM103 / SM107)
-    is :func:`flashinfer.cake_dsa_indexer_det_train.cake_dsa_indexer_det_train_topk`
-    (flashinfer-ai/flashinfer#8928); ``backend="cake"`` raises a ``ValueError``
-    that names it.
+    The Cake training form was removed from FlashInfer;
+    ``backend="cake"`` raises a ``ValueError``.
 
     Every row selects the exact global top ``min(top_k, visible)`` keys of its
     visible prefix, ranked by score descending then key id descending
@@ -166,6 +164,25 @@ def dsa_indexer_det_topk(
         Programmatic dependent launch: each kernel's
         launch and setup overlap the previous kernel's end; ``None``: on where
         the device supports it.
+    candidate_blocks : Optional[torch.Tensor]
+        The paged form only: int32 ``[B * next_n, C]`` request-local block ids
+        (blocks of ``candidate_block_size`` keys), in any order, with
+        duplicates and ``-1`` padding allowed (DeepSeek-V4.1's consumer
+        layers).  Row ``r`` then ranks only its visible keys whose block it
+        lists: its ids and scores are the plain form's over those keys.  Needs
+        ``C * candidate_block_size <= 16384``; ``C`` and the block size fix the
+        launches, so a captured graph replays for any lists.
+    candidate_block_size : int
+        Keys a candidate block: a power of two from 8 to
+        ``min(k.shape[1], 128)``; 8 or 16 with ``candidate_out``.
+    candidate_out : Optional[torch.Tensor]
+        The paged form only, not with ``candidate_blocks``: int32
+        ``[B * next_n, C]`` (``C <= 4096``) that also receives each row's top
+        ``min(C, blocks)`` blocks of ``candidate_block_size`` keys, in no
+        particular order, then ``-1`` (DeepSeek-V4.1's candidate source layer).
+        A block's score is the largest score of its visible keys; the row's
+        newest block, and a block with a NaN score, rank first.  Ties go to the
+        larger block id.  The row's own top-k is returned as without it.
 
     Returns
     -------
@@ -187,7 +204,7 @@ def dsa_indexer_det_topk(
     and the kernels never hang.
     """
     if backend == "cake":
-        raise ValueError(_CAKE_MOVED)
+        raise ValueError(_CAKE_REMOVED)
     if backend != "sm120":
         raise ValueError(
             f"DSA indexer top-k supports backend='sm120' only, got {backend!r}"
@@ -225,6 +242,13 @@ def dsa_indexer_det_topk(
             scores=scores,
             return_scores=return_scores,
             enable_pdl=enable_pdl,
+            candidate_blocks=candidate_blocks,
+            candidate_block_size=candidate_block_size,
+            candidate_out=candidate_out,
+        )
+    if candidate_blocks is not None or candidate_out is not None:
+        raise ValueError(
+            "candidate_blocks and candidate_out need the paged form of backend='sm120'"
         )
     if k_scale is None:
         raise ValueError("backend='sm120' requires k_scale")

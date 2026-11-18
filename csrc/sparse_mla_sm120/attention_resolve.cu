@@ -172,6 +172,7 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
       RES(DSV4_1_INLINE);
     }
 #undef RES
+    if (is_dsv41(mt) && p.implementation == Implementation::Ordinary) set_fp8_decode_resources(p);
   } else if (requested == NumericRoute::FullBF16) {
     p.implementation = Implementation::FullBF16;
     p.head_blocks = (m.heads + 15) / 16;

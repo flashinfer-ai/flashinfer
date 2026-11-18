@@ -92,6 +92,13 @@ from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     rubin_moe_cluster_covers_one_tile,
     validate_cute_dsl_moe_clamped_relu2_config,
+    validate_pre_fc2_options,
+    validate_pre_fc2_routing,
+    NVFP4_BLOCK_SIZE,
+    NVFP4_VALUES_PER_BYTE,
+    PRE_FC2_TILE_SIZE,
+    PRE_FC2_MMA_SHAPE,
+    PRE_FC2_CLUSTER_SHAPE,
     validate_cute_dsl_moe_situ_config,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
@@ -102,6 +109,7 @@ from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
 )
 from .tuner import (
     ALL_W4A8_MOE_TACTICS,
+    DEFAULT_BLACKWELL_MOE_TACTIC,
     CuteDslFusedMoERunner,
     CuteDslFusedMoEW4A16Runner,
     W4A16_MOE_TACTICS,
@@ -374,6 +382,7 @@ def _moe_core_impl(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     clamped_relu2_limit: Optional[torch.Tensor] = None,
+    routing_weights_before_fc2: bool = False,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     weight_dtype: Optional[str] = None,
     gemm1_k_steps: Optional[int] = None,
@@ -452,6 +461,10 @@ def _moe_core_impl(
             ActivationType.ClampedRelu2 (``relu(L * tanh(x / L)) ** 2`` on the
             alpha-scaled FC1 output), a one-element float32 CUDA tensor read
             at runtime; required with it and rejected otherwise.
+        routing_weights_before_fc2: Apply routing weights to BF16-rounded
+            ClampedRelu2 activations before NVFP4 quantization for GEMM2.
+            Requires W4A4, BF16 output, and the single-CTA 128x128 path.
+            Per-token scales, swap-AB and localized weights are unsupported.
         nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
             - omitted (the default): read FLASHINFER_NVFP4_4OVER6* on every
               call.
@@ -517,6 +530,64 @@ def _moe_core_impl(
             w2_weight_sf,
             weight_elems_per_byte=weight_elems_per_byte,
         )
+
+    validate_pre_fc2_routing(
+        routing_weights_before_fc2,
+        "w4a8" if is_mxfp8 else "w4a4",
+        activation,
+        output_dtype,
+        swap_ab,
+        per_token_scale=per_token_scale is not None,
+        localized_weights=localized_weights is not None,
+    )
+    if routing_weights_before_fc2:
+        if (
+            tile_size != PRE_FC2_TILE_SIZE
+            or gemm1_mma_tiler_mn != PRE_FC2_MMA_SHAPE
+            or gemm2_mma_tiler_mn != PRE_FC2_MMA_SHAPE
+            or gemm1_cluster_shape_mn != PRE_FC2_CLUSTER_SHAPE
+            or gemm2_cluster_shape_mn != PRE_FC2_CLUSTER_SHAPE
+            or gemm1_mma_tiler is not None
+            or gemm2_mma_tiler is not None
+        ):
+            raise ValueError(
+                "Pre-FC2 routing weighting requires single-CTA 128x128 tactics"
+            )
+        from ._routed_nvfp4 import (
+            _nvfp4_moe_with_pre_fc2_routing_weights,
+            _validate_pre_fc2_inputs,
+            _validate_pre_fc2_output,
+        )
+
+        _validate_pre_fc2_inputs(
+            x,
+            x_sf,
+            token_selected_experts,
+            token_final_scales,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            fc2_input_scale,
+        )
+        if token_selected_experts.shape[1] != top_k:
+            raise ValueError("top_k must match the routing tensors")
+        if w1_weight.shape[0] != num_local_experts:
+            raise ValueError("num_local_experts must match the expert weights")
+        if (
+            num_local_experts <= 0
+            or local_expert_offset < 0
+            or local_expert_offset + num_local_experts > num_experts
+        ):
+            raise ValueError("Local expert range must be within num_experts")
+        if moe_output is not None:
+            _validate_pre_fc2_output(
+                moe_output, x, x.shape[0], x.shape[1] * NVFP4_VALUES_PER_BYTE
+            )
+        # The output is zeroed in-stream before GEMM1 (see _routed_nvfp4).
+        use_async_memset = False
 
     num_tokens = token_selected_experts.size(0)
     hidden_size = _moe_hidden_size(w2_weight, localized_weights)
@@ -584,6 +655,9 @@ def _moe_core_impl(
             f"moe_output must be sliced to num_tokens rows before calling "
             f"_moe_core_impl (got {moe_output.size(0)}, expected {num_tokens})"
         )
+
+    if routing_weights_before_fc2 and num_tokens == 0:
+        return moe_output
 
     # Fused finalize overlaps output zeroing with GEMM1.
     if use_async_memset and use_fused_finalize:
@@ -691,6 +765,30 @@ def _moe_core_impl(
         enable_pdl=enable_pdl,
         **moe_sort_kwargs,
     )
+
+    if routing_weights_before_fc2:
+        return _nvfp4_moe_with_pre_fc2_routing_weights(
+            x,
+            x_sf,
+            token_final_scales,
+            token_selected_experts,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            fc2_input_scale,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles,
+            clamped_relu2_limit,
+            moe_output,
+            use_fused_finalize,
+            enable_pdl,
+        )
 
     if use_localized_path:
         # Allocate once: both domains fill disjoint columns of this buffer.
@@ -1084,6 +1182,8 @@ class CuteDslMoEWrapper:
         quant_mode: str = "w4a4",
         clamped_relu2_limit: Optional[torch.Tensor] = None,
         swap_ab: bool = False,
+        *,
+        routing_weights_before_fc2: bool = False,
     ):
         r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
 
@@ -1163,12 +1263,28 @@ class CuteDslMoEWrapper:
             graph replays) without recompiling. Required with ``ClampedRelu2``
             and rejected for every other activation. Not supported by
             ``"w4a16"`` or on SM107.
+        routing_weights_before_fc2 : bool
+            Apply routing weights before GEMM2-input NVFP4 quantization,
+            preserving BF16 rounding after GEMM1, clamping, squaring and
+            weighting. Requires W4A4, ClampedRelu2, BF16 output,
+            ``tile_size=128``, ``sf_vec_size=16`` and ``swap_ab=False``.
+            Per-token scales are unsupported. See :func:`cute_dsl_fused_moe`.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = _canonicalize_quant_mode(quant_mode)
         validate_cute_dsl_moe_clamped_relu2_config(activation, clamped_relu2_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         _check_clamped_relu2_supported(activation, quant_mode, device)
+        validate_pre_fc2_routing(
+            routing_weights_before_fc2, quant_mode, activation, output_dtype, swap_ab
+        )
+        if routing_weights_before_fc2 and (
+            tile_size != PRE_FC2_TILE_SIZE or sf_vec_size != NVFP4_BLOCK_SIZE
+        ):
+            raise ValueError(
+                "Pre-FC2 routing weighting requires tile_size=128 and sf_vec_size=16"
+            )
+        self.routing_weights_before_fc2 = routing_weights_before_fc2
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
@@ -1260,10 +1376,11 @@ class CuteDslMoEWrapper:
                 situ_linear_beta=situ_linear_beta,
                 clamped_relu2_limit=clamped_relu2_limit,
                 use_per_token_activation=False,
+                routing_weights_before_fc2=routing_weights_before_fc2,
                 quant_mode=quant_mode,
                 swap_ab=swap_ab,
             )
-            if quant_mode == "w4a4":
+            if quant_mode == "w4a4" and not routing_weights_before_fc2:
                 self._per_token_runner = CuteDslFusedMoERunner(
                     forward_impl=_forward_with_tactic_weak,
                     num_experts=num_experts,
@@ -1285,7 +1402,7 @@ class CuteDslMoEWrapper:
                     swap_ab=swap_ab,
                 )
 
-            if use_cuda_graph:
+            if use_cuda_graph and not routing_weights_before_fc2:
                 self._aux_stream = torch.cuda.Stream(device=self.device)
                 self._main_event = torch.cuda.Event()
                 self._memset_event = torch.cuda.Event()
@@ -1396,6 +1513,7 @@ class CuteDslMoEWrapper:
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
             clamped_relu2_limit=self.clamped_relu2_limit,
+            routing_weights_before_fc2=self.routing_weights_before_fc2,
             nvfp4_4over6=nvfp4_4over6,
             gemm1_k_steps=gemm1_k_steps,
             gemm2_k_steps=gemm2_k_steps,
@@ -1473,6 +1591,10 @@ class CuteDslMoEWrapper:
         torch.Tensor
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
+        validate_pre_fc2_options(
+            self.routing_weights_before_fc2,
+            per_token_scale=per_token_scale is not None,
+        )
         num_tokens = token_selected_experts.size(0)
 
         if self.quant_mode in ("w4a8", "mxfp8"):
@@ -1581,6 +1703,8 @@ class CuteDslMoEWrapper:
 
     def get_valid_tactics(self) -> list:
         """Return list of valid tactics for this MoE configuration."""
+        if self.routing_weights_before_fc2:
+            return [DEFAULT_BLACKWELL_MOE_TACTIC]
         if self.swap_ab and self.quant_mode != "w4a16":
             from .blackwell.moe_swap_ab_tuner import ALL_SWAP_AB_MOE_TACTICS
 
@@ -1675,6 +1799,7 @@ def _cute_dsl_fused_moe_impl(
     gemm1_use_clc_scheduler: bool = True,
     gemm2_use_clc_scheduler: bool = False,
     swap_ab: bool = False,
+    routing_weights_before_fc2: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1716,6 +1841,7 @@ def _cute_dsl_fused_moe_impl(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         clamped_relu2_limit=clamped_relu2_limit,
+        routing_weights_before_fc2=routing_weights_before_fc2,
         nvfp4_4over6=nvfp4_4over6,
         localized_memset_stream=localized_memset_stream,
         localized_weights=localized_weights,
@@ -1773,6 +1899,7 @@ def cute_dsl_fused_moe(
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     clamped_relu2_limit: Optional[torch.Tensor] = None,
     swap_ab: bool = False,
+    routing_weights_before_fc2: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
@@ -1956,6 +2083,14 @@ def cute_dsl_fused_moe(
     autotune_use_cuda_graph : bool
         Profile tactics through CUDA Graph replay.
 
+    routing_weights_before_fc2 : bool
+        Apply routing weights after ClampedRelu2 and before NVFP4
+        quantization of the GEMM2 input. Rounds to BF16 after GEMM1,
+        soft clamping, squaring, and routing-weight multiplication.
+        Requires W4A4, BF16 output and ``swap_ab=False`` on SM100/SM103.
+        Per-token scales and localized weights are unsupported. This path
+        uses a single-CTA 128x128 tactic on one stream without PDL.
+
     Returns
     -------
     torch.Tensor
@@ -1974,6 +2109,15 @@ def cute_dsl_fused_moe(
     )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     _check_clamped_relu2_supported(activation, quant_mode, x.device)
+    validate_pre_fc2_routing(
+        routing_weights_before_fc2,
+        quant_mode,
+        activation,
+        output_dtype,
+        swap_ab,
+        per_token_scale=per_token_scale is not None,
+        localized_weights=localized_weights is not None,
+    )
 
     if quant_mode in ("w4a8", "mxfp8"):
         _validate_mxfp_weight_dtype(quant_mode, x, w1_weight, w2_weight, swap_ab)
@@ -2031,6 +2175,7 @@ def cute_dsl_fused_moe(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             clamped_relu2_limit=clamped_relu2_limit,
+            routing_weights_before_fc2=routing_weights_before_fc2,
             use_per_token_activation=use_per_token_activation,
             quant_mode=quant_mode,
             use_cuda_graph=autotune_use_cuda_graph,

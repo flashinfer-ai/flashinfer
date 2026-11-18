@@ -26,6 +26,7 @@ from flashinfer import autotune
 from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from flashinfer.prefill import trtllm_fmha_v2_prefill
 from flashinfer.utils import (
+    get_compute_capability,
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
     is_sm12x_supported,
@@ -108,8 +109,12 @@ def _get_prims_ts_module():
     return prims_ts
 
 
-def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype):
-    """Helper for checking if PrimTS supports the given dtypes."""
+def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype, *, is_nvfp4_kv):
+    """Return whether PrimTS decode supports the Q/KV/output dtype combination.
+
+    NVFP4 K/V is stored as packed ``torch.uint8`` bytes; ``is_nvfp4_kv``
+    names that format instead of inferring it from the storage dtype.
+    """
     return (
         (
             q_dtype == torch.float16
@@ -118,21 +123,26 @@ def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype):
         )
         or (
             q_dtype == torch.bfloat16
-            and kv_dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.uint8)
+            and (is_nvfp4_kv or kv_dtype in (torch.bfloat16, torch.float8_e4m3fn))
             and out_dtype == torch.bfloat16
         )
         or (
             q_dtype == torch.float8_e4m3fn
-            and kv_dtype in (torch.float8_e4m3fn, torch.uint8)
-            and out_dtype in (torch.float16, torch.float8_e4m3fn)
+            and (is_nvfp4_kv or kv_dtype == torch.float8_e4m3fn)
+            and out_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         )
     )
 
 
-def _prims_ts_decode_supports_head_dim(head_dim, q_dtype, kv_dtype):
-    """PrimTS decode supports H64/128/192/256, and H512 only for FP8 Q + NVFP4 KV."""
+def _prims_ts_decode_supports_head_dim(head_dim, q_dtype, *, is_nvfp4_kv):
+    """Return whether PrimTS decode supports ``head_dim`` for these dtypes.
+
+    H64/128/192/256 support every dtype above. H512 is qualified only for FP8 Q
+    with NVFP4 K/V (``_validate_headdim_512``); other H512 dtypes have not been
+    validated yet.
+    """
     return head_dim in (64, 128, 192, 256) or (
-        head_dim == 512 and q_dtype == torch.float8_e4m3fn and kv_dtype == torch.uint8
+        head_dim == 512 and q_dtype == torch.float8_e4m3fn and is_nvfp4_kv
     )
 
 
@@ -859,7 +869,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             backends.remove("auto")
 
     if "prims-ts" in backends:
-        if not _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, o_data_type):
+        if not _prims_ts_decode_supports_dtypes(
+            q_dtype, kv_dtype, o_data_type, is_nvfp4_kv=is_nvfp4_kv
+        ):
             _drop_backend(
                 backends,
                 "prims-ts",
@@ -874,7 +886,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "requires matching K/V dtypes, except QK-BF16/PV-FP8",
             )
         elif head_dim_qk != head_dim_vo or not _prims_ts_decode_supports_head_dim(
-            head_dim_qk, q_dtype, kv_dtype
+            head_dim_qk, q_dtype, is_nvfp4_kv=is_nvfp4_kv
         ):
             _drop_backend(
                 backends,
@@ -899,16 +911,25 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         elif args.enable_pdl:
             print("[WARNING] prims-ts does not expose PDL; ignoring --enable_pdl.")
 
+    if speculative_decode and spec_dec_mask_mode == "full":
+        while "trtllm-gen" in backends:
+            _drop_backend(
+                backends,
+                "trtllm-gen",
+                "uses implicit causal masking and does not support full-mask speculative decode",
+            )
+        if "trtllm-native" in backends and get_compute_capability(device)[0] == 10:
+            while "trtllm-native" in backends:
+                _drop_backend(
+                    backends,
+                    "trtllm-native",
+                    "with backend=auto resolves to causal trtllm-gen on SM10x and "
+                    "does not support full-mask speculative decode",
+                )
+
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
-
-    if speculative_decode and spec_dec_mask_mode == "full" and "trtllm-gen" in backends:
-        print(
-            "[WARNING] trtllm-gen wrapper backend applies implicit causal masking to "
-            "the draft block and ignores the non-causal (DFlash) mask; refcheck "
-            "against trtllm-native may mismatch."
-        )
 
     # Storage for timing results and outputs
     backend_times = {backend: [] for backend in backends}

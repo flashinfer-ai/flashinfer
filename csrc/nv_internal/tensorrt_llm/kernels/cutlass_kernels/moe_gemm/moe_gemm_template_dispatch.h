@@ -1026,7 +1026,7 @@ size_t MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
                                   std::is_same_v<WeightType, __nv_bfloat16>)) {
         CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION);
       }
-      if (sm_ == 90) {
+      if (sm_ >= 90) {
         CALC_SIZE_FUSION(TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE);
       }
 
