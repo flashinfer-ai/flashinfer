@@ -2601,7 +2601,14 @@ _gqa_ctx_fp8q_sm90_announced = False
 class _GqaCtxFp8qSm90Capacity(Exception):
     """A CUDA-graph-mode replan needed a bigger plan-owned buffer than the
     retained one a capture may already hold a pointer to; the plan declines
-    the specialized kernel instead of swapping the pointer."""
+    the specialized kernel instead of swapping the pointer.
+
+    Contract: such a capacity-declined replan INVALIDATES any CUDA graph
+    captured against the earlier plan. ``graph.replay()`` never re-enters
+    Python, so no runtime guard can stop a stale capture from replaying the
+    old metadata; callers that replan past the retained capacity must discard
+    and re-capture their graphs, mirroring the invalidation rule stock
+    FlashInfer wrappers document for geometry-growing replans."""
 
 
 def _gqa_ctx_fp8q_sm90_disabled() -> bool:
