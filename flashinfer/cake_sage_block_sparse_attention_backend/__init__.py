@@ -259,6 +259,12 @@ _ATTENTION_ROUTES = {
 #: same bits on every run); the split depends on how the grid fills.
 _TAIL_SPLIT_ROLE = "attention_sd_tsplit"
 _TAIL_SPLIT = {"sm_100a": 24, "sm_103a": 32}
+#: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
+#: next tile runs) and, per architecture, the band of selected blocks a row in which it
+#: replaces the default or ``attention_qs`` build when every CTA of the persistent grid
+#: runs at least two tiles (``total_tiles >= 2 x SMs``).  It writes the default bits.
+_P3_ROLE = "attention_p3"
+_P3_BANDS = {"sm_100a": (6, 23), "sm_103a": (16, 23)}
 
 
 def _attention_role(arch: str, block_sparse_num: int) -> str:
@@ -268,6 +274,18 @@ def _attention_role(arch: str, block_sparse_num: int) -> str:
         if block_sparse_num >= min_sel and role in _loader.MODULES:
             return role
     return "attention"
+
+
+def _p3(arch: str, block_sparse_num: int, tiles: int, sms: int) -> bool:
+    """Does a call with ``block_sparse_num`` selected blocks a row and ``tiles`` tiles
+    run the ``p3`` build on a device of ``sms`` SMs?"""
+    band = _P3_BANDS.get(arch)
+    return (
+        band is not None
+        and band[0] <= block_sparse_num <= band[1]
+        and tiles >= 2 * sms
+        and _P3_ROLE in _loader.MODULES
+    )
 
 
 def _tail_split(
@@ -302,8 +320,8 @@ def _tail_split(
 #: pdl)``: ``(record, items, split, tail)``, where ``items`` is the ``total_tiles``
 #: argument, ``split`` the tail-split parameters and ``tail`` the PDL flag and the
 #: grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
-#: so a repeated call pays one dict lookup.  Code that changes ``_ATTENTION_ROUTES`` or
-#: ``_TAIL_SPLIT`` clears it.
+#: so a repeated call pays one dict lookup.  Code that changes ``_ATTENTION_ROUTES``,
+#: ``_TAIL_SPLIT`` or ``_P3_BANDS`` clears it.
 _ROUTES: dict = {}
 
 
@@ -315,7 +333,8 @@ def _route(
     if hit is not None:
         return hit
     role = _attention_role(arch, block_sparse_num)
-    grid = max(1, min(total_tiles, _loader.sm_count(device_index)))
+    sms = _loader.sm_count(device_index)
+    grid = max(1, min(total_tiles, sms))
     items = total_tiles
     split: Tuple[int, ...] = ()
     if role == "attention_sd":
@@ -324,6 +343,8 @@ def _route(
             role = _TAIL_SPLIT_ROLE
             grid, split_from, items = plan
             split = (split_from,)
+    elif _p3(arch, block_sparse_num, total_tiles, sms):
+        role = _P3_ROLE
     record, flag = _record(role, pdl)
     hit = (record, items, split, flag + (grid, 1, 1))
     if not torch.cuda.is_current_stream_capturing():

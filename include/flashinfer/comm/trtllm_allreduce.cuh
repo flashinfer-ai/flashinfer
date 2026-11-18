@@ -193,9 +193,6 @@ struct neg_zero<float> {
 };
 
 template <typename T>
-__device__ static constexpr T neg_zero_v = neg_zero<T>::value;
-
-template <typename T>
 __device__ bool is_negative_zero(T) {
   return false;
 }
@@ -246,7 +243,7 @@ __device__ __forceinline__ void remove_neg_zero(vec_t<T, VEC_SIZE>& vec) {
 template <typename T>
 __device__ __forceinline__ void set_neg_zero(T* addr) {
   vec_t<T, 16 / sizeof(T)> val;
-  val.fill(neg_zero_v<T>);
+  val.fill(neg_zero<T>::value);
   val.store_global_volatile(addr);
 }
 

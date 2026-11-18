@@ -116,8 +116,12 @@ def quantize(tensor, kind, norm=1.0):
     return quantize_mxfp8_block32(tensor.float(), dtype)
 
 
-def weight_pack(w13, w2, kind, *, scaled=False):
-    """Return canonical packed weights and matching global-scale corrections."""
+def weight_pack(w13, w2, kind, *, scaled=False, chunk=None):
+    """Return canonical packed weights and matching global-scale corrections.
+
+    ``chunk`` quantizes that many experts at a time: a bank of production
+    geometry (48 experts of 7168 x 6144) at once takes more memory than one
+    GPU holds."""
     experts = w13.shape[0]
     if scaled:
         n1 = torch.linspace(1.1, 2.3, experts, device=w13.device)
@@ -136,9 +140,22 @@ def weight_pack(w13, w2, kind, *, scaled=False):
         q1, sf1 = quantize_mxfp4_block32(w13)
         q2, sf2 = quantize_mxfp4_block32(w2)
     else:
-        q1, sf1 = quantize(w13, kind, n1[:, None, None])
-        q2, sf2 = quantize(w2, kind, n2[:, None, None])
+        q1, sf1 = _quantize_chunked(w13, kind, n1, chunk)
+        q2, sf2 = _quantize_chunked(w2, kind, n2, chunk)
     return PrequantizedMoEWeights(q1, q2, sf1, sf2), input_norm, scalars
+
+
+def _quantize_chunked(weight, kind, norm, chunk):
+    """``quantize`` of every expert with its norm, ``chunk`` experts at a time."""
+    if chunk is None:
+        return quantize(weight, kind, norm[:, None, None])
+    parts = [
+        quantize(weight[e : e + chunk], kind, norm[e : e + chunk, None, None])
+        for e in range(0, weight.shape[0], chunk)
+    ]
+    data = torch.cat([q.view(torch.uint8) for q, _ in parts]).view(parts[0][0].dtype)
+    scale = torch.cat([sf.view(torch.uint8) for _, sf in parts]).view(parts[0][1].dtype)
+    return data, scale
 
 
 def canonical_reference(

@@ -292,7 +292,8 @@ struct SM120BlockScaledGemmKernel {
 
         cute::for_each(
             cute::make_int_sequence<KT::SFConfig::kNumTileKPerPackSF>{}, [&](auto k_in_sf) {
-              constexpr int stage = sf_stage * KT::SFConfig::kNumTileKPerPackSF + k_in_sf;
+              constexpr int stage = decltype(sf_stage)::value * KT::SFConfig::kNumTileKPerPackSF +
+                                    decltype(k_in_sf)::value;
               constexpr int ab_stage = stage & (KT::AB_Stages - 1);
 
               ab_full_mbar[ab_stage].wait(ab_phase);
@@ -316,28 +317,29 @@ struct SM120BlockScaledGemmKernel {
       cute::copy(s2r_copy_SFB, tXsSFB(_, _, _, sf_stage), tXrSFB);
       sf_empty_mbar[sf_stage].arrive();
 
-      cute::for_each(cute::make_int_sequence<KT::SFConfig::kNumTileKPerPackSF>{},
-                     [&](auto k_in_sf) {
-                       constexpr int stage = sf_stage * KT::SFConfig::kNumTileKPerPackSF + k_in_sf;
-                       constexpr int ab_stage = stage & (KT::AB_Stages - 1);
-                       constexpr bool is_last_k_tile =
-                           stage == KT::SFConfig::SF_Stages * KT::SFConfig::kNumTileKPerPackSF - 1;
+      cute::for_each(
+          cute::make_int_sequence<KT::SFConfig::kNumTileKPerPackSF>{}, [&](auto k_in_sf) {
+            constexpr int stage = decltype(sf_stage)::value * KT::SFConfig::kNumTileKPerPackSF +
+                                  decltype(k_in_sf)::value;
+            constexpr int ab_stage = stage & (KT::AB_Stages - 1);
+            constexpr bool is_last_k_tile =
+                stage == KT::SFConfig::SF_Stages * KT::SFConfig::kNumTileKPerPackSF - 1;
 
-                       ab_full_mbar[ab_stage].wait(ab_phase);
-                       cute::copy(s2r_copy_A, tXsA(_, _, _, Int<ab_stage>{}), tXrA);
-                       cute::copy(s2r_copy_B, tXsB(_, _, _, Int<ab_stage>{}), tXrB);
-                       ab_empty_mbar[ab_stage].arrive();
-                       if constexpr (ab_stage == KT::AB_Stages - 1) {
-                         ab_phase ^= 1;
-                       }
+            ab_full_mbar[ab_stage].wait(ab_phase);
+            cute::copy(s2r_copy_A, tXsA(_, _, _, Int<ab_stage>{}), tXrA);
+            cute::copy(s2r_copy_B, tXsB(_, _, _, Int<ab_stage>{}), tXrB);
+            ab_empty_mbar[ab_stage].arrive();
+            if constexpr (ab_stage == KT::AB_Stages - 1) {
+              ab_phase ^= 1;
+            }
 
-                       if constexpr (KT::kUnionSmem && is_last_k_tile) {
-                         cutlass::arch::NamedBarrier::sync(KT::MMAConfig::kNumMathThreads, 0);
-                       }
+            if constexpr (KT::kUnionSmem && is_last_k_tile) {
+              cutlass::arch::NamedBarrier::sync(KT::MMAConfig::kNumMathThreads, 0);
+            }
 
-                       cute::gemm(mma, make_zip_tensor(tCrA, tCrSFA_frg(_, _, _, k_in_sf)),
-                                  make_zip_tensor(tCrB, tCrSFB_frg(_, _, _, k_in_sf)), accum);
-                     });
+            cute::gemm(mma, make_zip_tensor(tCrA, tCrSFA_frg(_, _, _, k_in_sf)),
+                       make_zip_tensor(tCrB, tCrSFB_frg(_, _, _, k_in_sf)), accum);
+          });
     });
     sf_phase ^= 1;
 
