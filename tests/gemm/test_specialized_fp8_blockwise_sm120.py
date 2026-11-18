@@ -207,6 +207,31 @@ def test_kill_switch_disables_backend(stock_sentinel, monkeypatch):
     assert _rel(out, ref) < REL_TOL
 
 
+def test_capture_guard_is_keyed_by_exact_m(monkeypatch):
+    """An eager launch of one M must not admit a different M of the same
+    (N, K) class under capture: the dispatcher picks a different kernel per
+    M range, so warm-up state is keyed by the exact dispatched shape."""
+    from flashinfer.gemm import specialized_fp8_blockwise_sm120 as specmod
+
+    snapshot = set(specmod._warmed)
+    specmod._warmed.clear()
+    try:
+        a, b, a_scale, b_scale = _gen_inputs(1, 64, 2048, seed=49)
+        out = torch.full((1, 64), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+        _call(a, b, a_scale, b_scale, backend="specialized", out=out)  # warms M=1
+        torch.cuda.synchronize()
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        a4, b4, s4, t4 = _gen_inputs(4, 64, 2048, seed=50)
+        assert not specmod.is_specialized_supported(a4, b4, s4, t4, "K", (1, 128, 128))
+        assert specmod.fallback_reasons[-1] == ("specialized", "capture:unwarmed")
+        # ... while the M actually launched stays admissible under capture.
+        assert specmod.is_specialized_supported(
+            a, b, a_scale, b_scale, "K", (1, 128, 128)
+        )
+    finally:
+        specmod._warmed |= snapshot
+
+
 def test_cuda_graph_replay_matches_eager():
     """After ``warmup()`` an auto-routed allowlisted call is capturable and
     the replay reproduces the eager output bitwise."""

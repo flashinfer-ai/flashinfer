@@ -25,9 +25,11 @@ accepts it and returns silently wrong output, so there the backend is also
 a correctness fix.
 
 CUDA-graph rules: the host entry takes the ambient stream per call
-(tvm-ffi); under stream capture only (N, K) classes already warmed via
-:func:`warmup` dispatch (no lazy module/kernel load under capture).
-Autotune mode falls back.
+(tvm-ffi); under stream capture only (M, N, K) shapes already launched on
+that device (all of them after :func:`warmup`) dispatch, so no lazy
+module/kernel load happens under capture. The key is the exact shape, not
+the (N, K) class, because the dispatcher picks a different kernel per M
+range. Autotune mode falls back.
 """
 
 import functools
@@ -62,8 +64,14 @@ def _allowlist() -> dict:
 fallback_reasons: deque = deque(maxlen=256)
 dispatch_stats: Counter = Counter()
 
-# (device_index, N, K) classes warmed on that device (CUDA-graph readiness)
-_warmed_nk: Set[Tuple[int, int, int]] = set()
+# (device_index, M, N, K) calls already launched on that device (CUDA-graph
+# readiness). Keyed by the full shape, NOT by (N, K) class: combo_entry.cu
+# picks a different kernel per M range inside a class (with exact-M cluster
+# forms, e.g. at N=64), so one launched M says nothing about the kernel a
+# different M would lazily load under capture. A given (M, N, K) always takes
+# the same dispatch route, so this key identifies the kernel actually loaded;
+# warmup() launches every admitted M and therefore warms every route.
+_warmed: Set[Tuple[int, int, int, int]] = set()
 
 
 @functools.cache
@@ -159,7 +167,7 @@ def is_specialized_supported(
         return _no("autotune_probe_failed")
     if (
         torch.cuda.is_current_stream_capturing()
-        and (a.device.index, N, K) not in _warmed_nk
+        and (a.device.index, M, N, K) not in _warmed
     ):
         return _no("capture:unwarmed")
     return True
@@ -175,7 +183,7 @@ def run_specialized_gemm_fp8_blockwise(
     """DPS entry: Y = dequant(A) @ dequant(B).T, written into ``out``."""
     module = get_specialized_gemm_fp8_blockwise_sm120_module()
     module.run(a, b, a_scale, b_scale, out)
-    _warmed_nk.add((a.device.index, b.shape[0], a.shape[1]))
+    _warmed.add((a.device.index, a.shape[0], b.shape[0], a.shape[1]))
     dispatch_stats["specialized"] += 1
     return out
 
