@@ -107,12 +107,8 @@ from .api import (
     QuantFormat,
     RoutingInputMode,
 )
-from .prepare import (
-    _SM80_KEYS,
-    _check_sm80_nvfp4_operands,
-    cutlass_nvfp4_sm80_weights,
-    trtllm_nvfp4_sm80_weights,
-)
+from .prepare import _SM80_KEYS, _check_sm80_nvfp4_operands
+from .prepare import cutlass_nvfp4_sm80_weights, trtllm_nvfp4_sm80_weights
 from .utils import (
     _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS,
     _cutile_max_permuted_rows,

@@ -2186,6 +2186,19 @@ def _check_sm80_nvfp4_operands(
 # (m0, e0, e1, sign) bit positions per output register in a 16-bit half (hi half = +16).
 _W4A16_CODE_BITS = ((0, 1, 2, 9), (3, 4, 5, 12), (6, 7, 8, 15), (13, 10, 11, 14))
 
+# Below SM100 the records' (csrc/w4a16_moe_sm80.cu) tactics: row tile, GEMM1 and GEMM2 variant.
+# Variants: 0 the row tile's own; at row tile 64, 1 GEMM1 at 2 stages (GEMM2 as 0), 2 GEMM2 at 2
+# stages, 3 GEMM1 and 4 GEMM2 over two 128-column records per CTA, 5 GEMM2 as 4 with vector scale
+# loads; at row tile 96, 6 and 7 the 2-stage paths, 7 with 12 row parts. Untuned: row tile 64.
+W4A16_SM80_TACTICS = (
+    (8, 0, 0), (16, 0, 0), (32, 0, 0), (64, 0, 0), (96, 0, 0), (64, 1, 1), (64, 1, 2),
+    (64, 3, 2), (64, 3, 4), (64, 1, 4), (64, 3, 5), (64, 1, 5), (96, 6, 6), (96, 7, 7),
+)  # fmt: skip
+
+
+def _sm80_records(scale: torch.Tensor) -> bool:  # records in place of weight scales
+    return scale.dtype == torch.uint8 and scale.dim() == 2
+
 
 def _w4a16_records_geometry(n: int, k: int, gated: bool) -> Tuple[int, int, bool, int]:
     """Record columns, K steps of 128, whether the last is a 5120 B record, an expert's bytes."""
@@ -2196,17 +2209,24 @@ def _w4a16_records_geometry(n: int, k: int, gated: bool) -> Tuple[int, int, bool
     return cols, steps, half, size
 
 
-def _w4a16_records(w: torch.Tensor, scale: torch.Tensor, gated: bool) -> torch.Tensor:
+def _w4a16_records(
+    w: torch.Tensor, scale: torch.Tensor, gated: bool,
+    rows_from: Optional[torch.Tensor] = None, k_used: Optional[int] = None,
+) -> torch.Tensor:  # fmt: skip
     """Packed NVFP4 [E, N, K / 2] (low nibble = even K) and its E4M3 block scales, MMA-layout or
     128x4 swizzled, as records [E, columns / 128 x K steps x record], experts chunked to ~1 GiB of
     int32 buffers. Codes [half 2][warp 8][lane 32][4 words], 3 + 1 bits each; scales
-    [warp 8][g 8][16 B] U5 bytes, byte 4 j2 + 2 hi + jl. Padding is zero codes."""
+    [warp 8][g 8][16 B] U5 bytes, byte 4 j2 + 2 hi + jl. Padding is zero codes. ``rows_from``: the
+    stored row of each row in order (gated: up rows, then gate rows), ``k_used``: the leading K."""
     if scale.dim() == 6:  # the MMA layout in byte order is the 128x4 swizzled layout
         scale = scale.permute(5, 2, 4, 0, 1, 3)
     w = w.view(torch.uint8).view(w.shape[0], w.shape[1], -1)
     num_experts, n, half_k = w.shape
     k, dev = 2 * half_k, w.device
     sf = _unswizzle_batched_sf_128x4(scale.view(torch.uint8), num_experts, n, k // 16)
+    if gated and rows_from is not None:  # to 64 up rows, then 64 gate rows, alternating
+        rows_from = rows_from.view(2, -1, 64).transpose(0, 1).flatten()
+    n, k = n if rows_from is None else rows_from.numel(), k_used or k
     cols, steps, half, size = _w4a16_records_geometry(n, k, gated)
     chunks, kf = cols // 128, 128 * steps
     # Up to two int32 copies of an expert's padded codes live at once: cp and x.
@@ -2225,7 +2245,10 @@ def _w4a16_records(w: torch.Tensor, scale: torch.Tensor, gated: bool) -> torch.T
     u5_table = torch.where(b == 0, 0, torch.where(b == 127, 0xFF, u5))
     out = torch.empty(num_experts, size, dtype=torch.uint8, device=dev)
     for e0 in range(0, num_experts, chunk):
-        q, sb = w[e0 : e0 + chunk], sf[e0 : e0 + chunk].to(torch.int32)
+        q, sb = w[e0 : e0 + chunk, :, : k // 2], sf[e0 : e0 + chunk, :, : k // 16]
+        if rows_from is not None:
+            q, sb = q[:, rows_from], sb[:, rows_from]
+        sb = sb.to(torch.int32)
         m = q.shape[0]
         codes = torch.stack((q & 0xF, q >> 4), dim=-1).view(m, n, k).to(torch.int32)
         mag = sb & 0x7F
@@ -2302,28 +2325,34 @@ def cute_dsl_w4a16_sm80_supported(
 
 @flashinfer_api
 def cute_dsl_w4a16_sm80_weights(
-    w1: torch.Tensor, s1: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor, gated: bool
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    w1: torch.Tensor, s1: torch.Tensor, w2: torch.Tensor, s2: torch.Tensor, gated: bool,
+    interleaved: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:  # fmt: skip
     """Records below-SM100 W4A16 ``cute_dsl_fused_moe`` takes in place of the block scales, where
     ``cute_dsl_w4a16_sm80_supported``; it otherwise converts them on every call. Given the records,
     it reads ``w1_weight`` and ``w2_weight`` for their shapes only, so their storage may be freed.
+    Below SM100 ``cutlass_fused_moe`` (NVFP4, W4A4 or W4A16) and the CuTe-DSL W4A4 MoE take them
+    likewise where so supported, and ``trtllm_nvfp4_sm80_weights`` returns them for TRT-LLM's.
 
     Parameters
     ----------
     w1, w2 : torch.Tensor
-        FC1 and FC2 weights, packed, in any integer view; gated FC1 rows alternate 64 up and 64
-        gate rows.
+        FC1 and FC2 weights, packed, in any integer view.
     s1, s2 : torch.Tensor
         Their block scales in the MMA layout ``cute_dsl_fused_moe`` takes, or 128x4 swizzled.
     gated : bool
         FC1 holds gate and up rows (SwiGLU), not one projection (ReLU2).
+    interleaved : bool
+        Gated FC1 rows alternate 64 up and 64 gate rows (CuTe-DSL), else are the up rows, then the
+        gate rows (CUTLASS).
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
         FC1 and FC2 uint8 records ``[num_experts, bytes]`` for ``w1_weight_sf``/``w2_weight_sf``.
     """
-    return _w4a16_records(w1, s1, gated), _w4a16_records(w2, s2, False)
+    r = None if interleaved or not gated else torch.arange(w1.size(1), device=w1.device)
+    return _w4a16_records(w1, s1, gated, r), _w4a16_records(w2, s2, False)
 
 
 def _trtllm_fc1_rows(
@@ -2351,10 +2380,13 @@ def trtllm_nvfp4_sm80_weights(
     mx: bool = False,
     valid_intermediate_size: Optional[int] = None,
     sm90: bool = False,
+    records: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
     """SM80 operands (BF16 output) of TRT-LLM NVFP4 or MXFP4 MoE weights, which below SM100
     ``trtllm_fp4_block_scale_moe`` and ``trtllm_fp4_block_scale_routed_moe`` take in place of the
     weights and scales (NVFP4 with NVFP4 activations, else MXFP4); they otherwise convert per call.
+    With ``records``, NVFP4's records instead (see ``cute_dsl_w4a16_sm80_weights``), which they take
+    in place of the scales where ``cute_dsl_w4a16_sm80_supported``, reading the weights' shapes only.
 
     Parameters
     ----------
@@ -2373,11 +2405,14 @@ def trtllm_nvfp4_sm80_weights(
         GEMM2 as much K. ``None`` keeps them all.
     sm90 : bool
         Return MXFP4's SM90 operands instead, for MXFP8 activations.
+    records : bool
+        Return NVFP4's records ``(r1, r2)`` instead.
 
     Returns
     -------
     Tuple[torch.Tensor, ...]
-        ``(w1, s1, w2, s2)`` as ``cutlass_nvfp4_sm80_weights`` returns them with ``dtype`` BF16.
+        ``(w1, s1, w2, s2)`` as ``cutlass_nvfp4_sm80_weights`` returns them with ``dtype`` BF16, or
+        with ``records`` ``(r1, r2)``.
     """
     from .core import (
         _maybe_get_cached_w3_w1_permute_indices, get_w2_permute_indices_with_cache,
@@ -2395,6 +2430,13 @@ def trtllm_nvfp4_sm80_weights(
     rows1, k2 = p1.argsort(), None
     if fc1_rows is not None:
         rows1, k2 = rows1[fc1_rows], fc1_rows.numel() // (2 if gated else 1)
+    if records:
+        if mx or sm90:
+            raise ValueError("Below SM100 records hold NVFP4 weights only")
+        return (
+            _w4a16_records(w1, s1, gated, rows1, w2.shape[1]),
+            _w4a16_records(w2, s2, False, p2.argsort(), k2),
+        )
     return cutlass_nvfp4_sm80_weights(
         w1, s1, w2, s2, rows_from=(rows1, p2.argsort()), mx=mx, k=(w2.shape[1], k2), sm90=sm90
     )  # fmt: skip

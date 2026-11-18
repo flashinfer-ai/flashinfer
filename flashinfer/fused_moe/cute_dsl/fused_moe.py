@@ -52,7 +52,6 @@ Example (Wrapper API with CUDA Graph):
 
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
-import functools
 import warnings
 import weakref
 
@@ -88,8 +87,7 @@ from ...quantization.nvfp4_quantization_utils import (
     resolve_nvfp4_4over6,
 )
 from ...utils import supported_compute_capability
-from ...jit.fused_moe import gen_w4a16_moe_sm80_module
-from ..prepare import _w4a16_records_geometry, cute_dsl_w4a16_sm80_supported
+from ..prepare import _sm80_records, cute_dsl_w4a16_sm80_supported
 from ..prepare import cute_dsl_w4a16_sm80_weights, cutlass_nvfp4_sm80_weights
 from .moe_utils import (
     moe_output_memset_inplace,
@@ -170,12 +168,9 @@ def _check_clamped_relu2_supported(
         and torch.cuda.get_device_capability(device) == (10, 7)
     ):
         raise ValueError("ActivationType.ClampedRelu2 is not supported on SM107")
-    if (
-        device.type == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device)[0] < 10
-    ):
-        raise ValueError("ActivationType.ClampedRelu2 is not supported below SM100")
+    if device.type == "cuda" and torch.cuda.is_available():
+        if torch.cuda.get_device_capability(device)[0] < 10:
+            raise ValueError("ActivationType.ClampedRelu2 is not supported below SM100")
 
 
 #: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales
@@ -1880,86 +1875,57 @@ def _cute_dsl_fused_moe_impl(
     )
 
 
-@functools.cache
-def _w4a16_sm80_module():
-    return gen_w4a16_moe_sm80_module().build_and_load()
-
-
-def _w4a16_moe_sm80(runner, inputs, tactic, gated, runnable):
-    """Runs W4A16 on records: routing into row blocks, GEMM1 with the activation, GEMM2 and the
-    top-k weighted sum, with ``tactic`` from ``W4A16_SM80_TACTICS``."""
-    if not runnable:
-        raise ValueError(
-            "Below SM100 W4A16 records run SwiGLU with default parameters and ReLU2 over all "
-            "experts; pass the CuTe-DSL weights for other configurations."
-        )
-    x, experts, scales, w1, r1, alpha1, w2, r2, alpha2, out = inputs
-    tactic = W4A16_SM80_TACTICS[3] if tactic in (None, -1) else tuple(tactic)
-    if tactic not in W4A16_SM80_TACTICS:
-        raise ValueError(
-            f"W4A16 records take a tactic of {W4A16_SM80_TACTICS}, got {tactic}."
-        )
-    row_tile, gemm1, gemm2 = tactic
-    tokens, hidden = x.shape
-    num_experts, rows1, top_k = w1.shape[0], w1.shape[1], experts.shape[1]
-    inter = rows1 // 2 if gated else rows1
-    n1, _, _, bytes1 = _w4a16_records_geometry(rows1, hidden, gated)
-    n2, _, _, bytes2 = _w4a16_records_geometry(hidden, inter, False)
-    expected = ((num_experts, bytes1), (num_experts, bytes2))
-    if (tuple(r1.shape), tuple(r2.shape)) != expected:
-        raise ValueError(
-            f"W4A16 records must be {expected}, got {r1.shape} and {r2.shape}."
-        )
-    if tokens == 0:
-        return out
-    m = experts.numel()
-    max_blocks = -(-m // row_tile) + min(num_experts, m)
-    ids = experts.to(torch.int32).contiguous()
-    meta = ids.new_empty(1 + 2 * max_blocks)
-    rowmap = ids.new_empty(max_blocks * row_tile)
-    workspace = ids.new_empty((-(-m // 2048) + 1) * num_experts)
-    blocked = x.new_empty(max_blocks * row_tile, inter)
-    y = x.new_empty(m, hidden)
-    module = _w4a16_sm80_module()
-    module.prep(
-        ids, meta, rowmap, workspace, num_experts, row_tile, max_blocks, None, None, None
-    )  # fmt: skip
-    module.gemm(
-        r1, alpha1.float().contiguous(), x.contiguous(), meta, rowmap, blocked, row_tile,
-        1 if gated else 2, top_k, n1, hidden, inter, max_blocks, gemm1, None, None,
-    )  # fmt: skip
-    module.gemm(
-        r2, alpha2.float().contiguous(), blocked, meta, rowmap, y, row_tile, 0, top_k, n2,
-        inter, hidden, max_blocks, gemm2, None, None,
-    )  # fmt: skip
-    module.finalize(y, scales.float().contiguous(), ids, out, top_k)
-    return out
-
-
-def _cute_dsl_fused_moe_sm80(runner, inputs, tactic, op_name=None, nvfp4_4over6=_UNSET):
+def _cute_dsl_fused_moe_sm80(
+    runner, inputs, tactic, op_name=None, nvfp4_4over6=_UNSET, fc1_input_scale=None
+):
     """Runs ``runner`` on the CUTLASS SM80 kernels (W4A8 as W4A16 with MXFP8 activations, on SM90
     the FP8 mixed-input GEMM), converting weights unless given operands. As from SM100 the GEMM2
     input is standard NVFP4, or per token the pinned 4over6 recipe, else the environment's.
     From the public APIs (``op_name``), W4A16 converts MMA-layout scales to records where they
     run, tuned under ``op_name`` unless given ``tactic``."""
     from ..core import _trtllm_fp4_nvfp4_4over6_code, get_cutlass_fused_moe_module
+    from ..core import _records_moe_sm80, _w4a16_moe_sm80
 
     w4a16 = isinstance(runner, CuteDslFusedMoEW4A16Runner)
     _, gated = normalize_cute_dsl_moe_activation_type(runner.activation_type)
-    runnable = w4a16 and cute_dsl_w4a16_sm80_supported(
+    supported = cute_dsl_w4a16_sm80_supported(
         runner.num_experts, runner.num_local_experts, runner.local_expert_offset,
         runner.output_dtype, runner.activation_type, runner.swiglu_alpha, runner.swiglu_beta,
         runner.swiglu_limit, runner.situ_beta,
     )  # fmt: skip
-    if runnable and op_name and inputs[4].dim() == 6:
+    if w4a16 and supported and op_name and inputs[4].dim() == 6:
         r1, r2 = cute_dsl_w4a16_sm80_weights(*inputs[3:5], *inputs[6:8], gated)
         inputs = [*inputs[:4], r1, inputs[5], inputs[6], r2, *inputs[8:]]
     if w4a16 and op_name and tactic is None and inputs[4].dim() == 2:
         _, tactic = AutoTuner.get().choose_one(
             op_name, [runner], runner.tuning_config, inputs
         )
-    if w4a16 and inputs[4].dtype == torch.uint8 and inputs[4].dim() == 2:
-        return _w4a16_moe_sm80(runner, inputs, tactic, gated, runnable)
+    if _sm80_records(inputs[4 if w4a16 else 5]):  # cute_dsl_w4a16_sm80_weights
+        w4a4 = getattr(runner, "quant_mode", None) == "w4a4" and len(inputs) == 12
+        if not supported or not (w4a16 or w4a4):
+            raise ValueError(
+                "Below SM100 CuTe-DSL records run SwiGLU with default parameters or ReLU2 over all "
+                "experts, W4A4 without per-token scales; pass block scales otherwise."
+            )
+        if w4a16:
+            return _w4a16_moe_sm80(inputs, tactic, gated)
+        # W4A4: GEMM1 quantizes its output to GEMM2's standard NVFP4 input, the recipe here.
+        x, x_sf, ids, scales, w1, r1, alpha1, fc2_scale, w2, r2, alpha2, out = inputs
+        if fc1_input_scale is not None and x.shape != out.shape:
+            raise ValueError(f"fc1_input_scale takes x of shape {tuple(out.shape)}.")
+        x_fp4 = (
+            (x.view(torch.uint8), x_sf.view(torch.uint8).view(len(x), -1), False)
+            if fc1_input_scale is None  # else BF16, quantized under it in the prep
+            else (x.contiguous(), fc1_input_scale.float().reshape(1), False)
+        )
+        # One FC2 input scale, as CUTLASS reads.
+        inputs = [
+            out.new_empty(out.shape), ids, scales, w1, r1, alpha1, w2, r2, alpha2, out,
+            fc2_scale.reshape(-1)[:1], None,
+        ]  # fmt: skip
+        if tactic in (None, -1):
+            return _records_moe_sm80(inputs, gated, x_fp4)
+        return _w4a16_moe_sm80(inputs, tactic, gated, x_fp4=x_fp4)
     w4a8 = getattr(runner, "quant_mode", None) == "w4a8"
     situ = runner.situ_beta is not None
     if not (w4a16 or w4a8 or runner.quant_mode == "w4a4") or tactic not in (None, -1):
@@ -2062,6 +2028,7 @@ def cute_dsl_fused_moe(
     clamped_relu2_limit: Optional[torch.Tensor] = None,
     swap_ab: bool = False,
     routing_weights_before_fc2: bool = False,
+    fc1_input_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
@@ -2099,6 +2066,10 @@ def cute_dsl_fused_moe(
     fc2_input_scale : Optional[torch.Tensor]
         Global scale for W4A4 GEMM2 input quantization; must be ``None`` for
         W4A8, W8A8, and W4A16.
+    fc1_input_scale : Optional[torch.Tensor]
+        Below SM100, with ``cute_dsl_w4a16_sm80_weights`` records for W4A4: one FP32
+        global scale under which BF16 ``x`` (``x_sf=None``) is quantized to NVFP4 as
+        the records route it, as standard activations. Rejected elsewhere.
     w2_weight : torch.Tensor
         GEMM2 weights (down projection).
     w2_weight_sf : torch.Tensor
@@ -2288,8 +2259,20 @@ def cute_dsl_fused_moe(
         _validate_mxfp_weight_dtype(quant_mode, x, w1_weight, w2_weight, swap_ab)
         if torch.cuda.get_device_capability(x.device) == (10, 7):
             raise ValueError(f"quant_mode={quant_mode!r} is not supported on SM107")
-    elif quant_mode == "w4a4" and x.dtype is not torch.uint8:
+    elif quant_mode == "w4a4" and fc1_input_scale is None and x.dtype != torch.uint8:
         raise TypeError("quant_mode='w4a4' requires packed uint8 input")
+    if fc1_input_scale is not None and (  # BF16 x, quantized in the SM80 records' prep
+        quant_mode != "w4a4" or x.dtype is not torch.bfloat16 or x_sf is not None
+        or fc2_input_scale is None or per_token_scale is not None or localized_weights is not None
+        or fc1_input_scale.numel() != 1 or not fc1_input_scale.is_floating_point()
+        or not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] >= 10
+        or not _sm80_records(w1_weight_sf)
+    ):  # fmt: skip
+        raise ValueError(
+            "Below SM100 fc1_input_scale is one floating-point scale for BF16 x with W4A4 records "
+            "(cute_dsl_w4a16_sm80_weights) and fc2_input_scale, without x_sf, per_token_scale "
+            "or localized_weights."
+        )
 
     if num_local_experts is None:
         num_local_experts = num_experts
@@ -2442,8 +2425,9 @@ def cute_dsl_fused_moe(
         op_name += "::SwapAB"
     if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
         return _cute_dsl_fused_moe_sm80(
-            runners[0], inputs, tactic, op_name, **recipe_kwargs
-        )
+            runners[0], inputs, tactic, op_name, fc1_input_scale=fc1_input_scale,
+            **recipe_kwargs,
+        )  # fmt: skip
     if tactic is not None:
         return runners[0](inputs, tactic=tactic, aux_stream=aux_stream, **recipe_kwargs)
 
@@ -2501,6 +2485,7 @@ def cute_dsl_fused_moe_nvfp4(
     autotune_use_cuda_graph: bool = False,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     clamped_relu2_limit: Optional[torch.Tensor] = None,
+    fc1_input_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -2555,6 +2540,7 @@ def cute_dsl_fused_moe_nvfp4(
         autotune_use_cuda_graph=autotune_use_cuda_graph,
         nvfp4_4over6=nvfp4_4over6,
         clamped_relu2_limit=clamped_relu2_limit,
+        fc1_input_scale=fc1_input_scale,
     )
 
 

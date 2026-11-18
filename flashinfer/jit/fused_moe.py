@@ -199,12 +199,8 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
 
 
 def gen_cutlass_fused_moe_sm80_module(use_fast_build: bool = False) -> JitSpec:
-    nvcc_flags = sw_cvt_nvcc_flags("80") + [
-        "-DENABLE_BF16",
-        "-DENABLE_FP8",
-        "-DENABLE_FP4",
-        "-DUSING_OSS_CUTLASS_MOE_GEMM",
-    ]
+    defines = ["ENABLE_BF16", "ENABLE_FP8", "ENABLE_FP4", "USING_OSS_CUTLASS_MOE_GEMM"]
+    nvcc_flags = sw_cvt_nvcc_flags("80") + [f"-D{d}" for d in defines]
     return gen_cutlass_fused_moe_module(nvcc_flags, "80", use_fast_build)
 
 
@@ -215,15 +211,13 @@ def gen_w4a16_moe_sm80_module() -> JitSpec:
     flags = [f"-gencode=arch=compute_{m}0,code=sm_{m}0" for m in (8, 9) if m in majors]
     if not flags:
         raise RuntimeError("W4A16 MoE records kernels need an SM80 to SM90 target")
+    defines = "ENABLE_BF16 ENABLE_FP8 ENABLE_FP4 FLASHINFER_FP4_SW_CVT FLASHINFER_FP4_SW_CVT_FFMA"
+    nv_internal = jit_env.FLASHINFER_CSRC_DIR / "nv_internal"
     return gen_jit_spec(
         "w4a16_moe_sm80",
         [jit_env.FLASHINFER_CSRC_DIR / "w4a16_moe_sm80.cu"],
-        extra_cuda_cflags=flags
-        + ["-DENABLE_BF16", "-DENABLE_FP8", "-DENABLE_FP4", "-DFLASHINFER_FP4_SW_CVT"],
-        extra_include_paths=[
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
-            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
-        ],
+        extra_cuda_cflags=flags + [f"-D{d}" for d in defines.split()],
+        extra_include_paths=[nv_internal, nv_internal / "include"],
         use_fast_math=False,
     )
 
@@ -307,8 +301,7 @@ def gen_cutlass_fused_moe_module(
         / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/kernels/lora/lora.cpp",
     ]
-    if "-DFLASHINFER_FP4_SW_CVT" in nvcc_flags:
-        # Below SM100 the NVFP4 input is quantized with the FP4 quantization kernels.
+    if "-DFLASHINFER_FP4_SW_CVT" in nvcc_flags:  # NVFP4 input quantizer below SM100
         sources.append(
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/kernels/quantization.cu"
         )

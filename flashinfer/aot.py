@@ -102,11 +102,9 @@ from .jit.cake_kda_packed_t1 import (
 )
 from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
-from .jit.fp8_quantization import (
-    gen_mxfp8_quantization_sm80_module,
-    gen_mxfp8_quantization_sm90_module,
-    gen_mxfp8_quantization_sm100_module,
-)
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm80_module
+from .jit.fp8_quantization import gen_mxfp8_quantization_sm90_module
 from .jit.cudnn_frost import FROST_DTYPES, gen_cudnn_frost_moe_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
@@ -980,11 +978,9 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm80_module())
             jit_specs.append(gen_mxfp8_quantization_sm80_module())
             jit_specs.append(gen_cutlass_fused_moe_sm80_module())
-        if has_sm89:
-            # SM89 devices load their own CUTLASS MoE module.
+        if has_sm89:  # SM89 devices load their own CUTLASS MoE module
             jit_specs.append(gen_cutlass_fused_moe_sm89_module())
-        if has_sm80 or has_sm90:
-            # One module emits the requested SM80/SM90 targets of the W4A16 MoE records.
+        if has_sm80 or has_sm90:  # one module for the records' SM80/SM90 targets
             jit_specs.append(gen_w4a16_moe_sm80_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())

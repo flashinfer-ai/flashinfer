@@ -52,6 +52,7 @@ from ..utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
+from ..prepare import W4A16_SM80_TACTICS, _sm80_records
 from ._inputs_helper import CuteDslMoEInputsHelper
 from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
@@ -1191,16 +1192,6 @@ def get_w4a16_moe_valid_tactics() -> List[Tuple]:
 W4A16_MOE_TACTICS = tuple(get_w4a16_moe_valid_tactics())
 
 
-# Below SM100 W4A16 records' (csrc/w4a16_moe_sm80.cu) tactics: row tile, GEMM1 and GEMM2 variant.
-# Variants: 0 the row tile's own; at row tile 64, 1 GEMM1 at 2 stages (GEMM2 as 0), 2 GEMM2 at 2
-# stages, 3 GEMM1 and 4 GEMM2 over two 128-column records per CTA, 5 GEMM2 as 4 with vector scale
-# loads; at row tile 96, 6 and 7 the 2-stage paths, 7 with 12 row parts. Untuned: row tile 64.
-W4A16_SM80_TACTICS = (
-    (8, 0, 0), (16, 0, 0), (32, 0, 0), (64, 0, 0), (96, 0, 0), (64, 1, 1), (64, 1, 2),
-    (64, 3, 2), (64, 3, 4), (64, 1, 4), (64, 3, 5), (64, 1, 5), (96, 6, 6), (96, 7, 7),
-)  # fmt: skip
-
-
 class CuteDslFusedMoEW4A16Runner(TunableRunner):
     """Tunable runner for the BF16-activation, NVFP4-weight MoE pipeline.
 
@@ -1351,8 +1342,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
 
         x = inputs[0]
         if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 10:
-            records = inputs[4].dtype == torch.uint8 and inputs[4].dim() == 2
-            return list(W4A16_SM80_TACTICS) if records else []
+            return list(W4A16_SM80_TACTICS) if _sm80_records(inputs[4]) else []
         w1_weight = inputs[3]
         w2_weight = inputs[6]
         num_tokens = inputs[0].shape[0]

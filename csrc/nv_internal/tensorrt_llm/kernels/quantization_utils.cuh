@@ -116,11 +116,44 @@ inline __device__ void quantizeAndStore(QuantT* dstPtr, uint4 vec, T const clamp
 __device__ __forceinline__ uint32_t fp32_to_e2m1_sw(float x) {
   uint32_t const bits = __float_as_uint(x);
   uint32_t const mag = bits & 0x7FFFFFFFu;
+#if defined(FLASHINFER_FP4_SW_CVT_FFMA)  // FMA-based code; opt-in per module (records)
+  uint32_t const lowc =
+      __float_as_uint(__fmaf_rn(__uint_as_float(mag), 2.f, 8388608.f)) - 0x4B000000u;
+  uint32_t const q = ((mag + 0x1FFFFFu + (mag >> 22 & 1u)) >> 22) - 252u;
+  uint32_t const code = mag < 0x40000000u ? lowc : (q < 7u ? q : 7u);
+  return (mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | code;
+#else
   uint32_t const hi = mag >= 0x3FE00000u;
   uint32_t const mid = mag >= (hi ? 0x40600000u : 0x3F400000u);
   uint32_t const lo =
       mag > (hi ? (mid ? 0x40A00000u : 0x40200000u) : (mid ? 0x3FA00000u : 0x3E800000u));
   return (mag > 0x7F800000u ? 0u : bits >> 28 & 0x8u) | hi << 2 | mid << 1 | lo;
+#endif
+}
+
+// The NVFP4 scale and payload products flush FP32 subnormals, as the -use_fast_math modules do.
+__device__ __forceinline__ float nvfp4_quantize_mul(float a, float b) {
+  float result;
+  asm("mul.ftz.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+  return result;
+}
+
+// Below SM89: __nv_fp8_e4m3(x).__x and its float value, bit for bit, without the double and half
+// emulation.
+__device__ __forceinline__ uint8_t fp32_to_e4m3_sw(float x) {
+  uint32_t const bits = __float_as_uint(x), mag = bits & 0x7FFFFFFFu;
+  if (mag > 0x7F800000u) return 0x7Fu;
+  uint32_t const n = ((mag + 0x7FFFFu + (mag >> 20 & 1u)) >> 20) - 0x3C0u;  // satfinite at 0x7E
+  uint32_t const v =
+      mag < 0x3C800000u ? __float2uint_rn(__uint_as_float(mag) * 512.f) : (n < 0x7Eu ? n : 0x7Eu);
+  return static_cast<uint8_t>((bits >> 24 & 0x80u) | v);
+}
+
+__device__ __forceinline__ float e4m3_to_fp32_sw(uint8_t v) {
+  float f;  // exponent and mantissa in FP32 places times 2^120, not FTZ (subnormal codes)
+  asm("mul.rn.f32 %0, %1, 0f7B800000;" : "=f"(f) : "f"(__uint_as_float((v & 0x7Fu) << 20)));
+  return (v & 0x7Fu) == 0x7Fu ? __uint_as_float(0x7FFFFFFFu)
+                              : __uint_as_float(__float_as_uint(f) | (v & 0x80u) << 24);
 }
 #endif
 
@@ -538,16 +571,33 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     // Compute this independent reciprocal before the E4M3 zero-scale check,
     // so the scale conversion does not delay it.
     float const reciprocalSFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+    auto SFValue = nvfp4_quantize_mul(SFScaleVal,
+                                      nvfp4_quantize_mul(vecMax, reciprocal_approximate_ftz(6.0f)));
+#else
     auto SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+#endif
 
     // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 890
+    fp8SFVal = fp32_to_e4m3_sw(SFValue);
+    SFValue = e4m3_to_fp32_sw(fp8SFVal);
+#else
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
+#endif
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
     // A nonzero block can round to a zero E4M3 scale; match the CuTe zero-scale contract.
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+    outputScale =
+        fp8SFVal != 0
+            ? reciprocal_approximate_ftz(nvfp4_quantize_mul(SFValue, reciprocalSFScaleVal))
+            : 0.0f;
+#else
     outputScale = fp8SFVal != 0 ? reciprocal_approximate_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
+#endif
   }
 
   if constexpr (!UE8M0_SF && IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value) {
@@ -759,8 +809,13 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
       fp2Vals[i].x = mx_quantize_mul(fp2Vals[i].x, outputScale);
       fp2Vals[i].y = mx_quantize_mul(fp2Vals[i].y, outputScale);
     } else {
+#if defined(FLASHINFER_FP4_SW_CVT) && __CUDA_ARCH__ < 1000
+      fp2Vals[i].x = nvfp4_quantize_mul(fp2Vals[i].x, outputScale);
+      fp2Vals[i].y = nvfp4_quantize_mul(fp2Vals[i].y, outputScale);
+#else
       fp2Vals[i].x *= outputScale;
       fp2Vals[i].y *= outputScale;
+#endif
     }
   }
 
