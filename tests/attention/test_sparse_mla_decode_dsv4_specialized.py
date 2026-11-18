@@ -277,13 +277,26 @@ def test_invalid_table_entries_never_reach_a_gather():
     tbl = inp["sparse_indices"]
     tbl[1, 40:] = 2**31 - 1024  # far out of range
     tbl[9, 100:] = -(2**30)
-    # the fp32 reference gathers unmasked entries clamped only at 0, so give
-    # it a SANITIZED table (masked entries -> -1; they cannot affect the
-    # defined output) while the kernel gets the poisoned one
+    # the fp32 reference clamps -1 holes to pool row 0 and gathers it (its
+    # 0-probability times a poisoned NaN row is still NaN), so the
+    # reference gets CLEAN pools and a sanitized table; the defined output
+    # (holes and tails masked) is identical, while the kernel gets the
+    # poisoned pools and table
     clean_tbl = tbl.clone()
     clean_tbl[1, 40:] = -1
     clean_tbl[9, 100:] = -1
-    gold = _reference({**inp, "sparse_indices": clean_tbl}).float()
+    clean_swa = inp["swa_kv_cache"].clone()
+    clean_swa.reshape(-1, D)[0] = 0
+    clean_ckv = inp["compressed_kv_cache"].clone()
+    clean_ckv.reshape(-1, D)[0] = 0
+    gold = _reference(
+        {
+            **inp,
+            "sparse_indices": clean_tbl,
+            "swa_kv_cache": clean_swa,
+            "compressed_kv_cache": clean_ckv,
+        }
+    ).float()
     assert torch.isfinite(gold).all()
     out = _api(inp, backend="specialized")
     torch.cuda.synchronize()
