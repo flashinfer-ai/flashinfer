@@ -40,7 +40,9 @@ def _graphs(key):
 
 
 def _store(key, built):
-    return gb._store_cudnn_prebuilt(key, [t for t, _ in built], built, handle=None)
+    return gb._store_cudnn_prebuilt(
+        key, [t for t, _ in built], built, handle=None, build_here=()
+    )
 
 
 def test_storing_a_key_again_forgets_its_old_graphs():
@@ -94,6 +96,7 @@ class FakePool:
             result=(
                 [t for t, _ in _built("ok", 2)] + [(0, ())],
                 _built("ok", 2) + [((0, ()), b"bad")],
+                [],
             )
         ),
     ],
@@ -110,7 +113,7 @@ def test_pool_failures_fall_back_and_disable_the_pool(pool):
 
 
 def test_pool_result_is_stored_and_returned():
-    pool = FakePool(result=([t for t, _ in _built("ok")], _built("ok")))
+    pool = FakePool(result=([t for t, _ in _built("ok")], _built("ok"), []))
     tactics = gb._pool_plan_tactics(
         pool, "k", spec=None, device_index=0, heur_modes=[0], handle=None
     )
@@ -121,7 +124,7 @@ def test_pool_result_is_stored_and_returned():
 def test_unbuilt_candidate_is_listed_and_fails_only_when_profiling(monkeypatch):
     built = _built("ok", 3)
     candidates = [t for t, _ in built] + [(9, ())]
-    pool = FakePool(result=(candidates, built))
+    pool = FakePool(result=(candidates, built, []))
     tactics = gb._pool_plan_tactics(
         pool, "k", spec=None, device_index=0, heur_modes=[0], handle=None
     )
@@ -144,3 +147,29 @@ def test_unbuilt_candidate_is_listed_and_fails_only_when_profiling(monkeypatch):
     monkeypatch.setattr(gb, "is_in_profile_measurement", lambda: False)
     assert gb._get_cudnn_override_graph(builder, (9, ())) == "in-process"
     assert calls == [{"tactic": (9, ())}]
+
+
+def test_plan_the_workers_could_not_export_is_built_here_even_when_profiling(
+    monkeypatch,
+):
+    built = _built("ok", 2)
+    candidates = [t for t, _ in built] + [(9, ())]
+    pool = FakePool(result=(candidates, built, [(9, ())]))
+    tactics = gb._pool_plan_tactics(
+        pool, "k", spec=None, device_index=0, heur_modes=[0], handle=None
+    )
+    assert tactics == candidates
+    assert len(gb._cudnn_single_plan_graphs) == 2
+
+    monkeypatch.setattr(gb, "_cudnn_override_key", lambda builder, kwargs: "k")
+    monkeypatch.setattr(gb, "is_in_profile_measurement", lambda: True)
+    calls = []
+
+    def builder(**kwargs):
+        calls.append(kwargs)
+        return "in-process"
+
+    assert gb._get_cudnn_override_graph(builder, (9, ())) == "in-process"
+    assert calls == [{"tactic": (9, ())}]
+    gb._discard_cudnn_prebuilt("k")
+    assert not gb._cudnn_single_plan_graphs

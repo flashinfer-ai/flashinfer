@@ -4252,13 +4252,17 @@ _cudnn_override_all_plans: weakref.WeakValueDictionary[tuple, Any] = (
 
 # Single-plan graphs deserialized from plan-build workers
 # (FLASHINFER_CUDNN_PLAN_BUILD_WORKERS): override key -> {tactic: graph} in
-# candidate order. Whole keys are stored and evicted, bounded like the
+# candidate order; the value is None for a candidate the workers could not
+# build and _CUDNN_BUILD_IN_PROCESS for one they built but could not export. Whole keys are stored and evicted, bounded like the
 # builders' LRUs. ``_cudnn_single_plan_graphs`` maps id -> graph (a strong
 # reference, so an id cannot be reused while registered) and lets the plan
 # lookup recognise these graphs, which hold exactly their tactic's plan but
 # expose no engine/knob query by index. Mutated only under the GIL.
 _CUDNN_PREBUILT_MAX_KEYS = 2048
 _cudnn_override_prebuilt: "OrderedDict[tuple, dict]" = OrderedDict()
+# Registry value for a tactic whose plan built in a worker but could not be
+# exported: usable, so it is built in-process when requested.
+_CUDNN_BUILD_IN_PROCESS = object()
 _cudnn_single_plan_graphs: dict[int, Any] = {}
 
 
@@ -4278,18 +4282,30 @@ def _cudnn_prebuilt_tactics(key):
 
 def _discard_cudnn_prebuilt(key) -> None:
     for graph in (_cudnn_override_prebuilt.pop(key, None) or {}).values():
-        if graph is not None:
+        if graph is not None and graph is not _CUDNN_BUILD_IN_PROCESS:
             _cudnn_single_plan_graphs.pop(id(graph), None)
 
 
-def _store_cudnn_prebuilt(key, candidates, built, handle) -> list:
-    """Store worker-built plans for ``key``; a candidate without one maps to None."""
+def _store_cudnn_prebuilt(key, candidates, built, handle, build_here=()) -> list:
+    """Store worker-built plans for ``key``.
+
+    A candidate the workers could not build maps to None; one in
+    ``build_here`` (built but not exportable) maps to _CUDNN_BUILD_IN_PROCESS.
+    """
     built_graphs = {}
     for tactic, blob in built:
         graph = cudnn.pygraph(handle=handle)
         graph.deserialize(blob)
         built_graphs[tactic] = graph
-    graphs = {tactic: built_graphs.get(tactic) for tactic in candidates}
+    build_here = set(build_here)
+    graphs = {
+        tactic: (
+            _CUDNN_BUILD_IN_PROCESS
+            if tactic in build_here
+            else built_graphs.get(tactic)
+        )
+        for tactic in candidates
+    }
     _discard_cudnn_prebuilt(key)
     _cudnn_override_prebuilt[key] = graphs
     _cudnn_single_plan_graphs.update((id(g), g) for g in built_graphs.values())
@@ -4308,8 +4324,8 @@ def _pool_plan_tactics(pool, key, spec, device_index, heur_modes, handle):
         result = pool.build(spec, device_index, heur_modes)
         if result is None:
             return None
-        candidates, built = result
-        return _store_cudnn_prebuilt(key, candidates, built, handle)
+        candidates, built, build_here = result
+        return _store_cudnn_prebuilt(key, candidates, built, handle, build_here)
     except Exception as exc:  # noqa: BLE001 - fall back to the in-process build
         _discard_cudnn_prebuilt(key)
         pool.disable(f"{type(exc).__name__}: {exc}")
@@ -4329,12 +4345,13 @@ def _get_cudnn_override_graph(builder, tactic, **kwargs):
         prebuilt = _cudnn_override_prebuilt.get(key)
         if prebuilt is not None and tactic in prebuilt:
             _cudnn_override_prebuilt.move_to_end(key)
-            if prebuilt[tactic] is not None:
-                return prebuilt[tactic]
+            graph = prebuilt[tactic]
+            if graph is not None and graph is not _CUDNN_BUILD_IN_PROCESS:
+                return graph
             # The workers could not build this candidate. In-process it would
             # fail at profiling too, so report it as unsupported there rather
             # than paying for another build attempt.
-            if is_in_profile_measurement():
+            if graph is None and is_in_profile_measurement():
                 raise RuntimeError(
                     "cuDNN plan for this engine/knob tactic could not be built "
                     "by the plan-build workers; reporting as unsupported."

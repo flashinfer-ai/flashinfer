@@ -102,6 +102,15 @@ def normalize_tactic(engine_id, knobs) -> Tactic:
 
 def enumerate_tactics(graph, heur_modes: list[int]) -> list[Tactic]:
     """Candidate engine/knob tactics in plan-index order, without building plans."""
+    return [tactic for _, tactic in enumerate_plan_tactics(graph, heur_modes)]
+
+
+def enumerate_plan_tactics(graph, heur_modes: list[int]) -> list[tuple[int, Tactic]]:
+    """``(plan_index, tactic)`` for each candidate, without building plans.
+
+    A plan whose engine config cannot be read is skipped, so a candidate's
+    position is not necessarily its cuDNN plan index.
+    """
     import cudnn
 
     graph.validate()
@@ -114,7 +123,7 @@ def enumerate_tactics(graph, heur_modes: list[int]) -> list[Tactic]:
             engine_id, knobs = graph.get_engine_and_knobs_at_index(index)
         except (AttributeError, RuntimeError):
             continue
-        tactics.append(normalize_tactic(engine_id, knobs))
+        tactics.append((index, normalize_tactic(engine_id, knobs)))
     return tactics
 
 
@@ -172,29 +181,38 @@ def spec_to_wire(spec: Bf16OverrideGraphSpec) -> dict:
 def build_shard(spec: Bf16OverrideGraphSpec, handle, heur_modes, shard):
     """Enumerate all candidates; build and serialize this shard's plans.
 
-    Returns ``(candidates, [(index, tactic, blob), ...])``. A candidate whose
-    plan fails to build has no entry in the plans; it stays in the candidates
-    so the caller can report it as failed, as the in-process path does.
+    Returns ``(candidates, [(index, tactic, blob), ...], build_here)`` where
+    ``index`` is the candidate's position. A candidate whose plan fails to
+    build has no entry in the plans; it stays in the candidates so the caller
+    can report it as failed, as the in-process path does. A plan that built
+    but could not be exported is listed (by position) in ``build_here``: it is
+    usable, so the caller builds it itself.
     """
     shard_index, shard_count = shard
     # One graph per shard: building plans by index on it costs what
     # build_plans(ALL) does, while a fresh graph per tactic repeats validation
     # and support checks (~25% more on BF16).
     graph = build_bf16_override_graph(spec, handle)
-    candidates = enumerate_tactics(graph, heur_modes)
+    plan_tactics = enumerate_plan_tactics(graph, heur_modes)
+    candidates = [tactic for _, tactic in plan_tactics]
     plans = []
-    for index, tactic in enumerate(candidates):
+    build_here = []
+    for index, (plan_index, tactic) in enumerate(plan_tactics):
         if index % shard_count != shard_index:
             continue
         try:
             # Select, then build: serialize() exports the selected, built plan.
-            graph.select_plan(index)
-            graph.build_plan_at_index(index)
-            blob = graph.serialize(as_bytes=True)
+            graph.select_plan(plan_index)
+            graph.build_plan_at_index(plan_index)
         except Exception:  # noqa: BLE001 - an unbuildable plan is skipped
             continue
+        try:
+            blob = graph.serialize(as_bytes=True)
+        except Exception:  # noqa: BLE001 - usable, just not exportable
+            build_here.append(index)
+            continue
         plans.append((index, tactic, bytes(blob)))
-    return candidates, plans
+    return candidates, plans, build_here
 
 
 def _worker_main() -> None:
@@ -214,12 +232,13 @@ def _worker_main() -> None:
             "device_index": request["device_index"],
             "candidates": [],
             "plans": [],
+            "in_process": [],
             "error": None,
         }
         try:
             if handle is None:
                 handle = cudnn.create_handle()
-            candidates, plans = build_shard(
+            candidates, plans, build_here = build_shard(
                 Bf16OverrideGraphSpec(**request["spec"]),
                 handle,
                 request["heur_modes"],
@@ -227,6 +246,7 @@ def _worker_main() -> None:
             )
             response["candidates"] = candidates
             response["plans"] = plans
+            response["in_process"] = build_here
         except Exception as exc:  # noqa: BLE001 - reported to the parent
             response["error"] = f"{type(exc).__name__}: {exc}"
         write_frame(protocol_out, response)

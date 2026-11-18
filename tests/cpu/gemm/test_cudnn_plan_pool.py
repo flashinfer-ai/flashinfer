@@ -70,6 +70,12 @@ FAKE_WORKER = textwrap.dedent(
             plans = plans[1:]
         if mode == "none":
             plans = []
+        build_here = []
+        if mode == "inproc" and i == 0:
+            plans = plans[1:]
+            build_here = [0]
+        if mode == "badinproc":
+            build_here = [99]
         if mode == "badindex":
             plans = [(99, mine[0], b"x")]
         rid = req.get("request_id")
@@ -80,6 +86,7 @@ FAKE_WORKER = textwrap.dedent(
             "device_index": req["device_index"],
             "candidates": mine,
             "plans": plans,
+            "in_process": build_here,
             "error": None,
             "seen": {{"device_index": req["device_index"],
                       "visible": os.environ.get("CUDA_VISIBLE_DEVICES")}},
@@ -113,6 +120,7 @@ def test_results_are_reassembled_in_candidate_order(fake_cmd):
     assert result == (
         CANDIDATES,
         [(tac, f"blob{i}".encode()) for i, tac in enumerate(CANDIDATES)],
+        [],
     )
 
 
@@ -193,7 +201,7 @@ def test_env_parsing(monkeypatch, caplog, value, workers, warns):
             pool.shutdown()
 
 
-@pytest.mark.parametrize("mode", ["garbage", "badindex", "none"])
+@pytest.mark.parametrize("mode", ["garbage", "badindex", "none", "badinproc"])
 def test_malformed_or_empty_results_fall_back(fake_cmd, mode):
     pool = _pool(fake_cmd, mode)
     try:
@@ -285,12 +293,13 @@ def test_unbuilt_plans_keep_their_candidates(fake_cmd):
     # then fails at profiling); the pool must list it too, and stay on.
     pool = _pool(fake_cmd, "partial")
     try:
-        candidates, built = pool.build(SPEC, device_index=0, heur_modes=[0])
+        candidates, built, build_here = pool.build(SPEC, device_index=0, heur_modes=[0])
         assert not pool.broken
     finally:
         pool.shutdown()
     assert candidates == CANDIDATES
     assert built == [(CANDIDATES[i], f"blob{i}".encode()) for i in (1, 2)]
+    assert build_here == []
 
 
 def test_worker_stderr_tail_is_logged(fake_cmd, caplog):
@@ -413,3 +422,15 @@ def test_failed_spawn_stops_the_workers_already_started(fake_cmd, monkeypatch):
         assert not pool._stderr_logs
     finally:
         pool.shutdown()
+
+
+def test_plans_built_but_not_exported_are_returned_to_build_here(fake_cmd):
+    pool = _pool(fake_cmd, "inproc")
+    try:
+        candidates, built, build_here = pool.build(SPEC, device_index=0, heur_modes=[0])
+        assert not pool.broken
+    finally:
+        pool.shutdown()
+    assert candidates == CANDIDATES
+    assert [tactic for tactic, _ in built] == CANDIDATES[1:]
+    assert build_here == [CANDIDATES[0]]

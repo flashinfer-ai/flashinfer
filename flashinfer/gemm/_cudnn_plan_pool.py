@@ -194,10 +194,12 @@ class CudnnPlanBuildPool:
             raise
 
     def build(self, spec: Bf16OverrideGraphSpec, device_index: int, heur_modes):
-        """Return ``(candidates, [(tactic, serialized_plan), ...])``, or ``None``.
+        """Return ``(candidates, [(tactic, serialized_plan), ...], build_here)``, or ``None``.
 
         ``candidates`` is every tactic in plan-index order; the plans follow
-        that order and omit candidates that could not be built.
+        that order and omit candidates that could not be built. ``build_here``
+        lists tactics whose plans built in a worker but could not be exported;
+        the caller builds those itself.
         """
         if os.getpid() != self._owner_pid:
             return None
@@ -264,6 +266,7 @@ class CudnnPlanBuildPool:
 
         candidates = responses[0]["candidates"]
         by_index = {}
+        build_here = set()
         for response in responses:
             if response.get("error"):
                 raise _WorkerFailure(response["error"])
@@ -275,11 +278,19 @@ class CudnnPlanBuildPool:
                 if not 0 <= index < len(candidates) or candidates[index] != tactic:
                     raise _WorkerFailure("plan does not match its candidate")
                 by_index[index] = (tactic, blob)
+            for index in response.get("in_process", ()):
+                if not 0 <= index < len(candidates):
+                    raise _WorkerFailure("plan does not match its candidate")
+                build_here.add(index)
         # No plan at all points at the workers' environment rather than at
         # individual engines, so build in-process instead.
-        if not by_index:
+        if not by_index and not build_here:
             raise _WorkerFailure(f"built none of {len(candidates)} candidate plans")
-        return candidates, [by_index[index] for index in sorted(by_index)]
+        return (
+            candidates,
+            [by_index[index] for index in sorted(by_index)],
+            [candidates[index] for index in sorted(build_here)],
+        )
 
     def _fail(self, exc) -> None:
         self._broken = True

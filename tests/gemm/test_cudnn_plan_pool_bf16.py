@@ -165,7 +165,10 @@ def test_shard_exports_each_tactics_own_plan(pool_off, shards):
     pb, spec, handle, heur = _spec_and_handle(64)
     exported = {}
     for shard in range(shards):
-        candidates, plans = pb.build_shard(spec, handle, heur, (shard, shards))
+        candidates, plans, build_here = pb.build_shard(
+            spec, handle, heur, (shard, shards)
+        )
+        assert build_here == []
         exported.update({tactic: blob for _, tactic, blob in plans})
     assert sorted(exported) == sorted(candidates)
     configs = set()
