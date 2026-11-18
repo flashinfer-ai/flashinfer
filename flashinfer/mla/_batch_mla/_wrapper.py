@@ -667,6 +667,7 @@ class BatchMLAPagedAttentionWrapper:
         self._mla_dec_fp8q_sm90_requested = False
         _fp8q_sm90_prospective = False
         _fp8q_sm90_prospective_state = None
+        _fp8q_sm90_graph_buf_snapshot = None
         if (
             q_data_type == torch.float8_e4m3fn
             and kv_data_type == torch.float8_e4m3fn
@@ -674,6 +675,19 @@ class BatchMLAPagedAttentionWrapper:
             and _get_compute_capability(self.device) == (9, 0)
         ):
             _fp8q_sm90_prospective = True
+            if self._use_cuda_graph:
+                # prepare below rewrites the reused block-table and
+                # sequence-length buffers IN PLACE when the geometry matches.
+                # A graph captured from the previous plan reads those
+                # buffers, so snapshot their contents: if the backend then
+                # rejects this plan, they are restored (see the
+                # plan_from_wrapper call) and the old capture stays valid.
+                _fp8q_bufs = getattr(self, "_mla_dec_fp8q_sm90_bufs", None) or {}
+                _fp8q_sm90_graph_buf_snapshot = {
+                    name: _fp8q_bufs[name].clone()
+                    for name in ("block_table", "seq_lens")
+                    if isinstance(_fp8q_bufs.get(name), torch.Tensor)
+                }
             _mla_dec_fp8q_sm90_prepare(
                 self,
                 plan_metadata,
@@ -774,7 +788,26 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
-        planned_backend = self._backend_type.plan_from_wrapper(plan_args)
+        try:
+            planned_backend = self._backend_type.plan_from_wrapper(plan_args)
+        except Exception:
+            # A rejected replan must leave every buffer a captured graph
+            # reads unchanged. The specialized state was only held in locals
+            # (never published), but prepare rewrote the reused block-table
+            # and sequence-length buffer CONTENTS in place; restore them so
+            # a graph captured from the previous plan does not replay with
+            # the rejected plan's page IDs and lengths.
+            if _fp8q_sm90_graph_buf_snapshot:
+                _fp8q_bufs = getattr(self, "_mla_dec_fp8q_sm90_bufs", None) or {}
+                for _name, _saved in _fp8q_sm90_graph_buf_snapshot.items():
+                    _live = _fp8q_bufs.get(_name)
+                    if (
+                        isinstance(_live, torch.Tensor)
+                        and _live.shape == _saved.shape
+                        and _live.dtype == _saved.dtype
+                    ):
+                        _live.copy_(_saved)
+            raise
         capabilities = planned_backend._plan_capabilities
         if capabilities.is_experimental:
             warn_experimental_backend_once(
@@ -1138,10 +1171,20 @@ class BatchMLAPagedAttentionWrapper:
         _fp8q_first = query[0] if isinstance(query, (tuple, list)) else query
         if isinstance(_fp8q_first, (tuple, list)) and len(_fp8q_first) > 0:
             _fp8q_first = _fp8q_first[0]
-        if getattr(self, "_mla_dec_fp8q_sm90_requested", False) and (
+        _fp8q_route = getattr(self, "_mla_dec_fp8q_sm90_requested", False) and (
             isinstance(_fp8q_first, torch.Tensor)
             and _fp8q_first.dtype == torch.float8_e4m3fn
-        ):
+        )
+        if q_scale is not None and not _fp8q_route:
+            # Only the fp8-Q route consumes q_scale (kernel descale, or
+            # applied during the dequant fallback). Any other plan/query
+            # combination would drop it silently, so reject it here.
+            raise ValueError(
+                "q_scale is only supported for fp8 e4m3 queries on a plan "
+                "that requested the SM90 fp8-query MLA decode route; this "
+                "plan or query would silently ignore it."
+            )
+        if _fp8q_route:
             _fp8q_res, query = _mla_dec_fp8q_sm90_dispatch(
                 self,
                 query,

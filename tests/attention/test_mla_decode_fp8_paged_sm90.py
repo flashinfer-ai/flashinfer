@@ -583,8 +583,14 @@ def test_failed_plan_does_not_publish_specialized_state(monkeypatch):
         )
     assert w._mla_dec_fp8q_sm90_state is None
     assert w._mla_dec_fp8q_sm90_requested is False
-    with pytest.raises(ValueError, match="does not match the planned"):
+    # With the route torn down, q_scale would be silently ignored, so it is
+    # rejected up front ...
+    with pytest.raises(ValueError, match="q_scale is only supported"):
         _run(w, batch2)
+    # ... and without q_scale the call still refuses against the previous
+    # (bf16-query) plan instead of mixing the two plans' state.
+    with pytest.raises(ValueError, match="does not match the planned"):
+        _run(w, batch2, q_scale=None)
     assert _mla_dec_fp8q_sm90_stats()["runs_dispatched"] == 0
 
 
