@@ -978,7 +978,9 @@ def gen_all_modules(
             # fp8 blockscale GEMM (SM90)
             jit_specs.append(gen_fp8_blockscale_gemm_sm90_module())
             jit_specs.append(gen_fp4_quantization_sm90_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm90_module())
+            # The generic module only: the device-specific prebuilt-D variants are
+            # selected at JIT time and must not follow the build host's GPU.
+            jit_specs.append(gen_cutlass_fused_moe_sm90_module(enable_prebuilt_d=False))
             # MonoMoe kernel: single-kernel block-FP8 top-K MoE, Hopper
             # (SM90a) only (uses wgmma.mma_async + TMA).  Hard-specialized to
             # the fixed E=256/N=512/K=2048 shape (BS8).
@@ -1368,8 +1370,10 @@ def copy_built_kernels(
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=False)
     for jit_spec in jit_specs:
-        src = jit_env.FLASHINFER_JIT_DIR / jit_spec.name / f"{jit_spec.name}.so"
-        dst = out_dir / jit_spec.name / f"{jit_spec.name}.so"
+        # module.dll on Windows and <name>.so elsewhere: the file the loader opens.
+        library_name = jit_env.jit_library_name(jit_spec.name)
+        src = jit_env.FLASHINFER_JIT_DIR / jit_spec.name / library_name
+        dst = out_dir / jit_spec.name / library_name
         dst.parent.mkdir(exist_ok=False, parents=False)
         shutil.copy2(src, dst)
 
@@ -1754,8 +1758,6 @@ def main():
     config = get_default_config()
     build_dir = jit_env.FLASHINFER_WORKSPACE_DIR
     out_dir: Optional[Path] = None
-
-    # Override with command line arguments
     if args.out_dir:
         out_dir = Path(args.out_dir)
     if args.build_dir:

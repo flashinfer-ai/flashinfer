@@ -22,8 +22,12 @@ def test_quantized_masked_combine_graph(combine, tokens, hidden, topk, weighted)
 
     pkg.require_sm107_dsl()
     pkg.bootstrap_paths()
-    from sources.kernel_src.rubin.inference.mega.topk_reduce import TopkReduce
-    from sources.quant_def import CombineFormat
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+        TopkReduce,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+        CombineFormat,
+    )
 
     experts = 128
     fp4 = combine == "nvfp4"

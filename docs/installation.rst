@@ -50,7 +50,7 @@ FlashInfer provides three packages:
     pip install flashinfer-python
     flashinfer download-kernels
 
-This eliminates compilation and downloading overhead at runtime.
+This reduces compilation and downloading overhead at runtime.
 ``flashinfer download-kernels`` installs the ``flashinfer-cubin`` and
 ``flashinfer-jit-cache`` wheels that match the installed ``flashinfer-python``
 version and the CUDA version of the installed PyTorch. By default it installs
