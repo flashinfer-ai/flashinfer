@@ -598,7 +598,8 @@ def _resolve(
         )
     if a.ndim != 3 or b.ndim != 3:
         raise ValueError("a must have shape (B, M, K) and b must have shape (B, N, K)")
-    B, M, K = a.shape
+    # Plain ints (a SymInt never reaches the _PLANS / _LAYOUTS keys).
+    B, M, K = map(int, a.shape)
     N = int(b.shape[1])
     if min(B, M, N, K) <= 0 or M % BLOCK or N % BLOCK or K % BLOCK:
         raise ValueError(
@@ -931,7 +932,19 @@ def _take_public_admission() -> Optional[tuple[Any, ...]]:
     """What this public call's admission check left (taken once), or ``None``
     (``skip_check=True``, or no check ran in this call); closes the call.  The
     public API takes it before anything else of its run, so nothing is left
-    behind when the run then fails."""
+    behind when the run then fails.
+
+    An entry remains only when a public call fails after its ``bypass`` hook
+    opened it and before its body took it: ``_OPEN`` when the call fails
+    before its admission check (argument binding, backend or compute
+    capability rejected), or this call's admission when it fails between the
+    check and the body.  Either is harmless: only this function reads the
+    entry, and only the body of a public ``backend="cake"`` call calls it,
+    after that call's hook replaced any entry with ``_OPEN`` (the hook runs
+    on every call, ``skip_check=True`` too).  A check outside a public call
+    after a leftover ``_OPEN`` leaves an admission the same way, replaced by
+    the next public call's hook.  :func:`run_batch_deepgemm_fp8_nt_groupwise`
+    never reads the entry."""
     state = _PUBLIC
     entry = state.entry
     state.entry = None
@@ -1487,14 +1500,16 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor
     after it is freed faults on replay, so keep it alive as long as such a graph.
-    For an ``nn.Parameter`` ``b`` (or a subclass of it) the homed copy is
-    returned as a parameter of the same class with the same ``requires_grad``
-    and a shallow copy of ``b.__dict__`` (the instance attributes a framework
-    may have attached, such as a weight loader); the subclass's constructor is
-    not called.  Every alias of the whole returned tensor is homed as well (an
-    ``nn.Parameter`` over it, ``detach()``, ``.data``, a view of the same
-    shape, and a tensor given it as ``.data``); a view of part of it is not:
-    pass the whole tensor.
+    For an ``nn.Parameter`` ``b`` (or a plain Python subclass of it) the homed
+    copy is returned as a parameter of the same class with the same
+    ``requires_grad`` and a shallow copy of ``b.__dict__`` (the instance
+    attributes a framework may have attached, such as a weight loader); the
+    subclass's constructor is not called.  A tensor subclass with its own
+    ``__torch_dispatch__`` (a wrapper subclass whose data lives in inner
+    tensors), a parameter or not, is returned unhomed.  Every alias of the
+    whole returned tensor is homed as well (an ``nn.Parameter`` over it,
+    ``detach()``, ``.data``, a view of the same shape, and a tensor given it
+    as ``.data``); a view of part of it is not: pass the whole tensor.
     """
     if not isinstance(b, torch.Tensor) or b.device.type != "cuda" or b.ndim != 3:
         raise ValueError("b must be a CUDA torch.Tensor of shape (B, N, K)")
@@ -1504,6 +1519,10 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     if g_cut is not None and not 0 <= int(g_cut) <= groups:
         raise ValueError(f"g_cut must be in [0, {groups}], got {g_cut}")
     if b.dtype != torch.float8_e4m3fn:
+        return b
+    if type(b).__torch_dispatch__ is not torch.Tensor.__torch_dispatch__:
+        # A __torch_dispatch__ (wrapper) subclass keeps its data in inner
+        # tensors, which a homed copy of the outer tensor would not carry.
         return b
     index = _device_index(b.device)
     if cake_locality._stream_capturing(index):

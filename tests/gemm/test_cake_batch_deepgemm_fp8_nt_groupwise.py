@@ -1463,7 +1463,8 @@ def test_localized_weights_homed_through_full_aliases():
     shape, and ``localize_weights`` of an ``nn.Parameter``); a view of part of it
     runs the whole-GPU program.  A tensor whose ``.data`` is replaced is homed
     as its new data is, and ``localize_weights`` of a parameter subclass keeps
-    the subclass and its attributes."""
+    the subclass and its attributes; a ``__torch_dispatch__`` wrapper subclass
+    (a parameter too) is returned unhomed."""
     device, table = _require_domain()
     cell = ((4096, 7168), 64, 1)
     _require_routed(cell, device, table)
@@ -1537,6 +1538,40 @@ def test_localized_weights_homed_through_full_aliases():
     assert localized is not loaded
     assert route(localized) == DOMAIN_SERVING_ROUTE
     assert torch.equal(localized.view(torch.uint8), b.view(torch.uint8))
+
+    # A tensor subclass with its own __torch_dispatch__ (its data in an inner
+    # tensor), as a parameter too, is returned unhomed.
+    class Wrapped(torch.Tensor):
+        @staticmethod
+        def __new__(cls, inner):
+            return torch.Tensor._make_wrapper_subclass(
+                cls,
+                inner.shape,
+                strides=inner.stride(),
+                dtype=inner.dtype,
+                device=inner.device,
+            )
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        @classmethod
+        def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+            def unwrap(x):
+                return x.inner if isinstance(x, Wrapped) else x
+
+            result = func(
+                *[unwrap(x) for x in args],
+                **{key: unwrap(x) for key, x in (kwargs or {}).items()},
+            )
+            return Wrapped(result) if func is torch.ops.aten.detach.default else result
+
+    wrapped = Wrapped(b)
+    wrapped_parameter = torch.nn.Parameter(wrapped, requires_grad=False)
+    assert isinstance(wrapped_parameter, torch.nn.Parameter)
+    assert isinstance(wrapped_parameter, Wrapped)
+    for weights in (wrapped, wrapped_parameter):
+        assert localize_weights(weights) is weights
 
 
 @_packed_serving
@@ -2177,7 +2212,8 @@ def test_public_call_resolves_once(monkeypatch):
     the run of the public call that made it, for operands of the checked
     fingerprint: a check outside a public call or one whose call failed leaves
     nothing a direct run or a ``skip_check=True`` call takes, so an operand
-    changed since (``a.data`` strided or misaligned) is validated again."""
+    changed since (``a.data`` strided or misaligned) is validated again.
+    ``backend="cake"`` passed by position resolves once per call too."""
     import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
 
     _require_packed()
@@ -2225,6 +2261,30 @@ def test_public_call_resolves_once(monkeypatch):
             torch.cuda.synchronize()
             _assert_valid_rows_close(out, reference, masked_m)
     assert len(selections) == 1
+    # backend="cake" passed by position (the 10th argument): the bypass hook
+    # reads it there too, so the call still resolves its problem once.
+    for given_out in (True, False):
+        resolves.clear()
+        out = batch_deepgemm_fp8_nt_groupwise(
+            a,
+            b,
+            a_packed,
+            b_packed,
+            masked_m,
+            expected_m,
+            (1, 128, 128),
+            torch.empty(
+                (a.shape[0], a.shape[1], nk[0]), dtype=torch.bfloat16, device=device
+            )
+            if given_out
+            else None,
+            None,
+            "cake",
+        )
+        assert len(resolves) == 1
+        assert module._PUBLIC.entry is None
+        torch.cuda.synchronize()
+        _assert_valid_rows_close(out, reference, masked_m)
 
     def check(*operands, out=None):
         # The backend_requirement checker of backend="cake", as called by the

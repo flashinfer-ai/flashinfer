@@ -12916,6 +12916,11 @@ def _open_batch_deepgemm_fp8_nt_groupwise_cake_call(*args, **kwargs) -> bool:
     ``bypass`` hook of its ``backend_requirement``; never bypasses): with
     ``backend="cake"`` it opens the call, so the problem the admission check of
     this call resolves is reused by the run of this call only."""
+    # Why the bypass hook: backend_requirement runs it first on every call
+    # (skip_check=True too), before the admission check, and it is the only
+    # per-call point there.  It returns False, so the wrapper still runs every
+    # check; it only marks this call.  It sees the arguments as passed, so
+    # ``backend`` passed by position (the 10th argument) is read as well.
     backend = kwargs["backend"] if "backend" in kwargs else (args[9:10] or [None])[0]
     if backend == "cake":
         _cake_batch_deepgemm_fp8()._open_public_call()
@@ -12927,6 +12932,8 @@ def _open_batch_deepgemm_fp8_nt_groupwise_cake_call(*args, **kwargs) -> bool:
         "deepgemm": _check_batch_deepgemm_fp8_nt_groupwise_deepgemm,
         "cake": _check_batch_deepgemm_fp8_nt_groupwise_cake,
     },
+    # Never bypasses (returns False): opens a backend="cake" call before its
+    # admission check, so the check's resolved problem is reused by this call.
     bypass=_open_batch_deepgemm_fp8_nt_groupwise_cake_call,
 )
 @flashinfer_api(trace=batch_deepgemm_fp8_nt_groupwise_trace)
