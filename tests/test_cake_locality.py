@@ -313,6 +313,11 @@ def test_split_empty_homes_each_side(parts):
         cut=cut,
     )
     assert cl.homing(tensor[5:]) == home  # a view resolves through its storage
+    # The returned tensor carries its record; its views and copies do not.
+    assert cl.tensor_homing(tensor) == home
+    assert cl.tensor_homing(tensor[5:]) is None
+    assert cl.tensor_homing(tensor[:]) is None
+    assert cl.tensor_homing(tensor.clone()) is None
     assert cl.homing(tensor.data_ptr()) == home
     assert cl.homing(tensor.data_ptr() + 4) is None
     # The whole range reads back what was written across the cut.

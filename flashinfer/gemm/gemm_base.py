@@ -10418,9 +10418,11 @@ _BMM_MXFP8_CUTE_DSL_TUNING_CONFIG = TuningConfig(
         ConstraintSpec(
             2,
             0,
-            lambda shapes: shapes[0][0]
-            * _mxfp8_swizzled_scale_len(
-                shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+            lambda shapes: (
+                shapes[0][0]
+                * _mxfp8_swizzled_scale_len(
+                    shapes[0][1], shapes[0][2], SfLayout.layout_128x4
+                )
             ),
         ),
         ConstraintSpec(4, 1, lambda shapes: shapes[0][1]),
@@ -12857,12 +12859,14 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     geometries the architecture's route chain owns, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
     operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
     UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
-    output.  Every other problem raises through ``backend_requirement``.
+    output.  Every other problem raises through ``backend_requirement``.  The
+    resolved problem is reused by the run of the same call, so a call resolves
+    it once.
     """
     del backend
-    from .cake_batch_deepgemm_fp8 import check_batch_deepgemm_fp8_nt_groupwise_cake
+    from .cake_batch_deepgemm_fp8 import _admit_public_call
 
-    return check_batch_deepgemm_fp8_nt_groupwise_cake(
+    return _admit_public_call(
         a,
         b,
         a_scale,

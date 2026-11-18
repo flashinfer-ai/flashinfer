@@ -40,6 +40,8 @@ program.
 from __future__ import annotations
 
 import contextlib
+import threading
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -349,18 +351,54 @@ class _Problem:
     sm_table: Any = None
 
 
+# Route decisions already made: (arch, SM count, packed scales, B, M, N, K,
+# expected_m, die SM counts of homed ``b`` or None) -> RoutePlan.  The decision
+# reads only these, so a call re-validates its tensors and reuses the decision.
+# At most PLAN_LIMIT entries; the oldest is dropped past it.
+PLAN_LIMIT = 4096
+_PLANS: dict[tuple[Any, ...], RoutePlan] = {}
+# (arch, program) -> (FFI entry, argument plan) of a loaded generated program.
+_ENTRIES: dict[tuple[str, str], tuple[Callable[..., Any], list[list[str]]]] = {}
+
+
+def _remember_plan(key: tuple[Any, ...], plan: RoutePlan) -> None:
+    while len(_PLANS) >= PLAN_LIMIT:
+        try:
+            del _PLANS[next(iter(_PLANS))]
+        except (KeyError, RuntimeError, StopIteration):  # another thread evicted it
+            break
+    _PLANS[key] = plan
+
+
+def _program_entry(
+    arch: str, program: str
+) -> tuple[Callable[..., Any], list[list[str]]]:
+    cached = _ENTRIES.get((arch, program))
+    if cached is None:
+        record = PROGRAMS[program]
+        entry = getattr(
+            load_cake_batch_deepgemm_fp8_module(module_name(arch, program)),
+            record["ffi_entry"],
+        )
+        cached = _ENTRIES.setdefault(
+            (arch, program), (entry, ARG_PLANS[record["arg_plan"]])
+        )
+    return cached
+
+
 def _domain_homing(
     b: torch.Tensor, index: int, groups: int
 ) -> Optional[tuple[int, Any]]:
-    """``(g_cut, sm_table)`` when ``b`` is a whole :func:`localize_weights`
-    allocation (not a view of part of one) on a device with a probed SM table, else
-    ``None``.  ``g_cut`` is the group of ``b`` nearest to its die cut (the twin's
-    result does not depend on it)."""
-    # The registry first: it builds nothing when no split allocation was made.
-    homed = cake_locality.homing(b)
+    """``(g_cut, sm_table)`` when ``b`` is the very tensor :func:`localize_weights`
+    returned (the whole allocation; not a view or a copy of it) on a device with a
+    probed SM table, else ``None``.  ``g_cut`` is the group of ``b`` nearest to its
+    die cut (the twin's result does not depend on it).  Reads the record the
+    allocation carries (:func:`flashinfer.cake_locality.tensor_homing`), not the
+    allocation registry."""
+    homed = cake_locality.tensor_homing(b)
     if homed is None or homed.device_index != index:
         return None
-    if int(b.data_ptr()) != homed.base or b.numel() * b.element_size() != homed.nbytes:
+    if b.numel() * b.element_size() != homed.nbytes:
         return None
     table = cake_locality.sm_table(index)
     if table is None:
@@ -475,16 +513,14 @@ def _resolve(
             strides=(N * cols, 1, N),
         )
         domain = _domain_homing(b, index, B) if arch == DOMAIN_ARCH else None
-        plan = serving_plan(
-            arch,
-            sm_count,
-            B,
-            M,
-            N,
-            K,
-            expected_m,
-            counts=None if domain is None else domain[1].counts,
-        )
+        counts = None if domain is None else domain[1].counts
+        key = (arch, sm_count, True, B, M, N, K, expected_m, counts)
+        plan = _PLANS.get(key)
+        if plan is None:
+            plan = serving_plan(arch, sm_count, B, M, N, K, expected_m, counts=counts)
+            for stage in plan.stages:
+                module_name(arch, stage.program)
+            _remember_plan(key, plan)
         if plan.route == DOMAIN_SERVING_ROUTE:
             assert domain is not None
             g_cut, table = domain
@@ -509,14 +545,20 @@ def _resolve(
             dtype=torch.float32,
             device=device,
         )
-        plan = select_route(arch, sm_count, B, M, N, K, expected_m)
-        if plan is None:
-            raise ValueError(
-                f"the Cake batch DeepGEMM FP8 dispatcher owns no route for B={B}, M={M}, N={N}, K={K}, "
-                f"expected_m={expected_m} on {arch}"
-            )
-    for stage in plan.stages:
-        module_name(arch, stage.program)
+        key = (arch, sm_count, False, B, M, N, K, expected_m, None)
+        cached = _PLANS.get(key)
+        if cached is None:
+            selected = select_route(arch, sm_count, B, M, N, K, expected_m)
+            if selected is None:
+                raise ValueError(
+                    f"the Cake batch DeepGEMM FP8 dispatcher owns no route for B={B}, M={M}, N={N}, K={K}, "
+                    f"expected_m={expected_m} on {arch}"
+                )
+            for stage in selected.stages:
+                module_name(arch, stage.program)
+            _remember_plan(key, selected)
+            cached = selected
+        plan = cached
     return _Problem(
         arch,
         sm_count,
@@ -564,6 +606,99 @@ def check_batch_deepgemm_fp8_nt_groupwise_cake(
         scale_granularity_mnk=scale_granularity_mnk,
     )
     return True
+
+
+class _CheckedCall(threading.local):
+    """The problem the public API's admission check resolved last in this thread,
+    for the run of the same call (see :func:`_admit_public_call`)."""
+
+    entry: Optional[tuple[Any, ...]] = None
+
+
+_CHECKED = _CheckedCall()
+
+
+def _admit_public_call(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    *,
+    scale_granularity_mnk: tuple[int, int, int],
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+) -> bool:
+    """:func:`check_batch_deepgemm_fp8_nt_groupwise_cake` for the public API, whose
+    run of the same call follows in this thread: the resolved problem is left for
+    :func:`run_batch_deepgemm_fp8_nt_groupwise`, which takes it when it gets the
+    very same operands, so one public call resolves its problem once.  Only weak
+    references to the operands are kept."""
+    _CHECKED.entry = None
+    problem = _resolve(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out=out,
+        out_dtype=out_dtype,
+        scale_granularity_mnk=scale_granularity_mnk,
+    )
+    _CHECKED.entry = (
+        weakref.ref(a),
+        weakref.ref(b),
+        weakref.ref(a_scale),
+        weakref.ref(b_scale),
+        weakref.ref(masked_m),
+        None if out is None else weakref.ref(out),
+        expected_m,
+        problem,
+    )
+    return True
+
+
+def _take_admitted(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    out: torch.Tensor,
+) -> Optional[_Problem]:
+    """The problem :func:`_admit_public_call` resolved for exactly these operands
+    (``out``: the same tensor, or a valid output when the check had none), or
+    ``None``.  Takes it at most once."""
+    entry = _CHECKED.entry
+    if entry is None:
+        return None
+    _CHECKED.entry = None
+    ref_a, ref_b, ref_as, ref_bs, ref_m, ref_out, checked_m, problem = entry
+    if (
+        ref_a() is not a
+        or ref_b() is not b
+        or ref_as() is not a_scale
+        or ref_bs() is not b_scale
+        or ref_m() is not masked_m
+        or type(expected_m) is not int
+        or expected_m != checked_m
+    ):
+        return None
+    if ref_out is None:
+        # The check saw no output: the public API allocated this one since.
+        _require_tensor(
+            out,
+            "out",
+            shape=(problem.B, problem.M, problem.N),
+            dtype=torch.bfloat16,
+            device=problem.device,
+        )
+    elif ref_out() is not out:
+        return None
+    return problem
 
 
 def is_batch_deepgemm_fp8_nt_groupwise_cake_available(device: torch.device) -> bool:
@@ -710,7 +845,9 @@ def _allocate_workspace(
     if DOMAIN_COUNTERS[0] in plan.workspaces:
         pair: tuple[torch.Tensor, ...]
         if launch_now:
-            pair = cake_locality.launch_counters(PAIR_COUNTER_WORDS, device)
+            pair = cake_locality.launch_counters(
+                PAIR_COUNTER_WORDS, _device_index(device)
+            )
         elif torch.cuda.is_current_stream_capturing():
             # Locality-domain memory is not allocated under capture: zeroed
             # counters from the capture's pool (same bits, unhomed claims).
@@ -941,57 +1078,7 @@ def _prepare(
             capture_id = cake_locality._capture_id(_device_index(device))
     else:
         _check_workspace(plan, workspace, device)
-    launches = []
-    if problem.packed_scales:
-        (stage,) = plan.stages
-        program = PROGRAMS[stage.program]
-        entry = getattr(
-            load_cake_batch_deepgemm_fp8_module(
-                module_name(problem.arch, stage.program)
-            ),
-            program["ffi_entry"],
-        )
-        bindings = _serving_bindings(
-            problem, a, b, a_scale, b_scale, masked_m, out, workspace
-        )
-        launches.append(
-            (
-                entry,
-                bind_named_arguments(
-                    ARG_PLANS[program["arg_plan"]],
-                    bindings,
-                    stage.grid,
-                    program=stage.program,
-                ),
-            )
-        )
-    else:
-        bindings = _family_bindings(
-            problem, a, b, a_scale, b_scale, masked_m, out, workspace
-        )
-        for stage in plan.stages:
-            program = PROGRAMS[stage.program]
-            entry = getattr(
-                load_cake_batch_deepgemm_fp8_module(
-                    module_name(problem.arch, stage.program)
-                ),
-                program["ffi_entry"],
-            )
-            positional = tuple(
-                bindings[item] if isinstance(item, str) else int(item)
-                for item in stage.args
-            )
-            launches.append(
-                (
-                    entry,
-                    bind_arguments(
-                        ARG_PLANS[program["arg_plan"]],
-                        positional,
-                        stage.grid,
-                        program=stage.program,
-                    ),
-                )
-            )
+    launches = _bind_launches(problem, a, b, a_scale, b_scale, masked_m, out, workspace)
     return PreparedBatchDeepGemmFp8NtGroupwise(
         route=plan.route,
         parent=plan.parent,
@@ -1006,6 +1093,54 @@ def _prepare(
         capture_only=capture_only,
         capture_id=capture_id,
     )
+
+
+def _bind_launches(
+    problem: _Problem,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    out: torch.Tensor,
+    workspace: dict[str, torch.Tensor],
+) -> list[tuple[Callable[..., Any], tuple[Any, ...]]]:
+    """``(FFI entry, arguments)`` of each kernel of the problem's route."""
+    plan = problem.plan
+    launches = []
+    if problem.packed_scales:
+        (stage,) = plan.stages
+        entry, arg_plan = _program_entry(problem.arch, stage.program)
+        bindings = _serving_bindings(
+            problem, a, b, a_scale, b_scale, masked_m, out, workspace
+        )
+        launches.append(
+            (
+                entry,
+                bind_named_arguments(
+                    arg_plan, bindings, stage.grid, program=stage.program
+                ),
+            )
+        )
+    else:
+        bindings = _family_bindings(
+            problem, a, b, a_scale, b_scale, masked_m, out, workspace
+        )
+        for stage in plan.stages:
+            entry, arg_plan = _program_entry(problem.arch, stage.program)
+            positional = tuple(
+                bindings[item] if isinstance(item, str) else int(item)
+                for item in stage.args
+            )
+            launches.append(
+                (
+                    entry,
+                    bind_arguments(
+                        arg_plan, positional, stage.grid, program=stage.program
+                    ),
+                )
+            )
+    return launches
 
 
 def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tensor:
@@ -1126,19 +1261,32 @@ def run_batch_deepgemm_fp8_nt_groupwise(
     by ``torch.cuda.ExternalStream`` must not be destroyed while calls on it are
     in flight.  A prepared launch (:func:`prepare_batch_deepgemm_fp8_nt_groupwise`)
     keeps its own pair.
+
+    Called by the public API after its admission check, the call reuses the
+    problem that check resolved (same operands, same thread) instead of
+    resolving it again; the route decision itself is remembered per problem
+    geometry, device and homing, so a call validates its tensors and makes no
+    other per-call decision.
     """
-    return _prepare(
-        a,
-        b,
-        a_scale,
-        b_scale,
-        masked_m,
-        expected_m,
-        out=out,
-        workspace=None,
-        scale_granularity_mnk=(1, BLOCK, BLOCK),
-        launch_now=True,
-    ).launch()
+    problem = _take_admitted(a, b, a_scale, b_scale, masked_m, expected_m, out)
+    if problem is None:
+        problem = _resolve(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            masked_m,
+            expected_m,
+            out=out,
+            out_dtype=None,
+            scale_granularity_mnk=(1, BLOCK, BLOCK),
+        )
+    workspace = _allocate_workspace(problem.plan, problem.device, launch_now=True)
+    launches = _bind_launches(problem, a, b, a_scale, b_scale, masked_m, out, workspace)
+    with torch.cuda.device(problem.device), tvm_ffi.use_torch_stream():
+        for entry, arguments in launches:
+            entry(*arguments)
+    return out
 
 
 __all__ = [

@@ -1506,6 +1506,7 @@ def test_localize_weights_refuses_what_could_run_slower(monkeypatch):
     )
     homed = localize_weights(weights)
     assert homed is not weights and cake_locality.homing(homed) is not None
+    assert cake_locality.tensor_homing(homed) == cake_locality.homing(homed)
     del homed
     with pytest.raises(ValueError, match="g_cut"):
         localize_weights(weights, groups + 1)
@@ -1710,6 +1711,8 @@ def test_domain_fallbacks_take_the_whole_route(monkeypatch):
     for cells in ({}, {device_sm_count(device): {}}):
         with monkeypatch.context() as patch:
             patch.setattr(module, "DOMAIN_SERVING_CELLS", cells)
+            # Route decisions made under the patched cells stay in this dict.
+            patch.setattr(module, "_PLANS", {})
             assert localize_weights(b) is b
             prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
                 a, homed, a_packed, b_packed, masked_m, expected_m
@@ -1929,8 +1932,11 @@ def test_domain_public_call_reuses_counters(cell):
 
 @_host_only
 def test_domain_homing_needs_the_whole_allocation(monkeypatch):
-    """Only the whole homed allocation plans as homed: a view of part of it (a
-    slice of its groups) and another device's tensor plan as unhomed."""
+    """Only the very tensor of the homed allocation plans as homed, read from the
+    record it carries (no registry query): a view of all or part of it, a copy,
+    another device's tensor and a tensor whose storage moved plan as unhomed."""
+    import copy
+
     import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
 
     b = torch.empty((4, 8, 16), dtype=torch.uint8)
@@ -1938,17 +1944,99 @@ def test_domain_homing_needs_the_whole_allocation(monkeypatch):
     record = cake_locality.Homing(
         device_index=0, base=base, nbytes=b.numel(), size=b.numel(), cut=2 * 8 * 16
     )
+    setattr(b, cake_locality._HOMING_ATTR, record)
     table = cake_locality.SmTable(device_index=0, counts=(106, 106), entries=None)
 
-    def homing(tensor):
-        return record if int(tensor.untyped_storage().data_ptr()) == base else None
+    def registry(tensor_or_ptr):
+        raise AssertionError("planning must not query the allocation registry")
 
-    monkeypatch.setattr(cake_locality, "homing", homing)
+    monkeypatch.setattr(cake_locality, "homing", registry)
     monkeypatch.setattr(cake_locality, "sm_table", lambda device=None: table)
+    assert cake_locality.tensor_homing(b) is record
     assert module._domain_homing(b, 0, 4) == (2, table)
     assert module._domain_homing(b[:2], 0, 2) is None
     assert module._domain_homing(b[1:], 0, 3) is None
+    assert module._domain_homing(b[:], 0, 4) is None
+    assert module._domain_homing(b.view(4, 8, 16), 0, 4) is None
+    assert module._domain_homing(b.clone(), 0, 4) is None
+    assert module._domain_homing(copy.deepcopy(b), 0, 4) is None
     assert module._domain_homing(b, 1, 4) is None
+    moved = torch.empty((4, 8, 16), dtype=torch.uint8)
+    setattr(moved, cake_locality._HOMING_ATTR, record)
+    assert module._domain_homing(moved, 0, 4) is None
+
+
+@_packed_serving
+def test_public_call_resolves_once(monkeypatch):
+    """The public API's call resolves its problem once (its admission check's
+    resolution is reused by its run), and a repeated call reuses the route
+    decision: no route selection runs again."""
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    _require_packed()
+    device = torch.device("cuda")
+    nk, groups, expected_m = (4096, 7168), 32, 1
+    a, b, _, _, a_packed, b_packed, masked_m, reference, _ = _serving_problem(
+        nk, groups, expected_m
+    )
+    resolves = []
+    selections = []
+    resolve = module._resolve
+    plan = module.serving_plan
+
+    def counted_resolve(*args, **kwargs):
+        resolves.append(1)
+        return resolve(*args, **kwargs)
+
+    def counted_plan(*args, **kwargs):
+        selections.append(1)
+        return plan(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_resolve", counted_resolve)
+    monkeypatch.setattr(module, "serving_plan", counted_plan)
+    monkeypatch.setattr(module, "_PLANS", {})
+    for _ in range(3):
+        for given_out in (True, False):
+            resolves.clear()
+            out = batch_deepgemm_fp8_nt_groupwise(
+                a,
+                b,
+                a_packed,
+                b_packed,
+                masked_m,
+                expected_m,
+                out=torch.empty(
+                    (a.shape[0], a.shape[1], nk[0]),
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                if given_out
+                else None,
+                backend="cake",
+            )
+            assert len(resolves) == 1
+            torch.cuda.synchronize()
+            _assert_valid_rows_close(out, reference, masked_m)
+    assert len(selections) == 1
+    # Another problem's operands do not take the problem a check left behind.
+    module._admit_public_call(
+        a,
+        b,
+        a_packed,
+        b_packed,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk=(1, 128, 128),
+        out=None,
+        out_dtype=None,
+    )
+    assert (
+        module._take_admitted(
+            a, b.clone(), a_packed, b_packed, masked_m, expected_m, out=None
+        )
+        is None
+    )
+    assert module._CHECKED.entry is None
 
 
 @_packed_serving

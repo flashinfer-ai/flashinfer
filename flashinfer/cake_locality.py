@@ -37,7 +37,9 @@ caller then takes its whole-GPU route.
 :func:`split_empty` reserves one virtual address range and backs ``[0, cut)``
 with memory of die 0 and ``[cut, size)`` with memory of die 1. The allocation is
 in a registry keyed by its base pointer from allocation until its last tensor is
-freed; :func:`homing` reads it. Freeing it unmaps the memory, so a CUDA graph
+freed; :func:`homing` reads it. The tensor :func:`split_empty` returns also
+carries its :class:`Homing` record, which :func:`tensor_homing` reads without a
+registry query; a view or a copy of it does not carry the record. Freeing it unmaps the memory, so a CUDA graph
 that still reads a freed allocation faults on its next replay: keep the tensor
 alive as long as any graph that reads it.
 
@@ -85,6 +87,7 @@ __all__ = [
     "sm_table",
     "split_empty",
     "split_units",
+    "tensor_homing",
 ]
 
 # The SM table a twin takes by value: one int32 word per SM id.
@@ -483,7 +486,10 @@ def split_empty(
     tensor and all its views are freed: the device is synchronized, both parts are
     unmapped and released, and the allocation leaves the :func:`homing` registry.
     Allocate and free outside CUDA graph capture; a graph that still reads the
-    tensor after it is freed faults on replay."""
+    tensor after it is freed faults on replay.
+
+    The returned tensor carries its :class:`Homing` record (see
+    :func:`tensor_homing`); its views and copies do not."""
     import math
 
     import torch
@@ -508,7 +514,27 @@ def split_empty(
     raw = _module().cake_locality_split_empty(nbytes, cut, index)
     if not isinstance(raw, torch.Tensor):
         raw = torch.from_dlpack(raw)
-    return raw.view(dtype).view(shape)
+    tensor = raw.view(dtype).view(shape)
+    record = homing(tensor)
+    if record is not None:
+        setattr(tensor, _HOMING_ATTR, record)
+    return tensor
+
+
+# The attribute of the tensor split_empty returns that holds its Homing record.
+_HOMING_ATTR = "_flashinfer_cake_homing"
+
+
+def tensor_homing(tensor: Any) -> Homing | None:
+    """The :class:`Homing` of ``tensor`` when it is the very tensor
+    :func:`split_empty` returned (it still starts at the allocation's base), else
+    ``None``: a view, a copy, or any other tensor, even one over the same memory,
+    gives ``None``. Reads an attribute of the tensor, not the registry, so it
+    costs no call into the locality module."""
+    record = getattr(tensor, _HOMING_ATTR, None)
+    if record is None or int(tensor.data_ptr()) != record.base:
+        return None
+    return record
 
 
 def homing(tensor_or_ptr: Any) -> Homing | None:
@@ -732,6 +758,14 @@ def _refill_capture_reserve(device_index: int, words: int) -> None:
     for, and no lock is held while waiting. An allocation that could not be homed
     for lack of memory is not published (a later refill tries again)."""
     state = _counter_state(device_index)
+    reserve = state.reserves.get(words)
+    if reserve is not None and (
+        reserve.refilling
+        or 2 * len(reserve.free) > max(CAPTURE_RESERVE, 2 * reserve.peak)
+    ):
+        # Full enough (read without the lock; the check below under the lock
+        # decides): the steady state of an eager call takes no lock here.
+        return
     with state.lock:
         reserve = state.reserves.setdefault(words, _CaptureReserve())
         target = max(CAPTURE_RESERVE, 2 * reserve.peak)
