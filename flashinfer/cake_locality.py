@@ -490,8 +490,10 @@ def split_empty(
 
     ``cut_bytes`` is ``0`` (all on die 1), the tensor's byte size (all on die 0), or
     a multiple of :func:`granularity` between them. The memory is freed when the
-    tensor and all its views are freed: the device is synchronized, both parts are
-    unmapped and released, and the allocation leaves the :func:`homing` registry.
+    tensor and all its views are freed: the context that made the allocation and
+    the context that frees it are synchronized, both parts are unmapped and
+    released, and the allocation leaves the :func:`homing` registry. Work of any
+    other context that reads the tensor must be complete before then.
     Allocate and free outside CUDA graph capture; a graph that still reads the
     tensor after it is freed faults on replay.
 
@@ -596,15 +598,17 @@ def pointer_domain(ptr: int, device: Any = None) -> int:
 
 # Devices whose locality-domain pools refused (a LocalityDomainError, which a
 # later call would repeat): their counters are ordinary tensors from then on. A
-# pool that ran out of memory (see _pool_out_of_memory) is not a refusal: a later
-# call tries the pools again.
+# pool that ran out of memory (see _pool_out_of_memory), also at PyTorch's own
+# memory limit, is not a refusal: a later call tries the pools again.
 _POOLS_UNAVAILABLE: set[int] = set()
 
 
 def _pool_out_of_memory(exc: BaseException) -> bool:
     """Whether a locality-domain pool error is exhaustion, which a later call may
     not meet: a ``torch.OutOfMemoryError``, or a ``LocalityDomainError`` from the
-    pools' first allocation whose allocator error is ``CUDA_ERROR_OUT_OF_MEMORY``.
+    pools' first allocation whose allocator error is ``CUDA_ERROR_OUT_OF_MEMORY``
+    or that carries no allocator error at all (PyTorch refused the request, for
+    example at its per-process memory limit, before the pool's allocator ran).
     That first allocation reports every allocator failure as an out-of-memory
     cause, so its other driver errors (``CUDA_ERROR_NOT_SUPPORTED``,
     ``CUDA_ERROR_INVALID_VALUE``, ...) are refusals."""
@@ -612,9 +616,12 @@ def _pool_out_of_memory(exc: BaseException) -> bool:
 
     if isinstance(exc, torch.OutOfMemoryError):
         return True
-    return isinstance(
-        exc.__cause__, torch.OutOfMemoryError
-    ) and "CUDA_ERROR_OUT_OF_MEMORY" in str(exc)
+    if not isinstance(exc.__cause__, torch.OutOfMemoryError):
+        return False
+    text = str(exc)
+    return "CUDA_ERROR_OUT_OF_MEMORY" in text or text.endswith(
+        "allocation smoke test failed"
+    )
 
 
 def _allocate_pair(words: int, device_index: int) -> tuple[tuple[Any, Any], bool]:

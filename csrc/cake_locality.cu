@@ -21,7 +21,6 @@
 // registry keyed by its base pointer until then.
 
 #include <cuda.h>
-#include <cuda_runtime_api.h>
 #include <tvm/ffi/container/array.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
@@ -64,46 +63,43 @@ std::string CuError(CUresult result) {
 }
 
 // Makes `device` current (and its primary context exist) for the scope; on exit
-// the thread's state is as it was on entry.
+// the thread's state is as it was on entry. Only the driver is used: the
+// runtime's selected device of the thread is never changed.
 //
-// With a current context on entry, the runtime selects `device` when it is not
-// the caller's device, and the caller's context is made current again on exit
-// (also a non-primary one).
-//
-// Without a current context on entry (for example a garbage-collection thread)
-// the runtime is not used at all: `device`'s primary context is retained through
-// the driver and made current, and on exit the thread has no current context
-// again. The runtime's selected device of the thread is never changed; changing
-// it would leave the runtime reporting `device` while its next call binds device
-// 0's primary context, and callers that skip cudaSetDevice when the reported
-// device already matches would then allocate on device 0. The first primary
-// context reference taken this way for a device is kept for the process
-// lifetime, so the context (and the context id a split records) outlives the
-// scope even when the runtime holds no reference to it.
+// When the caller's current context (also a non-primary one) is on `device`, it
+// stays current. Otherwise (another device's context, or none, for example in a
+// garbage-collection thread) `device`'s primary context is retained through the
+// driver and made current, and on exit the caller's context is made current
+// again (or none). Selecting `device` through the runtime instead would leave
+// the runtime reporting `device` after a caller that pushed its own context pops
+// it, while its next call binds another device's primary context; callers that
+// skip cudaSetDevice when the reported device already matches would then
+// allocate on that device. The first primary context reference taken this way
+// for a device is kept for the process lifetime, so the context (and the context
+// id a split records) outlives the scope even when the runtime holds no
+// reference to it.
 class DeviceScope {
  public:
   explicit DeviceScope(int device) {
     if (cuCtxGetCurrent(&previous_context_) != CUDA_SUCCESS) {
       previous_context_ = nullptr;
     }
-    if (previous_context_ == nullptr) {
-      EnterPrimary(device);
-      return;
+    if (previous_context_ != nullptr) {
+      CUdevice current{};
+      CUdevice wanted{};
+      if (cuCtxGetDevice(&current) == CUDA_SUCCESS &&
+          cuDeviceGet(&wanted, device) == CUDA_SUCCESS && current == wanted) {
+        ok_ = true;  // the caller's context is on `device`: keep it
+        return;
+      }
     }
-    int previous = 0;
-    ok_ = cudaGetDevice(&previous) == cudaSuccess;
-    if (ok_ && previous != device) {
-      restore_ = true;  // also when cudaSetDevice fails: restoring is harmless
-      ok_ = cudaSetDevice(device) == cudaSuccess;
-    }
-    ok_ = ok_ && cudaFree(nullptr) == cudaSuccess;
+    EnterPrimary(device);
   }
   DeviceScope(DeviceScope const&) = delete;
   DeviceScope& operator=(DeviceScope const&) = delete;
   ~DeviceScope() {
     if (restore_) {
-      // Not cudaSetDevice: it would make the previous device's primary context
-      // current. nullptr restores a thread that had no current context.
+      // nullptr restores a thread that had no current context.
       static_cast<void>(cuCtxSetCurrent(previous_context_));
     }
     if (release_) {
@@ -372,13 +368,16 @@ class ContextScope {
 
 // Frees a split allocation; called by the tensor deleter, so it never throws.
 // It runs in the context that made the allocation when that context still exists
-// (when another context is current, that context is current again afterwards).
+// (when another context is current, that context is synchronized first and is
+// current again afterwards).
 // When it was destroyed, the range is unmapped and released in the device's
 // current context: VMM memory belongs to the process, not to a context, and the
 // stale context handle (which may name another context now) is never made
-// current. The registry lock is not held while the context synchronizes. A CUDA
-// graph that still reads the allocation faults on its next replay, as the range
-// is unmapped.
+// current. The registry lock is not held while the contexts synchronize. Work of
+// any other context (neither the one that made the allocation nor the one that
+// frees it) that reads the allocation must be complete before its last tensor
+// is freed. A CUDA graph that still reads the allocation faults on its next
+// replay, as the range is unmapped.
 void SplitFree(CUdeviceptr address) noexcept {
   try {
     Split split{};
@@ -410,8 +409,13 @@ void SplitFree(CUdeviceptr address) noexcept {
     if (current_id != split.context_id) {
       unsigned long long id = 0;
       bool const alive = cuCtxGetId(split.context, &id) == CUDA_SUCCESS && id == split.context_id;
-      if (alive && !context_scope.Push(split.context)) {
-        return;  // cannot enter the allocation's context: leave it mapped
+      if (alive) {
+        // The freeing context's work may read the memory too: wait for it here,
+        // and for the allocation's context below.
+        static_cast<void>(cuCtxSynchronize());
+        if (!context_scope.Push(split.context)) {
+          return;  // cannot enter the allocation's context: leave it mapped
+        }
       }
       // Not alive: the allocation's context was destroyed; free in the current one.
     }
