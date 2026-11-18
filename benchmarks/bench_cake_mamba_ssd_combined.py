@@ -247,9 +247,10 @@ def _state_slot_arm(
     serves the initial, final and, with ``--checkpoint-pool``, checkpoint
     states in place; the slot vectors are column 0 of a ``[num_seqs,
     --slots-step]`` table, ``--flags-frac`` of the sequences read their
-    initial row, and each checkpoint lands on the first chunk end inside its
-    sequence (else its end) in a second block column.  Returns the runner,
-    the run arguments and the arm's report fields."""
+    initial row (none with ``--no-initial-states``), and each checkpoint
+    lands on the first chunk end inside its sequence (else its end) in a
+    second block column.  Returns the runner, the run arguments and the
+    arm's report fields."""
 
     num_sequences = len(sequence_lengths)
     nheads = args.nheads
@@ -272,10 +273,19 @@ def _state_slot_arm(
         final_states=pool,
         final_state_slots=slots,
     )
+    flags_kind = None
     if args.flags_frac is not None:
+        flags_kind = "frac"
         states["initial_state_flags"] = (
             torch.rand(num_sequences, generator=generator) < args.flags_frac
         ).cuda()
+    elif args.no_initial_states:
+        # Every call, the timed ones included, starts each sequence from zero
+        # state, like the dense arm, and still stores its final row.
+        flags_kind = "all_zero"
+        states["initial_state_flags"] = torch.zeros(
+            num_sequences, dtype=torch.bool, device="cuda"
+        )
     if args.checkpoint_pool:
         starts = np.cumsum([0, *sequence_lengths[:-1]])
         tokens = [
@@ -313,6 +323,7 @@ def _state_slot_arm(
     fields = {
         "slots_step": args.slots_step,
         "flags_frac": args.flags_frac,
+        "initial_state_flags": flags_kind,
         "checkpoint_pool": args.checkpoint_pool,
         "slot_route": args.slot_route,
         "pool_row_stride": row + pad,
@@ -345,7 +356,8 @@ def main() -> None:
         "--no-initial-states",
         action="store_true",
         help="run Cake with initial_states=None (zero state); the CuTe arm gets "
-        "explicit zero states since it requires them in varlen mode",
+        "explicit zero states since it requires them in varlen mode and the "
+        "state-slot arm all-zero initial_state_flags",
     )
     parser.add_argument("--has-z", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -397,6 +409,10 @@ def main() -> None:
     # NaN fails the chained comparison too.
     if args.flags_frac is not None and not 0.0 <= args.flags_frac <= 1.0:
         raise ValueError("--flags-frac must be in [0, 1]")
+    if args.no_initial_states and args.flags_frac is not None:
+        raise ValueError(
+            "--flags-frac reads initial states; it conflicts with --no-initial-states"
+        )
 
     torch.manual_seed(args.seed)
     if args.mode == "batched":
@@ -558,7 +574,8 @@ def main() -> None:
         slot_final = arguments["final_states"][final_rows].clone()
         slot_fields["program"] = runner._cake_runner.last_program_name
         flags = arguments.get("initial_state_flags")
-        if flags is None:
+        if flags is None or args.no_initial_states:
+            # All-zero flags run the dense arm's no-initial-state workload.
             dense_out, dense_final = outputs["cake"]
             slot_fields["out_vs_cake_reference"] = "dense_cake"
         else:
@@ -566,26 +583,9 @@ def main() -> None:
             # pool row holds: compare with a dense Cake call on the
             # flag-masked initial states, so both sides run one recurrence.
             masked = initial_states * flags.view(-1, 1, 1, 1).to(initial_states.dtype)
-            # The dense Cake runner takes explicit initial states unless
-            # --no-initial-states built it without them.
+            # --flags-frac excludes --no-initial-states, so the dense Cake
+            # runner takes explicit initial states.
             dense_runner = runners["cake"]
-            if not arms["cake"]["has_initial_states"]:
-                dense_runner = SSDCombined(
-                    chunk_size=128,
-                    nheads=args.nheads,
-                    headdim=64,
-                    dstate=128,
-                    ngroups=args.ngroups,
-                    io_dtype=torch.bfloat16,
-                    state_dtype=torch.bfloat16,
-                    has_d=True,
-                    d_has_hdim=False,
-                    has_initial_states=True,
-                    has_varlen=True,
-                    has_z=args.has_z,
-                    seq_idx_dtype=torch.int32,
-                    backend="cake",
-                )
             dense_arguments = {
                 **arms["cake"]["arguments"],
                 "initial_states": masked,

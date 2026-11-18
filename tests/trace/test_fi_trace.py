@@ -356,22 +356,26 @@ def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
     from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
 
     templates = ssd_combined_trace_dispatch.templates
-    assert len(templates) == 24
-    assert len({id(template) for template in templates}) == 24
+    assert len(templates) == 48
+    assert len({id(template) for template in templates}) == 48
     # A final-state pool (varlen_slots / varlen_fslots) is written only when
-    # final states are returned.
+    # final states are returned. A slot schema names its state dtype; the
+    # dense names carry none.
     assert {template.name_prefix for template in templates} == {
         f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}"
         for mode in (
             "batched",
             "varlen",
-            "varlen_islots",
-            "varlen_slots",
-            "varlen_fslots",
+            *(
+                f"{slots}_{state}"
+                for slots in ("varlen_islots", "varlen_slots", "varlen_fslots")
+                for state in ("bf16", "f16", "f32")
+            ),
         )
         for d_layout in ("none", "vector", "matrix")
         for final_suffix in ("no_final", "final")
-        if final_suffix == "final" or mode in ("batched", "varlen", "varlen_islots")
+        if final_suffix == "final"
+        or not mode.startswith(("varlen_slots_", "varlen_fslots_"))
     }
 
 
@@ -554,7 +558,7 @@ def test_ssd_combined_fi_trace_state_slot_pools(
     mode = modes[initial_pool, final_pool]
     final_suffix = "final" if return_final_states else "no_final"
     assert definition["name"].startswith(
-        f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}_"
+        f"ssd_combined_{mode}_f16_d_{d_layout}_{final_suffix}_"
     )
     axes = definition["axes"]
     assert axes["cu_seqlens_size"]["type"] == "var"
@@ -566,7 +570,7 @@ def test_ssd_combined_fi_trace_state_slot_pools(
     final_axis = "final_state_rows" if final_pool else "num_sequences"
     assert inputs["initial_states"]["shape"] == [initial_axis, *pool_axes]
     assert inputs["final_states"]["shape"] == [final_axis, *pool_axes]
-    # A slot vector requires its pool, so the pool dtype is in the routing key.
+    # A slot vector requires its pool.
     assert inputs["initial_states"].get("optional", False) is (not initial_pool)
     assert inputs["final_states"].get("optional", False) is (not final_pool)
     assert inputs["out"]["shape"] == ["batch_size", "seqlen", "nheads", "headdim"]
@@ -632,7 +636,7 @@ def test_ssd_combined_fi_trace_state_slots_unaligned_seqlen():
         final_states=pool,
         final_state_slots=torch.tensor([2], dtype=torch.int32),
     )
-    assert definition["name"].startswith("ssd_combined_varlen_slots_d_none_final_")
+    assert definition["name"].startswith("ssd_combined_varlen_slots_bf16_d_none_final_")
     assert definition["axes"]["seqlen"]["type"] == "var"
     assert definition["axes"]["chunk_size"]["value"] == 128
     assert "seqlen % chunk_size == 0" not in definition["constraints"]

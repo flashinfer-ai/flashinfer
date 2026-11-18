@@ -451,6 +451,81 @@ def _ssd_combined_apply(kwargs: dict):
     return template, namespace, _derive_output_dests(template, original)
 
 
+def _ssd_combined_definition_name(kwargs: dict) -> str:
+    """The definition name the Apply wrapper computes for one call."""
+    template, namespace, _ = _ssd_combined_apply(kwargs)
+    axes = extract_axes(build_extractor_maps([template]), namespace)
+    return template.definition_name(axes)
+
+
+def _ssd_combined_state_kwargs(*, slots: bool, dtype: torch.dtype) -> dict:
+    """``_ssd_combined_kwargs`` with every state tensor in ``dtype``."""
+    kwargs = _ssd_combined_kwargs(slots=slots, checkpoint_rows=5)
+    for key in ("initial_states", "final_states", "checkpoint_states"):
+        if key in kwargs:
+            kwargs[key] = kwargs[key].to(dtype)
+    return kwargs
+
+
+@pytest.mark.cpu_only
+def test_ssd_combined_apply_routes_slot_pools_by_state_dtype(monkeypatch, tmp_path):
+    """Slot calls of identical dimensions with f16 and f32 state pools have
+    different definition names, so each reaches only its own solution and
+    traces to its own JSON file. The dense names carry no state dtype."""
+    import functools
+
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    f16_kwargs = _ssd_combined_state_kwargs(slots=True, dtype=torch.float16)
+    f32_kwargs = _ssd_combined_state_kwargs(slots=True, dtype=torch.float32)
+    f16_name = "ssd_combined_varlen_slots_f16_d_none_final_h2_d64_g2_s128"
+    f32_name = "ssd_combined_varlen_slots_f32_d_none_final_h2_d64_g2_s128"
+    for kwargs, name in ((f16_kwargs, f16_name), (f32_kwargs, f32_name)):
+        assert _ssd_combined_definition_name(kwargs) == name
+        definition = module.ssd_combined_fwd.fi_trace(save_dir=tmp_path, **kwargs)
+        assert definition["name"] == name
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        f"{f16_name}.json",
+        f"{f32_name}.json",
+    ]
+    for dtype in (torch.bfloat16, torch.float32):
+        dense_kwargs = _ssd_combined_state_kwargs(slots=False, dtype=dtype)
+        assert (
+            _ssd_combined_definition_name(dense_kwargs)
+            == "ssd_combined_batched_d_none_final_h2_d64_g2_s128"
+        )
+
+    calls = []
+
+    @functools.wraps(module.ssd_combined_fwd)
+    def cpu_original(*args, **kwargs):
+        calls.append("original")
+        return kwargs["x"], kwargs["final_states"]
+
+    def solution_for(tag):
+        def solution(**inputs):
+            calls.append(tag)
+            return inputs["x"], inputs["final_states"]
+
+        return solution
+
+    monkeypatch.setattr(module, "ssd_combined_fwd", cpu_original)
+    assert ta.enable_apply(
+        {f16_name: solution_for("f16"), f32_name: solution_for("f32")}
+    )
+    module.ssd_combined_fwd(**f32_kwargs)
+    module.ssd_combined_fwd(**f16_kwargs)
+    assert calls == ["f32", "f16"]
+    assert ta.stats().get(SSD_FI_API, {}).get("hit", 0) == 2
+
+    # Only the f16 name registered: the f32 call reaches the original.
+    calls.clear()
+    ta.enable_apply({f16_name: solution_for("f16")})
+    module.ssd_combined_fwd(**f32_kwargs)
+    module.ssd_combined_fwd(**f16_kwargs)
+    assert calls == ["original", "f16"]
+    assert ta.stats().get(SSD_FI_API, {}).get("fallback_no_candidate", 0) == 1
+
+
 @pytest.mark.cpu_only
 def test_ssd_combined_templates_bind_final_states_second():
     # ssd_combined_fwd returns (out, final_states | None): a value-returning
@@ -476,8 +551,9 @@ def test_ssd_combined_value_returning_slot_solution_keeps_checkpoints(
     # copy after the solution ran otherwise).
     kwargs = _ssd_combined_kwargs(slots=True, checkpoint_rows=checkpoint_rows)
     template, namespace, dests = _ssd_combined_apply(kwargs)
-    assert template.name_prefix.startswith("ssd_combined_varlen_slots_")
-    # The pools are required inputs, so their dtypes route.
+    # Apply routes by definition name, which carries the pools' state dtype.
+    assert template.name_prefix.startswith("ssd_combined_varlen_slots_f32_")
+    # The pools are required inputs.
     assert {("initial_states", "float32"), ("final_states", "float32")} <= set(
         adapt.extract_input_dtypes(template, namespace)
     )
