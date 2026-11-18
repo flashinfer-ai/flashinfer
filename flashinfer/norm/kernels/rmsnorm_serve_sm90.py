@@ -25,9 +25,13 @@ of :func:`flashinfer.norm.rmsnorm` (#5667 pattern):
   the dispatch stats) — an explicitly selected backend never falls back;
   only ``"auto"`` routes around a refusal.
 - ``backend="auto"`` (the default) routes to ``"specialized"`` only on the
-  dispatch allowlist (``flashinfer/rmsnorm_serve_sm90_dispatch.json``), and
-  otherwise among the named incumbents; auto is purely a router and carries
-  no behavior of its own.
+  dispatch allowlist (``flashinfer/rmsnorm_serve_sm90_dispatch.json``) and
+  inside the measured-win token region (T <= 512; see ``_AUTO_MAX_TOKENS``),
+  and otherwise among the named incumbents; auto is purely a router and
+  carries no behavior of its own.  A cheap cached pre-gate
+  (:func:`rmsnorm_serve_auto_eligible`) runs before the full guard so calls
+  the kernels can never serve (non-SM90 devices, off-envelope shapes) cost
+  what they did before this path existed.
 - ``backend="cuda"`` pins the legacy CUDA JIT norm kernel and
   ``backend="cutedsl"`` the CuTe DSL kernels — the incumbent implementations
   by nature-name; an explicitly selected backend is never silently swapped,
@@ -75,6 +79,13 @@ _SERVE_H_ALLOWLIST = (512, 2048, 6144)
 _GENERIC_H_MIN = 512
 _GENERIC_H_MAX = 6144
 _MAX_TOKENS = 8192
+# backend="auto" routes to these kernels only inside the measured-win token
+# region: review timing on H200 showed wins at every measured T <= 512 and
+# losses at the large end (H=512 T=8192 0.82x, H=4096 T=2048 0.94x stock), so
+# auto stops at 512.  Explicit backend="specialized" keeps the full
+# correctness-validated envelope (_MAX_TOKENS): an explicit pin is the
+# caller's deliberate choice, and auto is purely a router.
+_AUTO_MAX_TOKENS = 512
 
 _ENV_VAR = "FLASHINFER_SM90_SERVE_RMSNORM"
 # Kill switch shared by FlashInfer's specialized kernels (read per call).
@@ -444,6 +455,44 @@ def _autotune_active() -> bool:
         return False
 
 
+# Per-device cache for the one guard input that costs a runtime query:
+# whether the device is SM90.  device index -> bool.
+_SM90_DEVICE_CACHE: dict = {}
+
+
+def rmsnorm_serve_auto_eligible(input: torch.Tensor) -> bool:
+    """O(1) pre-gate for ``backend="auto"``: the cheap dtype/shape/token
+    checks plus a per-device cached "SM90 CUDA device" flag (and the CuTe DSL
+    availability constant), evaluated BEFORE :func:`try_rmsnorm_serve_sm90`,
+    so a call these kernels can never serve skips the full guard chain — its
+    env reads, stats bookkeeping and capability query — and costs what it did
+    before this path existed (non-SM90 architectures and off-envelope calls
+    in particular).  The full guard stays authoritative: this gate may admit
+    a call the guard then declines, but never excludes one auto would serve.
+    """
+    if input.dtype is not torch.bfloat16:
+        return False
+    tokens, hidden = input.shape
+    if tokens <= 0 or tokens > _AUTO_MAX_TOKENS:
+        return False
+    if hidden % 8 != 0 or not _GENERIC_H_MIN <= hidden <= _GENERIC_H_MAX:
+        return False
+    device = input.device
+    if device.type != "cuda":
+        return False
+    is_sm90 = _SM90_DEVICE_CACHE.get(device.index)
+    if is_sm90 is None:
+        is_sm90 = torch.cuda.get_device_capability(device) == (9, 0)
+        _SM90_DEVICE_CACHE[device.index] = is_sm90
+    if not is_sm90:
+        return False
+    if not _HAS_CUTE_DSL and _variant() != "cuda":
+        # No runnable variant: without the DSL runtime only the env-opted
+        # CUDA variant could serve (env read only on this rare path).
+        return False
+    return True
+
+
 def try_rmsnorm_serve_sm90(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -487,6 +536,12 @@ def try_rmsnorm_serve_sm90(
         return False
     if not 0 < tokens <= _MAX_TOKENS:
         _fallback(f"{requested}: tokens {tokens} outside envelope")
+        return False
+    if requested == "auto" and tokens > _AUTO_MAX_TOKENS:
+        # auto routes to the specialized kernels only where they measured
+        # faster than the incumbents (T <= _AUTO_MAX_TOKENS); explicit
+        # backend="specialized" keeps the full correctness envelope.
+        _fallback(f"auto: tokens {tokens} beyond the measured-win cap")
         return False
     if not _h_in_envelope(hidden, backend):
         _fallback(f"{requested}: H {hidden} off the allowlist")
@@ -571,4 +626,8 @@ def try_rmsnorm_serve_sm90(
     return True
 
 
-__all__ = ["RMSNORM_BACKENDS", "try_rmsnorm_serve_sm90"]
+__all__ = [
+    "RMSNORM_BACKENDS",
+    "rmsnorm_serve_auto_eligible",
+    "try_rmsnorm_serve_sm90",
+]

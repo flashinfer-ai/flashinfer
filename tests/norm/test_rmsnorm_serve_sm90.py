@@ -68,6 +68,7 @@ def test_dispatch_table_loads_and_matches_guard_constants():
     assert "specialized" in table["backends"]
     op = table["ops"]["rmsnorm_serve"]
     assert op["envelope"]["max_tokens"] == 8192
+    assert op["envelope"]["auto_max_tokens"] == 512
     assert op["envelope"]["hidden_exact_allowlist"] == [512, 2048, 6144]
     band = op["envelope"]["hidden_generic_band"]
     assert (band["min"], band["max"], band["multiple_of"]) == (512, 6144, 8)
@@ -155,14 +156,24 @@ def test_auto_routes_on_allowlist_only():
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["backend_dispatches"]["specialized"] == 1, stats
     assert _matched(y, _ref(x, w)) >= 0.999
-    # off-allowlist H (not a multiple of 8): auto -> stock path
+    # off-allowlist H (not a multiple of 8): the cheap pre-gate keeps auto
+    # off the specialized dispatch entirely (not consulted, not counted)
     _reset_rmsnorm_serve_sm90_stats()
     x2, w2 = _case(tokens=8, hidden=516)
     y2 = flashinfer.norm.rmsnorm(x2, w2)
     stats = _rmsnorm_serve_sm90_stats()
+    assert stats["calls"] == 0, stats
     assert stats["backend_dispatches"]["specialized"] == 0, stats
-    assert any("off the allowlist" in r for r in stats["fallback_reasons"]), stats
     assert _matched(y2, _ref(x2, w2)) >= 0.999
+    # beyond the measured-win token cap: same — auto serves via the
+    # incumbent path without consulting the specialized dispatch
+    _reset_rmsnorm_serve_sm90_stats()
+    x3, w3 = _case(tokens=1024, hidden=2048)
+    y3 = flashinfer.norm.rmsnorm(x3, w3)
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["calls"] == 0, stats
+    assert stats["backend_dispatches"]["specialized"] == 0, stats
+    assert _matched(y3, _ref(x3, w3)) >= 0.999
 
 
 def test_explicit_specialized_off_envelope_raises():
@@ -260,22 +271,33 @@ def test_cutedsl_in_place_is_supported():
 
 
 def test_stats_census_sums_to_calls(monkeypatch):
-    """Every call is attributed to exactly one backend, fallbacks included:
-    calls == specialized + cuda + cutedsl."""
+    """Every call that reaches the backend surface is attributed exactly
+    once: served calls to a backend, and an explicit "specialized" call the
+    guard refuses to a recorded refusal (it raises — an explicitly selected
+    backend never falls back): calls == specialized + cuda + cutedsl +
+    explicit refusals."""
     _sm90_or_skip()
     x, w = _case(tokens=16, hidden=2048)
     flashinfer.norm.rmsnorm(x, w, backend="specialized")  # specialized
     flashinfer.norm.rmsnorm(x, w, backend="cutedsl")  # explicit incumbent
     x2, w2 = _case(tokens=8, hidden=516)
-    flashinfer.norm.rmsnorm(x2, w2, backend="specialized")  # guard fallback
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        flashinfer.norm.rmsnorm(x2, w2, backend="specialized")  # refusal
     monkeypatch.setenv(DISABLE_ENV, "1")
-    flashinfer.norm.rmsnorm(x, w)  # kill-switch fallback
+    flashinfer.norm.rmsnorm(x, w)  # kill-switch fallback under auto
     stats = _rmsnorm_serve_sm90_stats()
     assert stats["calls"] == 4, stats
+    refusals = sum(
+        n
+        for reason, n in stats["fallback_reasons"].items()
+        if reason.startswith("specialized:")
+    )
+    assert refusals == 1, stats
     assert (
         stats["backend_dispatches"]["specialized"]
         + stats["backend_dispatches"]["cuda"]
         + stats["backend_dispatches"]["cutedsl"]
+        + refusals
         == stats["calls"]
     ), stats
 

@@ -1,5 +1,5 @@
 {
-  "comment": "Dispatch surface of the specialized SM90 serve-shape RMSNorm kernels behind flashinfer.norm.rmsnorm's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys backend='auto' matches a call against (the compiled-in guards in flashinfer/norm/kernels/rmsnorm_serve_sm90.py stay authoritative) plus the measured envelope. Two kernel variants (cutedsl default, cuda via FLASHINFER_SM90_SERVE_RMSNORM=cuda) sit behind the one 'specialized' backend. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the specialized kernels regardless of this file: backend='auto' keeps the incumbent (cuda/cutedsl) path, explicit backend='specialized' raises.",
+  "comment": "Dispatch surface of the specialized SM90 serve-shape RMSNorm kernels behind flashinfer.norm.rmsnorm's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys backend='auto' matches a call against (the compiled-in guards in flashinfer/norm/kernels/rmsnorm_serve_sm90.py stay authoritative) plus the measured envelope: auto_max_tokens is the measured-win token cap backend='auto' stops at, while max_tokens is the correctness-validated envelope explicit backend='specialized' keeps. Two kernel variants (cutedsl default, cuda via FLASHINFER_SM90_SERVE_RMSNORM=cuda) sit behind the one 'specialized' backend. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the specialized kernels regardless of this file: backend='auto' keeps the incumbent (cuda/cutedsl) path, explicit backend='specialized' raises.",
   "backends": ["auto", "specialized", "cuda", "cutedsl"],
   "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
   "ops": {
@@ -9,6 +9,7 @@
       "compute_capability": [9, 0],
       "envelope": {
         "max_tokens": 8192,
+        "auto_max_tokens": 512,
         "hidden_exact_allowlist": [512, 2048, 6144],
         "hidden_generic_band": {"min": 512, "max": 6144, "multiple_of": 8,
                                  "variant": "cutedsl"}

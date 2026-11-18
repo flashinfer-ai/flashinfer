@@ -89,10 +89,12 @@ try:
     from .kernels.rmsnorm_serve_sm90 import (
         RMSNORM_BACKENDS,
         record_incumbent_dispatch as _record_rmsnorm_incumbent,
+        rmsnorm_serve_auto_eligible as _rmsnorm_serve_auto_eligible,
         try_rmsnorm_serve_sm90 as _try_rmsnorm_serve_sm90,
     )
 except (ImportError, AttributeError):
     _try_rmsnorm_serve_sm90 = None
+    _rmsnorm_serve_auto_eligible = None
     _record_rmsnorm_incumbent = None
     RMSNORM_BACKENDS = ("auto", "specialized", "cuda", "cutedsl")
 
@@ -1314,10 +1316,13 @@ def rmsnorm(
         cannot serve the device). ``"auto"`` (default) is purely a router
         over the named backends: it routes to ``"specialized"`` only on its
         dispatch allowlist
-        (``flashinfer/rmsnorm_serve_sm90_dispatch.json``) and otherwise
+        (``flashinfer/rmsnorm_serve_sm90_dispatch.json``) and inside the
+        measured-win token region (T <= 512), and otherwise
         between ``"cuda"`` and ``"cutedsl"`` by device/runtime support — an
         explicitly selected backend is never silently swapped, and unknown
-        names raise.
+        names raise. A cached per-device pre-gate keeps the specialized
+        dispatch off the hot path for devices and shapes it can never serve,
+        so those calls cost what they did before this path existed.
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) disables
         the specialized kernels (``"auto"`` keeps the incumbent path,
         explicit ``"specialized"`` raises); ``FLASHINFER_SM90_SERVE_RMSNORM=0`` is a
@@ -1381,10 +1386,15 @@ def _rmsnorm_impl(
         _try_rmsnorm_serve_sm90(out, input, weight, eps, backend)
         return
     if backend == "auto":
+        # The cached pre-gate keeps the specialized dispatch off the hot path
+        # for calls it can never serve (non-SM90 devices, off-envelope
+        # dtype/shape/token counts): they cost what they did before this
+        # path existed and are not consulted (so not counted) at all.
         if (
             _try_rmsnorm_serve_sm90 is not None
             and input.dim() == 2
             and not _USE_CUDA_NORM
+            and _rmsnorm_serve_auto_eligible(input)
         ):
             consulted = True
             if _try_rmsnorm_serve_sm90(out, input, weight, eps, backend):
