@@ -822,6 +822,7 @@ _CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES = {
     (12, 1): "sm_121a",
 }
 _CAKE_GDN_AFFINE_SPLIT_HEADS = (4, 8, 16, 32)
+_CAKE_GDN_AFFINE_SPLIT_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def _cake_gdn_affine_split_scope(
@@ -846,13 +847,11 @@ def _cake_gdn_affine_split_scope(
     ``output`` of ``None`` is the one the entry allocates, which fits."""
 
     capability = (int(device_capability[0]), int(device_capability[1]))
-    if capability != (10, 3):
-        if capability == (10, 0):
-            return "sm_100a is not yet supported"
+    if capability not in _CAKE_GDN_AFFINE_SPLIT_CAPABILITIES:
         arch = _CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES.get(
             capability, f"sm_{capability[0]}{capability[1]}"
         )
-        return f"{arch} is not supported (sm_103a only)"
+        return f"{arch} is not supported (sm_100a, sm_103a and sm_107a only)"
     device = q.device
     io = (q, k, v) if output is None else (q, k, v, output)
     total = int(q.shape[0]) if q.ndim == 3 else -1
@@ -1007,6 +1006,9 @@ def _run_cake_gdn_affine_split(
         num_heads=num_v_heads,
         max_seqlen=bound,
         sm_count=sm_count,
+        target=_CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES[
+            (int(device_capability[0]), int(device_capability[1]))
+        ],
         split_count=split_count,
     )
     tiles, _ = _affine_split.pass1_grid(num_seqs, num_v_heads, plan.p_bound, sm_count)
@@ -1041,26 +1043,31 @@ def _run_cake_gdn_affine_split(
         # it ships no initial-state variant without a final state, so
         # neither is used. The launch depends on the bound only, as the
         # split route's does.
-        return _run_cake_gdn_prefill(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-            output=output,
-            output_state=output_state,
-            state_checkpoints=None,
-            checkpoint_cu_starts=None,
-            checkpoint_every_n_tokens=0,
-            state_indices=None,
-            max_seqlen=bound,
-            cu_seqlens_cpu=None,
-        )
+        try:
+            return _run_cake_gdn_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=False,
+                output=output,
+                output_state=output_state,
+                state_checkpoints=None,
+                checkpoint_cu_starts=None,
+                checkpoint_every_n_tokens=0,
+                state_indices=None,
+                max_seqlen=bound,
+                cu_seqlens_cpu=None,
+            )
+        except _cake_gdn.CakeGDNUnsupportedError:
+            # No unsplit record for this key: the resolver refuses it on the
+            # host, before any launch, and the first kernel alone serves it.
+            pass
     # p_bound == 1: the first kernel alone at a cap of one segment, the bits
     # of a one-segment sequence inside any split launch, whatever the batch.
     _chunk_gated_delta_rule_gdn_affine_split_sm100(
@@ -1908,14 +1915,20 @@ def chunk_gated_delta_rule(
         sequence of at most 960 tokens is never split. When the longest
         possible sequence (the exact longest of ``cu_seqlens_cpu``, else
         ``max_seqlen``, else ``total_seq_len``) gets ``P = 1``, the first
-        kernel runs alone, the default Cake kernel's DV-split arithmetic: each
-        sequence's output is bitwise equal to ``use_affine_split=False`` on
-        that sequence alone, and on the whole call while that route resolves
-        its DV-split variant (``2 * num_seqs * num_v_heads <= 160`` on SM103). Supported: SM103, BF16 Q/K/V/output, head size 128,
+        kernel runs alone, the non-CP Cake kernel's DV-split arithmetic: each
+        sequence's output is bitwise equal to the non-CP route
+        (``use_affine_split=False, use_cp=False``) on that sequence alone, and
+        on the whole call while that route resolves its DV-split variant
+        (``2 * num_seqs * num_v_heads`` at most the device's active clusters:
+        148 on SM100, 160 on SM103 and 212 on SM107). Supported: SM100, SM103 and
+        SM107, BF16 Q/K/V/output, head size 128,
         ``num_v_heads`` in (4, 8, 16, 32) with ``num_k_heads == num_q_heads``
-        dividing it, any number of sequences with FP32 ``initial_state`` /
-        ``output_state`` ``[num_seqs, H, V, K]`` (contiguous, 16-byte aligned
-        addresses), FP32
+        dividing it, any number of sequences up to 2**20 packed tokens and
+        131072 first-kernel tiles (``num_seqs * num_v_heads * (4 * P - 2)``
+        at the cap ``P`` of the bound, so a tighter bound from
+        ``cu_seqlens_cpu`` or ``max_seqlen`` admits more sequences), with
+        FP32 ``initial_state`` / ``output_state`` ``[num_seqs, H, V, K]``
+        (contiguous, 16-byte aligned addresses), FP32
         ``g``/``beta`` (or the gate forms materialized to them). Checkpoints, state pools, ``prefix_lens`` and
         ``use_cp=True`` are rejected with ``ValueError``. The call owns
         workspaces (768 B per token and value head, plus 192 KiB per
@@ -1927,7 +1940,8 @@ def chunk_gated_delta_rule(
         between replays, omit ``cu_seqlens_cpu`` and warm up and capture with
         a ``max_seqlen`` that covers every replay. A ``max_seqlen`` hint
         smaller than a live sequence changes that sequence's segments (its
-        result stays exact, its bits change).
+        result stays exact, its bits change); with ``cu_seqlens_cpu``, a hint
+        smaller than its longest sequence raises ``ValueError``.
     _affine_split_count : int, optional
         Internal segment-cap override of ``use_affine_split=True``, used for
         testing. ``None`` lets the route choose the cap; an explicit positive
