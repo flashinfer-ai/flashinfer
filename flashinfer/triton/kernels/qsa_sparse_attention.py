@@ -2236,11 +2236,16 @@ def _desc(k_cache, v_cache, bn, nslot):
 
 
 def _ws(key, nelem, dtype, device):
-    """Reusable split-K scratch, fully overwritten before every combine."""
-    buf = _SCRATCH.get(key)
-    if buf is None or buf.numel() < nelem or buf.device != device:
+    """Reusable split-K scratch, fully overwritten before every combine.
+
+    Keyed by (device, name) so warmup on one GPU is not discarded by a call
+    on another: the warmup guarantee is about avoiding new persistent scratch
+    allocations, and a name-only key would re-allocate on every device switch.
+    """
+    buf = _SCRATCH.get((device, key))
+    if buf is None or buf.numel() < nelem:
         buf = torch.empty(nelem, dtype=dtype, device=device)
-        _SCRATCH[key] = buf
+        _SCRATCH[(device, key)] = buf
     return _hold_for_graph(buf)
 
 
