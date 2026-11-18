@@ -33,6 +33,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -62,18 +63,38 @@ std::string CuError(CUresult result) {
   return os.str();
 }
 
-// Makes `device` current (and its primary context exist) for the scope. On exit
-// the caller's context is current again, also when it is not a primary context.
+// Makes `device` current (and its primary context exist) for the scope; on exit
+// the thread's state is as it was on entry.
+//
+// With a current context on entry, the runtime selects `device` when it is not
+// the caller's device, and the caller's context is made current again on exit
+// (also a non-primary one).
+//
+// Without a current context on entry (for example a garbage-collection thread)
+// the runtime is not used at all: `device`'s primary context is retained through
+// the driver and made current, and on exit the thread has no current context
+// again. The runtime's selected device of the thread is never changed; changing
+// it would leave the runtime reporting `device` while its next call binds device
+// 0's primary context, and callers that skip cudaSetDevice when the reported
+// device already matches would then allocate on device 0. The first primary
+// context reference taken this way for a device is kept for the process
+// lifetime, so the context (and the context id a split records) outlives the
+// scope even when the runtime holds no reference to it.
 class DeviceScope {
  public:
   explicit DeviceScope(int device) {
-    ok_ = cudaGetDevice(&previous_) == cudaSuccess;
     if (cuCtxGetCurrent(&previous_context_) != CUDA_SUCCESS) {
       previous_context_ = nullptr;
     }
-    if (ok_ && previous_ != device) {
+    if (previous_context_ == nullptr) {
+      EnterPrimary(device);
+      return;
+    }
+    int previous = 0;
+    ok_ = cudaGetDevice(&previous) == cudaSuccess;
+    if (ok_ && previous != device) {
+      restore_ = true;  // also when cudaSetDevice fails: restoring is harmless
       ok_ = cudaSetDevice(device) == cudaSuccess;
-      restore_ = ok_;
     }
     ok_ = ok_ && cudaFree(nullptr) == cudaSuccess;
   }
@@ -81,21 +102,41 @@ class DeviceScope {
   DeviceScope& operator=(DeviceScope const&) = delete;
   ~DeviceScope() {
     if (restore_) {
-      // cudaSetDevice would make the previous device's primary context current.
-      if (previous_context_ != nullptr) {
-        static_cast<void>(cuCtxSetCurrent(previous_context_));
-      } else {
-        static_cast<void>(cudaSetDevice(previous_));
-      }
+      // Not cudaSetDevice: it would make the previous device's primary context
+      // current. nullptr restores a thread that had no current context.
+      static_cast<void>(cuCtxSetCurrent(previous_context_));
+    }
+    if (release_) {
+      static_cast<void>(cuDevicePrimaryCtxRelease(primary_device_));
     }
   }
   bool ok() const { return ok_; }
 
  private:
-  int previous_{};
+  void EnterPrimary(int device) {
+    CUcontext primary{};
+    if (cuInit(0) != CUDA_SUCCESS || cuDeviceGet(&primary_device_, device) != CUDA_SUCCESS ||
+        cuDevicePrimaryCtxRetain(&primary, primary_device_) != CUDA_SUCCESS) {
+      return;
+    }
+    release_ = !KeepFirstReference(device);
+    restore_ = true;
+    ok_ = cuCtxSetCurrent(primary) == CUDA_SUCCESS;
+  }
+
+  // True the first time it is called for `device` in the process.
+  static bool KeepFirstReference(int device) {
+    static auto* mutex = new std::mutex;
+    static auto* kept = new std::set<int>;
+    std::lock_guard<std::mutex> lock(*mutex);
+    return kept->insert(device).second;
+  }
+
   CUcontext previous_context_{};
+  CUdevice primary_device_{};
   bool ok_{};
   bool restore_{};
+  bool release_{};
 };
 
 template <typename Proc>

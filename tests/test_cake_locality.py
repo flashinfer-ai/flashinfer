@@ -15,6 +15,11 @@
 from __future__ import annotations
 
 import gc
+import json
+import subprocess
+import sys
+import threading
+from typing import Any
 
 import pytest
 import torch
@@ -601,6 +606,150 @@ def test_split_calls_on_another_device_keep_the_callers_context():
             _ok(driver.cuCtxPopCurrent())
         _ok(driver.cuCtxDestroy(other))
     assert _current_context(driver) == primary
+
+
+def _runtime_libraries() -> list[Any]:
+    """Every CUDA runtime library loaded in this process (the selected device is
+    kept per runtime library and thread)."""
+    import ctypes
+
+    with open("/proc/self/maps") as maps:
+        paths = sorted(
+            {
+                line.split()[-1]
+                for line in maps
+                if "/libcudart.so" in line and line.split()[-1].startswith("/")
+            }
+        )
+    return [ctypes.CDLL(path) for path in paths]
+
+
+def _thread_state(driver, runtimes: list[Any]) -> dict[str, Any]:
+    """The calling thread's current context (0: none), the device each runtime
+    library reports for it, and ``torch.cuda.current_device()``."""
+    import ctypes
+
+    devices = []
+    for runtime in runtimes:
+        index = ctypes.c_int(-1)
+        assert runtime.cudaGetDevice(ctypes.byref(index)) == 0
+        devices.append(index.value)
+    return {
+        "context": _current_context(driver),
+        "runtime_devices": devices,
+        "torch_device": torch.cuda.current_device(),
+    }
+
+
+def _free_in_a_new_thread(device: int) -> dict[str, Any]:
+    """Makes a split allocation on ``device``, then frees it and reads the
+    granularity of ``device`` in a new thread that never used CUDA, and then
+    allocates ``torch.empty(4, device=f"cuda:{device}")`` in that thread. Returns
+    the thread's state (see ``_thread_state``) before and after the split calls,
+    whether device 0's primary context is active before and after, and the device
+    that holds the memory of the thread's tensor."""
+    from cuda.bindings import driver
+
+    _ok(driver.cuInit(0))
+    first = _ok(driver.cuDeviceGet(0))
+
+    def primary_active() -> bool:
+        error, _flags, active = driver.cuDevicePrimaryCtxGetState(first)
+        assert int(error) == 0, error
+        return bool(active)
+
+    seen: dict[str, Any] = {"primary_active_at_start": primary_active()}
+    unit = cl.granularity(device)
+    held = [cl.split_empty((2 * unit,), torch.uint8, unit, device)]
+    base = held[0].data_ptr()
+    runtimes = _runtime_libraries()
+    seen["runtime_libraries"] = len(runtimes)
+    # The thread's tensor then needs a new device allocation (no cached block).
+    torch.cuda.empty_cache()
+    tensors = []
+
+    def run() -> None:
+        try:
+            seen["before"] = _thread_state(driver, runtimes)
+            seen["primary_active_before"] = primary_active()
+            del held[0]  # the last reference: the split is freed in this thread
+            gc.collect()
+            seen["freed"] = cl.homing(base) is None
+            seen["after_free"] = _thread_state(driver, runtimes)
+            seen["granularity"] = cl.granularity(device)
+            seen["after"] = _thread_state(driver, runtimes)
+            seen["primary_active_after"] = primary_active()
+            tensors.append(torch.empty(4, device=f"cuda:{device}"))
+            seen["tensor_device"] = tensors[0].device.index
+            seen["primary_active_after_tensor"] = primary_active()
+        except BaseException as exc:  # reported by the caller
+            seen["error"] = repr(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    if tensors:
+        seen["tensor_memory_device"] = int(
+            _ok(
+                driver.cuPointerGetAttribute(
+                    driver.CUpointer_attribute.CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                    tensors[0].data_ptr(),
+                )
+            )
+        )
+    seen["unit"] = unit
+    return seen
+
+
+@pytest.mark.parametrize("process", ["this_process", "new_process"])
+def test_split_calls_in_a_thread_without_a_context_keep_its_state(process):
+    """Freeing split memory of the last device, and then reading its granularity,
+    from a thread with no current context leaves that thread as it was: no current
+    context, and the same device reported by the CUDA runtime and by
+    ``torch.cuda.current_device()``. A tensor the thread then allocates on the last
+    device is in that device's memory, and no primary context is created on device
+    0. The new process uses only the last device, so device 0's primary context is
+    not active before and that check is not vacuous."""
+    _require_locality()
+    _driver()
+    last = torch.cuda.device_count() - 1
+    if last < 1 or torch.cuda.get_device_capability(last) != (10, 7):
+        pytest.skip("needs a second sm_107a device")
+    if process == "this_process":
+        seen = _free_in_a_new_thread(last)
+    else:
+        script = (
+            "import importlib.util, json, sys\n"
+            "import torch\n"
+            "torch.cuda.set_device(int(sys.argv[2]))\n"
+            "spec = importlib.util.spec_from_file_location('locality_tests', sys.argv[1])\n"
+            "tests = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(tests)\n"
+            "print('SEEN', json.dumps(tests._free_in_a_new_thread(int(sys.argv[2]))))\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script, __file__, str(last)],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        lines = [
+            line for line in result.stdout.splitlines() if line.startswith("SEEN ")
+        ]
+        assert result.returncode == 0 and lines, result.stdout + result.stderr
+        seen = json.loads(lines[-1][len("SEEN ") :])
+    assert "error" not in seen, seen
+    if process == "new_process":
+        assert not seen["primary_active_before"], seen
+    assert seen["freed"] and seen["granularity"] == seen["unit"], seen
+    assert seen["before"]["context"] == 0, seen
+    assert seen["after_free"] == seen["before"], seen
+    assert seen["after"] == seen["before"], seen
+    assert seen["tensor_device"] == last, seen
+    assert seen["tensor_memory_device"] == last, seen
+    if not seen["primary_active_before"]:
+        assert not seen["primary_active_after"], seen
+        assert not seen["primary_active_after_tensor"], seen
 
 
 def test_split_empty_cuda_graph_replay():
