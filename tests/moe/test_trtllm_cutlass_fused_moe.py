@@ -711,6 +711,78 @@ def test_moe_raw_op_rejects_clamped_relu2_on_deepseek_blockscale():
         )
 
 
+def _strided_copy(t):
+    """The same values in a view whose last dimension has stride 2."""
+    s = torch.empty(*t.shape[:-1], 2 * t.shape[-1], dtype=t.dtype, device=t.device)
+    s = s[..., ::2]
+    s.copy_(t)
+    return s
+
+
+def _transposed_storage_copy(t):
+    """The same values in a view whose last two dimensions are stored transposed."""
+    s = torch.empty(
+        *t.shape[:-2], t.shape[-1], t.shape[-2], dtype=t.dtype, device=t.device
+    ).transpose(-1, -2)
+    s.copy_(t)
+    return s
+
+
+@_CUTLASS_MOE_ARCH_SKIP
+@pytest.mark.parametrize(
+    "operand, make_view",
+    [
+        ("input", _strided_copy),
+        ("token_selected_experts", _strided_copy),
+        ("token_selected_experts", _transposed_storage_copy),
+        ("token_final_scales", _strided_copy),
+        ("fc1_expert_weights", _transposed_storage_copy),
+        ("fc2_expert_weights", _transposed_storage_copy),
+        ("output", _strided_copy),
+    ],
+)
+def test_moe_rejects_a_non_contiguous_operand(operand, make_view):
+    """The kernels read every operand through a raw pointer as dense row-major
+    storage. A strided or transposed view used to be accepted and read as if it
+    were contiguous, which returned wrong values (or NaN for FP8) without an
+    error; it must be refused instead.
+    """
+    torch.manual_seed(0)
+    num_tokens, hidden_size, intermediate_size, num_experts, top_k = 96, 256, 128, 8, 2
+    operands = dict(
+        input=torch.randn(num_tokens, hidden_size, device="cuda").bfloat16(),
+        fc1_expert_weights=(
+            torch.randn(num_experts, 2 * intermediate_size, hidden_size, device="cuda")
+            / 16
+        ).bfloat16(),
+        fc2_expert_weights=(
+            torch.randn(num_experts, hidden_size, intermediate_size, device="cuda") / 11
+        ).bfloat16(),
+        output=torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
+        ),
+    )
+    routing_weights, selected_experts = compute_routing(
+        torch.randn(num_tokens, num_experts, device="cuda"), top_k
+    )
+    operands["token_selected_experts"] = selected_experts.to(torch.int)
+    operands["token_final_scales"] = routing_weights
+    operands[operand] = make_view(operands[operand])
+    assert not operands[operand].is_contiguous()
+
+    with pytest.raises(Exception, match="must be contiguous"):
+        fused_moe.cutlass_fused_moe(
+            operands["input"],
+            operands["token_selected_experts"],
+            operands["token_final_scales"],
+            operands["fc1_expert_weights"],
+            operands["fc2_expert_weights"],
+            torch.bfloat16,
+            output=operands["output"],
+            quant_scales=None,
+        )
+
+
 def compute_with_experts_gelu_tanh(
     num_experts,
     x,

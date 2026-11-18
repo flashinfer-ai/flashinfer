@@ -337,6 +337,26 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         << ", Output: " << DLDataTypeToString(mOutputDtype);
   }
 
+  // The kernels index these tensors through raw pointers as dense row-major
+  // storage, so a strided or transposed view would be read (or written) as if
+  // it were contiguous: refuse it instead of returning wrong values.
+  static void checkDenseOperands(TensorView const& output, TensorView const& input,
+                                 TensorView const& token_selected_experts,
+                                 Optional<TensorView> const& token_final_scales,
+                                 TensorView const& fc1_expert_weights,
+                                 Optional<TensorView> const& fc1_expert_biases,
+                                 TensorView const& fc2_expert_weights,
+                                 Optional<TensorView> const& fc2_expert_biases) {
+    CHECK_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(token_selected_experts);
+    if (token_final_scales.has_value()) CHECK_CONTIGUOUS(token_final_scales.value());
+    CHECK_CONTIGUOUS(fc1_expert_weights);
+    CHECK_CONTIGUOUS(fc2_expert_weights);
+    if (fc1_expert_biases.has_value()) CHECK_CONTIGUOUS(fc1_expert_biases.value());
+    if (fc2_expert_biases.has_value()) CHECK_CONTIGUOUS(fc2_expert_biases.value());
+  }
+
   void runMoe(TensorView output, TensorView input, TensorView token_selected_experts,
               Optional<TensorView> token_final_scales, TensorView fc1_expert_weights,
               Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
@@ -357,6 +377,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK(cluster_size == 1 && cluster_rank == 0)
         << "smart_router is supported in min_latency mode";
 
+    checkDenseOperands(output, input, token_selected_experts, token_final_scales,
+                       fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                       fc2_expert_biases);
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {
@@ -524,6 +547,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
+    checkDenseOperands(output, input, token_selected_experts, token_final_scales,
+                       fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
+                       fc2_expert_biases);
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {
