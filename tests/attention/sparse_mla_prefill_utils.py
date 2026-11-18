@@ -462,7 +462,7 @@ def decode_call(f, impl, mega=True):
     return lse
 
 
-def native_prefill_calls(f, module=None):
+def native_prefill_calls(f, module=None, *, streaming_prefill=True, chunks_per_block=0):
     from flashinfer.jit.mla import gen_sparse_mla_sm120_module
 
     module = module or gen_sparse_mla_sm120_module().build_and_load()
@@ -477,17 +477,19 @@ def native_prefill_calls(f, module=None):
         caches[1].shape[1],
         caches[0].stride(0),
         caches[1].stride(0),
-        0,
+        chunks_per_block,
         device.multi_processor_count,
         device.shared_memory_per_block_optin,
-        True,
+        streaming_prefill,
         False,
         lengths[0] is not None,
         lengths[1] is not None,
         f["sink"] is not None,
     )
-    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
-    mid, mlse = f["context"], f["context"].view(torch.float32)
+    mid, mlse, lse = [
+        torch.empty(tuple(shape), dtype=getattr(torch, str(dtype)), device=q.device)
+        for shape, dtype, _, _ in plan.workspace()
+    ]
 
     def arguments(query):
         return (
@@ -509,8 +511,10 @@ def native_prefill_calls(f, module=None):
         )
 
     def mega():
+        args = list(arguments(q))
+        args[6] = q  # Match run_mega: the BF16 output descriptor is unused.
         module.dsv4_nvfp4_execute_attention_rope_fp8(
-            *arguments(q),
+            *args,
             f["positions"],
             f["cs"],
             f["out"].view(torch.uint8),

@@ -174,7 +174,10 @@ def test_mega_graph_kernel_boundaries(cache_format, tokens, tmp_path):
     text = path.read_text()
     nodes = re.findall(r'"graph_\d+_node_\d+"\[.*?\];', text, re.DOTALL)
     kernels = [node for node in nodes if 'label="{KERNEL' in node]
-    assert plan["implementation"] in ("dsv4_fp8_decode", "dsv4_fp8_splitkv_decode")
+    if cache_format == "nvfp4":
+        assert plan["implementation"] == "dsv4_nvfp4_prefill"
+    else:
+        assert plan["implementation"] in ("dsv4_fp8_decode", "dsv4_fp8_splitkv_decode")
     assert len(kernels) == 1, text
     assert all("sparse_mla" in node for node in kernels), text
     assert len(nodes) == len(kernels), text

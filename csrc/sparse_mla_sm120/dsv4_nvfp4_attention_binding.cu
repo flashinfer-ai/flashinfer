@@ -170,7 +170,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
         m.extra_page_size == p.extra_page_size && m.has_lengths == topk_length.has_value() &&
         m.has_extra_lengths == extra_topk_length.has_value() && m.has_sink == attn_sink.has_value())
         << "DSV4 NVFP4 execution plan tensor metadata mismatch";
-    check_output_alignment(output, *prepared);
+    if (!mega.output) check_output_alignment(output, *prepared);
     const auto status = dispatch_attention(p, *prepared, stream);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
         << "NVFP4 execute_attention: " << cudaGetErrorString(status);
@@ -192,7 +192,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   plan.metadata.has_lengths = topk_length.has_value();
   plan.metadata.has_extra_lengths = extra_topk_length.has_value();
   plan.metadata.has_sink = attn_sink.has_value();
-  check_output_alignment(output, plan);
+  if (!mega.output) check_output_alignment(output, plan);
   const auto status = dispatch_attention(p, plan, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "NVFP4 dispatch_attention: " << cudaGetErrorString(status);
