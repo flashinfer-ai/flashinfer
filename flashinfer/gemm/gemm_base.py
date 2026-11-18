@@ -13276,9 +13276,10 @@ def fp8_blockscale_gemm_sm90(
 
     # Specialized SM90 decode-M backend (fp8bs_gemm_decodem_sm90): serves
     # the BF16-activation / FP8-weight / per-block-scale form at M <= 24 on
-    # its packaged allowlist; explicit "deepgemm" never reaches it, and a
-    # "specialized"/"auto" call it cannot serve continues on the stock
-    # route below with the reason recorded.
+    # its packaged allowlist; explicit "deepgemm" never reaches it, an
+    # "auto" call it cannot serve continues on the stock route below with
+    # the reason recorded, and an explicit "specialized" call it cannot
+    # serve raises (an explicitly selected backend never falls back).
     if backend in ("auto", "specialized"):
         res = _fp8bs_decodem_try_dispatch(
             input, weight, input_scale, weight_scale, out, requested=backend

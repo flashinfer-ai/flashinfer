@@ -26,8 +26,9 @@ Backends
     ``backend="deepgemm"``.
 ``"specialized"``
     The agent-generated SM90 decode-M kernel, i.e. the underlying entry
-    with ``backend="specialized"`` (that entry's own composable fallback
-    and kill-switch semantics apply).
+    with ``backend="specialized"`` (a call that entry cannot serve raises
+    with the refusal reason — an explicitly selected backend never falls
+    back; its kill-switch semantics apply).
 ``"auto"``
     On SM90, the underlying entry's own ``backend="auto"`` (stock, with
     the specialized decode-M kernel on its packaged allowlist). On any
@@ -85,10 +86,11 @@ def fp8_blockscale_gemm(
     backend : str
         One of ``FP8_BLOCKSCALE_GEMM_BACKENDS = ("auto", "deepgemm",
         "specialized")``. ``"deepgemm"`` pins the stock SM90 route,
-        ``"specialized"`` the agent-generated SM90 decode-M kernel (with
-        that backend's own composable fallback), and ``"auto"`` the
-        underlying entry's own auto routing. Unknown names raise; an
-        explicitly selected backend is never silently swapped.
+        ``"specialized"`` the agent-generated SM90 decode-M kernel (a call
+        it cannot serve raises with the refusal reason — an explicitly
+        selected backend never falls back), and ``"auto"`` the underlying
+        entry's own auto routing. Unknown names raise; an explicitly
+        selected backend is never silently swapped.
 
     Returns
     -------

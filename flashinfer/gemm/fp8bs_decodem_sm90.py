@@ -16,17 +16,20 @@ Backend surface (#5667 semantics), driven from
   allowlist (``flashinfer/fp8bs_gemm_decodem_sm90_dispatch.json``);
   otherwise it is exactly the stock route.
 - ``"specialized"`` selects this kernel explicitly; a call it cannot serve
-  falls back to the stock route (this op's composable path) with the
-  reason recorded — never to another fused backend.
+  raises ``NotImplementedError`` with the refusal reason (also recorded in
+  the dispatch stats) — an explicitly selected backend never falls back;
+  only ``"auto"`` routes around a refusal.
 - ``"deepgemm"`` pins the stock route; an explicitly selected backend is
   never silently swapped.
 - ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call; shared by
-  FlashInfer's specialized kernels) keeps every call on the stock route.
+  FlashInfer's specialized kernels) disables this kernel: ``"auto"`` keeps
+  the stock route, explicit ``"specialized"`` raises.
 
 Introspection: :func:`_fp8bs_decodem_stats` reports per-backend dispatch
 counts and a ``fallback_reasons`` census. Guard order is GPU-free checks →
-layout guards → device guards; a JIT build failure is logged once and the
-call served by the stock route.
+layout guards → device guards; a JIT build failure is logged once — under
+``"auto"`` the call is served by the stock route, explicit ``"specialized"``
+raises.
 """
 
 import functools
@@ -192,13 +195,21 @@ def _fp8bs_decodem_try_dispatch(
     requested: str,
 ) -> Optional[torch.Tensor]:
     """Serve the call with the specialized kernel, or return None (with the
-    reason recorded for auto/specialized) so the caller continues on the
-    stock route."""
+    reason recorded) so an ``"auto"`` caller continues on the stock route.
+    Explicit ``requested="specialized"`` calls the kernel declines raise
+    ``NotImplementedError`` with the refusal reason — an explicitly selected
+    backend never falls back."""
     eligible, reason = _eligibility(input, weight, input_scale, weight_scale, out)
     if eligible and requested == "auto" and _dispatch_table() is None:
         eligible, reason = False, "no_dispatch_table"
     if not eligible:
         _fallback(f"{requested}: {reason}")
+        if requested == "specialized":
+            raise NotImplementedError(
+                "fp8_blockscale_gemm_sm90 backend='specialized' cannot serve "
+                f"this call ({reason}); an explicitly selected backend never "
+                "falls back — use backend='auto' or 'deepgemm'"
+            )
         return None
     try:
         module = _get_module()
@@ -207,12 +218,20 @@ def _fp8bs_decodem_try_dispatch(
     except Exception as e:
         if _stats["jit_build"] == "not attempted":
             logger.warning(
-                "fp8bs_gemm_decodem_sm90: specialized kernel JIT build "
-                "failed; serving via the stock route",
+                "fp8bs_gemm_decodem_sm90: specialized kernel JIT build failed%s",
+                "; serving via the stock route"
+                if requested == "auto"
+                else "; explicit backend='specialized' raises",
                 exc_info=True,
             )
         _stats["jit_build"] = f"failed ({str(e)[:120]})"
         _fallback(f"{requested}: jit_build_failure")
+        if requested == "specialized":
+            raise NotImplementedError(
+                "fp8_blockscale_gemm_sm90 backend='specialized' JIT build "
+                f"failed ({str(e)[:200]}); an explicitly selected backend "
+                "never falls back — use backend='auto' or 'deepgemm'"
+            ) from e
         return None
     module.run(input, weight, weight_scale, _QUANT_EPS, out)
     _stats["backend_dispatches"]["specialized"] += 1

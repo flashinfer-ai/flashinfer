@@ -1,5 +1,5 @@
 {
-  "comment": "Dispatch surface of the specialized SM90 decode-M dense fp8 block-scale GEMM, behind fp8_blockscale_gemm_sm90's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys (the compiled-in guards in flashinfer/gemm/fp8bs_decodem_sm90.py stay authoritative). backend='auto' routes to the specialized kernel only when this file is present and well-formed; FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the stock route regardless of this file.",
+  "comment": "Dispatch surface of the specialized SM90 decode-M dense fp8 block-scale GEMM, behind fp8_blockscale_gemm_sm90's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys (the compiled-in guards in flashinfer/gemm/fp8bs_decodem_sm90.py stay authoritative). backend='auto' routes to the specialized kernel only when this file is present and well-formed; FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 disables the specialized kernel regardless of this file: backend='auto' keeps the stock route, explicit backend='specialized' raises.",
   "backends": ["auto", "specialized", "deepgemm"],
   "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
   "ops": {

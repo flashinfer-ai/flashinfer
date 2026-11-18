@@ -135,6 +135,9 @@ def test_kill_switch_forces_stock(monkeypatch):
     st = _fp8bs_decodem_stats()
     assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
     assert st["fallback_reasons"] == {"auto: kill_switch": 1}, st
+    # explicit "specialized" raises under the kill switch (never falls back)
+    with pytest.raises(NotImplementedError, match="kill_switch"):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
     monkeypatch.delenv(SPECIALIZED_KERNEL_DISABLE_ENV)
     # both backends agree against the fp32 reference
     ref = _reference(x, wq, ws)
@@ -142,21 +145,29 @@ def test_kill_switch_forces_stock(monkeypatch):
 
 
 @requires_sm90
-def test_off_coverage_specialized_falls_back_recorded():
-    # above the measured decode-M band
+def test_off_coverage_explicit_raises_auto_takes_stock():
+    # above the measured decode-M band: explicit "specialized" raises with
+    # the reason (never falls back); auto keeps the stock route
     x, wq, ws = _make(32, 2048, 2048, seed=5)
     _reset_fp8bs_decodem_stats()
-    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    with pytest.raises(NotImplementedError, match="m_band"):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    st = _fp8bs_decodem_stats()
+    assert st["backend_dispatches"]["specialized"] == 0, st
+    assert st["fallback_reasons"] == {"specialized: m_band": 1}, st
+    _reset_fp8bs_decodem_stats()
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="auto")
     st = _fp8bs_decodem_stats()
     assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
-    assert st["fallback_reasons"] == {"specialized: m_band": 1}, st
+    assert st["fallback_reasons"] == {"auto: m_band": 1}, st
     assert _rel_fro(out, _reference(x, wq, ws)) <= 0.03
 
-    # per-token (1x128) weight-scale granularity stays on the stock route
+    # per-token (1x128) weight-scale granularity: explicit raises too
     x2, wq2, _ = _make(4, 2048, 2048, seed=6)
     ws_pt = torch.full((2048, 2048 // G), 0.125, device="cuda", dtype=torch.float32)
     _reset_fp8bs_decodem_stats()
-    fp8_blockscale_gemm_sm90(x2, wq2, None, ws_pt, backend="specialized")
+    with pytest.raises(NotImplementedError, match="weight_scale_granularity"):
+        fp8_blockscale_gemm_sm90(x2, wq2, None, ws_pt, backend="specialized")
     st = _fp8bs_decodem_stats()
     assert st["backend_dispatches"]["specialized"] == 0, st
     assert st["fallback_reasons"] == {"specialized: weight_scale_granularity": 1}, st
@@ -232,10 +243,17 @@ def test_jit_build_failure_falls_back_to_stock(monkeypatch):
     monkeypatch.setitem(mod._stats, "jit_build", "not attempted")
     monkeypatch.setattr(mod, "_get_module", ninja_boom)
     _reset_fp8bs_decodem_stats()
-    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    # explicit "specialized" raises on the build failure (never falls back)
+    with pytest.raises(NotImplementedError, match="JIT build"):
+        fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    st = _fp8bs_decodem_stats()
+    assert st["fallback_reasons"] == {"specialized: jit_build_failure": 1}, st
+    # auto serves the same call on the stock route
+    _reset_fp8bs_decodem_stats()
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="auto")
     st = _fp8bs_decodem_stats()
     assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
-    assert st["fallback_reasons"] == {"specialized: jit_build_failure": 1}, st
+    assert st["fallback_reasons"] == {"auto: jit_build_failure": 1}, st
     assert _rel_fro(out, ref) <= 0.03
 
     # the capture-without-warmup error keeps surfacing instead of falling back
