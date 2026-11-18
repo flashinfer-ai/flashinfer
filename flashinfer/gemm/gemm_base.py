@@ -11688,6 +11688,9 @@ def gemm_fp8_nt_groupwise(
     Notes
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
+    The ``cutlass`` backend on SM10x does not need this: with ``scale_major_mode="MN"`` and
+    ``scale_granularity_mnk[0] == 1`` it pads ``m`` internally and returns the original ``m`` rows,
+    and its other configurations accept any ``m``.
     """
     if batch_invariant:
         from .batch_invariant.tuning import gemm_fp8_nt_groupwise_batch_invariant_auto
@@ -11745,17 +11748,42 @@ def gemm_fp8_nt_groupwise(
                 scale_major_mode,
             )
         elif is_sm100a_supported(a.device):
+            # With per-row MN-major scales SFA is M-contiguous and the general SM100 kernel
+            # loads it with a 4-element vector, so `can_implement` rejects any m that is not a
+            # multiple of 4. Pad and slice back rather than making the caller do it; the padded
+            # rows are zero, so they only produce discarded zero output rows. m <= 32 runs the
+            # swap-AB small-batch kernel, which accepts any m, and block-scaled A
+            # (scale_granularity_m == 128) has ceil(m / 128) scale columns and no such
+            # requirement; neither is padded.
+            m = a.shape[0]
+            m_padded = (m + 3) // 4 * 4
+            if (
+                scale_major_mode == "MN"
+                and scale_granularity_mnk[0] == 1
+                and m > 32
+                and m_padded != m
+            ):
+                a_in = a.new_zeros((m_padded, a.shape[1]))
+                a_in[:m] = a
+                a_scale_in = a_scale.new_zeros((a_scale.shape[0], m_padded))
+                a_scale_in[:, :m] = a_scale
+                out_in = out.new_empty((m_padded, out.shape[1]))
+            else:
+                a_in, a_scale_in, out_in = a, a_scale, out
+
             get_gemm_sm100_module().gemm_fp8_nt_groupwise(
                 workspace_buffer,
-                a,
+                a_in,
                 b,
-                a_scale,
+                a_scale_in,
                 b_scale,
-                out,
+                out_in,
                 *scale_granularity_mnk,
                 scale_major_mode,
                 mma_sm,
             )
+            if out_in is not out:
+                out.copy_(out_in[:m])
         else:
             raise ValueError(f"Unsupported device for FP8 GEMM: {a.device}")
     elif backend == "trtllm":
