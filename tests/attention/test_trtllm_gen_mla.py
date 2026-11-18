@@ -2975,6 +2975,73 @@ def test_trtllm_mla_blackwell_exact007826_geometry(padded, blackwell_domains) ->
     assert blackwell_domains == [expected]
 
 
+def test_trtllm_mla_blackwell_kv_lens_identity_outlives_its_tensor() -> None:
+    """A KV-length read cached for a freed tensor never serves a new tensor.
+
+    The cache entry holds the tensor it read, so a later ``seq_lens`` with other
+    values cannot take its address and version counter; the padded request then
+    leaves the exact-geometry route.
+    """
+    _skip_unless_blackwell()
+    from flashinfer.mla.cake_trtllm_mla_blackwell import _host_kv_lens
+
+    live = [1024] * 512
+    padded = [0] + live[1:]
+    first = torch.tensor(live, dtype=torch.int32, device="cuda")
+    assert _host_kv_lens(first) == tuple(live)
+    address = first.data_ptr()
+    del first
+    second = torch.tensor(padded, dtype=torch.int32, device="cuda")
+    assert second.data_ptr() != address
+    assert _host_kv_lens(second) == tuple(padded)
+
+
+@pytest.mark.parametrize("layout", ["rows", "tail"])
+def test_trtllm_mla_blackwell_row_plan_identity_outlives_its_tensor(layout) -> None:
+    """A row plan cached for a freed ``seq_lens`` never serves a new tensor.
+
+    The plan holds the tensors it was derived from, so a later ``seq_lens`` with
+    other values cannot take its address, version counter, shape and strides.
+    Each ``seq_lens`` is a view of its own 64 MiB block: the plan's small device
+    temporaries never reuse that block, so without the held source the second
+    block lands at the first one's address and the stale plan is returned.
+    """
+    _skip_unless_blackwell()
+    from flashinfer.mla.cake_trtllm_mla_blackwell import _row_plan, row_metadata
+
+    cum_seq_lens_q = torch.tensor([0, 1, 3, 4, 6], dtype=torch.int32, device="cuda")
+    block_tables = torch.zeros(4, 4, dtype=torch.int32, device="cuda")
+    plan_args = dict(
+        cum_seq_lens_q=cum_seq_lens_q,
+        block_tables=block_tables,
+        batch_size=4,
+        q_len=2,
+        total_q=6,
+        page_size=32,
+        topk=0,
+    )
+
+    def seq_lens_in_own_block(values):
+        block = torch.empty(16 << 20, dtype=torch.int32, device="cuda")
+        block[: len(values)].copy_(torch.tensor(values, dtype=torch.int32))
+        return block[: len(values)]
+
+    first = seq_lens_in_own_block([10, 20, 30, 40])
+    _row_plan(layout, seq_lens=first, **plan_args)
+    address = first.data_ptr()
+    del first
+    second = seq_lens_in_own_block([5, 1, 70, 0])
+    assert second.data_ptr() != address
+    plan = _row_plan(layout, seq_lens=second, **plan_args)
+    row_batches, row_seq_lens = row_metadata(
+        second, cum_seq_lens_q, batch_size=4, q_len=2, total_q=6
+    )
+    if layout == "tail":
+        row_seq_lens = row_seq_lens.clamp_min(0)
+    assert torch.equal(plan["row_batches"], row_batches)
+    assert torch.equal(plan["row_seq_lens"], row_seq_lens)
+
+
 _PDL_PREDECESSOR_SOURCE = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>

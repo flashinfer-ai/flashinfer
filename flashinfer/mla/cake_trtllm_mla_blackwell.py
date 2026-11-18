@@ -1020,8 +1020,14 @@ def _host_kv_lens(seq_lens: torch.Tensor) -> Optional[tuple[int, ...]]:
         return state["kv_lens"]
     if torch.cuda.is_current_stream_capturing():
         return None
+    # The entry holds ``seq_lens``: while it is cached no other tensor can take
+    # its storage address with a fresh version counter and alias its identity.
     return _workspace(
-        key, lambda: {"kv_lens": tuple(int(v) for v in seq_lens.tolist())}
+        key,
+        lambda: {
+            "kv_lens": tuple(int(v) for v in seq_lens.tolist()),
+            "source": seq_lens,
+        },
     )["kv_lens"]
 
 
@@ -1064,7 +1070,17 @@ def _row_plan(
             q_len=q_len,
             total_q=total_q,
         )
-        state = {"row_batches": row_batches, "row_seq_lens": row_seq_lens}
+        # The plan holds the tensors it was derived from, so a cached identity
+        # cannot alias a later tensor allocated at a freed address.
+        state = {
+            "row_batches": row_batches,
+            "row_seq_lens": row_seq_lens,
+            "sources": (
+                seq_lens,
+                cum_seq_lens_q,
+                block_tables if layout == "table" else None,
+            ),
+        }
         if layout == "table":
             state["table"] = _aligned_page_table(
                 block_tables, row_batches, row_seq_lens, page_size
