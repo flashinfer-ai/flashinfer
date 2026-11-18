@@ -580,14 +580,19 @@ def test_planner_swaps_unit_kinds():
     assert kinds(decode(16, 8192, 64)) == (0, 2048, 128, 0)
     assert kinds(decode(8, 1024, 64)) == (64, 0, 0, 0)
     assert kinds(decode(64, 32768, 64)) == (512, 0, 0, 171)
-    # off the parts the grid model was fitted on (grid_search False: the engine's rule for every other part) the fused walk keeps
-    # the full grid while the fuse-or-split choice stands: on 148 SMs 512 long units fuse on the full grid (74 with the search),
-    # 64 long units fuse on their own 64 CTAs, one unit of 16 chunks still splits
-    assert kinds(decode(64, 8192, 128, sm=148, grid_search=False)) == (512, 0, 0, 0)
+    # off the parts the grid model was fitted on (grid_search False: the engine's rule for every other part) the fused walk takes
+    # the full grid or the even-waves grid (no fitted constant) and a part-filled last wave never turns the batch into a split one:
+    # on 148 SMs 512 long units take four waves of 128 (74 with the fitted search), 320 units three waves of 107 (a thin third wave
+    # on the full grid), 192 units two waves of 96 at every head dim, 64 units their own 64 CTAs; one unit of 16 chunks still splits
+    assert kinds(decode(64, 8192, 128, sm=148, grid_search=False)) == (512, 0, 0, 128)
     assert kinds(decode(64, 8192, 128, sm=148)) == (512, 0, 0, 74)
+    assert kinds(decode(40, 8192, 128, sm=148, grid_search=False)) == (320, 0, 0, 107)
+    assert kinds(decode(40, 2048, 128, sm=148, grid_search=False)) == (320, 0, 0, 107)
+    assert kinds(decode(24, 8192, 64, sm=148, grid_search=False)) == (192, 0, 0, 96)
+    assert kinds(decode(20, 8192, 128, sm=148, grid_search=False)) == (160, 0, 0, 80)
     assert kinds(decode(8, 8192, 128, sm=148, grid_search=False)) == (64, 0, 0, 0)
     assert kinds(decode(1, 8192, 128, sm=148, grid_search=False)) == (0, 128, 8, 0)
-    assert kinds(decode(256, 8192, 256, sm=148, grid_search=False)) == (2048, 0, 0, 0)
+    assert kinds(decode(256, 8192, 256, sm=148, grid_search=False)) == (2048, 0, 0, 147)
     # the grid search terminates on parts of one or two SMs (the integral-wave grid is one CTA there) and never names a grid
     # below one CTA or above the part
     for sm in (1, 2, 3):
