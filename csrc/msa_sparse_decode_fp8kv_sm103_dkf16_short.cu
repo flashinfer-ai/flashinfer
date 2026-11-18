@@ -216,6 +216,9 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   } else {
     pgr = pt[blkr >= 0 ? blkr : 0];
   }
+  // Contract (documented at the Python wrapper): valid q2k entries are an
+  // ascending prefix, -1-padded at the tail only, so counting them and
+  // consuming lanes 0..nb-1 is exact. An interior -1 is out of contract.
   unsigned vmask = __ballot_sync(0xffffffffu, (lane < 16) && (lane < lim) && (blkr >= 0));
   const int nb = __popc(vmask & 0xffffu);
 
@@ -609,6 +612,13 @@ static void launchf(int B, const void* qp, const void* kp, const void* vp, const
         (const __nv_bfloat16*)qp + (size_t)base * HQ * DH, (const uint8_t*)kp, (const uint8_t*)vp,
         (const int*)tkp + (size_t)base * TOPKC, (const int*)ptp + (size_t)base * pages,
         (const int*)slp + base, (__nv_bfloat16*)op + (size_t)base * HQ * DH, pages, bpc, nblk);
+    // A rejected launch (e.g. a cluster geometry a reduced-resource context
+    // cannot place) must never return success with an unwritten `out`.
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+      TVM_FFI_THROW(RuntimeError) << "specialized msa decode launch failed: "
+                                  << cudaGetErrorString(launch_status);
+    }
     base += chunk;
   }
 }

@@ -4,7 +4,12 @@ sparse block == KV page == 128 tokens, 16 selected blocks per query token,
 single-token decode (seqlen_q 1).
 
 Scope: this exact geometry and softmax scale on SM103; everything else stays
-on the stock msa_sparse_decode_attention dispatch. Kill switch:
+on the stock msa_sparse_decode_attention dispatch. q2k_indices rows follow
+the documented producer contract: valid block ids ascending, padded with -1
+at the tail only. An interior -1 (a hole before a valid id) is out of
+contract and the selection it produces is undefined; the kernels count valid
+entries and consume them as a prefix, and no per-element device-side
+validation pass is run on the hot path. Kill switch:
 FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1. CUDA graphs: the route is taken
 under capture only after the module was built eagerly (single fatbin, no
 per-shape JIT); dispatch is host-int based with no syncs, and the kernel

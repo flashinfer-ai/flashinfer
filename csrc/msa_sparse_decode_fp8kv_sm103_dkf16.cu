@@ -457,6 +457,11 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
         ldm2t_b8(vf[gq][0], vf[gq][1], vf[gq][2], vf[gq][3],
                  vb + (uint32_t)(gq << (HALFOUT ? 11 : 12)));
     }
+    // The ldm2t_b8 reads above are generic-proxy; the TMA write that reuses
+    // this stage (ISSUEV below) is async-proxy. Fence the reads into the
+    // async proxy before the barrier, or the next tma_load_v can overwrite
+    // the stage while those reads are still unordered against it.
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     __syncthreads();  // row maxes visible + V consumed
     // Every warp pulled its V fragments before the barrier above, so the
     // stage is already free: re-arm the next TMA here instead of after the
@@ -675,6 +680,13 @@ static void launchf(int B, const void* qp, const void* kp, const void* vp, const
         (const int*)tkp + (size_t)base * TOPKC, (const int*)ptp + (size_t)base * pages,
         (const int*)slp + base, (__nv_bfloat16*)op + (size_t)base * HQ * DH, pages, bpc, nblk,
         vmap);
+    // A rejected launch (e.g. a cluster geometry a reduced-resource context
+    // cannot place) must never return success with an unwritten `out`.
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+      TVM_FFI_THROW(RuntimeError) << "specialized msa decode launch failed: "
+                                  << cudaGetErrorString(launch_status);
+    }
     base += chunk;
   }
 }
