@@ -209,19 +209,33 @@ shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime condition
 Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
 metadata only between completed launches/replays and remain within plan bounds.
 
-### Per-query KV prefixes for MLA decode
+### Context-parallel MLA decode
 
-MLA decode supports `plan(use_kv_bounds=True)` with per-run `kv_bounds`:
-contiguous CUDA int32 counts shaped `[B * SQ]` for fixed Q or `[total_q]` for
-packed Q. Counts are shared across a token's heads, replace dense/causal
-visibility, and must be nondecreasing within each request and no larger than
-that request's `seq_lens_kv`. Zero local lengths and prefixes return zero O
-and optional base-2 LSE `-inf`. Bounds are per-run metadata, not retained
-plan values. `plan(zero_empty_rows=False)` skips neutral-row initialization but
-retains prefix masking; empty-row results are then unspecified, not preserved.
-Callers must initialize those rows or exclude them from consumption/merging.
-The default is `True`; the flag is ignored without `use_kv_bounds` and does not
-change workspace sizing. One-shot MLA exposes the same flag.
+MLA decode compiles `plan(cp_world=1, cp_interleave_size=1)` and accepts
+`run(cp_rank=0)` as a runtime integer. `seq_lens_kv` is the global logical
+request length, including current Q tokens. Page tables and planned
+`max_kv_len` remain rank-local capacity. Global token `t` belongs to rank
+`(t // cp_interleave_size) % cp_world`, and each local cache stores its owned
+tokens in global order. Token interleaving uses size 1; page interleaving may
+use size 128 independently of the physical cache page size.
+
+For interleave I and world C, global prefix n maps to local count
+`n // (I*C) * I + clamp(n % (I*C) - cp_rank*I, 0, I)`. Dense rows use the full
+global length; causal row i uses `global_length - actual_Q + i + 1`. Packed
+`actual_Q` comes from that request's `qo_indptr` delta, not the planned maximum.
+The kernel derives these prefixes without a separate bounds tensor or prep
+launch. Global lengths and Q offsets remain graph-live runtime metadata;
+`cp_rank` is a runtime scalar captured by value. `run(validate=False)` performs
+no device-to-host metadata readback.
+
+For CP>1, empty local prefixes return zero O and optional base-2 LSE `-inf`,
+including fully empty ranks. `plan(zero_empty_rows=False)` skips neutral-row
+initialization but retains CP masking; empty-row results are unspecified,
+not preserved. Callers must sanitize those rows before consumption/merging.
+The default is `True`; it is ignored for CP=1 and does not change workspace
+sizing. CP=1 preserves ordinary dense/causal behavior. One-shot MLA exposes
+the same CP arguments, and workspace sizing takes matching compile-time
+`cp_world` and `cp_interleave_size`.
 See the [MLA contract](kernels/mla_decode/README.md) for validation,
 empty-cache, and workspace details.
 

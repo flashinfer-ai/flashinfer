@@ -1,3 +1,4 @@
+# Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native Prims-TS MLA per-query local-KV prefix bounds and merge-compatible LSE."""
+"""Global-length CP masking and merge-compatible LSE in native Prims-TS MLA."""
 
 from __future__ import annotations
 
@@ -40,6 +41,7 @@ from tests.attention.test_attention_ts_mla_decode import (
     _make_mla_case,
     _mla_tolerances,
     _policy_dict,
+    _pack_mla_case,
 )
 
 
@@ -75,12 +77,13 @@ def _make_bounded_case(
     )
 
 
-def _plan_bounds(
+def _plan_cp(
     case: _MLACase,
     *,
     max_q_len: int,
     packed_query: bool = False,
-    use_kv_bounds: bool = True,
+    cp_world: int = 8,
+    cp_interleave_size: int = 128,
     zero_empty_rows: bool = True,
 ) -> BatchMLADecodePagedTSWrapper:
     wrapper = BatchMLADecodePagedTSWrapper()
@@ -98,12 +101,14 @@ def _plan_bounds(
         kv_dtype=case.kv_cache.dtype,
         out_dtype=case.out_dtype,
         mask_type=case.mask_type,
-        use_kv_bounds=use_kv_bounds,
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
         lse_mode="base2",
         zero_empty_rows=zero_empty_rows,
     )
     assert wrapper._plan_state is not None
-    assert wrapper._plan_state.use_kv_bounds is use_kv_bounds
+    assert wrapper._plan_state.cp_world == cp_world
+    assert wrapper._plan_state.cp_interleave_size == cp_interleave_size
     assert callable(wrapper._plan_state.compiled)
     assert _policy_dict(wrapper)["kernel"] in (
         "throughput_latency_1cta",
@@ -112,11 +117,12 @@ def _plan_bounds(
     return wrapper
 
 
-def _run_bounds(
+def _run_cp(
     wrapper: BatchMLADecodePagedTSWrapper,
     case: _MLACase,
-    bounds: torch.Tensor | None,
+    global_lengths: torch.Tensor,
     *,
+    cp_rank: int = 0,
     qo_indptr: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     stats: torch.Tensor | None = None,
@@ -133,9 +139,9 @@ def _run_bounds(
         case.query,
         case.kv_cache,
         case.block_tables,
-        case.seq_lens_kv,
+        global_lengths,
         qo_indptr=qo_indptr,
-        kv_bounds=bounds,
+        cp_rank=cp_rank,
         softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
         out=out,
@@ -143,6 +149,42 @@ def _run_bounds(
         validate=validate,
     )
     return output, stats
+
+
+def _cp_reference_inputs(
+    case: _MLACase,
+    global_lengths: torch.Tensor,
+    *,
+    cp_rank: int,
+    cp_world: int,
+    cp_interleave_size: int,
+    qo_indptr: torch.Tensor | None = None,
+) -> tuple[_MLACase, torch.Tensor]:
+    """Enumerate global ownership independently of the kernel prefix formula."""
+    q_lengths = (
+        (qo_indptr[1:] - qo_indptr[:-1]).tolist()
+        if qo_indptr is not None
+        else [case.query.shape[1]] * case.block_tables.shape[0]
+    )
+    local_lengths, bounds = [], []
+    for length, q_len in zip(global_lengths.tolist(), q_lengths, strict=True):
+        positions = torch.arange(length, device=case.query.device)
+        owned = positions[(positions // cp_interleave_size) % cp_world == cp_rank]
+        local_lengths.append(owned.numel())
+        for q_idx in range(q_len):
+            endpoint = (
+                length if case.mask_type == "dense" else length - q_len + q_idx + 1
+            )
+            bounds.append(int((owned < endpoint).sum().item()))
+    return (
+        replace(
+            case,
+            seq_lens_kv=torch.tensor(
+                local_lengths, dtype=torch.int32, device=case.query.device
+            ),
+        ),
+        torch.tensor(bounds, dtype=torch.int32, device=case.query.device),
+    )
 
 
 @torch.no_grad()
@@ -280,7 +322,7 @@ def _assert_bounded_result(
 
 
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_kv_bounds_split_reduction() -> None:
+def test_attention_ts_mla_cp_split_reduction() -> None:
     """Split reducers must preserve neutral rows and short partial prefixes."""
 
     case = _make_bounded_case(
@@ -289,30 +331,89 @@ def test_attention_ts_mla_kv_bounds_split_reduction() -> None:
         kv_lengths=(32769, 32769, 32769, 32769),
         qkv_dtype=_FP8,
         page_size=128,
+        mask_type="dense",
     )
-    bounds = torch.tensor([0, 1, 129, 32769], dtype=torch.int32, device="cuda")
-    wrapper = _plan_bounds(case, max_q_len=1)
+    global_lengths = torch.tensor(
+        [0, 9, 1033, 262153], dtype=torch.int32, device="cuda"
+    )
+    wrapper = _plan_cp(case, max_q_len=1, cp_interleave_size=1)
     assert int(_policy_dict(wrapper)["split_kv"]) > 1
-    output, stats = _run_bounds(wrapper, case, bounds)
-    _assert_bounded_result(case, bounds, output, stats, policy=_policy_dict(wrapper))
+    output, stats = _run_cp(wrapper, case, global_lengths, cp_rank=1)
+    local_case, bounds = _cp_reference_inputs(
+        case, global_lengths, cp_rank=1, cp_world=8, cp_interleave_size=1
+    )
+    assert bounds.tolist() == [0, 1, 129, 32769]
+    _assert_bounded_result(
+        local_case, bounds, output, stats, policy=_policy_dict(wrapper)
+    )
+
+
+def _run_cp_ranks(
+    case: _MLACase, *, global_length: int, cp_world: int, cp_interleave_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
+    """Run every rank through the same B=1 plan; rank must not specialize JIT."""
+
+    def rank_case(rank):
+        return replace(
+            case,
+            query=case.query[rank : rank + 1],
+            block_tables=case.block_tables[rank : rank + 1],
+            seq_lens_kv=case.seq_lens_kv[rank : rank + 1],
+        )
+
+    wrapper = _plan_cp(
+        rank_case(0),
+        max_q_len=case.query.shape[1],
+        cp_world=cp_world,
+        cp_interleave_size=cp_interleave_size,
+    )
+    compiled = wrapper._plan_state.compiled
+    global_lengths = torch.tensor(
+        [global_length], dtype=torch.int32, device=case.query.device
+    )
+    outputs, stats, all_bounds = [], [], []
+    for rank in range(cp_world):
+        local_case = rank_case(rank)
+        local_case, bounds = _cp_reference_inputs(
+            local_case,
+            global_lengths,
+            cp_rank=rank,
+            cp_world=cp_world,
+            cp_interleave_size=cp_interleave_size,
+        )
+        output, lse = _run_cp(wrapper, local_case, global_lengths, cp_rank=rank)
+        _assert_bounded_result(
+            local_case,
+            bounds,
+            output,
+            lse,
+            policy=_policy_dict(wrapper),
+            bf16_single_tile=case.query.dtype == torch.bfloat16,
+        )
+        assert wrapper._plan_state.compiled is compiled
+        outputs.append(output)
+        stats.append(lse)
+        all_bounds.append(bounds)
+    return (
+        torch.cat(outputs),
+        torch.cat(stats),
+        torch.cat(all_bounds),
+        _policy_dict(wrapper),
+    )
 
 
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_kv_bounds_helix_page_boundary() -> None:
+def test_attention_ts_mla_cp_helix_page_boundary() -> None:
     """BF16 PV rounding on short local prefixes must not corrupt LSE merging."""
 
     case = _make_bounded_case(
         seq_len_q=6, kv_lengths=(64, 5, 0), qkv_dtype=torch.bfloat16
     )
     case.query[1:].copy_(case.query[:1].expand(2, -1, -1, -1))
-    bounds = torch.tensor(
-        [64] * 6 + list(range(6)) + [0] * 6, dtype=torch.int32, device="cuda"
+    output, stats, bounds, _ = _run_cp_ranks(
+        case, global_length=69, cp_world=3, cp_interleave_size=64
     )
-    wrapper = _plan_bounds(case, max_q_len=6)
-    output, stats = _run_bounds(wrapper, case, bounds)
-    _assert_bounded_result(
-        case, bounds, output, stats, policy=_policy_dict(wrapper), bf16_single_tile=True
-    )
+    assert bounds.tolist() == [64] * 6 + list(range(6)) + [0] * 6
 
     merged, merged_stats = _merge_reference(output, stats)
     global_cache = torch.cat([_gather_request_cache(case, rank) for rank in range(3)])
@@ -346,18 +447,16 @@ def test_attention_ts_mla_kv_bounds_helix_page_boundary() -> None:
     ),
 )
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_kv_bounds_cp8_page128(first_position: int) -> None:
+def test_attention_ts_mla_cp8_page128(first_position: int) -> None:
     """Single-device CP8 page-interleaving and merge oracle for H96/Q8."""
 
     cp_size, page_size, seq_len_q = 8, 128, 8
     qkv_dtype = _FP8
     total_tokens = first_position + seq_len_q
 
-    def local_prefix(global_prefix: int, rank: int) -> int:
-        full_cycles, tail = divmod(global_prefix, cp_size * page_size)
-        return full_cycles * page_size + min(max(tail - rank * page_size, 0), page_size)
-
-    kv_lengths = tuple(local_prefix(total_tokens, rank) for rank in range(cp_size))
+    positions = torch.arange(total_tokens, device="cuda")
+    owners = (positions // page_size) % cp_size
+    kv_lengths = tuple(int((owners == rank).sum().item()) for rank in range(cp_size))
     case = _make_bounded_case(
         num_heads=96,
         seq_len_q=seq_len_q,
@@ -366,15 +465,10 @@ def test_attention_ts_mla_kv_bounds_cp8_page128(first_position: int) -> None:
         page_size=page_size,
     )
     case.query[1:].copy_(case.query[:1].expand(cp_size - 1, -1, -1, -1))
-    bounds = torch.tensor(
-        [
-            local_prefix(position + 1, rank)
-            for rank in range(cp_size)
-            for position in range(first_position, total_tokens)
-        ],
-        dtype=torch.int32,
-        device=case.query.device,
+    output, stats, bounds, policy = _run_cp_ranks(
+        case, global_length=total_tokens, cp_world=cp_size, cp_interleave_size=page_size
     )
+    assert policy["kernel"] == "throughput_2cta"
     per_rank_bounds = bounds.reshape(cp_size, seq_len_q)
     if first_position == 127:
         assert per_rank_bounds[:2, :3].tolist() == [[128, 128, 128], [0, 1, 2]]
@@ -383,20 +477,11 @@ def test_attention_ts_mla_kv_bounds_cp8_page128(first_position: int) -> None:
         assert per_rank_bounds[0, :3].tolist() == [128, 129, 130]
         assert per_rank_bounds[7, :3].tolist() == [128, 128, 128]
 
-    wrapper = _plan_bounds(case, max_q_len=seq_len_q)
-    assert _policy_dict(wrapper)["kernel"] == "throughput_2cta"
-    output, stats = _run_bounds(wrapper, case, bounds)
-    policy = _policy_dict(wrapper)
-    _assert_bounded_result(case, bounds, output, stats, policy=policy)
-
     merged, merged_stats = _merge_reference(output, stats)
     local_expected, local_stats = _bounded_reference(case, bounds, policy=policy)
     quantized_merged, _ = _merge_reference(local_expected, local_stats)
 
-    # Reconstruct global token order by explicit page ownership rather than the
-    # prefix arithmetic above. CP8 wraps to rank zero at the ninth global page.
-    positions = torch.arange(total_tokens, device=case.query.device)
-    owners = (positions // page_size) % cp_size
+    # CP8 wraps to rank zero at the ninth global page.
     global_cache = torch.empty(
         (total_tokens, case.query.shape[-1]), device=case.query.device
     )
@@ -421,25 +506,41 @@ def test_attention_ts_mla_kv_bounds_cp8_page128(first_position: int) -> None:
     )
 
 
-def _exercise_bounds_graph(
+def _exercise_cp_graph(
     case: _MLACase,
     initial: list[int],
     updated: list[int],
     *,
     max_q_len: int,
+    cp_rank: int,
+    cp_interleave_size: int,
     qo_indptr: torch.Tensor | None = None,
+    updated_offsets: list[int] | None = None,
     expected_kernel: str | None = None,
     check_opt_out: bool = False,
 ) -> None:
-    bounds = torch.tensor(initial, dtype=torch.int32, device=case.query.device)
-    wrapper = _plan_bounds(
-        case, max_q_len=max_q_len, packed_query=qo_indptr is not None
+    global_lengths = torch.tensor(initial, dtype=torch.int32, device=case.query.device)
+    wrapper = _plan_cp(
+        case,
+        max_q_len=max_q_len,
+        packed_query=qo_indptr is not None,
+        cp_interleave_size=cp_interleave_size,
     )
     if expected_kernel is not None:
         assert _policy_dict(wrapper)["kernel"] == expected_kernel
-    eager_output, eager_stats = _run_bounds(wrapper, case, bounds, qo_indptr=qo_indptr)
-    _assert_bounded_result(
+    eager_output, eager_stats = _run_cp(
+        wrapper, case, global_lengths, cp_rank=cp_rank, qo_indptr=qo_indptr
+    )
+    local_case, bounds = _cp_reference_inputs(
         case,
+        global_lengths,
+        cp_rank=cp_rank,
+        cp_world=8,
+        cp_interleave_size=cp_interleave_size,
+        qo_indptr=qo_indptr,
+    )
+    _assert_bounded_result(
+        local_case,
         bounds,
         eager_output,
         eager_stats,
@@ -450,10 +551,11 @@ def _exercise_bounds_graph(
     graph_stats = torch.empty_like(eager_stats)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured, captured_stats = _run_bounds(
+        captured, captured_stats = _run_cp(
             wrapper,
             case,
-            bounds,
+            global_lengths,
+            cp_rank=cp_rank,
             qo_indptr=qo_indptr,
             out=graph_out,
             stats=graph_stats,
@@ -461,28 +563,34 @@ def _exercise_bounds_graph(
         )
     assert captured is graph_out
     assert captured_stats is graph_stats
-    bounds_ptr = bounds.data_ptr()
-    original_pages = case.block_tables[0].clone()
-    original_kv_len = int(case.seq_lens_kv[0].item())
-    first_q_len = int(qo_indptr[1].item()) if qo_indptr is not None else max_q_len
-    for values, empty_request in (
-        (updated, False),
-        ([0] * first_q_len + updated[first_q_len:], True),
-        (initial, False),
+    lengths_ptr = global_lengths.data_ptr()
+    original_pages = case.block_tables.clone()
+    initial_offsets = qo_indptr.tolist() if qo_indptr is not None else None
+    for values, offsets in (
+        (updated, updated_offsets),
+        ([0] * len(initial), updated_offsets),
+        (initial, initial_offsets),
     ):
-        case.seq_lens_kv[0] = 0 if empty_request else original_kv_len
-        if empty_request:
-            case.block_tables[0].fill_(-1)
-        else:
-            case.block_tables[0].copy_(original_pages)
-        bounds.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
-        assert bounds.data_ptr() == bounds_ptr
+        global_lengths.copy_(torch.tensor(values, dtype=torch.int32, device="cuda"))
+        if qo_indptr is not None:
+            qo_indptr.copy_(torch.tensor(offsets, dtype=torch.int32, device="cuda"))
+        local_case, bounds = _cp_reference_inputs(
+            case,
+            global_lengths,
+            cp_rank=cp_rank,
+            cp_world=8,
+            cp_interleave_size=cp_interleave_size,
+            qo_indptr=qo_indptr,
+        )
+        case.block_tables.copy_(original_pages)
+        case.block_tables[local_case.seq_lens_kv == 0] = -1
+        assert global_lengths.data_ptr() == lengths_ptr
         graph_out.fill_(float("nan"))
         graph_stats.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
         _assert_bounded_result(
-            case,
+            local_case,
             bounds,
             graph_out,
             graph_stats,
@@ -490,26 +598,30 @@ def _exercise_bounds_graph(
             policy=_policy_dict(wrapper),
         )
     _CUDA_GRAPH_ANCHOR_OWNERS.append(
-        (graph, wrapper, case, bounds, qo_indptr, graph_out, graph_stats)
+        (graph, wrapper, case, global_lengths, qo_indptr, graph_out, graph_stats)
     )
     if check_opt_out:
-        no_init = _plan_bounds(
+        no_init = _plan_cp(
             case,
             max_q_len=max_q_len,
             packed_query=qo_indptr is not None,
             zero_empty_rows=False,
+            cp_interleave_size=cp_interleave_size,
         )
         assert no_init._plan_state.compiled is not wrapper._plan_state.compiled
         assert (
             no_init._plan_state.workspace_layout == wrapper._plan_state.workspace_layout
         )
-        output, stats = _run_bounds(no_init, case, bounds, qo_indptr=qo_indptr)
+        output, stats = _run_cp(
+            no_init, case, global_lengths, cp_rank=cp_rank, qo_indptr=qo_indptr
+        )
         no_init_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(no_init_graph):
-            _run_bounds(
+            _run_cp(
                 no_init,
                 case,
-                bounds,
+                global_lengths,
+                cp_rank=cp_rank,
                 qo_indptr=qo_indptr,
                 out=output,
                 stats=stats,
@@ -545,35 +657,43 @@ def _exercise_bounds_graph(
     ),
 )
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_kv_bounds_page128_graph_smoke(
+def test_attention_ts_mla_cp_graph_smoke(
     num_heads: int,
     seq_len_q: int,
     expected_kernel: str,
 ) -> None:
-    """K3 TP16, Helix8/MTP7, and DEP16/MTP5 runtime bounds under one graph."""
+    """K3 TP16, Helix8/MTP7, and packed DEP16/MTP5 global lengths under a graph."""
 
     kv_len = 127 if expected_kernel == "throughput_latency_1cta" else 129
     case = _make_bounded_case(
         num_heads=num_heads,
         seq_len_q=seq_len_q,
-        kv_lengths=(kv_len, kv_len),
+        kv_lengths=(kv_len,) * (3 if seq_len_q == 6 else 2),
         qkv_dtype=_FP8,
         page_size=128,
     )
-    initial = (
-        [kv_len]
-        if seq_len_q == 1
-        else [
-            min(value, kv_len)
-            for value in [0, 1, 127, 128, 129, 129, 129, 129][:seq_len_q]
-        ]
-    )
-    updated = [min(2, value) for value in initial]
-    _exercise_bounds_graph(
+    qo_indptr = None
+    updated_offsets = None
+    if seq_len_q == 1:
+        initial, updated = [1015, 1009], [16, 1]
+        cp_rank, interleave = 7, 1
+    elif seq_len_q == 8:
+        initial, updated = [135, 136], [1025, 1026]
+        cp_rank, interleave = 1, 128
+    else:
+        case, qo_indptr = _pack_mla_case(case, (3, 6, 0))
+        initial, updated = [131, 133, 0], [1030, 0, 131]
+        updated_offsets = [0, 6, 6, 9]
+        cp_rank, interleave = 1, 128
+    _exercise_cp_graph(
         case,
-        initial + [kv_len] * seq_len_q,
-        updated + [kv_len] * seq_len_q,
+        initial,
+        updated,
         max_q_len=seq_len_q,
+        cp_rank=cp_rank,
+        cp_interleave_size=interleave,
+        qo_indptr=qo_indptr,
+        updated_offsets=updated_offsets,
         expected_kernel=expected_kernel,
         check_opt_out=seq_len_q in (1, 8),
     )

@@ -230,6 +230,15 @@ alias `kv_dtype`. `BlockSparseTSWrapper.plan()` instead accepts `k_data_type`,
 `v_data_type`, and the common-KV alias `kv_data_type`. Use the names for the
 specific wrapper.
 
+Prims-TS MLA CP plans specialize `cp_world` and `cp_interleave_size`, but keep
+`cp_rank` a runtime integer and `seq_lens_kv` a graph-live global logical length
+vector including current Q tokens. The planned `max_kv_len` and page tables
+remain rank-local capacity. Causal packed queries derive their alignment from
+actual `qo_indptr` deltas, never from the maximum Q capacity. Validation checks
+local ownership for the actual rank; trusted `run(validate=False)` must not
+copy lengths or offsets to the CPU. CP>1 empty rows are neutral O/`-inf` LSE
+unless `zero_empty_rows=False`, in which case the caller must sanitize them.
+
 ### H100 D256 paged admission
 
 On H100 80GB HBM3 with 132 SMs, BF16 or FP16 HND/page16 D256 auto may select cuDNN
