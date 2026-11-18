@@ -35,10 +35,12 @@ pytestmark = pytest.mark.skipif(not SM107, reason="requires SM107 (Rubin)")
 
 
 @pytest.fixture(autouse=True)
-def _allow_experimental_auto_backends(monkeypatch):
-    """backend="auto" routes to the experimental specialized backend only
-    under the documented opt-in; these tests exercise that route."""
-    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
+def _no_experimental_auto_opt_in(monkeypatch):
+    """The specialized backend is stable-classed: backend="auto" must reach
+    it WITHOUT FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS (which gates only
+    experimental-classed backends, e.g. cake). Keep the variable unset so
+    every auto-routing test proves default reachability."""
+    monkeypatch.delenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", raising=False)
 
 
 def ref_qsa_sparse_attention(q, gate, k_cache, v_cache, packed, cu_seqlens, page_base):
@@ -234,17 +236,22 @@ def test_exact_capacity_cache(lengths):
     assert_close_at_gate(out, ref)
 
 
-def test_auto_requires_experimental_opt_in(monkeypatch):
-    """Without FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1, backend="auto"
-    must not silently route to the experimental specialized backend; the
-    gate's error names the opt-in. Explicit selection stays available."""
+def test_auto_reaches_specialized_by_default(monkeypatch):
+    """The specialized backend is a DEFAULT auto candidate: backend="auto"
+    routes to it with FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS unset or 0
+    (the opt-in gates only experimental-classed backends, such as cake)."""
+    from flashinfer import sparse as sparse_mod
+
     inputs = make_inputs((64,), seed=21)
     monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "0")
-    with pytest.raises(RuntimeError, match="EXPERIMENTAL_AUTO_BACKENDS"):
-        run_api(inputs, backend="auto")
+    before = sparse_mod.qsa_sparse_paged_attention_dispatch_stats["specialized"]
+    auto = run_api(inputs, backend="auto")
+    assert (
+        sparse_mod.qsa_sparse_paged_attention_dispatch_stats["specialized"]
+        == before + 1
+    )
     spec = run_api(inputs, backend="specialized")
-    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", "1")
-    assert torch.equal(run_api(inputs, backend="auto"), spec)
+    assert torch.equal(auto, spec)
 
 
 def test_wider_query_magnitude_stays_at_gate():

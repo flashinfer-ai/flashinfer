@@ -2746,7 +2746,7 @@ def qsa_sparse_paged_attention(
     implementation runs every cache format on SM80 through SM90. NVFP4 on 10.0, 10.3, 10.7 and
     12.0 is served by the experimental Cake backend, and an FP8 cache on SM107 at the Qwen QSA
     TP4 geometry (6 query heads over 1 kv head, page size 64, unit scales, selection width
-    2052) is served by the experimental specialized backend (see ``backend``).
+    2052) is served by the specialized backend (see ``backend``).
 
     Parameters
     ----------
@@ -2786,9 +2786,9 @@ def qsa_sparse_paged_attention(
         :mod:`flashinfer.experimental.cake_qsa_nvfp4` (NVFP4 only, on the capabilities that
         package exports a library for: 12.0 on the ``mma.sync`` programs; 10.0, 10.3 and 10.7
         on the tcgen05 programs) and emits an ``ExperimentalWarning`` once.
-        ``"specialized"`` runs the experimental agent-generated SM107 Triton kernel for FP8
-        caches at the Qwen QSA TP4 geometry (see Notes) and also emits an
-        ``ExperimentalWarning`` once; it is never silently swapped: a call it cannot serve
+        ``"specialized"`` runs the agent-generated SM107 Triton kernel for FP8
+        caches at the Qwen QSA TP4 geometry (see Notes); it is never silently swapped and
+        never falls back: a call it cannot serve
         raises ``NotImplementedError`` naming the reason, which is also appended to
         ``flashinfer.sparse.qsa_sparse_paged_attention_fallback_reasons`` (successful
         dispatches are counted in
@@ -2798,10 +2798,10 @@ def qsa_sparse_paged_attention(
         reports the unsupported device on SM107, since no composable path implements this
         form). ``"auto"`` (the default) selects ``"specialized"`` exactly when it can serve
         the call — an FP8 cache on SM107 at the geometry above, the one form every other
-        backend refuses — and, like every automatic route to an experimental backend,
-        only when ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set; without the
-        opt-in it raises ``RuntimeError`` naming that variable and the explicit
-        ``backend="specialized"`` alternative. Otherwise ``"auto"`` selects ``"default"``
+        backend refuses — by default, like every stable backend (the
+        ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS`` opt-in gates only
+        experimental-classed backends, such as ``"cake"`` here). Otherwise ``"auto"``
+        selects ``"default"``
         for every cache on 8.x and 9.0 and for FP8 and BF16 caches anywhere. For an NVFP4 cache on a capability the Cake
         package exports, ``"auto"`` selects ``"cake"`` only when
         ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set and raises ``RuntimeError``
@@ -2840,17 +2840,12 @@ def qsa_sparse_paged_attention(
         )
         if reason is None:
             # The one form every other backend refuses: an FP8 cache on
-            # SM107 at the specialized kernel's contract. Automatic routing
-            # to an experimental backend still takes the opt-in gate; its
-            # error names the opt-in and the explicit backend, which beats
-            # "default"'s bare unsupported-device report.
-            require_experimental_auto_backends(
-                "qsa_sparse_paged_attention -> specialized"
-            )
+            # SM107 at the specialized kernel's contract. The specialized
+            # backend is stable-classed (it lives outside
+            # flashinfer.experimental), so it is a DEFAULT auto candidate:
+            # the FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS opt-in gates
+            # only experimental-classed backends (cake below).
             backend = "specialized"
-            warn_experimental_backend_once(
-                "qsa_sparse_paged_attention", "specialized", automatic=True
-            )
         else:
             if (
                 q.device.type == "cuda"
@@ -2871,7 +2866,6 @@ def qsa_sparse_paged_attention(
     elif backend == "cake":
         warn_experimental_backend_once("qsa_sparse_paged_attention", "cake")
     elif backend == "specialized":
-        warn_experimental_backend_once("qsa_sparse_paged_attention", "specialized")
         reason = _qsa_specialized_unservable_reason(
             q, k_cache, v_cache, logical_indices, k_scale, v_scale, k_sf, v_sf
         )
