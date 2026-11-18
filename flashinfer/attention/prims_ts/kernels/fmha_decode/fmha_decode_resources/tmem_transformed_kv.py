@@ -1629,7 +1629,7 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
         )
         dst_base = Int32(self._stage_base(stage_info).data_ptr().toint())
         slab_bytes = cfg.tile_size_kv * 128
-        src_stage = raw.state_src.consumer_work_stage
+        src_stage = consumer_work_stage(raw)
         captured = raw.uses_register_capture
         token, _, half = raw.bf16_unit(0)
         if cutlass.const_expr(not captured):
@@ -1716,7 +1716,7 @@ class SmemKvFromNvfp4Resource(SmemKvTileResource):
         half_scale_blocks = cfg.headdim // 32
         slab_bytes = cfg.tile_size_kv * 128
         raw = self.raw_src
-        src_stage = raw.state_src.consumer_work_stage
+        src_stage = consumer_work_stage(raw)
         for rep in cutlass.range_constexpr(units // num_threads):
             unit = thread + Int32(rep * num_threads)
             token = unit % Int32(cfg.tile_size_kv)
