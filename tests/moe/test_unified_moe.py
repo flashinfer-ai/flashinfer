@@ -3187,7 +3187,6 @@ def _bf16_dense_reference(
     expert_offset=0,
     *,
     narrow_routing_weights=True,
-    activation: SwiGLU | ReLU2 | None = None,
 ):
     """fp32 dense MoE authority for the bf16 path.
 
@@ -3196,10 +3195,8 @@ def _bf16_dense_reference(
     ``x1 = a[:, :I]`` is the linear half, ``x2 = a[:, I:]`` the gate, and the
     SwiGLU output is ``silu(x2) * x1``.  ``w1``/``w2`` hold only this rank's
     LOCAL experts; a token routed to global id ``g`` uses local weight
-    ``g - expert_offset``. For ReLU2, FC1 has width I and the activation is
-    ``relu(a) ** 2``.
+    ``g - expert_offset``.
     """
-    activation = activation or SwiGLU()
     if narrow_routing_weights:
         final_scales = final_scales.to(torch.bfloat16)
     final_scales = final_scales.float()
@@ -3211,10 +3208,7 @@ def _bf16_dense_reference(
             continue
         tok, nth = torch.where(mask)
         a = x32[tok] @ w1[local_e].float().t()
-        if activation == ReLU2():
-            inter = F.relu(a).square()
-        else:
-            inter = F.silu(a[:, intermediate_size:]) * a[:, :intermediate_size]
+        inter = F.silu(a[:, intermediate_size:]) * a[:, :intermediate_size]
         inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
         expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
         out[tok] += final_scales[tok, nth, None].float() * expert_out
@@ -3228,7 +3222,6 @@ def _make_bf16_packs_and_config(
     intermediate_size: int,
     num_experts: int,
     top_k: int,
-    activation: SwiGLU | ReLU2 | None = None,
     local_num_experts: int | None = None,
     local_expert_offset: int = 0,
     max_tokens: int | None = None,
@@ -3248,7 +3241,6 @@ def _make_bf16_packs_and_config(
     reading is numerically distinguishable.  One native view is prepared per
     entry of ``backend_configs``.
     """
-    activation = activation or SwiGLU()
     local_num_experts = local_num_experts or num_experts
     max_tokens = max_tokens or max(num_tokens, 8192)
     device = torch.device("cuda", torch.cuda.current_device())
@@ -3258,7 +3250,7 @@ def _make_bf16_packs_and_config(
     w1 = (
         torch.randn(
             local_num_experts,
-            (2 if activation.is_gated else 1) * intermediate_size,
+            2 * intermediate_size,
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -3311,7 +3303,6 @@ def _make_bf16_packs_and_config(
                 num_local_experts=local_num_experts,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                activation=activation,
                 device=device,
             ),
         )
@@ -3324,7 +3315,7 @@ def _make_bf16_packs_and_config(
             local_expert_offset=local_expert_offset,
             local_num_experts=local_num_experts,
         ),
-        activation=activation,
+        activation=SwiGLU(),
         backend=BackendOptions(candidates=backend_configs),
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
@@ -3501,7 +3492,7 @@ def _bf16_make(
     )
 
 
-def _bf16_ref(act_pack, tensors, expert_offset=0, *, activation=None):
+def _bf16_ref(act_pack, tensors, expert_offset=0):
     return _bf16_dense_reference(
         tensors["x"],
         tensors["w1"],
@@ -3513,7 +3504,6 @@ def _bf16_ref(act_pack, tensors, expert_offset=0, *, activation=None):
         narrow_routing_weights=(
             act_pack.routing_input_mode is not RoutingInputMode.UnpackedPrecomputed
         ),
-        activation=activation,
     )
 
 
