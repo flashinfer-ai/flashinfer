@@ -46,6 +46,7 @@ per workload row on GB300 against the stock trtllm-gen path of this API.
 import functools
 import json as _json
 import os as _os
+import threading as _threading
 from pathlib import Path as _Path
 
 import torch
@@ -72,24 +73,38 @@ def _allowlist():
 
 
 _MODULE = None
-_MODULE_ERROR = None
+_MODULE_ERROR = None  # "TypeName: message" string; deliberately traceback-free
+_MODULE_LOCK = _threading.Lock()
 
 
 def get_sparse_mla_decode_dsv4_module():
-    """Build-and-load exactly once. functools.cache would not remember a
-    *failed* build, so every later backend="auto" call would repeat the JIT
-    compile attempt (seconds per decode step); remember the first failure
-    and re-raise it so the fallback to stock dispatch stays cheap."""
+    """Build-and-load exactly once per process. functools.cache would not
+    remember a *failed* build, so every later backend="auto" call would
+    repeat the JIT compile attempt (seconds per decode step). The failure is
+    remembered as a traceback-free string (re-raising one cached exception
+    object appends caller frames to its __traceback__ on every raise,
+    pinning those frames' tensors) and a fresh RuntimeError is raised per
+    request; the lock keeps concurrent cold callers from compiling twice."""
     global _MODULE, _MODULE_ERROR
     if _MODULE is not None:
         return _MODULE
     if _MODULE_ERROR is not None:
-        raise _MODULE_ERROR
-    try:
-        _MODULE = gen_sparse_mla_decode_dsv4_module().build_and_load()
-    except Exception as exc:
-        _MODULE_ERROR = exc
-        raise
+        raise RuntimeError(
+            "specialized module build failed previously: " + _MODULE_ERROR
+        )
+    with _MODULE_LOCK:
+        if _MODULE is not None:
+            return _MODULE
+        if _MODULE_ERROR is not None:
+            raise RuntimeError(
+                "specialized module build failed previously: " + _MODULE_ERROR
+            )
+        try:
+            mod = gen_sparse_mla_decode_dsv4_module().build_and_load()
+        except Exception as exc:
+            _MODULE_ERROR = f"{type(exc).__name__}: {exc}"
+            raise
+        _MODULE = mod
     _BUILT["ready"] = True
     return _MODULE
 
@@ -158,7 +173,9 @@ def supported_with_reasons(
             r.append(name)
     if r:
         return r
-    if abs(bmm1_scale - _SCALE) > 1e-7 or bmm2_scale != 1.0:
+    # The inverted <= form rejects NaN (every NaN comparison is false, so
+    # `> 1e-7` alone would admit NaN to the baked-scale kernel).
+    if not (abs(bmm1_scale - _SCALE) <= 1e-7) or bmm2_scale != 1.0:
         r.append("scale_mismatch")
     if (
         query.dim() != 3
