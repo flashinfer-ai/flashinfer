@@ -1574,7 +1574,7 @@ def chunk_gated_delta_rule(
         Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
         float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
-        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM110/SM120),
+        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM107/SM110/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
         from row ``state_indices[i]``; on SM100/SM103/SM110 every rank-4
@@ -1645,7 +1645,7 @@ def chunk_gated_delta_rule(
         requires CP support, and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
         Int32 or int64 tensor of shape ``[num_seqs]``
-        (SM8x/SM90/SM100/SM103/SM110/SM120). When provided,
+        (SM8x/SM90/SM100/SM103/SM107/SM110/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row

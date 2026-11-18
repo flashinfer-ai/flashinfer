@@ -17,7 +17,25 @@ from .utils import get_compute_capability
 
 @dataclass(frozen=True)
 class CakeFmhaRequestOrderedDecodePlan:
-    """Immutable host-selected launch plan for graph-safe request ordering."""
+    """Immutable host-selected launch plan for graph-safe request ordering.
+
+    Attributes
+    ----------
+    module_name : str
+        Generated kernel module selected for this plan.
+    batch_size : int
+        Number of requests in the batch.
+    q_len : int
+        Number of query tokens per request.
+    workspace_parts : int
+        Number of KV partitions selected by the plan.
+    grid : tuple[int, int, int]
+        CUDA launch grid for the selected kernel.
+    total_tiles : int
+        Number of work tiles scheduled by the selected kernel.
+    write_lse : bool
+        Whether the kernel writes log-sum-exp output.
+    """
 
     module_name: str
     batch_size: int

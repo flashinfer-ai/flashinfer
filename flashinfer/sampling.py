@@ -971,7 +971,8 @@ def softmax(
     Parameters
     ----------
     logits : torch.Tensor
-        Two-dimensional CUDA tensor of logits.
+        Two-dimensional CUDA tensor of logits. With ``batch_invariant=True``,
+        leading batch dimensions are also supported, e.g. three-dimensional logits.
     temperature: Optional[Union[torch.Tensor, float]]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the temperature for temperature scaling.
         If a scalar, the same temperature is used for all requests.
@@ -1103,8 +1104,10 @@ def log_probs(
     out: Optional[torch.Tensor] = None,
     lse_out: Optional[torch.Tensor] = None,
 ):
-    r"""The log-probability of one token per row under ``softmax(logits / temperature)``, with a batch-invariant
-    dataflow: the teacher-forced score of a sampled token (a trainer re-scoring a rollout) and the returned
+    r"""The log-probability of one token per row under ``softmax(logits / temperature)``.
+
+    With ``batch_invariant=True``, the dataflow is batch-invariant: the teacher-forced score of a sampled
+    token (a trainer re-scoring a rollout) and the returned
     log-probability of a decode step (an inference engine) are the same bits whatever the batch, its padding,
     the row's position or the SM count, and run-to-run deterministic.
 
@@ -1385,7 +1388,7 @@ def sampling_from_logits(
 
     Returns
     -------
-    samples: torch.Tensor
+    samples : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         Sampled categories, shape (batch_size,). It's equivalent to sampling from
         :attr:`logits` after applying softmax. Under ``batch_invariant=True`` a row whose weights do
         not sum to a positive finite number (a row of ``-inf`` logits, or with a NaN) draws ``-1``, and with
@@ -1571,7 +1574,9 @@ def sampling_from_probs(
 
     Note
     ----
-    This function expects float32 inputs, and the output is int32 unless ``indices`` is provided, in which case the output has the same dtype as ``indices``.
+    The default path expects float32 inputs. With ``batch_invariant=True``, inputs may
+    be bfloat16, float16, or float32 probabilities or unnormalised weights.
+    The output is int32 unless ``indices`` is provided, in which case the output has the same dtype as ``indices``.
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):

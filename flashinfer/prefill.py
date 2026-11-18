@@ -5101,7 +5101,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
-            Whether to return the logsumexp of attention output
+            Whether to return the logsumexp of attention logits
         lse_base : str
             Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
             ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
@@ -5183,7 +5183,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             * The attention output, shape:
               ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+            * The logsumexp of attention logits, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
@@ -6300,7 +6300,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and after scaling. The mask tensor should be in the same device as the input tensors.
         causal : bool
             Whether to apply causal mask to the attention matrix.
-            This argument is ignored if ``mask`` is provided in :meth:`plan`.
+            This argument is ignored if ``custom_mask`` or ``packed_custom_mask`` is provided in :meth:`plan`.
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -7472,7 +7472,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
-            Whether to return the logsumexp of attention output
+            Whether to return the logsumexp of attention logits
         lse_base : str
             Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
             ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
@@ -7510,7 +7510,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+            * The logsumexp of attention logits, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
