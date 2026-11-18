@@ -115,10 +115,16 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     # groups of HEADS_PER_CTA; with an odd HV/H the last group has one head.
     group_size = HV // H
     groups = (group_size + HEADS_PER_CTA - 1) // HEADS_PER_CTA
-    head_group = block % (H * groups)
-    i_n = block // (H * groups)
-    i_h = head_group // groups
-    i_hv0 = i_h * group_size + (head_group % groups) * HEADS_PER_CTA
+    if cutlass.const_expr(group_size % HEADS_PER_CTA == 0):
+        head_group = block % (HV // HEADS_PER_CTA)
+        i_n = block // (HV // HEADS_PER_CTA)
+        i_hv0 = head_group * HEADS_PER_CTA
+        i_h = i_hv0 // group_size
+    else:
+        head_group = block % (H * groups)
+        i_n = block // (H * groups)
+        i_h = head_group // groups
+        i_hv0 = i_h * group_size + (head_group % groups) * HEADS_PER_CTA
     i_hv1 = i_hv0 + 1
     partial_pairs = HEADS_PER_CTA == 2 and group_size % 2 == 1
     has_pair = HEADS_PER_CTA == 2
