@@ -14,8 +14,12 @@ def test_bmm_fp8_valid_scalar_scale():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     b, m, k, n = 2, 4, 8, 16
 
-    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
     A_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
     B_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
@@ -29,8 +33,12 @@ def test_bmm_fp8_per_row_scale_rejected():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     b, m, k, n = 2, 4, 8, 16
 
-    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
     A_scale = torch.ones(b, m, 1, dtype=torch.float32, device=device)  # Wrong: per-row
     B_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
@@ -43,8 +51,12 @@ def test_bmm_fp8_wrong_dtype_rejected():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     b, m, k, n = 2, 4, 8, 16
 
-    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
     A_scale = torch.tensor(1.0, dtype=torch.float16, device=device)  # Wrong: float16
     B_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
@@ -76,8 +88,12 @@ def test_bmm_fp8_zero_dim_scalar_rejected():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     b, m, k, n = 2, 4, 8, 16
 
-    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    A = torch.randn(b, m, k, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    B = torch.randn(b, k, n, device=device, dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
     # Valid: 0-dim scalar
     A_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
     B_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
