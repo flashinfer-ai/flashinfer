@@ -162,3 +162,40 @@ def test_legacy_coverage_replayed_then_refreshed(setup, monkeypatch, tmp_path, m
     with tuning(mode):
         assert tuner.choose_one("legacy", [runner], config, inputs) == (runner, 1)
     assert (PoolRunner, 1) in calls
+
+
+def test_persisted_signature_text_is_canonical():
+    from flashinfer.autotuner.autotuner import _ProfilingCandidates
+
+    dtypes = ["fp16", "bf16", "fp8", "fp4", "int8", "mxfp8"]
+
+    class SetRunner(PoolRunner):
+        def get_tactic_cache_key(self, inputs):
+            return (frozenset(dtypes), ("rev", 2, frozenset({3, 1})))
+
+    keys = _ProfilingCandidates.from_runners([SetRunner([1])], [torch.zeros(1)])
+    expected = (tuple(sorted(dtypes)), ("rev", 2, (1, 3)))
+    # str(frozenset) follows the per-process hash seed; the persisted key must not.
+    assert keys.file_keys == (str(("SetRunner", (), expected)),)
+
+
+@pytest.mark.parametrize("mode", ["v1", "managed"])
+def test_signature_changed_by_preparation_retunes(setup, mode):
+    tuner, calls = setup
+
+    class GrowingRunner(PoolRunner):
+        def forward(self, inputs, tactic=-1, do_preparation=False):
+            if do_preparation and 2 not in self.tactics:
+                # The pool grows after enumeration, so tactic 2 was not compared.
+                self.tactics.append(2)
+            return inputs[0]
+
+    runner = GrowingRunner([1])
+    inputs, config = [torch.zeros(4, 8)], TuningConfig()
+    with tuning(mode):
+        assert tuner.choose_one("growing", [runner], config, inputs) == (runner, 1)
+    assert (GrowingRunner, 2) not in calls
+    calls.clear()
+    with tuning(mode):
+        assert tuner.choose_one("growing", [runner], config, inputs) == (runner, 2)
+    assert (GrowingRunner, 2) in calls
