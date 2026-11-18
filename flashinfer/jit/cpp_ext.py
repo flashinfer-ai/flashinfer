@@ -418,12 +418,18 @@ def build_cuda_cflags(
     cc_env = os.environ.get("CC")
     if cc_env is not None:
         cuda_cflags += ["-ccbin", cc_env]
-    cuda_cflags += [
-        "$common_cuda_flags",
-        "--expt-relaxed-constexpr",
-    ]
-    if not is_windows:
-        cuda_cflags.append("--compiler-options=-fPIC")
+    if is_windows:
+        # nvcc with the MSVC host compiler takes its own common flag set, and a
+        # DLL build needs no -fPIC.
+        cuda_cflags += ["$common_cuda_flags", "--expt-relaxed-constexpr"]
+    else:
+        # Keep this order: ninja and sccache key on the command line, so any
+        # change here rebuilds every cached module once.
+        cuda_cflags += [
+            "$common_cflags",
+            "--compiler-options=-fPIC",
+            "--expt-relaxed-constexpr",
+        ]
     cuda_version = get_cuda_version()
     # enable -static-global-template-stub when cuda version >= 12.8
     if cuda_version >= Version("12.8"):
@@ -587,7 +593,13 @@ def generate_ninja_build_for_op(
         f"nvcc_launcher = {nvcc_launcher}",
         "",
         "common_cflags = " + join_multiline(common_cflags),
-        "common_cuda_flags = " + join_multiline(common_cuda_flags),
+        # Only the MSVC build has a separate nvcc flag set; the Linux build.ninja
+        # keeps its layout so existing ninja and sccache caches stay valid.
+        *(
+            ["common_cuda_flags = " + join_multiline(common_cuda_flags)]
+            if is_windows
+            else []
+        ),
         "cflags = " + join_multiline(cflags),
         "post_cflags =",
         "cuda_cflags = " + join_multiline(cuda_cflags),
