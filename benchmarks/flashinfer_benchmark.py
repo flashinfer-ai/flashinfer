@@ -237,8 +237,10 @@ def parse_args(line=sys.argv[1:]):
         default=False,
         help=(
             "Enable Programmatic Dependent Launch (PDL) for routines whose backing "
-            "API accepts it. When omitted, PDL is forced off for every routine. "
-            "Routines whose API does not accept PDL emit a warning and ignore the flag."
+            "API accepts it. When omitted, PDL is forced off for every routine except "
+            "the prims-ts backends, which keep their API default (on where the device "
+            "supports PDL). Routines whose API does not accept PDL emit a warning and "
+            "ignore the flag."
         ),
     )
 

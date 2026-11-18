@@ -54,6 +54,17 @@ TRTLLM_RAGGED_ROW_ACTIVITY_MODES = (
 TRTLLM_RAGGED_TIMING_METRIC = "cuda_event_eager_per_call_v1"
 
 
+def _prims_ts_enable_pdl(args):
+    """PDL for the prims-ts plans: on with --enable_pdl, else the plan default.
+
+    Before the prims-ts plans took ``enable_pdl`` they ignored --enable_pdl and
+    used their built-in PDL choice. Keeping the plan default (on where the
+    device supports PDL) when the flag is omitted keeps those rows comparable
+    to earlier runs.
+    """
+    return True if args.enable_pdl else None
+
+
 def normalize_backends(backends):
     """
     Normalize backend names planned for deprecation and print warnings.
@@ -1207,7 +1218,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             mask_type=prims_ts_mask_type,
             seq_lens_kv=actual_seq_lens_kv.flatten().tolist(),
             workspace_buffer=workspace_buffer,
-            enable_pdl=args.enable_pdl,
+            enable_pdl=_prims_ts_enable_pdl(args),
         )
 
     backend_outputs = {}
@@ -1955,7 +1966,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             output_scale=prims_ts_output_scale,
             uniform_packed_lengths=not args.random_actual_seq_len,
             has_q_offset=causal and s_qo != s_kv,
-            enable_pdl=args.enable_pdl,
+            enable_pdl=_prims_ts_enable_pdl(args),
         )
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
@@ -2931,7 +2942,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             out_dtype=out_dtype,
-            enable_pdl=args.enable_pdl,
+            enable_pdl=_prims_ts_enable_pdl(args),
         )
 
     # Build the input argument for trtllm-fmha-v2 once, in whichever layout was
@@ -3716,7 +3727,7 @@ def testBatchMLAPagedAttentionWrapper(args):
             tuning=prims_ts.MLAAttentionTuning(
                 softmax_rescale_threshold_log2=mla_softmax_rescale_threshold_log2
             ),
-            enable_pdl=args.enable_pdl,
+            enable_pdl=_prims_ts_enable_pdl(args),
         )
 
     direct_out = None
