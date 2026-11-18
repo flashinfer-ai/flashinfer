@@ -77,9 +77,8 @@ void* ensure_workspace(size_t bytes, int device) {
         << "specialized MoE workspace cudaMalloc(" << bytes
         << ") failed: " << cudaGetErrorString(err);
     cudaError_t zerr = cudaMemset(g_workspace.ptr, 0, bytes);
-    TVM_FFI_ICHECK(zerr == cudaSuccess)
-        << "specialized MoE workspace cudaMemset(" << bytes
-        << ") failed: " << cudaGetErrorString(zerr);
+    TVM_FFI_ICHECK(zerr == cudaSuccess) << "specialized MoE workspace cudaMemset(" << bytes
+                                        << ") failed: " << cudaGetErrorString(zerr);
     g_workspace.bytes = bytes;
     g_workspace.device = device;
   }
