@@ -1131,7 +1131,13 @@ class BatchMLAPagedAttentionWrapper:
         # FLASHINFER_DISABLE_MLA_DECODE_FP8_PAGED_SM90). `q_scale` is the
         # scalar fp8-q descale; on the fallback it is applied during
         # dequantisation and consumed.
+        # Route on the first tensor LEAF of the structural form, so the
+        # reversed dual form ((nope, pe), packed) reaches the fp8-Q dispatch
+        # (whose shared structural parser decides the form) instead of the
+        # stock lowering's dtype check.
         _fp8q_first = query[0] if isinstance(query, (tuple, list)) else query
+        if isinstance(_fp8q_first, (tuple, list)) and len(_fp8q_first) > 0:
+            _fp8q_first = _fp8q_first[0]
         if getattr(self, "_mla_dec_fp8q_sm90_requested", False) and (
             isinstance(_fp8q_first, torch.Tensor)
             and _fp8q_first.dtype == torch.float8_e4m3fn

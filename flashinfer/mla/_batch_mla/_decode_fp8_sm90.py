@@ -490,18 +490,26 @@ def _packed_fp8_view(
     value: Any, widths: Tuple[int, int], name: str
 ) -> Optional[torch.Tensor]:
     """Return the packed fp8 (…, widths[0]+widths[1]) tensor for `value`,
-    which may be packed already or a zero-copy adjacent split pair; None when
-    the representation is not the packed-fp8 contract (caller falls back)."""
+    which may be any structural form the shared contract accepts — packed,
+    a zero-copy adjacent split pair, or the (redundant) dual forms; None when
+    the representation is not the packed-fp8 contract (caller falls back).
+    `value` is normalized through `_parse_structural_mla_input`, the SAME
+    parser the dequant fallback uses, so the two gates accept and reject the
+    same structural forms (a bare list is rejected by both; the dual forms
+    are served by both through their packed leaf)."""
     w0, w1 = widths
-    if isinstance(value, torch.Tensor):
-        if value.dtype != torch.float8_e4m3fn or value.shape[-1] != w0 + w1:
+    try:
+        packed, split = _parse_structural_mla_input(value, name=name)
+    except (TypeError, ValueError):
+        return None
+    if packed is not None:
+        # Packed leaf (alone, or the packed side of a dual form — the dequant
+        # fallback likewise trusts the packed leaf of a dual form).
+        if packed.dtype != torch.float8_e4m3fn or packed.shape[-1] != w0 + w1:
             return None
-        return value if value.is_contiguous() else None
-    if not (isinstance(value, (tuple, list)) and len(value) == 2):
-        return None
-    a, b = value
-    if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
-        return None
+        return packed if packed.is_contiguous() else None
+    assert split is not None
+    a, b = split
     if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
         return None
     if a.shape[-1] != w0 or b.shape[-1] != w1:
@@ -621,27 +629,39 @@ def _mla_dec_fp8q_sm90_dispatch(
             )
         counters["runs_dequant_fallback"] += 1
         return None, _dequant_query(query, q_scale)
-    try:
+    # The guard computes only a reason string; _fallback runs ONCE, outside
+    # the try block. _fallback itself raises under fp8q_backend='specialized'
+    # and runs the dequant fallback (which can raise, e.g. for a CUDA-tensor
+    # q_scale under capture); were it called inside the try, the except arm
+    # would catch that raise and call it a second time, double-counting
+    # specialized_raises / runs_ineligible / runs_dequant_fallback and
+    # nesting the user-facing message inside a truncated guard_error.
+    q_packed = kv_packed = None
+    qs = ks = 0.0
+    device = None
+
+    def _guard() -> Optional[str]:
+        nonlocal q_packed, kv_packed, qs, ks, device
         if return_lse or lse is not None:
-            return _fallback("return_lse")
+            return "return_lse"
         if sinks is not None:
-            return _fallback("sinks")
+            return "sinks"
         if skip_softmax_threshold_scale_factor is not None:
-            return _fallback("skip_softmax_threshold_scale_factor")
+            return "skip_softmax_threshold_scale_factor"
         if ckv_scale_arr is not None:
-            return _fallback("ckv_scale_arr (per-token scales)")
+            return "ckv_scale_arr (per-token scales)"
         q_packed = _packed_fp8_view(query, (_HEAD_DIM_CKV, _HEAD_DIM_KPE), "query")
         if q_packed is None or q_packed.dim() != 3:
-            return _fallback("query is not a packed/adjacent fp8 form")
+            return "query is not a packed/adjacent fp8 form"
         # The kernels read the packed query with 16-byte vectorized loads
         # (uint4) from its base address; a contiguous offset view whose data
         # pointer is not 16-byte aligned would read misaligned. This also
         # covers packed parents reconstructed from adjacent split views,
         # whose base is the first view's data pointer.
         if q_packed.data_ptr() % 16 != 0:
-            return _fallback("query base address is not 16-byte aligned")
+            return "query base address is not 16-byte aligned"
         if q_packed.shape[0] != state.total_q or q_packed.shape[1] != _NUM_HEADS:
-            return _fallback(
+            return (
                 f"query shape {tuple(q_packed.shape)} != planned "
                 f"({state.total_q}, {_NUM_HEADS}, {_DIMQ})"
             )
@@ -649,25 +669,31 @@ def _mla_dec_fp8q_sm90_dispatch(
             kv_cache, (_HEAD_DIM_CKV, _HEAD_DIM_KPE), "kv_cache"
         )
         if kv_packed is None or kv_packed.dim() not in (3, 4):
-            return _fallback("kv_cache is not a packed/adjacent fp8 form")
+            return "kv_cache is not a packed/adjacent fp8 form"
         if kv_packed.dim() == 4:
             if kv_packed.shape[2] != 1:
-                return _fallback("kv_cache head dim != 1")
+                return "kv_cache head dim != 1"
             kv_packed = kv_packed.reshape(kv_packed.shape[0], kv_packed.shape[1], _DIMQ)
         if kv_packed.shape[1] != _PAGE_SIZE:
-            return _fallback(f"kv page size {kv_packed.shape[1]}")
+            return f"kv page size {kv_packed.shape[1]}"
+        # The kv base feeds 16-byte cp.async.cg loads (MT <= 2) and
+        # cuTensorMapEncodeTiled (MT == 3), both of which require a 16-byte
+        # aligned base; the native entry checks only strides, so a contiguous
+        # view at an odd storage offset must be refused here, like the query.
+        if kv_packed.data_ptr() % 16 != 0:
+            return "kv_cache base address is not 16-byte aligned"
         qs, reason = _scale_value(q_scale, "q_scale")
         if reason is not None:
-            return _fallback(reason)
+            return reason
         ks, reason = _scale_value(ckv_scale, "ckv_scale")
         if reason is not None:
-            return _fallback(reason)
+            return reason
         if kpe_scale is not None:
             ps, reason = _scale_value(kpe_scale, "kpe_scale")
             if reason is not None:
-                return _fallback(reason)
+                return reason
             if not (math.isfinite(ps) and abs(ps - ks) <= 1e-12):
-                return _fallback(
+                return (
                     "the packed cache takes one finite KV descale; "
                     f"kpe_scale={ps} != ckv_scale={ks}"
                 )
@@ -677,22 +703,26 @@ def _mla_dec_fp8q_sm90_dispatch(
         # those values instead.
         for sv, sname in ((qs, "q_scale"), (ks, "ckv_scale")):
             if not (math.isfinite(sv) and sv > 0.0):
-                return _fallback(
-                    f"{sname}={sv} is not a finite positive scalar descale"
-                )
+                return f"{sname}={sv} is not a finite positive scalar descale"
         if out is not None and (
             out.dtype != torch.bfloat16
             or tuple(out.shape) != (state.total_q, _NUM_HEADS, _HEAD_DIM_CKV)
             or not out.is_contiguous()
         ):
-            return _fallback(f"out {out.dtype} {tuple(out.shape)}")
+            return f"out {out.dtype} {tuple(out.shape)}"
         device = q_packed.device
         if device.type != "cuda" or (
             device.index is not None and device.index != state.device_index
         ):
-            return _fallback(f"device {device}")
+            return f"device {device}"
+        return None
+
+    try:
+        guard_reason = _guard()
     except Exception as exc:
-        return _fallback(f"guard_error:{type(exc).__name__}: {exc}"[:300])
+        guard_reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
+    if guard_reason is not None:
+        return _fallback(guard_reason)
 
     module = _module
     capturing = bool(
@@ -701,6 +731,15 @@ def _mla_dec_fp8q_sm90_dispatch(
     )
     if module is None:
         return _fallback("module dropped")
+    # The kernel writes `out` through vectorized (__nv_bfloat162 / uint4)
+    # stores from its base address, and the stock path's output store is also
+    # vectorized — so a misaligned caller buffer cannot be served by falling
+    # back with the same `out` either. Stage the result through a fresh
+    # (allocator-aligned) buffer and copy into the caller's view; the copy is
+    # capture-safe and runs only for this pathological input.
+    staged_user_out = None
+    if out is not None and out.data_ptr() % 16 != 0:
+        staged_user_out, out = out, None
     if out is None:
         out = torch.empty(
             (state.total_q, _NUM_HEADS, _HEAD_DIM_CKV),
@@ -739,6 +778,9 @@ def _mla_dec_fp8q_sm90_dispatch(
         out.view(state.batch_size, state.q_len, _NUM_HEADS, _HEAD_DIM_CKV),
         state.workspace,
     )
+    if staged_user_out is not None:
+        staged_user_out.copy_(out)
+        out = staged_user_out
     counters["runs_dispatched"] += 1
     if capturing:
         counters["runs_dispatched_capturing"] += 1
