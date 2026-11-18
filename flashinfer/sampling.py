@@ -974,9 +974,13 @@ def softmax(
         Two-dimensional CUDA tensor of logits. With ``batch_invariant=True``,
         leading batch dimensions are also supported, e.g. three-dimensional logits.
     temperature: Optional[Union[torch.Tensor, float]]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the temperature for temperature scaling.
+        Either a scalar or a tensor of shape ``(batch_size,)`` for two-dimensional logits.
+        With ``batch_invariant=True`` and additional leading dimensions, a per-row
+        temperature tensor has shape ``(M,)`` with
+        ``M = logits.numel() // logits.shape[-1]``, or ``logits.shape[:-1]``;
+        a length-one tensor applies to all rows.
         If a scalar, the same temperature is used for all requests.
-        If a tensor, each request has its own temperature. The tensor must be on
+        A per-row tensor gives each row its own temperature. The tensor must be on
         the same CUDA device as ``logits`` and have dtype float16, bfloat16,
         float32, or float64.
     enable_pdl : Optional[bool]
@@ -1576,7 +1580,8 @@ def sampling_from_probs(
     ----
     The default path expects float32 inputs. With ``batch_invariant=True``, inputs may
     be bfloat16, float16, or float32 probabilities or unnormalised weights.
-    The output is int32 unless ``indices`` is provided, in which case the output has the same dtype as ``indices``.
+    The output is int32 unless ``indices`` is provided, in which case the output has the same dtype as ``indices``
+    when ``out`` is not supplied. With ``batch_invariant=True`` and ``out`` supplied, the output has ``out.dtype``.
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):

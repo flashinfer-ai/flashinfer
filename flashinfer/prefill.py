@@ -6300,7 +6300,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and after scaling. The mask tensor should be in the same device as the input tensors.
         causal : bool
             Whether to apply causal mask to the attention matrix.
-            This argument is ignored if ``custom_mask`` or ``packed_custom_mask`` is provided in :meth:`plan`.
+            This argument is ignored if ``custom_mask`` or ``packed_custom_mask`` is provided in :meth:`plan`
+            for backends that apply custom masks. The ``cutlass`` backend ignores custom masks,
+            so ``causal`` still applies there.
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
