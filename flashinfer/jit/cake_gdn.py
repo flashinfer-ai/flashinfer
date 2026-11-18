@@ -52,12 +52,19 @@ _RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
 _RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
 # A decode record whose kernel takes its state as a ``const __grid_constant__ CUtensorMap``
 # (the TMA-state bodies) spells ``"tma_abi": "grid_constant"``; its host template encodes the
-# tensor map (``_DECODE_TMA_TEMPLATES``).  Every other decode record derives ``pointer``.
+# tensor map (``_DECODE_TMA_TEMPLATES``: the whole-GPU body's, and the locality-domain twin's,
+# which also passes the twin's row cut, claim counters and SM table).  Every other decode
+# record derives ``pointer``.
 _RECORD_TMA_ABI_SPELLED = {
     "decode": ("pointer", "grid_constant"),
     "prefill": ("grid_constant",),
 }
-_DECODE_TMA_TEMPLATES = frozenset({"host/templates/decode_fp32_t1_tma_state.cc.in"})
+_DECODE_TMA_TEMPLATES = frozenset(
+    {
+        "host/templates/decode_fp32_t1_tma_state.cc.in",
+        "host/templates/decode_fp32_t1_tma_state_domain.cc.in",
+    }
+)
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -1994,9 +2001,13 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3": 1,
 }
 # The decode schedules whose kernel takes its state as a tensor map (records spelling
-# ``"tma_abi": "grid_constant"``).
+# ``"tma_abi": "grid_constant"``): the whole-GPU `hqsplit_tma3` body and its locality-domain
+# twin (``CAKE_GDN_NONTRANSPOSE_FP32_T1_DOMAIN_ROUTES``).
 CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
-    {"gdn_decode_nontranspose_fp32_t1_hqsplit_tma3"}
+    {
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_domain",
+    }
 )
 
 
