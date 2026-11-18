@@ -27,7 +27,9 @@ On a dual-die SM107a device (two locality domains) whose weights ``b`` were
 allocated by :func:`localize_weights`, a packed-scale serving problem in a
 listed cell runs the serving program's locality-domain twin: one launch over
 both dies, each die claiming first the groups of ``b`` homed in its memory,
-through a pair of per-die claim counters owned by the prepared launch.  A twin
+through a pair of per-die claim counters: a prepared launch owns its pair, and
+the public API's call reuses the pair of its stream (a captured call takes a
+pre-zeroed pair of its own; see :func:`run_batch_deepgemm_fp8_nt_groupwise`).  A twin
 is bitwise equal to the whole-GPU build of the same source for any cut; it is
 equal within the family's tolerance to the whole-GPU serving program shipped
 here, which is an older build, so falling back to the whole-GPU program may
@@ -37,6 +39,7 @@ program.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -176,10 +179,18 @@ def domain_serving_program(
     """The locality-domain twin of serving configuration ``key`` for a device of
     ``sm_count`` SMs split ``counts`` over its two dies, or ``None`` when the cell
     ``(sm_count, die class, expected_m class)`` is not routed to a twin."""
+    return _domain_cell_program(
+        arch, sm_count, key, expected_m, cake_locality.die_class(counts)
+    )
+
+
+def _domain_cell_program(
+    arch: str, sm_count: int, key: str, expected_m: int, die_class: str
+) -> Optional[str]:
     qualified = f"{arch}:{key}"
     if arch != DOMAIN_ARCH or qualified not in DOMAIN_SERVING_PROGRAMS:
         return None
-    cell = (cake_locality.die_class(counts), expected_m_class(expected_m))
+    cell = (die_class, expected_m_class(expected_m))
     if qualified not in DOMAIN_SERVING_CELLS.get(sm_count, {}).get(cell, ()):
         return None
     return DOMAIN_SERVING_PROGRAMS[qualified]
@@ -199,6 +210,15 @@ def domain_serving_routed(
     selects has a twin listed in the cell of that ``expected_m``.  Homed weights
     of any other shape could run a whole-GPU program, which is slower on homed
     weights than on ordinary ones, so :func:`localize_weights` refuses them."""
+    return _domain_class_routed(
+        arch, sm_count, cake_locality.die_class(counts), n, k, groups
+    )
+
+
+def _domain_class_routed(
+    arch: str, sm_count: int, die_class: str, n: int, k: int, groups: int
+) -> bool:
+    """:func:`domain_serving_routed` for the die class ``die_class``."""
     if (
         arch != DOMAIN_ARCH
         or (n, k) not in PACKED_NK
@@ -210,7 +230,7 @@ def domain_serving_routed(
         # The serving rule reads K, expected_m and the device, not M.
         stages, epi, hint, _, l2 = serving_config(0, k, expected_m, sm_count, arch)
         key = serving_program_key(n, k, groups, stages, epi, hint, l2)
-        if domain_serving_program(arch, sm_count, key, expected_m, counts) is None:
+        if _domain_cell_program(arch, sm_count, key, expected_m, die_class) is None:
             return False
     return True
 
@@ -332,12 +352,15 @@ class _Problem:
 def _domain_homing(
     b: torch.Tensor, index: int, groups: int
 ) -> Optional[tuple[int, Any]]:
-    """``(g_cut, sm_table)`` when ``b`` is a :func:`localize_weights` allocation on a
-    device with a probed SM table, else ``None``.  ``g_cut`` is the group of ``b``
-    nearest to its die cut (the twin's result does not depend on it)."""
+    """``(g_cut, sm_table)`` when ``b`` is a whole :func:`localize_weights`
+    allocation (not a view of part of one) on a device with a probed SM table, else
+    ``None``.  ``g_cut`` is the group of ``b`` nearest to its die cut (the twin's
+    result does not depend on it)."""
     # The registry first: it builds nothing when no split allocation was made.
     homed = cake_locality.homing(b)
     if homed is None or homed.device_index != index:
+        return None
+    if int(b.data_ptr()) != homed.base or b.numel() * b.element_size() != homed.nbytes:
         return None
     table = cake_locality.sm_table(index)
     if table is None:
@@ -620,10 +643,12 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     and ``workspace["counters1"]``: zero before the first launch, left zero by
     every launch.  Launches of one prepared launch must therefore not overlap
     (successive launches on one stream, or graph replays on one stream, never
-    do); prepare one launch per concurrent stream.  A twin launch prepared under
-    CUDA graph capture without caller-owned counters zeroes its counters inside
-    that capture, so it belongs to that capture: ``launch()`` raises outside
-    capture, and it must be launched in the capture it was prepared in.
+    do); prepare one launch per concurrent stream.  Counters the launch allocates
+    at preparation outside capture are zeroed before preparation returns, so the
+    first launch may run on any stream; keep the prepared launch alive until its
+    launches are done.  A twin launch prepared under CUDA graph capture without
+    caller-owned counters zeroes its counters inside that capture, so it belongs
+    to that capture: ``launch()`` raises outside capture and in any other capture.
     """
 
     route: str
@@ -638,12 +663,21 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     # The locality-domain twin's first group of ``b`` homed on die 1 (``None`` on
     # every other route).
     g_cut: Optional[int] = None
-    # True when the launch's counters were zeroed inside a graph capture.
+    # True when the launch's counters were zeroed inside a graph capture, and
+    # CUDA's id of that capture (0 when it could not be read).
     capture_only: bool = False
+    capture_id: int = 0
 
     def launch(self) -> torch.Tensor:
         with torch.cuda.device(self.out.device), tvm_ffi.use_torch_stream():
-            if self.capture_only and not torch.cuda.is_current_stream_capturing():
+            if self.capture_only and (
+                not torch.cuda.is_current_stream_capturing()
+                or (
+                    self.capture_id
+                    and cake_locality._capture_id(_device_index(self.out.device))
+                    != self.capture_id
+                )
+            ):
                 raise RuntimeError(
                     "this locality-domain launch was prepared under CUDA graph "
                     "capture, which zeroes its claim counters: launch it only in "
@@ -687,7 +721,9 @@ def _allocate_workspace(
                 for name in DOMAIN_COUNTERS
             )
         else:
-            pair = cake_locality.counters(PAIR_COUNTER_WORDS, device)
+            # Zeroed on a private stream and waited for: the launch may run on
+            # any stream.
+            pair = cake_locality.counters(PAIR_COUNTER_WORDS, device, settle=True)
         workspace.update(zip(DOMAIN_COUNTERS, pair, strict=True))
     return workspace
 
@@ -893,6 +929,7 @@ def _prepare(
         )
     plan = problem.plan
     capture_only = False
+    capture_id = 0
     if workspace is None:
         workspace = _allocate_workspace(plan, device, launch_now=launch_now)
         capture_only = (
@@ -900,6 +937,8 @@ def _prepare(
             and DOMAIN_COUNTERS[0] in plan.workspaces
             and torch.cuda.is_current_stream_capturing()
         )
+        if capture_only:
+            capture_id = cake_locality._capture_id(_device_index(device))
     else:
         _check_workspace(plan, workspace, device)
     launches = []
@@ -965,6 +1004,7 @@ def _prepare(
         _launches=tuple(launches),
         g_cut=problem.g_cut,
         capture_only=capture_only,
+        capture_id=capture_id,
     )
 
 
@@ -979,14 +1019,18 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     locality-domain twin of its serving program; the twin's result is the same
     bits for any ``g_cut``.
 
-    Returns ``b`` itself, unhomed, when homing could make a call slower: the
-    device has no SM table (:func:`flashinfer.cake_locality.sm_table` is
-    ``None``), ``b`` is not float8_e4m3fn weights of a packed-scale serving shape
-    (``(N, K)`` in ``PACKED_NK``, ``B`` in ``PACKED_GROUPS``), some ``expected_m``
-    of that shape selects a serving program without a twin listed in its cell
-    (:func:`domain_serving_routed`), or the cut is not a multiple of the
-    allocation granularity of locality-domain memory.  Raises ``ValueError`` for
-    a ``g_cut`` outside ``[0, B]``.
+    Returns ``b`` itself, unhomed, when the call is under CUDA graph capture, or
+    when homing could make a call slower: ``b`` is not float8_e4m3fn weights of a
+    packed-scale serving shape (``(N, K)`` in ``PACKED_NK``, ``B`` in
+    ``PACKED_GROUPS``) on an SM107a device, no die class of the device's SM count
+    routes every ``expected_m`` of that shape to a twin, the device has no SM
+    table (:func:`flashinfer.cake_locality.sm_table` is ``None``), some
+    ``expected_m`` of that shape selects a serving program without a twin listed
+    in the cell of the device's dies (:func:`domain_serving_routed`), or the cut
+    is not a multiple of the allocation granularity of locality-domain memory.
+    The checks that need no device work come first: a refused shape is returned
+    before the SM table is probed or anything is built or synchronized.  Raises
+    ``ValueError`` for a ``g_cut`` outside ``[0, B]``.
 
     With the cells listed for 212-SM devices, only ``B=64`` weights of
     ``(N, K) = (4096, 7168)`` are homed: at every ``expected_m`` their serving
@@ -995,9 +1039,16 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     ``(4096, 7168)`` and ``B=32`` and ``B=64`` weights of ``(7168, 2048)`` are
     returned unhomed: their ``expected_m <= 1`` serving program has no twin.
 
-    Call it outside CUDA graph capture.  The memory is freed with the returned
-    tensor; a CUDA graph that reads the tensor after it is freed faults on
-    replay, so keep it alive as long as such a graph.
+    Homing weights also fills the device's reserve of pre-zeroed claim counter
+    pairs for captured public calls
+    (:func:`flashinfer.cake_locality.reserve_launch_counters`), so a CUDA graph
+    captured before any eager call holds no memset node; a failure there does
+    not fail this call.
+
+    Call it outside CUDA graph capture (under capture it returns ``b``).  The
+    memory is freed with the returned tensor; a CUDA graph that reads the tensor
+    after it is freed faults on replay, so keep it alive as long as such a graph.
+    A view of part of the returned tensor is not homed: pass the whole tensor.
     """
     if not isinstance(b, torch.Tensor) or b.device.type != "cuda" or b.ndim != 3:
         raise ValueError("b must be a CUDA torch.Tensor of shape (B, N, K)")
@@ -1009,15 +1060,23 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     if b.dtype != torch.float8_e4m3fn:
         return b
     index = _device_index(b.device)
+    if cake_locality._stream_capturing(index):
+        return b
     arch = device_arch(index)
     if arch != DOMAIN_ARCH:
+        return b
+    sm_count = device_sm_count(index)
+    # Before any probe, build or synchronization: some die class must route
+    # every expected_m of this shape.
+    if not any(
+        _domain_class_routed(arch, sm_count, die, n, k, groups)
+        for die in ("even", "uneven")
+    ):
         return b
     table = cake_locality.sm_table(index)
     if table is None:
         return b
-    if not domain_serving_routed(
-        arch, device_sm_count(index), table.counts, n, k, groups
-    ):
+    if not domain_serving_routed(arch, sm_count, table.counts, n, k, groups):
         return b
     if g_cut is None:
         g_cut = cake_locality.split_units(groups, table.counts)[0]
@@ -1027,6 +1086,10 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
         return b
     homed = cake_locality.split_empty(tuple(b.shape), b.dtype, cut, index)
     homed.copy_(b)
+    # A failure here does not fail the call: captured calls then zero their own
+    # counters until an eager call refills the reserve.
+    with contextlib.suppress(Exception):
+        cake_locality.reserve_launch_counters(PAIR_COUNTER_WORDS, index)
     return homed
 
 
@@ -1046,17 +1109,23 @@ def run_batch_deepgemm_fp8_nt_groupwise(
     ``torch.empty`` released when the call returns, and the call may be captured
     into a CUDA graph.
 
-    The locality-domain twin's claim counters are not allocated per call: every
-    launch leaves its pair zero, so the call takes an already zero pair from
-    :func:`flashinfer.cake_locality.launch_counters` (die-homed when FlashInfer's
-    locality-domain pools exist, ordinary zeroed tensors otherwise).  Eager calls
-    on one stream reuse that stream's pair (their launches are ordered); a call
-    under CUDA graph capture gets a pre-zeroed pair of its own, used by no eager
-    call and no other capture, so the graph holds no memset node and may replay
-    on any stream while eager calls run.  The same graph must not replay on two
-    streams at once (its launch would share its pair with itself), as for any
-    workspace a graph holds; a prepared launch
-    (:func:`prepare_batch_deepgemm_fp8_nt_groupwise`) keeps its own pair.
+    The locality-domain twin's claim counters are not allocated or zeroed per
+    call in steady state: every launch leaves its pair zero, so the call takes an
+    already zero pair from :func:`flashinfer.cake_locality.launch_counters`
+    (die-homed when FlashInfer's locality-domain pools exist, ordinary zeroed
+    tensors otherwise).  Eager calls on one stream reuse that stream's pair
+    (their launches are ordered), made at the stream's first call; on the
+    default stream and the per-thread stream handles the pair is kept per
+    thread.  A call under CUDA graph capture takes a pre-zeroed pair of its own
+    from a reserve filled by :func:`localize_weights` and topped up by eager
+    calls, used by no eager call and no other capture, so the graph holds no
+    memset node and may replay on any stream while eager calls run; when the
+    reserve is empty, the captured call zeroes its pair inside the graph.  The
+    same graph must not replay on two streams at once (its launch would share
+    its pair with itself), as for any workspace a graph holds; a stream wrapped
+    by ``torch.cuda.ExternalStream`` must not be destroyed while calls on it are
+    in flight.  A prepared launch (:func:`prepare_batch_deepgemm_fp8_nt_groupwise`)
+    keeps its own pair.
     """
     return _prepare(
         a,

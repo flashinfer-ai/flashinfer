@@ -1056,6 +1056,10 @@ _SHAPE_CELLS = [
     for expected_m in _CLASS_EXPECTED_M
 ]
 _DOMAIN_CELLS = [cell for cell in _SHAPE_CELLS if _listed(cell)]
+# The public reuse test: two cells, and the expected_m <= 1 cell of the homed shape.
+_PUBLIC_REUSE_CELLS = _DOMAIN_CELLS[:2] + [
+    cell for cell in _DOMAIN_CELLS if cell == ((4096, 7168), 64, 1)
+]
 
 
 def _whole_program(key):
@@ -1390,14 +1394,23 @@ def test_counters_fall_back_to_unhomed_zeros(monkeypatch):
         raise locality_domain.LocalityDomainError("backend:cudaMallocAsync")
 
     monkeypatch.setattr(locality_domain, "_domain_pools", refuse)
-    first, second = cake_locality.counters(PAIR_COUNTER_WORDS)
-    for tensor in (first, second):
-        assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (
-            PAIR_COUNTER_WORDS,
-        )
-        assert tensor.device.type == "cuda"
-        assert int(tensor.abs().sum()) == 0
-    assert first.data_ptr() != second.data_ptr()
+    cake_locality._forget_counters()
+    try:
+        first, second = cake_locality.counters(PAIR_COUNTER_WORDS)
+        for tensor in (first, second):
+            assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (
+                PAIR_COUNTER_WORDS,
+            )
+            assert tensor.device.type == "cuda"
+            assert int(tensor.abs().sum()) == 0
+        assert first.data_ptr() != second.data_ptr()
+        # The refusal is remembered: the next pair does not ask the pools again.
+        assert torch.cuda.current_device() in cake_locality._POOLS_UNAVAILABLE
+        monkeypatch.setattr(locality_domain, "_domain_pools", None)
+        settled = cake_locality.counters(PAIR_COUNTER_WORDS, settle=True)
+        assert all(int(t.abs().sum()) == 0 for t in settled)
+    finally:
+        cake_locality._forget_counters()
 
 
 @_packed_serving
@@ -1782,8 +1795,15 @@ def test_domain_twin_cuda_graph_capture_and_replay(cell):
         )
         captured.launch()
     assert captured.route == DOMAIN_SERVING_ROUTE and captured.capture_only
+    assert captured.capture_id != 0
     with pytest.raises(RuntimeError, match="capture"):
         captured.launch()
+    # Another capture may not launch it either.
+    other_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(other_graph, stream=stream):
+        with pytest.raises(RuntimeError, match="capture"):
+            captured.launch()
+        out.add_(0)
     captured.out.fill_(float("nan"))
     torch.cuda.synchronize()
     captured_graph.replay()
@@ -1792,7 +1812,7 @@ def test_domain_twin_cuda_graph_capture_and_replay(cell):
 
 
 @_packed_serving
-@pytest.mark.parametrize("cell", _DOMAIN_CELLS[:2], ids=_cell_id)
+@pytest.mark.parametrize("cell", _PUBLIC_REUSE_CELLS, ids=_cell_id)
 def test_domain_public_call_reuses_counters(cell):
     """(g) The public API's twin call allocates no counters in steady state: eager
     calls on one stream reuse that stream's pair, another stream gets its own,
@@ -1854,7 +1874,7 @@ def test_domain_public_call_reuses_counters(cell):
         int(t.data_ptr()) for t in pair
     )
     assert all(int(t.abs().sum()) == 0 for t in side_pair)
-    reserve = cake_locality._CAPTURE_RESERVES[(device, PAIR_COUNTER_WORDS)]
+    reserve = cake_locality._COUNTER_STATES[device].reserves[PAIR_COUNTER_WORDS]
     issued = reserve.issued
     captured_pair = reserve.free[-1]
     graph_out = torch.empty_like(out)
@@ -1905,6 +1925,118 @@ def test_domain_public_call_reuses_counters(cell):
     for die in range(2):
         for counters in (pair, side_pair, captured_pair):
             assert cake_locality.pointer_domain(counters[die].data_ptr()) == die
+
+
+@_host_only
+def test_domain_homing_needs_the_whole_allocation(monkeypatch):
+    """Only the whole homed allocation plans as homed: a view of part of it (a
+    slice of its groups) and another device's tensor plan as unhomed."""
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    b = torch.empty((4, 8, 16), dtype=torch.uint8)
+    base = int(b.data_ptr())
+    record = cake_locality.Homing(
+        device_index=0, base=base, nbytes=b.numel(), size=b.numel(), cut=2 * 8 * 16
+    )
+    table = cake_locality.SmTable(device_index=0, counts=(106, 106), entries=None)
+
+    def homing(tensor):
+        return record if int(tensor.untyped_storage().data_ptr()) == base else None
+
+    monkeypatch.setattr(cake_locality, "homing", homing)
+    monkeypatch.setattr(cake_locality, "sm_table", lambda device=None: table)
+    assert module._domain_homing(b, 0, 4) == (2, table)
+    assert module._domain_homing(b[:2], 0, 2) is None
+    assert module._domain_homing(b[1:], 0, 3) is None
+    assert module._domain_homing(b, 1, 4) is None
+
+
+@_packed_serving
+def test_localize_weights_refuses_before_probing_and_under_capture(monkeypatch):
+    """A shape no die class routes is returned before the SM table is probed or
+    any memory is homed; under CUDA graph capture every shape is returned as is."""
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    device, table = _require_domain()
+    sm_count = device_sm_count(device)
+    shapes = [
+        (nk, groups) for nk in sorted(PACKED_NK) for groups in sorted(PACKED_GROUPS)
+    ]
+    refused = [
+        (nk, groups)
+        for nk, groups in shapes
+        if not any(
+            module._domain_class_routed("sm_107a", sm_count, die, *nk, groups)
+            for die in ("even", "uneven")
+        )
+    ]
+    if sm_count == _SOURCE_SM_COUNT:
+        assert set(refused) == _REFUSED_SHAPES
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("localize_weights probed or homed a refused call")
+
+    target = torch.device("cuda", device)
+    with monkeypatch.context() as patch:
+        patch.setattr(cake_locality, "sm_table", forbidden)
+        patch.setattr(cake_locality, "split_empty", forbidden)
+        for nk, groups in refused:
+            weights = torch.zeros(
+                (groups, *nk), dtype=torch.float8_e4m3fn, device=target
+            )
+            assert localize_weights(weights) is weights
+            del weights
+        homable = [shape for shape in shapes if shape not in refused]
+        if not homable:
+            pytest.skip(f"no serving shape is localizable on {sm_count} SMs")
+        nk, groups = homable[0]
+        weights = torch.zeros((groups, *nk), dtype=torch.float8_e4m3fn, device=target)
+        work = torch.zeros(1, device=target)
+        stream = torch.cuda.Stream(device=target)
+        stream.wait_stream(torch.cuda.current_stream(target))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            assert localize_weights(weights) is weights
+            work.add_(1)
+    torch.cuda.synchronize(target)
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS[:1], ids=_cell_id)
+def test_domain_prepared_counters_ready_on_any_stream(cell, monkeypatch):
+    """A prepared twin's counters are zero when preparation returns, without
+    waiting for the caller's stream: its first launch may run on another stream."""
+    device, table = _require_domain()
+    _require_routed(cell, device, table)
+    _, _, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, _ = _serving_problem(*cell)
+    homed = _home(b, table)
+    torch.cuda.synchronize()
+    waited = []
+    synchronize = torch.cuda.Stream.synchronize
+
+    def record(stream):
+        waited.append(int(stream.cuda_stream))
+        return synchronize(stream)
+
+    caller = torch.cuda.Stream()
+    other = torch.cuda.Stream()
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda.Stream, "synchronize", record)
+        with torch.cuda.stream(caller):
+            prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+                a, homed, a_packed, b_packed, masked_m, expected_m
+            )
+    assert prepared.route == DOMAIN_SERVING_ROUTE
+    assert waited and caller.cuda_stream not in waited and 0 not in waited
+    with torch.cuda.stream(other):
+        prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    counters = (prepared.workspace["counters0"], prepared.workspace["counters1"])
+    assert all(int(t.abs().sum()) == 0 for t in counters)
+    for die, tensor in enumerate(counters):
+        assert cake_locality.pointer_domain(tensor.data_ptr()) == die
 
 
 # The race's occupier: one 1024-thread block per SM (its whole opt-in shared

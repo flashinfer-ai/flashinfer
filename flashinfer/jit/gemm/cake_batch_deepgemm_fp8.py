@@ -1773,9 +1773,9 @@ DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
 # reach a twin, and homed weights of that shape must not fall back to the whole
 # program in any class (the whole program runs slower on homed weights than on
 # ordinary ones).  There the twin is the faster program on homed weights and
-# faster than the shipped whole program on ordinary weights (expected_m 64: 184
-# and 191 us against 196 and 198 us, even and uneven dies), though not by the
-# 0.98 margin over a full-grid whole build, which is not shipped.  The other
+# faster than the shipped whole program on ordinary weights on both die
+# classes, though not by the 0.98 margin over a full-grid whole build, which is
+# not shipped.  The other
 # three serving shapes have an "em<=1" key without a twin, so localize_weights
 # does not home them and their em16+ cells are not listed.
 DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {

@@ -487,12 +487,130 @@ def test_launch_counters_cache_is_bounded(fresh_counters, monkeypatch):
     streams = [torch.cuda.Stream(device=device) for _ in range(5)]
     handles = {s.cuda_stream for s in streams}
     keep = cl.launch_counters(2, device)
-    for stream in streams:
+    first = streams[0]
+    with torch.cuda.stream(first):
+        kept = cl.launch_counters(2, device)
+    for stream in streams[1:]:
         with torch.cuda.stream(stream):
             cl.launch_counters(2, device)
-        assert cl.launch_counters(2, device)[0] is keep[0]  # recently used: kept
-    assert len(cl._STREAM_PAIRS) <= 3
-    assert len({key[1] for key in cl._STREAM_PAIRS} & handles) <= 2
+        with torch.cuda.stream(first):
+            assert cl.launch_counters(2, device)[0] is kept[0]  # recently used
+        assert cl.launch_counters(2, device)[0] is keep[0]  # per thread: kept
+    pairs = cl._COUNTER_STATES[device].stream_pairs
+    assert len(pairs) == 3
+    assert {key[0] for key in pairs} == {
+        first.cuda_stream,
+        streams[-2].cuda_stream,
+        streams[-1].cuda_stream,
+    }
+    assert {key[0] for key in pairs} <= handles
+
+
+def test_launch_counters_default_stream_pairs_are_per_thread(
+    fresh_counters, monkeypatch
+):
+    """The default stream's handle may name a different stream in each thread:
+    each thread keeps its own pair for it, reused by that thread."""
+    import threading
+
+    device = _require_cuda()
+    _unhomed(monkeypatch)
+    assert torch.cuda.current_stream(device).cuda_stream == 0
+    mine = cl.launch_counters(2, device)
+    assert cl.launch_counters(2, device)[0] is mine[0]
+    seen = []
+
+    def call():
+        torch.cuda.set_device(device)
+        pair = cl.launch_counters(2, device)
+        assert cl.launch_counters(2, device)[0] is pair[0]
+        seen.append(int(pair[0].data_ptr()))
+        torch.cuda.synchronize(device)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+        thread.join()
+    assert len(seen) == 2 and int(mine[0].data_ptr()) not in seen
+    assert not cl._COUNTER_STATES[device].stream_pairs
+    assert {0, 1, 2} == cl._THREAD_KEYED_HANDLES
+
+
+def test_launch_counters_out_of_memory_pair_not_cached(fresh_counters, monkeypatch):
+    """A pair made unhomed because a locality-domain pool was out of memory serves
+    its call and is not cached; the next call tries the pools again."""
+    from flashinfer import locality_domain
+
+    device = _require_cuda()
+    calls = []
+
+    def exhausted(_index):
+        calls.append(_index)
+        raise torch.OutOfMemoryError("pool exhausted")
+
+    monkeypatch.setattr(locality_domain, "_domain_pools", exhausted)
+    stream = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(stream):
+        first = cl.launch_counters(2, device)
+        second = cl.launch_counters(2, device)
+    torch.cuda.synchronize(device)
+    assert first[0] is not second[0]
+    assert all(int(t.abs().sum()) == 0 for t in (*first, *second))
+    assert not cl._COUNTER_STATES[device].stream_pairs
+    assert len(calls) >= 2 and device not in cl._POOLS_UNAVAILABLE
+    _unhomed(monkeypatch)  # a LocalityDomainError is remembered and cached
+    with torch.cuda.stream(stream):
+        third = cl.launch_counters(2, device)
+        assert cl.launch_counters(2, device)[0] is third[0]
+    assert device in cl._POOLS_UNAVAILABLE
+
+
+def test_launch_counters_refill_failure_does_not_fail_the_call(
+    fresh_counters, monkeypatch
+):
+    """A capture reserve refill that raises leaves the call's pair intact."""
+    device = _require_cuda()
+    _unhomed(monkeypatch)
+
+    def broken(_words, _index):
+        raise RuntimeError("refill failed")
+
+    monkeypatch.setattr(cl, "_settled_pair", broken)
+    pair = cl.launch_counters(2, device)
+    torch.cuda.synchronize(device)
+    assert all(int(t.abs().sum()) == 0 for t in pair)
+    reserve = cl._COUNTER_STATES[device].reserves[2]
+    assert not reserve.refilling and not reserve.free
+    monkeypatch.undo()
+    _unhomed(monkeypatch)
+    assert cl.launch_counters(2, device)[0] is pair[0]
+    assert len(reserve.free) == cl.CAPTURE_RESERVE
+
+
+def test_launch_counters_refill_waits_only_for_its_own_stream(
+    fresh_counters, monkeypatch
+):
+    """The reserve is zeroed on the device's private stream: a refill waits for
+    that stream, never for the caller's stream, and holds no lock while waiting."""
+    device = _require_cuda()
+    _unhomed(monkeypatch)
+    waited = []
+    synchronize = torch.cuda.Stream.synchronize
+
+    def record(stream):
+        state = cl._COUNTER_STATES[device]
+        waited.append((int(stream.cuda_stream), state.lock.locked()))
+        return synchronize(stream)
+
+    monkeypatch.setattr(torch.cuda.Stream, "synchronize", record)
+    caller = torch.cuda.Stream(device=device)
+    with torch.cuda.stream(caller):
+        cl.reserve_launch_counters(2, device)
+        cl.launch_counters(2, device)
+    side = cl._COUNTER_STATES[device].side_stream
+    assert waited and all(handle == side.cuda_stream for handle, _ in waited)
+    assert not any(locked for _, locked in waited)
+    assert side.cuda_stream not in (caller.cuda_stream, 0)
 
 
 def test_launch_counters_threads_share_one_streams_pair(fresh_counters, monkeypatch):
@@ -534,13 +652,15 @@ def test_launch_counters_capture_takes_a_reserved_pair(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         early = cl.launch_counters(2, device)
+        assert cl._capture_id(device) != 0
+    assert cl._capture_id(device) == 0
     graph.replay()
     torch.cuda.synchronize(device)
     assert all(int(t.abs().sum()) == 0 for t in early)
     eager = cl.launch_counters(2, device)  # fills the reserve
     with torch.cuda.stream(stream):
         eager_side = cl.launch_counters(2, device)
-    reserve = cl._CAPTURE_RESERVES[(device, 2)]
+    reserve = cl._COUNTER_STATES[device].reserves[2]
     assert len(reserve.free) >= cl.CAPTURE_RESERVE
     captured = []
     for _ in range(2):
@@ -557,7 +677,7 @@ def test_launch_counters_capture_takes_a_reserved_pair(
     assert len(set(pointers)) == len(pointers)
     for pair in captured:
         for die, tensor in enumerate(pair):
-            assert int(tensor.data_ptr()) % 16 == 0
+            assert int(tensor.data_ptr()) % 128 == 0
             assert int(tensor.abs().sum()) == 0
             if homed:
                 assert cl.pointer_domain(tensor.data_ptr(), device) == die
@@ -574,8 +694,11 @@ def test_launch_counters_reserve_refills_and_is_bounded(fresh_counters, monkeypa
     monkeypatch.setattr(cl, "CAPTURE_RESERVE", 4)
     monkeypatch.setattr(cl, "CAPTURE_PAIR_LIMIT", 6)
     cl.launch_counters(2, device)
-    reserve = cl._CAPTURE_RESERVES[(device, 2)]
+    reserve = cl._COUNTER_STATES[device].reserves[2]
     assert (len(reserve.free), reserve.made) == (4, 4)
+    # Pairs of one block are 128 bytes apart: no two share an L2 line.
+    starts = sorted(int(pair[0].data_ptr()) for pair in reserve.free)
+    assert all(b - a == 128 for a, b in zip(starts, starts[1:], strict=False))
     stream = torch.cuda.Stream(device=device)
     graphs = []
 
@@ -601,3 +724,39 @@ def test_launch_counters_reserve_refills_and_is_bounded(fresh_counters, monkeypa
     graphs[-1].replay()
     torch.cuda.synchronize(device)
     assert all(int(t.abs().sum()) == 0 for t in beyond)
+
+
+def test_capture_reserve_covers_twice_the_largest_capture(fresh_counters, monkeypatch):
+    """``reserve_launch_counters`` fills the reserve before any eager call; a
+    capture that takes several pairs makes the next refill keep at least twice
+    that many."""
+    device = _require_cuda()
+    _unhomed(monkeypatch)
+    monkeypatch.setattr(cl, "CAPTURE_RESERVE", 4)
+    cl.reserve_launch_counters(2, device)
+    reserve = cl._COUNTER_STATES[device].reserves[2]
+    assert (len(reserve.free), reserve.made) == (4, 4)
+    stream = torch.cuda.Stream(device=device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        before = _allocations(device)
+        pairs = [cl.launch_counters(2, device) for _ in range(3)]
+        assert _allocations(device) == before
+    assert (reserve.peak, reserve.issued, len(reserve.free)) == (3, 3, 1)
+    cl.launch_counters(2, device)
+    assert len(reserve.free) == 6 and reserve.made == 9
+    graph.replay()
+    torch.cuda.synchronize(device)
+    assert all(int(t.abs().sum()) == 0 for pair in pairs for t in pair)
+    # Under capture it does nothing.
+    work = torch.zeros(1, device=f"cuda:{device}")
+    other = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(other, stream=stream):
+        cl.reserve_launch_counters(2, device)
+        work.add_(1)
+    assert reserve.made == 9
+
+
+def test_sm_table_of_an_invalid_device_is_none():
+    _require_cuda()
+    assert cl.sm_table(torch.cuda.device_count() + 7) is None
