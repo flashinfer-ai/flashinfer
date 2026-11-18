@@ -20,8 +20,11 @@ limitations under the License.
 Covers the backend-dispatch semantics (auto routing on the shipped
 allowlist, never-swap-explicit, composable fallback for explicit
 ``backend="specialized"`` off-allowlist, kill switch), numeric correctness
-against a dequant+matmul reference (including a 128-unaligned N=64 case),
-and CUDA-graph capture/replay.
+against a dequant+matmul reference for every allowlisted (N, K) class at the
+dispatch-route M boundaries of combo_entry.cu (including the 128-unaligned
+N=64 class) over several seeds and both scale granularities, with every
+checked output NaN-poisoned before the call, and CUDA-graph capture/replay
+with exact-shape warm-up keying.
 """
 
 import pytest
@@ -132,23 +135,46 @@ def _call(a, b, a_scale, b_scale, backend, out=None):
     )
 
 
-@pytest.mark.parametrize(
-    "m,n,k",
-    [
-        (4, 64, 2048),  # 128-unaligned N (partial scale block)
-        (1, 1024, 2048),
-        (16, 2048, 4096),
-    ],
-)
-def test_auto_routes_to_specialized_on_allowlist(stock_sentinel, m, n, k):
-    """``backend="auto"`` on an allowlisted shape dispatches the specialized
-    kernels (stock proven not called) and matches the dequant reference."""
+# Every allowlisted (N, K) class, exercised at the dispatch-route boundaries
+# of combo_entry.cu (each class picks a different kernel per M range, and some
+# routes have exact-M forms, e.g. the N=64 cluster launches at M=1/16/32 and
+# the N=1024 switch at M<=2), with M capped at the class's admitted max.
+ALLOWLIST_NK_MMAX = {
+    (64, 2048): 32,
+    (1024, 2048): 32,
+    (2048, 512): 32,
+    (2048, 4096): 32,
+    (9216, 2048): 16,
+    (12288, 2048): 16,
+}
+ROUTE_BOUNDARY_MS = (1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 32)
+ROUTE_CASES = [
+    (m, n, k)
+    for (n, k), m_max in sorted(ALLOWLIST_NK_MMAX.items())
+    for m in ROUTE_BOUNDARY_MS
+    if m <= m_max
+]
+
+
+def _nan_out(m, n):
+    """NaN-poisoned output buffer: every correctness check writes into a
+    buffer pre-filled with NaN, so an element the kernel never writes (or a
+    wrong-route dispatch that writes a subset) cannot pass the comparison."""
+    return torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+
+
+@pytest.mark.parametrize("m,n,k", ROUTE_CASES)
+@pytest.mark.parametrize("seed", (0, 1, 2))
+def test_auto_routes_to_specialized_on_allowlist(stock_sentinel, m, n, k, seed):
+    """``backend="auto"`` on every allowlisted (N, K) class at every route
+    boundary dispatches the specialized kernels (stock proven not called)
+    and matches the dequant reference into a NaN-poisoned output."""
     from flashinfer.gemm import specialized_fp8_blockwise_sm120 as specmod
 
-    a, b, a_scale, b_scale = _gen_inputs(m, n, k, seed=42)
+    a, b, a_scale, b_scale = _gen_inputs(m, n, k, seed=seed * 1000 + m)
     ref = _reference(a, b, a_scale, b_scale)
     before = specmod.dispatch_stats.get("specialized", 0)
-    out = _call(a, b, a_scale, b_scale, backend="auto")
+    out = _call(a, b, a_scale, b_scale, backend="auto", out=_nan_out(m, n))
     torch.cuda.synchronize()
     assert specmod.dispatch_stats.get("specialized", 0) == before + 1
     assert _rel(out, ref) < REL_TOL
@@ -180,7 +206,7 @@ def test_explicit_specialized_composable_fallback(stock_sentinel):
         a, b, a_scale, b_scale = _gen_inputs(m, n, k, seed=seed)
         ref = _reference(a, b, a_scale, b_scale)
         before = specmod.dispatch_stats.get("specialized_composable_fallback", 0)
-        out = _call(a, b, a_scale, b_scale, backend="specialized")
+        out = _call(a, b, a_scale, b_scale, backend="specialized", out=_nan_out(m, n))
         torch.cuda.synchronize()
         assert (
             specmod.dispatch_stats.get("specialized_composable_fallback", 0)
@@ -202,7 +228,52 @@ def test_kill_switch_disables_backend(stock_sentinel, monkeypatch):
     reasons = {reason for _, reason in specmod.fallback_reasons}
     assert "kill_switch" in reasons
     ref = _reference(a, b, a_scale, b_scale)
-    out = _call(a, b, a_scale, b_scale, backend="specialized")
+    out = _call(a, b, a_scale, b_scale, backend="specialized", out=_nan_out(4, 64))
+    torch.cuda.synchronize()
+    assert _rel(out, ref) < REL_TOL
+
+
+@pytest.mark.parametrize("granularity", ((1, 128, 128), (128, 128, 128)))
+def test_explicit_specialized_both_scale_granularities(stock_sentinel, granularity):
+    """Numerics at both scale granularities of the op: (1, 128, 128) is the
+    kernel contract; (128, 128, 128) is off-contract for the kernel and must
+    be served by the composable fallback with correct numerics (never
+    another fused backend)."""
+    from flashinfer.gemm import gemm_fp8_nt_groupwise
+
+    gm, gn, gk = granularity
+    m, n, k = 8, 1024, 2048
+    gen = torch.Generator(device="cpu").manual_seed(7)
+    a = (torch.randn(m, k, generator=gen) * 0.5).to(torch.float8_e4m3fn).to(DEVICE)
+    b = (torch.randn(n, k, generator=gen) * 0.5).to(torch.float8_e4m3fn).to(DEVICE)
+    a_scale = (
+        (torch.rand((m + gm - 1) // gm, k // gk, generator=gen) * 0.5 + 0.5)
+        .float()
+        .to(DEVICE)
+    )
+    b_scale = (
+        (torch.rand((n + gn - 1) // gn, k // gk, generator=gen) * 0.5 + 0.5)
+        .float()
+        .to(DEVICE)
+    )
+    a32 = (
+        a.float() * a_scale.repeat_interleave(gm, 0)[:m].repeat_interleave(gk, 1)[:, :k]
+    )
+    b32 = (
+        b.float() * b_scale.repeat_interleave(gn, 0)[:n].repeat_interleave(gk, 1)[:, :k]
+    )
+    ref = (a32 @ b32.T).to(torch.bfloat16)
+    out = gemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        scale_major_mode="K",
+        scale_granularity_mnk=granularity,
+        out=_nan_out(m, n),
+        out_dtype=torch.bfloat16,
+        backend="specialized",
+    )
     torch.cuda.synchronize()
     assert _rel(out, ref) < REL_TOL
 
@@ -239,7 +310,7 @@ def test_cuda_graph_replay_matches_eager():
 
     specmod.warmup()
     a, b, a_scale, b_scale = _gen_inputs(8, 64, 2048, seed=48)
-    out = torch.empty(8, 64, dtype=torch.bfloat16, device=DEVICE)
+    out = _nan_out(8, 64)
     eager = _call(a, b, a_scale, b_scale, backend="auto", out=out).clone()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
