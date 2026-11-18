@@ -9851,24 +9851,87 @@ def trtllm_batch_context_with_kv_cache(
     return result_out
 
 
-# Backends for the generalized batch-context entry: the same enum as the
-# specific entry it connects to. New backends are added here.
-BATCH_CONTEXT_BACKENDS = TRTLLM_BATCH_CONTEXT_BACKENDS
+# Backends of the generalized batch-context front. Every name is a real
+# implementation ("trtllm" = the trtllm-gen cubin path behind
+# trtllm_batch_context_with_kv_cache, "cake" = its cake path,
+# "specialized" = the agent-generated SM103 CUDA kernel, linked directly);
+# "auto" only SELECTS among the named backends and carries no behavior of
+# its own.
+BATCH_CONTEXT_BACKENDS = ("auto", "specialized", "trtllm", "cake")
 
 
-def batch_context_with_kv_cache(*args, **kwargs):
+def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
     """Generalized batch-context (chunked-prefill) attention over paged KV.
 
-    Vendor-neutral front for the batch-context contract. Identical
-    signature, defaults and semantics to
-    :func:`trtllm_batch_context_with_kv_cache`, which stays unchanged and
-    is one of this entry's backends: ``backend`` selects among
-    ``BATCH_CONTEXT_BACKENDS`` — ``"auto"`` (default) behaves as
-    ``"trtllm-gen"`` except that strictly allowlisted calls route to the
-    agent-generated ``"specialized"`` kernel; an explicitly selected
-    backend is never silently swapped, and ``"specialized"`` raises a
-    ``ValueError`` listing ``fallback_reasons`` for calls it cannot serve.
+    Vendor-neutral front over the batch-context contract. Parameters are
+    those of :func:`trtllm_batch_context_with_kv_cache` (which stays
+    unchanged), except ``backend``, which names a real implementation from
+    ``BATCH_CONTEXT_BACKENDS``:
+
+    - ``"specialized"``: the agent-generated SM103 CUDA kernel, called
+      directly at this front (not through the trtllm-named entry). Raises
+      a ``ValueError`` listing ``fallback_reasons`` for calls outside its
+      strict allowlist — an explicitly selected backend is never silently
+      swapped.
+    - ``"trtllm"`` / ``"cake"``: the corresponding paths of the
+      trtllm-named entry.
+    - ``"auto"`` (default): selection only, no behavior of its own —
+      routes to ``"specialized"`` when its allowlist serves the call,
+      otherwise to ``"trtllm"``.
     """
+    if backend not in BATCH_CONTEXT_BACKENDS:
+        raise ValueError(
+            f"backend must be one of {BATCH_CONTEXT_BACKENDS}, got {backend!r}"
+        )
+    if backend in ("auto", "specialized"):
+        import inspect as _inspect
+
+        from .gqa_ctx_fp8_ikv_cuda import maybe_dispatch_specialized as _mds
+
+        bound = _inspect.signature(trtllm_batch_context_with_kv_cache).bind(
+            *args, **kwargs
+        )
+        bound.apply_defaults()
+        a = bound.arguments
+        served = _mds(
+            backend=backend,
+            query=a["query"],
+            kv_cache=a["kv_cache"],
+            block_tables=a["block_tables"],
+            seq_lens=a["seq_lens"],
+            max_q_len=a["max_q_len"],
+            max_kv_len=a["max_kv_len"],
+            bmm1_scale=a["bmm1_scale"],
+            bmm2_scale=a["bmm2_scale"],
+            batch_size=a["batch_size"],
+            cum_seq_lens_q=a["cum_seq_lens_q"],
+            cum_seq_lens_kv=a["cum_seq_lens_kv"],
+            out=a["out"],
+            extras=dict(
+                out_dtype=a["out_dtype"],
+                lse=a["lse"],
+                return_lse=a["return_lse"],
+                sinks=a["sinks"],
+                kv_cache_sf=a["kv_cache_sf"],
+                o_sf_scale=a["o_sf_scale"],
+                skip_softmax=a["skip_softmax_threshold_scale_factor"],
+                uses_shared_paged_kv_idx=a["uses_shared_paged_kv_idx"],
+                multi_ctas=a["multi_ctas_kv_counter_buffer"],
+                causal=a["causal"],
+                kv_layout=a["kv_layout"],
+                window_left=a["window_left"],
+                window_right=a["window_right"],
+                use_fp16_softmax=a["use_fp16_softmax"],
+                uses_spcompress=a["uses_spcompress"],
+                vw_starts=a["variable_window_token_starts"],
+                vw_ends=a["variable_window_token_ends"],
+            ),
+        )
+        if served is not None:
+            return served
+        # backend == "auto": the specialized allowlist cannot serve; route
+        # to the named "trtllm" backend (explicit "specialized" raised).
+    kwargs["backend"] = "cake" if backend == "cake" else "trtllm-gen"
     return trtllm_batch_context_with_kv_cache(*args, **kwargs)
 
 

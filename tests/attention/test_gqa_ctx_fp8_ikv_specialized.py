@@ -229,15 +229,16 @@ def test_cuda_graph_replay_matches_eager():
 
 @requires_sm103
 def test_generalized_entry_parity_and_dispatch():
-    """batch_context_with_kv_cache is the vendor-neutral front: same enum,
-    same dispatch semantics, bitwise parity with the direct entry."""
+    """batch_context_with_kv_cache is a front over NAMED real backends:
+    "specialized" links directly to the agent-generated kernel, "trtllm"/
+    "cake" are the trtllm-named entry's paths, and "auto" only selects
+    among the names (no behavior of its own)."""
     from flashinfer.prefill import (
         BATCH_CONTEXT_BACKENDS,
-        TRTLLM_BATCH_CONTEXT_BACKENDS,
         batch_context_with_kv_cache,
     )
 
-    assert BATCH_CONTEXT_BACKENDS == TRTLLM_BATCH_CONTEXT_BACKENDS
+    assert BATCH_CONTEXT_BACKENDS == ("auto", "specialized", "trtllm", "cake")
     inp = _make_inputs([2] * 8, [2] * 8, seed=11)
     kv = inp["kv_buf"]
     kwargs = dict(
@@ -255,22 +256,54 @@ def test_generalized_entry_parity_and_dispatch():
         cum_seq_lens_kv=inp["cu_kv"],
         window_left=-1,
     )
-    # auto on the allowlist routes to specialized, same as the direct entry
+    # "auto" selects "specialized" on its allowlist (dispatch stats move)
     before = dict(spec_mod.DISPATCH_STATS)
     gen_out = batch_context_with_kv_cache(out=_out_like(inp), **kwargs)
     assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1
-    direct_out = _api(inp, _out_like(inp))
-    assert torch.equal(gen_out, direct_out)
-    # explicit backends behave identically through the front
+    # the direct specialized name produces the same bits, without touching
+    # the trtllm-named entry's dispatch
     gen_spec = batch_context_with_kv_cache(
         out=_out_like(inp), backend="specialized", **kwargs
     )
     assert torch.equal(gen_spec, gen_out)
+    # parity with the direct (entry-level) specialized route
+    direct_out = _api(inp, _out_like(inp), backend="specialized")
+    assert torch.equal(gen_out, direct_out)
+    # the named "trtllm" backend equals the entry's trtllm-gen path
     gen_stock = batch_context_with_kv_cache(
-        out=_out_like(inp), backend="trtllm-gen", **kwargs
+        out=_out_like(inp), backend="trtllm", **kwargs
     )
     direct_stock = _api(inp, _out_like(inp), backend="trtllm-gen")
     assert torch.equal(gen_stock, direct_stock)
-    # invalid backend raises through the front too
-    with pytest.raises(ValueError):
+    # off-allowlist: auto selects "trtllm"; explicit "specialized" raises
+    big = _make_inputs([2] * 2, [600] * 2, seed=13)  # multi-page KV
+    bkv = big["kv_buf"]
+    bkwargs = dict(
+        query=big["q"],
+        kv_cache=(bkv[:, :, 0, :].unsqueeze(1), bkv[:, :, 1, :].unsqueeze(1)),
+        workspace_buffer=_ws(),
+        block_tables=big["bt"],
+        seq_lens=big["seq_lens"],
+        max_q_len=big["max_q"],
+        max_kv_len=big["max_kv"],
+        bmm1_scale=SCALE,
+        bmm2_scale=1.0,
+        batch_size=int(big["seq_lens"].shape[0]),
+        cum_seq_lens_q=big["cu_q"],
+        cum_seq_lens_kv=big["cu_kv"],
+        window_left=-1,
+    )
+    before = dict(spec_mod.DISPATCH_STATS)
+    auto_out = batch_context_with_kv_cache(out=_out_like(big), **bkwargs)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"]
+    trt_out = batch_context_with_kv_cache(
+        out=_out_like(big), backend="trtllm", **bkwargs
+    )
+    assert torch.equal(auto_out, trt_out)
+    with pytest.raises(ValueError, match="fallback_reasons"):
+        batch_context_with_kv_cache(
+            out=_out_like(big), backend="specialized", **bkwargs
+        )
+    # invalid backend raises at the front
+    with pytest.raises(ValueError, match="backend must be one of"):
         batch_context_with_kv_cache(out=_out_like(inp), backend="bogus", **kwargs)
