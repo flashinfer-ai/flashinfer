@@ -43,7 +43,17 @@ Contract and restrictions (validated eagerly, never silently relaxed):
   page table, and K mutations after ``prepare_pool`` stay visible.
 - ``plan`` performs a host sync (prefixes are read on host) and is NOT
   capturable on this backend; ``run`` is capturable after an eager
-  warmup. Environment validation mirrors the functional entry's dispatch
+  warmup. ``host_length_hints`` is rejected (the ``cutedsl`` backend
+  honors it; ``backend="auto"`` demotes on the rejection rather than
+  silently ignoring the bound).
+- ``plan`` releases the previous plan's device tensors (page table,
+  prefix metadata, scratch). A CUDA graph captured against an earlier
+  plan holds raw addresses into that storage, so discard such graphs
+  before replanning; replaying one across a replan is undefined. This is
+  the wrapper rule — keep capture inputs alive until the caller discards
+  its graphs — applied to plan-owned tensors: states are not retained
+  across replans because that retention would grow without bound.
+- Environment validation mirrors the functional entry's dispatch
   guards AT CONSTRUCTION: unvalidated CUDA toolkits (torch build or JIT
   nvcc, outside ``VALIDATED_CUDA_VERSIONS``), the kill switch, and
   non-SM103 devices all raise here, so ``backend="auto"`` demotes instead
@@ -67,6 +77,7 @@ from .prefill_indexer import (
     VALIDATED_CUDA_VERSIONS,
     _toolkit_validation_reasons,
     fp8_paged_mqa_topk_indexer,
+    get_fp8_paged_mqa_topk_indexer_module,
 )
 
 _RATIO = 4
@@ -152,8 +163,10 @@ class SpecializedTopKPlan:
         self.error = 0
         self.repair_error = 0
         self.active_shape = None
-        self._pool = None  # padded paged key pool view (NCP, 64, 1, 128)
-        self._pool_src = None  # data_ptr of the prepared K
+        # prepared K bindings keyed by data_ptr: padded paged views
+        # (NCP, 64, 1, 128). data_ptr is host metadata, so run's binding
+        # lookup stays safe during graph capture.
+        self._pools = {}
         self._state = None  # per-plan device tensors
         self._out = None  # shared output storage
 
@@ -184,13 +197,11 @@ class SpecializedTopKPlan:
             "backend='specialized' requires key storage in multiples of 64 "
             "rows (zero-copy paged view; pad the storage allocation)",
         )
-        self._pool = k.view(-1, _PAGE_BLOCKS, 1, 128)
-        self._pool_src = k.data_ptr()
+        self._pools[k.data_ptr()] = k.view(-1, _PAGE_BLOCKS, 1, 128)
         return None
 
     def clear_pools(self):
-        self._pool = None
-        self._pool_src = None
+        self._pools = {}
         return None
 
     def input_buffers(self):
@@ -211,12 +222,34 @@ class SpecializedTopKPlan:
             not torch.cuda.is_current_stream_capturing(),
             "backend='specialized' plan is not capturable (host sync)",
         )
-        _require(self._pool is not None, "prepare_pool must run before plan")
+        _require(self._pools, "prepare_pool must run before plan")
+        _require(
+            host_length_hints is None,
+            "backend='specialized' does not serve host_length_hints "
+            "(the cutedsl backend honors them; this rejection lets "
+            "backend='auto' demote instead of silently ignoring the bound)",
+        )
+        # Resolve the JIT module now (one-time build, cached): a validated
+        # nvcc can report its version and still fail to build the module,
+        # and discovering that at run() is too late for backend='auto' to
+        # demote to a working backend.
+        try:
+            get_fp8_paged_mqa_topk_indexer_module()
+        except Exception as e:
+            raise ValueError(
+                f"backend='specialized' kernel module unavailable ({type(e).__name__})"
+            ) from e
         qo = qo_indptr.to("cpu", torch.int64).tolist()
         kv = kv_indptr.to("cpu", torch.int64).tolist()
         _require(
             len(qo) == len(kv) and len(qo) >= 2, "qo/kv_indptr must share shape [B+1]"
         )
+        # Per-request checks keep both arrays strictly increasing, so
+        # non-negative first values make every value non-negative. A
+        # negative KV start passes the 256-alignment check (-256 % 256 ==
+        # 0) and would plan a negative page number addressing outside the
+        # prepared pool.
+        _require(qo[0] >= 0 and kv[0] >= 0, "qo/kv_indptr must be non-negative")
         b = len(qo) - 1
         _require(b <= self._max_batch_size, "batch exceeds max_batch_size")
         dev = self._device
@@ -246,8 +279,11 @@ class SpecializedTopKPlan:
                 _require(q_len == next_n, "next_n mismatch")
             key_start = kv[r] // _RATIO
             n_keys = kv_len // _RATIO  # complete compressed keys only
+            # every prepared binding must cover the plan: run() may be
+            # called with any of them, so check the smallest
             _require(
-                key_start + n_keys <= self._pool.shape[0] * _PAGE_BLOCKS,
+                key_start + n_keys
+                <= min(p.shape[0] for p in self._pools.values()) * _PAGE_BLOCKS,
                 "prepared pool too small for planned prefixes",
             )
             # request-local original-token positions of the query rows
@@ -288,11 +324,12 @@ class SpecializedTopKPlan:
             "q must be CUDA fp8 [Q, 4, 128]",
         )
         _require(q.shape[0] >= t and q.shape[1] == 4 and q.shape[2] == 128, "bad q")
+        # binding lookup by data_ptr (host metadata, capture-safe): each
+        # prepared K stays addressable, and an unknown binding is rejected
+        # in captured runs too, instead of recording another binding's keys
+        pool = self._pools.get(k.data_ptr())
+        _require(pool is not None, "run must use a prepared K binding")
         if not torch.cuda.is_current_stream_capturing():
-            _require(
-                self._pool_src == k.data_ptr(),
-                "run must use the prepared K binding",
-            )
             _require(
                 bool(torch.all(k_scale == 1.0).item()),
                 "backend='specialized' requires unit k_scale at run as well",
@@ -310,7 +347,7 @@ class SpecializedTopKPlan:
             )
         packed = fp8_paged_mqa_topk_indexer(
             q[:t],
-            self._pool,
+            pool,
             st["page_table"],
             st["cu_seqlens"],
             st["pos"],
@@ -325,11 +362,15 @@ class SpecializedTopKPlan:
         cand = torch.where(mask, ids, torch.full_like(ids, _SENTINEL))
         sel = cand.sort(dim=1).values[:, :_TOPK]
         if out is None:
-            if self._out is None or self._out.shape[0] < t:
+            # the wrapper contract returns the full supplied Q extent
+            # ([Q, top_k] with -1 in the inactive rows), not just the
+            # plan's t live rows
+            nq = q.shape[0]
+            if self._out is None or self._out.shape[0] < nq:
                 self._out = torch.empty(
-                    t, _TOPK, dtype=torch.int32, device=self._device
+                    nq, _TOPK, dtype=torch.int32, device=self._device
                 )
-            out = self._out[:t]
+            out = self._out[:nq]
         # out may carry more rows than the plan's t live rows (the wrapper
         # contract allows a [Q, top_k] destination with Q >= t): write the
         # live rows and pad the rest, instead of a shape-mismatched copy_.
