@@ -2806,6 +2806,21 @@ class SpecializedFp8BlockSmallTRunner(CutlassFp8BlockRunner):
                 f"({_module_error})."
             )
 
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        # The specialized kernel manages its own plan-sized scratch inside
+        # smallt_sm90; the CUTLASS workspace the base class sizes here is
+        # never consumed by this runner's forward. Sizing it anyway would
+        # load (and on first use, build) the stock CUTLASS module and retain
+        # a large per-(bucket, hidden) allocation on BOTH packing paths
+        # (pack_inputs and the tuning-input hook), so this override keeps
+        # only the token-ceiling check and binds no CUTLASS resource.
+        max_num_tokens = self.config.execution.tune_max_num_tokens
+        if num_tokens > max_num_tokens:
+            raise ValueError(
+                f"workspace num_tokens={num_tokens} exceeds tune_max_num_tokens="
+                f"{max_num_tokens}."
+            )
+
     def _band_geometry_ok(self, num_tokens: int, hidden_size: int) -> bool:
         from .smallt_sm90 import _BAND2_LO, _BAND2_HI, _MAX_TOKENS
 
