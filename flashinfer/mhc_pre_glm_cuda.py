@@ -63,11 +63,17 @@ def supported_with_reasons(
     mhc_sinkhorn_eps,
     mhc_post_mult_value,
     sinkhorn_repeat,
+    _ignore_residual_layout=False,
 ):
     """Guard order: GPU-free (kill switch, scalar-parameter pins, dtype,
     geometry allowlist) -> layout guards -> device guards. Returns [] when
     the specialized kernel can serve the call, else fallback reasons. No
-    device syncs."""
+    device syncs.
+
+    ``_ignore_residual_layout=True`` skips the residual contiguity and
+    alignment checks (both re-established by a ``.contiguous()`` copy):
+    the dispatcher uses it to decide whether a non-contiguous residual is
+    worth normalizing at all."""
     if _os.environ.get(KILL_SWITCH_ENV, "0") == "1":
         return ["kill_switch:" + KILL_SWITCH_ENV + "=1"]
     r = []
@@ -86,7 +92,7 @@ def supported_with_reasons(
         or residual.shape[1] != _HC
         or residual.shape[2] != _H
         or residual.dtype != torch.bfloat16
-        or not residual.is_contiguous()
+        or not (_ignore_residual_layout or residual.is_contiguous())
     ):
         r.append("residual_geometry")
     elif not (1 <= residual.shape[0] <= _MAX_TOKENS):
@@ -122,7 +128,7 @@ def supported_with_reasons(
     # the kernel's vectorized/TMA paths need 16-byte-aligned bases;
     # contiguity alone does not establish that (e.g. backing[1:].view(...))
     for _name, _t in (("residual", residual), ("fn", fn)):
-        if _t.data_ptr() % 16:
+        if _t.data_ptr() % 16 and not (_ignore_residual_layout and _name == "residual"):
             r.append(_name + "_not_16B_aligned")
     if r:
         return r
@@ -148,7 +154,35 @@ def maybe_dispatch_specialized(
     """Route for backend in ("auto", "specialized"). Returns the output tuple
     when served; None when "auto" should continue on the big-fuse composition.
     An explicitly requested "specialized" backend is never silently swapped:
-    if it cannot serve the call it raises."""
+    if it cannot serve the call it raises.
+
+    A non-contiguous residual is normalized here, and only after the cheap
+    layout-independent checks pass: a call the device or scalar pins exclude
+    must not pay for a (potentially hundreds of MiB) contiguous copy the
+    big-fuse fallback does not need."""
+    if not residual.is_contiguous():
+        reasons = supported_with_reasons(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            mhc_pre_eps,
+            mhc_sinkhorn_eps,
+            mhc_post_mult_value,
+            sinkhorn_repeat,
+            _ignore_residual_layout=True,
+        )
+        if reasons:
+            LAST_FALLBACK_REASONS[:] = reasons
+            if backend == "specialized":
+                raise ValueError(
+                    "backend='specialized' cannot serve this call and is never "
+                    f"silently swapped; fallback_reasons={reasons}"
+                )
+            DISPATCH_STATS["fallback"] += 1
+            return None
+        residual = residual.contiguous()
     reasons = supported_with_reasons(
         residual,
         fn,

@@ -433,12 +433,13 @@ def mhc_pre(
     if backend != "big-fuse":
         from . import mhc_pre_glm_cuda
 
+        # Layout normalization for a non-contiguous residual happens inside
+        # the dispatcher, after its cheap eligibility checks: an ineligible
+        # call must reach the big-fuse fallback without paying for the copy.
         residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size)
         served = mhc_pre_glm_cuda.maybe_dispatch_specialized(
             backend,
-            residual_flat
-            if residual_flat.is_contiguous()
-            else residual_flat.contiguous(),
+            residual_flat,
             fn,
             hc_scale,
             hc_base,
