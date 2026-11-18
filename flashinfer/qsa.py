@@ -5,8 +5,6 @@
 
 import functools
 import importlib
-import os
-from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -14,11 +12,6 @@ from packaging.version import Version
 
 from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.qsa import qsa_forward_trace, qsa_indexed_forward_trace
-from .utils import (
-    get_compute_capability,
-    register_custom_op,
-    register_fake_op,
-)
 
 __all__ = ["qsa_forward", "qsa_indexed_forward", "qsa_topk_indexer"]
 
@@ -38,11 +31,11 @@ QSA_INDEXER_PACKED_WIDTH = 2052
 # NotImplementedError (with the reason recorded) instead of falling back.
 QSA_TOPK_INDEXER_BACKENDS = ("auto", "specialized")
 
-# Kill switch: set FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 to force the
+# The kill switch FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the
 # non-fused path. For this op that path does not exist, so the call raises
 # NotImplementedError; the switch still guarantees the specialized kernel is
-# never dispatched.
-_SPECIALIZED_KILL_SWITCH = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+# never dispatched. It is checked by the backend support check in
+# flashinfer/experimental/qsa_topk_indexer/backend.py.
 
 # Observability: per-backend dispatch counts and the reasons recorded each
 # time "specialized" declined a call.
@@ -190,35 +183,6 @@ def qsa_indexed_forward(
     return result["out"], result["out_fp32"], result["lse"]
 
 
-@functools.cache
-def _get_qsa_topk_indexer_module():
-    from .jit import gen_qsa_topk_indexer_module
-
-    module = gen_qsa_topk_indexer_module().build_and_load()
-
-    @register_custom_op("flashinfer::qsa_topk_indexer", mutates_args=("packed",))
-    def _qsa_topk_indexer(
-        packed: torch.Tensor,
-        qi: torch.Tensor,
-        ck_cache: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        cpage_base: torch.Tensor,
-    ) -> None:
-        module.run(qi, ck_cache, cu_seqlens, cpage_base, packed)
-
-    @register_fake_op("flashinfer::qsa_topk_indexer")
-    def _fake_qsa_topk_indexer(
-        packed: torch.Tensor,
-        qi: torch.Tensor,
-        ck_cache: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        cpage_base: torch.Tensor,
-    ) -> None:
-        pass
-
-    return SimpleNamespace(run=_qsa_topk_indexer)
-
-
 def _check_qsa_topk_indexer_inputs(
     qi: torch.Tensor,
     ck_cache: torch.Tensor,
@@ -308,21 +272,6 @@ def _check_qsa_topk_indexer_inputs(
             t_hi = t_lo + t.numel() * t.element_size()
             if out_lo < t_hi and t_lo < out_hi:
                 raise ValueError(f"out must not share storage with {name}.")
-
-
-def _qsa_topk_indexer_unservable_reason(qi: torch.Tensor) -> Optional[str]:
-    """Why the "specialized" backend cannot serve this call, or None.
-
-    GPU-free guards first (the kill switch), then the device guard. Contract
-    violations (dtype / geometry / contiguity) are caller errors and raise
-    ValueError in _check_qsa_topk_indexer_inputs instead.
-    """
-    if os.environ.get(_SPECIALIZED_KILL_SWITCH) == "1":
-        return f"{_SPECIALIZED_KILL_SWITCH}=1 disables the specialized kernel"
-    cc = get_compute_capability(qi.device)
-    if cc != (10, 7):
-        return f"specialized kernel targets SM107 only; device is sm{cc[0]}{cc[1]}"
-    return None
 
 
 @flashinfer_experimental_api(
@@ -423,7 +372,11 @@ def qsa_topk_indexer(
             f"backend must be one of {QSA_TOPK_INDEXER_BACKENDS}, got {backend!r}."
         )
     _check_qsa_topk_indexer_inputs(qi, ck_cache, cu_seqlens, cpage_base, out)
-    reason = _qsa_topk_indexer_unservable_reason(qi)
+    # Deferred handoff: kernels, JIT spec, loader cache and the backend
+    # support check live under flashinfer/experimental/qsa_topk_indexer/.
+    from .experimental.qsa_topk_indexer.backend import run, unservable_reason
+
+    reason = unservable_reason(qi)
     if reason is not None:
         qsa_topk_indexer_fallback_reasons.append(reason)
         raise NotImplementedError(
@@ -437,6 +390,6 @@ def qsa_topk_indexer(
             dtype=torch.int32,
             device=qi.device,
         )
-    _get_qsa_topk_indexer_module().run(out, qi, ck_cache, cu_seqlens, cpage_base)
+    run(out, qi, ck_cache, cu_seqlens, cpage_base)
     qsa_topk_indexer_dispatch_stats["specialized"] += 1
     return out

@@ -5,7 +5,7 @@
 // top-512 block selection over a paged FP8 compressed-key cache, expanded to
 // token ids with the causal tail, packed int32 output (ascending ids, -1 pad,
 // count in the last column). Ties break toward the lower block index; see the
-// pure-PyTorch reference in tests/attention/test_qsa_topk_indexer.py.
+// pure-PyTorch reference in tests/experimental/test_qsa_topk_indexer.py.
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
