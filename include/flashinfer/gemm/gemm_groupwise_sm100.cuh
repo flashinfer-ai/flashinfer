@@ -29,6 +29,74 @@ namespace gemm {
 
 using namespace cute;
 
+namespace detail {
+
+// Backport of NVIDIA/cutlass#3816 for the pinned CUTLASS, which predates it.
+//
+// For K-major scale factors, CUTLASS's SM100 blockwise builder gives each scale tensor a fixed
+// 32-thread cp.async copy. When a CTA tile holds fewer than 32 scales per stage, the extra lanes
+// partition past the end of the stage's smem slice: lane i (i >= scales per tile) copies the
+// global scale at tile offset i into the *next* pipeline stage, and `load_sf` predicates only
+// on the global shape. The swap-AB small-batch kernel below is such a tile (16 per-token scales
+// along N), so for m > 16 lanes 16..m-1 overwrite the next stage's scales while that stage is
+// being filled or read, corrupting output rows 0..m-17 (flashinfer-ai/flashinfer#4396).
+// Tiles whose scale mode is broadcast (granularity == tile extent) only produce duplicate writes
+// of the same value, which is why the general kernel is unaffected.
+//
+// The fix is upstream's: clamp the K-major copy to min(32, scales per tile) threads. Idle lanes
+// are predicated off but still make their producer arrivals, so the SF pipeline's arrival count
+// is unchanged. MN-major copies are already sized to the tile and are passed through. Once the
+// CUTLASS pin includes #3816 this alias resolves to the builder's own CollectiveOp.
+template <class Element, class LayoutSF, int ScalesPerTileMN, int ScalesPerTileK, class BuilderCopy>
+constexpr auto clamp_k_major_scale_copy() {
+  if constexpr (size<0, 1>(LayoutSF{}.stride()) == 1) {
+    return BuilderCopy{};
+  } else {
+    using CopyAtom = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<Element>, Element>;
+    return make_tiled_copy(CopyAtom{},
+                           Layout<Shape<Int<cute::min(32, ScalesPerTileMN * ScalesPerTileK)>>>{},
+                           Layout<Shape<_1>>{});
+  }
+}
+
+template <class CollectiveMainloop>
+struct ClampScaleCopiesToTile;
+
+template <int Stages, int SchedulerPipelineStageCount, int AccumulatorPipelineStageCount,
+          class ClusterShape, class ArchTag, class TileShape, class ElementA, class StridePairA,
+          class ElementB, class StridePairB, class TiledMma, class GmemTiledCopyA,
+          class GmemTiledCopySFA, class SmemLayoutAtomA, class SmemCopyAtomA, class TransformA,
+          class GmemTiledCopyB, class GmemTiledCopySFB, class SmemLayoutAtomB, class SmemCopyAtomB,
+          class TransformB>
+struct ClampScaleCopiesToTile<cutlass::gemm::collective::CollectiveMma<
+    cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockwiseScaling<
+        Stages, SchedulerPipelineStageCount, AccumulatorPipelineStageCount, ClusterShape, ArchTag>,
+    TileShape, ElementA, StridePairA, ElementB, StridePairB, TiledMma,
+    cute::tuple<GmemTiledCopyA, GmemTiledCopySFA>, SmemLayoutAtomA, SmemCopyAtomA, TransformA,
+    cute::tuple<GmemTiledCopyB, GmemTiledCopySFB>, SmemLayoutAtomB, SmemCopyAtomB, TransformB>> {
+  using DispatchPolicy = cutlass::gemm::MainloopSm100TmaUmmaWarpSpecializedBlockwiseScaling<
+      Stages, SchedulerPipelineStageCount, AccumulatorPipelineStageCount, ClusterShape, ArchTag>;
+  using FromBuilder = cutlass::gemm::collective::CollectiveMma<
+      DispatchPolicy, TileShape, ElementA, StridePairA, ElementB, StridePairB, TiledMma,
+      cute::tuple<GmemTiledCopyA, GmemTiledCopySFA>, SmemLayoutAtomA, SmemCopyAtomA, TransformA,
+      cute::tuple<GmemTiledCopyB, GmemTiledCopySFB>, SmemLayoutAtomB, SmemCopyAtomB, TransformB>;
+
+  static constexpr int ScaleKsPerTile = size<2>(TileShape{}) / FromBuilder::ScaleGranularityK;
+  using ClampedCopySFA = decltype(clamp_k_major_scale_copy<
+                                  typename FromBuilder::ElementSFA, typename FromBuilder::LayoutSFA,
+                                  FromBuilder::ScaleMsPerTile, ScaleKsPerTile, GmemTiledCopySFA>());
+  using ClampedCopySFB = decltype(clamp_k_major_scale_copy<
+                                  typename FromBuilder::ElementSFB, typename FromBuilder::LayoutSFB,
+                                  FromBuilder::ScaleNsPerTile, ScaleKsPerTile, GmemTiledCopySFB>());
+
+  using type = cutlass::gemm::collective::CollectiveMma<
+      DispatchPolicy, TileShape, ElementA, StridePairA, ElementB, StridePairB, TiledMma,
+      cute::tuple<GmemTiledCopyA, ClampedCopySFA>, SmemLayoutAtomA, SmemCopyAtomA, TransformA,
+      cute::tuple<GmemTiledCopyB, ClampedCopySFB>, SmemLayoutAtomB, SmemCopyAtomB, TransformB>;
+};
+
+}  // namespace detail
+
 template <int ScaleGranularityM, int ScaleGranularityN, int ScaleGranularityK, bool ScaleMajorK,
           int MmaSM, typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassGroupwiseScaledGEMMSM100(void* float_buffer, size_t float_buffer_size_in_bytes,
@@ -217,7 +285,7 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100LowLatency(void* float_buffer,
       ElementD, LayoutD, AlignmentD, cutlass::epilogue::TmaWarpSpecialized1Sm,
       cutlass::epilogue::fusion::LinearCombination<ElementD, float, void, float>>::CollectiveOp;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+  using CollectiveMainloopFromBuilder = typename cutlass::gemm::collective::CollectiveBuilder<
       /*ArchTag=*/cutlass::arch::Sm100, /*OpClass=*/cutlass::arch::OpClassTensorOp, ElementA,
       /*GemmLayoutA=*/cute::tuple<LayoutA, LayoutSFA>, AlignmentA, ElementB,
       /*GemmLayoutB=*/cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator,
@@ -227,6 +295,14 @@ cudaError_t CutlassGroupwiseScaledGEMMSM100LowLatency(void* float_buffer,
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       /*KernelScheduleType=*/cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100>::
       CollectiveOp;
+  // The 16-wide N tile holds 16 per-token scales per stage; keep the K-major SFB copy within
+  // them (see detail::ClampScaleCopiesToTile and flashinfer-ai/flashinfer#4396).
+  using CollectiveMainloop =
+      typename detail::ClampScaleCopiesToTile<CollectiveMainloopFromBuilder>::type;
+  static_assert(size(typename CollectiveMainloop::GmemTiledCopySFB{}) <=
+                    CollectiveMainloop::ScaleNsPerTile *
+                        (size<2>(MmaTileShape_MNK{}) / CollectiveMainloop::ScaleGranularityK),
+                "SFB scale copy must not have more threads than SFB scales per stage");
 
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
       /*ProblemShapeOrThreadblockMma_=*/Shape<int, int, int, int>, CollectiveMainloop,
