@@ -58,6 +58,7 @@ import torch
 
 from flashinfer import nvfp4_kv_dequantize
 from flashinfer.sdsa import indexer_scores, indexer_threshold_select
+from flashinfer.sdsa.shapes import MAX_ROWS
 from flashinfer.testing.utils import bench_gpu_time
 
 PAGE, DIM = 64, 128
@@ -226,8 +227,12 @@ def main() -> None:
         parser.error("--top-k must be positive")
     if args.sample_rank < 1:
         parser.error("--sample-rank must be positive")
-    if not 0 <= args.slack < math.inf:
-        parser.error("--slack must be finite and nonnegative")
+    if not all(1 <= rows <= MAX_ROWS for rows in args.rows):
+        parser.error(f"--rows must each be 1 to {MAX_ROWS}")
+    # Without slack, the select's first row, which sees --select-rows - 1 fewer
+    # keys than its last, always expects fewer than top_k candidates.
+    if not 0 < args.slack < math.inf:
+        parser.error("--slack must be finite and positive")
 
     torch.manual_seed(0)
     major, minor = torch.cuda.get_device_capability()
