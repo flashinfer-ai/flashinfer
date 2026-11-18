@@ -1177,9 +1177,31 @@ def _allocate_workspace(
     return workspace
 
 
+def _byte_extent(tensor: torch.Tensor) -> tuple[int, int]:
+    """``[start, end)``: the device bytes a tensor view can address (empty when it
+    has no elements), from its shape and strides, not its whole storage."""
+    start = int(tensor.data_ptr())
+    if tensor.numel() == 0:
+        return start, start
+    last = sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
+    return start, start + (last + 1) * tensor.element_size()
+
+
 def _check_workspace(
-    plan: RoutePlan, workspace: dict[str, torch.Tensor], device: torch.device
+    plan: RoutePlan,
+    workspace: dict[str, torch.Tensor],
+    device: torch.device,
+    *,
+    operands: dict[str, torch.Tensor],
 ) -> None:
+    """Validate caller-owned ``workspace`` tensors: the keys, shapes, dtypes and
+    alignment the route binds, two dies' counters that share no byte, and no
+    workspace byte inside the exact extent of an ``operands`` tensor (a kernel
+    writes its workspaces while it reads the operands, e.g. its row counts from
+    ``masked_m``). Disjoint views of one buffer are accepted."""
     if set(workspace) != set(plan.workspaces):
         raise ValueError(
             f"route {plan.route} binds workspaces {sorted(plan.workspaces)}, got {sorted(workspace)}"
@@ -1207,6 +1229,15 @@ def _check_workspace(
                 f"workspaces {DOMAIN_COUNTERS[0]} and {DOMAIN_COUNTERS[1]} overlap; "
                 "each die needs its own zeroed counters"
             )
+    extents = {name: _byte_extent(tensor) for name, tensor in operands.items()}
+    for key in plan.workspaces:
+        start, end = _byte_extent(workspace[key])
+        for name, (first, last) in extents.items():
+            if start < last and first < end:
+                raise ValueError(
+                    f"workspace {key} overlaps {name}; a workspace needs memory "
+                    "of its own"
+                )
 
 
 def _family_bindings(
@@ -1308,8 +1339,9 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
         ``RoutePlan.workspaces``): the packed-scale workspace of a swap-AB route,
         or the zeroed int32 claim counters ``counters0`` / ``counters1`` of the
         locality-domain twin route (homed on die 0 / die 1 by
-        :func:`flashinfer.cake_locality.counters`).  Allocated at preparation if
-        omitted: a prepared launch owns its counters (the public API's call
+        :func:`flashinfer.cake_locality.counters`).  No workspace tensor may share
+        a byte with ``a``, ``b``, the scales, ``masked_m`` or ``out``
+        (``ValueError``).  Allocated at preparation if omitted: a prepared launch owns its counters (the public API's call
         instead reuses a counter pair per stream, see
         :func:`run_batch_deepgemm_fp8_nt_groupwise`).
 
@@ -1393,7 +1425,19 @@ def _prepare(
             # counters(settle=True) marked them used on this stream.
             counter_streams = {int(torch._C._cuda_getCurrentRawStream(index))}
     else:
-        _check_workspace(plan, workspace, device)
+        _check_workspace(
+            plan,
+            workspace,
+            device,
+            operands={
+                "a": a,
+                "b": b,
+                "a_scale": a_scale,
+                "b_scale": b_scale,
+                "masked_m": masked_m,
+                "out": out,
+            },
+        )
     launches = _bind_launches(problem, a, b, a_scale, b_scale, masked_m, out, workspace)
     return PreparedBatchDeepGemmFp8NtGroupwise(
         route=plan.route,

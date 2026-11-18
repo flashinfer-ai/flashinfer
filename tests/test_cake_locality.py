@@ -115,8 +115,10 @@ class _Probes:
 
 
 def _fake_device(monkeypatch, probe):
+    # Capture detection is stubbed at the module level: the real one selects the
+    # (fake) device first when more than one GPU is visible.
     monkeypatch.setattr(cl, "_is_locality_arch", lambda index: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(cl, "_stream_capturing", lambda device_index: False)
     monkeypatch.setattr(cl, "_probe", lambda device_index: probe(device_index))
 
 
@@ -199,6 +201,60 @@ def test_force_table():
         _check_words(table.counts, table.entries.tolist(), 212)
     finally:
         cl._forget()
+
+
+def test_sm_table_on_the_cpu_under_a_cuda_default_device():
+    """The SM table is a CPU tensor (the twin bindings take it from host memory)
+    also when the default device is CUDA; split_empty allocates nothing else
+    there."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    previous = torch.get_default_device()
+    cl._forget()
+    try:
+        torch.set_default_device("cuda")
+        table = cl._force_table((106, 106), device_index=7)
+        assert table.entries.device.type == "cpu"
+        assert table.entries.dtype == torch.int32 and table.entries.is_contiguous()
+        assert table.entries.shape == (cl.SM_TABLE_LENGTH,)
+        cl._forget()
+        device = torch.cuda.current_device()
+        if torch.cuda.get_device_capability(device) == (10, 7):
+            torch.set_default_device(previous)
+            device = _require_locality()
+            torch.set_default_device("cuda")
+            table = cl.sm_table(device)
+            assert table is not None
+            assert table.entries.device.type == "cpu"
+            assert table.entries.dtype == torch.int32 and table.entries.is_contiguous()
+            unit = cl.granularity(device)
+            before = _allocations(device)
+            tensor = cl.split_empty((2 * unit,), torch.uint8, unit, device)
+            assert _allocations(device) == before  # no stray caching-allocator block
+            assert cl.homing(tensor) is not None
+    finally:
+        torch.set_default_device(previous)
+        cl._forget()
+
+
+def test_generated_source_is_published_whole(tmp_path):
+    """Generated sources are written to a temporary file and moved into place; an
+    unchanged source is not rewritten (its timestamp stays)."""
+    import os
+
+    from flashinfer.jit.cake_locality import _publish_if_different
+
+    path = tmp_path / "gen" / "cake_locality_probe.cu"
+    _publish_if_different(path, "first")
+    assert path.read_text() == "first"
+    stamp = os.stat(path).st_mtime_ns
+    inode = os.stat(path).st_ino
+    _publish_if_different(path, "first")
+    assert os.stat(path).st_mtime_ns == stamp and os.stat(path).st_ino == inode
+    _publish_if_different(path, "second")
+    assert path.read_text() == "second"
+    assert os.stat(path).st_ino != inode  # replaced, not truncated in place
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
 
 
 # --------------------------------------------------------------------------- device
@@ -402,6 +458,71 @@ def test_split_empty_free_and_registry_cleanup():
     assert free_after >= free_before - 16 * 1024**2
 
 
+def _driver():
+    try:
+        from cuda.bindings import driver
+    except ImportError:
+        pytest.skip("the cuda-python driver bindings are required")
+    return driver
+
+
+def _ok(result):
+    """The value of a cuda.bindings call ``(error, value)``; fails on an error."""
+    assert int(result[0]) == 0, result[0]
+    return result[1] if len(result) > 1 else None
+
+
+def _current_context(driver) -> int:
+    return int(_ok(driver.cuCtxGetCurrent()))
+
+
+@pytest.mark.parametrize(
+    "case", ["freed_under_another", "made_under_another", "context_destroyed"]
+)
+def test_split_empty_freed_in_its_own_context(case):
+    """A split allocation is unmapped and leaves the registry when its last tensor
+    is freed while another context of the device is current, in the context that
+    made it (the caller's context is current again afterwards); when that
+    context was destroyed, its registry entry is dropped."""
+    device = _require_locality()
+    driver = _driver()
+    unit = cl.granularity(device)
+    torch.cuda.synchronize(device)
+    primary = _current_context(driver)
+    tensor = None
+    if case == "freed_under_another":
+        tensor = cl.split_empty((2 * unit,), torch.uint8, unit, device)
+    cu_device = _ok(driver.cuDeviceGet(device))
+    try:
+        other = _ok(driver.cuCtxCreate(None, 0, cu_device))
+    except TypeError:  # cuda-python 12: cuCtxCreate(flags, dev)
+        other = _ok(driver.cuCtxCreate(0, cu_device))
+    destroyed = False
+    try:
+        assert _current_context(driver) == int(other) != primary
+        if tensor is None:
+            tensor = cl.split_empty((2 * unit,), torch.uint8, unit, device)
+            _ok(driver.cuCtxPopCurrent())
+            assert _current_context(driver) == primary
+            if case == "context_destroyed":
+                _ok(driver.cuCtxDestroy(other))
+                destroyed = True
+        base = tensor.data_ptr()
+        assert cl.homing(base) is not None
+        caller = _current_context(driver)
+        del tensor
+        gc.collect()
+        assert cl.homing(base) is None
+        assert _current_context(driver) == caller
+    finally:
+        if not destroyed:
+            if _current_context(driver) == int(other):
+                _ok(driver.cuCtxPopCurrent())
+            _ok(driver.cuCtxDestroy(other))
+    assert _current_context(driver) == primary
+    torch.cuda.synchronize(device)
+
+
 def test_split_empty_cuda_graph_replay():
     device = _require_locality()
     unit = cl.granularity(device)
@@ -550,9 +671,15 @@ def test_launch_counters_default_stream_pairs_are_per_thread(
     assert {0, 1, 2} == cl._THREAD_KEYED_HANDLES
 
 
-def test_launch_counters_out_of_memory_pair_not_cached(fresh_counters, monkeypatch):
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "wrapped"])
+def test_launch_counters_out_of_memory_pair_not_cached(
+    fresh_counters, monkeypatch, wrapped
+):
     """A pair made unhomed because a locality-domain pool was out of memory serves
-    its call and is not cached; the next call tries the pools again."""
+    its call and is not cached; the next call tries the pools again. The same
+    holds when the pools' first allocation wraps the exhaustion in a
+    LocalityDomainError (as ``_domain_pools`` does); any other refusal is
+    remembered."""
     from flashinfer import locality_domain
 
     device = _require_cuda()
@@ -560,7 +687,14 @@ def test_launch_counters_out_of_memory_pair_not_cached(fresh_counters, monkeypat
 
     def exhausted(_index):
         calls.append(_index)
-        raise torch.OutOfMemoryError("pool exhausted")
+        if not wrapped:
+            raise torch.OutOfMemoryError("pool exhausted")
+        try:
+            raise torch.OutOfMemoryError("pool exhausted")
+        except torch.OutOfMemoryError as exc:
+            raise locality_domain.LocalityDomainError(
+                "locality-domain pool smoke allocation failed"
+            ) from exc
 
     monkeypatch.setattr(locality_domain, "_domain_pools", exhausted)
     stream = torch.cuda.Stream(device=device)
@@ -666,8 +800,10 @@ def test_launch_counters_capture_takes_a_reserved_pair(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
         early = cl.launch_counters(2, device)
-        assert cl._capture_id(device) != 0
-    assert cl._capture_id(device) == 0
+        assert cl._stream_capturing(device)
+        assert cl._capture_id(device) != 0  # None without CUDA Python bindings
+    assert not cl._stream_capturing(device)
+    assert cl._capture_id(device) in (0, None)
     graph.replay()
     torch.cuda.synchronize(device)
     assert all(int(t.abs().sum()) == 0 for t in early)
@@ -769,6 +905,32 @@ def test_capture_reserve_covers_twice_the_largest_capture(fresh_counters, monkey
         cl.reserve_launch_counters(2, device)
         work.add_(1)
     assert reserve.made == 9
+
+
+def test_capture_reserve_counts_each_capture_separately(fresh_counters, monkeypatch):
+    """Overlapping captures keep separate counts: capture A takes 34 pairs, B one,
+    then A 21 more, so the most pairs one capture took is 55 and the next refill
+    keeps 110 pairs. Only the most recent _CAPTURE_IDS_TRACKED capture ids are
+    kept."""
+    device = _require_cuda()
+    _unhomed(monkeypatch)
+    current = []
+    monkeypatch.setattr(cl, "_capture_id", lambda _index: current[-1])
+    for capture, count in ((101, 34), (102, 1), (101, 21)):
+        current.append(capture)
+        for _ in range(count):
+            cl._captured_pair(device, 2)
+    reserve = cl._COUNTER_STATES[device].reserves[2]
+    assert reserve.peak == 55
+    assert list(reserve.taken.items()) == [(102, 1), (101, 55)]
+    cl.reserve_launch_counters(2, device)
+    assert len(reserve.free) == 2 * 55
+    tracked = cl._CAPTURE_IDS_TRACKED
+    for capture in range(1000, 1000 + 2 * tracked):
+        current.append(capture)
+        cl._captured_pair(device, 2)
+    assert list(reserve.taken) == list(range(1000 + tracked, 1000 + 2 * tracked))
+    assert reserve.peak == 55
 
 
 def test_sm_table_of_an_invalid_device_is_none():

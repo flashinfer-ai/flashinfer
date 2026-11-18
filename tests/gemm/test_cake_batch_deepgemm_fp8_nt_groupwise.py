@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests of the generated Cake programs behind ``batch_deepgemm_fp8_nt_groupwise(backend="cake")``."""
 
+import contextlib
 import ctypes
 import functools
 import gc
@@ -1365,12 +1366,64 @@ def test_domain_counters_must_not_overlap():
     words = torch.zeros(8, dtype=torch.int32, device=device)
     with pytest.raises(ValueError, match="overlap"):
         _check_workspace(
-            plan, {"counters0": words[0:2], "counters1": words[0:2]}, device
+            plan,
+            {"counters0": words[0:2], "counters1": words[0:2]},
+            device,
+            operands={},
         )
     for first, second in ((words[0:2], words[1:3]), (words[1:3], words[0:2])):
         with pytest.raises(ValueError, match="16-byte aligned"):
-            _check_workspace(plan, {"counters0": first, "counters1": second}, device)
-    _check_workspace(plan, {"counters0": words[4:6], "counters1": words[0:2]}, device)
+            _check_workspace(
+                plan, {"counters0": first, "counters1": second}, device, operands={}
+            )
+    _check_workspace(
+        plan, {"counters0": words[4:6], "counters1": words[0:2]}, device, operands={}
+    )
+
+
+@_host_only
+def test_workspace_must_not_overlap_an_operand():
+    """Caller-owned workspaces must not share a byte with a bound operand (the
+    kernel reads its row counts from masked_m while it updates its counters);
+    disjoint aligned views of one buffer are valid."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from flashinfer.gemm.cake_batch_deepgemm_fp8 import _check_workspace
+
+    (nk, groups, expected_m) = _DOMAIN_CELLS[0]
+    counts = (106, 106)
+    plan = serving_plan(
+        "sm_107a", sum(counts), groups, _SERVING_M, *nk, expected_m, counts=counts
+    )
+    assert plan.route == DOMAIN_SERVING_ROUTE
+    device = torch.device("cuda", torch.cuda.current_device())
+    buffer = torch.zeros(64, dtype=torch.int32, device=device)
+    masked_m = buffer[0:8]
+    # A strided operand (every 8th word of buffer[32:64]) covers its exact extent
+    # [32, 57), gaps included: a workspace in a gap still overlaps it.
+    scale = buffer[32:64].as_strided((4,), (8,))
+    separate = torch.zeros(8, dtype=torch.int32, device=device)
+    operands = {"masked_m": masked_m, "a_scale": scale, "out": separate[4:8]}
+
+    def check(counters0, counters1):
+        _check_workspace(
+            plan,
+            {"counters0": counters0, "counters1": counters1},
+            device,
+            operands=operands,
+        )
+
+    with pytest.raises(ValueError, match="workspace counters0 overlaps masked_m"):
+        check(masked_m[0:2], separate[0:2])
+    with pytest.raises(ValueError, match="workspace counters1 overlaps masked_m"):
+        check(separate[0:2], masked_m[4:6])
+    with pytest.raises(ValueError, match="workspace counters0 overlaps a_scale"):
+        check(buffer[36:38], separate[0:2])
+    with pytest.raises(ValueError, match="workspace counters1 overlaps out"):
+        check(separate[0:2], separate[4:6])
+    # Disjoint aligned views of the same buffers stay valid.
+    check(buffer[8:10], buffer[12:14])
+    check(buffer[60:62], separate[0:2])
 
 
 @_host_only
@@ -2595,13 +2648,22 @@ def _run_beside_occupier(device, die, domains, table, launch):
     release = torch.zeros(1, dtype=torch.int32, device=f"cuda:{device}")
     state = torch.zeros(2, dtype=torch.int32, device=f"cuda:{device}")
     smids = torch.full((blocks,), -1, dtype=torch.int32, device=f"cuda:{device}")
+    occupier_stream = driver.CUstream(domains.streams[die].cuda_stream)
+    launched = False
     torch.cuda.synchronize()
     # No garbage collection while the occupier holds SMs: freeing a split
     # allocation synchronizes the device, which waits for the occupier.
     gc.collect()
     gc.disable()
+
+    def release_and_drain():
+        # The occupier polls `release` and writes `state` / `smids` until it is
+        # released or out of budget: those buffers stay alive until it is done.
+        release.fill_(1)
+        _checked(driver.cuStreamSynchronize(occupier_stream), "cuStreamSynchronize")
+        torch.cuda.synchronize()
+
     try:
-        occupier_stream = driver.CUstream(domains.streams[die].cuda_stream)
         args = (
             (
                 release.data_ptr(),
@@ -2617,6 +2679,7 @@ def _run_beside_occupier(device, die, domains, table, launch):
             ),
             "cuLaunchKernel(occupier)",
         )
+        launched = True
         reader = torch.cuda.Stream(device=device)
         started = time.monotonic()
         resident = 0
@@ -2628,9 +2691,15 @@ def _run_beside_occupier(device, die, domains, table, launch):
                 break
             time.sleep(1e-3)
         launch()
-        release.fill_(1)
-        _checked(driver.cuStreamSynchronize(occupier_stream), "cuStreamSynchronize")
-        torch.cuda.synchronize()
+    except BaseException:
+        # Release and drain a queued occupier also when the twin launch raised;
+        # that launch's exception is the one reported.
+        if launched:
+            with contextlib.suppress(Exception):
+                release_and_drain()
+        raise
+    else:
+        release_and_drain()  # after the twin launch: the run measured the overlap
     finally:
         gc.enable()
     held, timed_out = smids.tolist(), int(state[1])

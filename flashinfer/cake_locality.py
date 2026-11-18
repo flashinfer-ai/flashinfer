@@ -51,6 +51,7 @@ inside the functions that need them.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import fractions
@@ -426,7 +427,9 @@ def _probe(device_index: int) -> tuple[SmTable | None, bool]:
     if packed is None:
         return None, True
     counts, words = packed
-    entries = torch.tensor(words, dtype=torch.int32)
+    # Explicitly on the CPU: a twin binding takes the table by value from host
+    # memory, whatever torch.set_default_device or a torch.device context says.
+    entries = torch.tensor(words, dtype=torch.int32, device="cpu")
     return SmTable(device_index=device_index, counts=counts, entries=entries), True
 
 
@@ -441,7 +444,7 @@ def _force_table(counts: Sequence[int], device_index: int = 0) -> SmTable:
     packed = pack_rows(rows)
     if packed is None:
         raise ValueError(f"SM counts {tuple(counts)} make no SM table")
-    words = torch.tensor(packed[1], dtype=torch.int32)
+    words = torch.tensor(packed[1], dtype=torch.int32, device="cpu")
     table = SmTable(device_index=int(device_index), counts=packed[0], entries=words)
     with _LOCK:
         _TABLES[int(device_index)] = table
@@ -504,7 +507,7 @@ def split_empty(
     shape = tuple(int(extent) for extent in shape)
     if any(extent < 0 for extent in shape):
         raise ValueError(f"invalid shape {shape}")
-    itemsize = torch.empty((), dtype=dtype).element_size()
+    itemsize = torch.empty((), dtype=dtype, device="cpu").element_size()
     nbytes = math.prod(shape) * itemsize
     if nbytes == 0:
         raise ValueError(f"a split allocation needs at least one byte, got {shape}")
@@ -592,7 +595,10 @@ def pointer_domain(ptr: int, device: Any = None) -> int:
 
 
 # Devices whose locality-domain pools refused (a LocalityDomainError, which a
-# later call would repeat): their counters are ordinary tensors from then on.
+# later call would repeat): their counters are ordinary tensors from then on. A
+# pool that ran out of memory (torch.OutOfMemoryError, raised directly or as the
+# cause of a LocalityDomainError from the pools' first allocation) is not a
+# refusal: a later call tries the pools again.
 _POOLS_UNAVAILABLE: set[int] = set()
 
 
@@ -616,14 +622,19 @@ def _allocate_pair(words: int, device_index: int) -> tuple[tuple[Any, Any], bool
                 with use_mem_pool(pools[die], device=target):
                     pair.append(torch.empty(shape, dtype=torch.int32, device=target))
             return (pair[0], pair[1]), True
-        except locality_domain.LocalityDomainError:
+        except (locality_domain.LocalityDomainError, torch.OutOfMemoryError) as exc:
+            if isinstance(exc, torch.OutOfMemoryError) or isinstance(
+                exc.__cause__, torch.OutOfMemoryError
+            ):
+                # Exhaustion, also when the pools' first allocation wrapped it in
+                # a LocalityDomainError: not remembered, a later call retries.
+                unhomed = tuple(
+                    torch.empty(shape, dtype=torch.int32, device=target)
+                    for _ in range(2)
+                )
+                return (unhomed[0], unhomed[1]), False
             with _LOCK:
                 _POOLS_UNAVAILABLE.add(device_index)
-        except torch.OutOfMemoryError:
-            unhomed = tuple(
-                torch.empty(shape, dtype=torch.int32, device=target) for _ in range(2)
-            )
-            return (unhomed[0], unhomed[1]), False
     plain = tuple(
         torch.empty(shape, dtype=torch.int32, device=target) for _ in range(2)
     )
@@ -703,6 +714,10 @@ STREAM_PAIR_LIMIT = 64
 # lifetime.
 CAPTURE_RESERVE = 64
 CAPTURE_PAIR_LIMIT = 1 << 16
+# Pairs taken are counted per capture id for this many of the most recently
+# active captures of one (device, words); an older capture's count is dropped
+# (CUDA capture ids only grow, so a retired id does not come back).
+_CAPTURE_IDS_TRACKED = 64
 # Pairs cut from one reserve allocation start 128 bytes apart: no two pairs share
 # an L2 line.
 _PAIR_STRIDE_BYTES = 128
@@ -716,17 +731,20 @@ _THREAD_KEYED_HANDLES = frozenset({0, 1, 2})
 class _CaptureReserve:
     """The pre-zeroed pairs of one (device, words): ``free`` pairs are not handed out
     yet; ``issued`` were handed to captures; ``made`` counts every pair cut;
-    ``peak`` is the most pairs one capture took (``taken`` by capture
-    ``capture_id`` so far); ``blocks`` holds every allocation the pairs were cut
-    from, for the life of the process (a graph may read a handed-out pair at any
-    later replay)."""
+    ``peak`` is the most pairs one capture took; ``taken`` counts the pairs each
+    capture id took so far, for the :data:`_CAPTURE_IDS_TRACKED` most recently
+    active captures (least recent first), so overlapping captures keep separate
+    counts; ``blocks`` holds every allocation the pairs were cut from, for the
+    life of the process (a graph may read a handed-out pair at any later
+    replay)."""
 
     free: list[tuple[Any, Any]] = dataclasses.field(default_factory=list)
     issued: int = 0
     made: int = 0
     peak: int = 0
-    capture_id: int = 0
-    taken: int = 0
+    taken: collections.OrderedDict[int, int] = dataclasses.field(
+        default_factory=collections.OrderedDict
+    )
     refilling: bool = False
     blocks: list[tuple[Any, Any]] = dataclasses.field(default_factory=list)
 
@@ -866,10 +884,11 @@ def _captured_pair(device_index: int, words: int) -> tuple[Any, Any]:
         capture = -1
     with state.lock:
         reserve = state.reserves.setdefault(words, _CaptureReserve())
-        if capture != reserve.capture_id:
-            reserve.capture_id, reserve.taken = capture, 0
-        reserve.taken += 1
-        reserve.peak = max(reserve.peak, reserve.taken)
+        taken = reserve.taken.pop(capture, 0) + 1
+        reserve.taken[capture] = taken  # most recently active last
+        while len(reserve.taken) > _CAPTURE_IDS_TRACKED:
+            reserve.taken.popitem(last=False)
+        reserve.peak = max(reserve.peak, taken)
         if reserve.free:
             reserve.issued += 1
             return reserve.free.pop()

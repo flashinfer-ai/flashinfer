@@ -14,10 +14,42 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import functools
+import os
+import pathlib
+import tempfile
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, sm107a_nvcc_flags, write_if_different
+from .core import JitSpec, gen_jit_spec, sm107a_nvcc_flags
+
+
+def _publish_if_different(path: pathlib.Path, content: str) -> None:
+    """Write ``content`` to ``path`` unless the file already holds it.
+
+    Source generation runs before the JIT build lock, so another process can be
+    compiling ``path`` while this one writes it. A changed file is therefore written
+    to a temporary file in the same directory and moved into place with
+    ``os.replace``: a reader sees either the old or the new contents, never a
+    truncated file. An unchanged file is not rewritten, so warm builds keep their
+    source timestamps."""
+    try:
+        if path.read_text() == content:
+            return
+    except FileNotFoundError:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(temporary, 0o644)  # mkstemp creates 0600; match a plain open()
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+        raise
 
 
 @functools.cache
@@ -31,12 +63,12 @@ def gen_cake_locality_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     gen_directory.mkdir(parents=True, exist_ok=True)
     allocator = gen_directory / "cake_locality.cu"
-    write_if_different(
+    _publish_if_different(
         allocator,
         (jit_env.FLASHINFER_CSRC_DIR / "cake_locality.cu").read_text(),
     )
     probe = gen_directory / "cake_locality_probe.cu"
-    write_if_different(probe, PROBE_SOURCE)
+    _publish_if_different(probe, PROBE_SOURCE)
     return gen_jit_spec(
         uri,
         [allocator, probe],

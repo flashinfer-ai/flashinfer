@@ -190,6 +190,7 @@ struct Split {
   size_t cut{};       // bytes [0, cut) from the base are on domain 0
   size_t boundary{};  // physical boundary: cut, or size when cut == nbytes
   CUcontext context{};
+  unsigned long long context_id{};  // cuCtxGetId of `context`: a reused handle differs
 };
 
 std::map<CUdeviceptr, Split>& Splits() {
@@ -220,6 +221,10 @@ CUdeviceptr SplitAlloc(int device, size_t nbytes, size_t cut) {
   CUresult result = cuCtxGetCurrent(&context);
   TVM_FFI_ICHECK(result == CUDA_SUCCESS && context != nullptr)
       << "failed to resolve the current CUDA context: " << CuError(result);
+  unsigned long long context_id = 0;
+  result = cuCtxGetId(context, &context_id);
+  TVM_FFI_ICHECK(result == CUDA_SUCCESS)
+      << "failed to read the current CUDA context id: " << CuError(result);
 
   size_t const unit = Granularity(device);
   TVM_FFI_ICHECK(nbytes <= std::numeric_limits<size_t>::max() - (unit - 1))
@@ -266,10 +271,17 @@ CUdeviceptr SplitAlloc(int device, size_t nbytes, size_t cut) {
   }
   if (result == CUDA_SUCCESS) {
     std::lock_guard<std::mutex> lock(SplitsMutex());
-    bool const inserted =
-        Splits().emplace(address, Split{device, nbytes, size, cut, boundary, context}).second;
-    if (!inserted) {
-      result = CUDA_ERROR_INVALID_VALUE;
+    try {
+      bool const inserted =
+          Splits()
+              .emplace(address, Split{device, nbytes, size, cut, boundary, context, context_id})
+              .second;
+      if (!inserted) {
+        result = CUDA_ERROR_INVALID_VALUE;
+      }
+    } catch (...) {
+      // No registry entry (std::bad_alloc): release the mapped range below.
+      result = CUDA_ERROR_OUT_OF_MEMORY;
     }
   }
   if (result != CUDA_SUCCESS) {
@@ -285,9 +297,33 @@ CUdeviceptr SplitAlloc(int device, size_t nbytes, size_t cut) {
   return address;
 }
 
+// Makes `context` current for the scope when another context is current, and
+// makes the caller's context current again on exit.
+class ContextScope {
+ public:
+  ContextScope() = default;
+  ContextScope(ContextScope const&) = delete;
+  ContextScope& operator=(ContextScope const&) = delete;
+  bool Push(CUcontext context) {
+    pushed_ = cuCtxPushCurrent(context) == CUDA_SUCCESS;
+    return pushed_;
+  }
+  ~ContextScope() {
+    if (pushed_) {
+      CUcontext popped{};
+      static_cast<void>(cuCtxPopCurrent(&popped));
+    }
+  }
+
+ private:
+  bool pushed_{};
+};
+
 // Frees a split allocation; called by the tensor deleter, so it never throws.
-// The registry lock is not held while the context synchronizes. A CUDA graph that
-// still reads the allocation faults on its next replay, as the range is unmapped.
+// It runs in the context that made the allocation: when another context is
+// current, that context is current again afterwards. The registry lock is not
+// held while the context synchronizes. A CUDA graph that still reads the
+// allocation faults on its next replay, as the range is unmapped.
 void SplitFree(CUdeviceptr address) noexcept {
   try {
     Split split{};
@@ -307,8 +343,22 @@ void SplitFree(CUdeviceptr address) noexcept {
       Splits().erase(address);
       return;
     }
-    if (result != CUDA_SUCCESS || current != split.context) {
-      return;  // not this allocation's context: leave it mapped rather than corrupt it
+    if (result != CUDA_SUCCESS) {
+      return;  // no current context to read: leave it mapped rather than corrupt it
+    }
+    ContextScope context_scope;  // declared after `scope`: restored before the device
+    if (current != split.context) {
+      unsigned long long id = 0;
+      if (cuCtxGetId(split.context, &id) != CUDA_SUCCESS || id != split.context_id) {
+        // The allocation's context was destroyed, and its handle may name a new
+        // context now: never make it current. Only the registry entry remains.
+        std::lock_guard<std::mutex> lock(SplitsMutex());
+        Splits().erase(address);
+        return;
+      }
+      if (!context_scope.Push(split.context)) {
+        return;  // cannot enter the allocation's context: leave it mapped
+      }
     }
     {
       // The range leaves the registry before it is unmapped: no lookup finds it.
@@ -343,7 +393,13 @@ Tensor SplitEmpty(int64_t nbytes, int64_t cut, int64_t device) {
       SplitAlloc(static_cast<int>(device), static_cast<size_t>(nbytes), static_cast<size_t>(cut));
   DLDataType const dtype{kDLUInt, 8, 1};
   DLDevice const dl_device{kDLCUDA, static_cast<int32_t>(device)};
-  return Tensor::FromNDAlloc(SplitNDAlloc{address}, tvm::ffi::Shape({nbytes}), dtype, dl_device);
+  try {
+    return Tensor::FromNDAlloc(SplitNDAlloc{address}, tvm::ffi::Shape({nbytes}), dtype, dl_device);
+  } catch (...) {
+    // No tensor owns the allocation (its deleter never ran): release it here.
+    SplitFree(address);
+    throw;
+  }
 }
 
 // [device, nbytes, size, cut] of the split allocation based at `pointer`, or [].
