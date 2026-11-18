@@ -1698,11 +1698,13 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
   __shared__ __align__(1024) uint8_t wa[KU][64 * 128];
   __shared__ __align__(1024) uint8_t bq[KU][ATOMS * 1024];
   __shared__ float activation_scale[KU][MT];
-  // FP32 partial pairs: two 32-bit words per packed element.
-  __shared__ __align__(16) uint32_t
-      push_partial[FlatPush
-                       ? SplitkMailbox<MT, SPLIT, (MT >= 16 || PackMT8)>::WORDS
-                       : ((PushDSM || AsyncPush) ? (CompactM2 ? SPLIT * 64 : SPLIT * 256) : 1)];
+  // FP32 partial pairs (two 32-bit words per packed element) in DYNAMIC
+  // shared memory: CUDA 12.x ptxas enforces the 48 KiB per-function STATIC
+  // shared-memory limit, and the KU=4 weight staging (32 KiB) plus this
+  // mailbox (14 KiB at SPLIT=14) exceeds it as static storage.  The
+  // launcher sizes it via ku_push_mailbox_words and raises
+  // cudaFuncAttributeMaxDynamicSharedMemorySize per launch.
+  extern __shared__ __align__(16) uint32_t push_partial[];
   __shared__ __align__(8) uint64_t rbar[PerWarpMbar ? 4 : 1];
   uint32_t* const split_partial = reinterpret_cast<uint32_t*>(wa);
   uint64_t wa_desc0 = 0;
@@ -2274,42 +2276,41 @@ template <int MT, int SPLIT, bool KeepX, int KU = 2, bool PipeWeights = false, b
 static void launch_ku(dim3 grid, bool lb, cudaStream_t stream, const __nv_bfloat16* x,
                       const uint8_t* weight, const float* weight_scale, float eps,
                       __nv_bfloat16* out, int M, int N, int K) {
+  auto* kern =
+      fp8_blockscale_wgmma_ku_kernel<MT, SPLIT, KU, KeepX, PipeWeights, PackMT8, ExactRound,
+                                     PairPipe, PushDSM, FlatPush, CompactM2, ExplicitSTS, DenseTile,
+                                     DenseOut, PrefetchScale, AsyncPush, DenseN, MmaPipe, Quant8,
+                                     PerWarpMbar, PreWaitScale, SpreadOwners>;
+  // The push/flat mailbox is DYNAMIC shared memory (the 12.x ptxas static
+  // limit is 48 KiB per function and the KU=4 instantiations exceed it with
+  // the mailbox counted as static).  Both attributes are set per launch:
+  // cudaFuncSetAttribute applies to the current device only, so a
+  // once-per-process flag would skip the opt-in on every later device.
+  constexpr size_t PUSH_BYTES =
+      sizeof(uint32_t) *
+      (FlatPush ? SplitkMailbox<MT, SPLIT, (MT >= 16 || PackMT8)>::WORDS
+                : ((PushDSM || AsyncPush) ? (CompactM2 ? SPLIT * 64 : SPLIT * 256) : 1));
   if constexpr (SPLIT > 8) {
-    // Set per launch: cudaFuncSetAttribute applies to the current device
-    // only, so a once-per-process flag would skip the opt-in on every later
-    // device.
-    TVM_FFI_ICHECK_EQ(
-        cudaFuncSetAttribute(
-            fp8_blockscale_wgmma_ku_kernel<
-                MT, SPLIT, KU, KeepX, PipeWeights, PackMT8, ExactRound, PairPipe, PushDSM, FlatPush,
-                CompactM2, ExplicitSTS, DenseTile, DenseOut, PrefetchScale, AsyncPush, DenseN,
-                MmaPipe, Quant8, PerWarpMbar, PreWaitScale, SpreadOwners>,
-            cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
-        cudaSuccess);
+    TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+                      cudaSuccess);
   }
+  TVM_FFI_ICHECK_EQ(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(PUSH_BYTES)),
+                    cudaSuccess);
   if (lb) {
     cudaLaunchConfig_t config = {};
     config.gridDim = grid;
     config.blockDim = dim3(128, 1, 1);
+    config.dynamicSmemBytes = PUSH_BYTES;
     config.stream = stream;
     cudaLaunchAttribute attribute = {};
     attribute.id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
     attribute.val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = &attribute;
     config.numAttrs = 1;
-    cudaLaunchKernelEx(
-        &config,
-        fp8_blockscale_wgmma_ku_kernel<MT, SPLIT, KU, KeepX, PipeWeights, PackMT8, ExactRound,
-                                       PairPipe, PushDSM, FlatPush, CompactM2, ExplicitSTS,
-                                       DenseTile, DenseOut, PrefetchScale, AsyncPush, DenseN,
-                                       MmaPipe, Quant8, PerWarpMbar, PreWaitScale, SpreadOwners>,
-        x, weight, weight_scale, eps, out, M, N, K);
+    cudaLaunchKernelEx(&config, kern, x, weight, weight_scale, eps, out, M, N, K);
   } else {
-    fp8_blockscale_wgmma_ku_kernel<MT, SPLIT, KU, KeepX, PipeWeights, PackMT8, ExactRound, PairPipe,
-                                   PushDSM, FlatPush, CompactM2, ExplicitSTS, DenseTile, DenseOut,
-                                   PrefetchScale, AsyncPush, DenseN, MmaPipe, Quant8, PerWarpMbar,
-                                   PreWaitScale, SpreadOwners>
-        <<<grid, 128, 0, stream>>>(x, weight, weight_scale, eps, out, M, N, K);
+    kern<<<grid, 128, PUSH_BYTES, stream>>>(x, weight, weight_scale, eps, out, M, N, K);
   }
 }
 
