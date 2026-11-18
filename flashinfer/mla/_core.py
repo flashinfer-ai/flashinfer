@@ -1819,20 +1819,6 @@ def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
-# Backends for trtllm_batch_decode_sparse_mla_dsv4. "auto" (the default)
-# behaves as the stock architecture-based dispatch except that allowlisted
-# calls route to the agent-generated "specialized" kernel; explicitly
-# selected backends are never swapped.
-DSV4_SPARSE_MLA_DECODE_BACKENDS = (
-    "auto",
-    "specialized",
-    "trtllm-gen",
-    "cute-dsl",
-    "sparse",
-    "cake",
-)
-
-
 @flashinfer_api(trace=trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch)
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
@@ -1853,9 +1839,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     swa_topk_lens: Optional[torch.Tensor] = None,
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
-    backend: Literal[
-        "auto", "specialized", "trtllm-gen", "cute-dsl", "sparse", "cake"
-    ] = "auto",
+    backend: Literal["auto", "trtllm-gen", "cute-dsl", "sparse", "cake"] = "auto",
     hca_swa_indices: Optional[torch.Tensor] = None,
     hca_compressed_block_tables: Optional[torch.Tensor] = None,
     hca_seq_lens: Optional[torch.Tensor] = None,
@@ -2105,23 +2089,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         INT32. With ``backend="cake"``, compressed-only lengths ``[T]`` that
         replace ``sparse_topk_lens`` (the host adds the 128 SWA slots through
         ``sparse_topk_lens_offset``).
-    backend : {"auto", "specialized", "trtllm-gen", "cute-dsl", "sparse", "cake"}
+    backend : {"auto", "trtllm-gen", "cute-dsl", "sparse", "cake"}
         Backend selection. ``"auto"`` preserves the architecture-based default:
-        the prebuilt cubins on SM100/SM103/SM107 and sparse on SM120/SM121,
-        except that calls matching the ``"specialized"`` allowlist -- the
-        bf16-dense-KV ABI (bf16 varlen query ``[T, 16, 512]``, bf16
-        ``[*, 256, 512]`` SWA and ``[*, 64, 512]`` compressed pools, one
-        combined ``[T, 640]`` int32 storage-offset table with
-        ``sparse_indices_are_storage_offsets=True``, fp32 ``sinks``,
-        ``bmm1_scale == 512**-0.5``, ``bmm2_scale == 1.0``,
-        ``max_q_len == 6`` with ``T == 6 * batch_size`` for batch sizes
-        1-13, on SM103) -- route to an agent-generated kernel
-        (:mod:`flashinfer.sparse_mla_decode_dsv4_cuda`). An explicitly
-        selected backend is never silently swapped: ``"specialized"``
-        raises with the exact ``fallback_reasons`` when it cannot serve
-        the call. Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
-        (``"auto"`` then keeps the stock dispatch). Warm the specialized
-        route once eagerly before CUDA-graph capture. HCA is selected
+        the prebuilt cubins on SM100/SM103/SM107 and sparse on SM120/SM121.
+        (The agent-generated specialized kernel for the SM103 bf16-dense-KV
+        DeepSeek-V4.1 contract is exposed through the unified sparse-MLA
+        decode front, not through this vendor-named entry.) HCA is selected
         only when ``"cute-dsl"`` is requested explicitly. Source-level CAKE
         kernels are selected only when ``"cake"`` is requested explicitly: on
         SM100/SM103 the FP8/BF16 DSv4 family, on SM120/SM121 the NVFP4 DSv4
@@ -2249,61 +2222,6 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
         layout described above.
     """
-    if backend not in DSV4_SPARSE_MLA_DECODE_BACKENDS:
-        raise ValueError(
-            f"backend must be one of {DSV4_SPARSE_MLA_DECODE_BACKENDS}, got {backend!r}"
-        )
-    # "specialized" backend: an agent-generated kernel for the SM103
-    # bf16-dense-KV DeepSeek-V4.1 sparse decode contract
-    # (flashinfer/sparse_mla_decode_dsv4_cuda.py). backend="auto" (the
-    # default; otherwise identical to the stock architecture-based
-    # dispatch) routes to it only on its strict allowlist; explicitly
-    # selected backends are never swapped; kill switch:
-    # FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1.
-    if backend in ("auto", "specialized"):
-        from ..sparse_mla_decode_dsv4_cuda import (
-            maybe_dispatch_specialized as _mds,
-        )
-
-        _specialized_out = _mds(
-            backend=backend,
-            query=query,
-            swa_kv_cache=swa_kv_cache,
-            compressed_kv_cache=compressed_kv_cache,
-            sparse_indices=sparse_indices,
-            sparse_topk_lens=sparse_topk_lens,
-            seq_lens=seq_lens,
-            cum_seq_lens_q=cum_seq_lens_q,
-            max_q_len=max_q_len,
-            sinks=sinks,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            out=out,
-            extras=dict(
-                kv_layout=kv_layout,
-                kv_cache_format=kv_cache_format,
-                swa_topk_lens=swa_topk_lens,
-                extra_sparse_indices=extra_sparse_indices,
-                extra_sparse_topk_lens=extra_sparse_topk_lens,
-                sparse_indices_are_storage_offsets=(sparse_indices_are_storage_offsets),
-                remapped_sparse_indices_buffer=remapped_sparse_indices_buffer,
-                dsv4_inv_rope_cos_sin_cache=dsv4_inv_rope_cos_sin_cache,
-                dsv4_output_scale=dsv4_output_scale,
-                hca_swa_indices=hca_swa_indices,
-                hca_compressed_block_tables=hca_compressed_block_tables,
-                hca_seq_lens=hca_seq_lens,
-                hca_sparse_indices_format=hca_sparse_indices_format,
-                hca_use_persistent=hca_use_persistent,
-                sparse_topk_lens_offset=sparse_topk_lens_offset,
-            ),
-        )
-        if _specialized_out is not None:
-            return _specialized_out
-
-    # An explicitly requested "specialized" backend either served the call
-    # above or raised (never silently swapped), so only the stock backend
-    # names reach the resolver.
-    assert backend != "specialized"
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(
         kv_cache_format, backend, sm120_cake=_is_sm120_family(query.device)

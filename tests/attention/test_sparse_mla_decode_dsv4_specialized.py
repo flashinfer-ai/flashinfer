@@ -166,7 +166,53 @@ def _ws():
     return _WS["b"]
 
 
+def _front(inp, out=None, backend="auto"):
+    """Stand-in for the unified sparse-MLA decode front (#9575): calls this
+    module's front-registration hook with the dsv4-class argument set.
+    Returns the kernel's output, or None when "auto" should route to
+    another named backend (here: the vendor entry's stock dispatch)."""
+    return spec_mod.maybe_dispatch_specialized(
+        backend=backend,
+        query=inp["q"],
+        swa_kv_cache=inp["swa_kv_cache"],
+        compressed_kv_cache=inp["compressed_kv_cache"],
+        sparse_indices=inp["sparse_indices"],
+        sparse_topk_lens=inp["sparse_topk_lens"],
+        seq_lens=inp["seq_lens"],
+        cum_seq_lens_q=inp["cum_seq_lens_q"],
+        max_q_len=int(inp["max_q_len"]),
+        sinks=inp["sinks"],
+        bmm1_scale=SCALE,
+        bmm2_scale=1.0,
+        out=out,
+        extras=dict(
+            kv_layout="HND",
+            kv_cache_format="fp8",
+            swa_topk_lens=None,
+            extra_sparse_indices=None,
+            extra_sparse_topk_lens=None,
+            sparse_indices_are_storage_offsets=True,
+            remapped_sparse_indices_buffer=None,
+            dsv4_inv_rope_cos_sin_cache=None,
+            dsv4_output_scale=None,
+            hca_swa_indices=None,
+            hca_compressed_block_tables=None,
+            hca_seq_lens=None,
+            hca_sparse_indices_format=None,
+            hca_use_persistent=False,
+            sparse_topk_lens_offset=0,
+        ),
+    )
+
+
 def _api(inp, out=None, backend="auto"):
+    """A call as the unified front would make it: the specialized hook
+    first ("auto" routing), then the stock vendor entry."""
+    if backend in ("auto", "specialized"):
+        served = _front(inp, out=out, backend=backend)
+        if served is not None or backend == "specialized":
+            return served
+        backend = "auto"
     return trtllm_batch_decode_sparse_mla_dsv4(
         query=inp["q"],
         swa_kv_cache=inp["swa_kv_cache"],
@@ -219,6 +265,24 @@ def test_off_allowlist_stays_stock_and_explicit_raises():
     _assert_close(out, _reference(inp).float())
     with pytest.raises(ValueError, match="fallback_reasons"):
         _api(inp, backend="specialized")
+    # the vendor-named entry stays STOCK: it has no "specialized" value
+    with pytest.raises(ValueError, match="backend"):
+        trtllm_batch_decode_sparse_mla_dsv4(
+            query=inp["q"],
+            swa_kv_cache=inp["swa_kv_cache"],
+            workspace_buffer=_ws(),
+            sparse_indices=inp["sparse_indices"],
+            compressed_kv_cache=inp["compressed_kv_cache"],
+            sparse_topk_lens=inp["sparse_topk_lens"],
+            seq_lens=inp["seq_lens"],
+            bmm1_scale=SCALE,
+            bmm2_scale=1.0,
+            sinks=inp["sinks"],
+            cum_seq_lens_q=inp["cum_seq_lens_q"],
+            max_q_len=int(inp["max_q_len"]),
+            backend="specialized",
+            sparse_indices_are_storage_offsets=True,
+        )
 
 
 @requires_sm103
