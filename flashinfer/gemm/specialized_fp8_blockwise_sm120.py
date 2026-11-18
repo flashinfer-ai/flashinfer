@@ -39,9 +39,10 @@ from typing import Set, Tuple
 
 import torch
 
-from ..jit.core import JitSpec, gen_jit_spec
-from ..jit import env as jit_env
 from ..jit.cpp_ext import is_cuda_version_at_least
+from ..jit.gemm.specialized_fp8_blockwise_sm120 import (
+    gen_specialized_gemm_fp8_blockwise_sm120_module,
+)
 
 _HERE = Path(__file__).parent
 
@@ -65,33 +66,11 @@ dispatch_stats: Counter = Counter()
 _warmed_nk: Set[Tuple[int, int, int]] = set()
 
 
-def gen_specialized_gemm_fp8_blockwise_sm120_module() -> JitSpec:
-    src_dir = jit_env.FLASHINFER_CSRC_DIR / "specialized_gemm_fp8_blockwise_sm120"
-    sources = sorted(Path(src_dir).glob("*.cu"))
-    return gen_jit_spec(
-        "specialized_gemm_fp8_blockwise_sm120",
-        sources,
-        extra_cuda_cflags=[
-            "-O3",
-            "--use_fast_math",
-            "-std=c++17",
-            "--extra-device-vectorization",
-            "-Xptxas",
-            "-O3",
-            "-Xptxas",
-            "--allow-expensive-optimizations=true",
-            # single-token form REQUIRED: cpp_ext only treats "-gencode=..."
-            # as a module arch override. The sm_120f family target caps
-            # static smem at 48KB while these kernels opt into 64KB of
-            # dynamic smem (sm_120a permits it), so the module must build
-            # for sm_120a exactly.
-            "-gencode=arch=compute_120a,code=sm_120a",
-        ],
-    )
-
-
 @functools.cache
 def get_specialized_gemm_fp8_blockwise_sm120_module():
+    # The JIT spec lives with its siblings in flashinfer/jit/gemm/ and is
+    # registered in flashinfer/aot.py (exact sm_120a target), so jit-cache
+    # installs carry a prebuilt copy instead of compiling on first call.
     return gen_specialized_gemm_fp8_blockwise_sm120_module().build_and_load()
 
 

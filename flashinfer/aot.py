@@ -138,6 +138,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm120_module_cutlass_nvfp4_svdquant,
+    gen_specialized_gemm_fp8_blockwise_sm120_module,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm103_module_cutlass_fp4,
@@ -1069,6 +1070,11 @@ def gen_all_modules(
             # SM120 only: the CUTLASS SVDQuant kernel is compiled for sm120a and
             # is not shared with SM121, unlike the modules in the branch below.
             jit_specs.append(gen_gemm_sm120_module_cutlass_nvfp4_svdquant())
+            # SM120 only: the specialized fp8 blockwise-scale decode GEMMs
+            # (gemm_fp8_nt_groupwise backend "specialized") are pinned to the
+            # exact sm_120a target (64 KB dynamic-smem opt-in, measured
+            # allowlist); SM121 resolves to the stock backends.
+            jit_specs.append(gen_specialized_gemm_fp8_blockwise_sm120_module())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:
