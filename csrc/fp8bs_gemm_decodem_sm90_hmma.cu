@@ -175,7 +175,14 @@ __global__ __launch_bounds__(NWARP * 32) void fp8bs_kernel(const __nv_bfloat16* 
           am = o > am ? o : am;
         }
         float amax = __uint_as_float(am << 16);
-        float cl = fmaxf(amax, eps);
+        // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires
+        // only for amax == 0 (exactly the stock zero contribution) or an
+        // amax below 2^-117 — far under any BF16-normal magnitude — where
+        // both routes' outputs round to the same BF16 value.  Every other
+        // amax scales by amax/448 unclamped (bitwise-stock for power-of-two
+        // amax, <=1 ulp otherwise).  448/cl stays finite (<= 448*2^117 <
+        // FLT_MAX), so no 0*inf NaN can form.
+        float cl = fmaxf(amax, 6.019e-36f);
         if (qt == 0) dsc[m] = (m < Mloc) ? (cl * (1.0f / 448.0f)) : 0.0f;
         float inv = __fdividef(448.0f, cl);
         const int sw = m & 1;

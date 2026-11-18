@@ -44,16 +44,19 @@ def _make(M, N, K, seed=0, device="cuda"):
     return x, wq, ws
 
 
-def _reference(x, wq, ws, eps=1e-4):
-    """fp32 emulation of the contract: fused 1x128 activation quantization
-    (amax/448) then dequantized matmul."""
+def _reference(x, wq, ws):
+    """fp32 emulation of the contract with the STOCK scale_1x128 activation
+    quantization semantics: scale = 448/amax for nonzero amax, the identity
+    scale for an all-zero group, and NO epsilon clamp.  The kernel's scales
+    equal these bitwise for power-of-two amax (every exact probe below) and
+    stay within 1 ulp otherwise, well inside the tolerance checks."""
     M, K = x.shape
     N = wq.shape[0]
     xf = x.float().view(M, K // G, G)
-    amax = xf.abs().amax(dim=-1, keepdim=True).clamp_min(eps)
-    xs = amax / 448.0
-    xq = (xf / xs).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
-    xdq = (xq * xs).view(M, K)
+    amax = xf.abs().amax(dim=-1, keepdim=True)
+    inv = torch.where(amax != 0, 448.0 / amax, torch.ones_like(amax))
+    xq = (xf * inv).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    xdq = (xq * (1.0 / inv)).view(M, K)
     wf = wq.float().view(N, K // G, G)
     ws_rows = ws.repeat_interleave(G, dim=0)[:N]  # (N, K//G)
     wdq = (wf * ws_rows.unsqueeze(-1)).view(N, K)
@@ -109,6 +112,76 @@ def test_specialized_matches_reference(backend, shape):
     # bitwise determinism
     out2 = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
     assert torch.equal(out.view(torch.int16), out2.view(torch.int16))
+
+
+@requires_sm90
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (1, 8192, 1536),
+        (4, 2048, 2048),
+        (12, 2624, 6144),
+        (24, 6144, 2048),
+    ],
+)
+def test_splitk_cancellation_exact(backend, shape):
+    """Reviewer repro (exactly representable): BF16 activations all ones;
+    each FP8 weight row is +1 for the first K/2 entries and -1 for the rest,
+    with its first entry 2; unit scales.  The exact result is 1 everywhere.
+    BF16-packed split-K partials cancel to 0 instead; FP32 partials must
+    reproduce the stock result exactly."""
+    M, N, K = shape
+    x = torch.ones((M, K), device="cuda", dtype=torch.bfloat16)
+    w = torch.ones((N, K), device="cuda", dtype=torch.float32)
+    w[:, K // 2 :] = -1.0
+    w[:, 0] = 2.0
+    wq = w.to(torch.float8_e4m3fn)
+    ws = torch.ones(((N + G - 1) // G, K // G), device="cuda", dtype=torch.float32)
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+    assert torch.equal(out, torch.ones_like(out)), (
+        float(out.min()),
+        float(out.max()),
+    )
+    stock = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="deepgemm")
+    assert torch.equal(out.view(torch.int16), stock.view(torch.int16))
+
+
+@requires_sm90
+@pytest.mark.parametrize("backend", ["auto", "specialized"])
+@pytest.mark.parametrize("exp", [-20, -34])
+def test_small_amax_matches_stock_quantization(backend, exp):
+    """Reviewer repro: tiny uniform activations with a compensating weight
+    scale on a non-split route.  Stock quantization (448/amax for nonzero
+    amax, no clamp) gives exactly 128; an epsilon-clamped scale returns 135
+    (A=2**-20) or 0 (A=2**-34)."""
+    M, N, K = 4, 64, 128
+    x = torch.full((M, K), 2.0**exp, device="cuda", dtype=torch.bfloat16)
+    wq = torch.ones((N, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    ws = torch.full((1, 1), 2.0**-exp, device="cuda", dtype=torch.float32)
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
+    assert torch.equal(out, torch.full_like(out, 128.0)), (
+        float(out.min()),
+        float(out.max()),
+    )
+    stock = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="deepgemm")
+    assert torch.equal(out.view(torch.int16), stock.view(torch.int16))
+
+
+@requires_sm90
+def test_zero_amax_group_matches_stock_identity_scale():
+    """An all-zero 1x128 activation group contributes exactly 0, as it does
+    on the stock route (quantized zeros); nonzero groups in the same row are
+    unaffected and match stock bitwise."""
+    M, N, K = 4, 128, 256
+    x = torch.zeros((M, K), device="cuda", dtype=torch.bfloat16)
+    x[:, G:] = 1.0  # group 0 all-zero, group 1 all-ones
+    wq = torch.ones((N, K), device="cuda", dtype=torch.float32).to(torch.float8_e4m3fn)
+    ws = torch.ones((1, 2), device="cuda", dtype=torch.float32)
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
+    assert torch.equal(out, torch.full_like(out, 128.0))
+    stock = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="deepgemm")
+    assert torch.equal(out.view(torch.int16), stock.view(torch.int16))
 
 
 @requires_sm90

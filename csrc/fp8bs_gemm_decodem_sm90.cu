@@ -81,9 +81,16 @@ __global__ __launch_bounds__(64, 2) void fp8_blockscale_kernel(
     }
     local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 1));
     local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 2));
-    const float scale = fmaxf(local_max, eps) * (1.0f / 448.0f);
-    const float inv_scale = 1.0f / scale;
-    if (lane_in_group == 0) activation_scale[quant_row_local] = scale;
+    // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires
+    // only for amax == 0 (exactly the stock zero contribution) or an amax
+    // below 2^-117 — far under any BF16-normal magnitude — where both
+    // routes' outputs round to the same BF16 value.  Every other amax
+    // scales by amax/448 unclamped (bitwise-stock for power-of-two amax,
+    // <=1 ulp otherwise).  448/cl stays finite (<= 448*2^117 < FLT_MAX),
+    // so no 0*inf NaN can form.
+    const float cl = fmaxf(local_max, 6.019e-36f);
+    const float inv_scale = __fdividef(448.0f, cl);
+    if (lane_in_group == 0) activation_scale[quant_row_local] = cl * (1.0f / 448.0f);
 
     uint32_t* aq_dst = reinterpret_cast<uint32_t*>(aq + quant_row_local * 128 + lane_in_group * 32);
     if (quant_row < M) {
@@ -310,9 +317,16 @@ __device__ __forceinline__ void quantize_activation_row_raw(const uint32_t* __re
   float inv_scale = 0.0f;
   if (subgroup_lane == 0) {
     const float local_max = __uint_as_float(local_absmax << 16);
-    const float scale = fmaxf(local_max, eps) * (1.0f / 448.0f);
-    activation_scale[row] = scale;
-    inv_scale = 1.0f / scale;
+    // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires
+    // only for amax == 0 (exactly the stock zero contribution) or an amax
+    // below 2^-117 — far under any BF16-normal magnitude — where both
+    // routes' outputs round to the same BF16 value.  Every other amax
+    // scales by amax/448 unclamped (bitwise-stock for power-of-two amax,
+    // <=1 ulp otherwise).  448/cl stays finite (<= 448*2^117 < FLT_MAX),
+    // so no 0*inf NaN can form.
+    const float cl = fmaxf(local_max, 6.019e-36f);
+    activation_scale[row] = cl * (1.0f / 448.0f);
+    inv_scale = __fdividef(448.0f, cl);
   }
   inv_scale = __shfl_sync(0xffffffffu, inv_scale, 0, GROUP);
 
@@ -419,9 +433,16 @@ __device__ __forceinline__ void quantize_activation_row_contiguous16(
   float inv_scale = 0.0f;
   if (subgroup_lane == 0) {
     const float local_max = __uint_as_float(local_absmax << AMAX_SHIFT);
-    const float scale = fmaxf(local_max, eps) * (1.0f / 448.0f);
-    activation_scale[row] = scale;
-    inv_scale = 1.0f / scale;
+    // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires
+    // only for amax == 0 (exactly the stock zero contribution) or an amax
+    // below 2^-117 — far under any BF16-normal magnitude — where both
+    // routes' outputs round to the same BF16 value.  Every other amax
+    // scales by amax/448 unclamped (bitwise-stock for power-of-two amax,
+    // <=1 ulp otherwise).  448/cl stays finite (<= 448*2^117 < FLT_MAX),
+    // so no 0*inf NaN can form.
+    const float cl = fmaxf(local_max, 6.019e-36f);
+    activation_scale[row] = cl * (1.0f / 448.0f);
+    inv_scale = __fdividef(448.0f, cl);
   }
   inv_scale = __shfl_sync(0xffffffffu, inv_scale, 0, 16);
 
@@ -472,9 +493,16 @@ __device__ __forceinline__ void quantize_activation_row_contiguous8_fast(
   float inv_scale = 0.0f;
   if (subgroup_lane == 0) {
     const float local_max = __uint_as_float(local_absmax);
-    const float scale = fmaxf(local_max, eps) * (1.0f / 448.0f);
-    activation_scale[row] = scale;
-    inv_scale = 1.0f / scale;
+    // Stock scale_1x128 semantics: the clamp floor is 2^-117 and fires
+    // only for amax == 0 (exactly the stock zero contribution) or an amax
+    // below 2^-117 — far under any BF16-normal magnitude — where both
+    // routes' outputs round to the same BF16 value.  Every other amax
+    // scales by amax/448 unclamped (bitwise-stock for power-of-two amax,
+    // <=1 ulp otherwise).  448/cl stays finite (<= 448*2^117 < FLT_MAX),
+    // so no 0*inf NaN can form.
+    const float cl = fmaxf(local_max, 6.019e-36f);
+    activation_scale[row] = cl * (1.0f / 448.0f);
+    inv_scale = __fdividef(448.0f, cl);
   }
   inv_scale = __shfl_sync(0xffffffffu, inv_scale, 0, 8);
 

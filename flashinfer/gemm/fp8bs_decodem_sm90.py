@@ -5,9 +5,13 @@
 An agent-generated kernel for the decode-M classes of
 :func:`flashinfer.gemm.fp8_blockscale_gemm_sm90` in its BF16-activation /
 FP8-weight / 128x128-block-scale form: the activation 1x128 per-token-group
-quantization happens inside the kernel (amax/448 convention, matching the
-stock route's internal quantization), weights and their
-(ceil(N/128), K/128) float32 scale grid are consumed as passed.
+quantization happens inside the kernel with the stock route's scale_1x128
+semantics (no epsilon clamp: a nonzero amax scales by amax/448 — bitwise
+equal to the stock scales for power-of-two amax and within 1 ulp otherwise —
+and an all-zero group contributes exactly 0, as on the stock route; the
+kernel's internal floor, 2^-117, sits far below every BF16-normal
+magnitude), weights and their (ceil(N/128), K/128) float32 scale grid are
+consumed as passed.
 
 Backend surface (#5667 semantics), driven from
 ``fp8_blockscale_gemm_sm90(..., backend=...)``:
@@ -51,9 +55,12 @@ _DISPATCH_FILE = "fp8bs_gemm_decodem_sm90_dispatch.json"
 # The measured decode-M envelope (captured serve rows span M in [1, 24];
 # interior points admitted by band interpolation, the study's banded form).
 _M_MAX = 24
-# The kernel's internal 1x128 activation quantization epsilon (the
-# campaign definition's value, carried by the packaged allowlist too).
-_QUANT_EPS = 1e-4
+# The kernel implements the stock scale_1x128 quantization semantics
+# (no epsilon clamp: scale = amax/448 for nonzero amax; an all-zero group
+# contributes exactly 0 as on the stock route — the internal floor, 2^-117,
+# is far below every BF16-normal magnitude).  The launch parameter is
+# retained for ABI stability and ignored by the kernels' quantization.
+_QUANT_EPS = 0.0
 
 
 class GraphCaptureJitError(RuntimeError):
