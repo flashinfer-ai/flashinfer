@@ -40,49 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_K_PIPE_STAGES 3
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_V_PIPE_STAGES 2
-#define NUM_GATE_PIPE_STAGES 5
-#define NUM_AB_PIPE_STAGES 3
-#define NUM_QK_PIPE_STAGES 3
-#define NUM_O_PIPE_STAGES 1
-#define SMEM_SMEM_K_OFF 1024
-#define SMEM_SMEM_K_STAGE_BYTES 16384
-#define SMEM_SMEM_K_STRIDE 16384
-#define SMEM_SMEM_K_MN_OFF 1024
-#define SMEM_SMEM_K_MN_STAGE_BYTES 16384
-#define SMEM_SMEM_K_MN_STRIDE 16384
-#define SMEM_SMEM_Q_OFF 50176
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_V_OFF 82944
-#define SMEM_SMEM_V_STAGE_BYTES 8192
-#define SMEM_SMEM_V_STRIDE 8192
-#define SMEM_SMEM_AB_OFF 99328
-#define SMEM_SMEM_AB_STAGE_BYTES 8192
-#define SMEM_SMEM_AB_STRIDE 8192
-#define SMEM_SMEM_ABO_OFF 123904
-#define SMEM_SMEM_ABO_STAGE_BYTES 8192
-#define SMEM_SMEM_ABO_STRIDE 8192
-#define SMEM_SMEM_QK_OFF 148480
-#define SMEM_SMEM_QK_STAGE_BYTES 8192
-#define SMEM_SMEM_QK_STRIDE 8192
-#define SMEM_SMEM_O_OFF 173056
-#define SMEM_SMEM_O_STAGE_BYTES 8192
-#define SMEM_SMEM_O_STRIDE 8192
-#define SMEM_SMEM_PRIME_OFF 181248
-#define SMEM_SMEM_PRIME_STAGE_BYTES 8192
-#define SMEM_SMEM_PRIME_STRIDE 8192
-#define SMEM_SMEM_GATE_OFF 189440
-#define SMEM_SMEM_GATE_STAGE_BYTES 1536
-#define SMEM_SMEM_GATE_STRIDE 1536
-#define SMEM_SMEM_CT_OFF 197120
-#define SMEM_SMEM_CT_STAGE_BYTES 256
-#define SMEM_SMEM_CT_STRIDE 256
-#define SMEM_TOTAL 197376
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -172,7 +129,7 @@ __device__ __forceinline__ void tma_store_3d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -212,7 +169,7 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_k_addr = smem + 1024;
     __nv_bfloat16* smem_k_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -236,8 +193,7 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
     float* smem_ct = reinterpret_cast<float*>(smem_raw + 197120);
     const int __unused = smem + 197120;
 
-    // Mbarrier init (15 pipeline groups, 0 ordered-sequence groups, 43 barriers)
-    // Mbarriers at smem_raw[0..344)
+    // Mbarrier init (43 barriers at smem_raw[0..344))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -396,7 +352,7 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                 int batch_end = ((end_floor < total_tokens) ? end_floor : total_tokens);
                 int exp_len = (batch_end - batch_start) * num_householder;
                 int num_chunks = (exp_len + 63) / 64;
-                long long output_head_base = (long long)batch_idx * output_state_stride_slot + (long long)head_idx * 8192;
+                long long output_head_base = (long long)batch_idx * output_state_stride_slot + (long long)head_idx * 8192ll;
                 state[0] = 0.0f;
                 state[1] = 0.0f;
                 state[2] = 0.0f;
@@ -518,15 +474,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                     : "memory");
                 asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                     : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                    : "r"(prime_a[4]), "r"(prime_a[(4) + 1]), "r"(prime_a[(4) + 2]), "r"(prime_a[(4) + 3]), "l"(prime_desc + 2)
+                    : "r"(prime_a[4]), "r"(prime_a[(4) + 1]), "r"(prime_a[(4) + 2]), "r"(prime_a[(4) + 3]), "l"(prime_desc + 2ull)
                     : "memory");
                 asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                     : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                    : "r"(prime_a[8]), "r"(prime_a[(8) + 1]), "r"(prime_a[(8) + 2]), "r"(prime_a[(8) + 3]), "l"(prime_desc + 4)
+                    : "r"(prime_a[8]), "r"(prime_a[(8) + 1]), "r"(prime_a[(8) + 2]), "r"(prime_a[(8) + 3]), "l"(prime_desc + 4ull)
                     : "memory");
                 asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                     : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                    : "r"(prime_a[12]), "r"(prime_a[(12) + 1]), "r"(prime_a[(12) + 2]), "r"(prime_a[(12) + 3]), "l"(prime_desc + 6)
+                    : "r"(prime_a[12]), "r"(prime_a[(12) + 1]), "r"(prime_a[(12) + 2]), "r"(prime_a[(12) + 3]), "l"(prime_desc + 6ull)
                     : "memory");
                 asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                 #pragma unroll 1
@@ -735,15 +691,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(s_img[4]), "r"(s_img[(4) + 1]), "r"(s_img[(4) + 2]), "r"(s_img[(4) + 3]), "l"(q_lo + 2)
+                            : "r"(s_img[4]), "r"(s_img[(4) + 1]), "r"(s_img[(4) + 2]), "r"(s_img[(4) + 3]), "l"(q_lo + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(s_img[8]), "r"(s_img[(8) + 1]), "r"(s_img[(8) + 2]), "r"(s_img[(8) + 3]), "l"(q_lo + 4)
+                            : "r"(s_img[8]), "r"(s_img[(8) + 1]), "r"(s_img[(8) + 2]), "r"(s_img[(8) + 3]), "l"(q_lo + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(s_img[12]), "r"(s_img[(12) + 1]), "r"(s_img[(12) + 2]), "r"(s_img[(12) + 3]), "l"(q_lo + 6)
+                            : "r"(s_img[12]), "r"(s_img[(12) + 1]), "r"(s_img[(12) + 2]), "r"(s_img[(12) + 3]), "l"(q_lo + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
@@ -751,15 +707,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(s_img[20]), "r"(s_img[(20) + 1]), "r"(s_img[(20) + 2]), "r"(s_img[(20) + 3]), "l"(q_hi + 2)
+                            : "r"(s_img[20]), "r"(s_img[(20) + 1]), "r"(s_img[(20) + 2]), "r"(s_img[(20) + 3]), "l"(q_hi + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(s_img[24]), "r"(s_img[(24) + 1]), "r"(s_img[(24) + 2]), "r"(s_img[(24) + 3]), "l"(q_hi + 4)
+                            : "r"(s_img[24]), "r"(s_img[(24) + 1]), "r"(s_img[(24) + 2]), "r"(s_img[(24) + 3]), "l"(q_hi + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                            : "r"(s_img[28]), "r"(s_img[(28) + 1]), "r"(s_img[(28) + 2]), "r"(s_img[(28) + 3]), "l"(q_hi + 6)
+                            : "r"(s_img[28]), "r"(s_img[(28) + 1]), "r"(s_img[(28) + 2]), "r"(s_img[(28) + 3]), "l"(q_hi + 6ull)
                             : "memory");
                         uint64_t _wgmma_desc_4 = (((uint64_t)(((smem_k_addr + k_cur * 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
                         uint64_t kh_lo = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_4 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_4);
@@ -771,15 +727,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[4]), "r"(s_img[(4) + 1]), "r"(s_img[(4) + 2]), "r"(s_img[(4) + 3]), "l"(kh_lo + 2)
+                            : "r"(s_img[4]), "r"(s_img[(4) + 1]), "r"(s_img[(4) + 2]), "r"(s_img[(4) + 3]), "l"(kh_lo + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[8]), "r"(s_img[(8) + 1]), "r"(s_img[(8) + 2]), "r"(s_img[(8) + 3]), "l"(kh_lo + 4)
+                            : "r"(s_img[8]), "r"(s_img[(8) + 1]), "r"(s_img[(8) + 2]), "r"(s_img[(8) + 3]), "l"(kh_lo + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[12]), "r"(s_img[(12) + 1]), "r"(s_img[(12) + 2]), "r"(s_img[(12) + 3]), "l"(kh_lo + 6)
+                            : "r"(s_img[12]), "r"(s_img[(12) + 1]), "r"(s_img[(12) + 2]), "r"(s_img[(12) + 3]), "l"(kh_lo + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
@@ -787,15 +743,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[20]), "r"(s_img[(20) + 1]), "r"(s_img[(20) + 2]), "r"(s_img[(20) + 3]), "l"(kh_hi + 2)
+                            : "r"(s_img[20]), "r"(s_img[(20) + 1]), "r"(s_img[(20) + 2]), "r"(s_img[(20) + 3]), "l"(kh_hi + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[24]), "r"(s_img[(24) + 1]), "r"(s_img[(24) + 2]), "r"(s_img[(24) + 3]), "l"(kh_hi + 4)
+                            : "r"(s_img[24]), "r"(s_img[(24) + 1]), "r"(s_img[(24) + 2]), "r"(s_img[(24) + 3]), "l"(kh_hi + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[28]), "r"(s_img[(28) + 1]), "r"(s_img[(28) + 2]), "r"(s_img[(28) + 3]), "l"(kh_hi + 6)
+                            : "r"(s_img[28]), "r"(s_img[(28) + 1]), "r"(s_img[(28) + 2]), "r"(s_img[(28) + 3]), "l"(kh_hi + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("" : "+f"(ks[0]) :: "memory");
@@ -939,15 +895,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[4]), "r"(s_img[(4) + 1]), "r"(s_img[(4) + 2]), "r"(s_img[(4) + 3]), "l"(k_lo + 2)
+                            : "r"(s_img[4]), "r"(s_img[(4) + 1]), "r"(s_img[(4) + 2]), "r"(s_img[(4) + 3]), "l"(k_lo + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[8]), "r"(s_img[(8) + 1]), "r"(s_img[(8) + 2]), "r"(s_img[(8) + 3]), "l"(k_lo + 4)
+                            : "r"(s_img[8]), "r"(s_img[(8) + 1]), "r"(s_img[(8) + 2]), "r"(s_img[(8) + 3]), "l"(k_lo + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[12]), "r"(s_img[(12) + 1]), "r"(s_img[(12) + 2]), "r"(s_img[(12) + 3]), "l"(k_lo + 6)
+                            : "r"(s_img[12]), "r"(s_img[(12) + 1]), "r"(s_img[(12) + 2]), "r"(s_img[(12) + 3]), "l"(k_lo + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
@@ -955,15 +911,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[20]), "r"(s_img[(20) + 1]), "r"(s_img[(20) + 2]), "r"(s_img[(20) + 3]), "l"(k_hi + 2)
+                            : "r"(s_img[20]), "r"(s_img[(20) + 1]), "r"(s_img[(20) + 2]), "r"(s_img[(20) + 3]), "l"(k_hi + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[24]), "r"(s_img[(24) + 1]), "r"(s_img[(24) + 2]), "r"(s_img[(24) + 3]), "l"(k_hi + 4)
+                            : "r"(s_img[24]), "r"(s_img[(24) + 1]), "r"(s_img[(24) + 2]), "r"(s_img[(24) + 3]), "l"(k_hi + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                             : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                            : "r"(s_img[28]), "r"(s_img[(28) + 1]), "r"(s_img[(28) + 2]), "r"(s_img[(28) + 3]), "l"(k_hi + 6)
+                            : "r"(s_img[28]), "r"(s_img[(28) + 1]), "r"(s_img[(28) + 2]), "r"(s_img[(28) + 3]), "l"(k_hi + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("" : "+f"(ks[0]) :: "memory");
@@ -1472,15 +1428,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                         : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                        : "r"(y_img[4]), "r"(y_img[(4) + 1]), "r"(y_img[(4) + 2]), "r"(y_img[(4) + 3]), "l"(ab_desc + 2)
+                        : "r"(y_img[4]), "r"(y_img[(4) + 1]), "r"(y_img[(4) + 2]), "r"(y_img[(4) + 3]), "l"(ab_desc + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                         : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                        : "r"(y_img[8]), "r"(y_img[(8) + 1]), "r"(y_img[(8) + 2]), "r"(y_img[(8) + 3]), "l"(ab_desc + 4)
+                        : "r"(y_img[8]), "r"(y_img[(8) + 1]), "r"(y_img[(8) + 2]), "r"(y_img[(8) + 3]), "l"(ab_desc + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                         : "+f"(ks[0]), "+f"(ks[1]), "+f"(ks[2]), "+f"(ks[3]), "+f"(ks[4]), "+f"(ks[5]), "+f"(ks[6]), "+f"(ks[7]), "+f"(ks[8]), "+f"(ks[9]), "+f"(ks[10]), "+f"(ks[11]), "+f"(ks[12]), "+f"(ks[13]), "+f"(ks[14]), "+f"(ks[15]), "+f"(ks[16]), "+f"(ks[17]), "+f"(ks[18]), "+f"(ks[19]), "+f"(ks[20]), "+f"(ks[21]), "+f"(ks[22]), "+f"(ks[23]), "+f"(ks[24]), "+f"(ks[25]), "+f"(ks[26]), "+f"(ks[27]), "+f"(ks[28]), "+f"(ks[29]), "+f"(ks[30]), "+f"(ks[31])
-                        : "r"(y_img[12]), "r"(y_img[(12) + 1]), "r"(y_img[(12) + 2]), "r"(y_img[(12) + 3]), "l"(ab_desc + 6)
+                        : "r"(y_img[12]), "r"(y_img[(12) + 1]), "r"(y_img[(12) + 2]), "r"(y_img[(12) + 3]), "l"(ab_desc + 6ull)
                         : "memory");
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     state[0] = state[0] * gamma;
@@ -1844,15 +1800,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                         : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(du_img[4]), "r"(du_img[(4) + 1]), "r"(du_img[(4) + 2]), "r"(du_img[(4) + 3]), "l"(kmn_desc + 128)
+                        : "r"(du_img[4]), "r"(du_img[(4) + 1]), "r"(du_img[(4) + 2]), "r"(du_img[(4) + 3]), "l"(kmn_desc + 128ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                         : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(du_img[8]), "r"(du_img[(8) + 1]), "r"(du_img[(8) + 2]), "r"(du_img[(8) + 3]), "l"(kmn_desc + 256)
+                        : "r"(du_img[8]), "r"(du_img[(8) + 1]), "r"(du_img[(8) + 2]), "r"(du_img[(8) + 3]), "l"(kmn_desc + 256ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                         : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(du_img[12]), "r"(du_img[(12) + 1]), "r"(du_img[(12) + 2]), "r"(du_img[(12) + 3]), "l"(kmn_desc + 384)
+                        : "r"(du_img[12]), "r"(du_img[(12) + 1]), "r"(du_img[(12) + 2]), "r"(du_img[(12) + 3]), "l"(kmn_desc + 384ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                         : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
@@ -1860,15 +1816,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                         : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(du_lo[4]), "r"(du_lo[(4) + 1]), "r"(du_lo[(4) + 2]), "r"(du_lo[(4) + 3]), "l"(kmn_desc + 128)
+                        : "r"(du_lo[4]), "r"(du_lo[(4) + 1]), "r"(du_lo[(4) + 2]), "r"(du_lo[(4) + 3]), "l"(kmn_desc + 128ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                         : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(du_lo[8]), "r"(du_lo[(8) + 1]), "r"(du_lo[(8) + 2]), "r"(du_lo[(8) + 3]), "l"(kmn_desc + 256)
+                        : "r"(du_lo[8]), "r"(du_lo[(8) + 1]), "r"(du_lo[(8) + 2]), "r"(du_lo[(8) + 3]), "l"(kmn_desc + 256ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, {%64, %65, %66, %67}, %68, 1, 1, 1, 1;\n}\n"
                         : "+f"(state[0]), "+f"(state[1]), "+f"(state[2]), "+f"(state[3]), "+f"(state[4]), "+f"(state[5]), "+f"(state[6]), "+f"(state[7]), "+f"(state[8]), "+f"(state[9]), "+f"(state[10]), "+f"(state[11]), "+f"(state[12]), "+f"(state[13]), "+f"(state[14]), "+f"(state[15]), "+f"(state[16]), "+f"(state[17]), "+f"(state[18]), "+f"(state[19]), "+f"(state[20]), "+f"(state[21]), "+f"(state[22]), "+f"(state[23]), "+f"(state[24]), "+f"(state[25]), "+f"(state[26]), "+f"(state[27]), "+f"(state[28]), "+f"(state[29]), "+f"(state[30]), "+f"(state[31]), "+f"(state[32]), "+f"(state[33]), "+f"(state[34]), "+f"(state[35]), "+f"(state[36]), "+f"(state[37]), "+f"(state[38]), "+f"(state[39]), "+f"(state[40]), "+f"(state[41]), "+f"(state[42]), "+f"(state[43]), "+f"(state[44]), "+f"(state[45]), "+f"(state[46]), "+f"(state[47]), "+f"(state[48]), "+f"(state[49]), "+f"(state[50]), "+f"(state[51]), "+f"(state[52]), "+f"(state[53]), "+f"(state[54]), "+f"(state[55]), "+f"(state[56]), "+f"(state[57]), "+f"(state[58]), "+f"(state[59]), "+f"(state[60]), "+f"(state[61]), "+f"(state[62]), "+f"(state[63])
-                        : "r"(du_lo[12]), "r"(du_lo[(12) + 1]), "r"(du_lo[(12) + 2]), "r"(du_lo[(12) + 3]), "l"(kmn_desc + 384)
+                        : "r"(du_lo[12]), "r"(du_lo[(12) + 1]), "r"(du_lo[(12) + 2]), "r"(du_lo[(12) + 3]), "l"(kmn_desc + 384ull)
                         : "memory");
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     uint64_t _wgmma_desc_16 = (((uint64_t)(((smem_qk_addr + qk_cur * 8192)) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
@@ -1879,15 +1835,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                         : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(nv_img[4]), "r"(nv_img[(4) + 1]), "r"(nv_img[(4) + 2]), "r"(nv_img[(4) + 3]), "l"(qk_desc + 2)
+                        : "r"(nv_img[4]), "r"(nv_img[(4) + 1]), "r"(nv_img[(4) + 2]), "r"(nv_img[(4) + 3]), "l"(qk_desc + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                         : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(nv_img[8]), "r"(nv_img[(8) + 1]), "r"(nv_img[(8) + 2]), "r"(nv_img[(8) + 3]), "l"(qk_desc + 4)
+                        : "r"(nv_img[8]), "r"(nv_img[(8) + 1]), "r"(nv_img[(8) + 2]), "r"(nv_img[(8) + 3]), "l"(qk_desc + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, {%32, %33, %34, %35}, %36, 1, 1, 1, 0;\n}\n"
                         : "+f"(q_state[0]), "+f"(q_state[1]), "+f"(q_state[2]), "+f"(q_state[3]), "+f"(q_state[4]), "+f"(q_state[5]), "+f"(q_state[6]), "+f"(q_state[7]), "+f"(q_state[8]), "+f"(q_state[9]), "+f"(q_state[10]), "+f"(q_state[11]), "+f"(q_state[12]), "+f"(q_state[13]), "+f"(q_state[14]), "+f"(q_state[15]), "+f"(q_state[16]), "+f"(q_state[17]), "+f"(q_state[18]), "+f"(q_state[19]), "+f"(q_state[20]), "+f"(q_state[21]), "+f"(q_state[22]), "+f"(q_state[23]), "+f"(q_state[24]), "+f"(q_state[25]), "+f"(q_state[26]), "+f"(q_state[27]), "+f"(q_state[28]), "+f"(q_state[29]), "+f"(q_state[30]), "+f"(q_state[31])
-                        : "r"(nv_img[12]), "r"(nv_img[(12) + 1]), "r"(nv_img[(12) + 2]), "r"(nv_img[(12) + 3]), "l"(qk_desc + 6)
+                        : "r"(nv_img[12]), "r"(nv_img[(12) + 1]), "r"(nv_img[(12) + 2]), "r"(nv_img[(12) + 3]), "l"(qk_desc + 6ull)
                         : "memory");
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     asm volatile("" : "+f"(state[0]) :: "memory");
@@ -2028,136 +1984,136 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                     mbarrier_arrive(qk_empty_addr + (((qk_cur + 2 >= 3) ? qk_cur + 2 - 3 : qk_cur + 2)) * 8);
                 }
                 int row_top = warp_id_in_role * 16 + (lane >> 2);
-                long long base_top = output_head_base + (long long)row_top * 128;
-                long long base_bot = base_top + 1024;
+                long long base_top = output_head_base + (long long)row_top * 128ll;
+                long long base_bot = base_top + 1024ll;
                 long long lane_pair = (long long)((lane & 3) * 2);
                 {
                     float2 _v2 = make_float2(state[0 + 0], state[0 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 0)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[2 + 0], state[2 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 0)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[4 + 0], state[4 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 8)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 8ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[6 + 0], state[6 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 8)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 8ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[8 + 0], state[8 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 16)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 16ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[10 + 0], state[10 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 16)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 16ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[12 + 0], state[12 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 24)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 24ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[14 + 0], state[14 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 24)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 24ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[16 + 0], state[16 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 32)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 32ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[18 + 0], state[18 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 32)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 32ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[20 + 0], state[20 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 40)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 40ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[22 + 0], state[22 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 40)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 40ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[24 + 0], state[24 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 48)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 48ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[26 + 0], state[26 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 48)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 48ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[28 + 0], state[28 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 56)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 56ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[30 + 0], state[30 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 56)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 56ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[32 + 0], state[32 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 64)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 64ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[34 + 0], state[34 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 64)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 64ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[36 + 0], state[36 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 72)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 72ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[38 + 0], state[38 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 72)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 72ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[40 + 0], state[40 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 80)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 80ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[42 + 0], state[42 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 80)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 80ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[44 + 0], state[44 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 88)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 88ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[46 + 0], state[46 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 88)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 88ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[48 + 0], state[48 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 96)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 96ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[50 + 0], state[50 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 96)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 96ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[52 + 0], state[52 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 104)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 104ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[54 + 0], state[54 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 104)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 104ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[56 + 0], state[56 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 112)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 112ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[58 + 0], state[58 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 112)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 112ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[60 + 0], state[60 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 120)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_top + lane_pair + 120ll)) + 0) = _v2;
                 }
                 {
                     float2 _v2 = make_float2(state[62 + 0], state[62 + 1]);
-                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 120)) + 0) = _v2;
+                    *reinterpret_cast<float2*>((output_state + (base_bot + lane_pair + 120ll)) + 0) = _v2;
                 }
             }
         }
@@ -2261,15 +2217,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                        : "l"(pa_lo + 2), "l"(pb_lo + 2)
+                        : "l"(pa_lo + 2ull), "l"(pb_lo + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                        : "l"(pa_lo + 4), "l"(pb_lo + 4)
+                        : "l"(pa_lo + 4ull), "l"(pb_lo + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                        : "l"(pa_lo + 6), "l"(pb_lo + 6)
+                        : "l"(pa_lo + 6ull), "l"(pb_lo + 6ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
@@ -2277,15 +2233,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                        : "l"(pa_hi + 2), "l"(pb_hi + 2)
+                        : "l"(pa_hi + 2ull), "l"(pb_hi + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                        : "l"(pa_hi + 4), "l"(pb_hi + 4)
+                        : "l"(pa_hi + 4ull), "l"(pb_hi + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                        : "l"(pa_hi + 6), "l"(pb_hi + 6)
+                        : "l"(pa_hi + 6ull), "l"(pb_hi + 6ull)
                         : "memory");
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     asm volatile("" : "+f"(acc_qk[0]) :: "memory");
@@ -2335,15 +2291,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                        : "l"(pa_lo_0 + 2), "l"(pb_lo_0 + 2)
+                        : "l"(pa_lo_0 + 2ull), "l"(pb_lo_0 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                        : "l"(pa_lo_0 + 4), "l"(pb_lo_0 + 4)
+                        : "l"(pa_lo_0 + 4ull), "l"(pb_lo_0 + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                        : "l"(pa_lo_0 + 6), "l"(pb_lo_0 + 6)
+                        : "l"(pa_lo_0 + 6ull), "l"(pb_lo_0 + 6ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
@@ -2351,15 +2307,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                        : "l"(pa_hi_0 + 2), "l"(pb_hi_0 + 2)
+                        : "l"(pa_hi_0 + 2ull), "l"(pb_hi_0 + 2ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                        : "l"(pa_hi_0 + 4), "l"(pb_hi_0 + 4)
+                        : "l"(pa_hi_0 + 4ull), "l"(pb_hi_0 + 4ull)
                         : "memory");
                     asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                         : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                        : "l"(pa_hi_0 + 6), "l"(pb_hi_0 + 6)
+                        : "l"(pa_hi_0 + 6ull), "l"(pb_hi_0 + 6ull)
                         : "memory");
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     k_nxt += 1;
@@ -2468,7 +2424,7 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         for (int i_3 = 0; i_3 < 8; i_3++) {
                             #pragma unroll
                             for (int e_3 = 0; e_3 < 2; e_3++) {
-                                cs16[2 * i_3 + e_3] = smem_gate[a_gb + 0 + i_3 * 8 + a_quad * 2 + e_3];
+                                cs16[2 * i_3 + e_3] = smem_gate[a_gb + i_3 * 8 + a_quad * 2 + e_3];
                             }
                         }
                         int qrow0 = a_row_base + a_lane_row;
@@ -2520,8 +2476,8 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         int srow1 = srow0 + 8;
                         float sb0 = smem_gate[a_gb + 320 + srow0];
                         float sb1 = smem_gate[a_gb + 320 + srow1];
-                        float scs0 = smem_gate[a_gb + 0 + srow0];
-                        float scs1 = smem_gate[a_gb + 0 + srow1];
+                        float scs0 = smem_gate[a_gb + srow0];
+                        float scs1 = smem_gate[a_gb + srow1];
                         int seed_row = lane % 16;
                         int seed_col = lane / 16 * 8;
                         #pragma unroll
@@ -2709,15 +2665,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                            : "l"(pa_lo_1 + 2), "l"(pb_lo_1 + 2)
+                            : "l"(pa_lo_1 + 2ull), "l"(pb_lo_1 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                            : "l"(pa_lo_1 + 4), "l"(pb_lo_1 + 4)
+                            : "l"(pa_lo_1 + 4ull), "l"(pb_lo_1 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                            : "l"(pa_lo_1 + 6), "l"(pb_lo_1 + 6)
+                            : "l"(pa_lo_1 + 6ull), "l"(pb_lo_1 + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
@@ -2725,15 +2681,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                            : "l"(pa_hi_1 + 2), "l"(pb_hi_1 + 2)
+                            : "l"(pa_hi_1 + 2ull), "l"(pb_hi_1 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                            : "l"(pa_hi_1 + 4), "l"(pb_hi_1 + 4)
+                            : "l"(pa_hi_1 + 4ull), "l"(pb_hi_1 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_kk[0]), "+f"(acc_kk[1]), "+f"(acc_kk[2]), "+f"(acc_kk[3]), "+f"(acc_kk[4]), "+f"(acc_kk[5]), "+f"(acc_kk[6]), "+f"(acc_kk[7]), "+f"(acc_kk[8]), "+f"(acc_kk[9]), "+f"(acc_kk[10]), "+f"(acc_kk[11]), "+f"(acc_kk[12]), "+f"(acc_kk[13]), "+f"(acc_kk[14]), "+f"(acc_kk[15]), "+f"(acc_kk[16]), "+f"(acc_kk[17]), "+f"(acc_kk[18]), "+f"(acc_kk[19]), "+f"(acc_kk[20]), "+f"(acc_kk[21]), "+f"(acc_kk[22]), "+f"(acc_kk[23]), "+f"(acc_kk[24]), "+f"(acc_kk[25]), "+f"(acc_kk[26]), "+f"(acc_kk[27]), "+f"(acc_kk[28]), "+f"(acc_kk[29]), "+f"(acc_kk[30]), "+f"(acc_kk[31])
-                            : "l"(pa_hi_1 + 6), "l"(pb_hi_1 + 6)
+                            : "l"(pa_hi_1 + 6ull), "l"(pb_hi_1 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("" : "+f"(acc_qk[0]) :: "memory");
@@ -2783,15 +2739,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                            : "l"(pa_lo_2 + 2), "l"(pb_lo_2 + 2)
+                            : "l"(pa_lo_2 + 2ull), "l"(pb_lo_2 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                            : "l"(pa_lo_2 + 4), "l"(pb_lo_2 + 4)
+                            : "l"(pa_lo_2 + 4ull), "l"(pb_lo_2 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                            : "l"(pa_lo_2 + 6), "l"(pb_lo_2 + 6)
+                            : "l"(pa_lo_2 + 6ull), "l"(pb_lo_2 + 6ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
@@ -2799,15 +2755,15 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                            : "l"(pa_hi_2 + 2), "l"(pb_hi_2 + 2)
+                            : "l"(pa_hi_2 + 2ull), "l"(pb_hi_2 + 2ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                            : "l"(pa_hi_2 + 4), "l"(pb_hi_2 + 4)
+                            : "l"(pa_hi_2 + 4ull), "l"(pb_hi_2 + 4ull)
                             : "memory");
                         asm volatile("{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, %33, 1, 1, 1, 0, 0;\n}\n"
                             : "+f"(acc_qk[0]), "+f"(acc_qk[1]), "+f"(acc_qk[2]), "+f"(acc_qk[3]), "+f"(acc_qk[4]), "+f"(acc_qk[5]), "+f"(acc_qk[6]), "+f"(acc_qk[7]), "+f"(acc_qk[8]), "+f"(acc_qk[9]), "+f"(acc_qk[10]), "+f"(acc_qk[11]), "+f"(acc_qk[12]), "+f"(acc_qk[13]), "+f"(acc_qk[14]), "+f"(acc_qk[15]), "+f"(acc_qk[16]), "+f"(acc_qk[17]), "+f"(acc_qk[18]), "+f"(acc_qk[19]), "+f"(acc_qk[20]), "+f"(acc_qk[21]), "+f"(acc_qk[22]), "+f"(acc_qk[23]), "+f"(acc_qk[24]), "+f"(acc_qk[25]), "+f"(acc_qk[26]), "+f"(acc_qk[27]), "+f"(acc_qk[28]), "+f"(acc_qk[29]), "+f"(acc_qk[30]), "+f"(acc_qk[31])
-                            : "l"(pa_hi_2 + 6), "l"(pb_hi_2 + 6)
+                            : "l"(pa_hi_2 + 6ull), "l"(pb_hi_2 + 6ull)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         k_nxt += 1;
@@ -2991,7 +2947,7 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         for (int i_4 = 0; i_4 < 8; i_4++) {
                             #pragma unroll
                             for (int e_4 = 0; e_4 < 2; e_4++) {
-                                cs16_1[2 * i_4 + e_4] = smem_gate[a_gb_1 + 0 + i_4 * 8 + a_quad * 2 + e_4];
+                                cs16_1[2 * i_4 + e_4] = smem_gate[a_gb_1 + i_4 * 8 + a_quad * 2 + e_4];
                             }
                         }
                         int qrow0_1 = a_row_base + a_lane_row;
@@ -3043,8 +2999,8 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         int srow1_1 = srow0_1 + 8;
                         float sb0_1 = smem_gate[a_gb_1 + 320 + srow0_1];
                         float sb1_1 = smem_gate[a_gb_1 + 320 + srow1_1];
-                        float scs0_1 = smem_gate[a_gb_1 + 0 + srow0_1];
-                        float scs1_1 = smem_gate[a_gb_1 + 0 + srow1_1];
+                        float scs0_1 = smem_gate[a_gb_1 + srow0_1];
+                        float scs1_1 = smem_gate[a_gb_1 + srow1_1];
                         int seed_row_1 = lane % 16;
                         int seed_col_1 = lane / 16 * 8;
                         #pragma unroll
@@ -3401,7 +3357,7 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                             al_la = al_la + al_up_a_4;
                         }
                         float al_carry;
-                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(al_carry) : "f"(al_la), "r"(31));
+                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xFFFFFFFF;" : "=f"(al_carry) : "f"(al_la), "r"(31));
                         smem_ct[al_lane] = al_la;
                         int al_tok_b = al_tok_a + 32;
                         float al_gb = 1.0f;
@@ -3457,7 +3413,7 @@ kernel_cake_gdp_0de8fd0ee57885709a1c(const __grid_constant__ CUtensorMap Q, cons
                         int ac_m = ac_lane + ac_h * 32;
                         int ac_tk = (int)((unsigned int)(bp_roff_4 + ac_m) * rl_magic / 1048576);
                         float ac_l = smem_ct[ac_tk] - ac_carry;
-                        smem_gate[ac_gb + 0 + ac_m] = ac_l;
+                        smem_gate[ac_gb + ac_m] = ac_l;
                         float _exp2_4 = approx_exp2(ac_l);
                         smem_gate[ac_gb + 64 + ac_m] = _exp2_4;
                         float _exp2_5 = approx_exp2(ac_cs63 - ac_l);
