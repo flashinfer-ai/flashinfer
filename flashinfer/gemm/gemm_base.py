@@ -8095,18 +8095,18 @@ def _cudnn_mm_mxfp8_runner():
     return CudnnMmMxfp8GemmRunner()
 
 
-# The CC list spans every arch mm_mxfp8 itself supports: the specialized
-# backend must stay selectable (explicitly and in auto resolution) everywhere,
-# because its dispatcher owns the exact device gate (CC 10.7) and refuses
-# explicit "specialized" calls it cannot serve with a precise reason
-# (NotImplementedError) rather than a generic checker error. The auto
-# heuristic ranks "specialized" FIRST exactly when the call is on the
-# kernel's measured allowlist (specialized_mm_mxfp8_eligible), so it is a
-# default auto candidate and a first-class autotune candidate there; this
-# checker stays permissive so the dispatcher's refusal carries the reason. The
-# decorator also supplies is_compute_capability_supported, which
-# suitable_auto_backends calls on EVERY registered checker.
-@supported_compute_capability([100, 103, 107, 110, 120, 121])
+# The kernel is SM107-only, so the checker gates "specialized" to CC 10.7
+# (the same pattern as the SM120 "specialized" mm_fp4 backend): explicit
+# backend="specialized" on any other arch raises the decorator's standard
+# unsupported-backend error, and auto resolution never lists it there. On
+# SM107 the dispatcher still owns the fine-grained gates (allowlist, scale
+# layout, alignment, kill switch) and refuses explicit calls it cannot serve
+# with the precise reason (NotImplementedError) — an explicitly selected
+# backend never falls back. The auto heuristic ranks "specialized" FIRST
+# exactly when the call is on the kernel's measured allowlist
+# (specialized_mm_mxfp8_eligible), so it is a default auto candidate and a
+# first-class autotune candidate there.
+@supported_compute_capability([107])
 def _specialized_mm_mxfp8_requirement(
     a: torch.Tensor,  # unused
     b: torch.Tensor,  # unused
@@ -8301,8 +8301,9 @@ def mm_mxfp8(
           shape keeps the stock ranking. An explicitly selected backend is
           never silently swapped and never falls back: explicit
           ``backend="specialized"`` that cannot serve a call (off-list shape,
-          non-SM107 device, kill switch, JIT failure) raises
-          ``NotImplementedError`` with the refusal reason; only ``"auto"``
+          kill switch, JIT failure) raises ``NotImplementedError`` with the
+          refusal reason, and on a non-SM107 device the backend checker
+          raises its standard unsupported-backend error; only ``"auto"``
           routes around a refusal.
           ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time)
           disables the kernel: ``"auto"`` keeps the stock path, explicit

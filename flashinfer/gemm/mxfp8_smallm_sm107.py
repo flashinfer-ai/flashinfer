@@ -25,8 +25,10 @@ Dispatch contract (the specialized-backend pattern):
 - An explicitly selected backend is never silently swapped AND never falls
   back: only ``backend="specialized"`` (or "auto") can reach this kernel, and
   explicit ``backend="specialized"`` that cannot serve a call raises
-  ``NotImplementedError`` with the refusal reason. Only ``"auto"`` may route
-  around a refusal (to the stock ranking).
+  ``NotImplementedError`` with the refusal reason (on a non-SM107 device the
+  backend checker in ``gemm_base`` raises its standard unsupported-backend
+  error before this module is reached). Only ``"auto"`` may route around a
+  refusal (to the stock ranking).
 - Guard order: GPU-free checks (kill switch, dtypes, geometry, contiguity,
   allowlist) first, then scale-layout guards, then device guards.
 - A JIT build failure is logged once; auto falls through to the stock path,
