@@ -11,18 +11,17 @@ MTP/verify decode classes (``max_q_len == 6``, ``T == 6 * batch_size``,
 ``batch_size`` 1-13 — the allowlist JSON next to this package). Kill
 switch: FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1.
 
-FRONT REGISTRATION (unified sparse-MLA decode front, family union): this
-module is the front's ``"specialized"`` backend for the DeepSeek-V4.1
-dense-KV contract class. It is NOT exposed through the vendor-named
+FRONT REGISTRATION: this module is the ``"specialized"`` backend of the
+generic masked/SWA sparse-MLA decode front
+:func:`flashinfer.mla.batch_decode_sparse_mla_dsv4` (the dsv4-contract
+op; distinct from pure-selection sparse-MLA decode, which is a different
+op with its own front). It is NOT exposed through the vendor-named
 ``trtllm_batch_decode_sparse_mla_dsv4`` entry (that entry stays stock).
-Per-backend union semantics, stated loudly: this is a dsv4-class
-(masked-selection) backend — it REQUIRES the dense-pool dsv4 argument set
-(the combined storage-offset ``sparse_indices`` with
+This backend REQUIRES the dense-pool dsv4 argument set (the combined
+storage-offset ``sparse_indices`` with
 ``sparse_indices_are_storage_offsets=True``, ``sparse_topk_lens``, fp32
 ``sinks``, the baked scales) and accepts ``seq_lens`` /
-``cum_seq_lens_q`` / ``max_q_len`` as scheduling metadata; pure-selection
-call forms (no masking table / no ``seq_lens``) are NOT served and
-surface as ``fallback_reasons``. Entry points for the front:
+``cum_seq_lens_q`` / ``max_q_len`` as scheduling metadata. Front hooks:
 ``supported_with_reasons(...)`` (the applicability gate — the front's
 ``auto`` may route around a non-empty result) and
 ``maybe_dispatch_specialized(backend=..., ...)`` (serves the call, or —

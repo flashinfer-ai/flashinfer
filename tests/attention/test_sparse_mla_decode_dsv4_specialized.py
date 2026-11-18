@@ -26,7 +26,10 @@ import pytest
 import torch
 
 import flashinfer.sparse_mla_decode_dsv4_cuda as spec_mod
-from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
+from flashinfer.mla import (
+    batch_decode_sparse_mla_dsv4,
+    trtllm_batch_decode_sparse_mla_dsv4,
+)
 
 requires_sm103 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
@@ -166,54 +169,10 @@ def _ws():
     return _WS["b"]
 
 
-def _front(inp, out=None, backend="auto"):
-    """Stand-in for the unified sparse-MLA decode front (#9575): calls this
-    module's front-registration hook with the dsv4-class argument set.
-    Returns the kernel's output, or None when "auto" should route to
-    another named backend (here: the vendor entry's stock dispatch)."""
-    return spec_mod.maybe_dispatch_specialized(
-        backend=backend,
-        query=inp["q"],
-        swa_kv_cache=inp["swa_kv_cache"],
-        compressed_kv_cache=inp["compressed_kv_cache"],
-        sparse_indices=inp["sparse_indices"],
-        sparse_topk_lens=inp["sparse_topk_lens"],
-        seq_lens=inp["seq_lens"],
-        cum_seq_lens_q=inp["cum_seq_lens_q"],
-        max_q_len=int(inp["max_q_len"]),
-        sinks=inp["sinks"],
-        bmm1_scale=SCALE,
-        bmm2_scale=1.0,
-        out=out,
-        extras=dict(
-            kv_layout="HND",
-            kv_cache_format="fp8",
-            swa_topk_lens=None,
-            extra_sparse_indices=None,
-            extra_sparse_topk_lens=None,
-            sparse_indices_are_storage_offsets=True,
-            remapped_sparse_indices_buffer=None,
-            dsv4_inv_rope_cos_sin_cache=None,
-            dsv4_output_scale=None,
-            hca_swa_indices=None,
-            hca_compressed_block_tables=None,
-            hca_seq_lens=None,
-            hca_sparse_indices_format=None,
-            hca_use_persistent=False,
-            sparse_topk_lens_offset=0,
-        ),
-    )
-
-
 def _api(inp, out=None, backend="auto"):
-    """A call as the unified front would make it: the specialized hook
-    first ("auto" routing), then the stock vendor entry."""
-    if backend in ("auto", "specialized"):
-        served = _front(inp, out=out, backend=backend)
-        if served is not None or backend == "specialized":
-            return served
-        backend = "auto"
-    return trtllm_batch_decode_sparse_mla_dsv4(
+    # the generic front is the ONLY surface exposing the specialized
+    # backend (the vendor-named entry stays stock)
+    return batch_decode_sparse_mla_dsv4(
         query=inp["q"],
         swa_kv_cache=inp["swa_kv_cache"],
         workspace_buffer=_ws(),
@@ -317,3 +276,41 @@ def test_cuda_graph_replay_matches_eager():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, eager)
+
+
+@requires_sm103
+def test_front_backend_names_and_trtllm_parity():
+    """The front (upstream's backend-neutral alias name, taken over) keeps
+    every pre-existing backend value working, adds "specialized", and
+    rejects invalid names."""
+    from flashinfer.mla import BATCH_DECODE_SPARSE_MLA_DSV4_BACKENDS
+
+    assert BATCH_DECODE_SPARSE_MLA_DSV4_BACKENDS == (
+        "auto",
+        "specialized",
+        "trtllm-gen",
+        "cute-dsl",
+        "sparse",
+        "cake",
+    )
+    inp = _make_inputs(1, 6, 32768, seed=37)
+    front_stock = _api(inp, backend="trtllm-gen")
+    entry_stock = trtllm_batch_decode_sparse_mla_dsv4(
+        query=inp["q"],
+        swa_kv_cache=inp["swa_kv_cache"],
+        workspace_buffer=_ws(),
+        sparse_indices=inp["sparse_indices"],
+        compressed_kv_cache=inp["compressed_kv_cache"],
+        sparse_topk_lens=inp["sparse_topk_lens"],
+        seq_lens=inp["seq_lens"],
+        bmm1_scale=SCALE,
+        bmm2_scale=1.0,
+        sinks=inp["sinks"],
+        cum_seq_lens_q=inp["cum_seq_lens_q"],
+        max_q_len=int(inp["max_q_len"]),
+        backend="trtllm-gen",
+        sparse_indices_are_storage_offsets=True,
+    )
+    assert torch.equal(front_stock, entry_stock)
+    with pytest.raises(ValueError, match="backend must be one of"):
+        _api(inp, backend="bogus")
