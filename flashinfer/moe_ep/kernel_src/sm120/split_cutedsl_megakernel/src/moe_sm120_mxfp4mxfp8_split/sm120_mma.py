@@ -138,8 +138,6 @@ def _arch_mma_m16n8k32_mxfp8(
     b_dtype: Type[cutlass.Numeric],
     acc_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
-    byte_id_a: int = 0,
-    byte_id_b: int = 0,
     thread_id_a: int = 0,
     thread_id_b: int = 0,
     loc=None,
@@ -167,8 +165,8 @@ def _arch_mma_m16n8k32_mxfp8(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X"
         f".m16n8k32.row.col.f32.{ptx_types[a_dtype]}.{ptx_types[b_dtype]}.f32.ue8m0"
     )
-    # Keep the scalar scale byte in the low byte of a b32 register. The PTX
-    # selectors and accumulator ties match the packed-SFB issue path below.
+    # Each scalar scale occupies the low byte of its 32-bit register.
+    scalar_byte_id = cutlass.Int16(0).ir_value(loc=loc, ip=ip)
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
         [
@@ -179,10 +177,10 @@ def _arch_mma_m16n8k32_mxfp8(
             Uint32(b_i32[0]).ir_value(loc=loc, ip=ip),
             Uint32(b_i32[1]).ir_value(loc=loc, ip=ip),
             Uint32(sfa_u8).ir_value(loc=loc, ip=ip),
-            cutlass.Int16(byte_id_a).ir_value(loc=loc, ip=ip),
+            scalar_byte_id,
             cutlass.Int16(thread_id_a).ir_value(loc=loc, ip=ip),
             Uint32(sfb_u8).ir_value(loc=loc, ip=ip),
-            cutlass.Int16(byte_id_b).ir_value(loc=loc, ip=ip),
+            scalar_byte_id,
             cutlass.Int16(thread_id_b).ir_value(loc=loc, ip=ip),
             Float32(acc[0]).ir_value(loc=loc, ip=ip),
             Float32(acc[1]).ir_value(loc=loc, ip=ip),

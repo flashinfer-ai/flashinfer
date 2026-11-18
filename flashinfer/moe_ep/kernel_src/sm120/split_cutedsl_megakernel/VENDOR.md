@@ -11,6 +11,8 @@ preserved when applying upstream kernel changes.
 
 The vendored scalar-scale MMA helper also includes the upstream compatibility
 fix for CuTeDSL releases that removed the intermediate SM120 MMA operation.
+FlashInfer fixes both scalar byte selectors at zero because each E8M0 scale
+occupies the low byte of its register.
 
 The local frontend experiment adds 384/512/1024/2048/4096 row buckets between
 the existing decode buckets and caller-provided workspace capacity. Buckets
