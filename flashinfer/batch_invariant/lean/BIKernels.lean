@@ -17,6 +17,7 @@ import BIKernels.Stream
 import BIKernels.Draw
 import BIKernels.SamplingCases
 import BIKernels.MoE
+import BIKernels.MoEFp8
 import BIKernels.MoECases
 import BIKernels.MegaMoE
 import BIKernels.MegaMoECases
@@ -33,3 +34,5 @@ import BIKernels.A16MegaMoECases
 import BIKernels.CombineWire
 import BIKernels.CombineWireCases
 import BIKernels.QuantizedStagePartition
+import BIKernels.Gdn
+import BIKernels.GdnCases

@@ -565,15 +565,16 @@ def test_numerical_contract_covers_activation_recipe_and_combine(monkeypatch):
     )
     mega = MegaConfig(Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(256, 4))
     assert numerical_contract(mega, prototype, None) == contract
+    base_native = native
     for overrides in (
         {"apply_routing_weights_before_fc2": True},
         {"combine_dtype": "nvfp4"},
+        {"use_tanh_sigmoid": True},
+        {"epilogue_warpgroups": 2, "fc2_use_bulk": True},
     ):
-        native = dataclasses.replace(native, **overrides)
+        native = dataclasses.replace(base_native, **overrides)
         assert numerical_contract(mega, prototype, None) != contract
-        native = dataclasses.replace(
-            native, apply_routing_weights_before_fc2=False, combine_dtype="bf16"
-        )
+    native = base_native
     split.kernel.moe_config = dataclasses.replace(
         cfg, quant=dataclasses.replace(cfg.quant, per_token_scale=True)
     )

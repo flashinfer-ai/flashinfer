@@ -2356,6 +2356,36 @@ class TestCuteDslFusedMoeFunctional:
         )
 
     @pytest.mark.parametrize(
+        "quant_mode,intermediate_size",
+        [
+            # intermediate_size % (128 * sf_vec_size) != 0: the act-fusion epilogue's last N
+            # subtile row is partial, so its scale-factor store must stop at the N boundary.
+            # (The mxfp8 scalar-byte path is covered by the mxfp8 cases below at
+            # intermediate_size 128, already short of its 128 * 32 tile.)
+            pytest.param("w4a4", 768, id="w4a4-interm768"),
+            pytest.param("w4a4", 1152, id="w4a4-interm1152"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "activation_type", [ActivationType.Swiglu, ActivationType.Relu2]
+    )
+    def test_numerical_accuracy_ragged_sf_n(
+        self, activation_type: ActivationType, quant_mode: str, intermediate_size: int
+    ):
+        """Accuracy with an intermediate size that is not a multiple of the scale-factor tile."""
+        self._run_numerical_accuracy(
+            activation_type,
+            128,
+            2,
+            256,
+            intermediate_size,
+            256,
+            quant_mode,
+            False,
+            use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
+        )
+
+    @pytest.mark.parametrize(
         "quant_mode,activation_type,num_tokens,top_k,hidden_size,intermediate_size,num_experts,use_per_token_activation,swap_ab,tactic,situ_beta,situ_linear_beta",
         [
             pytest.param(

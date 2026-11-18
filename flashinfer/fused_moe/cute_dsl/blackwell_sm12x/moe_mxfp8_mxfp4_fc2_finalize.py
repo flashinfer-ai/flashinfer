@@ -41,9 +41,9 @@ EPIS = SCATTER_EPIS
 DEFAULT_EPI = EpiMethod.WG_SCATTER
 
 
-def resolve_stage(tile, epi: EpiMethod = DEFAULT_EPI):
+def resolve_stage(tile, epi: EpiMethod = DEFAULT_EPI, *, pingpong=False):
     return Sm12xGemmConfig.max_ab_stage(
-        functools.partial(make_cfg, epi=epi), tuple(tile)
+        functools.partial(make_cfg, epi=epi, pingpong=pingpong), tuple(tile)
     )
 
 
@@ -60,9 +60,16 @@ class CuteDslSm120GroupedMxfp8Mxfp4Fc2FinalizeOp:
             )
         self.n, self.k, self.tile = n, k, tuple(tile)
         self.epi, self.enable_pdl = epi, enable_pdl
-        self.ab_stage = resolve_stage(self.tile, epi)
+        self.pingpong = self.tile in ((32, 128, BK), (64, 128, BK)) and k <= 1024
+        self.ab_stage = resolve_stage(self.tile, epi, pingpong=self.pingpong)
         self.tactic = (self.tile[0], self.tile[1], epi)
-        self.cfg = make_cfg(self.tile, self.ab_stage, epi=epi, enable_pdl=enable_pdl)
+        self.cfg = make_cfg(
+            self.tile,
+            self.ab_stage,
+            epi=epi,
+            enable_pdl=enable_pdl,
+            pingpong=self.pingpong,
+        )
 
     @classmethod
     def is_constructible(cls, tile, epi: EpiMethod = DEFAULT_EPI) -> bool:
@@ -120,7 +127,7 @@ def compiled_kernel(
 ):
     # Scale recasts are specialized to the input tensor element types.
     scale_dtypes = tuple(arg.element_type for arg in sample_args[2:4])
-    key = (op.tactic, op.enable_pdl, grid_x, sm_version, scale_dtypes)
+    key = (op.tactic, op.pingpong, op.enable_pdl, grid_x, sm_version, scale_dtypes)
     hit = _COMPILED.get(key)
     if hit is None:
         hit = cute.compile(op.build(grid_x), *sample_args)
@@ -128,10 +135,12 @@ def compiled_kernel(
     return hit
 
 
-def select_tile(*, total_rows: int, n: int, num_experts: int, num_sms: int):
+def select_tile(*, total_rows: int, n: int, k: int, num_experts: int, num_sms: int):
     m_per_expert = total_rows // num_experts if num_experts > 0 else 0
     if m_per_expert <= 32:
         return (32, 128, BK)
+    if k <= 1024:
+        return (64, 128, BK)
     return (128, 128, BK)
 
 
@@ -198,6 +207,7 @@ def cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
         tile = select_tile(
             total_rows=int(a_q.shape[0]),
             n=n,
+            k=k,
             num_experts=int(b_q.shape[0]),
             num_sms=grid_x,
         )
@@ -279,6 +289,7 @@ class _Fc2FinalizeRunner(TunableRunner):
                 select_tile(
                     total_rows=int(a_q.shape[0]),
                     n=n,
+                    k=k,
                     num_experts=int(b_q.shape[0]),
                     num_sms=grid_x,
                 ),
