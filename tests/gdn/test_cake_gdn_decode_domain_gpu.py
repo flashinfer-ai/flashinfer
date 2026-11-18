@@ -289,6 +289,7 @@ def test_twin_matches_the_whole_body_bitwise(
         torch.testing.assert_close(homed, expected_state, atol=1e-3, rtol=1e-3)
     homed.copy_(initial)
     monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES", {})
     out = _public(tensors, homed, scale, backend="auto")
     torch.cuda.synchronize()
     launch = _domain_launch(device, batch_size, scale, table, homed)
@@ -668,8 +669,9 @@ def test_twin_race_gate(case) -> None:
 
 def test_public_path_resolves_once_and_follows_the_state(monkeypatch) -> None:
     # The twin launch of a row is resolved and loaded once; the whole launch table
-    # keeps its (entry, grid) value; calls alternating between two homed states and
-    # an ordinary one each update their own state (the tensor map follows the state).
+    # keeps its (entry, grid) value; each homed allocation is bound to the twin
+    # once; calls alternating between two homed states and an ordinary one each
+    # update their own state (the tensor map follows the state).
     device, table = _require_domain()
     batch_size = 64
     tensors, first = _inputs(batch_size)
@@ -695,6 +697,7 @@ def test_public_path_resolves_once_and_follows_the_state(monkeypatch) -> None:
     monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", spy)
     monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", {})
     monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES", {})
     for order in (("first", "second", "ordinary"), ("ordinary", "second", "first")):
         for name in order:
             states[name].copy_(initial[name])
@@ -711,3 +714,10 @@ def test_public_path_resolves_once_and_follows_the_state(monkeypatch) -> None:
     assert list(gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES) == [key]
     (domain_key,) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES
     assert domain_key[:7] == key and domain_key[7] == table.counts
+    records = [
+        cake_locality.tensor_homing(states[name]) for name in ("first", "second")
+    ]
+    bound = gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES
+    assert sorted(bound) == sorted(id(record) for record in records)
+    for record in records:
+        assert bound[id(record)][0] is record and bound[id(record)][2] is not None

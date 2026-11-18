@@ -285,7 +285,12 @@ public nontranspose decode runs the twin only for a state that is the whole
 homed allocation on a device with an SM table, in a listed cell; it keeps
 those launches in `gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES`, keyed
 by the row, the dies' SM counts and the die cut, and every other call runs
-the launch it runs without the twin.
+the launch it runs without the twin. The first call on a homed allocation
+binds it to its launch (`_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES`, by the
+allocation's homing record), so later calls on it make no SM table query and
+no launch lookup; an eager twin launch reuses the claim counter pair that
+`cake_locality.launch_counters` gave its thread and stream, and a captured
+one takes its pair from `launch_counters`.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

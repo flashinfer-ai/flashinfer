@@ -21,6 +21,7 @@ CUDA tensors and kernel entries) and the refusals of
 from __future__ import annotations
 
 import re
+import threading
 import types
 
 import pytest
@@ -373,9 +374,9 @@ def _decode_inputs(batch_size: int) -> dict[str, torch.Tensor]:
 
 
 class _Device:
-    """Fakes for one device: its capability and SM count, its SM table, the state
-    homing records, the claim counters and the kernel entries (each records its
-    calls)."""
+    """Fakes for one device: its capability and SM count, its SM table (counting the
+    queries), the state homing records, the current stream (or a capture), the claim
+    counters and the kernel entries (each records its calls)."""
 
     def __init__(
         self, monkeypatch, *, capability=(10, 7), sm_count=212, counts=(106, 106)
@@ -388,17 +389,24 @@ class _Device:
         self.failing_launch: set[str] = set()
         self.table = self.make_table(counts)
         self.counters = (object(), object())
+        self.table_queries = 0
+        self.capturing = False
+        self.stream = 7
         properties = types.SimpleNamespace(
             major=capability[0], minor=capability[1], multi_processor_count=sm_count
         )
         monkeypatch.setattr(gdn_decode, "get_compute_capability", lambda _d: capability)
         monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _i: properties)
         monkeypatch.setattr(cake_gdn, "load_cake_gdn_kernel", self.load)
-        monkeypatch.setattr(cake_locality, "sm_table", lambda device=None: self.table)
+        monkeypatch.setattr(cake_locality, "sm_table", self.sm_table)
         monkeypatch.setattr(cake_locality, "tensor_homing", self.tensor_homing)
         monkeypatch.setattr(cake_locality, "launch_counters", self.launch_counters)
+        monkeypatch.setattr(gdn_decode, "_cake_gdn_eager_stream", self.eager_stream)
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_LAUNCHES", {})
         monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
+        monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES", {})
+        monkeypatch.setattr(gdn_decode, "_CAKE_GDN_DOMAIN_PAIRS", threading.local())
+        monkeypatch.setattr(gdn_decode, "_CAKE_GDN_DOMAIN_CAPTURED", set())
 
     @staticmethod
     def make_table(counts):
@@ -423,8 +431,15 @@ class _Device:
 
         return entry
 
+    def sm_table(self, device=None):
+        self.table_queries += 1
+        return self.table
+
     def tensor_homing(self, tensor):
         return self.homings.get(id(tensor))
+
+    def eager_stream(self, device_index):
+        return None if self.capturing else (device_index, self.stream)
 
     def launch_counters(self, words, device=None):
         self.counter_calls.append((words, device))
@@ -490,6 +505,7 @@ def test_unhomed_state_launches_the_whole_route_as_before(monkeypatch) -> None:
             device.calls.clear()
         assert device.counter_calls == []
         assert gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES == {}
+        assert gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES == {}
         assert not any(_TWIN in name for name in device.loads)
 
 
@@ -499,9 +515,9 @@ def test_homed_state_launches_the_twin_in_a_listed_cell(
     monkeypatch, scale, counts
 ) -> None:
     # A whole homed allocation on a 212-SM sm_107a device with an SM table runs the
-    # twin of its row: rows0 at the state's die cut, the call's counter pair, the SM
+    # twin of its row: rows0 at the state's die cut, the stream's counter pair, the SM
     # table by value and a B * HV grid.  The whole launch table keeps its value; the
-    # twin is loaded once and the counters are taken per call.
+    # twin is loaded once, and the stream's counter pair is taken once and reused.
     device = _Device(monkeypatch, counts=counts)
     for batch_size, rows0 in ((32, 16), (37, 19), (64, 13), (512, 256)):
         inputs = _decode_inputs(batch_size)
@@ -520,8 +536,14 @@ def test_homed_state_launches_the_twin_in_a_listed_cell(
             key + (tuple(counts), rows0 * _ROW_BYTES)
         ]
         assert twin[1:] == (batch_size * 32, rows0, device.table)
+        record = device.homings[id(inputs["state"])]
+        assert gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES[id(record)] == (
+            record,
+            whole,
+            twin,
+        )
         device.calls.clear()
-    assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)] * 12
+    assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)]
     assert locality.DOMAIN_COUNTER_WORDS == 1
 
 
@@ -623,11 +645,20 @@ def test_twin_load_failure_at_its_launch_runs_whole(monkeypatch) -> None:
     (launch,) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.items()
     assert launch[0] == key + ((106, 106), 32 * _ROW_BYTES)
     assert launch[1][0] is None and launch[1][1:] == (64 * 32, 32, device.table)
+    # The allocation was bound again, to the row's whole-GPU launch.
+    ((record, whole, domain),) = (
+        gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES.values()
+    )
+    assert record is device.homings[id(inputs["state"])] and domain is None
+    assert whole is gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES[key]
 
 
 def test_twin_launch_follows_the_sm_table_and_the_cut(monkeypatch) -> None:
-    # A launch is reused only for the SM table object it was resolved with, and the
-    # dies' SM counts and the die cut are part of its key.
+    # A homed allocation keeps the launch it was bound to at its first call, with that
+    # call's SM table (a device's table does not change once probed).  A new
+    # allocation is bound again through the twin launch table, which reuses a launch
+    # only for the SM table object it was resolved with and keys the dies' SM counts
+    # and the die cut.
     device = _Device(monkeypatch)
     inputs = _decode_inputs(64)
     device.home(inputs["state"], rows0=32)
@@ -637,14 +668,19 @@ def test_twin_launch_follows_the_sm_table_and_the_cut(monkeypatch) -> None:
     first = device.table
     device.table = device.make_table((106, 106))
     _run(inputs)
+    assert device.loads.count(_twin_name(_SCALE)) == 1
+    assert device.calls[-1][1][12] is first.entries
+    device.home(inputs["state"], rows0=32)
+    _run(inputs)
     assert device.loads.count(_twin_name(_SCALE)) == 2
     assert device.calls[-1][1][12] is device.table.entries
-    assert device.calls[0][1][12] is first.entries
     device.home(inputs["state"], rows0=20)
     _run(inputs)
     device.table = device.make_table((100, 112))
+    device.home(inputs["state"], rows0=20)
     _run(inputs)
-    assert [args[9] for _, args in device.calls] == [32, 32, 32, 20, 20]
+    assert device.calls[-1][1][12] is device.table.entries
+    assert [args[9] for _, args in device.calls] == [32, 32, 32, 32, 20, 20]
     keys = sorted(key[-2:] for key in gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES)
     assert keys == [
         ((100, 112), 20 * _ROW_BYTES),
@@ -661,7 +697,115 @@ def test_twin_launch_table_is_cleared_at_its_limit(monkeypatch) -> None:
         device.home(inputs["state"], rows0=rows0)
         _run(inputs)
     assert len(gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES) == 1
+    assert len(gdn_decode._CAKE_GDN_NONTRANSPOSE_HOMED_LAUNCHES) == 1
     assert [args[9] for _, args in device.calls] == [1, 2, 3, 4]
+
+
+def test_homed_allocation_is_bound_once(monkeypatch) -> None:
+    # The first call on a homed allocation binds it to its row's launch; later calls
+    # on it (the same homing record) query no SM table and resolve nothing.  A new
+    # allocation and a new whole launch of the row bind again; a binding to the whole
+    # launch (a part of an allocation) is kept too; a call that finds no SM table is
+    # not bound, so a later call with a table runs the twin.
+    device = _Device(monkeypatch)
+    binds = []
+    bind = gdn_decode._bind_cake_gdn_nontranspose_domain_launch
+
+    def spy(key, whole, state, homed):
+        binds.append(homed)
+        return bind(key, whole, state, homed)
+
+    monkeypatch.setattr(gdn_decode, "_bind_cake_gdn_nontranspose_domain_launch", spy)
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"])
+    _run(inputs)
+    queries = device.table_queries
+    for _ in range(3):
+        _run(inputs)
+    assert len(binds) == 1 and device.table_queries == queries
+    assert [name for name, _ in device.calls] == [_twin_name(_SCALE)] * 4
+    # A new allocation binds through the twin launch table: no new load.
+    device.home(inputs["state"])
+    _run(inputs)
+    _run(inputs)
+    assert len(binds) == 2 and device.loads.count(_twin_name(_SCALE)) == 1
+    # A new whole launch of the row (its table was cleared) binds again.
+    gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES.clear()
+    _run(inputs)
+    _run(inputs)
+    assert len(binds) == 3
+    assert [name for name, _ in device.calls[4:]] == [_twin_name(_SCALE)] * 4
+    # A prefix view of a larger allocation is bound to the whole launch.
+    device.calls.clear()
+    device.home(inputs["state"], nbytes=2 * 64 * _ROW_BYTES)
+    queries = device.table_queries
+    for _ in range(2):
+        _run(inputs)
+    assert len(binds) == 4 and device.table_queries == queries
+    assert [name for name, _ in device.calls] == [_whole_name(_SCALE)] * 2
+    # No SM table: the whole launch, unbound; then the twin once the table is there.
+    device.calls.clear()
+    device.home(inputs["state"])
+    device.table = None
+    _run(inputs)
+    device.table = device.make_table((106, 106))
+    _run(inputs)
+    _run(inputs)
+    assert len(binds) == 6
+    assert [name for name, _ in device.calls] == [_whole_name(_SCALE)] + [
+        _twin_name(_SCALE)
+    ] * 2
+    assert device.calls[-1][1][12] is device.table.entries
+
+
+def test_twin_counters_are_reused_per_stream_and_thread(monkeypatch) -> None:
+    # Eager twin launches take their stream's pair from launch_counters once and reuse
+    # it; another stream or another thread takes its own; each captured launch takes
+    # a pair from launch_counters, and the first eager launch after a capture goes
+    # through launch_counters again (it tops the capture reserve up).  The pairs kept
+    # per thread are dropped past STREAM_PAIR_LIMIT.
+    device = _Device(monkeypatch)
+    pairs: list[tuple] = []
+
+    def launch_counters(words, device_index=None):
+        device.counter_calls.append((words, device_index))
+        pairs.append((object(), object()))
+        return pairs[-1]
+
+    monkeypatch.setattr(cake_locality, "launch_counters", launch_counters)
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"])
+
+    def used():
+        _run(inputs)
+        name, args = device.calls[-1]
+        assert name == _twin_name(_SCALE)
+        return args[10:12]
+
+    first = used()
+    assert used() == first == pairs[0] and used() == first
+    device.stream = 9
+    second = used()
+    assert second == pairs[1] and used() == second
+    device.stream = 7
+    assert used() == first and len(pairs) == 2
+    theirs: list[tuple] = []
+    thread = threading.Thread(target=lambda: theirs.append(used()))
+    thread.start()
+    thread.join()
+    assert theirs == [pairs[2]]
+    assert used() == first and len(pairs) == 3
+    device.capturing = True
+    assert [used(), used()] == pairs[3:5]
+    device.capturing = False
+    after = used()
+    assert after == pairs[5] and used() == after and len(pairs) == 6
+    monkeypatch.setattr(cake_locality, "STREAM_PAIR_LIMIT", 2)
+    device.stream = 11
+    assert used() == pairs[6] and len(pairs) == 7
+    device.stream = 7
+    assert used() == pairs[7] and len(pairs) == 8
+    assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)] * 8
 
 
 # --------------------------------------------------------------------------- helper
