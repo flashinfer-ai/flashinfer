@@ -84,3 +84,20 @@ CP implementation. The existing ``chunk_gated_delta_rule`` API
 remains the only public entry point. Every TMA-backed stage passes its
 descriptor through CUDA's ``__grid_constant__`` kernel-argument ABI; the
 backend does not retain a process-lifetime descriptor arena.
+
+Batch-invariant mode
+--------------------
+
+``chunk_gated_delta_rule(..., batch_invariant=True)`` runs the batch-invariant
+class ``gdn.bf16.c64`` of :mod:`flashinfer.batch_invariant` for prefill, chunked
+prefill, decode and multi-token steps on an fp32 state pool: every output row is
+the native SM100 / SM103 / SM107 chunked prefill kernel's without context
+parallelism,
+so a token's decode output is bit for bit its prefill output whatever the batch.
+A call with one token per sequence is a decode step; it runs a step kernel that
+computes the prefill's row from rows cached since the last 64-token boundary,
+and costs more than the regular decode kernels. The contract (fp32 pool
+addressed by ``state_indices``, the call shapes and ``prefix_lens``, the
+supported arguments, CUDA graphs) is in ``flashinfer/batch_invariant/README.md``;
+``flashinfer.batch_invariant.fingerprint("chunk_gated_delta_rule")`` names the
+class.

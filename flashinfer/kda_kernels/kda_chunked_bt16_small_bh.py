@@ -2507,7 +2507,7 @@ class ChunkKdaFwdK2:
             else:
                 tSrS.fill(0.0)
 
-            for _ in cutlass.range(num_tiles, unroll=0):
+            for t_tile in cutlass.range(num_tiles, unroll=0):
                 tma_full = tma_consumer.wait_and_advance()
                 tma_O_empty = None
 
@@ -2668,8 +2668,22 @@ class ChunkKdaFwdK2:
 
                         if cutlass.const_expr(k == total_k // 2):
                             tPrV_tile = tPrV[None, None, None, ti]
-                            for i in cutlass.range_constexpr(cute.size(tPrV_tile)):
-                                tPrV_tile[i] -= tVrV[i].to(tPrV_tile.element_type)
+                            if cutlass.const_expr(mCuSeqlens is not None):
+                                tail_tokens = seq_len - t_tile * self.TT - ti * self.BT
+                                tVcV = thr_mma.partition_C(
+                                    cute.make_identity_tensor((self.BV, self.BT))
+                                )
+                                for i in cutlass.range_constexpr(cute.size(tPrV_tile)):
+                                    _, tok = tVcV[i]
+                                    if tok < tail_tokens:
+                                        tPrV_tile[i] -= tVrV[i].to(
+                                            tPrV_tile.element_type
+                                        )
+                                    else:
+                                        tPrV_tile[i] = tPrV_tile.element_type(0.0)
+                            else:
+                                for i in cutlass.range_constexpr(cute.size(tPrV_tile)):
+                                    tPrV_tile[i] -= tVrV[i].to(tPrV_tile.element_type)
                             cute.gemm(
                                 tiled_mma,
                                 tPrP,

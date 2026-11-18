@@ -66,7 +66,7 @@ import math
 import torch
 import tvm_ffi
 
-from ...utils import get_compute_capability, get_device_sm_count
+from ...utils import _get_stream_cache_buf, get_compute_capability, get_device_sm_count
 from .cake_jit import (
     ARG_PLANS,
     KERNELS,
@@ -2337,29 +2337,35 @@ def _flat_u8_scales(sf: torch.Tensor, name: str, rows: int, cols: int) -> torch.
     return sf.reshape(-1)
 
 
-_STREAM_K_WORKSPACE: dict[int, torch.Tensor] = {}
-_STREAM_K_FLAGS: dict[tuple[int, int], torch.Tensor] = {}
-
-
 def _stream_k_workspace(
     device: torch.device, floats: int, flags: int, slices: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-device FP32 partial workspace and per-(device, slice count) slot flags of the
-    stream-K tail, grown on demand (never shrunk) and shared by the device's stream-K
-    launches, which the stream orders.  The flags are free-running per-launch generations
-    (every word of a tail tile advances once per launch in which the tile exists, so all
-    words of a tile share one history for a fixed slice count); grown arrays restart from
-    zero.  No per-launch initialisation and nothing is reset."""
-    index = _device_index(device)
-    ws = _STREAM_K_WORKSPACE.get(index)
-    if ws is None or ws.numel() < max(floats, 1):
-        ws = torch.empty(max(floats, 1), dtype=torch.float32, device=device)
-        _STREAM_K_WORKSPACE[index] = ws
-    fl = _STREAM_K_FLAGS.get((index, slices))
-    if fl is None or fl.numel() < max(flags, 1):
-        fl = torch.zeros(max(flags, 1), dtype=torch.uint32, device=device)
-        _STREAM_K_FLAGS[(index, slices)] = fl
-    return ws, fl
+    """FP32 partial workspace and per-slice-count slot flags of the stream-K tail.
+
+    Eager launches take them from the current CUDA stream of ``device``
+    (:func:`_get_stream_cache_buf`), grown on demand (never shrunk): launches on one
+    stream are ordered, so its stream-K launches share them; launches on different
+    streams get their own.  The flags are free-running per-launch generations (every
+    word of a tail tile advances once per launch in which the tile exists, so all words
+    of a tile share one history for a fixed slice count); grown arrays restart from zero.
+    No per-launch initialisation and nothing is reset.
+
+    Under CUDA Graph capture each launch gets its own scratch from the graph's memory
+    pool, with the zero fill of its flags recorded in the same graph ahead of the GEMM.
+    Every replay therefore starts from zeroed flags, whatever other graphs or eager
+    launches ran before it, and graphs that do not share a memory pool may replay
+    concurrently.  The zero fill adds one small kernel to each captured stream-K launch."""
+    if torch.cuda.is_current_stream_capturing():
+        return (
+            torch.empty(max(floats, 1), dtype=torch.float32, device=device),
+            torch.zeros(max(flags, 1), dtype=torch.uint32, device=device),
+        )
+    device = torch.device("cuda", _device_index(device))
+    ws = _get_stream_cache_buf("cake_nvfp4_sk_partials", 4 * max(floats, 1), device)
+    fl = _get_stream_cache_buf(
+        f"cake_nvfp4_sk_flags_{slices}", 4 * max(flags, 1), device, zero_init=True
+    )
+    return ws.view(torch.float32), fl.view(torch.uint32)
 
 
 def prepare_mm_fp4_per_token(
@@ -2380,7 +2386,12 @@ def prepare_mm_fp4_per_token(
     ``alpha [M]`` the FP32 per-token scale and ``out [M, N]`` a contiguous bf16 /
     fp16 tensor.  ``tactic`` overrides :func:`default_tactic`; without it the GEMM runs the
     program of :func:`gemm_alone_tactic` on the cells of :data:`GEMM_ALONE_EP_RULES`.  The
-    JIT module is built and loaded here, so prepare outside CUDA Graph capture."""
+    JIT module is built and loaded here, so prepare outside CUDA Graph capture.  A
+    stream-K binding holds the stream-K scratch of the stream current at prepare time
+    (:func:`_stream_k_workspace`), shared with the other stream-K bindings and eager
+    launches prepared on that stream: their launches must not run concurrently.  The
+    first prepare on a stream enqueues the zero fill of its flags there, so a launch on
+    another stream must first wait for the prepare stream (``wait_stream``)."""
     if a_fp4.dim() != 2 or a_fp4.dtype != torch.uint8 or not a_fp4.is_contiguous():
         raise ValueError("a_fp4 must be a contiguous uint8 [M, K/2] tensor")
     if b_fp4.dim() != 2 or b_fp4.dtype != torch.uint8 or not b_fp4.is_contiguous():

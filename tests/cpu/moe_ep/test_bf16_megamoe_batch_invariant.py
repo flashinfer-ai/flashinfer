@@ -28,7 +28,7 @@ from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
     MegaMoEBf16Frontend,
 )
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [pytest.mark.cpu_only, pytest.mark.usefixtures("host_only_cuda")]
 
 
 def _config(**overrides):
@@ -337,7 +337,7 @@ def test_cache_separates_sm107_math_even_with_identical_device_names(
     ],
 )
 def test_low_level_config_rejects_unvalidated_mode(field, value):
-    with pytest.raises(ValueError, match="batch_invariant"):
+    with pytest.raises(ValueError, match=field):
         _config(**{field: value})
 
 

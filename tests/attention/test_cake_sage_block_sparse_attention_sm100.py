@@ -504,6 +504,215 @@ def test_cake_sage_sm100_cuda_graph_replay_matches_eager():
 
 
 @requires_sm100
+@pytest.mark.parametrize(
+    ("sel", "wide"),
+    [(12, False), (24, False), (32, False), (6, True), (16, True), (23, True)],
+)
+def test_routed_attention_builds_write_the_default_bits(sel, wide, monkeypatch):
+    """The builds a call routes to (split QK from 10 blocks a row on SM100, double S from
+    24 on both, and the p3 build in its band of blocks a row once every CTA runs at
+    least two tiles) write the default build's bits, with and without PDL, uniform and
+    with per-row counts.  A call that takes the tail split (a partial last wave, from the
+    architecture's ``_TAIL_SPLIT`` threshold) sums its split tiles in another order: it
+    holds the kernel's tolerances against the default build instead, the same bits on
+    every call."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability())
+    sms = loader.sm_count(index)
+    q_blocks = _ceil_div(640, _BLOCK)
+    # A wide case has twice as many tiles as SMs at least: the p3 band's rows.
+    heads = 2 * _ceil_div(sms, q_blocks) if wide else 4
+    tiles = heads * q_blocks
+    for per_row in (False, True):
+        c = _make_case(
+            (
+                f"route_{sel}_{wide}_{per_row}",
+                1,
+                heads,
+                2,
+                640,
+                4096,
+                sel,
+                per_row,
+                per_row,
+                3,
+                33,
+                True,
+                1.0,
+            ),
+            device,
+        )
+        role = pkg._attention_role(arch, sel)
+        assert role == (
+            "attention_sd"
+            if sel >= 24
+            else ("attention_qs" if arch == "sm_100a" and sel >= 10 else "attention")
+        )
+        split = role == "attention_sd" and (
+            pkg._tail_split(arch, tiles, sel, index) is not None
+        )
+        # The p3 band: 6 to 23 blocks a row on SM100, 16 to 23 on SM103.
+        p3 = wide and {"sm_100a": 6, "sm_103a": 16}[arch] <= sel <= 23
+        assert tiles >= 2 * sms if wide else tiles < 2 * sms
+        if p3:
+            role = "attention_p3"
+        elif split:
+            role = "attention_sd_tsplit"
+        for pdl in (False, True):
+            record = pkg._route(arch, sel, tiles, index, pdl)[0]
+            assert record == (f"{role}_pdl" if pdl else role), record
+        names = cuda_kernel_names(lambda: _run(c, enable_pdl=False))
+        assert names == [loader.MODULES[role]["kernel_symbol"]], names
+        routed = [_run(c, enable_pdl=pdl) for pdl in (False, True)]
+        with monkeypatch.context() as m:
+            m.setattr(pkg, "_ATTENTION_ROUTES", {})
+            m.setattr(pkg, "_P3_BANDS", {})
+            m.setattr(pkg, "_ROUTES", {})
+            names = cuda_kernel_names(lambda: _run(c, enable_pdl=False))
+            assert names == [loader.MODULES["attention"]["kernel_symbol"]], names
+            out, lse = _run(c, enable_pdl=False)
+        torch.cuda.synchronize()
+        for o, l in routed:
+            if not split:
+                assert torch.equal(o, out) and torch.equal(l, lse)
+                continue
+            assert torch.equal(o, routed[0][0]) and torch.equal(l, routed[0][1])
+            error = (o.float() - out.float()).abs()
+            assert bool((error <= 1e-2 + 1e-2 * out.float().abs()).all()), error.max()
+            finite = torch.isfinite(lse)
+            assert torch.equal(torch.isfinite(l), finite)
+            torch.testing.assert_close(l[finite], lse[finite], atol=1e-2, rtol=0)
+
+
+@requires_sm100
+def test_tail_split_rows_are_deterministic_and_close_to_the_default_build(monkeypatch):
+    """A row with at least ``_TAIL_SPLIT``'s blocks whose last wave of tiles is partial
+    runs the tail-split build: one kernel, the same bits on every call and in a CUDA
+    graph, and within the kernel's tolerance of the unsplit build, whose bits are the
+    default build's."""
+    device = torch.device("cuda")
+    sel = max(40, *pkg._TAIL_SPLIT.values())
+    c = _make_case(
+        ("tail_split_b1_h8", 1, 8, 8, 4096, 4096, sel, True, True, 0, None, True, 1.0),
+        device,
+    )
+    index = torch.cuda.current_device()
+    tiles = 8 * _ceil_div(4096, _BLOCK)
+    arch = loader.device_arch(index)
+    plan = pkg._tail_split(arch, tiles, int(c["index"].shape[-1]), index)
+    if plan is None:
+        pytest.skip(f"{tiles} tiles leave no tail to split on this device")
+    names = cuda_kernel_names(lambda: _run(c, enable_pdl=False))
+    assert names == [loader.MODULES["attention_sd_tsplit"]["kernel_symbol"]], names
+    runs = [_run(c, enable_pdl=pdl) for pdl in (False, True, False)]
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    out_graph = torch.empty_like(runs[0][0])
+    lse_graph = torch.empty_like(runs[0][1])
+    with torch.cuda.stream(stream):
+        _run(c, out=out_graph, lse=lse_graph)
+        stream.synchronize()
+        with torch.cuda.graph(graph, stream=stream):
+            _run(c, out=out_graph, lse=lse_graph)
+    out_graph.zero_()
+    graph.replay()
+    with monkeypatch.context() as m:
+        m.setattr(pkg, "_TAIL_SPLIT", {})
+        m.setattr(pkg, "_ROUTES", {})
+        unsplit, unsplit_lse = _run(c, enable_pdl=False)
+        m.setattr(pkg, "_ATTENTION_ROUTES", {})
+        m.setattr(pkg, "_ROUTES", {})
+        default, default_lse = _run(c, enable_pdl=False)
+    torch.cuda.synchronize()
+    out, lse = runs[0]
+    for o, l in [*runs[1:], (out_graph, lse_graph)]:
+        assert torch.equal(o, out) and torch.equal(l, lse)
+    assert torch.equal(unsplit, default) and torch.equal(unsplit_lse, default_lse)
+    error = (out.float() - default.float()).abs()
+    assert bool((error <= 1e-2 + 1e-2 * default.float().abs()).all()), (
+        error.max().item()
+    )
+    finite = torch.isfinite(default_lse)
+    assert torch.equal(torch.isinf(lse), ~finite)
+    torch.testing.assert_close(lse[finite], default_lse[finite], atol=1e-2, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    ("sel", "wide"),
+    [
+        (6, False),
+        (12, False),
+        (24, False),
+        (40, False),
+        (6, True),
+        (16, True),
+        (23, True),
+    ],
+)
+def test_attention_builds_write_the_same_bits_to_a_16_byte_aligned_out(
+    sel, wide, monkeypatch
+):
+    """``out`` may start on any 16-byte boundary: a contiguous view eight BF16 elements
+    into a buffer (16 bytes past a 32-byte boundary) gets the bits of a fresh, 32-byte
+    aligned ``out`` from every build a call routes to (default, split QK, double S, its
+    tail split, p3), with and without PDL, and from the default build; nothing outside
+    the view is written."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability())
+    sms = loader.sm_count(index)
+    sq = 640
+    q_blocks = _ceil_div(sq, _BLOCK)
+    heads = 2 * _ceil_div(sms, q_blocks) if wide else 4
+    c = _make_case(
+        (
+            f"out16_{sel}_{wide}",
+            1,
+            heads,
+            2,
+            sq,
+            4096,
+            sel,
+            True,
+            True,
+            3,
+            33,
+            True,
+            1.0,
+        ),
+        device,
+    )
+    shape = (1, sq, heads, _HEAD_DIM)
+    numel = math.prod(shape)
+    records = []
+    for routed in (True, False):
+        with monkeypatch.context() as m:
+            if not routed:
+                m.setattr(pkg, "_ATTENTION_ROUTES", {})
+                m.setattr(pkg, "_P3_BANDS", {})
+            m.setattr(pkg, "_ROUTES", {})
+            for pdl in (False, True):
+                records.append(pkg._route(arch, sel, heads * q_blocks, index, pdl)[0])
+                ref, ref_lse = _run(c, enable_pdl=pdl)
+                assert ref.data_ptr() % 32 == 0
+                buf = torch.full(
+                    (numel + 16,), float("nan"), dtype=torch.bfloat16, device=device
+                )
+                out = buf[8 : 8 + numel].view(shape)
+                assert out.data_ptr() % 32 == 16
+                o, lse = _run(c, enable_pdl=pdl, out=out)
+                torch.cuda.synchronize()
+                assert o.data_ptr() == out.data_ptr()
+                assert torch.equal(o, ref) and torch.equal(lse, ref_lse), records[-1]
+                assert bool(buf[:8].isnan().all()) and bool(
+                    buf[8 + numel :].isnan().all()
+                )
+    assert records[2:] == ["attention", "attention_pdl"], records
+
+
+@requires_sm100
 def test_run_module_matches_the_host_api():
     """The generic ``run_module`` (logical names through the record's ``arg_plan``)
     launches what the host API binds positionally: the same bits."""
@@ -890,7 +1099,8 @@ def test_registry_records_reference_the_build_manifest() -> None:
     )
     assert all(loader.MODULES[name]["arches"] == ["sm_120a"] for name in sm120)
     # The default attention build (and its PDL build) ships on both architectures; the
-    # second build of each architecture (split QK on SM100, per tile on SM103) on its own.
+    # second build of each architecture (split QK on SM100, per tile on SM103) on its own;
+    # the double-S build, its tail-split build and the p3 build on both.
     assert {
         name: loader.MODULES[name]["arches"]
         for name in loader.records_of_role("attention")
@@ -901,4 +1111,15 @@ def test_registry_records_reference_the_build_manifest() -> None:
         "attention_qs_pdl": ["sm_100a"],
         "attention_per_tile": ["sm_103a"],
         "attention_per_tile_pdl": ["sm_103a"],
+        "attention_sd": ["sm_100a", "sm_103a"],
+        "attention_sd_pdl": ["sm_100a", "sm_103a"],
+        "attention_sd_tsplit": ["sm_100a", "sm_103a"],
+        "attention_sd_tsplit_pdl": ["sm_100a", "sm_103a"],
+        "attention_p3": ["sm_100a", "sm_103a"],
+        "attention_p3_pdl": ["sm_100a", "sm_103a"],
     }
+    assert all(
+        loader.MODULES[name]["launch"]["cluster"] == (2, 1, 1)
+        and loader.MODULES[name]["grid_rule"] == {"kind": "tail_split_clusters"}
+        for name in ("attention_sd_tsplit", "attention_sd_tsplit_pdl")
+    )

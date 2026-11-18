@@ -138,12 +138,11 @@ void checkEx(T ptr, std::initializer_list<T> const& validReturns, char const* co
 inline std::optional<bool> isCudaLaunchBlocking() {
   thread_local bool firstCall = true;
   thread_local std::optional<bool> result = std::nullopt;
-  if (!firstCall) {
+  if (firstCall) {
+    // Unset leaves result disengaged so doCheckError keeps its debug-build default.
     char const* env = std::getenv("CUDA_LAUNCH_BLOCKING");
-    if (env != nullptr && std::string(env) == "1") {
-      result = true;
-    } else {
-      result = false;
+    if (env != nullptr) {
+      result = std::string(env) == "1";
     }
     firstCall = false;
   }
