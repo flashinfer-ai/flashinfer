@@ -87,12 +87,12 @@ C_MIN: dict[int, int] = {4: 8, 8: 8, 16: 16, 32: 16}
 #: A call whose longest possible sequence has at most this many tokens runs
 #: the unsplit kernel: on SM103 two segments do not beat it there.
 SPLIT_MIN_TOKENS = 1024
-#: The pass-2 program of each value-head count (its compose slice width).
-_PASS2: dict[int, Any] = {
-    4: _programs.PASS2_W4,
-    8: _programs.PASS2_W8,
-    16: _programs.PASS2_W16,
-    32: _programs.PASS2_W16,
+#: The pass-2 program name of each value-head count (its compose slice width).
+_PASS2_NAMES: dict[int, str] = {
+    4: "PASS2_W4",
+    8: "PASS2_W8",
+    16: "PASS2_W16",
+    32: "PASS2_W16",
 }
 _SLICE_WIDTH: dict[int, int] = {4: 4, 8: 8, 16: 16, 32: 16}
 _EAGER_LIMIT = 8
@@ -233,6 +233,12 @@ def pass2_grid(
     return min(bound, compose + max(2 * sm_count - compose, 32))
 
 
+def _pass2_program(num_heads: int) -> Any:
+    """The pass-2 program of a value-head count."""
+
+    return getattr(_programs, _PASS2_NAMES[num_heads])
+
+
 def _check_args(program: Any, expected: tuple[str, ...]) -> None:
     if tuple(program.args) != expected:
         raise RuntimeError(
@@ -286,7 +292,7 @@ class _Entry:
         self.p_cap, self.c_min = p_cap, c_min
         self.tiles1, self.grid1 = pass1_grid(n, h, p_cap, sm_count)
         self.run_pass2 = p_cap >= 2
-        pass2 = _PASS2[h] if self.run_pass2 else None
+        pass2 = _pass2_program(h) if self.run_pass2 else None
         self.grid2 = (
             pass2_grid(n, h, t, p_cap, _SLICE_WIDTH[h], sm_count)
             if self.run_pass2
@@ -408,7 +414,8 @@ class _Entry:
 
 
 _EAGER: "collections.OrderedDict[tuple[Any, ...], _Entry]" = collections.OrderedDict()
-_PINNED: list[_Entry] = []
+#: The entries captured graphs own, by capture id and plan key.
+_PINNED: dict[tuple[int, tuple[Any, ...]], _Entry] = {}
 
 
 def clear_affine_split_plans() -> None:
@@ -419,18 +426,43 @@ def clear_affine_split_plans() -> None:
     _PINNED.clear()
 
 
-def _entry_for(key: tuple[Any, ...], make: Any) -> _Entry:
-    capturing = torch.cuda.is_current_stream_capturing()
-    entry = _EAGER.get(key)
-    if capturing:
+def _capture_id(stream: int) -> int:
+    """CUDA's id of the capture the raw stream ``stream`` takes part in, 0
+    when it is not capturing. Two captures are distinct even on one stream."""
+
+    from cuda.bindings import runtime as cudart
+
+    info = cudart.cudaStreamGetCaptureInfo(stream)
+    if info[0] != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(f"cudaStreamGetCaptureInfo failed: {info[0]!r}")
+    if info[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+        return 0
+    return int(info[2])
+
+
+def _entry_for(key: tuple[Any, ...], stream: int, make: Any) -> _Entry:
+    """The plan entry of ``key`` on the raw stream ``stream``.
+
+    A capture takes the warmed eager entry and owns it for the life of the
+    process; a later call of the same key in the same capture reuses it.
+    The key holds the stream, so those calls are stream-ordered, as repeated
+    eager calls are."""
+
+    capture = _capture_id(stream)
+    if capture:
+        pinned = _PINNED.get((capture, key))
+        if pinned is not None:
+            return pinned
+        entry = _EAGER.get(key)
         if entry is None or not entry.warm:
             raise RuntimeError(
-                "affine-split plan must be warmed before CUDA graph capture"
+                "affine-split plan must be warmed before CUDA graph capture: "
+                "run the same call once eagerly on this stream first"
             )
-        # The captured graph owns the entry for the life of the process.
         del _EAGER[key]
-        _PINNED.append(entry)
+        _PINNED[(capture, key)] = entry
         return entry
+    entry = _EAGER.get(key)
     if entry is not None:
         _EAGER.move_to_end(key)
         return entry
@@ -503,7 +535,7 @@ def chunk_gated_delta_rule_gdn_affine_split_sm100(
             cu_int64=cu_seqlens.dtype == torch.int64,
         )
 
-    entry = _entry_for(key, make)
+    entry = _entry_for(key, int(stream), make)
     entry.launch(
         q=q,
         k=k,

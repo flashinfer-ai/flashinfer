@@ -834,14 +834,15 @@ def _cake_gdn_affine_split_scope(
     output_final_state: bool,
     cu_seqlens: torch.Tensor,
     use_qk_l2norm_in_kernel: bool,
-    output: torch.Tensor,
+    output: Optional[torch.Tensor],
     output_state: Optional[torch.Tensor],
     device_capability: tuple[int, int],
     cuda_major: int,
 ) -> Optional[str]:
     """Why ``use_affine_split=True`` cannot serve the call, or ``None``.
 
-    Host metadata only: no device read, no allocation, no launch."""
+    Host metadata only: no device read, no allocation, no launch. An
+    ``output`` of ``None`` is the one the entry allocates, which fits."""
 
     capability = (int(device_capability[0]), int(device_capability[1]))
     if capability != (10, 3):
@@ -852,7 +853,7 @@ def _cake_gdn_affine_split_scope(
         )
         return f"{arch} is not supported (sm_103a only)"
     device = q.device
-    io = (q, k, v, output)
+    io = (q, k, v) if output is None else (q, k, v, output)
     total = int(q.shape[0]) if q.ndim == 3 else -1
     if (
         device.type != "cuda"
@@ -871,7 +872,7 @@ def _cake_gdn_affine_split_scope(
         num_v_heads not in _CAKE_GDN_AFFINE_SPLIT_HEADS
         or num_k_heads != num_q_heads
         or num_v_heads % num_q_heads != 0
-        or int(output.shape[1]) != num_v_heads
+        or (output is not None and int(output.shape[1]) != num_v_heads)
     ):
         return "requires Hv in (4, 8, 16, 32), Hk == Hq and Hv % Hq == 0"
     if int(cu_seqlens.numel()) != 2:
@@ -959,6 +960,11 @@ def _run_cake_gdn_affine_split(
     )
     if reason is not None:
         raise ValueError(f"use_affine_split=True: {reason}")
+    if cu_seqlens_cpu is not None:
+        # Validated on every route, the split one included, before a launch.
+        _cake_gdn_prefill_host_offsets(
+            cu_seqlens_cpu, num_seqs=1, total_tokens=int(q.shape[0])
+        )
     from .gdn_kernels.blackwell import cake_gdn_affine_split as _affine_split
 
     if use_qk_l2norm_in_kernel:
@@ -1841,7 +1847,13 @@ def chunk_gated_delta_rule(
         are rejected with ``ValueError``. The call owns workspaces (about
         ``1 KiB * total_seq_len * num_v_heads`` plus ``64 KiB`` per head and
         segment); it is CUDA-graph capturable after one eager call with the
-        same shapes on the capturing stream.
+        same shapes on the capturing stream, and one capture may repeat the
+        call.
+    _affine_split_count : int, optional
+        Internal segment-cap override of ``use_affine_split=True``, used for
+        testing. ``None`` lets the route choose the cap; an explicit positive
+        value caps the split at that many segments (at most one wave of the
+        device), one chunk per segment at least, even at 1024 tokens or fewer.
 
     Returns
     -------
@@ -2129,6 +2141,27 @@ def chunk_gated_delta_rule(
             return cudnn_chunk_gated_delta_rule(q, k, v, g, beta, scale, **options)
 
     if gate_domain != "linear" or use_gate_in_kernel or beta_is_logit:
+        if use_affine_split:
+            # Reject an unsupported call before the gate materialization
+            # launches; the route checks the materialized g/beta again.
+            _cuda_parts = torch.version.cuda.split(".") if torch.version.cuda else []
+            reason = _cake_gdn_affine_split_scope(
+                q=q,
+                k=k,
+                v=v,
+                g=None,
+                beta=None,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                output=output,
+                output_state=output_state,
+                device_capability=get_compute_capability(q.device),
+                cuda_major=int(_cuda_parts[0]) if _cuda_parts else 0,
+            )
+            if reason is not None:
+                raise ValueError(f"use_affine_split=True: {reason}")
         from .gdn_kernels.gates import materialize_gates
 
         g, beta = materialize_gates(

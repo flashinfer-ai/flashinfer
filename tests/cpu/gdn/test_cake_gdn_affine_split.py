@@ -304,7 +304,9 @@ def test_program_table_matches_the_sources_and_the_host():
         assert tuple(program.args) == split._PASS2_ARGS
         assert program.block == (256, 1, 1)
     assert programs.PASS1.block == (384, 1, 1)
-    assert {split._PASS2[h] for h in (4, 8, 16, 32)} == set(programs.PROGRAMS[1:])
+    assert {split._pass2_program(h) for h in (4, 8, 16, 32)} == set(
+        programs.PROGRAMS[1:]
+    )
     for program in programs.PROGRAMS:
         assert isinstance(program, CakeProgram)
         assert program.targets == ("sm_103a",)

@@ -162,7 +162,7 @@ def _p_bound(hv, t, split_count=None):
 
 def _zero_words():
     split = _split_module()
-    entries = list(split._EAGER.values()) + list(split._PINNED)
+    entries = list(split._EAGER.values()) + list(split._PINNED.values())
     return all(
         int(e.flags.count_nonzero()) == 0 and int(e.ticket.count_nonzero()) == 0
         for e in entries
@@ -509,6 +509,53 @@ def test_two_streams_concurrently_in_eager():
     split.clear_affine_split_plans()
 
 
+def test_one_capture_repeats_a_call_of_one_plan():
+    """Two same-shape calls in one capture (two layers) share the capture's
+    entry; a second capture of the same shapes owns another one."""
+
+    split = _split_module()
+    split.clear_affine_split_plans()
+    t, hv = 4096, 8
+    layers = [_problem(4, hv, t, "real", seed=s) for s in (1, 2)]
+    cu = torch.tensor([0, t], dtype=torch.int32, device="cuda")
+    outs = [torch.empty(t, hv, D, dtype=torch.bfloat16, device="cuda") for _ in layers]
+    states = [
+        torch.empty(1, hv, D, D, dtype=torch.float32, device="cuda") for _ in layers
+    ]
+
+    def run_layers():
+        for pr, o, st in zip(layers, outs, states, strict=True):
+            _call(pr, cu=cu, output=o, output_state=st, use_affine_split=True)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run_layers()
+    stream.synchronize()
+    graphs = []
+    for _ in range(2):
+        with torch.cuda.stream(stream):
+            _call(layers[0], cu=cu, use_affine_split=True)  # warm a fresh entry
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run_layers()
+        graphs.append(graph)
+        assert len(split._PINNED) == len(graphs) and not split._EAGER
+    for graph in graphs:
+        for o, st in zip(outs, states, strict=True):
+            o.fill_(float("nan"))
+            st.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert _zero_words()
+        for pr, o, st in zip(layers, outs, states, strict=True):
+            o_eager, s_eager = _call(pr, use_affine_split=True)
+            assert torch.equal(o.view(torch.int16), o_eager.view(torch.int16))
+            assert torch.equal(st.view(torch.int32), s_eager.view(torch.int32))
+    split.clear_affine_split_plans()
+
+
 # --- rejections on the device -------------------------------------------------
 
 
@@ -583,3 +630,55 @@ def test_out_of_scope_calls_raise_before_any_launch(change, reason):
         )
     torch.cuda.synchronize()
     assert torch.isnan(output).all()
+
+
+@pytest.mark.parametrize(
+    "cu_cpu,match",
+    [
+        ([0, 1], "spanning all input tokens"),
+        ([0, 2048, 4096], "cu_seqlens_cpu must have num_seqs \\+ 1 = 2 entries"),
+    ],
+)
+def test_host_offsets_are_checked_on_the_split_route(cu_cpu, match):
+    pr = _problem(4, 8, 4096, "real")
+    assert _p_bound(8, 4096) > 1
+    output = torch.full((4096, 8, D), float("nan"), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(NotImplementedError, match=match):
+        _call(pr, output=output, cu_seqlens_cpu=cu_cpu, use_affine_split=True)
+    torch.cuda.synchronize()
+    assert torch.isnan(output).all()
+    o_cpu, s_cpu = _call(pr, cu_seqlens_cpu=[0, 4096], use_affine_split=True)
+    o_cpu, s_cpu = o_cpu.clone(), s_cpu.clone()
+    o_dev, s_dev = _call(pr, use_affine_split=True)
+    assert torch.equal(o_cpu, o_dev) and torch.equal(s_cpu, s_dev)
+
+
+def test_scope_is_checked_before_the_gates_are_materialized():
+    """A log-domain gate is materialized by a launch; an out-of-scope state
+    must be rejected before it."""
+
+    pr = _problem(4, 8, 2048, "real")
+    log_g = torch.log(pr["g"].clamp_min(1e-30))
+    h0 = torch.zeros(1, 8, D, D, dtype=torch.bfloat16, device="cuda")
+
+    def bad_call():
+        with pytest.raises(
+            ValueError,
+            match=r"use_affine_split=True: requires FP32 states with contiguous",
+        ):
+            chunk_gated_delta_rule(
+                pr["q"],
+                pr["k"],
+                pr["v"],
+                g=log_g,
+                beta=pr["beta"],
+                scale=SCALE,
+                initial_state=h0,
+                output_final_state=True,
+                cu_seqlens=torch.tensor([0, 2048], dtype=torch.int32, device="cuda"),
+                backend="cake_gdn",
+                gate_domain="log",
+                use_affine_split=True,
+            )
+
+    assert _kernel_names(bad_call) == []
