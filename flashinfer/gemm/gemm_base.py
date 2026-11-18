@@ -11321,6 +11321,13 @@ def gemm_fp8_nt_groupwise(
     -----
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
+    # Validate 128-alignment for N dimension (scale granularity requirement)
+    n = b.shape[0]
+    if n % 128 != 0:
+        raise ValueError(
+            f"N must be a multiple of 128 for scale granularity (1, 128, 128), got N={n}"
+        )
+
     if batch_invariant:
         from .batch_invariant.tuning import gemm_fp8_nt_groupwise_batch_invariant_auto
 
@@ -11695,6 +11702,18 @@ def gemm_fp8_nt_blockscaled(
     torch.Tensor
         Output tensor of shape ``(M, N)`` with dtype ``out_dtype``.
     """
+    # Validate 128-alignment for M and N dimensions (scale granularity requirement)
+    m = a.shape[0]
+    n = b.shape[0]
+    if m % 128 != 0:
+        raise ValueError(
+            f"M must be a multiple of 128 for block-scaled granularity (128, 128, 128), got M={m}"
+        )
+    if n % 128 != 0:
+        raise ValueError(
+            f"N must be a multiple of 128 for block-scaled granularity (128, 128, 128), got N={n}"
+        )
+
     return gemm_fp8_nt_groupwise(
         a,
         b,
