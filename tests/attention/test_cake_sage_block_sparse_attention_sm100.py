@@ -512,7 +512,8 @@ def test_cake_sage_sm100_cuda_graph_replay_matches_eager():
 
 
 #: The build of each unsplit case of the routed-bits test: (sel, wide) -> {arch: role}.
-#: A narrow case has fewer tiles than half the SMs, a wide one two to five times as many.
+#: A narrow case has fewer tiles than half the SMs, a wide one two to two and a half
+#: times as many.
 _UNSPLIT_ROLES = {
     (5, False): {"sm_100a": "attention", "sm_103a": "attention_sdp3"},
     (6, False): {"sm_100a": "attention_sdp3", "sm_103a": "attention_sdp3"},
@@ -540,11 +541,14 @@ def test_routed_attention_builds_write_the_default_bits(sel, wide, monkeypatch):
     arch = loader.arch_for_capability(torch.cuda.get_device_capability())
     sms = loader.sm_count(index)
     q_blocks = _ceil_div(640, _BLOCK)
-    # A wide case has twice as many tiles as SMs at least: the p3 band's rows.  A narrow
-    # case has fewer tiles than half the SMs (the SM103 windows of 5 and 6 blocks a row),
-    # also on a device with fewer SMs; its head count stays even for the two KV heads.
+    # A wide case has two to two and a half tiles per SM: the p3 band's rows, below the
+    # SM103 window of 6 blocks a row from 2.5 tiles per SM.  A narrow case has fewer
+    # tiles than half the SMs (the SM103 windows of 5 and 6 blocks a row).  Both hold on
+    # a device with fewer SMs, or skip; the head count stays even for the two KV heads.
     if wide:
         heads = 2 * _ceil_div(sms, q_blocks)
+        if 2 * heads * q_blocks >= 5 * sms:
+            pytest.skip(f"{sms} SMs leave no wide case below 2.5 tiles per SM")
     else:
         heads = next((h for h in (4, 2) if 2 * h * q_blocks < sms), 0)
         if not heads:
@@ -569,7 +573,7 @@ def test_routed_attention_builds_write_the_default_bits(sel, wide, monkeypatch):
             ),
             device,
         )
-        assert 2 * sms <= tiles < 5 * sms if wide else 2 * tiles < sms
+        assert 2 * sms <= tiles and 2 * tiles < 5 * sms if wide else 2 * tiles < sms
         # On SM103 a tail split (from 24 blocks a row) takes the p3 one once the grid
         # holds a tile per SM, else splits without p3 from 32 blocks a row; SM100
         # splits without p3 from 24 blocks a row.
