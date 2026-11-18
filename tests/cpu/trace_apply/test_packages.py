@@ -313,6 +313,7 @@ def test_sealed_files_and_directories_must_not_be_symbolic_links(tmp_path, name)
         pk.verify_package(tmp_path, digest)
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo (POSIX)")
 @pytest.mark.parametrize("name", ["unsealed-sidecar", "bundle/unsealed-file"])
 def test_root_and_bundle_special_file_safety_checks_remain(tmp_path, name):
     """A special file (a FIFO) in the package root or bundle refuses."""

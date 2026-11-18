@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import platform
+
 from . import env as jit_env
 from .core import gen_jit_spec
 
@@ -28,4 +30,5 @@ def gen_spdlog_module():
             jit_env.SPDLOG_INCLUDE_DIR,
             jit_env.FLASHINFER_INCLUDE_DIR,
         ],
+        extra_cflags=["/EHsc"] if platform.system() == "Windows" else [],
     )

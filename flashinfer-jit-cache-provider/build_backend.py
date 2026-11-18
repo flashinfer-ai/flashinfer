@@ -75,13 +75,19 @@ def _ensure_build_inputs() -> None:
 
 
 def _write_provider_manifest(jit_cache_dir: Path) -> None:
+    # The library the loader opens: module.dll on Windows, <name>.so elsewhere.
+    from flashinfer.jit import env as jit_env
+
     modules = sorted(
         module_dir.name
         for module_dir in jit_cache_dir.iterdir()
-        if module_dir.is_dir() and (module_dir / f"{module_dir.name}.so").is_file()
+        if module_dir.is_dir()
+        and (module_dir / jit_env.jit_library_name(module_dir.name)).is_file()
     )
     if not modules:
-        raise RuntimeError("No .so files were generated for the jit-cache provider")
+        raise RuntimeError(
+            "No module libraries were generated for the jit-cache provider"
+        )
 
     manifest = {
         "schema_version": 1,

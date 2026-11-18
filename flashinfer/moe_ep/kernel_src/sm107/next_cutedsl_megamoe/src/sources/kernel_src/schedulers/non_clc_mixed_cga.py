@@ -136,14 +136,33 @@ class NonClcMixedCgaSchedulerWorker:
     fallback_registration_counter_region = "non_clc_mixed_cga.fallback_registration_counter"
     fallback_group_token_region = "non_clc_mixed_cga.fallback_group_tokens"
 
-    def __init__(self, *, config: NonClcMixedCgaConfig, work_id_mode: WorkIdAcquisitionMode, stream_count: int) -> None:
+    def __init__(
+        self,
+        *,
+        config: NonClcMixedCgaConfig,
+        work_id_mode: WorkIdAcquisitionMode,
+        stream_count: int,
+        work_id_stride: Optional[int] = None,
+    ) -> None:
         if work_id_mode not in ("grid_stride", "atomic_counter"):
             raise ValueError("Non-CLC mixed-CGA scheduling supports grid_stride or atomic_counter work IDs.")
         if isinstance(stream_count, bool) or not isinstance(stream_count, int) or stream_count <= 0:
             raise ValueError("stream_count must be a positive Python int.")
+        if work_id_stride is None:
+            work_id_stride = config.launch_cluster_cnt_merge_as_preferred
+        if isinstance(work_id_stride, bool) or not isinstance(work_id_stride, int) or work_id_stride <= 0:
+            raise ValueError("work_id_stride must be a positive Python int.")
         self.config = config
         self.work_id_mode = work_id_mode
         self.stream_count = stream_count
+        # The work stream can have fewer participants than the physical launch
+        # when some clusters only communicate. Atomic claims do not use this.
+        self.work_id_stride = work_id_stride
+
+    @property
+    def max_fallback_cluster_count(self) -> int:
+        """Upper bound on physical fallback clusters: every preferred-cluster slot of the launch split."""
+        return self.config.launch_cluster_cnt_merge_as_preferred * self.config.split_factor
 
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Register the cluster-local claim broadcast channel."""
@@ -169,10 +188,12 @@ class NonClcMixedCgaSchedulerWorker:
                     buffer_space="local",
                     reset="tail_reset",
                 )
+                # Under PDL more slots can split into fallback clusters than the host plan assumed: size the group
+                # table for every slot splitting.
                 device_workspace.register(
                     self.fallback_group_token_region,
                     cutlass.Int64,
-                    (self.config.fallback_cluster_count,),
+                    (self.max_fallback_cluster_count,),
                     buffer_space="local",
                     reset="tail_reset",
                 )
@@ -248,7 +269,7 @@ class NonClcMixedCgaSchedulerWorker:
                     registration_counter_pointer=device_workspace.ptr(self.fallback_registration_counter_region),
                     group_token_pointer=device_workspace.ptr(self.fallback_group_token_region),
                     split_factor=self.config.split_factor,
-                    fallback_cluster_count=self.config.fallback_cluster_count,
+                    fallback_cluster_count=self.max_fallback_cluster_count,
                     is_fallback_cluster=is_fallback_cluster,
                     fallback_group_idx=Int32(0),
                     in_group_idx=Int32(0),
@@ -261,7 +282,7 @@ class NonClcMixedCgaSchedulerWorker:
         else:
             self._work_id_state = GridStrideWorkIdState(
                 next_work_id=Int32(block_idx[2]),
-                work_id_stride=Int32(self.config.launch_cluster_cnt_merge_as_preferred),
+                work_id_stride=Int32(self.work_id_stride),
             )
         self.claimed_stream_index = Int32(0)
 
@@ -288,6 +309,33 @@ class NonClcMixedCgaSchedulerWorker:
             cta_coord_in_active_cluster[1] + inner_cluster_n * Int32(self.config.fallback_cluster_shape[1]),
             Int32(0),
         )
+
+    @cute.jit
+    def finish_claim_channel(self) -> None:
+        """Scheduler warp, once after the last claim: the leader waits until every peer's remote arrive has landed.
+
+        Peers arrive on the leader's empty mbarrier over DSMEM after each broadcast (``sync_object_empty.arrive`` in
+        work_id_claim). The gen-phase kernel's last-arriver tail has no grid sync to keep the leader resident, so the
+        leader must not exit while an arrive is in flight; the kernel calls this under the decode scheduler. Its
+        grouped / phase_interleave builds exit without this drain; their atomic_counter builds share the same
+        in-flight-arrive hazard, which a separate change addresses for every schedule.
+        ``producer_tail`` waits for the empty phase of the last broadcast (all ``32 * cluster_size`` arrives). It cannot
+        deadlock: every scheduler warp consumes every broadcast, including the past-the-end ids. No-op without the
+        atomic_counter claim channel.
+        """
+        if cutlass.const_expr(self.work_id_mode == "atomic_counter"):
+            if cutlass.const_expr(self.config.is_mixed):
+                raise ValueError(
+                    "finish_claim_channel drains the physical-cluster claim channel; fixed fallback groups share one "
+                    "work id across split_factor clusters and are not supported by the early-exit tail."
+                )
+            # The else-branch re-assignment yields the state from the dynamic ``if``, carrying producer_tail's in-place
+            # producer_state advance (same pattern as BlackwellMoeWgradScheduler.produce_tail).
+            work_id_state = self._work_id_state
+            if self._work_id_state.is_leader_cta:
+                self._work_id_state.cluster_pipeline.producer_tail(self._work_id_state.producer_state)
+            else:
+                self._work_id_state = work_id_state
 
     @cute.jit
     def get_atomic_counter_pointer(self, stream_index: Int32) -> cute.Pointer:
@@ -379,6 +427,16 @@ class NonClcMixedCgaSchedulerWorker:
         self.claimed_stream_index = Int32(claim_stream_index)
         return ready, claimed_work_id
 
+    @cute.jit
+    def produce_tail(self) -> None:
+        """Atomic-counter leader waits for the cluster's final release, since peers release on its empty barrier."""
+        if cutlass.const_expr(self.work_id_mode == "atomic_counter"):
+            atomic_counter_state = self._work_id_state
+            if cutlass.const_expr(isinstance(atomic_counter_state, FixedGroupMixedCgaAtomicCounterWorkIdState)):
+                atomic_counter_state = atomic_counter_state.atomic_counter_state
+            if atomic_counter_state.is_leader_cta:
+                atomic_counter_state.cluster_pipeline.producer_tail(atomic_counter_state.producer_state.clone())
+
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
         values.extend(extract_mlir_values(self._work_id_state))
@@ -398,7 +456,12 @@ class NonClcMixedCgaSchedulerWorker:
             value_index += field_value_count
             return result
 
-        result = type(self)(config=self.config, work_id_mode=self.work_id_mode, stream_count=self.stream_count)
+        result = type(self)(
+            config=self.config,
+            work_id_mode=self.work_id_mode,
+            stream_count=self.stream_count,
+            work_id_stride=self.work_id_stride,
+        )
         result._work_id_state = rebuild(self._work_id_state)
         result.cta_coord_in_preferred_cluster = rebuild(self.cta_coord_in_preferred_cluster)
         result.claimed_stream_index = rebuild(self.claimed_stream_index)

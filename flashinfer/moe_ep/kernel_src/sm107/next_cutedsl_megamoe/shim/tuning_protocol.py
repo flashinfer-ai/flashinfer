@@ -103,6 +103,8 @@ class RubinTuningProtocol:
                 self.cfg.quant_kind,
                 kernel_variant=self.cfg.kernel_variant,
                 batch_invariant=getattr(self.cfg, "batch_invariant", False),
+                combine_dedup=self.cfg.combine_dedup,
+                token_back_mode=self.cfg.token_back_mode,
             )
             if candidates is None
             else candidates
@@ -148,6 +150,10 @@ class RubinTuningProtocol:
             situ_linear_beta=cfg.situ_linear_beta,
             swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
             swiglu_beta=getattr(cfg, "swiglu_beta", None),
+            use_tanh_sigmoid=cfg.use_tanh_sigmoid,
+            epilogue_warpgroups=cfg.epilogue_warpgroups,
+            shared_expert=cfg.shared_expert,
+            combine_dedup=cfg.combine_dedup,
             gate_up_clamp=cfg.gate_up_clamp,
             batch_invariant=getattr(cfg, "batch_invariant", False),
             input_norm_const=getattr(cfg, "input_norm_const", 1.0),
@@ -158,6 +164,10 @@ class RubinTuningProtocol:
         from flashinfer.autotuner.autotuner import _collect_metadata
 
         config = dataclasses.asdict(self.cfg)
+        if self.cfg.shared_expert is None:
+            config.pop("shared_expert", None)
+        if not self.cfg.combine_dedup:
+            config.pop("combine_dedup", None)
         for key in (*KNOB_KEYS, "rank", "max_tokens_per_rank"):
             config.pop(key, None)
         if getattr(self.cfg, "batch_invariant", False):
