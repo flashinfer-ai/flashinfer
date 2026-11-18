@@ -27,11 +27,16 @@ once before capture. Under capture the route is taken only after that
 eager warm-up; dispatch is host-int based with no device syncs.
 
 Semantics notes (documented, verified by the integration test suite):
-- The kernel consumes the per-token sparse table and ``sparse_topk_lens``
-  exactly; ``seq_lens`` / ``cum_seq_lens_q`` / ``max_q_len`` are accepted
-  and not re-read (on this contract the table builder already encodes the
-  SWA validity window, and the allowlist keys on ``max_q_len`` and the
-  token count). ``workspace_buffer`` is not used by the specialized route.
+- The kernel consumes the per-token sparse table, ``sparse_topk_lens``,
+  ``seq_lens`` and ``cum_seq_lens_q`` exactly as the stock dispatch does:
+  the 128 SWA columns of each token's table row are additionally bounded by
+  the seq_lens-derived visibility window ``clamp(seq_lens[b] - (q_len_b - 1
+  - q_off), 0, 128)``, enforced in-kernel at index staging. ``max_q_len``
+  is accepted and keys the allowlist only. ``workspace_buffer`` is not used
+  by the specialized route.
+- Split partials are staged for the cluster merge as bf16 plus a bf16
+  residual and merged in fp32, so cross-split cancellation is preserved
+  to ~2^-16 relative instead of bf16's 2^-8.
 - ``bmm1_scale`` / ``bmm2_scale`` must be the contract's float values
   (baked into the kernel); tensor scales fall back.
 
@@ -59,6 +64,20 @@ DISPATCH_STATS = {"specialized": 0, "fallback": 0}
 LAST_FALLBACK_REASONS: list = []
 _BUILT = {"ready": False}
 _WARMED: set = set()  # device indices warmed before capture
+
+
+def _capturing_on(dev):
+    """is_current_stream_capturing() reads the AMBIENT device's current
+    stream, so a multi-GPU caller whose default device differs from the
+    query's would get the wrong capture answer. Pin the probe to the query's
+    device; enter the (host-costly) device context only when the ambient
+    device actually differs, keeping the common single-device dispatch path
+    at one cheap current_device() call."""
+    idx = dev.index
+    if idx is not None and idx != torch.cuda.current_device():
+        with torch.cuda.device(dev):
+            return torch.cuda.is_current_stream_capturing()
+    return torch.cuda.is_current_stream_capturing()
 
 
 @functools.cache
@@ -260,7 +279,7 @@ def supported_with_reasons(
     # device guards
     if torch.cuda.get_device_capability(query.device) != (10, 3):
         return ["not_sm103"]
-    if torch.cuda.is_current_stream_capturing() and query.device.index not in _WARMED:
+    if _capturing_on(query.device) and query.device.index not in _WARMED:
         return ["not_warmed_before_graph_capture"]
     return []
 
@@ -361,6 +380,6 @@ def _run_specialized(
         sinks,
         out,
     )
-    if not torch.cuda.is_current_stream_capturing():
+    if not _capturing_on(query.device):
         _WARMED.add(query.device.index)
     return out
