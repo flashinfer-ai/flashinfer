@@ -39,8 +39,10 @@ the refusal rather than a weaker contract.
 
 There is no other FlashInfer path serving this fused contract today:
 ``fp8_paged_mqa_logits`` + ``FP8MQATopKWrapper`` cover the decode-side
-logits and a single-request prefill selection over a different (fused)
-cache layout, and the wrapper refuses multi-request batches.
+logits and prefill selection over a different (fused) cache layout. The
+wrapper's ``cutedsl`` backend is single-request; its
+``backend="specialized"`` route serves aligned multi-request full
+prefill through this entry.
 
 Generated-kernel provenance: agent-generated kernel (search-campaign
 winner), source-vetted (producer/consumer ordering via CUDA Programmatic
