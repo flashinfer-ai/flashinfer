@@ -473,7 +473,15 @@ def _mla_dec_fp8q_sm90_prepare(
         sm_scale=float(sm_scale),
         device_index=device_index,
         scales_cached=None,
-        graph_captured=False,
+        # The descale buffers live in wrapper-owned `bufs` and survive
+        # replans, so a graph captured against an earlier state keeps
+        # rewriting them on every replay. The "a graph holds these buffers"
+        # fact must therefore persist on the wrapper, not on the per-plan
+        # state, or a replan would let eager calls trust the scales cache
+        # that a replay can invalidate behind its back.
+        graph_captured=bool(
+            getattr(wrapper, "_mla_dec_fp8q_sm90_scales_captured", False)
+        ),
     )
     counters["plans_prepared"] += 1
 
@@ -695,6 +703,7 @@ def _mla_dec_fp8q_sm90_dispatch(
         state.q_descale.fill_(qs)
         state.k_descale.fill_(ks)
         state.graph_captured = True
+        wrapper._mla_dec_fp8q_sm90_scales_captured = True
     elif state.graph_captured or state.scales_cached != (qs, ks):
         # Once any graph holds these buffers, a replay rewrites them to the
         # captured values behind the cache's back, so eager calls must always
