@@ -122,6 +122,38 @@ def _record_runners(monkeypatch) -> list:
     return offered
 
 
+class _GroupPlanChecked(Exception):
+    """Raised by the stubbed autotune-group plan check once it has recorded."""
+
+
+def _record_group_plans(monkeypatch, tuner) -> tuple[list, list]:
+    """Put ``tuner`` in tuning mode without timing anything. Record the runner
+    names of every AutoTuner.choose_one call (``offered``) and the runner names
+    that its autotune-group plan check compares across ranks (``planned``).
+    The check raises _GroupPlanChecked instead of running a collective; a call
+    without a group returns runners[0] with its default tactic."""
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    offered, planned = [], []
+    choose_one = AutoTuner.choose_one
+
+    def check(phase, selection=(), error=None):
+        assert phase == "operation" and selection[0] == "choose_one", phase
+        planned.append(list(selection[2]))
+        raise _GroupPlanChecked
+
+    def spy(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        offered.append([type(r).__name__ for r in runners])
+        if autotuner_module._tune_process_group is None:
+            return runners[0], -1
+        return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
+
+    monkeypatch.setattr(autotuner_module, "_check_tuning_group_phase", check)
+    monkeypatch.setattr(AutoTuner, "choose_one", spy)
+    monkeypatch.setattr(tuner, "is_tuning_mode", True)
+    return offered, planned
+
+
 def _count_calls(monkeypatch, owner, name: str) -> list:
     """Wrap ``owner.name`` so every call is recorded and still runs."""
     calls = []
@@ -863,6 +895,69 @@ def test_disable_env_closes_cake_candidates_before_the_gate(monkeypatch, fresh_t
     assert not gemm_base._cake_auto_candidate_open(CAKE_FP4_RUNNER)  # pyright: ignore[reportPrivateUsage]
     heuristic = gemm_svdquant._heuristic_func_nvfp4_svdquant  # pyright: ignore[reportPrivateUsage]
     assert heuristic(["cutlass", "cake"]) == ["cutlass"]
+
+
+def test_group_tuning_closes_cake_candidates(monkeypatch, fresh_tuner):
+    """Tuning under an autotune process group lists no automatic Cake
+    candidate, since ranks with M in different tuning buckets would list
+    different runners. Without tuning the group changes nothing. No GPU needed."""
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    _set_switches(monkeypatch, cake_enabled=True, experimental=False)
+    is_open = gemm_base._cake_auto_candidate_open  # pyright: ignore[reportPrivateUsage]
+    bmm_heuristic = gemm_base._heuristic_func_bmm_bf16  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(fresh_tuner, "is_tuning_mode", True)
+    assert is_open(CAKE_BMM_RUNNER) and is_open(CAKE_FP4_RUNNER)
+    assert bmm_heuristic(["cudnn", "cake"], None, None) == ["cudnn", "cake"]
+
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", object())
+    assert fresh_tuner.may_select_runner_class(CAKE_BMM_RUNNER)
+    assert not is_open(CAKE_BMM_RUNNER) and not is_open(CAKE_FP4_RUNNER)
+    assert bmm_heuristic(["cudnn", "cake"], None, None) == ["cudnn"]
+
+    # Serving with the group still set: listed as without a group.
+    monkeypatch.setattr(fresh_tuner, "is_tuning_mode", False)
+    assert not is_open(CAKE_BMM_RUNNER)
+    _hold_cake_entry(fresh_tuner, CAKE_BMM_RUNNER)
+    _hold_cake_entry(fresh_tuner, CAKE_FP4_RUNNER)
+    assert is_open(CAKE_BMM_RUNNER) and is_open(CAKE_FP4_RUNNER)
+
+
+def test_bmm_bf16_group_tuning_plans_the_same_runners_for_every_m(
+    monkeypatch, fresh_tuner
+):
+    """(c) Under an autotune process group every rank must list the same
+    runners: AutoTuner.choose_one compares their class names across ranks
+    before timing. A rank at M=64 (bucket (32, 64], which offers cake while
+    tuning) and a rank at M=16 (bucket (8, 16] of a swap-AB row, which does
+    not) plan the same runners, without cake. Without a group M=64 still
+    lists cake."""
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    _skip_unless_cake_bf16_bmm_supported()
+    _set_switches(monkeypatch, cake_enabled=True, experimental=False)
+    monkeypatch.delenv(SWAP_AB_DISABLE_ENV, raising=False)
+    batch, n, k, res_dtype = 4, 1024, 1024, torch.float16
+    row = (batch, 16, n, k, res_dtype)
+    device = torch.device("cuda")
+    assert gemm_base._cake_bf16_bmm_swap_ab_row_route(device, row) is not None  # pyright: ignore[reportPrivateUsage]
+    cases = [_bmm_case(batch, m, n, k, seed=5) for m in (64, 16)]
+    offered, planned = _record_group_plans(monkeypatch, fresh_tuner)
+
+    for a, mat2, ref in cases:
+        out = bmm_bf16(a, mat2, out_dtype=res_dtype, backend="auto")
+        torch.testing.assert_close(out, ref.to(res_dtype), rtol=2e-2, atol=5e-2)
+    assert not planned
+    with_cake, without_cake = offered
+    assert CAKE_BMM_RUNNER not in without_cake
+    assert with_cake == [*without_cake, CAKE_BMM_RUNNER]
+
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", object())
+    for a, mat2, _ in cases:
+        with pytest.raises(_GroupPlanChecked):
+            bmm_bf16(a, mat2, out_dtype=res_dtype, backend="auto")
+    assert offered[2:] == planned == [without_cake, without_cake]
 
 
 def test_cake_runner_class_names_match_the_gate():

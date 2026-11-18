@@ -591,6 +591,81 @@ def test_cake_runner_class_name_matches_the_gate():
     assert gemm_svdquant._CAKE_SVDQUANT_RUNNER == _CAKE_RUNNER
 
 
+def test_group_tuning_lists_no_cake_candidate(monkeypatch):
+    # Cake is offered per tuning cache key of the rank-local M, so tuning under
+    # an autotune process group leaves it out: every rank must list the same
+    # runners. Without tuning the group changes nothing. No GPU needed.
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    tuner = AutoTuner.get()
+    heuristic = gemm_svdquant._heuristic_func_nvfp4_svdquant
+    monkeypatch.setattr(tuner, "is_tuning_mode", True)
+    assert heuristic(["cutlass", "cake"]) == ["cutlass", "cake"]
+
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", object())
+    assert tuner.may_select_runner_class(_CAKE_RUNNER)
+    assert heuristic(["cutlass", "cake"]) == ["cutlass"]
+
+    # Serving with the group still set: listed as without a group.
+    monkeypatch.setattr(tuner, "is_tuning_mode", False)
+    assert heuristic(["cutlass", "cake"]) == ["cutlass"]
+    _hold_cake_entry()
+    assert heuristic(["cutlass", "cake"]) == ["cutlass", "cake"]
+
+
+class _GroupPlanChecked(Exception):
+    """Raised by the stubbed autotune-group plan check once it has recorded."""
+
+
+def test_group_tuning_plans_the_same_runners_for_every_m(monkeypatch):
+    # Under an autotune process group every rank must list the same runners:
+    # AutoTuner.choose_one compares their class names across ranks before
+    # timing. A rank at M=129 (routed: Cake listed while tuning) and a rank at
+    # M=65 (unrouted) plan CUTLASS only. Without a group M=129 still lists
+    # Cake. The group check is stubbed: it records the compared runner names
+    # and stops the call, so no collective runs and nothing is timed.
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    _skip_unless_cake_backend()
+    torch.manual_seed(0)
+    routed, unrouted = (129, 3072, 3072, 32, True), (65, 3072, 3072, 32, True)
+    assert routed in _ROUTED and unrouted in _UNROUTED
+    problems = [
+        _make_gemm_problem(m, n, k, rank=rank)
+        for m, n, k, rank, _ in (routed, unrouted)
+    ]
+    offered, planned = [], []
+    choose_one = AutoTuner.choose_one
+
+    def check(phase, selection=(), error=None):
+        assert phase == "operation" and selection[:2] == ("choose_one", _OP), phase
+        planned.append(list(selection[2]))
+        raise _GroupPlanChecked
+
+    def recording(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        assert custom_op == _OP
+        offered.append(_runner_names(runners))
+        if autotuner_module._tune_process_group is None:
+            return runners[0], -1
+        return choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
+
+    monkeypatch.setattr(autotuner_module, "_check_tuning_group_phase", check)
+    monkeypatch.setattr(AutoTuner, "choose_one", recording)
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+
+    for p in problems:
+        out = _run(p, True)
+        assert _sqnr_db(p["ref_bias"], out.float()) > 40.0
+    assert not planned
+    assert offered == [[_CUTLASS_RUNNER, _CAKE_RUNNER], [_CUTLASS_RUNNER]]
+
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", object())
+    for p in problems:
+        with pytest.raises(_GroupPlanChecked):
+            _run(p, True)
+    assert offered[2:] == planned == [[_CUTLASS_RUNNER], [_CUTLASS_RUNNER]]
+
+
 def test_untuned_call_does_no_cake_work(monkeypatch, svdquant_choices):
     # Without tuning and without a Cake entry the call runs no Cake route or
     # bucket check and builds no Cake runner; a held Cake entry makes it reach

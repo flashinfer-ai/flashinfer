@@ -29,6 +29,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    get_autotune_process_group,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -915,11 +916,17 @@ def _heuristic_func_nvfp4_svdquant(
     # Outside tuning it is listed only while the tuner holds a Cake entry
     # (AutoTuner.may_select_runner_class): otherwise no lookup can select it,
     # and leaving it out keeps the CUTLASS-only call's list and host cost.
+    # Tuning under an autotune process group also leaves it out: Cake is
+    # offered per tuning key of the rank-local M, and every rank of the group
+    # must list the same runners.
     backends = [backend for backend in suitable_backends if backend != "cake"]
     if (
         backends
         and "cake" in suitable_backends
         and cake_auto_candidates_enabled()
+        and not (
+            get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
+        )
         and AutoTuner.get().may_select_runner_class(_CAKE_SVDQUANT_RUNNER)
     ):
         backends.append("cake")
@@ -1088,7 +1095,9 @@ def mm_nvfp4_svdquant(
         route, so ``m <= 128`` never selects it, and it is used only when it
         measured faster. Untuned calls
         and cache misses run CUTLASS; outside tuning, Cake is listed only while
-        the autotuner holds a Cake result.
+        the autotuner holds a Cake result. Tuning under
+        :func:`flashinfer.autotuner.set_autotune_process_group` does not
+        measure Cake.
         ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes the Cake
         candidate. On SM120 it tunes
         across CuTe DSL fused/unfused and CUTLASS implementations; SM121 compares
@@ -1198,7 +1207,8 @@ def mm_nvfp4_svdquant(
     inputs = [a, b, a_sf, b_sf, alpha_scalar, d, l1, bias, out, workspace_buffer]
     if offer_cake:
         # CUTLASS stays runners[0], the untuned and cache-miss default; Cake is
-        # measured only under autotuning and wins only when faster. Cake is
+        # measured only under autotuning (not under an autotune process group)
+        # and wins only when faster. Cake is
         # listed only when every M of this call's tuning cache key has a route
         # with a matching PDL setting, and its tactic is offered under the same
         # rule. A key that can hold a Cake winner is therefore listed by all

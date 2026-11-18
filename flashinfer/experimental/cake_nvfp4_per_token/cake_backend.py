@@ -66,7 +66,7 @@ import math
 import torch
 import tvm_ffi
 
-from ...utils import get_compute_capability, get_device_sm_count
+from ...utils import _get_stream_cache_buf, get_compute_capability, get_device_sm_count
 from .cake_jit import (
     ARG_PLANS,
     KERNELS,
@@ -2337,29 +2337,22 @@ def _flat_u8_scales(sf: torch.Tensor, name: str, rows: int, cols: int) -> torch.
     return sf.reshape(-1)
 
 
-_STREAM_K_WORKSPACE: dict[int, torch.Tensor] = {}
-_STREAM_K_FLAGS: dict[tuple[int, int], torch.Tensor] = {}
-
-
 def _stream_k_workspace(
     device: torch.device, floats: int, flags: int, slices: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-device FP32 partial workspace and per-(device, slice count) slot flags of the
-    stream-K tail, grown on demand (never shrunk) and shared by the device's stream-K
-    launches, which the stream orders.  The flags are free-running per-launch generations
-    (every word of a tail tile advances once per launch in which the tile exists, so all
-    words of a tile share one history for a fixed slice count); grown arrays restart from
-    zero.  No per-launch initialisation and nothing is reset."""
-    index = _device_index(device)
-    ws = _STREAM_K_WORKSPACE.get(index)
-    if ws is None or ws.numel() < max(floats, 1):
-        ws = torch.empty(max(floats, 1), dtype=torch.float32, device=device)
-        _STREAM_K_WORKSPACE[index] = ws
-    fl = _STREAM_K_FLAGS.get((index, slices))
-    if fl is None or fl.numel() < max(flags, 1):
-        fl = torch.zeros(max(flags, 1), dtype=torch.uint32, device=device)
-        _STREAM_K_FLAGS[(index, slices)] = fl
-    return ws, fl
+    """FP32 partial workspace and per-slice-count slot flags of the stream-K tail, owned by
+    the current CUDA stream of ``device`` (:func:`_get_stream_cache_buf`), grown on demand
+    (never shrunk).  Launches on one stream are ordered, so its stream-K launches share
+    them; launches on different streams get their own.  The flags are free-running
+    per-launch generations (every word of a tail tile advances once per launch in which the
+    tile exists, so all words of a tile share one history for a fixed slice count); grown
+    arrays restart from zero.  No per-launch initialisation and nothing is reset."""
+    device = torch.device("cuda", _device_index(device))
+    ws = _get_stream_cache_buf("cake_nvfp4_sk_partials", 4 * max(floats, 1), device)
+    fl = _get_stream_cache_buf(
+        f"cake_nvfp4_sk_flags_{slices}", 4 * max(flags, 1), device, zero_init=True
+    )
+    return ws.view(torch.float32), fl.view(torch.uint32)
 
 
 def prepare_mm_fp4_per_token(

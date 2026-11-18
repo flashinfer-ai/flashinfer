@@ -562,7 +562,11 @@ Some GEMM APIs append their Cake backend as the **last** runner of the
 and the per-token-alpha path of ``mm_fp4``. The Cake runner is offered only for
 inputs it serves. Being last, it never changes the untuned default or a cache-miss
 fallback (``runners[0]``, tactic ``-1``); under ``flashinfer.autotune()`` it is
-measured with the other runners and is used only when it is the fastest. Outside
+measured with the other runners and is used only when it is the fastest.
+Tuning under an autotune process group
+(:func:`flashinfer.autotuner.set_autotune_process_group`) does not measure Cake:
+every rank of the group must list the same runners, and Cake is offered per
+rank-local operands. Outside
 tuning, the Cake runner is listed only while the autotuner can select it: it holds
 a Cake result tuned in this process or loaded from a cache file, or an
 ``autotune_v2`` store is active (``AutoTuner.may_select_runner_class``). Untuned

@@ -56,6 +56,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+    get_autotune_process_group,
     is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
@@ -1249,11 +1250,27 @@ def _cake_auto_candidate_open(runner_class_name: str) -> bool:
     (:meth:`AutoTuner.may_select_runner_class`). Otherwise listing it changes
     no selection, so it is left out: the call keeps the runner list and host
     cost of the other backends. ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``
-    always leaves it out.
+    always leaves it out, and so does tuning under an autotune process group
+    (:func:`_cake_group_tuning`).
     """
-    return cake_auto_candidates_enabled() and AutoTuner.get().may_select_runner_class(
-        runner_class_name
+    return (
+        cake_auto_candidates_enabled()
+        and not _cake_group_tuning()
+        and AutoTuner.get().may_select_runner_class(runner_class_name)
     )
+
+
+def _cake_group_tuning() -> bool:
+    """Whether the tuner now tunes under an autotune process group
+    (:func:`~flashinfer.autotuner.set_autotune_process_group`).
+
+    Group tuning requires every rank to list the same runners for an op. The
+    automatic Cake candidates are offered per operands and per tuning bucket of
+    the rank-local M, so ranks could disagree; they are left out while a group
+    tunes, and every rank lists the other backends only. Outside tuning the
+    group checks nothing, and Cake is listed as without a group.
+    """
+    return get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
 
 
 @backend_requirement(
@@ -1312,7 +1329,8 @@ def bmm_bf16(
         (see ``AutoTuner.may_select_runner_class``).
         Under
         ``flashinfer.autotune()``, ``"cake"`` is measured with the other
-        candidates and runs only when it is the fastest.
+        candidates and runs only when it is the fastest; tuning under
+        ``flashinfer.autotuner.set_autotune_process_group`` does not list it.
         ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes it from
         ``"auto"``; ``backend="cake"`` is not affected.
 
@@ -10503,8 +10521,9 @@ def _heuristic_func_mm_fp4(
     also suitable, the call passes its checker,
     ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` lets experimental backends
     into ``suitable_backends``, ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES``
-    is not ``1``, and the tuner may select it (tuning, or a held ``cake``
-    result; see :func:`_cake_auto_candidate_open`).  The untuned call runs
+    is not ``1``, and the tuner may select it (tuning without an autotune
+    process group, or a held ``cake`` result; see
+    :func:`_cake_auto_candidate_open`).  The untuned call runs
     ``cute-dsl``; ``cake`` runs only when ``flashinfer.autotune()`` measures it
     faster.
     """
