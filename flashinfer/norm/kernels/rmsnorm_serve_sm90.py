@@ -141,6 +141,15 @@ def record_incumbent_dispatch(impl: str, *, count_call: bool = False) -> None:
     _stats["backend_dispatches"][impl] += 1
 
 
+def _capturing_on(device: torch.device) -> bool:
+    """Whether the current stream on ``device`` is capturing a CUDA graph.
+    ``torch.cuda.is_current_stream_capturing()`` only inspects the process's
+    current device, which on a mixed-device host may differ from the device
+    the launch targets, so query under that device."""
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
+
+
 def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
     """Whether two tensors' storage byte ranges overlap (both contiguous
     here, so [data_ptr, data_ptr + numel * itemsize) covers each)."""
@@ -567,6 +576,13 @@ def try_rmsnorm_serve_sm90(
         # another row's CTA has yet to read.
         _fallback(f"{requested}: out partially overlaps input")
         return False
+    if _overlaps(weight, out):
+        # Every variant reads the full weight row while out rows are being
+        # written concurrently (by other rows' CTAs, or other slices under the
+        # cuda variant's split launches), so weight sharing bytes with out can
+        # be read after an overwrite. Such calls take the incumbent path.
+        _fallback(f"{requested}: weight overlaps out")
+        return False
     if torch.cuda.get_device_capability(input.device) != (9, 0):
         _fallback(f"{requested}: not SM90")
         return False
@@ -583,7 +599,7 @@ def try_rmsnorm_serve_sm90(
             # read of the same row.  In-place calls take the incumbent path.
             _fallback(f"{requested}: cuda variant does not support in-place")
             return False
-        if _cuda_module is None and torch.cuda.is_current_stream_capturing():
+        if _cuda_module is None and _capturing_on(input.device):
             # Never JIT-build the module under CUDA-graph capture.
             _fallback(f"{requested}: cuda variant uncompiled under capture")
             return False
@@ -603,7 +619,7 @@ def try_rmsnorm_serve_sm90(
     key = (hidden, input.dtype)
     fn = _COMPILED.get(key)
     if fn is None:
-        if torch.cuda.is_current_stream_capturing():
+        if _capturing_on(input.device):
             # Never JIT-compile a new (H, dtype) variant under capture.
             _fallback(f"{requested}: cutedsl variant uncompiled under capture")
             return False

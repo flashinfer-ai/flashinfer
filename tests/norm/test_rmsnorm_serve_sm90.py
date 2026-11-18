@@ -314,3 +314,19 @@ def test_use_cuda_norm_env_still_pins_legacy_cuda_kernels(monkeypatch):
     assert stats["calls"] == 0, stats
     assert stats["backend_dispatches"]["specialized"] == 0, stats
     assert _matched(y, _ref(x, w)) >= 0.999
+
+
+def test_weight_overlapping_out_is_declined():
+    """weight sharing storage with out is a read/write race for the
+    specialized variants (each row's CTA reads the full weight row while other
+    rows write out), so the specialized path never runs such a call: explicit
+    "specialized" raises, auto declines to the incumbent dispatch."""
+    _sm90_or_skip()
+    x, w = _case(tokens=16, hidden=2048)
+    out = torch.empty_like(x)
+    out[0] = w  # the overlapping "weight" view is out's first row
+    with pytest.raises(NotImplementedError, match="never falls back"):
+        flashinfer.norm.rmsnorm(x, out[0], out=out, backend="specialized")
+    stats = _rmsnorm_serve_sm90_stats()
+    assert stats["backend_dispatches"]["specialized"] == 0, stats
+    assert any("weight overlaps out" in r for r in stats["fallback_reasons"]), stats
