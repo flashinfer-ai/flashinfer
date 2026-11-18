@@ -1126,7 +1126,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     scale = float(1.0 / (head_dim_qk**0.5))
     workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
     gqa_multi_ctas_kv_counter_buffer = None
-    if "trtllm-native" in backends:
+    if "trtllm-native" in backends or "cake-nvfp4" in backends:
         counter_bytes = get_trtllm_gen_multi_ctas_kv_counter_bytes(
             batch_size, num_qo_heads, get_device_sm_count(device)
         )
@@ -1360,6 +1360,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 q_len_per_req=s_qo,
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
+                # Without it, every call allocates and zero-fills a counter
+                # buffer for the trtllm-gen fallback inside the timed region.
+                multi_ctas_kv_counter_buffer=gqa_multi_ctas_kv_counter_buffer,
                 out=out,
                 out_dtype=o_data_type,
             )
