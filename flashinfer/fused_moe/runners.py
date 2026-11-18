@@ -8484,16 +8484,18 @@ class SM12xFp8Runner(MoERunner):
 class SpecializedFp8BlockRunner(MoERunner):
     """Adapter for the specialized (agent-generated) SM120 DeepSeek FP8 kernels.
 
-    Wraps ``flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120`` — the
-    same kernels the flat ``cutlass_fused_moe(backend="specialized")`` path
-    serves — so ``MoELayer``'s cross-backend autotune can reach them as a
-    first-class candidate. The module's shipped dispatch surface stays
-    authoritative: its workload allowlist gates construction (contract +
-    validated device profile) and per-call acceptance (``num_tokens``), its
-    kill switch (``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``) rejects the
-    backend at ``check_support`` and again inside the launch, and every
-    launch goes through ``maybe_run_specialized`` so the flat path's guard
-    order and dispatch statistics apply unchanged.
+    Calls the kernels' own module
+    (``flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120``) directly
+    — the kernels are not CUTLASS kernels and do not route through
+    ``cutlass_fused_moe`` — so ``MoELayer``'s ``backend=auto`` cross-backend
+    autotune times and dispatches them as a first-class named candidate. The
+    module's shipped dispatch surface stays authoritative: its workload
+    allowlist gates construction (contract + validated device profile) and
+    per-call acceptance (``num_tokens``), its kill switch
+    (``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``) rejects the backend at
+    ``check_support`` and again inside the launch, and every launch goes
+    through ``maybe_run_specialized`` so the module's guard order and
+    dispatch statistics apply unchanged.
     """
 
     backend_key = "specialized_fp8_block"
@@ -8581,7 +8583,7 @@ class SpecializedFp8BlockRunner(MoERunner):
                 "use_fused_finalize=True (finalize is fused into its FC2 "
                 "accumulation)."
             )
-        # Device guards, mirroring the flat path's dispatch surface.
+        # Device guards, mirroring the module's shipped dispatch surface.
         cc = tuple(get_compute_capability(self.device))
         if not (allow["min_cc"] <= cc <= allow["max_cc"]):
             raise RuntimeError(
@@ -8647,7 +8649,7 @@ class SpecializedFp8BlockRunner(MoERunner):
                 f"{self.backend_key} prepared weights are missing {missing}."
             )
         x = act.hidden_states_q
-        # The launch re-validates every operand through the flat path's guard
+        # The launch re-validates every operand through the module's guard
         # (maybe_run_specialized); the output buffer is zeroed there.
         output = torch.empty(
             x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device

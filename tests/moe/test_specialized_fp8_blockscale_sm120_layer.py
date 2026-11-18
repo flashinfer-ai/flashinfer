@@ -16,12 +16,13 @@ limitations under the License.
 
 """Unified-API tests for the specialized SM120 FP8 block-scale MoE backend.
 
-``SpecializedFp8BlockConfig`` + ``SpecializedFp8BlockRunner`` make the
-agent-generated kernels (the flat ``cutlass_fused_moe(backend="specialized")``
-path) a first-class ``MoELayer`` autotune candidate. Registration, arch
-gating and the GPU-free support checks run anywhere; layer dispatch,
-kill-switch fallback and numeric parity against the flat path run only on
-the validated SM120 device profile.
+``SpecializedFp8BlockConfig`` + ``SpecializedFp8BlockRunner`` are the
+agent-generated kernels' sole public home: a DEFAULT ``MoELayer`` candidate
+whose runner calls the kernels' own module directly (no
+``cutlass_fused_moe`` hop). Registration, arch gating, default-list
+visibility and the GPU-free support checks run anywhere; layer dispatch,
+kill-switch fallback and numeric parity against the module's own dispatch
+run only on the validated SM120 device profile.
 """
 
 import pytest
@@ -109,12 +110,20 @@ def test_supported_arch_gating():
         assert not SpecializedFp8BlockConfig.supported(arch)
 
 
-def test_not_in_default_backend_order():
-    """Opt-in like the other SM12x backends: reachable only when listed in
-    ``BackendOptions``, never part of the default search order."""
-    assert SpecializedFp8BlockConfig not in {
-        type(c) for c in _DEFAULT_BACKEND.candidates
-    }
+def test_default_backend_visibility():
+    """DEFAULT-VISIBLE: a matching layer reaches the kernels through
+    backend=auto with no opt-in; supported() gates the arch (SM120) and the
+    runner gates the generated contract."""
+    assert SpecializedFp8BlockConfig in {type(c) for c in _DEFAULT_BACKEND.candidates}
+    assert any(
+        isinstance(c, SpecializedFp8BlockConfig)
+        for c in _DEFAULT_BACKEND.valid_for(120)
+    )
+    for arch in (90, 100, 103, 121):
+        assert not any(
+            isinstance(c, SpecializedFp8BlockConfig)
+            for c in _DEFAULT_BACKEND.valid_for(arch)
+        )
 
 
 def test_runner_quant_and_routing_declarations():
@@ -291,32 +300,32 @@ def test_moe_layer_kill_switch_fallback(weights, monkeypatch):
 @requires_sm120
 @requires_toolkit
 @pytest.mark.parametrize("t", [4, 256])
-def test_layer_matches_flat_specialized_path(weights, t):
-    """Numerics parity: the layer route serves the same kernels as the flat
-    ``cutlass_fused_moe(backend="specialized")`` path. Accumulation order is
-    not bitwise-stable on every token count (bf16-atomics class), so parity
-    is asserted at a few-ulp tolerance at output magnitude."""
-    from flashinfer.fused_moe import cutlass_fused_moe
+def test_layer_matches_module_dispatch(weights, t):
+    """Numerics parity: the layer route serves the same kernels as the
+    module's own dispatch entry. Accumulation order is not bitwise-stable on
+    every token count (bf16-atomics class), so parity is asserted at a
+    few-ulp tolerance at output magnitude."""
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+        maybe_run_specialized,
+    )
 
     w13, w2, w13_scale, w2_scale = weights
     x, ids, tw = _routing(t, seed=400 + t)
     layer = MoELayer(_contract_config())
     act = MoEActivationPack(x, None, ids, tw)
     out_layer = layer(act, _weight_pack(weights))
-    flat = cutlass_fused_moe(
-        input=x,
-        token_selected_experts=ids,
-        token_final_scales=tw,
-        fc1_expert_weights=w13,
-        fc2_expert_weights=w2,
-        output_dtype=torch.bfloat16,
-        quant_scales=[w13_scale, w2_scale],
-        use_deepseek_fp8_block_scale=True,
-        backend="specialized",
+    direct, reason = maybe_run_specialized(
+        x,
+        ids,
+        tw,
+        w13,
+        w2,
+        [w13_scale, w2_scale],
+        None,
+        context_ok=True,
     )
-    if isinstance(flat, (tuple, list)):
-        flat = flat[0]
+    assert reason is None and direct is not None
     torch.cuda.synchronize()
-    tol = 2.0**-5 * flat.float().abs().max().clamp(min=1e-3).item()
-    max_abs = (out_layer.float() - flat.float()).abs().max().item()
-    assert max_abs <= tol, f"layer vs flat max_abs {max_abs} > {tol}"
+    tol = 2.0**-5 * direct.float().abs().max().clamp(min=1e-3).item()
+    max_abs = (out_layer.float() - direct.float()).abs().max().item()
+    assert max_abs <= tol, f"layer vs module max_abs {max_abs} > {tol}"

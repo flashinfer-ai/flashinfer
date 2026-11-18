@@ -1535,14 +1535,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     )
 
 
-# Backends selectable on cutlass_fused_moe. "auto" (the default) behaves
-# exactly like "cutlass" except where the dispatch surface of the
-# "specialized" backend (agent-generated kernels; see
-# flashinfer/fused_moe/specialized/) applies; an explicitly selected
-# backend is never silently swapped.
-MOE_BACKENDS = ("auto", "specialized", "cutlass", "cake")
-
-
 # ref: https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/torch_custom_ops.py#L121
 @flashinfer_api(trace=cutlass_fused_moe_trace)
 def cutlass_fused_moe(
@@ -1584,7 +1576,7 @@ def cutlass_fused_moe(
     clamped_relu2_limit: Optional[torch.Tensor] = None,
     situ_beta: Optional[torch.Tensor] = None,
     situ_linear_beta: Optional[torch.Tensor] = None,
-    backend: str = "auto",
+    backend: str = "cutlass",
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
@@ -1843,20 +1835,8 @@ def cutlass_fused_moe(
         from .cake_kimi_k3_situ import _cake_situ_fused_moe
 
         return _cake_situ_fused_moe(locals())
-    if backend not in MOE_BACKENDS:
-        raise ValueError(
-            f"unsupported fused MoE backend: {backend!r}; expected one of "
-            f"{MOE_BACKENDS}"
-        )
-    if backend == "specialized" and not use_deepseek_fp8_block_scale:
-        # An explicitly selected backend is never silently swapped: the
-        # specialized backend currently serves only the fp8 block-scale MoE
-        # contract on SM120.
-        raise NotImplementedError(
-            "backend='specialized' currently serves only "
-            "use_deepseek_fp8_block_scale=True on SM120; use backend='auto' "
-            "or 'cutlass'"
-        )
+    if backend != "cutlass":
+        raise ValueError(f"unsupported fused MoE backend: {backend!r}")
     major, minor = get_compute_capability(input.device)
     if int(activation_type) == int(ActivationType.ClampedRelu2):
         if clamped_relu2_limit is None:
@@ -1918,57 +1898,6 @@ def cutlass_fused_moe(
         raise NotImplementedError("min latency mode not yet implemented for Blackwell.")
 
     if use_deepseek_fp8_block_scale:
-        if backend in ("auto", "specialized"):
-            # Specialized backend (agent-generated CUDA kernels, SM120):
-            # the only fp8 block-scale MoE path on that arch. "auto" routes
-            # here on the allowlisted contract only; off-allowlist it falls
-            # through to the stock path below (the explicit refusal —
-            # fail-closed). An explicit "specialized" that cannot serve the
-            # call raises rather than being swapped to another backend.
-            from .specialized.fp8_blockscale_moe_sm120 import (
-                maybe_run_specialized,
-            )
-
-            context_ok = (
-                fc1_expert_biases is None
-                and fc2_expert_biases is None
-                and input_sf is None
-                and output_dtype == torch.bfloat16
-                and tp_size == 1
-                and ep_size == 1
-                and cluster_size == 1
-                and not enable_alltoall
-                and not min_latency_mode
-                and int(activation_type) == int(ActivationType.Swiglu)
-                # Parameterized SwiGLU (SwigluBias semantics) is not
-                # implemented by the specialized kernels.
-                and swiglu_alpha is None
-                and swiglu_beta is None
-                and swiglu_limit is None
-                # The specialized kernels accumulate route outputs with
-                # floating-point atomics, so they cannot honor the
-                # deterministic (use_fused_finalize=False) contract.
-                and use_fused_finalize
-            )
-            out_specialized, fallback_reason = maybe_run_specialized(
-                input,
-                token_selected_experts,
-                token_final_scales,
-                fc1_expert_weights,
-                fc2_expert_weights,
-                quant_scales,
-                output,
-                context_ok,
-            )
-            if out_specialized is not None:
-                return out_specialized
-            if backend == "specialized":
-                raise NotImplementedError(
-                    "backend='specialized' cannot serve this "
-                    f"cutlass_fused_moe call (reason: {fallback_reason}); "
-                    "no composable fallback exists for this op — use "
-                    "backend='auto' or handle the shape upstream"
-                )
         if device_arch != "90":
             raise NotImplementedError(
                 "FP8 block scaling not yet implemented for Blackwell."
@@ -2111,10 +2040,8 @@ def cutlass_fused_moe_workspace_size(
         from .cake_kimi_k3_situ import _cake_situ_workspace_size
 
         return _cake_situ_workspace_size(locals())
-    if backend not in MOE_BACKENDS:
+    if backend != "cutlass":
         raise ValueError(f"unsupported fused MoE backend: {backend!r}")
-    # "auto"/"specialized" need no workspace of their own; the cutlass
-    # sizing below is the safe upper bound for every non-cake backend.
     if max_num_tokens <= 0:
         raise ValueError(f"max_num_tokens must be positive, got {max_num_tokens}")
     if hidden_size <= 0:

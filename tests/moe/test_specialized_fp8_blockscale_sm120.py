@@ -14,18 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Tests for the "specialized" SM120 backend of ``cutlass_fused_moe`` with
-``use_deepseek_fp8_block_scale=True`` (agent-generated fp8 [128,128]
-block-scale MoE kernels at the contract E=256, top_k=8, hidden=2048,
-intermediate=512, silu-gated, bf16 activations).
+"""Silicon tests for the specialized SM120 fp8 [128,128] block-scale MoE
+kernels (agent-generated, contract E=256, top_k=8, hidden=2048,
+intermediate=512, silu-gated, bf16 activations), whose sole public home is
+the unified MoE API (``SpecializedFp8BlockConfig`` /
+``SpecializedFp8BlockRunner``; the unified-surface tests live in
+``test_specialized_fp8_blockscale_sm120_layer.py``).
 
-On SM120 the stock path refuses this contract outright, so the dispatch
-tests verify fail-closed semantics: auto routes to the specialized kernels
-exactly on the shipped token-count allowlist and keeps the stock refusal
-everywhere else; an explicitly selected backend is never silently swapped;
-the kill switch restores the stock refusal. Numeric correctness is checked
-against an fp32 block-dequant reference MoE, plus a CUDA-graph
-capture/replay smoke.
+These tests exercise the kernels' own module directly
+(``maybe_run_specialized``: the guard's token allowlist, kill switch,
+fail-closed refusals), numeric correctness against an fp32 block-dequant
+reference MoE, a CUDA-graph capture/replay smoke, and the NEGATIVE CONTROL
+for the flat vendor entry: ``cutlass_fused_moe`` keeps its upstream surface
+(stock SM120 dsfp8 refusal, no "specialized"/"auto" backend) and never
+reaches these kernels.
 """
 
 import pytest
@@ -127,7 +129,8 @@ def _reference(x, ids, tw, weights):
     return out.to(torch.bfloat16)
 
 
-def _call(x, ids, tw, weights, output=None, **overrides):
+def _flat_call(x, ids, tw, weights, output=None, **overrides):
+    """The flat vendor entry (negative-control arm): upstream surface only."""
     from flashinfer.fused_moe import cutlass_fused_moe
 
     w13, w2, w13_scale, w2_scale = weights
@@ -150,6 +153,26 @@ def _call(x, ids, tw, weights, output=None, **overrides):
     return out
 
 
+def _dispatch(x, ids, tw, weights, output=None):
+    """Call the kernels' own module directly (what the unified
+    SpecializedFp8BlockRunner does); returns (output_or_None, reason)."""
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+        maybe_run_specialized,
+    )
+
+    w13, w2, w13_scale, w2_scale = weights
+    return maybe_run_specialized(
+        x,
+        ids,
+        tw,
+        w13,
+        w2,
+        [w13_scale, w2_scale],
+        output,
+        context_ok=True,
+    )
+
+
 def _assert_close_to_reference(out, ref):
     scale = ref.float().abs().max().clamp(min=1e-3).item()
     rel_l2 = (
@@ -161,10 +184,9 @@ def _assert_close_to_reference(out, ref):
 
 
 @pytest.mark.parametrize("t", [4, 16])
-def test_auto_routes_on_allowlist_and_matches_reference(weights, t):
-    """On SM120 only the specialized backend can serve this contract (the
-    stock path raises), so a successful auto call proves the dispatch; the
-    output must match the fp32 block-dequant reference."""
+def test_module_dispatch_matches_reference(weights, t):
+    """The kernels' own module serves allowlisted token counts; the output
+    must match the fp32 block-dequant reference."""
     from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
         specialized_moe_fp8_blockscale_stats,
     )
@@ -172,54 +194,58 @@ def test_auto_routes_on_allowlist_and_matches_reference(weights, t):
     x, ids, tw = _routing(t, seed=100 + t)
     ref = _reference(x, ids, tw, weights)
     before = specialized_moe_fp8_blockscale_stats()["specialized_dispatches"]
-    out = _call(x, ids, tw, weights)
+    out, reason = _dispatch(x, ids, tw, weights)
     torch.cuda.synchronize()
+    assert reason is None and out is not None
     after = specialized_moe_fp8_blockscale_stats()["specialized_dispatches"]
     assert after == before + 1
     _assert_close_to_reference(out, ref)
 
 
-def test_auto_off_allowlist_keeps_stock_refusal(weights):
-    """A token count off the shipped allowlist falls through to the stock
-    path, which still refuses the contract on SM120 (fail-closed)."""
+def test_off_allowlist_token_count_declined(weights):
+    """A token count off the shipped allowlist is declined with the reason
+    recorded (the unified layer then routes the call elsewhere or refuses —
+    the kernels never serve it)."""
     from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
         specialized_moe_fp8_blockscale_stats,
     )
 
     x, ids, tw = _routing(7, seed=1)
-    with pytest.raises(NotImplementedError):
-        _call(x, ids, tw, weights)
+    out, reason = _dispatch(x, ids, tw, weights)
+    assert out is None and reason == "num_tokens_off_allowlist"
     reasons = specialized_moe_fp8_blockscale_stats()["fallback_reasons"]
     assert reasons.get("num_tokens_off_allowlist", 0) >= 1
 
 
-def test_explicit_cutlass_never_swapped(weights):
-    """An explicitly selected stock backend must never receive the
-    specialized kernels: it keeps today's refusal even on-allowlist."""
+def test_flat_entry_negative_control(weights):
+    """The flat vendor entry keeps its upstream surface: the stock SM120
+    dsfp8 refusal on an allowlisted shape (the specialized kernels never
+    serve it), a "cutlass" default, and no "specialized"/"auto" backend."""
+    import inspect
+
+    from flashinfer.fused_moe import cutlass_fused_moe
+    from flashinfer.fused_moe.specialized.fp8_blockscale_moe_sm120 import (
+        specialized_moe_fp8_blockscale_stats,
+    )
+
+    assert (
+        inspect.signature(cutlass_fused_moe).parameters["backend"].default == "cutlass"
+    )
     x, ids, tw = _routing(16, seed=2)
+    before = specialized_moe_fp8_blockscale_stats()["specialized_dispatches"]
     with pytest.raises(NotImplementedError):
-        _call(x, ids, tw, weights, backend="cutlass")
+        _flat_call(x, ids, tw, weights)
+    for name in ("specialized", "auto"):
+        with pytest.raises(ValueError, match="unsupported fused MoE backend"):
+            _flat_call(x, ids, tw, weights, backend=name)
+    assert specialized_moe_fp8_blockscale_stats()["specialized_dispatches"] == before
 
 
-def test_explicit_specialized_off_allowlist_raises(weights):
-    x, ids, tw = _routing(7, seed=3)
-    with pytest.raises(NotImplementedError, match="specialized"):
-        _call(x, ids, tw, weights, backend="specialized")
-
-
-def test_bogus_backend_raises(weights):
-    x, ids, tw = _routing(4, seed=4)
-    with pytest.raises(ValueError):
-        _call(x, ids, tw, weights, backend="bogus")
-
-
-def test_kill_switch_restores_refusal(weights, monkeypatch):
+def test_kill_switch_declines(weights, monkeypatch):
     monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
     x, ids, tw = _routing(16, seed=5)
-    with pytest.raises(NotImplementedError):
-        _call(x, ids, tw, weights)
-    with pytest.raises(NotImplementedError, match="kill_switch"):
-        _call(x, ids, tw, weights, backend="specialized")
+    out, reason = _dispatch(x, ids, tw, weights)
+    assert out is None and reason == "kill_switch"
 
 
 def test_cuda_graph_replay_matches_eager(weights):
@@ -232,18 +258,18 @@ def test_cuda_graph_replay_matches_eager(weights):
     t = 16
     x, ids, tw = _routing(t, seed=6)
     out = torch.zeros(t, H, dtype=torch.bfloat16, device=DEVICE)
-    _call(x, ids, tw, weights, output=out)
+    assert _dispatch(x, ids, tw, weights, output=out)[1] is None
     torch.cuda.synchronize()
     eager = out.clone()
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _call(x, ids, tw, weights, output=out)
+        assert _dispatch(x, ids, tw, weights, output=out)[1] is None
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
-        _call(x, ids, tw, weights, output=out)
+        assert _dispatch(x, ids, tw, weights, output=out)[1] is None
     out.zero_()
     graph.replay()
     torch.cuda.synchronize()

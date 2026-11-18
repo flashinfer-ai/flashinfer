@@ -2677,11 +2677,10 @@ class SM12xFp8Config:
 
 @dataclass(frozen=True)
 class SpecializedFp8BlockConfig:
-    """Specialized (agent-generated) SM120 DeepSeek FP8 block-scale backend.
-
-    Serves the same agent-generated kernels as the flat
-    ``cutlass_fused_moe(..., backend="specialized")`` path
-    (``flashinfer/fused_moe/specialized/fp8_blockscale_moe_sm120.py``):
+    """Specialized (agent-generated) SM120 DeepSeek FP8 block-scale backend
+    (its own module,
+    ``flashinfer/fused_moe/specialized/fp8_blockscale_moe_sm120.py`` — not a
+    CUTLASS kernel, and not reachable through ``cutlass_fused_moe``):
     fp8 e4m3 weights with fp32 ``[128, 128]`` block scales, BF16 activations
     in/out, default SwiGLU, pre-routed (``PackedPrecomputed``) inputs only.
     The kernels' shipped dispatch surface stays authoritative: the backend
@@ -2691,9 +2690,11 @@ class SpecializedFp8BlockConfig:
     ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` kill switch removes it from
     the candidate set at layer construction and refuses it at call time.
 
-    Opt-in only: like the other SM12x backends it is not part of the default
-    backend search order — list it in ``BackendOptions`` to let ``MoELayer``'s
-    cross-backend autotune reach it.
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM120) and
+    the runner gates the contract and per-call token allowlist, so under
+    ``backend=auto`` the ``MoELayer`` cross-backend shootout times the
+    specialized kernels directly on matching layers — FlashInfer's only
+    resident fp8-block-scale MoE path on SM120 — with no opt-in.
     """
 
     @classmethod
@@ -3609,6 +3610,11 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runner gate arch + contract; out-of-domain calls are declined
+        # and served by the other candidates).
+        SpecializedFp8BlockConfig(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),

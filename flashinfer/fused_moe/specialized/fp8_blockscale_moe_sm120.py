@@ -10,11 +10,15 @@ cutlass path refuses this contract on SM120 ("FP8 block scaling not yet
 implemented for Blackwell"); this backend is the first FlashInfer-resident
 path for it.
 
-Dispatch follows the specialized-backend pattern (PR #5667): it serves
-``cutlass_fused_moe(use_deepseek_fp8_block_scale=True)`` through
-``backend="auto"`` (on-allowlist only) or an explicit
-``backend="specialized"``; an explicitly selected other backend is never
-swapped. The dispatch surface lives in
+This module is the kernels' OWN dispatch surface, and its sole public home
+is the unified MoE API: ``SpecializedFp8BlockConfig`` (``api.py``, a default
+backend candidate on SM120) and ``SpecializedFp8BlockRunner``
+(``runners.py``) call :func:`maybe_run_specialized` directly. The kernels
+are not CUTLASS kernels and are not reachable through ``cutlass_fused_moe``
+or any other backend's entry point; ``MoELayer``'s ``backend=auto``
+cross-backend shootout times them as their own named candidate
+(``"specialized_fp8_block"``) and routes to them where they win. The
+dispatch surface (token allowlist, device profile) lives in
 ``fp8_blockscale_moe_sm120_workload.json`` next to this module.
 ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read at call time) disables the
 backend entirely. Guard order: GPU-free checks (kill switch, dtype,
