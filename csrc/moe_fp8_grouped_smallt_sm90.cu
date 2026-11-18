@@ -539,6 +539,39 @@ void moe_fp8_grouped_smallt_sm90_run(TensorView hidden_states, TensorView fc1_we
     TVM_FFI_ICHECK_EQ(H % 256, 0) << "grouped path requires hidden_size % 256 == 0 (fc2 tiles)";
     TVM_FFI_ICHECK_EQ(I, 256) << "grouped path requires intermediate_size == 256 (fp8 fc2 K)";
   }
+  // Dynamic shared-memory capacity of the small-path launches: they are
+  // data-dependent and launch without the >48KiB opt-in (the grouped band's
+  // kernels use launch-class constants and opt in where needed), so geometry
+  // whose requirement exceeds the default limit must be rejected, not
+  // launched into a failure after FC1 already ran.
+  constexpr int64_t kMaxDynSmem = 48 * 1024;
+  if (T == 1) {
+    TVM_FFI_ICHECK_LE((int64_t)H * 2, kMaxDynSmem)
+        << "T == 1 fc1 staging needs " << (int64_t)H * 2 << "B shared memory (limit " << kMaxDynSmem
+        << "B)";
+  } else if (T < 256) {
+    const int64_t sn1 = (2 * (int64_t)I + 127) / 128;
+    const int64_t sh = ((int64_t)H + 127) / 128;
+    TVM_FFI_ICHECK_LE((int64_t)H * 2 + sn1 * sh * 4, kMaxDynSmem)
+        << "small-path fc1 needs " << ((int64_t)H * 2 + sn1 * sh * 4) << "B shared memory (limit "
+        << kMaxDynSmem << "B)";
+    TVM_FFI_ICHECK_LE((int64_t)KTOP * I * 2, kMaxDynSmem)
+        << "small-path fc2 needs " << (int64_t)KTOP * I * 2 << "B shared memory (limit "
+        << kMaxDynSmem << "B)";
+  }
+  // The kernels read activations, weights and the fp16 intermediate through
+  // uint4 (16-byte) vectors; contiguity does not imply address alignment
+  // for a view with a storage offset.
+  const auto aligned16 = [](const void* p) { return (reinterpret_cast<uintptr_t>(p) & 15) == 0; };
+  TVM_FFI_ICHECK(aligned16(hidden_states.data_ptr()))
+      << "hidden_states must be 16-byte aligned (vectorized loads)";
+  TVM_FFI_ICHECK(aligned16(fc1_weights.data_ptr()))
+      << "fc1_weights must be 16-byte aligned (vectorized loads)";
+  TVM_FFI_ICHECK(aligned16(fc2_weights.data_ptr()))
+      << "fc2_weights must be 16-byte aligned (vectorized loads)";
+  TVM_FFI_ICHECK(aligned16(out.data_ptr())) << "out must be 16-byte aligned (vectorized stores)";
+  TVM_FFI_ICHECK(aligned16(workspace.data_ptr()))
+      << "workspace must be 16-byte aligned (vectorized intermediate)";
   TVM_FFI_ICHECK_GE((int64_t)workspace.numel(),
                     moe_fp8_grouped_smallt_sm90_plan_workspace_bytes(T, KTOP, I, H, E))
       << "workspace too small: plan with plan_workspace_bytes(" << T << ", " << KTOP << ", " << I

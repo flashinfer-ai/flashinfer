@@ -53,9 +53,10 @@ kept for one release.
 
 The dispatch never allocates on the hot path except the output tensor when
 the caller did not pass one: the fp16 intermediate workspace is cached per
-(device, stream) at the serving band's capacity and the JIT build happens at
-layer init or on the first eligible call outside any CUDA-graph capture (a
-capture without a built module is declined).
+(device, stream) at the serving band's capacity (a CUDA-graph capture
+adopts a primed buffer and takes ownership of it) and the JIT build happens
+at layer init or on the first eligible call outside any CUDA-graph capture
+(a capture without a built module is declined).
 """
 
 import os
@@ -81,6 +82,16 @@ _MAX_TOKENS = 16  # small-path band cap (measured won rows T=1/4/16)
 _BAND2_LO = 256
 _BAND2_HI = 4096
 _COMPUTE_CAPABILITY = (9, 0)
+# Per-block dynamic shared memory available WITHOUT the explicit opt-in the
+# launcher performs only for the grouped band's constant-size kernels. The
+# small path's launches are data-dependent (fc1 stages H halves (+ the fc1
+# scale grid for T >= 2), fc2 stages top_k * I halves), so geometry whose
+# requirement exceeds this must be declined before launch.
+_SMEM_LIMIT = 48 * 1024
+# The kernels read activations, weights and the fp16 intermediate through
+# uint4 (16-byte) vectors; CUDA requires natural alignment, which a
+# contiguous view with a storage offset does not guarantee.
+_VEC_ALIGN = 16
 
 _backend_dispatches: Dict[str, int] = {"specialized": 0, "declined": 0}
 _fallback_reasons: Dict[str, int] = {}
@@ -105,10 +116,18 @@ _module_error: Optional[str] = None
 # Intermediate workspaces keyed by (device index, CUDA stream handle): the
 # native run launches on the caller's current stream, so two streams sharing
 # one buffer would overwrite each other's intermediates. A CUDA-graph
-# capture adopts the device's largest primed workspace instead (the
-# torch.cuda.graph warmup pattern primes the cache on the warmup stream, and
-# a graph's own launches serialize at replay).
+# capture adopts the device's largest primed workspace (the torch.cuda.graph
+# warmup pattern primes the cache on the warmup stream) and takes OWNERSHIP
+# of it: the buffer moves to _graph_workspaces, keyed by the capture stream,
+# and never returns to eager use — a replay is ordered only against work on
+# its own replay stream, so scratch shared with eager calls (or with a graph
+# captured on another stream) could be written by two executions
+# concurrently. Launches inside one graph serialize at replay, so reuse
+# within a capture is safe; graphs captured on the SAME stream share scratch
+# and must not replay concurrently (the rule PyTorch states for graphs
+# sharing memory).
 _workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
+_graph_workspaces: Dict[Tuple[int, int], torch.Tensor] = {}
 # Workspaces replaced by larger ones are retained for the life of the
 # process: a CUDA graph captured earlier may still replay into the old
 # tensor's address, so releasing it to the allocator would let unrelated
@@ -264,6 +283,18 @@ def _eligibility(
             return f"H={H} not 256-aligned (grouped fc2 tiles)"
         if I != 256:
             return f"I={I} != 256 (grouped fp8 fc2 K blocks)"
+    # Dynamic shared-memory capacity of the small-path launches (mirrored by
+    # the native validation; the grouped band's kernels use launch-class
+    # constants and opt in where they exceed the default limit).
+    if T == 1:
+        if 2 * H > _SMEM_LIMIT:
+            return f"fc1 staging smem {2 * H}B > {_SMEM_LIMIT}B (H={H})"
+    elif T <= _MAX_TOKENS:
+        fc1_smem = 2 * H + 4 * ((2 * I + 127) // 128) * ((H + 127) // 128)
+        if fc1_smem > _SMEM_LIMIT:
+            return f"fc1 smem {fc1_smem}B > {_SMEM_LIMIT}B (H={H}, I={I})"
+        if 2 * KTOP * I > _SMEM_LIMIT:
+            return f"fc2 smem {2 * KTOP * I}B > {_SMEM_LIMIT}B (top_k={KTOP}, I={I})"
     if output is not None and (
         output.dtype != torch.bfloat16 or tuple(output.shape) != (T, H)
     ):
@@ -281,6 +312,14 @@ def _eligibility(
             return f"{name} not contiguous"
         if t.device != input.device:
             return f"{name} device {t.device}"
+    # Contiguity does not imply address alignment: a contiguous view with a
+    # storage offset can be only element-aligned, and the kernels read these
+    # tensors through 16-byte (uint4) vectors.
+    for name, t in (("input", input), ("fc1", w1), ("fc2", w2)):
+        if t.data_ptr() % _VEC_ALIGN:
+            return f"{name} not {_VEC_ALIGN}-byte aligned (vectorized loads)"
+    if output is not None and output.data_ptr() % _VEC_ALIGN:
+        return f"output not {_VEC_ALIGN}-byte aligned (vectorized stores)"
     if input.device.type != "cuda":
         return f"device {input.device}"
     try:
@@ -371,34 +410,49 @@ def _moe_smallt_sm90_dispatch(
     band_cap = _MAX_TOKENS if T <= _MAX_TOKENS else _BAND2_HI
     need = int(module.plan_workspace_bytes(band_cap, KTOP, I, H_sz, E_sz))
     ws_key = (dev_index, torch.cuda.current_stream(input.device).cuda_stream)
-    ws = _workspaces.get(ws_key)
-    if ws is not None and (ws.numel() < need or ws.device != input.device):
-        ws = None
-    if ws is None and capturing:
-        # Never allocate (or cache) inside a capture: adopt the device's
-        # largest primed workspace — the torch.cuda.graph warmup pattern
-        # primes it on the warmup stream, and a graph's own launches
-        # serialize at replay, so reuse inside one graph is safe.
-        for (dev, _stream), cand in _workspaces.items():
-            if (
-                dev == dev_index
-                and cand.numel() >= need
-                and (ws is None or cand.numel() > ws.numel())
-            ):
-                ws = cand
+    if capturing:
+        ws = _graph_workspaces.get(ws_key)
+        if ws is not None and (ws.numel() < need or ws.device != input.device):
+            ws = None
         if ws is None:
-            _counters["runs_capture_unready"] += 1
-            _fallback("workspace alloc under capture")
-            _backend_dispatches["declined"] += 1
-            return None
-    elif ws is None:
-        old = _workspaces.get(ws_key)
-        ws = torch.empty(need, dtype=torch.uint8, device=input.device)
-        if old is not None:
-            # a captured graph may still replay into the old buffer
-            _retired_workspaces.append(old)
-        _workspaces[ws_key] = ws
-        _counters["workspace_allocs"] += 1
+            # Never allocate (or cache) inside a capture: adopt the device's
+            # largest primed eager workspace — the torch.cuda.graph warmup
+            # pattern primes it on the warmup stream — and take ownership:
+            # the buffer leaves the eager cache so no eager call or capture
+            # on another stream can race the graph's replays over it (see
+            # the _graph_workspaces comment).
+            adopt_key = None
+            for key, cand in _workspaces.items():
+                if (
+                    key[0] == dev_index
+                    and cand.numel() >= need
+                    and (ws is None or cand.numel() > ws.numel())
+                ):
+                    ws, adopt_key = cand, key
+            if ws is None:
+                _counters["runs_capture_unready"] += 1
+                _fallback("workspace alloc under capture")
+                _backend_dispatches["declined"] += 1
+                return None
+            del _workspaces[adopt_key]
+            old = _graph_workspaces.get(ws_key)
+            if old is not None:
+                # an earlier graph captured on this stream may still replay
+                # into the smaller buffer
+                _retired_workspaces.append(old)
+            _graph_workspaces[ws_key] = ws
+    else:
+        ws = _workspaces.get(ws_key)
+        if ws is not None and (ws.numel() < need or ws.device != input.device):
+            ws = None
+        if ws is None:
+            old = _workspaces.get(ws_key)
+            ws = torch.empty(need, dtype=torch.uint8, device=input.device)
+            if old is not None:
+                # a captured graph may still replay into the old buffer
+                _retired_workspaces.append(old)
+            _workspaces[ws_key] = ws
+            _counters["workspace_allocs"] += 1
 
     ids = token_selected_experts
     if ids.dtype != torch.int32:
