@@ -11,6 +11,8 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include <cstring>
+
 #include "fp8bs_gemm_decodem_sm90.h"
 
 namespace cg = cooperative_groups;
@@ -56,11 +58,15 @@ __device__ __forceinline__ float bhi(uint32_t v) { return __uint_as_float(v & 0x
 
 __device__ __forceinline__ uint32_t pack_partial_bf16x2(float a, float b) {
   __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-  return *reinterpret_cast<uint32_t*>(&v);
+  uint32_t u;
+  memcpy(&u, &v, sizeof(u));  // alias-safe 4-byte representation transfer
+  return u;
 }
 
 __device__ __forceinline__ float2 unpack_partial_bf16x2(uint32_t u) {
-  return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&u));
+  __nv_bfloat162 v;
+  memcpy(&v, &u, sizeof(v));  // alias-safe 4-byte representation transfer
+  return __bfloat1622float2(v);
 }
 
 template <int MT, int NWARP, int KSHIFT>
