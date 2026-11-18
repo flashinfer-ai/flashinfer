@@ -21,13 +21,17 @@ decode-serve envelope on SM90, served through the ``"specialized"`` backend
 of :func:`flashinfer.norm.rmsnorm` (#5667 pattern):
 
 - ``backend="specialized"`` selects it explicitly; a call it cannot serve
-  falls back to the stock rmsnorm dispatch (this op's composable path) —
+  falls back to the incumbent rmsnorm dispatch (this op's composable path) —
   never to another fused backend — with the reason recorded in the dispatch
   stats.
 - ``backend="auto"`` (the default) routes to ``"specialized"`` only on the
-  dispatch allowlist (``flashinfer/rmsnorm_serve_sm90_dispatch.json``).
-- ``backend="stock"`` pins the stock dispatch; an explicitly selected
-  backend is never silently swapped, and unknown names raise.
+  dispatch allowlist (``flashinfer/rmsnorm_serve_sm90_dispatch.json``), and
+  otherwise among the named incumbents; auto is purely a router and carries
+  no behavior of its own.
+- ``backend="cuda"`` pins the legacy CUDA JIT norm kernel and
+  ``backend="cutedsl"`` the CuTe DSL kernels — the incumbent implementations
+  by nature-name; an explicitly selected backend is never silently swapped,
+  and unknown names raise.
 
 Behind ``"specialized"`` sit TWO agent-generated kernel variants (one
 backend string, per #5667, which also shipped multiple sources):
@@ -40,21 +44,21 @@ backend string, per #5667, which also shipped multiple sources):
   CUDA C++ specialist (csrc/norm_serve_sm90.cu, JIT module
   ``norm_serve_sm90``) with shape-specialized kernels for H in exactly
   {512, 2048, 6144}; dispatch admits only that exact allowlist (its generic
-  fallback is correct but slower than the stock path off-list).
+  fallback is correct but slower than the incumbent paths off-list).
 
 Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (checked per call;
-shared by FlashInfer's specialized kernels) forces the stock path.
+shared by FlashInfer's specialized kernels) forces the incumbent path.
 ``FLASHINFER_SM90_SERVE_RMSNORM=0`` remains a deprecated kill alias for one
 release.  Any call outside the guard (shape, dtype, layout, architecture,
 token count, CUDA-graph or autotune constraints below) also falls back to
-the stock path.
+the incumbent path.
 
 CUDA-graph rules: the compiled kernels take their stream from the caller's
 current stream on every call (TVM-FFI env stream / per-call stream query), so
 capture goes to the capture stream; no variant is JIT-compiled under capture
-(an uncompiled (H, dtype) during capture falls back to the stock path, which
+(an uncompiled (H, dtype) during capture falls back to the incumbent path, which
 has the same no-JIT-under-capture discipline once warmed); autotune tuning
-mode bails to the stock path so tuning measures stock tactics only.
+mode bails to the incumbent path so tuning measures incumbent tactics only.
 """
 
 import os
@@ -73,28 +77,46 @@ _ENV_VAR = "FLASHINFER_SM90_SERVE_RMSNORM"
 # Kill switch shared by FlashInfer's specialized kernels (read per call).
 _SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 # Backends of flashinfer.norm.rmsnorm, as plain strings (#5667): "specialized"
-# is the agent-generated fast path (both variants), "stock" the existing
-# dispatch. An explicitly selected backend is never silently swapped.
-RMSNORM_BACKENDS = ("auto", "specialized", "stock")
+# is the agent-generated fast path (both variants); the two incumbent
+# implementations are named by nature — "cuda" (the legacy CUDA JIT norm
+# kernel) and "cutedsl" (the CuTe DSL kernels) — and "auto" is purely a
+# router over the named backends. An explicitly selected backend is never
+# silently swapped.
+RMSNORM_BACKENDS = ("auto", "specialized", "cuda", "cutedsl")
 _DISPATCH_FILE = "rmsnorm_serve_sm90_dispatch.json"
 
 # Per-backend dispatch census and fallback reasons (#5667-style).  Every
-# call is attributed to exactly one backend ("specialized" when these
-# kernels produced the output, "stock" otherwise, including every guard
-# fallback), so ``calls == specialized + stock`` always holds.
+# call that goes through the backend surface is attributed to exactly one
+# backend ("specialized" when these kernels produced the output; "cuda" or
+# "cutedsl" when the respective incumbent implementation did, recorded by
+# the dispatcher via record_incumbent_dispatch), so
+# ``calls == specialized + cuda + cutedsl`` holds over surface calls.
 _stats: dict = {
     "calls": 0,
-    "backend_dispatches": {"specialized": 0, "stock": 0},
+    "backend_dispatches": {"specialized": 0, "cuda": 0, "cutedsl": 0},
     "variant_dispatches": {"cutedsl": 0, "cuda": 0},
     "fallback_reasons": {},
 }
 
 
 def _fallback(reason):
-    # A fallback is served by the stock path: record both the reason and the
-    # stock dispatch so the per-backend census stays complete.
-    _stats["backend_dispatches"]["stock"] += 1
+    # The call will be served by an incumbent backend; the dispatcher
+    # attributes it ("cuda"/"cutedsl") via record_incumbent_dispatch once it
+    # knows which implementation ran. Record the reason here.
     _stats["fallback_reasons"][reason] = _stats["fallback_reasons"].get(reason, 0) + 1
+
+
+def record_incumbent_dispatch(impl: str, *, count_call: bool = False) -> None:
+    """Attribute a call served by an incumbent backend ("cuda"/"cutedsl").
+
+    ``count_call=True`` also counts the call itself (used for explicit
+    ``backend="cuda"``/``"cutedsl"`` pins, which never enter
+    :func:`try_rmsnorm_serve_sm90` and would otherwise be missing from the
+    census).
+    """
+    if count_call:
+        _stats["calls"] += 1
+    _stats["backend_dispatches"][impl] += 1
 
 
 def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -420,16 +442,18 @@ def try_rmsnorm_serve_sm90(
 ) -> bool:
     """Run the SM90 serve-shape RMSNorm when the call is inside the measured
     envelope.  Returns ``True`` when the output has been produced; ``False``
-    means the caller must run the stock path (this op's composable path:
-    guard miss, kill switch, backend="stock", off the auto allowlist,
-    missing runtime, uncompiled variant under CUDA-graph capture, or
-    autotune tuning mode).  ``requested`` is the public backend kwarg:
-    "stock" never reaches these kernels; "specialized" is explicit (guards
-    still apply, with the miss reason recorded); "auto" additionally
-    requires the dispatch allowlist to be loaded."""
+    means the caller must run an incumbent backend (this op's composable
+    path: guard miss, kill switch, explicit backend="cuda"/"cutedsl", off
+    the auto allowlist, missing runtime, uncompiled variant under
+    CUDA-graph capture, or autotune tuning mode).  ``requested`` is the
+    public backend kwarg: "cuda" and "cutedsl" never reach these kernels;
+    "specialized" is explicit (guards still apply, with the miss reason
+    recorded); "auto" additionally requires the dispatch allowlist to be
+    loaded. Incumbent-backend attribution is the caller's
+    (record_incumbent_dispatch), since only the caller knows which
+    implementation ran."""
     _stats["calls"] += 1
-    if requested == "stock":
-        _stats["backend_dispatches"]["stock"] += 1
+    if requested in ("cuda", "cutedsl"):
         return False
     if _disabled():
         _fallback(f"{requested}: kill switch")
@@ -489,7 +513,7 @@ def try_rmsnorm_serve_sm90(
             # up to 64 tokens) cover one row with several CTAs, each reading
             # the full row while writing only a slice of it, so with out
             # aliasing input one CTA's write can land before another CTA's
-            # read of the same row.  In-place calls take the stock path.
+            # read of the same row.  In-place calls take the incumbent path.
             _fallback(f"{requested}: cuda variant does not support in-place")
             return False
         if _cuda_module is None and torch.cuda.is_current_stream_capturing():

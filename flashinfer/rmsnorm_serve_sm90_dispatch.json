@@ -1,6 +1,6 @@
 {
-  "comment": "Dispatch surface of the specialized SM90 serve-shape RMSNorm kernels behind flashinfer.norm.rmsnorm's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys backend='auto' matches a call against (the compiled-in guards in flashinfer/norm/kernels/rmsnorm_serve_sm90.py stay authoritative) plus the measured envelope. Two kernel variants (cutedsl default, cuda via FLASHINFER_SM90_SERVE_RMSNORM=cuda) sit behind the one 'specialized' backend. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the stock path regardless of this file.",
-  "backends": ["auto", "specialized", "stock"],
+  "comment": "Dispatch surface of the specialized SM90 serve-shape RMSNorm kernels behind flashinfer.norm.rmsnorm's 'specialized' backend. 'backends' lists the backend strings; the op entry carries the auto-routing keys backend='auto' matches a call against (the compiled-in guards in flashinfer/norm/kernels/rmsnorm_serve_sm90.py stay authoritative) plus the measured envelope. Two kernel variants (cutedsl default, cuda via FLASHINFER_SM90_SERVE_RMSNORM=cuda) sit behind the one 'specialized' backend. FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1 forces the incumbent (cuda/cutedsl) path regardless of this file.",
+  "backends": ["auto", "specialized", "cuda", "cutedsl"],
   "kill_switch": "FLASHINFER_SPECIALIZED_KERNEL_DISABLE",
   "ops": {
     "rmsnorm_serve": {
