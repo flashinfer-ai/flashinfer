@@ -493,16 +493,18 @@ __global__ __launch_bounds__((MODE == 3 ? 128 : NTHREAD), 2) void attn_kernel(
        clamp-restaged page) would otherwise reach the PV accumulator for
        valid rows. The K side needs no scrub (the mask overwrites the score
        bits). Each thread rewrites only the chunks it staged itself, before
-       the barrier publishes the tile. */
+       the barrier publishes the tile. vt_build permutes the within-page key
+       order (slot j holds key VPERM(j)), so the scrub must test the key a
+       slot holds, not the slot index. */
     if (kv0 + BN > kvlen) {
 #pragma unroll
       for (int i = 0; i < (PACK ? BN / 16 : BN / 32); ++i) {
         const int vc = PACK ? i : vpg + 2 * i;
         uint8_t* chunk = Vb + vsh0 + ((vc ^ vx) << 4);
-        const int lim = kvlen - kv0 - vc * 16; /* slots < lim hold live keys */
+        const int lim = kvlen - kv0 - vc * 16; /* keys < lim are live */
 #pragma unroll
         for (int ss = 0; ss < 16; ++ss)
-          if (ss >= lim) chunk[ss] = 0;
+          if (VPERM(ss) >= lim) chunk[ss] = 0;
       }
     }
     /* cp.async completion and the scrub above are generic-proxy writes; the
