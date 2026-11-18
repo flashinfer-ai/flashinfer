@@ -19,12 +19,19 @@
 // Top-p renormalisation of float32 probability rows with one thread-block cluster (8 or 16 CTAs)
 // per row: one read of the row and one write of the output, in a single launch.
 //
-// Semantics (identical to the AIR path of top_p_renorm_probs): keep {p >= threshold}, where
-// threshold is the smallest value of the shortest descending prefix whose mass reaches
-// top_p * M, M being the row's positive mass (AIR's target is blockSum * p); ties at the
-// threshold are kept; the kept entries are divided by their sum, every other entry is 0. The
-// target is relative to the row's own mass, so a row that does not sum to 1 (scaled, vanishing or
-// unnormalised) keeps the same entries as on the AIR path.
+// Semantics: keep {p >= threshold}, where threshold is the smallest value of the shortest
+// descending prefix whose mass reaches top_p * M, M being the row's positive mass; ties at the
+// threshold are kept; the kept entries are divided by their sum (left as they are if it is
+// <= 1e-8), every other entry is 0. This is the rule of the AIR path of top_p_renorm_probs (its
+// target is blockSum * p, relative to the row's own mass, so a row that does not sum to 1 keeps
+// the same entries), evaluated with exact masses: every sum below is a 64-bit fixed-point sum,
+// exact for the row's entries, so the kept set is what float64 (exact) arithmetic keeps and never
+// depends on a summation order. AIR evaluates the rule with float32 sums whose rounding depends on
+// its reduction order (float atomics across CTAs, so the launch); where a prefix mass lies within
+// that rounding of the target the two can keep different entries. Example: float32 [0.5, 0.3,
+// 0.2] at top_p 0.5 has an exact mass of 1 + 2^-26, so the target is just above 0.5 and this kernel
+// keeps {0.5, 0.3} (output [0.625, 0.375]) like a float64 evaluation; AIR's float32 row sum rounds
+// to 1.0 and keeps 0.5 alone.
 //
 // Fast path: every CTA streams its slice of the row once, writes zeros to the matching output
 // slice, adds the slice up in float32 and collects the entries >= 2^-8 (at most 256 per row when

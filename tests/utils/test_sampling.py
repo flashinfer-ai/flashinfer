@@ -3418,6 +3418,37 @@ def test_top_p_renorm_probs_specialized_vanishing_rows_match_air(
     assert not out[5].any()
 
 
+def test_top_p_renorm_probs_specialized_exact_mass_contract(top_p_specialized_enabled):
+    # The nucleus target is top_p times the row's EXACT mass (fixed-point sums, independent of any
+    # summation order), so the kept set is the float64 reference's. Float32 [0.5, 0.3, 0.2] sums
+    # to 1 + 2^-26 exactly: at top_p 0.5 the target is just above 0.5, so 0.3 is kept too and the
+    # output is [0.625, 0.375]. AIR's float32 row sum rounds to 1.0 here and keeps 0.5 alone; at
+    # such ties AIR's float32 result depends on its accumulation order (float atomics across
+    # CTAs), so the kernel follows exact arithmetic instead (documented in the kernel header).
+    _skip_unless_sm103()
+    batch_size, vocab_size = 5, 154880
+    probs = torch.zeros(batch_size, vocab_size)
+    probs[0, :3] = torch.tensor([0.5, 0.3, 0.2])
+    # the same row with its entries in other CTAs' slices
+    probs[1, [vocab_size - 1, 0, vocab_size // 2]] = torch.tensor([0.5, 0.3, 0.2])
+    # the same tie at mass 2 + 2^-25
+    probs[2, :3] = torch.tensor([1.0, 0.6, 0.4])
+    # an exact tie: the prefix {0.5} reaches the target 0.5 exactly, so 0.25 is not kept
+    probs[3, :3] = torch.tensor([0.5, 0.25, 0.25])
+    # row 4 stays all zero
+    tp = torch.full((batch_size,), 0.5)
+    out = flashinfer.sampling.top_p_renorm_probs(probs.cuda(), tp.cuda()).cpu()
+    expected = torch.zeros(batch_size, vocab_size)
+    expected[0, :2] = torch.tensor([0.625, 0.375])
+    expected[1, [vocab_size - 1, 0]] = torch.tensor([0.625, 0.375])
+    expected[2, :2] = torch.tensor([0.625, 0.375])
+    expected[3, 0] = 1.0
+    torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        out, _top_p_specialized_reference(probs, tp), atol=0.0, rtol=0.0
+    )
+
+
 def test_top_p_renorm_probs_specialized_launch_plan_matches_the_kernel(
     top_p_specialized_enabled,
 ):
