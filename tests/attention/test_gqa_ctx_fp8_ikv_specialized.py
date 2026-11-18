@@ -25,7 +25,10 @@ import pytest
 import torch
 
 import flashinfer.gqa_ctx_fp8_ikv_cuda as spec_mod
-from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+from flashinfer.prefill import (
+    batch_context_with_kv_cache,
+    trtllm_batch_context_with_kv_cache,
+)
 
 requires_sm103 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
@@ -93,8 +96,10 @@ def _reference(inp):
 
 
 def _api(inp, out, backend="auto"):
+    # the generic front is the ONLY surface exposing the specialized
+    # backend (vendor-named entries stay stock)
     kv = inp["kv_buf"]
-    return trtllm_batch_context_with_kv_cache(
+    return batch_context_with_kv_cache(
         query=inp["q"],
         kv_cache=(kv[:, :, 0, :].unsqueeze(1), kv[:, :, 1, :].unsqueeze(1)),
         workspace_buffer=_ws(),
@@ -266,14 +271,16 @@ def test_generalized_entry_parity_and_dispatch():
         out=_out_like(inp), backend="specialized", **kwargs
     )
     assert torch.equal(gen_spec, gen_out)
-    # parity with the direct (entry-level) specialized route
-    direct_out = _api(inp, _out_like(inp), backend="specialized")
-    assert torch.equal(gen_out, direct_out)
+    # the vendor-named entry stays STOCK: it has no specialized backend
+    with pytest.raises(ValueError, match="trtllm-gen|cake"):
+        trtllm_batch_context_with_kv_cache(
+            out=_out_like(inp), backend="specialized", **kwargs
+        )
     # the named "trtllm" backend equals the entry's trtllm-gen path
     gen_stock = batch_context_with_kv_cache(
         out=_out_like(inp), backend="trtllm", **kwargs
     )
-    direct_stock = _api(inp, _out_like(inp), backend="trtllm-gen")
+    direct_stock = _api(inp, _out_like(inp), backend="trtllm")
     assert torch.equal(gen_stock, direct_stock)
     # off-allowlist: auto selects "trtllm"; explicit "specialized" raises
     big = _make_inputs([2] * 2, [600] * 2, seed=13)  # multi-page KV
