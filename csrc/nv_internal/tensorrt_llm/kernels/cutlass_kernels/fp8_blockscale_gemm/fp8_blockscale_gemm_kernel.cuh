@@ -294,6 +294,11 @@ __global__ void __launch_bounds__(TILE_M == 64 ? 256 : 384, 1)
   constexpr int TMA_ISSUE_INTERVAL = 1;
   using Barrier = cuda::barrier<cuda::thread_scope_block>;
 
+  // Launched with PDL: wait for the previous kernel before reading anything it may have written.
+  // That is A and its scales, and for the grouped visitor also problem_m_offsets, which
+  // m_boundary() and m_offset() read just below.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
   int tile_m_idx = ProblemVisitor::tile_m_idx();
   int m_boundary = ProblemVisitor::m_boundary(problem_input);
   if (tile_m_idx * TILE_M >= m_boundary) return;
@@ -363,9 +368,6 @@ __global__ void __launch_bounds__(TILE_M == 64 ? 256 : 384, 1)
     }
     cutlass::arch::fence_view_async_shared();
   }
-  // Launched with PDL: wait for the kernel that produced A and its scales before
-  // any TMA load.
-  asm volatile("griddepcontrol.wait;" ::: "memory");
   int math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / 128 - 1, 0);
 
   float scale_b_r, scale_b_r_second_part;
@@ -747,9 +749,9 @@ class Fp8Gemm {
     typename ProblemVisitor::Input problem_input{shape_m};
     auto grid_size = ProblemVisitor::grid_dim(guessed_m, shape_n);
 
-    kernel_utils::launch_kernel_pdl(Kernel, grid_size, BLOCK_SIZE, smem_size, stream, enable_pdl,
-                                    gmem_d, ld_d, scales_b, problem_input, shape_n, shape_k,
-                                    tma_a_desc, tma_b_desc, tma_scales_a_desc, guessed_m);
+    TLLM_CUDA_CHECK(kernel_utils::launch_kernel_pdl(
+        Kernel, grid_size, BLOCK_SIZE, smem_size, stream, enable_pdl, gmem_d, ld_d, scales_b,
+        problem_input, shape_n, shape_k, tma_a_desc, tma_b_desc, tma_scales_a_desc, guessed_m));
 #undef Kernel
   }
 
@@ -1487,9 +1489,9 @@ void fp8_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, int ld_a
 
   if (internal_quantize_a) {
     auto quant_kernel = scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3, float>;
-    kernel_utils::launch_kernel_pdl(quant_kernel, kNumDeviceSMs * 8, 256, 0, stream, enable_pdl,
-                                    fp8_mat_a, scales_a, mat_a, static_cast<int>(shape_k),
-                                    static_cast<int>(shape_m));
+    TLLM_CUDA_CHECK(kernel_utils::launch_kernel_pdl(
+        quant_kernel, kNumDeviceSMs * 8, 256, 0, stream, enable_pdl, fp8_mat_a, scales_a, mat_a,
+        static_cast<int>(shape_k), static_cast<int>(shape_m)));
   }
   if (internal_quantize_b) {
     scale_128x128_kernel<<<kNumDeviceSMs, 256, 0, stream>>>(fp8_mat_b, scales_b, mat_b, shape_k,

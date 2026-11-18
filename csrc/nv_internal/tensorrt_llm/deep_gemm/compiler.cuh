@@ -46,6 +46,12 @@
 
 namespace deep_gemm::jit {
 
+// Version of the JIT kernel sources, part of the on-disk cache name. A cubin found in the cache is
+// loaded without recompiling, so bump this whenever fp8_gemm_impl.cuh or the generated source
+// changes what a kernel assumes about its launch (v1: the kernels run griddepcontrol.wait before
+// their first load and are launched with PDL).
+static constexpr char const* kKernelCacheVersion = "v1";
+
 // Generate a unique ID for temporary directories to avoid collisions
 inline std::string generateUniqueId() {
   // Use current time and random number to generate a unique ID
@@ -258,13 +264,15 @@ class Compiler {
           sm_version);
     }
 
-    // Build signature - simplified, no MD5 calculation
-    std::string name = std::string(swapAB ? "gemm_swapAB_" : "gemm_") + std::to_string(shape_n) +
-                       "_" + std::to_string(shape_k) + "_" + std::to_string(block_m) + "_" +
-                       std::to_string(block_n) + "_" + std::to_string(block_k) + "_" +
-                       std::to_string(num_groups) + "_" + std::to_string(num_stages) +
-                       std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" +
-                       std::to_string(num_tma_multicast) + "_" + gemm_type_to_string(gemm_type);
+    // Build signature - simplified, no MD5 calculation; kKernelCacheVersion stands in for the
+    // source hash
+    std::string name = std::string(swapAB ? "gemm_swapAB_" : "gemm_") + kKernelCacheVersion + "_" +
+                       std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_" +
+                       std::to_string(block_m) + "_" + std::to_string(block_n) + "_" +
+                       std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" +
+                       std::to_string(num_stages) + std::to_string(num_groups) + "_" +
+                       std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast) + "_" +
+                       gemm_type_to_string(gemm_type);
     std::filesystem::path path = getCacheDir() / name;
 
     // Check runtime cache or file system hit
