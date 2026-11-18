@@ -661,15 +661,23 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
 
 
 def _allocate_workspace(
-    plan: RoutePlan, device: torch.device
+    plan: RoutePlan, device: torch.device, *, launch_now: bool = False
 ) -> dict[str, torch.Tensor]:
+    """The route's workspace.  ``launch_now`` (the public API's call, launched at
+    once on the current stream) takes the twin's counters from
+    :func:`flashinfer.cake_locality.launch_counters` (a pair reused per stream,
+    or a pre-zeroed pair for a capture) instead of allocating a pair the
+    prepared launch owns."""
     workspace = {
         key: torch.empty(shape, dtype=WORKSPACE_DTYPES[key], device=device)
         for key, shape in plan.workspaces.items()
         if key not in DOMAIN_COUNTERS
     }
     if DOMAIN_COUNTERS[0] in plan.workspaces:
-        if torch.cuda.is_current_stream_capturing():
+        pair: tuple[torch.Tensor, ...]
+        if launch_now:
+            pair = cake_locality.launch_counters(PAIR_COUNTER_WORDS, device)
+        elif torch.cuda.is_current_stream_capturing():
             # Locality-domain memory is not allocated under capture: zeroed
             # counters from the capture's pool (same bits, unhomed claims).
             pair = tuple(
@@ -821,7 +829,9 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
         or the zeroed int32 claim counters ``counters0`` / ``counters1`` of the
         locality-domain twin route (homed on die 0 / die 1 by
         :func:`flashinfer.cake_locality.counters`).  Allocated at preparation if
-        omitted.
+        omitted: a prepared launch owns its counters (the public API's call
+        instead reuses a counter pair per stream, see
+        :func:`run_batch_deepgemm_fp8_nt_groupwise`).
 
     Returns
     -------
@@ -838,6 +848,33 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
     :func:`localize_weights` run the locality-domain twin route in the listed
     cells (``route == "seed_serving_m32_packed_domain"``).
     """
+    return _prepare(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out=out,
+        workspace=workspace,
+        scale_granularity_mnk=scale_granularity_mnk,
+        launch_now=False,
+    )
+
+
+def _prepare(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    *,
+    out: Optional[torch.Tensor],
+    workspace: Optional[dict[str, torch.Tensor]],
+    scale_granularity_mnk: tuple[int, int, int],
+    launch_now: bool,
+) -> PreparedBatchDeepGemmFp8NtGroupwise:
     problem = _resolve(
         a,
         b,
@@ -857,9 +894,10 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
     plan = problem.plan
     capture_only = False
     if workspace is None:
-        workspace = _allocate_workspace(plan, device)
+        workspace = _allocate_workspace(plan, device, launch_now=launch_now)
         capture_only = (
-            DOMAIN_COUNTERS[0] in plan.workspaces
+            not launch_now
+            and DOMAIN_COUNTERS[0] in plan.workspaces
             and torch.cuda.is_current_stream_capturing()
         )
     else:
@@ -1005,13 +1043,32 @@ def run_batch_deepgemm_fp8_nt_groupwise(
     """One masked batch FP8 GEMM into ``out`` (the ``backend="cake"`` path of the public API).
 
     The route's packed-scale workspace, when it needs one, is a per-call
-    ``torch.empty`` released when the call returns: nothing is cached across calls
-    and the call may be captured into a CUDA graph.  The locality-domain twin's
-    claim counters are allocated per call the same way (die-homed outside
-    capture, from the capture's pool under capture).
+    ``torch.empty`` released when the call returns, and the call may be captured
+    into a CUDA graph.
+
+    The locality-domain twin's claim counters are not allocated per call: every
+    launch leaves its pair zero, so the call takes an already zero pair from
+    :func:`flashinfer.cake_locality.launch_counters` (die-homed when FlashInfer's
+    locality-domain pools exist, ordinary zeroed tensors otherwise).  Eager calls
+    on one stream reuse that stream's pair (their launches are ordered); a call
+    under CUDA graph capture gets a pre-zeroed pair of its own, used by no eager
+    call and no other capture, so the graph holds no memset node and may replay
+    on any stream while eager calls run.  The same graph must not replay on two
+    streams at once (its launch would share its pair with itself), as for any
+    workspace a graph holds; a prepared launch
+    (:func:`prepare_batch_deepgemm_fp8_nt_groupwise`) keeps its own pair.
     """
-    return prepare_batch_deepgemm_fp8_nt_groupwise(
-        a, b, a_scale, b_scale, masked_m, expected_m, out=out
+    return _prepare(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out=out,
+        workspace=None,
+        scale_granularity_mnk=(1, BLOCK, BLOCK),
+        launch_now=True,
     ).launch()
 
 

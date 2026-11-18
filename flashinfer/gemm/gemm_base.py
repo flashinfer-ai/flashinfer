@@ -13009,7 +13009,11 @@ def batch_deepgemm_fp8_nt_groupwise(
         locality-domain form of the serving program: one launch over both dies,
         each die reading first the expert weights homed in its own memory.  Its
         result is equal within tolerance to the whole-GPU program's, not
-        bitwise.
+        bitwise.  Its per-die claim counters are reused, not allocated per call:
+        eager calls on one stream share that stream's pair, and a captured call
+        gets a pre-zeroed pair of its own (see
+        :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.run_batch_deepgemm_fp8_nt_groupwise`);
+        a graph holding such a call must not replay on two streams at once.
         Every launch of the Cake backend, including the first, may be captured
         into a CUDA graph; see
         :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`

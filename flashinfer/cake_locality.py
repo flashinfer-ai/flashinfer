@@ -18,7 +18,8 @@ Locality-domain runtime of the Cake kernels on a dual-die GPU (sm_107a).
 A Cake locality-domain kernel is one launch over both dies of the GPU. It reads
 the die of its SM from the SM table (:func:`sm_table`), takes the operands that
 each die reads most from memory homed on that die (:func:`split_empty`), and
-claims its work through one small counter workspace per die (:func:`counters`).
+claims its work through one small counter workspace per die (:func:`counters`, or
+:func:`launch_counters` for a call that launches at once).
 The SM table and the homing only order the claims: such a kernel is bitwise
 equal to the whole-GPU build of the same source for any cut and any SM table.
 It is equal within the family's tolerance to the whole-GPU programs FlashInfer
@@ -44,6 +45,7 @@ inside the functions that need them.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import fractions
 import functools
@@ -58,18 +60,22 @@ __all__ = [
     "ENTRY_DOMAIN_SHIFT",
     "ENTRY_RANK_SHIFT",
     "ENTRY_SUPPLEMENTAL_SHIFT",
+    "CAPTURE_PAIR_LIMIT",
+    "CAPTURE_RESERVE",
     "EVEN_GAP",
     "LOCALITY_ARCH",
     "LOCALITY_CUDA",
     "PROBE_ATTEMPTS",
     "PROBE_SOURCE",
     "SM_TABLE_LENGTH",
+    "STREAM_PAIR_LIMIT",
     "Homing",
     "SmTable",
     "counters",
     "die_class",
     "granularity",
     "homing",
+    "launch_counters",
     "pack_rows",
     "pointer_domain",
     "sm_table",
@@ -552,3 +558,140 @@ def counters(words: int, device: Any = None) -> tuple[Any, Any]:
     for tensor in pair:
         tensor.zero_()
     return pair[0], pair[1]
+
+
+# ----------------------------------------------------------------- launch counters
+
+# Eager launches: one cached pair per (device, stream handle, words), at most this
+# many pairs; past it the least recently used pair is dropped.
+STREAM_PAIR_LIMIT = 64
+# Captured launches: pre-zeroed pairs made outside capture. A refill keeps at least
+# CAPTURE_RESERVE pairs ready (more once captures have taken more) and makes at most
+# CAPTURE_PAIR_LIMIT pairs per (device, words) in the process's lifetime.
+CAPTURE_RESERVE = 64
+CAPTURE_PAIR_LIMIT = 1 << 16
+# Pairs cut from one reserve allocation start 16 bytes apart (counter alignment).
+_PAIR_STRIDE_BYTES = 16
+
+
+@dataclasses.dataclass
+class _CaptureReserve:
+    """The pre-zeroed pairs of one (device, words): ``free`` pairs are not handed out
+    yet; ``issued`` were handed to captures; ``made`` counts every pair cut;
+    ``blocks`` holds every allocation the pairs were cut from, for the life of the
+    process (a graph may read a handed-out pair at any later replay)."""
+
+    free: list[tuple[Any, Any]] = dataclasses.field(default_factory=list)
+    issued: int = 0
+    made: int = 0
+    blocks: list[tuple[Any, Any]] = dataclasses.field(default_factory=list)
+
+
+_COUNTER_LOCK = threading.Lock()
+_STREAM_PAIRS: collections.OrderedDict[tuple[int, int, int], tuple[Any, Any]] = (
+    collections.OrderedDict()
+)
+_CAPTURE_RESERVES: dict[tuple[int, int], _CaptureReserve] = {}
+
+
+def _stream_capturing(device_index: int) -> bool:
+    import torch
+
+    if device_index == torch.cuda.current_device():
+        return bool(torch.cuda.is_current_stream_capturing())
+    with torch.cuda.device(device_index):
+        return bool(torch.cuda.is_current_stream_capturing())
+
+
+def _refill_capture_reserve(device_index: int, words: int) -> None:
+    """Top up the capture reserve of ``(device_index, words)``; outside capture,
+    under ``_COUNTER_LOCK``. Allocates only after captures took about half of it."""
+    import torch
+
+    reserve = _CAPTURE_RESERVES.setdefault((device_index, words), _CaptureReserve())
+    target = max(CAPTURE_RESERVE, reserve.issued)
+    if 2 * len(reserve.free) > target:
+        return
+    count = min(target - len(reserve.free), CAPTURE_PAIR_LIMIT - reserve.made)
+    if count <= 0:
+        return
+    stride = -(-words * 4 // _PAIR_STRIDE_BYTES) * _PAIR_STRIDE_BYTES // 4
+    block = counters(count * stride, device_index)
+    # A graph may replay on any stream: wait here, outside capture, until the
+    # zeroing is done, so a reserved pair is zero before any replay reads it.
+    torch.cuda.current_stream(device_index).synchronize()
+    reserve.blocks.append(block)
+    reserve.free.extend(
+        (
+            block[0][i * stride : i * stride + words],
+            block[1][i * stride : i * stride + words],
+        )
+        for i in reversed(range(count))
+    )
+    reserve.made += count
+
+
+def launch_counters(words: int, device: Any = None) -> tuple[Any, Any]:
+    """Each die's claim counters (two zeroed int32 tensors of ``words`` words, homed
+    as by :func:`counters`) for one launch enqueued right away on the current
+    stream of ``device``, by a kernel that leaves them zero. Allocates nothing in
+    steady state.
+
+    - Outside capture, the pair is cached per ``(device, stream handle, words)``:
+      every launch on one stream reuses its stream's pair, which is safe because
+      launches on one stream are ordered. The key is the raw ``cudaStream_t``:
+      PyTorch hands out stream handles from a per-device pool, and a recycled
+      handle names the same CUDA stream, so launches with one handle are ordered
+      whatever stream object made them. At most :data:`STREAM_PAIR_LIMIT` pairs
+      are cached; the least recently used one is dropped past it (its memory goes
+      back to the caching allocator, which reuses it only in its stream's order).
+    - Under CUDA graph capture, the pair is a pre-zeroed pair of a reserve made
+      outside capture, handed to that one capture and to no eager launch or other
+      capture, and kept alive for the life of the process (a graph may replay it
+      at any time). The graph then has no memset node. A reserve is topped up by
+      the next eager call of this function after captures took half of it
+      (:data:`CAPTURE_RESERVE` pairs or more; :data:`CAPTURE_PAIR_LIMIT` pairs per
+      device and ``words`` at most). When no reserved pair is available (the
+      first call of the process is captured, a capture took the whole reserve, or
+      the limit is reached), the pair is zeroed inside the capture from the
+      capture's own memory pool (unhomed; the graph keeps it alive).
+
+    A captured pair is used by every replay of its graph: replaying one graph
+    concurrently on two streams is not supported, as for any FlashInfer workspace
+    held by a graph."""
+    import torch
+
+    index = _device_index(device)
+    words = int(words)
+    if _stream_capturing(index):
+        with _COUNTER_LOCK:
+            reserve = _CAPTURE_RESERVES.get((index, words))
+            if reserve is not None and reserve.free:
+                reserve.issued += 1
+                return reserve.free.pop()
+        # No reserved pair: zero one inside the capture (memset nodes in the graph).
+        target = torch.device("cuda", index)
+        return (
+            torch.zeros((words,), dtype=torch.int32, device=target),
+            torch.zeros((words,), dtype=torch.int32, device=target),
+        )
+    key = (index, int(torch._C._cuda_getCurrentRawStream(index)), words)
+    with _COUNTER_LOCK:
+        pair = _STREAM_PAIRS.get(key)
+        if pair is None:
+            # Allocated and zeroed on this stream, ahead of the launch.
+            pair = counters(words, index)
+            _STREAM_PAIRS[key] = pair
+            while len(_STREAM_PAIRS) > STREAM_PAIR_LIMIT:
+                _STREAM_PAIRS.popitem(last=False)
+        else:
+            _STREAM_PAIRS.move_to_end(key)
+        _refill_capture_reserve(index, words)
+    return pair
+
+
+def _forget_counters() -> None:
+    """Test only: drop the cached stream pairs and the capture reserves."""
+    with _COUNTER_LOCK:
+        _STREAM_PAIRS.clear()
+        _CAPTURE_RESERVES.clear()

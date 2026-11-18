@@ -1608,6 +1608,7 @@ def test_domain_twin_counters_zero_and_reused(cell, monkeypatch):
         )
         assert unhomed.route == DOMAIN_SERVING_ROUTE
         unhomed.launch()
+        cake_locality._forget_counters()  # the public call makes an unhomed pair
         public = batch_deepgemm_fp8_nt_groupwise(
             a, homed, a_packed, b_packed, masked_m, expected_m, backend="cake"
         )
@@ -1615,6 +1616,11 @@ def test_domain_twin_counters_zero_and_reused(cell, monkeypatch):
     assert torch.equal(_valid_bits(unhomed.out, valid), first)
     assert torch.equal(_valid_bits(public, valid), first)
     assert all(int(t.abs().sum()) == 0 for t in unhomed.workspace.values())
+    assert all(
+        int(t.abs().sum()) == 0
+        for t in cake_locality.launch_counters(PAIR_COUNTER_WORDS)
+    )
+    cake_locality._forget_counters()
 
 
 @_packed_serving
@@ -1783,6 +1789,122 @@ def test_domain_twin_cuda_graph_capture_and_replay(cell):
     captured_graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(_valid_bits(captured.out, valid), first)
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS[:2], ids=_cell_id)
+def test_domain_public_call_reuses_counters(cell):
+    """(g) The public API's twin call allocates no counters in steady state: eager
+    calls on one stream reuse that stream's pair, another stream gets its own,
+    a captured call takes a pre-zeroed pair of its own (no allocation, so no
+    memset node in the graph) and replays beside eager calls; every pair is zero
+    after its launches and every result is the prepared twin's bits."""
+    device, table = _require_domain()
+    _require_routed(cell, device, table)
+    _, _, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
+    homed = _home(b, table)
+    cake_locality._forget_counters()
+    prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m
+    )
+    assert prepared.route == DOMAIN_SERVING_ROUTE
+    prepared.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(prepared.out, reference, masked_m)
+    first = _valid_bits(prepared.out, valid)
+    out = torch.empty_like(prepared.out)
+
+    def public(target):
+        target.fill_(float("nan"))
+        return batch_deepgemm_fp8_nt_groupwise(
+            a,
+            homed,
+            a_packed,
+            b_packed,
+            masked_m,
+            expected_m,
+            out=target,
+            backend="cake",
+        )
+
+    def stats():
+        torch.cuda.synchronize()
+        return torch.cuda.memory_stats()["allocation.all.allocated"]
+
+    public(out)  # the stream's pair and the capture reserve are made here
+    pair = cake_locality.launch_counters(PAIR_COUNTER_WORDS)
+    for _ in range(3):
+        before = stats()
+        public(out)
+        assert stats() == before
+        assert torch.equal(_valid_bits(out, valid), first)
+        assert all(int(t.abs().sum()) == 0 for t in pair)
+    assert cake_locality.launch_counters(PAIR_COUNTER_WORDS)[0] is pair[0]
+    assert prepared.workspace["counters0"] is not pair[0]
+    stream = torch.cuda.Stream()
+    side_out = torch.empty_like(out)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        public(side_out)
+        side_pair = cake_locality.launch_counters(PAIR_COUNTER_WORDS)
+    torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(side_out, valid), first)
+    assert {int(t.data_ptr()) for t in side_pair}.isdisjoint(
+        int(t.data_ptr()) for t in pair
+    )
+    assert all(int(t.abs().sum()) == 0 for t in side_pair)
+    reserve = cake_locality._CAPTURE_RESERVES[(device, PAIR_COUNTER_WORDS)]
+    issued = reserve.issued
+    captured_pair = reserve.free[-1]
+    graph_out = torch.empty_like(out)
+    graph = torch.cuda.CUDAGraph()
+    before = stats()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        batch_deepgemm_fp8_nt_groupwise(
+            a,
+            homed,
+            a_packed,
+            b_packed,
+            masked_m,
+            expected_m,
+            out=graph_out,
+            backend="cake",
+        )
+    assert stats() == before  # nothing allocated in the capture: no memset node
+    assert reserve.issued == issued + 1
+    replay_stream = torch.cuda.Stream()
+    for _ in range(4):
+        graph_out.fill_(float("nan"))
+        out.fill_(float("nan"))
+        side_out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        replay_stream.wait_stream(torch.cuda.current_stream())
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(replay_stream):
+            graph.replay()
+        batch_deepgemm_fp8_nt_groupwise(
+            a, homed, a_packed, b_packed, masked_m, expected_m, out=out, backend="cake"
+        )
+        with torch.cuda.stream(stream):
+            batch_deepgemm_fp8_nt_groupwise(
+                a,
+                homed,
+                a_packed,
+                b_packed,
+                masked_m,
+                expected_m,
+                out=side_out,
+                backend="cake",
+            )
+        torch.cuda.synchronize()
+        for result in (graph_out, out, side_out):
+            assert torch.equal(_valid_bits(result, valid), first)
+        for counters in (pair, side_pair, captured_pair):
+            assert all(int(t.abs().sum()) == 0 for t in counters)
+    for die in range(2):
+        for counters in (pair, side_pair, captured_pair):
+            assert cake_locality.pointer_domain(counters[die].data_ptr()) == die
 
 
 # The race's occupier: one 1024-thread block per SM (its whole opt-in shared
