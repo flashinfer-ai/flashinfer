@@ -22,6 +22,13 @@ Contract and restrictions (validated eagerly, never silently relaxed):
   ``top_k=512``, ``compression_ratio=4``, fp32 logits/weights,
   ``math_mode`` None or ``"relu_strict"`` (scoring is fp32 accumulation
   with per-head relu).
+- FULL-PREFILL chunks only: every request must have ``q_len == kv_len``
+  (all of a request's tokens are query rows, the kernel's campaign
+  contract — its per-row block space is sized from the query extent).
+  Chunked prefill (a short query window over a longer KV context) is
+  rejected at ``plan``; measured on GB300, the kernel's visible-block
+  coverage degrades to the query extent on such calls, so serving them
+  would be silently wrong.
 - ``k_scale`` must be all-ones and per-row head ``weights`` must be a
   positive per-row constant: the kernel scores ``sum_h relu(q_h . k)``,
   and a per-row positive constant scales every candidate's score equally,
@@ -200,6 +207,12 @@ class SpecializedTopKPlan:
             q_len = qo[r + 1] - qo[r]
             kv_len = kv[r + 1] - kv[r]
             _require(q_len >= 1 and kv_len >= q_len, "invalid prefixes")
+            _require(
+                q_len == kv_len,
+                "backend='specialized' serves full-prefill chunks only "
+                "(q_len == kv_len per request); chunked prefill is outside "
+                "the kernel's validated contract",
+            )
             _require(q_len <= self._max_chunk_size, "q_len exceeds max_chunk_size")
             _require(
                 kv_len <= self._max_context_length,

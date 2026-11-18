@@ -108,9 +108,9 @@ def _wrapper(inp, max_bs):
 @pytest.mark.parametrize(
     "kv_lens,q_lens",
     [
-        ([1024], [8]),  # direct regime, B=1
-        ([2930], [16]),  # scored regime (visible > 512), B=1
-        ([512, 2816, 300], [4, 9, 3]),  # multi-request, aligned segments
+        ([1024], [1024]),  # direct regime, B=1 (full prefill)
+        ([2930], [2930]),  # scored regime (visible > 512), B=1
+        ([512, 2816, 300], [512, 2816, 300]),  # multi-request, aligned
     ],
 )
 def test_selection_matches_reference(kv_lens, q_lens):
@@ -131,7 +131,7 @@ def test_selection_matches_reference(kv_lens, q_lens):
 def test_multi_request_vs_cutedsl_refusal():
     """The specialized backend serves the multi-request batch the cutedsl
     backend's constructor refuses."""
-    inp = _mk([512, 2816], [4, 4], seed=5)
+    inp = _mk([512, 2816], [512, 2816], seed=5)
     w = _wrapper(inp, max_bs=2)
     out = w.run(inp["q"], inp["weights"], inp["k"], k_scale=inp["k_scale"])
     assert torch.equal(out, _reference_rows(inp))
@@ -140,7 +140,7 @@ def test_multi_request_vs_cutedsl_refusal():
 @requires_sm103
 @requires_validated_toolkit
 def test_rejection_semantics():
-    inp = _mk([1024], [4], seed=9)
+    inp = _mk([1024], [1024], seed=9)
     # constructor rejects unservable configurations loudly
     with pytest.raises(ValueError, match="num_heads=4"):
         FP8MQATopKWrapper(
@@ -166,7 +166,7 @@ def test_rejection_semantics():
     # misaligned multi-request segment rejected at plan
     w2 = FP8MQATopKWrapper(
         max_context_length=4096,
-        max_chunk_size=64,
+        max_chunk_size=4096,
         max_batch_size=2,
         device="cuda",
         backend="specialized",
@@ -175,10 +175,15 @@ def test_rejection_semantics():
         num_keys=inp["k"].shape[0],
     )
     w2.prepare_pool(inp["k"], k_scale=inp["k_scale"])
-    qo = torch.tensor([0, 2, 4], dtype=torch.int32, device="cuda")
+    qo = torch.tensor([0, 100, 1024], dtype=torch.int32, device="cuda")
     kv = torch.tensor([0, 100, 1024], dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError, match="multiple of 256"):
         w2.plan(qo, kv)
+    # chunked prefill (q_len < kv_len) is outside the validated contract
+    qo3 = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    kv3 = torch.tensor([0, 1024], dtype=torch.int32, device="cuda")
+    with pytest.raises(ValueError, match="full-prefill"):
+        w2.plan(qo3, kv3)
 
 
 @requires_sm103
