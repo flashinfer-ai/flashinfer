@@ -1585,7 +1585,17 @@ def _make_decode_compile_spec(
 
     if launch_spec.config.fixed_seqlen:
         raise ValueError("cached TS decode compiles runtime sequence lengths only")
-    config_items = dict(launch_spec.config.compile_signature())
+    if packed_query is None:
+        packed_query = launch_spec.config.use_variable_seqlens_q
+    packed_query = packed_query or direct_q1_spec is not None
+    config = launch_spec.config
+    if not packed_query:
+        # A fixed-Q plan validates every launch's query against its planned
+        # length, so the kernel may treat Q as exact: complete grouped Q tiles
+        # then compile without the per-tile inactive-row score mask. This keys
+        # the cache on the Q length; packed Q keeps one kernel across lengths.
+        config = replace(config, exact_seq_len_q=True)
+    config_items = dict(config.compile_signature())
     # Public wrapper plans use runtime KV metadata in compiled kernels. False is retained only
     # for internal prepared/sparse recipes with a fixed native layout.
     if runtime_kv_lengths:
@@ -1616,12 +1626,7 @@ def _make_decode_compile_spec(
         k_dtype_key=k_dtype_key,
         v_dtype_key=v_dtype_key,
         out_dtype_key=out_dtype_key,
-        packed_query=(
-            launch_spec.config.use_variable_seqlens_q
-            if packed_query is None
-            else packed_query
-        )
-        or direct_q1_spec is not None,
+        packed_query=packed_query,
         max_active_clusters=launch_spec.max_active_clusters,
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,

@@ -48,6 +48,7 @@ from flashinfer.attention.prims_ts.decode import (
     _DECODE_MAX_KV_TILE_SIZE,
     _DecodePlanState,
     _get_compiled_decode,
+    _make_decode_compile_spec,
     _make_decode_workspace_layout,
     _resolve_decode_launch_spec,
     _validate_prims_ts_q_token_kv_block_sparse_group_layout,
@@ -7152,6 +7153,53 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
     finally:
         _resolve_decode_launch_spec.cache_clear()
         _get_compiled_decode.cache_clear()
+
+
+@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed-q", "packed-q"))
+def test_attention_ts_decode_fixed_q_compiles_exact_q_length(packed_query: bool):
+    """Fixed-Q plans key the kernel on the exact Q length; packed Q does not."""
+
+    def compile_items(seq_len_q: int) -> dict[str, object]:
+        spec = _resolve_decode_launch_spec(
+            torch.cuda.current_device(),
+            16,
+            32,
+            4,
+            128,
+            32,
+            4096,
+            seq_len_q,
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            "bfloat16",
+            "HND",
+            "causal",
+            packed_query,
+            -1,
+        )
+        compile_spec = _make_decode_compile_spec(
+            spec,
+            device_index=torch.cuda.current_device(),
+            num_qo_heads=32,
+            num_kv_heads=4,
+            head_dim=128,
+            page_size=32,
+            q_dtype_key="float8_e4m3fn",
+            k_dtype_key="float8_e4m3fn",
+            v_dtype_key="float8_e4m3fn",
+            out_dtype_key="bfloat16",
+            packed_query=packed_query,
+        )
+        assert compile_spec.packed_query == packed_query
+        return dict(compile_spec.config_items)
+
+    items = compile_items(4)
+    assert items["exact_seq_len_q"] is not packed_query
+    assert ("max_seq_len_q" in items) is not packed_query
+    if not packed_query:
+        assert items["max_seq_len_q"] == 4
+        assert not FmhaDecodeConfig(**items).q_score_rows_need_mask
 
 
 @pytest.mark.parametrize(

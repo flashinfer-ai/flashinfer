@@ -2674,8 +2674,11 @@ class FmhaDecodeConfig:
             and self.heads_q_per_kv % self.tile_size_q == 0
         ):
             return True
-        if self.use_variable_seqlens_q or not (
-            self.fixed_seqlen or self.exact_seq_len_q
+        # A fixed-Q plan launched through the flattened-Q ABI has packed
+        # offsets but one exact length for every request, so its Q geometry
+        # decides fullness just as in the fixed layout.
+        if not self.exact_seq_len_q and (
+            self.use_variable_seqlens_q or not self.fixed_seqlen
         ):
             return False
         if self.uses_nontrivial_grouped_q_layout:
