@@ -164,7 +164,7 @@ __global__ __launch_bounds__(512) void k_silu_q_fp8(const __nv_bfloat16* __restr
   if (lane == 0) hs[gidx] = make_float2(__frcp_rn(invs[0]) * invs[1], __frcp_rn(invs[1]));
 }
 
-__global__ __launch_bounds__(128, 8) void k_reduce9_v16(const __half* __restrict__ partial,
+__global__ __launch_bounds__(128, 8) void k_reduce9_v16(const __nv_bfloat16* __restrict__ partial,
                                                         const float* __restrict__ tw,
                                                         __nv_bfloat16* __restrict__ out, int H) {
   __shared__ float sw[9];
@@ -181,18 +181,18 @@ __global__ __launch_bounds__(128, 8) void k_reduce9_v16(const __half* __restrict
       const uint4* src = (const uint4*)(partial + ((size_t)t * 9 + k) * H + d16 * 16);
       const uint4 h0 = src[0];
       const uint4 h1 = src[1];
-      const __half2* hh0 = (const __half2*)&h0;
-      const __half2* hh1 = (const __half2*)&h1;
+      const __nv_bfloat162* hh0 = (const __nv_bfloat162*)&h0;
+      const __nv_bfloat162* hh1 = (const __nv_bfloat162*)&h1;
       const float w = sw[k];
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        const float2 f = __half22float2(hh0[q]);
+        const float2 f = __bfloat1622float2(hh0[q]);
         acc[2 * q] = fmaf(w, f.x, acc[2 * q]);
         acc[2 * q + 1] = fmaf(w, f.y, acc[2 * q + 1]);
       }
 #pragma unroll
       for (int q = 0; q < 4; ++q) {
-        const float2 f = __half22float2(hh1[q]);
+        const float2 f = __bfloat1622float2(hh1[q]);
         acc[8 + 2 * q] = fmaf(w, f.x, acc[8 + 2 * q]);
         acc[8 + 2 * q + 1] = fmaf(w, f.y, acc[8 + 2 * q + 1]);
       }
@@ -208,7 +208,7 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
     const uint8_t* __restrict__ hq, const float2* __restrict__ hs, const uint8_t* __restrict__ W2,
     const float* __restrict__ W2S, const int* __restrict__ order, const int* __restrict__ cnt,
     const int* __restrict__ off, const int* __restrict__ toff, const int2* __restrict__ tasks,
-    __half* __restrict__ partial, int H, int I, int KTOP, int Si, int Sh, int E, int pairs) {
+    __nv_bfloat16* __restrict__ partial, int H, int I, int KTOP, int Si, int Sh, int E, int pairs) {
   static_assert(BM == 128 && THREADS == 256,
                 "This first native-FP8 path is specialized for wide M");
   const int ntl = H >> 7;
@@ -351,14 +351,14 @@ __global__ __launch_bounds__(THREADS) void fc2_wgmma_np_fp8(
     for (int w = 0; w < 8; ++w) {
       const int c = w * 16 + cb;
       if (row < rows) {
-        __half* dst = partial + (size_t)sPair[row] * H + nt * 128 + c;
-        *(__half2*)dst = __floats2half2_rn(acc[w * 8], acc[w * 8 + 1]);
-        *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
+        __nv_bfloat16* dst = partial + (size_t)sPair[row] * H + nt * 128 + c;
+        *(__nv_bfloat162*)dst = __floats2bfloat162_rn(acc[w * 8], acc[w * 8 + 1]);
+        *(__nv_bfloat162*)(dst + 8) = __floats2bfloat162_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
       }
       if (row8 < rows) {
-        __half* dst = partial + (size_t)sPair[row8] * H + nt * 128 + c;
-        *(__half2*)dst = __floats2half2_rn(acc[w * 8 + 2], acc[w * 8 + 3]);
-        *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
+        __nv_bfloat16* dst = partial + (size_t)sPair[row8] * H + nt * 128 + c;
+        *(__nv_bfloat162*)dst = __floats2bfloat162_rn(acc[w * 8 + 2], acc[w * 8 + 3]);
+        *(__nv_bfloat162*)(dst + 8) = __floats2bfloat162_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
       }
     }
   }
@@ -411,10 +411,10 @@ void launch_moe_grouped(const void* X, const void* W13, const float* W13S, const
   cudaFuncSetAttribute(fc2_wgmma_np_fp8<128, 256, FC2_NGROUP>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, FC2_SMEM);
   fc2_wgmma_np_fp8<128, 256, FC2_NGROUP><<<task_bound * fc2_ng, 256, FC2_SMEM, st>>>(
-      hq, hs, (const uint8_t*)W2, W2S, order, cnt, off, toff, tasks, (__half*)partial, H, I, KTOP,
-      Si, Sh1, E, pairs);
+      hq, hs, (const uint8_t*)W2, W2S, order, cnt, off, toff, tasks, (__nv_bfloat16*)partial, H, I,
+      KTOP, Si, Sh1, E, pairs);
 
-  k_reduce9_v16<<<T, 128, 0, st>>>((const __half*)partial, tw, (__nv_bfloat16*)out, H);
+  k_reduce9_v16<<<T, 128, 0, st>>>((const __nv_bfloat16*)partial, tw, (__nv_bfloat16*)out, H);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,7 +445,7 @@ MoeWsLayout moe_grouped_ws_layout(int64_t T, int64_t K, int64_t I, int64_t H, in
   L.raw_off = 0;
   L.hb_off = moe_align16(L.raw_off + (size_t)pairs * 2 * I * 2);    // bf16
   L.partial_off = moe_align16(L.hb_off + (size_t)pairs * I * 2);    // bf16
-  L.ibuf_off = moe_align16(L.partial_off + (size_t)pairs * H * 2);  // fp16
+  L.ibuf_off = moe_align16(L.partial_off + (size_t)pairs * H * 2);  // bf16 (output-ranged partials)
   L.tasks_off = moe_align16(L.ibuf_off + (size_t)(3 * E + E + 1 + pairs) * 4);
   L.total = moe_align16(L.tasks_off + (size_t)L.max_tasks * 2 * 4);
   return L;

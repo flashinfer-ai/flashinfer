@@ -30,6 +30,20 @@ __device__ __forceinline__ __half2 bf2_to_h2_prescaled(__nv_bfloat162 v) {
   return __floats2half2_rn(f.x * FC1_XS_PRESCALE, f.y * FC1_XS_PRESCALE);
 }
 
+// The small-T fc2 inner products accumulate RAW e4m3 mantissas (the
+// [128,128] quantizer drives every block's peak to ~448) against the fp16
+// fc1 intermediate, whose magnitude is bounded only by half range: one
+// 8-product __hfma2 chain can reach 8 * 448 * 65504 and overflow to inf
+// long before the fp32 block scale is applied. Prescaling the unpacked
+// weights by 2^-14 — exact for EVERY e4m3 value (4 significant bits, the
+// multiply is a pure exponent shift, subnormal halves included) — bounds
+// the chain by 8 * 448 * 2^-14 * 65504 = 14336, safely inside half range;
+// the exact 2^14 is restored in fp32 where the block scale is applied
+// (FC2_W_UNSCALE folded into the scale), so in-range results keep the
+// original rounding behavior.
+#define FC2_W_PRESCALE 6.103515625e-5f /* 2^-14 */
+#define FC2_W_UNSCALE 16384.f
+
 // ------------------------------------------------------------------
 // fc1 for small T: one warp per intermediate column j, one block row
 // per (token,slot) pair.  Weight-streaming GEMV, memory bound.
@@ -399,15 +413,16 @@ __global__ __launch_bounds__(512, 3) void fc2_t1_w32(
 #pragma unroll
   for (int kk = 0; kk < KT; ++kk) {
     const uint4 hv = *(const uint4*)(Hb + kk * I + j0);
-    const float sc = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)];
+    const float sc = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)] * FC2_W_UNSCALE;
     const __half2* hp = (const __half2*)&hv;
+    const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
     __half2 lh = __float2half2_rn(0.f), a, b;
     unpack4(w[kk].x, a, b);
-    lh = __hfma2(a, hp[0], lh);
-    lh = __hfma2(b, hp[1], lh);
+    lh = __hfma2(__hmul2(a, wps), hp[0], lh);
+    lh = __hfma2(__hmul2(b, wps), hp[1], lh);
     unpack4(w[kk].y, a, b);
-    lh = __hfma2(a, hp[2], lh);
-    lh = __hfma2(b, hp[3], lh);
+    lh = __hfma2(__hmul2(a, wps), hp[2], lh);
+    lh = __hfma2(__hmul2(b, wps), hp[3], lh);
     float2 f = __half22float2(lh);
     acc = fmaf(tws[kk] * sc, f.x + f.y, acc);
   }
@@ -450,7 +465,8 @@ __global__ __launch_bounds__(256, 3) void fc2_t1_pr(
   // cache misses can overlap the producer instead of extending the wait.
   float wsc[KT];
 #pragma unroll
-  for (int kk = 0; kk < KT; ++kk) wsc[kk] = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)];
+  for (int kk = 0; kk < KT; ++kk)
+    wsc[kk] = W2S[((size_t)eid[kk] * Sh + (d >> 7)) * Si + (j0 >> 7)] * FC2_W_UNSCALE;
 
   cudaGridDependencySynchronize();
   float acc = 0.f;
@@ -462,19 +478,20 @@ __global__ __launch_bounds__(256, 3) void fc2_t1_pr(
     const float sc = wsc[kk];
     const __half2* p0 = (const __half2*)&h0;
     const __half2* p1 = (const __half2*)&h1;
+    const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
     __half2 lh = __float2half2_rn(0.f), a, b;
     unpack4(w[kk].x, a, b);
-    lh = __hfma2(a, p0[0], lh);
-    lh = __hfma2(b, p0[1], lh);
+    lh = __hfma2(__hmul2(a, wps), p0[0], lh);
+    lh = __hfma2(__hmul2(b, wps), p0[1], lh);
     unpack4(w[kk].y, a, b);
-    lh = __hfma2(a, p0[2], lh);
-    lh = __hfma2(b, p0[3], lh);
+    lh = __hfma2(__hmul2(a, wps), p0[2], lh);
+    lh = __hfma2(__hmul2(b, wps), p0[3], lh);
     unpack4(w[kk].z, a, b);
-    lh = __hfma2(a, p1[0], lh);
-    lh = __hfma2(b, p1[1], lh);
+    lh = __hfma2(__hmul2(a, wps), p1[0], lh);
+    lh = __hfma2(__hmul2(b, wps), p1[1], lh);
     unpack4(w[kk].w, a, b);
-    lh = __hfma2(a, p1[2], lh);
-    lh = __hfma2(b, p1[3], lh);
+    lh = __hfma2(__hmul2(a, wps), p1[2], lh);
+    lh = __hfma2(__hmul2(b, wps), p1[3], lh);
     float2 f = __half22float2(lh);
     acc = fmaf(tws[kk] * sc, f.x + f.y, acc);
   }
@@ -527,22 +544,22 @@ extern "C" __global__ void fc2_l16(const __half* __restrict__ Hb, const uint8_t*
     const int j0 = sub * 16;
     uint4 w = *(const uint4*)(wp + j0);
     const __half2* hp = (const __half2*)hs + kk * 144 + sub * 9;
-    __half2 zero = __float2half2_rn(0.f);
-    __half2 lh = zero, a, b;
+    const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
+    __half2 lh = __float2half2_rn(0.f), a, b;
     unpack4(w.x, a, b);
-    lh = __hfma2(a, hp[0], lh);
-    lh = __hfma2(b, hp[1], lh);
+    lh = __hfma2(__hmul2(a, wps), hp[0], lh);
+    lh = __hfma2(__hmul2(b, wps), hp[1], lh);
     unpack4(w.y, a, b);
-    lh = __hfma2(a, hp[2], lh);
-    lh = __hfma2(b, hp[3], lh);
+    lh = __hfma2(__hmul2(a, wps), hp[2], lh);
+    lh = __hfma2(__hmul2(b, wps), hp[3], lh);
     unpack4(w.z, a, b);
-    lh = __hfma2(a, hp[4], lh);
-    lh = __hfma2(b, hp[5], lh);
+    lh = __hfma2(__hmul2(a, wps), hp[4], lh);
+    lh = __hfma2(__hmul2(b, wps), hp[5], lh);
     unpack4(w.w, a, b);
-    lh = __hfma2(a, hp[6], lh);
-    lh = __hfma2(b, hp[7], lh);
+    lh = __hfma2(__hmul2(a, wps), hp[6], lh);
+    lh = __hfma2(__hmul2(b, wps), hp[7], lh);
     float2 f = __half22float2(lh);
-    part = fmaf(scp[j0 >> 7], f.x + f.y, part);
+    part = fmaf(scp[j0 >> 7] * FC2_W_UNSCALE, f.x + f.y, part);
     acc = fmaf(topk_w[t * KTOP + kk], part, acc);
   }
   acc += __shfl_down_sync(FULLM, acc, 8);
@@ -582,22 +599,22 @@ extern "C" __global__ void fc2_l8(const __half* __restrict__ Hb, const uint8_t* 
       const int j0 = sub * 16 + c;
       uint4 w = *(const uint4*)(wp + j0);
       const __half2* hp = (const __half2*)(hs + kk * I + j0);
-      __half2 zero = __float2half2_rn(0.f);
-      __half2 lh = zero, a, b;
+      const __half2 wps = __float2half2_rn(FC2_W_PRESCALE);
+      __half2 lh = __float2half2_rn(0.f), a, b;
       unpack4(w.x, a, b);
-      lh = __hfma2(a, hp[0], lh);
-      lh = __hfma2(b, hp[1], lh);
+      lh = __hfma2(__hmul2(a, wps), hp[0], lh);
+      lh = __hfma2(__hmul2(b, wps), hp[1], lh);
       unpack4(w.y, a, b);
-      lh = __hfma2(a, hp[2], lh);
-      lh = __hfma2(b, hp[3], lh);
+      lh = __hfma2(__hmul2(a, wps), hp[2], lh);
+      lh = __hfma2(__hmul2(b, wps), hp[3], lh);
       unpack4(w.z, a, b);
-      lh = __hfma2(a, hp[4], lh);
-      lh = __hfma2(b, hp[5], lh);
+      lh = __hfma2(__hmul2(a, wps), hp[4], lh);
+      lh = __hfma2(__hmul2(b, wps), hp[5], lh);
       unpack4(w.w, a, b);
-      lh = __hfma2(a, hp[6], lh);
-      lh = __hfma2(b, hp[7], lh);
+      lh = __hfma2(__hmul2(a, wps), hp[6], lh);
+      lh = __hfma2(__hmul2(b, wps), hp[7], lh);
       float2 f = __half22float2(lh);
-      part = fmaf(scp[j0 >> 7], f.x + f.y, part);
+      part = fmaf(scp[j0 >> 7] * FC2_W_UNSCALE, f.x + f.y, part);
     }
     acc = fmaf(topk_w[t * KTOP + kk], part, acc);
   }
@@ -675,30 +692,72 @@ __device__ __forceinline__ void cvt8h(const uint4 v, __half* dst) {
     *(__half2*)(dst + q * 2) = __float22half2_rn(__bfloat1622float2(bp[q]));
 }
 
+// Dequantize against the fp32 block scale without ever pushing the scale
+// through half's limited range: a [128,128] block scale is amax/448, so a
+// small-magnitude block's fp32 scale can sit at or below half's subnormal
+// range — narrowing it BEFORE the multiply flushes it toward zero (or
+// strips most of its mantissa), zeroing or warping the whole dequantized
+// tile. When the scale is outside half's safe window the raw e4m3 value is
+// multiplied by the fp32 scale and the PRODUCT is narrowed, rounding the
+// true effective weight once (subnormal halves included). Inside the
+// window (normal-range scale, products of raw mantissas <= 448 cannot
+// overflow) the single-instruction half multiply is kept: it differs from
+// the fp32-scaled product by at most one extra half ulp, nine bits below
+// the e4m3 quantization floor, and keeps the wgmma staging loops at their
+// original instruction count. The branch is uniform per tile (one scale).
+__device__ __forceinline__ bool cvt_sc_half_safe(float sc) {
+  const float a = fabsf(sc);
+  return a >= 6.103515625e-5f /* half min normal */ && a < 128.f /* 448*128 < 65504 */;
+}
+
 __device__ __forceinline__ void cvt16h(const uint4 w, float sc, __half* dst) {
   const uint32_t* wp = (const uint32_t*)&w;
-  const __half2 hs = __float2half2_rn(sc);
+  if (cvt_sc_half_safe(sc)) {
+    const __half2 hs = __float2half2_rn(sc);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      __half2 a, b;
+      unpack4(wp[q], a, b);
+      *(__half2*)(dst + q * 4) = __hmul2(a, hs);
+      *(__half2*)(dst + q * 4 + 2) = __hmul2(b, hs);
+    }
+    return;
+  }
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
     __half2 a, b;
     unpack4(wp[q], a, b);
-    *(__half2*)(dst + q * 4) = __hmul2(a, hs);
-    *(__half2*)(dst + q * 4 + 2) = __hmul2(b, hs);
+    const float2 fa = __half22float2(a), fb = __half22float2(b);
+    *(__half2*)(dst + q * 4) = __floats2half2_rn(fa.x * sc, fa.y * sc);
+    *(__half2*)(dst + q * 4 + 2) = __floats2half2_rn(fb.x * sc, fb.y * sc);
   }
 }
 
 __device__ __forceinline__ void cvt16h_sw128(const uint4 w, float sc, __half* base, int row,
                                              int group2) {
   const uint32_t* wp = (const uint32_t*)&w;
-  const __half2 hs = __float2half2_rn(sc);
+  if (cvt_sc_half_safe(sc)) {
+    const __half2 hs = __float2half2_rn(sc);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      __half2 a, b;
+      unpack4(wp[q], a, b);
+      const int g = (group2 + (q >> 1)) ^ (row & 7);
+      __half* dst = base + (row * 8 + g) * 8 + (q & 1) * 4;
+      *(__half2*)(dst) = __hmul2(a, hs);
+      *(__half2*)(dst + 2) = __hmul2(b, hs);
+    }
+    return;
+  }
 #pragma unroll
   for (int q = 0; q < 4; ++q) {
     __half2 a, b;
     unpack4(wp[q], a, b);
+    const float2 fa = __half22float2(a), fb = __half22float2(b);
     const int g = (group2 + (q >> 1)) ^ (row & 7);
     __half* dst = base + (row * 8 + g) * 8 + (q & 1) * 4;
-    *(__half2*)(dst) = __hmul2(a, hs);
-    *(__half2*)(dst + 2) = __hmul2(b, hs);
+    *(__half2*)(dst) = __floats2half2_rn(fa.x * sc, fa.y * sc);
+    *(__half2*)(dst + 2) = __floats2half2_rn(fb.x * sc, fb.y * sc);
   }
 }
 
@@ -991,12 +1050,16 @@ extern "C" __global__ void k_silu(const __nv_bfloat16* __restrict__ raw,
     rb_np[q] = *(const uint4*)(W2 + ((size_t)e * H + grow) * I + (kb) + c * 16); \
   }
 
+// The per-slot partial buffer is BF16: the final output is BF16, and a
+// partial legitimately reaches any magnitude the combined output can (the
+// combine weights are a convex sum), so a half-typed buffer overflows to
+// inf at 65504 while the true result is still well inside BF16 range.
 template <int BM, int BN, int THREADS>
 __global__ __launch_bounds__(THREADS) void fc2_wmma(
     const __nv_bfloat16* __restrict__ Hb, const uint8_t* __restrict__ W2,
     const float* __restrict__ W2S, const int* __restrict__ order, const int* __restrict__ cnt,
     const int* __restrict__ off, const int* __restrict__ toff, const int2* __restrict__ tasks,
-    __half* __restrict__ partial, int H, int I, int KTOP, int Si, int Sh, int E) {
+    __nv_bfloat16* __restrict__ partial, int H, int I, int KTOP, int Si, int Sh, int E) {
   using namespace nvcuda;
   const int ntl = H / BN;
   const int ti = blockIdx.x / ntl;
@@ -1064,14 +1127,14 @@ __global__ __launch_bounds__(THREADS) void fc2_wmma(
   for (int w = 0; w < 8; ++w) {
     const int c = w * 16 + cb;
     if (row < rows) {
-      __half* dst = partial + (size_t)sPair[row] * H + col0 + c;
-      *(__half2*)(dst) = __floats2half2_rn(acc[w * 8], acc[w * 8 + 1]);
-      *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
+      __nv_bfloat16* dst = partial + (size_t)sPair[row] * H + col0 + c;
+      *(__nv_bfloat162*)(dst) = __floats2bfloat162_rn(acc[w * 8], acc[w * 8 + 1]);
+      *(__nv_bfloat162*)(dst + 8) = __floats2bfloat162_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
     }
     if (row + 8 < rows) {
-      __half* dst = partial + (size_t)sPair[row + 8] * H + col0 + c;
-      *(__half2*)(dst) = __floats2half2_rn(acc[w * 8 + 2], acc[w * 8 + 3]);
-      *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
+      __nv_bfloat16* dst = partial + (size_t)sPair[row + 8] * H + col0 + c;
+      *(__nv_bfloat162*)(dst) = __floats2bfloat162_rn(acc[w * 8 + 2], acc[w * 8 + 3]);
+      *(__nv_bfloat162*)(dst + 8) = __floats2bfloat162_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
     }
   }
 }
@@ -1081,7 +1144,7 @@ __global__ __launch_bounds__(THREADS) void fc2_wmma_np(
     const __nv_bfloat16* __restrict__ Hb, const uint8_t* __restrict__ W2,
     const float* __restrict__ W2S, const int* __restrict__ order, const int* __restrict__ cnt,
     const int* __restrict__ off, const int* __restrict__ toff, const int2* __restrict__ tasks,
-    __half* __restrict__ partial, int H, int I, int KTOP, int Si, int Sh, int E) {
+    __nv_bfloat16* __restrict__ partial, int H, int I, int KTOP, int Si, int Sh, int E) {
   const int ntl = H >> 7;
   const int ngl = (ntl + NGROUP - 1) / NGROUP;
   const int ti = blockIdx.x / ngl;
@@ -1156,20 +1219,20 @@ __global__ __launch_bounds__(THREADS) void fc2_wmma_np(
     for (int w = 0; w < 8; ++w) {
       const int c = w * 16 + cb;
       if (row < rows) {
-        __half* dst = partial + (size_t)sPair[row] * H + nt * 128 + c;
-        *(__half2*)dst = __floats2half2_rn(acc[w * 8], acc[w * 8 + 1]);
-        *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
+        __nv_bfloat16* dst = partial + (size_t)sPair[row] * H + nt * 128 + c;
+        *(__nv_bfloat162*)dst = __floats2bfloat162_rn(acc[w * 8], acc[w * 8 + 1]);
+        *(__nv_bfloat162*)(dst + 8) = __floats2bfloat162_rn(acc[w * 8 + 4], acc[w * 8 + 5]);
       }
       if (row + 8 < rows) {
-        __half* dst = partial + (size_t)sPair[row + 8] * H + nt * 128 + c;
-        *(__half2*)dst = __floats2half2_rn(acc[w * 8 + 2], acc[w * 8 + 3]);
-        *(__half2*)(dst + 8) = __floats2half2_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
+        __nv_bfloat16* dst = partial + (size_t)sPair[row + 8] * H + nt * 128 + c;
+        *(__nv_bfloat162*)dst = __floats2bfloat162_rn(acc[w * 8 + 2], acc[w * 8 + 3]);
+        *(__nv_bfloat162*)(dst + 8) = __floats2bfloat162_rn(acc[w * 8 + 6], acc[w * 8 + 7]);
       }
     }
   }
 }
 
-extern "C" __global__ void k_reduce9(const __half* __restrict__ partial,
+extern "C" __global__ void k_reduce9(const __nv_bfloat16* __restrict__ partial,
                                      const float* __restrict__ tw, __nv_bfloat16* __restrict__ out,
                                      int H) {
   __shared__ float sw[9];
@@ -1182,9 +1245,9 @@ extern "C" __global__ void k_reduce9(const __half* __restrict__ partial,
 #pragma unroll
     for (int k = 0; k < 9; ++k) {
       uint2 hv = *(const uint2*)(partial + ((size_t)t * 9 + k) * H + d4 * 4);
-      const __half2* hh = (const __half2*)&hv;
-      float2 f0 = __half22float2(hh[0]);
-      float2 f1 = __half22float2(hh[1]);
+      const __nv_bfloat162* hh = (const __nv_bfloat162*)&hv;
+      float2 f0 = __bfloat1622float2(hh[0]);
+      float2 f1 = __bfloat1622float2(hh[1]);
       const float w = sw[k];
       a0 = fmaf(w, f0.x, a0);
       a1 = fmaf(w, f0.y, a1);
@@ -1244,17 +1307,17 @@ void launch_moe_grouped(const void* X, const void* W13, const float* W13S, const
                          cudaFuncAttributeMaxDynamicSharedMemorySize, FC2_SMEM);
     fc2_wmma_np<128, 256, FC2_NGROUP><<<max_tasks * fc2_ng, 256, FC2_SMEM, st>>>(
         (const __nv_bfloat16*)Hb, (const uint8_t*)W2, W2S, order, cnt, off, toff, tasks,
-        (__half*)partial, H, I, KTOP, Si, Sh1, E);
+        (__nv_bfloat16*)partial, H, I, KTOP, Si, Sh1, E);
   } else if (wide_n)
     fc2_wmma<64, 256, 256><<<max_tasks*(H / 256), 256, 0, st>>>(
         (const __nv_bfloat16*)Hb, (const uint8_t*)W2, W2S, order, cnt, off, toff, tasks,
-        (__half*)partial, H, I, KTOP, Si, Sh1, E);
+        (__nv_bfloat16*)partial, H, I, KTOP, Si, Sh1, E);
   else
     fc2_wmma<64, 128, 128><<<max_tasks*(H >> 7), 128, 0, st>>>(
         (const __nv_bfloat16*)Hb, (const uint8_t*)W2, W2S, order, cnt, off, toff, tasks,
-        (__half*)partial, H, I, KTOP, Si, Sh1, E);
+        (__nv_bfloat16*)partial, H, I, KTOP, Si, Sh1, E);
   if (wide_m)
-    k_reduce9<<<T, 512, 0, st>>>((const __half*)partial, tw, (__nv_bfloat16*)out, H);
+    k_reduce9<<<T, 512, 0, st>>>((const __nv_bfloat16*)partial, tw, (__nv_bfloat16*)out, H);
   else
-    k_reduce9<<<T, 256, 0, st>>>((const __half*)partial, tw, (__nv_bfloat16*)out, H);
+    k_reduce9<<<T, 256, 0, st>>>((const __nv_bfloat16*)partial, tw, (__nv_bfloat16*)out, H);
 }
