@@ -432,6 +432,9 @@ def test_install_prepares_independent_storage_before_releasing_previous(
     raw = SimpleNamespace(prepare=lambda *weights: events.append("prepare"))
     selected = Mock()
     selected._allocate_workspace.return_value = raw
+    selected.ep_prepare_fixed.side_effect = (
+        lambda workspace, weights: workspace.prepare(*weights)
+    )
     monkeypatch.setattr(protocol.backend, "_backend", lambda *args: selected)
     protocol._install({"variant": "genphase", "knobs": {}})
     assert events == ["prepare", "release"]

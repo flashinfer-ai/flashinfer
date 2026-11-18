@@ -42,6 +42,7 @@ def _next_allocation_failure(rank, architecture):
     )
     nbytes = config.padded_tokens_per_rank * config.num_topk * config.hidden * 2
     kernel = SimpleNamespace(
+        get_tmp_buffer_bytes=lambda: nbytes,
         _device_workspace=SimpleNamespace(
             total_bytes=lambda _region: nbytes,
             offset=lambda _region: 0,
@@ -85,6 +86,7 @@ def _next_allocation_failure(rank, architecture):
 
     with (
         patch.object(module.torch, "zeros", local_zeros),
+        patch.object(module.torch, "empty", local_zeros),
         patch.object(module.comm, "sym_zeros", symmetric_zeros),
         patch.object(
             module.comm,

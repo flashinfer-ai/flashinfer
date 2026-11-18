@@ -261,23 +261,27 @@ class MoERunner(TunableRunner):
         )
 
         moe_inputs = MoeRunnerInputs.from_list(inputs)
-        rows = self.moe_op.trtllm_get_valid_moe_factorizations(
-            self.dtype_act,
-            self.dtype_weights,
-            self.fp8_quantization_type,
-            self.top_k + self.num_fused_shared_experts,
-            self.hidden_size,
-            self.hidden_size_output,
-            self.intermediate_size,
-            self.num_local_experts + self.num_fused_shared_experts,
-            self.num_experts + self.num_fused_shared_experts,
-            self.activation_type,
-            self.use_shuffled_weight,
-            self.weight_layout,
-            self.use_per_token_scaling,
-            moe_inputs.hidden_states.shape[0],
-            moe_inputs.gemm1_lora_delta is not None,
-        )
+        # The anchor probe loads each tile's default cubin in the current CUDA
+        # context, so run it on the inputs' device: a tile loadable only there
+        # would otherwise be dropped.
+        with torch.cuda.device(moe_inputs.hidden_states.device):
+            rows = self.moe_op.trtllm_get_valid_moe_factorizations(
+                self.dtype_act,
+                self.dtype_weights,
+                self.fp8_quantization_type,
+                self.top_k + self.num_fused_shared_experts,
+                self.hidden_size,
+                self.hidden_size_output,
+                self.intermediate_size,
+                self.num_local_experts + self.num_fused_shared_experts,
+                self.num_experts + self.num_fused_shared_experts,
+                self.activation_type,
+                self.use_shuffled_weight,
+                self.weight_layout,
+                self.use_per_token_scaling,
+                moe_inputs.hidden_states.shape[0],
+                moe_inputs.gemm1_lora_delta is not None,
+            )
         tactics = []
         anchors = {}
         for tile_n, config, fc1, fc2, is_anchor in rows:

@@ -1517,6 +1517,7 @@ def test_public_prepare_delegates_to_the_cake_runner_without_gpu():
         "num_seqs",
         "cu_seqlens",
         "out",
+        "final_states",
     }
     runner._backend = "cute"
     with pytest.raises(NotImplementedError, match="backend='cake'"):
