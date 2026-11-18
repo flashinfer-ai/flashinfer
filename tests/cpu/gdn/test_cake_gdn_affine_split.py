@@ -19,6 +19,7 @@ import torch
 from flashinfer import gdn_prefill
 from flashinfer.gdn_kernels.blackwell import cake_gdn_affine_split as split
 from flashinfer.jit import cake_gdn_affine_split as programs
+from flashinfer.jit import core as jit_core
 from flashinfer.jit.cake_program import GRID_ARGS, TARGET_FLAGS, CakeProgram
 
 pytestmark = pytest.mark.cpu_only
@@ -292,7 +293,12 @@ def test_grids():
 # --- the generated program table -------------------------------------------------
 
 
-def test_program_table_matches_the_sources_and_the_host():
+def test_program_table_matches_the_sources_and_the_host(monkeypatch):
+    # The spec checks the build's target architectures; a CPU runner detects
+    # none, so pin the one these programs ship for.
+    monkeypatch.setattr(
+        jit_core.current_compilation_context, "TARGET_CUDA_ARCHS", {(10, "3a")}
+    )
     assert programs.PROGRAMS == (
         programs.PASS1,
         programs.PASS2_W4,
