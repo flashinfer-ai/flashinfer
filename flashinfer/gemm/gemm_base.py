@@ -13079,6 +13079,29 @@ def fp8_blockscale_gemm_sm90(
         Output tensor of shape (M, N). If None, will be allocated.
     out_dtype : torch.dtype, optional
         Output data type. Default is torch.bfloat16.
+    backend : str
+        One of ``("auto", "specialized", "deepgemm")``, keyword-only.
+        ``"auto"`` (the default) is the stock route, except that it routes
+        to ``"specialized"`` — an SM90 decode-M kernel for the
+        BF16-activation / FP8-weight / 128x128-block-scale form with the
+        1x128 activation quantization fused in — only on that kernel's
+        packaged allowlist
+        (``flashinfer/fp8bs_gemm_decodem_sm90_dispatch.json``: M <= 24, the
+        measured decode envelope). ``"specialized"`` selects it explicitly;
+        a call it cannot serve raises ``NotImplementedError`` with the
+        refusal reason (also recorded in
+        ``flashinfer.gemm.fp8bs_decodem_sm90._fp8bs_decodem_stats()``) — an
+        explicitly selected backend never falls back; only ``"auto"`` routes
+        around a refusal.
+        ``"deepgemm"`` pins the stock DeepGEMM-backed route: an explicitly
+        selected backend is never silently swapped. Unknown names raise
+        ``ValueError``.
+        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) keeps
+        ``backend="auto"`` on the stock route; an explicit
+        ``backend="specialized"`` call under the switch raises
+        ``NotImplementedError`` (reason ``kill_switch``) rather than being
+        rerouted — the switch disables the kernel, it does not swap an
+        explicitly selected backend.
     Returns
     -------
     torch.Tensor
@@ -13124,28 +13147,6 @@ def fp8_blockscale_gemm_sm90(
       * Per-block (128x128 blocks): (N//128, K//128)
     - Input scales only support per-token format: (M, K//128)
     - The function uses DeepGEMM backend with JIT compilation
-    backend : str
-        One of ``("auto", "specialized", "deepgemm")``, keyword-only.
-        ``"auto"`` (the default) is the stock route, except that it routes
-        to ``"specialized"`` — an SM90 decode-M kernel for the
-        BF16-activation / FP8-weight / 128x128-block-scale form with the
-        1x128 activation quantization fused in — only on that kernel's
-        packaged allowlist
-        (``flashinfer/fp8bs_gemm_decodem_sm90_dispatch.json``: M <= 24, the
-        measured decode envelope). ``"specialized"`` selects it explicitly;
-        a call it cannot serve raises ``NotImplementedError`` with the
-        refusal reason (also recorded in
-        ``flashinfer.gemm.fp8bs_decodem_sm90._fp8bs_decodem_stats()``) — an
-        explicitly selected backend never falls back; only ``"auto"`` routes
-        around a refusal.
-        ``"deepgemm"`` pins the stock DeepGEMM-backed route: an explicitly selected backend is
-        never silently swapped. Unknown names raise ``ValueError``.
-        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) keeps
-        ``backend="auto"`` on the stock route; an explicit
-        ``backend="specialized"`` call under the switch raises
-        ``NotImplementedError`` (reason ``kill_switch``) rather than being
-        rerouted — the switch disables the kernel, it does not swap an
-        explicitly selected backend.
     """
     from .fp8bs_decodem_sm90 import (
         FP8BS_GEMM_BACKENDS,
