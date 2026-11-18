@@ -658,6 +658,13 @@ static void launchf(int B, const void* qp, const void* kp, const void* vp, const
             (const uint8_t*)vp, (const int*)tkp + (size_t)base * TOPKC,
             (const int*)ptp + (size_t)base * pages, (const int*)slp + base,
             (__nv_bfloat16*)op + (size_t)base * HQ * DH, pages, bpc, nblk);
+    // A rejected launch (e.g. a cluster geometry a reduced-resource context
+    // cannot place) must never return success with an unwritten `out`.
+    const cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+      TVM_FFI_THROW(RuntimeError) << "specialized msa decode launch failed: "
+                                  << cudaGetErrorString(launch_status);
+    }
     base += chunk;
   }
 }

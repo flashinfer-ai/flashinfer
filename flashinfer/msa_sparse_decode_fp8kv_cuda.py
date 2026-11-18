@@ -153,12 +153,20 @@ def supported_with_reasons(
     if out is not None:
         if out.data_ptr() % 16:
             r.append("out_not_16B_aligned")
-        _q0 = q.data_ptr()
-        _q1 = _q0 + q.numel() * q.element_size()
         _o0 = out.data_ptr()
         _o1 = _o0 + out.numel() * out.element_size()
-        if out.device == q.device and _o0 < _q1 and _q0 < _o1:
-            r.append("out_overlaps_q")
+        for _nm, _t in (
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("q2k_indices", q2k_indices),
+            ("page_table", page_table),
+            ("seqused_k", seqused_k),
+        ):
+            _t0 = _t.data_ptr()
+            _t1 = _t0 + _t.numel() * _t.element_size()
+            if out.device == _t.device and _o0 < _t1 and _t0 < _o1:
+                r.append("out_overlaps_" + _nm)
     if r:
         return r
     if torch.cuda.get_device_capability(q.device) != (10, 3):

@@ -215,3 +215,24 @@ def test_backend_names_reflect_implementations():
     gold = _reference(inp)
     diff = (out_cake.float() - gold.float()).abs()
     assert float((diff <= 0.02 + 0.05 * gold.float().abs()).float().mean()) >= 0.99
+
+
+@requires_sm103
+def test_empty_selection_rows_produce_zero_output():
+    """A query row whose q2k_indices are all -1 selects nothing; the
+    specialized route must return ZERO for that row (the packed backend's
+    empty-effective-KV convention), never 0/0 = NaN."""
+    inp = _make_inputs(4, 300, seed=47)
+    inp["q2k_indices"][0, 2, :] = -1
+    gold = _reference(inp)
+    out = _api(inp, backend="specialized")
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all()
+    row = out.float()[2]
+    assert float(row.abs().max()) == 0.0
+    # the other rows stay reference-close
+    keep = [i for i in range(out.shape[0]) if i != 2]
+    diff = (out.float()[keep] - gold.float()[keep]).abs()
+    assert (
+        float((diff <= 0.02 + 0.05 * gold.float()[keep].abs()).float().mean()) >= 0.99
+    )
