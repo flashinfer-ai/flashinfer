@@ -4,6 +4,9 @@ fast path."""
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, sm103a_nvcc_flags
 
+# Thin TVM-FFI binding/launch TUs. The framework-independent device code they
+# wrap lives under include/flashinfer/attention/msa_sparse_decode_fp8kv_sm103/
+# (one .cuh per kernel TU), which is on the default JIT include path.
 _SOURCES = [
     "msa_sparse_decode_fp8kv_sm103_dispatch.cu",
     "msa_sparse_decode_fp8kv_sm103_c12.cu",
