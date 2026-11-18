@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Opt-in exact sequence split of the Cake GDN prefill on SM103.
+"""Opt-in exact sequence split of the Cake GDN prefill on SM100, SM103 and
+SM107.
 
 ``chunk_gated_delta_rule(..., backend="cake_gdn", use_affine_split=True)``
 cuts a sequence of ``L`` tokens into ``P`` chunk-aligned segments and runs
@@ -36,8 +37,9 @@ clamp(cu[n], 0, T)``, ``L = clamp(cu[n + 1], start, T) - start`` and
 ``clamp(nchunks // c_min, 1, p_cap)`` otherwise; segment ``s`` holds the
 tokens ``[start + 64 * floor(s * nchunks / P), start + min(64 * floor((s +
 1) * nchunks / P), L))``.  ``p_cap`` and ``c_min`` are plan constants of the
-device and the value-head count only (:func:`plan_constants`), so a
-sequence's bits do not depend on the other sequences of a batch.
+device (its target and SM count) and the value-head count only
+(:func:`plan_constants`), so a sequence's bits do not depend on the other
+sequences of a batch.
 
 A call of ``N`` sequences launches with the cap ``p_launch``, the segment
 count of its longest possible sequence (:func:`plan_split`): every live
@@ -74,6 +76,7 @@ __all__ = [
     "P_MAX",
     "SPLIT_MIN_TOKENS",
     "SplitPlan",
+    "TARGETS",
     "chunk_gated_delta_rule_gdn_affine_split_sm100",
     "clear_affine_split_plans",
     "pass1_grid",
@@ -84,19 +87,32 @@ __all__ = [
     "tile_cap",
 ]
 
-_TARGET = "sm_103a"
+#: The targets the programs ship for.
+TARGETS = ("sm_100a", "sm_103a", "sm_107a")
 _HEAD_SIZE = 128
 _CHUNK = 64
 #: Bytes of the pass-1 device tensor-map scratch per CTA.
 _TMAP_BYTES = 512
-#: The largest segment count per value-head count on SM103 (one pass-1 wave).
-P_MAX: dict[int, int] = {4: 8, 8: 5, 16: 2, 32: 1}
-#: The fewest chunks per segment per value-head count.
-C_MIN: dict[int, int] = {4: 8, 8: 8, 16: 16, 32: 16}
-#: No sequence of at most this many tokens is split, at any value-head count:
-#: a consequence of :data:`C_MIN`, which the device rule applies to every live
-#: length (15 chunks at 8 chunks per segment).
-SPLIT_MIN_TOKENS = _CHUNK * (2 * min(C_MIN.values()) - 1)
+#: The largest segment count per target and value-head count, measured on
+#: B200 (sm_100a), GB300 (sm_103a) and VR200 (sm_107a). One pass-1 wave
+#: bounds it too (:func:`tile_cap`).
+P_MAX: dict[str, dict[int, int]] = {
+    "sm_100a": {4: 8, 8: 5, 16: 2, 32: 1},
+    "sm_103a": {4: 8, 8: 5, 16: 2, 32: 1},
+    "sm_107a": {4: 8, 8: 6, 16: 3, 32: 2},
+}
+#: The fewest chunks per segment per target and value-head count.
+C_MIN: dict[str, dict[int, int]] = {
+    "sm_100a": {4: 8, 8: 8, 16: 16, 32: 16},
+    "sm_103a": {4: 8, 8: 8, 16: 16, 32: 16},
+    "sm_107a": {4: 8, 8: 8, 16: 12, 32: 32},
+}
+#: No sequence of at most this many tokens is split, on any target and at any
+#: value-head count: a consequence of :data:`C_MIN`, which the device rule
+#: applies to every live length (15 chunks at 8 chunks per segment).
+SPLIT_MIN_TOKENS = _CHUNK * (
+    2 * min(min(table.values()) for table in C_MIN.values()) - 1
+)
 #: The pass-1 kernel's limits on its tiles and tokens.
 MAX_PASS1_TILES = 131072
 MAX_TOKENS = 1 << 20
@@ -175,15 +191,20 @@ def tile_cap(num_heads: int, sm_count: int) -> int:
 
 
 def plan_constants(
-    num_heads: int, sm_count: int, split_count: Optional[int] = None
+    num_heads: int,
+    sm_count: int,
+    split_count: Optional[int] = None,
+    *,
+    target: str,
 ) -> tuple[int, int]:
-    """``(p_cap, c_min)``: the planner's constants, or with ``split_count``
-    the forced cap ``min(split_count, tile_cap)`` at one chunk per segment."""
+    """``(p_cap, c_min)``: the planner's constants of ``target``, or with
+    ``split_count`` the forced cap ``min(split_count, tile_cap)`` at one chunk
+    per segment."""
 
     cap = tile_cap(num_heads, sm_count)
     if split_count is not None:
         return min(int(split_count), cap), 1
-    return min(cap, P_MAX[num_heads]), C_MIN[num_heads]
+    return min(cap, P_MAX[target][num_heads]), C_MIN[target][num_heads]
 
 
 def segment_count(length: int, p_cap: int, c_min: int) -> int:
@@ -208,16 +229,17 @@ def plan_split(
     num_heads: int,
     max_seqlen: int,
     sm_count: int,
+    target: str,
     split_count: Optional[int] = None,
 ) -> SplitPlan:
-    """The plan constants and the segment count of a sequence of
+    """The plan constants of ``target`` and the segment count of a sequence of
     ``max_seqlen`` tokens, an upper bound on every live sequence's (the
     device rule is monotone in the length).
 
     Without ``split_count``, ``max_seqlen <= SPLIT_MIN_TOKENS`` gives
     ``p_bound = 1``."""
 
-    p_cap, c_min = plan_constants(num_heads, sm_count, split_count)
+    p_cap, c_min = plan_constants(num_heads, sm_count, split_count, target=target)
     return SplitPlan(p_cap, c_min, segment_count(max_seqlen, p_cap, c_min))
 
 
@@ -273,7 +295,7 @@ def _entries(device_index: int, pass2: Any) -> tuple[Any, Optional[Any]]:
     _check_args(_programs.PASS1, _PASS1_ARGS)
     capability = torch.cuda.get_device_capability(device_index)
     target = _programs.PASS1.target_for(capability)
-    if target != _TARGET:
+    if target not in TARGETS:
         raise RuntimeError(
             f"the Cake GDN affine-split programs ship no build for compute "
             f"capability {capability[0]}.{capability[1]}"

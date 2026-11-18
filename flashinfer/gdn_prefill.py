@@ -822,6 +822,7 @@ _CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES = {
     (12, 1): "sm_121a",
 }
 _CAKE_GDN_AFFINE_SPLIT_HEADS = (4, 8, 16, 32)
+_CAKE_GDN_AFFINE_SPLIT_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def _cake_gdn_affine_split_scope(
@@ -846,13 +847,11 @@ def _cake_gdn_affine_split_scope(
     ``output`` of ``None`` is the one the entry allocates, which fits."""
 
     capability = (int(device_capability[0]), int(device_capability[1]))
-    if capability != (10, 3):
-        if capability == (10, 0):
-            return "sm_100a is not yet supported"
+    if capability not in _CAKE_GDN_AFFINE_SPLIT_CAPABILITIES:
         arch = _CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES.get(
             capability, f"sm_{capability[0]}{capability[1]}"
         )
-        return f"{arch} is not supported (sm_103a only)"
+        return f"{arch} is not supported (sm_100a, sm_103a and sm_107a only)"
     device = q.device
     io = (q, k, v) if output is None else (q, k, v, output)
     total = int(q.shape[0]) if q.ndim == 3 else -1
@@ -1007,6 +1006,9 @@ def _run_cake_gdn_affine_split(
         num_heads=num_v_heads,
         max_seqlen=bound,
         sm_count=sm_count,
+        target=_CAKE_GDN_AFFINE_SPLIT_ARCH_NAMES[
+            (int(device_capability[0]), int(device_capability[1]))
+        ],
         split_count=split_count,
     )
     tiles, _ = _affine_split.pass1_grid(num_seqs, num_v_heads, plan.p_bound, sm_count)
@@ -1908,10 +1910,13 @@ def chunk_gated_delta_rule(
         sequence of at most 960 tokens is never split. When the longest
         possible sequence (the exact longest of ``cu_seqlens_cpu``, else
         ``max_seqlen``, else ``total_seq_len``) gets ``P = 1``, the first
-        kernel runs alone, the default Cake kernel's DV-split arithmetic: each
-        sequence's output is bitwise equal to ``use_affine_split=False`` on
-        that sequence alone, and on the whole call while that route resolves
-        its DV-split variant (``2 * num_seqs * num_v_heads <= 160`` on SM103). Supported: SM103, BF16 Q/K/V/output, head size 128,
+        kernel runs alone, the non-CP Cake kernel's DV-split arithmetic: each
+        sequence's output is bitwise equal to the non-CP route
+        (``use_affine_split=False, use_cp=False``) on that sequence alone, and
+        on the whole call while that route resolves its DV-split variant
+        (``2 * num_seqs * num_v_heads`` at most the device's active clusters:
+        148 on SM100, 160 on SM103 and 212 on SM107). Supported: SM100, SM103 and
+        SM107, BF16 Q/K/V/output, head size 128,
         ``num_v_heads`` in (4, 8, 16, 32) with ``num_k_heads == num_q_heads``
         dividing it, any number of sequences with FP32 ``initial_state`` /
         ``output_state`` ``[num_seqs, H, V, K]`` (contiguous, 16-byte aligned
