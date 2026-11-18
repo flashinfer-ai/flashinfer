@@ -110,10 +110,8 @@ def test_native_cuda_checks_both_entry_points_on_the_input_device(monkeypatch, b
 
 
 @pytest.mark.parametrize("sf_layout", list(SfLayout))
-def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(
-    monkeypatch, sf_layout
-):
-    """All scale layouts retain copyable FP32 inputs without architecture narrowing."""
+def test_cute_preflight_preserves_copyable_inputs(monkeypatch, sf_layout):
+    """CuTe can prepare noncontiguous FP32 input on SM100."""
     from flashinfer import cute_dsl
 
     x = _fake_cuda((2, 64), torch.float32, step=2)
@@ -121,8 +119,7 @@ def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(
     unexpected = Mock(side_effect=AssertionError("unexpected runtime detection"))
     monkeypatch.setattr(utils, "get_compute_capability", unexpected)
     monkeypatch.setattr(fp8, "device_support_pdl", unexpected)
-    # CuTe prepares this layout itself and supports fp32. Do not impose the
-    # native CUDA backend's SM100 or contiguous-input restrictions here.
+    monkeypatch.setattr(fp8, "get_compute_capability", lambda device: (10, 0))
     assert (
         mxfp8_quantize.validate_call(x, backend="cute-dsl", sf_swizzle_layout=sf_layout)
         is None
@@ -133,6 +130,22 @@ def test_cute_preflight_preserves_copyable_inputs_and_architecture_policy(
         mxfp8_quantize(x, backend="cute-dsl", sf_swizzle_layout=sf_layout)
     dependency_probe.assert_called_once_with()
     unexpected.assert_not_called()
+
+
+def test_cute_preflight_rejects_fp32_on_sm90(monkeypatch):
+    cc = Mock(return_value=(9, 0))
+    monkeypatch.setattr(fp8, "get_compute_capability", cc)
+
+    for dtype in (torch.float16, torch.bfloat16):
+        assert (
+            mxfp8_quantize.validate_call(_fake_cuda(dtype=dtype), backend="cute-dsl")
+            is None
+        )
+
+    x = _fake_cuda(dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="requires SM100 or newer for float32"):
+        mxfp8_quantize.validate_call(x, backend="cute-dsl")
+    cc.assert_called_once_with(x.device)
 
 
 @pytest.mark.parametrize(
@@ -298,24 +311,30 @@ def test_batch_invariant_reuses_its_runtime_validation(monkeypatch):
     unexpected.assert_not_called()
 
 
-def test_benchmark_uses_public_checks_and_keeps_backend_order(monkeypatch, capsys):
+@pytest.mark.parametrize("major, expected", [(9, []), (10, ["cute-dsl"])])
+def test_benchmark_uses_public_checks_and_keeps_backend_order(
+    monkeypatch, capsys, major, expected
+):
     from benchmarks.routines.quantization import _filter_mxfp8_backends
 
     x = _fake_cuda(dtype=torch.float32)
     backends = ["cuda", "cute-dsl", "auto"]
-    # Native CUDA rejects fp32 before any device query; CuTe accepts it.
-    cc = Mock(side_effect=AssertionError("dtype rejection must precede device query"))
-    monkeypatch.setattr(utils, "get_compute_capability", cc)
-    assert _filter_mxfp8_backends(
-        x,
-        backends,
-        is_sf_swizzled_layout=True,
-        alignment=32,
-        enable_pdl=None,
-    ) == ["cute-dsl"]
+    # Only CuTe's FP32 preflight should query the input device.
+    cc = Mock(return_value=(major, 0))
+    monkeypatch.setattr(fp8, "get_compute_capability", cc)
+    assert (
+        _filter_mxfp8_backends(
+            x,
+            backends,
+            is_sf_swizzled_layout=True,
+            alignment=32,
+            enable_pdl=None,
+        )
+        == expected
+    )
     assert backends == ["cuda", "cute-dsl", "auto"]
     assert "requires float16 or bfloat16" in capsys.readouterr().out
-    cc.assert_not_called()
+    cc.assert_called_once_with(x.device)
 
 
 def test_benchmark_rejects_dtype_before_allocating_input(monkeypatch):

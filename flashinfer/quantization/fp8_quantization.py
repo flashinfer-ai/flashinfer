@@ -470,6 +470,13 @@ def _check_mxfp8_cute_dsl_inputs(input, alignment):
     if k == 0:
         raise ValueError("CuTe-DSL MXFP8 input must have a nonempty last dimension")
     assert k % 32 == 0, f"K ({k}) must be divisible by SF_VEC_SIZE=32"
+    if input.dtype == torch.float32:
+        major, minor = get_compute_capability(input.device)
+        if major < 10:
+            raise RuntimeError(
+                "mxfp8_quantize with backend='cute-dsl' requires SM100 or newer "
+                f"for float32 input, got SM{major}{minor}"
+            )
 
 
 def _validate_mxfp8_quantize_call(
@@ -493,8 +500,8 @@ def _validate_mxfp8_quantize_call(
     This checks metadata, not tensor values or storage addresses. A return
     does not certify dependency availability, compilation, native launch or
     numerical correctness. ``enable_pdl`` is accepted for call compatibility;
-    no PDL detection runs. CuTe's input copies/alignment repair are left to
-    execution, and its supported architectures are not narrowed here.
+    no PDL detection runs. CuTe's input copies and alignment repair are left
+    to execution.
     """
     sf_swizzle_layout = _mxfp8_scale_layout(is_sf_swizzled_layout, sf_swizzle_layout)
     _check_mxfp8_backend(input, backend, batch_invariant)
@@ -560,7 +567,8 @@ def mxfp8_quantize(
         - ``"cuda"``: stable JIT-compiled kernel. CUDA inputs require
           SM100 or newer. CPU inputs use the host implementation and
           require ``torch.float32``.
-        - ``"cute-dsl"``: CuTe-DSL kernel (SM90+, **experimental**).
+        - ``"cute-dsl"``: CuTe-DSL kernel (**experimental**). Requires SM90+
+          for fp16/bf16 and SM100+ for fp32.
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
         ``is_sf_swizzled_layout``. Native and CuTe backends require explicit

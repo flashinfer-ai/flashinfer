@@ -1672,16 +1672,10 @@ def backend_requirement(
                 capability = major * 10 + minor
             return capability
 
-        def _validate(args, kwargs):
-            kwargs_with_defaults = bind_with_defaults(args, kwargs)
+        def _validate(args, kwargs, kwargs_with_defaults):
             if call_check is not None:
                 call_check(**kwargs_with_defaults)
                 return
-            if bypass is not None and bypass(*args, **kwargs):
-                raise NotImplementedError(
-                    f"{func.__name__}.validate_call is not available for this bypassed "
-                    "mode; the mode owns input validation"
-                )
 
             backend = kwargs_with_defaults.get("backend")
             capability = _get_capability(*args, **kwargs)
@@ -1739,7 +1733,13 @@ def backend_requirement(
             # Explicit validation cannot be disabled by the execution-only flag.
             if validate_on_call:
                 kwargs.pop("skip_check", None)
-            return _validate(args, kwargs)
+            kwargs_with_defaults = bind_with_defaults(args, kwargs)
+            if call_check is None and bypass is not None and bypass(*args, **kwargs):
+                raise NotImplementedError(
+                    f"{func.__name__}.validate_call is not available for this bypassed "
+                    "mode; the mode owns input validation"
+                )
+            return _validate(args, kwargs, kwargs_with_defaults)
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -1748,7 +1748,7 @@ def backend_requirement(
                 # A mode the function validates and dispatches itself: no backend selection here.
                 return func(*args, **kwargs)
             if not skip_check:
-                _validate(args, kwargs)
+                _validate(args, kwargs, bind_with_defaults(args, kwargs))
             elif call_check is None:
                 backend = kwargs.get("backend")
                 if backend == "auto" and heuristic_func is not None:

@@ -343,6 +343,12 @@ def test_bypass_skips_backend_selection_and_checks():
     """A call the ``bypass`` predicate claims runs the function directly: no requirement check, no heuristic, no
     capability lookup. Every other call keeps the full selection."""
     calls = []
+    bypass_calls = []
+
+    def _bypass(*args, **kwargs):
+        own_mode = kwargs.get("own_mode", False)
+        bypass_calls.append(own_mode)
+        return own_mode
 
     def _check_a(x, backend="auto", own_mode=False):
         calls.append("check_a")
@@ -362,7 +368,7 @@ def test_bypass_skips_backend_selection_and_checks():
         {"a": _check_a},
         common_check=_common,
         heuristic_func=_heuristic,
-        bypass=lambda *args, **kwargs: kwargs.get("own_mode", False),
+        bypass=_bypass,
     )
     def my_kernel(x, backend="auto", *, own_mode=False):
         return "own" if own_mode else my_kernel.suitable_auto_backends[0]
@@ -380,7 +386,9 @@ def test_bypass_skips_backend_selection_and_checks():
             my_kernel.validate_call(x, backend="b", own_mode=True)
     assert calls == []
 
+    bypass_calls.clear()
     assert my_kernel(1) == "a"
+    assert bypass_calls == [False]
     assert calls == ["common", "check_a", "heuristic"]
 
 
