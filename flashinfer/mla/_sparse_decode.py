@@ -116,6 +116,7 @@ def _reset_sparse_mla_decode_stats() -> None:
     _stats["auto_routes"].clear()
 
 
+@flashinfer_api
 def is_sparse_mla_decode_supported(device: torch.device) -> bool:
     """Whether ``backend="auto"`` has a route for ``device``."""
     device = torch.device(device)
