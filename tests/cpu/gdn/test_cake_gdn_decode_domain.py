@@ -343,6 +343,20 @@ def _fake(shape, dtype) -> torch.Tensor:
     )
 
 
+class _FakeCudaWrapper(_FakeCuda):
+    """A ``__torch_dispatch__`` subclass of :class:`_FakeCuda` (no op may reach it)."""
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        raise AssertionError(f"dispatched {func} to a wrapper subclass")
+
+
+def _wrapper(shape, dtype) -> torch.Tensor:
+    return torch.Tensor._make_subclass(
+        _FakeCudaWrapper, torch.empty(shape, dtype=dtype, device="meta")
+    )
+
+
 def _decode_inputs(batch_size: int) -> dict[str, torch.Tensor]:
     bf16, fp32 = torch.bfloat16, torch.float32
     return {
@@ -371,6 +385,7 @@ class _Device:
         self.counter_calls: list[tuple[int, int]] = []
         self.homings: dict[int, cake_locality.Homing] = {}
         self.failing: set[str] = set()
+        self.failing_launch: set[str] = set()
         self.table = self.make_table(counts)
         self.counters = (object(), object())
         properties = types.SimpleNamespace(
@@ -403,6 +418,8 @@ class _Device:
 
         def entry(*args):
             self.calls.append((name, args))
+            if name in self.failing_launch:
+                raise RuntimeError(f"failed to load the kernel of {name}")
 
         return entry
 
@@ -584,6 +601,30 @@ def test_twin_build_failure_is_remembered_and_runs_whole(monkeypatch) -> None:
     assert device.counter_calls == []
 
 
+def test_twin_load_failure_at_its_launch_runs_whole(monkeypatch) -> None:
+    # A twin whose kernel fails to load at its first launch (the failure comes before
+    # the launch) leaves the call to the row's whole launch, and every later call on
+    # such a state runs the whole launch alone; the whole launch table keeps its value.
+    device = _Device(monkeypatch)
+    device.failing_launch.add(_twin_name(_SCALE))
+    inputs = _decode_inputs(64)
+    device.home(inputs["state"])
+    for _ in range(3):
+        assert _run(inputs) is inputs["output"]
+    assert [name for name, _ in device.calls] == [_twin_name(_SCALE)] + [
+        _whole_name(_SCALE)
+    ] * 3
+    assert device.calls[0][1] == _twin_args(inputs, device, 32)
+    assert [args for _, args in device.calls[1:]] == [_whole_args(inputs, 64 * 32)] * 3
+    assert device.loads.count(_twin_name(_SCALE)) == 1
+    assert device.counter_calls == [(locality.DOMAIN_COUNTER_WORDS, 0)]
+    key = (0, 64, 16, 16, 32, _SCALE, True)
+    assert gdn_decode._CAKE_GDN_NONTRANSPOSE_LAUNCHES[key][1] == 64 * 32
+    (launch,) = gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.items()
+    assert launch[0] == key + ((106, 106), 32 * _ROW_BYTES)
+    assert launch[1][0] is None and launch[1][1:] == (64 * 32, 32, device.table)
+
+
 def test_twin_launch_follows_the_sm_table_and_the_cut(monkeypatch) -> None:
     # A launch is reused only for the SM table object it was resolved with, and the
     # dies' SM counts and the die cut are part of its key.
@@ -683,8 +724,9 @@ def test_localize_refuses_bad_arguments() -> None:
 
 
 def test_localize_refuses_before_probing(monkeypatch) -> None:
-    # Rows no die class routes, another dtype or head size, capture and another
-    # architecture are returned unhomed before the SM table is probed.
+    # Rows no die class routes, another dtype or head size, a __torch_dispatch__
+    # subclass, capture and another architecture are returned unhomed before the SM
+    # table is probed.
     def refused(helper, state, *args, **kwargs):
         assert locality.localize_gdn_decode_state(state, *args, **kwargs) is state
         assert not helper.probed and helper.allocations == [] and helper.reserves == []
@@ -698,6 +740,7 @@ def test_localize_refuses_before_probing(monkeypatch) -> None:
     refused(helper, state, 4)
     refused(helper, state, 16, scale=0.5)
     refused(helper, _fake((64, 16, 128, 128), torch.float32), 16)
+    refused(helper, _wrapper((64, 32, 128, 128), torch.float32), 16)
     helper.capturing = True
     refused(helper, state, 16)
     for arch, sm_count in (

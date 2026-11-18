@@ -626,6 +626,27 @@ def _resolve_cake_gdn_nontranspose_domain_launch(key: tuple, table, cut: int) ->
     return (entry, batch_size * num_v_heads, rows0, table)
 
 
+def _drop_cake_gdn_nontranspose_domain_twin(
+    key: tuple, homed, launch: tuple, error: Exception
+) -> None:
+    """Record that the twin of ``launch`` (the ``_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES``
+    value of the row ``key`` on a state whose homing record is ``homed``) failed to load
+    at its launch: the row runs its whole-GPU launch on such states from now on."""
+    _, grid_x, rows0, table = launch
+    logger.warning(
+        "Cake GDN locality-domain decode of row %s failed to load (%s); "
+        "the row runs its whole-GPU kernel",
+        key,
+        error,
+    )
+    _CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES[key + (table.counts, homed.cut)] = (
+        None,
+        grid_x,
+        rows0,
+        table,
+    )
+
+
 def _run_cake_gdn_decode_nontranspose(
     *,
     q: torch.Tensor,
@@ -767,25 +788,33 @@ def _run_cake_gdn_decode_nontranspose(
             counters0, counters1 = _cake_locality.launch_counters(
                 _CAKE_GDN_DOMAIN_COUNTER_WORDS, device_index
             )
-            twin(
-                q,
-                k,
-                v,
-                state,
-                A_log,
-                a,
-                dt_bias,
-                b,
-                output,
-                rows0,
-                counters0,
-                counters1,
-                table.entries,
-                twin_grid_x,
-                1,
-                1,
-            )
-            return output
+            try:
+                twin(
+                    q,
+                    k,
+                    v,
+                    state,
+                    A_log,
+                    a,
+                    dt_bias,
+                    b,
+                    output,
+                    rows0,
+                    counters0,
+                    counters1,
+                    table.entries,
+                    twin_grid_x,
+                    1,
+                    1,
+                )
+            except RuntimeError as error:
+                # The twin's kernel loads and opts in to its shared memory at its
+                # first launch, before the launch itself: a failure there leaves the
+                # state, the output and the counters untouched, so the row runs its
+                # whole-GPU launch, now and on later calls.
+                _drop_cake_gdn_nontranspose_domain_twin(key, homed, domain, error)
+            else:
+                return output
     entry(q, k, v, state, A_log, a, dt_bias, b, output, grid_x, 1, 1)
     return output
 
