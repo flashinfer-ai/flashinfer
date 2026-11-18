@@ -322,6 +322,61 @@ def test_batch_of_one_segment_uses_the_unsplit_kernel_only_where_bitwise(hq, hv,
         assert torch.equal(o_alone, o[a:b]) and torch.equal(s_alone[0], s[i]), i
 
 
+def test_one_segment_from_initial_states_without_final_states():
+    """From initial states and without final states, a batch of one-segment
+    sequences runs the first kernel alone, as the unsplit kernel ships no
+    such variant, with the output of the call that keeps the states."""
+
+    pr = _batch(8, 16, [512, 512])
+    cu = torch.tensor(pr["cu"], dtype=torch.int32, device="cuda")
+
+    def only():
+        return chunk_gated_delta_rule(
+            pr["q"],
+            pr["k"],
+            pr["v"],
+            g=pr["g"],
+            beta=pr["beta"],
+            scale=SCALE,
+            initial_state=pr["h0"],
+            output_final_state=False,
+            cu_seqlens=cu,
+            backend="cake_gdn",
+            use_affine_split=True,
+        )
+
+    o = only().clone()
+    names = _kernel_names(only)
+    assert len(names) == 1 and "cake_gdn_affine_split" in names[0], names
+    o_ref, _ = _call_batch(pr, use_affine_split=True)
+    assert torch.equal(o, o_ref)
+
+
+def test_one_sequence_state_of_any_slot_stride():
+    """A one-sequence state is contiguous whatever its slot stride (a size-1
+    dimension, as after a DLPack round trip), so it runs with the bits of
+    the dense state."""
+
+    pr = _problem(4, 8, 2048, "real")
+    o_ref, s_ref = (x.clone() for x in _call(pr, use_affine_split=True))
+    h0 = pr["h0"].clone().as_strided((1, 8, D, D), (1, D * D, D, 1))
+    state = torch.empty(8 * D * D, device="cuda").as_strided(
+        (1, 8, D, D), (1, D * D, D, 1)
+    )
+    assert h0.is_contiguous() and h0.stride(0) == 1
+    o, s = _call(pr, initial_state=h0, output_state=state, use_affine_split=True)
+    assert torch.equal(o, o_ref) and torch.equal(s, s_ref)
+
+
+def test_batch_of_empty_sequences_keeps_the_initial_states():
+    pr = _batch(4, 8, [0, 0, 0])
+    assert pr["t"] == 0
+    o, s = _call_batch(pr, use_affine_split=True)
+    assert o.shape == (0, 8, D) and torch.equal(s, pr["h0"])
+    o, s = _call_batch(pr, initial_state=None, use_affine_split=True)
+    assert not s.any()
+
+
 @pytest.mark.parametrize("use_cp", ["auto", False])
 def test_default_false_keeps_the_route_and_the_bits(use_cp):
     pr = _problem(4, 8, 4096, "real")
@@ -625,20 +680,24 @@ def _unaligned_state():
         (dict(heads=6), "requires Hv in (4, 8, 16, 32), Hk == Hq and Hv % Hq == 0"),
         (
             dict(cu=[0, 1000, 2048]),
-            "requires FP32 states with contiguous [H, V, K] rows",
+            "requires contiguous FP32 states [N, H, V, K]",
         ),
         (
             dict(cu=[0, 1000, 2048], h0="expanded"),
-            "requires FP32 states whose sequence slots do not overlap",
+            "requires contiguous FP32 states [N, H, V, K]",
+        ),
+        (
+            dict(cu=[0, 1000, 2048], h0="padded"),
+            "requires contiguous FP32 states [N, H, V, K]",
         ),
         (
             dict(cu=[0, 7, 2048, 9], cu_step=2),
             "requires contiguous int32 or int64 cu_seqlens",
         ),
-        (dict(h0="bf16"), "requires FP32 states with contiguous [H, V, K] rows"),
+        (dict(h0="bf16"), "requires contiguous FP32 states [N, H, V, K]"),
         (
             dict(h0="unaligned"),
-            "requires 16-byte aligned state pointers and slot strides",
+            "requires 16-byte aligned state pointers",
         ),
         (dict(g="strided"), "requires contiguous FP32 g/beta [tokens, heads]"),
         (
@@ -667,6 +726,10 @@ def test_out_of_scope_calls_raise_before_any_launch(change, reason):
         h0 = h0.to(torch.bfloat16)
     elif change.get("h0") == "expanded":
         h0 = h0.expand(2, hv, D, D)
+    elif change.get("h0") == "padded":
+        # Aligned sequence slots that do not overlap, 4 floats apart.
+        slots = torch.zeros(2, hv * D * D + 4, device="cuda")
+        h0 = slots[:, : hv * D * D].view(2, hv, D, D)
     elif change.get("h0") == "unaligned":
         h0 = _unaligned_state()
     if change.get("g") == "strided":
@@ -729,7 +792,7 @@ def test_scope_is_checked_before_the_gates_are_materialized():
     def bad_call():
         with pytest.raises(
             ValueError,
-            match=r"use_affine_split=True: requires FP32 states with contiguous",
+            match=r"use_affine_split=True: requires contiguous FP32 states",
         ):
             chunk_gated_delta_rule(
                 pr["q"],
@@ -1068,6 +1131,13 @@ def test_batch_graph_replay_with_new_lengths(hq, hv):
         graph.replay()
         torch.cuda.synchronize()
         assert _zero_words(), replay
+        # Rows past the last offset stay untouched (NaN), as in eager calls.
+        assert torch.isfinite(out[: offsets[-1]]).all(), (replay, lens)
+        assert torch.isnan(out[offsets[-1] :]).all(), (replay, lens)
+        assert torch.isfinite(state).all(), (replay, lens)
+        for i, n in enumerate(lens):
+            if n == 0:
+                assert torch.equal(state[i], static["h0"][i]), (replay, lens, i)
         o_eager = torch.full_like(out, float("nan"))
         s_eager = torch.full_like(state, float("nan"))
         _call(

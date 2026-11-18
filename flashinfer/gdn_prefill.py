@@ -896,14 +896,16 @@ def _cake_gdn_affine_split_scope(
             or tensor.device != device
             or tensor.ndim != 4
             or tuple(tensor.shape) != (num_seqs, num_v_heads, 128, 128)
-            or tuple(tensor.stride()[1:]) != (16384, 128, 1)
+            or not tensor.is_contiguous()
         ):
-            return "requires FP32 states with contiguous [H, V, K] rows"
-        if num_seqs > 1 and int(tensor.stride(0)) < num_v_heads * 16384:
-            return "requires FP32 states whose sequence slots do not overlap"
+            # The kernels' bindings check contiguity, so padded sequence
+            # slots are refused here, before any launch.
+            return "requires contiguous FP32 states [N, H, V, K]"
     for tensor in states:
-        if (tensor.data_ptr() | (int(tensor.stride(0)) * 4)) & 15:
-            return "requires 16-byte aligned state pointers and slot strides"
+        # Contiguous slots are 16-byte aligned apart from the base, and a
+        # one-sequence state's slot stride is never read.
+        if tensor.data_ptr() & 15:
+            return "requires 16-byte aligned state pointers"
     for tensor in (g, beta):
         if tensor is not None and (
             tensor.dtype != torch.float32
@@ -978,6 +980,22 @@ def _run_cake_gdn_affine_split(
                 "sequence in cu_seqlens_cpu"
             )
         bound = longest
+    if int(q.shape[0]) == 0:
+        # Every sequence is empty: no launch, each final state is its
+        # initial state (zeros without one).
+        if not output_final_state:
+            return output
+        if output_state is None:
+            output_state = torch.empty(
+                (num_seqs, int(v.shape[1]), 128, 128),
+                dtype=torch.float32,
+                device=q.device,
+            )
+        if initial_state is None:
+            output_state.zero_()
+        else:
+            output_state.copy_(initial_state)
+        return output, output_state
     from .gdn_kernels.blackwell import cake_gdn_affine_split as _affine_split
 
     num_v_heads = int(v.shape[1])
@@ -1012,14 +1030,17 @@ def _run_cake_gdn_affine_split(
     if (
         plan.p_bound == 1
         and initial_state is not None
+        and output_final_state
         and 2 * num_seqs * num_v_heads
         <= _cake_gdn._ARCH_ACTIVE_CLUSTERS[_cake_gdn_arch(device_index)]
     ):
-        # Every sequence in one segment, from an initial state, where the
-        # unsplit kernel resolves its DV-split variant: bitwise equal to the
-        # first kernel alone, per sequence, and faster. Its full-DV variant
-        # (more sequences or heads) has other bits, so it is not used. The
-        # launch depends on the bound only, as the split route's does.
+        # Every sequence in one segment, from an initial state to a final
+        # one, where the unsplit kernel resolves its DV-split variant:
+        # bitwise equal to the first kernel alone, per sequence, and faster.
+        # Its full-DV variant (more sequences or heads) has other bits, and
+        # it ships no initial-state variant without a final state, so
+        # neither is used. The launch depends on the bound only, as the
+        # split route's does.
         return _run_cake_gdn_prefill(
             q=q,
             k=k,
@@ -1873,7 +1894,7 @@ def chunk_gated_delta_rule(
         Opt-in exact sequence split of the Cake GDN prefill
         (``backend="cake_gdn"`` only; never selected automatically, and
         ``use_cp="auto"`` is ignored). A sequence is cut into ``P``
-        chunk-aligned segments that run in one wave: segment 0 from the
+        chunk-aligned segments: segment 0 from the
         initial state, every other segment from zeros and from the identity;
         a second kernel composes the carried states and corrects the later
         segments' outputs. The result is the same recurrence in another
@@ -1893,21 +1914,26 @@ def chunk_gated_delta_rule(
         its DV-split variant (``2 * num_seqs * num_v_heads <= 160`` on SM103). Supported: SM103, BF16 Q/K/V/output, head size 128,
         ``num_v_heads`` in (4, 8, 16, 32) with ``num_k_heads == num_q_heads``
         dividing it, any number of sequences with FP32 ``initial_state`` /
-        ``output_state`` ``[num_seqs, H, V, K]`` (dense ``[H, V, K]`` rows,
-        slots that do not overlap, 16-byte aligned addresses), FP32
+        ``output_state`` ``[num_seqs, H, V, K]`` (contiguous, 16-byte aligned
+        addresses), FP32
         ``g``/``beta`` (or the gate forms materialized to them). Checkpoints, state pools, ``prefix_lens`` and
         ``use_cp=True`` are rejected with ``ValueError``. The call owns
         workspaces (768 B per token and value head, plus 192 KiB per
         sequence, value head and segment); it is CUDA-graph capturable after
-        one eager call with the same shapes on the capturing stream, and one
-        capture may repeat the call. A ``max_seqlen`` hint smaller than a
-        live sequence changes that sequence's segments (its result stays
-        exact, its bits change).
+        one eager call with the same shapes and the same segment cap on the
+        capturing stream, and one capture may repeat the call. The cap comes
+        from the bound at capture (the longest of ``cu_seqlens_cpu``, else
+        ``max_seqlen``), and a replay keeps it: when the lengths change
+        between replays, omit ``cu_seqlens_cpu`` and warm up and capture with
+        a ``max_seqlen`` that covers every replay. A ``max_seqlen`` hint
+        smaller than a live sequence changes that sequence's segments (its
+        result stays exact, its bits change).
     _affine_split_count : int, optional
         Internal segment-cap override of ``use_affine_split=True``, used for
         testing. ``None`` lets the route choose the cap; an explicit positive
-        value caps the split at that many segments (at most one wave of the
-        device), one chunk per segment at least, even at 960 tokens or fewer.
+        value caps the split at that many segments (at most what one
+        sequence's tiles fill in one wave), one chunk per segment at least,
+        even at 960 tokens or fewer.
     batch_invariant : bool
         Keyword-only. ``True`` runs the batch-invariant class ``gdn.bf16.c64``
         (``flashinfer.batch_invariant``) in place of the backends: every

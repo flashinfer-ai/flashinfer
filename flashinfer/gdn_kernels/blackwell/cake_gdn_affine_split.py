@@ -167,8 +167,9 @@ _PASS2_ARGS = (
 
 
 def tile_cap(num_heads: int, sm_count: int) -> int:
-    """The largest segment count whose pass-1 tiles fit one wave:
-    ``num_heads * (4 * P - 2) <= sm_count``, at least 1."""
+    """The largest segment count whose pass-1 tiles of one sequence fit one
+    wave: ``num_heads * (4 * P - 2) <= sm_count``, at least 1. A batch may
+    have more tiles than CTAs."""
 
     return max(1, (sm_count // num_heads + 2) // 4)
 
@@ -224,7 +225,8 @@ def pass1_grid(
     num_seqs: int, num_heads: int, p_cap: int, sm_count: int
 ) -> tuple[int, int]:
     """``(total_tiles, grid_x)`` of pass 1: segment 0 has ``2 * H`` tiles,
-    every later segment ``4 * H``; one wave of at most ``sm_count`` CTAs."""
+    every later segment ``4 * H``; at most ``sm_count`` CTAs, so a CTA runs
+    several tiles when there are more tiles than CTAs."""
 
     tiles = num_seqs * num_heads * (4 * p_cap - 2)
     return tiles, min(tiles, sm_count)
