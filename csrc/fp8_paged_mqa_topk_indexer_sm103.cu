@@ -11,6 +11,23 @@
 
 namespace ffi = tvm::ffi;
 
+// CUDA 13.0's ptxas optimizer miscompiles the warp-specialized tcgen05 UMMA
+// pattern in the ks<4 descriptor loops below: at the default -O3 the build
+// faults (out-of-range shared address inside the UMMA helper), at -O1 it is
+// silently wrong, at -O0 it is correct, and CUDA 13.1+ is correct at every
+// optimization level from identical source. Forcing `unroll 1` on exactly
+// these ten loops was validated bit-exact on the full trigger battery under
+// 13.0 and fully green under 13.3, at a measured ~3.5% geomean cost — so it
+// is applied only when the compiling toolkit is 13.0 (keyed on the nvcc that
+// compiles this TU, which supplies the ptxas that carries the defect); every
+// other toolkit keeps the full-speed unrolled path.
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDACC_VER_MAJOR__ == 13) && \
+    defined(__CUDACC_VER_MINOR__) && (__CUDACC_VER_MINOR__ == 0)
+#define UMMA_KS_UNROLL _Pragma("unroll 1")
+#else
+#define UMMA_KS_UNROLL _Pragma("unroll")
+#endif
+
 #define IHEADS 4
 #define IDIM 128
 #define CRATIO 4
@@ -649,7 +666,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
         constexpr uint64_t KBASE = QTILE_B >> 4;
         constexpr uint64_t STAGE = KTILE_B >> 4;
         const uint64_t bdesc0 = adesc0 + KBASE + (uint64_t)(tile % 3) * STAGE;
-#pragma unroll
+        UMMA_KS_UNROLL
         for (int ks = 0; ks < 4; ++ks) {
           const uint64_t ao = (uint64_t)(ks * 32 >> 4);
           const uint64_t bd = bdesc0 + ao;
@@ -1000,7 +1017,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
         constexpr uint64_t KBASE = QTILE_B >> 4;
         constexpr uint64_t STAGE = KTILE_B >> 4;
         const uint64_t bdesc0 = adesc0 + KBASE + (uint64_t)(tile % 3) * STAGE;
-#pragma unroll
+        UMMA_KS_UNROLL
         for (int ks = 0; ks < 4; ++ks) {
           const uint64_t ao = (uint64_t)(ks * 32 >> 4);
           const uint64_t bd = bdesc0 + ao;
@@ -1016,7 +1033,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
             umma2_open_b3(taddr, taddr + N_TILE, d0, d1, bd, idesc, 1);
         }
         umma_commit(mbar0);
-#pragma unroll
+        UMMA_KS_UNROLL
         for (int ks = 0; ks < 4; ++ks) {
           const uint64_t ao = (uint64_t)(ks * 32 >> 4);
           const uint64_t bd = bdesc0 + ao;
@@ -1194,7 +1211,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
 
           if (tid == 0) {
             const uint32_t kbase = sm_addr(sK) + (tile % 3) * KTILE_B;
-#pragma unroll
+            UMMA_KS_UNROLL
             for (int ks = 0; ks < 4; ++ks) {
               const uint64_t ao = (uint64_t)(ks * 32 >> 4);
               const uint64_t bd = make_desc_sw128(kbase + ks * 32);
@@ -1210,7 +1227,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
                 umma2_open_b3(taddr, taddr + N_TILE, d0, d1, bd, idesc, 1);
             }
             umma_commit(mbar0);
-#pragma unroll
+            UMMA_KS_UNROLL
             for (int ks = 0; ks < 4; ++ks) {
               const uint64_t ao = (uint64_t)(ks * 32 >> 4);
               const uint64_t bd = make_desc_sw128(kbase + ks * 32);
@@ -4107,7 +4124,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
         constexpr uint64_t KBASE = QTILE_B >> 4;
         constexpr uint64_t STAGE = KTILE_B >> 4;
         const uint64_t bdesc0 = adesc0 + KBASE + (uint64_t)(tile % 3) * STAGE;
-#pragma unroll
+        UMMA_KS_UNROLL
         for (int ks = 0; ks < 4; ++ks) {
           const uint64_t ao = (uint64_t)(ks * 32 >> 4);
           const uint64_t bd = bdesc0 + ao;
@@ -4458,7 +4475,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
         constexpr uint64_t KBASE = QTILE_B >> 4;
         constexpr uint64_t STAGE = KTILE_B >> 4;
         const uint64_t bdesc0 = adesc0 + KBASE + (uint64_t)(tile % 3) * STAGE;
-#pragma unroll
+        UMMA_KS_UNROLL
         for (int ks = 0; ks < 4; ++ks) {
           const uint64_t ao = (uint64_t)(ks * 32 >> 4);
           const uint64_t bd = bdesc0 + ao;
@@ -4474,7 +4491,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
             umma2_open_b3(taddr, taddr + N_TILE, d0, d1, bd, idesc, 1);
         }
         umma_commit(mbar0);
-#pragma unroll
+        UMMA_KS_UNROLL
         for (int ks = 0; ks < 4; ++ks) {
           const uint64_t ao = (uint64_t)(ks * 32 >> 4);
           const uint64_t bd = bdesc0 + ao;
@@ -4648,7 +4665,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
 
           if (tid == 0) {
             const uint32_t kbase = sm_addr(sK) + (tile % 3) * KTILE_B;
-#pragma unroll
+            UMMA_KS_UNROLL
             for (int ks = 0; ks < 4; ++ks) {
               const uint64_t ao = (uint64_t)(ks * 32 >> 4);
               const uint64_t bd = make_desc_sw128(kbase + ks * 32);
@@ -4664,7 +4681,7 @@ __global__ void __launch_bounds__(SCORE_THREADS, 2)
                 umma2_open_b3(taddr, taddr + N_TILE, d0, d1, bd, idesc, 1);
             }
             umma_commit(mbar0);
-#pragma unroll
+            UMMA_KS_UNROLL
             for (int ks = 0; ks < 4; ++ks) {
               const uint64_t ao = (uint64_t)(ks * 32 >> 4);
               const uint64_t bd = make_desc_sw128(kbase + ks * 32);

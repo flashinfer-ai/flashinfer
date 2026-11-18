@@ -163,6 +163,19 @@ requires_validated_toolkit = pytest.mark.skipif(
 )
 
 
+def test_cuda_130_admitted_with_workaround():
+    """CPU-reachable: CUDA 13.0 is a validated toolkit — served through the
+    compiled-in unroll-1 workaround for its ptxas optimizer defect (see the
+    kernel source comment), validated exact at a small perf cost on that
+    toolkit only — so the exact-membership gate must admit it while still
+    rejecting the never-validated neighbors."""
+    assert "13.0" in pi.VALIDATED_CUDA_VERSIONS
+    assert pi._is_validated_release("13.0")
+    assert pi._is_validated_release("13.0.1")  # major.minor extraction
+    assert not pi._is_validated_release("12.9")
+    assert not pi._is_validated_release("13.00")  # exact membership, no prefixes
+
+
 def _row_scores(inp, r, blocks):
     """fp32 reference scores of the given block indices for request r."""
     cu = inp["cu_seqlens"].to(torch.int64).tolist()

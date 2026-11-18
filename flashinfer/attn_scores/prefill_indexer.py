@@ -28,14 +28,21 @@ The kernel is validated per CUDA toolkit, and dispatch refuses to serve
 when the current toolkit (``torch.version.cuda``) is not in
 ``VALIDATED_CUDA_VERSIONS`` (fallback reason ``unvalidated_toolkit``):
 behavior under other compilers is measured to differ and is not
-guaranteed. On the validated toolkits (nvcc 13.1-13.4, each qualified by
+guaranteed. On the validated toolkits (nvcc 13.0-13.4, each qualified by
 the full per-toolkit validation) the selection matches an
-fp32 reference bit-for-bit on every verified row. Measured under nvcc 12.9
-and 13.0, the top-512 set can differ from that reference by a score-TIED
-boundary block at the selection threshold (set difference <= 1 block per
-row, packed format/causal tail/ordering/count exact), and nvcc 13.0
-additionally showed intermittent instability under investigation — hence
-the refusal rather than a weaker contract.
+fp32 reference bit-for-bit on every verified row. nvcc 13.0 is served
+through a compiled-in workaround: its ptxas optimizer miscompiles the
+kernel's warp-specialized tcgen05 UMMA loops (faults at -O3, silently
+wrong at -O1, correct at -O0; fixed in 13.1+), so the kernel source
+forces ``unroll 1`` on those loops when — and only when — the compiling
+nvcc is 13.0. The 13.0 build was validated bit-exact on the full trigger
+battery at a measured ~3.5% geomean perf cost on that toolkit only;
+13.1+ builds keep the full-speed path and are byte-identical to the
+pre-workaround source. Measured under nvcc 12.9 (not validated), the
+top-512 set can differ from the reference by a score-TIED boundary block
+at the selection threshold (set difference <= 1 block per row, packed
+format/causal tail/ordering/count exact) — hence refusal there rather
+than a weaker contract.
 
 There is no other FlashInfer path serving this fused contract today:
 ``fp8_paged_mqa_logits`` + ``FP8MQATopKWrapper`` cover the decode-side
@@ -101,8 +108,12 @@ BACKENDS = ("specialized",)
 # Exact major.minor CUDA releases the kernel is validated on. Dispatch
 # refuses off this list; extend it only after re-running the full
 # per-toolkit validation (reference exactness + sanitizers on the scored
-# regime), as was done for each entry here.
+# regime), as was done for each entry here. 13.0 is validated WITH the
+# compiled-in unroll-1 workaround for its ptxas optimizer defect (see the
+# module docstring and the kernel source comment): exact on the full
+# trigger battery, at ~3.5% geomean perf cost on that toolkit only.
 VALIDATED_CUDA_VERSIONS = (
+    "13.0",
     "13.1",
     "13.2",
     "13.3",
