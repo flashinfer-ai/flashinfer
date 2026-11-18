@@ -33,7 +33,7 @@ import tvm_ffi
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
-from ..api_logging import cake_auto_candidates_enabled, flashinfer_api
+from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
     batch_deepgemm_fp8_nt_groupwise_trace,
     bmm_bf16_trace,
@@ -56,7 +56,7 @@ from ..autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
-    get_autotune_process_group,
+    cake_auto_candidate_open,
     is_in_profile_measurement,
 )
 from ..fused_moe.utils import (
@@ -1242,35 +1242,9 @@ _CAKE_BF16_BMM_RUNNER = "CakeBf16BmmRunner"
 _CAKE_FP4_GEMM_RUNNER = "CakeFp4GemmRunner"
 
 
-def _cake_auto_candidate_open(runner_class_name: str) -> bool:
-    """Whether ``backend="auto"`` lists the Cake runner of this class now.
-
-    The runner is always the last candidate, so the tuner selects it only
-    while tuning or from a cache entry of its class
-    (:meth:`AutoTuner.may_select_runner_class`). Otherwise listing it changes
-    no selection, so it is left out: the call keeps the runner list and host
-    cost of the other backends. ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``
-    always leaves it out, and so does tuning under an autotune process group
-    (:func:`_cake_group_tuning`).
-    """
-    return (
-        cake_auto_candidates_enabled()
-        and not _cake_group_tuning()
-        and AutoTuner.get().may_select_runner_class(runner_class_name)
-    )
-
-
-def _cake_group_tuning() -> bool:
-    """Whether the tuner now tunes under an autotune process group
-    (:func:`~flashinfer.autotuner.set_autotune_process_group`).
-
-    Group tuning requires every rank to list the same runners for an op. The
-    automatic Cake candidates are offered per operands and per tuning bucket of
-    the rank-local M, so ranks could disagree; they are left out while a group
-    tunes, and every rank lists the other backends only. Outside tuning the
-    group checks nothing, and Cake is listed as without a group.
-    """
-    return get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
+# The shared gate (FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES, autotune process
+# group, AutoTuner.may_select_runner_class); see cake_auto_candidate_open.
+_cake_auto_candidate_open = cake_auto_candidate_open
 
 
 @backend_requirement(

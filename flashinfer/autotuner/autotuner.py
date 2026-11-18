@@ -31,6 +31,7 @@ from typing import (
 
 import torch
 
+from flashinfer.api_logging import cake_auto_candidates_enabled
 from flashinfer.autotune_cache import _ManagedCacheRecord
 from flashinfer.tllm_utils import delay_kernel, get_trtllm_utils_module
 from flashinfer.utils import (
@@ -1358,6 +1359,38 @@ def set_autotune_process_group(
 def get_autotune_process_group() -> Optional["torch.distributed.ProcessGroup"]:
     """Return the process group previously passed to ``set_autotune_process_group``."""
     return _tune_process_group
+
+
+def cake_auto_candidate_open(runner_class_name: str) -> bool:
+    """Whether ``backend="auto"`` lists the automatic Cake runner of this class now.
+
+    The runner is always the last candidate, so the tuner selects it only
+    while tuning or from a cache entry of its class
+    (:meth:`AutoTuner.may_select_runner_class`). Otherwise listing it changes
+    no selection, so it is left out: the call keeps the runner list and host
+    cost of the other backends. ``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1``
+    always leaves it out, and so does tuning under an autotune process group
+    (:func:`cake_group_tuning`).
+    """
+    return (
+        cake_auto_candidates_enabled()
+        and not cake_group_tuning()
+        and AutoTuner.get().may_select_runner_class(runner_class_name)
+    )
+
+
+def cake_group_tuning() -> bool:
+    """Whether the tuner now tunes under an autotune process group
+    (:func:`set_autotune_process_group`).
+
+    Group tuning requires every rank to list the same runners for an op. The
+    automatic Cake candidates are offered per operands, per tuning bucket of
+    the rank-local batch and per rank-local build outcome, so ranks could
+    disagree; they are left out while a group tunes, and every rank lists the
+    other backends only. Outside tuning the group checks nothing, and Cake is
+    listed as without a group.
+    """
+    return get_autotune_process_group() is not None and AutoTuner.get().is_tuning_mode
 
 
 class _TuningGroupError(RuntimeError):

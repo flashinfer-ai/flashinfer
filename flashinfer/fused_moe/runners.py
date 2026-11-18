@@ -51,6 +51,7 @@ from ..autotuner import (
     DynamicTensorSpec,
     TunableRunner,
     TuningConfig,
+    cake_group_tuning,
 )
 from ..quantization.nvfp4_quantization_utils import (
     _UNSET,
@@ -99,6 +100,7 @@ from .api import (
     SwiGLUStep,
     # Unified config and pack types
     ActivationType,
+    CakeWarpDecodeConfig,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -1010,8 +1012,26 @@ class CakeWarpDecodeRunner(MoERunner):
     def _uses_clamped_swiglu(self) -> bool:
         return self.config.activation == SwiGLU(limit=10.0)
 
+    def _is_default_candidate(self) -> bool:
+        """Whether this runner serves the default backend list's Cake entry."""
+        return any(
+            isinstance(candidate, CakeWarpDecodeConfig) and candidate.default_candidate
+            for candidate in self.config.backend
+        )
+
     def _check_support(self) -> None:
         super()._check_support()
+        default_candidate = self._is_default_candidate()
+        if default_candidate:
+            from ..api_logging import cake_auto_candidates_enabled
+
+            # Read when MoELayer builds its runners: layers built while the
+            # switch is set have no automatic Cake candidate.
+            if not cake_auto_candidates_enabled():
+                raise NotImplementedError(
+                    "Automatic Cake candidates are disabled by "
+                    "FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1."
+                )
         if self._device_arch not in (100, 103):
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires exact SM100 or SM103, "
@@ -1021,7 +1041,14 @@ class CakeWarpDecodeRunner(MoERunner):
             raise NotImplementedError("Clamped E256 warp decode requires exact SM100.")
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
-        if self.config.execution.enable_pdl is not True:
+        enable_pdl = self.config.execution.enable_pdl
+        if enable_pdl is None and default_candidate:
+            # The default entry keeps ExecutionConfig's automatic PDL meaning.
+            # An explicit Cake config still requires enable_pdl=True.
+            from ..utils import device_support_pdl
+
+            enable_pdl = device_support_pdl(self.device)
+        if enable_pdl is not True:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires ExecutionConfig(enable_pdl=True)."
             )
@@ -1069,6 +1096,19 @@ class CakeWarpDecodeRunner(MoERunner):
             )
 
     def _build(self) -> None:
+        if self._is_default_candidate():
+            # Load on first use instead (see _require_built). A default-list
+            # layer whose weight pack has no "cake" view then never compiles or
+            # loads the Cake module.
+            return
+        self._module = self._load_module()
+
+    def _require_built(self) -> None:
+        super()._require_built()
+        if self._module is None:
+            self._module = self._load_module()
+
+    def _load_module(self) -> Any:
         from ..jit.cake_fused_moe_warp_decode import (
             get_cake_fused_moe_warp_decode_module,
         )
@@ -1083,11 +1123,99 @@ class CakeWarpDecodeRunner(MoERunner):
                 "CakeWarpDecodeRunner build requires exact SM100 or SM103, "
                 f"got SM{self._device_arch}."
             )
-        self._module = get_cake_fused_moe_warp_decode_module(target, device=self.device)
+        return get_cake_fused_moe_warp_decode_module(target, device=self.device)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
         return [-1]
+
+    def _accepts_shape(self, act: MoEActivationPack) -> bool:
+        if not self._is_default_candidate():
+            # An explicit Cake config keeps reporting unsupported inputs from
+            # pack_inputs.
+            return super()._accepts_shape(act)
+        # Repeat the cheap pack_inputs checks, so MoELayer skips the default
+        # entry for inputs it cannot serve instead of failing the whole call.
+        hidden_states = act.hidden_states_q
+        hidden_states_scale = act.hidden_states_scale
+        if (
+            hidden_states.ndim != 2
+            or hidden_states.dtype != torch.uint8
+            or not hidden_states.is_contiguous()
+            or not 1 <= hidden_states.shape[0] <= 32
+        ):
+            return False
+        num_tokens = int(hidden_states.shape[0])
+        hidden_size = int(hidden_states.shape[1]) * 2
+        routing = self.config.routing
+        intermediate_size = self.config.experts.intermediate_size
+        configuration = (
+            self.config.activation,
+            hidden_size,
+            intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+        )
+        if configuration not in self._SUPPORTED_CONFIGURATIONS:
+            return False
+        if (
+            hidden_states_scale is None
+            or hidden_states_scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+            or tuple(hidden_states_scale.shape) != (num_tokens, hidden_size // 16)
+            or not hidden_states_scale.is_contiguous()
+            or act.topk_ids is None
+            or act.topk_weights is None
+            or act.topk_weights.dtype != torch.bfloat16
+            or not act.topk_ids.is_contiguous()
+            or not act.topk_weights.is_contiguous()
+        ):
+            return False
+        # Group tuning requires every rank to tune the same runners, and this
+        # entry's eligibility depends on the rank-local token count.
+        if cake_group_tuning():
+            return False
+        # Stream workspaces are never evicted. Leave the default entry out
+        # before that limit is reached instead of failing the call. One winner
+        # selection can add two stream workspaces: the caller stream and the
+        # timing warmup stream.
+        if len(self._workspace_cache) > self._MAX_STREAM_WORKSPACES - 2:
+            return False
+        geometry = (
+            num_tokens,
+            hidden_size,
+            intermediate_size,
+            routing.num_experts,
+            routing.top_k,
+        )
+        if self._is_current_stream_capturing() and not self._capture_ready(geometry):
+            return False
+        return True
+
+    def _capture_ready(self, geometry: tuple[int, int, int, int, int]) -> bool:
+        """Whether pack_inputs can serve this geometry during CUDA Graph capture.
+
+        Capture cannot allocate or prepare a workspace, so a prepared workspace
+        for this exact geometry must exist from an eager call.
+        """
+        cached = self._workspace_cache.get(
+            (self._stream_token(self._current_stream()), geometry)
+        )
+        candidates = (
+            [cached]
+            if cached is not None
+            else [
+                entry
+                for cached_key, entry in self._workspace_cache.items()
+                if cached_key[1] == geometry
+            ]
+        )
+        for _, workspace in candidates:
+            prepared = self._prepared_workspaces.get(
+                self._workspace_identity(workspace, geometry)
+            )
+            if prepared is not None and prepared[0] is workspace:
+                return True
+        return False
 
     @staticmethod
     def _workspace_identity(
@@ -1399,6 +1527,7 @@ class CakeWarpDecodeRunner(MoERunner):
         )
         # Expert ids outside [0, num_experts) are dropped inside the kernels;
         # the host never reads topk_ids, so capture and replay need no receipt.
+        topk_ids, topk_weights = act.topk_ids, act.topk_weights
         device = act.hidden_states_q.device
         if device != self.device:
             raise ValueError(
@@ -1529,8 +1658,8 @@ class CakeWarpDecodeRunner(MoERunner):
             workspace,
             act.hidden_states_q,
             act.hidden_states_scale,
-            act.topk_ids,
-            act.topk_weights,
+            topk_ids,
+            topk_weights,
             view["gemm1_weights"],
             view["gemm1_weights_scale"],
             view["gemm2_weights"],

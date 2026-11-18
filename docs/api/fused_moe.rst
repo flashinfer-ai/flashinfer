@@ -539,10 +539,14 @@ single-kernel or entirely on-chip intermediate implementation.
 Cake NVFP4 Warp Decode (SM100/SM103)
 ------------------------------------
 
-The Cake warp-decode runner is an explicit unified-MoE backend for exact
-SM100 and exact SM103. Select it with
-``CakeWarpDecodeConfig(backend="cake")``; it is not in the default backend
-list. Each device loads only its exact generated target. The current generated
+The Cake warp-decode runner is a unified-MoE backend for exact SM100 and
+exact SM103. Select it explicitly with
+``CakeWarpDecodeConfig(backend="cake")``. The default backend list also ends
+with a Cake entry: a ``MoELayer`` built without ``backend=`` selects it only
+for a weight pack with a ``"cake"`` view and only when it measures faster
+than every earlier eligible backend;
+``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` removes it. Each device loads
+only its exact generated target. The current generated
 portfolio fails closed outside these contracts:
 
 * ``(activation, hidden_size, intermediate_size, num_experts, top_k)`` is

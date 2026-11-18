@@ -185,6 +185,7 @@ def _activation_pack(
     mode: RoutingInputMode = RoutingInputMode.UnpackedPrecomputed,
     weights_dtype: torch.dtype = torch.bfloat16,
     topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
     hidden_size: int = 2048,
 ) -> MoEActivationPack:
     return MoEActivationPack(
@@ -193,7 +194,9 @@ def _activation_pack(
         topk_ids
         if topk_ids is not None
         else _TensorSpec((num_tokens, top_k), torch.int32),
-        _TensorSpec((num_tokens, top_k), weights_dtype),
+        topk_weights
+        if topk_weights is not None
+        else _TensorSpec((num_tokens, top_k), weights_dtype),
         routing_input_mode=mode,
     )
 
@@ -240,7 +243,7 @@ def _weight_pack(
     return weights, view
 
 
-def test_config_is_explicit_exact_sm100_sm103_and_not_default():
+def test_config_is_exact_sm100_sm103_and_last_default_entry():
     config = CakeWarpDecodeConfig(backend="cake")
     assert repr(config) == "CakeWarpDecodeConfig(backend='cake')"
     assert config.supported(100)
@@ -248,7 +251,15 @@ def test_config_is_explicit_exact_sm100_sm103_and_not_default():
     assert not config.supported(101)
     assert not config.supported(107)
     assert _BACKEND_RUNNERS[CakeWarpDecodeConfig] is CakeWarpDecodeRunner
-    assert not any(isinstance(item, CakeWarpDecodeConfig) for item in _DEFAULT_BACKEND)
+    # The default list holds only the default-candidate entry, and holds it
+    # last; an explicit config is never part of it.
+    assert [
+        item for item in _DEFAULT_BACKEND if isinstance(item, CakeWarpDecodeConfig)
+    ] == [CakeWarpDecodeConfig(default_candidate=True)]
+    assert _DEFAULT_BACKEND.candidates[-1] == CakeWarpDecodeConfig(
+        default_candidate=True
+    )
+    assert config not in tuple(_DEFAULT_BACKEND)
     with pytest.raises(ValueError, match="must be 'cake'"):
         CakeWarpDecodeConfig(backend="auto")
 
