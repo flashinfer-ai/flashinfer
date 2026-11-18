@@ -51,14 +51,19 @@ __device__ __forceinline__ float qsa_checked_dot(float d, float abs_sum, const u
 //
 // Reuse all shipped kernels and dispatch branches unchanged.  The included
 // root is symbol-renamed so this translation unit can replace only the generic
-// qsa_topk_slow launch used above the bounded shared-score regimes.
+// qsa_topk_slow launch used above the bounded shared-score regimes.  The
+// legacy composite entry point is not exported (QSA_LEGACY_NO_EXPORT): its
+// generic launch reaches qsa_topk_slow, whose per-token selection-flag
+// scratch (256 histogram words) only covers rows with at most 8192 visible
+// blocks, a bound the scope-safe replacement below enforces and the legacy
+// T > 131071 branch does not.
+#define QSA_LEGACY_NO_EXPORT
 #define LaunchGeneric LaunchGenericLegacy
 #define Run RunLegacy
-#define run run_legacy_scope
 #include "kernel_regime_a3_scope_legacy.cuh"
-#undef run
 #undef Run
 #undef LaunchGeneric
+#undef QSA_LEGACY_NO_EXPORT
 
 #include "pack_fill.cuh"
 #include "pack_mid.cuh"

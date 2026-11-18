@@ -139,21 +139,24 @@ __device__ __forceinline__ void ldm2(unsigned& r0, unsigned& r1, const void* p) 
 
 // 16 fp8 bytes -> 16 fp16 (32 bytes), exact for e4m3
 __device__ __forceinline__ void cvt16(const uint4& raw, uint4& o0, uint4& o1) {
-  const unsigned short* p = reinterpret_cast<const unsigned short*>(&raw);
-  unsigned* o = reinterpret_cast<unsigned*>(&o0);
+  // Extract the halfwords by shift/mask instead of an unsigned short view of
+  // the uint4 (not type-accessible under the aliasing rules); the
+  // little-endian halfword order is unchanged.
+  unsigned out[8];
 #pragma unroll
   for (int i = 0; i < 8; ++i) {
-    __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)p[i], __NV_E4M3);
+    const unsigned word = (i < 2) ? raw.x : (i < 4) ? raw.y : (i < 6) ? raw.z : raw.w;
+    const unsigned short p = static_cast<unsigned short>(word >> (16 * (i & 1)));
+    __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)p, __NV_E4M3);
     union {
       __half2_raw h;
       unsigned u;
     } c;
     c.h = hr;
-    if (i < 4)
-      o[i] = c.u;
-    else
-      reinterpret_cast<unsigned*>(&o1)[i - 4] = c.u;
+    out[i] = c.u;
   }
+  o0 = make_uint4(out[0], out[1], out[2], out[3]);
+  o1 = make_uint4(out[4], out[5], out[6], out[7]);
 }
 
 __device__ __forceinline__ void dec2(unsigned short src, float& a, float& b) {

@@ -190,4 +190,9 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlen
   cross_best_impl::Run(qi, ck_cache, cu_seqlens, cpage_base, packed);
 }
 
+// The composed root (qsa_topk_indexer.cu) suppresses this export: the generic
+// qsa_topk_slow launch above is only scope-correct for the shipped regime
+// bounds, and the module must expose a single, scope-safe entry point.
+#ifndef QSA_LEGACY_NO_EXPORT
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, Run);
+#endif
