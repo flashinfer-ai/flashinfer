@@ -137,7 +137,8 @@ def test_unknown_backend_raises():
     "env", [SPECIALIZED_KERNEL_DISABLE_ENV, PER_TOKEN_GROUP_QUANT_CUTE_DSL_DISABLE_ENV]
 )
 def test_kill_switches_match_stock(monkeypatch, env):
-    # The kill-switch fallback serves the call on the stock cutile route.
+    # Under the kill switch, auto serves the call on the stock cutile route;
+    # explicit "specialized" raises (never falls back).
     _skip_unless_stock_cutile_usable()
     torch.manual_seed(7)
     x = torch.empty((64, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-3, 3)
@@ -146,6 +147,9 @@ def test_kill_switches_match_stock(monkeypatch, env):
 
     monkeypatch.setenv(env, "1")
     assert not _eligible(x)
+    _reset_per_token_group_quant_stats()
+    with pytest.raises(NotImplementedError, match="kill_switch"):
+        per_token_group_quant_8bit(x, 128, backend="specialized")
     _reset_per_token_group_quant_stats()
     stock_q, stock_s = per_token_group_quant_8bit(x, 128)  # auto
     assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
@@ -179,15 +183,26 @@ def test_option_forms_stay_on_stock_path(kwargs):
         x, group_size, dst_dtype, cms, False, False
     )
     assert not ok and reason in ("option_form", "group_or_dtype")
-    # Explicit "specialized" off-contract falls back to the composable
-    # cutile path (recorded), it never errors and never reroutes elsewhere.
+    # Explicit "specialized" off-contract raises with the reason (an
+    # explicitly selected backend never falls back); auto serves the same
+    # call on the stock cutile path with the reason recorded.
+    _reset_per_token_group_quant_stats()
+    with pytest.raises(NotImplementedError, match=reason):
+        per_token_group_quant_8bit(
+            x,
+            group_size,
+            dst_dtype=dst_dtype,
+            column_major_scales=cms,
+            backend="specialized",
+        )
+    assert _ptgq_stats["fallback_reasons"] == {reason: 1}
     _reset_per_token_group_quant_stats()
     q, s = per_token_group_quant_8bit(
         x,
         group_size,
         dst_dtype=dst_dtype,
         column_major_scales=cms,
-        backend="specialized",
+        backend="auto",
     )
     assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
     assert _ptgq_stats["fallback_reasons"] == {reason: 1}
@@ -210,15 +225,20 @@ def test_misaligned_input_stays_on_stock_path():
     assert not ok and reason == "alignment"
 
     _skip_unless_stock_cutile_usable()
-    for backend in ("auto", "specialized"):
-        _reset_per_token_group_quant_stats()
-        q, s = per_token_group_quant_8bit(x, 128, backend=backend)
-        assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
-        assert _ptgq_stats["fallback_reasons"] == {"alignment": 1}
-        expected_q, expected_s = _reference(x)
-        torch.testing.assert_close(s, expected_s, rtol=2e-7, atol=0)
-        exact = (q.view(torch.uint8) == expected_q.view(torch.uint8)).float()
-        assert exact.mean().item() >= 0.999
+    # explicit "specialized" raises on the misaligned form
+    _reset_per_token_group_quant_stats()
+    with pytest.raises(NotImplementedError, match="alignment"):
+        per_token_group_quant_8bit(x, 128, backend="specialized")
+    assert _ptgq_stats["fallback_reasons"] == {"alignment": 1}
+    # auto serves it on the stock path with the reason recorded
+    _reset_per_token_group_quant_stats()
+    q, s = per_token_group_quant_8bit(x, 128, backend="auto")
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
+    assert _ptgq_stats["fallback_reasons"] == {"alignment": 1}
+    expected_q, expected_s = _reference(x)
+    torch.testing.assert_close(s, expected_s, rtol=2e-7, atol=0)
+    exact = (q.view(torch.uint8) == expected_q.view(torch.uint8)).float()
+    assert exact.mean().item() >= 0.999
 
 
 def test_dispatch_table_present_and_well_formed():

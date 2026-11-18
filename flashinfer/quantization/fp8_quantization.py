@@ -1368,16 +1368,20 @@ def per_token_group_quant_8bit(
         dispatches to a specialized agent-generated CuTe-DSL kernel with
         identical semantics, gated by the packaged allowlist
         ``ptgq_fp8_g128_sm90_dispatch.json`` (warm the op up once before CUDA
-        graph capture). ``"specialized"`` requests that kernel explicitly and
-        falls back to the ``"cutile"`` path, recorded in the module's
-        fallback stats, when the call is off-contract. ``"cutile"`` and
+        graph capture). ``"specialized"`` requests that kernel explicitly;
+        a call it cannot serve (off-contract, kill switch, JIT or launch
+        failure) raises ``NotImplementedError`` with the refusal reason
+        (also recorded in the module's fallback stats) — an explicitly
+        selected backend never falls back; only ``"auto"`` routes around a
+        refusal. ``"cutile"`` and
         ``"cuda"`` are never rerouted: ``"cutile"`` always runs the stock
         cuda.tile Python backend, and ``"cuda"`` always runs the stock
         register-resident native CUDA kernel (``group_size=128`` with
         FP16/BF16 input). Setting ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``
         (or, deprecated for one release,
-        ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL=1``) keeps every
-        call on the stock paths. The stock backends compute the scale with
+        ``FLASHINFER_DISABLE_PER_TOKEN_GROUP_QUANT_CUTE_DSL=1``) disables the
+        specialized kernel: ``"auto"`` keeps the stock paths, explicit
+        ``"specialized"`` raises. The stock backends compute the scale with
         IEEE float32 division and, for ``dst_dtype=torch.int8``, round half
         up (``floor(x + 0.5)``); the specialized kernel matches the
         ``"cutile"`` outputs except one-ulp fp8 payload differences on a
@@ -1419,7 +1423,16 @@ def per_token_group_quant_8bit(
                 out = per_token_group_quant_fp8_g128_cute_dsl(x, eps)
                 _ptgq_stats["backend_dispatches"]["specialized"] += 1
                 return out
-            except Exception:
+            except Exception as exc:
+                if backend == "specialized":
+                    # An explicitly selected backend never falls back.
+                    _ptgq_record_fallback("jit_or_launch_failure")
+                    raise NotImplementedError(
+                        "per_token_group_quant_8bit backend='specialized' "
+                        f"failed (jit_or_launch_failure: {type(exc).__name__}); "
+                        "an explicitly selected backend never falls back — "
+                        "use backend='auto', 'cutile' or 'cuda'"
+                    ) from exc
                 import logging
 
                 logging.getLogger(__name__).warning(
@@ -1429,6 +1442,14 @@ def per_token_group_quant_8bit(
                 )
                 reason = "jit_or_launch_failure"
         _ptgq_record_fallback(reason)
+        if backend == "specialized":
+            # An explicitly selected backend never falls back: refuse loudly
+            # with the reason; only "auto" routes to the stock paths.
+            raise NotImplementedError(
+                "per_token_group_quant_8bit backend='specialized' cannot "
+                f"serve this call ({reason}); an explicitly selected backend "
+                "never falls back — use backend='auto', 'cutile' or 'cuda'"
+            )
         backend = "cutile"
 
     _ptgq_stats["backend_dispatches"]["stock"] += 1
