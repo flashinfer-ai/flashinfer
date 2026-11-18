@@ -30,10 +30,11 @@ Keys and queries are random. The select's thresholds are each row's
 ``top_k * (1 + --slack)``-th largest score, estimated from a key sample sized so
 that the threshold is the ``--sample-rank``-th largest sampled score at every
 context. A row rarely misses, so the times are of the select, not the repair.
-Contexts shorter than ``top_k * (1 + --slack)``, or too short to sample enough
-keys before the first row's end, skip the select. Each timed select call first
-restores the thresholds and zeroes the counters, and the select times include
-these two small copies.
+A context skips the select when it is too short to sample enough keys before
+the first row's end, or when the first row would expect fewer than
+``top_k * (1 + --slack / 2)`` keys above its threshold, since the early rows
+would then repair. Each timed select call first restores the thresholds and
+zeroes the counters, and the select times include these two small copies.
 
 Times are GPU kernel times from ``bench_gpu_time`` (CUPTI, or CUDA events when
 CUPTI is missing; ``--no-cupti`` forces events), with a cold L2, after a
@@ -124,6 +125,18 @@ def sample_size(context: int, args) -> int:
     """Keys to sample so that the ``--sample-rank``-th largest sampled score
     estimates the ``top_k * (1 + --slack)``-th largest score of the context."""
     return math.ceil(args.sample_rank * context / (args.top_k * (1 + args.slack)))
+
+
+def select_fits(context: int, args) -> bool:
+    """Whether the key sample fits before the first row's end, and the first row
+    expects top_k keys above its threshold with half the slack to spare."""
+    first = context - args.select_rows + 1
+    # The threshold admits top_k * (1 + slack) of the context's keys, and a row
+    # ending at key e expects e / context of them.
+    expected = args.top_k * (1 + args.slack) * first / context
+    return args.sample_rank <= sample_size(
+        context, args
+    ) <= first and expected >= args.top_k * (1 + args.slack / 2)
 
 
 def bench_select(fmt: str, context: int, args) -> float:
@@ -228,9 +241,8 @@ def main() -> None:
         return
     print("select times include restoring the thresholds and zeroing the counters")
     for context in args.contexts:
-        size = sample_size(context, args)
-        if not args.sample_rank <= size <= context - args.select_rows + 1:
-            print(f"select at context {context}: skipped, too short to sample")
+        if not select_fits(context, args):
+            print(f"select at context {context}: skipped, too short")
             continue
         for fmt in formats:
             us = bench_select(fmt, context, args)
