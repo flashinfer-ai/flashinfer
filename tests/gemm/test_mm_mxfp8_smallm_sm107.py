@@ -272,14 +272,12 @@ def test_specialized_matches_exact_reference_on_every_allowlisted_shape(
     allowlist = _load_allowlist()
     assert allowlist is not None
     calls = _count_kernel_launches(monkeypatch)
-    served = 0
-    for m, n, k in sorted(allowlist["shapes"]):
+    for served, (m, n, k) in enumerate(sorted(allowlist["shapes"]), start=1):
         a_q, b_q, a_sf, b_sf, _ = _quantized_problem(m, n, k)
         reference = _exact_dequant_reference(a_q, b_q, a_sf, b_sf)
         res = mm_mxfp8(
             a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
         )
-        served += 1
         assert len(calls) == served, (
             f"({m},{n},{k}): allowlisted explicit call must run the kernel"
         )

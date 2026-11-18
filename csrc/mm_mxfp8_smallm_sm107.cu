@@ -31,13 +31,12 @@
 // This translation unit holds the TVM-FFI binding and the measured per-shape
 // route table; the framework-agnostic raw-pointer kernel (kmain) and its
 // device helpers live in include/flashinfer/gemm/mm_mxfp8_smallm_sm107.cuh.
-#include <flashinfer/gemm/mm_mxfp8_smallm_sm107.cuh>
-
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <flashinfer/gemm/mm_mxfp8_smallm_sm107.cuh>
 
 #include "tvm_ffi_utils.h"
 
@@ -166,12 +165,11 @@ static void launch_gen(const Args& A, int CLS, int64_t gpc, cudaStream_t st) {
     attr[0].val.clusterDim.z = 1;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    cudaError_t launch_status =
-        cudaLaunchKernelEx(&cfg,
-                           kmain<MSUB, 2, 1, WK, false, BPS, true, 0, SCVD, false, 0, false, false,
-                                 false, false, false, 0, 0, 0, 0, false, false, false, WIDE>,
-                           A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc,
-                           CLS, A.m0);
+    cudaError_t launch_status = cudaLaunchKernelEx(
+        &cfg,
+        kmain<MSUB, 2, 1, WK, false, BPS, true, 0, SCVD, false, 0, false, false, false, false,
+              false, 0, 0, 0, 0, false, false, false, WIDE>,
+        A.aq, A.bq, A.asf, A.bsf, A.out, A.M, A.N, A.K, nkb, cdiv(nkb, 4), gpc, CLS, A.m0);
     TVM_FFI_ICHECK(launch_status == cudaSuccess)
         << "mm_mxfp8_smallm_sm107: clustered fallback launch failed: "
         << cudaGetErrorString(launch_status);
