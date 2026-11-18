@@ -28,14 +28,14 @@ from flashinfer.utils import get_compute_capability
 
 _MIN_COS_SIM = 0.98
 
-# A spread of allowlisted shapes across the measured families.
-_ON_LIST_SHAPES = [
-    (4, 6144, 384),
-    (1, 5120, 2048),
-    (8, 1152, 5120),
-    (24, 768, 6144),
-    (32, 1536, 6144),
-]
+# Every allowlisted shape: each has its own compile-time route, so each must
+# run numerically. Derived from the shipped dispatch surface so the test can
+# never drift from the allowlist.
+from flashinfer.gemm.mxfp8_smallm_sm107 import _load_allowlist
+
+_ALLOWLIST = _load_allowlist()
+assert _ALLOWLIST is not None, "specialized allowlist must ship with the package"
+_ON_LIST_SHAPES = sorted(_ALLOWLIST["shapes"])
 # A neighbor of the measured families that is NOT allowlisted.
 _OFF_LIST_SHAPE = (20, 7168, 5120)
 
