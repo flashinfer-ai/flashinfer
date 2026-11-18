@@ -70,11 +70,17 @@ def _hold_for_graph(buf):
 
 
 def _tma_alloc(size, alignment, stream):
-    """Reusable device scratch for Triton's device-side TMA descriptors."""
-    buf = _TMA_SCRATCH.get("b")
+    """Reusable device scratch for Triton's device-side TMA descriptors.
+
+    Keyed by the current CUDA device: a cached buffer is reused only on the
+    device that owns it, so a later call on another GPU allocates its own
+    scratch instead of handing the launch a pointer into a peer's memory.
+    """
+    dev = torch.cuda.current_device()
+    buf = _TMA_SCRATCH.get(dev)
     if buf is None or buf.numel() < size:
-        buf = torch.empty(max(size, 1 << 18), dtype=torch.int8, device="cuda")
-        _TMA_SCRATCH["b"] = buf
+        buf = torch.empty(max(size, 1 << 18), dtype=torch.int8, device=dev)
+        _TMA_SCRATCH[dev] = buf
     return _hold_for_graph(buf)
 
 

@@ -2658,6 +2658,7 @@ def _qsa_sparse_paged_attention_specialized(
         and block_table.stride(1) == 1,
         "block_table must be a non-empty int32 2D tensor with a contiguous last dim",
     )
+    _qsa_check(k_cache.shape[0] > 0, "k_cache must not be empty")
     _qsa_check(
         logical_indices.shape[0] == num_rows and logical_indices.dtype == torch.int32,
         "logical_indices must be int32 [rows, selection_width + 1]",
