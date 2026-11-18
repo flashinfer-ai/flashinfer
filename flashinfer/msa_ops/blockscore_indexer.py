@@ -89,6 +89,10 @@ def is_msa_blockscore_indexer_supported(device: torch.device) -> bool:
     device = torch.device(device)
     if device.type != "cuda":
         return False
+    if not torch.cuda.is_available():
+        # A CUDA-typed device on a CUDA-less install must answer False, not
+        # raise out of torch.cuda.current_device() during CUDA init.
+        return False
     if device.index is None:
         # get_compute_capability caches on the device object, and an
         # index-less "cuda" device would pin the answer to whichever device
@@ -130,9 +134,11 @@ def msa_blockscore_topk_indexer(
     cu_seqlens[r])`` of its request, and block ids in the output are
     request-local (0 is the request's first block).
 
-    The call path performs no device synchronization and allocates nothing
-    once the module is built, so it is CUDA-graph capturable; build the module
-    (one eager warm-up call) before capture. The scoring workspace is chosen
+    The call path performs no device synchronization, and with a caller-
+    supplied ``output`` it allocates nothing once the module is built, so it
+    is CUDA-graph capturable; build the module (one eager warm-up call) before
+    capture, and pass a preallocated ``output`` where the call must be
+    allocation-free (omitting it allocates the result tensor on every call). The scoring workspace is chosen
     per stream when the call is enqueued (the process's first stream owns the
     primary slot): a captured graph bakes that choice in, so replay a graph
     only on the stream it was captured from, and do not run eager calls of
@@ -182,6 +188,10 @@ def msa_blockscore_topk_indexer(
     a sync, which is illegal under CUDA-graph capture. The caller must supply
     metadata consistent with the layout above; inconsistent metadata reads
     ``ki`` out of bounds.
+
+    First use JIT-compiles the module for ``sm_107a``, so the installed NVCC
+    must support SM107; a toolkit that only meets the package's general CUDA
+    minimum cannot build it (the device gate passes, the build raises).
 
     Setting ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the
     specialized backend. Because this op has no composable fallback
