@@ -70,6 +70,8 @@ from typing import Any, Optional
 
 import torch
 
+from flashinfer.kda_prefill import _supports_strided_qkv, _tensor_byte_range
+
 # ---------------------------------------------------------------------------
 # Shape constants and scalars both variants agree on.
 #
@@ -880,16 +882,10 @@ def clear_pinned_staging() -> None:
 
 
 def storage_interval(tensor: Optional[torch.Tensor]):
-    """``[data_ptr, data_ptr + numel * element_size)``; ``None`` when empty.
-
-    Every tensor reaching this point is contiguous, so the interval is exactly
-    the bytes the tensor owns.  A zero-element tensor owns nothing and cannot
-    alias anything.
-    """
+    """Byte span including stride gaps; ``None`` when empty."""
     if tensor is None or tensor.numel() == 0:
         return None
-    start = tensor.data_ptr()
-    return (start, start + tensor.numel() * tensor.element_size())
+    return _tensor_byte_range(tensor)
 
 
 def intervals_overlap(a, b) -> bool:
@@ -1003,7 +999,8 @@ def _check_device_and_contiguity(named: dict) -> torch.device:
             f"{device}, {name} is on {dev}",
         )
     for name, tensor in present.items():
-        _require(tensor.is_contiguous(), f"{name} must be contiguous")
+        if name not in ("q", "k", "v"):
+            _require(tensor.is_contiguous(), f"{name} must be contiguous")
     return device
 
 
@@ -1174,6 +1171,12 @@ def validate_inputs(
     _require(
         v.shape[3] == DV, f"the value dimension is fixed at {DV}, got {v.shape[3]}"
     )
+    if q.numel() != 0:
+        for name in ("q", "k", "v"):
+            _require(
+                _supports_strided_qkv(named[name]),
+                f"{name} must have dense head/features and aligned token rows with a flattenable batch",
+            )
     _require(
         tuple(beta.shape) == tuple(q.shape[:3]),
         f"beta must be q without its last dimension, got {tuple(beta.shape)} "
@@ -1698,7 +1701,7 @@ def tensor_identity(tensor: Optional[torch.Tensor]):
         tensor.shape,
         tensor.dtype,
         tensor.device,
-        tensor.is_contiguous(),
+        tuple(tensor.stride()),
         tensor_version(tensor),
     )
 

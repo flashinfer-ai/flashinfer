@@ -432,6 +432,7 @@ class _DummyResource(MemoryResource):
         desc_b_mma_base,
         smem_b_stage_ptr,
         first_k_tile: cutlass.Constexpr[Optional[bool]] = None,
+        k_subblock: cutlass.Constexpr[Optional[int]] = None,
     ):
         pass
 
@@ -691,6 +692,7 @@ def _cfg(**overrides) -> SimpleNamespace:
         "num_padding_warps": 1,
         "padding_regs": 24,
         "use_early_exit": False,
+        "weight_l2_evict_first": 0,
     }
     values.update(overrides)
     return SimpleNamespace(**values, warp_layout=SimpleNamespace(**values))

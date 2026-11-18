@@ -96,6 +96,7 @@ def _rubin(module, monkeypatch, calls, arch="sm_107a"):
     """The device answers as ``arch`` (212 SMs on sm_107a); launches are
     captured, nothing runs."""
 
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(module, "_target_arch", lambda *_: arch)
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
@@ -105,6 +106,9 @@ def _rubin(module, monkeypatch, calls, arch="sm_107a"):
     monkeypatch.setattr(
         module, "_launch_program", lambda name, _arch, **kwargs: calls.append(name)
     )
+    # run() also loads (builds) the shape's own program when the seq_idx check
+    # program replaced it; nothing may reach nvcc in a source test.
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
     monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda *_: SimpleNamespace(cuda_stream=0x1234)
@@ -442,7 +446,10 @@ def test_source_unit_cluster_variant_matches_its_definition():
         ("bf16", 8, 384, 128, "triple", "exactpre_bf16_varlen"),
         ("f32", 8, 384, 128, "triple", "exactpre_f32_varlen"),
         # one-launch calls (seq_idx triple): tablefirst below 128 CTAs,
-        # tableroles from it on
+        # tableroles from it on (the single-sequence calls among them run the
+        # fused batched program with the seq_idx check CTA,
+        # :func:`single_sequence_batched_variant`; their twin is judged with
+        # that rule off)
         ("bf16", 1, 128, 8, "triple", "exactone_bf16_varlen_tablefirst"),
         ("bf16", 1, 127, 8, "triple", "exactone_bf16_varlen_tablefirst"),
         ("bf16", 1, 128, 32, "triple", "exactone_bf16_varlen_tablefirst"),
@@ -475,6 +482,9 @@ def test_source_rubin_varlen_calls_take_the_twin_by_the_rule(
             **kwargs,
         )
 
+    if num_seqs == 1 and form == "triple":
+        assert run() == f"exactfused_{state}_batched_chk"
+        monkeypatch.setattr(module, "single_sequence_batched_variant", lambda **_: None)
     monkeypatch.setattr(module, "_UNIT_CLUSTER_RULES", {})
     try:
         off = run()

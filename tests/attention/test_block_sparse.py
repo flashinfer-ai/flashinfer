@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
+import sys
+
 import numpy as np
 import pytest
 import torch
@@ -26,7 +29,7 @@ except ImportError:
     sp = None
     HAVE_SCIPY = False
 
-from tests.test_helpers.jit_utils import (
+from tests.jit.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
@@ -37,6 +40,15 @@ from flashinfer.utils import (
     get_compute_capability,
     has_flashinfer_jit_cache,
     is_sm100a_supported,
+)
+
+_HAS_QUACK = importlib.util.find_spec("quack") is not None
+_QUACK_SKIP_REASON = (
+    "quack-kernels is unsupported on native Windows pending "
+    "https://github.com/Dao-AILab/quack/pull/216"
+    if sys.platform == "win32"
+    else "vsa_blackwell requires the quack package "
+    "(pip install --no-deps quack-kernels==0.6.4)"
 )
 
 
@@ -149,6 +161,8 @@ def _run_block_sparse_attention_case(
             pytest.skip(
                 "vsa_blackwell does not support per-element block masks (mask_inside_block=True)"
             )
+        if sys.platform == "win32" or not _HAS_QUACK:
+            pytest.skip(_QUACK_SKIP_REASON)
 
     if backend == "cutile":
         if not is_cuda_tile_available():
@@ -224,7 +238,20 @@ def _run_block_sparse_attention_case(
     torch.testing.assert_close(o_ref, o_buffer, atol=1e-2, rtol=1e-3)
 
 
-@pytest.mark.parametrize("backend", ["auto", "vsa_blackwell"])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "auto",
+        pytest.param(
+            "vsa_blackwell",
+            # Skip before the module-autouse JIT warmup fixture can run.
+            marks=pytest.mark.skipif(
+                sys.platform == "win32" or not _HAS_QUACK,
+                reason=_QUACK_SKIP_REASON,
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("R", [1, 4, 16, 128])
 @pytest.mark.parametrize("C", [1, 4, 16, 128])
 @pytest.mark.parametrize("M", [64, 128, 256])

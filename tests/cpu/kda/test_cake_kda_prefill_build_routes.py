@@ -30,15 +30,16 @@ ARCHES = ["sm_100a", "sm_103a"]
 N32 = "cake_kda_bf16_02c6dae5d13691ae05c3"
 N16 = "cake_kda_bf16_51e813006f17147a02a5"
 DIR = "cake_kda_bf16_893740628d53688ac269"
-# The next-state prefetch builds of the work-binned programs.
+# The next-state prefetch builds of the work-binned programs (the N16 build
+# also stores its final state with per-warp TMA boxes).
 PREFETCH = {
-    N32: "cake_kda_prefill_74a3da867cd39aaf3f37",
-    N16: "cake_kda_prefill_fabda08e14ff5630314d",
+    N32: "cake_kda_prefill_4a42f56b2227bc7d99fa",
+    N16: "cake_kda_prefill_e37381d75cc3b9e271d7",
 }
 # The per-warp checkpoint build of the owner/helper program, and the pooled
 # owner/helper program.
-CHECKPOINT_SLICES = {DIR: "cake_kda_prefill_df73a4f384e307d64f3d"}
-POOLED = {DIR: "cake_kda_prefill_ac35b1d0efcd4f718676"}
+CHECKPOINT_SLICES = {DIR: "cake_kda_prefill_ba0babf290c384f20023"}
+POOLED = {DIR: "cake_kda_prefill_c9f26577363f5853f195"}
 
 
 @pytest.fixture

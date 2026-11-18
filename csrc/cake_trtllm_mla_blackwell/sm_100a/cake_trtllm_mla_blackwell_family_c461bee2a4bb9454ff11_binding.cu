@@ -361,7 +361,12 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_
   float v_bmm2_scale = (float)arg_bmm2_scale;
   void* kargs[] = {&p_partial_O, &p_partial_stats, &p_O, &p_LSE, &v_num_split, &v_num_reduce_ctas, &v_num_queries, &v_bmm2_scale};
 
-
+  // Reserve 96 KiB of dynamic shared memory that the reducer never addresses: shared memory then limits
+  // the reducer to two resident CTAs per SM instead of three, which is faster. The kernel and its
+  // arguments are unchanged.
+  static const bool smem_ready = CakeSetMaxDynamicSmem(
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_4de3d4bf2f8c5467bf29), 98304);
+  (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(512u, 1u, 1u);
 
@@ -374,7 +379,7 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_stats, TensorView arg_
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 0u;
+  config.dynamicSmemBytes = 98304u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;

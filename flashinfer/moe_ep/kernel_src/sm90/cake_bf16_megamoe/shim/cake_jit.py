@@ -30,6 +30,7 @@ from ......jit.core import JitSpec, gen_jit_spec, sm90a_nvcc_flags
 
 __all__ = [
     "GROUPED_GEMM_STAGES",
+    "GROUPED_GEMM_WCX_STAGES",
     "gen_sm90_cake_bf16_combine_per_route_module",
     "gen_sm90_cake_bf16_combine_prereduced_module",
     "gen_sm90_cake_bf16_combine_tail_module",
@@ -296,11 +297,19 @@ _GROUPED_GEMM_MANIFEST = _SOURCE_DIR / f"{_GROUPED_GEMM_PACKAGE}_manifest.json"
 # FC2 early-start pair (runner fc2_early_max_tokens): FC1 variants that release
 # per-m-tile readiness counters and an FC2 that claims its tiles dynamically.
 GROUPED_GEMM_EARLY_STAGES = ("fc1_gated_signal", "fc1_gated_clamp_signal", "fc2_early")
+# WCX decode rounds (runner wcx_max_tokens): the early-start pair in swap-AB form
+# reading compressed expert weights (Sm90CakeWcxWeights); same protocol, same bits.
+GROUPED_GEMM_WCX_STAGES = (
+    "fc1_gated_signal_swap",
+    "fc1_gated_clamp_signal_swap",
+    "fc2_early_swap",
+)
 GROUPED_GEMM_STAGES = (
     "fc1_gated",
     "fc1_gated_clamp",
     "fc2",
     *GROUPED_GEMM_EARLY_STAGES,
+    *GROUPED_GEMM_WCX_STAGES,
 )
 
 

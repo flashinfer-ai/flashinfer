@@ -34,6 +34,7 @@
 #include <limits>
 #include <utility>
 
+#include "flashinfer/megamoe/batch_invariant_topk_reduce.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
@@ -43,11 +44,22 @@ constexpr int32_t kTopK = 6;
 constexpr int32_t kHiddenSize = 4096;
 constexpr int32_t kRequiredAlignmentBytes = 128;
 
-// The generated source holds the reducer in four CTA shapes.  Every thread runs
+// The generated source holds the reducer in seven CTA shapes.  Every thread runs
 // the same program (six loads, FP32 adds in increasing k, one RN rounding), so
 // all shapes write bit-identical rows; they differ in threads per CTA, BF16
-// values per thread and the L2 prefetch size of the loads.
-enum class CtaShape { k512x2, k512x4, k512x4Pf256, k1024x4Pf256 };
+// values per thread, the L2 prefetch size or eviction priority of the loads and
+// the add instruction (a widening FMA or add.rn.f32.bf16, the same RN sum).
+// The sm_100a and sm_103a tiers launch the first four, the sm_107a tiers the
+// last three.
+enum class CtaShape {
+  k512x2,
+  k512x4,
+  k512x4Pf256,
+  k1024x4Pf256,
+  k64x8BaddL2Ef,
+  k256x2BaddL2Ef,
+  k256x4BaddL2Ef,
+};
 
 // The fastest shape depends on the live token count and the architecture: the
 // module launches the first tier whose max_tokens covers num_tokens.
@@ -71,8 +83,16 @@ constexpr TokenTier kTokenTiers[] = {
     {192, CtaShape::k512x4Pf256},  {256, CtaShape::k1024x4Pf256},
     {1024, CtaShape::k512x4Pf256}, {kNoTokenLimit, CtaShape::k1024x4Pf256},
 };
+#elif CAKE_MEGAMOE_TOPK_REDUCE_ARCH == 107
+// R200 runs at most 1024 threads per SM: the middle tiers use 256-thread CTAs
+// and the large tier 64-thread CTAs with 128-bit accesses.
+constexpr TokenTier kTokenTiers[] = {
+    {64, CtaShape::k256x2BaddL2Ef},
+    {212, CtaShape::k256x4BaddL2Ef},
+    {kNoTokenLimit, CtaShape::k64x8BaddL2Ef},
+};
 #else
-#error "CAKE_MEGAMOE_TOPK_REDUCE_ARCH must be 100 (sm_100a) or 103 (sm_103a)"
+#error "CAKE_MEGAMOE_TOPK_REDUCE_ARCH must be 100 (sm_100a), 103 (sm_103a) or 107 (sm_107a)"
 #endif
 
 inline CtaShape SelectShape(int64_t num_tokens) {
@@ -172,11 +192,76 @@ void Run(TensorView partials, TensorView out, int64_t num_tokens, int64_t cuda_s
       kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t1024x4_pf256<<<
           TokenGrid(num_tokens, 1024, 4), 1024, 0, stream>>>(partials_ptr, out_ptr);
       break;
+    case CtaShape::k64x8BaddL2Ef:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t64x8_badd_l2ef<<<
+          TokenGrid(num_tokens, 64, 8), 64, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k256x2BaddL2Ef:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t256x2_badd_l2ef<<<
+          TokenGrid(num_tokens, 256, 2), 256, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k256x4BaddL2Ef:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t256x4_badd_l2ef<<<
+          TokenGrid(num_tokens, 256, 4), 256, 0, stream>>>(partials_ptr, out_ptr);
+      break;
   }
   CheckCuda(cudaGetLastError(), "MegaMoE TopK-reduce launch");
+}
+
+void RunBatchInvariant(TensorView partials, TensorView ids, TensorView out, int64_t num_tokens,
+                       int64_t num_experts, int64_t cuda_stream) {
+  CHECK_CUDA(partials);
+  ffi::CUDADeviceGuard device_guard(partials.device().device_id);
+  CHECK_CUDA(ids);
+  CHECK_CUDA(out);
+  CHECK_DEVICE(partials, ids);
+  CHECK_DEVICE(partials, out);
+  CHECK_INPUT_TYPE(partials, dl_bfloat16);
+  CHECK_INPUT_TYPE(out, dl_bfloat16);
+  CHECK_CONTIGUOUS(partials);
+  CHECK_CONTIGUOUS(ids);
+  CHECK_CONTIGUOUS(out);
+  TVM_FFI_ICHECK(partials.ndim() == 3) << "partials must have shape [capacity, top_k, hidden]";
+  const int64_t capacity = partials.size(0);
+  const int64_t top_k = partials.size(1);
+  const int64_t hidden = partials.size(2);
+  TVM_FFI_ICHECK(top_k >= 1 && top_k <= 32 && hidden > 0 && hidden % 512 == 0)
+      << "BI reducer requires top_k in [1,32] and positive hidden divisible by 512";
+  TVM_FFI_ICHECK(ids.ndim() == 2 && ids.size(0) == capacity && ids.size(1) == top_k)
+      << "ids must have shape [capacity, top_k]";
+  TVM_FFI_ICHECK(ids.dtype().code == kDLInt && ids.dtype().lanes == 1 &&
+                 (ids.dtype().bits == 32 || ids.dtype().bits == 64))
+      << "ids must be int32 or int64";
+  TVM_FFI_ICHECK(out.ndim() == 2 && out.size(0) == capacity && out.size(1) == hidden)
+      << "out must have shape [capacity, hidden]";
+  TVM_FFI_ICHECK(num_tokens >= 0 && num_tokens <= capacity && num_experts > 0 && cuda_stream >= 0)
+      << "invalid BI reducer token count, expert count or stream";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(partials.data_ptr()) % 4 == 0 &&
+                 reinterpret_cast<uintptr_t>(out.data_ptr()) % 4 == 0)
+      << "BI payload and output require 4-byte alignment";
+  CheckNoOverlap(partials, "partials", out, "out");
+  CheckNoOverlap(ids, "ids", out, "out");
+  if (num_tokens == 0) return;
+  const int64_t blocks = num_tokens * (hidden / 512);
+  TVM_FFI_ICHECK(blocks <= std::numeric_limits<int32_t>::max()) << "BI grid is too large";
+  const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const auto* payload = reinterpret_cast<const __nv_bfloat16*>(partials.data_ptr());
+  auto* output = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  if (ids.dtype().bits == 32) {
+    BatchInvariantReduce<<<static_cast<uint32_t>(blocks), 256, 0, stream>>>(
+        payload, reinterpret_cast<const int32_t*>(ids.data_ptr()), output, hidden, top_k,
+        num_experts);
+  } else {
+    BatchInvariantReduce<<<static_cast<uint32_t>(blocks), 256, 0, stream>>>(
+        payload, reinterpret_cast<const int64_t*>(ids.data_ptr()), output, hidden, top_k,
+        num_experts);
+  }
+  CheckCuda(cudaGetLastError(), "BI MegaMoE TopK-reduce launch");
 }
 
 }  // namespace cake_megamoe_topk_reduce
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::cake_megamoe_topk_reduce::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_batch_invariant,
+                              flashinfer::cake_megamoe_topk_reduce::RunBatchInvariant);

@@ -36,6 +36,10 @@ def make_workspace_config(
         if tuning.get(name) is None:
             tuning.pop(name, None)
     try:
+        from ..sm100.common.block_scaled_batch_invariant import (
+            block_scaled_batch_invariant_metadata,
+        )
+
         return Sm107BlockScaledMoeConfig(
             num_total_experts=fleet_params.num_experts,
             max_tokens_per_rank=fleet_params.max_tokens_per_rank,
@@ -51,8 +55,18 @@ def make_workspace_config(
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
+            **(
+                dict(swiglu_alpha=k.swiglu_alpha, swiglu_beta=k.swiglu_beta)
+                if getattr(k, "batch_invariant", False)
+                else {}
+            ),
+            use_tanh_sigmoid=k.use_tanh_sigmoid,
+            epilogue_warpgroups=k.epilogue_warpgroups,
+            shared_expert=k.shared_expert,
+            combine_dedup=k.combine_dedup,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
+            **block_scaled_batch_invariant_metadata(k),
             **tuning,
         )
     except (TypeError, ValueError) as exc:
@@ -112,8 +126,8 @@ def validate_forward_metadata(
         raise MoEEpConfigError("hidden_states must be 2D [num_tokens, hidden]")
     tokens, cols = hidden_states.shape
     hidden = fleet_params.token_hidden_size
-    fp4 = quant_kind == "nvfp4"
-    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
+    fp4 = quant_kind in ("nvfp4", "mxfp4")
+    if quant_kind not in ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
         raise MoEEpConfigError(f"unsupported quant_kind {quant_kind!r}")
     expected_cols = hidden // 2 if fp4 and not quantize_input else hidden
     if tokens > fleet_params.max_tokens_per_rank or cols != expected_cols:
@@ -149,7 +163,7 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 "MoEEpTensors.scales is required when quantize_input=False"
             )
-        sf_cols = hidden // (16 if fp4 else 32)
+        sf_cols = hidden // (16 if quant_kind == "nvfp4" else 32)
         padded_cols = (sf_cols + 3) // 4 * 4
         if (
             scales.ndim != 2
@@ -159,7 +173,9 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 f"scales must have {tokens} rows and {sf_cols}..{padded_cols} columns"
             )
-        expected_sf = torch.float8_e4m3fn if fp4 else torch.float8_e8m0fnu
+        expected_sf = (
+            torch.float8_e4m3fn if quant_kind == "nvfp4" else torch.float8_e8m0fnu
+        )
         if scales.dtype not in (expected_sf, torch.uint8):
             raise MoEEpConfigError(
                 f"scales must have dtype {expected_sf} or uint8 containing its raw bytes"
@@ -178,14 +194,14 @@ def validate_forward_metadata(
 def validate_routing_values(
     topk_ids, topk_weights, num_experts: int, *, workspace=None
 ) -> None:
-    """Device assertions run before dispatch unless explicitly disabled.
+    """Check routing values when FLASHINFER_SM107_MEGA_CHECK_ROUTES=1.
 
     Duplicate valid routes violate the router's workspace capacity proof.
     -1 is a masked slot whose score is ignored; all other IDs must be in range
     and have finite scores. A failed CUDA assertion invalidates that worker's
     CUDA context, as with invalid indices in other CUDA indexing operations.
     """
-    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") == "0":
+    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") == "0":
         return
     if (
         topk_ids.is_cuda

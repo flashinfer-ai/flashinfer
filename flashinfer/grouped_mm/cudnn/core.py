@@ -28,8 +28,9 @@ from ...gemm.gemm_base import (
     _check_cudnn_plan_build_not_capturing,
     _gemm_workspace_at_least,
     _get_real_fp4_shape_from_packed_uint8,
+    _retain_cudnn_graph_if_capturing,
 )
-from ...utils import _get_cache_buf
+from ...utils import _get_stream_cache_buf, get_compute_capability
 
 # ---------------------------------------------------------------------------
 # Optional cuDNN import
@@ -58,6 +59,7 @@ _CUDNN_MOE_BLOCK_SCALE_SM12X_MIN_VERSION = 92200  # 9.22.0
 # First backend that reads first_token_offset as explicit boundaries; it keeps
 # the E segment-starts format (deprecated) only for E > 1.
 _CUDNN_MOE_EXPLICIT_OFFSETS_MIN_VERSION = 92800  # 9.28.0
+_CUDNN_MOE_SM107_BF16_FIX_VERSION = 92900  # 9.29.0
 
 
 class _CUDNN_UIDs(Enum):
@@ -190,6 +192,7 @@ def _build_cudnn_moe_grouped_gemm_graph(
     fto_stride,
     alpha_cudnn_dtype,
     output_cudnn_dtype,
+    device,
     policy=None,
 ):
     if policy is None:
@@ -257,10 +260,30 @@ def _build_cudnn_moe_grouped_gemm_graph(
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    exclude_eng0 = (
+        cudnn.backend_version() < _CUDNN_MOE_SM107_BF16_FIX_VERSION
+        and get_compute_capability(device) == (10, 7)
+        and all(
+            dtype == cudnn.data_type.BFLOAT16
+            for dtype in (token_cudnn_dtype, weight_cudnn_dtype, output_cudnn_dtype)
+        )
+    )
+    if exclude_eng0:
+        # Older backends can select cuBLASLt plans that leave BF16 output tiles
+        # unwritten on SM107 (#7101). cuDNN 9.29 handles the cuBLASLt version
+        # check internally. Exclude both heuristic and indexed plans until then.
+        graph.deselect_engines(["eng0"])
     graph.check_support()
     graph.build_plans(policy)
 
-    return graph, graph.get_workspace_size()
+    # deselect_engines does not remove entries from the frontend's plan list.
+    # Expose contiguous tactic indices over only the executable plans.
+    plan_indices = tuple(
+        index
+        for index in range(graph.get_execution_plan_count())
+        if not exclude_eng0 or "eng0" not in graph.get_plan_name_at_index(index)
+    )
+    return graph, graph.get_workspace_size(), plan_indices
 
 
 def _cudnn_moe_grouped_gemm_plan_count(
@@ -282,7 +305,7 @@ def _cudnn_moe_grouped_gemm_plan_count(
     token_3d = a.unsqueeze(0)
     weight_3d = b.transpose(1, 2)
     fto = _cudnn_moe_first_token_offset(m_indptr, a.shape[0])
-    graph, _ = _build_cudnn_moe_grouped_gemm_graph(
+    _, _, plan_indices = _build_cudnn_moe_grouped_gemm_graph(
         _get_handle(a.device),
         token_3d.shape,
         token_3d.stride(),
@@ -295,8 +318,9 @@ def _cudnn_moe_grouped_gemm_plan_count(
         _to_cudnn_dtype(alpha.dtype) if alpha is not None else None,
         _to_cudnn_dtype(out_dtype),
         policy=cudnn.build_plan_policy.ALL,
+        device=a.device,
     )
-    return graph.get_execution_plan_count()
+    return len(plan_indices)
 
 
 def _run_cudnn_moe_grouped_gemm(
@@ -336,7 +360,7 @@ def _run_cudnn_moe_grouped_gemm(
         else cudnn.build_plan_policy.ALL
     )
 
-    graph, ws = _build_cudnn_moe_grouped_gemm_graph(
+    graph, ws, plan_indices = _build_cudnn_moe_grouped_gemm_graph(
         handle,
         token_3d.shape,
         token_3d.stride(),
@@ -349,6 +373,7 @@ def _run_cudnn_moe_grouped_gemm(
         alpha_cudnn_dtype,
         out_cudnn_dtype,
         policy=policy,
+        device=a.device,
     )
 
     if out is None:
@@ -365,15 +390,18 @@ def _run_cudnn_moe_grouped_gemm(
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
     workspace = _gemm_workspace_at_least(
-        _get_cache_buf("grouped_mm_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
+        _get_stream_cache_buf("grouped_mm_workspace", DEFAULT_WORKSPACE_SIZE, a.device),
+        ws,
     )
+    _retain_cudnn_graph_if_capturing(graph)
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
-        plan_count = graph.get_execution_plan_count()
-        if tactic >= plan_count:
+        if tactic >= len(plan_indices):
             return None
-        graph.execute_plan_at_index(variant_pack, workspace, tactic, handle=handle)
+        graph.execute_plan_at_index(
+            variant_pack, workspace, plan_indices[tactic], handle=handle
+        )
     return out
 
 
@@ -643,9 +671,12 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
     workspace = _gemm_workspace_at_least(
-        _get_cache_buf("grouped_mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device),
+        _get_stream_cache_buf(
+            "grouped_mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        ),
         ws,
     )
+    _retain_cudnn_graph_if_capturing(graph)
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
@@ -751,8 +782,12 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
     workspace = _gemm_workspace_at_least(
-        _get_cache_buf("grouped_mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
+        _get_stream_cache_buf(
+            "grouped_mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        ),
+        ws,
     )
+    _retain_cudnn_graph_if_capturing(graph)
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:

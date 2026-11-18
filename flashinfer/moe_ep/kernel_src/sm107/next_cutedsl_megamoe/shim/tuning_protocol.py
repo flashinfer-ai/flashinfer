@@ -42,8 +42,35 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _publish_record(context, record):
+    """Publish a fixed-variant winner on the designated writer rank."""
+    key = hashlib.sha256(
+        _json(
+            {
+                k: v
+                for k, v in record.items()
+                if k
+                not in (
+                    "knobs",
+                    "p50_us",
+                    "source",
+                    "tuned_at",
+                    "measurement_policy",
+                    "profiling_policy",
+                )
+            }
+        ).encode()
+    ).hexdigest()
+    context.publish(key, record)
+    if context.disk_cache_enabled:
+        try:
+            knob_cache.write_record(record)
+        except Exception as exc:
+            logger.warning(f"[Autotuner]: Cannot write MegaMoE cache file: {exc}")
+
+
 class RubinTuningProtocol:
-    """Retain native candidates, inputs, numerical checks and event timing."""
+    """Collective candidate selection with managed cache compatibility."""
 
     def __init__(
         self,
@@ -59,7 +86,12 @@ class RubinTuningProtocol:
         process_group: ProcessGroup | None = None,
         install_winner: bool = False,
         allow_nondeterministic: bool | None = None,
+        make_trial=None,
+        execution_contract: dict | None = None,
     ) -> None:
+        if (make_trial is None) != (execution_contract is None):
+            raise ValueError("a custom trial requires its execution contract")
+        self.make_trial, self.execution_contract = make_trial, execution_contract
         self.y, self.l1, self.l2 = y, l1, l2
         self.workspace = workspace
         self.cfg = workspace.config
@@ -68,7 +100,11 @@ class RubinTuningProtocol:
         )
         self.candidates = (
             sm107_candidates(
-                self.cfg.quant_kind, kernel_variant=self.cfg.kernel_variant
+                self.cfg.quant_kind,
+                kernel_variant=self.cfg.kernel_variant,
+                batch_invariant=getattr(self.cfg, "batch_invariant", False),
+                combine_dedup=self.cfg.combine_dedup,
+                token_back_mode=self.cfg.token_back_mode,
             )
             if candidates is None
             else candidates
@@ -112,7 +148,15 @@ class RubinTuningProtocol:
             activation=cfg.activation,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
+            swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
+            swiglu_beta=getattr(cfg, "swiglu_beta", None),
+            use_tanh_sigmoid=cfg.use_tanh_sigmoid,
+            epilogue_warpgroups=cfg.epilogue_warpgroups,
+            shared_expert=cfg.shared_expert,
+            combine_dedup=cfg.combine_dedup,
             gate_up_clamp=cfg.gate_up_clamp,
+            batch_invariant=getattr(cfg, "batch_invariant", False),
+            input_norm_const=getattr(cfg, "input_norm_const", 1.0),
         )
 
     def _contract(self):
@@ -120,8 +164,24 @@ class RubinTuningProtocol:
         from flashinfer.autotuner.autotuner import _collect_metadata
 
         config = dataclasses.asdict(self.cfg)
+        if self.cfg.shared_expert is None:
+            config.pop("shared_expert", None)
+        if not self.cfg.combine_dedup:
+            config.pop("combine_dedup", None)
         for key in (*KNOB_KEYS, "rank", "max_tokens_per_rank"):
             config.pop(key, None)
+        if getattr(self.cfg, "batch_invariant", False):
+            from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
+                block_scaled_batch_invariant_version,
+                block_scaled_batch_invariant_fingerprint,
+            )
+
+            config["batch_invariant_version"] = block_scaled_batch_invariant_version(
+                self.cfg
+            )
+            config["batch_invariant_fingerprint"] = (
+                block_scaled_batch_invariant_fingerprint(self.cfg, arch="sm_107")
+            )
         device = None
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -131,10 +191,20 @@ class RubinTuningProtocol:
             "environment": _collect_metadata(),
             "config": config,
             "device": device,
+            **(
+                {"execution": self._gather(self.execution_contract)}
+                if self.make_trial is not None
+                else {}
+            ),
         }
 
     def _compatible(self, record, contract, context, measurement):
         if not isinstance(record, dict):
+            return False
+        boundary = "complete_forward" if self.make_trial is not None else "kernel"
+        if record.get("timing_boundary", "kernel") != boundary:
+            return False
+        if self.make_trial is not None and record.get("protocol_contract") != contract:
             return False
         if record.get("protocol_contract") not in (None, contract):
             return False
@@ -184,6 +254,19 @@ class RubinTuningProtocol:
             entries=[e for e in records.values() if isinstance(e, dict)],
             **{k: v for k, v in query.items() if k != "live_tokens"},
         )
+        if context.tuning_enabled:
+            # Replay fallbacks do not establish tuning coverage for this workload.
+            entries = [
+                e
+                for e in entries
+                if e["max_tokens"] == query["max_tokens"]
+                and (
+                    e["max_tokens"]
+                    if e.get("live_tokens") is None
+                    else e["live_tokens"]
+                )
+                == query["live_tokens"]
+            ]
         valid = [self._compatible(e, contract, context, measurement) for e in entries]
         ranks = self._gather(valid)
         return knob_cache.lookup_record(
@@ -192,6 +275,22 @@ class RubinTuningProtocol:
             ],
             **query,
         )
+
+    def _lookup_cached(self, query, contract, context, measurement):
+        if context.force_tune or context.skipped:
+            return None
+        record = self._lookup(
+            list(context.records().values()), query, contract, context, measurement
+        )
+        if record is None and context.disk_cache_enabled:
+            path = knob_cache.knob_cache_path()
+            try:
+                entries = [] if path is None else knob_cache._load_entries(path)
+            except Exception as exc:
+                logger.warning(f"[Autotuner]: Cannot read MegaMoE cache file: {exc}")
+                entries = []
+            record = self._lookup(entries, query, contract, context, measurement)
+        return record
 
     def run(self, context: TuningContext) -> TuningResult:
         import torch
@@ -255,6 +354,7 @@ class RubinTuningProtocol:
             self.timed_iters,
             self.allow_nondeterministic,
             self.install_winner,
+            self.make_trial is not None,
             context.tuning_enabled,
             context.force_tune,
             context.disk_cache_enabled,
@@ -291,21 +391,7 @@ class RubinTuningProtocol:
             raise ValueError(
                 "EP ranks disagree on the Rubin tuning implementation or device"
             )
-        record = None
-        if not context.force_tune:
-            record = self._lookup(
-                list(context.records().values()), query, contract, context, measurement
-            )
-            if record is None and context.disk_cache_enabled:
-                path = knob_cache.knob_cache_path()
-                try:
-                    entries = [] if path is None else knob_cache._load_entries(path)
-                except Exception as exc:
-                    logger.warning(
-                        f"[Autotuner]: Cannot read MegaMoE cache file: {exc}"
-                    )
-                    entries = []
-                record = self._lookup(entries, query, contract, context, measurement)
+        record = self._lookup_cached(query, contract, context, measurement)
         cache_hit = record is not None
         if record is None:
             if not context.tuning_enabled:
@@ -327,6 +413,11 @@ class RubinTuningProtocol:
                 timed_iters=self.timed_iters,
                 process_group=self.group,
                 measurement=measurement,
+                **(
+                    {"make_trial": self.make_trial}
+                    if self.make_trial is not None
+                    else {}
+                ),
             )
             record = knob_cache.make_record(
                 knobs,
@@ -334,6 +425,8 @@ class RubinTuningProtocol:
                 p50_us=score,
                 source="autotune-sampled-oracle",
             )
+            if self.make_trial is not None:
+                record["timing_boundary"] = "complete_forward"
             record["measurement_policy"] = policy_fields
             record["profiling_policy"] = measurement
         else:
@@ -367,32 +460,7 @@ class RubinTuningProtocol:
         if cfg.rank == 0:
             try:
                 record = {**record, "protocol_contract": contract}
-                key = hashlib.sha256(
-                    _json(
-                        {
-                            k: v
-                            for k, v in record.items()
-                            if k
-                            not in (
-                                "knobs",
-                                "p50_us",
-                                "source",
-                                "tuned_at",
-                                "measurement_policy",
-                                "profiling_policy",
-                            )
-                        }
-                    ).encode()
-                ).hexdigest()
-                context.publish(key, record)
-                # File consumers must see winners selected from either cache.
-                if context.disk_cache_enabled:
-                    try:
-                        knob_cache.write_record(record)
-                    except Exception as exc:
-                        logger.warning(
-                            f"[Autotuner]: Cannot write MegaMoE cache file: {exc}"
-                        )
+                _publish_record(context, record)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
         errors = self._gather(error)

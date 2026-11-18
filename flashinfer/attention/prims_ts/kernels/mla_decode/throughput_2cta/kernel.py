@@ -128,6 +128,7 @@ from .tasks import (
     create_padding_task,
     create_output_tma_task,
     create_scheduler_task,
+    MlaStagedOutputTask,
 )
 
 
@@ -174,13 +175,13 @@ def build_mla_decode_task_manager(
     acc_output=None,
     lse=None,
     acc_lse=None,
-    # Domain (k_tile_count)
     domain=4,
     # Persistent loop support
     work_queue=None,
     # For k_index_base computation (split_kv support)
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     split_kv=None,
     logical_num_heads_q=128,
     logical_seq_len_q=1,
@@ -478,6 +479,7 @@ def build_mla_decode_task_manager(
 
     tmem_s = TmemSResource(
         page_offsets=page_offsets,
+        kv_bounds=kv_bounds,
         smem_q_latent=smem_q_latent_arr,
         smem_q_rope=smem_q_rope_arr,
         smem_p=smem_p_arr,
@@ -696,7 +698,9 @@ def build_mla_decode_task_manager(
         iterations_pv_n=cfg.iterations_pv_n,
         per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
         work_queue=work_queue,
-        task_class=non_interleaved_task_class,
+        task_class=(
+            MlaStagedOutputTask if cfg.stage_bf16_output else non_interleaved_task_class
+        ),
         domain=task_domain,
         num_registers=cfg.correction_reg_num,
     )
@@ -902,6 +906,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        use_kv_bounds: bool = False,
+        zero_empty_rows: bool = True,
         softmax_rescale_threshold_log2: float = 0.0,
         fixed_seqlen: bool = False,
     ):
@@ -1002,6 +1008,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
+        self.use_kv_bounds = use_kv_bounds
+        self.zero_empty_rows = zero_empty_rows
         # Validate eagerly: the config (and its own check) is only built when
         # the kernel is traced, after plan() has bound a workspace.
         self.softmax_rescale_threshold_log2 = (
@@ -1074,6 +1082,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.num_heads,
             self.seq_len_q if self.fixed_seqlen else None,
             self.mask_type,
+            self.use_kv_bounds,
+            self.zero_empty_rows,
             self.softmax_rescale_threshold_log2,
             self.reduction_split_capacity,
             self.query_tile_layout if self.fixed_seqlen else None,
@@ -1173,6 +1183,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             is_var_seq=self.is_var_seq,
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
+            use_kv_bounds=self.use_kv_bounds,
             lse_base_on_e=self.lse_base_on_e,
             sparse_gather_warps=self.sparse_gather_warps,
             sparse_kv_stages=self.sparse_kv_stages,
@@ -1199,6 +1210,24 @@ class MlaDecodeTs(Nvfp4KVConfig):
             and self.seq_len_q == 1
             and cfg.mma_pv_tiler_mn == (128, 256)
         )
+        # The same whole-tile geometry stores BF16 rows from the correction
+        # warps through 32 KiB of swizzled SMEM instead of 32-row strided
+        # vector stores, which throttle the LSU that softmax also uses. A
+        # third V stage leaves no SMEM for the staging boxes (GB300 H128
+        # top-k 512 prefill, 1024 rows: 77.8 -> 76.2 us).
+        cfg.stage_bf16_output = bool(
+            self.output_quant is None
+            and self.fuse_sparse_epilogue
+            and cfg.is_fp8_qkv()
+            and cfg.use_bf16_output
+            and not cfg.has_nvfp4_kv
+            and not cfg.rope_dim
+            and cfg.page_size == 1
+            and self.num_heads == 128
+            and self.seq_len_q == 1
+            and cfg.mma_pv_tiler_mn == (128, 256)
+            and cfg.load_v_stage == 2
+        )
         return cfg
 
     @cute.jit
@@ -1216,11 +1245,12 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
+        kv_bounds=None,
     ):
         """Execute the MLA decode TS kernel."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
@@ -1572,7 +1602,19 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
 
-        scale_softmax_log2 = softmax_scale * LOG2_E
+        if cutlass.const_expr(cfg.stage_bf16_output):
+            # Flattened sparse rows are contiguous [rows * H, 512] BF16 output.
+            output_rows = cute.size(o) // 512
+            tma_desc_o = create_tensor_map_tiled_from_view(
+                cute.make_tensor(
+                    o.iterator,
+                    cute.make_layout((512, output_rows), stride=(1, 512)),
+                ),
+                box_dims=(64, 32),
+                stride_order=(0, 1),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
 
         kernel_split_kv = (
             Int32(self.static_split_kv)
@@ -1640,6 +1682,16 @@ class MlaDecodeTs(Nvfp4KVConfig):
         # before reading partials. Persistent schedules retain stream ordering.
         use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
+        # Host FP32 scales enter the device kernel in log2 units. Device
+        # buffers retain natural units until they are loaded by the kernel.
+        softmax_scale_operand = softmax_scale
+        if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
+            softmax_scale_operand = softmax_scale * LOG2_E
+
+        if cutlass.const_expr(self.use_kv_bounds and self.zero_empty_rows):
+            from ..helpers.kv_bounds import initialize_empty_rows
+
+            initialize_empty_rows(o, lse, kv_bounds, stream)
         self.split_kv_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -1657,7 +1709,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cache_seqs,
             cu_seqlens_q,
             block_split_kvs,
-            scale_softmax_log2,
+            softmax_scale_operand,
             output_scale,
             tile_sched_params,
             clc_tile_sched_params,
@@ -1667,6 +1719,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             tma_desc_sparse_rope,
             tma_desc_sparse_extra_rope,
             max_q_len,
+            kv_bounds,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1882,8 +1935,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
-        scale_softmax_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale_operand: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
         output_quant_args=None,
@@ -1892,13 +1945,24 @@ class MlaDecodeTs(Nvfp4KVConfig):
         tma_desc_sparse_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         tma_desc_sparse_extra_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         max_q_len: cutlass.Int32 = 0,
+        kv_bounds: cute.Tensor | None = None,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
+        if cutlass.const_expr(acc_o is not None and not self.is_persistent):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        if cutlass.const_expr(isinstance(softmax_scale_operand, cute.Tensor)):
+            scale_softmax_log2 = softmax_scale_operand[0] * LOG2_E
+        else:
+            scale_softmax_log2 = softmax_scale_operand
+        if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
+            output_scale = output_scale[0]
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
             si, ci, sl, cl, sinks, ks = block_split_kvs
+            if cutlass.const_expr(isinstance(ks, cute.Tensor)):
+                ks = ks[0]
             capacity = ((Int32(si.shape[-1]) + 127) // 128) * 128
             if cutlass.const_expr(self.direct_sparse_capacities[1] > 0):
                 capacity = capacity + ((Int32(ci.shape[-1]) + 127) // 128) * 128
@@ -2015,7 +2079,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 alignment=16,
             )
         smem_o = None
-        if cutlass.const_expr(cfg.use_tma_output):
+        # Both staged outputs use 32 KiB: two 16 KiB FP8 N-slice stages, or
+        # two 4 KiB BF16 boxes for each of the four correction warps.
+        if cutlass.const_expr(cfg.use_tma_output or cfg.stage_bf16_output):
             smem_o = cutlass.Array(
                 cutlass.Uint8,
                 OUTPUT_TMA_STAGES * OUTPUT_TMA_STAGE_BYTES,
@@ -2179,7 +2245,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 tile_batch_idx,
             )
             if cutlass.const_expr(
-                cfg.mask_type == MaskType.CAUSAL.value
+                not cfg.use_kv_bounds
+                and cfg.mask_type == MaskType.CAUSAL.value
                 and (not self.fixed_seqlen or self.seq_len_q > 1)
             ):
                 _, _, logical_q_idx, _, _ = flat_query_row_state(
@@ -2351,6 +2418,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 work_queue=mla_work_queue,
                 cache_seqs=cache_seqs,
                 cu_seqlens_q=cu_seqlens_q,
+                kv_bounds=kv_bounds,
                 split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=seq_len_q,
@@ -2524,6 +2592,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            use_kv_bounds=self.use_kv_bounds,
             lse_base_on_e=self.lse_base_on_e,
         )
         if cutlass.const_expr(not self.is_persistent):
@@ -2573,6 +2642,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            use_kv_bounds=self.use_kv_bounds,
             lse_base_on_e=self.lse_base_on_e,
         )
         if cutlass.const_expr(not self.is_persistent):

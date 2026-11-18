@@ -1,4 +1,4 @@
-"""Runtime owner for the capacity-bounded SM100 BF16 rank-major MoE-EP DAG."""
+"""Runtime owner for the capacity-bounded SM100/SM107 BF16 rank-major MoE-EP DAG."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -43,6 +44,11 @@ _LL_SLOT_WORDS = _LL_HEADER_WORDS + _LL_ROW_WORDS
 _DESCRIPTOR_BYTES = 128
 _FC1_WEIGHT_BOX_DIM = (64, 128, 2, 1)
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
+# One source, compiled for the architecture of the device that opens the session.
+_ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 7): "sm_107a"}
+_ARCHS = tuple(_ARCH_BY_CAPABILITY.values())
+# nvcc releases older than this cannot target the architecture.
+_MIN_NVCC_BY_ARCH = {"sm_107a": (13, 4)}
 _STAGE_NAMES = (
     "stage_inputs",
     "input_arrive",
@@ -208,6 +214,44 @@ _STAGE_BINDINGS = {
         "ll_reuse",
     ),
 }
+# Stage fields one architecture replaces (the kernel symbol and bindings; the
+# launch contract otherwise holds): on sm_107a, stage_inputs also builds every
+# owner's route codes, so input_arrive only sends them; local_unpermute pushes
+# each partial row into its source's local_partials (combine then reads them locally).
+_ARCH_STAGE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
+    "sm_107a": {
+        "stage_inputs": {
+            "symbol": "kernel_rank_major_stage_inputs_v2",
+            "bindings": (*_STAGE_BINDINGS["stage_inputs"], "route_codes_out"),
+        },
+        "input_arrive": {
+            "symbol": "kernel_rank_major_input_arrive_v3",
+            "bindings": (
+                "active_tokens_per_rank",
+                "pg_world",
+                "pg_rank",
+                "pg_flags",
+                "route_codes_out",
+                "route_codes_peers",
+            ),
+        },
+        "local_unpermute": {
+            "symbol": "kernel_rank_major_exact_unpermute_v11",
+            "bindings": (
+                "expert_output",
+                "topk_weights",
+                "token_to_permuted",
+                "local_partials_peers",
+                "hidden_size",
+                "active_tokens_per_rank",
+                "pg_rank",
+            ),
+        },
+    },
+}
+# sm_100a runs the same overridden stages as sm_107a: route codes built in
+# stage_inputs, push unpermute above 32 tokens per rank.
+_ARCH_STAGE_OVERRIDES["sm_100a"] = _ARCH_STAGE_OVERRIDES["sm_107a"]
 _STAGE_LAUNCH_CONTRACTS = {
     "stage_inputs": (
         (128, 1, 1),
@@ -420,8 +464,10 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
     }
     if manifest.get("schema_version") != 1:
         raise RuntimeError("Blackwell BF16 rank-major manifest schema must be 1")
-    if manifest.get("arch") != "sm_100a":
-        raise RuntimeError("Blackwell BF16 rank-major manifest arch must be sm_100a")
+    if manifest.get("archs") != list(_ARCHS):
+        raise RuntimeError(
+            f"Blackwell BF16 rank-major manifest archs must be {list(_ARCHS)}"
+        )
     if manifest.get("compile_flags") != ["--use_fast_math"]:
         raise RuntimeError(
             "Blackwell BF16 rank-major compile flags must be ['--use_fast_math']"
@@ -505,7 +551,29 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
             raise RuntimeError(
                 f"Blackwell BF16 rank-major stage {stage_name} launch contract drifted"
             )
+    expected_overrides = {
+        arch: {
+            stage_name: {
+                field: list(value) if field == "bindings" else value
+                for field, value in fields.items()
+            }
+            for stage_name, fields in overrides.items()
+        }
+        for arch, overrides in _ARCH_STAGE_OVERRIDES.items()
+    }
+    if manifest.get("arch_stage_overrides") != expected_overrides:
+        raise RuntimeError(
+            "Blackwell BF16 rank-major per-architecture stage overrides drifted"
+        )
     return manifest, source_path
+
+
+def _stages_for_arch(manifest: dict[str, Any], arch: str) -> list[dict[str, Any]]:
+    """The manifest stages with the kernel symbol and bindings ``arch`` replaces."""
+    overrides = manifest["arch_stage_overrides"].get(arch, {})
+    return [
+        {**stage, **overrides.get(stage["name"], {})} for stage in manifest["stages"]
+    ]
 
 
 def _nvcc() -> Path:
@@ -523,25 +591,60 @@ def _nvcc() -> Path:
     return Path(candidate).resolve()
 
 
-def _compile_cubin(source_path: Path, manifest: dict[str, Any]) -> Path:
+def _arch_for_capability(capability: tuple[int, int]) -> str:
+    major, minor = capability
+    arch = _ARCH_BY_CAPABILITY.get((major, minor))
+    if arch is None:
+        raise RuntimeError(
+            "Blackwell BF16 rank-major session requires SM100 or SM107, got compute "
+            f"capability {(major, minor)}"
+        )
+    return arch
+
+
+def _nvcc_release(nvcc: Path) -> tuple[int, int]:
+    process = subprocess.run(
+        [str(nvcc), "--version"], text=True, capture_output=True, check=False
+    )
+    match = re.search(r"release (\d+)\.(\d+)", process.stdout)
+    if process.returncode != 0 or match is None:
+        raise RuntimeError(
+            f"cannot read the CUDA release of {nvcc}:\n{process.stdout}{process.stderr}"
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def _compile_cubin(source_path: Path, manifest: dict[str, Any], arch: str) -> Path:
     from flashinfer.jit import env as jit_env
 
+    if arch not in _ARCHS:
+        raise RuntimeError(f"Blackwell BF16 rank-major cannot target {arch}")
     nvcc = _nvcc()
+    minimum = _MIN_NVCC_BY_ARCH.get(arch)
+    if minimum is not None:
+        release = _nvcc_release(nvcc)
+        if release < minimum:
+            raise RuntimeError(
+                f"Blackwell BF16 rank-major {arch} needs nvcc "
+                f"{minimum[0]}.{minimum[1]} or newer, got {release[0]}.{release[1]} "
+                f"({nvcc})"
+            )
     digest = hashlib.sha256()
     digest.update(source_path.read_bytes())
     digest.update(json.dumps(manifest, sort_keys=True).encode())
     digest.update(str(nvcc).encode())
+    digest.update(arch.encode())
     key = digest.hexdigest()[:20]
     build_dir = jit_env.FLASHINFER_JIT_DIR / f"blackwell_bf16_rank_major_{key}"
     build_dir.mkdir(parents=True, exist_ok=True)
-    cubin_path = build_dir / "blackwell_bf16_rank_major_sm100.cubin"
+    cubin_path = build_dir / f"blackwell_bf16_rank_major_{arch}.cubin"
     with FileLock(build_dir / "build.lock", thread_local=False):
         if not cubin_path.is_file():
             temporary = build_dir / f"kernel.{os.getpid()}.tmp.cubin"
             command = [
                 str(nvcc),
                 "-cubin",
-                "-arch=sm_100a",
+                f"-arch={arch}",
                 "--std=c++17",
                 "-O3",
                 *manifest["compile_flags"],
@@ -853,11 +956,9 @@ class BlackwellBf16RankMajorSession:
         self._rank = rank
         self._device_index = torch.cuda.current_device()
         self._device = torch.device("cuda", self._device_index)
-        if torch.cuda.get_device_capability(self._device) != (10, 0):
-            raise RuntimeError(
-                "Blackwell BF16 rank-major session requires SM100, got compute capability "
-                f"{torch.cuda.get_device_capability(self._device)}"
-            )
+        self._arch = _arch_for_capability(
+            torch.cuda.get_device_capability(self._device)
+        )
         name = _group_name(process_group)
         self._hidden_states = _alloc_symmetric(
             (_TOKENS_PER_RANK, _HIDDEN_SIZE),
@@ -905,6 +1006,16 @@ class BlackwellBf16RankMajorSession:
             group_name=name,
         )
         self._route_codes.local.zero_()
+        # sm_107a: route codes [owner][token][8] that stage_inputs builds and
+        # input_arrive sends into every owner's route codes; the routed owner
+        # masks stay unused there (dispatch reads the route codes instead).
+        self._route_codes_out: torch.Tensor | None = None
+        if self._arch in ("sm_100a", "sm_107a"):
+            self._route_codes_out = torch.zeros(
+                (_WORLD_SIZE * _TOKENS_PER_RANK * 2,),
+                dtype=torch.int32,
+                device=self._device,
+            )
         # LL (flag-in-data) buffers of the small-T path: [bank][source][token][header + row] dispatch words and
         # [bank][owner][token][row] combine words; zero words never match an epoch (epochs start at 1).
         self._ll_dispatch = _alloc_symmetric(
@@ -995,14 +1106,11 @@ class BlackwellBf16RankMajorSession:
         )
 
         self._manifest, source_path = _load_manifest()
-        self._stage_by_name = {
-            stage["name"]: stage for stage in self._manifest["stages"]
-        }
-        cubin_path = _compile_cubin(source_path, self._manifest)
+        stages = _stages_for_arch(self._manifest, self._arch)
+        self._stage_by_name = {stage["name"]: stage for stage in stages}
+        cubin_path = _compile_cubin(source_path, self._manifest, self._arch)
         torch.distributed.barrier(group=process_group)
-        self._library = _KernelLibrary(
-            cubin_path, self._manifest["stages"], self._device_index
-        )
+        self._library = _KernelLibrary(cubin_path, stages, self._device_index)
         self._weight_descriptor_sets: dict[tuple[int, int], _WeightDescriptorSet] = {}
         self._active_weight_key: tuple[int, int] | None = None
         self._descriptors: dict[str, int] = {}
@@ -1194,20 +1302,30 @@ class BlackwellBf16RankMajorSession:
             self._inputs_staged = True
             self._staged_capture_id = capture_id
             return
+        values: tuple[Any, ...] = (
+            p(hidden_states),
+            p(topk_ids),
+            p(topk_weights),
+            p(self._hidden_states.local),
+            p(self._topk_ids.local),
+            p(self._topk_weights.local),
+            1 if topk_ids.dtype is torch.int64 else 0,
+            hidden_copy,
+            active_tokens_per_rank,
+        )
+        types: tuple[Any, ...] = (
+            *self._pointer_types(6),
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+        )
+        if self._route_codes_out is not None:
+            values = (*values, p(self._route_codes_out))
+            types = (*types, ctypes.c_void_p)
         self._library.launch(
             self._stage_by_name["stage_inputs"],
-            (
-                p(hidden_states),
-                p(topk_ids),
-                p(topk_weights),
-                p(self._hidden_states.local),
-                p(self._topk_ids.local),
-                p(self._topk_weights.local),
-                1 if topk_ids.dtype is torch.int64 else 0,
-                hidden_copy,
-                active_tokens_per_rank,
-            ),
-            (*self._pointer_types(6), ctypes.c_int32, ctypes.c_int32, ctypes.c_int32),
+            values,
+            types,
             torch.cuda.current_stream(self._device).cuda_stream,
             grid=(active_tokens_per_rank, 1, 1),
         )
@@ -1399,6 +1517,17 @@ class BlackwellBf16RankMajorSession:
             )
         active_tokens_per_rank = self._active_tokens_per_rank
         world_rank = (_WORLD_SIZE, self._rank)
+        if name == "input_arrive" and self._route_codes_out is not None:
+            return (
+                (
+                    active_tokens_per_rank,
+                    *world_rank,
+                    p(self._flags.peers),
+                    p(self._route_codes_out),
+                    p(self._route_codes.peers),
+                ),
+                (*(ctypes.c_int32,) * 3, *self._pointer_types(3)),
+            )
         if name in ("input_barrier", "input_arrive"):
             return (
                 (
@@ -1560,6 +1689,17 @@ class BlackwellBf16RankMajorSession:
                 _INTERMEDIATE_SIZE,
             )
             return values, (*self._pointer_types(6), ctypes.c_int32)
+        if name == "local_unpermute" and self._arch in ("sm_100a", "sm_107a"):
+            values = (
+                p(self._gemm2_output),
+                p(self._recv_weights),
+                p(self._token_to_permuted),
+                p(self._local_partials.peers),
+                _HIDDEN_SIZE,
+                active_tokens_per_rank,
+                self._rank,
+            )
+            return values, (*self._pointer_types(4), *(ctypes.c_int32,) * 3)
         if name == "local_unpermute":
             values = (
                 p(self._gemm2_output),

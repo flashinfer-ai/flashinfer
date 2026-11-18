@@ -11,7 +11,7 @@ from flashinfer.mla import (
     batch_decode_sparse_mla_dsv4,
     trtllm_batch_decode_sparse_mla_dsv4,
 )
-from tests.test_helpers.hca_dsv4 import (
+from tests.attention.test_helpers.hca_dsv4 import (
     _cpu_hca_inputs,
     _cpu_compressed_page_aligned_sparse_hca_inputs,
     _cpu_compressed_page_aligned_conversion_inputs,
@@ -60,12 +60,7 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
         == "cute-dsl"
     )
-    with pytest.raises(
-        ValueError, match="requires SM100/SM103 or SM120/SM121, got SM107"
-    ):
-        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cake")
-
-    for cc in ((10, 0), (10, 3), (12, 0), (12, 1)):
+    for cc in ((10, 0), (10, 3), (10, 7), (12, 0), (12, 1)):
         monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: cc)
         assert (
             mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cake")

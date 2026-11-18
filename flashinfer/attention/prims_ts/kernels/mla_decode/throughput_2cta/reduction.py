@@ -25,7 +25,7 @@ from .config import (
     REDUCTION_VALUES_PER_THREAD,
     REDUCTION_VECTOR_BYTES,
 )
-from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.constants import STANDALONE_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.math import ceil_div
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.ops import (
@@ -145,7 +145,8 @@ def run_reduction_kernel(
     tile_k = cute.math.max(tile_k, Int32(0))
     row_k = tile_k
     if cutlass.const_expr(
-        cfg.mask_type == MaskType.CAUSAL.value
+        not cfg.use_kv_bounds
+        and cfg.mask_type == MaskType.CAUSAL.value
         and (not kernel.fixed_seqlen or seq_len_q > 1)
     ):
         _, logical_seq_len_q = query_batch_bounds(
@@ -244,7 +245,7 @@ def run_reduction_kernel(
 
     # Independent writer warps publish scales before any row consumes
     # them.  Invalid/padded rows participate so this remains a full CTA barrier.
-    prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
+    prims.barrier_cta_sync(STANDALONE_REDUCTION_SCALE_BARRIER_ID)
 
     element_idx = row_thread_idx * Int32(REDUCTION_VALUES_PER_THREAD)
     acc_vec = vector_from_scalars(
