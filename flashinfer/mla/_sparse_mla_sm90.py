@@ -315,15 +315,26 @@ def _ffi_device(index: int):
     return tvm_ffi.device("cuda", index)
 
 
-@functools.cache
+# Settled device verdicts: hardware ineligibility and successful module
+# probes. Transient JIT-build failures are deliberately NOT cached here (and
+# functools.cache on _get_module does not cache exceptions), so a later call
+# retries the build once the prerequisite is restored.
+_device_supported_cache: Dict[torch.device, bool] = {}
+
+
 def _device_supported(device: torch.device) -> bool:
     # HW eligibility first (no module build), then the module's own probe.
     # A failed JIT build (e.g. FLASHINFER_DISABLE_JIT=1 with no cached
-    # module) reports "unsupported": "auto" then routes to the composable
-    # reference path and explicit "specialized" raises with the reason —
-    # except under CUDA-graph capture, where the eager-warmup discipline
-    # stays loud.
+    # module) reports "unsupported" without settling the verdict: "auto"
+    # then routes to the composable reference path and explicit
+    # "specialized" raises with the reason — except under CUDA-graph
+    # capture, where the eager-warmup discipline stays loud — and later
+    # calls retry the build.
+    cached = _device_supported_cache.get(device)
+    if cached is not None:
+        return cached
     if torch.cuda.get_device_capability(device) != (9, 0):
+        _device_supported_cache[device] = False
         return False
     try:
         module = _get_module()
@@ -332,13 +343,15 @@ def _device_supported(device: torch.device) -> bool:
             raise
         logger.warning_once(
             "sparse_mla_decode_sm90: JIT module unavailable (%s: %s); the "
-            "device probe reports unsupported and the composable reference "
-            "path serves this process",
+            "device probe reports unsupported until a later call rebuilds "
+            "it, and the composable reference path serves those calls",
             type(exc).__name__,
             str(exc)[:300],
         )
         return False
-    return bool(module.device_supported(device.index))
+    supported = bool(module.device_supported(device.index))
+    _device_supported_cache[device] = supported
+    return supported
 
 
 @flashinfer_api
@@ -350,7 +363,8 @@ def is_sparse_mla_sm90_supported(device: torch.device) -> bool:
     device : torch.device
         The CUDA device to probe (a ``torch.device`` or anything
         ``torch.device`` accepts, e.g. ``"cuda"`` or ``"cuda:1"``). An
-        unindexed ``"cuda"`` device is resolved to the current CUDA device.
+        unindexed ``"cuda"`` device is resolved to the current CUDA device;
+        non-CUDA devices report ``False``.
 
     Returns
     -------
@@ -368,7 +382,12 @@ def is_sparse_mla_sm90_supported(device: torch.device) -> bool:
     if _disabled():
         return False
     device = torch.device(device)
-    if device.type == "cuda" and device.index is None:
+    if device.type != "cuda":
+        # A support probe answers, it does not raise: non-CUDA devices are
+        # simply unsupported (torch.cuda.get_device_capability would reject
+        # them instead of answering).
+        return False
+    if device.index is None:
         # An unindexed CUDA device is a valid spelling of the current
         # device; the native probe needs a concrete ordinal (and the
         # functools cache must key on the resolved device).
@@ -712,6 +731,18 @@ def sparse_mla_decode_sm90(
             )
     else:  # "auto"
         routed, reason = _auto_routes(query, nq)
+        if routed and any(
+            t.data_ptr() % 16 for t in (query, kv_cache, workspace_buffer, out)
+        ):
+            # Fused-only buffer requirements are checked BEFORE committing
+            # to the fused route: an otherwise valid call whose buffers miss
+            # the kernel's 16-byte alignment is served by the reference path
+            # under "auto", while explicit "specialized" still raises the
+            # alignment error in validation.
+            routed, reason = (
+                False,
+                "buffers below the fused kernel's 16-byte alignment",
+            )
         if routed:
             chosen = "specialized"
         else:
