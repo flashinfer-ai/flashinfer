@@ -2353,7 +2353,8 @@ def _stream_k_workspace(
     Under CUDA Graph capture each launch gets its own scratch from the graph's memory
     pool, with the zero fill of its flags recorded in the same graph ahead of the GEMM.
     Every replay therefore starts from zeroed flags, whatever other graphs or eager
-    launches ran before it, and graphs may replay concurrently."""
+    launches ran before it, and graphs that do not share a memory pool may replay
+    concurrently.  The zero fill adds one small kernel to each captured stream-K launch."""
     if torch.cuda.is_current_stream_capturing():
         return (
             torch.empty(max(floats, 1), dtype=torch.float32, device=device),
