@@ -23,9 +23,9 @@ row on GB300 against both existing FlashInfer forms of this op (bf16-Q and
 fp8-Q fused) and a vendored Triton baseline.
 """
 
-import functools
 import math
 import os as _os
+import threading as _threading
 
 import torch
 
@@ -38,11 +38,41 @@ LAST_FALLBACK_REASONS: list = []
 _BUILT = {"ready": False}
 
 
-@functools.cache
+_MODULE = None
+_MODULE_ERROR = None  # "TypeName: message" string; deliberately traceback-free
+_MODULE_LOCK = _threading.Lock()
+
+
 def get_msa_sparse_decode_fp8kv_module():
-    mod = gen_msa_sparse_decode_fp8kv_module().build_and_load()
+    """Build-and-load exactly once per process. functools.cache would not
+    remember a *failed* build, so every later backend="auto" call would
+    repeat the JIT compile attempt (seconds per decode step). The failure is
+    remembered as a traceback-free string (re-raising one cached exception
+    object appends caller frames to its __traceback__ on every raise,
+    pinning those frames' tensors) and a fresh RuntimeError is raised per
+    request; the lock keeps concurrent cold callers from compiling twice."""
+    global _MODULE, _MODULE_ERROR
+    if _MODULE is not None:
+        return _MODULE
+    if _MODULE_ERROR is not None:
+        raise RuntimeError(
+            "specialized module build failed previously: " + _MODULE_ERROR
+        )
+    with _MODULE_LOCK:
+        if _MODULE is not None:
+            return _MODULE
+        if _MODULE_ERROR is not None:
+            raise RuntimeError(
+                "specialized module build failed previously: " + _MODULE_ERROR
+            )
+        try:
+            mod = gen_msa_sparse_decode_fp8kv_module().build_and_load()
+        except Exception as exc:
+            _MODULE_ERROR = f"{type(exc).__name__}: {exc}"
+            raise
+        _MODULE = mod
     _BUILT["ready"] = True
-    return mod
+    return _MODULE
 
 
 def supported_with_reasons(
@@ -85,14 +115,21 @@ def supported_with_reasons(
         return r
     if (
         q.dim() != 3
+        or q.shape[0] == 0
         or q.shape[1] != 16
         or q.shape[2] != 128
         or q.dtype != torch.bfloat16
         or not q.is_contiguous()
     ):
+        # Return before anything below reads q.shape[0]: a wrong-rank query
+        # must reach stock validation (its ValueError), not raise IndexError
+        # here, and a zero-token batch must not be "served" as an empty
+        # success the stock path would reject.
         r.append("q_geometry_not_bf16_16x128")
+        return r
     if (
         k.dim() != 4
+        or k.shape[0] == 0
         or k.shape[1] != 1
         or k.shape[2] != 128
         or k.shape[3] != 128
@@ -176,8 +213,12 @@ def supported_with_reasons(
         return r
     if torch.cuda.get_device_capability(q.device) != (10, 3):
         return ["not_sm103"]
-    if torch.cuda.is_current_stream_capturing() and not _BUILT["ready"]:
-        return ["module_not_built_before_graph_capture"]
+    # Query capture state on the device that will run the kernel: the
+    # ambient current device can differ from q.device, and its capture
+    # state is the wrong answer for both directions of this guard.
+    with torch.cuda.device(q.device):
+        if torch.cuda.is_current_stream_capturing() and not _BUILT["ready"]:
+            return ["module_not_built_before_graph_capture"]
     return []
 
 
