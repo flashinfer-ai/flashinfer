@@ -9,6 +9,9 @@ and shape-bounded local-combine prefill tuning (`KERNEL_CACHE_ABI=35`).
 FlashInfer-specific child-graph capture and vendored import adaptations are
 preserved when applying upstream kernel changes.
 
+The vendored scalar-scale MMA helper also includes the upstream compatibility
+fix for CuTeDSL releases that removed the intermediate SM120 MMA operation.
+
 The local frontend experiment adds 384/512/1024/2048/4096 row buckets between
 the existing decode buckets and caller-provided workspace capacity. Buckets
 are prepared lazily and remain part of the kernel and frontend graph cache
