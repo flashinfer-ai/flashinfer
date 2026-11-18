@@ -344,7 +344,11 @@ class _AutoTopKPlan:
             out = self._cand.prepare_pool(k, k_scale=k_scale)
         except ValueError as e:
             self._demote(str(e))
-            out = None
+            # _demote replayed only the earlier bindings; the binding that
+            # was rejected must be prepared on the new candidate too, or a
+            # caller who prepared every binding before capture would hit an
+            # unprepared-binding raise from cutedsl under capture.
+            out = self._cand.prepare_pool(k, k_scale=k_scale)
         self._bindings.append((k, k_scale))
         return out
 
