@@ -87,15 +87,26 @@ html_theme_options = {
 
 
 def _limit_api_sidebar_depth(app, pagename, templatename, context, doctree):
+    from bs4 import BeautifulSoup
     from furo.navigation import get_navigation_tree
 
-    # Furo requests unlimited depth, overriding the root toctree's maxdepth.
-    # Keep API symbols on their topic pages instead of in the global sidebar.
-    context["furo_navigation_tree"] = get_navigation_tree(
+    # Keep tutorial subpages visible while removing generated symbols below API topics.
+    tree = BeautifulSoup(
         context["toctree"](
             collapse=False, titles_only=True, maxdepth=2, includehidden=True
-        )
+        ),
+        "html.parser",
     )
+    for caption in tree.select("p.caption"):
+        if not caption.get_text(strip=True).startswith("API:"):
+            continue
+        group = caption.find_next_sibling("ul")
+        if group is not None:
+            for topic in group.find_all("li", recursive=False):
+                children = topic.find("ul", recursive=False)
+                if children is not None:
+                    children.decompose()
+    context["furo_navigation_tree"] = get_navigation_tree(str(tree))
 
 
 def setup(app):
