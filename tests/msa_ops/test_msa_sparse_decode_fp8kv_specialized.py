@@ -243,3 +243,151 @@ def test_empty_selection_rows_produce_zero_output(B, SEQ):
     assert (
         float((diff <= 0.02 + 0.05 * gold.float()[keep].abs()).float().mean()) >= 0.99
     )
+
+
+# ---------------------------------------------------------------------------
+# Numerical-gap regressions (constructions from the PR review, each measured
+# on SM103 silicon against the fp32 reference / stock arm before the fix):
+# 1. bf16 Q exponent spread must survive QK staging,
+# 2. partial numerators must cross the cluster merge in fp32,
+# 3. NaN bytes in the unwritten tail of a partial last KV page must not
+#    reach the output through the PV mma,
+# 4. probabilities far below the max must survive f16 P staging.
+# The (B, SEQ) pairs below cover every kernel TU the dispatcher can select:
+# pages==3 -> c12 (B<=2) / direct-K b8 (B<=16) / direct-K short (else);
+# pages>=16 -> b8 (B<=2) / direct-K TMA (else); otherwise the native-F16
+# core (single-CTA at large B, clustered merge at small B).
+# ---------------------------------------------------------------------------
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "B,SEQ",
+    [
+        (2, 384),  # c12
+        (8, 384),  # direct-K short b8
+        (64, 384),  # direct-K short
+        (2, 2048),  # b8, full top-16 selection
+        (4, 2048),  # direct-K TMA
+        (8, 512),  # native-F16 core
+    ],
+)
+def test_query_exponent_spread_preserved(B, SEQ):
+    """A bf16 query mixing a 2^40 channel with a 16.0 channel: the small
+    channel must survive QK staging (fp16-staged Q flushed it to zero and
+    returned 0 where the reference gives ~0.887)."""
+    inp = _make_inputs(B, SEQ, seed=11)
+    dev = inp["q"].device
+    pages = (SEQ + BLOCK - 1) // BLOCK
+    total = B * pages
+    q = torch.zeros(B, HQ, D, device=dev)
+    q[:, :, 0] = 2.0**40
+    q[:, :, 1] = 16.0
+    inp["q"] = q.to(torch.bfloat16)
+    k = torch.zeros(total, 1, BLOCK, D, device=dev)
+    k[:, :, : BLOCK // 2, 1] = 1.0
+    k[:, :, BLOCK // 2 :, 1] = -1.0
+    v = torch.empty(total, 1, BLOCK, D, device=dev)
+    v[:, :, : BLOCK // 2, :] = 1.0
+    v[:, :, BLOCK // 2 :, :] = -1.0
+    inp["k"] = k.to(torch.float8_e4m3fn)
+    inp["v"] = v.to(torch.float8_e4m3fn)
+    gold = _reference(inp).float()
+    assert float(gold.abs().max()) > 0.5  # non-degenerate construction
+    out = _api(inp, backend="specialized").float()
+    assert float((out - gold).abs().max()) <= 0.02
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "B,SEQ",
+    [
+        (8, 256),  # native-F16 core, 2-CTA cluster merge
+        (2, 384),  # c12, 12-CTA quarter-page merge
+        (8, 384),  # direct-K short b8 merge
+        (64, 384),  # direct-K short merge
+        (4, 2048),  # direct-K TMA, 16-CTA merge
+    ],
+)
+def test_partial_numerator_cancellation_survives_merge(B, SEQ):
+    """Q=K=0 (uniform attention); V page of block 0 holds +64 with a single
+    +60 token, block 1 holds -64 everywhere, later blocks hold 0.  The exact
+    answer is -4/SEQ on every output element; bf16-rounded partial
+    numerators cancelled the residual entirely and returned 0."""
+    inp = _make_inputs(B, SEQ, seed=13)
+    dev = inp["q"].device
+    pages = (SEQ + BLOCK - 1) // BLOCK
+    total = B * pages
+    inp["q"] = torch.zeros(B, HQ, D, device=dev).to(torch.bfloat16)
+    vf = torch.zeros(total, 1, BLOCK, D, device=dev)
+    p0 = inp["pt"][:, 0].long()
+    p1 = inp["pt"][:, 1].long()
+    vf[p0] = 64.0
+    vf[p0, 0, 0, :] = 60.0
+    vf[p1] = -64.0
+    inp["v"] = vf.to(torch.float8_e4m3fn)
+    inp["k"] = torch.zeros_like(vf).to(torch.float8_e4m3fn)
+    gold = _reference(inp).float()
+    expect = -4.0 / SEQ
+    assert abs(float(gold.mean()) - expect) < 1e-4  # construction sanity
+    out = _api(inp, backend="specialized").float()
+    assert float((out - gold).abs().max()) <= 2.5e-4
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "B,SEQ",
+    [
+        (2, 300),  # c12
+        (8, 300),  # direct-K short b8
+        (64, 300),  # direct-K short
+        (32, 2020),  # direct-K TMA (16 pages, partial last)
+        (8, 484),  # native-F16 core (4 pages, partial last)
+    ],
+)
+def test_nan_bytes_in_partial_last_page_tail(B, SEQ):
+    """The unwritten tail of a partial last KV page is arbitrary allocator
+    memory.  E4M3 NaN bytes (0x7F) there must not reach the output: the
+    score mask zeroes P, but 0 * NaN is NaN in the PV mma unless the staged
+    V tail itself is zeroed."""
+    inp = _make_inputs(B, SEQ, seed=17)
+    gold = _reference(inp).float()
+    out_clean = _api(inp, backend="specialized").clone()
+    rem = SEQ % BLOCK
+    assert rem != 0
+    pages = (SEQ + BLOCK - 1) // BLOCK
+    last_phys = inp["pt"][:, pages - 1].long()
+    for t in (inp["k"], inp["v"]):
+        tb = t.view(torch.uint8)
+        tb[last_phys, 0, rem:, :] = 0x7F
+    out = _api(inp, backend="specialized")
+    assert torch.isfinite(out.float()).all()
+    assert torch.equal(out, out_clean)
+    _assert_close(out, gold)
+
+
+@requires_sm103
+def test_small_probabilities_survive_f16_staging():
+    """Single-CTA F16 route (B=160, 15 full pages, selections [0..14, -1]):
+    nonpeak probabilities of ~1e-8 keep ~2000 V contributions of 448 alive
+    in the fp32 denominator; flushing them to zero in f16 P staging returned
+    0 where the reference gives ~0.0095."""
+    B, SEQ = 160, 15 * BLOCK
+    inp = _make_inputs(B, SEQ, seed=19)
+    dev = inp["q"].device
+    pages = SEQ // BLOCK
+    total = B * pages
+    q = torch.zeros(B, HQ, D, device=dev)
+    q[:, :, 0] = 16.0
+    inp["q"] = q.to(torch.bfloat16)
+    k = torch.zeros(total, 1, BLOCK, D, device=dev)
+    v = torch.full((total, 1, BLOCK, D), 448.0, device=dev)
+    first_phys = inp["pt"][:, 0].long()
+    k[first_phys, 0, 0, 0] = 13.0
+    v[first_phys, 0, 0, :] = 0.0
+    inp["k"] = k.to(torch.float8_e4m3fn)
+    inp["v"] = v.to(torch.float8_e4m3fn)
+    gold = _reference(inp).float()
+    assert 0.005 <= float(gold.mean()) <= 0.02  # construction sanity
+    out = _api(inp, backend="specialized").float()
+    assert float((out - gold).abs().max()) <= 2e-4

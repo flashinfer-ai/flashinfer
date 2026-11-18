@@ -1,11 +1,16 @@
 // MSA block-sparse GQA decode (q_len 1, 16 heads, 1 KV head, D=128, fp8 paged KV).
-// Native-f16 tensor-core core: on SM100 `mma.sync ... e4m3` is emulated
+// Native-16-bit tensor-core core: on SM100 `mma.sync ... e4m3` is emulated
 // (F2FP + HMMA.16816 + FADD), and the emulation re-converts the loop-invariant
-// A operand on every instruction.  Dequantise K/V to f16 once in registers and
-// issue HMMA.16816 directly instead, which also keeps Q and P at full f16
-// precision rather than e4m3.
+// A operand on every instruction.  Dequantise K/V once in registers and issue
+// HMMA.16816 directly instead.  QK runs on bf16 (Q is the caller's bf16
+// verbatim; e4m3 K widens to bf16 exactly), so no per-head Q scaling is needed
+// and wide per-head exponent spreads survive.  P stays f16 for the PV mma but
+// is staged as exp2(s - m + PSHIFT): the 2^PSHIFT factor rides O and l alike
+// and cancels at normalization, keeping tiny probabilities above the f16
+// subnormal floor instead of flushing them to zero against an fp32 denominator.
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/tvm_ffi.h>
@@ -26,24 +31,39 @@ namespace cg = cooperative_groups;
 #define FSTRIDE 272       // 128 f16 + 16B pad -> conflict-free ldmatrix
 #define QBYTES (HQ * FSTRIDE)
 #define PBYTES (HQ * FSTRIDE)
-#define SCRB 1152  // 128 maxes, 16 q scales, 128 row sums
+#define SCRB 1152  // 128 maxes, 128 row sums (16 former q-scale slots unused)
 template <int CLU>
 struct Geo {
   static constexpr int NSLOT = ((HQ + CLU - 1) / CLU) * CLU;
-  static constexpr int MERGE = ((NSLOT * DH * 2 + NSLOT * 8) + 127) / 128 * 128;
+  // fp32 partial numerators + (m, l) pairs cross the cluster merge; a
+  // single-CTA grid never merges, so it carries no mailbox at all.
+  static constexpr int MERGE = (CLU == 1) ? 0 : ((NSLOT * DH * 4 + NSLOT * 8) + 127) / 128 * 128;
 };
-#define SMEM_N(N, C) ((N) * STAGEB + Geo<C>::MERGE + QBYTES + PBYTES + SCRB)
-#define SMEM_O(N, C, O) (SMEM_N(N, C) - (((O) > 1) ? PBYTES : 0))
+// P aliases the Q staging buffer: Q is hoisted to registers before the page
+// loop on every compiled occupancy (static_assert in the kernel).
+#define SMEM_N(N, C) ((N) * STAGEB + Geo<C>::MERGE + QBYTES + SCRB)
+#define SMEM_O(N, C, O) SMEM_N(N, C)
 
 #define QSCALE 0.08838834764831845f
 #define LOG2EF 1.4426950408889634f
 #define SCL (QSCALE * LOG2EF)
+// P is staged as exp2(s - m + PSHIFT); the exact power of two rides the O
+// accumulators and the row sums alike, so it cancels in every O/l ratio.
+#define PSHIFT 14.0f
 
 __device__ __forceinline__ uint32_t sptr(const void* p) {
   return (uint32_t)__cvta_generic_to_shared(p);
 }
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+}
+// src-size form: full ? copy 16 bytes : zero-fill the 16-byte destination.
+// Tokens at or beyond the sequence end in a partial last page are unwritten
+// allocator memory; an E4M3 NaN byte there would survive the score mask as
+// 0 * NaN in the PV mma, so the stage itself must hold zeros for them.
+__device__ __forceinline__ void cp16z(uint32_t dst, const void* src, bool full) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
+               "r"(full ? 16u : 0u));
 }
 __device__ __forceinline__ void cpcommit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
@@ -136,6 +156,26 @@ __device__ __forceinline__ uint32_t f2bf2(float lo, float hi) {
   r.bf = __floats2bfloat162_rn(lo, hi);
   return r.u;
 }
+// four packed e4m3 -> the two bf16x2 halves of one m16n8k16 B fragment.
+// e4m3 -> f16 is exact and every e4m3 value is exactly representable in
+// bf16, so the widening chain loses nothing.
+__device__ __forceinline__ void cvt8bf(uint32_t s, uint32_t& lo, uint32_t& hi) {
+  uint32_t a, b;
+  cvt8(s, a, b);
+  float2 fa = __half22float2(*reinterpret_cast<__half2*>(&a));
+  float2 fb = __half22float2(*reinterpret_cast<__half2*>(&b));
+  lo = f2bf2(fa.x, fa.y);
+  hi = f2bf2(fb.x, fb.y);
+}
+__device__ __forceinline__ void mma_bf16(float& d0, float& d1, float& d2, float& d3, uint32_t a0,
+                                         uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                         uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+      : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
 // Logical contraction index -> slot inside a 16-element group.  ldmatrix hands
 // each lane four consecutive bytes while the mma fragment wants {2j,2j+1} and
 // {2j+8,2j+9}; applying this permutation to the operand we build ourselves (Q,
@@ -170,7 +210,9 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   uint64_t* merge_bar = reinterpret_cast<uint64_t*>(sm + SMEM_O(NSTAGE, CLU, OSPLIT) - 64);
   if constexpr (ASYNC_MERGE) {
     const uint32_t owned_heads = (HQ - sp + CLU - 1) / CLU;
-    if (tid == 0) mbar_init_expect(merge_bar, owned_heads * CLU * (256 / OSPLIT + 8));
+    // fp32 partials: DH * 4 bytes of O per contributing CTA (split OSPLIT
+    // ways) plus the 8-byte (m, l) pair.
+    if (tid == 0) mbar_init_expect(merge_bar, owned_heads * CLU * (512 / OSPLIT + 8));
   }
   if constexpr (CLU > 1) cluster_arrive_relaxed();
 
@@ -196,11 +238,14 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   int blkr;
   asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(blkr) : "l"(topk + b * TOPKC + jj));
 
+  // Q dies into registers (QHOIST below) before the first P write, so P
+  // aliases the Q staging buffer on every route.
+  static_assert(OCC < 3, "P aliases Q; requires the register-hoisted Q path");
   uint8_t* Sb = sm;
   uint8_t* Mg = Sb + NSTAGE * STAGEB;
   uint8_t* Qs = Mg + Geo<CLU>::MERGE;
-  uint8_t* Pb = (OSPLIT > 1) ? Qs : Qs + QBYTES;
-  float* scr = (float*)(Pb + ((OSPLIT > 1) ? QBYTES : PBYTES));
+  uint8_t* Pb = Qs;
+  float* scr = (float*)(Pb + QBYTES);
   float* scrl = scr + 144;
 
   int pgr;
@@ -214,6 +259,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   }
   unsigned vmask = __ballot_sync(0xffffffffu, (lane < 16) && (lane < lim) && (blkr >= 0));
   const int nb = __popc(vmask & 0xffffu);
+  const bool needs_mask = (seqlen != pages * BLKT);
 
   const int tbase0 = 16 * warp;
   int soff[4];
@@ -239,6 +285,11 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   do {                                                                             \
     if ((J) < nb) {                                                                \
       int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                                \
+      int lim_ = BLKT;                                                             \
+      if (needs_mask) {                                                            \
+        int cb_ = __shfl_sync(0xffffffffu, blkr, (J));                             \
+        lim_ = seqlen - cb_ * BLKT;                                                \
+      }                                                                            \
       uint8_t* kd_ = Sb + (ST) * STAGEB;                                           \
       const uint8_t* vg_ = vc + (size_t)pg_ * PGB;                                 \
       uint8_t* vd_ = kd_ + PGB;                                                    \
@@ -246,14 +297,14 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
         if (tid < 128) {                                                           \
           int tok_ = tid, c_ = dgroup;                                             \
           int vo_ = (tok_ << 7) | ((c_ ^ (tok_ & 7)) << 4);                        \
-          cp16(sptr(vd_ + vo_), vg_ + ((size_t)tok_ * 8 + c_) * 16);               \
+          cp16z(sptr(vd_ + vo_), vg_ + ((size_t)tok_ * 8 + c_) * 16, tok_ < lim_); \
         }                                                                          \
       } else if constexpr (OSPLIT == 4) {                                          \
         int ig_ = lane >> 3;                                                       \
         int tok_ = 16 * warp + 8 * (ig_ >> 1) + 2 * ((lane & 7) >> 1) + (ig_ & 1); \
         int c_ = 2 * dgroup + (lane & 1);                                          \
         int vo_ = (tok_ << 7) | ((c_ ^ (tok_ & 7)) << 4);                          \
-        cp16(sptr(vd_ + vo_), vg_ + ((size_t)tok_ * 8 + c_) * 16);                 \
+        cp16z(sptr(vd_ + vo_), vg_ + ((size_t)tok_ * 8 + c_) * 16, tok_ < lim_);   \
       } else if constexpr (OSPLIT == 2) {                                          \
         _Pragma("unroll") for (int t2 = 0; t2 < 2; ++t2) {                         \
           int tok_, c_;                                                            \
@@ -266,12 +317,13 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
             c_ = 4 * dgroup + (u_ & 3);                                            \
           }                                                                        \
           int vo_ = (tok_ << 7) | ((c_ ^ (tok_ & 7)) << 4);                        \
-          cp16(sptr(vd_ + vo_), vg_ + ((size_t)tok_ * 8 + c_) * 16);               \
+          cp16z(sptr(vd_ + vo_), vg_ + ((size_t)tok_ * 8 + c_) * 16, tok_ < lim_); \
         }                                                                          \
       } else {                                                                     \
         const uint32_t vsd_ = sptr(vd_) + soff0;                                   \
         _Pragma("unroll") for (int t2 = 0; t2 < 4; ++t2)                           \
-            cp16(vsd_ + 4096u * t2, vbase + (size_t)pg_ * PGB + 4096 * t2);        \
+            cp16z(vsd_ + 4096u * t2, vbase + (size_t)pg_ * PGB + 4096 * t2,        \
+                  ((tid >> 3) + 32 * t2) < lim_);                                  \
       }                                                                            \
     }                                                                              \
     cpcommit();                                                                    \
@@ -284,44 +336,22 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   }
   if constexpr (CLU > 1) cluster_wait_acquire();
 
-  // ---- Q: bf16 -> f16 with a per-head power-of-two scale (exact, and keeps
-  // any in-range bf16 query inside the f16 exponent range).
+  // ---- Q: the caller's bf16 verbatim (QK runs on bf16 HMMA, so no per-head
+  // scaling is needed and no exponent range is clipped).
   {
     const int h = tid >> 4, dg = tid & 15;
     uint32_t raw[4] = {qw.x, qw.y, qw.z, qw.w};
-    float v[8];
-    float am = 0.f;
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      float2 f = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&raw[i]));
-      v[2 * i] = f.x;
-      v[2 * i + 1] = f.y;
-      am = fmaxf(am, fmaxf(fabsf(f.x), fabsf(f.y)));
-    }
-    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 1));
-    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 2));
-    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 4));
-    am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, 8));
-    int sh = 0;
-    if (am > 0.f) {
-      int ex = (__float_as_int(am) >> 23) & 0xFF;
-      sh = 8 - (ex - 127);
-      sh = min(max(sh, -100), 100);
-    }
-    float scq = __int_as_float((127 + sh) << 23);
-    float inv = __int_as_float((127 - sh) << 23);
     const int d0 = dg * 8;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
       int d = d0 + 2 * i;
-      *(uint32_t*)(Qs + h * FSTRIDE + perm16(d) * 2) = f2h2(v[2 * i] * scq, v[2 * i + 1] * scq);
+      *(uint32_t*)(Qs + h * FSTRIDE + perm16(d) * 2) = raw[i];
     }
-    if (dg == 0) scr[128 + h] = SCL * inv;
   }
   if (nb == 0 && tid < 128) scrl[tid] = 0.f;
   __syncthreads();
-  const float fac0 = scr[128 + g];
-  const float fac1 = scr[128 + g + 8];
+  const float fac0 = SCL;
+  const float fac1 = SCL;
 
   float O[2][4];
 #pragma unroll
@@ -347,7 +377,6 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
   constexpr int OWARPS = 8 / OSPLIT;
   const int owarp = (OSPLIT > 1) ? (warp + OWARPS * dgroup) : warp;
   const uint32_t vswz = (uint32_t)(((owarp ^ (lane & 7)) << 4));
-  const bool needs_mask = (seqlen != pages * BLKT);
   int st = 0;
   for (int j = 0; j < nb; ++j) {
     const int cb = needs_mask ? __shfl_sync(0xffffffffu, blkr, j) : 0;
@@ -383,10 +412,10 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
             ldm4(a0, a1, a2, a3, qbase + (uint32_t)(ks * 32));
           }
           uint32_t b0, b1;
-          cvt8(ka[c], b0, b1);
-          mma16(S[0][0], S[0][1], S[0][2], S[0][3], a0, a1, a2, a3, b0, b1);
-          cvt8(kbb[c], b0, b1);
-          mma16(S[1][0], S[1][1], S[1][2], S[1][3], a0, a1, a2, a3, b0, b1);
+          cvt8bf(ka[c], b0, b1);
+          mma_bf16(S[0][0], S[0][1], S[0][2], S[0][3], a0, a1, a2, a3, b0, b1);
+          cvt8bf(kbb[c], b0, b1);
+          mma_bf16(S[1][0], S[1][1], S[1][2], S[1][3], a0, a1, a2, a3, b0, b1);
         }
       }
     }
@@ -464,10 +493,13 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
     float sum0 = 0.f, sum1 = 0.f;
 #pragma unroll
     for (int t2 = 0; t2 < 2; ++t2) {
-      float p0 = exp2f(S[t2][0] - nm0);
-      float p1 = exp2f(S[t2][1] - nm0);
-      float p2 = exp2f(S[t2][2] - nm1);
-      float p3 = exp2f(S[t2][3] - nm1);
+      // 2^PSHIFT-scaled staging: p <= 2^PSHIFT stays inside f16 range while
+      // probabilities down to 2^-24-PSHIFT of the max survive staging.  O and
+      // l both carry the factor, so every O/l normalization cancels it.
+      float p0 = exp2f(S[t2][0] - nm0 + PSHIFT);
+      float p1 = exp2f(S[t2][1] - nm0 + PSHIFT);
+      float p2 = exp2f(S[t2][2] - nm1 + PSHIFT);
+      float p3 = exp2f(S[t2][3] - nm1 + PSHIFT);
       sum0 += p0 + p1;
       sum1 += p2 + p3;
       int tok = perm16(tbase0 + 8 * t2 + 2 * tig);
@@ -541,12 +573,14 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
 
   {
     constexpr int NSLOT = Geo<CLU>::NSLOT;
-    __nv_bfloat16* oh = (__nv_bfloat16*)Mg;
-    float* ml = (float*)(oh + NSLOT * DH);
+    // fp32 partial numerators: rounding them to bf16 here can cancel the
+    // entire residual of adversarially opposing pages in the merge.
+    float* oh = (float*)Mg;
+    float* ml = oh + NSLOT * DH;
     cg::cluster_group clu = cg::this_cluster();
     const int ha = g, hb = g + 8;
-    __nv_bfloat16* oa = (__nv_bfloat16*)clu.map_shared_rank(oh, ha % CLU);
-    __nv_bfloat16* ob = (__nv_bfloat16*)clu.map_shared_rank(oh, hb % CLU);
+    float* oa = (float*)clu.map_shared_rank(oh, ha % CLU);
+    float* ob = (float*)clu.map_shared_rank(oh, hb % CLU);
     const int sa = (ha / CLU) * CLU + sp;
     const int sb = (hb / CLU) * CLU + sp;
     uint64_t* bara = clu.map_shared_rank(merge_bar, ha % CLU);
@@ -555,14 +589,18 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
 #pragma unroll
       for (int nd = 0; nd < 2; ++nd) {
         int d = 16 * owarp + 8 * nd + 2 * tig;
-        uint32_t va = f2bf2(O[nd][0], O[nd][1]);
-        uint32_t vb = f2bf2(O[nd][2], O[nd][3]);
+        union Pack64 {
+          float2 f;
+          uint64_t u;
+        } va, vb;
+        va.f = make_float2(O[nd][0], O[nd][1]);
+        vb.f = make_float2(O[nd][2], O[nd][3]);
         if constexpr (ASYNC_MERGE) {
-          st_async_u32(sptr(oa + sa * DH + d), va, sptr(bara));
-          st_async_u32(sptr(ob + sb * DH + d), vb, sptr(barb));
+          st_async_u64(sptr(oa + sa * DH + d), va.u, sptr(bara));
+          st_async_u64(sptr(ob + sb * DH + d), vb.u, sptr(barb));
         } else {
-          *reinterpret_cast<uint32_t*>(oa + sa * DH + d) = va;
-          *reinterpret_cast<uint32_t*>(ob + sb * DH + d) = vb;
+          *reinterpret_cast<float2*>(oa + sa * DH + d) = va.f;
+          *reinterpret_cast<float2*>(ob + sb * DH + d) = vb.f;
         }
       }
     }
@@ -622,7 +660,7 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
       float a0 = 0.f, a1 = 0.f;
 #pragma unroll
       for (int c = 0; c < CLU; ++c) {
-        float2 o = __bfloat1622float2(*(const __nv_bfloat162*)(oh + (hi * CLU + c) * DH + dd));
+        float2 o = *(const float2*)(oh + (hi * CLU + c) * DH + dd);
         float w = wv[c] * inv;
         a0 += o.x * w;
         a1 += o.y * w;
@@ -695,8 +733,8 @@ void F16Run(ffi::TensorView q, ffi::TensorView kc, ffi::TensorView vc, ffi::Tens
     setattr<3, 4, 2>();
     setattr<1, 8, 2>();
     setattr<2, 8, 2>();
-    setattr<1, 4, 4>();
-    setattr<1, 8, 4>();
+    // The former <1,4,4>/<1,8,4> occupancy-4 variants had no launch site and
+    // are incompatible with the P-aliases-Q layout (Q must be hoisted).
     g_f16_attr[attr_di & 63] = true;
   }
 

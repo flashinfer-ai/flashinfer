@@ -37,7 +37,7 @@ namespace cg = cooperative_groups;
 // The resource fallback has three ranks and bf16 Q, so it does not use
 // the fp8 scale table or page-table scratch beyond the row reductions.
 #define COMPACT_FALLBACK(N, C, H, W) ((W) && !(H) && (C) == 3 && (N) == 1)
-#define FALLBACK_V2 ((((HQ + 2) / 3 * 3 * (DH * 2 + 12)) + 127) / 128 * 128)
+#define FALLBACK_V2 ((((HQ + 2) / 3 * 3 * (DH * 4 + 12)) + 127) / 128 * 128)
 #define SMEM_VARIANT(N, C, H, W)                                                          \
   (COMPACT_FALLBACK(N, C, H, W) ? KSTAGE + VSTAGE + FALLBACK_V2 + HQ * (272 + 272) + 2048 \
                                 : SMEM_N(N))
@@ -45,7 +45,10 @@ static_assert((LBASE + (HQ - 1) * SSTRIDE + 8) * 4 + 64 <= 2048);
 
 #define QSCALE 0.08838834764831845f
 #define LOG2EF 1.4426950408889634f
-#define PEXP 8.0f  // P is stored as exp2(s - m + PEXP) so e4m3 keeps range
+#define PEXP 8.0f  // fp8-P routes: exp2(s - m + PEXP) keeps e4m3 range
+#define PEXP_F16 \
+  14.0f  // f16-P routes: keeps tiny probabilities above the
+         // f16 subnormal floor; O and l both carry the factor
 
 __device__ __forceinline__ uint32_t sptr(const void* p) {
   return (uint32_t)__cvta_generic_to_shared(p);
@@ -55,6 +58,14 @@ __device__ __forceinline__ int kvsw(int row, int chunk) {
 }
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
+}
+// src-size form: full ? copy 16 bytes : zero-fill the 16-byte destination.
+// Tokens at or beyond the sequence end in a partial last page are unwritten
+// allocator memory; an E4M3 NaN byte there would survive the score mask as
+// 0 * NaN in the PV mma, so the stage itself must hold zeros for them.
+__device__ __forceinline__ void cp16z(uint32_t dst, const void* src, bool full) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
+               "r"(full ? 16u : 0u));
 }
 __device__ __forceinline__ void cpcommit() { asm volatile("cp.async.commit_group;\n" ::); }
 template <int N>
@@ -244,12 +255,12 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     asm volatile("ld.global.nc.u32 %0, [%1];\n" : "=r"(early_blkr) : "l"(topk + b * TOPKC + psp));
   }
   if constexpr (ASYNC_MERGE) {
-    // Each owner CTA receives one 128-byte BF16 output half plus one
+    // Each owner CTA receives one 256-byte FP32 output half plus one
     // 8-byte (m,l) pair from every cluster rank for each head it owns.
     // With HQ=16 and CLU=12, ranks 0..3 own two heads while the rest own
     // one, so a uniform transaction count over-completes four barriers.
     const uint32_t owned_heads = 1u + (sp < 4);
-    if (tid == 0) mbar_init_expect(merge_bar, owned_heads * CLU * (128 + 8));
+    if (tid == 0) mbar_init_expect(merge_bar, owned_heads * CLU * (256 + 8));
   }
   if constexpr (CLU > 1) cluster_arrive_relaxed();
 
@@ -278,7 +289,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       COMPACT_FALLBACK(NSTAGE, CLU, HALFPAGE, BF16_Q_F16_P)
           ? FALLBACK_V2
           : V2BYTES - (BF16_Q_F16_P ? HQ * (QSTEP + PSTEP - QSTRIDE - PSTRIDE) : 0);
-  static_assert(!BF16_Q_F16_P || V2ROOM >= ((HQ + CLU - 1) / CLU) * CLU * (DH * 2 + 12));
+  static_assert(!BF16_Q_F16_P || V2ROOM >= ((HQ + CLU - 1) / CLU) * CLU * (DH * 4 + 12));
   uint8_t* Pb = V2 + V2ROOM;
   uint8_t* Qs = Pb + HQ * PSTEP;
   float* scr = (float*)(Qs + HQ * QSTEP);
@@ -317,60 +328,66 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     nb = __popc(vmask & 0xffffu);
   }
 
+  const bool needs_mask = seqlen != pages * BLKT;
   constexpr int NT2 = HALFPAGE ? 1 : 2;
   constexpr int KSN = HALFPAGE ? 1 : 4;
   const int tbase0 = (HALFPAGE ? 8 : 16) * warp;
-#define ISSUE(J, ST)                                                                         \
-  do {                                                                                       \
-    if ((J) < nb) {                                                                          \
-      int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                                          \
-      const uint8_t* kg_ = kc + (size_t)pg_ * (BLKT * DH) + hoff * DH;                       \
-      const uint8_t* vg_ = vc + (size_t)pg_ * (BLKT * DH) + hoff * DH;                       \
-      uint8_t* kd_ = Kb + (ST) * KSTAGE;                                                     \
-      uint8_t* vd_ = Vb + (ST) * VSTAGE;                                                     \
-      _Pragma("unroll") for (int t2 = 0; t2 < (HALFPAGE ? 256 : 1024) / CTA_THREADS; ++t2) { \
-        int u_ = tid + CTA_THREADS * t2;                                                     \
-        int tok_ = u_ >> 3, c_ = u_ & 7;                                                     \
-        cp16(sptr(kd_ + kvsw(tok_, c_)), kg_ + (size_t)u_ * 16);                             \
-      }                                                                                      \
-      cpcommit();                                                                            \
-      if constexpr (HALFPAGE && QUARTER) {                                                   \
-        if (tid < 64) {                                                                      \
-          int tok_ = tid >> 1, c_ = 2 * dgroup + (tid & 1);                                  \
-          cp16(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16);              \
-        }                                                                                    \
-      } else if constexpr (HALFPAGE && HALFOUT) {                                            \
-        if (tid < 128) {                                                                     \
-          int tok_ = tid >> 2, c_ = 4 * dgroup + (tid & 3);                                  \
-          cp16(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16);              \
-        }                                                                                    \
-      } else if constexpr (HALFPAGE) {                                                       \
-        _Pragma("unroll") for (int t2 = 0; t2 < 256 / CTA_THREADS; ++t2) {                   \
-          int u_ = tid + CTA_THREADS * t2;                                                   \
-          int tok_ = u_ >> 3, c_ = u_ & 7;                                                   \
-          cp16(sptr(vd_ + kvsw(tok_, c_)), vg_ + (size_t)u_ * 16);                           \
-        }                                                                                    \
-      } else if constexpr (QUARTER) {                                                        \
-        int tok_ = tid >> 1, c_ = 2 * dgroup + (tid & 1);                                    \
-        cp16(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16);                \
-      } else if constexpr (HALFOUT) {                                                        \
-        _Pragma("unroll") for (int t2 = 0; t2 < 512 / CTA_THREADS; ++t2) {                   \
-          int u_ = tid + CTA_THREADS * t2;                                                   \
-          int tok_ = u_ >> 2, c_ = 4 * dgroup + (u_ & 3);                                    \
-          cp16(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16);              \
-        }                                                                                    \
-      } else {                                                                               \
-        _Pragma("unroll") for (int t2 = 0; t2 < 1024 / CTA_THREADS; ++t2) {                  \
-          int u_ = tid + CTA_THREADS * t2;                                                   \
-          int tok_ = u_ >> 3, c_ = u_ & 7;                                                   \
-          cp16(sptr(vd_ + kvsw(tok_, c_)), vg_ + (size_t)u_ * 16);                           \
-        }                                                                                    \
-      }                                                                                      \
-      cpcommit();                                                                            \
-    } else {                                                                                 \
-      cpcommit();                                                                            \
-      cpcommit();                                                                            \
-    }                                                                                        \
+#define ISSUE(J, ST)                                                                          \
+  do {                                                                                        \
+    if ((J) < nb) {                                                                           \
+      int pg_ = __shfl_sync(0xffffffffu, pgr, (J));                                           \
+      int lim_ = BLKT;                                                                        \
+      if (needs_mask) {                                                                       \
+        int cb_ = __shfl_sync(0xffffffffu, blkr, (J));                                        \
+        lim_ = seqlen - cb_ * BLKT - hoff;                                                    \
+      }                                                                                       \
+      const uint8_t* kg_ = kc + (size_t)pg_ * (BLKT * DH) + hoff * DH;                        \
+      const uint8_t* vg_ = vc + (size_t)pg_ * (BLKT * DH) + hoff * DH;                        \
+      uint8_t* kd_ = Kb + (ST) * KSTAGE;                                                      \
+      uint8_t* vd_ = Vb + (ST) * VSTAGE;                                                      \
+      _Pragma("unroll") for (int t2 = 0; t2 < (HALFPAGE ? 256 : 1024) / CTA_THREADS; ++t2) {  \
+        int u_ = tid + CTA_THREADS * t2;                                                      \
+        int tok_ = u_ >> 3, c_ = u_ & 7;                                                      \
+        cp16(sptr(kd_ + kvsw(tok_, c_)), kg_ + (size_t)u_ * 16);                              \
+      }                                                                                       \
+      cpcommit();                                                                             \
+      if constexpr (HALFPAGE && QUARTER) {                                                    \
+        if (tid < 64) {                                                                       \
+          int tok_ = tid >> 1, c_ = 2 * dgroup + (tid & 1);                                   \
+          cp16z(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16, tok_ < lim_); \
+        }                                                                                     \
+      } else if constexpr (HALFPAGE && HALFOUT) {                                             \
+        if (tid < 128) {                                                                      \
+          int tok_ = tid >> 2, c_ = 4 * dgroup + (tid & 3);                                   \
+          cp16z(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16, tok_ < lim_); \
+        }                                                                                     \
+      } else if constexpr (HALFPAGE) {                                                        \
+        _Pragma("unroll") for (int t2 = 0; t2 < 256 / CTA_THREADS; ++t2) {                    \
+          int u_ = tid + CTA_THREADS * t2;                                                    \
+          int tok_ = u_ >> 3, c_ = u_ & 7;                                                    \
+          cp16z(sptr(vd_ + kvsw(tok_, c_)), vg_ + (size_t)u_ * 16, tok_ < lim_);              \
+        }                                                                                     \
+      } else if constexpr (QUARTER) {                                                         \
+        int tok_ = tid >> 1, c_ = 2 * dgroup + (tid & 1);                                     \
+        cp16z(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16, tok_ < lim_);   \
+      } else if constexpr (HALFOUT) {                                                         \
+        _Pragma("unroll") for (int t2 = 0; t2 < 512 / CTA_THREADS; ++t2) {                    \
+          int u_ = tid + CTA_THREADS * t2;                                                    \
+          int tok_ = u_ >> 2, c_ = 4 * dgroup + (u_ & 3);                                     \
+          cp16z(sptr(vd_ + kvsw(tok_, c_)), vg_ + ((size_t)tok_ * 8 + c_) * 16, tok_ < lim_); \
+        }                                                                                     \
+      } else {                                                                                \
+        _Pragma("unroll") for (int t2 = 0; t2 < 1024 / CTA_THREADS; ++t2) {                   \
+          int u_ = tid + CTA_THREADS * t2;                                                    \
+          int tok_ = u_ >> 3, c_ = u_ & 7;                                                    \
+          cp16z(sptr(vd_ + kvsw(tok_, c_)), vg_ + (size_t)u_ * 16, tok_ < lim_);              \
+        }                                                                                     \
+      }                                                                                       \
+      cpcommit();                                                                             \
+    } else {                                                                                  \
+      cpcommit();                                                                             \
+      cpcommit();                                                                             \
+    }                                                                                         \
   } while (0)
 
 #pragma unroll
@@ -446,7 +463,6 @@ __global__ void __cluster_dims__(CLU, 1, 1)
   const int prow = (lane & 7) + ((lane >> 3) & 1) * 8;
   const int phalf = (lane >> 4) * 16;
   const int owarp = (HALFOUT || QUARTER) ? (warp + dgroup * OWARPS) : warp;
-  const bool needs_mask = seqlen != pages * BLKT;
   for (int j = 0; j < nb; ++j) {
     const int st = j & (NSTAGE - 1);
     int cb = 0;
@@ -606,10 +622,11 @@ __global__ void __cluster_dims__(CLU, 1, 1)
       if (!HALFPAGE || warp < 4) {
 #pragma unroll
         for (int t2 = 0; t2 < NT2; ++t2) {
-          float p0 = exp2f(S[t2][0] - nm0 + PEXP);
-          float p1 = exp2f(S[t2][1] - nm0 + PEXP);
-          float p2 = exp2f(S[t2][2] - nm1 + PEXP);
-          float p3 = exp2f(S[t2][3] - nm1 + PEXP);
+          constexpr float PE = BF16_Q_F16_P ? PEXP_F16 : PEXP;
+          float p0 = exp2f(S[t2][0] - nm0 + PE);
+          float p1 = exp2f(S[t2][1] - nm0 + PE);
+          float p2 = exp2f(S[t2][2] - nm1 + PE);
+          float p3 = exp2f(S[t2][3] - nm1 + PE);
           sum0 += p0 + p1;
           sum1 += p2 + p3;
           int tok = tbase0 + 8 * t2 + 2 * tig;
@@ -696,13 +713,15 @@ __global__ void __cluster_dims__(CLU, 1, 1)
   cluster_wait_acquire();
   {
     constexpr int NSLOT = ((HQ + CLU - 1) / CLU) * CLU;
-    __nv_bfloat16* oh = (__nv_bfloat16*)V2;  // [NSLOT][128]
-    float* ml = (float*)(oh + NSLOT * DH);   // [NSLOT][2] = (m, l)
-    float* wt = ml + 2 * NSLOT;              // [NSLOT] normalized weights
+    // fp32 partial numerators: rounding them to bf16 here can cancel the
+    // entire residual of adversarially opposing pages in the merge.
+    float* oh = (float*)V2;       // [NSLOT][128]
+    float* ml = oh + NSLOT * DH;  // [NSLOT][2] = (m, l)
+    float* wt = ml + 2 * NSLOT;   // [NSLOT] normalized weights
     cg::cluster_group clu = cg::this_cluster();
     const int ha = g, hb = g + 8;
-    __nv_bfloat16* oa = (__nv_bfloat16*)clu.map_shared_rank(oh, ha % CLU);
-    __nv_bfloat16* ob = (__nv_bfloat16*)clu.map_shared_rank(oh, hb % CLU);
+    float* oa = (float*)clu.map_shared_rank(oh, ha % CLU);
+    float* ob = (float*)clu.map_shared_rank(oh, hb % CLU);
     float* mla = (float*)clu.map_shared_rank(ml, ha % CLU);
     float* mlb = (float*)clu.map_shared_rank(ml, hb % CLU);
     uint64_t* bara = clu.map_shared_rank(merge_bar, ha % CLU);
@@ -713,12 +732,18 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 #pragma unroll
       for (int nd = 0; nd < 2; ++nd) {
         int d = 16 * owarp + 8 * nd + 2 * tig;
+        union Pack64 {
+          float2 f;
+          uint64_t u;
+        } va, vb;
+        va.f = make_float2(O[nd][0], O[nd][1]);
+        vb.f = make_float2(O[nd][2], O[nd][3]);
         if constexpr (ASYNC_MERGE) {
-          st_async_u32(sptr(oa + sa * DH + d), f2bf2(O[nd][0], O[nd][1]), sptr(bara));
-          st_async_u32(sptr(ob + sb * DH + d), f2bf2(O[nd][2], O[nd][3]), sptr(barb));
+          st_async_u64(sptr(oa + sa * DH + d), va.u, sptr(bara));
+          st_async_u64(sptr(ob + sb * DH + d), vb.u, sptr(barb));
         } else {
-          *(__nv_bfloat162*)(oa + sa * DH + d) = __floats2bfloat162_rn(O[nd][0], O[nd][1]);
-          *(__nv_bfloat162*)(ob + sb * DH + d) = __floats2bfloat162_rn(O[nd][2], O[nd][3]);
+          *(float2*)(oa + sa * DH + d) = va.f;
+          *(float2*)(ob + sb * DH + d) = vb.f;
         }
       }
     }
@@ -797,8 +822,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 #pragma unroll
         for (int c = 0; c < 12; ++c) {
           float wc = wv[c];
-          __nv_bfloat162 x = *(__nv_bfloat162*)(oh + (warp * CLU + c) * DH + d);
-          float2 xf = __bfloat1622float2(x);
+          float2 xf = *(const float2*)(oh + (warp * CLU + c) * DH + d);
           acc.x += xf.x * wc;
           acc.y += xf.y * wc;
         }
@@ -857,8 +881,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 #pragma unroll
             for (int c = 0; c < 16; ++c) {
               float w = __shfl_sync(MASK, lane_w, c, WIDTH);
-              __nv_bfloat162 x = *reinterpret_cast<__nv_bfloat162*>(oh + c * DH + d);
-              float2 xf = __bfloat1622float2(x);
+              float2 xf = *reinterpret_cast<const float2*>(oh + c * DH + d);
               acc.x += xf.x * w;
               acc.y += xf.y * w;
             }
@@ -878,8 +901,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
 #pragma unroll
             for (int c = 0; c < CLU; ++c) {
               float w = wt[hi * CLU + c];
-              __nv_bfloat162 x = *(__nv_bfloat162*)(oh + (hi * CLU + c) * DH + d);
-              float2 xf = __bfloat1622float2(x);
+              float2 xf = *(const float2*)(oh + (hi * CLU + c) * DH + d);
               acc.x += xf.x * w;
               acc.y += xf.y * w;
             }
@@ -894,8 +916,7 @@ __global__ void __cluster_dims__(CLU, 1, 1)
           for (int hi = htid; hi < nh; hi += hstep) {
             float acc = 0.f;
 #pragma unroll
-            for (int c = 0; c < CLU; ++c)
-              acc += __bfloat162float(oh[(hi * CLU + c) * DH + d]) * wt[hi * CLU + c];
+            for (int c = 0; c < CLU; ++c) acc += oh[(hi * CLU + c) * DH + d] * wt[hi * CLU + c];
             outp[(size_t)b * (HQ * DH) + (sp + hi * CLU) * DH + d] = __float2bfloat16(acc);
           }
         }
