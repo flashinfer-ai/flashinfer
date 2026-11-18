@@ -11190,17 +11190,6 @@ def _specialized_gemm_fp8_nt_groupwise_requirement(*args, **kwargs):
     return check_specialized_requirement(*args, **kwargs)
 
 
-# Backends accepted by gemm_fp8_nt_groupwise, as plain strings.
-GEMM_FP8_NT_GROUPWISE_BACKENDS = (
-    "auto",
-    "specialized",
-    "cutlass",
-    "trtllm",
-    "cutile",
-    "cute-dsl",
-)
-
-
 @backend_requirement(
     {
         "specialized": _specialized_gemm_fp8_nt_groupwise_requirement,
@@ -11278,7 +11267,7 @@ def gemm_fp8_nt_groupwise(
         If out is not specified, we will create an output tensor with this dtype.
         Defaults to ``torch.bfloat16``.
 
-    backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "auto"]
+    backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "specialized", "auto"]
         The backend to use for the operation. Defaults to ``"cutlass"``.
 
         ``"specialized"`` (SM120 only) runs agent-generated shape-specialized
