@@ -382,9 +382,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     TVM_FFI_ICHECK(cluster_size == 1 && cluster_rank == 0)
         << "smart_router is supported in min_latency mode";
 
+    CHECK_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(token_selected_experts);
+    CHECK_CONTIGUOUS(fc1_expert_weights);
+    CHECK_CONTIGUOUS(fc2_expert_weights);
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {
+      CHECK_CONTIGUOUS(token_final_scales.value());
       CHECK_INPUT_TYPE(token_final_scales.value(), dl_float32)
     }
     if (mWeightDtype == dl_uint4x2) {
@@ -404,6 +410,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 
     auto const bias_dtype = kRestoredMxfp4 && isWMxfp4AMxfp8Quant() ? dl_bfloat16 : mOutputDtype;
     if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
+      CHECK_CONTIGUOUS(fc1_expert_biases.value());
+      CHECK_CONTIGUOUS(fc2_expert_biases.value());
       CHECK_INPUT_TYPE(fc1_expert_biases.value(), bias_dtype);
       CHECK_INPUT_TYPE(fc2_expert_biases.value(), bias_dtype);
 
@@ -606,9 +614,15 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     std::lock_guard<std::mutex> lock(mMutex);
     ffi::CUDADeviceGuard device_guard(input.device().device_id);
 
+    CHECK_CONTIGUOUS(input);
+    CHECK_CONTIGUOUS(output);
+    CHECK_CONTIGUOUS(token_selected_experts);
+    CHECK_CONTIGUOUS(fc1_expert_weights);
+    CHECK_CONTIGUOUS(fc2_expert_weights);
     CHECK_INPUT_TYPE(input, mActivationDtype)
     CHECK_INPUT_TYPE(token_selected_experts, dl_int32)
     if (token_final_scales) {
+      CHECK_CONTIGUOUS(token_final_scales.value());
       CHECK_INPUT_TYPE(token_final_scales.value(), dl_float32)
     }
     if (mWeightDtype == dl_uint4x2) {
@@ -627,6 +641,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_DIM(3, fc2_expert_weights);
 
     if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
+      CHECK_CONTIGUOUS(fc1_expert_biases.value());
+      CHECK_CONTIGUOUS(fc2_expert_biases.value());
       CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
       CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
       CHECK_DIM(2, fc1_expert_biases.value());

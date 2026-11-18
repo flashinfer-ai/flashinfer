@@ -196,9 +196,14 @@ def adapt_and_call(
       for; the solution writes them; return them.
     - ``positional``: C++/CUDA (TVM-FFI) solutions take positional args; Python
       take keyword.
+    - A template whose API returns a fixed tuple names it in ``return_outputs``:
+      returned values bind to those outputs by name, not by output position,
+      and DPS returns those destination buffers (``None`` for one not passed).
     Returns ``None`` for in-place APIs, else the (single or tuple) output value.
     """
     out_keys = _tensor_output_keys(template)
+    return_outputs = getattr(template, "return_outputs", None)
+    ret_keys = list(return_outputs) if return_outputs else out_keys
 
     def dest_buf(json_key: str):
         param = dests.get(json_key)
@@ -222,7 +227,10 @@ def adapt_and_call(
             fn(*ordered_input_values(template, namespace), *out_bufs.values())
         else:
             fn(**build_candidate_kwargs(template, namespace), **out_bufs)
-        produced = list(out_bufs.values())
+        if return_outputs:
+            produced = [out_bufs.get(k) for k in ret_keys]
+        else:
+            produced = list(out_bufs.values())
     else:
         if positional:
             ret = fn(*ordered_input_values(template, namespace))
@@ -233,8 +241,8 @@ def adapt_and_call(
         # solution's own arity as the returned arity.
         produced = []
         for i, val in enumerate(values):
-            if i < len(out_keys) and isinstance(val, torch.Tensor):
-                buf = dest_buf(out_keys[i])
+            if i < len(ret_keys) and isinstance(val, torch.Tensor):
+                buf = dest_buf(ret_keys[i])
                 if buf is not None and val.data_ptr() != buf.data_ptr():
                     buf.copy_(val)
                     val = buf

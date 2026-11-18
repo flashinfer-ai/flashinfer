@@ -17,7 +17,7 @@ import cutlass.cute as cute
 
 #: The trigger placement of every kernel of the backend: ``none`` (the dependents launch at completion).
 TRIGGER = "none"
-#: The placements the swapped box form compiles under (asserted by its builder, ``blocks/swap_bf16.py``): the form reads
+#: The placements the swapped box form compiles under (asserted by its builder, ``blocks/swap.py``): the form reads
 #: the plan's group counts -- its predecessor's predecessor's output -- before its own wait, which holds while every
 #: dependent launches only after its predecessor's wait has returned (the trigger after the loads, or completion). The
 #: early placement is kept out as the rule's margin: a trigger that close to the wait is one edit from preceding it.

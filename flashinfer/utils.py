@@ -301,6 +301,22 @@ def _get_cache_buf(
     return buf
 
 
+def make_l2_flush(num_bytes: int, device) -> Callable[[], None]:
+    """Return a callable that evicts L2 by reading a ``num_bytes`` scratch buffer.
+
+    The buffer is only read, so L2 is left holding clean lines. A write-based
+    flush (``zero_()``) leaves L2 full of dirty lines, and the next kernel pays
+    for writing them back to DRAM (about 8 us for a memory-bound GEMM on B200).
+    """
+    buffer = torch.empty(num_bytes // 8, dtype=torch.int64, device=device)
+    out = torch.empty((), dtype=torch.int64, device=device)
+
+    def flush() -> None:
+        torch.sum(buffer, dim=0, out=out)
+
+    return flush
+
+
 _stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
 # Per-device private pools keep these long-lived buffers out of CUDA graph pools.
 _stream_cache_mem_pools: Dict[int, torch.cuda.MemPool] = {}
@@ -326,7 +342,13 @@ def _get_stream_cache_buf(
     index = device.index
     if index is None:
         index = torch.cuda.current_device()
-    key = (name, device, torch._C._cuda_getCurrentRawStream(index))
+    if torch.compiler.is_dynamo_compiling():
+        # Under torch.compile(dynamic=True) Dynamo can pass a symbolic index, which
+        # the raw binding rejects; the Stream object is traceable and has the same handle.
+        stream = torch.cuda.current_stream(device).cuda_stream
+    else:
+        stream = torch._C._cuda_getCurrentRawStream(index)
+    key = (name, device, stream)
     buf = _stream_cache_buf.get(key)
     if buf is None or buf.size(0) < num_bytes:
         if buf is not None:

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1069,6 +1069,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   float* permuted_token_final_scales_{};
 
   int64_t* expert_first_token_offset_{};
+  int64_t* gemm_expert_first_token_offset_{};
 
   void* glu_inter_result_{};
   void* fc2_result_{};

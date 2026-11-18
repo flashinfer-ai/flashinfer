@@ -29,12 +29,14 @@ def _sweep_sm100_mega_moe(
     calls_per_sample=8,
     process_group=None,
     measurement=None,
+    make_trial=None,
 ):
     """Check sampled Torch correctness and minimize median(max EP rank).
 
     All EP ranks must enter together outside capture. A CUDA/compile failure
     aborts the supervised worker job; collective cleanup after a rank-local
-    GPU failure could deadlock peers. Timing excludes staging and weight prep.
+    GPU failure could deadlock peers. Timing includes staging when a complete
+    forward trial is supplied; weight preparation is always outside timing.
     """
     import torch
     import torch.distributed as dist
@@ -81,6 +83,7 @@ def _sweep_sm100_mega_moe(
         calls_per_sample,
         hardware,
         valid,
+        make_trial is not None,
     )
     proposals = [proposal]
     if collective:
@@ -134,8 +137,12 @@ def _sweep_sm100_mega_moe(
 
     def error(trial):
         """Return the maximum sampled output error across the EP group."""
-        output = trial.output_activation[:checked_tokens]
-        if getattr(cfg, "use_custom_finalize", False):
+        output = (
+            y[:checked_tokens]
+            if make_trial is not None and y is not None
+            else trial.output_activation[:checked_tokens]
+        )
+        if make_trial is None and getattr(cfg, "use_custom_finalize", False):
             partials = trial.custom_finalize_workspace()[:checked_tokens].float()
             valid = (trial.topk_idx[:checked_tokens] >= 0) & (
                 trial.topk_idx[:checked_tokens] < cfg.num_total_experts
@@ -178,33 +185,39 @@ def _sweep_sm100_mega_moe(
             continue
         trial = workspace_type(
             trial_cfg,
+            **({"process_group": process_group} if process_group is not None else {}),
             **(
                 {"num_valid_tokens_tensor": live_count}
                 if live_count is not None
                 else {}
             ),
         )
-        for name in ("x", "x_sf", "topk_idx", "topk_weights"):
-            getattr(trial, name).view(torch.uint8).copy_(
-                getattr(symm_buffer, name).view(torch.uint8)
-            )
-        for name in (
-            "fc1_alpha",
-            "fc2_alpha",
-            "fc1_norm_const",
-            "fc1_activation_per_token_scale",
-        ):
-            source = getattr(symm_buffer, name, None)
-            if source is not None:
-                getattr(trial, name).copy_(source)
-        trial.note_staged_tokens(num_tokens)
-        _prepare_collectively(
-            lambda: trial.prepare(transformed_l1, transformed_l2),
+
+        def prepare_trial():
+            for name in ("x", "x_sf", "topk_idx", "topk_weights"):
+                getattr(trial, name).view(torch.uint8).copy_(
+                    getattr(symm_buffer, name).view(torch.uint8)
+                )
+            for name in (
+                "fc1_alpha",
+                "fc2_alpha",
+                "fc1_norm_const",
+                "fc1_activation_per_token_scale",
+            ):
+                source = getattr(symm_buffer, name, None)
+                if source is not None:
+                    getattr(trial, name).copy_(source)
+            trial.note_staged_tokens(num_tokens)
+            trial.prepare(transformed_l1, transformed_l2)
+            return trial if make_trial is None else make_trial(trial)
+
+        measured_trial = _prepare_collectively(
+            prepare_trial,
             cfg.world_size,
             process_group,
         )
         barrier()
-        trial.launch(transformed_l1, transformed_l2)
+        measured_trial.launch(transformed_l1, transformed_l2)
         torch.cuda.synchronize()
         measured_error = error(trial)
         score = math.inf
@@ -218,11 +231,11 @@ def _sweep_sm100_mega_moe(
             }
             if settings["cuda_graph_profile_replays"] is None:
                 for _ in range(warmup_iters):
-                    trial.launch(transformed_l1, transformed_l2)
+                    measured_trial.launch(transformed_l1, transformed_l2)
                 torch.cuda.synchronize()
             try:
                 samples = measure_samples(
-                    trial,
+                    measured_trial,
                     (transformed_l1, transformed_l2),
                     timed_iters,
                     settings,
@@ -258,9 +271,9 @@ def _sweep_sm100_mega_moe(
 
 
 def _prepare_collectively(prepare, world_size, process_group):
-    error = None
+    result, error = None, None
     try:
-        prepare()
+        result = prepare()
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     errors = [error]
@@ -270,7 +283,9 @@ def _prepare_collectively(prepare, world_size, process_group):
         errors = [None] * world_size
         dist.all_gather_object(errors, error, group=process_group)
     if any(errors):
+        result = None
         raise RuntimeError(f"MegaMoE preparation failed on EP ranks: {errors}")
+    return result
 
 
 def autotune_sm100_block_scaled_mega_moe(

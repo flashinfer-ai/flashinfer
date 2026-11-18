@@ -120,6 +120,7 @@ from .utils import (
     get_alibi_slopes,
     get_compute_capability,
     get_device_sm_count,
+    get_device_name,
     is_float8,
     is_sm12x_supported,
     is_sm100a_supported,
@@ -2521,12 +2522,13 @@ def _build_block_tables_from_paged_kv_indices(
 
 
 def _paged_kv_host_metadata(indptr, last_page_len, seq_lens, page_size):
-    indptr_host = indptr.to("cpu")
-    last_host = last_page_len.to("cpu")
+    # CPU inputs can retain strides across .to(); the planners read raw pointers.
+    indptr_host = indptr.to("cpu").contiguous()
+    last_host = last_page_len.to("cpu").contiguous()
     lengths = (
         get_seq_lens(indptr_host, last_host, page_size)
         if seq_lens is None
-        else seq_lens.cpu().flatten().to(torch.int32)
+        else seq_lens.cpu().flatten().to(torch.int32).contiguous()
     )
     return indptr_host, last_host, lengths
 
@@ -2547,6 +2549,77 @@ def _validate_paged_query_lengths(backend, seq_lens_q, qo_indptr_host):
         "Use backend='cudnn', or omit seq_lens_q when qo_indptr already "
         "describes the valid query lengths. Non-cuDNN backends only accept "
         "explicit query lengths on CPU that equal the differences in qo_indptr."
+    )
+
+
+def _hopper_paged_auto_cudnn(
+    device,
+    layout,
+    q_dtype,
+    kv_dtype,
+    o_dtype,
+    head_dim_qk,
+    head_dim_vo,
+    batch,
+    hq,
+    hk,
+    max_q,
+    max_kv,
+    page_size,
+    total_q,
+    qo_indptr_host,
+    kv_lens,
+    seq_lens_q=None,
+    causal=True,
+):
+    """H100 D256 admission after the native planner has selected FA3."""
+    if not (
+        layout == "HND"
+        and q_dtype == kv_dtype == o_dtype
+        and q_dtype in (torch.float16, torch.bfloat16)
+        and head_dim_qk == head_dim_vo == 256
+        and 1 <= batch <= 32
+        and 16 <= hq <= 48
+        and hk > 0
+        and hq % hk == 0
+        and hq // hk in (1, 2, 4, 8, 16)
+        and page_size == 16
+        and 65 <= max_q <= 16384
+        and max_q <= max_kv <= 32768
+        and qo_indptr_host.device.type == "cpu"
+        and kv_lens is not None
+        and kv_lens.device.type == "cpu"
+        and (seq_lens_q is None or seq_lens_q.device.type == "cpu")
+    ):
+        return False
+    bounds = qo_indptr_host.tolist()
+    queries = [end - start for start, end in zip(bounds, bounds[1:], strict=False)]
+    lengths = kv_lens.flatten().tolist()
+    if not (
+        len(queries) == len(lengths) == batch
+        and bounds[0] == 0
+        and bounds[-1] == total_q
+        and max(queries) == max_q
+        and max(lengths) == max_kv
+        and all(0 < q <= kv for q, kv in zip(queries, lengths, strict=True))
+        and (seq_lens_q is None or seq_lens_q.flatten().tolist() == queries)
+    ):
+        return False
+    # Amortize the cuDNN path using actual mask-specific work, including mixed rows.
+    # A product of declared maxima would admit nearly empty ragged batches.
+    paired_work = hq * sum(
+        q * (2 * kv - q + 1) // 2 if causal else q * kv
+        for q, kv in zip(queries, lengths, strict=True)
+    )
+    if paired_work < 1 << 24:
+        return False
+    # The short-query FA2 domain is deliberately retained. Do not transfer
+    # H100 measurements to H20, PCIe H100, or other Hopper devices.
+    return (
+        get_compute_capability(device) == (9, 0)
+        and get_device_sm_count(device) == 132
+        and get_device_name(device) == "NVIDIA H100 80GB HBM3"
+        and _cudnn_supports_paged_auto()
     )
 
 
@@ -4105,13 +4178,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # Per-token/head scales pin FA2; resolve auto without modifying plan state.
         if auto_backend is not None:
             planned_backend = auto_backend
+            cudnn_admission = (
+                _blackwell_paged_auto_cudnn
+                if planned_backend == "fa2"
+                else functools.partial(_hopper_paged_auto_cudnn, causal=causal)
+            )
             if (
-                planned_backend == "fa2"
-                # A retained FA2 capture also needs its CPU-generated schedule
+                planned_backend in ("fa2", "fa3")
+                # A retained native capture also needs its generated schedule
                 # refreshed, not just the raw page and length buffers. Keep
-                # planning FA2 instead of maintaining a second planner for it.
+                # planning its provider instead of maintaining a second planner.
                 and (not self.is_cuda_graph_enabled or self._plan_info is None)
-                and causal
+                and (causal or planned_backend == "fa3")
                 and pos_encoding_mode == "NONE"
                 and not use_fp16_qk_reduction
                 and custom_mask is None
@@ -4130,7 +4208,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     not self.is_cuda_graph_enabled
                     or self._qo_indptr_buf.dtype == torch.int32
                 )
-                and _blackwell_paged_auto_cudnn(
+                and cudnn_admission(
                     self.device,
                     self._kv_layout,
                     q_data_type,
@@ -4256,9 +4334,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._backend = planned_backend
 
         self._cudnn_paged_bounds = None
-        if self._requested_backend == "auto" and self._backend == "cudnn":
+        if (
+            self._requested_backend == "auto"
+            and self._backend == "cudnn"
+            and get_compute_capability(self.device) in ((10, 0), (10, 3))
+        ):
             # Actual per-request lengths still drive masking and addressing.
             # Stable declared bounds and table capacity avoid a graph per step.
+            # These buckets are qualified for Blackwell; Hopper keeps the exact
+            # declarations used by its explicit cuDNN plans.
             # Above the short-Q class, preserve both packed and unpacked tile counts.
             # Rounding whole powers of two can hide an underfilled grid.
             q_tile = 128 // (num_qo_heads // num_kv_heads)
@@ -4281,7 +4365,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr, paged_kv_last_page_len, seq_lens, page_size
                 )
             )
-        if kv_lens_arr_host is not None:
+        # fa2 derives kv lengths from the page table and never reads this
+        # buffer, so skip the copy, which syncs when the host lengths are
+        # pageable. A cuDNN graph retained from an earlier plan still reads it.
+        if kv_lens_arr_host is not None and (
+            self._backend != "fa2"
+            or (self.is_cuda_graph_enabled and self._cudnn_q_lens_buffer is not None)
+        ):
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -4662,15 +4752,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ):
             if self._backend == "cudnn" and (
                 pos_encoding_mode != "NONE"
-                or window_left != -1
                 or logits_soft_cap != 0
                 or packed_custom_mask is not None
                 or self._variant_owns_mask
                 or prefix_len_ptr is not None
             ):
                 raise NotImplementedError(
-                    "cuDNN paged prefill supports only causal or full attention without "
-                    "position encoding, window_left, logits_soft_cap or custom masks"
+                    "cuDNN paged prefill does not support position encoding, "
+                    "logits_soft_cap or custom masks"
                 )
             if self._qo_indptr_buf.dtype != torch.int32:
                 if self.is_cuda_graph_enabled:
@@ -4731,15 +4820,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
                 if self._cudnn_paged_bounds is not None:
                     max_pages = max(max_pages, self._cudnn_paged_bounds[1] // page_size)
-                    if self.is_cuda_graph_enabled:
-                        # Any request may later own all initialized indices,
-                        # even after auto selects FA2 for a longer prefix. Also
-                        # reserve padding for the largest admitted KV bucket.
-                        index_capacity = self._paged_kv_indices_buf.numel()
+                if self.is_cuda_graph_enabled:
+                    # Any request may later own all reserved indices. Capacity
+                    # is independent of the exact or bucketed graph declaration.
+                    index_capacity = self._paged_kv_indices_buf.numel()
+                    max_pages = max(max_pages, index_capacity)
+                    if self._cudnn_paged_bounds is not None:
+                        # Blackwell buckets can additionally require padding.
                         admitted_pages = min(index_capacity, 32768 // page_size)
                         max_pages = max(
                             max_pages,
-                            index_capacity,
                             1 << (admitted_pages - 1).bit_length(),
                         )
                 old_table = self._cudnn_block_tables
@@ -4789,6 +4879,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         graph_kv,
                         causal,
                         True,
+                        window_left=window_left if window_left >= 0 else None,
                         o_data_type=o_data_type,
                         actual_seq_lens_q=self._seq_lens_q,
                         actual_seq_lens_kv=self._seq_lens_kv,
@@ -5010,7 +5101,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
-            Whether to return the logsumexp of attention output
+            Whether to return the logsumexp of attention logits
         lse_base : str
             Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
             ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
@@ -5092,7 +5183,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             * The attention output, shape:
               ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+            * The logsumexp of attention logits, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
@@ -5321,6 +5412,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and self._backend == "cudnn"
             and self._cudnn_plan is not None
             and self._cudnn_plan.metadata.causal == self._causal
+            and self._cudnn_plan.metadata.window_left
+            == (window_left if window_left >= 0 else None)
             # Head-major Stats places tokens through the ragged offset; a plan
             # that dropped it (single-token GQA on cuDNN < 9.27) stages NH.
             and self._cudnn_plan.metadata.batch_offsets_stats is not None
@@ -5479,6 +5572,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if (
                 plan is not None
                 and plan.metadata.causal == self._causal
+                and plan.metadata.window_left
+                == (window_left if window_left >= 0 else None)
                 and q_scale is None
                 and k_scale is None
                 and v_scale is None
@@ -5543,6 +5638,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     batch_offsets_q=self._qo_indptr_buf,
                     batch_offsets_stats=self._qo_indptr_buf if return_lse else None,
                     batch_offsets_units="tokens",
+                    window_left=window_left if window_left >= 0 else None,
                     out=out,
                     lse=lse,
                     o_data_type=out_dtype,
@@ -6204,7 +6300,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and after scaling. The mask tensor should be in the same device as the input tensors.
         causal : bool
             Whether to apply causal mask to the attention matrix.
-            This argument is ignored if ``mask`` is provided in :meth:`plan`.
+            This argument is ignored if ``custom_mask`` or ``packed_custom_mask`` is provided in :meth:`plan`
+            for backends that apply custom masks. The ``cutlass`` backend ignores custom masks,
+            so ``causal`` still applies there.
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -7376,7 +7474,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
-            Whether to return the logsumexp of attention output
+            Whether to return the logsumexp of attention logits
         lse_base : str
             Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
             ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
@@ -7414,7 +7512,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+            * The logsumexp of attention logits, shape: ``[qo_indptr[-1], num_qo_heads]``
               (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
               (``"HN"``), in the base selected by :attr:`lse_base`.
         """
@@ -8359,8 +8457,10 @@ def trtllm_sage_attention_quantize(
 
     Returns
     -------
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
+    tuple of torch.Tensor
+        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
+        (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
+
         Quantized Q/K/V followed by their FP32 dequantization scales.
         When ``smooth_k=True``, the FP32 K mean is appended. The first six
         outputs can be passed directly to `trtllm_ragged_attention_deepseek`.
@@ -10200,8 +10300,10 @@ def trtllm_fmha_v2_prefill(
         Defaults to ``0`` (disabled).
     Returns
     -------
+    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         If :attr:`save_softmax_stats` is ``False``, the attention output tensor.
         If :attr:`save_softmax_stats` is ``True``, a tuple of two tensors:
+
         * The attention output tensor.
         * The softmax statistics tensor (LSE).
     """
