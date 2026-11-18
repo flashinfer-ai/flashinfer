@@ -68,6 +68,33 @@ are designed to co-exist, and neither supersedes the other.
     .. automethod:: __init__
     .. automethod:: __call__
 
+Backend selection
+~~~~~~~~~~~~~~~~~
+
+``MoELayer`` selects one backend per (token-count bucket, routing input mode,
+eligible set) and caches it; a CUDA graph captured afterwards keeps it. With
+several eligible backends, each is tuned for its best tactic and the backends
+are then timed against each other. They are not timed on the first call's own
+tensors, which usually come from a framework's warm-up batch. Frameworks capture
+CUDA graphs on static placeholder buffers, often zero-filled, and warm up on
+them, so every token in that batch is identical: router logits are identical
+across tokens and every token picks the same ``top_k`` experts. Backends rank
+differently on that routing than on served traffic. The timed pack keeps the
+call's shapes, dtypes, strides, expert weights and routing bias, and draws
+serving-like values from a fixed seed: iid standard-normal logits, or each
+token's ``top_k`` distinct experts drawn uniformly for precomputed routing, with
+standard-normal activations and unit block scales. Every call, process and rank
+of the same geometry therefore times the same values, and ``bench_gpu_time``
+already gathers the timings across the default ``torch.distributed`` group, so
+ranks that select together agree.
+
+Integrations can select ahead of time with :meth:`MoELayer.warmup`, once per
+token count they will capture, before capturing; it can draw routing from a
+recorded per-expert load (``expert_load``) or time the pack's own values, such
+as logits recorded from served traffic (``use_pack_values=True``). Select before
+capture: a first call of a bucket inside a capture synthesizes nothing and
+selects on its own tensors, which works only when one backend is eligible.
+
 Frost low-latency backend
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 

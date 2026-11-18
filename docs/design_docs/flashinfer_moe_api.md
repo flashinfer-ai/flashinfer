@@ -198,6 +198,8 @@ output = moe_layer(tensors, **config)
 
 Holds workspace and backend selection cache. On first call, selects and caches the best valid backend for the observed tensor shapes and arch. Subsequent calls are zero-overhead dispatch.
 
+The first call of a token-count bucket times the candidates on a serving-like synthetic pack with that call's geometry, weights and routing bias (iid routing, fixed seed), not on the call's own tensors, which usually come from a framework's warm-up on static, often zero-filled CUDA-graph buffers: every token is identical, so every token picks the same top-k experts. `layer.warmup(tensors, ...)` selects ahead of time, before CUDA-graph capture, optionally on a recorded expert load or on the caller's own values.
+
 ```
 layer  = MoELayer(**config)
 output = layer(tensors)        # first call: selects backend
