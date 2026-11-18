@@ -1171,6 +1171,39 @@ static void gen_m(const Args& A, cudaStream_t st);
 // One launch per measured shape family: CLS is a compile-time constant so the
 // cluster fold, the owner mapping and the grid shape are all resolved at
 // compile time, and only the kernel actually used by a route is instantiated.
+//
+// Route encoding — every template argument is a named tuning axis, in the
+// order of the launch<> sites in Run() (kmain's own WN is fixed to 1 here):
+//   MSUB  8-row m sub-tiles; one CTA always covers all of M (1..4 = M 1..32)
+//   NSUB  16-row n sub-tiles handled by one warp (per-warp n tile = 16*NSUB)
+//   WK    warps splitting the CTA's k range (reduced through smem)
+//   PIPE  software-pipelined k loop (overlapped load/convert schedule)
+//   BPS   __launch_bounds__ resident-block budget per SM
+//   CLS   thread-block cluster height (grid.y); CLS > 1 folds K across the
+//         cluster's CTAs and reduces through DSMEM
+//   SCV   fused scaled-cvt dequant form (cvt.rn.scaled ue8m0 up-conversion)
+//         instead of the two-step convert-and-scale form
+//   CLSC  compile-time __cluster_dims__ height (0 = runtime attribute)
+//   MZ    grid.z replication
+//   HALF  16-byte instead of 32-byte per-lane k chunk
+//   GPW   k-unit groups issued per warp step (0/1/2 schedule variants)
+//   Q32   maps a lane's two 16-byte scale chunks onto one aligned 32-byte
+//         block, and tests the small-scale (precise-dot) class per word
+//   AFFB / AFFA  precomputed per-row operand offset bases for B / A
+//   FS    cluster mbarrier startup handshake for the DSMEM epilogue
+//   DACC  second accumulator bank per (n, m) pair
+//   CM/CN/CK  the exact (M, N, K) the route was measured for, folded into
+//         the instantiation (0 = family catch-all with runtime dims)
+//   CGPC  compile-time k-groups-per-rank (0 = take the runtime value)
+//   L2P / L1B  operand load form (L2-prefetch / plain ldg128 / default)
+//   MBH   mbarrier wait form used for the cluster handshake
+// Re-deriving a route (for example after a CUDA toolkit bump): each entry is
+// the winner of a paired A/B sweep over these axes for its (M, N, K) under
+// CUDA-graph timing against the stock mm_mxfp8 backends; re-run such a sweep
+// for the shape, update the launch<> entry, and re-validate with
+// tests/gemm/test_mm_mxfp8_smallm_sm107.py (which runs every allowlisted
+// shape numerically). Routes must beat BOTH measured stock arms with margin
+// before their shape enters the dispatch allowlist JSON.
 template <int MSUB, int NSUB, int WK, bool PIPE, int BPS, int CLS, bool SCV = SCVD, int CLSC = CLS,
           int MZ = 1, bool HALF = false, int GPW = 0, bool Q32 = false, bool AFFB = false,
           bool AFFA = false, bool FS = false, bool DACC = false, int CM = 0, int CN = 0, int CK = 0,
@@ -1340,6 +1373,16 @@ void Run(TensorView aq, TensorView bq, TensorView a_sf, TensorView b_sf, TensorV
   // Every entry is the winner of a paired A/B against the alternatives for that
   // family: m tile, n tile (32 or 16 rows per warp), warp k-split, k unit size
   // (128 or 64 elements), cluster width, resident-block budget and dequant form.
+  //
+  // The table deliberately carries more routes than the Python dispatch gate
+  // admits. The gate's allowlist is exact membership over the shapes that beat
+  // both measured stock arms WITH MARGIN, so the exact-M routes of shapes that
+  // measured faster-but-not-with-margin (for example the N=8192/K=1280 family)
+  // and the measured M<=x family catch-alls are unreachable through mm_mxfp8
+  // today. They are kept because they are tuned, validated routes: widening
+  // the allowlist after a re-measure is then a JSON-only change (no kernel
+  // retuning, no new instantiations), and any out-of-gate caller of this FFI
+  // entry still gets a measured route instead of the generic fallback.
   if (K == 6144) {
     if (N == 768) {
       if (M == 24) {
