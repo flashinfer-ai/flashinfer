@@ -58,31 +58,13 @@
 #include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
 
 #include "attention_plan.h"
+#include "kernel_launch.cuh"
 #include "launch_validation.cuh"
 #include "prefill_result.h"
 
 namespace flashinfer::sparse_mla_sm120 {
 
 namespace {
-
-constexpr int kMaxCachedCudaDevices = 32;
-
-template <typename Kernel>
-PrefillLaunchResult configure_dynamic_smem_per_device(Kernel kernel, size_t smem_bytes,
-                                                      bool (&configured)[kMaxCachedCudaDevices]) {
-  if (smem_bytes <= 48 * 1024) return true;
-
-  int device = 0;
-  const cudaError_t device_error = cudaGetDevice(&device);
-  if (device_error != cudaSuccess) return {device_error, "cudaGetDevice"};
-  const bool cacheable_device = device >= 0 && device < kMaxCachedCudaDevices;
-  if (cacheable_device && configured[device]) return true;
-
-  const cudaError_t rc = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              static_cast<int>(smem_bytes));
-  if (rc == cudaSuccess && cacheable_device) configured[device] = true;
-  return {rc, "cudaFuncSetAttribute"};
-}
 
 template <int Heads, bool ExtraFp4, ModelType MT>
 PrefillLaunchResult launch_dsv41_bf16_prefill(const execution::AttentionParams& params,
@@ -92,7 +74,7 @@ PrefillLaunchResult launch_dsv41_bf16_prefill(const execution::AttentionParams& 
   constexpr size_t bytes = sizeof(Dsv41Bf16Smem);
   static bool configured[kMaxCachedCudaDevices] = {};
   const auto result = configure_dynamic_smem_per_device(kernel, bytes, configured);
-  if (result.error != cudaSuccess) return result;
+  if (result != cudaSuccess) return {result, "configure_dynamic_smem_per_device"};
   dim3 grid(params.num_tokens * ((params.num_heads + 15) / 16));
   cudaLaunchConfig_t config{grid, dim3(Dsv41Bf16Resources::BLOCK_THREADS), bytes, stream, nullptr,
                             0};
@@ -121,7 +103,8 @@ PrefillLaunchResult launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache,
     if (result != cudaSuccess) return {result, "validate_mixed_smem"};
   }
   const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
-  if (configured_result.error != cudaSuccess) return configured_result;
+  if (configured_result != cudaSuccess)
+    return {configured_result, "configure_dynamic_smem_per_device"};
 
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
@@ -147,7 +130,8 @@ PrefillLaunchResult launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache
   auto kernel = sparse_mla_prefill_swapab_kernel<MT, NUM_HEADS>;
   static bool configured[kMaxCachedCudaDevices] = {};
   const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
-  if (configured_result.error != cudaSuccess) return configured_result;
+  if (configured_result != cudaSuccess)
+    return {configured_result, "configure_dynamic_smem_per_device"};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
                   (void*)&output, (void*)&out_lse,  (void*)&cold};
@@ -173,7 +157,8 @@ PrefillLaunchResult launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache,
   auto kernel = sparse_mla_prefill_mg_kernel<MT, QkMode, NUM_HEADS, PAGE_BLOCK_SIZE, MG_N_HG_T>;
   static bool configured[kMaxCachedCudaDevices] = {};
   const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
-  if (configured_result.error != cudaSuccess) return configured_result;
+  if (configured_result != cudaSuccess)
+    return {configured_result, "configure_dynamic_smem_per_device"};
 
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,       (void*)&KV_cache,  (void*)&indices, (void*)&output,
@@ -200,7 +185,8 @@ PrefillLaunchResult launch_prefill_mg_dual_fulltile(
                                                            PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
   static bool configured[kMaxCachedCudaDevices] = {};
   const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
-  if (configured_result.error != cudaSuccess) return configured_result;
+  if (configured_result != cudaSuccess)
+    return {configured_result, "configure_dynamic_smem_per_device"};
 
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,
@@ -234,7 +220,8 @@ PrefillLaunchResult launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cach
                                                   PAGE_BLOCK_SIZE_EXTRA, MG_N_HG_T>;
   static bool configured[kMaxCachedCudaDevices] = {};
   const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
-  if (configured_result.error != cudaSuccess) return configured_result;
+  if (configured_result != cudaSuccess)
+    return {configured_result, "configure_dynamic_smem_per_device"};
 
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,

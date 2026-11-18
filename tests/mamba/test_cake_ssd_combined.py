@@ -2804,7 +2804,7 @@ def test_ssd_combined_fwd_caches_by_device_stream_and_config(monkeypatch, reques
         "seq_idx_dtype": torch.int32,
         "backend": "cake",
     }
-    forwarded = {**optional, "cu_seqlens": None}
+    forwarded = {**optional, "cu_seqlens": None, "final_states": None}
     assert runners[0].run_calls == [(positional, forwarded), (positional, forwarded)]
     assert runners[-1].run_calls[0][1]["dt_softplus"] is False
 
@@ -2890,6 +2890,7 @@ def test_source_public_api_signatures_are_stable():
         "return_final_states",
         "num_seqs",
         "cu_seqlens",
+        "final_states",
     )
     run_defaults = (
         empty,
@@ -2915,6 +2916,7 @@ def test_source_public_api_signatures_are_stable():
         True,
         None,
         None,
+        None,
     )
     expected_run = tuple(
         zip(
@@ -2929,7 +2931,12 @@ def test_source_public_api_signatures_are_stable():
         _signature_contract(cake_module.CakeSSDCombined.run, drop_self=True)
         == expected_run
     )
-    assert _signature_contract(module.ssd_combined_fwd) == expected_run
+    # The functional entry inserts the runner-config state dtype before the
+    # caller-owned final states.
+    expected_fwd = (
+        expected_run[:-1] + (("state_dtype", positional, None),) + expected_run[-1:]
+    )
+    assert _signature_contract(module.ssd_combined_fwd) == expected_fwd
 
     # The prepared (CUDA-graph-capturable) submission entry: keyword-only,
     # the shape-determining subset of ``run``'s arguments, identical on the
@@ -2954,6 +2961,7 @@ def test_source_public_api_signatures_are_stable():
         "num_seqs",
         "cu_seqlens",
         "out",
+        "final_states",
     )
     prepare_defaults = (
         empty,
@@ -2972,6 +2980,7 @@ def test_source_public_api_signatures_are_stable():
         None,
         None,
         True,
+        None,
         None,
         None,
         None,
@@ -3202,6 +3211,7 @@ def test_source_public_cake_dispatch_preserves_full_run_contract():
         "checkpoint_token_indices": object(),
         "checkpoint_state_slots": object(),
         "checkpoint_states": object(),
+        "final_states": object(),
     }
     out = torch.empty((1, 128, 2, 64), dtype=torch.bfloat16)
     kwargs = {
@@ -10141,3 +10151,156 @@ def test_source_every_selected_program_is_shipped_without_gpu(monkeypatch):
     # (10, 7) alone (test_source_sm107_many_one_chunk_items_take_the_claim_program,
     # test_source_sm107_short_item_calls_take_the_ibulk_program).
     assert seen == set(module._PROGRAMS) - module._SM107_ONLY_PROGRAMS
+
+
+@pytest.mark.parametrize(
+    "state_dtype", (torch.bfloat16, torch.float16, torch.float32), ids=str
+)
+@pytest.mark.parametrize("varlen", (False, True), ids=("batched", "varlen"))
+def test_cake_ssd_combined_caller_final_states_are_written_in_place(
+    state_dtype, varlen
+):
+    """A caller ``final_states`` is written in place and returned: bitwise
+    the final states of the same call without it, and a warm call with
+    caller ``out`` and ``final_states`` allocates nothing."""
+
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case(state_dtype=state_dtype, varlen=varlen)
+    runner = SSDCombined(**constructor, backend="cake")
+    out, final = runner.run(*tensors, **arguments)
+    out_buffer = torch.full_like(out, float("nan"))
+    final_buffer = torch.full_like(final, float("nan"))
+    out_run, final_run = runner.run(
+        *tensors, **arguments, out=out_buffer, final_states=final_buffer
+    )
+    assert out_run is out_buffer and final_run is final_buffer
+    assert runner._cake_runner._allocations_in_last_run == 0
+    assert torch.equal(out_run, out) and torch.equal(final_run, final)
+
+
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float32), ids=str)
+def test_cake_ssd_combined_without_final_states_allocates_no_state_storage(
+    state_dtype,
+):
+    """``return_final_states=False`` binds no ``num_seqs``-sized state
+    storage: 1024 one-token sequences (the capture batch of short prefills)
+    allocate far less than one state per sequence, while the same call
+    returning final states allocates them."""
+
+    _skip_unless_cake_arch()
+    lengths = (1,) * 1024
+    constructor, tensors, arguments = _case(
+        state_dtype=state_dtype, varlen=True, lengths=lengths, initial_states=False
+    )
+    arguments = _cu_seqlens_arguments(arguments, lengths)
+    state_bytes = (
+        len(lengths)
+        * constructor["nheads"]
+        * 64
+        * 128
+        * torch.empty((), dtype=state_dtype).element_size()
+    )
+    runner = SSDCombined(**constructor, backend="cake")
+    out = torch.empty_like(tensors[0])
+    runner.run(*tensors, **{**arguments, "out": out, "return_final_states": False})
+
+    def peak_growth(**overrides):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        result = runner.run(*tensors, **{**arguments, "out": out, **overrides})
+        torch.cuda.synchronize()
+        return result, torch.cuda.max_memory_allocated() - before
+
+    (_, final), growth = peak_growth(return_final_states=False)
+    assert final is None
+    assert runner._cake_runner._allocations_in_last_run == 0
+    assert growth < state_bytes // 8, (growth, state_bytes)
+    (_, final), growth = peak_growth(return_final_states=True)
+    assert final is not None and growth >= state_bytes, (growth, state_bytes)
+    _, growth = peak_growth(final_states=torch.empty_like(final))
+    assert runner._cake_runner._allocations_in_last_run == 0
+
+
+@pytest.mark.parametrize("state_dtype", (torch.float16, torch.float32), ids=str)
+def test_ssd_combined_fwd_state_dtype_without_state_tensors(state_dtype):
+    """``state_dtype`` selects the state programs without any state tensor:
+    the functional entry returns final states of that dtype, bitwise those
+    of a runner constructed with it."""
+
+    _skip_unless_cake_arch()
+    functional = importlib.import_module("flashinfer.mamba.ssd_combined")
+    lengths = (96, 160)
+    constructor, tensors, arguments = _case(
+        state_dtype=state_dtype, varlen=True, lengths=lengths, initial_states=False
+    )
+    arguments = _cu_seqlens_arguments(arguments, lengths)
+    out, final = functional.ssd_combined_fwd(
+        *tensors, **arguments, state_dtype=state_dtype
+    )
+    assert final.dtype == state_dtype
+    runner = SSDCombined(**constructor, backend="cake")
+    out_runner, final_runner = runner.run(*tensors, **arguments)
+    assert torch.equal(out, out_runner) and torch.equal(final, final_runner)
+
+
+def test_cake_ssd_combined_caller_final_states_validation():
+    """A caller ``final_states`` must be returned (``return_final_states``),
+    match the state shape, dtype and contiguity, and not overlap the
+    initial or checkpoint states."""
+
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case(varlen=False)
+    runner = SSDCombined(**constructor, backend="cake")
+    _, final = runner.run(*tensors, **arguments)
+    with pytest.raises(ValueError, match="return_final_states"):
+        runner.run(
+            *tensors,
+            **{**arguments, "return_final_states": False},
+            final_states=torch.empty_like(final),
+        )
+    for bad in (
+        torch.empty_like(final)[:1],
+        torch.empty_like(final, dtype=torch.float32),
+        torch.empty_like(final).transpose(2, 3).contiguous().transpose(2, 3),
+    ):
+        with pytest.raises(ValueError, match="final_states must be a contiguous"):
+            runner.run(*tensors, **arguments, final_states=bad)
+    with pytest.raises(ValueError, match="must not overlap initial_states"):
+        runner.run(*tensors, **arguments, final_states=arguments["initial_states"])
+
+
+def test_cake_ssd_combined_rejects_state_rows_beyond_32_bit_offsets():
+    """The kernels address states with 32-bit offsets: a call whose
+    ``num_seqs * nheads`` state rows exceed ``2**31 / (64 * 128)`` is
+    refused before any workspace is built."""
+
+    _skip_unless_cake_arch()
+    nheads = 128
+    lengths = (1,) * (2**31 // (64 * 128) // nheads + 1)
+    constructor, tensors, arguments = _case(
+        nheads=nheads, varlen=True, lengths=lengths, initial_states=False
+    )
+    arguments = _cu_seqlens_arguments(arguments, lengths)
+    runner = SSDCombined(**constructor, backend="cake")
+    with pytest.raises(ValueError, match="state rows the kernels address"):
+        runner.run(*tensors, **{**arguments, "return_final_states": False})
+
+
+def test_ssd_combined_fwd_state_dtype_validation_without_gpu():
+    """``state_dtype`` accepts the three state dtypes and every given state
+    tensor must have it; the CuTe backend refuses a caller ``final_states``."""
+
+    functional = importlib.import_module("flashinfer.mamba.ssd_combined")
+    x, dt, A, B, C = _cpu_public_run_inputs()
+    states = torch.empty((1, 2, 64, 128), dtype=torch.float16)
+    with pytest.raises(ValueError, match="state_dtype must be"):
+        functional.ssd_combined_fwd(x, dt, A, B, C, state_dtype=torch.int8)
+    for name in ("initial_states", "final_states", "checkpoint_states"):
+        with pytest.raises(ValueError, match=f"{name} dtype"):
+            functional.ssd_combined_fwd(
+                x, dt, A, B, C, state_dtype=torch.float32, **{name: states}
+            )
+    runner = _public_runner_without_constructor("cute", None)
+    with pytest.raises(ValueError, match="final_states require"):
+        runner.run(x, dt, A, B, C, final_states=states)

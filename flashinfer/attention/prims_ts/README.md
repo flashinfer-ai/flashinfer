@@ -70,8 +70,13 @@ metadata values back to the host. FMHA preserves initialized caller scratch
 by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
-capture. Zero caller-owned FMHA scratch before its first trusted standalone
-launch and re-zero it when workspace-layout inputs change; wrappers
+capture. Their default `validate=True` checks geometry and device support;
+FMHA also checks packed-Q offset values. For already-validated inputs,
+`validate=False` skips those repeated checks and offset readbacks while
+preserving alias resolution and the same internal policy cache. The caller
+owns hardware, geometry, dtype and metadata validity; a cold policy lookup
+may still query device properties. Zero caller-owned FMHA scratch before its
+first trusted standalone launch and re-zero it when workspace-layout inputs change; wrappers
 initialize control storage by default. Alternatively, FMHA plans for one
 device may share one buffer of at least the largest size returned for them:
 zero the whole buffer once, bind the same full tensor to every plan (not
@@ -203,6 +208,22 @@ Validation reads metadata values on the host. With `validate=False`, callers own
 shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime conditions.
 Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
 metadata only between completed launches/replays and remain within plan bounds.
+
+### Per-query KV prefixes for MLA decode
+
+MLA decode supports `plan(use_kv_bounds=True)` with per-run `kv_bounds`:
+contiguous CUDA int32 counts shaped `[B * SQ]` for fixed Q or `[total_q]` for
+packed Q. Counts are shared across a token's heads, replace dense/causal
+visibility, and must be nondecreasing within each request and no larger than
+that request's `seq_lens_kv`. Zero local lengths and prefixes return zero O
+and optional base-2 LSE `-inf`. Bounds are per-run metadata, not retained
+plan values. `plan(zero_empty_rows=False)` skips neutral-row initialization but
+retains prefix masking; empty-row results are then unspecified, not preserved.
+Callers must initialize those rows or exclude them from consumption/merging.
+The default is `True`; the flag is ignored without `use_kv_bounds` and does not
+change workspace sizing. One-shot MLA exposes the same flag.
+See the [MLA contract](kernels/mla_decode/README.md) for validation,
+empty-cache, and workspace details.
 
 ## QToken-KvBlock-Sparse-Attention interface
 

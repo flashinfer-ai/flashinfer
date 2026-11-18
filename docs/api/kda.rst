@@ -840,8 +840,8 @@ A fixed single sequence uses a BT32 front end and recurrent chain, with
 concurrent execution when the device has sufficient SMs; when its length is
 not divisible by 32, the final partial chunk continues on the fused kernel.
 Other inputs use a fused persistent BT64 kernel with a host-built work list.
-The work list is chosen per call from a cost model, independent of specific
-sequence lengths or SM counts: whole (sequence, head) chains packed by
+The work list is chosen per call from a cost model using the sequence lengths
+and available SM count: whole (sequence, head) chains packed by
 longest-processing-time, or equal-cost ranges that hand FP32 state between
 CTAs when that lowers the modelled makespan by at least 5%. TIRx is imported
 only when explicitly selecting this backend.
