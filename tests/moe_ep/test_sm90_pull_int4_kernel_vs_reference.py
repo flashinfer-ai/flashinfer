@@ -133,10 +133,6 @@ def test_int4_full_moe_reference_reuse_and_graph(monkeypatch, tile, hidden):
                 None, *transformed, buffer, num_tokens=n, gate_up_clamp=4.0, sync=True
             ).clone()
             assert torch.isfinite(actual).all()
-            rel_l2 = (
-                actual.float() - expected.float()
-            ).norm() / expected.float().norm()
-            print(f"INT4 {tile} H={hidden} T={n} rel_l2={float(rel_l2):.6f}")
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())

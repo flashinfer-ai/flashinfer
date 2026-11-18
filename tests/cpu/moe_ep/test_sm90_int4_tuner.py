@@ -19,7 +19,7 @@ _SHIM = "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim"
 _SHAPE = dict(hidden=3072, intermediate=1024, num_experts=256, world_size=2)
 
 
-@pytest.mark.parametrize("check", ["candidates", "cache", "auto_lifecycle"])
+@pytest.mark.parametrize("check", ["candidates", "cache", "clamp", "auto_lifecycle"])
 def test_int4_tuning_contract(check, tmp_path):
     # SM90 and SM100 kernel drops have mutually exclusive top-level modules.
     result = subprocess.run(
@@ -112,6 +112,40 @@ def _check_cache(monkeypatch, cache_path):
         assert cache.lookup_knobs(**{**key, **changed}) is None
 
 
+def _check_clamp(monkeypatch, cache_path):
+    frontend = importlib.import_module(_SHIM + ".hopper_int4")
+    allocate = mock.Mock()
+    monkeypatch.setattr(frontend, "_allocate_fp4_symm_buffer", allocate)
+    problem = dict(
+        num_total_experts=4,
+        num_max_tokens=16,
+        num_topk=2,
+        hidden=128,
+        intermediate=128,
+        rank=0,
+        world_size=1,
+        mma_tiler_mnk=(256, 64, 128),
+    )
+    for resolve in (
+        frontend._resolve_hopper_int4_mega_moe_config,
+        frontend.get_symm_buffer_for_hopper_int4_mega_moe,
+    ):
+        for kwargs, expected in (
+            ({}, 10.0),
+            ({"gate_up_clamp": None}, None),
+            ({"gate_up_clamp": 6.0}, 6.0),
+            ({"activation_clamp": 6.0}, 6.0),
+            ({"gate_up_clamp": None, "activation_clamp": 6.0}, 6.0),
+            ({"gate_up_clamp": 6.0, "activation_clamp": 6.0}, 6.0),
+        ):
+            allocate.reset_mock()
+            result = resolve(**problem, **kwargs)
+            config = allocate.call_args.args[0] if allocate.called else result
+            assert config.gate_up_clamp == expected
+        with pytest.raises(ValueError, match="disagree"):
+            resolve(**problem, gate_up_clamp=10.0, activation_clamp=6.0)
+
+
 def _check_auto_lifecycle(monkeypatch, cache_path):
     import torch
 
@@ -182,4 +216,7 @@ def test_int4_offline_tuner_dispatch(monkeypatch):
     )
     args = run.call_args.args[0]
     assert args.fp8_scale_mode == "mxfp4_hybrid"
+    assert args.gate_up_clamp == 10.0
     assert args.max_tokens == [128, 512]
+    assert tune.main([*argv, "--live-tokens", "64"]) == 2
+    run.assert_called_once()

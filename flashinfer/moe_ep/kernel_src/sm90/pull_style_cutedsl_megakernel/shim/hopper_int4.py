@@ -31,6 +31,7 @@ TransformedInt4Weights = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.T
 _INT4_TUNING_DTYPE_ID = (
     "sm90_w_int4_signed_k128_bf16_xor_reglut_pair_m16_presigned_a_fp8_hybrid_fused_v2"
 )
+_UNSET: Any = object()
 
 
 def _validate_complete_int4_tactic(knobs, *, source):
@@ -176,7 +177,7 @@ def _resolve_hopper_int4_mega_moe_config(
     rank: int,
     world_size: int,
     *,
-    gate_up_clamp: Optional[float] = 10.0,
+    gate_up_clamp: Optional[float] = _UNSET,
     activation_clamp: Optional[float] = None,
     knobs: Optional[Any] = None,
     **config_kwargs,
@@ -203,6 +204,8 @@ def _resolve_hopper_int4_mega_moe_config(
         raise ValueError(
             "pass either explicit INT4 geometry/execution axes or knobs=, not both"
         )
+    if gate_up_clamp is _UNSET:
+        gate_up_clamp = 10.0 if activation_clamp is None else None
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
@@ -246,7 +249,7 @@ def get_symm_buffer_for_hopper_int4_mega_moe(
     rank: int,
     world_size: int,
     *,
-    gate_up_clamp: Optional[float] = 10.0,
+    gate_up_clamp: Optional[float] = _UNSET,
     activation_clamp: Optional[float] = None,
     knobs: Optional[Any] = None,
     **config_kwargs,
@@ -256,6 +259,9 @@ def get_symm_buffer_for_hopper_int4_mega_moe(
     Stage inputs with ``stage_mega_moe_inputs`` (hybrid per-token FP8). All
     ranks allocate and launch in the same order. Collective tuning is exposed
     by ``autotune_hopper_int4_mega_moe``.
+
+    The gate/up clamp defaults to 10.0; pass None to disable it, or use the
+    deprecated ``activation_clamp`` alias.
     """
     config = _resolve_hopper_int4_mega_moe_config(
         num_total_experts,

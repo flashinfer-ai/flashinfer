@@ -94,7 +94,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("auto", "sm90", "sm100", "sm107"),
         default="auto",
         help="backend family; auto selects sm107 on Rubin, sm100 otherwise; "
-        "sm90_fp8_* / sm90_mxfp4 / sm90_bf16 dtypes select sm90",
+        "sm90_fp8_* / sm90_mxfp4 / sm90_int4 / sm90_bf16 dtypes select sm90",
     )
     parser.add_argument(
         "--implementation",
@@ -142,8 +142,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--gate-up-clamp",
         type=float,
         default=None,
-        help="numeric gate/up clamp (default: 10 for sm90_mxfp4; disabled "
-        "for existing dtypes)",
+        help="numeric gate/up clamp (default: 10 for sm90_mxfp4/sm90_int4; disabled "
+        "for other dtypes)",
     )
     parser.add_argument(
         "--activation",
@@ -210,8 +210,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "Use a decode-like count (e.g. 256) to tune for decode steps while "
         "keeping the engine's buffer bucket. The measured count is recorded as "
         "live_tokens in JSON; entries are keyed by capacity and live tokens, so "
-        "multiple workloads can share one cache file. For sm90_mxfp4, an explicit "
-        "value must equal every --max-tokens bucket.",
+        "multiple workloads can share one cache file. For sm90_mxfp4/sm90_int4, "
+        "an explicit value must equal every --max-tokens bucket.",
     )
     parser.add_argument(
         "--skew",
