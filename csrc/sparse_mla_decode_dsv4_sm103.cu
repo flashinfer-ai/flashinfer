@@ -729,7 +729,6 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
   constexpr bool kC4OverlapQReload =
       TILE == 32 && (CSZ == 4 || CSZ == 5 || (CSZ == 7 && BAL7)) && !GROUPED && !OWNER && !kUseG4;
   const int len = slen[t];
-  const int swa_end = swa_window_end(sql, cql, nreq, tbase + t);
   const int* myidx = sidx + (size_t)t * WIDTH;
 
   auto issue_tile = [&](int tl) {
@@ -820,6 +819,10 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
     }
     asm volatile("cp.async.commit_group;\n");
   }
+  // Only splits that stage SWA columns need the visibility bound, and the
+  // dependent seq_lens/cum_seq_lens_q loads start after the Q copies are in
+  // flight, keeping them off the launch critical path.
+  const int swa_end = (tile0 * TILE < 128) ? swa_window_end(sql, cql, nreq, tbase + t) : 128;
   {
     const int ncols = ntile * TILE;
     constexpr int FIRST_STAGED_COL = kC4DirectTile0 ? TILE : 0;
@@ -1873,7 +1876,6 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
   const int lane = tid & 31;
   const int gcol0 = sp * 64;
   const int len = slen[t];
-  const int swa_end = swa_window_end(sql, cql, nreq, t);
   const int* myidx = sidx + (size_t)t * WIDTH;
   {
     const uint8_t* src = qp + (size_t)t * (HEADS * DIM * 2);
@@ -1888,10 +1890,14 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
     }
     asm volatile("cp.async.commit_group;\n");
   }
+  // Only ranks that stage SWA columns need the visibility bound (after the Q
+  // copies are in flight, off the launch critical path).
+  const int swa_end = (gcol0 < 128) ? swa_window_end(sql, cql, nreq, t) : 128;
   if (tid < 64) {
     const int gcol = gcol0 + tid;
-    // inactive tail columns carry no offset-validity contract: mask BEFORE
-    // staging so they never reach a gather (softmax length mask unchanged)
+    // inactive tail columns and SWA columns outside the seq_lens-derived
+    // visibility window carry no offset-validity contract: mask BEFORE
+    // staging so they never reach a gather (softmax -1 mask drops them too)
     const int v = myidx[gcol];
     Idx[tid] = (gcol < len && (gcol >= 128 || gcol < swa_end) && v >= 0) ? v : -1;
   }
@@ -2284,7 +2290,6 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
   const int lane = tid & 31;
   const int gcol0 = sp * 64;
   const int len = slen[t];
-  const int swa_end = swa_window_end(sql, cql, nreq, t);
   const int* myidx = sidx + (size_t)t * WIDTH;
 
   {
@@ -2301,6 +2306,9 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
     }
     asm volatile("cp.async.commit_group;\n");
   }
+  // Only ranks that stage SWA columns need the visibility bound (after the Q
+  // copies are in flight, off the launch critical path).
+  const int swa_end = (gcol0 < 128) ? swa_window_end(sql, cql, nreq, t) : 128;
   if (tid < 64) {
     const int gcol = gcol0 + tid;
     // inactive tail columns carry no offset-validity contract: mask BEFORE
@@ -3039,7 +3047,6 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
   const int len = slen[t];
-  const int swa_end = swa_window_end(sql, cql, nreq, t);
   const int* myidx = sidx + (size_t)t * WIDTH;
 
   auto issue_tile = [&](int tl) {
@@ -3076,6 +3083,9 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
     }
     asm volatile("cp.async.commit_group;\n");
   }
+  // Only splits that stage SWA columns need the visibility bound (after the Q
+  // copies are in flight, off the launch critical path).
+  const int swa_end = (tile0 * TILE < 128) ? swa_window_end(sql, cql, nreq, t) : 128;
   {
     const int ncols = ntile * TILE;
     for (int i = tid; i < ncols; i += NTHREAD) {
