@@ -2450,10 +2450,11 @@ class AutoTuner:
                 self._runner_class_names_memo = (generation, names)
         if runner_class_name in names:
             return True
-        return (
-            _bundled_configs_hold_runner_class(runner_class_name)
-            and os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0") == "1"
-        )
+        # The environment check first: without it the bundled configs are
+        # never read, so their modules are not imported.
+        return os.environ.get(
+            "FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0"
+        ) == "1" and _bundled_configs_hold_runner_class(runner_class_name)
 
     def search_cache(
         self,

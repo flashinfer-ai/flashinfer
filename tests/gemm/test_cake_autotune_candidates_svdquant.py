@@ -36,6 +36,7 @@ from flashinfer.autotuner import (
     StaticDim,
     make_bucket_mapper,
 )
+from flashinfer import cake_nvfp4_svdquant_gemm_backend as cake_backend
 from flashinfer.cake_nvfp4_svdquant_gemm_backend import cake_jit
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
 from flashinfer.gemm import gemm_svdquant
@@ -73,10 +74,22 @@ _UNROUTED = [
 @pytest.fixture(autouse=True)
 def _fresh_tuner_cache(monkeypatch):
     monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    # clear_cache() keeps an autotune_v2 store that an earlier test attached;
+    # while attached it opens the Cake gate. Detach it for this test only.
+    monkeypatch.setattr(AutoTuner.get(), "_managed_cache", None)
     AutoTuner.get().clear_cache()
     AutoTuner.get().reset_statistics()
     yield
     AutoTuner.get().clear_cache()
+
+
+class _Choices(list):
+    """``(runners, selection)`` of each recorded call; ``lookups`` holds the
+    ``(tuning_config, inputs)`` of the same calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.lookups = []
 
 
 @pytest.fixture
@@ -84,12 +97,13 @@ def svdquant_choices(monkeypatch):
     """Record the runner list and selection of each ``nvfp4_svdquant_gemm`` call."""
     tuner = AutoTuner.get()
     choose_one = tuner.choose_one
-    calls = []
+    calls = _Choices()
 
     def recording_choose_one(custom_op, runners, tuning_config, inputs, **kwargs):
         selection = choose_one(custom_op, runners, tuning_config, inputs, **kwargs)
         if custom_op == _OP:
             calls.append((list(runners), selection))
+            calls.lookups.append((tuning_config, list(inputs)))
         return selection
 
     monkeypatch.setattr(tuner, "choose_one", recording_choose_one)
@@ -112,6 +126,23 @@ def _hold_cake_entry():
 
 def _holds_cake_winner(tuner):
     return any(key.runner_class_name == _CAKE_RUNNER for key in tuner.profiling_cache)
+
+
+def _exact_key_winner(runner, lookup):
+    """The tactic that the tuner holds for ``runner`` under the exact cache key
+    of a recorded call (its own bucket, no fallback to another bucket), or
+    ``None`` when that key holds no entry."""
+    tuning_config, inputs = lookup
+    tuner = AutoTuner.get()
+    key = AutoTuner._get_cache_key(
+        _OP,
+        runner,
+        tuner._get_input_sizes(inputs),
+        tuning_config,
+        runner.get_cache_key_extras(inputs),
+    )
+    entry = tuner._winner_cache().get(key)
+    return None if entry is None else entry[0]
 
 
 def _run(p, use_bias, backend="auto", **kwargs):
@@ -281,6 +312,8 @@ def test_cake_never_wins_a_bucket_holding_unrouted_m(svdquant_choices):
     runners, (runner, tactic) = svdquant_choices[-1]
     assert _runner_names(runners) == [_CUTLASS_RUNNER]
     assert runner is runners[0] and tactic != -1
+    # The M=128 key itself holds that CUTLASS tactic, not a fallback.
+    assert _exact_key_winner(runner, svdquant_choices.lookups[-1]) == tactic
     assert _sqnr_db(p["ref_bias"], replay.float()) > 40.0
 
 
@@ -329,11 +362,22 @@ def test_explicit_pdl_admits_only_matching_cake_program(svdquant_choices):
 
 
 @pytest.mark.parametrize("m,n,k,rank,use_bias", _ROUTED)
-def test_autotuned_auto_is_accurate(svdquant_choices, m, n, k, rank, use_bias):
+def test_autotuned_auto_is_accurate(
+    monkeypatch, svdquant_choices, m, n, k, rank, use_bias
+):
     _skip_unless_cake_backend()
     torch.manual_seed(0)
     p = _make_gemm_problem(m, n, k, rank=rank)
     expected = _expected(p, use_bias)
+    # (runner class, profiled M) of every measurement, timed as usual.
+    profiled = []
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def recording(self, runner, inputs, *args, **kwargs):
+        profiled.append((type(runner).__name__, int(inputs[0].shape[0])))
+        return profile_single_kernel(self, runner, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", recording)
 
     with autotune(True):
         tuned = _run(p, use_bias)
@@ -349,6 +393,10 @@ def test_autotuned_auto_is_accurate(svdquant_choices, m, n, k, rank, use_bias):
         assert not listed
     offered = cake_runner.get_valid_tactics(inputs, _profile(m))
     assert offered == ([0] if listed else [])
+    # Tuning measured Cake at the bucket of M exactly when its key lists Cake;
+    # either runner may win.
+    assert ((_CAKE_RUNNER, m) in profiled) == listed
+    assert (_CUTLASS_RUNNER, m) in profiled
     failed = AutoTuner.get().stats.failed_tactics
     assert f"{_OP}::{_CAKE_RUNNER}" not in failed
 
@@ -526,6 +574,8 @@ def test_cake_absent_from_a_key_holding_an_m_with_other_pdl(svdquant_choices):
         assert _runner_names(runners) == [_CUTLASS_RUNNER]
         # The tuned CUTLASS tactic of the key, not the untuned default.
         assert runner is runners[0] and tactic != -1, m
+        # Held under this M's own key (4096), not served from another bucket.
+        assert _exact_key_winner(runner, svdquant_choices.lookups[-1]) == tactic, m
         assert _sqnr_db(p["ref_bias"], out.float()) > 40.0
 
 
@@ -542,12 +592,32 @@ def test_cake_runner_class_name_matches_the_gate():
 
 
 def test_untuned_call_does_no_cake_work(monkeypatch, svdquant_choices):
-    # Without tuning and without a Cake entry the call runs no Cake check and
-    # builds no Cake runner; a held Cake entry makes it reach the Cake checks.
+    # Without tuning and without a Cake entry the call runs no Cake route or
+    # bucket check and builds no Cake runner; a held Cake entry makes it reach
+    # the Cake checks. backend_requirement still runs the "cake" support
+    # checker on every automatic call, as before Cake joined the candidates:
+    # one route lookup for M through the package's select_record.
     _skip_unless_cake_backend()
     torch.manual_seed(0)
     m, n, k, rank, use_bias = _ROUTED[0]
     p = _make_gemm_problem(m, n, k, rank=rank)
+    support_probes, route_lookups = [], []
+
+    def spy(calls, select_record):
+        def recording(*args, **kwargs):
+            calls.append(kwargs.get("m"))
+            return select_record(*args, **kwargs)
+
+        return recording
+
+    # is_supported (the support checker) reads the package binding; the
+    # candidate's route and bucket checks read cake_jit.select_record.
+    monkeypatch.setattr(
+        cake_backend, "select_record", spy(support_probes, cake_backend.select_record)
+    )
+    monkeypatch.setattr(
+        cake_jit, "select_record", spy(route_lookups, cake_jit.select_record)
+    )
     for name in (
         "_cake_nvfp4_svdquant_gemm_runner",
         "_cake_nvfp4_svdquant_problem",
@@ -561,6 +631,8 @@ def test_untuned_call_does_no_cake_work(monkeypatch, svdquant_choices):
 
     out = _run(p, use_bias)
 
+    assert support_probes == [m]
+    assert route_lookups == []
     assert mm_nvfp4_svdquant.suitable_auto_backends == ["cutlass"]
     ((runners, (runner, tactic)),) = svdquant_choices
     assert _runner_names(runners) == [_CUTLASS_RUNNER]
@@ -587,7 +659,11 @@ def test_cake_winner_served_after_tuning_and_from_cache_file(
         if problem is not None and _key_admits(m, problem, None):
             break
     else:
-        pytest.skip("no routed problem has a Cake route at every M of its key")
+        pytest.fail(
+            "no _ROUTED problem has a Cake route at every M of its tuning cache "
+            "key on this GPU; Cake NVFP4 SVDQuant is supported here, so a "
+            "declared routed problem must be admitted"
+        )
     expected = _expected(p, use_bias)
 
     calls = []

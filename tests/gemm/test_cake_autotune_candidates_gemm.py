@@ -34,6 +34,9 @@ from flashinfer import SfLayout, autotune, bmm_bf16, mm_bf16, mm_fp4, nvfp4_quan
 from flashinfer.autotune_cache import autotune_v2
 from flashinfer.autotuner import AutoTuner, ProfilingCacheKey
 from flashinfer.cute_dsl.availability import is_cute_dsl_available
+from flashinfer.experimental.cake_nvfp4_per_token import (
+    auto_candidate as cake_candidate,
+)
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket_uncapped
 from flashinfer.gemm import gemm_base
@@ -367,7 +370,7 @@ def test_mm_fp4_cake_runner_forced(monkeypatch, fresh_tuner, m, out_dtype):
     forced = _mm_fp4(operands, out_dtype)
     assert calls[-1].runner == CAKE_FP4_RUNNER
 
-    runner = gemm_base._cake_gemm_fp4_runner(False, True)  # pyright: ignore[reportPrivateUsage]
+    runner = cake_candidate.cake_gemm_fp4_runner(False, True)
     direct = torch.empty_like(explicit)
     inputs = _fp4_runner_inputs(operands, direct)
     assert runner.get_valid_tactics(inputs, None) == [-1]
@@ -385,7 +388,7 @@ def test_mm_fp4_cake_runner_rejects_unsupported_inputs():
     operands, _ = _fp4_case(16)
     out = torch.empty((16, FP4_N), device="cuda", dtype=torch.bfloat16)
     inputs = _fp4_runner_inputs(operands, out)
-    runner = gemm_base._cake_gemm_fp4_runner  # pyright: ignore[reportPrivateUsage]
+    runner = cake_candidate.cake_gemm_fp4_runner
     assert runner(False, True).get_valid_tactics(inputs, None) == [-1]
     assert runner(True, True).get_valid_tactics(inputs, None) == []  # 8x4 scales
     assert runner(False, False).get_valid_tactics(inputs, None) == []  # no PDL
@@ -414,10 +417,10 @@ def test_mm_fp4_cake_runner_needs_n_32(monkeypatch, fresh_tuner, n):
     operands, _ = _fp4_case(m, n=n)
     out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
     inputs = _fp4_runner_inputs(operands, out)
-    runner = gemm_base._cake_gemm_fp4_runner(False, True)  # pyright: ignore[reportPrivateUsage]
+    runner = cake_candidate.cake_gemm_fp4_runner(False, True)
     expected = [-1] if n >= 32 else []
     assert runner.get_valid_tactics(inputs, None) == expected
-    assert gemm_base._cake_fp4_gemm_serves(inputs, False, True) == (n >= 32)  # pyright: ignore[reportPrivateUsage]
+    assert cake_candidate.cake_fp4_gemm_serves(inputs, False, True) == (n >= 32)
     if n >= 32:
         return
     # The auto call never offers cake, so tuning cannot time it and raise.
@@ -749,7 +752,7 @@ def test_cake_candidates_absent_on_unsupported_arch(monkeypatch, fresh_tuner):
     if compute_capability[0] >= 10:  # nvfp4_quantize needs SM100+
         operands, _ = _fp4_case(16)
         fp4_out = torch.empty((16, FP4_N), device="cuda", dtype=torch.bfloat16)
-        fp4_runner = gemm_base._cake_gemm_fp4_runner(False, True)  # pyright: ignore[reportPrivateUsage]
+        fp4_runner = cake_candidate.cake_gemm_fp4_runner(False, True)
         inputs = _fp4_runner_inputs(operands, fp4_out)
         assert fp4_runner.get_valid_tactics(inputs, None) == []
 
@@ -824,13 +827,51 @@ def test_runner_class_gate_follows_tuner_sources(monkeypatch, fresh_tuner):
     assert gate(CAKE_BMM_RUNNER) and not gate(CAKE_FP4_RUNNER)
 
 
+def test_runner_class_gate_scans_bundled_configs_only_when_loading(
+    monkeypatch, fresh_tuner
+):
+    """Without ``FLASHINFER_AUTOTUNER_LOAD_FROM_FILE=1`` the gate never scans
+    (and so never imports) the bundled config modules. No GPU needed."""
+    from flashinfer.autotuner import autotuner as autotuner_module
+
+    scanned = []
+
+    def scan(name):
+        scanned.append(name)
+        return False
+
+    monkeypatch.setattr(autotuner_module, "_bundled_configs_hold_runner_class", scan)
+    gate = fresh_tuner.may_select_runner_class
+    monkeypatch.delenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", raising=False)
+    assert not gate(CAKE_BMM_RUNNER)
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    assert not gate(CAKE_BMM_RUNNER)
+    assert scanned == []
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "1")
+    assert not gate(CAKE_BMM_RUNNER)
+    assert scanned == [CAKE_BMM_RUNNER]
+
+
+def test_disable_env_closes_cake_candidates_before_the_gate(monkeypatch, fresh_tuner):
+    """``FLASHINFER_DISABLE_CAKE_AUTO_CANDIDATES=1`` leaves every automatic
+    Cake candidate out without consulting the tuner's gate. No GPU needed."""
+    from flashinfer.gemm import gemm_svdquant
+
+    _set_switches(monkeypatch, cake_enabled=False, experimental=False)
+    _raise_if_called(monkeypatch, fresh_tuner, "may_select_runner_class")
+    assert not gemm_base._cake_auto_candidate_open(CAKE_BMM_RUNNER)  # pyright: ignore[reportPrivateUsage]
+    assert not gemm_base._cake_auto_candidate_open(CAKE_FP4_RUNNER)  # pyright: ignore[reportPrivateUsage]
+    heuristic = gemm_svdquant._heuristic_func_nvfp4_svdquant  # pyright: ignore[reportPrivateUsage]
+    assert heuristic(["cutlass", "cake"]) == ["cutlass"]
+
+
 def test_cake_runner_class_names_match_the_gate():
     """The gate keys on the class names the runners are cached under."""
     assert type(gemm_base._cake_bf16_bmm_runner()).__name__ == CAKE_BMM_RUNNER  # pyright: ignore[reportPrivateUsage]
     assert gemm_base._CAKE_BF16_BMM_RUNNER == CAKE_BMM_RUNNER  # pyright: ignore[reportPrivateUsage]
     for layout in (False, True):
         for pdl in (False, True):
-            runner = gemm_base._cake_gemm_fp4_runner(layout, pdl)  # pyright: ignore[reportPrivateUsage]
+            runner = cake_candidate.cake_gemm_fp4_runner(layout, pdl)
             assert type(runner).__name__ == CAKE_FP4_RUNNER
     assert gemm_base._CAKE_FP4_GEMM_RUNNER == CAKE_FP4_RUNNER  # pyright: ignore[reportPrivateUsage]
 
@@ -969,7 +1010,7 @@ def test_is_contiguous_layout_matches_torch():
         torch.empty(0, 3).t(),
     ]
     for view in views:
-        layout = gemm_base._is_contiguous_layout(view.shape, view.stride())  # pyright: ignore[reportPrivateUsage]
+        layout = cake_candidate._is_contiguous_layout(view.shape, view.stride())  # pyright: ignore[reportPrivateUsage]
         assert layout == view.is_contiguous(), (view.shape, view.stride())
 
 
@@ -986,7 +1027,7 @@ def test_mm_fp4_untuned_call_does_no_cake_work(monkeypatch, fresh_tuner):
 
     _set_switches(monkeypatch, cake_enabled=True, experimental=True)
     _raise_if_called(
-        monkeypatch, gemm_base, "_cake_fp4_gemm_serves", "_cake_gemm_fp4_runner"
+        monkeypatch, cake_candidate, "cake_fp4_gemm_serves", "cake_gemm_fp4_runner"
     )
     out = _mm_fp4(operands, torch.bfloat16)
     assert mm_fp4.suitable_auto_backends == ["cute-dsl"]

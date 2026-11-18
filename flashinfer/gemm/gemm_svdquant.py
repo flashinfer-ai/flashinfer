@@ -919,8 +919,8 @@ def _heuristic_func_nvfp4_svdquant(
     if (
         backends
         and "cake" in suitable_backends
-        and AutoTuner.get().may_select_runner_class(_CAKE_SVDQUANT_RUNNER)
         and cake_auto_candidates_enabled()
+        and AutoTuner.get().may_select_runner_class(_CAKE_SVDQUANT_RUNNER)
     ):
         backends.append("cake")
     return backends
