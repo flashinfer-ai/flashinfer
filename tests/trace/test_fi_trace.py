@@ -356,20 +356,21 @@ def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
     from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
 
     templates = ssd_combined_trace_dispatch.templates
-    assert len(templates) == 48
-    assert len({id(template) for template in templates}) == 48
+    assert len(templates) == 84
+    assert len({id(template) for template in templates}) == 84
     # A final-state pool (varlen_slots / varlen_fslots) is written only when
-    # final states are returned. A slot schema names its state dtype; the
-    # dense names carry none.
+    # final states are returned. A slot schema names its state dtype and its
+    # seq_idx dtype; the dense names carry neither.
     assert {template.name_prefix for template in templates} == {
         f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}"
         for mode in (
             "batched",
             "varlen",
             *(
-                f"{slots}_{state}"
+                f"{slots}_{state}_sidx_{seq_idx}"
                 for slots in ("varlen_islots", "varlen_slots", "varlen_fslots")
                 for state in ("bf16", "f16", "f32")
+                for seq_idx in ("i32", "i64")
             ),
         )
         for d_layout in ("none", "vector", "matrix")
@@ -471,9 +472,15 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
         assert definition["outputs"]["seq_chunk_cumsum"]["optional"] is True
         assert definition["outputs"]["seq_chunk_cumsum"]["param"] == "seq_chunk_cumsum"
     assert ("final_states" in definition["outputs"]) == return_final_states
+    # The base revision's positional destination order; the API's
+    # (out, final_states) tuple binds by name.
+    assert list(definition["outputs"]) == [
+        "out",
+        "checkpoint_states",
+        *(["seq_chunk_cumsum"] if mode == "varlen" else []),
+        *(["final_states"] if return_final_states else []),
+    ]
     if return_final_states:
-        # The API returns (out, final_states): the tuple binds by position.
-        assert list(definition["outputs"])[:2] == ["out", "final_states"]
         assert definition["outputs"]["final_states"]["dtype"] == expected_state_dtype
         assert definition["outputs"]["final_states"]["param"] == "final_states"
     json.dumps(definition, allow_nan=False)
@@ -558,7 +565,7 @@ def test_ssd_combined_fi_trace_state_slot_pools(
     mode = modes[initial_pool, final_pool]
     final_suffix = "final" if return_final_states else "no_final"
     assert definition["name"].startswith(
-        f"ssd_combined_{mode}_f16_d_{d_layout}_{final_suffix}_"
+        f"ssd_combined_{mode}_f16_sidx_i64_d_{d_layout}_{final_suffix}_"
     )
     axes = definition["axes"]
     assert axes["cu_seqlens_size"]["type"] == "var"
@@ -597,9 +604,17 @@ def test_ssd_combined_fi_trace_state_slot_pools(
     for name in ("cu_seqlens", "seq_idx", "chunk_indices", "chunk_offsets"):
         assert inputs[name]["optional"] is True, name
     assert ("final_states" in definition["outputs"]) == return_final_states
+    # The dense positional destination order; the API's (out, final_states)
+    # tuple binds by name.
+    assert list(definition["outputs"]) == [
+        "out",
+        "checkpoint_states",
+        "seq_chunk_cumsum",
+        *(["final_states"] if return_final_states else []),
+    ]
+    # The cu_seqlens form runs the int64 seq_idx runner.
+    assert inputs["seq_idx"]["dtype"] == "int64"
     if return_final_states:
-        # The API returns (out, final_states): the tuple binds by position.
-        assert list(definition["outputs"])[:2] == ["out", "final_states"]
         final = definition["outputs"]["final_states"]
         assert final["shape"] == [final_axis, *pool_axes]
         assert final["dtype"] == "float16"
@@ -636,7 +651,9 @@ def test_ssd_combined_fi_trace_state_slots_unaligned_seqlen():
         final_states=pool,
         final_state_slots=torch.tensor([2], dtype=torch.int32),
     )
-    assert definition["name"].startswith("ssd_combined_varlen_slots_bf16_d_none_final_")
+    assert definition["name"].startswith(
+        "ssd_combined_varlen_slots_bf16_sidx_i64_d_none_final_"
+    )
     assert definition["axes"]["seqlen"]["type"] == "var"
     assert definition["axes"]["chunk_size"]["value"] == 128
     assert "seqlen % chunk_size == 0" not in definition["constraints"]

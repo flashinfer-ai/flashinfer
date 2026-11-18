@@ -246,8 +246,9 @@ def _state_slot_arm(
     pool (row 0 a null block, each row followed by 4096 padding elements)
     serves the initial, final and, with ``--checkpoint-pool``, checkpoint
     states in place; the slot vectors are column 0 of a ``[num_seqs,
-    --slots-step]`` table, ``--flags-frac`` of the sequences read their
-    initial row (none with ``--no-initial-states``), and each checkpoint
+    --slots-step]`` table, each sequence reads its initial row with
+    probability ``--flags-frac`` (none with ``--no-initial-states``; the
+    count is reported as ``initial_state_reads``), and each checkpoint
     lands on the first chunk end inside its sequence (else its end) in a
     second block column.  Returns the runner, the run arguments and the
     arm's report fields."""
@@ -273,16 +274,23 @@ def _state_slot_arm(
         final_states=pool,
         final_state_slots=slots,
     )
-    flags_kind = None
+    # Every timed call after the first reads the final rows the previous call
+    # stored into the same pool rows (the work does not depend on their
+    # values); all-zero flags start each sequence from zero state instead.
+    flags_kind, initial_state_reads = None, num_sequences
+    timed_initial_states = "carried_from_previous_call"
     if args.flags_frac is not None:
         flags_kind = "frac"
-        states["initial_state_flags"] = (
-            torch.rand(num_sequences, generator=generator) < args.flags_frac
-        ).cuda()
+        # One independent draw per sequence: report the actual count.
+        flags = torch.rand(num_sequences, generator=generator) < args.flags_frac
+        initial_state_reads = int(flags.sum())
+        timed_initial_states = "carried_for_flagged_sequences"
+        states["initial_state_flags"] = flags.cuda()
     elif args.no_initial_states:
         # Every call, the timed ones included, starts each sequence from zero
         # state, like the dense arm, and still stores its final row.
-        flags_kind = "all_zero"
+        flags_kind, initial_state_reads = "all_zero", 0
+        timed_initial_states = "zero_flags"
         states["initial_state_flags"] = torch.zeros(
             num_sequences, dtype=torch.bool, device="cuda"
         )
@@ -324,6 +332,8 @@ def _state_slot_arm(
         "slots_step": args.slots_step,
         "flags_frac": args.flags_frac,
         "initial_state_flags": flags_kind,
+        "initial_state_reads": initial_state_reads,
+        "timed_initial_states": timed_initial_states,
         "checkpoint_pool": args.checkpoint_pool,
         "slot_route": args.slot_route,
         "pool_row_stride": row + pad,
@@ -381,7 +391,9 @@ def main() -> None:
     parser.add_argument(
         "--flags-frac",
         type=float,
-        help="pass initial_state_flags with this fraction of sequences set",
+        help="pass initial_state_flags; each sequence independently reads its "
+        "initial-state row with this probability (the actual count is "
+        "reported as initial_state_reads)",
     )
     parser.add_argument(
         "--checkpoint-pool",
@@ -569,7 +581,9 @@ def main() -> None:
 
         slot_out, _ = invoke_slots()
         # The timed calls keep updating the pool in place: read the final rows
-        # of this first call now.
+        # of this first call now. shape.initial_states describes the dense arms
+        # and these first-call diagnostics; the slot timing reads the rows the
+        # previous call stored (timed_initial_states).
         final_rows = arguments["final_state_slots"].long()
         slot_final = arguments["final_states"][final_rows].clone()
         slot_fields["program"] = runner._cake_runner.last_program_name
