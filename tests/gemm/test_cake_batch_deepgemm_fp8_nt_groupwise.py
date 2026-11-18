@@ -1335,11 +1335,13 @@ def test_unlisted_sm_counts_of_sm100a_sm103a_still_raise(monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(module, "device_arch", patch_arch)
             patch.setattr(module, "device_sm_count", patch_sms)
+            patch.setattr(module, "_DEVICES", {})
             with pytest.raises(ValueError, match=f"this device has {sm_count}$"):
                 prepare_batch_deepgemm_fp8_nt_groupwise(a, a, scale, scale, masked_m, 0)
     with monkeypatch.context() as patch:
         patch.setattr(module, "device_arch", lambda _index: "sm_107a")
         patch.setattr(module, "device_sm_count", lambda _index: 212)
+        patch.setattr(module, "_DEVICES", {})
         with pytest.raises(ValueError, match="aligned M, N and K"):
             prepare_batch_deepgemm_fp8_nt_groupwise(a, a, scale, scale, masked_m, 0)
 
@@ -1459,7 +1461,9 @@ def test_localized_weights_homed_through_full_aliases():
     """Every alias of the whole tensor ``localize_weights`` returns runs the twin
     (an ``nn.Parameter`` over it, ``detach()``, ``.data``, a view of the same
     shape, and ``localize_weights`` of an ``nn.Parameter``); a view of part of it
-    runs the whole-GPU program."""
+    runs the whole-GPU program.  A tensor whose ``.data`` is replaced is homed
+    as its new data is, and ``localize_weights`` of a parameter subclass keeps
+    the subclass and its attributes."""
     device, table = _require_domain()
     cell = ((4096, 7168), 64, 1)
     _require_routed(cell, device, table)
@@ -1503,6 +1507,36 @@ def test_localized_weights_homed_through_full_aliases():
         a[:half], part, a_packed[:half], b_packed[:half], masked_m[:half], expected_m
     )
     assert prepared.route == _SERVING_ROUTE
+
+    def route(weights):
+        return prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, weights, a_packed, b_packed, masked_m, expected_m
+        ).route
+
+    # A homed tensor given another homed allocation's data is homed; given
+    # plain data it is not.
+    swapped = localize_weights(b)
+    swapped.data = localize_weights(b)
+    assert route(swapped) == DOMAIN_SERVING_ROUTE
+    swapped.data = b.clone()
+    assert route(swapped) == _SERVING_ROUTE
+    # A parameter subclass keeps its class and its attributes.
+
+    class LoadedParameter(torch.nn.Parameter):
+        pass
+
+    def loader(param, weight):
+        param.data.copy_(weight)
+
+    loaded = LoadedParameter(b, requires_grad=False)
+    loaded.weight_loader = loader
+    localized = localize_weights(loaded)
+    assert type(localized) is LoadedParameter
+    assert localized.weight_loader is loader
+    assert not localized.requires_grad
+    assert localized is not loaded
+    assert route(localized) == DOMAIN_SERVING_ROUTE
+    assert torch.equal(localized.view(torch.uint8), b.view(torch.uint8))
 
 
 @_packed_serving
@@ -2027,10 +2061,99 @@ def test_domain_homing_needs_the_whole_allocation(monkeypatch):
     swapped = b.detach()
     swapped.data = torch.empty((4, 8, 16), dtype=torch.uint8)
     assert homing(swapped) is None
+    # The record is read from the storage the tensor uses now.  A homed tensor
+    # given another homed allocation's data is homed as that allocation:
+    other = torch.empty((4, 8, 16), dtype=torch.uint8)
+    other_record = cake_locality.Homing(
+        device_index=0,
+        base=int(other.data_ptr()),
+        nbytes=other.numel(),
+        size=other.numel(),
+        cut=3 * 8 * 16,
+    )
+    cake_locality._mark_homed(other, other_record)
+    rehomed = b.detach()
+    # A record on the tensor object itself is not read.
+    setattr(rehomed, cake_locality._HOMING_ATTR, record)
+    rehomed.data = other
+    assert cake_locality.tensor_homing(rehomed) is other_record
+    assert homing(rehomed) == (3, table)
+    # and a homed tensor given plain data is unhomed, even when that data sits
+    # at the base address of an allocation the tensor used before (a reused
+    # virtual address): ``stale`` carries a record whose base is ``plain``'s.
+    plain = torch.empty((4, 8, 16), dtype=torch.uint8)
+    stale = torch.empty((4, 8, 16), dtype=torch.uint8)
+    stale_record = cake_locality.Homing(
+        device_index=0,
+        base=int(plain.data_ptr()),
+        nbytes=plain.numel(),
+        size=plain.numel(),
+        cut=2 * 8 * 16,
+    )
+    cake_locality._mark_homed(stale, stale_record)
+    setattr(stale, cake_locality._HOMING_ATTR, stale_record)
+    stale.data = plain
+    assert int(stale.data_ptr()) == int(plain.data_ptr())
+    assert cake_locality.tensor_homing(stale) is None
+    assert homing(stale) is None
     # A shape localize_weights refuses plans unhomed, however b was homed.
     monkeypatch.setattr(module, "domain_serving_routed", lambda *args: False)
     monkeypatch.setattr(module, "_PLANS", {})
     assert homing(b) is None
+
+
+@_host_only
+def test_serving_launch_template_per_device(monkeypatch):
+    """Twin launches alternating between two devices keep one argument template
+    per device (none is rebuilt per call), and each binds its own device's SM
+    table."""
+    import types
+
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    names = (
+        [["grid", axis] for axis in ("grid_x", "grid_y", "grid_z")]
+        + [["tma_buffer", name] for name in ("A", "B", "C_tma")]
+        + [["tma_buffer", name] for name in ("SFA_packed", "SFB_packed")]
+        + [["buffer", name] for name in ("masked_m", "counters0", "counters1")]
+        + [["parameter", name] for name in ("num_groups", "shape_m", "N", "K")]
+        + [["parameter", "g_cut"], ["param_array", "sm_table"]]
+    )
+    builds = []
+
+    def program_entry(arch, program):
+        builds.append((arch, program))
+        return "entry", names
+
+    monkeypatch.setattr(module, "_program_entry", program_entry)
+    monkeypatch.setattr(module, "_SERVING_LAUNCHES", {})
+    stage = types.SimpleNamespace(program="twin", grid=(212, 1, 1))
+    plan = types.SimpleNamespace(route=module.DOMAIN_SERVING_ROUTE)
+    tables = {index: types.SimpleNamespace(entries=object()) for index in (0, 1)}
+    problems = {
+        index: types.SimpleNamespace(
+            device=torch.device("cuda", index),
+            arch="sm_107a",
+            B=64,
+            M=512,
+            N=4096,
+            K=7168,
+            g_cut=32,
+            sm_table=tables[index],
+            plan=plan,
+        )
+        for index in (0, 1)
+    }
+    values = tuple(f"value{i}" for i in range(len(module._SERVING_VALUES)))
+    for _ in range(3):
+        for index in (0, 1):
+            entry, fixed, getter = module._serving_launch(problems[index], stage)
+            arguments = getter(values + fixed)
+            assert entry == "entry"
+            assert arguments[:3] == (212, 1, 1)
+            assert arguments[3:11] == values
+            assert arguments[11:] == (64, 512, 4096, 7168, 32, tables[index].entries)
+    assert len(builds) == 2
 
 
 @_host_only
@@ -2050,7 +2173,11 @@ def test_capture_id_without_cuda_python_is_unknown(monkeypatch):
 def test_public_call_resolves_once(monkeypatch):
     """The public API's call resolves its problem once (its admission check's
     resolution is reused by its run), and a repeated call reuses the route
-    decision: no route selection runs again."""
+    decision: no route selection runs again.  An admission is reused only by
+    the run of the public call that made it, for operands of the checked
+    fingerprint: a check outside a public call or one whose call failed leaves
+    nothing a direct run or a ``skip_check=True`` call takes, so an operand
+    changed since (``a.data`` strided or misaligned) is validated again."""
     import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
 
     _require_packed()
@@ -2098,71 +2225,103 @@ def test_public_call_resolves_once(monkeypatch):
             torch.cuda.synchronize()
             _assert_valid_rows_close(out, reference, masked_m)
     assert len(selections) == 1
-    # Another problem's operands do not take the problem a check left behind.
-    module._admit_public_call(
-        a,
-        b,
-        a_packed,
-        b_packed,
-        masked_m,
-        expected_m,
-        scale_granularity_mnk=(1, 128, 128),
-        out=None,
-        out_dtype=None,
-    )
-    assert (
-        module._take_admitted(
-            a, b.clone(), a_packed, b_packed, masked_m, expected_m, out=None
+
+    def check(*operands, out=None):
+        # The backend_requirement checker of backend="cake", as called by the
+        # public wrapper (and by any other caller of the admission check).
+        from flashinfer.gemm.gemm_base import (
+            _check_batch_deepgemm_fp8_nt_groupwise_cake,
         )
-        is None
-    )
-    assert module._CHECKED.entry is None
-    # The same objects changed in place since the check are resolved again:
-    # ``b`` moved to other storage, or ``a`` of another shape.
-    out = torch.empty(
-        (a.shape[0], a.shape[1], nk[0]), dtype=torch.bfloat16, device=device
-    )
-    moved_b = b.detach().clone()
-    for change in ("b", "a"):
-        checked_b = b.detach().clone()
-        checked_a = a.detach().clone()
-        module._admit_public_call(
-            checked_a,
-            checked_b,
+
+        return _check_batch_deepgemm_fp8_nt_groupwise_cake(
+            *operands, expected_m, out=out, backend="cake"
+        )
+
+    def direct(a_):
+        return module.run_batch_deepgemm_fp8_nt_groupwise(
+            a_, b, a_packed, b_packed, masked_m, expected_m, out=out
+        )
+
+    def public(a_):
+        return batch_deepgemm_fp8_nt_groupwise(
+            a_,
+            b,
             a_packed,
             b_packed,
             masked_m,
             expected_m,
-            scale_granularity_mnk=(1, 128, 128),
             out=out,
-            out_dtype=None,
+            backend="cake",
+            skip_check=True,
         )
-        if change == "b":
-            checked_b.data = moved_b
-        else:
-            checked_a.data = checked_a[:, : a.shape[1] // 2].contiguous()
-        assert (
-            module._take_admitted(
-                checked_a, checked_b, a_packed, b_packed, masked_m, expected_m, out=out
+
+    out = torch.empty(
+        (a.shape[0], a.shape[1], nk[0]), dtype=torch.bfloat16, device=device
+    )
+    # A check outside a public call leaves nothing (and drops what was left).
+    module._open_public_call()
+    check(a, b, a_packed, b_packed, masked_m)
+    assert module._PUBLIC.entry is not None
+    check(a, b, a_packed, b_packed, masked_m)
+    assert module._PUBLIC.entry is None
+    # A check whose call failed before its run leaves an admission that no
+    # later call takes: a direct run and a public call with skip_check=True
+    # resolve their problem, as a fresh call does.
+    for run in (direct, public):
+        module._open_public_call()
+        check(a, b, a_packed, b_packed, masked_m, out=out)
+        assert module._PUBLIC.entry is not None
+        resolves.clear()
+        run(a)
+        assert len(resolves) == 1, run.__name__
+        assert module._PUBLIC.entry is None or run is direct
+    # ... so an operand changed since that check (``a.data`` of the same shape,
+    # but strided or misaligned) is validated again and refused.
+    rows, k = a.shape[1], a.shape[2]
+    wide = torch.empty((a.shape[0], rows, 2 * k), dtype=a.dtype, device=device)
+    strided = wide[:, :, ::2]
+    flat = torch.empty(a.numel() + 16, dtype=torch.uint8, device=device)
+    misaligned = flat[1 : 1 + a.numel()].view(a.dtype).view(a.shape)
+    for changed, error in ((strided, "contiguous"), (misaligned, "aligned")):
+        assert changed.shape == a.shape
+        for run in (direct, public):
+            checked_a = a.detach().clone()
+            module._open_public_call()
+            check(checked_a, b, a_packed, b_packed, masked_m, out=out)
+            checked_a.data = changed
+            with pytest.raises(ValueError, match=error):
+                run(checked_a)
+    # The run of a public call reuses its admission only for operands of the
+    # checked fingerprint: here a stale one is handed over directly.
+    for changed in (strided, misaligned):
+        checked_a = a.detach().clone()
+        module._open_public_call()
+        check(checked_a, b, a_packed, b_packed, masked_m, out=out)
+        admitted = module._take_public_admission()
+        assert admitted is not None
+        checked_a.data = changed
+        with pytest.raises(ValueError):
+            module._run_public_call(
+                admitted,
+                checked_a,
+                b,
+                a_packed,
+                b_packed,
+                masked_m,
+                expected_m,
+                out=out,
             )
-            is None
-        ), change
-    # Unchanged operands still take the check's problem.
-    module._admit_public_call(
-        a,
-        b,
-        a_packed,
-        b_packed,
-        masked_m,
-        expected_m,
-        scale_granularity_mnk=(1, 128, 128),
-        out=out,
-        out_dtype=None,
+    # Unchanged operands take this call's admission without resolving again.
+    module._open_public_call()
+    check(a, b, a_packed, b_packed, masked_m, out=out)
+    admitted = module._take_public_admission()
+    resolves.clear()
+    module._run_public_call(
+        admitted, a, b, a_packed, b_packed, masked_m, expected_m, out=out
     )
-    assert (
-        module._take_admitted(a, b, a_packed, b_packed, masked_m, expected_m, out=out)
-        is not None
-    )
+    assert not resolves
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(out, reference, masked_m)
 
 
 @_packed_serving

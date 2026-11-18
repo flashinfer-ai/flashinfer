@@ -12837,6 +12837,15 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     )
 
 
+@functools.cache
+def _cake_batch_deepgemm_fp8() -> Any:
+    """The Cake batch DeepGEMM FP8 module, imported on first use (once, not per
+    call: the public call reaches it three times)."""
+    from . import cake_batch_deepgemm_fp8
+
+    return cake_batch_deepgemm_fp8
+
+
 @supported_compute_capability([100, 103, 107])
 def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     a: torch.Tensor,
@@ -12858,13 +12867,11 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
     operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
     UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
     output.  Every other problem raises through ``backend_requirement``.  The
-    resolved problem is reused by the run of the same call, so a call resolves
-    it once.
+    resolved problem is reused by the run of the same call when its operands
+    are unchanged, so a call resolves it once.
     """
     del backend
-    from .cake_batch_deepgemm_fp8 import _admit_public_call
-
-    return _admit_public_call(
+    return _cake_batch_deepgemm_fp8()._admit_public_call(
         a,
         b,
         a_scale,
@@ -12904,11 +12911,23 @@ def _check_batch_deepgemm_fp8_nt_groupwise_deepgemm(
     )
 
 
+def _open_batch_deepgemm_fp8_nt_groupwise_cake_call(*args, **kwargs) -> bool:
+    """Start of every :func:`batch_deepgemm_fp8_nt_groupwise` call (the
+    ``bypass`` hook of its ``backend_requirement``; never bypasses): with
+    ``backend="cake"`` it opens the call, so the problem the admission check of
+    this call resolves is reused by the run of this call only."""
+    backend = kwargs["backend"] if "backend" in kwargs else (args[9:10] or [None])[0]
+    if backend == "cake":
+        _cake_batch_deepgemm_fp8()._open_public_call()
+    return False
+
+
 @backend_requirement(
     {
         "deepgemm": _check_batch_deepgemm_fp8_nt_groupwise_deepgemm,
         "cake": _check_batch_deepgemm_fp8_nt_groupwise_cake,
     },
+    bypass=_open_batch_deepgemm_fp8_nt_groupwise_cake_call,
 )
 @flashinfer_api(trace=batch_deepgemm_fp8_nt_groupwise_trace)
 def batch_deepgemm_fp8_nt_groupwise(
@@ -13067,17 +13086,26 @@ def batch_deepgemm_fp8_nt_groupwise(
     - All input tensors must be on the same CUDA device
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
+    if backend == "cake":
+        cake = _cake_batch_deepgemm_fp8()
+        # Taken first: an admission is never left behind for another call.
+        admitted = cake._take_public_admission()
+        if out is None:
+            out = torch.empty(
+                a.shape[0],
+                a.shape[1],
+                b.shape[1],
+                dtype=out_dtype or torch.bfloat16,
+                device=a.device,
+            )
+        return cake._run_public_call(
+            admitted, a, b, a_scale, b_scale, masked_m, expected_m, out=out
+        )
+
     if out is None:
         out_dtype = out_dtype or torch.bfloat16
         out = torch.empty(
             a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
-        )
-
-    if backend == "cake":
-        from .cake_batch_deepgemm_fp8 import run_batch_deepgemm_fp8_nt_groupwise
-
-        return run_batch_deepgemm_fp8_nt_groupwise(
-            a, b, a_scale, b_scale, masked_m, expected_m, out=out
         )
 
     from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked

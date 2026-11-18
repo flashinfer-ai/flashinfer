@@ -526,19 +526,19 @@ def split_empty(
     return tensor
 
 
-# The attribute that holds the Homing record of a split_empty allocation: set on
-# the storage of the returned tensor (shared by every alias of it; PyTorch keeps
-# a storage's Python object, and so its attributes, alive as long as the storage)
-# and on the returned tensor itself (read first: no storage lookup).
+# The attribute that holds the Homing record of a split_empty allocation, set on
+# the storage of the returned tensor only: every alias of it shares that storage
+# (PyTorch keeps a storage's Python object, and so its attributes, alive as long
+# as the storage), and a tensor whose ``.data`` or storage is replaced later sees
+# the record of its new storage, not a stale one of its own.
 _HOMING_ATTR = "_flashinfer_cake_homing"
 # Whether this process ever marked an allocation: until then no tensor is homed.
 _MARKED: list[bool] = []
 
 
 def _mark_homed(tensor: Any, record: Homing) -> None:
-    """Attach ``record`` to ``tensor`` and to its storage."""
+    """Attach ``record`` to the storage of ``tensor``."""
     setattr(tensor.untyped_storage(), _HOMING_ATTR, record)
-    setattr(tensor, _HOMING_ATTR, record)
     if not _MARKED:
         _MARKED.append(True)
 
@@ -550,16 +550,15 @@ def tensor_homing(tensor: Any) -> Homing | None:
     an ``nn.Parameter`` over it, its ``detach()``, its ``.data`` and its views
     (a view of part of it starting at the base too: callers that need the whole
     allocation also compare the byte size with ``Homing.nbytes``). A copy has
-    its own storage and gives ``None``. Reads attributes, not the registry, so it
-    costs no call into the locality module."""
+    its own storage and gives ``None``. The record is read from the storage the
+    tensor uses now: after ``w.data = other`` (or ``set_``) ``w`` is homed
+    exactly when ``other``'s storage is, even when ``other`` reuses the address
+    of an allocation ``w`` used before. Reads an attribute, not the registry,
+    so it costs no call into the locality module."""
     if not _MARKED:
         return None
-    record = getattr(tensor, _HOMING_ATTR, None)
-    if record is None:
-        record = getattr(tensor.untyped_storage(), _HOMING_ATTR, None)
-        if record is None:
-            return None
-    if int(tensor.data_ptr()) != record.base:
+    record = getattr(tensor.untyped_storage(), _HOMING_ATTR, None)
+    if record is None or int(tensor.data_ptr()) != record.base:
         return None
     return record
 

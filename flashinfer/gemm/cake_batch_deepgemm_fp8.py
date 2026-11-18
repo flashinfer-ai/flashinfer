@@ -42,7 +42,6 @@ from __future__ import annotations
 import contextlib
 import operator
 import threading
-import weakref
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -305,6 +304,19 @@ def _device_index(device: torch.device) -> int:
     return torch.cuda.current_device() if device.index is None else int(device.index)
 
 
+# Device index -> (generated-program architecture or None, SM count): fixed for
+# the process, so a call does not query the device properties again.
+_DEVICES: dict[int, tuple[Optional[str], int]] = {}
+
+
+def _device_info(index: int) -> tuple[Optional[str], int]:
+    """``(device_arch(index), device_sm_count(index))``, queried once per device."""
+    info = _DEVICES.get(index)
+    if info is None:
+        info = _DEVICES.setdefault(index, (device_arch(index), device_sm_count(index)))
+    return info
+
+
 def _require_tensor(
     tensor: Any,
     name: str,
@@ -320,7 +332,7 @@ def _require_tensor(
         raise ValueError(f"{name} must be on {device}, got {tensor.device}")
     if tensor.dtype != dtype:
         raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
-    if tuple(tensor.shape) != shape:
+    if tensor.shape != shape:
         raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
     if strides is None:
         if not tensor.is_contiguous():
@@ -413,7 +425,9 @@ def _run_launches(device: torch.device, launches: Any) -> None:
     """Submit ``(FFI entry, arguments)`` launches on the current stream of
     ``device``, making it the current device only when it is not."""
     index = _device_index(device)
-    if torch.cuda.current_device() == index:
+    # CUDA is initialized (the operands live on the device): read the current
+    # device without torch.cuda.current_device()'s lazy-init wrapper.
+    if torch._C._cuda_getDevice() == index:
         with _ffi_stream(index):
             for entry, arguments in launches:
                 entry(*arguments)
@@ -435,10 +449,12 @@ _SERVING_VALUES = (
     "counters0",
     "counters1",
 )
-# (arch, program, grid, B, M, N, K, g_cut) -> (FFI entry, the fixed arguments,
-# a getter of the argument tuple from the per-call values followed by the fixed
-# ones, the SM table tensor bound): a serving launch's arguments without a dict
-# per call.  At most PLAN_LIMIT entries, as _PLANS.
+# (device index, arch, program, grid, B, M, N, K, g_cut) -> (FFI entry, the
+# fixed arguments, a getter of the argument tuple from the per-call values
+# followed by the fixed ones, the SM table tensor bound): a serving launch's
+# arguments without a dict per call.  The device is part of the key because the
+# twin binds its device's SM table: calls alternating between two devices keep
+# one template each.  At most PLAN_LIMIT entries, as _PLANS.
 _SERVING_LAUNCHES: dict[tuple[Any, ...], tuple[Any, tuple[Any, ...], Any, Any]] = {}
 
 
@@ -451,6 +467,7 @@ def _serving_launch(
     table = None if problem.sm_table is None else problem.sm_table.entries
     grid = _grid3(stage.grid)
     key = (
+        problem.device.index,
         problem.arch,
         stage.program,
         grid,
@@ -559,14 +576,13 @@ def _resolve(
         raise ValueError("a must be a CUDA torch.Tensor")
     device = a.device
     index = _device_index(device)
-    arch = device_arch(index)
+    arch, sm_count = _device_info(index)
     if arch is None:
         raise ValueError(
             "the Cake batch DeepGEMM FP8 backend requires an SM100a, SM103a or SM107a device "
             f"(compute capability {sorted(SUPPORTED_COMPUTE_CAPABILITIES)}); "
             f"got {torch.cuda.get_device_capability(index)}"
         )
-    sm_count = device_sm_count(index)
     # SM107a runs its packed-scale serving programs on every SM count (their grid
     # comes from the SM count); its float32-scale route chain is checked below.
     if arch != DOMAIN_ARCH and route_chain(arch, sm_count) is None:
@@ -574,13 +590,15 @@ def _resolve(
             f"the Cake batch DeepGEMM FP8 backend is exported for {arch} devices with "
             f"{sorted(_exported_sm_counts(arch))} SMs; this device has {sm_count}"
         )
-    if tuple(int(v) for v in scale_granularity_mnk) != (1, BLOCK, BLOCK):
+    if scale_granularity_mnk != (1, BLOCK, BLOCK) and tuple(
+        int(v) for v in scale_granularity_mnk
+    ) != (1, BLOCK, BLOCK):
         raise ValueError(
             f"the Cake batch DeepGEMM FP8 backend requires scale_granularity_mnk=(1, {BLOCK}, {BLOCK})"
         )
     if a.ndim != 3 or b.ndim != 3:
         raise ValueError("a must have shape (B, M, K) and b must have shape (B, N, K)")
-    B, M, K = (int(v) for v in a.shape)
+    B, M, K = a.shape
     N = int(b.shape[1])
     if min(B, M, N, K) <= 0 or M % BLOCK or N % BLOCK or K % BLOCK:
         raise ValueError(
@@ -743,14 +761,125 @@ def check_batch_deepgemm_fp8_nt_groupwise_cake(
     return True
 
 
-class _CheckedCall(threading.local):
-    """The problem the public API's admission check resolved last in this thread,
-    for the run of the same call (see :func:`_admit_public_call`)."""
+class _PublicCall(threading.local):
+    """The public API call running in this thread (see :func:`_open_public_call`):
+    ``entry`` is ``_OPEN`` until its admission check runs, then what that check
+    left for the run of the same call, else ``None``."""
 
-    entry: Optional[tuple[Any, ...]] = None
+    entry: Any = None
 
 
-_CHECKED = _CheckedCall()
+_PUBLIC = _PublicCall()
+# The entry of a public call whose admission check has not run yet.
+_OPEN = object()
+
+
+def _open_public_call() -> None:
+    """Start of a public API call with ``backend="cake"`` (called by the public
+    wrapper first, before its admission check): drops whatever an earlier call
+    left behind and lets this call's check leave its resolved problem for this
+    call's run."""
+    _PUBLIC.entry = _OPEN
+
+
+def _operand_addresses(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    out: Optional[torch.Tensor],
+) -> tuple[Any, ...]:
+    """The address of every operand (of ``out`` when given)."""
+    return (
+        a.data_ptr(),
+        b.data_ptr(),
+        a_scale.data_ptr(),
+        b_scale.data_ptr(),
+        masked_m.data_ptr(),
+        None if out is None else out.data_ptr(),
+    )
+
+
+def _operand_layout(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    out: Optional[torch.Tensor],
+) -> tuple[Any, ...]:
+    """Shape, strides and dtype of every operand (of ``out`` when given)."""
+    return (
+        a.shape,
+        a.stride(),
+        a.dtype,
+        b.shape,
+        b.stride(),
+        b.dtype,
+        a_scale.shape,
+        a_scale.stride(),
+        a_scale.dtype,
+        b_scale.shape,
+        b_scale.stride(),
+        b_scale.dtype,
+        masked_m.shape,
+        masked_m.stride(),
+        masked_m.dtype,
+        None if out is None else (out.shape, out.stride(), out.dtype),
+    )
+
+
+# (packed scales, out given, B, M, N, K) -> the operand layout (as
+# _operand_layout) _resolve admits for that problem with canonical strides.  At
+# most PLAN_LIMIT entries, as _PLANS.
+_LAYOUTS: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+
+
+def _admitted_layout(problem: _Problem, out_given: bool) -> tuple[Any, ...]:
+    """The layout of operands ``problem`` was resolved for: every operand
+    contiguous, the packed scales MN-major, as :func:`_resolve` requires.  (A
+    layout it also admits with other strides, such as a size-1 dimension of
+    any stride, differs from it and is resolved again.)"""
+    key = (problem.packed_scales, out_given, problem.B, problem.M, problem.N, problem.K)
+    layout = _LAYOUTS.get(key)
+    if layout is None:
+        _, _, B, M, N, K = key
+        if problem.packed_scales:
+            cols = K // PACKED_K_GRANULE
+            scales: tuple[Any, ...] = (
+                (B, M, cols),
+                (M * cols, 1, M),
+                torch.int32,
+                (B, N, cols),
+                (N * cols, 1, N),
+                torch.int32,
+            )
+        else:
+            kb, nb = K // BLOCK, N // BLOCK
+            scales = (
+                (B, M, kb),
+                (M * kb, kb, 1),
+                torch.float32,
+                (B, nb, kb),
+                (nb * kb, kb, 1),
+                torch.float32,
+            )
+        layout = (
+            (B, M, K),
+            (M * K, K, 1),
+            torch.float8_e4m3fn,
+            (B, N, K),
+            (N * K, K, 1),
+            torch.float8_e4m3fn,
+            *scales,
+            (B,),
+            (1,),
+            torch.int32,
+            ((B, M, N), (M * N, N, 1), torch.bfloat16) if out_given else None,
+        )
+        _remember_plan(key, layout, _LAYOUTS)
+    return layout
 
 
 def _admit_public_call(
@@ -765,12 +894,18 @@ def _admit_public_call(
     out: Optional[torch.Tensor],
     out_dtype: Optional[torch.dtype],
 ) -> bool:
-    """:func:`check_batch_deepgemm_fp8_nt_groupwise_cake` for the public API, whose
-    run of the same call follows in this thread: the resolved problem is left for
-    :func:`run_batch_deepgemm_fp8_nt_groupwise`, which takes it when it gets the
-    very same operands, so one public call resolves its problem once.  Only weak
-    references to the operands are kept."""
-    _CHECKED.entry = None
+    """:func:`check_batch_deepgemm_fp8_nt_groupwise_cake` for the public API.
+
+    Inside a public call (opened by :func:`_open_public_call`) the resolved
+    problem is left, once, for the run of the same call
+    (:func:`_run_public_call`) with the operands' fingerprint: their addresses
+    and the layout (shapes, strides, dtypes) the check admitted.  So the call
+    resolves its problem once.  Any other call of the check (outside a public
+    call, or a second one in the same call) leaves nothing and drops what was
+    left."""
+    state = _PUBLIC
+    opened = state.entry is _OPEN
+    state.entry = None
     problem = _resolve(
         a,
         b,
@@ -782,79 +917,78 @@ def _admit_public_call(
         out_dtype=out_dtype,
         scale_granularity_mnk=scale_granularity_mnk,
     )
-    _CHECKED.entry = (
-        weakref.ref(a),
-        weakref.ref(b),
-        weakref.ref(a_scale),
-        weakref.ref(b_scale),
-        weakref.ref(masked_m),
-        None if out is None else weakref.ref(out),
-        expected_m,
-        a.shape,
-        b.shape,
-        int(b.data_ptr()),
-        problem,
-    )
+    if opened:
+        state.entry = (
+            _operand_addresses(a, b, a_scale, b_scale, masked_m, out),
+            _admitted_layout(problem, out is not None),
+            expected_m,
+            problem,
+        )
     return True
 
 
-def _take_admitted(
+def _take_public_admission() -> Optional[tuple[Any, ...]]:
+    """What this public call's admission check left (taken once), or ``None``
+    (``skip_check=True``, or no check ran in this call); closes the call.  The
+    public API takes it before anything else of its run, so nothing is left
+    behind when the run then fails."""
+    state = _PUBLIC
+    entry = state.entry
+    state.entry = None
+    return None if entry is _OPEN else entry
+
+
+def _run_public_call(
+    admitted: Optional[tuple[Any, ...]],
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
+    *,
     out: torch.Tensor,
-) -> Optional[_Problem]:
-    """The problem :func:`_admit_public_call` resolved for exactly these operands
-    (``out``: the same tensor, or a valid output when the check had none), or
-    ``None``.  Takes it at most once.  The operands must be the same objects and
-    ``a`` and ``b`` still of the checked shapes, ``b`` still at the checked
-    address (its homing and route depend on it): an operand changed in place
-    since the check (``set_``, ``resize_``, ``.data =``) is resolved again."""
-    entry = _CHECKED.entry
-    if entry is None:
-        return None
-    _CHECKED.entry = None
-    (
-        ref_a,
-        ref_b,
-        ref_as,
-        ref_bs,
-        ref_m,
-        ref_out,
-        checked_m,
-        a_shape,
-        b_shape,
-        b_ptr,
-        problem,
-    ) = entry
-    if (
-        ref_a() is not a
-        or ref_b() is not b
-        or ref_as() is not a_scale
-        or ref_bs() is not b_scale
-        or ref_m() is not masked_m
-        or type(expected_m) is not int
-        or expected_m != checked_m
-        or a.shape != a_shape
-        or b.shape != b_shape
-        or int(b.data_ptr()) != b_ptr
-    ):
-        return None
-    if ref_out is None:
-        # The check saw no output: the public API allocated this one since.
-        _require_tensor(
-            out,
-            "out",
-            shape=(problem.B, problem.M, problem.N),
-            dtype=torch.bfloat16,
-            device=problem.device,
+) -> torch.Tensor:
+    """The run of a public API call: :func:`run_batch_deepgemm_fp8_nt_groupwise`
+    reusing the problem ``admitted`` (this call's admission) resolved when every
+    operand (``out`` too when the check had it) still has the checked address
+    and the shape, strides and dtype the check admitted, and ``expected_m`` is
+    the checked int (``out`` the check did not see is validated here);
+    otherwise the problem is resolved again, as a fresh call would."""
+    problem: Optional[_Problem] = None
+    if admitted is not None:
+        addresses, layout, checked_m, resolved = admitted
+        checked_out = out if addresses[-1] is not None else None
+        if (
+            type(expected_m) is int
+            and expected_m == checked_m
+            and addresses
+            == _operand_addresses(a, b, a_scale, b_scale, masked_m, checked_out)
+            and layout == _operand_layout(a, b, a_scale, b_scale, masked_m, checked_out)
+        ):
+            if checked_out is None:
+                # The check saw no output: the public API allocated this one since.
+                _require_tensor(
+                    out,
+                    "out",
+                    shape=(resolved.B, resolved.M, resolved.N),
+                    dtype=torch.bfloat16,
+                    device=resolved.device,
+                )
+            problem = resolved
+    if problem is None:
+        problem = _resolve(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            masked_m,
+            expected_m,
+            out=out,
+            out_dtype=None,
+            scale_granularity_mnk=(1, BLOCK, BLOCK),
         )
-    elif ref_out() is not out:
-        return None
-    return problem
+    return _run(problem, a, b, a_scale, b_scale, masked_m, out)
 
 
 def is_batch_deepgemm_fp8_nt_groupwise_cake_available(device: torch.device) -> bool:
@@ -1353,11 +1487,14 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     Call it outside CUDA graph capture (under capture it returns ``b``).  The
     memory is freed with the returned tensor; a CUDA graph that reads the tensor
     after it is freed faults on replay, so keep it alive as long as such a graph.
-    For an ``nn.Parameter`` ``b`` the homed copy is returned as an
-    ``nn.Parameter`` (same ``requires_grad``).  Every alias of the whole returned
-    tensor is homed as well (an ``nn.Parameter`` over it, ``detach()``,
-    ``.data``, a view of the same shape); a view of part of it is not: pass the
-    whole tensor.
+    For an ``nn.Parameter`` ``b`` (or a subclass of it) the homed copy is
+    returned as a parameter of the same class with the same ``requires_grad``
+    and a shallow copy of ``b.__dict__`` (the instance attributes a framework
+    may have attached, such as a weight loader); the subclass's constructor is
+    not called.  Every alias of the whole returned tensor is homed as well (an
+    ``nn.Parameter`` over it, ``detach()``, ``.data``, a view of the same
+    shape, and a tensor given it as ``.data``); a view of part of it is not:
+    pass the whole tensor.
     """
     if not isinstance(b, torch.Tensor) or b.device.type != "cuda" or b.ndim != 3:
         raise ValueError("b must be a CUDA torch.Tensor of shape (B, N, K)")
@@ -1371,10 +1508,9 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     index = _device_index(b.device)
     if cake_locality._stream_capturing(index):
         return b
-    arch = device_arch(index)
+    arch, sm_count = _device_info(index)
     if arch != DOMAIN_ARCH:
         return b
-    sm_count = device_sm_count(index)
     # Before any probe, build or synchronization: some die class must route
     # every expected_m of this shape.
     if not any(
@@ -1401,7 +1537,12 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
     with contextlib.suppress(Exception):
         cake_locality.reserve_launch_counters(PAIR_COUNTER_WORDS, index)
     if isinstance(b, torch.nn.Parameter):
-        return torch.nn.Parameter(homed, requires_grad=b.requires_grad)
+        # The class of ``b`` (a subclass too) without calling its constructor,
+        # as nn.Parameter itself builds one, and a shallow copy of its instance
+        # attributes (e.g. a weight loader a framework attached to it).
+        parameter = torch.Tensor._make_subclass(type(b), homed, b.requires_grad)
+        parameter.__dict__.update(b.__dict__)
+        return parameter
     return homed
 
 
@@ -1439,25 +1580,36 @@ def run_batch_deepgemm_fp8_nt_groupwise(
     in flight.  A prepared launch (:func:`prepare_batch_deepgemm_fp8_nt_groupwise`)
     keeps its own pair.
 
-    Called by the public API after its admission check, the call reuses the
-    problem that check resolved (same operands, same thread) instead of
-    resolving it again; the route decision itself is remembered per problem
-    geometry, device and homing, so a call validates its tensors and makes no
-    other per-call decision.
+    Every call validates its tensors (the public API's call validates them once,
+    in its admission check, and its run reuses that check's problem only for
+    operands of the same fingerprint); the route decision itself is remembered
+    per problem geometry, device and homing, so a call makes no other per-call
+    decision.
     """
-    problem = _take_admitted(a, b, a_scale, b_scale, masked_m, expected_m, out)
-    if problem is None:
-        problem = _resolve(
-            a,
-            b,
-            a_scale,
-            b_scale,
-            masked_m,
-            expected_m,
-            out=out,
-            out_dtype=None,
-            scale_granularity_mnk=(1, BLOCK, BLOCK),
-        )
+    problem = _resolve(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out=out,
+        out_dtype=None,
+        scale_granularity_mnk=(1, BLOCK, BLOCK),
+    )
+    return _run(problem, a, b, a_scale, b_scale, masked_m, out)
+
+
+def _run(
+    problem: _Problem,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Submit the launches of the resolved ``problem`` into ``out``."""
     if problem.packed_scales:
         # One serving launch; the twin takes its stream's reused counter pair.
         counters: tuple[Any, Any] = (None, None)
