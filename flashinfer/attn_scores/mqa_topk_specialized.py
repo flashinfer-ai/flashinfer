@@ -43,9 +43,11 @@ Contract and restrictions (validated eagerly, never silently relaxed):
   page table, and K mutations after ``prepare_pool`` stay visible.
 - ``plan`` performs a host sync (prefixes are read on host) and is NOT
   capturable on this backend; ``run`` is capturable after an eager
-  warmup. Toolkit validation is inherited from the functional entry:
-  construction raises on CUDA toolkits outside
-  ``VALIDATED_CUDA_VERSIONS`` (and the kernel call would refuse anyway).
+  warmup. Environment validation mirrors the functional entry's dispatch
+  guards AT CONSTRUCTION: unvalidated CUDA toolkits (torch build or JIT
+  nvcc, outside ``VALIDATED_CUDA_VERSIONS``), the kill switch, and
+  non-SM103 devices all raise here, so ``backend="auto"`` demotes instead
+  of resolving to a plan whose every ``run`` would refuse.
 
 Output follows the wrapper contract: shared int32 ``[Q, top_k]`` storage
 of request-local COMPRESSED-KEY indices, ascending, ``-1`` padded. The
@@ -57,9 +59,13 @@ from __future__ import annotations
 
 import torch
 
+import os as _os
+
 from .prefill_indexer import (
+    KILL_SWITCH_ENV,
     PACKED_WIDTH,
     VALIDATED_CUDA_VERSIONS,
+    _toolkit_validation_reasons,
     fp8_paged_mqa_topk_indexer,
 )
 
@@ -95,13 +101,27 @@ class SpecializedTopKPlan:
         weights_dtype,
         model_config,
     ):
+        # Environment gates mirror the functional entry's dispatch guards,
+        # applied at construction so an unservable environment fails here --
+        # which lets backend="auto" demote to cutedsl instead of building a
+        # sticky plan whose every run() raises.
         _require(
-            bool(
-                torch.version.cuda
-                and torch.version.cuda.startswith(VALIDATED_CUDA_VERSIONS)
-            ),
+            not _toolkit_validation_reasons(),
             "backend='specialized' requires a validated CUDA toolkit "
-            f"(cuda={torch.version.cuda}, validated={VALIDATED_CUDA_VERSIONS})",
+            f"(cuda={torch.version.cuda}, validated={VALIDATED_CUDA_VERSIONS}; "
+            "the JIT nvcc is gated identically)",
+        )
+        _require(
+            _os.environ.get(KILL_SWITCH_ENV, "0") != "1",
+            f"backend='specialized' is disabled ({KILL_SWITCH_ENV}=1)",
+        )
+        _dev = torch.device(device)
+        _require(
+            _dev.type == "cuda"
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability(_dev) == (10, 3),
+            "backend='specialized' requires an SM103 CUDA device "
+            f"(device={device})",
         )
         _require(qkv_dtype == "fp8", "backend='specialized' supports qkv_dtype='fp8'")
         _require(num_heads == 4, "backend='specialized' supports num_heads=4")
@@ -311,5 +331,10 @@ class SpecializedTopKPlan:
                     t, _TOPK, dtype=torch.int32, device=self._device
                 )
             out = self._out[:t]
-        out.copy_(torch.where(sel != _SENTINEL, sel, torch.full_like(sel, -1)))
+        # out may carry more rows than the plan's t live rows (the wrapper
+        # contract allows a [Q, top_k] destination with Q >= t): write the
+        # live rows and pad the rest, instead of a shape-mismatched copy_.
+        live = torch.where(sel != _SENTINEL, sel, torch.full_like(sel, -1))
+        out[:t].copy_(live)
+        out[t:].fill_(-1)
         return out
