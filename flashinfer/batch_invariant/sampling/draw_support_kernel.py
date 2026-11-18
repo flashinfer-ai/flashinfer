@@ -21,6 +21,11 @@ Built on the two kernels' plumbing (``support_kernel``: the staged words, the ra
 finish, the integer reducer, the masked tree; ``draw_kernel``: the loader, the recording peers, the block totals and the
 crossing pass); its own cache module (``DRAW_SUPPORT_MODULE``), so an edit here never recompiles the other kernels (an edit
 to either of them recompiles this one too).
+
+The tail on the list (``draw_support_tail``): after the top-k threshold the kept candidates are compacted once WITH their
+positions, and when they fit the list (64 entries; the usual case) the kept-set sum, the top-p rank, the final mass and the
+crossing are computed on the list inside every CTA -- the same trees (the identity leaves are exact) and the same integer
+procedures, bit for bit, with no further sweep over the row; the dense passes above remain the fallback for larger kept sets.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ import functools
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64
+from cutlass import Boolean, Float32, Int32, Int64
 
 from .. import canon, jit
 from .cute_ext import CuteF32
@@ -43,13 +48,24 @@ from .draw_kernel import (
     _DrawPeers,
     _imax,
 )
+from .draw_support_tail import (
+    alloc_tail,
+    gather_lists,
+    list_tail,
+    reset_box,
+    tail_smem_bytes,
+)
 from .kernel import NAN, NEG_INF, _select, _tiled_copy
 from .schedule import BLOCK, LANES, SMEM_BUDGET, V, LSEConfig
 from .spec import lg2, logp, max_reduction, scale, shifted, sum_reduction
 from .stream_kernel import philox_block, request_key, u64_lo32, u64_shr, uniform32
 from .support_kernel import (
+    CAP,
     INF_BITS,
+    WPT,
     _alloc_hist,
+    _compact_sweep,
+    _list_filter,
     _cvt_rzi_s64_f32,
     _f32_bits,
     _IntReducer,
@@ -57,8 +73,10 @@ from .support_kernel import (
     _kind,
     _masked_sum,
     _Radix,
+    _list_totals,
     _radix_select,
-    _radix_select_kept,
+    _select_small,
+    _smem_base,
     _smem_layout,
     _weight_bits,
     chunking,
@@ -165,7 +183,7 @@ class DrawSupportKernel:
 
     def _smem_bytes(self) -> int:
         """The dynamic shared memory: the exchange buffers (the peers' floats, their two integers, the reducer's), the
-        staged tile, the histograms, the early finish's list."""
+        staged tile, the histograms, the candidate list (with the kept positions) and the list tail's scratch."""
         b = 0
         if self.W > 1:
             b += self.n_entries * self.W * LANES * 4 + 2 * self.W * LANES * 4
@@ -173,7 +191,21 @@ class DrawSupportKernel:
         if self.C > 1:
             b += self.n_entries_cta * LANES * 4 + 2 * LANES * 4 + LANES * 4
         _, tile, hist, mslot, mred, cand = _smem_layout(self)
-        return b + tile + hist + mslot + mred + cand + 256
+        if not (self.use_k or self.use_p):
+            cand += (
+                (CAP + 1) * 4 + 2 * 4 + 32
+            )  # a min-p-only set: the list tail's list and box
+        return (
+            b
+            + tile
+            + hist
+            + mslot
+            + mred
+            + cand
+            + (CAP + 1) * 4
+            + tail_smem_bytes()
+            + 256
+        )
 
     @cute.jit
     def __call__(
@@ -332,9 +364,20 @@ class DrawSupportKernel:
             rcbuf = smem.allocate_tensor(
                 Int32, cute.make_layout((LANES,)), byte_alignment=16
             )
-        hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp, lst = _alloc_hist(
+        hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp, lst, lpos = _alloc_hist(
             self, smem
         )
+        if cutlass.const_expr(cand is None):  # a min-p-only set
+            cand = smem.allocate_tensor(
+                Int32, cute.make_layout((CAP + 1,)), byte_alignment=16
+            )
+            cbox = smem.allocate_tensor(
+                Int32, cute.make_layout((2,)), byte_alignment=16
+            )
+        cpos = smem.allocate_tensor(
+            Int32, cute.make_layout((CAP + 1,)), byte_alignment=16
+        )  # the kept candidates' positions
+        tout = alloc_tail(smem)
 
         in_bits = self.vec * mX.element_type.width
         thr_x, atom_x = _tiled_copy(mX, in_bits, tv_layout, tiler_mn, t)
@@ -416,10 +459,11 @@ class DrawSupportKernel:
             gcnt,
             gmass,
             cand,
+            lst,
             cbox,
             sq,
             sp,
-            lst,
+            lpos,
         )
         # the row sum is read by a top-p selection over the whole row (the joint order, or no top-k) -- with the top_k_first
         # shortcut the top-p base is the top-k kept mass (the masked tree below) -- and by the drawn token's
@@ -440,33 +484,175 @@ class DrawSupportKernel:
             w0, _, _, _ = philox_block(draw, Int32(0), k0, k1)
             u = uniform32(w0)
 
-        token, valid, mass, lp, lpk = _exact_draw(
-            self,
-            mX,
-            mK,
-            mP,
-            mMinP,
-            rx,
-            loader,
-            leaf,
-            peers,
-            red,
-            tid,
-            t,
-            w,
-            c_rank,
-            row_c,
-            src_c,
-            src_ok,
-            N,
-            S,
-            wmax,
-            nm,
-            c,
-            u,
-            fp,
-            mIds=mIds,
-        )
+        # ===== the list-tail flow (docs 21.3): the top-k threshold over the row, the kept compaction WITH positions, and the
+        # tail -- the kept-set sum, the top-p rank, the final mass and the crossing -- on the list inside every CTA when the
+        # kept set fits it; the dense sweeps as the fallback. Same bits: the same integer procedures and the same trees.
+        kp_log = self.Kp.bit_length() - 1
+        thr_bits = Int32(0)
+        n_list = Int32(-1)  # the count tail's list count when the kept set is on it
+        kk = Int32(0)
+        n_all = Int32(
+            CAP + 1
+        )  # the tail's list count: the top-k kept set (filtered from the count tail's list)
+        if cutlass.const_expr(self.use_k):
+            kk = mK[row_c]
+            # k <= 0: nothing kept (INF_BITS, an empty list); k >= N: everything kept (threshold 0, the list beyond its
+            # capacity -- the dense path); otherwise the selection
+            thr_bits = _select(kk <= Int32(0), Int32(INF_BITS), Int32(0))
+            n_all = _select(kk <= Int32(0), Int32(0), Int32(CAP + 1))
+            if (kk > Int32(0)) & (kk < N):
+                thr_bits, n_list = _topk_threshold(self, rx, tid, t, kk, peers, red)
+                # the kept set leaves the count tail's list NOW: the list aliases the mass slots that a top-p selection
+                # over the row clears (the joint order; a shortcut whose kept set exceeds the list) -- the tail's floor
+                # applies any later threshold (the final kept set is a subset of this one)
+                if n_list >= Int32(0):
+                    n_all = _list_filter(
+                        rx.lst,
+                        rx.lpos,
+                        n_list,
+                        thr_bits,
+                        rx.cand,
+                        cpos,
+                        rx.cbox,
+                        tid,
+                        t,
+                        self.num_threads,
+                    )
+                else:
+                    if cutlass.const_expr(_kept_shortcut(self)):
+                        n_all = _kept_compact(
+                            self, rx, tid, t, w, c_rank, thr_bits, peers, cpos
+                        )
+        fits = Boolean(False)
+        if cutlass.const_expr(self.use_p):
+            base = Int32(0)
+            Sp = S
+            if cutlass.const_expr(_kept_shortcut(self)):
+                base = thr_bits
+                fits = n_all <= Int32(CAP)
+                if fits:
+                    Sp, _ta, _tb = list_tail(
+                        cand,
+                        cpos,
+                        n_all,
+                        base,
+                        Float32(0.0),
+                        Boolean(False),
+                        w,
+                        t,
+                        tout,
+                        kp_log,
+                    )
+                else:
+                    Sp = _masked_sum(self, leaf, peers, thr_bits)
+                loader.frags.clear()  # fragments first loaded inside the branch must not be reused after it
+            scale_fix = fp.div(Float32(FIX_SCALE), Sp)
+            pv = mP[row_c]
+            target = _cvt_rzi_s64_f32(fp.mul(pv, Float32(FIX_SCALE)))
+            sel_p = Int32(0)
+            tot_c = Int32(0)
+            tot_m = Int64(0)
+            min_pos = Int32(INT_MAX)
+            if cutlass.const_expr(_kept_shortcut(self)):
+                if fits:
+                    tot_m, min_pos = _list_totals(cand, n_all, t, scale_fix)
+                    tot_c = n_all
+                    sel_p = _select_small(
+                        cand, sq, sp, n_all, t, w, Int32(0), target, scale_fix, True
+                    )
+                else:
+                    sel_p, tot_c, tot_m, min_pos, _nl = _radix_select(
+                        self,
+                        rx,
+                        tid,
+                        t,
+                        True,
+                        Int32(0),
+                        target,
+                        scale_fix,
+                        base,
+                        peers,
+                        red,
+                    )
+            else:
+                sel_p, tot_c, tot_m, min_pos, _nl = _radix_select(
+                    self,
+                    rx,
+                    tid,
+                    t,
+                    True,
+                    Int32(0),
+                    target,
+                    scale_fix,
+                    base,
+                    peers,
+                    red,
+                )
+            use_radix = (tot_m >= target) & (tot_c > Int32(0)) & (pv < Float32(1.0))
+            fallback = _select(min_pos == Int32(INT_MAX), Int32(INF_BITS), min_pos)
+            thr_bits = _imax(thr_bits, _select(use_radix, sel_p, fallback))
+            thr_bits = _select(
+                scale_fix < Float32(float("inf")), thr_bits, Int32(INF_BITS)
+            )
+        if cutlass.const_expr(self.use_m):
+            thr_bits = _imax(thr_bits, _f32_bits(fp.mul(wmax, mMinP[row_c])))
+        if cutlass.const_expr(not _kept_shortcut(self)):
+            if cutlass.const_expr(self.use_k):
+                # the tail's list holds the top-k kept set (filtered above; the final threshold is at or above the top-k one
+                # and the tail's floor applies it); without a list the row is compacted at the final threshold
+                if (n_list < Int32(0)) & ((kk > Int32(0)) & (kk < N)):
+                    n_all = _kept_compact(
+                        self, rx, tid, t, w, c_rank, thr_bits, peers, cpos
+                    )
+            else:
+                n_all = _kept_compact(
+                    self, rx, tid, t, w, c_rank, thr_bits, peers, cpos
+                )
+            fits = n_all <= Int32(CAP)
+        mass = Float32(0.0)
+        first_tok = Int32(-1)
+        last_tok = Int32(-1)
+        if fits:
+            mass, first_tok, last_tok = list_tail(
+                cand,
+                cpos,
+                n_all,
+                thr_bits,
+                u,
+                Boolean(not self.score),
+                w,
+                t,
+                tout,
+                kp_log,
+            )
+        else:
+            mass, first_tok, last_tok = _dense_tail(
+                self, loader, leaf, peers, thr_bits, u, t, w, c_rank
+            )
+        loader.frags.clear()
+        if cutlass.const_expr(self.score):
+            token, valid, mass, lp, lpk = _score_token(
+                self, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp
+            )
+        else:
+            tok = _select(first_tok >= Int32(0), first_tok, last_tok)
+            s_ok = (mass > Float32(0.0)) & (mass < Float32(float("inf")))
+            valid = s_ok & (tok >= Int32(0))
+            if cutlass.const_expr(self.has_indices):
+                valid = valid & src_ok
+            token = _select(valid, tok, Int32(-1))
+            lp = Float32(NAN)
+            lpk = Float32(NAN)
+            if cutlass.const_expr(self.return_logprob or self.return_kept_logprob):
+                tok_c = _select(valid, token, Int32(0))
+                xt = mX[src_c, tok_c].to(Float32)
+                zt = shifted(fp, xt, nm, c)
+                if cutlass.const_expr(self.return_logprob):
+                    lp = _select(valid, logp(fp, zt, fp.neg(lg2(fp, S))), Float32(NAN))
+                if cutlass.const_expr(self.return_kept_logprob):
+                    lpk = _select(
+                        valid, logp(fp, zt, fp.neg(lg2(fp, mass))), Float32(NAN)
+                    )
         if t == 0:
             if w == 0:
                 if c_rank == 0:
@@ -484,6 +670,92 @@ class DrawSupportKernel:
         peers.finish()
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
+
+
+def _topk_threshold(k, rx, tid, lane, kk, peers, red):
+    """The top-k threshold pattern of a row with ``0 < k < N`` and the count tail's list count (-1 when the kept set is not on
+    its list) -- two scalars, so the kernel's row-uniform branch around the selection carries no tuple."""
+    r = _radix_select(
+        k, rx, tid, lane, False, kk, Int64(0), Float32(0.0), Int32(0), peers, red
+    )
+    return r[0], r[4]
+
+
+def _kept_compact(k, rx, tid, lane, warp, c_rank, base_bits, peers, cpos):
+    """The positive weights with pattern ``>= base_bits`` compacted into the candidate list WITH their positions (every CTA its
+    share, then the cluster's lists appended through ``mapa``); returns the cluster-wide count (CTA-uniform). The list holds at
+    most ``CAP`` entries: the caller takes the list tail when the count fits, the dense sweeps otherwise."""
+    n = k.num_threads
+    n_iters = -(-(k.cfg.blocks_per_cta(k.N) * BLOCK * k.elem_bytes // 4) // (n * WPT))
+    reset_box(rx.cbox, tid)
+    cute.arch.barrier()
+    _compact_sweep(
+        rx.words,
+        rx.n_words,
+        rx.col0,
+        rx.N,
+        tid,
+        lane,
+        rx.nm,
+        rx.c,
+        Int32(0),
+        base_bits,
+        rx.cand,
+        _smem_base(rx.cbox),
+        31,
+        rx.kind,
+        rx.from_logits,
+        True,
+        n,
+        n_iters,
+        1 if rx.kind == 0 else 2,
+        Int32(INT_MAX),
+        CAP,
+        cpos,
+        True,
+    )
+    cute.arch.barrier()
+    n_all = gather_lists(rx.cand, cpos, rx.cbox, tid, c_rank, k.C, n)
+    if k.C > 1:
+        peers.n_cluster_exchanges += 1
+    return n_all
+
+
+def _addr_token(k, a, ok):
+    """The token of tree address ``a`` (``-1`` unless ``ok``)."""
+    slot = a >> 3
+    lane_a = slot >> (k.Kp.bit_length() - 1)
+    block_a = slot & Int32(k.Kp - 1)
+    return _select(ok, ((block_a << 5) + lane_a) * 8 + (a & 7), Int32(-1))
+
+
+def _dense_tail(k, loader, leaf, peers, thr_bits, u, t, w, c_rank):
+    """The list tail's fallback over the row: the kept mass as the masked tree with the peers recording, and (the draw forms)
+    the crossing over the masked leaf -- returns ``(mass, first token, last token)`` with ``-1`` tokens where none."""
+    fp = CuteF32
+
+    def masked_leaf(key):
+        we = leaf(key)
+        return _select(_weight_bits(we) >= thr_bits, we, Float32(0.0))
+
+    peers.recording = True
+    state, start = canon.init_state(k.plan_sum, fp, masked_leaf)
+    totals = _block_totals(k.plan_sum, state, k.kpw)
+    mass = canon.run(k.plan_sum, state, start, peers, fp)
+    peers.recording = False
+    first = Int32(INT_MAX)
+    last = Int32(-1)
+    if not k.score:
+        thr = fp.mul(u, mass)
+        first, last = _crossing_pass(
+            k, loader, masked_leaf, peers, totals, thr, t, w, c_rank
+        )
+        first, last = peers.int_reduce(first, last)
+    return (
+        mass,
+        _addr_token(k, first, first != Int32(INT_MAX)),
+        _addr_token(k, last, last >= Int32(0)),
+    )
 
 
 def _score_token(k, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp):
@@ -509,119 +781,6 @@ def _score_token(k, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp):
     if k.return_logprob:
         lp = _select(in_range, logp(fp, zt, fp.neg(lg2(fp, S))), Float32(NAN))
     return Int32(-1), kept, mass, lp, lpk
-
-
-def _exact_draw(
-    k,
-    mX,
-    mK,
-    mP,
-    mMinP,
-    rx,
-    loader,
-    leaf,
-    peers,
-    red,
-    tid,
-    t,
-    w,
-    c_rank,
-    row_c,
-    src_c,
-    src_ok,
-    N,
-    S,
-    wmax,
-    nm,
-    c,
-    u,
-    fp,
-    mIds=None,
-):
-    """The exact form: the support's thresholds (the support kernel's selection, verbatim), the masked tree with the
-    peers recording, the crossing over the masked leaf at the uniform ``u``; returns ``(token, valid, mass, logprob,
-    kept_logprob)`` -- the drawn token's log-probability under the full distribution (over ``S``) and under the kept set
-    (over ``mass``), NaN where not requested or the row is invalid (plain Python at trace time: the kernel stores them).
-    In the score form the crossing is replaced by the given token's chains (:func:`_score_token`)."""
-    # ===== the support's thresholds ===================================================================================
-    thr_bits = Int32(0)
-    if cutlass.const_expr(k.use_k):
-        kk = mK[row_c]
-        sel_k = _radix_select(
-            k, rx, tid, t, False, kk, Int64(0), Float32(0.0), Int32(0), peers, red
-        )
-        thr_bits = _select(
-            kk <= Int32(0), Int32(INF_BITS), _select(kk >= N, Int32(0), sel_k[0])
-        )
-    if cutlass.const_expr(k.use_p):
-        base = Int32(0)
-        Sp = S
-        if cutlass.const_expr(k.use_k and k.filters.order == "top_k_first"):
-            base = thr_bits
-            Sp = _masked_sum(k, leaf, peers, thr_bits)
-        scale_fix = fp.div(Float32(FIX_SCALE), Sp)
-        pv = mP[row_c]
-        target = _cvt_rzi_s64_f32(fp.mul(pv, Float32(FIX_SCALE)))
-        if cutlass.const_expr(_kept_shortcut(k)):
-            sel_p, tot_c, tot_m, min_pos = _radix_select_kept(
-                k, rx, tid, t, base, target, scale_fix, peers, red
-            )
-        else:
-            sel_p, tot_c, tot_m, min_pos = _radix_select(
-                k, rx, tid, t, True, Int32(0), target, scale_fix, base, peers, red
-            )
-        # p >= 1: the target is unreachable (the filter is off: every positive weight is kept)
-        use_radix = (tot_m >= target) & (tot_c > Int32(0)) & (pv < Float32(1.0))
-        fallback = _select(min_pos == Int32(INT_MAX), Int32(INF_BITS), min_pos)
-        thr_bits = _imax(thr_bits, _select(use_radix, sel_p, fallback))
-        # a (kept) sum below ~2^-84 overflows the fixed-point scale and every positive weight would saturate to the
-        # same mass: such a row keeps nothing and is invalid (support_spec.SELECT_RULE: scale-overflow -> +inf)
-        thr_bits = _select(scale_fix < Float32(float("inf")), thr_bits, Int32(INF_BITS))
-    if cutlass.const_expr(k.use_m):
-        thr_bits = _imax(thr_bits, _f32_bits(fp.mul(wmax, mMinP[row_c])))
-
-    # ===== the masked tree with the peers recording, the crossing over the kept weights =============================
-    def masked_leaf(key):
-        we = leaf(key)
-        return _select(_weight_bits(we) >= thr_bits, we, Float32(0.0))
-
-    peers.recording = True
-    state, start = canon.init_state(k.plan_sum, fp, masked_leaf)
-    totals = _block_totals(k.plan_sum, state, k.kpw)
-    mass = canon.run(k.plan_sum, state, start, peers, fp)
-    peers.recording = False
-    if cutlass.const_expr(k.score):
-        return _score_token(k, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp)
-    thr = fp.mul(u, mass)
-    first, last = _crossing_pass(
-        k, loader, masked_leaf, peers, totals, thr, t, w, c_rank
-    )
-    first, last = peers.int_reduce(first, last)
-    a = _select(first == Int32(INT_MAX), last, first)
-    s_ok = (Float32(0.0) < mass) & (Float32(float("inf")) > mass)
-    valid = s_ok & (a >= Int32(0))
-    if cutlass.const_expr(k.has_indices):
-        valid = (
-            valid & src_ok
-        )  # an index outside the source rows: an invalid output row
-    slot = a >> 3
-    lane_a = slot >> (k.Kp.bit_length() - 1)
-    block_a = slot & Int32(k.Kp - 1)
-    token = ((block_a << 5) + lane_a) * 8 + (a & 7)
-    token = _select(valid, token, Int32(-1))
-    lp = Float32(NAN)
-    lpk = Float32(NAN)
-    if cutlass.const_expr(k.return_logprob or k.return_kept_logprob):
-        tok_c = _select(valid, token, Int32(0))
-        xt = mX[src_c, tok_c].to(Float32)
-        zt = shifted(fp, xt, nm, c)
-        if cutlass.const_expr(k.return_logprob):
-            # the full distribution's: lse.row's logp at the token over the row sum (R4 with log_probs)
-            lp = _select(valid, logp(fp, zt, fp.neg(lg2(fp, S))), Float32(NAN))
-        if cutlass.const_expr(k.return_kept_logprob):
-            # renormalised over the kept set: the probability the token was drawn with
-            lpk = _select(valid, logp(fp, zt, fp.neg(lg2(fp, mass))), Float32(NAN))
-    return token, valid, mass, lp, lpk
 
 
 def kernel_name(

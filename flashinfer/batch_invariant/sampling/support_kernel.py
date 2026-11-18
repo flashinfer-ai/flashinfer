@@ -368,9 +368,9 @@ class _IntReducer:
 
 
 class _Radix:
-    """What the radix passes need: the staged words, their count and global column origin, the histograms, and the
-    early finish's buffers: the candidate list (``cand``), its counter box (``cbox``), the rank-ordered masses and
-    patterns (``sq`` / ``sp``)."""
+    """What the radix passes need: the staged words, their count and global column origin, the histograms, and the early
+    finish's buffers: the candidate list (``cand``), its counter box (``cbox``), the rank-ordered masses / patterns (``sq`` /
+    ``sp``)."""
 
     def __init__(
         self,
@@ -388,10 +388,11 @@ class _Radix:
         gcnt=None,
         gmass=None,
         cand=None,
+        lst=None,
         cbox=None,
         sq=None,
         sp=None,
-        lst=None,
+        lpos=None,
     ):
         self.words, self.n_words, self.col0, self.N, self.nm, self.c = (
             words,
@@ -409,7 +410,14 @@ class _Radix:
             from_logits,
         )
         self.gcnt, self.gmass = gcnt, gmass
-        self.cand, self.cbox, self.sq, self.sp, self.lst = cand, cbox, sq, sp, lst
+        self.cand, self.cbox, self.sq, self.sp, self.lst, self.lpos = (
+            cand,
+            cbox,
+            sq,
+            sp,
+            lst,
+            lpos,
+        )
 
 
 def _kind(dtype) -> int:
@@ -420,11 +428,13 @@ def _kind(dtype) -> int:
 
 
 def count_list_default(n_passes: int, tile_bytes: int) -> bool:
-    """The count selection's list mode by default: the four-pass kernels (fp32 inputs, the ``ex2`` weights of logits)
-    at a staged share of ``LIST_MODE_SHARE`` or more -- where the three replaced passes over the words outweigh the
-    compaction, the gather and the list passes; the two- and three-pass kernels and the short shares lose by it (Rubin
-    NVL8, 2026-11-13: f32 262144 x 4096 rows 7126 -> 6600 us, bf16 3081 -> 3537 us, f32 at one row 34.5 -> 39.4 us)."""
-    return n_passes >= 4 and tile_bytes >= LIST_MODE_SHARE
+    """The count selection's list mode by default: every kernel with two passes or more. Since 2026-11-17 the list carries the
+    kept set (the compaction with positions of every candidate at or above the selected bin), so the mode replaces the later
+    passes AND the row-wide kept compaction the tail needed otherwise (22k cycles per row); until then it was the four-pass
+    kernels at a staged share of ``LIST_MODE_SHARE`` or more only (2026-11-13: f32 262144 x 4096 rows 7126 -> 6600 us, bf16
+    3081 -> 3537 us, f32 at one row 34.5 -> 39.4 us), and the M = 64 picks (T256 members, short shares) ran the four passes
+    plus the kept compaction: 121k cycles per row against 89k on the list path."""
+    return n_passes >= 2
 
 
 def n_passes_for(kind: int, from_logits: bool) -> int:
@@ -437,9 +447,14 @@ def n_passes_for(kind: int, from_logits: bool) -> int:
     return 2 if kind == 1 else 3
 
 
+def _early_finish_of(k) -> str:
+    """The kernel's early-finish policy ("" / "mass" / "all"; the support draw's kernel takes the default)."""
+    return getattr(k, "early_finish", "mass")
+
+
 def _smem_layout(k):
-    """Byte sizes of the tile, the count histograms (two buffers, a dummy slot each), the mass slots, the reduced
-    masses and the early finish's buffers."""
+    """Byte sizes of the tile, the count histograms (two buffers, a dummy slot each), the mass slots, the reduced masses and
+    the early finish's buffers."""
     n_share = k.cfg.blocks_per_cta(k.N) * BLOCK
     tile = n_share * k.elem_bytes
     hist = 2 * (BINS + 1) * 4 if (k.use_k or k.use_p) else 0
@@ -448,21 +463,23 @@ def _smem_layout(k):
     if k.C > 1:
         hist += 2 * BINS * 4
         mred += 2 * BINS * 8 if k.use_p else 0
-    # the compaction list, its counter box and the rank-ordered masses / patterns: every selection may compact
-    cand = (CAP + 1) * (4 + 8 + 4) + 2 * 4 if (k.use_k or k.use_p) else 0
+    cand = (
+        (CAP + 1) * (4 + 8 + 4) + 2 * 4 if (k.use_k or k.use_p) else 0
+    )  # the compaction list, its counter box, the rank-ordered masses / patterns
     if k.use_k and not k.use_p:
         cand += (
-            (CAP_L + 1) * 4
-        )  # the count selection's gathered list (it aliases the mass slots otherwise)
+            2 * (CAP_L + 1) * 4
+        )  # the count selection's gathered list and its positions (they alias the mass slots otherwise)
     return n_share, tile, hist, mslot, mred, cand
 
 
 # ---- trace-time helpers (plain Python: static loops, selects, no staged control flow) --------------------------------
 def _alloc_hist(k, smem):
-    """The count histograms (two buffers, a dummy slot each), the mass chunk slots, the per-bin masses (two buffers),
-    for a cluster the gathered cluster-wide bins (counts and masses, two buffers), and for the early finish the
-    candidate list, its counter box and the rank-ordered masses / patterns (each ``CAP`` + a dummy slot)."""
-    hist = mslot = mred = gcnt = gmass = cand = cbox = sq = sp = lst = None
+    """The count histograms (two buffers, a dummy slot each), the mass chunk slots, the per-bin masses (two buffers), for a
+    cluster the gathered cluster-wide bins (counts and masses, two buffers), and for the early finish the candidate list,
+    its counter box and the rank-ordered masses / patterns (each ``CAP`` + a dummy slot), and the count selection's list with
+    its positions (``CAP_L`` + a dummy slot each; inside the mass slots when there are any)."""
+    hist = mslot = mred = gcnt = gmass = cand = cbox = sq = sp = lst = lpos = None
     if k.use_k or k.use_p:
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((2 * (BINS + 1),)), byte_alignment=16
@@ -494,14 +511,24 @@ def _alloc_hist(k, smem):
             gmass = smem.allocate_tensor(
                 Int64, cute.make_layout((2 * BINS,)), byte_alignment=16
             )
-        # the count selection's gathered list aliases the mass slots (the two are never live together: the count
-        # selection completes, and a cluster barrier ends its gather, before the mass selection clears its slots)
+        # the count selection's gathered list and its positions alias the mass slots (never live together: the count selection
+        # completes before the mass selection clears its slots, and a cluster barrier ends the gather)
+        assert (BINS * RM + LANES) * k.n_chunks >= 2 * (CAP_L + 1), (
+            "the mass slots hold the list and its positions"
+        )
         lst = cute.make_tensor(mslot.iterator, cute.make_layout((CAP_L + 1,)))
+        lpos = cute.domain_offset(
+            (CAP_L + 1,),
+            cute.make_tensor(mslot.iterator, cute.make_layout((2 * (CAP_L + 1),))),
+        )
     elif k.use_k:
         lst = smem.allocate_tensor(
             Int32, cute.make_layout((CAP_L + 1,)), byte_alignment=16
         )
-    return hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp, lst
+        lpos = smem.allocate_tensor(
+            Int32, cute.make_layout((CAP_L + 1,)), byte_alignment=16
+        )
+    return hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp, lst, lpos
 
 
 def _clear(tensor, start: int, size: int, tid, zero, n: int):
@@ -559,9 +586,9 @@ def _radix_sweep(
     n_iters: cutlass.Constexpr[int],
     epw: cutlass.Constexpr[int],
 ) -> Int32:
-    """One radix pass over the staged words: every candidate element adds one to its digit's bin (and its mass chunks);
-    the smallest candidate pattern (pass 0 of a mass selection) is returned. (No Python-object locals before the
-    runtime loop: the DSL carries every local through it.)"""
+    """One radix pass over the staged words: every candidate element adds one to its digit's bin (and its mass chunks); the
+    smallest candidate pattern (pass 0 of a mass selection) is returned. (No Python-object locals before the runtime loop:
+    the DSL carries every local through it.)"""
     dmask = Int32((1 << width) - 1)
     min_pos = Int32(INT_MAX)
     rep = lane & Int32(RM - 1)
@@ -585,6 +612,8 @@ def _radix_sweep(
                 digit = (bits >> shift) & dmask
                 _red_inc_u32(_select(ok, cnt_base + digit * 4, dummy_c))
                 if cutlass.const_expr(by_mass):
+                    # (2026-11-17: grouping the lanes by digit with match.any + redux.sync and issuing the reds from the group
+                    # leaders measured 4x SLOWER than these per-lane reds -- the hardware aggregates same-address lanes itself)
                     q = _cvt_rzi_s64_f32(CuteF32.mul(we, scale_fix))
                     slot = m_base + ((digit * RM + rep) * n_chunks) * 4
                     for ch in cutlass.range_constexpr(n_chunks):
@@ -681,14 +710,10 @@ def _scan_bins(hist, mred, gcnt, gmass, buf, lane, by_mass: bool, rem_k, rem_m, 
 def _cluster_reduce(
     hist, mred, gcnt, gmass, buf, tid, by_mass: bool, C: int, n: int, c_rank
 ):
-    """The cluster-wide bins in two rounds: (1) every CTA publishes its bins and CTA ``r`` sums bins ``[r * 256 / C,
-    (r + 1) * 256 / C)`` over the peers (one remote load per peer per bin, issued back to back) into its ``gcnt`` /
-    ``gmass`` of this buffer; (2) a barrier publishes those, and every CTA gathers all 256 reduced bins from their owners
-    into its own ``gcnt`` / ``gmass`` -- one remote load per thread per array. Two cluster round trips per pass; the scans
-    then read local shared memory. (The caller accounts the two exchanges to the peers.)"""
-    per = BINS // C  # bins each CTA owns
-    # round 1: publish, then the owner sums its bins over the peers (a thread per owned bin; the result parks in
-    # gcnt / gmass at the owned bin's index, this buffer -- only the owner writes those entries before the second barrier)
+    """The cluster-wide bins in ONE round trip: every CTA publishes its bins (the barrier: release / acquire) and every thread
+    sums its bins over the ``C`` peers' shared memories through ``mapa`` + ``ld.shared::cluster`` (``C`` remote loads per bin,
+    256 bins over the CTA's threads) into its own ``gcnt`` / ``gmass`` of this buffer; the scans then read local shared memory.
+    (Until 2026-11-17 an owner-sum round and a gather round: two round trips per pass; the sums are the same integers.)"""
     cute.arch.cluster_arrive()
     cute.arch.cluster_wait()
     hb = [
@@ -703,9 +728,10 @@ def _cluster_reduce(
         if by_mass
         else None
     )
-    for i in range(max(1, per // n)):
-        j = (tid + i * n) & Int32(per - 1)  # C and BINS are powers of two
-        b = c_rank * per + j
+    for i in range(max(1, BINS // n)):
+        b = (tid + i * n) & Int32(
+            BINS - 1
+        )  # more threads than bins: a bin summed twice, the same value
         parts = [_ld_shared_cluster_i32(hb[sid] + b * 4) for sid in range(C)]
         acc = parts[0]
         for sid in range(1, C):
@@ -717,40 +743,6 @@ def _cluster_reduce(
             for sid in range(1, C):
                 macc = macc + mparts[sid]
             gmass[Int32(buf * BINS) + b] = macc
-    # round 2: publish the owned sums, gather every owner's bins
-    cute.arch.cluster_arrive()
-    cute.arch.cluster_wait()
-    gb = [
-        _map_shared_rank(gcnt.iterator, Int32(sid)) + Int32(buf * BINS * 4)
-        for sid in range(C)
-    ]
-    gm = (
-        [
-            _map_shared_rank(gmass.iterator, Int32(sid)) + Int32(buf * BINS * 8)
-            for sid in range(C)
-        ]
-        if by_mass
-        else None
-    )
-    for i in range(max(1, BINS // n)):
-        b = (tid + i * n) & Int32(BINS - 1)
-        owner = (
-            b // per
-        )  # every thread fetches bin b from its owner: one load per array
-        base_c = gb[0]
-        for sid in range(1, C):
-            base_c = _select(owner == Int32(sid), gb[sid], base_c)
-        cnt = _ld_shared_cluster_i32(base_c + b * 4)
-        if by_mass:
-            base_m = gm[0]
-            for sid in range(1, C):
-                base_m = _select(owner == Int32(sid), gm[sid], base_m)
-            mv = _ld_shared_cluster_i64(base_m + b * 8)
-        gcnt[Int32(buf * BINS) + b] = (
-            cnt  # (our own bins come back through mapa to our own smem)
-        )
-        if by_mass:
-            gmass[Int32(buf * BINS) + b] = mv
     cute.arch.barrier()
 
 
@@ -785,9 +777,11 @@ def _pass(
     kind: int,
     from_logits: bool,
     by_mass: bool,
+    dbg=None,
 ):
-    """One radix pass: clear, sweep, (reduce the masses,) the cluster reduction, the scan. Returns ``(prefix, rem_k,
-    rem_m, the sweep's smallest candidate pattern, total count, total mass, the selected bin's count)``."""
+    """One radix pass: clear, sweep, (reduce the masses,) the cluster reduction, the scan. Returns ``(prefix, rem_k, rem_m, the
+    sweep's smallest candidate pattern, total count, total mass, the selected bin's count)``; ``dbg`` the debug trace's
+    ``(tensor, row)`` (the plain passes only)."""
     shift, width = PASS_SHIFTS[p], PASS_WIDTHS[p]
     buf = p % 2
     _clear(hist, buf * (BINS + 1), BINS + 1, tid, Int32(0), n)
@@ -826,9 +820,20 @@ def _pass(
         cute.arch.barrier()
     if C > 1:
         _cluster_reduce(hist, mred, gcnt, gmass, buf, tid, by_mass, C, n, c_rank)
+    if dbg is not None:
+        dbg[0][dbg[1], 48 + p] = hist[Int32(buf * (BINS + 1)) + Int32(127)]
+        dbg[0][dbg[1], 52 + p] = hist[Int32(buf * (BINS + 1)) + Int32(254)]
+        dbg[0][dbg[1], 56 + p] = hist[Int32(buf * (BINS + 1)) + Int32(0)]
     anyhit, sel, ab_c, ab_m, tot_c, tot_m, sel_c = _scan_bins(
         hist, mred, gcnt, gmass, buf, lane, by_mass, rem_k, rem_m, C
     )
+    if dbg is not None:
+        dbg[0][dbg[1], p * 8 + 0] = tot_c
+        dbg[0][dbg[1], p * 8 + 1] = sel
+        dbg[0][dbg[1], p * 8 + 2] = _select(anyhit, Int32(1), Int32(0))
+        dbg[0][dbg[1], p * 8 + 3] = ab_c
+        dbg[0][dbg[1], p * 8 + 4] = rem_k
+        dbg[0][dbg[1], p * 8 + 5] = prefix
     prefix = (prefix << width) | _select(anyhit, sel, Int32(0))
     rem_k = _select(anyhit, rem_k - ab_c, rem_k)
     if by_mass:
@@ -857,14 +862,29 @@ def _compact_sweep(
     nthreads: cutlass.Constexpr[int],
     n_iters: cutlass.Constexpr[int],
     epw: cutlass.Constexpr[int],
+    hi_bits: Int32,
     cap: cutlass.Constexpr[int] = CAP,
+    cpos: cute.Tensor = None,
+    with_pos: cutlass.Constexpr[bool] = False,
 ):
-    """The early finish's compaction: the patterns of the selected bin's candidates (``bits >> shift == prefix``, the
-    same candidates the pass counted) appended to ``cand`` -- warp-aggregated: a word batch with candidates reserves
-    its slots with one ``atom.shared.add`` by lane 0, the lanes' ranks within the ballot place them; a candidate past
-    the list's capacity goes to the dummy slot ``CAP`` (the caller takes this path only when the count fits)."""
+    """The compaction: the patterns of the candidates (``base_bits <= bits < hi_bits`` (``INT_MAX``: no bound) and ``bits >> shift
+    == prefix``; for the mass goal positive) appended to ``cand`` -- warp-aggregated over one iteration's ``WPT x epw`` sub-batches: the ballots of every
+    sub-batch first, then -- behind one warp-uniform branch per iteration, rarely taken -- ONE ``atom.shared.add`` by lane 0 for
+    their total (the other lanes add 0 to the box's second word) and the slots from the running prefix of the ballots (a store
+    in every iteration would order the next iteration's loads behind it: 16.5k cycles per sweep against the histogram sweep's
+    9.7k, measured 2026-11-17); a candidate past the list's capacity goes to the dummy slot ``cap`` (the
+    caller takes the list path only when the count fits); with ``with_pos`` the candidates' positions go to ``cpos`` at the
+    same slots. The list ORDER is a placement: the selections rank by pattern value (ties by position pick the same value)
+    and the list tail sorts by position. (Until 2026-11-17 every sub-batch ended in a dynamic ``if n_w > 0`` region with its
+    own atomic: 20-25k cycles per sweep against the histogram sweep's 9k.)"""
     lane_lt = (Int32(1) << lane) - Int32(1)
-    for it in range(n_iters):
+    lead = lane == Int32(0)
+    dummy = cnt_addr + Int32(4)
+    for it in cutlass.range_constexpr(n_iters):
+        bl = []
+        gl = []
+        okl = []
+        bal = []
         for m in cutlass.range_constexpr(WPT):
             idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
             valid = idx < n_words
@@ -874,19 +894,63 @@ def _compact_sweep(
                 we = _staged_weight(wv, h, kind, from_logits, nm, c)
                 bits = _weight_bits(we)
                 g = col0 + idxc * epw + h
-                ok = valid & (g < N) & (bits >= base_bits) & ((bits >> shift) == prefix)
+                ok = (
+                    valid
+                    & (g < N)
+                    & (bits >= base_bits)
+                    & (bits < hi_bits)
+                    & ((bits >> shift) == prefix)
+                )
                 if cutlass.const_expr(by_mass):
                     ok = ok & (bits > Int32(0))
-                ballot = cute.arch.vote_ballot_sync(ok)
-                n_w = _popc(ballot)
-                if n_w > Int32(0):
-                    old = Int32(0)
-                    if lane == Int32(0):
-                        old = _atom_add_u32(cnt_addr, n_w)
-                    base = cute.arch.shuffle_sync(old, offset=0)
-                    slot = base + _popc(ballot & lane_lt)
-                    slot = _select(ok & (slot < Int32(cap)), slot, Int32(cap))
-                    cand[slot] = bits
+                bl.append(bits)
+                gl.append(g)
+                okl.append(ok)
+                bal.append(cute.arch.vote_ballot_sync(ok))
+        tot = _popc(bal[0])
+        for j in cutlass.range_constexpr(1, WPT * epw):
+            tot = tot + _popc(bal[j])
+        if (
+            tot > Int32(0)
+        ):  # warp-uniform, rarely taken: the stores do not order the next iteration's loads
+            old = _atom_add_u32(
+                _select(lead, cnt_addr, dummy), _select(lead, tot, Int32(0))
+            )
+            run = cute.arch.shuffle_sync(old, offset=0)
+            for j in cutlass.range_constexpr(WPT * epw):
+                slot = run + _popc(bal[j] & lane_lt)
+                slot = _select(okl[j] & (slot < Int32(cap)), slot, Int32(cap))
+                cand[slot] = bl[j]
+                if cutlass.const_expr(with_pos):
+                    cpos[slot] = gl[j]
+                run = run + _popc(bal[j])
+
+
+@cute.jit
+def _bitonic64_desc(k0: Int32, k1: Int32, lane: Int32):
+    """The 64 keys of a warp (two per lane: index ``lane`` and ``lane + 32``) sorted ASCENDING by the bitonic network (the
+    partner of index ``i`` is ``i ^ j``; the lower index keeps the minimum when ``(i & k) == 0``; ``j == 32`` pairs a lane's two
+    registers, the other steps pair lanes of one register through xor shuffles). Returns the sorted ``(k0, k1)``."""
+    i0 = lane
+    i1 = lane + Int32(LANES)
+    for k in cutlass.range_constexpr(1, 7):  # k = 2 .. 64
+        kk = 1 << k
+        for jj in cutlass.range_constexpr(k):  # j = kk / 2 .. 1
+            j = kk >> (jj + 1)
+            if cutlass.const_expr(j == LANES):
+                lo = _imin(k0, k1)
+                hi = _imax(k0, k1)
+                k0 = lo
+                k1 = hi
+            else:
+                q0 = cute.arch.shuffle_sync_bfly(k0, offset=j)
+                q1 = cute.arch.shuffle_sync_bfly(k1, offset=j)
+                lower = (lane & Int32(j)) == Int32(0)
+                keep0 = lower == ((i0 & Int32(kk)) == Int32(0))
+                keep1 = lower == ((i1 & Int32(kk)) == Int32(0))
+                k0 = _select(keep0, _imin(k0, q0), _imax(k0, q0))
+                k1 = _select(keep1, _imin(k1, q1), _imax(k1, q1))
+    return k0, k1
 
 
 @cute.jit
@@ -902,58 +966,56 @@ def _select_small(
     scale_fix: Float32,
     by_mass: cutlass.Constexpr[bool],
 ) -> Int32:
-    """The exact selection over the compacted candidates (at most ``CAP``, two per lane): every candidate's rank in
-    descending pattern order (ties by list position), then the ``rem_k``-th largest pattern, or -- the masses written in
-    rank order, an exact 64-bit prefix over the lanes -- the first pattern in rank order at which the running mass
-    reaches ``rem_m`` (the first candidate when ``rem_m`` is 0, as the bin scan selects the first non-empty bin).
-    Every warp computes the same value from the same list; no candidate (``n_all == 0``) gives 0."""
+    """The exact selection over the compacted candidates (at most ``CAP``, two per lane): the candidates sorted by pattern,
+    descending (the bitonic network over shuffles; equal patterns in any order: the result is a pattern value), then the
+    ``rem_k``-th largest pattern, or -- the masses in that order with an exact 64-bit prefix over the lanes -- the first pattern
+    at which the running mass reaches ``rem_m`` (the first candidate when ``rem_m`` is 0, as the bin scan selects the first
+    non-empty bin). Every warp computes the same value from the same list; no candidate (``n_all == 0``) gives 0. (``sq`` /
+    ``sp`` are unused since 2026-11-17: the previous form ranked every candidate against the list and staged the masses in
+    rank order through them.)"""
     i0 = lane
     i1 = lane + Int32(LANES)
     v0 = i0 < n_all
     v1 = i1 < n_all
     p0 = cand[_select(v0, i0, Int32(CAP))]
     p1 = cand[_select(v1, i1, Int32(CAP))]
-    r0 = Int32(0)
-    r1 = Int32(0)
-    for j in cutlass.range_constexpr(CAP):
-        vj = Int32(j) < n_all
-        pj = cand[_select(vj, Int32(j), Int32(CAP))]
-        r0 = r0 + _select(
-            vj & ((pj > p0) | ((pj == p0) & (Int32(j) < i0))), Int32(1), Int32(0)
-        )
-        r1 = r1 + _select(
-            vj & ((pj > p1) | ((pj == p1) & (Int32(j) < i1))), Int32(1), Int32(0)
-        )
+    k0 = _select(
+        v0, Int32(INT_MAX) - p0, Int32(INT_MAX)
+    )  # ascending keys = descending patterns; a non-candidate sorts last
+    k1 = _select(v1, Int32(INT_MAX) - p1, Int32(INT_MAX))
+    k0, k1 = _bitonic64_desc(k0, k1, lane)
+    s0 = Int32(INT_MAX) - k0  # the pattern at sorted index lane (0 past the candidates)
+    s1 = Int32(INT_MAX) - k1  # ... and at lane + 32
+    res = Int32(0)
     if cutlass.const_expr(by_mass):
-        # the masses of the candidates (the same op on the same bits as the passes), in rank order
-        q0 = _cvt_rzi_s64_f32(CuteF32.mul(_bitcast_i32_to_f32(p0), scale_fix))
-        q1 = _cvt_rzi_s64_f32(CuteF32.mul(_bitcast_i32_to_f32(p1), scale_fix))
-        if warp == Int32(0):
-            sq[_select(v0, r0, Int32(CAP))] = _select(v0, q0, Int64(0))
-            sp[_select(v0, r0, Int32(CAP))] = _select(v0, p0, Int32(0))
-            sq[_select(v1, r1, Int32(CAP))] = _select(v1, q1, Int64(0))
-            sp[_select(v1, r1, Int32(CAP))] = _select(v1, p1, Int32(0))
-        cute.arch.barrier()
-        a0 = _select(v0, sq[i0], Int64(0))
-        a1 = _select(v1, sq[i1], Int64(0))
-        inc0 = a0
+        # the masses of the candidates (the same op on the same bits as the passes), in sorted order
+        q0 = _select(
+            v0,
+            _cvt_rzi_s64_f32(CuteF32.mul(_bitcast_i32_to_f32(s0), scale_fix)),
+            Int64(0),
+        )
+        q1 = _select(
+            v1,
+            _cvt_rzi_s64_f32(CuteF32.mul(_bitcast_i32_to_f32(s1), scale_fix)),
+            Int64(0),
+        )
+        inc0 = q0
         for d in cutlass.range_constexpr(5):
             o = _shfl_up_i64(inc0, 1 << d)
             inc0 = _select(lane >= Int32(1 << d), inc0 + o, inc0)
         tot0 = _shfl_idx_i64(inc0, LANES - 1)
-        inc1 = a1
+        inc1 = q1
         for d in cutlass.range_constexpr(5):
             o = _shfl_up_i64(inc1, 1 << d)
             inc1 = _select(lane >= Int32(1 << d), inc1 + o, inc1)
         inc1 = inc1 + tot0
-        hit0 = v0 & (inc0 >= rem_m) & ((inc0 - a0 < rem_m) | (i0 == Int32(0)))
-        hit1 = v1 & (inc1 >= rem_m) & (inc1 - a1 < rem_m)
-        res = _select(hit0, sp[i0], _select(hit1, sp[i1], Int32(0)))
-        cute.arch.barrier()  # the next writer of sq / sp (the other filter's early finish) waits for every reader
+        hit0 = v0 & (inc0 >= rem_m) & ((inc0 - q0 < rem_m) | (i0 == Int32(0)))
+        hit1 = v1 & (inc1 >= rem_m) & (inc1 - q1 < rem_m)
+        res = _select(hit0, s0, _select(hit1, s1, Int32(0)))
     else:
-        hit0 = v0 & (r0 == rem_k - Int32(1))
-        hit1 = v1 & (r1 == rem_k - Int32(1))
-        res = _select(hit0, p0, _select(hit1, p1, Int32(0)))
+        hit0 = v0 & (i0 == rem_k - Int32(1))
+        hit1 = v1 & (i1 == rem_k - Int32(1))
+        res = _select(hit0, s0, _select(hit1, s1, Int32(0)))
     for mask in cutlass.range_constexpr(5):
         res = _imax(res, cute.arch.shuffle_sync_bfly(res, offset=1 << mask))
     return res
@@ -1058,8 +1120,8 @@ def _finish_small(
     from_logits: cutlass.Constexpr[bool],
     by_mass: cutlass.Constexpr[bool],
 ) -> Int32:
-    """The early finish: compact the selected bin's candidates (every CTA its share; a cluster's CTAs append the peers'
-    lists through ``mapa``, so every CTA selects over the same set), then the exact rank selection over the list."""
+    """The early finish: compact the selected bin's candidates (every CTA its share; a cluster's CTAs append the peers' lists
+    through ``mapa``, so every CTA selects over the same set), then the exact rank selection over the list."""
     if tid == Int32(0):
         cbox[0] = Int32(0)
     cute.arch.barrier()
@@ -1083,6 +1145,7 @@ def _finish_small(
         nthreads,
         n_iters,
         1 if kind == 0 else 2,
+        Int32(INT_MAX),
     )
     cute.arch.barrier()
     n_all = cbox[0]
@@ -1105,10 +1168,9 @@ def _finish_small(
         n_all = off
         cute.arch.barrier()
     n_all = _imin(n_all, Int32(CAP))
-    res = _select_small(
+    return _select_small(
         cand, sq, sp, n_all, lane, warp, rem_k, rem_m, scale_fix, by_mass
     )
-    return res
 
 
 @cute.jit
@@ -1251,237 +1313,6 @@ def _list_totals(cand, n_all, lane, scale_fix):
     return tot, mn
 
 
-@cute.jit
-def _mass_select_kept(
-    words: cute.Tensor,
-    n_words: Int32,
-    col0: Int32,
-    N: Int32,
-    tid: Int32,
-    lane: Int32,
-    warp: Int32,
-    nm: Float32,
-    c: Float32,
-    scale_fix: Float32,
-    base_bits: Int32,
-    target: Int64,
-    hist: cute.Tensor,
-    mslot: cute.Tensor,
-    mred: cute.Tensor,
-    gcnt: cute.Tensor,
-    gmass: cute.Tensor,
-    cand: cute.Tensor,
-    cbox: cute.Tensor,
-    sq: cute.Tensor,
-    sp: cute.Tensor,
-    hbase: Int32,
-    mbase: Int32,
-    c_rank: Int32,
-    C: cutlass.Constexpr[int],
-    nthreads: cutlass.Constexpr[int],
-    n_iters: cutlass.Constexpr[int],
-    n_chunks: cutlass.Constexpr[int],
-    chunk_bits: cutlass.Constexpr[int],
-    kind: cutlass.Constexpr[int],
-    from_logits: cutlass.Constexpr[bool],
-    n_pass: cutlass.Constexpr[int],
-    use_ef: cutlass.Constexpr[bool],
-):
-    """The mass selection over the candidates ``pattern >= base_bits`` (positive): the candidates compacted into the
-    list (every CTA its share; a cluster's CTAs append the peers' lists through ``mapa``, so every CTA selects over the
-    same set), then -- when they fit (a cluster-uniform decision) -- the exact rank selection over the list, else the
-    passes. Returns ``(pattern, candidate count, candidate mass, smallest candidate pattern)``; the last is cluster-wide
-    in the list branch and per thread in the passes' branch (the caller reduces it either way)."""
-    if tid == Int32(0):
-        cbox[0] = Int32(0)
-    cute.arch.barrier()
-    _compact_sweep(
-        words,
-        n_words,
-        col0,
-        N,
-        tid,
-        lane,
-        nm,
-        c,
-        Int32(0),
-        base_bits,
-        cand,
-        _smem_base(cbox),
-        31,
-        kind,
-        from_logits,
-        True,
-        nthreads,
-        n_iters,
-        1 if kind == 0 else 2,
-    )
-    cute.arch.barrier()
-    n_all = cbox[0]
-    if cutlass.const_expr(C > 1):
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-        off = n_all
-        for sid in cutlass.range_constexpr(C):
-            cnt_s = _ld_shared_cluster_i32(_map_shared_rank(cbox.iterator, Int32(sid)))
-            cnt_s = _select(Int32(sid) == c_rank, Int32(0), cnt_s)
-            base_s = _map_shared_rank(cand.iterator, Int32(sid))
-            if warp == Int32(0):
-                for s in cutlass.range_constexpr(CAP // LANES):
-                    j = lane + Int32(s * LANES)
-                    ok = j < cnt_s
-                    v = _ld_shared_cluster_i32(base_s + _select(ok, j, Int32(0)) * 4)
-                    dst = off + j
-                    cand[_select(ok & (dst < Int32(CAP)), dst, Int32(CAP))] = v
-            off = off + cnt_s
-        n_all = off
-        cute.arch.barrier()
-    small = n_all <= Int32(CAP)
-    pattern = Int32(0)
-    tot_c = Int32(0)
-    tot_m = Int64(0)
-    min_pos = Int32(INT_MAX)
-    if small:
-        tot_m, min_pos = _list_totals(cand, n_all, lane, scale_fix)
-        tot_c = n_all
-        pattern = _select_small(
-            cand, sq, sp, n_all, lane, warp, Int32(0), target, scale_fix, True
-        )
-    else:
-        prefix = Int32(0)
-        rem_k = Int32(0)
-        rem_m = target
-        sel_c = Int32(0)
-        for p in cutlass.range_constexpr(EARLY_AFTER if use_ef else n_pass):
-            prefix, rem_k, rem_m, mp, tc, tm, sel_c = _pass(
-                p,
-                words,
-                n_words,
-                col0,
-                N,
-                tid,
-                lane,
-                nm,
-                c,
-                scale_fix,
-                base_bits,
-                prefix,
-                rem_k,
-                rem_m,
-                hist,
-                mslot,
-                mred,
-                gcnt,
-                gmass,
-                hbase,
-                mbase,
-                c_rank,
-                C,
-                nthreads,
-                n_iters,
-                n_chunks,
-                chunk_bits,
-                kind,
-                from_logits,
-                True,
-            )
-            if p == 0:
-                tot_c, tot_m, min_pos = tc, tm, mp
-        if cutlass.const_expr(use_ef):
-            pattern = _select_tail(
-                sel_c <= Int32(CAP),
-                words,
-                n_words,
-                col0,
-                N,
-                tid,
-                lane,
-                warp,
-                nm,
-                c,
-                scale_fix,
-                base_bits,
-                prefix,
-                rem_k,
-                rem_m,
-                hist,
-                mslot,
-                mred,
-                gcnt,
-                gmass,
-                cand,
-                cbox,
-                sq,
-                sp,
-                hbase,
-                mbase,
-                c_rank,
-                C,
-                nthreads,
-                n_iters,
-                n_chunks,
-                chunk_bits,
-                kind,
-                from_logits,
-                True,
-                n_pass,
-            )
-        else:
-            pattern = prefix << PASS_SHIFTS[n_pass - 1]
-    return pattern, tot_c, tot_m, min_pos
-
-
-def _radix_select_kept(k, rx, tid, lane, base_bits, target, scale_fix, peers, red):
-    """The mass selection over the top-k kept set (``_kept_shortcut``): the compaction and the rank selection, or the
-    passes when the kept set exceeds the list; returns what ``_radix_select`` returns for the mass goal."""
-    n_pass = k.n_passes
-    use_ef = bool(k.early_finish) and n_pass > EARLY_AFTER
-    C = k.C
-    n = k.num_threads
-    n_iters = -(-(k.cfg.blocks_per_cta(k.N) * BLOCK * k.elem_bytes // 4) // (n * WPT))
-    gcnt = rx.gcnt if C > 1 else rx.hist
-    gmass = rx.gmass if C > 1 else rx.hist
-    pattern, tot_c, tot_m, min_pos = _mass_select_kept(
-        rx.words,
-        rx.n_words,
-        rx.col0,
-        rx.N,
-        tid,
-        lane,
-        peers.warp_id,
-        rx.nm,
-        rx.c,
-        scale_fix,
-        base_bits,
-        target,
-        rx.hist,
-        rx.mslot,
-        rx.mred,
-        gcnt,
-        gmass,
-        rx.cand,
-        rx.cbox,
-        rx.sq,
-        rx.sp,
-        _smem_base(rx.hist),
-        _smem_base(rx.mslot),
-        peers.cta_rank,
-        C,
-        n,
-        n_iters,
-        k.n_chunks,
-        k.chunk_bits,
-        rx.kind,
-        rx.from_logits,
-        n_pass,
-        use_ef,
-    )
-    if C > 1:
-        peers.n_cluster_exchanges += 2 * (EARLY_AFTER if use_ef else n_pass) + 2
-    min_pos = red.reduce(min_pos, "min", peers)
-    return pattern, tot_c, tot_m, min_pos
-
-
 # ---- the count selection's list mode -------------------------------------------------------------------------------
 def _list_pass(
     p: int, lst, n_all, tid, lane, prefix, rem_k, hist, hbase, nthreads: int
@@ -1514,6 +1345,7 @@ def _list_pass(
 @cute.jit
 def _count_tail(
     small: Boolean,
+    all_fit: Boolean,
     words: cute.Tensor,
     n_words: Int32,
     col0: Int32,
@@ -1526,9 +1358,11 @@ def _count_tail(
     base_bits: Int32,
     prefix: Int32,
     rem_k: Int32,
+    k_all: Int32,
     hist: cute.Tensor,
     gcnt: cute.Tensor,
     lst: cute.Tensor,
+    lpos: cute.Tensor,
     cbox: cute.Tensor,
     sq: cute.Tensor,
     sp: cute.Tensor,
@@ -1542,17 +1376,28 @@ def _count_tail(
     kind: cutlass.Constexpr[int],
     from_logits: cutlass.Constexpr[bool],
     n_pass: cutlass.Constexpr[int],
-) -> Int32:
-    """After the count selection's first pass: when the selected bin's cluster-wide count fits the list (``small``, a
-    cluster-uniform value) its candidates are compacted -- every CTA its share, the cluster's lists gathered into every
-    CTA -- and the remaining digits are found on the list: by exact rank when at most ``CAP`` candidates, else by
-    CTA-local histogram passes over the list; otherwise the remaining passes run over the words. Returns the threshold
-    pattern."""
+):
+    """After the count selection's first pass: when the selected bin's candidates fit the list (``small``, cluster-uniform) they
+    are compacted WITH their positions -- and when the candidates ABOVE the bin fit too (``all_fit``) those as well, so that
+    the kept set (every element whose pattern is at or above any later threshold) is on ``lst`` / ``lpos`` and the kernel
+    filters it into the tail's list instead of sweeping the row again -- every CTA its share, the cluster's lists gathered
+    into every CTA (the loops over the peers' actual counts: a dynamic trip count); the remaining digits are found on the list:
+    by exact rank when at most ``CAP`` entries (the ``k_all``-th largest over the whole list with the entries above, the
+    ``rem_k``-th within the bin alone), else by CTA-local histogram passes over the list (the entries above the bin do not
+    match the prefix and are not counted); otherwise the remaining passes run over the words. Returns ``(the threshold
+    pattern, the list's count when it holds the kept set, else -1)``."""
     pattern = Int32(0)
+    n_list = Int32(-1)
     if small:
         if tid == Int32(0):
             cbox[0] = Int32(0)
         cute.arch.barrier()
+        lo = _imax(base_bits, prefix << PASS_SHIFTS[0])
+        hi = _select(
+            all_fit | (prefix >= Int32(BINS - 1)),
+            Int32(INT_MAX),
+            (prefix + Int32(1)) << PASS_SHIFTS[0],
+        )
         _compact_sweep(
             words,
             n_words,
@@ -1562,18 +1407,21 @@ def _count_tail(
             lane,
             nm,
             c,
-            prefix,
-            base_bits,
+            Int32(0),
+            lo,
             lst,
             _smem_base(cbox),
-            PASS_SHIFTS[0],
+            31,
             kind,
             from_logits,
             False,
             nthreads,
             n_iters,
             1 if kind == 0 else 2,
+            hi,
             CAP_L,
+            lpos,
+            True,
         )
         cute.arch.barrier()
         n_all = cbox[0]
@@ -1587,21 +1435,35 @@ def _count_tail(
                 )
                 cnt_s = _select(Int32(sid) == c_rank, Int32(0), cnt_s)
                 base_s = _map_shared_rank(lst.iterator, Int32(sid))
-                for s in cutlass.range_constexpr(-(-CAP_L // nthreads)):
-                    j = tid + Int32(s * nthreads)
+                base_p = _map_shared_rank(lpos.iterator, Int32(sid))
+                n_s = (cnt_s + Int32(nthreads - 1)) // Int32(nthreads)
+                for s in range(n_s):
+                    j = tid + s * Int32(nthreads)
                     ok = j < cnt_s
                     v = _ld_shared_cluster_i32(base_s + _select(ok, j, Int32(0)) * 4)
+                    g = _ld_shared_cluster_i32(base_p + _select(ok, j, Int32(0)) * 4)
                     dst = off + j
-                    lst[_select(ok & (dst < Int32(CAP_L)), dst, Int32(CAP_L))] = v
+                    slot = _select(ok & (dst < Int32(CAP_L)), dst, Int32(CAP_L))
+                    lst[slot] = v
+                    lpos[slot] = g
                 off = off + cnt_s
             n_all = off
-            # every CTA has read the peers' lists (the list may alias the mass slots the next selection clears)
-            cute.arch.cluster_arrive()
+            cute.arch.cluster_arrive()  # every CTA has read the peers' lists (the list may alias the mass slots)
             cute.arch.cluster_wait()
         n_all = _imin(n_all, Int32(CAP_L))
+        n_list = _select(all_fit, n_all, Int32(-1))
         if n_all <= Int32(CAP):
             pattern = _select_small(
-                lst, sq, sp, n_all, lane, warp, rem_k, Int64(0), Float32(0.0), False
+                lst,
+                sq,
+                sp,
+                n_all,
+                lane,
+                warp,
+                _select(all_fit, k_all, rem_k),
+                Int64(0),
+                Float32(0.0),
+                False,
             )
         else:
             pre = prefix
@@ -1648,25 +1510,77 @@ def _count_tail(
                 False,
             )
         pattern = pre << PASS_SHIFTS[n_pass - 1]
-    return pattern
+    return pattern, n_list
+
+
+@cute.jit
+def _list_filter(
+    lst: cute.Tensor,
+    lpos: cute.Tensor,
+    n_list: Int32,
+    thr_bits: Int32,
+    cand: cute.Tensor,
+    cpos: cute.Tensor,
+    cbox: cute.Tensor,
+    tid: Int32,
+    lane: Int32,
+    nthreads: cutlass.Constexpr[int],
+) -> Int32:
+    """The kept entries of the count tail's list (pattern ``>= thr_bits``, positive) compacted with their positions into the
+    tail's list (every CTA holds the same count-tail list, so every CTA builds a list of the same entries); returns the count
+    (CTA-uniform; past ``CAP`` the entries went to the dummy slot and the caller takes the dense path)."""
+    if tid == Int32(0):
+        cbox[0] = Int32(0)
+    cute.arch.barrier()
+    lane_lt = (Int32(1) << lane) - Int32(1)
+    lead = lane == Int32(0)
+    box = _smem_base(cbox)
+    n_s = (n_list + Int32(nthreads - 1)) // Int32(nthreads)
+    for s in range(n_s):
+        j = tid + s * Int32(nthreads)
+        ok = j < n_list
+        jc = _select(ok, j, Int32(CAP_L))
+        b = lst[jc]
+        g = lpos[jc]
+        ok = ok & (b >= thr_bits) & (b > Int32(0))
+        ballot = cute.arch.vote_ballot_sync(ok)
+        old = _atom_add_u32(
+            _select(lead, box, box + Int32(4)), _select(lead, _popc(ballot), Int32(0))
+        )
+        base = cute.arch.shuffle_sync(old, offset=0)
+        slot = base + _popc(ballot & lane_lt)
+        slot = _select(ok & (slot < Int32(CAP)), slot, Int32(CAP))
+        cand[slot] = b
+        cpos[slot] = g
+    cute.arch.barrier()
+    return cbox[0]
 
 
 def _radix_select(
-    k, rx, tid, lane, by_mass, goal_k, goal_m, scale_fix, base_bits, peers, red
+    k,
+    rx,
+    tid,
+    lane,
+    by_mass,
+    goal_k,
+    goal_m,
+    scale_fix,
+    base_bits,
+    peers,
+    red,
+    dbg=None,
 ):
-    """The threshold pattern among the candidates (present, pattern ``>= base_bits``; for the mass goal also positive):
-    the ``goal_k``-th largest pattern, or the largest pattern whose upward-closed fixed-point mass reaches ``goal_m``.
-    Returns ``(pattern, candidate count, candidate mass, smallest candidate pattern)`` -- the last three from the first
-    pass (INT_MAX when there is no candidate), for the mass goal's fallback. The pass count is the input kind's
-    (``n_passes_for``: the pattern is the final prefix shifted); with the early finish (the policy ``k.early_finish``:
-    the mass selection, every selection, or none) the passes after the second are replaced by the compaction and the
-    rank selection when the selected bin's candidates fit the list."""
-    n_pass = k.n_passes
-    use_ef = (
-        bool(k.early_finish)
-        and (k.early_finish == "all" or by_mass)
-        and n_pass > EARLY_AFTER
-    )
+    """The threshold pattern among the candidates (present, pattern ``>= base_bits``; for the mass goal also positive): the
+    ``goal_k``-th largest pattern, or the largest pattern whose upward-closed fixed-point mass reaches ``goal_m``. Returns
+    ``(pattern, candidate count, candidate mass, smallest candidate pattern, list count)`` -- the middle three from the first
+    pass (INT_MAX when there is no candidate), for the mass goal's fallback; the last the count tail's list count when the
+    kept set is on ``rx.lst`` / ``rx.lpos`` (the count selection's list mode), else -1. The pass count is the input kind's (``n_passes_for``:
+    the pattern is the final prefix shifted); with the early finish (the kernel's policy: the mass selection, every
+    selection, or none) the passes after the second are replaced by the compaction and the rank selection when the
+    selected bin's candidates fit the list."""
+    n_pass = n_passes_for(rx.kind, rx.from_logits)
+    ef = _early_finish_of(k)
+    use_ef = bool(ef) and (ef == "all" or by_mass) and n_pass > EARLY_AFTER
     C = k.C
     n = k.num_threads
     n_iters = -(-(k.cfg.blocks_per_cta(k.N) * BLOCK * k.elem_bytes // 4) // (n * WPT))
@@ -1683,7 +1597,7 @@ def _radix_select(
     tot_c0, tot_m0 = Int32(0), Int64(0)
     min_pos = Int32(INT_MAX)
     sel_c = Int32(0)
-    if not by_mass and k.count_list and n_pass >= 2:
+    if not by_mass and getattr(k, "count_list", True) and n_pass >= 2:
         # the list mode: the first pass over the words, then the selected bin's candidates on the list when they fit
         prefix, rem_k, rem_m, mp, tot_c, tot_m, sel_c = _pass(
             0,
@@ -1716,9 +1630,15 @@ def _radix_select(
             rx.kind,
             rx.from_logits,
             False,
+            dbg,
         )
-        prefix = _count_tail(
-            sel_c <= Int32(CAP_L),
+        small = sel_c <= Int32(CAP_L)
+        all_fit = (sel_c + (goal_k - rem_k)) <= Int32(
+            CAP_L
+        )  # the bin's candidates plus every candidate above it
+        prefix, n_list = _count_tail(
+            small,
+            all_fit,
             rx.words,
             rx.n_words,
             rx.col0,
@@ -1731,9 +1651,11 @@ def _radix_select(
             base_bits,
             prefix,
             rem_k,
+            goal_k,
             rx.hist,
             gcnt,
             rx.lst,
+            rx.lpos,
             rx.cbox,
             rx.sq,
             rx.sp,
@@ -1749,8 +1671,8 @@ def _radix_select(
             n_pass,
         )
         if C > 1:
-            peers.n_cluster_exchanges += 2 * n_pass + 2
-        return prefix, tot_c, tot_m, min_pos
+            peers.n_cluster_exchanges += n_pass + 2
+        return prefix, tot_c, tot_m, min_pos, n_list
     for p in range(EARLY_AFTER if use_ef else n_pass):
         prefix, rem_k, rem_m, mp, tot_c, tot_m, sel_c = _pass(
             p,
@@ -1783,9 +1705,10 @@ def _radix_select(
             rx.kind,
             rx.from_logits,
             by_mass,
+            dbg,
         )
         if C > 1:
-            peers.n_cluster_exchanges += 2
+            peers.n_cluster_exchanges += 1
         if p == 0:
             tot_c0, tot_m0 = tot_c, tot_m
             if by_mass:
@@ -1794,6 +1717,9 @@ def _radix_select(
         small = sel_c <= Int32(
             CAP
         )  # cluster-uniform: every CTA scanned the same reduced bins
+        # the early finish's list is the count selection's (it aliases the mass slots, free after the passes), never the tail's
+        # `cand`: a top-p selection over the row runs AFTER the kept set was filtered into `cand` / `cpos` (the joint order)
+        ef_list = rx.lst if rx.lst is not None else rx.cand
         prefix = _select_tail(
             small,
             rx.words,
@@ -1815,7 +1741,7 @@ def _radix_select(
             mred,
             gcnt,
             gmass,
-            rx.cand,
+            ef_list,
             rx.cbox,
             rx.sq,
             rx.sp,
@@ -1838,7 +1764,7 @@ def _radix_select(
         prefix = prefix << PASS_SHIFTS[n_pass - 1]
     if by_mass:
         min_pos = red.reduce(min_pos, "min", peers)
-    return prefix, tot_c0, tot_m0, min_pos
+    return prefix, tot_c0, tot_m0, min_pos, Int32(-1)
 
 
 def _masked_sum(k, leaf, peers, thr_bits):
