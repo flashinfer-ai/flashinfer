@@ -817,6 +817,16 @@ def _suite_specs(sm):
                                 ds, N, cfg, fl, fset, False, lp=fl, lpk=fl, ef=ef, cl=cl
                             )
                         )
+    # the negative-weight rows (every filter set over the members) and the kept-set list at the large vocabularies
+    for ds, N, eb in (("f32", 1000, 4), ("bf16", 4097, 2)):
+        for fset in ("kp", "k", "p", "m", "kpj"):
+            for c in _configs(N, eb, k=5) + [_d(N, 8, eb, sm)]:
+                specs.append(_spec(ds, N, c, False, fset, False))
+    for ds, eb in (("f32", 4), ("bf16", 2)):
+        for N in (32768, N_BIG):
+            for fset in ("kp", "k"):
+                for c in _configs(N, eb, k=2) + [_d(N, 5, eb, sm)]:
+                    specs.append(_spec(ds, N, c, False, fset, False))
     return list(dict.fromkeys(specs))
 
 
@@ -2149,3 +2159,93 @@ def test_kept_log_probs_receipt():
         "log_probs", N=1000, dtype="bf16", temperature=True, top_k=40, top_p=0.9
     )
     assert "+" not in plain
+
+
+@needs_device
+def test_negative_weights_make_the_row_invalid_on_every_placement():
+    """A probability row with a negative weight is outside the class (``support_spec.pattern``: weights are non-negative) and is
+    invalid -- token -1, no validity, NaN mass -- on every path and placement: the kept-set list (k <= 64), the dense sweeps
+    (k above the list, top-p alone, min-p alone), the joint order, the re-read, cluster and staged members; ``-0.0`` is a zero
+    and the other rows are untouched, as the exact model declares. The review of #9619 (2026-11-18) found the list path summing
+    such a weight as its magnitude and drawing it where the dense sweeps flagged the row invalid."""
+    M = 8
+    for N, dtype in ((1000, torch.float32), (4097, torch.bfloat16)):
+        w = weights(M, N, dtype, seed=9)
+        w[1] = -(w[1].abs() + 1e-3)  # every weight negative
+        w[2, 5] = -0.4  # one negative weight among positives
+        w[3, 7] = -0.0  # a signed zero: a zero, the row stays valid
+        w[4, 11] = -(2.0**-60)  # a tiny negative weight
+        if dtype == torch.float32:
+            w.view(torch.int32)[
+                6, 3
+            ] = -4194304  # 0xFFC00000: a NaN with the sign bit set
+        else:
+            w.view(torch.int16)[6, 3] = -64  # bf16 0xFFC0: a NaN with the sign bit set
+        s, o = keys(M, 7)
+
+        def full(v, dt=torch.float32):
+            return torch.full((M,), v, dtype=dt, device="cuda")
+
+        cases = (
+            (
+                {"top_k": full(2, torch.int32), "top_p": full(0.9)},
+                Filters(top_k=2, top_p=0.9),
+            ),
+            (
+                {"top_k": full(40, torch.int32), "top_p": full(0.9)},
+                Filters(top_k=40, top_p=0.9),
+            ),
+            (
+                {"top_k": full(200, torch.int32), "top_p": full(0.9)},
+                Filters(top_k=200, top_p=0.9),
+            ),
+            ({"top_k": full(8, torch.int32)}, Filters(top_k=8)),
+            ({"top_p": full(0.9)}, Filters(top_p=0.9)),
+            ({"min_p": full(0.1)}, Filters(min_p=0.1)),
+            (
+                {"top_k": full(5, torch.int32), "top_p": full(0.9), "order": "joint"},
+                Filters(top_k=5, top_p=0.9, order="joint"),
+            ),
+        )
+        for kw, f in cases:
+            ref = DR.draw_support_reference(w, s.tolist(), o.tolist(), [f] * M)
+            assert (
+                not ref["valid"][[1, 2, 4, 6]].any()
+                and bool(ref["valid"][0])
+                and bool(ref["valid"][3])
+            ), f
+            for cfg in _configs(N, dtype.itemsize, k=5) + [None]:
+                r = probs_draw(w, s, o, config=cfg, **kw)
+                _same(r, ref, label=f"{f} {cfg.describe() if cfg else 'default'}")
+                assert torch.equal(
+                    r["samples"][[1, 2, 4, 6]].cpu().long(),
+                    torch.full((4,), -1, dtype=torch.int64),
+                )
+                assert bool(torch.isnan(r["mass"][[1, 2, 4, 6]]).all())
+
+
+@needs_device
+@pytest.mark.parametrize("dtype", DT, ids=["f32", "bf16"])
+def test_kept_set_list_path_at_large_vocabularies(dtype):
+    """The kept-set list path (top-k of 33..64 then top-p, and top-k alone) at the large vocabularies against the exact model:
+    the exact-model tests draw k up to N / 2, so at 32768 and above few of their rows take the list (the review of #9619)."""
+    M = 5
+    ks = torch.tensor([33, 40, 48, 64, 50], dtype=torch.int32)
+    for N in (32768, N_BIG):
+        w = weights(M, N, dtype, seed=11)
+        s, o = keys(M, 13)
+        for kw, filters in (
+            (
+                {"top_k": ks.cuda(), "top_p": torch.full((M,), 0.9, device="cuda")},
+                [Filters(top_k=int(k), top_p=0.9) for k in ks],
+            ),
+            ({"top_k": ks.cuda()}, [Filters(top_k=int(k)) for k in ks]),
+        ):
+            ref = DR.draw_support_reference(w, s.tolist(), o.tolist(), filters)
+            for cfg in _configs(N, dtype.itemsize, k=2) + [None]:
+                r = probs_draw(w, s, o, config=cfg, **kw)
+                _same(
+                    r,
+                    ref,
+                    label=f"N={N} {sorted(kw)} {cfg.describe() if cfg else 'default'}",
+                )

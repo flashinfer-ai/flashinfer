@@ -214,6 +214,17 @@ def draw_support_reference(
             res = support_row(w, N, filters[r], w_max=1.0)
         else:
             w = xf[r]
+            bits = w.view(torch.int32)
+            if bool(((bits < 0) & ((bits & 0x7FFFFFFF) != 0)).any()):
+                # a NEGATIVE weight (the sign bit with a non-zero magnitude; -0.0 is a zero, a negative NaN counts): outside the
+                # class (support_spec.pattern) -- the row is invalid on every path and placement: token -1, NaN mass, NaN log-probs
+                words = stream.words(int(seeds[r]), int(offsets[r]), draw)
+                out["samples"].append(-1)
+                out["valid"].append(False)
+                for key in ("mass", "S", "threshold", "logprobs", "kept_logprobs"):
+                    out[key].append(float("nan"))
+                out["u"].append(stream.uniform32(words[0]))
+                continue
             res = support_row(w, N, filters[r])
         wk = torch.where(res["mask"], w, torch.zeros_like(w))
         S = row_sum(w, N)  # the row's canonical sum tree (lse.row's s for logits)

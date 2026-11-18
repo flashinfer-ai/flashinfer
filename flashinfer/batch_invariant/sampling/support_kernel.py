@@ -84,7 +84,6 @@ CAP = 64
 #: The count selection's list mode: the selected bin's candidates after the first pass that fit the gathered list.
 CAP_L = 1024
 #: The list mode pays from this staged share on, and only for the four-pass kernels (measured 2026-11-13).
-LIST_MODE_SHARE = 128 * 1024
 EARLY_AFTER = (
     2  # the passes before the early finish decides (the prefix then has 16 bits)
 )
@@ -369,8 +368,7 @@ class _IntReducer:
 
 class _Radix:
     """What the radix passes need: the staged words, their count and global column origin, the histograms, and the early
-    finish's buffers: the candidate list (``cand``), its counter box (``cbox``), the rank-ordered masses / patterns (``sq`` /
-    ``sp``)."""
+    finish's buffers: the candidate list (``cand``), its counter box (``cbox``)."""
 
     def __init__(
         self,
@@ -390,8 +388,6 @@ class _Radix:
         cand=None,
         lst=None,
         cbox=None,
-        sq=None,
-        sp=None,
         lpos=None,
     ):
         self.words, self.n_words, self.col0, self.N, self.nm, self.c = (
@@ -410,11 +406,9 @@ class _Radix:
             from_logits,
         )
         self.gcnt, self.gmass = gcnt, gmass
-        self.cand, self.cbox, self.sq, self.sp, self.lst, self.lpos = (
+        self.cand, self.cbox, self.lst, self.lpos = (
             cand,
             cbox,
-            sq,
-            sp,
             lst,
             lpos,
         )
@@ -431,7 +425,7 @@ def count_list_default(n_passes: int, tile_bytes: int) -> bool:
     """The count selection's list mode by default: every kernel with two passes or more. Since 2026-11-17 the list carries the
     kept set (the compaction with positions of every candidate at or above the selected bin), so the mode replaces the later
     passes AND the row-wide kept compaction the tail needed otherwise (22k cycles per row); until then it was the four-pass
-    kernels at a staged share of ``LIST_MODE_SHARE`` or more only (2026-11-13: f32 262144 x 4096 rows 7126 -> 6600 us, bf16
+    kernels at a staged share of 128 KB or more only (2026-11-13: f32 262144 x 4096 rows 7126 -> 6600 us, bf16
     3081 -> 3537 us, f32 at one row 34.5 -> 39.4 us), and the M = 64 picks (T256 members, short shares) ran the four passes
     plus the kept compaction: 121k cycles per row against 89k on the list path."""
     return n_passes >= 2
@@ -464,8 +458,8 @@ def _smem_layout(k):
         hist += 2 * BINS * 4
         mred += 2 * BINS * 8 if k.use_p else 0
     cand = (
-        (CAP + 1) * (4 + 8 + 4) + 2 * 4 if (k.use_k or k.use_p) else 0
-    )  # the compaction list, its counter box, the rank-ordered masses / patterns
+        (CAP + 1) * 4 + 2 * 4 if (k.use_k or k.use_p) else 0
+    )  # the compaction list and its counter box
     if k.use_k and not k.use_p:
         cand += (
             2 * (CAP_L + 1) * 4
@@ -479,7 +473,7 @@ def _alloc_hist(k, smem):
     cluster the gathered cluster-wide bins (counts and masses, two buffers), and for the early finish the candidate list,
     its counter box and the rank-ordered masses / patterns (each ``CAP`` + a dummy slot), and the count selection's list with
     its positions (``CAP_L`` + a dummy slot each; inside the mass slots when there are any)."""
-    hist = mslot = mred = gcnt = gmass = cand = cbox = sq = sp = lst = lpos = None
+    hist = mslot = mred = gcnt = gmass = cand = cbox = lst = lpos = None
     if k.use_k or k.use_p:
         hist = smem.allocate_tensor(
             Int32, cute.make_layout((2 * (BINS + 1),)), byte_alignment=16
@@ -492,12 +486,6 @@ def _alloc_hist(k, smem):
             Int32, cute.make_layout((CAP + 1,)), byte_alignment=16
         )
         cbox = smem.allocate_tensor(Int32, cute.make_layout((2,)), byte_alignment=16)
-        sq = smem.allocate_tensor(
-            Int64, cute.make_layout((CAP + 1,)), byte_alignment=16
-        )
-        sp = smem.allocate_tensor(
-            Int32, cute.make_layout((CAP + 1,)), byte_alignment=16
-        )
     if k.use_p:
         mslot = smem.allocate_tensor(
             Int32,
@@ -528,7 +516,7 @@ def _alloc_hist(k, smem):
         lpos = smem.allocate_tensor(
             Int32, cute.make_layout((CAP_L + 1,)), byte_alignment=16
         )
-    return hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp, lst, lpos
+    return hist, mslot, mred, gcnt, gmass, cand, cbox, lst, lpos
 
 
 def _clear(tensor, start: int, size: int, tid, zero, n: int):
@@ -557,6 +545,45 @@ def _staged_weight(wv, h: int, kind: int, from_logits: bool, nm, c):
     if from_logits:
         return CuteF32.ex2(shifted(CuteF32, x, nm, c))
     return x
+
+
+@cute.jit
+def _neg_sweep(
+    words: cute.Tensor,
+    n_words: Int32,
+    col0: Int32,
+    N: Int32,
+    tid: Int32,
+    kind: cutlass.Constexpr[int],
+    nthreads: cutlass.Constexpr[int],
+    n_iters: cutlass.Constexpr[int],
+    epw: cutlass.Constexpr[int],
+) -> Int32:
+    """This thread's count of NEGATIVE weights among the staged words of a probability input: the sign bit set with a non-zero
+    magnitude (``-0.0`` is a zero; a negative NaN counts). The class's weights are non-negative (``support_spec.pattern``), so a
+    row with a negative value is outside the contract and the kernels make it invalid on every path and placement -- the
+    selections work on 31-bit patterns, so the list path would otherwise sum such a weight as its magnitude and draw it where
+    the dense sweeps flagged the row invalid, the same row valid or invalid depending on k (the review of #9619, 2026-11-18)."""
+    cnt = Int32(0)
+    for it in cutlass.range_constexpr(n_iters):
+        for m in cutlass.range_constexpr(WPT):
+            idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
+            valid = idx < n_words
+            idxc = _select(valid, idx, n_words - 1)
+            wv = words[idxc]
+            for h in cutlass.range_constexpr(epw):
+                raw = _f32_bits(
+                    _staged_weight(wv, h, kind, False, Float32(0.0), Float32(0.0))
+                )
+                g = col0 + idxc * epw + h
+                neg = (
+                    valid
+                    & (g < N)
+                    & (raw < Int32(0))
+                    & ((raw & Int32(0x7FFFFFFF)) != Int32(0))
+                )
+                cnt = cnt + _select(neg, Int32(1), Int32(0))
+    return cnt
 
 
 @cute.jit
@@ -1013,8 +1040,6 @@ def _bitonic64_desc(k0: Int32, k1: Int32, lane: Int32):
 @cute.jit
 def _select_small(
     cand: cute.Tensor,
-    sq: cute.Tensor,
-    sp: cute.Tensor,
     n_all: Int32,
     lane: Int32,
     warp: Int32,
@@ -1027,9 +1052,7 @@ def _select_small(
     descending (the bitonic network over shuffles; equal patterns in any order: the result is a pattern value), then the
     ``rem_k``-th largest pattern, or -- the masses in that order with an exact 64-bit prefix over the lanes -- the first pattern
     at which the running mass reaches ``rem_m`` (the first candidate when ``rem_m`` is 0, as the bin scan selects the first
-    non-empty bin). Every warp computes the same value from the same list; no candidate (``n_all == 0``) gives 0. (``sq`` /
-    ``sp`` are unused since 2026-11-17: the previous form ranked every candidate against the list and staged the masses in
-    rank order through them.)"""
+    non-empty bin). Every warp computes the same value from the same list; no candidate (``n_all == 0``) gives 0."""
     i0 = lane
     i1 = lane + Int32(LANES)
     v0 = i0 < n_all
@@ -1167,8 +1190,6 @@ def _finish_small(
     rem_m: Int64,
     cand: cute.Tensor,
     cbox: cute.Tensor,
-    sq: cute.Tensor,
-    sp: cute.Tensor,
     c_rank: Int32,
     C: cutlass.Constexpr[int],
     nthreads: cutlass.Constexpr[int],
@@ -1224,9 +1245,7 @@ def _finish_small(
         n_all = off
         cute.arch.barrier()
     n_all = _imin(n_all, Int32(CAP))
-    return _select_small(
-        cand, sq, sp, n_all, lane, warp, rem_k, rem_m, scale_fix, by_mass
-    )
+    return _select_small(cand, n_all, lane, warp, rem_k, rem_m, scale_fix, by_mass)
 
 
 @cute.jit
@@ -1253,8 +1272,6 @@ def _select_tail(
     gmass: cute.Tensor,
     cand: cute.Tensor,
     cbox: cute.Tensor,
-    sq: cute.Tensor,
-    sp: cute.Tensor,
     hbase: Int32,
     mbase: Int32,
     c_rank: Int32,
@@ -1289,8 +1306,6 @@ def _select_tail(
             rem_m,
             cand,
             cbox,
-            sq,
-            sp,
             c_rank,
             C,
             nthreads,
@@ -1420,8 +1435,6 @@ def _count_tail(
     lst: cute.Tensor,
     lpos: cute.Tensor,
     cbox: cute.Tensor,
-    sq: cute.Tensor,
-    sp: cute.Tensor,
     hbase: Int32,
     c_rank: Int32,
     C: cutlass.Constexpr[int],
@@ -1511,8 +1524,6 @@ def _count_tail(
         if n_all <= Int32(CAP):
             pattern = _select_small(
                 lst,
-                sq,
-                sp,
                 n_all,
                 lane,
                 warp,
@@ -1713,8 +1724,6 @@ def _radix_select(
             rx.lst,
             rx.lpos,
             rx.cbox,
-            rx.sq,
-            rx.sp,
             hbase,
             c_rank,
             C,
@@ -1799,8 +1808,6 @@ def _radix_select(
             gmass,
             ef_list,
             rx.cbox,
-            rx.sq,
-            rx.sp,
             hbase,
             mbase,
             c_rank,

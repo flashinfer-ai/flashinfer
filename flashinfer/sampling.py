@@ -1277,7 +1277,7 @@ def log_softmax(
         out_dtype=)``. Any other dtype raises :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`.
     out : Optional[torch.Tensor]
         A caller-owned output buffer of the output dtype and ``logits.shape`` (contiguous, 16-byte aligned), written
-        in place and returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it): a trainer re-scoring rows in chunks reuses one buffer instead
+        in place and returned, so no output is allocated: a trainer re-scoring rows in chunks reuses one buffer instead
         of allocating batch x vocabulary floats per chunk. A buffer that does not fit is refused, never copied.
 
     Returns
@@ -1411,7 +1411,7 @@ def sampling_from_logits(
     out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``
         (the kernel's own output), or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens,
-        the dtype contract above) -- written in place and returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it). Refused, never copied, when
+        the dtype contract above) -- written in place and returned, so no output is allocated. Refused, never copied, when
         it does not fit.
     logprob_out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned float32 buffer of shape ``(batch_size,)`` for the
@@ -1573,7 +1573,7 @@ def sampling_from_probs(
     out : Optional[torch.Tensor]
         Only with ``batch_invariant=True``: a caller-owned buffer for ``samples`` -- int32 of shape ``(batch_size,)``,
         or int64 with int64 ``indices`` (filled by a cast from the kernel's int32 tokens) -- written in place and
-        returned, so no output is allocated (a Python-scalar filter is broadcast into a per-row tensor each call; per-row int32 / float32 tensors avoid it). Refused, never copied, when it does not fit.
+        returned, so no output is allocated. Refused, never copied, when it does not fit.
 
     Returns
     -------

@@ -72,6 +72,7 @@ from .support_kernel import (
     _kept_shortcut,
     _kind,
     _masked_sum,
+    _neg_sweep,
     _Radix,
     _list_totals,
     _radix_select,
@@ -364,9 +365,7 @@ class DrawSupportKernel:
             rcbuf = smem.allocate_tensor(
                 Int32, cute.make_layout((LANES,)), byte_alignment=16
             )
-        hist, mslot, mred, gcnt, gmass, cand, cbox, sq, sp, lst, lpos = _alloc_hist(
-            self, smem
-        )
+        hist, mslot, mred, gcnt, gmass, cand, cbox, lst, lpos = _alloc_hist(self, smem)
         if cutlass.const_expr(cand is None):  # a min-p-only set
             cand = smem.allocate_tensor(
                 Int32, cute.make_layout((CAP + 1,)), byte_alignment=16
@@ -461,10 +460,27 @@ class DrawSupportKernel:
             cand,
             lst,
             cbox,
-            sq,
-            sp,
             lpos,
         )
+        # ===== the input domain: a probability row with a negative weight is invalid on every path (support_kernel._neg_sweep) ====
+        no_neg = Boolean(True)
+        if cutlass.const_expr(not self.from_logits):
+            n_iters_w = -(
+                -(self.cfg.blocks_per_cta(self.N) * BLOCK * self.elem_bytes // 4)
+                // (self.num_threads * WPT)
+            )
+            neg_cnt = _neg_sweep(
+                words,
+                rx.n_words,
+                rx.col0,
+                N,
+                tid,
+                self.kind,
+                self.num_threads,
+                n_iters_w,
+                1 if self.kind == 0 else 2,
+            )
+            no_neg = red.reduce(neg_cnt, "add", peers) == Int32(0)
         # the row sum is read by a top-p selection over the whole row (the joint order, or no top-k) -- with the top_k_first
         # shortcut the top-p base is the top-k kept mass (the masked tree below) -- and by the drawn token's
         # full-distribution log-probability
@@ -558,7 +574,7 @@ class DrawSupportKernel:
                     tot_m, min_pos = _list_totals(cand, n_all, t, scale_fix)
                     tot_c = n_all
                     sel_p = _select_small(
-                        cand, sq, sp, n_all, t, w, Int32(0), target, scale_fix, True
+                        cand, n_all, t, w, Int32(0), target, scale_fix, True
                     )
                 else:
                     sel_p, tot_c, tot_m, min_pos, _nl = _radix_select(
@@ -634,6 +650,9 @@ class DrawSupportKernel:
                 self, loader, leaf, peers, thr_bits, u, t, w, c_rank
             )
         loader.frags.clear()
+        mass = _select(
+            no_neg, mass, Float32(NAN)
+        )  # a negative weight in the row: invalid (NaN mass fails every validity test below)
         if cutlass.const_expr(self.score):
             token, valid, mass, lp, lpk = _score_token(
                 self, mX, mIds, row_c, src_c, N, S, mass, thr_bits, nm, c, fp

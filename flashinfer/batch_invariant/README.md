@@ -282,7 +282,7 @@ with int64 `indices` (filled by a cast from the kernel's int32 tokens, the opera
 the entries allocate their outputs as the operator's own kernels do (graph-safe through torch's private pools). The
 inputs are read in place when they are in the kernels' form -- int64 or uint64 keys, an fp32 per-row temperature, int64
 indices, contiguous rows -- and conditioned (a cast or a copy) otherwise; the validity mask is formed only when asked
-for (`return_valid`). `softmax`, `sampling_from_probs` and `sampling_from_logits` refuse the buffers on their default path
+for (`return_valid`). A probability row with a negative weight is outside the contract (the samplers' weights are non-negative) and is invalid on every path and placement: token `-1`, `valid` false, NaN mass and log-probabilities; `-0.0` is a zero, and a logits input cannot produce one (`ex2` is never negative). `softmax`, `sampling_from_probs` and `sampling_from_logits` refuse the buffers on their default path
 (`batch_invariant=False`: the operator's kernels allocate their own outputs) rather than copying into them; `log_softmax`
 and `log_probs` run the class under either flag value and take them.
 
