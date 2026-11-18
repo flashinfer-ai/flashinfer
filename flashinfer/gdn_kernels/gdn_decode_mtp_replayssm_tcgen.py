@@ -704,19 +704,6 @@ def _launch_tcgen(
 
 
 _CACHE: dict = {}
-_CHAIN_PARENTS: dict = {}
-
-
-def _chain_parents(T: int, device: torch.device) -> torch.Tensor:
-    """Unread placeholder for the chain path; keeps the kernel ABI uniform."""
-    key = (T, device)
-    if key not in _CHAIN_PARENTS:
-        _CHAIN_PARENTS[key] = torch.arange(
-            -1, T - 1, dtype=torch.int32, device=device
-        ).view(1, T)
-    return _CHAIN_PARENTS[key]
-
-
 _VALIDATE_VERIFY_PARENTS = (
     os.environ.get("FLASHINFER_VALIDATE_VERIFY_PARENTS", "0") == "1"
 )
@@ -773,13 +760,13 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
     if target.major != 10:
         raise ValueError("tcgen05 ReplaySSM verify requires SM100/SM103")
     write_u = replayssm_u is not None
-    # The window not written by this mode is compile-time dead; bind existing
-    # tensors of the same rank and dtype so no placeholder is allocated.
+    # The window not written by this mode is compile-time dead; bind an existing
+    # rank-4 tensor so no per-call placeholder is created.
     if write_u:
         replayssm_rawv = replayssm_rawk
         replayssm_beta = replayssm_g
     else:
-        replayssm_u = replayssm_g.unsqueeze(-1)
+        replayssm_u = replayssm_rawv
     # A single request runs one head per CTA for more CTAs.
     heads_per_cta = 1 if q.shape[0] == 1 else 2
     has_paths = verify_parents is not None
@@ -794,7 +781,8 @@ def run_gdn_verify_kernel_mtp_replayssm_tcgen(
             raise ValueError("verify_parents must be on the query device")
         _assert_verify_parents(verify_parents)
     else:
-        verify_parents = _chain_parents(T, q.device)
+        # Never read without paths; any bound tensor satisfies the launch ABI.
+        verify_parents = state_indices
     # mark_layout_dynamic preserves the inferred unit-stride dimension.
     # Include it so sliced/transposed views do not reuse an incompatible ABI.
     layout_key = tuple(
