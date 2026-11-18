@@ -249,6 +249,7 @@ _LOCK = threading.Lock()
 _TABLES: dict[int, SmTable | None] = {}
 _PROBE_MODULE: list[Any] = []  # the loaded module, or None for an old toolkit
 _PROBE_LOCKS: dict[int, threading.Lock] = {}  # one per device: one probe at a time
+_UNPROBED = object()
 
 
 def _device_index(device: Any) -> int:
@@ -352,12 +353,15 @@ def sm_table(device: Any = None) -> SmTable | None:
         index = _device_index(device)
     except Exception:  # noqa: BLE001 - no CUDA device to probe
         return None
+    cached = _TABLES.get(index, _UNPROBED)  # a cached outcome needs no lock
+    if cached is not _UNPROBED:
+        return cached
     with _LOCK:
         if index in _TABLES:
             return _TABLES[index]
         lock = _PROBE_LOCKS.setdefault(index, threading.Lock())
     try:
-        capturing = torch.cuda.is_current_stream_capturing()
+        capturing = _stream_capturing(index)
     except Exception:  # noqa: BLE001 - no CUDA runtime to ask: nothing to probe yet
         return None
     if capturing:
@@ -618,11 +622,22 @@ def counters(
     The pair is allocated and zeroed on the current stream of ``device``. With
     ``settle=True`` it is allocated and zeroed on a private stream of the device
     instead, and the call waits for that zeroing (not for the caller's stream), so
-    the pair may be used at once on any stream; keep it alive until the launches
-    that use it are done."""
+    the pair may be used at once on any stream. The pair is marked used on the
+    caller's current stream (``Tensor.record_stream``): freed, its memory is not
+    reused before the work enqueued on that stream by then is done. A launch on
+    another stream must mark that stream too (a prepared launch does), or keep
+    the pair alive until its launches are done."""
     index = _device_index(device)
     if settle:
+        import torch
+
         pair, _ = _settled_pair(int(words), index)
+        # Allocated on the private stream: freeing the pair must also wait for
+        # the work the caller enqueues on its stream, or the next allocation on
+        # the private stream could take and zero it under a running launch.
+        stream = torch.cuda.current_stream(index)
+        for tensor in pair:
+            tensor.record_stream(stream)
         return pair
     pair, _ = _allocate_pair(int(words), index)
     for tensor in pair:
@@ -630,20 +645,26 @@ def counters(
     return pair
 
 
-def _capture_id(device_index: int) -> int:
+def _capture_id(device_index: int) -> int | None:
     """CUDA's id of the capture the current stream of ``device_index`` is in, 0
-    when it is not capturing or the id cannot be read."""
+    when it is not capturing, ``None`` when it cannot be read (no CUDA Python
+    runtime bindings: neither ``cuda.bindings.runtime`` nor ``cuda.cudart``)."""
     import torch
 
     try:
         from cuda.bindings import runtime as cudart
-
+    except ImportError:
+        try:
+            from cuda import cudart  # cuda-python before cuda.bindings
+        except ImportError:
+            return None
+    try:
         handle = int(torch._C._cuda_getCurrentRawStream(device_index))
         info = cudart.cudaStreamGetCaptureInfo(handle)
-    except Exception:  # noqa: BLE001 - no CUDA Python bindings: the id is unknown
-        return 0
+    except Exception:  # noqa: BLE001 - the bindings cannot read it: unknown
+        return None
     if info[0] != cudart.cudaError_t.cudaSuccess:
-        return 0
+        return None
     if info[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
         return 0
     return int(info[2])
@@ -722,9 +743,11 @@ def _thread_pairs() -> dict[tuple[int, int, int], tuple[Any, Any]]:
 
 
 def _stream_capturing(device_index: int) -> bool:
+    """Whether the current stream of device ``device_index`` (not of the current
+    device) is capturing a CUDA graph."""
     import torch
 
-    if device_index == torch.cuda.current_device():
+    if torch.cuda.device_count() <= 1 or device_index == torch.cuda.current_device():
         return bool(torch.cuda.is_current_stream_capturing())
     with torch.cuda.device(device_index):
         return bool(torch.cuda.is_current_stream_capturing())
@@ -809,7 +832,11 @@ def _captured_pair(device_index: int, words: int) -> tuple[Any, Any]:
     import torch
 
     state = _counter_state(device_index)
+    # An unreadable capture id counts every such capture as one capture: the
+    # reserve then grows with all of them (within CAPTURE_PAIR_LIMIT).
     capture = _capture_id(device_index)
+    if capture is None:
+        capture = -1
     with state.lock:
         reserve = state.reserves.setdefault(words, _CaptureReserve())
         if capture != reserve.capture_id:
@@ -903,7 +930,14 @@ def launch_counters(words: int, device: Any = None) -> tuple[Any, Any]:
                     while len(state.stream_pairs) > STREAM_PAIR_LIMIT:
                         state.stream_pairs.popitem(last=False)
     # A refill that fails does not fail the call: captures then zero their own
-    # pair until a later refill works.
+    # pair until a later refill works.  A full reserve needs no refill (checked
+    # here first, without the lock, as in _refill_capture_reserve).
+    reserve = _counter_state(index).reserves.get(words)
+    if reserve is not None and (
+        reserve.refilling
+        or 2 * len(reserve.free) > max(CAPTURE_RESERVE, 2 * reserve.peak)
+    ):
+        return pair
     with contextlib.suppress(Exception):
         _refill_capture_reserve(index, words)
     return pair

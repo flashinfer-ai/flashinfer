@@ -1952,18 +1952,39 @@ def test_domain_homing_needs_the_whole_allocation(monkeypatch):
 
     monkeypatch.setattr(cake_locality, "homing", registry)
     monkeypatch.setattr(cake_locality, "sm_table", lambda device=None: table)
+    monkeypatch.setattr(module, "domain_serving_routed", lambda *args: True)
+    monkeypatch.setattr(module, "_PLANS", {})
     assert cake_locality.tensor_homing(b) is record
-    assert module._domain_homing(b, 0, 4) == (2, table)
-    assert module._domain_homing(b[:2], 0, 2) is None
-    assert module._domain_homing(b[1:], 0, 3) is None
-    assert module._domain_homing(b[:], 0, 4) is None
-    assert module._domain_homing(b.view(4, 8, 16), 0, 4) is None
-    assert module._domain_homing(b.clone(), 0, 4) is None
-    assert module._domain_homing(copy.deepcopy(b), 0, 4) is None
-    assert module._domain_homing(b, 1, 4) is None
+
+    def homing(tensor, groups=4, index=0):
+        return module._domain_homing(tensor, index, groups, "sm_107a", 212)
+
+    assert homing(b) == (2, table)
+    assert homing(b[:2], 2) is None
+    assert homing(b[1:], 3) is None
+    assert homing(b[:]) is None
+    assert homing(b.view(4, 8, 16)) is None
+    assert homing(b.clone()) is None
+    assert homing(copy.deepcopy(b)) is None
+    assert homing(b, index=1) is None
     moved = torch.empty((4, 8, 16), dtype=torch.uint8)
     setattr(moved, cake_locality._HOMING_ATTR, record)
-    assert module._domain_homing(moved, 0, 4) is None
+    assert homing(moved) is None
+    # A shape localize_weights refuses plans unhomed, however b was homed.
+    monkeypatch.setattr(module, "domain_serving_routed", lambda *args: False)
+    monkeypatch.setattr(module, "_PLANS", {})
+    assert homing(b) is None
+
+
+@_host_only
+def test_capture_id_without_cuda_python_is_unknown(monkeypatch):
+    """Without CUDA Python runtime bindings the capture id is unknown (``None``),
+    never a silent 0."""
+    import sys
+
+    for name in ("cuda.bindings.runtime", "cuda.cudart"):
+        monkeypatch.setitem(sys.modules, name, None)
+    assert cake_locality._capture_id(0) is None
 
 
 @_packed_serving
@@ -2125,6 +2146,41 @@ def test_domain_prepared_counters_ready_on_any_stream(cell, monkeypatch):
     assert all(int(t.abs().sum()) == 0 for t in counters)
     for die, tensor in enumerate(counters):
         assert cake_locality.pointer_domain(tensor.data_ptr()) == die
+
+
+@_packed_serving
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS[:1], ids=_cell_id)
+def test_domain_prepared_launch_dropped_at_once(cell):
+    """``prepare(...).launch()`` with the prepared launch dropped at once, 200
+    times without a sync: each launch's counters (allocated and zeroed on the
+    private stream) are not reused, so not re-zeroed, while it runs; every
+    result is the first launch's bits."""
+    device, table = _require_domain()
+    _require_routed(cell, device, table)
+    _, _, expected_m = cell
+    a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
+    homed = localize_weights(b)
+    if homed is b:
+        homed = _home(b, table)
+    first = prepare_batch_deepgemm_fp8_nt_groupwise(
+        a, homed, a_packed, b_packed, masked_m, expected_m
+    )
+    assert first.route == DOMAIN_SERVING_ROUTE
+    first.launch()
+    torch.cuda.synchronize()
+    _assert_valid_rows_close(first.out, reference, masked_m)
+    expected = first.out.view(torch.int16)
+    del first
+    outs = [torch.empty_like(expected, dtype=torch.bfloat16) for _ in range(4)]
+    mismatches = torch.zeros((), dtype=torch.int64, device=a.device)
+    for launch in range(200):
+        out = outs[launch % len(outs)]
+        out.fill_(float("nan"))
+        prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, homed, a_packed, b_packed, masked_m, expected_m, out=out
+        ).launch()
+        mismatches += ((out.view(torch.int16) != expected) & valid[:, :, None]).sum()
+    assert int(mismatches) == 0
 
 
 # The race's occupier: one 1024-thread block per SM (its whole opt-in shared

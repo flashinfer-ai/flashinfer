@@ -352,16 +352,17 @@ class _Problem:
 
 
 # Route decisions already made: (arch, SM count, packed scales, B, M, N, K,
-# expected_m, die SM counts of homed ``b`` or None) -> RoutePlan.  The decision
-# reads only these, so a call re-validates its tensors and reuses the decision.
+# expected_m, die SM counts of homed ``b`` or None) -> RoutePlan, and ("routed",
+# arch, SM count, die SM counts, N, K, B) -> domain_serving_routed(...).  The
+# decisions read only these, so a call re-validates its tensors and reuses them.
 # At most PLAN_LIMIT entries; the oldest is dropped past it.
 PLAN_LIMIT = 4096
-_PLANS: dict[tuple[Any, ...], RoutePlan] = {}
+_PLANS: dict[tuple[Any, ...], Any] = {}
 # (arch, program) -> (FFI entry, argument plan) of a loaded generated program.
 _ENTRIES: dict[tuple[str, str], tuple[Callable[..., Any], list[list[str]]]] = {}
 
 
-def _remember_plan(key: tuple[Any, ...], plan: RoutePlan) -> None:
+def _remember_plan(key: tuple[Any, ...], plan: Any) -> None:
     while len(_PLANS) >= PLAN_LIMIT:
         try:
             del _PLANS[next(iter(_PLANS))]
@@ -387,14 +388,16 @@ def _program_entry(
 
 
 def _domain_homing(
-    b: torch.Tensor, index: int, groups: int
+    b: torch.Tensor, index: int, groups: int, arch: str, sm_count: int
 ) -> Optional[tuple[int, Any]]:
     """``(g_cut, sm_table)`` when ``b`` is the very tensor :func:`localize_weights`
     returned (the whole allocation; not a view or a copy of it) on a device with a
     probed SM table, else ``None``.  ``g_cut`` is the group of ``b`` nearest to its
     die cut (the twin's result does not depend on it).  Reads the record the
     allocation carries (:func:`flashinfer.cake_locality.tensor_homing`), not the
-    allocation registry."""
+    allocation registry.  A shape :func:`localize_weights` refuses
+    (:func:`domain_serving_routed` is False) plans unhomed even when its ``b`` was
+    homed some other way (e.g. by :func:`flashinfer.cake_locality.split_empty`)."""
     homed = cake_locality.tensor_homing(b)
     if homed is None or homed.device_index != index:
         return None
@@ -402,6 +405,14 @@ def _domain_homing(
         return None
     table = cake_locality.sm_table(index)
     if table is None:
+        return None
+    n, k = int(b.shape[1]), int(b.shape[2])
+    key = ("routed", arch, sm_count, table.counts, n, k, groups)
+    routed = _PLANS.get(key)
+    if routed is None:
+        routed = domain_serving_routed(arch, sm_count, table.counts, n, k, groups)
+        _remember_plan(key, routed)
+    if not routed:
         return None
     group_bytes = b.stride(0) * b.element_size()
     cut = homed.cut - (int(b.data_ptr()) - homed.base)
@@ -512,7 +523,9 @@ def _resolve(
             device=device,
             strides=(N * cols, 1, N),
         )
-        domain = _domain_homing(b, index, B) if arch == DOMAIN_ARCH else None
+        domain = (
+            _domain_homing(b, index, B, arch, sm_count) if arch == DOMAIN_ARCH else None
+        )
         counts = None if domain is None else domain[1].counts
         key = (arch, sm_count, True, B, M, N, K, expected_m, counts)
         plan = _PLANS.get(key)
@@ -780,8 +793,9 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     (successive launches on one stream, or graph replays on one stream, never
     do); prepare one launch per concurrent stream.  Counters the launch allocates
     at preparation outside capture are zeroed before preparation returns, so the
-    first launch may run on any stream; keep the prepared launch alive until its
-    launches are done.  A twin launch prepared under CUDA graph capture without
+    first launch may run on any stream, and are marked used on every stream a
+    launch runs on: dropping the prepared launch right after ``launch()`` is
+    safe, their memory is reused only after those launches are done.  A twin launch prepared under CUDA graph capture without
     caller-owned counters zeroes its counters inside that capture, so it belongs
     to that capture: ``launch()`` raises outside capture and in any other capture.
     """
@@ -802,22 +816,30 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     # CUDA's id of that capture (0 when it could not be read).
     capture_only: bool = False
     capture_id: int = 0
+    # Raw handles of the streams the launch's own counters are marked used on
+    # (``Tensor.record_stream``), so their memory outlives this object's launches
+    # on every stream; ``None`` when the launch does not own its counters.
+    _counter_streams: Optional[set[int]] = None
 
     def launch(self) -> torch.Tensor:
+        index = _device_index(self.out.device)
         with torch.cuda.device(self.out.device), tvm_ffi.use_torch_stream():
             if self.capture_only and (
-                not torch.cuda.is_current_stream_capturing()
-                or (
-                    self.capture_id
-                    and cake_locality._capture_id(_device_index(self.out.device))
-                    != self.capture_id
-                )
+                not cake_locality._stream_capturing(index)
+                or cake_locality._capture_id(index) != self.capture_id
             ):
                 raise RuntimeError(
                     "this locality-domain launch was prepared under CUDA graph "
                     "capture, which zeroes its claim counters: launch it only in "
                     "that capture, or prepare it outside capture"
                 )
+            if self._counter_streams is not None:
+                handle = int(torch._C._cuda_getCurrentRawStream(index))
+                if handle not in self._counter_streams:
+                    stream = torch.cuda.current_stream(index)
+                    for name in DOMAIN_COUNTERS:
+                        self.workspace[name].record_stream(stream)
+                    self._counter_streams.add(handle)
             for entry, arguments in self._launches:
                 entry(*arguments)
         return self.out
@@ -848,7 +870,7 @@ def _allocate_workspace(
             pair = cake_locality.launch_counters(
                 PAIR_COUNTER_WORDS, _device_index(device)
             )
-        elif torch.cuda.is_current_stream_capturing():
+        elif cake_locality._stream_capturing(_device_index(device)):
             # Locality-domain memory is not allocated under capture: zeroed
             # counters from the capture's pool (same bits, unhomed claims).
             pair = tuple(
@@ -1067,15 +1089,24 @@ def _prepare(
     plan = problem.plan
     capture_only = False
     capture_id = 0
+    counter_streams: Optional[set[int]] = None
     if workspace is None:
-        workspace = _allocate_workspace(plan, device, launch_now=launch_now)
-        capture_only = (
-            not launch_now
-            and DOMAIN_COUNTERS[0] in plan.workspaces
-            and torch.cuda.is_current_stream_capturing()
-        )
+        index = _device_index(device)
+        owns_counters = not launch_now and DOMAIN_COUNTERS[0] in plan.workspaces
+        capture_only = owns_counters and cake_locality._stream_capturing(index)
         if capture_only:
-            capture_id = cake_locality._capture_id(_device_index(device))
+            read = cake_locality._capture_id(index)
+            if not read:
+                raise RuntimeError(
+                    "cannot read the id of the current CUDA graph capture (CUDA "
+                    "Python runtime bindings are missing): pass caller-owned "
+                    "counters as workspace, or prepare outside capture"
+                )
+            capture_id = read
+        workspace = _allocate_workspace(plan, device, launch_now=launch_now)
+        if owns_counters and not capture_only:
+            # counters(settle=True) marked them used on this stream.
+            counter_streams = {int(torch._C._cuda_getCurrentRawStream(index))}
     else:
         _check_workspace(plan, workspace, device)
     launches = _bind_launches(problem, a, b, a_scale, b_scale, masked_m, out, workspace)
@@ -1092,6 +1123,7 @@ def _prepare(
         g_cut=problem.g_cut,
         capture_only=capture_only,
         capture_id=capture_id,
+        _counter_streams=counter_streams,
     )
 
 
