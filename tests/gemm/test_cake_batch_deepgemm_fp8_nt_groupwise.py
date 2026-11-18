@@ -1185,9 +1185,10 @@ def test_domain_serving_cells_follow_the_source_rule():
 def test_every_key_of_a_homed_shape_has_a_routed_twin():
     """Weights of a homed shape run a twin at every expected_m on both die
     classes: every serving key such a problem selects has a twin listed in the
-    cell of that expected_m.  Every other serving shape is refused: one of its
-    keys (the expected_m <= 1 key) has no twin.  Every twin serves a key some
-    serving shape selects."""
+    cell of that expected_m.  Every other serving shape is refused (its
+    expected_m <= 1 key has no twin), and none of its keys ships a twin: such a
+    twin would be unreachable.  Every twin serves a key some serving shape
+    selects."""
     shapes = {(nk, groups) for nk in PACKED_NK for groups in PACKED_GROUPS}
     assert shapes == _HOMED_SHAPES | _REFUSED_SHAPES
     assert not _HOMED_SHAPES & _REFUSED_SHAPES
@@ -1209,8 +1210,13 @@ def test_every_key_of_a_homed_shape_has_a_routed_twin():
                     assert twin == DOMAIN_SERVING_PROGRAMS[key], (key, dies, expected_m)
                 if key not in DOMAIN_SERVING_PROGRAMS:
                     untwinned.add(((nk, groups), expected_m_class(expected_m)))
-    # The keys without a twin are the expected_m <= 1 keys of the refused shapes.
-    assert untwinned == {(shape, "em<=1") for shape in _REFUSED_SHAPES}
+    # The keys without a twin: every key of the refused shapes, none of the homed.
+    assert {shape for shape, _ in untwinned} == _REFUSED_SHAPES
+    assert {(shape, "em<=1") for shape in _REFUSED_SHAPES} <= untwinned
+    for nk, groups in _REFUSED_SHAPES:
+        for expected_m in range(0, 70):
+            key = _serving_key("sm_107a", _SOURCE_SM_COUNT, nk, groups, expected_m)
+            assert key not in DOMAIN_SERVING_PROGRAMS, key
     assert sorted(set(DOMAIN_SERVING_PROGRAMS) - keys) == []
     for key, twin in DOMAIN_SERVING_PROGRAMS.items():
         assert PROGRAMS[twin]["arches"] == ["sm_107a"], key
@@ -1965,7 +1971,9 @@ def test_capture_id_without_cuda_python_is_unknown(monkeypatch):
     never a silent 0."""
     import sys
 
-    for name in ("cuda.bindings.runtime", "cuda.cudart"):
+    # A package already imported would hand out its loaded submodule: hide the
+    # packages themselves too.
+    for name in ("cuda", "cuda.bindings", "cuda.bindings.runtime", "cuda.cudart"):
         monkeypatch.setitem(sys.modules, name, None)
     assert cake_locality._capture_id(0) is None
 

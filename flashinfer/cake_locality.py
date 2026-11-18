@@ -249,7 +249,6 @@ _LOCK = threading.Lock()
 _TABLES: dict[int, SmTable | None] = {}
 _PROBE_MODULE: list[Any] = []  # the loaded module, or None for an old toolkit
 _PROBE_LOCKS: dict[int, threading.Lock] = {}  # one per device: one probe at a time
-_UNPROBED = object()
 
 
 def _device_index(device: Any) -> int:
@@ -353,9 +352,8 @@ def sm_table(device: Any = None) -> SmTable | None:
         index = _device_index(device)
     except Exception:  # noqa: BLE001 - no CUDA device to probe
         return None
-    cached = _TABLES.get(index, _UNPROBED)  # a cached outcome needs no lock
-    if cached is not _UNPROBED:
-        return cached
+    if index in _TABLES:  # a cached outcome needs no lock
+        return _TABLES.get(index)
     with _LOCK:
         if index in _TABLES:
             return _TABLES[index]
