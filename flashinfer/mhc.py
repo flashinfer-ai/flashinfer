@@ -331,6 +331,137 @@ def mhc_pre_big_fuse(
     )
 
 
+@flashinfer_api
+def mhc_pre(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float = 1e-6,
+    mhc_pre_eps: float = 1e-6,
+    mhc_sinkhorn_eps: float = 1e-6,
+    mhc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    backend: str = "auto",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply the full mHC pre map (projection GEMM included).
+
+    Unlike :func:`mhc_pre_big_fuse`, which takes externally computed
+    projection logits and square sums, this entry takes the projection
+    matrix ``fn`` itself and computes the whole op:
+
+    .. code-block:: text
+
+        x          = residual viewed (tokens, HC*H), fp32
+        mixes      = (x @ fn^T) * rsqrt(mean(x^2) + rms_eps)
+        pre gates  = sigmoid(mixes[:, :HC] * hc_scale[0] + hc_base[:HC])
+                     + mhc_pre_eps
+        post_mix   = sigmoid(mixes[:, HC:2*HC] * hc_scale[1]
+                     + hc_base[HC:2*HC]) * mhc_post_mult_value
+        comb       = sinkhorn(softmax(mixes[:, 2*HC:] * hc_scale[2]
+                     + hc_base[2*HC:]), sinkhorn_repeat, mhc_sinkhorn_eps)
+        layer_input = sum_i pre_gate[:, i] * residual[:, i, :]   (bfloat16)
+
+    Parameters
+    ----------
+    residual : torch.Tensor
+        Multi-head residual tensor, shape ``[..., HC=4, H]`` (bfloat16).
+    fn : torch.Tensor
+        Projection matrix, shape ``[24, HC*H]`` (float32). The 24 rows are
+        laid out as ``[pre(4), post(4), comb(16)]``.
+    hc_scale : torch.Tensor
+        Per-group scale, shape ``[3]`` (float32): one scale for each of the
+        pre / post / comb projection groups.
+    hc_base : torch.Tensor
+        Per-row bias, shape ``[24]`` (float32), same layout as ``fn`` rows.
+    rms_eps : float
+        RMSNorm epsilon. Default ``1e-6``. Must be strictly positive.
+    mhc_pre_eps : float
+        Epsilon added to the pre gates. Default ``1e-6``. Must be strictly
+        positive.
+    mhc_sinkhorn_eps : float
+        Sinkhorn-iteration epsilon. Default ``1e-6``. Must be strictly
+        positive.
+    mhc_post_mult_value : float
+        Post-mix multiplicative factor. Default ``1.0``.
+    sinkhorn_repeat : int
+        Number of Sinkhorn iterations. Default ``20``.
+    backend : str
+        One of ``"auto"`` (default), ``"specialized"`` or ``"big-fuse"``.
+
+        - ``"big-fuse"``: the composable path — projection GEMM and square
+          sum computed here (fp32, at the ambient matmul precision), then
+          :func:`mhc_pre_big_fuse`. Serves every shape this entry accepts.
+        - ``"specialized"``: a fused single-launch-sequence CUDA kernel for
+          the GLM-5.3 geometry (``residual`` of shape ``(T, 4, 4096)``,
+          ``1 <= T <= 16384``, default scalar parameters) on SM103.
+          Explicit selection never falls back: outside its allowlist it
+          raises, with the reasons in the message
+          (:data:`flashinfer.mhc_pre_glm_cuda.LAST_FALLBACK_REASONS`).
+          Kill switch: ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1``.
+        - ``"auto"``: purely a router — the specialized kernel when its
+          allowlist admits the call, else the big-fuse path, with identical
+          semantics either way.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(post_mix, comb_mix, layer_input)`` tensors with shapes
+        ``[..., HC=4, 1]`` (float32), ``[..., HC=4, HC=4]`` (float32) and
+        ``[..., H]`` (bfloat16).
+    """
+    if backend not in ("auto", "specialized", "big-fuse"):
+        raise ValueError(
+            f"backend must be one of 'auto', 'specialized', 'big-fuse'; got {backend!r}"
+        )
+    _check_positive_eps("rms_eps", rms_eps)
+    _check_positive_eps("mhc_pre_eps", mhc_pre_eps)
+    _check_positive_eps("mhc_sinkhorn_eps", mhc_sinkhorn_eps)
+    total_tokens, hidden_size, outer_shape = _check_mhc_pre_common_inputs(residual)
+
+    if backend != "big-fuse":
+        from . import mhc_pre_glm_cuda
+
+        residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size)
+        served = mhc_pre_glm_cuda.maybe_dispatch_specialized(
+            backend,
+            residual_flat
+            if residual_flat.is_contiguous()
+            else residual_flat.contiguous(),
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            mhc_pre_eps,
+            mhc_sinkhorn_eps,
+            mhc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        if served is not None:
+            post_mix, comb_mix, layer_input = served
+            return (
+                post_mix.reshape(outer_shape + (_MHC_HC, 1)),
+                comb_mix.reshape(outer_shape + (_MHC_HC, _MHC_HC)),
+                layer_input.reshape(outer_shape + (hidden_size,)),
+            )
+
+    k = _MHC_HC * hidden_size
+    x = residual.reshape(total_tokens, k).to(torch.float32)
+    return mhc_pre_big_fuse(
+        x @ fn.t().to(torch.float32),
+        x.square().sum(-1),
+        residual,
+        hc_scale,
+        hc_base,
+        k=k,
+        rms_eps=rms_eps,
+        mhc_pre_eps=mhc_pre_eps,
+        mhc_sinkhorn_eps=mhc_sinkhorn_eps,
+        mhc_post_mult_value=mhc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+    )
+
+
 @flashinfer_api(trace=mhc_pre_big_fuse_with_prenorm_trace)
 def mhc_pre_big_fuse_with_prenorm(
     dot_mix: torch.Tensor,
