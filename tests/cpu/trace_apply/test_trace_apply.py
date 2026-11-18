@@ -408,6 +408,172 @@ def test_output_arity_passthrough():
     assert isinstance(r, tuple) and r[0] is o and r[1] is lse
 
 
+SSD_FI_API = "flashinfer.mamba.ssd_combined.ssd_combined_fwd"
+
+
+def _ssd_combined_kwargs(*, slots: bool, checkpoint_rows: int) -> dict:
+    """CPU arguments of one ``ssd_combined_fwd`` call with a checkpoint pool:
+    batched with dense states, or packed varlen with an initial and a final
+    pool (five rows) addressed through slot vectors."""
+    seqlen, nheads = 16, 2
+    state = (nheads, 64, 128)
+    batch = 1 if slots else 2
+    kwargs = {
+        "x": torch.randn(batch, seqlen, nheads, 64),
+        "dt": torch.randn(batch, seqlen, nheads),
+        "A": torch.randn(nheads),
+        "B": torch.randn(batch, seqlen, nheads, 128),
+        "C": torch.randn(batch, seqlen, nheads, 128),
+        "checkpoint_token_indices": torch.tensor([3, 11], dtype=torch.int32),
+        "checkpoint_state_slots": torch.tensor([1, 0], dtype=torch.int32),
+        "checkpoint_states": torch.randn(checkpoint_rows, *state),
+    }
+    if slots:
+        kwargs.update(
+            cu_seqlens=torch.tensor([0, 8, seqlen], dtype=torch.int32),
+            initial_states=torch.randn(7, *state),
+            initial_state_slots=torch.tensor([4, 0], dtype=torch.int32),
+            final_states=torch.randn(5, *state),
+            final_state_slots=torch.tensor([1, 3], dtype=torch.int32),
+        )
+    return kwargs
+
+
+def _ssd_combined_apply(kwargs: dict):
+    """The selected template, namespace and output destinations of one
+    ``ssd_combined_fwd`` call, built as the Apply wrapper builds them."""
+    importlib.import_module("flashinfer.mamba.ssd_combined")
+    from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
+
+    original = _registry_by_fi_api()[SSD_FI_API][0]
+    namespace = bind_namespace(original, (), kwargs)
+    template = ssd_combined_trace_dispatch(**namespace)
+    return template, namespace, _derive_output_dests(template, original)
+
+
+@pytest.mark.cpu_only
+def test_ssd_combined_templates_bind_final_states_second():
+    # ssd_combined_fwd returns (out, final_states | None): a value-returning
+    # solution's tuple binds by output position.
+    from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
+
+    for template in ssd_combined_trace_dispatch.templates:
+        keys = adapt._tensor_output_keys(template)
+        if "final_states" in keys:
+            assert keys[:2] == ["out", "final_states"], template.name_prefix
+            assert template.outputs["final_states"].param == "final_states"
+        else:
+            assert keys[0] == "out", template.name_prefix
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("checkpoint_rows", (5, 7), ids=("same_shape", "seven_rows"))
+def test_ssd_combined_value_returning_slot_solution_keeps_checkpoints(
+    checkpoint_rows,
+):
+    # The returned final pool goes into the caller's final pool, never into the
+    # checkpoint pool (silently overwritten when the shapes match, a failed
+    # copy after the solution ran otherwise).
+    kwargs = _ssd_combined_kwargs(slots=True, checkpoint_rows=checkpoint_rows)
+    template, namespace, dests = _ssd_combined_apply(kwargs)
+    assert template.name_prefix.startswith("ssd_combined_varlen_slots_")
+    # The pools are required inputs, so their dtypes route.
+    assert {("initial_states", "float32"), ("final_states", "float32")} <= set(
+        adapt.extract_input_dtypes(template, namespace)
+    )
+    pool, checkpoints = kwargs["final_states"], kwargs["checkpoint_states"]
+    checkpoints_before = checkpoints.clone()
+    out_value = torch.randn_like(kwargs["x"])
+    new_pool = torch.randn_like(pool)
+
+    def sol(**inputs):
+        assert inputs["final_states"] is pool
+        assert inputs["checkpoint_states"] is checkpoints
+        return out_value, new_pool
+
+    out, final = adapt.adapt_and_call(
+        template=template,
+        fn=sol,
+        namespace=namespace,
+        dps=False,
+        is_inplace=False,
+        dests=dests,
+    )
+    assert out is out_value
+    assert final is pool and torch.equal(pool, new_pool)
+    assert torch.equal(checkpoints, checkpoints_before)
+
+
+@pytest.mark.cpu_only
+def test_ssd_combined_value_returning_dense_solution_keeps_checkpoints():
+    # A dense call: the returned final states go to the caller's final_states
+    # when given (else they are returned as is), never into the checkpoint
+    # buffer (of the same shape here) or the caller's out buffer.
+    kwargs = _ssd_combined_kwargs(slots=False, checkpoint_rows=2)
+    kwargs["out"] = torch.empty_like(kwargs["x"])
+    out_value = torch.randn_like(kwargs["x"])
+    final_value = torch.randn_like(kwargs["checkpoint_states"])
+    checkpoints = kwargs["checkpoint_states"]
+    checkpoints_before = checkpoints.clone()
+
+    def call(kwargs):
+        template, namespace, dests = _ssd_combined_apply(kwargs)
+        assert template.name_prefix.startswith("ssd_combined_batched_")
+        assert dests == {
+            "out": "out",
+            "final_states": "final_states",
+            "checkpoint_states": "checkpoint_states",
+        }
+        return adapt.adapt_and_call(
+            template=template,
+            fn=lambda **inputs: (out_value, final_value),
+            namespace=namespace,
+            dps=False,
+            is_inplace=False,
+            dests=dests,
+        )
+
+    out, final = call(kwargs)
+    assert out is kwargs["out"] and torch.equal(out, out_value)
+    assert final is final_value
+    assert torch.equal(checkpoints, checkpoints_before)
+    kwargs["final_states"] = torch.empty_like(final_value)
+    out, final = call(kwargs)
+    assert final is kwargs["final_states"] and torch.equal(final, final_value)
+    assert torch.equal(checkpoints, checkpoints_before)
+
+
+@pytest.mark.cpu_only
+def test_ssd_combined_positional_dps_slot_solution_writes_the_final_pool():
+    # A destination-passing solution receives the caller's final pool as the
+    # final_states destination, right after out, then the checkpoint pool.
+    kwargs = _ssd_combined_kwargs(slots=True, checkpoint_rows=7)
+    template, namespace, dests = _ssd_combined_apply(kwargs)
+    pool, checkpoints = kwargs["final_states"], kwargs["checkpoint_states"]
+    checkpoints_before = checkpoints.clone()
+    num_inputs = len(template.inputs)
+    destinations = []
+
+    def sol(*args):
+        destinations.extend(args[num_inputs:])
+        args[num_inputs + 1].fill_(1.0)
+
+    result = adapt.adapt_and_call(
+        template=template,
+        fn=sol,
+        namespace=namespace,
+        dps=True,
+        is_inplace=False,
+        dests=dests,
+        positional=True,
+    )
+    out_buffer, final_buffer, checkpoint_buffer = destinations
+    assert out_buffer.shape == kwargs["x"].shape
+    assert final_buffer is pool and checkpoint_buffer is checkpoints
+    assert result[1] is pool and bool((pool == 1.0).all())
+    assert torch.equal(checkpoints, checkpoints_before)
+
+
 @pytest.mark.cpu_only
 def test_python_solution_loader(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))

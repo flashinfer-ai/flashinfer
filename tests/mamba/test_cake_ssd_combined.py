@@ -10303,7 +10303,7 @@ def test_cake_ssd_combined_caller_final_states_validation():
     initial or checkpoint states.  A strided dense ``initial_states`` is
     packed before the launch: a ``final_states`` in the gaps between its
     rows (but on none of its elements) is accepted and gives the same
-    result."""
+    result; one on a row of it is refused."""
 
     _skip_unless_cake_arch()
     constructor, tensors, arguments = _case(varlen=False)
@@ -10338,6 +10338,12 @@ def test_cake_ssd_combined_caller_final_states_validation():
     )
     assert run_final.data_ptr() == storage[2:4].data_ptr()
     assert torch.equal(run_out, out) and torch.equal(run_final, final)
+    with pytest.raises(ValueError, match="must not overlap initial_states"):
+        runner.run(
+            *tensors,
+            **{**arguments, "initial_states": strided},
+            final_states=storage[:2],
+        )
     # Contiguous dense views that share a row still race and are refused.
     storage[:2].copy_(arguments["initial_states"])
     with pytest.raises(ValueError, match="must not overlap initial_states"):

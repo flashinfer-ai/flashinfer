@@ -1447,27 +1447,53 @@ def _chunk_parallel_mode() -> str:
     return mode
 
 
-def _storage_overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
-    """Whether the byte extents of two tensors, strided or not, intersect.
+def _storage_extent(t: torch.Tensor) -> tuple[int, int]:
+    """The byte extent of a tensor, strided or not: from its first element to
+    one past its last (``1 + sum((size - 1) * stride)`` elements, none for an
+    empty tensor)."""
 
-    A tensor's extent runs from its first element to one past its last
-    (``1 + sum((size - 1) * stride)`` elements, none for an empty tensor):
+    start = t.data_ptr()
+    elements = 0
+    if t.numel():
+        elements = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(t.shape, t.stride(), strict=True)
+        )
+    return start, start + elements * t.element_size()
+
+
+def _storage_overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether the byte extents of two tensors, strided or not, intersect:
     the elements a row-strided state pool skips between rows count as its
     own."""
 
-    def extent(t: torch.Tensor) -> tuple[int, int]:
-        start = t.data_ptr()
-        elements = 0
-        if t.numel():
-            elements = 1 + sum(
-                (size - 1) * stride
-                for size, stride in zip(t.shape, t.stride(), strict=True)
-            )
-        return start, start + elements * t.element_size()
-
-    a_start, a_end = extent(a)
-    b_start, b_end = extent(b)
+    a_start, a_end = _storage_extent(a)
+    b_start, b_end = _storage_extent(b)
     return a_start < b_end and b_start < a_end
+
+
+def _occupied_overlaps(rows: torch.Tensor, other: torch.Tensor) -> bool:
+    """Whether the byte extent of ``other`` meets an element ``rows`` occupies.
+
+    A row-strided ``rows`` (contiguous rows, a positive row stride of at least
+    one row) occupies only its rows, not the gaps between them; any other
+    geometry counts its whole extent (``_storage_overlaps``)."""
+
+    if (
+        rows.dim() == 0
+        or not rows.numel()
+        or not rows[0].is_contiguous()
+        or rows.stride(0) <= 0
+        or rows[0].numel() > rows.stride(0)
+    ):
+        return _storage_overlaps(rows, other)
+    start = rows.data_ptr()
+    row_bytes = rows[0].numel() * rows.element_size()
+    step = rows.stride(0) * rows.element_size()
+    other_start, other_end = _storage_extent(other)
+    # The first row that ends after ``other`` starts.
+    first = max(0, (other_start - start - row_bytes) // step + 1)
+    return first < rows.shape[0] and start + first * step < other_end
 
 
 def _same_tensor(a: torch.Tensor, b: torch.Tensor) -> bool:
@@ -5132,12 +5158,22 @@ class CakeSSDCombined:
                         f"initial_states must have shape {expected_states}"
                     )
         # A non-contiguous dense ``initial_states`` is packed into a private
-        # workspace buffer before the launch (``_contiguous_input``), so only an
-        # initial pool or a contiguous dense tensor can alias a state the call
-        # stores.
-        initial_in_place = initial_states is not None and (
-            initial_state_slots is not None or initial_states.is_contiguous()
+        # workspace buffer before the launch (``_contiguous_input``), so the
+        # kernels never read it in place; a state the call stores must still
+        # not land on an element of it (the caller's input), but may land in
+        # the gaps between its rows.  Any other tensor counts its whole
+        # extent.
+        initial_rows_only = (
+            initial_states is not None
+            and initial_state_slots is None
+            and not initial_states.is_contiguous()
         )
+
+        def overlaps(state: torch.Tensor, other: torch.Tensor) -> bool:
+            if initial_rows_only and other is initial_states:
+                return _occupied_overlaps(other, state)
+            return _storage_overlaps(state, other)
+
         if final_states is not None:
             if not return_final_states:
                 raise ValueError("final_states requires return_final_states=True")
@@ -5173,13 +5209,10 @@ class CakeSSDCombined:
                 and _same_tensor(final_states, initial_states)
             )
             for name, other in (
-                (
-                    "initial_states",
-                    None if same_pool or not initial_in_place else initial_states,
-                ),
+                ("initial_states", None if same_pool else initial_states),
                 ("checkpoint_states", None if state_slots else checkpoint_states),
             ):
-                if other is not None and _storage_overlaps(final_states, other):
+                if other is not None and overlaps(final_states, other):
                     raise ValueError(f"final_states must not overlap {name}")
         if state_slots and checkpoint_states is not None:
             # A checkpoint row is stored while other items still read initial
@@ -5189,16 +5222,12 @@ class CakeSSDCombined:
             # host cannot check without reading the slot values); any other
             # overlap with either state tensor, pool or dense, is refused.
             for name, other, pool in (
-                (
-                    "initial_states",
-                    initial_states if initial_in_place else None,
-                    initial_state_slots is not None,
-                ),
+                ("initial_states", initial_states, initial_state_slots is not None),
                 ("final_states", final_states, final_state_slots is not None),
             ):
                 if other is None or (pool and _same_tensor(checkpoint_states, other)):
                     continue
-                if _storage_overlaps(checkpoint_states, other):
+                if overlaps(checkpoint_states, other):
                     raise ValueError(
                         f"checkpoint_states must not overlap {name}: a checkpoint "
                         "pool may only be the identical pool tensor"

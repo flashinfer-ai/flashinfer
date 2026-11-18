@@ -1123,23 +1123,63 @@ def _pool_from(storage, rows, nheads, row_stride, offset=0):
     )
 
 
+def test_occupied_overlaps_counts_rows_not_gaps_without_gpu():
+    """``_occupied_overlaps`` of a row-strided tensor (contiguous rows, a
+    positive row stride of at least one row) meets only its rows: a tensor on
+    or straddling a row overlaps, one in the gap rows, before the first row or
+    after the last does not; the other tensor's own gaps still count.  Any
+    other geometry falls back to the gap-inclusive ``_storage_overlaps``."""
+
+    module = _module()
+    storage = torch.empty((9, 2, 4), dtype=torch.float32)
+    flat = storage.view(-1)
+    rows = storage[1::4]  # rows 1 and 5 of ``storage``
+    for other in (
+        storage[1],
+        storage[5],
+        storage[:2],
+        storage[4:6],
+        storage[5:],
+        flat[15:17],  # the last element of row 1 and the next one
+        flat[39:41],  # the element before row 5 and its first one
+        storage[::6],  # rows 0 and 6: its extent covers row 1
+    ):
+        assert module._occupied_overlaps(rows, other)
+    for other in (storage[0], storage[2:5], storage[2:5:2], storage[6:], flat[:8]):
+        assert not module._occupied_overlaps(rows, other)
+    # One row: only that row counts.
+    assert module._occupied_overlaps(storage[3:4], storage[3])
+    assert not module._occupied_overlaps(storage[3:4], storage[4:])
+    # Other geometries count their whole extent, gap rows included.
+    for fallback in (
+        rows.transpose(1, 2),  # rows not contiguous
+        flat.as_strided((3, 8), (4, 1)),  # rows overlap each other
+        flat.as_strided((2, 8), (0, 1)),  # zero row stride
+    ):
+        for other in (storage[2:5], storage[0], storage[6:]):
+            expected = module._storage_overlaps(fallback, other)
+            assert module._occupied_overlaps(fallback, other) == expected
+    assert module._occupied_overlaps(rows.transpose(1, 2), storage[2:5])
+
+
 def test_slot_call_validation_without_gpu(monkeypatch):
     """Slot vectors need packed varlen mode and their state tensor; they are
     int32 vectors of one slot per sequence on the device of ``x`` with a
     positive stride.  A pool is ``[rows, nheads, 64, 128]`` of the state
     dtype with dense rows, a row stride of at least one row and a 16-byte
     aligned base and row stride.  A final pool must not overlap a dense
-    initial_states; it may be the initial pool when both slot vectors are
-    given.  Flags need an initial slot vector and are contiguous bool /
-    uint8 ``[num_seqs]``; ``null_slot_id`` is an int in ``[-1, 2**31 - 1]``
-    and, unless -1, needs a slot vector on every state side the call binds
-    (a dense initial side or returned dense final states are refused; an
-    absent side is fine).  A slot call's checkpoint states are a
-    pool (strided slot vector allowed) that may only be the identical
-    initial or final pool tensor, never a partial overlap, also against a
-    dense initial side; a call without slot vectors refuses a row-strided
-    checkpoint pool and a strided checkpoint slot vector, and ``prepare``
-    refuses its checkpoint outputs."""
+    initial_states (for a strided one, its rows; its gap rows are free); it
+    may be the initial pool when both slot vectors are given.  Flags need an
+    initial slot vector and are contiguous bool / uint8 ``[num_seqs]``;
+    ``null_slot_id`` is an int in ``[-1, 2**31 - 1]`` and, unless -1, needs a
+    slot vector on every state side the call binds (a dense initial side or
+    returned dense final states are refused; an absent side is fine).  A slot
+    call's checkpoint states are a pool (strided slot vector allowed) that may
+    only be the identical initial or final pool tensor, never a partial
+    overlap, also against a dense initial side (for a strided one, its rows);
+    a call without slot vectors refuses a row-strided checkpoint pool and a
+    strided checkpoint slot vector, and ``prepare`` refuses its checkpoint
+    outputs."""
 
     module = _module()
     calls = []
@@ -1248,6 +1288,28 @@ def test_slot_call_validation_without_gpu(monkeypatch):
             final_states=storage[1:4],
             final_state_slots=slots,
         )
+    # A strided dense initial side (rows 0 and 4 of ``storage``, packed before
+    # the launch) refuses final states, pool or dense, on one of its rows and
+    # accepts a final pool in the gap rows between them.
+    strided_initial = storage[::4]
+    for final_state_slots in (slots, None):
+        with pytest.raises(ValueError, match="must not overlap initial_states"):
+            runner.run(
+                *tensors,
+                **kwargs,
+                initial_states=strided_initial,
+                final_states=storage[:2],
+                final_state_slots=final_state_slots,
+            )
+    gap = storage[2:4]
+    _, final = runner.run(
+        *tensors,
+        **kwargs,
+        initial_states=strided_initial,
+        final_states=gap,
+        final_state_slots=slots,
+    )
+    assert final is gap
     checkpoint_storage = torch.empty((5, nheads, 64, 128), dtype=torch.bfloat16)
     tokens = torch.tensor([95, 255], dtype=torch.int32)
     with pytest.raises(
@@ -1392,6 +1454,29 @@ def test_slot_call_validation_without_gpu(monkeypatch):
             **checkpoint,
             checkpoint_states=storage[1:4],
         )
+    # A checkpoint pool on a row of a strided dense initial side is refused;
+    # one in its gap rows is accepted.
+    with pytest.raises(
+        ValueError, match="checkpoint_states must not overlap initial_states"
+    ):
+        runner.run(
+            *tensors,
+            **kwargs,
+            initial_states=strided_initial,
+            final_states=_cpu_pool(4, nheads, torch.bfloat16),
+            final_state_slots=slots,
+            **checkpoint,
+            checkpoint_states=storage[3:5],
+        )
+    runner.run(
+        *tensors,
+        **kwargs,
+        initial_states=strided_initial,
+        final_states=_cpu_pool(4, nheads, torch.bfloat16),
+        final_state_slots=slots,
+        **checkpoint,
+        checkpoint_states=storage[1:4],
+    )
 
     # A call without slot vectors keeps the dense checkpoint rules.
     dense_checkpoint = dict(

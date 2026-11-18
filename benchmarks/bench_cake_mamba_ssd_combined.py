@@ -394,6 +394,9 @@ def main() -> None:
         raise ValueError("the state-slot arm requires --mode varlen")
     if args.slots_step < 1:
         raise ValueError("--slots-step must be positive")
+    # NaN fails the chained comparison too.
+    if args.flags_frac is not None and not 0.0 <= args.flags_frac <= 1.0:
+        raise ValueError("--flags-frac must be in [0, 1]")
 
     torch.manual_seed(args.seed)
     if args.mode == "batched":
@@ -484,8 +487,9 @@ def main() -> None:
 
     outputs = {}
     timings = {}
+    runners = {}
     for backend, arm in arms.items():
-        runner = SSDCombined(
+        runner = runners[backend] = SSDCombined(
             chunk_size=128,
             nheads=args.nheads,
             headdim=64,
@@ -562,22 +566,26 @@ def main() -> None:
             # pool row holds: compare with a dense Cake call on the
             # flag-masked initial states, so both sides run one recurrence.
             masked = initial_states * flags.view(-1, 1, 1, 1).to(initial_states.dtype)
-            dense_runner = SSDCombined(
-                chunk_size=128,
-                nheads=args.nheads,
-                headdim=64,
-                dstate=128,
-                ngroups=args.ngroups,
-                io_dtype=torch.bfloat16,
-                state_dtype=torch.bfloat16,
-                has_d=True,
-                d_has_hdim=False,
-                has_initial_states=True,
-                has_varlen=True,
-                has_z=args.has_z,
-                seq_idx_dtype=torch.int32,
-                backend="cake",
-            )
+            # The dense Cake runner takes explicit initial states unless
+            # --no-initial-states built it without them.
+            dense_runner = runners["cake"]
+            if not arms["cake"]["has_initial_states"]:
+                dense_runner = SSDCombined(
+                    chunk_size=128,
+                    nheads=args.nheads,
+                    headdim=64,
+                    dstate=128,
+                    ngroups=args.ngroups,
+                    io_dtype=torch.bfloat16,
+                    state_dtype=torch.bfloat16,
+                    has_d=True,
+                    d_has_hdim=False,
+                    has_initial_states=True,
+                    has_varlen=True,
+                    has_z=args.has_z,
+                    seq_idx_dtype=torch.int32,
+                    backend="cake",
+                )
             dense_arguments = {
                 **arms["cake"]["arguments"],
                 "initial_states": masked,

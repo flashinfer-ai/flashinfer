@@ -405,6 +405,10 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
     }
     if d_layout == "vector":
         kwargs["D"] = torch.empty(nheads, dtype=torch.bfloat16)
+        # Caller-owned output storage is token-major, like the returned out.
+        kwargs["out"] = torch.empty(
+            batch_size, seqlen, nheads, headdim, dtype=torch.bfloat16
+        )
     elif d_layout == "matrix":
         kwargs["D"] = torch.empty(nheads, headdim, dtype=torch.bfloat16)
 
@@ -444,6 +448,17 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
     assert ("D" in definition["inputs"]) == (d_layout != "none")
     assert ("seq_idx" in definition["inputs"]) == (mode == "varlen")
     assert definition["inputs"]["out"]["optional"] is True
+    assert definition["inputs"]["out"]["shape"] == [
+        "batch_size",
+        "seqlen",
+        "nheads",
+        "headdim",
+    ]
+    assert definition["inputs"]["out"]["dtype"] == "bfloat16"
+    assert "nchunks" not in definition["axes"]
+    # Dense state tensors stay optional inputs.
+    assert definition["inputs"]["initial_states"]["optional"] is True
+    assert definition["inputs"]["final_states"]["optional"] is True
     assert "param" not in definition["outputs"]["out"]
     assert definition["outputs"]["checkpoint_states"]["optional"] is True
     assert definition["outputs"]["checkpoint_states"]["param"] == "checkpoint_states"
@@ -453,31 +468,36 @@ def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
         assert definition["outputs"]["seq_chunk_cumsum"]["param"] == "seq_chunk_cumsum"
     assert ("final_states" in definition["outputs"]) == return_final_states
     if return_final_states:
+        # The API returns (out, final_states): the tuple binds by position.
+        assert list(definition["outputs"])[:2] == ["out", "final_states"]
         assert definition["outputs"]["final_states"]["dtype"] == expected_state_dtype
+        assert definition["outputs"]["final_states"]["param"] == "final_states"
     json.dumps(definition, allow_nan=False)
 
 
 @pytest.mark.parametrize(
-    ("initial_pool", "final_pool", "return_final_states"),
+    ("initial_pool", "final_pool", "return_final_states", "null_slot_id"),
     (
-        (True, True, True),
-        (True, False, False),
-        (True, False, True),
-        (False, True, True),
+        (True, True, True, 0),
+        (True, False, False, 0),
+        # A dense state side requires null_slot_id=-1.
+        (True, False, True, -1),
+        (False, True, True, -1),
     ),
     ids=("both_pools", "initial_pool_no_final", "initial_pool", "final_pool"),
 )
 @pytest.mark.parametrize("d_layout", ("none", "vector", "matrix"))
 def test_ssd_combined_fi_trace_state_slot_pools(
-    d_layout, initial_pool, final_pool, return_final_states
+    d_layout, initial_pool, final_pool, return_final_states, null_slot_id
 ):
     """A call reading or writing states through slot vectors traces a packed
     varlen slot schema: a state tensor given with its slot vector (a strided
-    column here) is a pool with its own row axis, the other state side keeps
-    one row per sequence (a returned dense final state is allocated, not
-    written into a caller pool), the flags have one entry per sequence,
-    ``null_slot_id`` is an int32 scalar and the checkpoint pool has its own
-    row axis."""
+    column here) is a required pool with its own row axis, the other state
+    side keeps one optional row per sequence (a returned dense final state is
+    allocated unless the caller gives final_states, not written into a caller
+    pool), the flags have one entry per sequence, ``null_slot_id`` is an int32
+    scalar (-1 when a state side is dense, as the API requires) and the
+    checkpoint pool has its own row axis."""
 
     module = __import__(
         "flashinfer.mamba.ssd_combined",
@@ -494,7 +514,7 @@ def test_ssd_combined_fi_trace_state_slot_pools(
         "C": torch.empty(1, seqlen, ngroups, dstate, dtype=torch.bfloat16),
         "dt_limit": (0.0, float("inf")),
         "cu_seqlens": torch.tensor([0, 100, 200, seqlen], dtype=torch.int32),
-        "null_slot_id": 0,
+        "null_slot_id": null_slot_id,
         "checkpoint_token_indices": torch.tensor([50, -1, 210], dtype=torch.int32),
         "checkpoint_state_slots": torch.tensor([5, 0, 6], dtype=torch.int32),
         "checkpoint_states": torch.empty(
@@ -546,6 +566,10 @@ def test_ssd_combined_fi_trace_state_slot_pools(
     final_axis = "final_state_rows" if final_pool else "num_sequences"
     assert inputs["initial_states"]["shape"] == [initial_axis, *pool_axes]
     assert inputs["final_states"]["shape"] == [final_axis, *pool_axes]
+    # A slot vector requires its pool, so the pool dtype is in the routing key.
+    assert inputs["initial_states"].get("optional", False) is (not initial_pool)
+    assert inputs["final_states"].get("optional", False) is (not final_pool)
+    assert inputs["out"]["shape"] == ["batch_size", "seqlen", "nheads", "headdim"]
     for name, pool in (
         ("initial_state_slots", initial_pool),
         ("final_state_slots", final_pool),
@@ -570,14 +594,14 @@ def test_ssd_combined_fi_trace_state_slot_pools(
         assert inputs[name]["optional"] is True, name
     assert ("final_states" in definition["outputs"]) == return_final_states
     if return_final_states:
+        # The API returns (out, final_states): the tuple binds by position.
+        assert list(definition["outputs"])[:2] == ["out", "final_states"]
         final = definition["outputs"]["final_states"]
         assert final["shape"] == [final_axis, *pool_axes]
         assert final["dtype"] == "float16"
-        if final_pool:
-            assert final["param"] == "final_states"
-        else:
-            # No caller pool: a fresh [num_sequences, ...] tensor is returned.
-            assert "param" not in final
+        # The caller's pool, or the caller's dense [num_sequences, ...]
+        # final_states when given (else a fresh tensor is returned).
+        assert final["param"] == "final_states"
     json.dumps(definition, allow_nan=False)
 
 

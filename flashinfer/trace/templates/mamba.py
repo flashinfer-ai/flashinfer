@@ -196,7 +196,6 @@ _SSD_COMBINED_COMMON_AXES: dict[str, Var | Const] = {
     "headdim": Const(abbrev="d", description="Per-head feature dimension."),
     "ngroups": Const(abbrev="g", description="Number of B/C state groups."),
     "dstate": Const(abbrev="s", description="Recurrent state dimension."),
-    "nchunks": Var(description="Physical chunks per batch row."),
     "chunk_size": Const(value=128, abbrev=""),
     "num_checkpoints": Var(description="Rows in caller-owned checkpoint storage."),
 }
@@ -277,9 +276,10 @@ def _make_ssd_combined_trace(
             axes["final_state_rows"] = Var(description="Rows of the final-state pool.")
         inputs.update(
             {
+                # A slot vector requires its pool.
                 "initial_states": Tensor(
                     [initial_rows_axis, "nheads", "headdim", "dstate"],
-                    optional=True,
+                    optional=not initial_slots,
                 ),
                 "seq_idx": Tensor(["batch_size", "seqlen"], optional=state_slots),
                 "chunk_indices": Tensor(
@@ -368,53 +368,41 @@ def _make_ssd_combined_trace(
             ),
             "final_states": Tensor(
                 [final_rows_axis, "nheads", "headdim", "dstate"],
-                optional=True,
-                description="Optional caller-owned final-state storage.",
+                optional=not final_slots,
+                description=(
+                    "Caller-owned final-state pool."
+                    if final_slots
+                    else "Optional caller-owned final-state storage."
+                ),
             ),
             "out": Tensor(
-                [
-                    "batch_size",
-                    "nheads",
-                    "headdim",
-                    "nchunks",
-                    "chunk_size",
-                ],
+                ["batch_size", "seqlen", "nheads", "headdim"],
                 dtype="bfloat16",
                 optional=True,
-                description="Optional caller-owned physical output storage.",
+                description=(
+                    "Optional caller-owned contiguous token-major output "
+                    "storage; returned as out."
+                ),
             ),
             "return_final_states": Scalar("bool", optional=True),
             "state_dtype": Scalar("dtype", optional=True),
         }
     )
 
+    # The API returns ``(out, final_states | None)``: a value-returning
+    # solution's tuple binds by output position, so ``final_states`` follows
+    # ``out`` and the side-effect buffers come after it.
     outputs: dict[str, Tensor | Scalar] = {
         "out": Tensor(
             ["batch_size", "seqlen", "nheads", "headdim"],
             dtype_from="x",
             description=(
-                "Token-major return view. The optional out parameter has a "
-                "distinct physical layout, so this remains a value-returning "
-                "trace output rather than a destination binding."
+                "Token-major output [batch, seqlen, nheads, headdim]; the "
+                "optional out parameter, when given, has this same layout and "
+                "is returned."
             ),
         ),
-        "checkpoint_states": Tensor(
-            ["num_checkpoints", "nheads", "headdim", "dstate"],
-            param="checkpoint_states",
-            dtype="bfloat16",
-            dtype_from="checkpoint_states",
-            optional=True,
-            description="Caller-owned selective checkpoint state output.",
-        ),
     }
-    if mode == "varlen":
-        outputs["seq_chunk_cumsum"] = Tensor(
-            ["seq_chunk_cumsum_size"],
-            param="seq_chunk_cumsum",
-            dtype="int32",
-            optional=True,
-            description="Caller-owned prefix-sum buffer when update is requested.",
-        )
     if final_slots:
         outputs["final_states"] = Tensor(
             [final_rows_axis, "nheads", "headdim", "dstate"],
@@ -425,11 +413,30 @@ def _make_ssd_combined_trace(
             description="Final states, stored into the caller's pool rows.",
         )
     elif return_final_states:
+        # Bound to the caller's dense final_states when given (an unbound
+        # output would be derived to the out parameter).
         outputs["final_states"] = Tensor(
             [state_batch_axis, "nheads", "headdim", "dstate"],
+            param="final_states",
             dtype="bfloat16",
             dtype_from="_ssd_state_dtype_source",
             dtype_from_scalar="state_dtype",
+        )
+    outputs["checkpoint_states"] = Tensor(
+        ["num_checkpoints", "nheads", "headdim", "dstate"],
+        param="checkpoint_states",
+        dtype="bfloat16",
+        dtype_from="checkpoint_states",
+        optional=True,
+        description="Caller-owned selective checkpoint state output.",
+    )
+    if mode == "varlen":
+        outputs["seq_chunk_cumsum"] = Tensor(
+            ["seq_chunk_cumsum_size"],
+            param="seq_chunk_cumsum",
+            dtype="int32",
+            optional=True,
+            description="Caller-owned prefix-sum buffer when update is requested.",
         )
 
     constraints = [
