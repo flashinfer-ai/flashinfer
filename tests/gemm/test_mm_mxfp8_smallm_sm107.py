@@ -44,6 +44,11 @@ def _is_sm107() -> bool:
     return get_compute_capability(torch.device("cuda")) == (10, 7)
 
 
+requires_sm100plus = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="mxfp8_quantize backend requires SM100 or newer",
+)
+
 requires_sm107 = pytest.mark.skipif(
     not _is_sm107(),
     reason="mm_mxfp8 specialized backend requires an SM107 (compute 10.7) GPU",
@@ -160,7 +165,7 @@ def test_swizzled_sf_numel_matches_quantizer_padding():
         assert _swizzled_sf_numel(rows, k) == expected
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@requires_sm100plus
 def test_swizzled_sf_numel_matches_quantizer_buffer():
     """The helper must agree with the scale buffer mxfp8_quantize actually
     returns: a padded class (K=576, 18 scale columns pad to 20) and an
@@ -184,6 +189,7 @@ def _reference_swizzle(lin, rows, k):
     return t.contiguous().view(-1)
 
 
+@requires_sm100plus
 def test_unswizzle_dequant_roundtrip_padded_k():
     """quantize(swizzle) -> _unswizzle_sf -> _dequant roundtrip on CPU,
     focused on the padded classes: k // 32 % 4 != 0 (scale-column padding)
