@@ -155,6 +155,7 @@ def construction_supported(
     has_d: bool,
     d_has_hdim: bool,
     has_z: bool,
+    has_initial_states: bool = False,
 ) -> Optional[str]:
     """Constructor-time (GPU-free) half of the guard: ``None`` when the
     specialized backend can serve instances with this geometry, else the
@@ -178,6 +179,8 @@ def construction_supported(
         return "d_form"
     if has_z:
         return "z_unsupported"
+    if has_initial_states:
+        return "initial_states_unsupported"
     return None
 
 
@@ -387,10 +390,20 @@ def warmup(nheads: int, device=None) -> None:
         return
     if os.environ.get(_DISABLE_ENV, "0") == "1":
         return
-    device = torch.device(device or "cuda")
-    if device.type == "cuda" and device.index is None:
+    if isinstance(device, int):  # 0 is a device index, never falsy
+        device = torch.device("cuda", device)
+    elif device is not None:
+        device = torch.device(device)
+        if device.type != "cuda":
+            return
+    if not torch.cuda.is_available():
+        return
+    if device is None or device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
     if _native_device is not None and device.index != _native_device:
+        return
+    cc = tuple(get_compute_capability(device))
+    if not (allow["min_cc"] <= cc <= allow["max_cc"]):
         return
     run = _kernel_entry()
     hd, ds, ng = allow["headdim"], allow["dstate"], allow["ngroups"]

@@ -351,6 +351,7 @@ class SSDCombined:
                         has_d=has_d,
                         d_has_hdim=d_has_hdim,
                         has_z=has_z,
+                        has_initial_states=has_initial_states,
                     )
                     is None
                 ):
@@ -370,6 +371,7 @@ class SSDCombined:
                 has_d=has_d,
                 d_has_hdim=d_has_hdim,
                 has_z=has_z,
+                has_initial_states=has_initial_states,
             )
             if reason is None and (major, minor) != (12, 0):
                 reason = "compute_capability"

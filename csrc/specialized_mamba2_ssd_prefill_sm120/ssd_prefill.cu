@@ -6,7 +6,11 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <tvm/ffi/extra/c_env_api.h>
+#include <tvm/ffi/extra/cuda/device_guard.h>
 #include <tvm/ffi/tvm_ffi.h>
+
+#include <atomic>
+#include <cstring>
 
 extern "C" __device__ float __nv_expf(float);
 extern "C" __device__ float __nv_log1pf(float);
@@ -79,21 +83,26 @@ DEVI float dexp(float x) {
   return L2 ? exp2f(x) : __expf(fminf(0.f, x));
 }
 
-DEVI uint32_t pack2(float a, float b) {
-  __nv_bfloat162 r = __floats2bfloat162_rn(a, b);
-  return *reinterpret_cast<uint32_t*>(&r);
+// Value punning between a two-element bf16 vector and its 32 packed bits.
+// memcpy is the aliasing-safe spelling; nvcc lowers it to a plain move.
+template <typename To, typename From>
+DEVI To punned(From v) {
+  static_assert(sizeof(To) == sizeof(From), "punned requires same-size types");
+  To r;
+  memcpy(&r, &v, sizeof(To));
+  return r;
 }
+
+DEVI uint32_t pack2(float a, float b) { return punned<uint32_t>(__floats2bfloat162_rn(a, b)); }
 DEVI uint32_t scale2(uint32_t v, float s0, float s1) {
-  __nv_bfloat162 b = *reinterpret_cast<__nv_bfloat162*>(&v);
+  __nv_bfloat162 b = punned<__nv_bfloat162>(v);
   __nv_bfloat162 s = __floats2bfloat162_rn(s0, s1);
-  __nv_bfloat162 r = __hmul2(b, s);
-  return *reinterpret_cast<uint32_t*>(&r);
+  return punned<uint32_t>(__hmul2(b, s));
 }
 DEVI uint32_t scale2_packed(uint32_t v, uint32_t w) {
-  __nv_bfloat162 b = *reinterpret_cast<__nv_bfloat162*>(&v);
-  __nv_bfloat162 s = *reinterpret_cast<__nv_bfloat162*>(&w);
-  __nv_bfloat162 r = __hmul2(b, s);
-  return *reinterpret_cast<uint32_t*>(&r);
+  __nv_bfloat162 b = punned<__nv_bfloat162>(v);
+  __nv_bfloat162 s = punned<__nv_bfloat162>(w);
+  return punned<uint32_t>(__hmul2(b, s));
 }
 
 DEVI float softplus_fast(float z) {
@@ -174,11 +183,15 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
 
   // ---- pipelined prologue helpers ----
   unsigned short dtnext_bits = 0xff80u;
+  // Padding is identified by the token-activity predicate, never inferred
+  // from the dt payload: every finite bf16 dt value is a legal input.
+  bool dtnext_active = false;
   float dtf_reg = 0.f;
   auto fetch_dt = [&](int cc) {
     if (tid < 128) {
       int t = cc * 128 + tid;
       bool active = FULL_T ? (cc < nchunks) : (t < T);
+      dtnext_active = active;
       if (active) {
         const bf16* p = dtbase + (size_t)t * HEADS;
         asm volatile("ld.global.nc.L2::128B.b16 %0, [%1];\n" : "=h"(dtnext_bits) : "l"(p));
@@ -191,7 +204,7 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
     if (tid < 128) {
       float dtnext = __uint_as_float((uint32_t)dtnext_bits << 16);
       float z = dtnext + dtb_h;
-      float dtf = (dtnext < -1e29f) ? 0.f : softplus_fast(z);
+      float dtf = dtnext_active ? softplus_fast(z) : 0.f;
       dtf_reg = dtf;
       sCum[buf * 128 + tid] = dtf * A_h;
     }
@@ -644,8 +657,8 @@ __global__ __launch_bounds__(256, 1) void ssd_kernel(
         asm volatile("ld.shared.b32 %0, [%1];\n"
                      : "=r"(xv1)
                      : "r"(addrU<XU>(aX, row1, nt + q) + t4 * 4));
-        float2 f0 = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&xv0));
-        float2 f1 = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&xv1));
+        float2 f0 = __bfloat1622float2(punned<__nv_bfloat162>(xv0));
+        float2 f1 = __bfloat1622float2(punned<__nv_bfloat162>(xv1));
         out[2 * q] = pack2(Yacc[nt + q][0] + D_h * f0.x, Yacc[nt + q][1] + D_h * f0.y);
         out[2 * q + 1] = pack2(Yacc[nt + q][2] + D_h * f1.x, Yacc[nt + q][3] + D_h * f1.y);
       }
@@ -719,21 +732,24 @@ void RunPeer(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::Tens
   if (NH >= 96) {
     constexpr int SH = 65536 + 128 * 64 * 2 + 2 * 64 * 128 * 2 + 4 * 2 * 128 * 4;
     if (!g_init[0]) {
-      cudaFuncSetAttribute(ssd_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH);
+      TVM_FFI_CHECK_CUDA_ERROR(
+          cudaFuncSetAttribute(ssd_kernel<64>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
       g_init[0] = 1;
     }
     ssd_kernel<64><<<NH, 256, SH, stream>>>(xp, dtp, Ap, Bp, Cp, Dp, dbp, yp, T, NH, nchunks);
   } else {
     constexpr int SH = 65536 + 2 * 128 * 32 * 2 + 2 * 32 * 128 * 2 + 3 * 2 * 128 * 4;
     if (!g_init[1]) {
-      cudaFuncSetAttribute(ssd_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH);
-      cudaFuncSetAttribute(ssd_kernel<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH);
-      cudaFuncSetAttribute(ssd_kernel<32, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           SH);
-      cudaFuncSetAttribute(ssd_kernel<32, true, false, true>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, SH);
-      cudaFuncSetAttribute(ssd_kernel<32, false, false, true>,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, SH);
+      TVM_FFI_CHECK_CUDA_ERROR(
+          cudaFuncSetAttribute(ssd_kernel<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
+      TVM_FFI_CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+          ssd_kernel<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
+      TVM_FFI_CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+          ssd_kernel<32, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
+      TVM_FFI_CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+          ssd_kernel<32, true, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
+      TVM_FFI_CHECK_CUDA_ERROR(cudaFuncSetAttribute(
+          ssd_kernel<32, false, false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, SH));
       g_init[1] = 1;
     }
     if (T <= 128)
@@ -752,6 +768,7 @@ void RunPeer(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::Tens
     else
       ssd_kernel<32><<<NH * 2, 256, SH, stream>>>(xp, dtp, Ap, Bp, Cp, Dp, dbp, yp, T, NH, nchunks);
   }
+  TVM_FFI_CHECK_CUDA_ERROR(cudaGetLastError());
 }
 
 #undef DEVI
@@ -812,10 +829,7 @@ DI void ldm2t(uint32_t (&d)[2], uint32_t a) {
                : "=r"(d[0]), "=r"(d[1])
                : "r"(a));
 }
-DI uint32_t pack2f(float a, float b) {
-  __nv_bfloat162 r = __floats2bfloat162_rn(a, b);
-  return *reinterpret_cast<uint32_t*>(&r);
-}
+DI uint32_t pack2f(float a, float b) { return punned<uint32_t>(__floats2bfloat162_rn(a, b)); }
 DI void mma_f32(float* d, const uint32_t* a, const uint32_t* b) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
@@ -894,7 +908,7 @@ DI uint32_t bf2h2(uint32_t w) {
   f.x = __uint_as_float(w << 16);
   f.y = __uint_as_float(w & 0xffff0000u);
   __half2 h = __float22half2_rn(f);
-  return *reinterpret_cast<uint32_t*>(&h);
+  return punned<uint32_t>(h);
 }
 DI int4 bf2h2_v(int4 v) {
   int4 r;
@@ -1333,7 +1347,13 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
           for (int n = 0; n < 128; ++n)
             s = __fmaf_rn(__bfloat162float(ci[n]), __bfloat162float(bj[n]), s);
         }
-        s = __fmul_rn(s, __nv_expf(__fsub_rn(prefix[i], prefix[j])));
+        // Decay over (j, i] from the interval's own step sum.  Subtracting
+        // running prefixes cancels catastrophically once one step dominates
+        // the fp32 mantissa (e.g. dt ~ 2^30): later prefixes all round to
+        // the same value and the pair decay collapses to exp(0) = 1.
+        float e = 0.f;
+        for (int k = j + 1; k <= i; ++k) e = __fadd_rn(e, steps[k]);
+        s = __fmul_rn(s, __nv_expf(__fmul_rn(ah, e)));
       }
       score[i * 128 + j] = s;
     }
@@ -1355,11 +1375,23 @@ __device__ __noinline__ void precise_head(const __nv_bfloat16* x, const __nv_bfl
     }
     __syncthreads();
     float total = prefix[count - 1], decay = __nv_expf(total);
+    // Rewrite prefix[] as the suffix step sums over (j, count-1]: additions
+    // of same-sign terms only, so the state-update weights never subtract
+    // two large prefixes (same cancellation as the score decay above).
+    __syncthreads();
+    if (tid == 0) {
+      float tail = 0.f;
+      for (int j = count - 1; j >= 0; --j) {
+        prefix[j] = __fmul_rn(ah, tail);
+        tail = __fadd_rn(tail, steps[j]);
+      }
+    }
+    __syncthreads();
     for (int q = tid; q < 64 * 128; q += blockDim.x) {
       int p = q / 128, n = q % 128;
       float update = 0.f;
       for (int j = 0; j < count; ++j) {
-        float w = __fmul_rn(steps[j], __nv_expf(__fsub_rn(total, prefix[j])));
+        float w = __fmul_rn(steps[j], __nv_expf(prefix[j]));
         float xv = __bfloat162float(x[((size_t)(start + j) * NH + h) * 64 + p]);
         float bv = __bfloat162float(B[((size_t)(start + j) * 8 + g) * 128 + n]);
         update = __fmaf_rn(__fmul_rn(w, xv), bv, update);
@@ -2462,6 +2494,36 @@ void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorVi
 
 void Run(ffi::TensorView x, ffi::TensorView dt, ffi::TensorView A, ffi::TensorView Bmat,
          ffi::TensorView Cmat, ffi::TensorView D, ffi::TensorView dt_bias, ffi::TensorView y) {
+  auto dev = x.device();
+  TVM_FFI_ICHECK_EQ((int)dev.device_type, (int)kDLCUDA) << "x must be a CUDA tensor";
+  auto same_device = [&](const ffi::TensorView& t, const char* name) {
+    TVM_FFI_ICHECK(t.device().device_type == dev.device_type &&
+                   t.device().device_id == dev.device_id)
+        << name << " must reside on the same CUDA device as x";
+  };
+  same_device(dt, "dt");
+  same_device(A, "A");
+  same_device(Bmat, "B");
+  same_device(Cmat, "C");
+  same_device(D, "D");
+  same_device(dt_bias, "dt_bias");
+  same_device(y, "y");
+  // The module binds its per-kernel launch state (shared-memory opt-in,
+  // cooperative residency capacity) to the first CUDA device that runs it.
+  // Enforce that binding here so a direct native caller on another device
+  // gets this clean refusal — mirroring the Python-side guard's
+  // "native_state_other_device" — instead of launching against state that
+  // was configured for a different device.
+  static std::atomic<int> bound_device{-1};
+  int expected = -1;
+  if (!bound_device.compare_exchange_strong(expected, dev.device_id)) {
+    TVM_FFI_ICHECK_EQ(expected, dev.device_id)
+        << "SSD prefill native launch state is bound to CUDA device " << expected
+        << "; run other devices from a separate process";
+  }
+  // Launches below use this device's stream; make it current first (a
+  // launch whose stream belongs to a non-current device is rejected).
+  ffi::CUDADeviceGuard device_guard(dev.device_id);
   if ((int)x.shape()[1] >= 96)
     regx::Run(x, dt, A, Bmat, Cmat, D, dt_bias, y);
   else
