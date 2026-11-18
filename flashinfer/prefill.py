@@ -3031,12 +3031,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
         # smaller replan would demand cache pages the plan never references.
         vt = _buf("vt", vt_pages * 2048, torch.uint8)[: vt_pages * 2048]
         tasks = _buf("tasks", 2 * npt, torch.int32)
-
         seq_lens_buf = _buf("seq_lens", batch_size, torch.int32)
-        seq_lens_dev = seq_lens_buf[:batch_size]
-        seq_lens_dev.copy_(
-            kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True
-        )
 
         nb = 0
         if batch_size:
@@ -3064,16 +3059,7 @@ def _gqa_ctx_fp8q_sm90_prepare(
             bt = torch.empty((batch_size, nb), dtype=torch.int32, device=device)
             bufs["block_table"] = bt
             counters["workspace_allocs"] += 1
-        block_table = _build_block_tables_from_paged_kv_indices(
-            paged_kv_indptr_host,
-            paged_kv_indices,
-            batch_size,
-            device,
-            out=bt[:batch_size],
-        )
-
         unit_descale = _buf("unit_descale", batch_size, torch.float32)[:batch_size]
-        unit_descale.fill_(1.0)
     except _GqaCtxFp8qSm90Capacity as exc:
         counters["plans_ineligible"] += 1
         _gqa_ctx_fp8q_sm90_fallback("plan: graph-retained workspace capacity")
@@ -3084,6 +3070,21 @@ def _gqa_ctx_fp8q_sm90_prepare(
             exc,
         )
         return
+
+    # Every capacity check passed: only now mutate the retained buffers in
+    # place. A refused replan above mutates nothing, so a capture made by the
+    # last accepted plan keeps reading a mutually consistent seq_lens /
+    # block_table pair (never new lengths against an old table).
+    seq_lens_dev = seq_lens_buf[:batch_size]
+    seq_lens_dev.copy_(kv_lens_arr_host[:batch_size].to(torch.int32), non_blocking=True)
+    block_table = _build_block_tables_from_paged_kv_indices(
+        paged_kv_indptr_host,
+        paged_kv_indices,
+        batch_size,
+        device,
+        out=bt[:batch_size],
+    )
+    unit_descale.fill_(1.0)
 
     wrapper._gqa_ctx_fp8q_sm90_state = SimpleNamespace(
         batch_size=batch_size,

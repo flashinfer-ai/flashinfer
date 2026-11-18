@@ -252,8 +252,9 @@ def _make_batch(q_lens, kv_lens, device, seed=0):
 
 def _reference(batch, qk_descale=1.0, sm_scale=None):
     """fp32 dequant-then-attend chunked-prefill reference (row pos of request
-    r sees kv_len_r - q_len_r + pos + 1 keys). ``qk_descale`` folds a uniform
-    per-sequence q_descale * k_descale product into the logits."""
+    r sees kv_len_r - q_len_r + pos + 1 keys). ``qk_descale`` folds a
+    per-sequence q_descale * k_descale product into the logits: a scalar
+    applies uniformly, a sequence applies its r-th value to request r."""
     device = batch["q"].device
     q = batch["q"].float()
     k_flat = batch["k_cache"].float().reshape(-1, HEAD_DIM)
@@ -262,13 +263,19 @@ def _reference(batch, qk_descale=1.0, sm_scale=None):
     kv_lens = batch["seq_lens"].tolist()
     bt = batch["block_table"]
     out = torch.empty(q.shape, dtype=torch.bfloat16, device=device)
-    scale = (HEAD_DIM**-0.5 if sm_scale is None else sm_scale) * qk_descale
+    base_scale = HEAD_DIM**-0.5 if sm_scale is None else sm_scale
     off = torch.arange(PAGE, device=device)
     for r in range(len(kv_lens)):
         q0, q1 = cu[r], cu[r + 1]
         ql = q1 - q0
         if ql == 0:
             continue
+        descale_r = (
+            qk_descale[r]
+            if isinstance(qk_descale, (list, tuple))
+            else (qk_descale[r].item() if torch.is_tensor(qk_descale) else qk_descale)
+        )
+        scale = base_scale * descale_r
         kvl = kv_lens[r]
         npages = (kvl + PAGE - 1) // PAGE
         flat = (bt[r, :npages].long().unsqueeze(1) * PAGE + off).reshape(-1)[:kvl]
@@ -660,6 +667,8 @@ def test_graph_mode_replan_never_swaps_buffer_pointers():
     assert _gqa_ctx_fp8q_sm90_stats()["plans_prepared"] == 1
     bufs2 = wrapper2._gqa_ctx_fp8q_sm90_bufs
     ptrs2 = {name: t.data_ptr() for name, t in bufs2.items()}
+    seq_lens_before = bufs2["seq_lens"].clone()
+    block_table_before = bufs2["block_table"].clone()
     # fits the stock graph buffers, not the retained plan buffers: the
     # explicit plan refuses loudly (never falls back) and mutates nothing
     with pytest.raises(NotImplementedError, match="never falls back"):
@@ -669,6 +678,10 @@ def test_graph_mode_replan_never_swaps_buffer_pointers():
     assert wrapper2._gqa_ctx_fp8q_sm90_state is None
     assert "plan: graph-retained workspace capacity" in stats["fallback_reasons"]
     assert {name: bufs2[name].data_ptr() for name in ptrs2} == ptrs2
+    # the refusal happened before any in-place refresh: a capture from the
+    # accepted plan still reads a consistent seq_lens / block_table pair
+    assert torch.equal(bufs2["seq_lens"], seq_lens_before)
+    assert torch.equal(bufs2["block_table"], block_table_before)
     # the narrow contract replans and keeps dispatching
     _plan2(narrow)
     assert _gqa_ctx_fp8q_sm90_stats()["plans_prepared"] == 2
@@ -689,12 +702,14 @@ def test_kill_switch_before_plan_still_serves_tensor_q_scale(monkeypatch):
     with pytest.raises(NotImplementedError, match="never falls back"):
         _plan_wrapper(batch, device)
     wrapper = _plan_wrapper(batch, device, backend="auto")
-    q_scale = torch.ones(3, dtype=torch.float32, device=device)
+    # distinct non-unit per-request descales (exact powers of two): a scale
+    # applied to the wrong request, or not at all, fails the comparison
+    q_scale = torch.tensor([0.5, 1.0, 2.0], dtype=torch.float32, device=device)
     out = wrapper.run(batch["q"], (batch["k_cache"], batch["v_cache"]), q_scale=q_scale)
     stats = _gqa_ctx_fp8q_sm90_stats()
     assert stats["runs_dispatched"] == 0
     assert stats["runs_dequant_fallback"] == 1, stats
-    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+    assert _matched_ratio(out, _reference(batch, qk_descale=[0.5, 1.0, 2.0])) >= MATCHED
 
 
 def test_mutated_sm_scale_declines_specialization():
