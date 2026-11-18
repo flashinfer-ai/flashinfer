@@ -677,7 +677,8 @@ __global__ void __cluster_dims__(CLU, 1, 1)
     L0 += __shfl_xor_sync(0xffffffffu, L0, 2);
     L1 += __shfl_xor_sync(0xffffffffu, L1, 1);
     L1 += __shfl_xor_sync(0xffffffffu, L1, 2);
-    float i0f = 1.0f / L0, i1f = 1.0f / L1;
+    // empty selection -> zero output (packed-backend convention)
+    float i0f = L0 > 0.f ? 1.0f / L0 : 0.f, i1f = L1 > 0.f ? 1.0f / L1 : 0.f;
 #pragma unroll
     for (int nd = 0; nd < 2; ++nd) {
       int d = 16 * warp + 8 * nd + 2 * tig;

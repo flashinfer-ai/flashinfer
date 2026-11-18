@@ -526,7 +526,8 @@ __global__ void __cluster_dims__(CLU, 1, 1) __launch_bounds__(256, OCC)
     float4 ld = *(const float4*)(scrl + (g + 8) * 8 + 4);
     float L0 = (la.x + la.y) + (la.z + la.w) + (lb.x + lb.y) + (lb.z + lb.w);
     float L1 = (lc.x + lc.y) + (lc.z + lc.w) + (ld.x + ld.y) + (ld.z + ld.w);
-    float i0f = 1.0f / L0, i1f = 1.0f / L1;
+    // empty selection -> zero output (packed-backend convention)
+    float i0f = L0 > 0.f ? 1.0f / L0 : 0.f, i1f = L1 > 0.f ? 1.0f / L1 : 0.f;
 #pragma unroll
     for (int nd = 0; nd < 2; ++nd) {
       int d = 16 * warp + 8 * nd + 2 * tig;
