@@ -1338,12 +1338,18 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(
       permuted_data.load(reinterpret_cast<T*>(params.allreduce_in) + thread_offset_across_token);
 
       // * acc += scale(data)
-      float block_scale = use_scale_factor ? static_cast<float>(static_cast<ScaleType*>(
-                                                 params.expert_scale_factor)[expanded_idx])
-                                           : 1.f;
+      if (use_scale_factor) {
+        float block_scale =
+            static_cast<float>(static_cast<ScaleType*>(params.expert_scale_factor)[expanded_idx]);
 #pragma unroll
-      for (int i = 0; i < VEC_SIZE; ++i) {
-        facc[i] += static_cast<float>(permuted_data[i]) * block_scale;
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          facc[i] += static_cast<float>(permuted_data[i]) * block_scale;
+        }
+      } else {
+#pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          facc[i] += static_cast<float>(permuted_data[i]);
+        }
       }
     }
 
