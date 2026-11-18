@@ -1796,6 +1796,8 @@ def cutlass_fused_moe(
 
     Raises
     ------
+    ValueError:
+        If the input, routing tensors, expert weights/biases, or output are not contiguous.
     NotImplementedError:
         If any of the following features are requested but not implemented:
             - Minimum Latency Mode
@@ -1837,6 +1839,19 @@ def cutlass_fused_moe(
         return _cake_situ_fused_moe(locals())
     if backend != "cutlass":
         raise ValueError(f"unsupported fused MoE backend: {backend!r}")
+    # Reject packed-layout violations before autotuning can read the operands.
+    for name, tensor in (
+        ("input", input),
+        ("token_selected_experts", token_selected_experts),
+        ("token_final_scales", token_final_scales),
+        ("fc1_expert_weights", fc1_expert_weights),
+        ("fc2_expert_weights", fc2_expert_weights),
+        ("fc1_expert_biases", fc1_expert_biases),
+        ("fc2_expert_biases", fc2_expert_biases),
+        ("output", output),
+    ):
+        if tensor is not None and not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
     major, minor = get_compute_capability(input.device)
     if int(activation_type) == int(ActivationType.ClampedRelu2):
         if clamped_relu2_limit is None:
@@ -3819,7 +3834,7 @@ def _build_trtllm_moe_namespace(module):
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
-        mutates_args=("routing_replay_out", "workspace_buffer"),
+        mutates_args=("routing_replay_out", "workspace_buffer", "fc2_input_out"),
     )
     def trtllm_fp4_block_scale_moe_op(
         routing_input_mode: int,
@@ -3875,6 +3890,7 @@ def _build_trtllm_moe_namespace(module):
         localized_weights: Optional[List[torch.Tensor]] = None,
         localized_streams: Optional[List[int]] = None,
         localized_sm_count: int = 0,
+        fc2_input_out: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor]:
         localized_weights = list(localized_weights or [])
         localized_streams = list(localized_streams or [])
@@ -3903,10 +3919,11 @@ def _build_trtllm_moe_namespace(module):
             gemm1_lora_delta is not None
             or n_fused_shared
             or workspace_buffer is not None
+            or fc2_input_out is not None
         ):
             raise ValueError(
-                "routing_metadata supports neither gemm1_lora_delta, fused shared experts "
-                "nor workspace_buffer"
+                "routing_metadata supports neither gemm1_lora_delta, fused shared experts, "
+                "workspace_buffer nor fc2_input_out"
             )
         total_experts_per_token = top_k + n_fused_shared
         # GEMM2's N (what the FC2 weights are sized for) and the narrower
@@ -4052,6 +4069,10 @@ def _build_trtllm_moe_namespace(module):
             "localized_weights": localized_weights,
             "localized_streams": localized_streams,
         }
+        # fc2_input_out is deliberately not in runner_kwargs: profiling must not
+        # capture (its batches can exceed the caller's rows, and the copy would be
+        # timed into every tactic). TrtllmMoERunner.forward() honors the argument,
+        # so a path that launches through it has to pass it explicitly.
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp4_block_scale_moe",
             [moe_runner],
@@ -4125,6 +4146,7 @@ def _build_trtllm_moe_namespace(module):
                 localized_weights,
                 localized_streams,
                 localized_sm_count if localized_weights else 0,
+                [] if fc2_input_out is None else list(fc2_input_out),
             )
             # FP4 always borrows the caller's topk_weights buffer (the launcher has
             # no allocate branch), so it is always the source for expert_weights.
@@ -4152,6 +4174,7 @@ def _build_trtllm_moe_namespace(module):
             and do_finalize
             and gemm1_lora_delta is None
             and num_fused_shared_experts == 0
+            and fc2_input_out is None
             and 0 < num_experts <= DA_MAX_EXPERTS
             # The distribution-aware body runs the non-localized GEMMs.
             and not localized_weights
@@ -4244,12 +4267,14 @@ def _build_trtllm_moe_namespace(module):
         localized_weights: Optional[List[torch.Tensor]] = None,
         localized_streams: Optional[List[int]] = None,
         localized_sm_count: int = 0,
+        fc2_input_out: Optional[List[torch.Tensor]] = None,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
         _ = hidden_states_scale_layout, nvfp4_4over6_code
         _ = routing_metadata, routing_metadata_tile_n
         _ = localized_weights, localized_streams, localized_sm_count
+        _ = fc2_input_out
         # Derive the padded hidden size exactly as the eager op does (NVFP4
         # activations arrive uint8-packed, two values per byte); GEMM2 then computes
         # roundUp(valid_hidden_size, 128) columns while finalize hands back only the
@@ -7151,6 +7176,7 @@ def trtllm_fp4_block_scale_moe(
     localized_weights: Optional[List[Dict[str, torch.Tensor]]] = None,
     localized_streams: Optional[List[Any]] = None,
     localized_sm_count: Optional[int] = None,
+    fc2_input_out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     r"""FP4 block-scaled MoE operation.
 
@@ -7398,6 +7424,31 @@ def trtllm_fp4_block_scale_moe(
         Number of SMs available to each stream in ``localized_streams``; sizes
         the persistent GEMM grids. Required with ``localized_weights``.
 
+    fc2_input_out : Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        Optional ``(codes, block_scales, token_scales)`` buffers that receive
+        a copy of the GEMM2 (FC2) input exactly as GEMM2 reads it, in
+        ``(token, top-k slot)`` order:
+
+        - ``codes``: ``uint8`` ``[num_tokens_or_larger, top_k, intermediate_size // 2]``,
+          packed E2M1 (element ``2i`` in the low nibble);
+        - ``block_scales``: ``float8_e4m3fn`` (or ``uint8``)
+          ``[num_tokens_or_larger, top_k, intermediate_size // 16]``, linear
+          (not swizzled), one scale per 16 elements;
+        - ``token_scales``: ``float32`` ``[num_tokens_or_larger, top_k]``, the
+          per-row decode scale; the row dequantizes as
+          ``e2m1(codes) * block_scales * token_scales``.
+
+        Only rows ``[0, num_tokens)`` are written, so a buffer allocated for
+        the largest batch can be reused under CUDA graphs. Slots routed to an
+        expert outside ``[local_expert_offset, local_expert_offset +
+        local_num_experts)`` are zero-filled. With ``valid_intermediate_size``
+        the buffers keep the padded ``intermediate_size`` width; only the
+        leading ``valid_intermediate_size`` columns are meaningful and the
+        rest must be ignored. Requires ``per_token_scale``
+        (the per-token NvFP4 path, where the GEMM2 input is quantized by a
+        separate kernel); not supported with fused shared experts. Autotuning
+        profiles do not write it. Default ``None`` (no copy, no extra work).
+
     Returns
     -------
     List[torch.Tensor]
@@ -7474,6 +7525,7 @@ def trtllm_fp4_block_scale_moe(
         localized_weights=localized[0],
         localized_streams=localized[1],
         localized_sm_count=localized[2],
+        fc2_input_out=fc2_input_out,
     )
 
 
@@ -7521,6 +7573,7 @@ def trtllm_fp4_block_scale_routed_moe(
     localized_weights: Optional[List[Dict[str, torch.Tensor]]] = None,
     localized_streams: Optional[List[Any]] = None,
     localized_sm_count: Optional[int] = None,
+    fc2_input_out: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -7732,6 +7785,31 @@ def trtllm_fp4_block_scale_routed_moe(
     localized_sm_count : Optional[int]
         SMs per domain stream; see :func:`trtllm_fp4_block_scale_moe`.
 
+    fc2_input_out : Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        Optional ``(codes, block_scales, token_scales)`` buffers that receive
+        a copy of the GEMM2 (FC2) input exactly as GEMM2 reads it, in
+        ``(token, top-k slot)`` order:
+
+        - ``codes``: ``uint8`` ``[num_tokens_or_larger, top_k, intermediate_size // 2]``,
+          packed E2M1 (element ``2i`` in the low nibble);
+        - ``block_scales``: ``float8_e4m3fn`` (or ``uint8``)
+          ``[num_tokens_or_larger, top_k, intermediate_size // 16]``, linear
+          (not swizzled), one scale per 16 elements;
+        - ``token_scales``: ``float32`` ``[num_tokens_or_larger, top_k]``, the
+          per-row decode scale; the row dequantizes as
+          ``e2m1(codes) * block_scales * token_scales``.
+
+        Only rows ``[0, num_tokens)`` are written, so a buffer allocated for
+        the largest batch can be reused under CUDA graphs. Slots routed to an
+        expert outside ``[local_expert_offset, local_expert_offset +
+        local_num_experts)`` are zero-filled. With ``valid_intermediate_size``
+        the buffers keep the padded ``intermediate_size`` width; only the
+        leading ``valid_intermediate_size`` columns are meaningful and the
+        rest must be ignored. Requires ``per_token_scale``
+        (the per-token NvFP4 path, where the GEMM2 input is quantized by a
+        separate kernel); not supported with fused shared experts. Autotuning
+        profiles do not write it. Default ``None`` (no copy, no extra work).
+
     Returns
     -------
     torch.Tensor or List[torch.Tensor]
@@ -7830,6 +7908,7 @@ def trtllm_fp4_block_scale_routed_moe(
         localized_weights=localized[0],
         localized_streams=localized[1],
         localized_sm_count=localized[2],
+        fc2_input_out=fc2_input_out,
     )
 
 
@@ -8616,10 +8695,10 @@ def _trtllm_fused_moe_workspace_size_impl(
             *ordinary, *valid,
         )  # fmt: skip
     # Every entry point ends with (workspace_buffer, query_workspace_size); the FP4
-    # entry additionally takes the 4over6 recipe code and the (empty) localization
-    # arguments.
+    # entry additionally takes the 4over6 recipe code, the (empty) localization
+    # arguments and fc2_input_out.
     tail: Tuple[Any, ...] = (
-        (NVFP4_4OVER6_CODE_FROM_ENV, [], [], 0)
+        (NVFP4_4OVER6_CODE_FROM_ENV, [], [], 0, [])
         if fn is moe_op.trtllm_fp4_block_scale_moe
         else ()
     )
