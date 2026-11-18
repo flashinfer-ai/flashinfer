@@ -927,6 +927,63 @@ def _compact_sweep(
 
 
 @cute.jit
+def _compact_sweep_eager(
+    words: cute.Tensor,
+    n_words: Int32,
+    col0: Int32,
+    N: Int32,
+    tid: Int32,
+    lane: Int32,
+    nm: Float32,
+    c: Float32,
+    prefix: Int32,
+    base_bits: Int32,
+    cand: cute.Tensor,
+    cnt_addr: Int32,
+    shift: cutlass.Constexpr[int],
+    kind: cutlass.Constexpr[int],
+    from_logits: cutlass.Constexpr[bool],
+    by_mass: cutlass.Constexpr[bool],
+    nthreads: cutlass.Constexpr[int],
+    n_iters: cutlass.Constexpr[int],
+    epw: cutlass.Constexpr[int],
+    cap: cutlass.Constexpr[int] = CAP,
+):
+    """The early finish's compaction, the EAGER form: every sub-batch of words whose ballot has candidates reserves its slots
+    behind its own warp-uniform branch -- the right form when almost every sub-batch is empty (the selected bin's few
+    candidates over the whole share): the branch-free form (`_compact_sweep`, the count tail's and the kept set's, where
+    many candidates are compacted) measured 56 us against this form's 32 us for top-p alone at bf16 32768 on the one-CTA
+    member (2026-11-17 ablation, docs 21.9). The patterns of the selected bin's candidates (``bits >> shift == prefix``, the same
+    candidates the pass counted) appended to ``cand`` -- warp-aggregated: a word batch with candidates reserves its slots with
+    one ``atom.shared.add`` by lane 0, the lanes' ranks within the ballot place them; a candidate past the list's capacity
+    goes to the dummy slot ``CAP`` (the caller takes this path only when the count fits)."""
+    lane_lt = (Int32(1) << lane) - Int32(1)
+    for it in range(n_iters):
+        for m in cutlass.range_constexpr(WPT):
+            idx = Int32(it * (nthreads * WPT) + m * nthreads) + tid
+            valid = idx < n_words
+            idxc = _select(valid, idx, n_words - 1)
+            wv = words[idxc]
+            for h in cutlass.range_constexpr(epw):
+                we = _staged_weight(wv, h, kind, from_logits, nm, c)
+                bits = _weight_bits(we)
+                g = col0 + idxc * epw + h
+                ok = valid & (g < N) & (bits >= base_bits) & ((bits >> shift) == prefix)
+                if cutlass.const_expr(by_mass):
+                    ok = ok & (bits > Int32(0))
+                ballot = cute.arch.vote_ballot_sync(ok)
+                n_w = _popc(ballot)
+                if n_w > Int32(0):
+                    old = Int32(0)
+                    if lane == Int32(0):
+                        old = _atom_add_u32(cnt_addr, n_w)
+                    base = cute.arch.shuffle_sync(old, offset=0)
+                    slot = base + _popc(ballot & lane_lt)
+                    slot = _select(ok & (slot < Int32(cap)), slot, Int32(cap))
+                    cand[slot] = bits
+
+
+@cute.jit
 def _bitonic64_desc(k0: Int32, k1: Int32, lane: Int32):
     """The 64 keys of a warp (two per lane: index ``lane`` and ``lane + 32``) sorted ASCENDING by the bitonic network (the
     partner of index ``i`` is ``i ^ j``; the lower index keeps the minimum when ``(i & k) == 0``; ``j == 32`` pairs a lane's two
@@ -1125,7 +1182,7 @@ def _finish_small(
     if tid == Int32(0):
         cbox[0] = Int32(0)
     cute.arch.barrier()
-    _compact_sweep(
+    _compact_sweep_eager(
         words,
         n_words,
         col0,
@@ -1145,7 +1202,6 @@ def _finish_small(
         nthreads,
         n_iters,
         1 if kind == 0 else 2,
-        Int32(INT_MAX),
     )
     cute.arch.barrier()
     n_all = cbox[0]

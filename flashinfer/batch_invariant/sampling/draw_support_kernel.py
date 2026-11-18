@@ -599,15 +599,19 @@ class DrawSupportKernel:
         if cutlass.const_expr(not _kept_shortcut(self)):
             if cutlass.const_expr(self.use_k):
                 # the tail's list holds the top-k kept set (filtered above; the final threshold is at or above the top-k one
-                # and the tail's floor applies it); without a list the row is compacted at the final threshold
+                # and the tail's floor applies it); without a list the row is compacted at the final threshold when the
+                # top-k bound says the kept set fits the list (k <= CAP), the dense sweeps otherwise
                 if (n_list < Int32(0)) & ((kk > Int32(0)) & (kk < N)):
-                    n_all = _kept_compact(
-                        self, rx, tid, t, w, c_rank, thr_bits, peers, cpos
-                    )
-            else:
-                n_all = _kept_compact(
-                    self, rx, tid, t, w, c_rank, thr_bits, peers, cpos
-                )
+                    if kk <= Int32(CAP):
+                        n_all = _kept_compact(
+                            self, rx, tid, t, w, c_rank, thr_bits, peers, cpos
+                        )
+                    else:
+                        n_all = Int32(CAP + 1)
+            # without a top-k bound (top-p alone, min-p alone) the kept set's size is unknown before a sweep and at the
+            # production thresholds exceeds the list (hundreds of tokens at p = 0.9 / min-p = 0.05 on the operator's probe
+            # rows): the row takes the dense sweeps directly -- a compaction that overflows is a wasted pass (2026-11-17
+            # A/B against the tree before the rework: min-p alone 1.25-2.9x and top-p alone 1.0-2.5x slower with it)
             fits = n_all <= Int32(CAP)
         mass = Float32(0.0)
         first_tok = Int32(-1)
