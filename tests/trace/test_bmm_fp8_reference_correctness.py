@@ -30,15 +30,10 @@ def test_bmm_fp8_reference_correctness(shape_kwargs, with_bias):
     )
 
     _skip_if_not_sm100_or_103()
-    inputs = bmm_fp8_trace.init(**shape_kwargs)
+    init = bmm_fp8_bias_trace.init if with_bias else bmm_fp8_trace.init
+    inputs = init(**shape_kwargs)
     b_fp8_kmaj = inputs["B"].transpose(1, 2).contiguous().transpose(1, 2)
-    # On the scale of the output, so a dropped bias fails the cosine check.
-    bias = (
-        torch.randn(shape_kwargs["N"], device="cuda", dtype=torch.bfloat16)
-        * shape_kwargs["K"] ** 0.5
-        if with_bias
-        else None
-    )
+    bias = inputs.get("bias")
     try:
         api = flashinfer.bmm_fp8(
             inputs["A"],

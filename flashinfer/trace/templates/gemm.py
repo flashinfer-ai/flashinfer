@@ -1223,6 +1223,30 @@ bmm_fp8_trace = TraceTemplate(
 )
 bmm_fp8_trace.axes["scalar"] = Var(description="A/B scale tensor length (typically 1).")
 
+
+def _bmm_fp8_bias_init(
+    *,
+    batch_size: int,
+    M: int = 64,
+    N: int = 64,
+    K: int = 128,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+    bias=None,
+):
+    del bias  # only selects this template in bmm_fp8.fi_init(..., bias=...)
+    inputs = _bmm_fp8_init(
+        batch_size=batch_size, M=M, N=N, K=K, scalar=scalar, device=device, seed=seed
+    )
+    # On the scale of the output, so a check notices a dropped bias.
+    inputs["bias"] = torch.randn(N, dtype=torch.bfloat16, device=device) * K**0.5
+    return inputs
+
+
+_bmm_fp8_bias_init._trace_init_dependencies = (_bmm_fp8_init,)  # type: ignore[attr-defined]
+_bmm_fp8_bias_init._trace_init_const_axes = ("N", "K")  # type: ignore[attr-defined]
+
 # A separate definition, so the unbiased one and the solutions written for it
 # (called with one positional argument per input) stay as they are.
 bmm_fp8_bias_trace = TraceTemplate(
@@ -1239,6 +1263,7 @@ bmm_fp8_bias_trace = TraceTemplate(
     tags=list(bmm_fp8_trace.tags),
     reference=_bmm_fp8_bias_reference,
     check=_gemm_check,
+    init=_bmm_fp8_bias_init,
 )
 
 
