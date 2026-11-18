@@ -416,11 +416,18 @@ def _mla_dec_fp8q_sm90_prepare(
                 _counters["workspace_allocs"] += 1
             else:
                 bt.zero_()
-            idx_dev = indices.to(device)
-            for i in range(B):
-                s, e = int(indptr[i]), int(indptr[i + 1])
-                if e > s:
-                    bt[i, : e - s].copy_(idx_dev[s:e].to(torch.int32))
+            # Build the dense table with one masked scatter instead of one
+            # small copy_ per request: plan() runs on every decode step, so
+            # the launch count must not scale with the batch size. The CSR
+            # segments are contiguous in `indices`, and the row-major order
+            # of the mask matches their concatenation.
+            idx_dev = indices.to(device=device, dtype=torch.int32)
+            counts = torch.tensor(pprs, dtype=torch.int64, device=device)
+            cols = torch.arange(pps, device=device)
+            mask = cols.unsqueeze(0) < counts.unsqueeze(1)
+            start = int(indptr[0])
+            total = int(indptr[B]) - start
+            bt[:B][mask] = idx_dev[start : start + total]
             block_table = bt[:B]
 
         seq_lens_buf = _buf("seq_lens", B, torch.int32)[:B]
