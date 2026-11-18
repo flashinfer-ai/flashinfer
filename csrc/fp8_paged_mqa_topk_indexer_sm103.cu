@@ -44,6 +44,10 @@ __device__ __forceinline__ void cp_commit() {
 template <int N>
 __device__ __forceinline__ void cp_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+  // Publish the generic-proxy cp.async writes to the async proxy before any
+  // consumer barrier: tcgen05.mma reads shared memory through the async
+  // proxy, and copy completion alone does not order across proxies.
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 __device__ __forceinline__ void prefetch_l2_bulk(const void* p, uint32_t bytes) {
   asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(bytes) : "memory");
@@ -1341,10 +1345,18 @@ __device__ __forceinline__ int packed_meta_value(int col, int block_tokens, int 
 
 __device__ __forceinline__ void emit_trivial_general(int* out, int tid, int v, int p) {
   const uint32_t pend = (uint32_t)p + 1u;
-  const int tail_start = (int)(pend & ~3u);
-  // The reference compacts negative tail indices away before int32 casting.
-  const int tail_count = p >= -1 ? (int)(pend & 3u) : 0;
   const int block_tokens = v * CRATIO;
+  // The tail follows the `visible` contract exactly as the reference does:
+  // it starts at visible*CRATIO and runs through pos. For canonical
+  // metadata (visible == (pos+1)/CRATIO) this is identical to the old
+  // (pend & ~3) derivation; for any other caller-supplied visible the
+  // emitted set still matches the reference. Negative tail indices are
+  // compacted away before int32 casting, and the row never exceeds the
+  // packed width.
+  const int tail_start = block_tokens;
+  int tail_count = p >= -1 ? (int)pend - block_tokens : 0;
+  if (tail_count < 0) tail_count = 0;
+  if (block_tokens + tail_count > PWIDTH - 1) tail_count = (PWIDTH - 1) - block_tokens;
   for (int q = tid; q < 512; q += SEL_THREADS) {
     const int i = q * 4;
     st_cs_v4(out + i, packed_meta_value(i + 0, block_tokens, tail_start, tail_count),
@@ -1393,9 +1405,12 @@ __global__ void __launch_bounds__(256, 8)
                cnt);
     return;
   }
-  const int tail_start = (int)(pend & ~3u);
-  const int tail_count = p >= -1 ? (int)(pend & 3u) : 0;
   const int block_tokens = v * CRATIO;
+  // tail follows the `visible` contract (see emit_trivial_general)
+  const int tail_start = block_tokens;
+  int tail_count = p >= -1 ? (int)pend - block_tokens : 0;
+  if (tail_count < 0) tail_count = 0;
+  if (block_tokens + tail_count > PWIDTH - 1) tail_count = (PWIDTH - 1) - block_tokens;
 #pragma unroll
   for (int q = tid; q < 512; q += 256) {
     const int i = q * 4;
@@ -3009,8 +3024,13 @@ __global__ void __launch_bounds__(SEL_THREADS, 16)
   const int p = pos[t];
   const int raw_v = visible[t];
   const uint32_t pend = (uint32_t)p + 1u;
-  bool canonical_meta =
-      raw_v >= 0 && raw_v <= max_nblk && raw_v <= min_req_nblk && (uint32_t)raw_v == (pend >> 2);
+  // The shape-derived min_req_nblk certificate is sound only for B == 1
+  // (the bound is exact there). For multi-request batches a caller whose
+  // pos/visible are inconsistent with cu_seqlens could otherwise certify a
+  // row past the producer's per-request clamp and read unwritten scores,
+  // so every multi-request row takes the exact request-local path below.
+  bool canonical_meta = SINGLE_REQ && raw_v >= 0 && raw_v <= max_nblk && raw_v <= min_req_nblk &&
+                        (uint32_t)raw_v == (pend >> 2);
   int v = raw_v;
   if (!canonical_meta) {
     // The shape-derived lower bound could not certify this row. Match the
@@ -3295,6 +3315,10 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
     chunk = (int)(kMaxWs / row_bytes);
     if (chunk < M_TILE) chunk = M_TILE;
   }
+  // CUDA caps gridDim.y at 65535: bound every chunk so the score launch is
+  // always a legal geometry (larger T just takes more chunks).
+  const int kMaxChunkRows = 65535 * M_TILE;
+  if (chunk > kMaxChunkRows) chunk = kMaxChunkRows;
   size_t need = row_bytes * (size_t)chunk;
 
   void* ws = nullptr;
@@ -3333,11 +3357,17 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
     throw std::runtime_error(cudaGetErrorString(attr_err));
   }
 
+  // Accepted OOM (WorkspaceIsUnusedAfterOOM certified every row trivial):
+  // no score may be produced or consumed, so the score launches are skipped
+  // outright and only the metadata-emitting selector runs.
+  const bool scores_available = output_workspace || ws != nullptr || row_bytes == 0;
   for (int row0 = 0; row0 < T; row0 += chunk) {
     int row1 = min(row0 + chunk, T);
     int rows = row1 - row0;
     float* score_ws = output_workspace ? (float*)p_out + (long)row0 * PWIDTH : (float*)ws;
-    if (compact_hot && row0 == 0 && row1 == T) {
+    if (!scores_available) {
+      // metadata-only emission below
+    } else if (compact_hot && row0 == 0 && row1 == T) {
       cudaLaunchConfig_t cfg{};
       cfg.gridDim = dim3(304);
       cfg.blockDim = dim3(SCORE_THREADS);
@@ -3428,6 +3458,13 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
                              p_pos, p_vis, p_cu, p_out, T, B, max_nblk, min_req_nblk, S, row0);
       }
     }
+    // A rejected launch (illegal geometry, insufficient resources) must
+    // never let dependent kernels run on unproduced data or return success.
+    const cudaError_t launch_st = cudaGetLastError();
+    if (launch_st != cudaSuccess) {
+      if (ws) cudaFreeAsync(ws, stream);
+      throw std::runtime_error(cudaGetErrorString(launch_st));
+    }
   }
   if (ws) cudaFreeAsync(ws, stream);
 }
@@ -3476,6 +3513,10 @@ __device__ __forceinline__ void cp_commit() {
 template <int N>
 __device__ __forceinline__ void cp_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory");
+  // Publish the generic-proxy cp.async writes to the async proxy before any
+  // consumer barrier: tcgen05.mma reads shared memory through the async
+  // proxy, and copy completion alone does not order across proxies.
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 __device__ __forceinline__ void prefetch_l2_bulk(const void* p, uint32_t bytes) {
   asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(bytes) : "memory");
@@ -4753,10 +4794,18 @@ __device__ __forceinline__ int packed_meta_value(int col, int block_tokens, int 
 
 __device__ __forceinline__ void emit_trivial_general(int* out, int tid, int v, int p) {
   const uint32_t pend = (uint32_t)p + 1u;
-  const int tail_start = (int)(pend & ~3u);
-  // The reference compacts negative tail indices away before int32 casting.
-  const int tail_count = p >= -1 ? (int)(pend & 3u) : 0;
   const int block_tokens = v * CRATIO;
+  // The tail follows the `visible` contract exactly as the reference does:
+  // it starts at visible*CRATIO and runs through pos. For canonical
+  // metadata (visible == (pos+1)/CRATIO) this is identical to the old
+  // (pend & ~3) derivation; for any other caller-supplied visible the
+  // emitted set still matches the reference. Negative tail indices are
+  // compacted away before int32 casting, and the row never exceeds the
+  // packed width.
+  const int tail_start = block_tokens;
+  int tail_count = p >= -1 ? (int)pend - block_tokens : 0;
+  if (tail_count < 0) tail_count = 0;
+  if (block_tokens + tail_count > PWIDTH - 1) tail_count = (PWIDTH - 1) - block_tokens;
   for (int q = tid; q < 512; q += SEL_THREADS) {
     const int i = q * 4;
     st_cs_v4(out + i, packed_meta_value(i + 0, block_tokens, tail_start, tail_count),
@@ -4799,9 +4848,12 @@ __global__ void __launch_bounds__(256, 8)
   const int r = find_req(cu, FIXED_B, t);
   const int nblk = min(max((cu[r + 1] - cu[r]) / CRATIO, 0), MAX_NBLK);
   const int v = min(max(raw_v, 0), nblk);
-  const int tail_start = (int)(pend & ~3u);
-  const int tail_count = p >= -1 ? (int)(pend & 3u) : 0;
   const int block_tokens = v * CRATIO;
+  // tail follows the `visible` contract (see emit_trivial_general)
+  const int tail_start = block_tokens;
+  int tail_count = p >= -1 ? (int)pend - block_tokens : 0;
+  if (tail_count < 0) tail_count = 0;
+  if (block_tokens + tail_count > PWIDTH - 1) tail_count = (PWIDTH - 1) - block_tokens;
 #pragma unroll
   for (int q = tid; q < 512; q += 256) {
     const int i = q * 4;
@@ -6417,7 +6469,10 @@ __global__ void __launch_bounds__(SEL_THREADS, 16)
   const int p = pos[t];
   const int raw_v = visible[t];
   const uint32_t pend = (uint32_t)p + 1u;
-  const bool canonical_meta = raw_v >= 0 && raw_v <= max_nblk && (uint32_t)raw_v == (pend >> 2);
+  // Sound only for B == 1 (see the primary selector): multi-request rows
+  // always take the exact request-local clamp below.
+  const bool canonical_meta =
+      SINGLE_REQ && raw_v >= 0 && raw_v <= max_nblk && (uint32_t)raw_v == (pend >> 2);
   int v = raw_v;
   if (!canonical_meta) {
     // Preserve the exact request-local clamp for arbitrary metadata.  Only
@@ -6640,6 +6695,10 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
     chunk = (int)(kMaxWs / row_bytes);
     if (chunk < M_TILE) chunk = M_TILE;
   }
+  // CUDA caps gridDim.y at 65535: bound every chunk so the score launch is
+  // always a legal geometry (larger T just takes more chunks).
+  const int kMaxChunkRows = 65535 * M_TILE;
+  if (chunk > kMaxChunkRows) chunk = kMaxChunkRows;
   size_t need = row_bytes * (size_t)chunk;
 
   void* ws = nullptr;
@@ -6678,11 +6737,17 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
     throw std::runtime_error(cudaGetErrorString(attr_err));
   }
 
+  // Accepted OOM (WorkspaceIsUnusedAfterOOM certified every row trivial):
+  // no score may be produced or consumed, so the score launches are skipped
+  // outright and only the metadata-emitting selector runs.
+  const bool scores_available = output_workspace || ws != nullptr || row_bytes == 0;
   for (int row0 = 0; row0 < T; row0 += chunk) {
     int row1 = min(row0 + chunk, T);
     int rows = row1 - row0;
     float* score_ws = output_workspace ? (float*)p_out + (long)row0 * PWIDTH : (float*)ws;
-    if (compact_hot && row0 == 0 && row1 == T) {
+    if (!scores_available) {
+      // metadata-only emission below
+    } else if (compact_hot && row0 == 0 && row1 == T) {
       cudaLaunchConfig_t cfg{};
       cfg.gridDim = dim3(304);
       cfg.blockDim = dim3(SCORE_THREADS);
@@ -6772,6 +6837,13 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cpage_tab
           cudaLaunchKernelEx(&cfg, select_kernel<false, false, true>, (const uint32_t*)score_ws,
                              p_pos, p_vis, p_cu, p_out, T, B, max_nblk, S, row0);
       }
+    }
+    // A rejected launch (illegal geometry, insufficient resources) must
+    // never let dependent kernels run on unproduced data or return success.
+    const cudaError_t launch_st = cudaGetLastError();
+    if (launch_st != cudaSuccess) {
+      if (ws) cudaFreeAsync(ws, stream);
+      throw std::runtime_error(cudaGetErrorString(launch_st));
     }
   }
   if (ws) cudaFreeAsync(ws, stream);

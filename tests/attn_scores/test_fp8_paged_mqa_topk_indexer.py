@@ -280,6 +280,7 @@ def test_cuda_graph_replay_matches_eager():
     eager = buf.clone()
     g = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())  # order after allocator work
     with torch.cuda.stream(stream):
         _api(inp, out=buf)
     torch.cuda.current_stream().wait_stream(stream)

@@ -58,6 +58,27 @@ from ..jit.fp8_paged_mqa_topk_indexer import (
 )
 
 KILL_SWITCH_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
+
+
+@functools.cache
+def _jit_nvcc_release() -> str:
+    """The CUDA release of the nvcc the JIT will compile with ("" when it
+    cannot be determined). torch.version.cuda describes torch's build, not
+    the compiler that builds this kernel, and the validated-toolkit
+    guarantee is about the compiler."""
+    import re
+    import subprocess
+
+    try:
+        txt = subprocess.run(
+            ["nvcc", "--version"], capture_output=True, text=True, timeout=30
+        ).stdout
+    except Exception:
+        return ""
+    m = re.search(r"release (\d+\.\d+)", txt)
+    return m.group(1) if m else ""
+
+
 DISPATCH_STATS = {"specialized": 0, "rejected": 0}
 LAST_FALLBACK_REASONS: list = []
 _BUILT = {"ready": False}
@@ -92,6 +113,16 @@ def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos, visible,
             + ";validated="
             + ",".join(VALIDATED_CUDA_VERSIONS)
         ]
+    _nvcc = _jit_nvcc_release()
+    if _nvcc and not _nvcc.startswith(VALIDATED_CUDA_VERSIONS):
+        # the environment's nvcc (which compiles the JIT module) differs
+        # from torch's CUDA build and is not a validated toolkit
+        return [
+            "unvalidated_toolkit:nvcc_"
+            + _nvcc
+            + ";validated="
+            + ",".join(VALIDATED_CUDA_VERSIONS)
+        ]
     r = []
     if (
         qi.dim() != 3
@@ -116,6 +147,10 @@ def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos, visible,
         or (cpage_table.dim() == 2 and cu_seqlens.shape[0] != cpage_table.shape[0] + 1)
     ):
         r.append("cu_seqlens_not_Bplus1_int32")
+    # qi.shape[0] is only meaningful once qi's rank is right: return the
+    # geometry errors first instead of raising on the shape read.
+    if r:
+        return r
     if pos.dim() != 1 or pos.dtype != torch.int32 or pos.shape[0] != qi.shape[0]:
         r.append("pos_not_T_int32")
     if (
@@ -152,6 +187,21 @@ def _supported_with_reasons(qi, ck_cache, cpage_table, cu_seqlens, pos, visible,
             r.append(_name + "_not_16B_aligned")
     if out is not None and out.data_ptr() % 16:
         r.append("out_not_16B_aligned")
+    if out is not None:
+        _o0 = out.data_ptr()
+        _o1 = _o0 + out.numel() * out.element_size()
+        for _nm, _t in (
+            ("qi", qi),
+            ("ck_cache", ck_cache),
+            ("cpage_table", cpage_table),
+            ("cu_seqlens", cu_seqlens),
+            ("pos", pos),
+            ("visible", visible),
+        ):
+            _t0 = _t.data_ptr()
+            _t1 = _t0 + _t.numel() * _t.element_size()
+            if out.device == _t.device and _o0 < _t1 and _t0 < _o1:
+                r.append("out_overlaps_" + _nm)
     if r:
         return r
     if qi.device.type != "cuda":
