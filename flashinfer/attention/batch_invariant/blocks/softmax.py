@@ -48,6 +48,8 @@ from .. import spec
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
+MASK_SELECT_MAX_D = 128  # the key mask as per-key selects (``masked_score``) serves the one-stage TMEM plan; the two-stage body at D = 256
+# keeps the per-key compare (the select form spills past its launch budget)
 
 
 @dsl_user_op
@@ -364,16 +366,29 @@ def unit_loop(
         if need_mask:
             # the row's visible range in tile-relative columns: key k0 + col is masked iff col < lim_lo or col >= lim_hi (the slice's
             # columns offset by col_base)
-            lim_lo = lo_row - k0
-            lim_hi = L_row - k0
-            if cutlass.const_expr(not exchange):
-                for i in cutlass.range_constexpr(T):
-                    rF[i] = masked_score(rF[i], lim_lo, lim_hi, int(cols_f[i]))
-            if cutlass.const_expr(not one_slice):
-                lim_lo_s = lim_lo - col_base
-                lim_hi_s = lim_hi - col_base
-                for i in cutlass.range_constexpr(kpt):
-                    rS[i] = masked_score(rS[i], lim_lo_s, lim_hi_s, int(cols_s[i]))
+            if cutlass.const_expr(st.D <= MASK_SELECT_MAX_D):
+                lim_lo = lo_row - k0
+                lim_hi = L_row - k0
+                if cutlass.const_expr(not exchange):
+                    for i in cutlass.range_constexpr(T):
+                        rF[i] = masked_score(rF[i], lim_lo, lim_hi, int(cols_f[i]))
+                if cutlass.const_expr(not one_slice):
+                    lim_lo_s = lim_lo - col_base
+                    lim_hi_s = lim_hi - col_base
+                    for i in cutlass.range_constexpr(kpt):
+                        rS[i] = masked_score(rS[i], lim_lo_s, lim_hi_s, int(cols_s[i]))
+            else:
+                # the two-stage body keeps the per-key compare: the select form raises its register pressure past the launch budget
+                if cutlass.const_expr(not exchange):
+                    for i in cutlass.range_constexpr(T):
+                        key = k0 + cols_f[i]
+                        if (key < lo_row) | (key >= L_row):
+                            rF[i] = neg_inf
+                if cutlass.const_expr(not one_slice):
+                    for i in cutlass.range_constexpr(kpt):
+                        key = k0 + col_base + cols_s[i]
+                        if (key < lo_row) | (key >= L_row):
+                            rS[i] = neg_inf
         if cutlass.const_expr(exchange):
             sp = []
             for i in cutlass.range_constexpr(kpt):
