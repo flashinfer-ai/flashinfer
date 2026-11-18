@@ -94,6 +94,7 @@ def gemm_persistent(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None, num_sms=N
         alpha=alpha,
         beta=beta,
         NUM_SMS=num_sms,
+        READ_C=beta != 0,
     )
     return c
 
@@ -172,6 +173,7 @@ def gemm(a, b, c=None, alpha=1.0, beta=0.0, out_dtype=None):
         c.stride(1),
         alpha=alpha,
         beta=beta,
+        READ_C=beta != 0,
     )
     return c
 
@@ -282,5 +284,6 @@ def gemm_descriptor_persistent(
         num_stages=3,
         num_warps=8,
         EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+        READ_C=beta != 0,
     )
     return c

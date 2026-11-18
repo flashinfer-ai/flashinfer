@@ -183,7 +183,9 @@ def test_sm_constraint_gemm(M, N, K, alpha, beta, num_sms, dtype, EPILOGUE_SUBTI
 @pytest.mark.parametrize("kernel", ["naive", "persistent", "descriptor_persistent"])
 @pytest.mark.parametrize("alpha", [1.0, 2.0])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_sm_constraint_gemm_beta_zero_does_not_read_c(kernel, alpha, dtype):
+def test_sm_constraint_gemm_beta_zero_does_not_read_c(
+    kernel, alpha, dtype, monkeypatch
+):
     # When c is not passed, the wrapper allocates it with torch.empty. With
     # beta == 0 the epilogue must not read that buffer: 0.0 * NaN is NaN, so a
     # single read turns the whole result into NaN.
@@ -196,31 +198,44 @@ def test_sm_constraint_gemm_beta_zero_does_not_read_c(kernel, alpha, dtype):
     b = torch.randn((K, N), device="cuda", dtype=torch.float16).to(dtype)
 
     if kernel == "naive":
-        run = lambda c: flashinfer.triton.sm_constraint_gemm.gemm(
-            a, b, c=c, alpha=alpha
-        )
+
+        def run(c):
+            return flashinfer.triton.sm_constraint_gemm.gemm(a, b, c=c, alpha=alpha)
+
     elif kernel == "persistent":
-        run = lambda c: flashinfer.triton.sm_constraint_gemm.gemm_persistent(
-            a, b, c=c, alpha=alpha
-        )
+
+        def run(c):
+            return flashinfer.triton.sm_constraint_gemm.gemm_persistent(
+                a, b, c=c, alpha=alpha
+            )
+
     else:
         bT = b.T.contiguous()
-        run = lambda c: flashinfer.triton.sm_constraint_gemm.gemm_descriptor_persistent(
-            a, bT, c=c, alpha=alpha
-        )
 
-    # Leave NaN behind in a block of exactly the output's size and dtype, so the
-    # caching allocator hands it to the torch.empty inside the wrapper.
-    run(torch.zeros((M, N), device="cuda", dtype=dtype))  # warm up (compile)
-    stale = torch.full((M, N), float("nan"), device="cuda", dtype=dtype)
-    stale_ptr = stale.data_ptr()
-    del stale
+        def run(c):
+            return flashinfer.triton.sm_constraint_gemm.gemm_descriptor_persistent(
+                a, bT, c=c, alpha=alpha
+            )
 
-    out = run(None)  # c=None, beta=0.0
-    assert out.data_ptr() == stale_ptr  # the poisoned block was reused
+    reference = run(torch.zeros((M, N), device="cuda", dtype=dtype))
+
+    # Fill every floating-point torch.empty the wrapper makes with NaN, so the
+    # output buffer is poisoned without relying on the caching allocator.
+    real_empty = torch.empty
+
+    def nan_empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if t.is_floating_point():
+            t.fill_(float("nan"))
+        return t
+
+    with monkeypatch.context() as m:
+        m.setattr(torch, "empty", nan_empty)
+        out = run(None)  # c=None, beta=0.0
+
     assert torch.isfinite(out).all()
     # Nothing about the buffer may reach the result.
-    assert torch.equal(out, run(torch.zeros((M, N), device="cuda", dtype=dtype)))
+    assert torch.equal(out, reference)
 
 
 @pytest.mark.parametrize("kernel", ["naive", "persistent", "descriptor_persistent"])
