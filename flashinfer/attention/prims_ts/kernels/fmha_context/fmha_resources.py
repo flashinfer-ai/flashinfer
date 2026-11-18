@@ -6774,6 +6774,12 @@ class TmemOResource(MemoryResource):
         self.tmem_addr_cached = Int32(0)
         self.tmem_ptr_raw_cached = _placeholder_tmem_ptr()
         self.tmem_o_addr_base_cached = Int32(0)
+        if cfg.vc_restores_means:
+            # Typed values for the mean-step state the MMA prologue caches, so
+            # every traced path that later reads it sees a value.
+            self.vc_mean_issue_cached = cutlass.Boolean(True)
+            self.vc_desc_l_cached = (Int64(0), Int64(0))
+            self.vc_idesc_mu_cached = prims.Tcgen05InstrDesc(0)
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Return the TMEM allocations for the double-buffered O accumulators."""
