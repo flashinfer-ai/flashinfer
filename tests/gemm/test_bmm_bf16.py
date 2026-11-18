@@ -106,12 +106,14 @@ def test_bmm_bf16_unaligned_n(monkeypatch):
 
 
 @pytest.mark.parametrize("k", [2049, 2052])
-def test_bmm_bf16_tgv_unaligned_k(k):
-    """TGV needs K % 8 == 0 (TMA strides): reject it, auto still gets the right answer."""
+def test_bmm_bf16_tgv_unaligned_k(monkeypatch, k):
+    """TGV needs K % 8 == 0 (TMA strides): reject it, keep it out of auto."""
     compute_capability = get_compute_capability(torch.device("cuda"))
     cc_num = compute_capability[0] * 10 + compute_capability[1]
     if not bmm_bf16.is_backend_supported("tgv", cc_num):
         pytest.skip("tgv backend not supported on current compute capability.")
+    if not CUDNN_AVAILABLE:
+        pytest.skip("cuDNN is the only auto candidate left for unaligned K.")
 
     torch.manual_seed(0)
     a = torch.randn([2, 16, k], device="cuda", dtype=torch.bfloat16)
@@ -121,7 +123,21 @@ def test_bmm_bf16_tgv_unaligned_k(k):
     with pytest.raises(ValueError, match="TGV backend requires K divisible by 8"):
         bmm_bf16(a, mat2, backend="tgv")
 
-    out = bmm_bf16(a, mat2, backend="auto")
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
+    with autotune(True, tuning_buckets=[1, 16]):
+        out = bmm_bf16(a, mat2, backend="auto")
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert "TGVRunner" not in profiled, profiled
+
     reference = torch.bmm(a.float(), mat2.float()).to(torch.bfloat16)
     torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
 
