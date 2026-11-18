@@ -28,22 +28,28 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
-from flashinfer.utils import device_support_pdl
+from flashinfer.utils import device_support_pdl, get_compute_capability
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
-from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout
+from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout, LOG2_E
 from flashinfer.cute_dsl.utils import (
     _as_cute_dsl_workspace_i8,
+    cute_dsl_compile_arch,
     get_max_active_clusters,
     get_num_sm,
     torch_to_cutlass_dtype,
 )
 
-
 _CUDA_GRID_Y_MAX = 65_535
-_REDUCER_D_TILE_CANDIDATES = (1, 2, 4)
-_STATIC_REDUCER_MAX_SPLITS = 32
+_STATIC_REDUCER_MAX_SPLITS = 48
+# Cap for launches with too few work units to fill the GPU at 48 splits.
+_SMALL_LAUNCH_REDUCER_MAX_SPLITS = 128
+# A raised cap only pays off while every split still streams at least this
+# many 128-token KV tiles (1K tokens); with thinner splits the per-split setup
+# and the extra reducer partials cost more than the idle SMs did. In practice
+# the cap is raised only for contexts of roughly 50K tokens and more.
+_RAISED_SPLIT_MIN_KV_TILES = 8
 
 
 def _validate_nonpersistent_grid_y(
@@ -66,33 +72,39 @@ def _get_reducer_d_tiles(
     num_sms: int,
     effective_split_kv: int,
 ) -> int:
-    """Choose output-side reducer parallelism for an underfilled row grid.
+    """Reducer D bands: two while the row count fits a quarter of the SMs, else one.
 
-    A reducer CTA normally owns one D512 row.  When the real row grid does not
-    cover one resident wave, compare the conservative wave count for one, two,
-    or four equal D bands and keep the smallest topology with the shortest
-    per-band critical path.  Once rows already cover every SM, retain one CTA
-    per row and avoid duplicated LSE work.
+    Each reducer thread keeps its band columns for a set of splits in
+    registers; a four-band thread would hold a single column.
     """
     reducer_rows = batch_size * seq_len_q * num_heads
-    if (
-        reducer_rows <= 0
-        or num_sms <= 0
-        or reducer_rows >= num_sms
-        or effective_split_kv <= 1
-    ):
-        return 1
+    if effective_split_kv > 1 and 0 < reducer_rows * 4 <= num_sms:
+        return 2
+    return 1
 
-    best_tiles = 1
-    best_waves = ceil_div(reducer_rows, num_sms)
-    for d_tiles in _REDUCER_D_TILE_CANDIDATES[1:]:
-        if d_tiles > effective_split_kv:
-            continue
-        waves = ceil_div(reducer_rows * d_tiles, num_sms)
-        if waves * best_tiles < best_waves * d_tiles:
-            best_tiles = d_tiles
-            best_waves = waves
-    return best_tiles
+
+@functools.cache
+def _get_reducer_max_splits(split_kv: int) -> int:
+    """Reducer capacity for ``split_kv``: the covering power of two (at least 4), capped.
+
+    The reducer keeps a set of splits' partials in registers per thread, so
+    sizing it to the launch avoids wasting registers when few splits run.
+    """
+    cap = (
+        _STATIC_REDUCER_MAX_SPLITS
+        if split_kv <= _STATIC_REDUCER_MAX_SPLITS
+        else _SMALL_LAUNCH_REDUCER_MAX_SPLITS
+    )
+    return min(cap, max(4, 1 << (split_kv - 1).bit_length()))
+
+
+def _reducer_split_cap(num_units: int, max_active_blocks: int) -> int:
+    """Split cap that lets ``num_units`` work units fill every resident 2-CTA cluster."""
+    clusters = max(1, max_active_blocks // 2)
+    return max(
+        _STATIC_REDUCER_MAX_SPLITS,
+        min(_SMALL_LAUNCH_REDUCER_MAX_SPLITS, ceil_div(clusters, max(1, num_units))),
+    )
 
 
 @functools.cache
@@ -104,6 +116,7 @@ def _get_split_kv_and_workspace_size(
     max_active_blocks: int,
     max_seq_len: Optional[int] = None,
     occupancy_q_tiles: Optional[int] = None,
+    num_kv_splits: Optional[int] = None,
 ) -> Tuple[int, int]:
     """Return the nonempty split count and its workspace requirement.
 
@@ -131,18 +144,44 @@ def _get_split_kv_and_workspace_size(
             "occupancy_q_tiles must be in "
             f"[1, {rectangular_q_tiles}], got {occupancy_q_tiles}"
         )
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        1, occupancy_q_tiles, max_active_blocks
-    )
+    split_cap = _reducer_split_cap(occupancy_q_tiles, max_active_blocks)
     if max_seq_len is not None:
         if max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
         k_tile_total = ceil_div(max_seq_len, mma_qk_tile_n)
+        if split_cap > _STATIC_REDUCER_MAX_SPLITS:
+            # Keep the static cap unless the raised one still leaves
+            # _RAISED_SPLIT_MIN_KV_TILES tiles in every split.
+            split_cap = max(
+                _STATIC_REDUCER_MAX_SPLITS,
+                min(split_cap, k_tile_total // _RAISED_SPLIT_MIN_KV_TILES),
+            )
+    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
+        1, occupancy_q_tiles, max_active_blocks, split_cap
+    )
+    if max_seq_len is not None:
         k_tiles_per_split = ceil_div(k_tile_total, split_kv)
         split_kv = ceil_div(k_tile_total, k_tiles_per_split)
+    if num_kv_splits is not None and (
+        isinstance(num_kv_splits, bool) or not isinstance(num_kv_splits, int)
+    ):
+        raise ValueError("num_kv_splits must be an integer or None")
+    if num_kv_splits is not None and num_kv_splits != -1:
+        if not 1 <= num_kv_splits <= _STATIC_REDUCER_MAX_SPLITS:
+            raise ValueError(
+                "num_kv_splits must be -1 or an integer in "
+                f"[1, {_STATIC_REDUCER_MAX_SPLITS}], got {num_kv_splits!r}"
+            )
+        # An explicit tactic is an exact launch budget. Device length changes
+        # may make trailing partitions empty; the kernel/reducer handle them.
+        split_kv = num_kv_splits
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         mma_qk_tile_m, num_q_tiles, kv_lora_rank, B, split_kv, cutlass.Float32
     )
+    # Explicit splits can exceed the scratch spans formerly bounded by the
+    # occupancy heuristic. Layout strides and counters use Int32 elements.
+    if workspace_size // 4 >= 1 << 31:
+        raise ValueError("workspace exceeds the CuTe MLA signed 32-bit indexing range")
     return split_kv, workspace_size
 
 
@@ -209,6 +248,7 @@ def _check_can_implement(
 
 @functools.cache
 def _get_compiled_mla_kernel(
+    arch: str,
     torch_dtype: torch.dtype,
     torch_out_dtype: torch.dtype,
     page_size: int,
@@ -233,10 +273,13 @@ def _get_compiled_mla_kernel(
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
     cum_seq_lens_q, causal_seqlens_kv_global, cp_rank_scalar,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar, lse_scale_scalar).
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("CuTe DSL MLA must be prepared before CUDA graph capture")
+
     # Tile sizes for Blackwell mma.
     # (128, 128) for QK and (128, 256) for PV.
     mma_qk_tiler_mn = (128, 128)
@@ -274,6 +317,7 @@ def _get_compiled_mla_kernel(
         reducer_max_splits=reducer_max_splits,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        arch=arch,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -287,7 +331,8 @@ def _get_compiled_mla_kernel(
     sym_kv_batch = cute.sym_int()  # KV cache batch dim (flat pool, =1 in paged mode)
     sym_seq_kv = cute.sym_int()
     sym_page_count = cute.sym_int()
-    sym_workspace_size = cute.sym_int()
+    # The byte extent can exceed 2 GiB while FP32 element indices fit.
+    sym_workspace_size = cute.sym_int(64)
 
     # q_latent, q_rope, c_latent, c_rope are slices of contiguous tensors on
     # the last dim (e.g. query[..., :kv_lora_rank]), so they are NOT contiguous:
@@ -441,8 +486,9 @@ def _get_compiled_mla_kernel(
         block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
+        Float32(1.0),  # lse_scale placeholder
         stream_fake,
-        options="--enable-tvm-ffi --opt-level 2",
+        options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch {arch}",
     )
 
     return compiled_kernel
@@ -466,12 +512,14 @@ def cute_dsl_mla_decode(
     enable_pdl: Optional[bool] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    lse_scale: float = 1 / LOG2_E,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     enable_dcp: bool = False,
     cp_world: int = 1,
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
+    num_kv_splits: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """CuTe DSL MLA decode kernel for Blackwell SM100.
 
@@ -539,6 +587,12 @@ def cute_dsl_mla_decode(
         Whether to return LSE values.  When True, the function returns
         ``(out, lse)`` (the ``lse`` tensor returned is in whatever shape
         the caller supplied).
+    lse_scale : float, default=1 / LOG2_E
+        Multiplier applied to the LSE at the store. This kernel computes LSE in
+        base 2, so the default ``1 / LOG2_E`` returns natural-log values and
+        ``1.0`` returns base-2. Set from ``return_lse_base`` by
+        ``flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla``. Has no effect
+        when ``return_lse`` is False.
     cum_seq_lens_q : Optional[torch.Tensor]
         Device-resident int32 cumulative query lengths with shape
         ``[B + 1]``. When provided, selects compact variable-Q input and
@@ -561,6 +615,9 @@ def cute_dsl_mla_decode(
     causal_seqlens_kv_global : Optional[torch.Tensor]
         Contiguous CUDA int32 tensor ``[B]`` containing the global exclusive
         causal bound for the newest query token. Required when DCP is enabled.
+    num_kv_splits : Optional[int]
+        Exact static split budget in [1, 48]. None or -1 retains the existing
+        heuristic. One split uses no intermediate workspace or reducer.
     Returns
     -------
     torch.Tensor or Tuple[torch.Tensor, torch.Tensor]
@@ -727,6 +784,7 @@ def cute_dsl_mla_decode(
         max_active_blocks,
         max_seq_len,
         occupancy_q_tiles=occupancy_q_tiles,
+        num_kv_splits=num_kv_splits,
     )
 
     is_persistent = not is_var_seq
@@ -823,6 +881,7 @@ def cute_dsl_mla_decode(
     # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
     # Otherwise, workspace_bytes is not None and it will launch two kernels.
     compiled_kernel = _get_compiled_mla_kernel(
+        arch=cute_dsl_compile_arch(*get_compute_capability(query.device)),
         torch_dtype=q_dtype,
         torch_out_dtype=o_dtype,
         page_size=page_size,
@@ -835,7 +894,7 @@ def cute_dsl_mla_decode(
         is_var_q=is_var_q,
         is_var_split_kv=is_var_split_kv,
         reducer_d_tiles=reducer_d_tiles,
-        reducer_max_splits=_STATIC_REDUCER_MAX_SPLITS,
+        reducer_max_splits=_get_reducer_max_splits(split_kv),
         skip_correction_threshold=skip_correction_threshold,
         is_workspace_size_zero=is_workspace_size_zero,
         enable_pdl=enable_pdl,
@@ -861,6 +920,7 @@ def cute_dsl_mla_decode(
         block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
+        Float32(lse_scale),
     )
 
     if return_lse:

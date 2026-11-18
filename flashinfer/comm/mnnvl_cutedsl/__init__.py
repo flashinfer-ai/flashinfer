@@ -31,6 +31,7 @@ def __getattr__(name: str):
         "DEFAULT_CONFIG",
         "HT_ONLY_CONFIG",
         "LL_ONLY_CONFIG",
+        "NO_NORM_CONFIG",
     }:
         presets = import_module(f"{__name__}.presets")
         value = getattr(presets, name)
@@ -44,6 +45,7 @@ __all__ = [
     "DEFAULT_CONFIG",
     "HT_ONLY_CONFIG",
     "LL_ONLY_CONFIG",
+    "NO_NORM_CONFIG",
     "KernelTarget",
     "MNNVLCuteDSLConfig",
     "MRangeDispatch",

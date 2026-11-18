@@ -33,7 +33,7 @@ from .....algo_knobs import (
 )
 from .....config import EpAlgorithm, EpLayout, FleetParams
 from .....core.bootstrap_utils import resolve_rendezvous_store
-from .....core.comm.fleet import Fleet, _BACKEND_REGISTRY
+from .....core.comm.fleet import Fleet, register_fleet
 from .....core.comm.fault_tolerance import (
     ACTIVE,
     MASKED,
@@ -152,6 +152,7 @@ def _map_algorithm(algo: EpAlgorithm):
     }[algo]
 
 
+@register_fleet("nccl_ep")
 class NcclEpFleet(FaultToleranceMixin, Fleet):
     """Owns the ``nccl.ep.Group`` lifecycle for one process."""
 
@@ -514,6 +515,3 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     @property
     def bootstrap(self) -> "BootstrapConfig":
         return self._bootstrap
-
-
-_BACKEND_REGISTRY["nccl_ep"] = NcclEpFleet

@@ -1,0 +1,326 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""Kernel tuning knobs for the SM90 Hopper FP8 MegaMoE frontend.
+
+Sibling-fork mirror of ``kernel_src/sm100/cutedsl_megamoe/shim/tuner.py``,
+retargeted at ``Sm90MegaMoE(SwapAB)Fp8Kernel``.  Exposes the SM90 tuning
+surface so callers -- or an autotuner -- can enumerate valid tactics and
+apply them to a :class:`.hopper_fp8.MegaMoEHopperFp8Config`.
+
+Two knob classes (same taxonomy as the SM100 tree):
+
+  * **correctness knobs** change a code path / output, so an autotuner must
+    keep the value it validated against (``in_kernel_fc2_reduce``,
+    ``token_back_mode``, ``load_balance_mode``).  ``in_kernel_fc2_reduce``
+    additionally makes the output accumulation order nondeterministic.
+  * **perf knobs** do not change the output and are free to sweep for speed.
+    Unlike SM100 (where tile/cluster are correctness knobs), the SM90 fork's
+    ``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` / ``cluster_shape_mnk`` /
+    ``fp8_accum_mode`` select numerically equivalent execution geometries,
+    so they live in the perf class together with ``group_hint`` /
+    ``tail_split_pairs`` / ``flag_batch`` / ``epi_flag_batch`` and the
+    dispatch-pull fields (``compact_pull_buffer`` / ``dispatch_pull_batch`` /
+    ``dispatch_pull_rotate``).
+
+The built-in heuristic (:func:`default_knobs`) wraps the kernel drop's
+token-bucket table (``moe_hopper_fp8/heuristic_config.py``), so
+``knobs=None`` without a cache entry reproduces the shim's established
+default launch configs exactly.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import itertools
+from typing import Any, Dict, Iterator, Optional, Tuple
+
+from flashinfer.moe_ep._compat import deprecated_aliases
+
+# --- knob value-sets (geometry domains mirror the kernel ctor validation;
+# see kernel_fp8_glu_fc12{,_swapab}.py _validate_mma_tiler_and_cluster_shape).
+
+CORRECTNESS_KNOBS: Dict[str, Tuple[Any, ...]] = {
+    "in_kernel_fc2_reduce": (False, True),
+    "token_back_mode": ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
+    "load_balance_mode": ("static", "atomic_counter"),
+    # Combine dedup + wire format change the combine numerics (fp32 group
+    # pre-reduce ordering; quantized wire), so an autotuner must keep the
+    # values it validated against.  Both are COLLECTIVE (wire format).
+    "grouped_token_back": (False, True),
+    "combine_format": ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"),
+}
+
+_NONSWAP_TILES = ((64, 128, 128), (64, 256, 128))
+# Keep in sync with hopper_fp8._SWAPAB_TILE_N_CHOICES (N=8 admitted 2026-09-10).
+_SWAPAB_TILES = tuple((m, n, 128) for m in (128, 256) for n in (8, 16, 32, 64, 128))
+_CLUSTER_SHAPES = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
+
+PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
+    "swap_ab": (False, True),
+    "pingpong": (False, True),
+    # Wire-level top-k dedup on dispatch; bit-exact with the non-dedup path
+    # (the duplicate pool rows receive the same payload bytes either way).
+    # COLLECTIVE: changes the route-word wire format -- all EP ranks must
+    # agree (a mixed on/off pair mis-decodes the flag bits).
+    "dedup_dispatch": (False, True),
+    # How many of the 4 dispatch warps do token-comm work (the rest idle);
+    # output-invariant partitioning (rank-local, no wire-format coupling).
+    "active_dispatch_warps": (1, 2, 4),
+    # FC1 store offload / early fc1_done publication: output-invariant
+    # (publication timing only; both self-gate to the configs they
+    # support and fall back to the baseline store elsewhere).
+    "fc1_store_offload": (False, True),
+    "fc1_early_done_publish": (False, True),
+    "fold_producer_warps": (False, True),
+    "mma_tiler_mnk": _NONSWAP_TILES + _SWAPAB_TILES,
+    "cluster_shape_mnk": _CLUSTER_SHAPES,
+    "fp8_accum_mode": ("1xacc", "2xacc"),
+    # ``group_hint=None`` means "use max_active_clusters" (occupancy hint).
+    "group_hint": (None, 64, 128, 256, 512),
+    # Tail-split pair tasks (both CTAs of a 2-CTA token cluster compute the
+    # single valid tail token tile against adjacent weight tiles); legal only
+    # with swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).  Output-invariant.
+    "tail_split_pairs": (False, True),
+    "flag_batch": (1, 2, 4, 8),
+    "epi_flag_batch": ((1, 1), (2, 2), (2, 4), (4, 4), (4, 8)),
+    # Dispatch pull (output-invariant): the compact buffer (one slot per
+    # active dispatch warp), rows in flight per active dispatch warp, and the
+    # per-pass rotation of the warp -> row assignment.  See
+    # :func:`validate_dispatch_pull` for the legal combinations.
+    "compact_pull_buffer": (True, False),
+    "dispatch_pull_batch": (1, 2, 3, 4),
+    "dispatch_pull_rotate": (False, True),
+}
+
+# Geometry knob names resolved as one unit by the heuristic table / cache.
+GEOMETRY_KNOBS = (
+    "swap_ab",
+    "pingpong",
+    "mma_tiler_mnk",
+    "cluster_shape_mnk",
+    "fp8_accum_mode",
+)
+
+# Dispatch-pull tactic fields and the values a tactic that omits them gets:
+# the compact buffer and the serial, unrotated pull.
+PULL_KNOB_DEFAULTS: Dict[str, Any] = {
+    "compact_pull_buffer": True,
+    "dispatch_pull_batch": 1,
+    "dispatch_pull_rotate": False,
+}
+
+
+def validate_dispatch_pull(
+    *,
+    compact_pull_buffer: bool,
+    dispatch_pull_batch: int,
+    dispatch_pull_rotate: bool,
+    token_back_mode: str,
+    dedup_dispatch: bool,
+    grouped_token_back: bool,
+    active_dispatch_warps: int,
+) -> None:
+    """Raise ``ValueError`` unless the dispatch-pull fields fit the layout.
+
+    A batch > 1 keeps its extra rows in the idle slots of the 4-slot pull
+    buffer of the serial ``epi_warps`` dispatch path; dispatch-side
+    token-back keeps the serial, unrotated pull loop.  Mirrors the kernel's
+    ``TokenInPullTokenBackPush`` checks; shared by the FP8 and packed-FP4
+    configs.
+    """
+    if type(dispatch_pull_batch) is not int or not 1 <= dispatch_pull_batch <= 4:
+        raise ValueError("dispatch_pull_batch must be an int in 1..4")
+    if type(dispatch_pull_rotate) is not bool:
+        raise ValueError("dispatch_pull_rotate must be a bool")
+    if dispatch_pull_rotate and token_back_mode != "epi_warps":
+        # Dispatch-side token-back keeps the unrotated serial pull loop.
+        raise ValueError("dispatch_pull_rotate requires token_back_mode='epi_warps'")
+    if dispatch_pull_batch > 1:
+        if compact_pull_buffer:
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires compact_pull_buffer=False"
+            )
+        if token_back_mode != "epi_warps" or dedup_dispatch or grouped_token_back:
+            raise ValueError(
+                "dispatch_pull_batch > 1 requires token_back_mode='epi_warps' "
+                "without dedup_dispatch / grouped_token_back"
+            )
+        if dispatch_pull_batch * active_dispatch_warps > 4:
+            raise ValueError(
+                "dispatch_pull_batch * active_dispatch_warps must not exceed the 4 pull slots"
+            )
+
+
+def default_knobs(
+    num_tokens: int, *, fp8_scale_mode: str = "per_tensor"
+) -> Dict[str, Any]:
+    """Default geometry knobs for a compile-time token count (buffer size).
+
+    Wraps the kernel drop's token-bucket heuristic table
+    (``heuristic_config.select_heuristic_config``), keyed on
+    ``fp8_scale_mode`` and the buffer capacity, so the ``knobs=None``
+    fallback matches the shim's established default launch configs.  The
+    table also carries the per-bucket ``token_back_mode``, ``group_hint``
+    and ``tail_split_pairs``; perf knobs it does not cover (``flag_batch`` /
+    ``epi_flag_batch``) are left unset -- the config defaults apply.
+
+    Returns a fresh dict each call.
+    """
+    from moe_hopper_fp8.heuristic_config import select_heuristic_config
+
+    sel = select_heuristic_config(fp8_scale_mode, max(int(num_tokens), 1))
+    c = sel.config
+    return {
+        "swap_ab": c.swap_ab,
+        "pingpong": c.pingpong,
+        "mma_tiler_mnk": tuple(c.mma_tiler_mnk),
+        "cluster_shape_mnk": tuple(c.cluster_shape_mnk),
+        "fp8_accum_mode": c.accum_mode,
+        "token_back_mode": c.token_back_mode,
+        "group_hint": c.group_hint,
+        "tail_split_pairs": c.tail_split_pairs,
+    }
+
+
+@deprecated_aliases(apply_topk_in_fc1="apply_routing_weights_before_fc2")
+def is_valid(
+    knobs: Dict[str, Any],
+    *,
+    apply_routing_weights_before_fc2: bool = True,
+    fp8_scale_mode: Optional[str] = None,
+) -> bool:
+    """``True`` if ``knobs`` is a compilable SM90 FP8 MegaMoE combo.
+
+    Mirrors the kernel ctor / config ``__post_init__`` rules; unspecified
+    knobs fall back to the kernel defaults, so a partial dict is fine.  The
+    swap-AB N72/N80 token tiles are blockwise-only: they are rejected when
+    ``fp8_scale_mode`` is given and is not ``"blockwise"``.
+    """
+    swap_ab = bool(knobs.get("swap_ab", False))
+    pingpong = bool(knobs.get("pingpong", False))
+    m, n, k = knobs.get("mma_tiler_mnk", (64, 128, 128))
+    cm, cn, ck = knobs.get("cluster_shape_mnk", (1, 1, 1))
+    accum = knobs.get("fp8_accum_mode", "1xacc")
+    in_kernel = knobs.get("in_kernel_fc2_reduce", False)
+
+    if swap_ab:
+        if m not in (128, 256) or n not in (8, 16, 32, 64, 72, 80, 128):
+            return False
+        if n in (72, 80) and (m != 256 or fp8_scale_mode not in (None, "blockwise")):
+            return False
+        if pingpong and m != 128:
+            return False
+    else:
+        if m != 64 or n not in (128, 256):
+            return False
+        if pingpong and n != 128:
+            return False
+    if k % 128 != 0:
+        return False
+    if ck != 1 or (cm, cn) not in ((1, 1), (2, 1), (1, 2), (2, 2)):
+        return False
+    if knobs.get("tail_split_pairs", False):
+        # Exactly two CTAs along the tokens and one along the weights.
+        token_cluster, weight_cluster = (cn, cm) if swap_ab else (cm, cn)
+        if token_cluster != 2 or weight_cluster != 1:
+            return False
+    if accum not in ("1xacc", "2xacc"):
+        return False
+    if knobs.get("token_back_mode") not in (
+        None,
+        "epi_warps",
+        "standalone_warps",
+        "reuse_dispatch_warps",
+    ):
+        return False
+    # Kernel invariant: the in-kernel reduce collapses topk before a separate
+    # reducer could apply routing weights.
+    if in_kernel and not apply_routing_weights_before_fc2:
+        return False
+    if knobs.get("active_dispatch_warps", 1) not in (1, 2, 4):
+        return False
+    grouped = bool(knobs.get("grouped_token_back", False))
+    combine_format = knobs.get("combine_format", "bf16")
+    if combine_format not in ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"):
+        return False
+    if combine_format != "bf16" and not grouped:
+        return False
+    if grouped:
+        if knobs.get("token_back_mode", "reuse_dispatch_warps") != (
+            "reuse_dispatch_warps"
+        ):
+            return False
+        if in_kernel or not apply_routing_weights_before_fc2:
+            return False
+    pull = dict(PULL_KNOB_DEFAULTS)
+    pull.update((k, knobs[k]) for k in PULL_KNOB_DEFAULTS if k in knobs)
+    token_back_mode = knobs.get("token_back_mode")
+    if token_back_mode is None:
+        token_back_mode = (
+            "reuse_dispatch_warps"
+            if knobs.get("token_back_by_dispatch", False)
+            else "epi_warps"
+        )
+    try:
+        validate_dispatch_pull(
+            **pull,
+            token_back_mode=token_back_mode,
+            dedup_dispatch=bool(knobs.get("dedup_dispatch", False)),
+            grouped_token_back=grouped,
+            active_dispatch_warps=knobs.get("active_dispatch_warps", 1),
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def iter_candidates(
+    *,
+    include_correctness: bool = False,
+    base: Optional[Dict[str, Any]] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Yield valid knob dicts (cross-product), each merged onto ``base``.
+
+    ``include_correctness=False`` (default) sweeps only the perf knobs
+    (output invariant); set ``True`` to also enumerate the correctness
+    knobs.  Illegal combos (per :func:`is_valid`) are skipped.
+    """
+    space = dict(PERF_KNOBS)
+    if include_correctness:
+        space = {**CORRECTNESS_KNOBS, **space}
+    names = list(space)
+    for values in itertools.product(*(space[n] for n in names)):
+        knobs = dict(base or {})
+        knobs.update(zip(names, values, strict=False))
+        if is_valid(knobs):
+            yield knobs
+
+
+def with_knobs(config: Any, knobs: Optional[Dict[str, Any]]) -> Any:
+    """Return a copy of ``config`` with ``knobs`` applied.
+
+    Only knobs the config declares are set (unknown keys are silently
+    dropped, mirroring the SM100 tree).  Passing ``knobs=None`` returns the
+    config unchanged.  The returned config re-runs ``__post_init__``
+    validation, so an invalid combination raises immediately.
+    """
+    if not knobs:
+        return config
+    fields = {f.name for f in dataclasses.fields(config)}
+    overrides = {k: v for k, v in knobs.items() if k in fields}
+    if not overrides:
+        return config
+    return dataclasses.replace(config, **overrides)
+
+
+__all__ = [
+    "CORRECTNESS_KNOBS",
+    "GEOMETRY_KNOBS",
+    "PERF_KNOBS",
+    "PULL_KNOB_DEFAULTS",
+    "default_knobs",
+    "is_valid",
+    "iter_candidates",
+    "validate_dispatch_pull",
+    "with_knobs",
+]

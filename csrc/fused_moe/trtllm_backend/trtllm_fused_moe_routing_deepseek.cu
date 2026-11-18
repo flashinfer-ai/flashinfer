@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/fused_moe/RoutingCustomPolicy.cuh"
@@ -129,10 +130,10 @@ __global__ void routingMainKernel(KernelParams params) {
 
   // declare shared memory structure
   // number of experts is bounded by number of threads
-  __shared__ float __attribute((aligned(128))) smemScoreSigmoid[KernelParams::MaxNumExperts];
-  __shared__ float __attribute((aligned(128))) smemScoreBias[KernelParams::MaxNumExperts];
+  __shared__ float __align__(128) smemScoreSigmoid[KernelParams::MaxNumExperts];
+  __shared__ float __align__(128) smemScoreBias[KernelParams::MaxNumExperts];
   // number of expert groups is bounded by number of warps
-  __shared__ float __attribute((aligned(128))) smemGroupScores[MaxNumGroups];
+  __shared__ float __align__(128) smemGroupScores[MaxNumGroups];
 
   // needed for warp reduce
   auto block = cg::this_thread_block();
@@ -142,7 +143,7 @@ __global__ void routingMainKernel(KernelParams params) {
   int32_t warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
   // note that for invalid scores, we use negative infinity,
   // needed for GLM-style routing where bias can be negative
-  static constexpr float invalidScoreFloat = float{-INFINITY};
+  static constexpr float invalidScoreFloat = -std::numeric_limits<float>::infinity();
   const OutputT invalidScore = OutputT{invalidScoreFloat};
 
   // load bias already; each warp represents one expert group
@@ -261,8 +262,8 @@ __global__ void routingMainKernel(KernelParams params) {
       int constexpr NumExpertWarps =
           (KernelParams::MaxNumExperts - 1) / topk::MaxNumExpertsUnit + 1;
       int constexpr NumInterTopK = NumExpertWarps * KernelParams::MaxNumTopExperts;
-      __shared__ float __attribute((aligned(128))) smemInterTopScores[NumInterTopK];
-      __shared__ int32_t __attribute((aligned(128))) smemInterTopExperts[NumInterTopK];
+      __shared__ float __align__(128) smemInterTopScores[NumInterTopK];
+      __shared__ int32_t __align__(128) smemInterTopExperts[NumInterTopK];
       if (warpIdx < NumExpertWarps) {
         int offset = warpIdx * WarpSize * MaxNumTopGroups;
 #pragma unroll
@@ -361,10 +362,11 @@ __global__ void routingMainKernel(KernelParams params) {
         params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
       }
 
-      // Routing replay: record all top-K selected expert IDs per token.
-      // Layout: [num_tokens, topK] -- same indexing as mPtrTopKPacked.
+      // Routing replay is routed-only: [num_tokens, topK] with stride topK.
+      // Packed ids/weights use mTotalExpertsPerToken (= topK + fused shared).
+      auto idxReplay = blockIdx.x * params.mTopK + laneIdx;
       if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
-        params.mPtrRoutingReplayOut[idxTopK] = static_cast<int16_t>(expertIdx);
+        params.mPtrRoutingReplayOut[idxReplay] = static_cast<int16_t>(expertIdx);
       }
     }
   }

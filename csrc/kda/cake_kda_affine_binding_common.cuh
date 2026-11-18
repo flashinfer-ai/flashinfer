@@ -46,17 +46,12 @@
 #ifndef FLASHINFER_CAKE_KDA_AFFINE_ROLE
 #error "FLASHINFER_CAKE_KDA_AFFINE_ROLE must select one sealed affine role"
 #endif
-#ifndef FLASHINFER_CAKE_KDA_AFFINE_ARG_PLAN_SHA256
-#error "FLASHINFER_CAKE_KDA_AFFINE_ARG_PLAN_SHA256 must seal the kernel ABI"
-#endif
 
 static_assert(FLASHINFER_CAKE_KDA_AFFINE_THREADS > 0);
 static_assert(FLASHINFER_CAKE_KDA_AFFINE_SMEM_BYTES > 0);
 static_assert(FLASHINFER_CAKE_KDA_AFFINE_USE_PDL == 0 || FLASHINFER_CAKE_KDA_AFFINE_USE_PDL == 1);
 static_assert(FLASHINFER_CAKE_KDA_AFFINE_ROLE >= FLASHINFER_CAKE_KDA_AFFINE_ROLE_MAIN &&
               FLASHINFER_CAKE_KDA_AFFINE_ROLE <= FLASHINFER_CAKE_KDA_AFFINE_ROLE_SCAN);
-static_assert(sizeof(FLASHINFER_CAKE_KDA_AFFINE_ARG_PLAN_SHA256) == 65,
-              "Cake KDA affine arg-plan identity must be a full SHA-256");
 
 // Frozen bodies own private fixed-width aliases. Keep them isolated from the
 // CUDA and TVM-FFI declarations in this translation unit.

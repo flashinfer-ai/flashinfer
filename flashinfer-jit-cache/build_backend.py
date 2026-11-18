@@ -26,20 +26,10 @@ from wheel.bdist_wheel import bdist_wheel
 # Add parent directory to path to import flashinfer modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from build_utils import get_build_dependency_requirements, get_git_version
+from build_utils import get_git_version
 
 # Skip version check when building flashinfer-jit-cache package
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
-
-
-def _wheel_kind() -> str:
-    kind = os.environ.get("FLASHINFER_JIT_CACHE_WHEEL_KIND", "legacy").strip()
-    if kind not in ("legacy", "shim"):
-        raise RuntimeError(
-            f"Invalid FLASHINFER_JIT_CACHE_WHEEL_KIND={kind!r}; "
-            "expected 'legacy' or 'shim'"
-        )
-    return kind
 
 
 def _provider_tag(architecture: str) -> str:
@@ -58,28 +48,18 @@ def _write_provider_requirements(version: str) -> None:
     requirements_path = (
         Path(__file__).parent / "flashinfer_jit_cache" / "_provider_requirements.txt"
     )
-    requirements = []
-    if _wheel_kind() == "shim":
-        architecture_list = os.environ.get(
-            "FLASHINFER_JIT_CACHE_PROVIDER_ARCHS",
-            os.environ.get("FLASHINFER_CUDA_ARCH_LIST", ""),
-        )
-        if not architecture_list.strip():
-            raise RuntimeError(
-                "A shim build requires FLASHINFER_JIT_CACHE_PROVIDER_ARCHS "
-                "or FLASHINFER_CUDA_ARCH_LIST"
-            )
-        provider_tags = sorted(
-            {_provider_tag(architecture) for architecture in architecture_list.split()}
-        )
-        # Provider lists are literal; sm80 SASS is not a portable baseline.
-        requirements = [
-            f"flashinfer-jit-cache-{provider_tag}=={version}"
-            for provider_tag in provider_tags
-        ]
-    requirements_path.write_text(
-        "\n".join(requirements) + ("\n" if requirements else "")
+    architecture_list = os.environ.get("FLASHINFER_JIT_CACHE_PROVIDER_ARCHS", "")
+    if not architecture_list.strip():
+        raise RuntimeError("A shim build requires FLASHINFER_JIT_CACHE_PROVIDER_ARCHS")
+    provider_tags = sorted(
+        {_provider_tag(architecture) for architecture in architecture_list.split()}
     )
+    # Dependencies are literal; runtime ranks compatibility from provider targets.
+    requirements = [
+        f"flashinfer-jit-cache-{provider_tag}=={version}"
+        for provider_tag in provider_tags
+    ]
+    requirements_path.write_text("\n".join(requirements) + "\n")
 
 
 def _create_build_metadata():
@@ -131,92 +111,9 @@ def _create_build_metadata():
 _create_build_metadata()
 
 
-def _compile_jit_cache(output_dir: Path, verbose: bool = True):
-    """Compile AOT modules using flashinfer.aot functions directly."""
-    # Get the project root directory
-    project_root = Path(__file__).parent.parent
-
-    # Ensure 3rdparty submodules are populated (may be empty in CI Docker images).
-    # Skip if submodules are already present or if git metadata is incomplete
-    # (e.g., Docker builds where .git points to a parent repo not in the context).
-    import subprocess
-
-    submodule_check_paths = [
-        project_root / "3rdparty" / "cutlass" / "include",
-        project_root / "3rdparty" / "spdlog" / "include",
-        project_root / "3rdparty" / "cccl" / "cub",
-    ]
-    if not all(p.exists() for p in submodule_check_paths):
-        result = subprocess.run(
-            ["git", "submodule", "update", "--init", "--recursive"],
-            cwd=str(project_root),
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            missing = [str(p) for p in submodule_check_paths if not p.exists()]
-            if missing:
-                raise RuntimeError(
-                    f"git submodule update failed and submodules are missing: {missing}\n"
-                    f"git stderr: {result.stderr.decode().strip()}"
-                )
-
-    # Ensure flashinfer/data/ symlinks exist (normally created by the main
-    # package's build_backend, but jit-cache builds may not install the main
-    # package first). Use importlib to avoid name collision with this file.
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "main_build_backend", project_root / "build_backend.py"
-    )
-    main_build_backend = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(main_build_backend)
-    main_build_backend._create_data_dir(use_symlinks=True)
-
-    from flashinfer import aot
-
-    # Set up build directory
-    build_dir = project_root / "build" / "aot"
-
-    # Use the centralized compilation function from aot.py
-    aot.compile_and_package_modules(
-        out_dir=output_dir,
-        build_dir=build_dir,
-        project_root=project_root,
-        config=None,  # Use default config
-        verbose=verbose,
-        skip_prebuilt=False,
-    )
-
-
-def _build_aot_modules():
-    # First, ensure AOT modules are compiled
-    aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
-    aot_package_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        # Compile AOT modules
-        _compile_jit_cache(aot_package_dir)
-
-        # Verify that some modules were actually compiled
-        so_files = list(aot_package_dir.rglob("*.so"))
-        if not so_files:
-            raise RuntimeError("No .so files were generated during AOT compilation")
-
-        print(f"Successfully compiled {len(so_files)} AOT modules")
-
-    except Exception as e:
-        print(f"Failed to compile AOT modules: {e}")
-        raise
-
-
 def _prepare_build():
-    """Shared preparation logic for both wheel and editable builds."""
+    """Generate shim metadata and remove stale monolithic build output."""
     _create_build_metadata()
-    if _wheel_kind() == "legacy":
-        _build_aot_modules()
-        return
-
-    # A shim wheel owns discovery and dependency metadata, not binary modules.
     aot_package_dir = Path(__file__).parent / "flashinfer_jit_cache" / "jit_cache"
     if aot_package_dir.exists():
         shutil.rmtree(aot_package_dir)
@@ -274,21 +171,19 @@ class _MonkeyPatchBdistWheel:
 
 
 def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
-    """Build wheel with custom AOT module compilation."""
-    print(f"Building flashinfer-jit-cache {_wheel_kind()} wheel...")
+    """Build the platform-specific provider shim wheel."""
+    print("Building flashinfer-jit-cache provider shim wheel...")
 
     _prepare_build()
 
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig.build_wheel(
-                wheel_directory, config_settings, metadata_directory
-            )
-    return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
+    # Requirements differ by CPU platform, so this metadata-only shim still
+    # needs a platform tag.
+    with _MonkeyPatchBdistWheel():
+        return _orig.build_wheel(wheel_directory, config_settings, metadata_directory)
 
 
 def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
-    """Build editable install with custom AOT module compilation."""
+    """Build an editable provider shim install."""
     print("Building flashinfer-jit-cache in editable mode...")
 
     _prepare_build()
@@ -297,47 +192,34 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     if _orig_build_editable is None:
         raise RuntimeError("build_editable not supported by setuptools backend")
 
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig_build_editable(
-                wheel_directory, config_settings, metadata_directory
-            )
-
-    return _orig_build_editable(wheel_directory, config_settings, metadata_directory)
+    with _MonkeyPatchBdistWheel():
+        return _orig_build_editable(
+            wheel_directory, config_settings, metadata_directory
+        )
 
 
 def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
     """Prepare metadata with platform-specific wheel tags."""
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig.prepare_metadata_for_build_wheel(
-                metadata_directory, config_settings
-            )
-    return _orig.prepare_metadata_for_build_wheel(metadata_directory, config_settings)
+    with _MonkeyPatchBdistWheel():
+        return _orig.prepare_metadata_for_build_wheel(
+            metadata_directory, config_settings
+        )
 
 
 def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
     """Prepare metadata for editable install."""
-    if _wheel_kind() == "legacy":
-        with _MonkeyPatchBdistWheel():
-            return _orig.prepare_metadata_for_build_editable(
-                metadata_directory, config_settings
-            )
-    return _orig.prepare_metadata_for_build_editable(
-        metadata_directory, config_settings
-    )
+    with _MonkeyPatchBdistWheel():
+        return _orig.prepare_metadata_for_build_editable(
+            metadata_directory, config_settings
+        )
 
 
 def get_requires_for_build_wheel(config_settings=None):
-    """Install configured dependencies in the isolated wheel build env."""
-    return [
-        *_orig.get_requires_for_build_wheel(config_settings),
-        *get_build_dependency_requirements(),
-    ]
+    """Return the shim's isolated wheel build requirements."""
+    return _orig.get_requires_for_build_wheel(config_settings)
 
 
 def get_requires_for_build_editable(config_settings=None):
-    """Install configured dependencies in the isolated editable build env."""
+    """Return the shim's isolated editable build requirements."""
     get_requires = getattr(_orig, "get_requires_for_build_editable", None)
-    requirements = [] if get_requires is None else get_requires(config_settings)
-    return [*requirements, *get_build_dependency_requirements()]
+    return [] if get_requires is None else get_requires(config_settings)

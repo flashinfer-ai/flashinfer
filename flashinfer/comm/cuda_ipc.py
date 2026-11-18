@@ -15,6 +15,9 @@ limitations under the License.
 """
 
 import ctypes
+import os
+import platform
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +43,36 @@ class Function:
     argtypes: List[Any]
 
 
+def _is_library_filename(maps_line: str, lib_name: str) -> bool:
+    """Whether a /proc/self/maps line maps ``lib_name`` itself, not a differently-named library.
+
+    ``lib_name in line`` alone matches any path that merely contains the name, so a library such
+    as ``libcudart_stub.so`` is indistinguishable from ``libcudart.so``. Binding the wrong object
+    is silent until the first symbol lookup, which then fails with an opaque
+    ``undefined symbol: cudaDeviceReset``.
+
+    The whole filename is validated, not a prefix: the name must be ``lib_name``, optionally
+    followed by a ``-<hash>`` build suffix of hexadecimal characters, then ``.so`` and zero or more
+    numeric version components. Checking only the part before ``.so`` is not enough, because ``.so``
+    also occurs inside names like ``libcudart.something``, and a trailing ``.backup`` would
+    otherwise be ignored. The suffix is restricted to hex rather than any text, so a hyphenated
+    stub such as ``libcudart-stub.so`` is rejected alongside ``libcudart_stub.so``.
+
+    Accepts the forms the loader produces -- ``libcudart.so``, ``libcudart.so.12``,
+    ``libcudart.so.11.0`` and the wheel-mangled ``libcudart-d0da41ae.so.11.0``. Rejects everything
+    else, including paths where the name appears only in a directory component.
+    """
+    if "/" not in maps_line:
+        return False
+    filename = maps_line.strip().rsplit("/", 1)[-1]
+    return (
+        re.fullmatch(
+            rf"{re.escape(lib_name)}(?:-[0-9a-fA-F]+)?\.so(?:\.\d+)*", filename
+        )
+        is not None
+    )
+
+
 def find_loaded_library(lib_name) -> Optional[str]:
     """
     According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
@@ -47,10 +80,47 @@ def find_loaded_library(lib_name) -> Optional[str]:
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
+    if platform.system() == "Windows":
+        import torch.version as torch_version
+
+        if os.environ.get("CUDA_HOME"):
+            cuda_path = os.environ.get("CUDA_HOME")
+        elif os.environ.get("CUDA_ROOT"):
+            cuda_path = os.environ.get("CUDA_ROOT")
+        elif os.environ.get("CUDA_PATH"):
+            cuda_path = os.environ.get("CUDA_PATH")
+        elif os.environ.get("CUDA_LIB_PATH"):
+            cuda_path = os.path.abspath(
+                os.path.join(os.environ.get("CUDA_LIB_PATH"), "..", "..")
+            )
+        else:
+            cuda_path = f"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v{torch_version.cuda}"
+
+        if cuda_path and os.path.exists(cuda_path):
+            cudart_version = torch_version.cuda.split(".")[0]
+            if cudart_version < "12":
+                cudart_version += "0"
+            cuda_arch = (
+                "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+            )
+            arch_bin_path = os.path.join(cuda_path, "bin", cuda_arch)
+            dll_bin_path = (
+                arch_bin_path
+                if os.path.exists(arch_bin_path)
+                else os.path.join(cuda_path, "bin")
+            )
+            return os.path.join(dll_bin_path, f"cudart64_{cudart_version}.dll")
+        else:
+            raise ValueError(
+                "CUDA_LIB_PATH is not set. "
+                "CUDA_LIB_PATH need to be set with the absolute path "
+                "to CUDA root folder on Windows (for example, set "
+                "CUDA_LIB_PATH=C:\\CUDA\\v12.4)"
+            )
     found = False
     with open("/proc/self/maps") as f:
         for line in f:
-            if lib_name in line:
+            if lib_name in line and _is_library_filename(line, lib_name):
                 found = True
                 break
     if not found:

@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import os
 import logging
 import functools
 import math
+from ctypes import byref
 from enum import Enum
 from functools import lru_cache
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -57,6 +59,27 @@ class TensorLayout(Enum):
 
 
 log2e = 1.44269504088896340736
+ln2 = 0.6931471805599453094
+
+# Bases the attention wrappers can return the LSE in. FlashInfer's kernels fold
+# log2(e) into the softmax scale and emit base-2 LSE ("log2"); "ln" is the
+# natural-log form (torch.logsumexp), what merge kernels written with expf take.
+LSE_BASES = ("log2", "ln")
+
+
+def check_lse_base(lse_base: str) -> None:
+    if lse_base not in LSE_BASES:
+        raise ValueError(f"lse_base must be one of {LSE_BASES}, got {lse_base!r}")
+
+
+# Layouts the LSE can be returned in: "NH" = [total_tokens, num_qo_heads] (default,
+# what the kernels write), "HN" = [num_qo_heads, total_tokens], contiguous.
+LSE_LAYOUTS = ("NH", "HN")
+
+
+def check_lse_layout(lse_layout: str) -> None:
+    if lse_layout not in LSE_LAYOUTS:
+        raise ValueError(f"lse_layout must be one of {LSE_LAYOUTS}, got {lse_layout!r}")
 
 
 class GPUArchitectureError(Exception):
@@ -176,6 +199,36 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
+def _check_head_dim(head_dim_qk: int, head_dim_vo: int, backend: str) -> None:
+    """Validate the FA2 prefill head-dimension safety requirements."""
+    if head_dim_qk <= 0 or head_dim_vo <= 0:
+        raise ValueError(
+            "head_dim_qk and head_dim_vo must be positive, got "
+            "head_dim_qk={}, head_dim_vo={}.".format(head_dim_qk, head_dim_vo)
+        )
+    if backend != "fa2":  # only FA2 silently corrupts for non-64-multiple head dims
+        return
+    if head_dim_qk % 64 != 0 or head_dim_vo % 64 != 0:
+        raise ValueError(
+            "head_dim_qk and head_dim_vo must be positive multiples of 64, got "
+            "head_dim_qk={}, head_dim_vo={}. The FA2 prefill kernels only "
+            "safely handle head dims divisible by 64; other dims lead to "
+            "out-of-bounds accesses or silently wrong results.".format(
+                head_dim_qk, head_dim_vo
+            )
+        )
+    # KernelTraits tiles the output in chunks of at most 256 dims, and a chunk
+    # must divide head_dim_vo; other sizes fail to compile.
+    if head_dim_vo > 256 and head_dim_vo % 256 != 0:
+        raise ValueError(
+            "head_dim_vo above 256 must be a multiple of 256, got "
+            "head_dim_vo={}. The FA2 prefill kernels split the output into "
+            "tiles of at most 256 dims, which must divide head_dim_vo.".format(
+                head_dim_vo
+            )
+        )
+
+
 def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 
@@ -248,6 +301,71 @@ def _get_cache_buf(
     return buf
 
 
+def make_l2_flush(num_bytes: int, device) -> Callable[[], None]:
+    """Return a callable that evicts L2 by reading a ``num_bytes`` scratch buffer.
+
+    The buffer is only read, so L2 is left holding clean lines. A write-based
+    flush (``zero_()``) leaves L2 full of dirty lines, and the next kernel pays
+    for writing them back to DRAM (about 8 us for a memory-bound GEMM on B200).
+    """
+    buffer = torch.empty(num_bytes // 8, dtype=torch.int64, device=device)
+    out = torch.empty((), dtype=torch.int64, device=device)
+
+    def flush() -> None:
+        torch.sum(buffer, dim=0, out=out)
+
+    return flush
+
+
+_stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
+# Per-device private pools keep these long-lived buffers out of CUDA graph pools.
+_stream_cache_mem_pools: Dict[int, torch.cuda.MemPool] = {}
+
+
+def _get_stream_cache_buf(
+    name: str, num_bytes: int, device: torch.device, zero_init: bool = False
+) -> torch.Tensor:
+    """Return the ``name`` scratch buffer owned by ``device``'s current CUDA stream.
+
+    Same contract as :func:`_get_cache_buf`, keyed additionally by the raw
+    ``cudaStream_t`` handle of the current stream. Launches on one stream are
+    ordered, so a kernel that leaves the buffer in a known state at exit can
+    reuse it on the next launch without re-initialising it; launches on
+    different streams are not ordered, so each stream gets its own buffer
+    (flashinfer-ai/flashinfer#3618). PyTorch draws stream handles from a fixed
+    per-device pool, which bounds the number of buffers.
+
+    Under CUDA graph capture the key is the capture stream, so graphs captured
+    on one stream share the buffer. That is safe only for stateless scratch and
+    only if those graphs never replay concurrently.
+    """
+    index = device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    if torch.compiler.is_dynamo_compiling():
+        # Under torch.compile(dynamic=True) Dynamo can pass a symbolic index, which
+        # the raw binding rejects; the Stream object is traceable and has the same handle.
+        stream = torch.cuda.current_stream(device).cuda_stream
+    else:
+        stream = torch._C._cuda_getCurrentRawStream(index)
+    key = (name, device, stream)
+    buf = _stream_cache_buf.get(key)
+    if buf is None or buf.size(0) < num_bytes:
+        if buf is not None:
+            _cache_buf_retired.append(buf)
+        pool = _stream_cache_mem_pools.get(index)
+        if pool is None:
+            with torch.cuda.device(index):
+                pool = _stream_cache_mem_pools[index] = torch.cuda.MemPool()
+        with torch.cuda.use_mem_pool(pool, device=index):
+            if zero_init:
+                buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+            else:
+                buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
+        _stream_cache_buf[key] = buf
+    return buf
+
+
 # find the least power of 2 that is greater than or equal to x
 def _ceil_pow2(x: int) -> int:
     return 1 << (x - 1).bit_length()
@@ -296,6 +414,16 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
         raise ValueError("device must be a cuda device")
     properties = get_device_properties(device)
     return properties.major, properties.minor
+
+
+def _check_block_scale_quantization_support(device: torch.device, op_name: str) -> None:
+    # The CUDA quantization kernels have no implementation below SM100.
+    if device.type == "cuda":
+        major, minor = get_compute_capability(device)
+        if major < 10:
+            raise RuntimeError(
+                f"{op_name} requires SM100 or newer; got SM{major}{minor}"
+            )
 
 
 # trtllm-gen ships the Fp16Softmax and Spcomp cubin variants for SM107 (Rubin) only - the
@@ -608,6 +736,7 @@ def determine_attention_backend(
     return "fa2"
 
 
+@functools.lru_cache(maxsize=32)
 def version_at_least(version: str, base_version: str) -> bool:
     from packaging import version as pkg_version
 
@@ -639,41 +768,49 @@ def get_cuda_python_version() -> str:
     return cuda.__version__
 
 
+@functools.cache
 def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and version_at_least(torch.version.cuda, "12.3")
 
 
+@functools.cache
 def is_sm100a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm100f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm110a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 11 and version_at_least(torch.version.cuda, "13.0")
 
 
+@functools.cache
 def is_sm120a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 0 and version_at_least(torch.version.cuda, "12.8")
 
 
+@functools.cache
 def is_sm120f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 12 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm121a_supported(device: torch.device) -> bool:
     major, minor = get_compute_capability(device)
     return major == 12 and minor == 1 and version_at_least(torch.version.cuda, "12.9")
 
 
+@functools.cache
 def is_sm12x_supported(device: torch.device) -> bool:
     """Check if the device is any SM12x GPU (SM120a, SM121a, or future variants).
 
@@ -691,27 +828,38 @@ def is_sm12x_supported(device: torch.device) -> bool:
     return version_at_least(torch.version.cuda, min_cuda)
 
 
+# Keep this table in sync with FLASHINFER_MAMBA_HAS_CVT_RS in
+# include/flashinfer/mamba/conversion.cuh.
+CVT_RS_SUPPORTED_ARCHES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
+
+
+def cvt_rs_supported_arches_text() -> str:
+    """Return the supported stochastic-rounding targets in a stable order."""
+    return ", ".join(CVT_RS_SUPPORTED_ARCHES.values())
+
+
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
-    Datacenter-Blackwell only: SM100 (B200, cc 10.0) and SM103 (B300, cc 10.3).
+    Datacenter Blackwell and Rubin only: SM100 (B200, cc 10.0), SM103 (B300,
+    cc 10.3) and SM107 (Rubin, cc 10.7 — `.rs` verified with CUDA 13.4 ptxas).
     ptxas REJECTS `.rs` on SM110a (cc 11.0) and it is absent on SM120 (consumer
     Blackwell) — both must return False, else the kernels silently compile the
     ~12-instruction software-emulation fallback and stochastic rounding runs
     ~4x slower (measured on B300 when the CUDA-side guard omitted SM103a).
     Keep this in lockstep with the FLASHINFER_MAMBA_HAS_CVT_RS guard in
-    include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
+    include/flashinfer/mamba/conversion.cuh.
     """
     if device is None:
         device = torch.device("cuda")
     # Match the CUDA guard exactly: only the arches where cvt.rs actually
     # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
     # (major 11) has no `.rs` feature.
-    return get_compute_capability(device) in ((10, 0), (10, 3))
-
-
-def determine_mla_backend(device: torch.device) -> str:
-    return "fa3" if is_sm90a_supported(device) else "fa2"
+    return get_compute_capability(device) in ((10, 0), (10, 3), (10, 7))
 
 
 def _check_block_tables_shape(
@@ -1038,6 +1186,15 @@ def get_shuffle_block_size(epilogue_tile_m: int) -> int:
     return shuffle_block_size
 
 
+def _unaligned_rows_message(M: int, alignment: int) -> str:
+    return (
+        f"input_tensor.shape[0]={M} must be a multiple of {alignment}. For the trtllm "
+        "block-scale MoE ops (FP8, FP4, MXINT4), zero-pad the unaligned dimension "
+        "(intermediate_size for FC1, hidden_size for FC2) to a multiple of 128 and "
+        "pass valid_intermediate_size / valid_hidden_size."
+    )
+
+
 def get_shuffle_matrix_a_row_indices(
     input_tensor: torch.Tensor, epilogue_tile_m: int
 ) -> torch.Tensor:
@@ -1057,9 +1214,7 @@ def get_shuffle_matrix_a_row_indices(
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
     row_map = srcToDstBlk16RowMap if shuffle_block_size == 16 else srcToDstBlk32RowMap
 
-    assert M % shuffle_block_size == 0, (
-        f"input_tensor.shape[0] must be multiples of {shuffle_block_size}"
-    )
+    assert M % shuffle_block_size == 0, _unaligned_rows_message(M, shuffle_block_size)
 
     # row_indices[new_row] = old_row
     # so row_indices is an array of size M telling us from which old_row
@@ -1088,7 +1243,7 @@ def get_shuffle_matrix_sf_a_row_indices(
 
     # M, K from the input
     M, K = input_tensor.shape
-    assert M % 128 == 0
+    assert M % 128 == 0, _unaligned_rows_message(M, 128)
     # K % 4 alignment is not required here, downstream block_scale_interleave kernel pads K to a multiple of 4 internally
     row_indices = get_shuffle_matrix_a_row_indices(input_tensor, epilogue_tile_m)
 
@@ -1219,10 +1374,50 @@ def experimental_backend(checker: Callable) -> Callable:
     return checker
 
 
+def _make_bind_with_defaults(sig: inspect.Signature) -> Callable:
+    """``dict(sig.bind(*args, **kwargs).apply_defaults().arguments)``, faster.
+
+    Covers the common call shape of a signature without ``*args`` /
+    ``**kwargs``; anything else (including every malformed call) goes through
+    ``sig.bind`` so its result and its ``TypeError`` are unchanged.
+    """
+    params = list(sig.parameters.values())
+    fast = all(p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) for p in params)
+    positional = tuple(p.name for p in params if p.kind == p.POSITIONAL_OR_KEYWORD)
+    ordered = tuple((p.name, p.default) for p in params)
+    empty = inspect.Parameter.empty
+
+    def slow(args, kwargs):
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        return dict(bound.arguments)
+
+    def bind(args, kwargs):
+        if not fast or len(args) > len(positional):
+            return slow(args, kwargs)
+        given = dict(zip(positional, args, strict=False))
+        for name, value in kwargs.items():
+            if name in given or name not in sig.parameters:
+                return slow(args, kwargs)
+            given[name] = value
+        out = {}
+        for name, default in ordered:
+            if name in given:
+                out[name] = given[name]
+            elif default is empty:
+                return slow(args, kwargs)
+            else:
+                out[name] = default
+        return out
+
+    return bind
+
+
 def backend_requirement(
     backend_checks: Dict[str, Callable],
     common_check: Optional[Callable] = None,
     heuristic_func: Optional[Callable] = None,
+    bypass: Optional[Callable[..., bool]] = None,
 ) -> Callable:
     """
     Decorator to enforce backend and problem size requirements for kernel functions.
@@ -1253,6 +1448,15 @@ def backend_requirement(
         Should return an ordered list of runnable backends with the most preferred backend first.
         When decorated function is not autotuned, the first backend in the heuristic list will be run.
         When decorated function is autotuned, the backends in the heuristic list will be autotuned over to find the best backend.
+    bypass : callable, optional
+        A predicate over the call's arguments (``bypass(*args, **kwargs) -> bool``). When it returns True the
+        wrapper performs no backend selection or validation and calls the function directly, which then owns
+        the validation of that call. For a mode that replaces the backends altogether, e.g.
+        ``mm_bf16(..., batch_invariant=True)``, which never runs a backend and raises its own typed errors:
+        evaluating every backend's requirement checks and the auto heuristic for it is pure host overhead.
+        The predicate runs on every call, so keep it a cheap keyword lookup. It gets the call's arguments as passed
+        (no defaults applied, positional arguments not bound to names), so key it on a keyword-only parameter: a
+        positional-or-keyword flag passed by position would silently never bypass.
 
     Returns
     -------
@@ -1338,6 +1542,7 @@ def backend_requirement(
     def decorator(func):
         # Get the function signature once for reuse
         sig = inspect.signature(func)
+        bind_with_defaults = _make_bind_with_defaults(sig)
 
         # Backends whose checker carries @experimental_backend. Placement is the
         # backstop: a checker defined under flashinfer.experimental without the
@@ -1492,14 +1697,15 @@ def backend_requirement(
             # It prevents the performance overhead of checking.
             skip_check = kwargs.pop("skip_check", False)
 
+            if bypass is not None and bypass(*args, **kwargs):
+                # A mode the function validates and dispatches itself: no backend selection here.
+                return func(*args, **kwargs)
+
             if not skip_check:
                 # Apply defaults from the function signature for validation
                 # This ensures that all parameters (including backend) have their default values
                 # if not explicitly provided by the caller
-                bound_args = sig.bind(*args, **kwargs)
-                bound_args.apply_defaults()
-                # Convert to kwargs for validation functions
-                kwargs_with_defaults = dict(bound_args.arguments)
+                kwargs_with_defaults = bind_with_defaults(args, kwargs)
                 backend = kwargs_with_defaults.get("backend")
                 capability = _get_capability(*args, **kwargs)
                 if not has_backend_choices() and common_check is None:
@@ -1542,8 +1748,15 @@ def backend_requirement(
                 else:
                     # If the function doesnt have backends (i.e., there is only 1, implicit backend), run the following checks.
                     if not is_compute_capability_supported(capability):
+                        _ccs = getattr(common_check, "_supported_ccs", None)
+                        _supported = (
+                            f"; supported compute capabilities: {sorted(_ccs)}"
+                            if _ccs
+                            else ""
+                        )
                         raise BackendSupportedError(
-                            f"{func.__name__} does not support compute capability {capability}"
+                            f"{func.__name__} does not support compute capability "
+                            f"{capability}{_supported}"
                         )
                     if not _is_problem_size_supported(**kwargs_with_defaults):
                         raise ValueError(
@@ -1621,19 +1834,44 @@ def is_confidential_compute() -> bool:
         return forced == "1"
     if not torch.cuda.is_available():
         return False
+
     try:
         import pynvml
-
-        pynvml.nvmlInit()
-        try:
-            state = pynvml.nvmlSystemGetConfComputeState()
-            # ccFeature != 0 means CC is enabled (ON or devtools).
-            return int(getattr(state, "ccFeature", 0)) != 0
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as e:
-        logger.debug("[Flashinfer]: Confidential-compute detection failed: %r", e)
+    except ImportError:
+        logger.warning(
+            "[Flashinfer]: pynvml not available; assuming Confidential Computing is off"
+        )
         return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"[Flashinfer]: Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"[Flashinfer]: Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        with contextlib.suppress(pynvml.NVMLError):
+            pynvml.nvmlShutdown()
+
+    return cc_enabled
 
 
 @lru_cache(maxsize=1)

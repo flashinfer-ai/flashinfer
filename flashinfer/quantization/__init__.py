@@ -14,15 +14,20 @@ Licensed under the Apache License, Version 2.0.
 # Re-export packbits functions
 from .packbits import packbits, segment_packbits
 
+# Re-export CSF block-scale compression
+from .csf import CsfScales, encode_csf_scales, expand_csf_scales
+
 # Re-export JIT module generator (used by tests and AOT compilation)
 from ..jit.quantization import gen_quantization_module
 
 # Re-export FP8 quantization
 from .fp8_quantization import (
     mxfp8_quantize,
+    mxfp8_quantize_bshd,
     mxfp8_grouped_quantize,
     mxfp8_dequantize_host,
     per_token_group_quant_8bit,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 
 # Re-export FP4 quantization (all public symbols)
@@ -48,6 +53,19 @@ from .fp4_quantization import (
     get_fp4_quantization_module,  # Used by activation.py
 )
 
+# Re-export the NVFP4 4over6 recipe types and helpers.  These spell the
+# ``nvfp4_4over6=`` parameter of the quantization APIs, replacing the
+# process-wide FLASHINFER_NVFP4_4OVER6* environment variables.
+from .nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    make_nvfp4_global_scale,
+    nvfp4_4over6_code,
+    nvfp4_4over6_from_code,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
+)
+
 # CuTe-DSL kernels (conditionally exported, EXPERIMENTAL)
 # Warning: These are experimental APIs and may change without notice.
 # Import is guarded to handle environments where cutlass is not installed.
@@ -71,13 +89,19 @@ __all__ = [
     # Packbits
     "packbits",
     "segment_packbits",
+    # CSF block scales
+    "CsfScales",
+    "encode_csf_scales",
+    "expand_csf_scales",
     # JIT module generator
     "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
+    "mxfp8_quantize_bshd",
     "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
     "per_token_group_quant_8bit",
+    "silu_and_mul_mxfp8_experts_quantize",
     # FP4
     "SfLayout",
     "block_scale_interleave",
@@ -98,6 +122,14 @@ __all__ = [
     "scaled_fp4_grouped_quantize",
     "silu_and_mul_nvfp4_quantize",
     "get_fp4_quantization_module",
+    # NVFP4 4over6 recipe
+    "NVFP44Over6Config",
+    "NVFP44Over6ErrMode",
+    "make_nvfp4_global_scale",
+    "nvfp4_4over6_code",
+    "nvfp4_4over6_from_code",
+    "nvfp4_e4m3_max",
+    "resolve_nvfp4_4over6",
 ]
 
 if _cute_dsl_available:

@@ -14,12 +14,14 @@ from flashinfer import (
     mxfp4_quantize,
 )
 from flashinfer.utils import (
+    BackendSupportedError,
     get_compute_capability,
     is_sm12x_supported,
     version_at_least,
     LibraryError,
 )
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from tests.utils.test_helpers.pdl import late_store
 
 
 def _test_mm_fp4(
@@ -259,6 +261,87 @@ def _nvfp4_operands(m, n, k):
     return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
 
 
+@pytest.mark.parametrize(
+    "m,n,out_dtype,backend,use_nvfp4,auto_tuning",
+    [
+        (1, 129, torch.bfloat16, "b12x", True, False),
+        (17, 1023, torch.float16, "b12x", True, False),
+        (129, 8193, torch.bfloat16, "auto", True, False),
+        (17, 129, torch.bfloat16, "b12x", False, False),
+        (129, 1023, torch.float16, "auto", False, True),
+        (1, 8193, torch.float16, "b12x", True, True),
+    ],
+)
+def test_mm_fp4_b12x_output_row_alignment(
+    m, n, out_dtype, backend, use_nvfp4, auto_tuning
+):
+    """Unaligned output rows must not use TMA, including cached FP4 tactics."""
+    if not (
+        is_sm12x_supported(torch.device("cuda"))
+        and version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("b12x NVFP4/MXFP4 requires SM120/SM121 + CUDA 13+.")
+
+    torch.manual_seed(0)
+    k = 256
+    # Alternate store modes in one process: the compiled-kernel cache must
+    # distinguish the aligned TMA path from the predicated global-store path.
+    aligned_n = (n + 7) // 8 * 8
+    for cols in (aligned_n, n, aligned_n):
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, cols, k)
+        if not use_nvfp4:
+            a_fp4, a_s = mxfp4_quantize(a)
+            b_fp4, b_s = mxfp4_quantize(b)
+            alpha = None
+        guard = 128
+        storage = torch.full(
+            (guard + m * cols + m * 128 + guard,),
+            42,
+            device="cuda",
+            dtype=out_dtype,
+        )
+        out = storage[guard : guard + m * cols].view(m, cols)
+        out.fill_(float("nan"))
+
+        def run():
+            mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_s,
+                b_s.T,
+                alpha,
+                out_dtype,
+                out,
+                block_size=16 if use_nvfp4 else 32,
+                backend=backend,
+                use_nvfp4=use_nvfp4,
+                skip_check=False,
+            )
+
+        # Profile this regression shape without allocating unrelated M buckets.
+        with autotune(auto_tuning, tuning_buckets=(m,)):
+            run()
+        torch.cuda.synchronize()
+        assert torch.all(storage[:guard] == 42)
+        assert torch.all(storage[guard + m * cols :] == 42)
+        assert torch.isfinite(out).all()
+        reference = torch.mm(a, b.T).float()
+        assert torch.all(F.cosine_similarity(reference, out.float(), dim=1) > 0.97)
+
+        if cols == n:
+            expected = out.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            for _ in range(2):
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                assert torch.all(storage[:guard] == 42)
+                assert torch.all(storage[guard + m * cols :] == 42)
+
+
 def test_mm_fp4_b12x_short_k_multi_wave():
     # One K tile and more work tiles than SMs stress the epilogue smem
     # handoff between a persistent CTA's work tiles, a regime the
@@ -325,5 +408,460 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
         )
 
 
+def _run_cute_dsl_fp4_tactic(m, n, k, fp4_type, tactic):
+    """Launch one forced tactic through the cute-dsl FP4 runner; check output."""
+    from flashinfer.gemm import gemm_base
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if major != 10:
+        pytest.skip("cute-dsl FP4 GEMM needs SM100/SM103.")
+    use_nvfp4 = fp4_type == "nvfp4"
+    if use_nvfp4:
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    else:
+        a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+        b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+        a_fp4, a_s = mxfp4_quantize(a)
+        b_fp4, b_s = mxfp4_quantize(b)
+        alpha = None
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    runner = gemm_base._cute_dsl_gemm_fp4_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16, use_nvfp4
+    )
+    runner(
+        inputs=[
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            16 if use_nvfp4 else 32,
+            use_nvfp4,
+            workspace,
+        ],
+        tactic=tactic,
+    )
+    torch.cuda.synchronize()
+    cos_sim = F.cosine_similarity(
+        torch.mm(a, b.T).float().reshape(-1), out.float().reshape(-1), dim=0
+    )
+    assert cos_sim > 0.97
+
+
+@pytest.mark.parametrize("fp4_type", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("m", [40, 64])
+@pytest.mark.parametrize("tile_n", [8, 16, 32])
+def test_mm_fp4_cute_dsl_stale_narrow_tile_tactic_falls_back(fp4_type, m, tile_n):
+    """A narrow swap-AB tactic tuned for M<=32 must not be replayed at M>32.
+
+    Narrow (< 64) N tiles cover at most 32 kernel-N columns; the runner falls
+    back to the untuned selector instead of faulting with
+    cudaErrorMisalignedAddress.
+    """
+    _run_cute_dsl_fp4_tactic(
+        m, 256, 2048, fp4_type, ((128, tile_n), (1, 1), True, False, "sm100", None)
+    )
+
+
+@pytest.mark.parametrize("m", [40, 64])
+@pytest.mark.parametrize("tile_n", [8, 32])
+def test_mm_fp4_cute_dsl_stale_split_k_tactic_falls_back(m, tile_n):
+    """A split-K tactic tuned for M<=32 falls back at M>32 instead of raising."""
+    _run_cute_dsl_fp4_tactic(
+        m, 256, 2048, "nvfp4", ((128, tile_n), (1, 1), True, False, "sm100sk", 2)
+    )
+
+
+def _skip_unless_per_token_alpha_gpu():
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if (major, minor) not in [(10, 0), (10, 3)]:
+        pytest.skip("per-token alpha needs the cute-dsl FP4 GEMM (SM100/SM103).")
+
+
+# m is swept in full because the per-row indexing is what varies with it; n and
+# k only change the tile schedule, so they are kept to the minimum that still
+# exercises both a single- and a multi-tile N.
+@pytest.mark.parametrize("m", [4, 17, 48, 128, 257])
+@pytest.mark.parametrize("n", [256, 512])
+@pytest.mark.parametrize("k", [256])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
+    """A per-token alpha must scale each output row by its own dequant scale."""
+    _skip_unless_per_token_alpha_gpu()
+
+    torch.manual_seed(0)
+    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    # alpha = 1 / (g_in * g_w) undoes both NVFP4 global encode scales
+    # ((448 * 6) / absmax) in a @ b.T; it is what a scalar-alpha call uses.
+    scalar_alpha = alpha.float().reshape(1)
+
+    # In production the per-token alpha is the dynamic per-row scale that
+    # nvfp4_quantize(..., per_token_activation=True) returns, times the weight
+    # scale. Here it is the scalar alpha times a synthetic per-row factor in
+    # [0.25, 1.25) that differs on every row, so an epilogue that reads alpha
+    # at the wrong coordinate cannot pass.
+    row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
+    per_token_alpha = (scalar_alpha * row).contiguous()
+
+    out = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    out_scalar = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    with autotune(auto_tuning):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            res_dtype,
+            out,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            scalar_alpha,
+            res_dtype,
+            out_scalar,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+    reference = torch.mm(a, b.T).float() * row[:, None]
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.float().reshape(-1), dim=0)
+    assert cos_sim > 0.97
+
+    # Both calls accumulate the same products, so the per-token result must be
+    # the scalar-alpha result scaled row by row. Cosine similarity stays high
+    # even when the epilogue reads alpha at the wrong coordinate; this does not.
+    torch.testing.assert_close(
+        out.float(),
+        out_scalar.float() * row[:, None],
+        rtol=2e-2,
+        atol=2e-2 * out_scalar.float().abs().max().item(),
+    )
+
+
+@pytest.mark.parametrize(
+    "backend", ["cutlass", "cudnn", "trtllm", "b12x", "cutedsl_low_latency"]
+)
+def test_mm_fp4_per_token_alpha_rejected_by_other_backends(backend):
+    """A backend without a per-row epilogue would apply alpha[0] to every row;
+    the implementation must refuse the call instead of running it."""
+    if get_compute_capability(torch.device("cuda"))[0] < 10:
+        pytest.skip("nvfp4_quantize needs SM100+.")
+    m, n, k = 16, 256, 256
+    torch.manual_seed(0)
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    per_token_alpha = alpha.float().reshape(1).expand(m).contiguous()
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(
+        (ValueError, BackendSupportedError),
+        match="per-token alpha|does not support backend",
+    ):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+
+def test_mm_fp4_per_token_alpha_auto_misaligned_n_raises():
+    """backend="auto" with a per-token alpha must go through the cute-dsl
+    requirement function like any other backend: n % 8 != 0 is refused before
+    the runner is built (it used to reach the runner and crash with a
+    TypeError once no tactic was valid)."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
+    m, n, k = 16, 130, 128  # n % 8 == 2
+    torch.manual_seed(0)
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    per_token_alpha = alpha.float().reshape(1).expand(m).contiguous()
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(BackendSupportedError, match="No suitable auto backends"):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            backend="auto",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+
+# The untuned low-M selector routes these shapes through the cluster split-K
+# kernel (<= 20 weight tiles with an 8/16-wide token tile -> 4 K slices; long K
+# -> 2 slices). Its epilogue applies the per-token alpha after the FP32
+# cluster reduction, so the row scaling must be exact here too, and the
+# result must still track the unquantised product.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 1536, 4096),
+        (8, 2048, 8192),
+        (16, 1024, 4096),
+        (17, 7168, 16384),
+        (32, 4096, 16384),
+        # 17 <= M <= 32 with few weight tiles: 8-wide token tile over several
+        # N tiles (SFB sub-tile addressing), two K slices.
+        (17, 1536, 7168),
+        (32, 2112, 7168),
+        (24, 2048, 4096),
+    ],
+)
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+def test_mm_fp4_per_token_alpha_splitk(m, n, k, res_dtype):
+    _skip_unless_per_token_alpha_gpu()
+    from flashinfer.gemm.gemm_base import _select_sm100_mm_fp4_splitk_tactic
+    from flashinfer.utils import get_device_sm_count
+
+    sm_count = get_device_sm_count(torch.device("cuda"))
+    tactic = _select_sm100_mm_fp4_splitk_tactic(m, n, k, sm_count, True)
+    assert tactic is not None, "shape must exercise the split-K kernel"
+
+    torch.manual_seed(0)
+    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    scalar_alpha = alpha.float().reshape(1)
+    row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
+    per_token_alpha = (scalar_alpha * row).contiguous()
+
+    out = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    out_scalar = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    for alpha_arg, dst in ((per_token_alpha, out), (scalar_alpha, out_scalar)):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            alpha_arg,
+            res_dtype,
+            dst,
+            block_size=16,
+            backend="cute-dsl",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+    reference = torch.mm(a, b.T).float() * row[:, None]
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.float().reshape(-1), dim=0)
+    assert cos_sim > 0.97
+    torch.testing.assert_close(
+        out.float(),
+        out_scalar.float() * row[:, None],
+        rtol=2e-2,
+        atol=2e-2 * out_scalar.float().abs().max().item(),
+    )
+
+    # The split-K sum must match the single-CTA persistent kernel (cutlass
+    # backend as an independent reference) within the FP4 GEMM tolerance.
+    out_ref = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    mm_fp4(
+        a_fp4,
+        b_fp4.T,
+        a_s,
+        b_s.T,
+        scalar_alpha,
+        torch.bfloat16,
+        out_ref,
+        block_size=16,
+        backend="cutlass",
+        use_nvfp4=True,
+        skip_check=False,
+    )
+    torch.testing.assert_close(
+        out_scalar.float(), out_ref.float(), rtol=1e-2, atol=1e-2
+    )
+
+
+# Narrow token tiles over a weight grid of about a wave or more (>= 128
+# tiles) take the K tile 512 persistent variant (8 MMA K instructions per stage); same accumulation
+# order, so the per-token result must match the scalar path row by row and the
+# cutlass backend within the FP4 tolerance.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (8, 18432, 7168),
+        (17, 28672, 8192),
+        (32, 18432, 7168),
+    ],
+)
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+def test_mm_fp4_per_token_alpha_deep_k(m, n, k, res_dtype):
+    _skip_unless_per_token_alpha_gpu()
+    from flashinfer.gemm.gemm_base import (
+        _SM100_DEEP_K_INST,
+        _select_sm100_mm_fp4_splitk_tactic,
+    )
+    from flashinfer.utils import get_device_sm_count
+
+    sm_count = get_device_sm_count(torch.device("cuda"))
+    tactic = _select_sm100_mm_fp4_splitk_tactic(m, n, k, sm_count, True)
+    assert tactic is not None and tactic[4] == "sm100", tactic
+    assert tactic[5] == _SM100_DEEP_K_INST and tactic[0][1] <= 32, tactic
+
+    _check_per_token_alpha_untuned(m, n, k, res_dtype)
+
+
+def _check_per_token_alpha_untuned(m, n, k, res_dtype):
+    """Per-token alpha through the untuned selector: per-token == scalar x row,
+    scalar == cutlass backend within the FP4 GEMM tolerance."""
+    torch.manual_seed(0)
+    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    scalar_alpha = alpha.float().reshape(1)
+    row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
+    per_token_alpha = (scalar_alpha * row).contiguous()
+
+    out = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    out_scalar = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    for alpha_arg, dst in ((per_token_alpha, out), (scalar_alpha, out_scalar)):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            alpha_arg,
+            res_dtype,
+            dst,
+            block_size=16,
+            backend="cute-dsl",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+    torch.testing.assert_close(
+        out.float(),
+        out_scalar.float() * row[:, None],
+        rtol=2e-2,
+        atol=2e-2 * out_scalar.float().abs().max().item(),
+    )
+
+    out_ref = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    mm_fp4(
+        a_fp4,
+        b_fp4.T,
+        a_s,
+        b_s.T,
+        scalar_alpha,
+        torch.bfloat16,
+        out_ref,
+        block_size=16,
+        backend="cutlass",
+        use_nvfp4=True,
+        skip_check=False,
+    )
+    torch.testing.assert_close(
+        out_scalar.float(), out_ref.float(), rtol=1e-2, atol=1e-2
+    )
+
+
+# SM103-only low-M rule (8192 <= K < 16384, <= sm_count/2 weight tiles): TMA
+# prefetch for 17 <= M <= 32. On other SMs (and for M <= 16) the same shapes
+# take the default persistent tactic; either way the result is checked.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (8, 8192, 8192),
+        (17, 8192, 8192),
+        (32, 8192, 8192),
+    ],
+)
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+def test_mm_fp4_per_token_alpha_low_m_untuned(m, n, k, res_dtype):
+    _skip_unless_per_token_alpha_gpu()
+    _check_per_token_alpha_untuned(m, n, k, res_dtype)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+def test_mm_fp4_l2_policy_rule():
+    """Weights load evict_first while they are streamed at most twice (<= 2
+    token tiles); with more token tiles both operands of the no-swap kernel
+    are pinned with evict_last; other kernels keep the default."""
+    from flashinfer.gemm.gemm_mm_fp4_cute_dsl import mm_fp4_l2_policy
+
+    # swap_ab: tokens are the kernel's N extent, weights the A operand
+    assert mm_fp4_l2_policy(1, (128, 8), True, "sm100") == "a_ef"
+    assert mm_fp4_l2_policy(32, (128, 32), True, "sm100") == "a_ef"
+    assert mm_fp4_l2_policy(64, (128, 32), True, "sm100") == "a_ef"
+    assert mm_fp4_l2_policy(65, (128, 32), True, "sm100") is None
+    # no swap: tokens are the M extent, weights the B operand
+    assert mm_fp4_l2_policy(130, (256, 128), False, "sm100") == "b_ef"
+    assert mm_fp4_l2_policy(512, (256, 256), False, "sm100") == "b_ef"
+    assert mm_fp4_l2_policy(513, (256, 256), False, "sm100") == "ab_el"
+    assert mm_fp4_l2_policy(8192, (256, 256), False, "sm100") == "ab_el"
+    # other kernels are untouched
+    assert mm_fp4_l2_policy(8, (128, 8), True, "sm100sk") is None
+    assert mm_fp4_l2_policy(8, (128, 8), True, "sm103") is None
+
+
+@pytest.mark.parametrize(
+    "backend,m,n,k",
+    [
+        ("cute-dsl", 128, 512, 512),
+        ("cute-dsl", 8, 2048, 4096),
+        ("cutedsl_low_latency", 8, 1280, 2944),
+        ("b12x", 128, 512, 512),
+    ],
+)
+def test_mm_fp4_pdl_waits_for_alpha(backend, m, n, k):
+    cc = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported(backend, cc[0] * 10 + cc[1]):
+        pytest.skip(f"{backend} is not supported on SM{cc[0]}{cc[1]}")
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_global_sf = (448 * 6) / a.float().abs().max()
+    b_global_sf = (448 * 6) / b.float().abs().max()
+    a_fp4, a_sf = nvfp4_quantize(a, a_global_sf, do_shuffle=False)
+    b_fp4, b_sf = nvfp4_quantize(b, b_global_sf, do_shuffle=False)
+    alpha_value = (1.0 / (a_global_sf * b_global_sf)).item()
+    alpha = torch.tensor(alpha_value, device="cuda")
+
+    def run():
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_sf.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            backend=backend,
+            enable_pdl=True,
+        )
+        return out
+
+    expected = run()
+
+    # alpha is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the GEMM.
+    alpha.fill_(alpha_value * 4)
+    late_store(alpha, alpha_value)
+    out = run()
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)

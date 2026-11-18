@@ -63,8 +63,9 @@ def _require_supported_gpu():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("low-latency block-scaled GEMM requires SM100 or SM103")
+        pytest.skip("low-latency block-scaled GEMM requires SM100, SM103 or SM107")
 
 
 def _reference_scales(scales, sf_vec_size, k):

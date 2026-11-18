@@ -10,11 +10,15 @@
     "mla"
   ],
   "axes": {
+    "workspace_size": {
+      "type": "var",
+      "description": "Optional caller scratch size in bytes."
+    },
     "batch_size": {
       "type": "var",
       "description": "Number of MLA decode requests."
     },
-    "num_heads": {
+    "num_qo_heads": {
       "type": "const",
       "value": 128
     },
@@ -56,7 +60,7 @@
     "head_dim_qk == kv_lora_rank + qk_rope_head_dim",
     "kv_lora_rank == 512",
     "qk_rope_head_dim == 64",
-    "page_size in (16, 32, 64, 128)",
+    "page_size in (4, 8, 16, 32, 64, 128)",
     "block_tables.shape[0] == batch_size",
     "seq_len_q >= 1"
   ],
@@ -65,7 +69,7 @@
       "shape": [
         "batch_size",
         "seq_len_q",
-        "num_heads",
+        "num_qo_heads",
         "head_dim_qk"
       ],
       "dtype": "bfloat16"
@@ -93,7 +97,7 @@
       ],
       "dtype": "int32"
     },
-    "seq_lens": {
+    "seq_lens_kv": {
       "shape": [
         "batch_size"
       ],
@@ -106,7 +110,7 @@
       "dtype": "int32",
       "optional": true
     },
-    "max_seq_len_q": {
+    "max_q_len": {
       "shape": null,
       "dtype": "int32",
       "optional": true
@@ -116,12 +120,24 @@
       "dtype": "int32",
       "optional": true
     },
-    "bmm1_scale": {
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "uint8",
+      "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
+    },
+    "softmax_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
     },
-    "bmm2_scale": {
+    "output_scale": {
       "shape": null,
       "dtype": "float32",
       "optional": true
@@ -142,7 +158,7 @@
       "shape": [
         "batch_size",
         "seq_len_q",
-        "num_heads",
+        "num_qo_heads",
         "kv_lora_rank"
       ],
       "dtype": "bfloat16",

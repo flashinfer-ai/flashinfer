@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Exact-SM103a Cake MXFP8 MegaMoE backend for EP16.
+# Cake MXFP8 MegaMoE backend for EP16 on SM100, SM103 and SM107 devices.
 
 from __future__ import annotations
 
@@ -30,7 +30,11 @@ import tvm_ffi
 from ...comm.torch_symmetric_memory import _enable_symm_mem_for_group
 from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from .jit import (
+    device_arch,
+    fused_grid_ctas,
     load_cake_mxfp8_megamoe_ep16_module,
+    require_cute_dsl_capability,
+    require_supported_capability,
 )
 
 _WORLD_SIZE = 16
@@ -44,8 +48,7 @@ _MAX_TOKENS_PER_RANK = 64
 _EXPERT_ROW_SEGMENTS = (32, 16, 16)
 _EXPERT_ROWS = sum(_EXPERT_ROW_SEGMENTS)
 _SUPPORTED_TOKENS = (16, 32, _MAX_TOKENS_PER_RANK)
-_FUSED_GRID_CTAS = 144
-_MAX_LAUNCH_EPOCH = (2**31 - 1) // _FUSED_GRID_CTAS - 1
+_CUTE_DSL_PEER_CAPACITY = 32
 
 
 def _require_tensor(
@@ -180,7 +183,8 @@ def preprocess_cake_mxfp8_megamoe_ep16_weights(
 class _SymmetricTensor:
     tensor: torch.Tensor
     handle: Any
-    peers: torch.Tensor
+    peers: torch.Tensor | None
+    peer_pointers: tuple[int, ...] | None = None
 
     @property
     def local(self) -> torch.Tensor:
@@ -201,12 +205,36 @@ def _validate_gathered_routing_capacity(gathered: torch.Tensor) -> None:
         )
 
 
-def _validate_launch_epoch(epoch: int) -> None:
-    if epoch < 0 or epoch > _MAX_LAUNCH_EPOCH:
+def _max_launch_epoch(grid_ctas: int) -> int:
+    # The grid counters count (epoch + 1) x CTAs of the launched fused grid in 32-bit signed arithmetic.
+    return (2**31 - 1) // grid_ctas - 1
+
+
+def _validate_launch_epoch(epoch: int, grid_ctas: int) -> None:
+    if epoch < 0 or epoch > _max_launch_epoch(grid_ctas):
         raise RuntimeError(
             "Cake MXFP8 MegaMoE session launch epoch is exhausted; "
             "create a new session before submitting another forward"
         )
+
+
+def _validate_backend(backend: str) -> None:
+    if not isinstance(backend, str) or backend not in ("cuda", "cute_dsl"):
+        raise ValueError("backend must be 'cuda' or 'cute_dsl'")
+
+
+def _validate_collective_backend(
+    backend: str, *, process_group: dist.ProcessGroup
+) -> None:
+    # Different backends use incompatible flag layouts. Agree before any
+    # symmetric allocation or backend-specific compilation begins.
+    # Gather before validation so an invalid rank cannot strand its peers.
+    choices: list[Any] = [None] * _WORLD_SIZE
+    dist.all_gather_object(choices, backend, group=process_group)
+    for choice in choices:
+        _validate_backend(choice)
+    if any(choice != backend for choice in choices):
+        raise ValueError("all EP16 ranks must select the same backend")
 
 
 def _validate_routing_capacity(
@@ -242,6 +270,7 @@ def _allocate_symmetric(
     device: torch.device,
     group_name: str,
     world_size: int,
+    host_peer_table: bool = False,
 ) -> _SymmetricTensor:
     tensor = symm_mem.empty(*shape, dtype=dtype, device=device)
     handle = symm_mem.rendezvous(tensor, group=group_name)
@@ -259,6 +288,17 @@ def _allocate_symmetric(
         ]
     if any(pointer == 0 for pointer in pointers):
         raise RuntimeError("symmetric peer mapping is unavailable")
+    if host_peer_table:
+        if len(pointers) > _CUTE_DSL_PEER_CAPACITY or any(
+            not 0 < pointer < 2**64 for pointer in pointers
+        ):
+            raise RuntimeError("invalid symmetric peer address table")
+        peer_pointers = tuple(pointers) + (0,) * (
+            _CUTE_DSL_PEER_CAPACITY - len(pointers)
+        )
+        return _SymmetricTensor(
+            tensor=tensor, handle=handle, peers=None, peer_pointers=peer_pointers
+        )
     peers = torch.tensor(pointers, dtype=torch.int64, device=device)
     return _SymmetricTensor(tensor=tensor, handle=handle, peers=peers)
 
@@ -284,35 +324,51 @@ class _Workspace:
         device: torch.device,
         group_name: str,
         tokens: int,
+        backend: str = "cuda",
     ) -> None:
+        _validate_backend(backend)
+        # The CuTe-DSL programs read their peer tables by value on the host;
+        # both backends share every other part of the layout below.
+        host_peer_table = backend == "cute_dsl"
+        # One sense-reversing word per cross-rank barrier: word 0 publishes the
+        # mailboxes, word 1 completes the return of the route terms.
         self.flags = _allocate_symmetric(
             (2,),
             torch.uint32,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
+            host_peer_table=host_peer_table,
         )
         self.flags.tensor.zero_()
+        # Row and route mailboxes with one slot per source rank. Every rank stores
+        # its routes into its slot on every rank and each BF16 row into its slot
+        # on the ranks that own the row's experts, so dispatch reads both from
+        # local memory.
+        route_slots = (_WORLD_SIZE,)
         self.published_hidden = _allocate_symmetric(
-            (tokens, _HIDDEN),
+            (*route_slots, tokens, _HIDDEN),
             torch.bfloat16,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
+            host_peer_table=host_peer_table,
         )
         self.published_topk_ids = _allocate_symmetric(
-            (tokens, _TOP_K),
+            (*route_slots, tokens, _TOP_K),
             torch.int32,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
+            host_peer_table=host_peer_table,
         )
         self.published_topk_weights = _allocate_symmetric(
-            (tokens, _TOP_K),
+            (*route_slots, tokens, _TOP_K),
             torch.float32,
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
+            host_peer_table=host_peer_table,
         )
         self.route_terms = _allocate_symmetric(
             (tokens, _TOP_K, _HIDDEN),
@@ -320,6 +376,7 @@ class _Workspace:
             device=device,
             group_name=group_name,
             world_size=_WORLD_SIZE,
+            host_peer_table=host_peer_table,
         )
 
         self.activation_bf16 = torch.empty(
@@ -366,21 +423,27 @@ class _Workspace:
         self.output_bf16 = torch.empty(
             (tokens, _HIDDEN), dtype=torch.bfloat16, device=device
         )
-        self.tma_backing, self.tma_workspace = _aligned_workspace(1024, device=device)
+        if backend == "cuda":
+            self.tma_backing, self.tma_workspace = _aligned_workspace(
+                1024, device=device
+            )
+        else:
+            self.tma_backing = self.tma_workspace = None
 
     def destroy(self) -> None:
         """Release resources when the owning session is discarded."""
 
 
 class CakeMxfp8MegaMoeEp16:
-    """Prepared EP16 MXFP8 MegaMoE session for exact SM103a devices.
+    """Prepared EP16 MXFP8 MegaMoE session for SM100, SM103 and SM107 devices.
 
     The route supports 512 experts, hidden size 3072, intermediate size 5120,
     top-k 8, 16/32/64 tokens per rank, and up to 64 routes per expert. Routing
     is validated once at construction and must remain immutable. Construction
     owns all symmetric memory and scratch storage. A session must be used
     serially from one CUDA stream. :meth:`run` submits without allocating, and
-    CUDA Graph capture is not supported.
+    CUDA Graph capture is not supported. ``backend="cute_dsl"`` explicitly
+    selects the CuTe-DSL implementation; ``"cuda"`` remains the default.
     """
 
     def __init__(
@@ -389,8 +452,10 @@ class CakeMxfp8MegaMoeEp16:
         topk_ids: torch.Tensor,
         *,
         process_group: dist.ProcessGroup | None = None,
+        backend: str = "cuda",
     ) -> None:
         if not dist.is_initialized():
+            _validate_backend(backend)
             raise RuntimeError("torch.distributed must be initialized")
         self._group = dist.group.WORLD if process_group is None else process_group
         self.rank = int(dist.get_rank(self._group))
@@ -398,11 +463,27 @@ class CakeMxfp8MegaMoeEp16:
         if world_size != _WORLD_SIZE:
             raise ValueError(f"Cake MXFP8 MegaMoE requires EP16, got EP{world_size}")
         device = torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.get_device_capability(device) != (10, 3):
-            major, minor = torch.cuda.get_device_capability(device)
+        capability = require_supported_capability(
+            torch.cuda.get_device_capability(device)
+        )
+        _validate_collective_backend(backend, process_group=self._group)
+        self._backend = backend
+        if backend == "cute_dsl":
+            require_cute_dsl_capability(capability)
+            from .cute_dsl import FUSED_GRID_CTAS, create_runner
+
+            grid_ctas = FUSED_GRID_CTAS[device_arch(capability)]
+        else:
+            grid_ctas = fused_grid_ctas(capability)
+        # The fused kernel's grid barriers need every CTA of its cooperative grid resident at once, one per SM.
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        if grid_ctas > sm_count:
             raise RuntimeError(
-                f"Cake MXFP8 MegaMoE requires compute capability 10.3, got {major}.{minor}"
+                f"Cake MXFP8 MegaMoE needs {grid_ctas} co-resident CTAs (one per SM) on compute capability "
+                f"{capability[0]}.{capability[1]}, but the device has {sm_count} SMs"
             )
+        self._fused_grid_ctas = grid_ctas
+
         self._validate_weights(weights, device=device)
         self.weights = weights
         _validate_routing_capacity(
@@ -426,19 +507,32 @@ class CakeMxfp8MegaMoeEp16:
             device=device,
             group_name=group_name,
             tokens=self.tokens,
+            backend=backend,
         )
         self._output = self._workspace.output_bf16
-        self._module = load_cake_mxfp8_megamoe_ep16_module(device=device)
+        self._module = None
+        self._cute_runner = None
+        if backend == "cuda":
+            self._module = load_cake_mxfp8_megamoe_ep16_module(device=device)
         with torch.cuda.device(device), tvm_ffi.use_torch_stream():
-            self._module.setup_tma(
-                self._w13,
-                self._w13_scale,
-                self._workspace.activation_bf16,
-                self._w2,
-                self._w2_scale,
-                self._workspace.fc1_workspace_bf16,
-                self._workspace.tma_workspace,
-            )
+            if backend == "cuda":
+                self._module.setup_tma(
+                    self._w13,
+                    self._w13_scale,
+                    self._workspace.activation_bf16,
+                    self._w2,
+                    self._w2_scale,
+                    self._workspace.fc1_workspace_bf16,
+                    self._workspace.tma_workspace,
+                )
+            else:
+                self._cute_runner = create_runner(
+                    device=device,
+                    tokens_per_rank=self.tokens,
+                    rank=self.rank,
+                    weights=weights,
+                    workspace=self._workspace,
+                )
         self._launch_epoch = 0
         torch.cuda.synchronize(device=device)
         dist.barrier(group=self._group)
@@ -544,45 +638,54 @@ class CakeMxfp8MegaMoeEp16:
 
         workspace = self._workspace
         launch_epoch = self._launch_epoch
-        _validate_launch_epoch(launch_epoch)
+        _validate_launch_epoch(launch_epoch, self._fused_grid_ctas)
         with torch.cuda.device(device), tvm_ffi.use_torch_stream():
-            self._module.run(
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                self._w13,
-                self._w13_scale,
-                workspace.activation_bf16,
-                self._w2,
-                self._w2_scale,
-                workspace.fc1_workspace_bf16,
-                workspace.fc2_output_bf16,
-                workspace.route_map_i32,
-                workspace.route_scale_f32,
-                workspace.route_counts_u32,
-                workspace.fc1_done,
-                workspace.publication_done,
-                workspace.publication_visible,
-                workspace.dispatch_done,
-                workspace.compute_done,
-                workspace.return_done,
-                workspace.return_visible,
-                launch_epoch,
-                tokens,
-                _WORLD_SIZE,
-                self.rank,
-                workspace.flags.peers,
-                workspace.published_hidden.tensor,
-                workspace.published_hidden.peers,
-                workspace.published_topk_ids.tensor,
-                workspace.published_topk_ids.peers,
-                workspace.published_topk_weights.tensor,
-                workspace.published_topk_weights.peers,
-                workspace.route_terms.tensor,
-                workspace.route_terms.peers,
-                out,
-                workspace.tma_workspace,
-            )
+            if self._backend == "cuda":
+                self._module.run(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    self._w13,
+                    self._w13_scale,
+                    workspace.activation_bf16,
+                    self._w2,
+                    self._w2_scale,
+                    workspace.fc1_workspace_bf16,
+                    workspace.fc2_output_bf16,
+                    workspace.route_map_i32,
+                    workspace.route_scale_f32,
+                    workspace.route_counts_u32,
+                    workspace.fc1_done,
+                    workspace.publication_done,
+                    workspace.publication_visible,
+                    workspace.dispatch_done,
+                    workspace.compute_done,
+                    workspace.return_done,
+                    workspace.return_visible,
+                    launch_epoch,
+                    tokens,
+                    _WORLD_SIZE,
+                    self.rank,
+                    workspace.flags.peers,
+                    workspace.published_hidden.tensor,
+                    workspace.published_hidden.peers,
+                    workspace.published_topk_ids.tensor,
+                    workspace.published_topk_ids.peers,
+                    workspace.published_topk_weights.tensor,
+                    workspace.published_topk_weights.peers,
+                    workspace.route_terms.tensor,
+                    workspace.route_terms.peers,
+                    out,
+                    workspace.tma_workspace,
+                )
+            else:
+                self._cute_runner.run(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    launch_epoch=launch_epoch,
+                    out=out,
+                )
         self._launch_epoch = launch_epoch + 1
         return out
 

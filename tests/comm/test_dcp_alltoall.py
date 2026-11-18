@@ -264,6 +264,8 @@ def test_repeated_alltoall(cp_size, batch_size, head_dim, stats_dim, dtype, num_
         recv_s = [None] * cp_size
 
         for r in range(cp_size):
+            # Inputs are generated asynchronously on the current stream.
+            streams[r].wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(streams[r]):
                 o, s = decode_cp_a2a_alltoall(
                     all_po[r], all_ss[r], workspace, r, cp_size

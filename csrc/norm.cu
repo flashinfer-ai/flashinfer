@@ -335,7 +335,7 @@ void layernorm(Tensor output, Tensor input, Tensor gamma, Tensor beta, double ep
     cudaError_t status = norm::LayerNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<float*>(gamma.data_ptr()),
         static_cast<float*>(beta.data_ptr()), static_cast<c_type*>(output.data_ptr()), batch_size,
-        hidden_size, eps, stream);
+        hidden_size, input.stride(0), output.stride(0), eps, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "LayerNorm failed with error code " << cudaGetErrorString(status);
     return true;
@@ -363,7 +363,7 @@ void layernorm_quant(TensorView output, TensorView input, TensorView gamma, Tens
   unsigned int hidden_size = input.size(1);
   TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
-  // generalLayerNorm indexes as bidx * hidden_size + i and takes no strides
+  // The quantized LayerNorm API requires contiguous input and output.
   TVM_FFI_ICHECK_EQ(input.stride(0), hidden_size) << "input must be contiguous";
   TVM_FFI_ICHECK_EQ(output.stride(0), hidden_size) << "output must be contiguous";
   // Match the layernorm binding: bf16 input with fp32 gamma/beta only.

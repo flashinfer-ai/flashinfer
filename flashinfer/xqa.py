@@ -27,7 +27,6 @@ from .jit.xqa import (
     ragged_q_changes_build,
     swap_ab_eligible,
 )
-from .jit.utils import filename_safe_dtype_map
 from .utils import (
     get_device_sm_count,
     register_custom_op,
@@ -212,6 +211,7 @@ def xqa(
     v_sf_cache: Optional[torch.Tensor] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA kernel.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -311,7 +311,7 @@ def xqa(
     - num_q_heads from q.shape[-2]
     - head_dim from q.shape[-1]
     - input_dtype from q.dtype
-    - kv_cache_dtype from k.dtype
+    - kv_cache_dtype from k_cache.dtype
     - head_group_ratio from num_q_heads // num_kv_heads
     - max_seq_len from page_table.shape[-1] * page_size
     """
@@ -465,17 +465,20 @@ def get_xqa_module_mla(
     head_group_ratio: int,
     use_sliding_window: bool = False,
 ):
-    module = gen_xqa_module_mla(
+    spec = gen_xqa_module_mla(
         input_dtype,
         kv_cache_dtype,
         page_size,
         head_dim,
         head_group_ratio,
         use_sliding_window,
-    ).build_and_load()
+    )
+    # Reuse the JIT module URI so the two names can never drift apart.
+    op_name = f"flashinfer::{spec.name}"
+    module = spec.build_and_load()
 
     @register_custom_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}",
+        op_name,
         mutates_args=("output", "workspace_buffer"),
     )
     def xqa_mla(
@@ -513,9 +516,7 @@ def get_xqa_module_mla(
             enable_pdl,
         )
 
-    @register_fake_op(
-        f"flashinfer::xqa_mla_input_{filename_safe_dtype_map[input_dtype]}_kv_cache_{filename_safe_dtype_map[kv_cache_dtype]}_page_size_{page_size}_head_dim_{head_dim}_head_group_ratio_{head_group_ratio}_use_sliding_window_{use_sliding_window}"
-    )
+    @register_fake_op(op_name)
     def _fake_xqa_mla(
         sm_count: int,
         q_scale: Union[float, torch.Tensor],
@@ -556,6 +557,7 @@ def xqa_mla(
     enable_pdl: Optional[bool] = None,
 ) -> None:
     r"""Apply attention with paged KV cache using XQA MLA (Multi-Head Latent Attention) kernel.
+
     Parameters
     ----------
     q : torch.Tensor
