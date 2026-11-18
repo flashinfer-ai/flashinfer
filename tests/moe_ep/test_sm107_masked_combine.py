@@ -22,8 +22,12 @@ def test_masked_combine_graph(tokens, hidden, topk, weighted):
 
     pkg.require_sm107_dsl()
     pkg.bootstrap_paths()
-    from sources.kernel_src.rubin.inference.mega.topk_reduce import TopkReduce
-    from sources.quant_def import CombineFormat
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+        TopkReduce,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+        CombineFormat,
+    )
 
     experts = 128
     # Exercise the advertised 16-byte alignment without relying on 32-byte alignment.
@@ -94,5 +98,129 @@ def test_masked_combine_graph(tokens, hidden, topk, weighted):
             torch.cuda.synchronize()
             assert torch.isfinite(output).all(), state
             torch.testing.assert_close(output, expected.bfloat16(), rtol=0, atol=0)
+    finally:
+        graph.reset()
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("hidden", [256, 264])
+@pytest.mark.parametrize("topk", [3, 17])
+def test_polled_combine_masks_scores(hidden, topk):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires SM107")
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.helpers.topk_reduce import (
+        TopkReduce,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+        CombineFormat,
+    )
+
+    experts, tokens = 64, 2
+    terms = torch.zeros((tokens, topk, hidden), device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((tokens, topk), -1, device="cuda", dtype=torch.int32)
+    scores = torch.ones((tokens, topk), device="cuda")
+    output = torch.empty((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+    reducer = TopkReduce(
+        hidden, topk, CombineFormat.parse("bf16"), num_experts=experts, ll_encoded=True
+    )
+    kwargs = dict(
+        combine_quant=from_dlpack(terms, assumed_align=16),
+        combine_sf=None,
+        reduced_output=from_dlpack(output, assumed_align=16),
+        topk_score=from_dlpack(scores, assumed_align=4),
+        topk_indices=from_dlpack(ids, assumed_align=4),
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    executable = cute.compile(reducer, **kwargs)
+    executable(**kwargs)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            kwargs["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            executable(**kwargs)
+        for score in (float("nan"), float("inf"), -float("inf")):
+            ids.zero_()
+            ids[:, ::2] = -1
+            valid = ids >= 0
+            values = torch.full_like(terms, 2)
+            terms.view(torch.int16).copy_(values.view(torch.int16).bitwise_not())
+            terms.masked_fill_(~valid.unsqueeze(-1), float("nan"))
+            scores.fill_(0.5).masked_fill_(~valid, score)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = valid.sum(dim=1).unsqueeze(-1).expand_as(output).bfloat16()
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+            assert (terms[valid] == 0).all()
+            assert torch.isnan(terms[~valid]).all()
+    finally:
+        graph.reset()
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("tokens,hidden,world", [(1, 32, 1), (3, 128, 4), (17, 384, 8)])
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_dedup_reduce_graph_with_16_byte_output(tokens, hidden, world, with_shared):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Requires SM107")
+    import cutlass.cute as cute
+    from cuda.bindings import driver as cuda
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.kernel_src.rubin.inference.mega.topk_reduce_dedup import (
+        TopkReduceDedup,
+    )
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.src.sources.quant_def import (
+        CombineFormat,
+    )
+
+    slots = torch.randn(tokens, world, hidden, device="cuda", dtype=torch.bfloat16)
+    mask = torch.zeros(tokens, device="cuda", dtype=torch.int32)
+    storage = torch.full(
+        (tokens * hidden + 16,), 7, device="cuda", dtype=torch.bfloat16
+    )
+    output = storage[8:-8].view(tokens, hidden)
+    assert output.data_ptr() % 32 == 16
+    shared = (
+        torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+        if with_shared
+        else None
+    )
+    args = dict(
+        rank_slots=from_dlpack(slots, assumed_align=32),
+        valid_rank_mask=from_dlpack(mask, assumed_align=4),
+        reduced_output=from_dlpack(output, assumed_align=16),
+        shared_term=from_dlpack(shared, assumed_align=32)
+        if shared is not None
+        else None,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    executable = cute.compile(
+        TopkReduceDedup(hidden, world, CombineFormat.parse("bf16")), **args
+    )
+    executable(**args)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            args["stream"] = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            executable(**args)
+        for state in (0, (1 << world) - 1, 0x55 & ((1 << world) - 1)):
+            slots.normal_()
+            mask.fill_(state)
+            output.fill_(float("nan"))
+            expected = torch.zeros(tokens, hidden, device="cuda", dtype=torch.float32)
+            for rank in range(world):
+                if state & (1 << rank):
+                    expected.add_(slots[:, rank].float())
+            if shared is not None:
+                expected.add_(shared.float())
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output, expected.bfloat16(), rtol=0, atol=0)
+            assert (storage[:8] == 7).all() and (storage[-8:] == 7).all()
     finally:
         graph.reset()

@@ -283,7 +283,10 @@ publish and the expand kernels read in O(1) per CTA; the generic shrink splits t
 dimension over extra CTAs at small pair counts and reduces the partials in a fixed order.
 Other inputs fall back to the portable
 ``bgmv_moe_shrink`` / ``bgmv_moe_expand`` kernels (``plan.backend_used ==
-"portable"``) unless ``fallback=False`` is passed.
+"portable"``) unless ``fallback=False`` is passed. ``backend="blackwell"`` and
+``BGMVMoEBlackwellPlan`` are deprecated aliases of ``backend="cake"`` and
+:class:`BGMVMoECakePlan`; with ``backend="blackwell"`` unsupported inputs raise
+``ValueError`` unless ``fallback=True`` is passed.
 
 .. autosummary::
     :toctree: ../generated

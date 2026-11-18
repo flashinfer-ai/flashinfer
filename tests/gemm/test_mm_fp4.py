@@ -21,6 +21,7 @@ from flashinfer.utils import (
     LibraryError,
 )
 from flashinfer.gemm.gemm_base import CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR
+from tests.utils.test_helpers.pdl import late_store
 
 
 def _test_mm_fp4(
@@ -258,6 +259,87 @@ def _nvfp4_operands(m, n, k):
         b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
     )
     return a, b, a_fp4, a_s, b_fp4, b_s, 1.0 / (g_in * g_w)
+
+
+@pytest.mark.parametrize(
+    "m,n,out_dtype,backend,use_nvfp4,auto_tuning",
+    [
+        (1, 129, torch.bfloat16, "b12x", True, False),
+        (17, 1023, torch.float16, "b12x", True, False),
+        (129, 8193, torch.bfloat16, "auto", True, False),
+        (17, 129, torch.bfloat16, "b12x", False, False),
+        (129, 1023, torch.float16, "auto", False, True),
+        (1, 8193, torch.float16, "b12x", True, True),
+    ],
+)
+def test_mm_fp4_b12x_output_row_alignment(
+    m, n, out_dtype, backend, use_nvfp4, auto_tuning
+):
+    """Unaligned output rows must not use TMA, including cached FP4 tactics."""
+    if not (
+        is_sm12x_supported(torch.device("cuda"))
+        and version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("b12x NVFP4/MXFP4 requires SM120/SM121 + CUDA 13+.")
+
+    torch.manual_seed(0)
+    k = 256
+    # Alternate store modes in one process: the compiled-kernel cache must
+    # distinguish the aligned TMA path from the predicated global-store path.
+    aligned_n = (n + 7) // 8 * 8
+    for cols in (aligned_n, n, aligned_n):
+        a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, cols, k)
+        if not use_nvfp4:
+            a_fp4, a_s = mxfp4_quantize(a)
+            b_fp4, b_s = mxfp4_quantize(b)
+            alpha = None
+        guard = 128
+        storage = torch.full(
+            (guard + m * cols + m * 128 + guard,),
+            42,
+            device="cuda",
+            dtype=out_dtype,
+        )
+        out = storage[guard : guard + m * cols].view(m, cols)
+        out.fill_(float("nan"))
+
+        def run():
+            mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_s,
+                b_s.T,
+                alpha,
+                out_dtype,
+                out,
+                block_size=16 if use_nvfp4 else 32,
+                backend=backend,
+                use_nvfp4=use_nvfp4,
+                skip_check=False,
+            )
+
+        # Profile this regression shape without allocating unrelated M buckets.
+        with autotune(auto_tuning, tuning_buckets=(m,)):
+            run()
+        torch.cuda.synchronize()
+        assert torch.all(storage[:guard] == 42)
+        assert torch.all(storage[guard + m * cols :] == 42)
+        assert torch.isfinite(out).all()
+        reference = torch.mm(a, b.T).float()
+        assert torch.all(F.cosine_similarity(reference, out.float(), dim=1) > 0.97)
+
+        if cols == n:
+            expected = out.clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+            for _ in range(2):
+                out.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                assert torch.all(storage[:guard] == 42)
+                assert torch.all(storage[guard + m * cols :] == 42)
 
 
 def test_mm_fp4_b12x_short_k_multi_wave():
@@ -735,3 +817,51 @@ def test_mm_fp4_l2_policy_rule():
     # other kernels are untouched
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm100sk") is None
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm103") is None
+
+
+@pytest.mark.parametrize(
+    "backend,m,n,k",
+    [
+        ("cute-dsl", 128, 512, 512),
+        ("cute-dsl", 8, 2048, 4096),
+        ("cutedsl_low_latency", 8, 1280, 2944),
+        ("b12x", 128, 512, 512),
+    ],
+)
+def test_mm_fp4_pdl_waits_for_alpha(backend, m, n, k):
+    cc = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported(backend, cc[0] * 10 + cc[1]):
+        pytest.skip(f"{backend} is not supported on SM{cc[0]}{cc[1]}")
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    a_global_sf = (448 * 6) / a.float().abs().max()
+    b_global_sf = (448 * 6) / b.float().abs().max()
+    a_fp4, a_sf = nvfp4_quantize(a, a_global_sf, do_shuffle=False)
+    b_fp4, b_sf = nvfp4_quantize(b, b_global_sf, do_shuffle=False)
+    alpha_value = (1.0 / (a_global_sf * b_global_sf)).item()
+    alpha = torch.tensor(alpha_value, device="cuda")
+
+    def run():
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_sf.T,
+            alpha,
+            torch.bfloat16,
+            out,
+            backend=backend,
+            enable_pdl=True,
+        )
+        return out
+
+    expected = run()
+
+    # alpha is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the GEMM.
+    alpha.fill_(alpha_value * 4)
+    late_store(alpha, alpha_value)
+    out = run()
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)

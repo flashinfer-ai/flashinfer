@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from flashinfer.jit import blackwell_msa as loader
+from flashinfer.jit import core
 
 
 def _routes(target):
@@ -36,7 +37,10 @@ def test_every_route_names_a_program_built_for_its_target(target):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ["sm100a", "sm103a"])
-def test_jit_spec_is_target_specific(target):
+def test_jit_spec_is_target_specific(target, monkeypatch):
+    # gen_jit_spec() rejects a host with no detected GPU; the spec is
+    # target-specific by construction, so the host's GPU is irrelevant here.
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
     name = next(iter(_routes(target).values()))
     spec = loader.gen_blackwell_msa_module(name, target)
     assert spec.name == f"blackwell_msa_{name}_{target}"
