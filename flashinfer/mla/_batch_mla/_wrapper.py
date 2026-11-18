@@ -687,6 +687,7 @@ class BatchMLAPagedAttentionWrapper:
                 skip_softmax,
                 use_sinks,
                 _fp8q_sm90_explicit_output_dtype,
+                use_profiler=use_profiler,
             )
             # Hold the prospective fast-path decision in locals until the
             # backend plan below validates and succeeds: a plan the backend

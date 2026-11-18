@@ -178,6 +178,7 @@ def _mla_dec_fp8q_sm90_prepare(
     skip_softmax: Any,
     use_sinks: Any,
     explicit_output_dtype: Optional[torch.dtype],
+    use_profiler: bool = False,
 ) -> None:
     """Plan-time half: decide eligibility, JIT-build the module (first time
     per process), build the dense block table and device kv-length vector,
@@ -231,6 +232,17 @@ def _mla_dec_fp8q_sm90_prepare(
             reason = "causal=False"
         elif sm_scale is None:
             reason = "sm_scale=None"
+        elif not (math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0):
+            # The kernels reduce the per-row score maximum BEFORE applying
+            # the fused qk scale (max(score) * qk_scale), which is only
+            # order-preserving for a positive scale; a zero scale would also
+            # turn -inf score masks into NaN. The stock path serves these.
+            reason = f"sm_scale={sm_scale} is not a finite positive value"
+        elif use_profiler:
+            # The specialized dispatch does not receive profiler_buffer and
+            # would produce no profiler records; profiled plans stay on the
+            # stock path, which implements the profiling workflow.
+            reason = "use_profiler"
         elif lse_mode not in (None, "none", False):
             reason = f"lse_mode={lse_mode}"
         elif skip_softmax:
@@ -596,6 +608,13 @@ def _mla_dec_fp8q_sm90_dispatch(
         q_packed = _packed_fp8_view(query, (_HEAD_DIM_CKV, _HEAD_DIM_KPE), "query")
         if q_packed is None or q_packed.dim() != 3:
             return _fallback("query is not a packed/adjacent fp8 form")
+        # The kernels read the packed query with 16-byte vectorized loads
+        # (uint4) from its base address; a contiguous offset view whose data
+        # pointer is not 16-byte aligned would read misaligned. This also
+        # covers packed parents reconstructed from adjacent split views,
+        # whose base is the first view's data pointer.
+        if q_packed.data_ptr() % 16 != 0:
+            return _fallback("query base address is not 16-byte aligned")
         if q_packed.shape[0] != state.total_q or q_packed.shape[1] != _NUM_HEADS:
             return _fallback(
                 f"query shape {tuple(q_packed.shape)} != planned "

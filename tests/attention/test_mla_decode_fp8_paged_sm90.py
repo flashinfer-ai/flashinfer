@@ -153,7 +153,9 @@ def _reference(batch, q_scale=1.0, kv_scale=1.0):
     return out
 
 
-def _plan_wrapper(batch, device, fp8q_backend="auto"):
+def _plan_wrapper(
+    batch, device, fp8q_backend="auto", sm_scale=SM_SCALE, use_profiler=False
+):
     ws = torch.zeros(160 * 1024 * 1024, dtype=torch.uint8, device=device)
     w = BatchMLAPagedAttentionWrapper(
         float_workspace_buffer=ws, backend="auto", fp8q_backend=fp8q_backend
@@ -168,9 +170,10 @@ def _plan_wrapper(batch, device, fp8q_backend="auto"):
         head_dim_kpe=KPE,
         page_size=PAGE,
         causal=True,
-        sm_scale=SM_SCALE,
+        sm_scale=sm_scale,
         q_data_type=torch.float8_e4m3fn,
         kv_data_type=torch.float8_e4m3fn,
+        use_profiler=use_profiler,
     )
     return w
 
@@ -429,6 +432,85 @@ def test_nonpositive_scales_never_reach_the_kernel():
     w2 = _plan_wrapper(batch, device, fp8q_backend="specialized")
     with pytest.raises(RuntimeError, match="finite positive"):
         _run(w2, batch, q_scale=0.0)
+
+
+@pytest.mark.parametrize("sm_scale", [0.0, -SM_SCALE, float("inf")])
+def test_nonpositive_sm_scale_is_ineligible(sm_scale):
+    """The kernels reduce max(score) BEFORE applying the fused qk scale,
+    which is only order-preserving for a positive sm_scale (and a zero scale
+    would turn -inf masks into NaN); such plans stay on the stock path
+    ('auto') or raise ('specialized')."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    _reset_mla_dec_fp8q_sm90_stats()
+    w = _plan_wrapper(batch, device, sm_scale=sm_scale)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0, stats
+    out = _run(w, batch)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
+    if sm_scale != float("inf"):
+        assert torch.isfinite(out.float()).all()
+
+    with pytest.raises(RuntimeError, match="finite positive"):
+        _plan_wrapper(batch, device, fp8q_backend="specialized", sm_scale=sm_scale)
+
+
+def test_profiled_plans_stay_on_stock_path():
+    """The specialized dispatch does not receive profiler_buffer, so a
+    use_profiler=True plan must not be served by the fast path (which would
+    silently produce no profiler records): stock for 'auto', raise for
+    'specialized'."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    _reset_mla_dec_fp8q_sm90_stats()
+    _plan_wrapper(batch, device, use_profiler=True)
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["plans_prepared"] == 0, stats
+
+    with pytest.raises(RuntimeError, match="use_profiler"):
+        _plan_wrapper(batch, device, fp8q_backend="specialized", use_profiler=True)
+
+
+def test_misaligned_query_views_fall_back():
+    """A contiguous offset view can put the packed query base at a
+    non-16-byte-aligned address, which the kernel's uint4 query loads do not
+    support; such calls are dequant-served ('auto') or raise ('specialized')."""
+    _sm90_or_skip()
+    device = torch.device("cuda:0")
+    batch = _make_batch([2983], device)
+    TQ = batch["q"].shape[0]
+    buf = torch.empty(TQ * NH * DIMQ + 16, dtype=torch.float8_e4m3fn, device=device)
+    q_mis = buf[1 : 1 + TQ * NH * DIMQ].view(TQ, NH, DIMQ)
+    assert q_mis.data_ptr() % 16 != 0
+    q_mis.copy_(batch["q"])
+    kv = batch["kv"]
+
+    _reset_mla_dec_fp8q_sm90_stats()
+    w = _plan_wrapper(batch, device)
+    out = w.run(
+        query=(q_mis[..., :CKV], q_mis[..., CKV:]),
+        kv_cache=(kv[..., :CKV], kv[..., CKV:]),
+        q_scale=1.0,
+        ckv_scale=1.0,
+        kpe_scale=1.0,
+    )
+    stats = _mla_dec_fp8q_sm90_stats()
+    assert stats["runs_dispatched"] == 0, stats
+    assert stats["runs_dequant_fallback"] >= 1, stats
+    assert _matched_ratio(out, _reference(batch)) >= MATCHED
+
+    w2 = _plan_wrapper(batch, device, fp8q_backend="specialized")
+    with pytest.raises(RuntimeError, match="aligned"):
+        w2.run(
+            query=(q_mis[..., :CKV], q_mis[..., CKV:]),
+            kv_cache=(kv[..., :CKV], kv[..., CKV:]),
+            q_scale=1.0,
+            ckv_scale=1.0,
+            kpe_scale=1.0,
+        )
 
 
 def test_specialized_path_enforces_run_contract():
