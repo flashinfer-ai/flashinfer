@@ -162,6 +162,98 @@ def test_specialized_correct_and_routed(q_lens, kv_lens):
     assert torch.equal(out, out2)
 
 
+def _make_padded_q128_inputs(B, q_len, seed=0):
+    """Padded-capacity packing: physical q/out rows say uniform q128
+    (q.shape[0] == B*128, max_q_len == 128) while cu_q packs the actual
+    shorter requests tightly.  This is the shape that must defeat the
+    uniform-q128 speculation per request, not just per batch."""
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    q = (torch.randn(B * PAGE, HQ, D, generator=g, device=dev) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    kv_buf = (torch.randn(B, PAGE, 2, D, generator=g, device=dev) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    bt = torch.arange(B, dtype=torch.int32, device=dev).view(B, 1)
+    cu_q = q_len * torch.arange(B + 1, dtype=torch.int32, device=dev)
+    cu_kv = PAGE * torch.arange(B + 1, dtype=torch.int32, device=dev)
+    seq_lens = torch.full((B,), PAGE, dtype=torch.int32, device=dev)
+    return dict(
+        q=q,
+        kv_buf=kv_buf,
+        bt=bt,
+        cu_q=cu_q,
+        cu_kv=cu_kv,
+        seq_lens=seq_lens,
+        max_q=PAGE,
+        max_kv=PAGE,
+    )
+
+
+@requires_sm103
+@pytest.mark.parametrize(
+    "B,q_len", [(2, 127), (7, 125), (10, 125), (10, 127), (15, 125)]
+)
+def test_u128_padded_capacity_short_requests(B, q_len):
+    # Regression: with padded physical capacity and shorter actual requests,
+    # the uniform-q128 tail warps used to write a full garbage result to each
+    # request's FIRST row (tok fell back to q0), racing the CTA that owns it.
+    inp = _make_padded_q128_inputs(B, q_len, seed=17)
+    gold = _reference(inp).float()
+    nvalid = B * q_len
+    before = dict(spec_mod.DISPATCH_STATS)
+    out = _out_like(inp)
+    _api(inp, out)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
+    valid = out[:nvalid].float()
+    diff = (valid - gold).abs()
+    tol = 0.005 + 0.05 * gold.abs()
+    assert float((diff <= tol).float().mean()) == 1.0
+    # the race was also nondeterministic: identical inputs must be bitwise
+    # repeatable on the valid rows
+    out2 = _out_like(inp)
+    _api(inp, out2)
+    assert torch.equal(out[:nvalid], out2[:nvalid])
+
+
+@requires_sm103
+def test_u2_large_batch_beyond_chunk_boundary():
+    # Regression: uniform q2/kv2 batches larger than 65535 used to be launched
+    # in request chunks with q/out pointers advanced by the chunk origin while
+    # the kernel's speculation fallback consumed cu_q's ABSOLUTE offsets --
+    # applying the origin twice: rows past the boundary were written outside
+    # the passed output view and the final logical rows were left untouched.
+    B = 65536
+    dev = torch.device("cuda")
+    q = torch.zeros(B * 2, HQ, D, device=dev).to(torch.float8_e4m3fn)
+    kv_buf = torch.empty(1, PAGE, 2, D, device=dev)
+    kv_buf[:, :, 0, :] = 0.0  # K = 0 -> uniform softmax
+    kv_buf[:, :, 1, :] = 1.0  # V = 1 -> every output element is exactly 1
+    kv_buf = kv_buf.to(torch.float8_e4m3fn)
+    inp = dict(
+        q=q,
+        kv_buf=kv_buf,
+        bt=torch.zeros(B, 1, dtype=torch.int32, device=dev),
+        cu_q=2 * torch.arange(B + 1, dtype=torch.int32, device=dev),
+        cu_kv=2 * torch.arange(B + 1, dtype=torch.int32, device=dev),
+        seq_lens=torch.full((B,), 2, dtype=torch.int32, device=dev),
+        max_q=2,
+        max_kv=2,
+    )
+    before = dict(spec_mod.DISPATCH_STATS)
+    out = torch.full((B * 2, HQ, D), -8.0, dtype=torch.bfloat16, device=dev)
+    _api(inp, out)
+    assert spec_mod.DISPATCH_STATS["specialized"] == before["specialized"] + 1, (
+        spec_mod.LAST_FALLBACK_REASONS
+    )
+    # every logical row (poisoned beforehand) must have been written, exactly
+    # within the passed view
+    assert float((out.float() - 1.0).abs().max()) <= 0.02
+
+
 @requires_sm103
 def test_allowlist_boundary_multi_page_stays_stock():
     # kv > 128 (multi-page) is outside the allowlist: auto must fall back.

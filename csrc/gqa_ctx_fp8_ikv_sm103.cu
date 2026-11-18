@@ -592,7 +592,9 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny_async(
   __shared__ __align__(128) uint8_t Qraw[WARPS * HQD];
   __shared__ __align__(128) uint8_t Kraw[8 * DH];
 
-  const int r = RFAST ? (int)blockIdx.x : (int)blockIdx.y;
+  // U2 takes the request from grid x (2^31-1 capacity): one launch covers any
+  // batch size, so cu_q's absolute packed offsets never need host rebasing.
+  const int r = (RFAST || U2) ? (int)blockIdx.x : (int)blockIdx.y;
   // one dependent round trip for all per-request metadata: issued together,
   // before any branch, so q and kv are only two round trips from kernel start.
   // U2 speculation verified against cu_q/seq_lens (loads issue together);
@@ -1024,7 +1026,16 @@ __global__ __launch_bounds__(32 * WARPS, WARPS == 4 ? 3 : 1) void attn_gen(
     const uint32_t qdst =
         smemu32(QBUF) + (uint32_t)(qw * QPITCH + head * DH + ((ch ^ (head & 7)) << 4));
     if constexpr (U128) {
-      cpasync16(qdst, q + (size_t)(q0 + pbase + qw) * HQD + tt * 16);
+      if (uni) {
+        cpasync16(qdst, q + (size_t)(q0 + pbase + qw) * HQD + tt * 16);
+      } else {
+        // Failed speculation: rows past the request's real qlen must not be
+        // fetched (they may lie outside the packed q rows), exactly like the
+        // generic path below.
+        const bool valid = (pbase + qw < qlen);
+        const int safe_qw = valid ? qw : 0;
+        cpasync16z(qdst, q + (size_t)(q0 + pbase + safe_qw) * HQD + tt * 16, valid ? 16 : 0);
+      }
     } else {
       const bool valid = (pbase + qw < qlen);
       const int safe_qw = valid ? qw : 0;
@@ -1076,6 +1087,10 @@ __global__ __launch_bounds__(32 * WARPS, WARPS == 4 ? 3 : 1) void attn_gen(
     }
     asm volatile("cp.async.commit_group;\n" ::);
 
+    // U128 keeps this gate compile-time (the hot loop stays branch-free).
+    // On failed speculation inactive warps compute garbage here, but every
+    // cross-lane op is warp-local and their store below is masked, so the
+    // waste is bounded by the tail warps of one CTA per request.
     if (U128 || (active && lbase < vis)) {
       const uint32_t kbase = smemu32(KBUF(buf)) + (uint32_t)((lane & 7) * KSTR + (lane >> 3) * 16);
       const bool full = (lbase + 32 <= vis);
@@ -1189,9 +1204,15 @@ __global__ __launch_bounds__(32 * WARPS, WARPS == 4 ? 3 : 1) void attn_gen(
 #undef VBUF
 #undef QBUF
   if constexpr (U128 && DS == 1) {
-    store_tile_rows8(
-        out + (size_t)tok * HQD, acc, 1.0f / la, 1.0f / lb,
-        reinterpret_cast<uint16_t*>(smem + NB * 32 * KSTR + NB * 32 * DH + warp * QPITCH), lane);
+    // On failed U128 speculation a tail warp past the real qlen holds
+    // tok == q0; its store would race the CTA that owns the request's first
+    // row.  The store is warp-wide (store_tile_rows8 only uses __syncwarp),
+    // so the whole inactive warp can skip it.
+    if (active) {
+      store_tile_rows8(
+          out + (size_t)tok * HQD, acc, 1.0f / la, 1.0f / lb,
+          reinterpret_cast<uint16_t*>(smem + NB * 32 * KSTR + NB * 32 * DH + warp * QPITCH), lane);
+    }
   } else {
     __syncthreads();  // all warps and async copies are done with KV buffers
     store_tile<true, NJ>(out + (size_t)tok * HQD + dh * (8 * NJ), acc, 1.0f / la, 1.0f / lb,
@@ -2351,21 +2372,26 @@ void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
   cudaStream_t st = static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, q.device().device_id));
 
   const bool uniform2 = max_q == 2 && max_kv_len == 2 && q.shape()[0] == (int64_t)total_B * 2;
+  // Routes whose request index rides grid x never chunk (x holds 2^31-1).
+  // uniform2 must be here: its kernels verify the uniform speculation against
+  // cu_q's ABSOLUTE packed offsets, which a chunk-local request index and a
+  // rebased q/out pointer would both break on every chunk after the first.
   const bool batch_on_x =
-      uniform128 || (max_kv_len <= 8 && max_q == max_kv_len && (max_q == 6 || max_q == 8));
+      uniform128 || uniform2 ||
+      (max_kv_len <= 8 && max_q == max_kv_len && (max_q == 6 || max_q == 8));
   const int batch_step = batch_on_x || total_B <= 65535 ? total_B : 65535;
   int rbase = 0;
   do {
     const int B = (total_B - rbase < batch_step) ? total_B - rbase : batch_step;
-    // General kernels use absolute packed offsets from cu_q.  U2 synthesizes
-    // its offsets, so only that specialization needs q/out pointer adjustment.
-    const size_t token_base = uniform2 ? (size_t)rbase * 2 : 0;
-    const uint8_t* qp = static_cast<const uint8_t*>(q.data_ptr()) + token_base * HQD;
+    // Every kernel consumes absolute packed offsets from cu_q (the U2/U128
+    // speculations are verified against them), so chunked launches advance
+    // only the per-request views and keep q/out at their global bases.
+    const uint8_t* qp = static_cast<const uint8_t*>(q.data_ptr());
     const uint8_t* kvp = static_cast<const uint8_t*>(kv_buf.data_ptr());
     const int* btp = static_cast<const int*>(block_table.data_ptr()) + (size_t)rbase * btw;
     const int* cqp = static_cast<const int*>(cu_q.data_ptr()) + rbase;
     const int* slp = static_cast<const int*>(seq_lens.data_ptr()) + rbase;
-    __nv_bfloat16* op = static_cast<__nv_bfloat16*>(out.data_ptr()) + token_base * HQD;
+    __nv_bfloat16* op = static_cast<__nv_bfloat16*>(out.data_ptr());
 
     if (max_kv_len <= 8) {
       if (uniform2) {
@@ -2375,17 +2401,17 @@ void Run(ffi::TensorView q, ffi::TensorView kv_buf, ffi::TensorView block_table,
         if (B <= 16) {
           if (btw == 1) {
             attn_tiny_async<2, true, true, 4, 2, false, true, true, false, true>
-                <<<dim3(1, B, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
+                <<<dim3(B, 1, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
           } else {
             attn_tiny_async<2, true, true, 4, 2, false, false, true, false, true>
-                <<<dim3(1, B, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
+                <<<dim3(B, 1, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
           }
         } else if (btw == 1) {
           attn_tiny_async<2, true, true, 4, 2, false, true, true>
-              <<<dim3(1, B, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
+              <<<dim3(B, 1, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
         } else {
           attn_tiny_async<2, true, true, 4, 2, false, false, true>
-              <<<dim3(1, B, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
+              <<<dim3(B, 1, 4), 64, 0, st>>>(qp, kvp, btp, cqp, slp, op, btw);
         }
       } else if (max_q == 3 && max_kv_len == 3) {
         // One CTA per request covers every query token, so no CTA is launched
