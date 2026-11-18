@@ -1144,7 +1144,9 @@ def test_retained_nvfp4_keep_ab_rejects_v_split(monkeypatch):
         )
 
 
-def test_caller_workspace_single_source_and_eager_api():
+def test_caller_workspace_single_source_and_eager_api(monkeypatch, tmp_path):
+    from flashinfer.jit import cute_dsl_core
+
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device="cuda", dtype=torch.bfloat16)
     kv[1] *= 2
@@ -1155,7 +1157,13 @@ def test_caller_workspace_single_source_and_eager_api():
     size = get_prims_ts_sparse_mla_decode_workspace_size(**args)
     workspace = torch.empty(size, device=q.device, dtype=torch.uint8)
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace)
+    with monkeypatch.context() as empty_cache:
+        empty_cache.setattr(cute_dsl_core.jit_env, "FLASHINFER_JIT_DIR", tmp_path)
+        wrapper.plan(**args, compile=False)
+        assert not wrapper.is_kernel_cached()
+        assert not list(tmp_path.iterdir())
     _plan_with_deferred_compilation(wrapper, **args)
+    assert wrapper.is_kernel_cached() == (not cute_dsl_core.cute_dsl_cache_disabled())
     metadata = prepare_sparse_mla_indices(wrapper, q, kv, indices)
     result, lse = wrapper.run(q, kv, **metadata)
     torch.testing.assert_close(result, torch.full_like(q, 1.5))
