@@ -6,6 +6,15 @@ launch sequence and writes ``post_mix``/``comb``/``layer_input`` directly.
 Scope: ``residual`` of shape ``(T, 4, 4096)`` bfloat16 with ``1 <= T <= 16384``
 (the validated range) on SM103; everything else stays on the composable
 big-fuse path. Kill switch: FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1.
+
+Numerics contract: the fused projection runs on tensor cores with
+reduced-precision operands (the fp32 ``fn`` weights are converted to
+bf16/tf32 depending on the token-count arm) and fp32 accumulation, and some
+epilogues accumulate in bf16. The backend is validated against an fp32
+reference at the audited tolerance (atol 4e-3, rtol 1e-2, matched ratio
+>= 0.995, max-error cap 0.05) on GLM-5.3 workload statistics; fp32 weight
+structure below bf16/tf32 resolution is not preserved. Callers that need
+strict fp32 projection semantics should select ``backend="big-fuse"``.
 CUDA graphs: the route is taken under capture only after the module was built
 eagerly (single fatbin, no per-shape JIT); dispatch is host-int based with no
 syncs, and the kernels use programmatic dependent launch on the current

@@ -390,7 +390,9 @@ def mhc_pre(
         One of ``"auto"`` (default), ``"specialized"`` or ``"big-fuse"``.
 
         - ``"big-fuse"``: the composable stock path — the projection GEMM
-          is computed here (fp32, at the ambient matmul precision), then
+          is computed here in fp32 (autocast is locally disabled so the
+          output stays fp32; the ambient fp32 matmul precision, e.g. tf32,
+          still applies), then
           :func:`mhc_pre_big_fuse_with_prenorm`, the big-fuse kernel
           variant that also fuses the RMS square-sum (the fastest existing
           FlashInfer composition for the full op, measured per row).
@@ -398,6 +400,12 @@ def mhc_pre(
         - ``"specialized"``: a fused single-launch-sequence CUDA kernel for
           the GLM-5.3 geometry (``residual`` of shape ``(T, 4, 4096)``,
           ``1 <= T <= 16384``, default scalar parameters) on SM103.
+          Numerics contract: the fused projection runs on tensor cores
+          with reduced-precision operands (bf16/tf32 depending on the
+          token-count arm) and fp32 accumulation, validated against an
+          fp32 reference at the audited tolerance (atol 4e-3, rtol 1e-2,
+          matched ratio >= 0.995, max-error cap 0.05); callers that need
+          strict fp32 projection semantics should select ``"big-fuse"``.
           Explicit selection never falls back: outside its allowlist it
           raises, with the reasons in the message
           (:data:`flashinfer.mhc_pre_glm_cuda.LAST_FALLBACK_REASONS`).
@@ -448,8 +456,13 @@ def mhc_pre(
                 layer_input.reshape(outer_shape + (hidden_size,)),
             )
 
-    x = residual.reshape(total_tokens, _MHC_HC * hidden_size).to(torch.float32)
-    dot_mix = (x @ fn.t().to(torch.float32)).reshape(outer_shape + (_MHC_MIX,))
+    # The downstream kernel requires fp32 ``dot_mix``. Under torch.autocast
+    # this matmul would run (and return) in the autocast dtype despite the
+    # fp32 operand casts, so disable autocast locally; the ambient fp32
+    # matmul precision (e.g. tf32) still applies.
+    with torch.autocast(device_type=residual.device.type, enabled=False):
+        x = residual.reshape(total_tokens, _MHC_HC * hidden_size).to(torch.float32)
+        dot_mix = (x @ fn.t().to(torch.float32)).reshape(outer_shape + (_MHC_MIX,))
     return mhc_pre_big_fuse_with_prenorm(
         dot_mix,
         residual,

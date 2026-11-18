@@ -115,6 +115,23 @@ def test_specialized_matches_big_fuse(T):
 
 
 @requires_sm103
+@pytest.mark.parametrize("backend", ["big-fuse", "auto"])
+def test_big_fuse_projection_unaffected_by_autocast(backend):
+    """The big-fuse projection must stay fp32 under torch.autocast: the
+    downstream kernel requires fp32 dot_mix, and results must match the
+    non-autocast call bitwise. For "auto", a non-default rms_eps forces the
+    big-fuse fallback path so autocast is exercised on the fallback too."""
+    inputs = _make_inputs(3, seed=7)
+    kwargs = {} if backend == "big-fuse" else {"rms_eps": 2e-6}
+    ref_out = mhc_pre(*inputs, backend=backend, **kwargs)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        ac_out = mhc_pre(*inputs, backend=backend, **kwargs)
+    for a, r in zip(ac_out, ref_out, strict=True):
+        assert a.dtype == r.dtype
+        assert torch.equal(a, r)
+
+
+@requires_sm103
 @pytest.mark.parametrize("T", [1, 256, 512])
 def test_back_to_back_determinism(T):
     """Three back-to-back pairs on the same inputs must be bitwise equal.
