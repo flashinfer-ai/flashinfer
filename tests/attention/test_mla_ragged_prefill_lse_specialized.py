@@ -345,3 +345,33 @@ def test_generalized_entry_parity_and_dispatch():
         )
     with pytest.raises(ValueError, match="backend must be one of"):
         ragged_attention_deepseek(**{**kwargs, "backend": "bogus"})
+
+
+@requires_sm103
+def test_uniform_attention_unbiased():
+    """Adversarial uniform-attention construction (the former disclosure):
+    constant k, v == 1 exactly, constant q scanned across three octaves of
+    the internal weight scale, so every attention weight is identical and
+    the exact output is v's row-mean (== 1).  Before the non-causal routes
+    normalized by the quantized-weight sum this construction showed a
+    systematic PV bias up to ~4.7% (the e4m3 numerator against the exact
+    normalizer); with the output normalizer built from the SAME e4m3
+    weights the numerator uses, the ratio is exact for uniform rows and the
+    worst bias over the scan must collapse to output-rounding level.  The
+    LSE keeps the exact sum and must stay within the class bound."""
+    dev = torch.device("cuda")
+    B, TQ, TKV, MAXQ, MAXKV = 1, 128, 12416, 128, 12416
+    inp = _make_inputs(B, TQ, TKV, MAXQ, MAXKV, 0, seed=5)
+    worst_bias, worst_lse = 0.0, 0.0
+    for i in range(25):
+        cq = 0.30 + 0.0125 * i
+        inp["q"] = torch.full((TQ, HQ, D_QK), cq, device=dev).to(torch.float8_e4m3fn)
+        inp["k"] = torch.full((TKV, HQ, D_QK), 0.5, device=dev).to(torch.float8_e4m3fn)
+        inp["v"] = torch.full((TKV, HQ, D_V), 1.0, device=dev).to(torch.float8_e4m3fn)
+        gold_o, gold_l = _reference(inp)
+        o, l = _api(inp, backend="specialized")
+        rel = float(((o.float() - gold_o.float()).abs() / gold_o.float().abs()).max())
+        worst_bias = max(worst_bias, rel)
+        worst_lse = max(worst_lse, float((l - gold_l).abs().max()))
+    assert worst_bias <= 0.01, worst_bias  # was ~4.7% before the fix
+    assert worst_lse <= 0.0057, worst_lse  # the class lse cap (unchanged)

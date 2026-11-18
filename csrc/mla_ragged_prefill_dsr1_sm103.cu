@@ -809,7 +809,13 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
     }
   }
 
-  float mv = MINIT, lv = 0.0f;
+  // lv: exact (pre-quantization) weight sum — feeds the LSE and the split
+  // stats.  lq: the dequantized sum of the SAME e4m3 weights the PV
+  // numerator uses — the non-causal output normalizer, so the output is a
+  // ratio of identical quantized weights (removes the uniform-attention
+  // bias).  Causal keeps the exact normalizer: its PV numerator carries
+  // the e5m2 residual and already matches it.
+  float mv = MINIT, lv = 0.0f, lq = 0.0f;
   uint32_t sr[128];
   int stage = 0, stage_phase = 0;
 
@@ -945,6 +951,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
 
     uint32_t short_residual = 0;
     uint32_t ps0 = 0, ps1 = 0, ps2 = 0, ps3 = 0;
+    [[maybe_unused]] uint32_t qs0 = 0, qs1 = 0, qs2 = 0, qs3 = 0;
 #pragma unroll
     for (int c = 0; c < 8; c++) {
       uint32_t pr[4], pres[CAUSAL ? 4 : 1];
@@ -969,6 +976,7 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
           sum01 = e01;
           sum23 = e23;
           pr[k] = pack_h2_to_f8(e01, e23);
+          uint32_t q01, q23;
           if (j == 0 && short_weights) {
             float p0 = ex2(fmaf(__int_as_float(sr[0]), QSCALE, bshift));
             float p1 = ex2(fmaf(__int_as_float(sr[1]), QSCALE, bshift));
@@ -980,6 +988,20 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
             e23 = 0;
             sum01 = e01;
             sum23 = 0;
+            // short path ships quantized+e5m2-residual weights: the
+            // numerator-matching sum IS sum01.
+            q01 = e01;
+            q23 = 0;
+          } else {
+            q01 = cvt_h2_f8x2((uint16_t)pr[k]);
+            q23 = cvt_h2_f8x2((uint16_t)(pr[k] >> 16));
+          }
+          if ((j & 1) == 0) {
+            qs0 = addh2(qs0, q01);
+            qs1 = addh2(qs1, q23);
+          } else {
+            qs2 = addh2(qs2, q01);
+            qs3 = addh2(qs3, q23);
           }
         }
         if ((j & 1) == 0) {
@@ -1005,6 +1027,13 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
     float l2 = unpack_h((uint16_t)ps2) + unpack_h((uint16_t)(ps2 >> 16));
     float l3 = unpack_h((uint16_t)ps3) + unpack_h((uint16_t)(ps3 >> 16));
     lv = lv * alpha + ((l0 + l1) + (l2 + l3));
+    if constexpr (!CAUSAL) {
+      float q0 = unpack_h((uint16_t)qs0) + unpack_h((uint16_t)(qs0 >> 16));
+      float q1 = unpack_h((uint16_t)qs1) + unpack_h((uint16_t)(qs1 >> 16));
+      float q2 = unpack_h((uint16_t)qs2) + unpack_h((uint16_t)(qs2 >> 16));
+      float q3 = unpack_h((uint16_t)qs3) + unpack_h((uint16_t)(qs3 >> 16));
+      lq = lq * alpha + ((q0 + q1) + (q2 + q3));
+    }
 
     if (__any_sync(0xffffffffu, alpha != 1.0f) && it > 0) {
       uint32_t orr[32];
@@ -1079,7 +1108,12 @@ __global__ __launch_bounds__(NTHREADS, 2) void mla_kernel(
   tc_fence_after();
 
   // ---------------- epilogue ----------------
-  float inv = (lv > 0.0f) ? 1.0f / lv : 0.0f;
+  // Non-causal normalizes the output by the quantized-weight sum; the LSE
+  // and the split stats keep the exact sum (the split combine weights the
+  // lq-normalized partials by the exact per-split sums — exact for uniform
+  // rows, second-order otherwise).
+  const float nrm = CAUSAL ? lv : lq;
+  float inv = (nrm > 0.0f) ? 1.0f / nrm : 0.0f;
   if (split_stride == 1 && (FULL_Q || myrow < rows)) Lse[tok * HQ + h] = lse2(mv, lv);
   uint32_t orr[32];
   if (split_stride == 1) {
@@ -1520,7 +1554,9 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
     }
   } else if (consumer) {
     if (!idle_rank) {
-      float mv = MINIT, lv = 0.0f;
+      // lv exact for LSE/stats; lq = dequantized e4m3 weight sum, the
+      // non-causal output normalizer (see mla_kernel).
+      float mv = MINIT, lv = 0.0f, lq = 0.0f;
       uint32_t sr[128];
       for (int it = 0; it < ntiles; it++) {
         const int kb0 = (t_begin + it * tile_step) * BN;
@@ -1593,6 +1629,7 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
         uint8_t* sPw = sP + (it & (PSTAGES2 - 1)) * PBYTES2;
         uint32_t short_residual = 0;
         uint32_t ps0 = 0, ps1 = 0, ps2 = 0, ps3 = 0;
+        [[maybe_unused]] uint32_t qs0 = 0, qs1 = 0, qs2 = 0, qs3 = 0;
         uint32_t held_p[4], held_pres[CAUSAL ? 4 : 1];
 #pragma unroll
         for (int c = 0; c < 8; c++) {
@@ -1621,6 +1658,7 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
               sum01 = e01;
               sum23 = e23;
               pr[k] = pack_h2_to_f8(e01, e23);
+              uint32_t q01, q23;
               if (j == 0 && short_weights) {
                 float p0 = ex2(fmaf(__int_as_float(sr[0]), QSCALE, bshift));
                 float p1 = ex2(fmaf(__int_as_float(sr[1]), QSCALE, bshift));
@@ -1632,6 +1670,20 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
                 e23 = 0;
                 sum01 = e01;
                 sum23 = 0;
+                // short path ships quantized+e5m2-residual weights: the
+                // numerator-matching sum IS sum01.
+                q01 = e01;
+                q23 = 0;
+              } else {
+                q01 = cvt_h2_f8x2((uint16_t)pr[k]);
+                q23 = cvt_h2_f8x2((uint16_t)(pr[k] >> 16));
+              }
+              if ((j & 1) == 0) {
+                qs0 = addh2(qs0, q01);
+                qs1 = addh2(qs1, q23);
+              } else {
+                qs2 = addh2(qs2, q01);
+                qs3 = addh2(qs3, q23);
               }
             }
             if ((j & 1) == 0) {
@@ -1682,6 +1734,13 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
         float l2 = unpack_h((uint16_t)ps2) + unpack_h((uint16_t)(ps2 >> 16));
         float l3 = unpack_h((uint16_t)ps3) + unpack_h((uint16_t)(ps3 >> 16));
         lv = lv * alpha + ((l0 + l1) + (l2 + l3));
+        if constexpr (!CAUSAL) {
+          float q0 = unpack_h((uint16_t)qs0) + unpack_h((uint16_t)(qs0 >> 16));
+          float q1 = unpack_h((uint16_t)qs1) + unpack_h((uint16_t)(qs1 >> 16));
+          float q2 = unpack_h((uint16_t)qs2) + unpack_h((uint16_t)(qs2 >> 16));
+          float q3 = unpack_h((uint16_t)qs3) + unpack_h((uint16_t)(qs3 >> 16));
+          lq = lq * alpha + ((q0 + q1) + (q2 + q3));
+        }
 
         if (__any_sync(0xffffffffu, alpha != 1.0f) && it > 0) {
           // A single-stage late-wait route acquired this exact completion phase
@@ -1736,7 +1795,10 @@ __global__ __cluster_dims__(2, 1, 1) __launch_bounds__(NTHREADS2, 2) void mla_ke
       // published.  Start the reciprocal and direct LSE store while the final
       // asynchronous PV MMA is still in flight, then wait only before TMEM O is
       // consumed.
-      float inv = (lv > 0.0f) ? 1.0f / lv : 0.0f;
+      // Non-causal normalizes the output by the quantized-weight sum; the
+      // LSE and the split stats keep the exact sum (see mla_kernel).
+      const float nrm = CAUSAL ? lv : lq;
+      float inv = (nrm > 0.0f) ? 1.0f / nrm : 0.0f;
       uint16_t* ep = reinterpret_cast<uint16_t*>(sQn);
       constexpr bool WIDE_DIRECT_EPI =
           !CAUSAL && EXACT && LATE_P_WAIT && !INTERLEAVED2 && FIXED_NS == 0 && !PADDED;
