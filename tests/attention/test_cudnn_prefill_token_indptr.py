@@ -151,6 +151,69 @@ def test_cudnn_prefill_explicit_lengths_exclude_storage_padding(
         graph.reset()
 
 
+def test_cudnn_prefill_element_offsets_explicit_lengths_exclude_storage_padding():
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+
+    torch.manual_seed(71)
+    q_lengths, kv_lengths = [33, 17], [129, 83]
+    q_starts, kv_starts = [0, 64, 96], [0, 160, 256]
+    heads, kv_heads, dim = 8, 2, 128
+
+    def padded(starts, lengths, h):
+        tensor = torch.full(
+            (starts[-1], h, dim), torch.nan, device="cuda", dtype=torch.bfloat16
+        )
+        for start, length in zip(starts[:-1], lengths, strict=True):
+            tensor[start : start + length].normal_()
+        return tensor
+
+    def offsets(starts, unit):
+        return torch.tensor(starts, device="cuda", dtype=torch.int32) * unit
+
+    q, k, v = (
+        padded(q_starts, q_lengths, heads),
+        padded(kv_starts, kv_lengths, kv_heads),
+        padded(kv_starts, kv_lengths, kv_heads),
+    )
+    out = torch.empty_like(q)
+    cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        dim**-0.5,
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8),
+        max_token_per_sequence=max(q_starts[1], q_starts[2] - q_starts[1]),
+        max_sequence_kv=max(kv_starts[1], kv_starts[2] - kv_starts[1]),
+        actual_seq_lens_q=torch.tensor(
+            q_lengths, device="cuda", dtype=torch.int32
+        ).view(-1, 1, 1, 1),
+        actual_seq_lens_kv=torch.tensor(
+            kv_lengths, device="cuda", dtype=torch.int32
+        ).view(-1, 1, 1, 1),
+        batch_offsets_q=offsets(q_starts, heads * dim),
+        batch_offsets_o=offsets(q_starts, heads * dim),
+        batch_offsets_k=offsets(kv_starts, kv_heads * dim),
+        batch_offsets_v=offsets(kv_starts, kv_heads * dim),
+        causal=True,
+        return_lse=False,
+        out=out,
+    )
+    for b, (nq, nk) in enumerate(zip(q_lengths, kv_lengths, strict=True)):
+        qs, ks = q_starts[b], kv_starts[b]
+        qb = q[qs : qs + nq].double().transpose(0, 1)
+        kb = k[ks : ks + nk].double().transpose(0, 1).repeat_interleave(4, 0)
+        vb = v[ks : ks + nk].double().transpose(0, 1).repeat_interleave(4, 0)
+        scores = qb @ kb.transpose(1, 2) * dim**-0.5
+        rows = torch.arange(nq, device="cuda")
+        cols = torch.arange(nk, device="cuda")
+        scores.masked_fill_(cols[None, :] > rows[:, None] + nk - nq, -torch.inf)
+        expected = (scores.softmax(-1) @ vb).transpose(0, 1)
+        torch.testing.assert_close(
+            out[qs : qs + nq].double(), expected, atol=0.01, rtol=0.01
+        )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("s_qo", [32, 87])
 @pytest.mark.parametrize("s_kv", [87, 512])

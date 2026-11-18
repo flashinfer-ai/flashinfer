@@ -1737,7 +1737,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
     @property
     def resolved_backend(self) -> str:
-        r"""What the last :meth:`plan` resolved ``backend="auto"`` to: ``"cudnn"``
+        r"""The backend reported by this wrapper.
+
+        The last :meth:`plan` resolves ``backend="auto"`` to ``"cudnn"``
         when the auto rule picked cuDNN, the tensor-core pick (``"fa2"`` / ``"fa3"``)
         otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
         reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
@@ -4507,7 +4509,7 @@ def trtllm_batch_decode_with_kv_cache(
 
     enable_pdl : Optional[bool] = None
         Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
-        When set to ``None``, the backend will be chosen based on the device architecture and kernel availability.
+        When set to ``None``, PDL is enabled automatically on supported device architectures.
 
     backend : str = "auto"
         The implementation backend, could be ``auto``/``xqa``/``trtllm-gen`` or
@@ -4565,8 +4567,8 @@ def trtllm_batch_decode_with_kv_cache(
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
 
     lse : Optional[torch.Tensor] = None
-        Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, only supported
-        by the ``trtllm-gen`` backend. Must have shape ``[num_tokens, num_qo_heads]``
+        Optional pre-allocated buffer for the Log-Sum-Exp (LSE) output, supported
+        by the ``trtllm-gen`` and ``cake`` backends. Must have shape ``[num_tokens, num_qo_heads]``
         and dtype ``torch.float32``. If provided, the tensor is filled regardless of
         :attr:`return_lse`. If ``return_lse`` is True and this is None, a buffer will
         be allocated internally.

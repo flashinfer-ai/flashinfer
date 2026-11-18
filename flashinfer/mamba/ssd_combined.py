@@ -437,6 +437,7 @@ class SSDCombined:
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        final_states: Optional[torch.Tensor] = None,
     ):
         """Prepare a call shape eagerly so that :meth:`run` on it is a pure
         launch that can be recorded into a CUDA graph (Cake backend only).
@@ -447,7 +448,8 @@ class SSDCombined:
         kernel; the arguments are those of :meth:`run` that determine the
         shape.  Run the shape eagerly once after preparing it and before
         capturing it (the host shim resolves its kernel handles on the first
-        launch).  After ``prepare(..., return_final_states=True)`` eager
+        launch).  After ``prepare(..., return_final_states=True)`` without
+        ``final_states`` eager
         :meth:`run` calls on the shape return the same static final-states
         buffer every time (overwritten by each launch) instead of fresh
         storage; a warm call captured without ``prepare`` allocates its
@@ -482,6 +484,7 @@ class SSDCombined:
             num_seqs=num_seqs,
             cu_seqlens=cu_seqlens,
             out=out,
+            final_states=final_states,
         )
 
     # -- buffer cache helpers --------------------------------------------------
@@ -598,6 +601,7 @@ class SSDCombined:
         return_final_states: bool = True,
         num_seqs: Optional[int] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
+        final_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run SSD combined forward pass.
 
@@ -700,13 +704,21 @@ class SSDCombined:
                 untouched sequences stay exact and the offending tokens'
                 outputs are undefined.  Rejected by the CuTe backend, which
                 takes the ``seq_idx`` triple.
+            final_states: Optional caller-owned contiguous output with shape
+                ``[num_seqs, nheads, headdim, dstate]`` (``[batch, ...]`` in
+                batched mode) and the state dtype, written in place.  It
+                requires ``return_final_states=True`` and must not overlap
+                ``initial_states`` or ``checkpoint_states``.  Without it the
+                final states are allocated per call, and with
+                ``return_final_states=False`` no final-state storage is
+                allocated.  Supported by the Cake backend.
 
         Returns:
             A pair containing token-major output with shape
             ``[batch, seqlen, nheads, headdim]`` and either the final states or
             ``None`` when ``return_final_states`` is false.  The Cake backend
-            returns ``out`` itself; the CuTe backend returns a view of the
-            chunked ``out`` buffer.
+            returns ``out`` itself and a given ``final_states`` itself; the
+            CuTe backend returns a view of the chunked ``out`` buffer.
         """
         # Keep backend-independent public validation ahead of dispatch so Cake
         # and CuTe expose the same exception type and message for shared API
@@ -823,6 +835,7 @@ class SSDCombined:
                 return_final_states=return_final_states,
                 num_seqs=num_seqs,
                 cu_seqlens=cu_seqlens,
+                final_states=final_states,
             )
 
         if any(
@@ -845,6 +858,10 @@ class SSDCombined:
             raise ValueError(
                 "cu_seqlens requires SSDCombined backend='cake'; the CuTe backend "
                 "takes the seq_idx / chunk_indices / chunk_offsets varlen form"
+            )
+        if final_states is not None:
+            raise ValueError(
+                "caller-owned final_states require SSDCombined backend='cake'"
             )
 
         _, _, ngroups, dstate = B.shape
@@ -1070,6 +1087,8 @@ def ssd_combined_fwd(
     return_final_states: bool = True,
     num_seqs: Optional[int] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
+    state_dtype: Optional[torch.dtype] = None,
+    final_states: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run the source-built Cake SSDCombined backend.
 
@@ -1093,6 +1112,7 @@ def ssd_combined_fwd(
         initial_states: Optional BF16, FP16, or FP32 initial states of shape
             ``[num_seqs, nheads, headdim, dstate]`` in packed-varlen mode, or
             ``[batch, nheads, headdim, dstate]`` in batched mode. Its dtype
+            must match ``state_dtype`` when that is given and otherwise
             selects the state dtype. When omitted in packed-varlen mode the
             scan starts from zero state and the sequence count comes from
             ``seq_chunk_cumsum`` or ``num_seqs``.
@@ -1131,23 +1151,53 @@ def ssd_combined_fwd(
             the segment metadata themselves (no ``chunk_indices`` /
             ``chunk_offsets``; ``seq_idx`` optional).  See
             :meth:`SSDCombined.run`.
+        state_dtype: Optional state dtype (``torch.bfloat16``,
+            ``torch.float16`` or ``torch.float32``) of the initial, final and
+            checkpoint states.  When omitted it is taken from
+            ``initial_states``, else ``final_states``, else
+            ``checkpoint_states``, else ``torch.bfloat16``.  Every given state
+            tensor must have this dtype.
+        final_states: Optional caller-owned contiguous final-state output of
+            shape ``[num_seqs, nheads, headdim, dstate]`` with the state
+            dtype, written in place and returned.  It requires
+            ``return_final_states=True`` and must not overlap
+            ``initial_states`` or ``checkpoint_states``.  Without it the
+            final states are allocated per call; with
+            ``return_final_states=False`` no final-state storage is
+            allocated.
 
     Returns:
         A pair containing the token-major output ``out`` with shape
         ``[batch, seqlen, nheads, headdim]`` and either final states of shape
-        ``[num_seqs, nheads, headdim, dstate]`` or ``None`` when
-        ``return_final_states`` is false.
+        ``[num_seqs, nheads, headdim, dstate]`` (``final_states`` itself when
+        given) or ``None`` when ``return_final_states`` is false.
     """
 
     _, _, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
-    state_dtype = (
-        initial_states.dtype
-        if initial_states is not None
-        else checkpoint_states.dtype
-        if checkpoint_states is not None
-        else torch.bfloat16
-    )
+    if state_dtype is None:
+        state_dtype = next(
+            (
+                states.dtype
+                for states in (initial_states, final_states, checkpoint_states)
+                if states is not None
+            ),
+            torch.bfloat16,
+        )
+    elif state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(
+            "state_dtype must be torch.bfloat16, torch.float16 or "
+            f"torch.float32, got {state_dtype}"
+        )
+    for name, states in (
+        ("initial_states", initial_states),
+        ("final_states", final_states),
+        ("checkpoint_states", checkpoint_states),
+    ):
+        if states is not None and states.dtype != state_dtype:
+            raise ValueError(
+                f"{name} dtype {states.dtype} doesn't match state_dtype {state_dtype}"
+            )
     config = _SSDCombinedRunnerConfig(
         chunk_size=128,
         nheads=nheads,
@@ -1194,4 +1244,5 @@ def ssd_combined_fwd(
         return_final_states=return_final_states,
         num_seqs=num_seqs,
         cu_seqlens=cu_seqlens,
+        final_states=final_states,
     )

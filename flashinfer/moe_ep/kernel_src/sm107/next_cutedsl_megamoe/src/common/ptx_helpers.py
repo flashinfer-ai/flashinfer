@@ -1,0 +1,1098 @@
+"""Inline PTX shared by kernels and runtime helpers."""
+
+from typing import Optional, Sequence
+
+import cutlass
+import cutlass.cute as cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import arith, llvm, vector
+from cutlass.cutlass_dsl import Float32, Int16, Int32, Int64, T, dsl_user_op
+
+TmaCacheHintEvictFirst = 0x12F0000000000000
+
+
+def _address_value(pointer_or_address, *, loc=None, ip=None):
+    if isinstance(pointer_or_address, Int64):
+        return pointer_or_address.ir_value()
+    return pointer_or_address.toint(loc=loc, ip=ip).ir_value()
+
+
+@dsl_user_op
+def nanosleep(sleep_cycles: int, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> None:
+    """Suspend the calling thread for approximately the requested nanoseconds."""
+    if cutlass.const_expr(hasattr(cute.arch, "nanosleep")):
+        cute.arch.nanosleep(sleep_time=sleep_cycles, loc=loc, ip=ip)
+        return
+
+    llvm.inline_asm(
+        res=None,
+        operands_=[Int32(sleep_cycles).ir_value(loc=loc, ip=ip)],
+        asm_string="nanosleep.u32 $0;",
+        constraints="r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def exit(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> None:
+    llvm.inline_asm(
+        res=None,
+        operands_=[],
+        asm_string="exit;",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def tanh_approx_f32(value, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Float32:
+    """``tanh.approx.f32``: one MUFU.TANH."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def sigmoid_pair_ex2_rcp(pair):
+    """``sigmoid(x) = rcp(1 + exp2(-x * log2e))`` on one f32x2 pair: one ``ex2.approx`` and one ``rcp.approx``
+    (MUFU.EX2 + MUFU.RCP) per element, the epilogue's default sigmoid. The tester's hardware-matched SiTU reference
+    calls this; the epilogue spells out the same packed sequence."""
+    neg_log2e = Float32(-1.4426950408889634)
+    one = Float32(1.0)
+    neg = cute.arch.mul_packed_f32x2(pair, (neg_log2e, neg_log2e))
+    e = (cute.math.exp2(neg[0], fastmath=True), cute.math.exp2(neg[1], fastmath=True))
+    d = cute.arch.add_packed_f32x2(e, (one, one))
+    return (cute.arch.rcp_approx(d[0]), cute.arch.rcp_approx(d[1]))
+
+
+def sigmoid_pair_tanh_approx(pair):
+    """``sigmoid(x) = 0.5 * tanh(0.5 * x) + 0.5`` on one f32x2 pair: one ``tanh.approx.f32`` (MUFU.TANH) per element
+    instead of the MUFU.EX2 + MUFU.RCP of ``sigmoid_pair_ex2_rcp``. The ``use_tanh_sigmoid`` problem field selects it
+    for the SwiGLU and SiTU cores; the Rubin epilogue and the tester's hardware-matched references both call this, so
+    they run the same instruction sequence."""
+    half = (Float32(0.5), Float32(0.5))
+    scaled = cute.arch.mul_packed_f32x2(pair, half)
+    return cute.arch.fma_packed_f32x2((tanh_approx_f32(scaled[0]), tanh_approx_f32(scaled[1])), half, half)
+
+
+def situ_pair_tanh_approx(gate_pair, up_pair, beta: float, linear_beta: float, sigmoid_gate):
+    """Kimi K3 SiTU on one f32x2 pair, its two tanh on ``tanh.approx.f32`` (one MUFU.TANH each):
+
+        beta * tanh(gate / beta) * sigmoid(gate) * linear_beta * tanh(up / linear_beta),
+
+    where ``sigmoid_gate`` is sigmoid of the raw gate pair (not the soft-capped one), from
+    ``sigmoid_pair_ex2_rcp`` or, with ``use_tanh_sigmoid``, ``sigmoid_pair_tanh_approx``. The betas fold at trace
+    time into the input scales and one output factor. The Rubin epilogue and the tester's hardware-matched reference
+    both call this, so they run the same instruction sequence.
+    """
+    def scaled_tanh(pair, scale):
+        scaled = cute.arch.mul_packed_f32x2(pair, (Float32(scale), Float32(scale)))
+        return (tanh_approx_f32(scaled[0]), tanh_approx_f32(scaled[1]))
+
+    tanh_gate = scaled_tanh(gate_pair, 1.0 / beta)
+    tanh_up = scaled_tanh(up_pair, 1.0 / linear_beta)
+    beta_product = Float32(beta * linear_beta)
+    soft_up = cute.arch.mul_packed_f32x2(tanh_up, (beta_product, beta_product))
+    return cute.arch.mul_packed_f32x2(cute.arch.mul_packed_f32x2(tanh_gate, sigmoid_gate), soft_up)
+
+
+@dsl_user_op
+def read_clock64(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int64:
+    """Read the per-SM 64-bit cycle counter."""
+    return Int64(
+        llvm.inline_asm(
+            T.i64(), [], "mov.u64 $0, %clock64;", "=l", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip
+        )
+    )
+
+
+@dsl_user_op
+def read_globaltimer_ns(*, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> cutlass.Uint64:
+    """Read the 64-bit global nanosecond timer, independent of SM clock rate."""
+    return cutlass.Uint64(
+        llvm.inline_asm(
+            T.i64(), [], "mov.u64 $0, %globaltimer;", "=l", has_side_effects=True, asm_dialect=0, loc=loc, ip=ip
+        )
+    )
+
+
+@cute.jit
+def movmatrix_b16(input_regs: cute.Tensor) -> cute.Tensor:
+    """Transpose every packed m8n8 b16 register fragment across the warp."""
+    if cutlass.const_expr(input_regs.element_type.width != 32):
+        raise TypeError(f"movmatrix_b16 expects packed 32-bit registers, got {input_regs.element_type}.")
+
+    input_words = cute.coalesce(cute.flatten(cute.recast_tensor(input_regs, Int32)))
+    output_words = cute.make_rmem_tensor((cute.size(input_words),), Int32)
+    for word_idx in cutlass.range_constexpr(cute.size(input_words)):
+        output_words[word_idx] = Int32(
+            llvm.inline_asm(
+                T.i32(),
+                [Int32(input_words[word_idx]).ir_value()],
+                "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
+                "=r,r",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+        )
+
+    output_regs = cute.make_rmem_tensor(input_regs.layout, input_regs.element_type)
+    output_regs_words = cute.coalesce(cute.flatten(cute.recast_tensor(output_regs, Int32)))
+    for word_idx in cutlass.range_constexpr(cute.size(output_words)):
+        output_regs_words[word_idx] = output_words[word_idx]
+    return output_regs
+
+
+@dsl_user_op
+def cvt_f32_to_fp8_to_f32(
+    value, fp8_type, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> Float32:
+    """Round one f32 through the selected FP8 format and widen it back."""
+    if cutlass.const_expr(fp8_type is cutlass.Float8E8M0FNU):
+        downcast_instruction = "cvt.rp.satfinite.ue8m0x2.f32"
+        upcast_instruction = "cvt.rn.bf16x2.ue8m0x2"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E4M3FN):
+        downcast_instruction = "cvt.rn.satfinite.e4m3x2.f32"
+        upcast_instruction = "cvt.rn.bf16x2.e4m3x2"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E5M2):
+        downcast_instruction = "cvt.rn.satfinite.e5m2x2.f32"
+        upcast_instruction = "cvt.rn.bf16x2.e5m2x2"
+    else:
+        raise ValueError(f"Unsupported FP8 type {fp8_type}.")
+
+    packed_bf16 = llvm.inline_asm(
+        T.i32(),
+        [Float32(value).ir_value(loc=loc, ip=ip)],
+        "{\n"
+        "  .reg .b16 converted;\n"
+        f"  {downcast_instruction} converted, 0f00000000, $1;\n"
+        f"  {upcast_instruction} $0, converted;\n"
+        "}",
+        "=r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    bf16_pair_type = ir.Type.parse("vector<2xbf16>")
+    bf16_pair = llvm.bitcast(bf16_pair_type, packed_bf16, loc=loc, ip=ip)
+    rounded_bf16 = vector.extract(bf16_pair, [], [0], loc=loc, ip=ip)
+    return Float32(arith.extf(Float32.mlir_type, rounded_bf16, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def tma_load_1d(
+    destination_smem, source_gmem, mbarrier_smem, num_bytes, *, evict_first=True, loc=None, ip=None
+) -> None:
+    """Issue a 1D GMEM-to-SMEM bulk copy with an optional L2 eviction hint."""
+    operands = [
+        destination_smem.toint(loc=loc, ip=ip).ir_value(),
+        _address_value(source_gmem, loc=loc, ip=ip),
+        num_bytes.ir_value(),
+        mbarrier_smem.toint(loc=loc, ip=ip).ir_value(),
+    ]
+    instruction = "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+    constraints = "r,l,r,r"
+    addresses = "[$0], [$1], $2, [$3]"
+    if evict_first:
+        operands.append(Int64(TmaCacheHintEvictFirst).ir_value())
+        instruction += ".L2::cache_hint"
+        constraints += ",l"
+        addresses += ", $4"
+    llvm.inline_asm(
+        None,
+        operands,
+        instruction + " " + addresses + ";",
+        constraints,
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def store_i32_to_peer_cluster_smem_async(
+    smem_pointer,
+    value: Int32,
+    mbarrier_pointer,
+    destination_cta_rank,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Store one Int32 to peer SMEM and complete its transaction barrier."""
+    smem_address = llvm.ptrtoint(T.i32(), smem_pointer.llvm_ptr, loc=loc, ip=ip)
+    mbarrier_address = llvm.ptrtoint(T.i32(), mbarrier_pointer.llvm_ptr, loc=loc, ip=ip)
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            smem_address,
+            value.ir_value(loc=loc, ip=ip),
+            mbarrier_address,
+            Int32(destination_cta_rank).ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="""{{
+            .reg .u32 remote_addr;
+            .reg .u32 remote_mbar;
+            mapa.shared::cluster.u32 remote_addr, $0, $3;
+            mapa.shared::cluster.u32 remote_mbar, $2, $3;
+            st.async.shared::cluster.mbarrier::complete_tx::bytes.u32 [remote_addr], $1, [remote_mbar];
+        }}""",
+        constraints="r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbarrier_arrive_expect_tx_on_peer(
+    mbarrier_pointer,
+    transaction_bytes: Int32,
+    destination_cta_rank,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Declare an expected peer-CTA SMEM transaction."""
+    mbarrier_address = llvm.ptrtoint(T.i32(), mbarrier_pointer.llvm_ptr, loc=loc, ip=ip)
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            mbarrier_address,
+            Int32(destination_cta_rank).ir_value(loc=loc, ip=ip),
+            transaction_bytes.ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="""{{
+            .reg .u32 remote_mbar;
+            mapa.shared::cluster.u32 remote_mbar, $0, $1;
+            mbarrier.arrive.expect_tx.shared::cluster.b64 _, [remote_mbar], $2;
+        }}""",
+        constraints="r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_async_bulk_s2g(
+    destination_gmem,
+    source_smem,
+    num_bytes,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            _address_value(destination_gmem, loc=loc, ip=ip),
+            source_smem.toint(loc=loc, ip=ip).ir_value(),
+            num_bytes.ir_value(),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_reduce_async_bulk_add_bf16_s2g(
+    destination_gmem,
+    source_smem,
+    num_bytes,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            destination_gmem.toint(loc=loc, ip=ip).ir_value(),
+            source_smem.toint(loc=loc, ip=ip).ir_value(),
+            num_bytes.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16 [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def cp_reduce_async_bulk_add_u32_s2g(
+    destination_gmem,
+    source_smem,
+    num_bytes,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    llvm.inline_asm(
+        None,
+        [
+            destination_gmem.toint(loc=loc, ip=ip).ir_value(),
+            source_smem.toint(loc=loc, ip=ip).ir_value(),
+            num_bytes.ir_value(),
+        ],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.u32 [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def lds128_v4_b32(smem_pointer, *, loc=None, ip=None):
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [smem_pointer.toint(loc=loc, ip=ip).ir_value()],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), result, [index])) for index in range(4))
+
+
+@dsl_user_op
+def ldg_v4_b32(address: Int64, *, loc=None, ip=None):
+    """One 16-byte global load (``ld.global.v4.b32``); the four words are returned as ``Int32``."""
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [address.ir_value()],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), result, [index])) for index in range(4))
+
+
+@dsl_user_op
+def stg_v4_b32(address: Int64, word0: Int32, word1: Int32, word2: Int32, word3: Int32, *, loc=None, ip=None) -> None:
+    """One 16-byte global store (``st.global.v4.b32``) of four ``Int32`` words."""
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), word0.ir_value(), word1.ir_value(), word2.ir_value(), word3.ir_value()],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def stg_f32(address: Int64, value: Float32, predicate: Optional[Int32] = None, *, loc=None, ip=None) -> None:
+    if predicate is None:
+        llvm.inline_asm(
+            None,
+            [address.ir_value(), value.ir_value()],
+            "st.global.f32 [$0], $1;",
+            "l,f",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+        return
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value(), predicate.ir_value()],
+        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $2, 0;\n\t@p st.global.f32 [$0], $1;\n\t}",
+        "l,f,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def stg_b64(address: Int64, value: Int64, predicate: Optional[Int32] = None, *, loc=None, ip=None) -> None:
+    if predicate is None:
+        llvm.inline_asm(
+            None,
+            [address.ir_value(), value.ir_value()],
+            "st.global.u64 [$0], $1;",
+            "l,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+        return
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value(), predicate.ir_value()],
+        "{\n\t.reg .pred p;\n\tsetp.ne.s32 p, $2, 0;\n\t@p st.global.u64 [$0], $1;\n\t}",
+        "l,l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_relaxed_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "red.relaxed.sys.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_relaxed_sys_f32(
+    address, value: Float32, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> None:
+    llvm.inline_asm(
+        None,
+        [address.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        "red.relaxed.sys.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_release_sys_s32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "red.release.sys.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_release_gpu_s32(
+    counter_pointer, value: Int32, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> None:
+    llvm.inline_asm(
+        None,
+        [counter_pointer.toint(loc=loc, ip=ip).ir_value(), value.ir_value()],
+        "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_async_add_release_gpu_s32(
+    counter_pointer, value: Int32, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> None:
+    llvm.inline_asm(
+        None,
+        [counter_pointer.toint(loc=loc, ip=ip).ir_value(), value.ir_value()],
+        "red.async.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_async_add_release_sys_u32(address: Int64, value: Int32, *, loc=None, ip=None) -> None:
+    """Fire-and-forget cross-rank counter bump carrying its own release ordering.
+
+    The issuing warp does not wait for the L2/HBM round trip, and the release is
+    enforced by the memory system, so this replaces an explicit ``membar.sys``
+    followed by a relaxed reduction. ``u32`` rather than ``s32`` only because a
+    counter bump is the same two's-complement add either way and this is the
+    spelling already proven on this path.
+
+    Operands go through uniform registers, so the address must be warp-uniform:
+    a fan-out where lanes target different peers cannot use this.
+    """
+    llvm.inline_asm(
+        None,
+        [address.ir_value(), value.ir_value()],
+        "red.async.release.sys.global.add.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_relaxed_sys_v2_bf16x2(
+    address, value0, value1, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> None:
+    llvm.inline_asm(
+        None,
+        [address.toint(loc=loc, ip=ip).ir_value(), value0.ir_value(), value1.ir_value()],
+        "red.relaxed.sys.global.add.noftz.v2.bf16x2 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def f32x2_pack(lo, hi, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int64:
+    """Pack two f32 into one b64 f32x2 operand (low word ``lo``, high word ``hi``)."""
+    packed = llvm.inline_asm(
+        T.i64(),
+        [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+        "mov.b64 $0, {$1, $2};",
+        "=l,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(packed)
+
+
+@dsl_user_op
+def fma_rn_f32x2_bf16x2(
+    word, scale2, acc2, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> Int64:
+    """``acc2 + word * scale2`` on a packed bf16x2 / f32x2 pair (``fma.rn.f32x2.bf16x2.f32x2.f32x2``, one rounding
+    per lane; scale 1.0 gives an exact ``acc + bf16``)."""
+    result = llvm.inline_asm(
+        T.i64(),
+        [
+            Int32(word).ir_value(loc=loc, ip=ip),
+            Int64(scale2).ir_value(loc=loc, ip=ip),
+            Int64(acc2).ir_value(loc=loc, ip=ip),
+        ],
+        "fma.rn.f32x2.bf16x2.f32x2.f32x2 $0, $1, $2, $3;",
+        "=l,r,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int64(result)
+
+
+@dsl_user_op
+def cvt_rn_bf16x2_f32x2(acc2, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None) -> Int32:
+    """Round a packed f32x2 (low word -> low bf16 half) to one bf16x2 word with RN rounding (one F2FP)."""
+    packed = llvm.inline_asm(
+        T.i32(),
+        [Int64(acc2).ir_value(loc=loc, ip=ip)],
+        "{\n  .reg .f32 lo, hi;\n  mov.b64 {lo, hi}, $1;\n  cvt.rn.bf16x2.f32 $0, hi, lo;\n}",
+        "=r,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed)
+
+
+@cute.jit
+def cvt_f32x4_to_f8x4_pack_i32(fp32x4: cute.Tensor, fp8_type, *, loc=None, ip=None) -> Int32:
+    """Round four f32 lanes to the selected FP8 format and pack them into one i32."""
+    fp32x4 = fp32x4.load()
+    src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
+
+    src0 = Float32(vector.extract(src_vec4, [], [0])).ir_value(loc=loc, ip=ip)
+    src1 = Float32(vector.extract(src_vec4, [], [1])).ir_value(loc=loc, ip=ip)
+    src2 = Float32(vector.extract(src_vec4, [], [2])).ir_value(loc=loc, ip=ip)
+    src3 = Float32(vector.extract(src_vec4, [], [3])).ir_value(loc=loc, ip=ip)
+
+    if cutlass.const_expr(fp8_type is cutlass.Float8E8M0FNU):
+        cvt_instruction = "cvt.rp.satfinite.ue8m0x2.f32"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E4M3FN):
+        cvt_instruction = "cvt.rn.satfinite.e4m3x2.f32"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E5M2):
+        cvt_instruction = "cvt.rn.satfinite.e5m2x2.f32"
+    else:
+        raise ValueError(f"Unsupported FP8 type {fp8_type}.")
+
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [src0, src1, src2, src3],
+        "{\n"
+        "  .reg .b16 lo;\n"
+        "  .reg .b16 hi;\n"
+        f"  {cvt_instruction} lo, $2, $1;\n"
+        f"  {cvt_instruction} hi, $4, $3;\n"
+        "  mov.b32 $0, {lo, hi};\n"
+        "}",
+        "=r,f,f,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(packed_i32)
+
+
+@dsl_user_op
+def cvt_f32_to_ue8m0_raw_i32(
+    value,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Int32:
+    """Round one f32 up to a raw UE8M0 byte in the low bits of an i32."""
+    packed_scale = llvm.inline_asm(
+        T.i32(),
+        [Float32(value).ir_value(loc=loc, ip=ip)],
+        "{\n"
+        "  .reg .b16 sf2;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 sf2, 0f00000000, $1;\n"
+        "  cvt.u32.u16 $0, sf2;\n"
+        "}",
+        "=r,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed_scale)
+
+
+@cute.jit
+def cvt_f32x4_to_f8x4_scaled_pack_i32(
+    fp32x4: cute.Tensor,
+    fp8_type,
+    scale_raw_i32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Pack four f32 values to FP8 while dividing by one UE8M0 scale."""
+    fp32x4 = fp32x4.load()
+    src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
+    srcs = [Float32(vector.extract(src_vec4, [], [index])).ir_value(loc=loc, ip=ip) for index in range(4)]
+    scale_i32 = Int32(scale_raw_i32).ir_value(loc=loc, ip=ip)
+
+    if cutlass.const_expr(fp8_type is cutlass.Float8E4M3FN):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E5M2):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e5m2x2.f32"
+    else:
+        raise ValueError(f"Scaled FP8 conversion does not support {fp8_type}.")
+
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [*srcs, scale_i32],
+        "{\n"
+        "  .reg .b16 lo;\n"
+        "  .reg .b16 hi;\n"
+        "  .reg .b8 s;\n"
+        "  cvt.u8.u32 s, $5;\n"
+        f"  {cvt_instruction} lo, $2, $1, s;\n"
+        f"  {cvt_instruction} hi, $4, $3, s;\n"
+        "  mov.b32 $0, {lo, hi};\n"
+        "}",
+        "=r,f,f,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed_i32)
+
+
+@cute.jit
+def cvt_f32x4_to_f8x4_scaled4_pack_i32(
+    fp32x4: cute.Tensor,
+    fp8_type,
+    scales_packed_i32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Pack four f32 values to FP8 using four independent UE8M0 scales."""
+    fp32x4 = fp32x4.load()
+    src_vec4 = fp32x4.ir_value(loc=loc, ip=ip) if hasattr(fp32x4, "ir_value") else fp32x4
+    srcs = [Float32(vector.extract(src_vec4, [], [index])).ir_value(loc=loc, ip=ip) for index in range(4)]
+    scales_i32 = Int32(scales_packed_i32).ir_value(loc=loc, ip=ip)
+
+    if cutlass.const_expr(fp8_type is cutlass.Float8E4M3FN):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e4m3x2.f32"
+    elif cutlass.const_expr(fp8_type is cutlass.Float8E5M2):
+        cvt_instruction = "cvt.rn.satfinite.scaled::n1::ue8m0.e5m2x2.f32"
+    else:
+        raise ValueError(f"Scaled FP8 conversion does not support {fp8_type}.")
+
+    packed_i32 = llvm.inline_asm(
+        T.i32(),
+        [*srcs, scales_i32],
+        "{\n"
+        "  .reg .b8 s0, s1, s2, s3;\n"
+        "  .reg .b16 t0, t1, t2, t3;\n"
+        "  .reg .b32 e1, e2, e3, p01, p23;\n"
+        "  shr.u32 e1, $5, 8;\n"
+        "  shr.u32 e2, $5, 16;\n"
+        "  shr.u32 e3, $5, 24;\n"
+        "  cvt.u8.u32 s0, $5;\n"
+        "  cvt.u8.u32 s1, e1;\n"
+        "  cvt.u8.u32 s2, e2;\n"
+        "  cvt.u8.u32 s3, e3;\n"
+        f"  {cvt_instruction} t0, $1, $1, s0;\n"
+        f"  {cvt_instruction} t1, $2, $2, s1;\n"
+        f"  {cvt_instruction} t2, $3, $3, s2;\n"
+        f"  {cvt_instruction} t3, $4, $4, s3;\n"
+        "  mov.b32 p01, {t0, t1};\n"
+        "  mov.b32 p23, {t2, t3};\n"
+        "  prmt.b32 $0, p01, p23, 0x6420;\n"
+        "}",
+        "=r,f,f,f,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Int32(packed_i32)
+
+
+@dsl_user_op
+def stg_e8m0_from_f32(addr: Int64, fp32_val: Float32, *, loc=None, ip=None) -> None:
+    """Convert ``fp32_val`` to E8M0 via PTX and store the 1-byte result to global memory.
+
+    Uses ``cvt.rp.satfinite.ue8m0x2.f32`` -- the correct fp32 -> E8M0 path -- rather
+    than the DSL's generic ``.to(Float8E8M0FNU)``, which does not lower correctly for
+    the non-IEEE-754 E8M0 type.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(), fp32_val.ir_value()],
+        "{\n"
+        "  .reg .b16 bf_lo;\n"
+        "  .reg .u32 tmp;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 bf_lo, 0f00000000, $1;\n"
+        "  cvt.u32.u16 tmp, bf_lo;\n"
+        "  st.global.b8 [$0], tmp;\n"
+        "}",
+        "l,f",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def stg_e8m0x8_from_f32(
+    addr: Int64,
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Convert 8 fp32 values to E8M0 and store them as 8 contiguous bytes in one shot.
+
+    Batched form of ``stg_e8m0_from_f32``: four ``cvt.rp.satfinite.ue8m0x2.f32`` each
+    pack two E8M0 bytes, the four ``.b16`` results are assembled into two ``.b32`` words,
+    and a single ``st.global.v2.u32`` writes all 8 bytes. ``addr`` must be 8-byte aligned;
+    output byte ``k`` holds E8M0(``v{k}``).
+    """
+    llvm.inline_asm(
+        None,
+        [
+            addr.ir_value(),
+            v0.ir_value(),
+            v1.ir_value(),
+            v2.ir_value(),
+            v3.ir_value(),
+            v4.ir_value(),
+            v5.ir_value(),
+            v6.ir_value(),
+            v7.ir_value(),
+        ],
+        "{\n"
+        "  .reg .b16 p0, p1, p2, p3;\n"
+        "  .reg .b32 w0, w1;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p0, $2, $1;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p1, $4, $3;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p2, $6, $5;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 p3, $8, $7;\n"
+        "  mov.b32 w0, {p0, p1};\n"
+        "  mov.b32 w1, {p2, p3};\n"
+        "  st.global.v2.u32 [$0], {w0, w1};\n"
+        "}",
+        "l,f,f,f,f,f,f,f,f",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def barrier_sync_unaligned(barrier_id, num_threads, *, loc=None, ip=None):
+    """``barrier.cta.sync id, count`` without ``.aligned``: a named barrier whose participating warps
+    reach it from different code paths (the gen-phase gather rendezvous and TMEM allocation wait).
+
+    TODO(nvidia-cutlass-dsl 4.9): up to the 4.8 wheel ``cute.arch.barrier`` has no ``aligned`` switch and
+    always emits the ``.aligned`` form (``bar.sync``), although ``cute.arch.barrier_arrive`` already takes
+    ``aligned=False``; 4.9 closes that gap. When the project moves to the 4.9 wheel, switch the call sites
+    to ``cute.arch.barrier(..., aligned=False)`` and delete this helper.
+    """
+    llvm.inline_asm(
+        res=None,
+        operands_=[Int32(barrier_id).ir_value(loc=loc, ip=ip), Int32(num_threads).ir_value(loc=loc, ip=ip)],
+        asm_string="barrier.cta.sync $0, $1;",
+        constraints="r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+
+__all__ = [
+    "barrier_sync_unaligned",
+    "TmaCacheHintEvictFirst",
+    "cp_async_bulk_s2g",
+    "cp_reduce_async_bulk_add_bf16_s2g",
+    "cp_reduce_async_bulk_add_u32_s2g",
+    "cvt_f32_to_fp8_to_f32",
+    "cvt_f32_to_ue8m0_raw_i32",
+    "cvt_f32x4_to_f8x4_pack_i32",
+    "cvt_f32x4_to_f8x4_scaled4_pack_i32",
+    "cvt_f32x4_to_f8x4_scaled_pack_i32",
+    "exit",
+    "ldg_v4_b32",
+    "lds128_v4_b32",
+    "mbarrier_arrive_expect_tx_on_peer",
+    "movmatrix_b16",
+    "nanosleep",
+    "read_clock64",
+    "read_globaltimer_ns",
+    "red_add_relaxed_sys_f32",
+    "red_add_relaxed_sys_s32",
+    "red_add_relaxed_sys_v2_bf16x2",
+    "red_async_add_release_gpu_s32",
+    "red_async_add_release_sys_u32",
+    "red_add_release_gpu_s32",
+    "red_add_release_sys_s32",
+    "store_i32_to_peer_cluster_smem_async",
+    "stg_b64",
+    "stg_e8m0_from_f32",
+    "stg_e8m0x8_from_f32",
+    "stg_f32",
+    "stg_v4_b32",
+    "tma_load_1d",
+    "f32x2_pack",
+    "fma_rn_f32x2_bf16x2",
+    "cvt_rn_bf16x2_f32x2",
+]
+
+
+@dsl_user_op
+def max_abs_bf16x2(a, b, *, loc=None, ip=None) -> Int32:
+    """Packed magnitude max of two BF16x2."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
+            "max.xorsign.abs.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def red_min_relaxed_gpu_u32_from_f32_raw(addr: Int64, value: Float32, *, loc=None, ip=None) -> None:
+    """``red.relaxed.gpu.global.min.u32`` on the bit pattern of a non-negative f32.
+
+    PTX has no float min-reduce; for non-negative floats the u32 bit order
+    matches the float order, so a u32 min on the reinterpreted bits realises a
+    float min. The target slot must be seeded with a large positive sentinel
+    (e.g. ``Fp32Max``) and only fed non-negative candidates. Relaxed/GPU scope
+    suffices: a kernel boundary separates the reduction from its reader.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(), value.ir_value()],
+        "{ .reg .b32 t; mov.b32 t, $1; red.relaxed.gpu.global.min.u32 [$0], t; }",
+        "l,f",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def cvt_e2m1_to_fp32_cvt_ptx(e2m1_reg: cute.Tensor, fp32_reg: cute.Tensor) -> None:
+    """Decode via the e2m1->f16 HW cvt (``cvt.rn.f16x2.e2m1x2``) then widen f16->f32.
+
+    Safe baseline: the per-pair ``cvt`` instruction is itself a two-op hardware sequence, so
+    the e2m1->f16 step already avoids ALU normalization; f16->f32 is one cheap
+    ``cvt.f32.f16`` per element.
+    """
+    src_words = cute.recast_tensor(e2m1_reg, Int32)  # (N,) e2m1 -> (N/8,) b32
+    for w in cutlass.range_constexpr(cute.size(src_words)):
+        res = llvm.inline_asm(
+            llvm.StructType.get_literal([T.f32()] * 8),
+            [src_words[w].ir_value()],
+            "{\n"
+            "  .reg .b8  b0, b1, b2, b3;\n"
+            "  .reg .b32 p0, p1, p2, p3;\n"
+            "  .reg .b16 c0, d0, c1, d1, c2, d2, c3, d3;\n"
+            "  mov.b32 {b0, b1, b2, b3}, $8;\n"
+            "  cvt.rn.f16x2.e2m1x2 p0, b0;\n"
+            "  cvt.rn.f16x2.e2m1x2 p1, b1;\n"
+            "  cvt.rn.f16x2.e2m1x2 p2, b2;\n"
+            "  cvt.rn.f16x2.e2m1x2 p3, b3;\n"
+            "  mov.b32 {c0, d0}, p0;\n"
+            "  mov.b32 {c1, d1}, p1;\n"
+            "  mov.b32 {c2, d2}, p2;\n"
+            "  mov.b32 {c3, d3}, p3;\n"
+            "  cvt.f32.f16 $0, c0;\n"
+            "  cvt.f32.f16 $1, d0;\n"
+            "  cvt.f32.f16 $2, c1;\n"
+            "  cvt.f32.f16 $3, d1;\n"
+            "  cvt.f32.f16 $4, c2;\n"
+            "  cvt.f32.f16 $5, d2;\n"
+            "  cvt.f32.f16 $6, c3;\n"
+            "  cvt.f32.f16 $7, d3;\n"
+            "}",
+            "=f,=f,=f,=f,=f,=f,=f,=f,r",
+            has_side_effects=False,
+        )
+        for i in cutlass.range_constexpr(8):
+            fp32_reg[w * 8 + i] = Float32(llvm.extractvalue(T.f32(), res, [i]))
+
+
+@cute.jit
+def cvt_e2m1_to_fp32_optimal_ptx(e2m1_reg: cute.Tensor, fp32_reg: cute.Tensor) -> None:
+    """Decode via a register-resident bf16 LUT + byte permutes, landing fp32 directly.
+
+    The 8 e2m1 magnitudes ``{0,.5,1,1.5,2,3,4,6}`` are exact bf16, so a byte permute
+    byte-gather of the per-magnitude hi/lo bytes builds the bf16; ``fp32 =
+    bf16 << 16`` makes the widen free. Sign (nibble bit3) is spread to the 4
+    output-byte MSBs with one ``prmt`` of ``{word<<4, word}`` (selector 0x5140),
+    avoiding the non-uniform shift the 4-bit-vs-8-bit stride would otherwise need.
+    """
+    src_words = cute.recast_tensor(e2m1_reg, Int32)  # (N,) e2m1 -> (N/8,) b32
+    dst_words = cute.recast_tensor(fp32_reg, Int32)  # write fp32 bit patterns
+    for w in cutlass.range_constexpr(cute.size(src_words)):
+        res = llvm.inline_asm(
+            llvm.StructType.get_literal([T.i32()] * 8),
+            [src_words[w].ir_value()],
+            "{\n"
+            "  .reg .b32 ha, hb, la, lb, inh, wl, ih, il, hl, ll, hh, lh, sl, sh, p0, p1, p2, p3;\n"
+            "  mov.b32 ha, 0x3F3F3F00;\n"  # hi byte LUT, magnitudes 0..3
+            "  mov.b32 hb, 0x40404040;\n"  # hi byte LUT, magnitudes 4..7
+            "  mov.b32 la, 0xC0800000;\n"  # lo byte LUT, magnitudes 0..3
+            "  mov.b32 lb, 0xC0804000;\n"  # lo byte LUT, magnitudes 4..7
+            "  shr.b32 inh, $8, 16;\n"  # high 4 elements -> low 16 bits
+            "  and.b32 il, $8, 0x00007777;\n"  # low 4 magnitude indices (clear sign)
+            "  and.b32 ih, inh, 0x00007777;\n"  # high 4 magnitude indices
+            "  prmt.b32 hl, ha, hb, il;\n"  # hi bytes for e0..e3
+            "  prmt.b32 ll, la, lb, il;\n"  # lo bytes for e0..e3
+            "  prmt.b32 hh, ha, hb, ih;\n"  # hi bytes for e4..e7
+            "  prmt.b32 lh, la, lb, ih;\n"  # lo bytes for e4..e7
+            "  shl.b32 wl, $8, 4;\n"
+            "  prmt.b32 sl, wl, $8, 0x5140;\n"  # gather s0..s3 to byte MSBs
+            "  and.b32 sl, sl, 0x80808080;\n"
+            "  or.b32  hl, hl, sl;\n"
+            "  shl.b32 wl, inh, 4;\n"
+            "  prmt.b32 sh, wl, inh, 0x5140;\n"  # gather s4..s7 to byte MSBs
+            "  and.b32 sh, sh, 0x80808080;\n"
+            "  or.b32  hh, hh, sh;\n"
+            "  prmt.b32 p0, ll, hl, 0x5140;\n"  # {bf16(e0), bf16(e1)}
+            "  prmt.b32 p1, ll, hl, 0x7362;\n"  # {bf16(e2), bf16(e3)}
+            "  prmt.b32 p2, lh, hh, 0x5140;\n"  # {bf16(e4), bf16(e5)}
+            "  prmt.b32 p3, lh, hh, 0x7362;\n"  # {bf16(e6), bf16(e7)}
+            "  shl.b32 $0, p0, 16;\n"
+            "  and.b32 $1, p0, 0xFFFF0000;\n"
+            "  shl.b32 $2, p1, 16;\n"
+            "  and.b32 $3, p1, 0xFFFF0000;\n"
+            "  shl.b32 $4, p2, 16;\n"
+            "  and.b32 $5, p2, 0xFFFF0000;\n"
+            "  shl.b32 $6, p3, 16;\n"
+            "  and.b32 $7, p3, 0xFFFF0000;\n"
+            "}",
+            "=r,=r,=r,=r,=r,=r,=r,=r,r",
+            has_side_effects=False,
+        )
+        for i in cutlass.range_constexpr(8):
+            dst_words[w * 8 + i] = Int32(llvm.extractvalue(T.i32(), res, [i]))

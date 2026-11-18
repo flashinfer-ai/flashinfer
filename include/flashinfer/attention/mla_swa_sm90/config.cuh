@@ -66,9 +66,9 @@ struct ReducePolicy {
   static constexpr Arena MailboxArena = B != Reduce::DSM ? Arena::None
                                         : M == 8         ? Arena::DeadKV
                                                          : Arena::DeadQ;
-  static constexpr ReduceSync Synchronization = B != Reduce::DSM ? ReduceSync::None
-                                                : M == 32        ? ReduceSync::PerWGReadyAck
-                                                                 : ReduceSync::Cluster;
+  static constexpr ReduceSync Synchronization = B != Reduce::DSM       ? ReduceSync::None
+                                                : (M == 16 || M == 32) ? ReduceSync::PerWGReadyAck
+                                                                       : ReduceSync::Cluster;
   static constexpr int VectorWords = B != Reduce::DSM ? 0 : M == 8 ? 2 : 4;
 };
 template <class Shape, class Roles, class Schedule, class Merge>
@@ -79,8 +79,9 @@ struct AttentionTactic : Shape, Roles, Schedule, Merge {
   using ReduceTraits = Merge;
   static constexpr bool DenseRowMailbox = Shape::M == 8 && Merge::Payload == Mailbox::RowPacked &&
                                           (Shape::VSliceCount - Roles::QkPV) % Roles::PvWG == 0;
-  static constexpr int StorageKind = Shape::M == 8                   ? 0
-                                     : Shape::M == 16                ? 1
+  static constexpr int StorageKind = Shape::M == 8    ? 0
+                                     : Shape::M == 16 ? (Merge::Backend == Reduce::DSM ? 5 : 1)
+                                     : Schedule::LookAhead > 0       ? 6
                                      : Merge::Backend == Reduce::DSM ? 3
                                                                      : 2;
   static_assert((Merge::Backend == Reduce::Direct) == (Shape::S == 1));
@@ -89,20 +90,25 @@ struct AttentionTactic : Shape, Roles, Schedule, Merge {
        Schedule::LookAhead == 0 &&
        ((Shape::S == 3 && Merge::Backend == Reduce::DSM && Merge::Payload == Mailbox::RowPacked &&
          Merge::PartialFormat == PartialForm::Raw) ||
-        ((Shape::S == 5 || Shape::S == 9) && Merge::Backend == Reduce::GlobalFP32 &&
-         Merge::Payload == Mailbox::None && Merge::PartialFormat == PartialForm::Normalized))) ||
-          (Shape::M == 16 && Shape::S == 2 && Roles::PvWG == 4 && Roles::QkPV == 0 &&
-           Roles::Interleave && Schedule::LookAhead == 4 && Merge::Backend == Reduce::DSM &&
-           Merge::Payload == Mailbox::NaturalFragment &&
-           Merge::PartialFormat == PartialForm::Raw) ||
+        ((Shape::S == 3 || Shape::S == 5 || Shape::S == 9) &&
+         Merge::Backend == Reduce::GlobalFP32 && Merge::Payload == Mailbox::None &&
+         Merge::PartialFormat == PartialForm::Normalized))) ||
+          (Shape::M == 16 && Roles::PvWG == 4 && Roles::QkPV == 0 && Roles::Interleave &&
+           Schedule::LookAhead == 6 &&
+           ((Shape::S == 2 && Merge::Backend == Reduce::DSM &&
+             Merge::Payload == Mailbox::NaturalFragment &&
+             Merge::PartialFormat == PartialForm::Raw) ||
+            (Shape::S == 4 && Merge::Backend == Reduce::GlobalFP32 &&
+             Merge::Payload == Mailbox::None &&
+             Merge::PartialFormat == PartialForm::Normalized))) ||
           (Shape::M == 32 && Roles::PvWG == 3 && Roles::QkPV == 0 && !Roles::Interleave &&
-           Schedule::LookAhead == 0 &&
+           (Schedule::LookAhead == 0 || (Shape::S == 1 && Schedule::LookAhead == 2)) &&
            ((Shape::S == 1 && Merge::Backend == Reduce::Direct &&
              Merge::Payload == Mailbox::None) ||
             (Shape::S == 2 && Merge::Backend == Reduce::DSM &&
              Merge::Payload == Mailbox::NaturalFragment &&
              Merge::PartialFormat == PartialForm::Raw))),
-      "Only the six frozen tactics are supported; not an arbitrary parameter product");
+      "Only explicitly qualified tactics are supported; not an arbitrary parameter product");
 };
 template <int M, int S, int PV, int QKPV, bool Interleave, int K, Reduce B, Mailbox L,
           PartialForm F = PartialForm::Normalized>
@@ -141,10 +147,11 @@ struct EventTraits {
 };
 using M8S9 = KernelConfig<8, 9, 3, 1, false, 0, Reduce::GlobalFP32, Mailbox::None>;
 using M8S5 = KernelConfig<8, 5, 3, 1, false, 0, Reduce::GlobalFP32, Mailbox::None>;
-using M8S3 = KernelConfig<8, 3, 3, 1, false, 0, Reduce::DSM, Mailbox::RowPacked, PartialForm::Raw>;
+using M8S3 = KernelConfig<8, 3, 3, 1, false, 0, Reduce::GlobalFP32, Mailbox::None>;
 using M16S2 =
-    KernelConfig<16, 2, 4, 0, true, 4, Reduce::DSM, Mailbox::NaturalFragment, PartialForm::Raw>;
+    KernelConfig<16, 2, 4, 0, true, 6, Reduce::DSM, Mailbox::NaturalFragment, PartialForm::Raw>;
+using M16S4Global = KernelConfig<16, 4, 4, 0, true, 6, Reduce::GlobalFP32, Mailbox::None>;
 using M32S2 =
     KernelConfig<32, 2, 3, 0, false, 0, Reduce::DSM, Mailbox::NaturalFragment, PartialForm::Raw>;
-using M32S1 = KernelConfig<32, 1, 3, 0, false, 0, Reduce::Direct, Mailbox::None>;
+using M32S1 = KernelConfig<32, 1, 3, 0, false, 2, Reduce::Direct, Mailbox::None>;
 }  // namespace mla_swa

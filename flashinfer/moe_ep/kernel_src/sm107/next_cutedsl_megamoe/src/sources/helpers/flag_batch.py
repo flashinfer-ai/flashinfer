@@ -6,9 +6,17 @@ from typing import Any, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int32, Int64
+from cutlass.cutlass_dsl import Boolean, Int32, Int64
 
-from .ptx_helpers import red_add_release_gpu_s32, red_async_add_release_gpu_s32
+from ...common.ptx_helpers import red_add_release_gpu_s32, red_add_release_sys_s32, red_async_add_release_gpu_s32
+
+
+@cute.jit
+def _publishes(accumulated_flags: Int32, phase: Int32, next_phase: Any, flush_threshold: int) -> Boolean:
+    """Predict whether the next accumulation releases its batch."""
+    if cutlass.const_expr(flush_threshold == 1):
+        return Boolean(True)
+    return (accumulated_flags + Int32(1) == Int32(flush_threshold)) | (next_phase != phase)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -31,6 +39,16 @@ class GpuReleaseFlagBatchTracker:
         if self.flag_address != Int64(0):
             pointer = cute.make_ptr(cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4)
             red_add_release_gpu_s32(pointer, Int32(1))
+
+    @cute.jit
+    def drained(self) -> "GpuReleaseFlagBatchTracker":
+        """The tracker after an explicit ``fire()``: nothing held, so a later flush cannot publish it again."""
+        return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=self.phase)
+
+    @cute.jit
+    def publishes_on_accumulate(self, next_phase: Any, flush_threshold: int) -> Boolean:
+        """Covered writes must complete before an accumulation that publishes."""
+        return _publishes(self.accumulated_flags, self.phase, next_phase, flush_threshold)
 
     @cute.jit
     def accumulate(
@@ -60,6 +78,22 @@ class GpuReleaseFlagBatchTracker:
 
 
 @dataclasses.dataclass(frozen=True)
+class SysReleaseFlagBatchTracker(GpuReleaseFlagBatchTracker):
+    """Lane-distributed tracker whose counters are read by another rank's system-scope acquire.
+
+    Same batching as the GPU-scope tracker; ``fire`` publishes with
+    ``red.release.sys.global.add.s32`` so an FC2 row set written by ordinary STG becomes
+    visible to a node-local peer (or an RDMA reader) that acquires ``fc2_done`` at system
+    scope. Used by the internode communication component (design invariant I9).
+    """
+
+    @cute.jit
+    def fire(self) -> None:
+        if self.flag_address != Int64(0):
+            red_add_release_sys_s32(self.flag_address, Int32(1))
+
+
+@dataclasses.dataclass(frozen=True)
 class GpuAsyncReleaseFlagBatchTracker:
     """Loop-carried warp-uniform state for asynchronous GPU release counters."""
 
@@ -80,6 +114,16 @@ class GpuAsyncReleaseFlagBatchTracker:
             pointer = cute.make_ptr(cutlass.Int32, self.flag_address, AddressSpace.gmem, assumed_align=4)
             with cute.arch.elect_one():
                 red_async_add_release_gpu_s32(pointer, Int32(1))
+
+    @cute.jit
+    def drained(self) -> "GpuAsyncReleaseFlagBatchTracker":
+        """The tracker after an explicit ``fire()``: nothing held, so a later flush cannot publish it again."""
+        return self._make(flag_address=Int64(0), accumulated_flags=Int32(0), phase=self.phase)
+
+    @cute.jit
+    def publishes_on_accumulate(self, next_phase: Any, flush_threshold: int) -> Boolean:
+        """Covered writes must complete before an accumulation that publishes."""
+        return _publishes(self.accumulated_flags, self.phase, next_phase, flush_threshold)
 
     @cute.jit
     def accumulate(
@@ -130,4 +174,9 @@ def make_flag_batch_tracker(
     )
 
 
-__all__ = ["GpuAsyncReleaseFlagBatchTracker", "GpuReleaseFlagBatchTracker", "make_flag_batch_tracker"]
+__all__ = [
+    "GpuAsyncReleaseFlagBatchTracker",
+    "GpuReleaseFlagBatchTracker",
+    "SysReleaseFlagBatchTracker",
+    "make_flag_batch_tracker",
+]
