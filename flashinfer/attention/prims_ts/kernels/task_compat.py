@@ -157,7 +157,9 @@ if TS_TREE_WALKING_TASK:
             return (
                 work_tile_loop_node is not None
                 and len(nodes) == len(work_tile_loop_node.body)
-                and all(a is b for a, b in zip(nodes, work_tile_loop_node.body))
+                and all(
+                    a is b for a, b in zip(nodes, work_tile_loop_node.body, strict=True)
+                )
             )
 
         def _begin_work_tile(self, work_tile):
