@@ -53,6 +53,36 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #include <math_constants.h>
 
+#ifndef CAKE_MEGAMOE_ROUTE_TERM_WORDS_DEFINED
+#define CAKE_MEGAMOE_ROUTE_TERM_WORDS_DEFINED
+// Loads the eight route-term words of one 8-column group and waits until none of their 32-bit words is all ones,
+// i.e. until every expert owner's store has arrived (each word is single-copy atomic; owners store it once per forward).
+static __device__ __forceinline__ void cake_megamoe_wait_route_terms(const __nv_bfloat16* route_terms, uint4 (&words)[8]) {
+    #pragma unroll
+    for (int route_slot = 0; route_slot < 8; route_slot++) {
+        asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                     : "=r"(words[route_slot].x), "=r"(words[route_slot].y), "=r"(words[route_slot].z), "=r"(words[route_slot].w)
+                     : "l"(route_terms + route_slot * 3072) : "memory");
+    }
+    #pragma unroll
+    for (int route_slot = 0; route_slot < 8; route_slot++) {
+        while (words[route_slot].x == 0xFFFFFFFFu || words[route_slot].y == 0xFFFFFFFFu ||
+               words[route_slot].z == 0xFFFFFFFFu || words[route_slot].w == 0xFFFFFFFFu) {
+            __nanosleep(64);
+            asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(words[route_slot].x), "=r"(words[route_slot].y), "=r"(words[route_slot].z), "=r"(words[route_slot].w)
+                         : "l"(route_terms + route_slot * 3072) : "memory");
+        }
+    }
+}
+// Re-arms the eight route-term words of one group for the next forward (peers store them only after its rank barrier 0).
+static __device__ __forceinline__ void cake_megamoe_rearm_route_terms(__nv_bfloat16* route_terms) {
+    #pragma unroll
+    for (int route_slot = 0; route_slot < 8; route_slot++) {
+        asm volatile("st.global.v4.b32 [%0], {%1, %1, %1, %1};" :: "l"(route_terms + route_slot * 3072), "r"(0xFFFFFFFFu) : "memory");
+    }
+}
+#endif
 extern "C" {
 
 __global__ __launch_bounds__(128) void
@@ -74,13 +104,16 @@ kernel_cake_mxfp8_megamoe_ep16_2ce7cc644321f53ef127(__nv_bfloat16* __restrict__ 
         int hidden_tile = worker - token * 384;
         int column = hidden_tile * 8;
         unsigned long long route_base = (unsigned long long)token * 8 * 3072 + (unsigned long long)column;
+        // Peers store this token's route terms during the fused kernel; wait for all eight words of the group.
+        uint4 _route_words[8];
+        cake_megamoe_wait_route_terms(route_terms_bf16 + route_base, _route_words);
+        cake_megamoe_rearm_route_terms(route_terms_bf16 + route_base);
         float _vec_load_0[8];
         {
-            const uint4* _vptr_0 = reinterpret_cast<const uint4*>(route_terms_bf16 + route_base + 0);
             uint4 _vld_0[1];
             #pragma unroll
             for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_0[_blk] = _vptr_0[_blk];
+                _vld_0[_blk] = _route_words[0];
                 uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -103,11 +136,10 @@ kernel_cake_mxfp8_megamoe_ep16_2ce7cc644321f53ef127(__nv_bfloat16* __restrict__ 
         for (int route_slot = 1; route_slot < 8; route_slot++) {
             float _vec_load_1[8];
             {
-                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(route_terms_bf16 + (route_base + (unsigned long long)(route_slot * 3072)) + 0);
                 uint4 _vld_1[1];
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
-                    _vld_1[_blk] = _vptr_1[_blk];
+                    _vld_1[_blk] = _route_words[route_slot];
                     uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {

@@ -96,6 +96,7 @@ class _BlockSparseCompileKey:
     use_block_sparse: bool = True
     sage: SageAttentionConfig | None = None
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
+    scale_types: tuple[bool, bool] = (False, False)
 
 
 @dataclass(frozen=True)
@@ -562,6 +563,8 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "groups_tokens_heads_q": True,
         "use_block_sparse": key.use_block_sparse,
         "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
+        # Block-sparse and Sage plans compile for their exact lengths.
+        "fixed_seqlen": True,
     }
     if key.use_block_sparse:
         config_args.update(
@@ -645,6 +648,7 @@ def _resolve_block_sparse_launch_spec(
     v_dtype_key: str,
     sage: SageAttentionConfig | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    scale_types: tuple[bool, bool] = (False, False),
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -709,6 +713,7 @@ def _resolve_block_sparse_launch_spec(
         out_dtype_key=out_dtype_key,
         v_dtype_key=v_dtype_key,
         sage=sage,
+        scale_types=scale_types,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     try:

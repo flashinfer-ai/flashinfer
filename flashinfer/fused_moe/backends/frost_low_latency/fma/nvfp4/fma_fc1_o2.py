@@ -13,6 +13,7 @@ from flashinfer.cute_dsl.fp4_common import (
     cvt_f32_to_e4m3,
     cvt_e4m3_to_f32_via_f16,
     rcp_approx_ftz,
+    fdiv_rn,
 )
 
 from flashinfer.fused_moe.backends.frost_low_latency.fma.activations import (
@@ -57,6 +58,8 @@ def _routed_fc1_kernel(
     quant_global: cute.Tensor,
     activation: cutlass.Constexpr,
     gated: cutlass.Constexpr,
+    unified: cutlass.Constexpr = False,
+    parameters: cutlass.Constexpr = None,
 ):
     tid, _, _ = cute.arch.thread_idx()
     SCALE_COLS = cute.size(x, mode=[1]) // 8
@@ -76,6 +79,8 @@ def _routed_fc1_kernel(
     token = route // top_k
     slot = route - token * top_k
     expert = ids[token, slot]
+    if cutlass.const_expr(unified):
+        expert = expert.to(cutlass.Int64)
     smem = utils.SmemAllocator()
     intermediate_values = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout(16), byte_alignment=16
@@ -221,13 +226,13 @@ def _routed_fc1_kernel(
                 a = alpha[expert]
                 up = up * a
                 gate = gate * a
-                value = apply_activation(up, gate, activation, True)
+                value = apply_activation(up, gate, activation, True, parameters)
                 intermediate_values[warp * 2] = value.to(cutlass.BFloat16).to(
                     cutlass.Float32
                 )
                 up2 = up2 * a
                 gate2 = gate2 * a
-                value2 = apply_activation(up2, gate2, activation, True)
+                value2 = apply_activation(up2, gate2, activation, True, parameters)
                 intermediate_values[warp * 2 + 1] = value2.to(cutlass.BFloat16).to(
                     cutlass.Float32
                 )
@@ -250,11 +255,20 @@ def _routed_fc1_kernel(
         gs = quant_global[0]
         sf_bits = cvt_f32_to_e4m3(maximum * cutlass.Float32(1.0 / 6.0) * gs)
         sf_float = cvt_e4m3_to_f32_via_f16(sf_bits)
-        inverse = cutlass.Float32(0.0)
-        if maximum != 0.0:
-            inverse = gs * rcp_approx_ftz(sf_float)
-        for j in cutlass.range_constexpr(16):
-            values[j] = values[j] * inverse
+        if cutlass.const_expr(unified):
+            # An approximate reciprocal can move an exact E2M1 midpoint to
+            # its other neighbor. Preserve ties-to-even in the unified path.
+            for j in cutlass.range_constexpr(16):
+                value = cutlass.Float32(0.0)
+                if sf_float > 0.0:
+                    value = fdiv_rn(values[j] * gs, sf_float)
+                values[j] = value
+        else:
+            inverse = cutlass.Float32(0.0)
+            if maximum != 0.0:
+                inverse = gs * rcp_approx_ftz(sf_float)
+            for j in cutlass.range_constexpr(16):
+                values[j] = values[j] * inverse
         lo = cvt_e2m1x8_f32(
             values[0],
             values[1],

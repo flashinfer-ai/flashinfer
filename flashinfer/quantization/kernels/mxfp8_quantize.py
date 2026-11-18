@@ -35,7 +35,6 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint8
 
-from ...api_logging import flashinfer_api
 from ...cute_dsl.fp4_common import (
     fmax_f32,
     ld_global_v4_u32,
@@ -544,6 +543,8 @@ class MXFP8QuantizeSwizzledKernel:
 
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_wait()
+            # Launch consumers early; they still wait before dependent reads.
+            cute.arch.griddepcontrol_launch_dependents()
 
         # Compile-time constants
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
@@ -1307,7 +1308,6 @@ def _get_compiled_kernel_mxfp8_swizzled(
     return compiled_kernel, kernel_obj.rows_per_block
 
 
-@flashinfer_api
 def mxfp8_quantize_cute_dsl(
     input: torch.Tensor,
     is_sf_swizzled_layout: bool = True,

@@ -507,6 +507,25 @@ def apply_membership_words(reg_S, words, *, n_cols: int = None, mask_value: floa
     return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
 
 
+def apply_membership_fragment(reg_S, word, shift, bit_of_cell, *, mask_value: float = float("-inf")):
+    """``reg_S[c] if bit bit_of_cell[c] of (word >> shift) else mask_value`` over a lane's FRAGMENT of one 32-column membership WORD.
+
+    The ``mma.sync`` m16n8 C layout hands a lane the column pair ``2 t, 2 t + 1`` of every n8 block (rows ``g`` and ``g + 8``), so its cells of a
+    32-key tile are the word's bits ``8 nb + 2 t + e`` -- not the contiguous column order :func:`apply_membership_words` assumes.  ``shift`` is
+    each lane's RUNTIME part of the bit index (``8 nb + 2 t``, or ``2 t`` with the n-block folded into ``bit_of_cell``), ``bit_of_cell[c]`` the
+    compile-time remainder (``e``, or ``8 nb + e``).  Same op as the words form: ONE bit test + ONE ``arith.select`` per cell, the same
+    ``-inf`` default (a fully-masked tile's max is ``-inf`` under any scale), the same truth table, the same R2P + FSEL lowering; the word
+    itself is the caller's (the SM107 lean sparse decode tile builds ONE per 32-key sub-tile from the gathered block ids).  Trace-time helper
+    (plain Python over traced values); returns a Python list of ``Float32`` (constexpr-indexed) so the caller keeps its fragment slots."""
+    bits = word >> shift
+    neg_inf = cutlass.Float32(mask_value)
+    out = []
+    for c, b in enumerate(bit_of_cell):
+        keep = cutlass.Boolean(bits & _membership_bit(bits, int(b)))
+        out.append(cutlass.Float32(arith.select(keep.ir_value(), reg_S[c].ir_value(), neg_inf.ir_value())))
+    return out
+
+
 def apply_membership_chunk(reg_S, word_lo, word_hi, *, n: int = 64, mask_value: float = float("-inf")):
     """Per-CELL membership mask for a ``n``-wide chunk of scores: cell ``i`` KEEPS ``reg_S[i]``
     iff bit ``i`` of the 64-bit pair ``(word_lo, word_hi)`` is set, else becomes ``mask_value``.

@@ -374,23 +374,23 @@ kernel_cake_nvfp4_svdquant_gemm_db7820791092b67f10cd(const __grid_constant__ CUt
                     tcgen05_cp_32x128b_warpx4((tmem_tmem_sfb + 4), make_sf_cp_desc_lo_sbo256((((smem_sfb_addr) >> 4) + (mma_stage) * 1152 + 8)));
                 }
                 int init_flag = ((k_tile_mma == 0) ? 1 : 0);
-                int _smem_desc_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
-                int _smem_desc_lo_1 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
+                int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
+                int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
                 if (elect_sync()) {
                     {
-                        uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_0) | ((uint64_t)0x80004020 << 32);
-                        uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_1) | ((uint64_t)0x80004020 << 32);
+                        uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_0) | ((uint64_t)0x80004020 << 32);
+                        uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_0) | ((uint64_t)0x80004020 << 32);
 
                         tcgen05_mma_mxf4nvf4_bs(tmem_accum, a_desc + 0, b_desc + 0,
                             0x8200480U, tmem_tmem_sfa + 0, tmem_tmem_sfb + 0, ((init_flag) ? 0 : 1));
                     }
                 }
-                int _smem_desc_lo_2 = make_warp_uniform((((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 1152);
-                int _smem_desc_lo_3 = make_warp_uniform((((smem_b_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 1152);
+                int _mma_a_lo_1 = make_warp_uniform((((smem_a_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 1152);
+                int _mma_b_lo_1 = make_warp_uniform((((smem_b_addr + 32) >> 4) & 0x3FFF) + (mma_stage) * 1152);
                 if (elect_sync()) {
                     {
-                        uint64_t a_desc = ((uint64_t)(uint32_t)_smem_desc_lo_2) | ((uint64_t)0x80004020 << 32);
-                        uint64_t b_desc = ((uint64_t)(uint32_t)_smem_desc_lo_3) | ((uint64_t)0x80004020 << 32);
+                        uint64_t a_desc = ((uint64_t)(uint32_t)_mma_a_lo_1) | ((uint64_t)0x80004020 << 32);
+                        uint64_t b_desc = ((uint64_t)(uint32_t)_mma_b_lo_1) | ((uint64_t)0x80004020 << 32);
 
                         tcgen05_mma_mxf4nvf4_bs(tmem_accum, a_desc + 0, b_desc + 0,
                             0x8200480U, tmem_tmem_sfa + 4 + 0, tmem_tmem_sfb + 4 + 0, 1);
@@ -405,18 +405,18 @@ kernel_cake_nvfp4_svdquant_gemm_db7820791092b67f10cd(const __grid_constant__ CUt
                 mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                int _smem_desc_lo_4 = make_warp_uniform((((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
-                int _smem_desc_lo_5 = make_warp_uniform((((smem_l1_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
+                int _mma_a_lo_2 = make_warp_uniform((((smem_d_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
+                int _mma_b_lo_2 = make_warp_uniform((((smem_l1_addr) >> 4) & 0x3FFF) + (mma_stage) * 1152);
                 {
-                    uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_smem_desc_lo_4);
-                    uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_smem_desc_lo_5);
+                    uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
+                    uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x80004020U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 136316048, 1);
+                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
                     }
-                    incr_smem_desc_lo(_mma_ss_a_desc_6, 2U);
-                    incr_smem_desc_lo(_mma_ss_b_desc_6, 2U);
+                    incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                    incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
                     if (elect_sync()) {
-                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_6, _mma_ss_b_desc_6, 136316048, 1);
+                        tcgen05_mma_f16(tmem_accum, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
                     }
                 }
                 elect_commit(tma_empty_addr + (mma_stage) * 8);

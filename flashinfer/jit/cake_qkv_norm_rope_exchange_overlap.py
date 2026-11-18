@@ -17,15 +17,21 @@ JIT loader of the Cake fused QKV projection + norm + RoPE + head-exchange
 programs (SM90 / SM100 / SM103).
 
 ``PROGRAMS`` records every delivered program: its device and binding
-translation units, the architectures it compiles for, its compile flags, the
-launch block, the cluster shape, the dynamic shared memory and the positional
-argument names of its ``run`` launcher.  ``ROUTES`` maps, per architecture, the
+translation units, the architectures it compiles for, its compile flags (and,
+where a program is built from another program's sources, the compile
+definitions naming its kernel symbol and host namespace), the launch block,
+the cluster shape and the positional argument names of its ``run``
+launcher.  ``ROUTES`` maps, per architecture, the
 logical stage keys to programs: ``barrier_p0``, ``barrier_p1`` and ``wait`` on
 every architecture, ``producer_bn<bn>[_pair][_<variant>]`` for the producer of
 a tile width (``_pair``: the 2-CTA pair tile; ``<variant>``: a producer build
 other than the baseline -- ``ow256`` wide operand loads, ``bulk_ow256`` wide
-operand loads with bulk row stores, ``bulk`` bulk row stores alone -- the
-baseline build has no suffix), and -- where the architecture's default launch
+operand loads with bulk row stores, ``bulk`` bulk row stores alone, ``fma`` /
+``ow256_fma`` the baseline / ``ow256`` build with the epilogue FMA contraction --
+the baseline build has no suffix; an ``xb`` (placed before any ``_fma``) names the
+cross-destination-band build of the bn256 pair tile, whose two heads store to their
+own destinations),
+and -- where the architecture's default launch
 path folds the cross-rank rendezvous into the producer
 (``FOLD_BARRIER_DEFAULT_BY_ARCH``) --
 ``producer_bn<bn>[_pair][_<variant>]_fold<phase>`` for the producer builds that
@@ -63,13 +69,13 @@ from .core import (
 
 # Filled mechanically from the program bundle.
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_qkv_norm_rope_exchange_overlap_02b1f09c700c0c153a86": {
+    "cake_qkv_norm_rope_exchange_overlap_08b4ec6ca8fe801cdba6": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_02b1f09c700c0c153a86_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_02b1f09c700c0c153a86_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_08b4ec6ca8fe801cdba6_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_08b4ec6ca8fe801cdba6_binding.cu",
         ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--fmad=false"],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
         "args": [
             "A",
             "B",
@@ -92,21 +98,27 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "rank",
             "world",
             "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
             "grid_x",
             "grid_y",
             "grid_z",
         ],
-        "block": [192, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_binding.cu",
         ],
         "arches": ["sm_90a"],
         "compile_flags": [],
+        "defines": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a417cf321e06ca27",
+        ],
         "args": [
             "device_index",
             "pg_world",
@@ -118,15 +130,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [32, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
     },
     "cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_binding.cu",
         ],
         "arches": ["sm_90a"],
         "compile_flags": [],
+        "defines": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_66e5f8bc245a7df8",
+        ],
         "args": [
             "device_index",
             "pg_world",
@@ -138,47 +153,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [32, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_0f87d1e5925cd81d327b": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_0f87d1e5925cd81d327b_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_0f87d1e5925cd81d327b_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "pg_world",
-            "pg_rank",
-            "pg_flags",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [224, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
     "cake_qkv_norm_rope_exchange_overlap_170e1046f21fa0612b2c": {
         "sources": [
@@ -218,7 +192,45 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+    },
+    "cake_qkv_norm_rope_exchange_overlap_1a4676073d1e1f0c4e7c": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_1a4676073d1e1f0c4e7c_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_1a4676073d1e1f0c4e7c_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_1f991a087fec97c4af30": {
         "sources": [
@@ -258,15 +270,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_2005b8b40b1a4ee10ef9": {
+    "cake_qkv_norm_rope_exchange_overlap_20b9655b37c8cc1a8128": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2005b8b40b1a4ee10ef9_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2005b8b40b1a4ee10ef9_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_20b9655b37c8cc1a8128_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_20b9655b37c8cc1a8128_binding.cu",
         ],
-        "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--fmad=false"],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
         "args": [
             "A",
             "B",
@@ -296,9 +307,47 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_y",
             "grid_z",
         ],
-        "block": [224, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_220967b584a014db3557": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_220967b584a014db3557_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_220967b584a014db3557_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_27a9e2ff563af5644d27": {
         "sources": [
@@ -335,91 +384,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [192, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_2a944243ea81979c5d5c": {
+    "cake_qkv_norm_rope_exchange_overlap_2f881db3651c08a1edb3": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2a944243ea81979c5d5c_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2a944243ea81979c5d5c_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2f881db3651c08a1edb3_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2f881db3651c08a1edb3_binding.cu",
         ],
-        "arches": ["sm_90a"],
-        "compile_flags": [],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [384, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 196704,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_2b9c189b86ebb1d20c79": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2b9c189b86ebb1d20c79_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2b9c189b86ebb1d20c79_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "pg_world",
-            "pg_rank",
-            "pg_flags",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [224, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_2ecceb2f544e52504015": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2ecceb2f544e52504015_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_2ecceb2f544e52504015_binding.cu",
-        ],
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--fmad=false"],
         "args": [
             "A",
@@ -449,12 +420,47 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [192, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_338093757d2ad7fe7cf4": {
+    "cake_qkv_norm_rope_exchange_overlap_3094a974370107f84339": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_338093757d2ad7fe7cf4_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_338093757d2ad7fe7cf4_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3094a974370107f84339_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3094a974370107f84339_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_3257742d919b491f4aae": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3257742d919b491f4aae_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3257742d919b491f4aae_binding.cu",
         ],
         "arches": ["sm_90a"],
         "compile_flags": [],
@@ -480,21 +486,17 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "rank",
             "world",
             "ready_target",
-            "pg_world",
-            "pg_rank",
-            "pg_flags",
             "grid_x",
             "grid_y",
             "grid_z",
         ],
         "block": [384, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 196704,
     },
-    "cake_qkv_norm_rope_exchange_overlap_4054da4210fed46e7645": {
+    "cake_qkv_norm_rope_exchange_overlap_32620c22a094f607492a": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_4054da4210fed46e7645_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_4054da4210fed46e7645_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_32620c22a094f607492a_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_32620c22a094f607492a_binding.cu",
         ],
         "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--fmad=false"],
@@ -529,12 +531,47 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_45ed8ce8f57f3a656890": {
+    "cake_qkv_norm_rope_exchange_overlap_3fdf42576006370f39fe": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_45ed8ce8f57f3a656890_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_45ed8ce8f57f3a656890_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3fdf42576006370f39fe_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3fdf42576006370f39fe_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_41dd7e01db84e1d9667d": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_41dd7e01db84e1d9667d_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_41dd7e01db84e1d9667d_binding.cu",
         ],
         "arches": ["sm_103a"],
         "compile_flags": ["--fmad=false"],
@@ -568,36 +605,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
         "block": [224, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad_binding.cu",
-        ],
-        "arches": ["sm_90a"],
-        "compile_flags": [],
-        "args": [
-            "ready",
-            "num_words_total",
-            "slot_base",
-            "ready_target",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [128, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
     },
-    "cake_qkv_norm_rope_exchange_overlap_5d4bb6b19c2e690f3024": {
+    "cake_qkv_norm_rope_exchange_overlap_43335626f8ffc9da0753": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_5d4bb6b19c2e690f3024_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_5d4bb6b19c2e690f3024_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_43335626f8ffc9da0753_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_43335626f8ffc9da0753_binding.cu",
         ],
-        "arches": ["sm_90a"],
-        "compile_flags": [],
+        "arches": ["sm_100a"],
+        "compile_flags": ["--fmad=false"],
         "args": [
             "A",
             "B",
@@ -624,14 +640,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_y",
             "grid_z",
         ],
-        "block": [384, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 196672,
+        "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
     },
-    "cake_qkv_norm_rope_exchange_overlap_61a999397a049761ea60": {
+    "cake_qkv_norm_rope_exchange_overlap_4bb208363394bbe1ba10": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_61a999397a049761ea60_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_61a999397a049761ea60_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_4bb208363394bbe1ba10_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_4bb208363394bbe1ba10_binding.cu",
         ],
         "arches": ["sm_100a"],
         "compile_flags": ["--fmad=false"],
@@ -665,8 +680,102 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_z",
         ],
         "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "defines": [
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_a7ef2527018941cd",
+        ],
+        "args": [
+            "ready",
+            "num_words_total",
+            "slot_base",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [128, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
+    },
+    "cake_qkv_norm_rope_exchange_overlap_52dff5d42931489577b7": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_52dff5d42931489577b7_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_52dff5d42931489577b7_binding.cu",
+        ],
+        "arches": ["sm_100a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_65e67345daa9b209c90f": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_65e67345daa9b209c90f_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_65e67345daa9b209c90f_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_68b414261baeee963c2a": {
         "sources": [
@@ -706,7 +815,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
     "cake_qkv_norm_rope_exchange_overlap_69efd34074e608023116": {
         "sources": [
@@ -743,7 +851,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [192, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
     "cake_qkv_norm_rope_exchange_overlap_6cea4b1cead955382caa": {
         "sources": [
@@ -783,15 +890,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_70830c62a710866bb7c7": {
+    "cake_qkv_norm_rope_exchange_overlap_6d76652bfe1611e64e5b": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_70830c62a710866bb7c7_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_70830c62a710866bb7c7_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_6d76652bfe1611e64e5b_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_6d76652bfe1611e64e5b_binding.cu",
         ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--fmad=false"],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
         "args": [
             "A",
             "B",
@@ -821,9 +927,44 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_y",
             "grid_z",
         ],
-        "block": [224, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_6fbf29e0638937eef9e6": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_6fbf29e0638937eef9e6_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_6fbf29e0638937eef9e6_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_70a5b6a09569b80313de": {
         "sources": [
@@ -860,7 +1001,84 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [192, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+    },
+    "cake_qkv_norm_rope_exchange_overlap_7c386db5c9be3a19cb52": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_7c386db5c9be3a19cb52_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_7c386db5c9be3a19cb52_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_7cb284fc476225907d7d": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_7cb284fc476225907d7d_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_7cb284fc476225907d7d_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [1, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_85994b80021f37783cfb": {
         "sources": [
@@ -900,15 +1118,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_8f59df10e4d9f8889a6a": {
+    "cake_qkv_norm_rope_exchange_overlap_871ccca045fc7f972699": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_8f59df10e4d9f8889a6a_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_8f59df10e4d9f8889a6a_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_871ccca045fc7f972699_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_871ccca045fc7f972699_binding.cu",
         ],
-        "arches": ["sm_90a"],
-        "compile_flags": [],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--fmad=false"],
         "args": [
             "A",
             "B",
@@ -938,16 +1155,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_y",
             "grid_z",
         ],
-        "block": [384, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 196672,
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
     },
-    "cake_qkv_norm_rope_exchange_overlap_9342da14c254f5bc59c6": {
+    "cake_qkv_norm_rope_exchange_overlap_89d1233c458a834ce0e0": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_9342da14c254f5bc59c6_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_9342da14c254f5bc59c6_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_89d1233c458a834ce0e0_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_89d1233c458a834ce0e0_binding.cu",
         ],
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a"],
         "compile_flags": ["--fmad=false"],
         "args": [
             "A",
@@ -971,13 +1187,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "rank",
             "world",
             "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
             "grid_x",
             "grid_y",
             "grid_z",
         ],
-        "block": [192, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+        "block": [224, 1, 1],
+        "cluster": [1, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_9a0d9b341b5180f7e493": {
         "sources": [
@@ -1017,15 +1235,14 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_9eae0db2863a18c91274": {
+    "cake_qkv_norm_rope_exchange_overlap_a384f39b9493195df2ea": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_9eae0db2863a18c91274_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_9eae0db2863a18c91274_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_a384f39b9493195df2ea_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_a384f39b9493195df2ea_binding.cu",
         ],
-        "arches": ["sm_90a"],
-        "compile_flags": [],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--fmad=false"],
         "args": [
             "A",
             "B",
@@ -1055,9 +1272,8 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_y",
             "grid_z",
         ],
-        "block": [384, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 196704,
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_a4c464facca189a5a803": {
         "sources": [
@@ -1094,47 +1310,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [192, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_a80e15c6e7962bb6e449": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_a80e15c6e7962bb6e449_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_a80e15c6e7962bb6e449_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "pg_world",
-            "pg_rank",
-            "pg_flags",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [224, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
     "cake_qkv_norm_rope_exchange_overlap_b1937d956988deed0eda": {
         "sources": [
@@ -1171,7 +1346,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [192, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
     "cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312": {
         "sources": [
@@ -1191,17 +1365,36 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [128, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
     },
-    "cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2": {
+    "cake_qkv_norm_rope_exchange_overlap_b2363446fe5408369ea5": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b2363446fe5408369ea5_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b2363446fe5408369ea5_binding.cu",
         ],
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arches": ["sm_100a", "sm_103a"],
         "compile_flags": ["--fmad=false"],
         "args": [
-            "device_index",
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
             "pg_world",
             "pg_rank",
             "pg_flags",
@@ -1209,14 +1402,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "grid_y",
             "grid_z",
         ],
-        "block": [32, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
     },
-    "cake_qkv_norm_rope_exchange_overlap_b8d1d4c4f468ac997963": {
+    "cake_qkv_norm_rope_exchange_overlap_b41ecacfeae5cfc9b2ce": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b8d1d4c4f468ac997963_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b8d1d4c4f468ac997963_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b41ecacfeae5cfc9b2ce_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b41ecacfeae5cfc9b2ce_binding.cu",
         ],
         "arches": ["sm_100a"],
         "compile_flags": ["--fmad=false"],
@@ -1251,7 +1443,211 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+    },
+    "cake_qkv_norm_rope_exchange_overlap_b49d20914727930ecab0": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b49d20914727930ecab0_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b49d20914727930ecab0_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_b4d7a1e826acb55c8fd2": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b4d7a1e826acb55c8fd2_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b4d7a1e826acb55c8fd2_binding.cu",
+        ],
+        "arches": ["sm_100a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "device_index",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [32, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_b93ecea16ffca1706f83": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b93ecea16ffca1706f83_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_b93ecea16ffca1706f83_binding.cu",
+        ],
+        "arches": ["sm_100a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_bcccc4de3d4c90b2af90": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_bcccc4de3d4c90b2af90_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_bcccc4de3d4c90b2af90_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_c1469130dc3bcf4787ab": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c1469130dc3bcf4787ab_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c1469130dc3bcf4787ab_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_c1dab51f71ed9c0b7410": {
         "sources": [
@@ -1291,49 +1687,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_c320e77573b04a75ecd2": {
+    "cake_qkv_norm_rope_exchange_overlap_c863ef92d742649bc797": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c320e77573b04a75ecd2_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c320e77573b04a75ecd2_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [192, 1, 1],
-        "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_c7cccaf9e086af62f948": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c7cccaf9e086af62f948_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c7cccaf9e086af62f948_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c863ef92d742649bc797_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c863ef92d742649bc797_binding.cu",
         ],
         "arches": ["sm_90a"],
         "compile_flags": [],
@@ -1368,7 +1726,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [384, 1, 1],
         "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 196672,
     },
     "cake_qkv_norm_rope_exchange_overlap_c941e7d765074f1713d9": {
         "sources": [
@@ -1408,106 +1765,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
-    "cake_qkv_norm_rope_exchange_overlap_e484812469d655377101": {
+    "cake_qkv_norm_rope_exchange_overlap_cbce443c2f348baf11dd": {
         "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e484812469d655377101_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e484812469d655377101_binding.cu",
-        ],
-        "arches": ["sm_100a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [192, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_e75374f0daa1274b01f2": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e75374f0daa1274b01f2_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e75374f0daa1274b01f2_binding.cu",
-        ],
-        "arches": ["sm_103a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [192, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_binding.cu",
-        ],
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "device_index",
-            "pg_world",
-            "pg_rank",
-            "pg_flags",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [32, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 0,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_ee977d94a3c09de15cbf": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee977d94a3c09de15cbf_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee977d94a3c09de15cbf_binding.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_cbce443c2f348baf11dd_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_cbce443c2f348baf11dd_binding.cu",
         ],
         "arches": ["sm_103a"],
         "compile_flags": ["--fmad=false"],
@@ -1542,7 +1804,256 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
+    },
+    "cake_qkv_norm_rope_exchange_overlap_ce5ebc885a8a9b71ff9e": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ce5ebc885a8a9b71ff9e_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ce5ebc885a8a9b71ff9e_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_d3622f2980c1541d6507": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_d3622f2980c1541d6507_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_d3622f2980c1541d6507_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_e235dfbd1dbdfc6b436c": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e235dfbd1dbdfc6b436c_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e235dfbd1dbdfc6b436c_binding.cu",
+        ],
+        "arches": ["sm_100a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_e7bd90ff387370074a7a": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e7bd90ff387370074a7a_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e7bd90ff387370074a7a_binding.cu",
+        ],
+        "arches": ["sm_100a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_e8807b2a1e74eedaaf98": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e8807b2a1e74eedaaf98_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e8807b2a1e74eedaaf98_binding.cu",
+        ],
+        "arches": ["sm_90a"],
+        "compile_flags": [],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [384, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "device_index",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [32, 1, 1],
+        "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_f3e6772802b022dbc60a": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_f3e6772802b022dbc60a_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_f3e6772802b022dbc60a_binding.cu",
+        ],
+        "arches": ["sm_100a", "sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_f3ef71043fa04f37683f": {
         "sources": [
@@ -1582,47 +2093,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_f680859b58db85fe3dac": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_f680859b58db85fe3dac_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_f680859b58db85fe3dac_binding.cu",
-        ],
-        "arches": ["sm_103a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "pg_world",
-            "pg_rank",
-            "pg_flags",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [224, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
     "cake_qkv_norm_rope_exchange_overlap_f86aebd1e176ce36e6d2": {
         "sources": [
@@ -1662,85 +2132,56 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [224, 1, 1],
         "cluster": [2, 1, 1],
-        "dynamic_smem_bytes": 232448,
-    },
-    "cake_qkv_norm_rope_exchange_overlap_fcd50bf61b8135ffbbbd": {
-        "sources": [
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_fcd50bf61b8135ffbbbd_kernel.cu",
-            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_fcd50bf61b8135ffbbbd_binding.cu",
-        ],
-        "arches": ["sm_103a"],
-        "compile_flags": ["--fmad=false"],
-        "args": [
-            "A",
-            "B",
-            "cos_sin",
-            "q_scale",
-            "k_scale",
-            "tiles",
-            "dst_ptrs",
-            "ready_ptrs",
-            "counters",
-            "num_tiles",
-            "M",
-            "K",
-            "S_local",
-            "head_stride",
-            "batch_stride",
-            "slot_elem_offset",
-            "pad_base",
-            "num_words",
-            "rank",
-            "world",
-            "ready_target",
-            "pg_world",
-            "pg_rank",
-            "pg_flags",
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        ],
-        "block": [224, 1, 1],
-        "cluster": [1, 1, 1],
-        "dynamic_smem_bytes": 232448,
     },
 }
 ROUTES: dict[str, dict[str, str]] = {
     "sm_90a": {
         "barrier_p0": "cake_qkv_norm_rope_exchange_overlap_0cc6f56e47ebab3fdb82",
         "barrier_p1": "cake_qkv_norm_rope_exchange_overlap_092734d18ca9cefe21b8",
-        "producer_bn128": "cake_qkv_norm_rope_exchange_overlap_2a944243ea81979c5d5c",
-        "producer_bn128_fold0": "cake_qkv_norm_rope_exchange_overlap_9eae0db2863a18c91274",
-        "producer_bn128_fold1": "cake_qkv_norm_rope_exchange_overlap_338093757d2ad7fe7cf4",
-        "producer_bn256": "cake_qkv_norm_rope_exchange_overlap_5d4bb6b19c2e690f3024",
-        "producer_bn256_fold0": "cake_qkv_norm_rope_exchange_overlap_8f59df10e4d9f8889a6a",
-        "producer_bn256_fold1": "cake_qkv_norm_rope_exchange_overlap_c7cccaf9e086af62f948",
+        "producer_bn128": "cake_qkv_norm_rope_exchange_overlap_65e67345daa9b209c90f",
+        "producer_bn128_fold0": "cake_qkv_norm_rope_exchange_overlap_e8807b2a1e74eedaaf98",
+        "producer_bn128_fold1": "cake_qkv_norm_rope_exchange_overlap_c863ef92d742649bc797",
+        "producer_bn128_sw3": "cake_qkv_norm_rope_exchange_overlap_6fbf29e0638937eef9e6",
+        "producer_bn128_sw3_fold0": "cake_qkv_norm_rope_exchange_overlap_20b9655b37c8cc1a8128",
+        "producer_bn128_sw3_fold1": "cake_qkv_norm_rope_exchange_overlap_d3622f2980c1541d6507",
+        "producer_bn256": "cake_qkv_norm_rope_exchange_overlap_bcccc4de3d4c90b2af90",
+        "producer_bn256_fold0": "cake_qkv_norm_rope_exchange_overlap_1a4676073d1e1f0c4e7c",
+        "producer_bn256_fold1": "cake_qkv_norm_rope_exchange_overlap_6d76652bfe1611e64e5b",
+        "producer_bn256_sw3": "cake_qkv_norm_rope_exchange_overlap_3257742d919b491f4aae",
+        "producer_bn256_sw3_fold0": "cake_qkv_norm_rope_exchange_overlap_08b4ec6ca8fe801cdba6",
+        "producer_bn256_sw3_fold1": "cake_qkv_norm_rope_exchange_overlap_220967b584a014db3557",
         "wait": "cake_qkv_norm_rope_exchange_overlap_502e52054565032af6ad",
     },
     "sm_100a": {
         "barrier_p0": "cake_qkv_norm_rope_exchange_overlap_ee7af16c3fae716e45d2",
         "barrier_p1": "cake_qkv_norm_rope_exchange_overlap_b7fcf611d8f7bdc09ca2",
         "producer_bn128": "cake_qkv_norm_rope_exchange_overlap_b1937d956988deed0eda",
-        "producer_bn128_bulk_ow256": "cake_qkv_norm_rope_exchange_overlap_e484812469d655377101",
-        "producer_bn128_bulk_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_2b9c189b86ebb1d20c79",
-        "producer_bn128_bulk_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_61a999397a049761ea60",
+        "producer_bn128_bulk_ow256_fma": "cake_qkv_norm_rope_exchange_overlap_b93ecea16ffca1706f83",
+        "producer_bn128_bulk_ow256_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_e235dfbd1dbdfc6b436c",
+        "producer_bn128_bulk_ow256_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_89d1233c458a834ce0e0",
         "producer_bn128_fold0": "cake_qkv_norm_rope_exchange_overlap_c1dab51f71ed9c0b7410",
         "producer_bn128_fold1": "cake_qkv_norm_rope_exchange_overlap_9a0d9b341b5180f7e493",
         "producer_bn128_pair": "cake_qkv_norm_rope_exchange_overlap_a4c464facca189a5a803",
-        "producer_bn128_pair_bulk_ow256": "cake_qkv_norm_rope_exchange_overlap_02b1f09c700c0c153a86",
-        "producer_bn128_pair_bulk_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_0f87d1e5925cd81d327b",
-        "producer_bn128_pair_bulk_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_70830c62a710866bb7c7",
+        "producer_bn128_pair_bulk_ow256_fma": "cake_qkv_norm_rope_exchange_overlap_52dff5d42931489577b7",
+        "producer_bn128_pair_bulk_ow256_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_4bb208363394bbe1ba10",
+        "producer_bn128_pair_bulk_ow256_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_b41ecacfeae5cfc9b2ce",
         "producer_bn128_pair_fold0": "cake_qkv_norm_rope_exchange_overlap_170e1046f21fa0612b2c",
         "producer_bn128_pair_fold1": "cake_qkv_norm_rope_exchange_overlap_c941e7d765074f1713d9",
         "producer_bn256_pair": "cake_qkv_norm_rope_exchange_overlap_70a5b6a09569b80313de",
-        "producer_bn256_pair_bulk_ow256": "cake_qkv_norm_rope_exchange_overlap_2ecceb2f544e52504015",
-        "producer_bn256_pair_bulk_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_a80e15c6e7962bb6e449",
-        "producer_bn256_pair_bulk_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_b8d1d4c4f468ac997963",
+        "producer_bn256_pair_bulk_ow256_fma": "cake_qkv_norm_rope_exchange_overlap_43335626f8ffc9da0753",
+        "producer_bn256_pair_bulk_ow256_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_b4d7a1e826acb55c8fd2",
+        "producer_bn256_pair_bulk_ow256_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_e7bd90ff387370074a7a",
+        "producer_bn256_pair_fma": "cake_qkv_norm_rope_exchange_overlap_2f881db3651c08a1edb3",
+        "producer_bn256_pair_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_a384f39b9493195df2ea",
+        "producer_bn256_pair_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_7c386db5c9be3a19cb52",
         "producer_bn256_pair_fold0": "cake_qkv_norm_rope_exchange_overlap_1f991a087fec97c4af30",
         "producer_bn256_pair_fold1": "cake_qkv_norm_rope_exchange_overlap_68b414261baeee963c2a",
-        "producer_bn256_pair_ow256": "cake_qkv_norm_rope_exchange_overlap_c320e77573b04a75ecd2",
-        "producer_bn256_pair_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_4054da4210fed46e7645",
-        "producer_bn256_pair_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_2005b8b40b1a4ee10ef9",
+        "producer_bn256_pair_ow256_fma": "cake_qkv_norm_rope_exchange_overlap_3094a974370107f84339",
+        "producer_bn256_pair_ow256_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_871ccca045fc7f972699",
+        "producer_bn256_pair_ow256_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_ce5ebc885a8a9b71ff9e",
+        "producer_bn256_pair_ow256_xb_fma": "cake_qkv_norm_rope_exchange_overlap_f3e6772802b022dbc60a",
+        "producer_bn256_pair_ow256_xb_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_32620c22a094f607492a",
+        "producer_bn256_pair_ow256_xb_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_b2363446fe5408369ea5",
         "wait": "cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312",
     },
     "sm_103a": {
@@ -1749,21 +2190,27 @@ ROUTES: dict[str, dict[str, str]] = {
         "producer_bn128": "cake_qkv_norm_rope_exchange_overlap_b1937d956988deed0eda",
         "producer_bn128_fold0": "cake_qkv_norm_rope_exchange_overlap_c1dab51f71ed9c0b7410",
         "producer_bn128_fold1": "cake_qkv_norm_rope_exchange_overlap_9a0d9b341b5180f7e493",
-        "producer_bn128_ow256": "cake_qkv_norm_rope_exchange_overlap_e75374f0daa1274b01f2",
-        "producer_bn128_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_f680859b58db85fe3dac",
-        "producer_bn128_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_fcd50bf61b8135ffbbbd",
+        "producer_bn128_ow256_fma": "cake_qkv_norm_rope_exchange_overlap_3fdf42576006370f39fe",
+        "producer_bn128_ow256_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_7cb284fc476225907d7d",
+        "producer_bn128_ow256_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_41dd7e01db84e1d9667d",
         "producer_bn128_pair": "cake_qkv_norm_rope_exchange_overlap_a4c464facca189a5a803",
         "producer_bn128_pair_fold0": "cake_qkv_norm_rope_exchange_overlap_170e1046f21fa0612b2c",
         "producer_bn128_pair_fold1": "cake_qkv_norm_rope_exchange_overlap_c941e7d765074f1713d9",
-        "producer_bn128_pair_ow256": "cake_qkv_norm_rope_exchange_overlap_9342da14c254f5bc59c6",
-        "producer_bn128_pair_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_45ed8ce8f57f3a656890",
-        "producer_bn128_pair_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_ee977d94a3c09de15cbf",
+        "producer_bn128_pair_ow256_fma": "cake_qkv_norm_rope_exchange_overlap_c1469130dc3bcf4787ab",
+        "producer_bn128_pair_ow256_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_b49d20914727930ecab0",
+        "producer_bn128_pair_ow256_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_cbce443c2f348baf11dd",
         "producer_bn256_pair": "cake_qkv_norm_rope_exchange_overlap_70a5b6a09569b80313de",
+        "producer_bn256_pair_fma": "cake_qkv_norm_rope_exchange_overlap_2f881db3651c08a1edb3",
+        "producer_bn256_pair_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_a384f39b9493195df2ea",
+        "producer_bn256_pair_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_7c386db5c9be3a19cb52",
         "producer_bn256_pair_fold0": "cake_qkv_norm_rope_exchange_overlap_1f991a087fec97c4af30",
         "producer_bn256_pair_fold1": "cake_qkv_norm_rope_exchange_overlap_68b414261baeee963c2a",
-        "producer_bn256_pair_ow256": "cake_qkv_norm_rope_exchange_overlap_c320e77573b04a75ecd2",
-        "producer_bn256_pair_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_4054da4210fed46e7645",
-        "producer_bn256_pair_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_2005b8b40b1a4ee10ef9",
+        "producer_bn256_pair_ow256_fma": "cake_qkv_norm_rope_exchange_overlap_3094a974370107f84339",
+        "producer_bn256_pair_ow256_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_871ccca045fc7f972699",
+        "producer_bn256_pair_ow256_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_ce5ebc885a8a9b71ff9e",
+        "producer_bn256_pair_ow256_xb_fma": "cake_qkv_norm_rope_exchange_overlap_f3e6772802b022dbc60a",
+        "producer_bn256_pair_ow256_xb_fma_fold0": "cake_qkv_norm_rope_exchange_overlap_32620c22a094f607492a",
+        "producer_bn256_pair_ow256_xb_fma_fold1": "cake_qkv_norm_rope_exchange_overlap_b2363446fe5408369ea5",
         "wait": "cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312",
     },
     "sm_107a": {
@@ -1781,23 +2228,61 @@ ROUTES: dict[str, dict[str, str]] = {
 # Default producer build per architecture and world size (``""`` = the baseline build), filled mechanically from
 # the exporter's pins; ``default_producer_variant`` reads it.
 PRODUCER_VARIANT_DEFAULT_BY_ARCH_WORLD: dict[str, dict[int, str]] = {
-    "sm_90a": {2: "", 4: "", 8: ""},
-    "sm_100a": {2: "", 4: "ow256", 8: "bulk_ow256"},
-    "sm_103a": {2: "", 4: "ow256", 8: "ow256"},
+    "sm_90a": {2: "sw3", 4: "sw3", 8: "sw3"},
+    "sm_100a": {2: "fma", 4: "ow256_fma", 8: "bulk_ow256_fma"},
+    "sm_103a": {2: "fma", 4: "ow256_fma", 8: "ow256_fma"},
     "sm_107a": {2: "", 4: "bulk", 8: ""},
 }
 
 # Producer builds a route table may carry: the baseline build (``SHIPPED_VARIANT``) first, then wide (256-bit) operand
-# loads, wide operand loads with bulk row stores, and bulk row stores alone (the baseline operand loads).  Every
-# build stores identical bits; the wide-load builds read their ``cos_sin`` / norm-weight operands through 32-byte
-# aligned bases (``PRODUCER_VARIANT_OPERAND_LOAD_WIDTH``; the Cake backend checks the alignment).
-PRODUCER_VARIANTS: tuple[str, ...] = ("", "ow256", "bulk_ow256", "bulk")
+# loads, wide operand loads with bulk row stores, and bulk row stores alone (the baseline operand loads), then the
+# ``fma`` forms (below).  The builds without ``fma`` store identical bits; an ``fma`` build can differ from them
+# within the kernel's accuracy tolerance.  The wide-load builds read their ``cos_sin`` / norm-weight operands through
+# 32-byte aligned bases (``PRODUCER_VARIANT_OPERAND_LOAD_WIDTH``; the Cake backend checks the alignment).
+PRODUCER_VARIANTS: tuple[str, ...] = (
+    "",
+    "ow256",
+    "bulk_ow256",
+    "bulk",
+    "fma",
+    "ow256_fma",
+    "bulk_ow256_fma",
+    "sw3",
+)
 SHIPPED_VARIANT = ""
 PRODUCER_VARIANT_OPERAND_LOAD_WIDTH: dict[str, int] = {
     "": 128,
     "ow256": 256,
     "bulk_ow256": 256,
     "bulk": 128,
+    "fma": 128,
+    "ow256_fma": 256,
+    "bulk_ow256_fma": 256,
+    "sw3": 128,
+}
+# ``fma`` / ``ow256_fma`` / ``bulk_ow256_fma``: the baseline / ``ow256`` /
+# ``bulk_ow256`` build whose norm and RoPE epilogue contracts its multiply-adds into
+# single-rounding FMAs (not bit-identical to the build without it).  ``sw3`` (SM90):
+# the baseline build whose epilogue stages each head in shared memory and three
+# storer warps issue its stores, ticket and readiness publish (identical bits).
+# Cross-destination-band builds: ``<variant>_xb`` (``xb`` for the baseline build) is the ``XBAND_BLOCK_N`` pair
+# producer of build ``<variant>`` whose tiles span two destination bands (each head stores to its own destination,
+# ten-field tile table).  Not a selectable build of its own: the plan selects it per row.  It runs the staged row
+# stores, so a bulk build's cross-destination-band build is that of its staged twin (``XBAND_STAGED_VARIANT``:
+# ``bulk_ow256`` -> ``ow256_xb``, ``bulk`` -> ``xb``).  The ``_xb`` goes before a trailing ``_fma``
+# (``ow256_fma`` -> ``ow256_xb_fma``).
+XBAND_SUFFIX = "xb"
+_FMA_SUFFIX = "fma"
+XBAND_BLOCK_N = 256
+XBAND_STAGED_VARIANT: dict[str, str] = {
+    "": "",
+    "ow256": "ow256",
+    "bulk_ow256": "ow256",
+    "bulk": "",
+    "fma": "fma",
+    "ow256_fma": "ow256_fma",
+    "bulk_ow256_fma": "ow256_fma",
+    "sw3": "sw3",
 }
 
 SOURCE_PACKAGE = "cake_qkv_norm_rope_exchange_overlap"
@@ -1914,18 +2399,73 @@ def default_producer_variant(arch: str, world_size: int) -> str:
         ) from None
 
 
+def xband_variant(variant: str = SHIPPED_VARIANT) -> str:
+    """The cross-destination-band build of producer build ``variant``: ``<staged>_xb`` (``xb`` for the baseline
+    build), ``<staged>`` = ``XBAND_STAGED_VARIANT[variant]`` (the build without bulk row stores).  Its tiles are
+    ``XBAND_BLOCK_N`` pair tiles whose two heads carry their own destination and slot base."""
+
+    if _check_variant(variant) and is_xband_variant(variant):
+        raise ValueError(f"{variant!r} is already a cross-destination-band build")
+    head, fma = _split_fma(XBAND_STAGED_VARIANT[variant])
+    return _join_fma(f"{head}_{XBAND_SUFFIX}" if head else XBAND_SUFFIX, fma)
+
+
+def _split_fma(variant: str) -> tuple[str, bool]:
+    """``variant`` without its trailing ``fma`` token, and whether it had one."""
+
+    text = str(variant)
+    if text == _FMA_SUFFIX:
+        return "", True
+    if text.endswith(f"_{_FMA_SUFFIX}"):
+        return text[: -len(_FMA_SUFFIX) - 1], True
+    return text, False
+
+
+def _join_fma(head: str, fma: bool) -> str:
+    if not fma:
+        return head
+    return f"{head}_{_FMA_SUFFIX}" if head else _FMA_SUFFIX
+
+
+def is_xband_variant(variant: str) -> bool:
+    """Whether ``variant`` names a cross-destination-band build (``xb`` / ``<variant>_xb``)."""
+
+    head, _fma = _split_fma(variant)
+    return head == XBAND_SUFFIX or head.endswith(f"_{XBAND_SUFFIX}")
+
+
+def base_variant(variant: str) -> str:
+    """The staged producer build a cross-destination-band build runs (``variant`` itself for any other build)."""
+
+    head, fma = _split_fma(variant)
+    if head == XBAND_SUFFIX:
+        return _join_fma(SHIPPED_VARIANT, fma)
+    if head.endswith(f"_{XBAND_SUFFIX}"):
+        return _join_fma(head[: -len(XBAND_SUFFIX) - 1], fma)
+    return variant
+
+
 def _check_variant(variant: str) -> str:
-    if variant not in PRODUCER_VARIANTS:
+    if base_variant(variant) not in PRODUCER_VARIANTS or (
+        is_xband_variant(variant) and xband_variant(base_variant(variant)) != variant
+    ):
         raise ValueError(
-            f"producer build variant must be one of {PRODUCER_VARIANTS}, got {variant!r}"
+            f"producer build variant must be one of {PRODUCER_VARIANTS}, optionally with the "
+            f"cross-destination-band suffix _{XBAND_SUFFIX}, got {variant!r}"
         )
     return variant
 
 
 def producer_key(block_n: int, pair: bool, variant: str = SHIPPED_VARIANT) -> str:
-    """Route key of a producer build: ``producer_bn<bn>[_pair][_<variant>]``."""
+    """Route key of a producer build: ``producer_bn<bn>[_pair][_<variant>]``.  A cross-destination-band build
+    (:func:`xband_variant`) exists for the ``XBAND_BLOCK_N`` pair tile only."""
 
     suffix = f"_{variant}" if _check_variant(variant) else ""
+    if is_xband_variant(variant) and (int(block_n) != XBAND_BLOCK_N or not pair):
+        raise ValueError(
+            f"the cross-destination-band build {variant!r} is a block_n={XBAND_BLOCK_N} pair producer, got "
+            f"block_n={block_n} pair={pair}"
+        )
     return f"producer_bn{int(block_n)}{'_pair' if pair else ''}{suffix}"
 
 
@@ -2025,6 +2565,18 @@ def fold_producers_delivered(arch: str) -> bool:
     return any("_fold" in key for key in ROUTES.get(arch, {}))
 
 
+def has_xband_producer(
+    arch: str, variant: str = SHIPPED_VARIANT, *, fold: bool = False
+) -> bool:
+    """Whether the cross-destination-band build of producer build ``variant`` is delivered on ``arch`` (``fold``:
+    both rendezvous phases of its folded producer as well)."""
+
+    xb = xband_variant(variant)
+    return has_producer(arch, XBAND_BLOCK_N, True, xb) and (
+        not fold or has_fold_producer(arch, XBAND_BLOCK_N, True, xb)
+    )
+
+
 def delivered_producer_variants(arch: str, block_n: int, pair: bool) -> tuple[str, ...]:
     """The producer builds delivered for one tile width and pair flag on ``arch``, in :data:`PRODUCER_VARIANTS`
     order (``""`` names the baseline build)."""
@@ -2108,7 +2660,13 @@ def spec(program: str, arch: str) -> JitSpec:
     return gen_jit_spec(
         name=f"{SOURCE_PACKAGE}_{arch}_{program}",
         sources=[_source_path(relative) for relative in record["sources"]],
-        extra_cuda_cflags=[*ARCH_FLAGS[arch], *record["compile_flags"]],
+        # ``defines``: the compile definitions of a program built from another
+        # program's sources (its kernel symbol and host-shim namespace).
+        extra_cuda_cflags=[
+            *ARCH_FLAGS[arch],
+            *record["compile_flags"],
+            *record.get("defines", []),
+        ],
         extra_include_paths=_include_paths(),
         # The source build carries its own math flags in ``compile_flags``
         # (no fast math); the default ``-use_fast_math`` would change them.
@@ -2119,26 +2677,6 @@ def spec(program: str, arch: str) -> JitSpec:
 @functools.cache
 def load(program: str, arch: str):
     return spec(program, arch).build_and_load()
-
-
-def launch_block(program: str) -> tuple[int, int, int]:
-    block = PROGRAMS[program]["block"]
-    return (int(block[0]), int(block[1]), int(block[2]))
-
-
-def cluster_dims(program: str) -> tuple[int, int, int]:
-    cluster = PROGRAMS[program]["cluster"]
-    return (int(cluster[0]), int(cluster[1]), int(cluster[2]))
-
-
-def dynamic_smem_bytes(program: str) -> int:
-    return int(PROGRAMS[program]["dynamic_smem_bytes"])
-
-
-def launcher_args(program: str) -> tuple[str, ...]:
-    """Positional argument names of the program's ``run`` launcher."""
-
-    return tuple(PROGRAMS[program]["args"])
 
 
 __all__ = [
@@ -2158,23 +2696,25 @@ __all__ = [
     "STAGE_KEYS",
     "SUPPORTED_WORLD_SIZES",
     "SUPPORTED_WORLD_SIZES_BY_ARCH",
+    "XBAND_BLOCK_N",
+    "XBAND_STAGED_VARIANT",
+    "XBAND_SUFFIX",
     "DeviceFacts",
     "ProducerKey",
     "barrier_flag_words",
     "barrier_program",
-    "cluster_dims",
+    "base_variant",
     "default_fold_barrier",
     "default_producer_variant",
     "delivered_producer_variants",
     "device_facts",
-    "dynamic_smem_bytes",
     "fold_producer_key",
     "fold_producer_program",
     "fold_producers_delivered",
     "has_fold_producer",
     "has_producer",
-    "launch_block",
-    "launcher_args",
+    "has_xband_producer",
+    "is_xband_variant",
     "load",
     "parse_producer_key",
     "producer_key",
@@ -2183,4 +2723,5 @@ __all__ = [
     "spec",
     "supported_world_sizes",
     "wait_program",
+    "xband_variant",
 ]

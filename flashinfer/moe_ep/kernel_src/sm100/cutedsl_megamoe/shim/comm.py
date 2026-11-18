@@ -181,6 +181,8 @@ class _CompiledMega:
     launch_key: Optional[tuple] = None
     launch_kwargs: Optional[dict] = None
     launch_output: Optional[torch.Tensor] = None
+    col_quant_data: Optional[torch.Tensor] = None
+    col_quant_sf: Optional[torch.Tensor] = None
 
 
 def _zero_local_workspace_preserving_phase(mega: _CompiledMega) -> None:

@@ -148,7 +148,7 @@ class Sm100W4A16MegaMoEKernel:
         acc_dtype=cutlass.Float32,
         in_kernel_fc2_reduce=False,
         token_back_mode="epi_warps",
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         gate_up_clamp=None,
         epi_flag_batch=(1, 1),
         flag_batch=1,
@@ -159,12 +159,26 @@ class Sm100W4A16MegaMoEKernel:
         swiglu_beta=None,
         situ_beta=None,
         situ_linear_beta=None,
+        batch_invariant=False,
     ):
+        self.batch_invariant = batch_invariant
+        if batch_invariant:
+            from flashinfer.fused_moe.cute_dsl.blackwell import moe_w4a16_utils
+
+            if not moe_w4a16_utils._HAS_DIRECT_FP4_TO_BF16_CVT:
+                raise ValueError(
+                    "W4A16 batch_invariant requires the native BF16 weight decoder "
+                    "available with CUDA 13.2 or newer"
+                )
+        if batch_invariant and (
+            in_kernel_fc2_reduce or mma_tiler_mnk != (256, 128, 256)
+        ):
+            raise ValueError("W4A16 BI requires external reduction and M256/N128/K256")
         if not force_static_sched or scenario != "2Dx3D":
             raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
         if load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError("Unsupported W4A16 load_balance_mode.")
-        self.apply_topk_in_fc1 = apply_topk_in_fc1
+        self.apply_routing_weights_before_fc2 = apply_routing_weights_before_fc2
         if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
             raise ValueError(
                 "W4A16 supports epi_warps or reuse_dispatch_warps token return."
@@ -235,7 +249,12 @@ class Sm100W4A16MegaMoEKernel:
         self.num_topk = num_topk
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden = hidden
-        self.topk_reduce = Bf16TopkReduce(hidden, num_topk)
+        self.topk_reduce = Bf16TopkReduce(
+            hidden,
+            num_topk,
+            batch_invariant=batch_invariant,
+            num_experts=world_size * static_expert_shape[0],
+        )
         self.num_experts_per_rank = static_expert_shape[0]
         self.num_total_experts = world_size * self.num_experts_per_rank
         self.intermediate_gateup = gateup
@@ -310,6 +329,26 @@ class Sm100W4A16MegaMoEKernel:
     def name(self):
         m, n, k = self.mma_tiler
         cm, cn = self.cluster_shape_mn
+        bi_suffix = ""
+        if self.batch_invariant:
+            import hashlib
+            from flashinfer.moe_ep.batch_invariant.activation_variants import (
+                ActivationVariant,
+            )
+
+            variant = ActivationVariant(
+                "w4a16",
+                "situ" if self.situ_beta is not None else "swiglu",
+                self.swiglu_alpha,
+                self.swiglu_beta,
+                self.situ_beta,
+                self.situ_linear_beta,
+                self.gate_up_clamp,
+            )
+            bi_suffix = (
+                "_bi1_act"
+                + hashlib.sha256(repr(variant.signature).encode()).hexdigest()[:16]
+            )
         return (
             f"megamoe_w4a16_{m}x{n}x{k}_cluster{cm}x{cn}_{self.load_balance_mode}"
             f"_expert{self.static_expert_shape}_group{self.group_hint}"
@@ -320,7 +359,12 @@ class Sm100W4A16MegaMoEKernel:
             f"_swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}"
             f"_situb{self.situ_beta}_situlinb{self.situ_linear_beta}"
             + ("_ikr" if self.in_kernel_fc2_reduce else "")
-            + ("_topk_fc1" if self.apply_topk_in_fc1 else "")
+            + (
+                "_routing_weights_before_fc2"
+                if self.apply_routing_weights_before_fc2
+                else ""
+            )
+            + bi_suffix
         )
 
     def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
@@ -771,7 +815,7 @@ class Sm100W4A16MegaMoEKernel:
             cluster_shape_mn=self.cluster_shape_mn,
             token_back_by_dispatch=self.token_back_by_dispatch,
             in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=self.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(self.apply_routing_weights_before_fc2),
             epi_flag_batch=self.epi_flag_batch,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
@@ -779,6 +823,7 @@ class Sm100W4A16MegaMoEKernel:
             swiglu_beta=self.swiglu_beta,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            batch_invariant=self.batch_invariant,
         )
         assert self.epilogue.acc_tmem_cols * self.num_acc_stage == mix.num_acc_tmem_cols
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -991,7 +1036,7 @@ class Sm100W4A16MegaMoEKernel:
         # Match the existing swapped Mega dynamic-N split in both FC phases.
         # Only two-CTA MMA splits B at align16(valid)/2. One-CTA
         # MMA consumes the full routed-N tile, multicast across the cluster.
-        if cutlass.const_expr(self.use_2cta_instrs):
+        if cutlass.const_expr(self.use_2cta_instrs and not self.batch_invariant):
             if cute.arch.block_idx()[0] % 2 != 0:
                 shift = dynamic_mainloop.compute_non_leader_cta_load_shift(
                     valid_tokens_in_tile=work.valid_tokens_in_cta_tile,
@@ -1055,7 +1100,7 @@ class Sm100W4A16MegaMoEKernel:
         if worker_idx < num_workers:
             token_idx, hidden_tile_idx = self.topk_reduce._prepare_bf16_worker(
                 None
-                if cutlass.const_expr(self.apply_topk_in_fc1)
+                if cutlass.const_expr(self.apply_routing_weights_before_fc2)
                 else token_comm_args.input_topk_weights_buffer,
                 score_reg,
                 worker_idx,
@@ -1434,7 +1479,14 @@ class Sm100W4A16MegaMoEKernel:
                             a_frag_tile=a_frag[(None, None, None, a_state.index)],
                             b_frag_tile=b_frag[(None, None, None, b_state.index)],
                             k_tile_idx=k_tile,
-                            valid_tokens_in_tile=work.valid_tokens_in_cta_tile,
+                            # BI fixes the actual instruction N, not merely
+                            # the maximum allocation. The paired TMA split
+                            # above also stays at its canonical N/2 boundary.
+                            valid_tokens_in_tile=(
+                                cutlass.Int32(self.mma_tiler[1])
+                                if cutlass.const_expr(self.batch_invariant)
+                                else work.valid_tokens_in_cta_tile
+                            ),
                             mma_tiler_mnk=self.mma_tiler,
                         )
                         iket.range_pop()
@@ -1517,7 +1569,7 @@ class Sm100W4A16MegaMoEKernel:
             not self.in_kernel_fc2_reduce and reduced_output is not None
         ):
             score_reg = None
-            if cutlass.const_expr(not self.apply_topk_in_fc1):
+            if cutlass.const_expr(not self.apply_routing_weights_before_fc2):
                 score_reg = cute.make_rmem_tensor(
                     (self.num_topk,), token_comm_args.input_topk_weights_buffer.dtype
                 )
@@ -1588,6 +1640,7 @@ class Sm100W4A16MegaMoEKernel:
                     "transform_decode_nvfp4_to_bf16",
                     (work.phase << 16) | work.expert_idx,
                 )
+                # MegaMoE consumes every padded MMA K column in the last stage.
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
                     raw_state, transform_state = self.mixed_fc1._transform_tile(
                         raw_pipe,
@@ -1595,7 +1648,8 @@ class Sm100W4A16MegaMoEKernel:
                         raw_state,
                         transform_state,
                         *parts_fc1,
-                        cutlass.Int32(self._fc1_k_tiles),
+                        self._fc1_k_tiles * self.mma_tiler[2],
+                        transform_group_idx,
                     )
                 else:
                     raw_state, transform_state = self.mixed_fc2._transform_tile(
@@ -1604,7 +1658,8 @@ class Sm100W4A16MegaMoEKernel:
                         raw_state,
                         transform_state,
                         *parts_fc2,
-                        cutlass.Int32(self._fc2_k_tiles),
+                        self._fc2_k_tiles * self.mma_tiler[2],
+                        transform_group_idx,
                     )
                 iket.range_pop()
                 iket.range_push("transform_wait_sched_record")
@@ -1676,12 +1731,15 @@ class Sm100W4A16MegaMoEKernel:
                     self.topk_reduce._reduce_bf16_worker(
                         combine,
                         None
-                        if cutlass.const_expr(self.apply_topk_in_fc1)
+                        if cutlass.const_expr(self.apply_routing_weights_before_fc2)
                         else token_comm_args.input_topk_weights_buffer,
                         reduced_output,
                         token_idx,
                         hidden_tile_idx,
                         score_reg,
+                        token_comm_args.topk_idx
+                        if cutlass.const_expr(self.batch_invariant)
+                        else None,
                     )
                     iket.range_pop()
                     worker_idx += worker_stride
@@ -1689,7 +1747,9 @@ class Sm100W4A16MegaMoEKernel:
                         token_idx, hidden_tile_idx = (
                             self.topk_reduce._prepare_bf16_worker(
                                 None
-                                if cutlass.const_expr(self.apply_topk_in_fc1)
+                                if cutlass.const_expr(
+                                    self.apply_routing_weights_before_fc2
+                                )
                                 else token_comm_args.input_topk_weights_buffer,
                                 score_reg,
                                 worker_idx,

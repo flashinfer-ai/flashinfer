@@ -14,37 +14,19 @@
  * limitations under the License.
  */
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long uint64_t;
+#include "cake_hopper_msa_device.h"
+
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags set the knob values below (a knob without a -D flag is a compile error) and name
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel).
+//   CAKE_L2_EVICT_FIRST  1 = K/V TMA loads carry the L2 evict-first cache hint; 0 = plain loads
+#ifndef CAKE_L2_EVICT_FIRST
+#error "CAKE_L2_EVICT_FIRST must come from the record's compile_flags"
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(64) CakeTensorMap64 {
-  uint64_t opaque[16];
-};
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
-#include <cuda.h>
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL (the program's kernel symbol) must come from the record's compile_flags"
 #endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-#define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_KV8_OFF 1024
 #define SMEM_KV8_STAGE_BYTES 32768
@@ -74,87 +56,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint32_t elect_sync() {
-  uint32_t pred = 0;
-  asm volatile(
-      "{\n\t"
-      ".reg .pred %%px;\n\t"
-      "elect.sync _|%%px, %1;\n\t"
-      "@%%px mov.s32 %0, 1;\n\t"
-      "}\n"
-      : "+r"(pred)
-      : "r"(0xFFFFFFFF));
-  return pred;
-}
-
-__device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
-}
-
-// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
-// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
-// explicit loop still makes this helper blocking until acquire succeeds.
-__device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-  asm volatile(
-      "{\n\t"
-      ".reg .pred P1;\n\t"
-      "LAB_WAIT:\n\t"
-      "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1;\n\t"
-      "@P1 bra.uni DONE;\n\t"
-      "bra.uni LAB_WAIT;\n\t"
-      "DONE:\n\t"
-      "}\n" ::"r"(mbar_addr),
-      "r"(phase)
-      : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;" ::"r"(mbar_addr),
-      "r"(bytes)
-      : "memory");
-}
-
-__device__ __forceinline__ float approx_exp2(float x) {
-  float y;
-  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
-__device__ __forceinline__ float approx_rcp(float x) {
-  float y;
-  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-  return y;
-}
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-  float c;
-  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-  return c;
-}
-
-__device__ __forceinline__ void cp_async_bulk_gmem2smem(unsigned smem_addr, const void* gmem_ptr,
-                                                        unsigned bytes, int mbar_addr) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
-      " [%0], [%1], %2, [%3];" ::"r"(smem_addr),
-      "l"(gmem_ptr), "r"(bytes), "r"(mbar_addr)
-      : "memory");
-}
-
-__device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
-  uint32_t result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(result) : "r"(val));
-  return result;
-}
-
 extern "C" {
 
-__global__
-__launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_5d570a1e487133c6dca6(
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void CAKE_PROGRAM_KERNEL(
     unsigned int* __restrict__ Q32, const __grid_constant__ CUtensorMap K,
     const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O,
     int* __restrict__ q2k_indices, int* __restrict__ page_table, int* __restrict__ seqused_k,
@@ -297,6 +201,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_5d570a1e48
     if (warp == 1) {
       if (elect_sync()) {
         mbarrier_arrive_expect_tx(kv_full_addr, 32768);
+#if CAKE_L2_EVICT_FIRST
         asm volatile(
             "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
             " [%0], [%1, {%2, %3, %4}], [%5], %6;" ::"r"(kv8_addr),
@@ -319,6 +224,12 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_5d570a1e48
             "l"((&V)), "r"(0), "r"(64), "r"(page_head), "r"(kv_full_addr),
             "l"(0x12F0000000000000ULL)
             : "memory");
+#else
+        tma_3d_gmem2smem(kv8_addr, (&K), 0, 0, page_head, kv_full_addr);
+        tma_3d_gmem2smem(kv8_addr + 8192, (&K), 0, 64, page_head, kv_full_addr);
+        tma_3d_gmem2smem(kv8_addr + 16384, (&V), 0, 0, page_head, kv_full_addr);
+        tma_3d_gmem2smem(kv8_addr + 24576, (&V), 0, 64, page_head, kv_full_addr);
+#endif
       }
     }
   }
@@ -795,6 +706,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_5d570a1e48
       if (warp == 1) {
         if (elect_sync()) {
           mbarrier_arrive_expect_tx(kv_full_addr + 8, 32768);
+#if CAKE_L2_EVICT_FIRST
           asm volatile(
               "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_"
               "hint"
@@ -823,6 +735,12 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_5d570a1e48
               "l"((&V)), "r"(0), "r"(64), "r"(page_head_1), "r"(kv_full_addr + 8),
               "l"(0x12F0000000000000ULL)
               : "memory");
+#else
+          tma_3d_gmem2smem(kv8_addr + 32768, (&K), 0, 0, page_head_1, kv_full_addr + 8);
+          tma_3d_gmem2smem(kv8_addr + 32768 + 8192, (&K), 0, 64, page_head_1, kv_full_addr + 8);
+          tma_3d_gmem2smem(kv8_addr + 32768 + 16384, (&V), 0, 0, page_head_1, kv_full_addr + 8);
+          tma_3d_gmem2smem(kv8_addr + 32768 + 24576, (&V), 0, 64, page_head_1, kv_full_addr + 8);
+#endif
         }
       }
     }
@@ -1947,6 +1865,7 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_5d570a1e48
       if (warp == 1) {
         if (elect_sync()) {
           mbarrier_arrive_expect_tx(kv_full_addr + (stage) * 8, 32768);
+#if CAKE_L2_EVICT_FIRST
           asm volatile(
               "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_"
               "hint"
@@ -1979,6 +1898,16 @@ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void kernel_cake_hopper_msa_5d570a1e48
               "l"((&V)), "r"(0), "r"(64), "r"(page_head_2_1), "r"(kv_full_addr + (stage) * 8),
               "l"(0x12F0000000000000ULL)
               : "memory");
+#else
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768), (&K), 0, 0, page_head_2_1,
+                           kv_full_addr + (stage) * 8);
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 8192, (&K), 0, 64,
+                           page_head_2_1, kv_full_addr + (stage) * 8);
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 16384, (&V), 0, 0,
+                           page_head_2_1, kv_full_addr + (stage) * 8);
+          tma_3d_gmem2smem(kv8_addr + (unsigned int)(stage * 32768) + 24576, (&V), 0, 64,
+                           page_head_2_1, kv_full_addr + (stage) * 8);
+#endif
         }
       }
     }

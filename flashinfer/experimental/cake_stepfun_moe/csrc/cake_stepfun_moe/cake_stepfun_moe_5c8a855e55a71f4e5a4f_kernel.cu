@@ -18,22 +18,6 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_stepfun_moe_device_common.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 16
-#define TMEM_ACCUM_OFFSET 0
-#define NUM_K_PIPE_STAGES 6
-#define NUM_OUT_PIPE_STAGES 1
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 32768
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 197632
-#define SMEM_SMEM_B_STAGE_BYTES 4096
-#define SMEM_SMEM_B_STRIDE 4096
-#define SMEM_EPI_STAGING_OFF 222208
-#define SMEM_EPI_STAGING_STAGE_BYTES 1024
-#define SMEM_EPI_STAGING_STRIDE 1024
-#define SMEM_TOTAL 223232
-#define THREADS 256
 #define BLOCK_N 16
 #define BLOCK_K 256
 #define LAUNCH_MIN_BLOCKS 1
@@ -74,19 +58,20 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_a_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 197632);
     const int smem_b_addr = smem + 197632;
     uint16_t* epi_staging = reinterpret_cast<uint16_t*>(smem_raw + 222208);
     const int epi_staging_addr = smem + 222208;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (__syncthreads_and(((int)blockIdx.y >> 1) + ((int)blockIdx.y & 1) * (grid_n - 1 - 2 * ((int)blockIdx.y >> 1)) >= num_non_exiting_ctas[0])) return;
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 19 barriers)
-    // Mbarriers at smem_raw[0..152)
+    // Mbarrier init (19 barriers at smem_raw[0..152))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -134,10 +119,8 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: epilogue ----
     if (warp <= 3) {
@@ -153,11 +136,11 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
             float sc = scale_c[expert];
             float sg = scale_gate[expert];
             float cl = clamp_limit[expert];
-            float _sub_0;
-            asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(0.0f), "f"(cl));
-            float neg_cl = _sub_0;
+            float neg_cl;
+            asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(neg_cl) : "f"(0.0f), "f"(cl));
             float quad[4] = {0};
-            float fused = mul_f32_rn_ftz(1.4426950216293335f, sg);
+            float fused;
+            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(fused) : "f"(1.442695f), "f"(sg));
             unsigned int _phase_mma_full_0 = 0;
             mbarrier_wait(mma_full_addr, _phase_mma_full_0);
             _phase_mma_full_0 ^= 1;
@@ -193,80 +176,68 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
                 float x1_11 = _tmem_load_1[token_group * 4 + 3];
                 float _max_0;
                 asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_0) : "f"(x0_00), "f"(neg_cl));
-                float _min_0;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_0) : "f"(_max_0), "f"(cl));
-                float x0c_00 = _min_0;
+                float x0c_00;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_00) : "f"(_max_0), "f"(cl));
                 float _max_1;
                 asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_1) : "f"(x0_01), "f"(neg_cl));
-                float _min_1;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_1) : "f"(_max_1), "f"(cl));
-                float x0c_01 = _min_1;
+                float x0c_01;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_01) : "f"(_max_1), "f"(cl));
                 float _max_2;
                 asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_2) : "f"(x0_10), "f"(neg_cl));
-                float _min_2;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_2) : "f"(_max_2), "f"(cl));
-                float x0c_10 = _min_2;
+                float x0c_10;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_10) : "f"(_max_2), "f"(cl));
                 float _max_3;
                 asm("max.ftz.f32 %0, %1, %2;" : "=f"(_max_3) : "f"(x0_11), "f"(neg_cl));
-                float _min_3;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_3) : "f"(_max_3), "f"(cl));
-                float x0c_11 = _min_3;
-                float _fma_0;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(x0c_00), "f"(sg), "f"(0.0f));
-                float lin_00 = _fma_0;
-                float _fma_1;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_1) : "f"(x0c_01), "f"(sg), "f"(0.0f));
-                float lin_01 = _fma_1;
-                float _fma_2;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_2) : "f"(x0c_10), "f"(sg), "f"(0.0f));
-                float lin_10 = _fma_2;
-                float _fma_3;
-                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(_fma_3) : "f"(x0c_11), "f"(sg), "f"(0.0f));
-                float lin_11 = _fma_3;
-                float _sub_1;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_1) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_00, fused)));
-                float _exp2_0 = approx_exp2(_sub_1);
-                float _add_0;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(1.0f), "f"(_exp2_0));
-                float _rcp_0 = approx_rcp(_add_0);
-                float sig_00 = _rcp_0;
-                float _sub_2;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_2) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_01, fused)));
-                float _exp2_1 = approx_exp2(_sub_2);
-                float _add_1;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(1.0f), "f"(_exp2_1));
-                float _rcp_1 = approx_rcp(_add_1);
-                float sig_01 = _rcp_1;
-                float _sub_3;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_3) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_10, fused)));
-                float _exp2_2 = approx_exp2(_sub_3);
-                float _add_2;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(1.0f), "f"(_exp2_2));
-                float _rcp_2 = approx_rcp(_add_2);
-                float sig_10 = _rcp_2;
-                float _sub_4;
-                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_4) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_11, fused)));
-                float _exp2_3 = approx_exp2(_sub_4);
-                float _add_3;
-                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_3) : "f"(1.0f), "f"(_exp2_3));
-                float _rcp_3 = approx_rcp(_add_3);
-                float sig_11 = _rcp_3;
-                float _min_4;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_4) : "f"(mul_f32_rn_ftz(x1_00, sig_00)), "f"(cl));
-                float act_00 = _min_4;
-                float _min_5;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_5) : "f"(mul_f32_rn_ftz(x1_01, sig_01)), "f"(cl));
-                float act_01 = _min_5;
-                float _min_6;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_6) : "f"(mul_f32_rn_ftz(x1_10, sig_10)), "f"(cl));
-                float act_10 = _min_6;
-                float _min_7;
-                asm("min.ftz.f32 %0, %1, %2;" : "=f"(_min_7) : "f"(mul_f32_rn_ftz(x1_11, sig_11)), "f"(cl));
-                float act_11 = _min_7;
-                float y_00 = mul_f32_rn_ftz(lin_00, act_00);
-                float y_10 = mul_f32_rn_ftz(lin_10, act_10);
-                float y_01 = mul_f32_rn_ftz(lin_01, act_01);
-                float y_11 = mul_f32_rn_ftz(lin_11, act_11);
+                float x0c_11;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(x0c_11) : "f"(_max_3), "f"(cl));
+                float lin_00;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_00) : "f"(x0c_00), "f"(sg), "f"(0.0f));
+                float lin_01;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_01) : "f"(x0c_01), "f"(sg), "f"(0.0f));
+                float lin_10;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_10) : "f"(x0c_10), "f"(sg), "f"(0.0f));
+                float lin_11;
+                asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(lin_11) : "f"(x0c_11), "f"(sg), "f"(0.0f));
+                float _sub_6;
+                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_6) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_00, fused)));
+                float _exp2_5 = approx_exp2(_sub_6);
+                float _add_4;
+                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_4) : "f"(1.0f), "f"(_exp2_5));
+                float sig_00 = approx_rcp(_add_4);
+                float _sub_9;
+                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_9) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_01, fused)));
+                float _exp2_8 = approx_exp2(_sub_9);
+                float _add_7;
+                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_7) : "f"(1.0f), "f"(_exp2_8));
+                float sig_01 = approx_rcp(_add_7);
+                float _sub_12;
+                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_12) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_10, fused)));
+                float _exp2_11 = approx_exp2(_sub_12);
+                float _add_10;
+                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_10) : "f"(1.0f), "f"(_exp2_11));
+                float sig_10 = approx_rcp(_add_10);
+                float _sub_15;
+                asm("sub.rn.ftz.f32 %0, %1, %2;" : "=f"(_sub_15) : "f"(0.0f), "f"(mul_f32_rn_ftz(x1_11, fused)));
+                float _exp2_14 = approx_exp2(_sub_15);
+                float _add_13;
+                asm("add.rn.ftz.f32 %0, %1, %2;" : "=f"(_add_13) : "f"(1.0f), "f"(_exp2_14));
+                float sig_11 = approx_rcp(_add_13);
+                float act_00;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_00) : "f"(mul_f32_rn_ftz(x1_00, sig_00)), "f"(cl));
+                float act_01;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_01) : "f"(mul_f32_rn_ftz(x1_01, sig_01)), "f"(cl));
+                float act_10;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_10) : "f"(mul_f32_rn_ftz(x1_10, sig_10)), "f"(cl));
+                float act_11;
+                asm("min.ftz.f32 %0, %1, %2;" : "=f"(act_11) : "f"(mul_f32_rn_ftz(x1_11, sig_11)), "f"(cl));
+                float y_00;
+                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_00) : "f"(lin_00), "f"(act_00));
+                float y_10;
+                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_10) : "f"(lin_10), "f"(act_10));
+                float y_01;
+                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_01) : "f"(lin_01), "f"(act_01));
+                float y_11;
+                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(y_11) : "f"(lin_11), "f"(act_11));
                 quad[0] = mul_f32_rn_ftz(y_00, sc);
                 quad[1] = mul_f32_rn_ftz(y_10, sc);
                 quad[2] = mul_f32_rn_ftz(y_01, sc);
@@ -390,11 +361,10 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
         { // mma_main
             unsigned int stage_2 = 0;
             unsigned int _phase_a_full = 0;
-            unsigned int _phase_b_full = 0;
             #pragma unroll 1
             for (int iter_k_2 = 0; iter_k_2 < K_tiles; iter_k_2++) {
                 mbarrier_wait(a_full_addr + (stage_2) * 8, _phase_a_full);
-                mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_b_full);
+                mbarrier_wait(b_full_addr + (stage_2) * 8, _phase_a_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_a_lo_0 = make_warp_uniform((((smem_a_addr) >> 4) & 0x3FFF) + (stage_2) * 2048);
                 int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x3FFF) + (stage_2) * 256);
@@ -426,7 +396,7 @@ kernel_cake_stepfun_moe_5c8a855e55a71f4e5a4f(const __grid_constant__ CUtensorMap
                     elect_commit(k_done_addr + (stage_2) * 8);
                 }
                 stage_2 += 1;
-                if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+                if (stage_2 == 6) { stage_2 = 0; _phase_a_full ^= 1; }
             }
         }
     }

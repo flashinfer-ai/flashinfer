@@ -2825,6 +2825,8 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
         row_route_offsets=torch.zeros(2, dtype=torch.int32),
         route_workspace=torch.zeros(4, dtype=torch.int32),
         page_size=None,
+        sm_scale=1.0 / math.sqrt(_HEAD_DIM),
+        output_scale=1.0,
     )
     q = torch.empty((1, 8, 8, _HEAD_DIM), dtype=torch.float16)
     k = torch.empty((1, 64, 1, _HEAD_DIM), dtype=torch.float16)
@@ -2950,6 +2952,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             None,  # v_scale
             None,  # v_mean
             1.25,
+            1.0,
         )
     ]
 
@@ -3021,6 +3024,7 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
             19,
             23,
             1.25,
+            1.0,
         )
     ]
 
@@ -3708,21 +3712,21 @@ def _paged_one_shot_metadata_abi_cases() -> list[object]:
             "seq_lens_kv",
             lambda: torch.tensor([[64]], **cuda_i32),
             ValueError,
-            "seq_lens must be one-dimensional",
+            "seq_lens_kv must be one-dimensional",
             id="seq_lens_kv-rank",
         ),
         pytest.param(
             "seq_lens_kv",
             lambda: torch.tensor([64], device="cuda", dtype=torch.int64),
             TypeError,
-            "seq_lens must have dtype torch.int32",
+            "seq_lens_kv must have dtype torch.int32",
             id="seq_lens_kv-dtype",
         ),
         pytest.param(
             "seq_lens_kv",
             lambda: torch.tensor([64], dtype=torch.int32),
             ValueError,
-            "seq_lens must be a CUDA tensor",
+            "seq_lens_kv must be a CUDA tensor",
             id="seq_lens_kv-device",
         ),
         pytest.param(
@@ -5898,75 +5902,6 @@ def test_dense_contiguous_plan_rejects_unsupported_arguments(
         block_sparse_module.BlockSparseTSWrapper().plan(**{**arguments, **overrides})
 
 
-def test_dense_static_profile_defaults_to_128_token_blocks() -> None:
-    """A dense plan may omit its block sizes; a block-sparse plan must name both."""
-
-    arguments: dict[str, object] = dict(
-        batch_size=1,
-        seq_len_q=256,
-        seq_len_kv=1024,
-        num_qo_heads=8,
-        num_kv_heads=8,
-        head_dim=_HEAD_DIM,
-        use_kv_valid_bits=False,
-        mask_type="dense",
-        q_dtype=torch.bfloat16,
-        kv_dtype=None,
-        output_dtype=None,
-    )
-    validate = block_sparse_module._validate_block_sparse_static_profile
-    dense = validate(
-        **arguments, q_block_size=None, kv_block_size=None, use_block_sparse=False
-    )
-    assert (dense.q_block_size, dense.kv_block_size) == (128, 128)
-    partial = validate(
-        **arguments, q_block_size=64, kv_block_size=None, use_block_sparse=False
-    )
-    assert (partial.q_block_size, partial.kv_block_size) == (64, 128)
-    with pytest.raises(ValueError, match="required by a block-sparse plan"):
-        validate(
-            **arguments,
-            q_block_size=None,
-            kv_block_size=64,
-            max_blocks_per_row=1,
-            use_block_sparse=True,
-        )
-
-
-@_REQUIRES_PRIMTS_GPU
-@torch.no_grad()
-def test_dense_contiguous_plan_defaults_to_q128_kv128() -> None:
-    """A dense plan and the dense one-shot without block sizes run as if they named 128."""
-
-    torch.manual_seed(20261020)
-    batch_size, seq_len_q, seq_len_kv, num_heads = 1, 256, 1000, 8
-    shape_q = (batch_size, seq_len_q, num_heads, _HEAD_DIM)
-    shape_kv = (batch_size, seq_len_kv, num_heads, _HEAD_DIM)
-    q = torch.randn(shape_q, device="cuda", dtype=torch.bfloat16) * 0.25
-    k = torch.randn(shape_kv, device="cuda", dtype=torch.bfloat16) * 0.25
-    v = torch.randn_like(k)
-    plan_args = (batch_size, seq_len_q, seq_len_kv, num_heads, num_heads, _HEAD_DIM)
-    plan_kwargs = dict(
-        device=torch.device("cuda", 0),
-        use_block_sparse=False,
-        q_data_type=torch.bfloat16,
-    )
-    implicit = block_sparse_module.BlockSparseTSWrapper()
-    implicit.plan(*plan_args, **plan_kwargs)
-    explicit = block_sparse_module.BlockSparseTSWrapper()
-    explicit.plan(*plan_args, 128, 128, **plan_kwargs)
-    policy = dict(implicit._policy)
-    assert policy["tile_size_q"] == 128
-    assert policy["tile_size_kv"] == 128
-    expected = explicit.run(q, k, v)
-    one_shot = block_sparse_module.block_sparse_attention(
-        q, k, v, None, None, use_block_sparse=False
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(implicit.run(q, k, v), expected)
-    assert torch.equal(one_shot, expected)
-
-
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
     "argument",
@@ -6045,3 +5980,144 @@ def test_dense_contiguous_run_matches_reference(case: _Case) -> None:
     assert torch.equal(actual, one_shot)
     tolerance = 2e-2 if case.dtype is torch.bfloat16 else 1e-2
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def _global_scale_case(kind, sm_scale, output_scale):
+    torch.manual_seed(911)
+    q = torch.randn((1, 16, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 128, 1, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indptr = torch.tensor([[[0, 1, 2]]], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    plan_args = dict(
+        device=q.device,
+        q_data_type=q.dtype,
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+    )
+    if kind == "paged":
+        wrapper = block_sparse_module.BlockSparsePagedTSWrapper()
+        wrapper.plan(
+            1,
+            16,
+            128,
+            1,
+            1,
+            128,
+            8,
+            64,
+            64,
+            max_blocks_per_row=1,
+            use_kv_valid_bits=False,
+            **plan_args,
+        )
+        # Allocate canonical HND strides, including the singleton head axis.
+        k_cache = torch.empty((2, 1, 64, 128), device=k.device, dtype=k.dtype)
+        v_cache = torch.empty_like(k_cache)
+        k_cache.copy_(k.view(2, 64, 1, 128).transpose(1, 2))
+        v_cache.copy_(v.view(2, 64, 1, 128).transpose(1, 2))
+        tables = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
+        run_args = (q, (k_cache, v_cache), tables, lengths, indptr, indices)
+    else:
+        wrapper = block_sparse_module.BlockSparseTSWrapper()
+        wrapper.plan(
+            1,
+            16,
+            128,
+            1,
+            1,
+            128,
+            8,
+            64,
+            max_blocks_per_row=1,
+            **plan_args,
+        )
+        run_args = (q, k, v, indptr, indices)
+    return wrapper, run_args, (q, k, v)
+
+
+def _global_scale_reference(inputs, sm_scale, output_scale):
+    q, k, v = (x[0, :, 0].float() for x in inputs)
+    logits = q @ k.T * sm_scale
+    allowed = torch.arange(16, device=q.device)[:, None] // 8 == (
+        torch.arange(128, device=q.device)[None, :] // 64
+    )
+    logits.masked_fill_(~allowed, -torch.inf)
+    return (logits.softmax(-1) @ v * output_scale)[None, :, None]
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("kind", ("sparse", "paged"))
+@torch.no_grad()
+def test_block_sparse_global_scales_graph_replay(kind):
+    sm_scale = torch.tensor(0.0625, device="cuda") if kind == "sparse" else 0.0625
+    output_scale = 1.75 if kind == "sparse" else torch.tensor(1.75, device="cuda")
+    wrapper, args, inputs = _global_scale_case(kind, sm_scale, output_scale)
+    out = wrapper.run(*args)
+    expected = _global_scale_reference(inputs, 0.0625, 1.75)
+    torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(*args, out=out, validate=False)
+    if kind == "sparse":
+        sm_scale.fill_(0.09375)
+        changed = (0.09375, 1.75)
+    else:
+        output_scale.fill_(0.75)
+        changed = (0.0625, 0.75)
+    graph.replay()
+    expected = _global_scale_reference(inputs, *changed)
+    torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
+    kwargs = dict(
+        q_block_size=8, kv_block_size=64, sm_scale=sm_scale, output_scale=output_scale
+    )
+    if kind == "paged":
+        eager = prims_ts.block_sparse_attention_with_paged_kv_cache(
+            *args, max_seq_len_kv=128, **kwargs
+        )
+    else:
+        eager = prims_ts.block_sparse_attention(
+            *args,
+            **kwargs,
+        )
+    torch.testing.assert_close(eager.float(), expected, atol=5e-3, rtol=5e-3)
+
+
+@_REQUIRES_PRIMTS_GPU
+@torch.no_grad()
+def test_sage_global_scales_include_restored_mean():
+    from tests.attention.test_attention_ts_sage import _SageCase, _random_inputs
+
+    case = _SageCase(
+        "global_mean",
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=256,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_tile=256,
+        sage=prims_ts.SageAttentionConfig(v_mean=True),
+    )
+    q, k, v, params, _ = _random_inputs(case)
+    # Dequantized V is exactly its channel mean, independent of P rounding.
+    v = torch.zeros(v.shape, device=v.device).to(v.dtype)
+    output_scale = torch.tensor(1.75, device="cuda")
+    result = prims_ts.block_sparse_attention(
+        q,
+        k,
+        v,
+        None,
+        None,
+        use_block_sparse=False,
+        q_block_size=64,
+        kv_block_size=64,
+        sm_scale=0.0625,
+        output_scale=output_scale,
+        sage=params,
+        sage_config=case.sage,
+    )
+    expected = (params.v_mean[:, None] * 1.75).expand_as(result).to(result.dtype)
+    torch.testing.assert_close(result, expected, atol=2e-3, rtol=8e-3)

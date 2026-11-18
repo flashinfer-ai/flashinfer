@@ -54,17 +54,15 @@ record's ``workspace`` leaf names the four buffers the host allocates
 zero at prepare and reset by the kernel, so a captured graph replays without a
 reset node).  No rule reads a tensor.
 
-The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
-``logical``) are rewritten by the exporter from the rendered binding; the
-other fields are the host plan and never change.
+The derived leaves of a record (``arg_plan``, ``logical``) are rewritten by
+the exporter from the rendered binding; the other fields are the host plan and
+never change.
 """
 
 from __future__ import annotations
 
 import functools
 from typing import Any
-
-import tvm_ffi
 
 from . import cake_build
 
@@ -80,7 +78,6 @@ HEAD_DIM = 128
 SHORT_CAPACITY_MAX = 64
 # The public ``num_splits`` values (the kernel takes any count; the API keeps this set).
 ACCEPTED_SPLITS = (1, 2, 4, 8, 10, 16)
-STAGES = ("decode",)
 
 # Logical argument names the host backend binds; every record maps its kernel
 # parameter names onto this vocabulary (``record["logical"]``).  ``Q`` is the
@@ -103,8 +100,8 @@ LOGICAL_TENSORS = (
 )
 LOGICAL_SCALARS = ("softmax_scale_log2",)
 
-# Filled mechanically by the exporter (the derived leaves ``kernel_symbol``, ``launch``, ``arg_plan``,
-# ``logical``); the host plan (``stage``, ``variant``, ``select_rule``, ``grid_rule``, ``library``, ``arches``)
+# Filled mechanically by the exporter (the derived leaves ``arg_plan``, ``logical``); the host plan
+# (``stage``, ``variant``, ``select_rule``, ``grid_rule``, ``library``, ``arches``)
 # is written by hand.  Every value is a literal: FlashInfer's manifest checker and the exporter read this file
 # with ``ast.literal_eval``.  A record is named by its route.
 MODULES: dict[str, dict[str, Any]] = {
@@ -123,14 +120,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "batch_heads", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_01f1434b7424417bec5c",
-        "launch": {
-            "block": (256, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 17152,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_01f1434b7424417bec5c",
         "logical": {
             "K": "K",
@@ -169,14 +158,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "batch_heads", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_daa3a415e53b721fe538",
-        "launch": {
-            "block": (384, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 50944,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_daa3a415e53b721fe538",
         "logical": {
             "K": "K",
@@ -219,14 +200,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_d8f05d2bfbbde5459902",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 41984,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_d8f05d2bfbbde5459902",
         "logical": {
             "K": "K",
@@ -264,14 +237,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_e5128e91902434559902",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 66560,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_e5128e91902434559902",
         "logical": {
             "K": "K",
@@ -325,14 +290,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": 1},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_f0ed92bc2f7a1e380d70",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 82944,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_f0ed92bc2f7a1e380d70",
         "logical": {
             "K": "K",
@@ -386,14 +343,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": "runtime"},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_b7f31235adbc7ac497d0",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 42112,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_b7f31235adbc7ac497d0",
         "logical": {
             "K": "K",
@@ -431,14 +380,6 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "split_pairs", "num_splits": "runtime"},
-        "kernel_symbol": "kernel_cake_sm110_gqa_decode_3f0576c3791ebdd23b5a",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 66688,
-            "use_pdl": False,
-        },
         "library": "cake_sm110_gqa_decode_3f0576c3791ebdd23b5a",
         "logical": {
             "K": "K",
@@ -480,21 +421,6 @@ def _inside(bounds: dict[str, Any], batch: int, capacity: int) -> bool:
     return int(b_lo) <= batch <= (batch if b_hi is None else int(b_hi)) and int(
         c_lo
     ) <= capacity <= (capacity if c_hi is None else int(c_hi))
-
-
-def _admits(
-    rule: dict[str, Any], *, batch: int, capacity: int, num_splits: int | None
-) -> bool:
-    kind = rule["kind"]
-    wanted = _split_class(num_splits)
-    if kind == "otherwise":
-        return rule["splits"] == wanted
-    if kind == "regions":
-        return any(
-            row["splits"] == wanted and _inside(row, batch, capacity)
-            for row in rule["regions"]
-        )
-    raise ValueError(f"unknown Cake SM110 GQA decode selection rule: {kind!r}")
 
 
 def _count(row_count: Any, num_splits: int | None, name: str) -> int:
@@ -617,14 +543,6 @@ def device_arch(device_index: int) -> str:
     return arch
 
 
-@functools.cache
-def sm_count(device_index: int) -> int:
-    """Streaming multiprocessor count of one CUDA device (immutable per process)."""
-    import torch
-
-    return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
-
-
 def library_name(name: str, arch: str) -> str:
     """``build.json`` library of record ``name`` built for ``arch``: ``<library>_<arch>``."""
     record = MODULES[name]
@@ -641,12 +559,6 @@ def load(name: str, arch: str) -> Any:
     prebuilt ``aot/`` library when a builder compiled it, else FlashInfer's JIT
     build of the same sources and flags (``cake_build.load_library``)."""
     return cake_build.load_library(library_name(name, arch))
-
-
-def specs_for_arch(arch: str) -> list[Any]:
-    """JIT specifications of every ``arch`` library without a prebuilt file (for
-    ahead-of-time warm-up through FlashInfer's ``build_jit_specs``)."""
-    return cake_build.jit_specs(arch)
 
 
 @functools.cache
@@ -694,17 +606,6 @@ def entry(name: str, device_index: int) -> Any:
     return getattr(load(name, device_arch(device_index)), MODULES[name]["ffi_entry"])
 
 
-def run_module(
-    name: str, values: dict[str, Any], *, grid: tuple[int, int, int], device_index: int
-) -> None:
-    """Launch record ``name`` with logical argument ``values`` on ``grid``
-    (:func:`launch_grid`) on the current torch stream of the device."""
-    run = entry(name, device_index)
-    args = argument_list(name, values, grid=grid)
-    with tvm_ffi.use_torch_stream():
-        run(*args)
-
-
 __all__ = [
     "ACCEPTED_SPLITS",
     "ARCHES",
@@ -716,7 +617,6 @@ __all__ = [
     "NUM_KV_HEADS",
     "NUM_Q_HEADS",
     "SHORT_CAPACITY_MAX",
-    "STAGES",
     "arch_for_capability",
     "argument_list",
     "device_arch",
@@ -724,9 +624,6 @@ __all__ = [
     "launch_grid",
     "library_name",
     "load",
-    "run_module",
     "select_record",
     "select_route",
-    "sm_count",
-    "specs_for_arch",
 ]

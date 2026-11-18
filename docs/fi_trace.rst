@@ -182,6 +182,9 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.mla``
      - ``BatchMLAPagedAttentionWrapper.run``
      - ``mla_paged``
+   * - ``flashinfer.mla``
+     - ``trtllm_batch_decode_sparse_mla_dsv4``
+     - ``sparse_mla_dsv4``
    * - ``flashinfer.gdn_decode``
      - ``gated_delta_rule_decode``, ``gated_delta_rule_mtp``
      - ``gdn``
@@ -307,7 +310,7 @@ The generated files can be passed directly to ``flashinfer-bench``:
 Adding Trace Support to a New Kernel
 --------------------------------------
 
-When adding a new kernel (see ``CLAUDE.md`` and ``.claude/skills/add-cuda-kernel/SKILL.md``
+When adding a new kernel (see ``AGENTS.md`` and ``.claude/skills/add-cuda-kernel/SKILL.md``
 for the full tutorial), attach a ``TraceTemplate`` to the ``@flashinfer_api`` decorator:
 
 .. code-block:: python

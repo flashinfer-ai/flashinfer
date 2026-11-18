@@ -99,7 +99,11 @@ def device_facts(index: int) -> DeviceFacts:
                     attribute.value.clusterDim.x,
                     attribute.value.clusterDim.y,
                     attribute.value.clusterDim.z,
-                ) = size, 1, 1
+                ) = (
+                    size,
+                    1,
+                    1,
+                )
                 launch.attrs, launch.numAttrs = [attribute], 1
                 result = drv.cuOccupancyMaxActiveClusters(function, launch)
                 if result[0] == drv.CUresult.CUDA_ERROR_INVALID_CLUSTER_SIZE:
@@ -127,7 +131,9 @@ def _sm120_block_scale_stages(value, smem_bytes, swap_ab):
     template's 2 KB reserve come off the budget first; GATHER adds 32 B of
     linear-scale scratch per routed token row (the token is B after swap-AB).
     Multi-GEMM (gated) kernels then drop stages until the aligned buffer
-    layout fits.
+    layout, budgeted at each operand's own SMEM row (the packed e2m1 side of a
+    mixed pair holds the fp8 K-tile in 64 B; its padded ``.b4x16_p64`` form and
+    every other operand in 128 B), fits.
     """
     m, n, _ = value("cta_tile_mnk")
     na, nb = value("num_a_operands"), value("num_b_operands")
@@ -161,14 +167,16 @@ def _sm120_block_scale_stages(value, smem_bytes, swap_ab):
     available = smem_bytes - 2048 - staging
     stages = min(available // per_stage, 16) if available >= per_stage else 0
     if gemms > 1:
-        kb = max(value("a_packed_per_row"), value("b_packed_per_row"))
+        # Each operand's own SMEM row: 128 B, or 64 B for the packed e2m1 side of
+        # a mixed pair (its padded .b4x16_p64 form holds one byte per value).
+        a_kb, b_kb = value("a_packed_per_row"), value("b_packed_per_row")
 
         def up(offset, align):
             return -(-offset // align) * align
 
         def footprint(count):
             offset = 1024
-            for operands, tile in ((na, m * kb), (nb, n * kb)):
+            for operands, tile in ((na, m * a_kb), (nb, n * b_kb)):
                 for _ in range(operands):
                     offset = up(offset, 1024) + count * tile
             for operands, tile in ((na, sfa), (nb, sfb)):
@@ -185,6 +193,96 @@ def _sm120_block_scale_stages(value, smem_bytes, swap_ab):
         while stages > 0 and footprint(stages) > smem_bytes:
             stages -= 1
     return stages
+
+
+def _gather_stages(value, constants, facts, swap_ab, tma_bytes):
+    """Mirror SM100 async-GATHER storage and descriptor-root constraints."""
+
+    def up(n, alignment):
+        return -(-n // alignment) * alignment
+
+    na, nb = value("num_a_operands"), value("num_b_operands")
+    if "sfa_smem_bytes" in constants:
+        nsa, nsb = value("num_sfa_operands"), value("num_sfb_operands")
+        rings = (
+            [value("sfa_smem_bytes")] * nsa
+            + [value("sfb_smem_bytes")] * nsb
+            + [value("sA_packed_elems")] * na
+            + [value("sB_packed_elems")] * nb
+        )
+        token_scales = nsb if swap_ab else nsa
+        token_rows = value("gather_token_rows")
+        extra = tma_bytes + (up(token_rows * 4, 128) if token_scales else 0)
+        scratch = token_scales * up(token_rows * value("gather_sf_row_bytes"), 128) + 8
+
+        def fit(reserve):
+            count = min(
+                16, (facts.smem_bytes - reserve - extra) // (sum(rings) + scratch)
+            )
+            while count > 0:
+                size = 0
+                for ring in rings:
+                    size = up(size, 1024) + ring * count
+                if size + extra + scratch * count <= facts.smem_bytes - reserve:
+                    return count
+                count -= 1
+            return 0
+
+        stages = fit(8192) or fit(4096)
+
+        def roots_fit(count, early):
+            root = 4096 + (tma_bytes if swap_ab or value("cta_group") == 1 else 0)
+            if early:
+                root += scratch * count
+            for ring in rings:
+                root = up(root, 1024)
+                if root >= 262144:
+                    return False
+                root += ring * count
+            return True
+
+        while stages > 1 and not roots_fit(stages, False):
+            stages -= 1
+        if stages and not roots_fit(stages, False):
+            stages = 0
+        return stages, roots_fit(stages, True) if stages else False
+
+    m, n, k = value("cta_tile_mnk")
+    per_stage = (na * m + nb * n) * k * 2
+    stages = min(16, (facts.smem_bytes - 4096 - tma_bytes) // per_stage)
+
+    def footprint(count):
+        size = 1024
+
+        def allocate(nbytes, alignment):
+            nonlocal size
+            size = up(size, alignment) + nbytes
+
+        paired = value("cta_group") == 2
+        for _ in range(3 if paired else 2):
+            allocate(8 * count, 8)
+        for _ in range(2):
+            allocate(8 * value("acc_stages"), 8)
+        if paired:
+            allocate(8, 8)
+        for nbytes, alignment in ((4, 4), (64, 16), (16, 8), (16, 8), (8, 16), (16, 8)):
+            allocate(nbytes, alignment)
+        cm, cn, _ = value("cluster_shape_mnk")
+        if cm * cn > 1:
+            allocate(8, 8)
+        for operands, rows in ((na, m), (nb, n)):
+            for _ in range(operands):
+                allocate(rows * k * 2 * count, 1024)
+        for _ in range(nb if swap_ab else na):
+            allocate(128, 128)
+        if value("n_tma_outputs", 0):
+            allocate(tma_bytes - 16, 1024)
+            allocate(128 * value("n_tma_outputs"), 128)
+        return size
+
+    while stages > 0 and footprint(stages) > facts.smem_bytes:
+        stages -= 1
+    return stages, None
 
 
 def specialize_parameters(parameters, facts: DeviceFacts):
@@ -215,7 +313,23 @@ def specialize_parameters(parameters, facts: DeviceFacts):
             * value("epi_slot_widen", 1)
             + 16
         )
-    if facts.arch == "sm_120a" and "sfa_smem_bytes" in constants:
+    elif value("moe_combine_swap_bulk_enabled", False):
+        # Swapped TMEM fragments are staged as 128 tokens x all M features.
+        tma_bytes = 128 * value("mma_size_m") * 128 * 2 + 16
+    elif value("moe_combine_bulk_enabled", False):
+        # COMBINE owns a 128-row BF16 staging tile even though its output is
+        # reported as STG. Account for it before sizing the AB pipeline.
+        tma_bytes = 128 * value("epi_cols_per_mma_m") * 2 + 16
+    scratch_first = None
+    # Quantization helpers precede the mode flags in some producer sources.
+    # Those flags stay in the template body; the tile's gathered-row count is
+    # still an exported geometry constant and is positive only for GATHER.
+    gather = value("moe_gather", value("gather_token_rows", 0) > 0)
+    if facts.arch == "sm_107a" and gather:
+        stages, scratch_first = _gather_stages(
+            value, constants, facts, result["swap_ab"], tma_bytes
+        )
+    elif facts.arch == "sm_120a" and "sfa_smem_bytes" in constants:
         stages = _sm120_block_scale_stages(value, facts.smem_bytes, result["swap_ab"])
     elif facts.arch == "sm_120a":
         reserve = 2048
@@ -233,7 +347,12 @@ def specialize_parameters(parameters, facts: DeviceFacts):
         stages = min(16, (facts.smem_bytes - reserve - tma_bytes) // sum(rings))
         while stages > 0:
             size = 0
-            root = reserve + (tma_bytes if not result["swap_ab"] else 0)
+            root = reserve + (
+                tma_bytes
+                if not result["swap_ab"]
+                or value("moe_combine_swap_bulk_enabled", False)
+                else 0
+            )
             safe = True
             for ring in rings:
                 size = (size + 1023) // 1024 * 1024 + ring * stages
@@ -253,6 +372,8 @@ def specialize_parameters(parameters, facts: DeviceFacts):
         "swizzle_l2_budget_bytes": str(facts.l2_bytes // 3),
         "ab_stages": str(stages),
     }
+    if scratch_first is not None:
+        derived["gather_scratch_before_rings"] = str(scratch_first)
     result["constants"] = [
         [name, derived.get(name, expression)]
         for name, expression in result["constants"]

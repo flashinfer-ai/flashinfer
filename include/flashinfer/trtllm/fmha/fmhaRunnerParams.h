@@ -203,6 +203,8 @@ struct TllmGenFmhaRunnerParams {
   TileScheduler mTileScheduler;
   // The multiCtasKvMode (i.e. multiBlockMode).
   bool mMultiCtasKvMode;
+  // Keep the initial grouped query tile instead of applying generation occupancy tuning.
+  bool mKeepGqaGenerationQueryTile;
 
   // Input QKV buffers.
   void const* qPtr;
@@ -386,6 +388,15 @@ struct TllmGenFmhaRunnerParams {
   bool enable_pdl;
 
   bool isSparseMla() const { return ::isSparseMla(mSparseMlaType); }
+
+  // MLA: K and V are one latent pool (DeepSeek V3 576/512, 320/256, or DeepSeek-V4 sparse 512/512).
+  bool isMla() const {
+    return (mHeadDimQk == 576 && mHeadDimV == 512) || (mHeadDimQk == 320 && mHeadDimV == 256) ||
+           (isSparseMla() && mHeadDimQk == 512 && mHeadDimV == 512);
+  }
+
+  // Token-sparse MQA: the token-sparse kernels over separate K and V (not MLA's latent pool).
+  bool isSparseMqa() const { return isSparseMla() && !isMla(); }
 
   // set the attention mask type
   TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType) {

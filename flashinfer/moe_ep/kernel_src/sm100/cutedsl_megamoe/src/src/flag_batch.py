@@ -18,10 +18,10 @@ from .ptx_helpers import (
 class FlagBatchTrackerBase:
     """Loop-carried per-thread state for batched release-counter publishing."""
 
-    flag_addr: Int64  # per-lane counter-slot address (0 == null)
+    flag_addr: Int64                # per-lane counter-slot address (0 == null)
     cumulated_flags: cutlass.Int32  # current batch fill count (uniform)
-    phase: cutlass.Int32  # current accumulated phase (uniform)
-    tid: cutlass.Int32  # lane/thread id within the rotating group
+    phase: cutlass.Int32            # current accumulated phase (uniform)
+    tid: cutlass.Int32              # lane/thread id within the rotating group
 
     @cute.jit
     def _make(
@@ -111,10 +111,7 @@ class GpuReleaseFlagBatchTracker(FlagBatchTrackerBase):
     def fire(self) -> None:
         if self.flag_addr != Int64(0):
             ptr = cute.make_ptr(
-                cutlass.Int32,
-                self.flag_addr,
-                AddressSpace.gmem,
-                assumed_align=4,
+                cutlass.Int32, self.flag_addr, AddressSpace.gmem, assumed_align=4,
             )
             red_add_release_gpu_s32(ptr, cutlass.Int32(1))
 

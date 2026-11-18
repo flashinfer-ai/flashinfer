@@ -52,9 +52,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": False,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_101dbbbac3c7c2b0929f_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_101dbbbac3c7c2b0929f_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_101dbbbac3c7c2b0929f",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_28dd049fbfcc6295",
+            "-DCAKE_BIND_SMEM=226304",
+            "-DCAKE_BIND_CLUSTER=0",
+        ],
     },
     "cake_msa_nvfp4_decode_21e04eaff519ea6cd53a": {
         "arches": ["sm_107a"],
@@ -63,9 +69,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tail": True,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_21e04eaff519ea6cd53a_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_21e04eaff519ea6cd53a_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_persistent_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_21e04eaff519ea6cd53a",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_c20b1fbb21802ae5",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=2",
+        ],
         "ctas_per_sm": 1,
         "cluster_capacity": {"212": 212},
     },
@@ -77,9 +89,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": True,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_44bc4ca2b8b4088f3deb_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_44bc4ca2b8b4088f3deb_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_44bc4ca2b8b4088f3deb",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_180e0cc0f5e0e8a5",
+            "-DCAKE_BIND_SMEM=229376",
+            "-DCAKE_BIND_CLUSTER=8",
+        ],
     },
     "cake_msa_nvfp4_decode_6618d950c63c1f5e1ebe": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -88,9 +106,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tail": False,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_6618d950c63c1f5e1ebe_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_6618d950c63c1f5e1ebe_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_persistent_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_6618d950c63c1f5e1ebe",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_baee5755c01e1113",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=4",
+        ],
         "ctas_per_sm": 1,
     },
     "cake_msa_nvfp4_decode_6c186c5235ad08b4ec9f": {
@@ -115,9 +139,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": True,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_a779981b54a3d1f15057_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_a779981b54a3d1f15057_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_a779981b54a3d1f15057",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_89d22d2f1cbd1564",
+            "-DCAKE_BIND_SMEM=229376",
+            "-DCAKE_BIND_CLUSTER=2",
+        ],
     },
     "cake_msa_nvfp4_decode_aa3e5180abff0afd4101": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -126,9 +156,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tail": False,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_aa3e5180abff0afd4101_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_aa3e5180abff0afd4101_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_persistent_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_aa3e5180abff0afd4101",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_5b3cddd39d316184",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=8",
+        ],
         "ctas_per_sm": 1,
     },
     "cake_msa_nvfp4_decode_af2e689ccab0037b5cda": {
@@ -139,9 +175,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": True,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_af2e689ccab0037b5cda_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_af2e689ccab0037b5cda_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_af2e689ccab0037b5cda",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_7e1ffd0374aaf0ab",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=4",
+        ],
     },
     "cake_msa_nvfp4_decode_b1fa7590f47de655145a": {
         "arches": ["sm_100a", "sm_103a"],
@@ -151,9 +193,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": True,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b1fa7590f47de655145a_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_b1fa7590f47de655145a_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_b1fa7590f47de655145a",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_372fb05ada7ee090",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=8",
+        ],
     },
     "cake_msa_nvfp4_decode_cb6eb3a9a43c7f43bab8": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -162,9 +210,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tail": False,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_cb6eb3a9a43c7f43bab8_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_cb6eb3a9a43c7f43bab8_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_persistent_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_cb6eb3a9a43c7f43bab8",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_7f1d386dd1b02524",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=0",
+        ],
         "ctas_per_sm": 1,
     },
     "cake_msa_nvfp4_decode_e52248a9dd736f72904e": {
@@ -175,9 +229,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": True,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e52248a9dd736f72904e_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e52248a9dd736f72904e_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_e52248a9dd736f72904e",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_1bc1078467974fc1",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=2",
+        ],
     },
     "cake_msa_nvfp4_decode_e55acc6adbda3b342ca9": {
         "arches": ["sm_100a", "sm_103a"],
@@ -187,9 +247,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": True,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e55acc6adbda3b342ca9_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e55acc6adbda3b342ca9_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_e55acc6adbda3b342ca9",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_8ca0fa5d767a2233",
+            "-DCAKE_BIND_SMEM=229376",
+            "-DCAKE_BIND_CLUSTER=4",
+        ],
     },
     "cake_msa_nvfp4_decode_e8432419536e3287998f": {
         "arches": ["sm_100a", "sm_103a"],
@@ -199,9 +265,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "cluster": False,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e8432419536e3287998f_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_e8432419536e3287998f_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_union_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_e8432419536e3287998f",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_2a6d75fc530f6402",
+            "-DCAKE_BIND_SMEM=228352",
+            "-DCAKE_BIND_CLUSTER=0",
+        ],
     },
     "cake_msa_nvfp4_decode_f789cce307344c958485": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -210,9 +282,15 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tail": False,
         "sources": [
             "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_f789cce307344c958485_kernel.cu",
-            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_f789cce307344c958485_binding.cu",
+            "cake_msa_nvfp4_decode/cake_msa_nvfp4_decode_persistent_binding.cu",
         ],
-        "compile_flags": ["--use_fast_math"],
+        "compile_flags": [
+            "--use_fast_math",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_msa_nvfp4_decode_f789cce307344c958485",
+            "-DCAKE_PROGRAM_SHIM=cake_host_shim_7809a241c3422e5f",
+            "-DCAKE_BIND_SMEM=227328",
+            "-DCAKE_BIND_CLUSTER=2",
+        ],
         "ctas_per_sm": 1,
     },
 }

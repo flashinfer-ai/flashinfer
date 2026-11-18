@@ -1182,6 +1182,13 @@ def test_mla_split_kv_cap():
     assert (
         _get_split_kv_and_workspace_size(1, 1, 12, 512, 212, max_seq_len=4096)[0] == 32
     )
+    # The raised cap needs >= 8 KV tiles per split: 8K-32K keep the static-cap
+    # counts, 64K and 128K use the raised cap.
+    for seq, expected in ((8192, 32), (32768, 43), (65536, 64), (131072, 103)):
+        assert (
+            _get_split_kv_and_workspace_size(1, 1, 12, 512, 212, max_seq_len=seq)[0]
+            == expected
+        )
 
 
 @pytest.mark.parametrize("d_tiles", [1, 2, 4])

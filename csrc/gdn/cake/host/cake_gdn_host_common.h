@@ -91,6 +91,46 @@ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits
       << ", lanes=" << (int)d.lanes << ")";
 }
 
+// 3D TMA descriptor of one Q/K/V/O buffer (`name` is the buffer letter of the message text):
+// the former per-template `EncodeTma_<letter>` body, compiled from the descriptor's
+// std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma3D(const TensorView& t, const char* name, CUtensorMapDataType dtype) {
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source '" << name << "' must have at least 3 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source '" << name << "' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
+      << "TMA source '" << name << "' trailing dims must be positive";
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source '" << name << "' physical strides must be positive";
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source '" << name << "' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d3), (uint64_t)(d2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for '" << name << "' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2], ValueError)
+      << "TMA box (64, 64, 1) exceeds resolved global dims for '" << name << "'";
+  uint64_t global_strides[2] = {
+      (uint64_t)((s3 * 16) / 8),
+      (uint64_t)((s2 * 16) / 8),
+  };
+  uint32_t box_dim[3] = {64u, 64u, 1u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, dtype, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, '" << name << "') failed: CUresult=" << (int)r;
+  return tm;
+}
+
 // A logical axis.outer(trailing) folds every source dim above the trailing
 // dimensions. Shape products are independent of physical strides, so verify
 // the leading dimensions form one dense row-major chain instead of inventing

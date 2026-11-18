@@ -345,7 +345,7 @@ def _workspace_creation_heuristic(
     # Single-node scenarios
     # From benchmarking data, we can see that MNNVL is either on par (smaller problem sizes) or significantly faster than TRTLLM (larger problem sizes such as hidden_dim=8192, token_num=64 for TP=4), for single-node scenarios.
     # TRTLLM still has the larger specialized-fusion surface, such as MoE
-    # patterns and packed group FP8 quantization.
+    # patterns.
     if "mnnvl" in suitable_backends:
         return ["mnnvl"]
     else:
@@ -764,6 +764,61 @@ def is_mnnvl_cutedsl_supported(
 # ============================================================================
 
 
+def _check_mxfp8_fusion_args(
+    pattern: int,
+    input: torch.Tensor,
+    residual_in: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    rms_gamma: Optional[torch.Tensor],
+    quant_out: Optional[torch.Tensor],
+    scale_out: Optional[torch.Tensor],
+    norm_out: Optional[torch.Tensor],
+    layout_code: Optional[int],
+) -> None:
+    """Validate the arguments of the MXFP8 allreduce fusion patterns.
+
+    ``quant_out`` is ``[token_num, hidden_dim]`` float8_e4m3fn and ``scale_out`` is a
+    1D uint8 UE8M0 tensor in the same layout ``mxfp8_quantize`` returns: for
+    SWIZZLED_128x4, rows padded to 128 and scale columns padded to 4. The kernel writes
+    the scales of rows ``< token_num`` (including their column padding) and leaves the
+    padding rows untouched; GEMMs read them only into output rows that are not stored.
+    """
+    token_num, hidden_dim = input.shape
+    if hidden_dim % 32 != 0:
+        raise ValueError(
+            f"hidden_dim must be divisible by 32 for MXFP8, got {hidden_dim}"
+        )
+    if residual_in is None or residual_out is None or rms_gamma is None:
+        raise ValueError(
+            f"residual_in, residual_out and rms_gamma are required for pattern: {pattern}"
+        )
+    if quant_out is None or scale_out is None:
+        raise ValueError(f"quant_out and scale_out are required for pattern: {pattern}")
+    if quant_out.shape != input.shape or quant_out.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            "quant_out must be float8_e4m3fn with shape [token_num, hidden_dim] for MXFP8"
+        )
+    layout = QuantizationSFLayout.SWIZZLED_128x4 if layout_code is None else layout_code
+    num_sf_cols = hidden_dim // 32
+    if layout == QuantizationSFLayout.SWIZZLED_128x4:
+        expected = ((token_num + 127) // 128 * 128) * ((num_sf_cols + 3) // 4 * 4)
+    elif layout == QuantizationSFLayout.LINEAR:
+        expected = token_num * num_sf_cols
+    else:
+        raise ValueError("MXFP8 fusion supports SWIZZLED_128x4 or LINEAR scale layouts")
+    if scale_out.dtype != torch.uint8 or not scale_out.is_contiguous():
+        raise ValueError("scale_out must be a contiguous uint8 tensor for MXFP8")
+    if scale_out.numel() < expected:
+        raise ValueError(
+            f"scale_out must hold at least {expected} scale factors, got {scale_out.numel()}"
+        )
+    if (
+        pattern == AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant
+        and norm_out is None
+    ):
+        raise ValueError("norm_out is required for kARResidualRMSNormOutMXFP8Quant")
+
+
 @flashinfer_api(trace=allreduce_fusion_trace)
 def allreduce_fusion(
     input: torch.Tensor,
@@ -845,15 +900,17 @@ def allreduce_fusion(
         * ``kARResidualRMSNormOutFP4Quant = 5``
         * ``kMoEReductionARResidualRMSNorm = 6`` (TRT-LLM only)
         * ``kMoEFinalizeARResidualRMSNorm = 7``
-        * ``kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8`` (TRT-LLM only)
-        * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9`` (TRT-LLM only)
+        * ``kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8``
+        * ``kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9``
         * ``kARResidualRMSNormDynamicFP8Quant = 10``
         * ``kARResidualRMSNormOutDynamicFP8Quant = 11``
         * ``kMoEFinalizeARResidualRMSNormFP8Quant = 12`` (MNNVL CuTe DSL only)
+        * ``kARResidualRMSNormMXFP8Quant = 13``
+        * ``kARResidualRMSNormOutMXFP8Quant = 14``
 
-        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5) and
-        dynamic FP8 patterns (10-11). Packed group quant patterns remain
-        TRT-LLM only.
+        MNNVL supports the standard FP8/NVFP4 quant patterns (2-5), packed
+        per-token-group FP8 patterns (8-9), dynamic FP8 patterns (10-11),
+        and MXFP8 patterns (13-14).
 
         ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM,
         Cake on a TRT-LLM workspace, and the explicit MNNVL CuTe DSL backend.
@@ -891,14 +948,21 @@ def allreduce_fusion(
     norm_out : Optional[torch.Tensor]
         Pre-allocated normalized output, shape ``[token_num, hidden_dim]``.
     quant_out : Optional[torch.Tensor]
-        Pre-allocated quantized output. FP8 uses shape
-        ``[token_num, hidden_dim]`` and NVFP4 uses shape
-        ``[token_num, hidden_dim / 2]``.
+        Pre-allocated quantized output. FP8 and MXFP8 use shape
+        ``[token_num, hidden_dim]`` (``torch.float8_e4m3fn``) and NVFP4 uses
+        shape ``[token_num, hidden_dim / 2]``.
     scale_out : Optional[torch.Tensor]
         Pre-allocated quantization scale-factor buffer. Dynamic FP8 uses
         shape ``[token_num, 1]`` and dtype ``torch.float32``. NVFP4 uses
-        the layout selected by ``layout_code``. Per-tensor FP8 does not use
-        ``scale_out``.
+        the layout selected by ``layout_code``. MXFP8 uses a 1D contiguous
+        ``torch.uint8`` buffer of UE8M0 scales, one per 32 elements, in the
+        layout selected by ``layout_code`` and sized as ``mxfp8_quantize``
+        returns it (rows padded to 128 and scale columns to 4 for
+        ``SWIZZLED_128x4``); the scales of the padding rows are not written.
+        Packed per-token-group FP8
+        uses shape ``[token_num, ceil(groups_per_row / 4)]``, dtype
+        ``torch.int32``, and stride ``(1, ceil(token_num / 4) * 4)``.
+        Per-tensor FP8 does not use ``scale_out``.
     residual_in : Optional[torch.Tensor]
         Residual tensor to add, shape ``[token_num, hidden_dim]``.
     rms_gamma : Optional[torch.Tensor]
@@ -915,7 +979,8 @@ def allreduce_fusion(
         and is used in place, so it may be updated between CUDA Graph replays.
         No per-token scale estimation or ``scale_out`` is used.
     layout_code : Optional[int]
-        NVFP4 scale-factor layout (``QuantizationSFLayout``). MNNVL
+        NVFP4/MXFP8 scale-factor layout (``QuantizationSFLayout``). MXFP8
+        supports ``SWIZZLED_128x4`` (default) and ``LINEAR``. MNNVL
         supports ``SWIZZLED_128x4`` and ``LINEAR``; ``SWIZZLED_8x4``
         remains TRT-LLM only.
     use_oneshot : Optional[bool]
@@ -947,8 +1012,10 @@ def allreduce_fusion(
         Optional shared-expert output to add, shape
         ``[token_num, hidden_dim]``.
     block_quant_group_size : Optional[int]
-        Group size for per-token-group FP8 packed quantization patterns
-        (TRT-LLM only).
+        Group size for per-token-group FP8 packed quantization patterns. The
+        MNNVL backend requires an exact row partition in which each CTA owns an
+        integral number of groups; unsupported ``(hidden_dim, group_size)``
+        pairs raise ``ValueError`` before launch.
     weight_bias : float
         Bias added to ``rms_gamma`` before scaling.
 
@@ -958,7 +1025,7 @@ def allreduce_fusion(
           (``out = (1 + gamma) * x * rsqrt(...)``).
 
         Supported by both TRT-LLM and MNNVL backends for standard RMSNorm
-        and quant patterns (1-5), and by TRT-LLM for MoE RMSNorm
+        and quant patterns (1-5, 8-11), and by TRT-LLM for MoE RMSNorm
         variants. Ignored for ``kAllReduce``.
     moe_finalize_backend : {"trtllm", "cake"}
         Implementation for ``kMoEFinalizeARResidualRMSNorm`` on a TRT-LLM
@@ -1170,6 +1237,22 @@ def allreduce_fusion(
                     f"scale_out dtype must be torch.int32, got {scale_out.dtype}"
                 )
 
+        if pattern in (
+            AllReduceFusionPattern.kARResidualRMSNormMXFP8Quant,
+            AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant,
+        ):
+            _check_mxfp8_fusion_args(
+                pattern,
+                input,
+                residual_in,
+                residual_out,
+                rms_gamma,
+                quant_out,
+                scale_out,
+                norm_out,
+                layout_code,
+            )
+
         dynamic_fp8_patterns = (
             AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant,
             AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant,
@@ -1213,10 +1296,14 @@ def allreduce_fusion(
                     "norm_out is required for kARResidualRMSNormOutDynamicFP8Quant"
                 )
 
-        # Dynamic FP8 patterns do not materialize allreduce_out, so avoid
-        # allocating an unused tensor. This keeps the preallocated dynamic path
+        # Dynamic FP8 and MXFP8 patterns do not materialize allreduce_out, so
+        # avoid allocating an unused tensor. This keeps the preallocated paths
         # compatible with CUDA Graph capture.
-        if output is None and pattern not in dynamic_fp8_patterns:
+        if output is None and pattern not in (
+            *dynamic_fp8_patterns,
+            AllReduceFusionPattern.kARResidualRMSNormMXFP8Quant,
+            AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant,
+        ):
             output = torch.empty_like(input)
 
         # Flatten all tensors to 1D for legacy trtllm_allreduce_fusion API
@@ -1276,7 +1363,11 @@ def allreduce_fusion(
             block_quant_group_size=block_quant_group_size,
         )
 
-        # Return the most downstream output (already in 2D shape from input views)
+        # Return the most downstream output (already in 2D shape from input views).
+        # This MXFP8 pattern also writes norm_out but returns quant_out as documented
+        # (and as the MNNVL path does).
+        if pattern == AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant:
+            return quant_out
         if norm_out is not None:
             return norm_out
         elif quant_out is not None:
@@ -1347,12 +1438,28 @@ def allreduce_fusion(
                 MNNVLQuantType.NVFP4,
                 True,
             ),
+            AllReduceFusionPattern.kARResidualRMSNormPerTokenGroupFP8PackedQuant: (
+                MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutPerTokenGroupFP8PackedQuant: (
+                MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+                True,
+            ),
             AllReduceFusionPattern.kARResidualRMSNormDynamicFP8Quant: (
                 MNNVLQuantType.DYNAMIC_FP8,
                 False,
             ),
             AllReduceFusionPattern.kARResidualRMSNormOutDynamicFP8Quant: (
                 MNNVLQuantType.DYNAMIC_FP8,
+                True,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormMXFP8Quant: (
+                MNNVLQuantType.MXFP8,
+                False,
+            ),
+            AllReduceFusionPattern.kARResidualRMSNormOutMXFP8Quant: (
+                MNNVLQuantType.MXFP8,
                 True,
             ),
         }
@@ -1430,23 +1537,38 @@ def allreduce_fusion(
                 )
 
             quant_type, has_norm_out = mnnvl_quant_patterns[pattern]
-            is_dynamic_fp8 = quant_type == MNNVLQuantType.DYNAMIC_FP8
-            if is_dynamic_fp8:
+            requires_preallocated_outputs = quant_type in (
+                MNNVLQuantType.DYNAMIC_FP8,
+                MNNVLQuantType.PER_TOKEN_GROUP_FP8_PACKED,
+            )
+            if quant_type == MNNVLQuantType.MXFP8:
+                _check_mxfp8_fusion_args(
+                    pattern,
+                    input,
+                    residual_in,
+                    residual_out,
+                    rms_gamma,
+                    quant_out,
+                    scale_out,
+                    norm_out,
+                    mnnvl_layout_code,
+                )
+            elif requires_preallocated_outputs:
                 if residual_out is None:
                     raise ValueError(
-                        "residual_out is required for MNNVL dynamic FP8 patterns"
+                        "residual_out is required for MNNVL preallocated quantization patterns"
                     )
                 if quant_out is None:
                     raise ValueError(
-                        "quant_out is required for MNNVL dynamic FP8 patterns"
+                        "quant_out is required for MNNVL preallocated quantization patterns"
                     )
                 if scale_out is None:
                     raise ValueError(
-                        "scale_out is required for MNNVL dynamic FP8 patterns"
+                        "scale_out is required for MNNVL preallocated quantization patterns"
                     )
                 if has_norm_out and norm_out is None:
                     raise ValueError(
-                        "norm_out is required for MNNVL dynamic FP8 norm-out pattern"
+                        "norm_out is required for MNNVL preallocated quantization norm-out patterns"
                     )
             elif has_norm_out and norm_out is None:
                 norm_out = torch.empty_like(input)
@@ -1469,6 +1591,7 @@ def allreduce_fusion(
                 launch_with_pdl=launch_with_pdl,
                 strategy=strategy,
                 weight_bias=weight_bias,
+                block_quant_group_size=block_quant_group_size,
             )
             return quant_result
 

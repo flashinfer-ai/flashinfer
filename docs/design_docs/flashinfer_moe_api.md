@@ -663,7 +663,7 @@ rationale above this section), so neither mechanism can see inside them.
 | --- | --- | --- |
 | [x] | Add `@flashinfer_api` to the public unified MoE execution entry points **at release time**, not before. | Done on `MoELayer.__init__` and `MoELayer.__call__`. `__init__` is decorated so the config is logged crash-safely *before* backend discovery and `runner.build()` (JIT compile) run — the two places construction actually fails. The runners' `pack_inputs` / `forward` are deliberately **not** decorated: they are `TunableRunner` plumbing driven by the autotuner in a tight per-tactic loop, and `MoELayer.__call__` already logs the same tensors one level up. The frozen `*Config` dataclasses and their `supported()` / `prepare_weights()` / `prepare_activations()` classmethods are **not** decorated either — see the per-entry-point rationale in the PR description. |
 | [ ] | Make level-10 (`FLASHINFER_LOGLEVEL=10`) dumps of `MoELayer.__call__` contain the actual input tensors. | **Partial today.** `_extract_value_for_dump` walks `list` / `tuple` / `dict` but falls through to `_serialize_value` for any other object, so a pack is recorded as `{"type": "MoEActivationPack", "repr": ...}` metadata and its tensors never reach `inputs.pt`. Levels 1/3/5 are unaffected (shape/dtype/device/stats all come from the pack repr and the output tensor). Fixing this means teaching `_extract_value_for_dump` to recurse into dataclasses — a change to the shared walker that alters dump contents for *every* decorated API, so it is out of scope for an rc cut. |
-| [ ] | Add a `TraceTemplate` for `MoELayer.__call__` per the `CLAUDE.md` "Trace Template Checklist". | **Blocked on trace infrastructure, not on MoE.** No attribute traversal exists in `_get_tensor` / `Tensor(param=...)`, and the routing/quant shape axes live on `self.config` rather than in the signature, so no template can reach a single tensor or axis today (`flashinfer/trace/` contains zero references to `MoELayer` / the packs). Closing this gate requires either dotted-path parameter support or a pack-flattening adapter; both are trace-framework changes and belong in their own PR. Until then `MoELayer` gets the logging half of `@flashinfer_api` but no `fi_trace`. Bare `@flashinfer_api` with no `trace=` is established house style for exactly this case (e.g. `flashinfer/norm/__init__.py:392`, `flashinfer/fused_moe/core.py:5409`). |
+| [ ] | Add a `TraceTemplate` for `MoELayer.__call__` per the `AGENTS.md` "Trace Template Checklist". | **Blocked on trace infrastructure, not on MoE.** No attribute traversal exists in `_get_tensor` / `Tensor(param=...)`, and the routing/quant shape axes live on `self.config` rather than in the signature, so no template can reach a single tensor or axis today (`flashinfer/trace/` contains zero references to `MoELayer` / the packs). Closing this gate requires either dotted-path parameter support or a pack-flattening adapter; both are trace-framework changes and belong in their own PR. Until then `MoELayer` gets the logging half of `@flashinfer_api` but no `fi_trace`. Bare `@flashinfer_api` with no `trace=` is established house style for exactly this case (e.g. `flashinfer/norm/__init__.py:392`, `flashinfer/fused_moe/core.py:5409`). |
 
 To keep the decorator from being actively harmful while those gates are open,
 `MoEActivationPack` and `MoEWeightPack` now define metadata-only `__repr__`s
@@ -833,7 +833,7 @@ order. MXFP8 and NVFP4 additionally use 128x4 weight-scale layouts. BF16 and
 MXFP8 traces retain `use_shuffled_weight` to select the row order. Serialized
 references restore these layouts using PyTorch.
 
-`PowLU` (CUTLASS only) rides the generic slots with changed meaning:
+For CUTLASS, per-expert `PowLU` overrides use the generic slots with changed meaning:
 `gemm1_alpha` carries the exponent `m` (not a sigmoid slope) and
 `gemm1_clamp_limit` the post-activation clamp on the gate plus the symmetric
 clamp on the linear branch; `gemm1_beta` has no PowLU meaning and per-expert
@@ -887,6 +887,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | --- | --- | --- | --- |
 | `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
 | `b12x_w4a16` | `B12xW4A16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
+| `batch_invariant_bf16` | `BatchInvariantBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `batch_invariant_fp8_per_tensor` | `BatchInvariantFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`, `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cake` | `CakeWarpDecodeConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiLU`, `SiTU` |
 | `cake_stepfun` | `CakeStepFunConfig` | `BF16×BF16` | `SwiGLUStep` |
 | `cake_stepfun` | `CakeStepFunConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLUStep` |
@@ -901,6 +903,7 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cute_dsl` | `CuteDslConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cutile_bf16` | `CuTileBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
@@ -922,19 +925,31 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU` |
-| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU` |
-| `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `BF16×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP16×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXFP8×MXFP8` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `MXINT4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×BF16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×FP16` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `frost_low_latency` | `FrostLowLatencyConfig` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `PowLU`, `GELU`, `ReLU`, `ReLU2`, `SiLU`, `Identity` |
+| `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
-| `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `ReLU2`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `MXFP4×BF16` | `SwiGLU` |
-| `prims_ts` | `PrimsTsConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
-| `prims_ts` | `PrimsTsConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2` |
-| `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
+| `prims_ts` | `PrimsTsConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `ReLU2`, `SiLU` |
+| `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2`, `SiLU` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |
 | `sm12x_mxfp8_mxfp4` | `SM12xMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SiTU` |
-| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `ReLU2` |
+| `sm12x_nvfp4` | `SM12xNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SiTU`, `ReLU2` |
 | `sm12x_nvfp4_bf16` | `SM12xNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `ReLU2` |
 | `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `ReLU2` |
 | `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4×BF16` | `SwiGLU` |
@@ -955,6 +970,9 @@ while other runner-specific restrictions remain in `check_support()`.
 
 TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
 pinned Rubin BMM artifact predates `SiTuGlu`.
+
+CuTe-DSL SiTU with MXFP4×MXFP8 or MXFP8×MXFP8 requires
+`CuteDslConfig(swap_ab=True)` on SM100/SM103.
 
 CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `situ_linear_beta`); its flat kernel does not expose a separate SiTU
@@ -1146,7 +1164,7 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`):
+**Known-failure ledger** (shared `tests/infra/test_helpers/fuzz_ledger.py`):
 wrong-answer findings still run and report `xfail` after healthy backends;
 crash-class findings are quarantined before launch. Unexpected passes fail
 strictly so stale waivers are removed.
@@ -1217,3 +1235,15 @@ crosses the Python API.
 | [ ] | Keep FP8, MXFP4, and additional backend families out of this PR. | Track as follow-up runners after the NVFP4 path is solid. |
 | [ ] | Keep general routing unification out of this PR. | This MVP assumes pre-routed inputs through `MoEActivationPack`. |
 | [ ] | Keep broader public API ergonomics separate from MVP correctness. | Backend discovery, pipe-operator sugar, repro replay, and a full eager functional API can evolve after the MVP contract is stable. |
+
+
+### Frost grouped DeepSeek block-FP8 candidates
+
+The existing `DeepSeekFp8` preparation and activation packs also serve the SM90
+and SM120 grouped Tensor Core paths. The bounded candidate region is finalized
+H2048/I512/top-k10, default SwiGLU T4/T8 and default ReLU2/SiLU T8. BF16 entry
+and prequantized E4M3 entry retain the same dynamic block-scale contract.
+All sixteen FMA choices remain available; other shapes and custom parameters
+retain FMA. No new public configuration or cross-backend auto-dispatch rule is
+introduced. See [the Frost guide](../frost_low_latency_moe.md#grouped-deepseek-block-fp8-on-sm90-and-sm120)
+for numerical boundaries and a full routed-expert GPU-time reproducer.

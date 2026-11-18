@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,7 +15,8 @@
  */
 // Rendered by the Cake source exporter — do not edit.
 // One-call host sequence of the Cake all-gather matmul route
-// 'bfloat16_ws4_n_major_sm_100a': NVLink barrier, bridge event, per-peer push copies with a
+// 'bfloat16_ws4_n_major_sm_100a' and, through the CAKE_SEQ_SHIM compile definition, of
+// 'bfloat16_ws4_n_major_sm_103a': NVLink barrier, bridge event, per-peer push copies with a
 // per-chunk readiness epoch (or, for small padded M, the SM push kernel
 // chained to the barrier and the main kernel through programmatic dependent
 // launch), tcgen05 main kernel. The main kernel computes 256-wide output
@@ -42,6 +43,9 @@
 #include <unordered_map>
 
 #include "cake_all_gather_matmul_host_common.cuh"
+#ifndef CAKE_SEQ_SHIM
+#define CAKE_SEQ_SHIM cake_host_shim_seq_a332a37520cc217a
+#endif
 
 #ifndef CAKE_PEER_POINTER_TABLE_DECLARED
 #define CAKE_PEER_POINTER_TABLE_DECLARED
@@ -69,7 +73,7 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_dba24f495a33b1a179e7(
     unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
     int remote_order);
 
-namespace cake_host_shim_seq_a332a37520cc217a {
+namespace CAKE_SEQ_SHIM {
 
 using namespace cake_host_shim_common;
 using tvm::ffi::TensorView;
@@ -976,7 +980,7 @@ void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView o
   launch_main_for(call, inp, scratch, weight, out, ready, /*programmatic_launch=*/true);
 }
 
-}  // namespace cake_host_shim_seq_a332a37520cc217a
+}  // namespace CAKE_SEQ_SHIM
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_seq_a332a37520cc217a::Run);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_push, cake_host_shim_seq_a332a37520cc217a::RunPush);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_SEQ_SHIM::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_push, CAKE_SEQ_SHIM::RunPush);

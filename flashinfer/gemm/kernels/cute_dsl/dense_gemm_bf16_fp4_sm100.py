@@ -1769,7 +1769,6 @@ class Sm100DenseGemmBf16Fp4Kernel:
             tile_info_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             while work_tile.is_valid_tile:
-                alpha_val = alpha[work_tile.group_idx]
                 if cutlass.const_expr(self.gated):
                     bSG_gC = bSG_gC_partitioned[(None, work_tile.cta_coord_m, None, 0)]
                 else:
@@ -1817,6 +1816,9 @@ class Sm100DenseGemmBf16Fp4Kernel:
                 ]
                 # Wait for accumulator buffer full
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                # Only the activation TMA warp waits on the previous grid; the full
+                # accumulator orders this read after that wait.
+                alpha_val = alpha[work_tile.group_idx]
                 if cutlass.const_expr(not self.gated):
                     bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 

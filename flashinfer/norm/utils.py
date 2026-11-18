@@ -28,7 +28,7 @@ Common utilities used by all norm kernels:
 import functools
 import math
 import operator
-from typing import Callable
+from typing import Callable, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -620,6 +620,71 @@ def get_sm_version(device=None) -> int:
     return props.major * 10 + props.minor
 
 
+_CLUSTER_PROBE_PTX = b"""
+.version 8.0
+.target sm_90
+.address_size 64
+.visible .entry fi_norm_cluster_probe()
+{
+    ret;
+}
+\x00"""
+
+
+@functools.lru_cache(maxsize=16)
+def _probe_max_cluster_n(device_index: int) -> Optional[int]:
+    """The driver's largest launchable cluster on a device; ``None`` if it cannot answer."""
+    try:
+        from cuda.bindings import driver
+
+        def check(result):
+            err, *values = result if isinstance(result, tuple) else (result,)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"CUDA driver error {err}")
+            return values[0] if values else None
+
+        with torch.cuda.device(device_index):
+            torch.empty(0, device="cuda")  # make the primary context current
+            module = check(driver.cuModuleLoadData(_CLUSTER_PROBE_PTX))
+            try:
+                function = check(
+                    driver.cuModuleGetFunction(module, b"fi_norm_cluster_probe")
+                )
+                check(
+                    driver.cuFuncSetAttribute(
+                        function,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+                        1,
+                    )
+                )
+                config = driver.CUlaunchConfig()
+                config.gridDimX, config.gridDimY, config.gridDimZ = 16, 1, 1
+                config.blockDimX, config.blockDimY, config.blockDimZ = 128, 1, 1
+                return int(
+                    check(driver.cuOccupancyMaxPotentialClusterSize(function, config))
+                )
+            finally:
+                driver.cuModuleUnload(module)
+    except Exception:
+        return None
+
+
+def max_cluster_n(sm_version: int) -> int:
+    """Largest power-of-two cluster (at most 16) the norm kernels may launch here.
+
+    16-CTA clusters are non-portable: RTX PRO 6000 (SM120) runs them, DGX Spark
+    (GB10, SM121) rejects them with cudaErrorInvalidClusterSize. Ask the driver;
+    if it cannot answer, use the portable 8 on SM12x and 16 elsewhere.
+    """
+    probed = _probe_max_cluster_n(torch.cuda.current_device())
+    if probed is None:
+        return 8 if sm_version // 10 == 12 else 16
+    cap = 1
+    while cap * 2 <= min(probed, 16):
+        cap *= 2
+    return cap
+
+
 @dsl_user_op
 def get_ptr_as_int64(tensor: cute.Tensor, offset: Int64, *, loc=None, ip=None) -> Int64:
     """Get the memory address of tensor[offset] as Int64.
@@ -1061,6 +1126,7 @@ __all__ = [
     "elem_pointer",
     # Device utilities
     "get_sm_version",
+    "max_cluster_n",
     # Reduction utilities
     "warp_reduce",
     "block_reduce",

@@ -32,6 +32,7 @@ import cuda.bindings.driver as cuda
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
+from .dtype_compat import as_bf16
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 
 # ============================================================================
@@ -929,7 +930,7 @@ def _pretranspose_kernel_name(
     HV: int,
     K: int,
     V: int,
-    dtype: torch.dtype,
+    dtype_key: tuple,
     scale: float,
     use_qk_l2norm: bool,
     use_pool_indexing: bool = False,
@@ -955,7 +956,7 @@ def _pretranspose_kernel_name(
         HV,
         K,
         V,
-        dtype,
+        dtype_key,
         scale,
         use_qk_l2norm,
         use_pool_indexing,
@@ -974,7 +975,7 @@ def _get_compiled_decode_kernel(
     HV: int,
     K: int,
     V: int,
-    dtype: torch.dtype,
+    dtype_key: tuple,
     scale: float,
     use_qk_l2norm: bool,
     use_pool_indexing: bool = False,
@@ -1027,6 +1028,10 @@ def run_pretranspose_decode(
         output_state_indices: Optional int32 indices for write destination, shape [B].
             When None, writes go to the same slot as initial_state_indices.
     """
+    # q/k/v reach the kernel through autovec_copy into cutlass.BFloat16 fragments,
+    # which reinterprets rather than converts, so pin them instead of keying them.
+    q, k, v = as_bf16(q, k, v)
+
     # Compile kernel with TVM FFI (cached)
     if use_pool_indexing:
         stride0, stride1, stride2, stride3 = tuple(int(x) for x in h0_source.stride())
@@ -1034,11 +1039,28 @@ def run_pretranspose_decode(
             "initial_state stride(0) must be a multiple of 4 FP32 elements "
             f"for 128-bit state copies, got stride(0)={stride0}"
         )
+        # This path compiles against a fake Float32 tensor, so h0_source.dtype in
+        # the key below cannot describe it.
+        assert h0_source.dtype == torch.float32, (
+            f"pool-indexed state is compiled as float32, got {h0_source.dtype}"
+        )
     else:
         stride1 = stride2 = stride3 = 0
     target = gdn_device_target(q.device)
     num_stages, blocks_per_state = _decode_launch_config(
         target.major, target.minor, B, HV
+    )
+    # from_dlpack bakes these dtypes into the compiled signature, and the key also
+    # names the on-disk artifact, so an omission collides across processes too
+    # (#4214). Unlike q/k/v these convert on load or store, so they are keyed
+    # rather than pinned.
+    dtype_key = (
+        h0_source.dtype,
+        A_log.dtype,
+        a.dtype,
+        dt_bias.dtype,
+        b.dtype,
+        output.dtype,
     )
     cache_key = (
         target.compile_key,
@@ -1047,7 +1069,7 @@ def run_pretranspose_decode(
         HV,
         K,
         V,
-        q.dtype,
+        dtype_key,
         scale,
         use_qk_l2norm,
         use_pool_indexing,
@@ -1098,14 +1120,14 @@ def run_pretranspose_decode(
             h0_source_tensor = h0_source_tensor.mark_compact_shape_dynamic(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )
-        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log)
         # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
-        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        a_tensor = from_dlpack(a).mark_layout_dynamic()
+        dt_bias_tensor = from_dlpack(dt_bias)
         q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
         k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
         v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
-        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b).mark_layout_dynamic()
         o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
         h0_indices_tensor = from_dlpack(
             h0_indices, assumed_align=16

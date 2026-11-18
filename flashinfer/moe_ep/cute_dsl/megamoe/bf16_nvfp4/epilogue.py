@@ -58,17 +58,34 @@ class W4A16Epilogue:
         static_expert_shape,
         token_back_by_dispatch=False,
         in_kernel_fc2_reduce=False,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         gate_up_clamp=None,
         epi_flag_batch=(1, 1),
         swiglu_alpha=None,
         swiglu_beta=None,
         situ_beta=None,
         situ_linear_beta=None,
+        batch_invariant=False,
     ):
+        self.batch_invariant = batch_invariant
+        self.batch_invariant_activation = None
+        if batch_invariant:
+            from flashinfer.moe_ep.batch_invariant.activation_variants import (
+                ActivationVariant,
+            )
+
+            self.batch_invariant_activation = ActivationVariant(
+                "w4a16",
+                "situ" if situ_beta is not None else "swiglu",
+                swiglu_alpha,
+                swiglu_beta,
+                situ_beta,
+                situ_linear_beta,
+                gate_up_clamp,
+            )
         self.token_back_by_dispatch = token_back_by_dispatch
         self.in_kernel_fc2_reduce = in_kernel_fc2_reduce
-        self.apply_topk_in_fc1 = apply_topk_in_fc1
+        self.apply_routing_weights_before_fc2 = apply_routing_weights_before_fc2
         self.gate_up_clamp = gate_up_clamp
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
@@ -316,7 +333,9 @@ class W4A16Fc2Epilogue(EpilogueContext):
             # register packing and STG remain.
             cute.arch.fence_view_async_tmem_load()
             acc_pipeline.consumer_release(acc_consumer_state)
-        if cutlass.const_expr(self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1):
+        if cutlass.const_expr(
+            self.in_kernel_fc2_reduce and not self.apply_routing_weights_before_fc2
+        ):
             # Preserve FC2's BF16 rounding before weighting; dispatch reduces
             # these weighted BF16 contributions into the source token output.
             for row in cutlass.range_constexpr(self._EpilogueTokenTileSize // 32):
@@ -430,6 +449,20 @@ class W4A16Fc1Epilogue(EpilogueContext):
     def _swiglu_act(self, t_swiglu, t_up, t_gate):
         # Match the local W4A16 kernel's up * (gate * sigmoid(gate))
         # association before the BF16 FC1 handoff.
+        if cutlass.const_expr(self.batch_invariant):
+            from flashinfer.moe_ep.batch_invariant.activation_variants import (
+                activation_accumulator,
+            )
+            from flashinfer.moe_ep.batch_invariant.device import PackedF32
+
+            for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
+                t_swiglu[i], t_swiglu[i + 1] = activation_accumulator(
+                    PackedF32,
+                    (t_gate[i], t_gate[i + 1]),
+                    (t_up[i], t_up[i + 1]),
+                    variant=self.batch_invariant_activation,
+                )
+            return
         for i in cutlass.range_constexpr(0, cute.size(t_swiglu), 2):
             gate = (t_gate[i], t_gate[i + 1])
             if cutlass.const_expr(self.swiglu_alpha is not None):
@@ -612,7 +645,7 @@ class W4A16Fc1Epilogue(EpilogueContext):
         )
         for half in cutlass.range_constexpr(self._EpilogueTokenTileSize // 32):
             token_col = subtile_idx * self._EpilogueTokenTileSize + half * 32
-            if cutlass.const_expr(self.apply_topk_in_fc1):
+            if cutlass.const_expr(self.apply_routing_weights_before_fc2):
                 # The existing accumulator wait also orders the dispatch
                 # weight store. Prefetch while activation and transpose run.
                 topk_score = cutlass.Float32(0)
@@ -652,7 +685,9 @@ class W4A16Fc1Epilogue(EpilogueContext):
             up.store(up.load() * weight_alpha)
             # Preserve the prior W4A16 sequence: post-alpha gate upper clamp,
             # symmetric up clamp, then up * (gate * sigmoid(gate)).
-            if cutlass.const_expr(self.gate_up_clamp is not None):
+            if cutlass.const_expr(
+                self.gate_up_clamp is not None and not self.batch_invariant
+            ):
                 for i in cutlass.range_constexpr(cute.size(up)):
                     gate[i] = fmin(gate[i], self.gate_up_clamp)
                     up[i] = fmin(up[i], self.gate_up_clamp)
@@ -698,7 +733,7 @@ class W4A16Fc1Epilogue(EpilogueContext):
                 in_bound = in_bound and output_column < real_fc1_output.shape[1]
             if in_bound:
                 token_row = work_tile_info.tile_n_idx * self.cta_tile_n + token_in_tile
-                if cutlass.const_expr(self.apply_topk_in_fc1):
+                if cutlass.const_expr(self.apply_routing_weights_before_fc2):
                     # Weight the completed FP32 activation before its BF16
                     # handoff; the final combine then sums the resulting partials.
                     for i in cutlass.range_constexpr(0, 16, 2):

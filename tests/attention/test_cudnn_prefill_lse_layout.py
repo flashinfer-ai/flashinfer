@@ -538,8 +538,7 @@ def test_wrapper_cudnn_single_token_gqa_lse(paged, lse_layout):
 def test_ragged_wrapper_cudnn_return_lse(causal):
     """``BatchPrefillWithRaggedKVCacheWrapper(backend="cudnn").run(...,
     return_lse=True)`` returns the ``[qo_len, num_qo_heads]`` LSE the wrapper
-    documents (it allocates that shape and hands it to the cuDNN path), matching
-    the default backend's."""
+    documents, checked against independent Torch O and LSE references."""
     _skip_unless_cudnn()
     device = "cuda:0"
     batch_size, s_qo, s_kv, h_qo, h_kv, d = 4, 87, 512, 8, 4, 128
@@ -569,23 +568,179 @@ def test_ragged_wrapper_cudnn_return_lse(causal):
     )
     out, lse = w_cudnn.run(q, k, v, return_lse=True)
 
-    w_ref = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        ws.clone(), kv_layout="NHD"
-    )
-    w_ref.plan(
-        qo_indptr,
-        kv_indptr,
-        h_qo,
-        h_kv,
-        d,
-        head_dim_vo=d,
-        causal=causal,
-        sm_scale=scale,
-        q_data_type=torch.bfloat16,
-        kv_data_type=torch.bfloat16,
-    )
-    out_ref, lse_ref = w_ref.run(q, k, v, return_lse=True)
+    # A default wrapper may also select cuDNN. Use an independent reference
+    # so a dispatch change cannot turn this into a comparison with itself.
+    ref_lse = _reference_lse(q, k, q_lens, kv_lens, qo_indptr, kv_indptr, scale, causal)
+    ref_out = torch.empty_like(out, dtype=torch.float32)
+    for batch in range(batch_size):
+        qs = slice(int(qo_indptr[batch]), int(qo_indptr[batch + 1]))
+        ks = slice(int(kv_indptr[batch]), int(kv_indptr[batch + 1]))
+        qi = q[qs].float().transpose(0, 1)
+        ki = k[ks].float().repeat_interleave(h_qo // h_kv, dim=1).transpose(0, 1)
+        vi = v[ks].float().repeat_interleave(h_qo // h_kv, dim=1).transpose(0, 1)
+        scores = qi @ ki.transpose(-1, -2) * scale
+        if causal:
+            lq, lkv = qi.size(1), ki.size(1)
+            row = torch.arange(lq, device=q.device)[:, None]
+            col = torch.arange(lkv, device=q.device)[None, :]
+            scores.masked_fill_(col > row + lkv - lq, -torch.inf)
+        ref_out[qs] = (scores.softmax(-1) @ vi).transpose(0, 1)
 
-    assert lse.shape == (q.shape[0], h_qo) == lse_ref.shape
-    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-2)
+    assert lse.shape == (q.shape[0], h_qo) == ref_lse.shape
+    torch.testing.assert_close(out.float(), ref_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("hk", [2, 4])
+@pytest.mark.parametrize("maxq", [1, 17])
+@pytest.mark.parametrize("packed_lse", [False, True])
+def test_cudnn_prefill_empty_requests_changed_lengths_replay(
+    dtype, paged, hk, maxq, packed_lse
+):
+    """Move the empty request on replay, checking live O and packed/padded LSE.
+
+    In particular, run this on the consumer cuDNN 9.24 stack: do not waive
+    zero-length requests just because newer backend tests require 9.25.
+    """
+    _skip_unless_cudnn()
+    if cudnn_prefill.cudnn.backend_version() < 92400:
+        pytest.skip("requires cuDNN 9.24 or later")
+    b, h, d, page, capacity = 3, 4, 128, 16, 48
+    first_q = [1, 0, 1] if maxq == 1 else [17, 0, 9]
+    second_q = [0, 1, 1] if maxq == 1 else [0, 9, 17]
+    first_k, second_k = [33, 0, 17], [0, 17, 33]
+    gen = torch.Generator().manual_seed(841)
+
+    def tensor(shape):
+        return torch.randn(shape, generator=gen, dtype=torch.float32).to(
+            device="cuda", dtype=dtype
+        )
+
+    q = tensor((sum(first_q), h, d))
+    if paged:
+        k, v = tensor((9, hk, page, d)), tensor((9, hk, page, d))
+        tables = torch.arange(9, dtype=torch.int32, device="cuda").reshape(b, 3)
+    else:
+        k, v = tensor((sum(first_k), hk, d)), tensor((sum(first_k), hk, d))
+        tables = None
+    out = torch.full(q.shape, torch.nan, dtype=dtype, device="cuda")
+    lse = torch.full(
+        (len(q), h) if packed_lse else (b, maxq, h), torch.nan, device="cuda"
+    )
+    ws = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
+    qlens = torch.tensor(first_q, dtype=torch.int32, device="cuda").reshape(b, 1, 1, 1)
+    klens = torch.tensor(first_k, dtype=torch.int32, device="cuda").reshape(b, 1, 1, 1)
+    qo = torch.tensor(
+        [0, *torch.tensor(first_q).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    ko = torch.tensor(
+        [0, *torch.tensor(first_k).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+
+    def run():
+        return cudnn_batch_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            d**-0.5,
+            ws,
+            max_token_per_sequence=maxq,
+            max_sequence_kv=capacity if paged else 33,
+            actual_seq_lens_q=qlens,
+            actual_seq_lens_kv=klens,
+            batch_offsets_q=qo,
+            batch_offsets_k=None if paged else ko,
+            batch_offsets_units="tokens",
+            block_tables=tables,
+            causal=True,
+            return_lse=True,
+            lse_base="ln",
+            out=out,
+            lse=lse,
+        )
+
+    if (
+        maxq == 1
+        and hk != h
+        and packed_lse
+        and cudnn_prefill._cudnn_single_token_gqa_ragged_stats_broken()
+    ):
+        # Existing public guard documents this unrepresentable packed Stats recipe.
+        with pytest.raises(ValueError, match="zero-length requests.*packed LSE"):
+            run()
+        return
+
+    def check(qsizes, ksizes):
+        qs = ks = 0
+        for i, (nq, nk) in enumerate(zip(qsizes, ksizes, strict=True)):
+            if nq:
+                qb = q[qs : qs + nq].double().transpose(0, 1)
+                if paged:
+                    kb = (
+                        k[i * 3 : (i + 1) * 3]
+                        .permute(1, 0, 2, 3)
+                        .reshape(hk, -1, d)[:, :nk]
+                    )
+                    vb = (
+                        v[i * 3 : (i + 1) * 3]
+                        .permute(1, 0, 2, 3)
+                        .reshape(hk, -1, d)[:, :nk]
+                    )
+                else:
+                    kb, vb = (
+                        k[ks : ks + nk].transpose(0, 1),
+                        v[ks : ks + nk].transpose(0, 1),
+                    )
+                kb, vb = (
+                    kb.double().repeat_interleave(h // hk, 0),
+                    vb.double().repeat_interleave(h // hk, 0),
+                )
+                scores = (qb @ kb.transpose(1, 2)) * d**-0.5
+                row, col = (
+                    torch.arange(nq, device="cuda"),
+                    torch.arange(nk, device="cuda"),
+                )
+                scores.masked_fill_(col[None, :] > row[:, None] + nk - nq, -torch.inf)
+                ref = (scores.softmax(-1) @ vb).transpose(0, 1)
+                stat = scores.logsumexp(-1).transpose(0, 1)
+                torch.testing.assert_close(
+                    out[qs : qs + nq].double(), ref, atol=0.015, rtol=0.015
+                )
+                got = lse[qs : qs + nq] if packed_lse else lse[i, :nq]
+                torch.testing.assert_close(got.double(), stat, atol=0.005, rtol=0.005)
+            qs += nq
+            ks += nk
+
+    run()
+    check(first_q, first_k)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    q.mul_(-0.5)
+    qlens.copy_(
+        torch.tensor(second_q, device="cuda", dtype=torch.int32).reshape_as(qlens)
+    )
+    klens.copy_(
+        torch.tensor(second_k, device="cuda", dtype=torch.int32).reshape_as(klens)
+    )
+    qo.copy_(
+        torch.tensor(
+            [0, *torch.tensor(second_q).cumsum(0).tolist()],
+            device="cuda",
+            dtype=torch.int32,
+        )
+    )
+    ko.copy_(
+        torch.tensor(
+            [0, *torch.tensor(second_k).cumsum(0).tolist()],
+            device="cuda",
+            dtype=torch.int32,
+        )
+    )
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    graph.replay()
+    torch.cuda.synchronize()
+    check(second_q, second_k)
