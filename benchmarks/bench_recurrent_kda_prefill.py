@@ -662,15 +662,26 @@ def _make_case(
     kda_prefill_cute_module = import_module("flashinfer.kda_prefill_cute")
     small_bh_module = import_module("flashinfer.kda_prefill_cute_small_bh")
     cudnn_module = import_module("flashinfer.cudnn")
+    vibecuda_backend_module = (
+        import_module("flashinfer.experimental.kda_vibecuda.backend")
+        if candidate_backend == "vibecuda"
+        else None
+    )
     original_get_module = kda_prefill_module._get_flash_kda_prefill_module
     original_get_generated_module = kda_prefill_module._get_flash_kda_generated_module
     original_cute_run = kda_prefill_cute_module._run_cute_dsl_kda_prefill
     original_small_bh_run = small_bh_module._run_kda_prefill_cute_small_bh
     original_cudnn_run = cudnn_module.cudnn_recurrent_kda
+    original_vibecuda_desc = (
+        vibecuda_backend_module._vibecuda_descriptor_storage
+        if vibecuda_backend_module is not None
+        else None
+    )
     resolved_cake_routes: list[tuple[str, str]] = []
     resolved_generated_cake_routes: list[tuple[str, str, str, str]] = []
     resolved_backends: list[str] = []
     resolved_cudnn_calls: list[str] = []
+    resolved_vibecuda_variants: list[str] = []
 
     def recording_get_module(variant, target):
         resolved_cake_routes.append((variant, target))
@@ -704,11 +715,18 @@ def _make_case(
         resolved_cudnn_calls.append("cudnn")
         return original_cudnn_run(*call_args, **kwargs)
 
+    def recording_vibecuda_desc(state, variant, device):
+        resolved_vibecuda_variants.append(variant)
+        assert original_vibecuda_desc is not None
+        return original_vibecuda_desc(state, variant, device)
+
     kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
     kda_prefill_module._get_flash_kda_generated_module = recording_get_generated_module
     kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
     small_bh_module._run_kda_prefill_cute_small_bh = recording_small_bh_run
     cudnn_module.cudnn_recurrent_kda = recording_cudnn_run
+    if vibecuda_backend_module is not None:
+        vibecuda_backend_module._vibecuda_descriptor_storage = recording_vibecuda_desc
     try:
         candidate_run()
         torch.cuda.synchronize()
@@ -720,9 +738,23 @@ def _make_case(
         kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
         small_bh_module._run_kda_prefill_cute_small_bh = original_small_bh_run
         cudnn_module.cudnn_recurrent_kda = original_cudnn_run
+        if vibecuda_backend_module is not None and original_vibecuda_desc is not None:
+            vibecuda_backend_module._vibecuda_descriptor_storage = (
+                original_vibecuda_desc
+            )
         reset_state_pools()
     has_cake_routes = bool(resolved_cake_routes or resolved_generated_cake_routes)
-    if resolved_cudnn_calls:
+    if resolved_vibecuda_variants:
+        assert vibecuda_backend_module is not None
+        resolved_backend = "vibecuda"
+        resolved_target = vibecuda_backend_module._vibecuda_prefill_target(q.device)
+        if "fn16_prepare" in resolved_vibecuda_variants:
+            resolved_variant = "bt16_fused"
+            resolved_physical_variants = ["fn16_prepare", "fn16_chain"]
+        else:
+            resolved_variant = resolved_vibecuda_variants[-1]
+            resolved_physical_variants = [resolved_variant]
+    elif resolved_cudnn_calls:
         if len(resolved_cudnn_calls) != 1 or resolved_backends or has_cake_routes:
             raise RuntimeError(
                 "expected exactly one cuDNN route during warmup, got "
@@ -925,7 +957,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "cute-dsl", "cake", "small-bh", "cudnn"),
+        choices=("auto", "cute-dsl", "cake", "small-bh", "cudnn", "vibecuda"),
         default="auto",
         help=(
             "Select one backend for this invocation of the public recurrent_kda "

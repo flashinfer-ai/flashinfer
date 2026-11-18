@@ -436,6 +436,25 @@ def _generated_affine_module_for_launch(
     return resolved.module
 
 
+class _LazyKdaDescriptorStorages(dict):
+    """Lazily allocate per-variant TMA descriptor storage on first access."""
+
+    def __init__(self, device: torch.device) -> None:
+        super().__init__()
+        self._device = device
+
+    def __missing__(self, variant: str) -> torch.Tensor:
+        size = (
+            _FLASH_KDA_SEVEN_DESCRIPTOR_STORAGE_BYTES
+            if variant in ("m128_n16_checkpoint", "small_bh_m128")
+            or variant.startswith("bt16_")
+            else _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES
+        )
+        tensor = torch.empty(size, dtype=torch.uint8, device=self._device)
+        self[variant] = tensor
+        return tensor
+
+
 class _RecurrentKDAPrefillWorkspaceBase:
     def __init__(self, device: torch.device | str) -> None:
         normalized_device = torch.device(device)
@@ -465,38 +484,9 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._cake_kda_affine_map_identity_data_ptr: Optional[int] = None
         self._cake_kda_affine_launch_plan: Optional[_CakeKDAAffineLaunchPlan] = None
         self._cute_dsl_workspace: Optional[torch.Tensor] = None
-        self._descriptor_storages = {
-            variant: torch.empty(
-                (
-                    _FLASH_KDA_SEVEN_DESCRIPTOR_STORAGE_BYTES
-                    if variant in ("m128_n16_checkpoint", "small_bh_m128")
-                    or variant.startswith("bt16_")
-                    else _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES
-                ),
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            for variant in (
-                "m64",
-                "m128",
-                "m128_tensor_state_decay",
-                "m128_h12_short",
-                "m128_h12_long",
-                "m128_n16",
-                "m128_n16_checkpoint",
-                "m128_n16_short",
-                "persistent_m128",
-                "piece_persistent_m128",
-                "small_bh_m128",
-                "bt16_prepare",
-                "bt16_prepare_beta_tma",
-                "bt16_chain_m64_s7",
-                "bt16_chain_m64_s8",
-                "bt16_chain_m64_s9",
-                "m128_unbounded_softplus",
-                "m128_bt64_unbounded_softplus",
-            )
-        }
+        self._descriptor_storages: dict[str, torch.Tensor] = _LazyKdaDescriptorStorages(
+            self.device
+        )
         # Receipt-selected modules own independent descriptor lifetimes.  The
         # dictionary is populated lazily because the physical selector (and
         # therefore the module id) is resolved from the runtime shape and
@@ -536,6 +526,10 @@ class _RecurrentKDAPrefillWorkspaceBase:
         #: so nothing serializes the launch sequence, device memory doubles,
         #: and a capture is recorded where no one will look for it.
         self._sm120_state_lock = threading.Lock()
+        # The VibeCUDA backend's per-workspace state, created on first use by
+        # ``_vibecuda_state``.
+        self._vibecuda_state: Optional[object] = None
+        self._vibecuda_state_lock = threading.Lock()
 
 
 class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
@@ -2639,11 +2633,16 @@ def _generated_affine_carriers(
     return carriers
 
 
+_raw_stream_ptr = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
 def _stream_cache_key(device: torch.device) -> tuple[int, int]:
-    stream = torch.cuda.current_stream(device)
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
+    if _raw_stream_ptr is not None:
+        return device_index, int(_raw_stream_ptr(device_index))
+    stream = torch.cuda.current_stream(device)
     return device_index, int(stream.cuda_stream)
 
 
@@ -2748,9 +2747,8 @@ def _workspace_buffer(
     zero_on_allocate: bool = False,
 ) -> torch.Tensor:
     buffer = getattr(workspace, attribute)
-    capturing = torch.cuda.is_current_stream_capturing()
     if buffer is None or buffer.numel() < numel:
-        if capturing:
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(capture_error)
         factory = torch.zeros if zero_on_allocate else torch.empty
         buffer = factory(numel, dtype=dtype, device=device)
@@ -6285,7 +6283,7 @@ def _run_flash_kda_prefill(
     scale_value = _FLASH_KDA_DEFAULT_SCALE if scale is None else float(scale)
     if not math.isfinite(scale_value):
         raise ValueError(f"scale must be finite, got {scale_value}")
-    stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
+    stream_ptr = _stream_cache_key(q.device)[1]
     explicit_workspace = prefill_workspace is not None
     workspace: _RecurrentKDAPrefillWorkspaceBase
     if prefill_workspace is None:

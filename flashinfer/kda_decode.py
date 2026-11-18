@@ -391,6 +391,12 @@ def recurrent_kda(
             "reachable through flashinfer.recurrent_kda rather than this decode "
             "entry point"
         )
+    if backend == "vibecuda":
+        raise ValueError(
+            "backend='vibecuda' covers ordinary multi-token prefill only, so it is "
+            "reachable through flashinfer.recurrent_kda rather than this decode "
+            "entry point"
+        )
     if backend not in ("cute-dsl", "cake", "auto"):
         raise ValueError(
             f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"
