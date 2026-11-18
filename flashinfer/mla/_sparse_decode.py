@@ -21,19 +21,25 @@ Backends
     flattened-storage-slot indices (``-1`` = invalid). Same math contract:
     softmax over exactly the valid indexed rows, latent (512-dim) value, no
     positional masking, no sink, no LSE output.
-``"sm120"``
-    :class:`flashinfer.mla.SparseMLASm120Wrapper` (SM120/SM121), run as a
-    single call on a front-cached runner. Same math contract for every
-    storage family the wrapper serves (DSv3.2 / GLM-NSA at d_qk 576,
-    GLM-5.3-NoPE / DSV4 / DSV4.1 at d_qk 512): selection is purely
-    caller-provided (``indices`` bounded by per-token
-    ``backend_args['topk_length']``), there is no ``seq_lens`` and no
-    positional masking anywhere in its contract. The wrapper's optional
-    extras are supersets of the same contract and are reachable through
-    ``backend_args``: a second indexed pool (``extra_kv_cache`` /
+``"cuda"``
+    :class:`flashinfer.mla.SparseMLASm120Wrapper` (SM120/SM121) pinned to
+    its hand-written CUDA kernels, run as a single call on a front-cached
+    runner. Same math contract for every storage family the wrapper serves
+    (DSv3.2 / GLM-NSA at d_qk 576, GLM-5.3-NoPE / DSV4 / DSV4.1 at d_qk
+    512): selection is purely caller-provided (``indices`` bounded by
+    per-token ``backend_args['topk_length']``), there is no ``seq_lens``
+    and no positional masking anywhere in its contract. The wrapper's
+    optional extras are supersets of the same contract and are reachable
+    through ``backend_args``: a second indexed pool (``extra_kv_cache`` /
     ``extra_indices`` / ``extra_topk_length`` — more rows in the SAME
     softmax), an ``attn_sink`` (extra denominator mass), and a base-2 LSE
-    output (``return_lse`` / ``lse_scale``).
+    output (``return_lse`` / ``lse_scale``). Backend names reflect the
+    implementation's nature, never the architecture.
+``"cake"``
+    The same wrapper surface pinned to its Cake SM120 kernels (the
+    wrapper's ``backend="cake"`` routes: DSV4 NVFP4, and the DeepSeek-V4.1
+    mixed cache), same selection-only math contract. The front owns the
+    wrapper's backend knob, so ``backend_args['backend']`` is refused.
 
 Deliberately NOT backends (different op, or different lifecycle)
 ----------------------------------------------------------------
@@ -70,7 +76,7 @@ import torch
 from ..api_logging import flashinfer_api
 
 # Backends behind the one public API (#5667 pattern; plain strings).
-SPARSE_MLA_DECODE_BACKENDS = ("auto", "specialized", "sm120")
+SPARSE_MLA_DECODE_BACKENDS = ("auto", "specialized", "cuda", "cake")
 
 # ``backend="auto"`` device routing: compute capability -> backend.
 # SM100/SM103/SM107 have no selection-only sparse-MLA decode entry in-tree
@@ -79,8 +85,10 @@ SPARSE_MLA_DECODE_BACKENDS = ("auto", "specialized", "sm120")
 # there and raises.
 _AUTO_ROUTE: Dict[Tuple[int, int], str] = {
     (9, 0): "specialized",
-    (12, 0): "sm120",
-    (12, 1): "sm120",
+    # The wrapper's own default on SM120/SM121 is its hand-written CUDA
+    # kernels; auto is purely a router over the named backends.
+    (12, 0): "cuda",
+    (12, 1): "cuda",
 }
 
 # Per-backend dispatch census (#5667-style introspection).
@@ -140,9 +148,9 @@ def _resolve_backend(backend: str, device: torch.device) -> str:
             f"sparse_mla_decode backend='auto' has no selection-only "
             f"sparse-MLA decode route for compute capability "
             f"{cc[0]}.{cc[1]}; supported: SM90 ('specialized') and "
-            "SM120/SM121 ('sm120'). The DeepSeek-V4 windowed dual-pool op "
-            "(trtllm_batch_decode_sparse_mla_dsv4) is a different op and "
-            "keeps its own entry"
+            "SM120/SM121 ('cuda' or 'cake'). The DeepSeek-V4 windowed "
+            "dual-pool op (trtllm_batch_decode_sparse_mla_dsv4) is a "
+            "different op and keeps its own entry"
         )
     key = f"{cc[0]}.{cc[1]}->{routed}"
     _stats["auto_routes"][key] = _stats["auto_routes"].get(key, 0) + 1
@@ -161,7 +169,11 @@ def _check_backend_args(
 
 
 # SparseMLASm120Wrapper constructor knobs (cached per device + knob set) and
-# run() keywords, both under the wrapper's own public names.
+# run() keywords, both under the wrapper's own public names. The wrapper's
+# own ``backend`` ctor knob is NOT passed through: the front's backend name
+# ("cuda" -> the wrapper's hand-written kernels, "cake" -> its Cake kernels)
+# owns that choice, so the front never routes one named backend's call to a
+# different implementation.
 _SM120_CTOR_KEYS = (
     "max_num_tokens",
     "max_num_heads",
@@ -170,7 +182,6 @@ _SM120_CTOR_KEYS = (
     "kv_cache_format",
     "extra_kv_fp4",
     "compute_precision",
-    "backend",
 )
 _SM120_RUN_KEYS = (
     "topk_length",
@@ -232,7 +243,8 @@ def _run_specialized(
     )
 
 
-def _run_sm120(
+def _run_sm120_wrapper(
+    backend: str,
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     indices: torch.Tensor,
@@ -242,26 +254,30 @@ def _run_sm120(
     out: Optional[torch.Tensor],
     backend_args: Dict[str, Any],
 ) -> torch.Tensor:
-    _check_backend_args("sm120", backend_args, _SM120_CTOR_KEYS + _SM120_RUN_KEYS)
+    _check_backend_args(backend, backend_args, _SM120_CTOR_KEYS + _SM120_RUN_KEYS)
     if seq_lens is not None:
         # The wrapper consumes per-token active lengths (topk_length), not
         # per-request original KV lengths; mapping seq_lens onto it would
         # change semantics. Refuse instead of papering over the difference.
         raise ValueError(
-            "sparse_mla_decode backend='sm120' does not read seq_lens: "
+            f"sparse_mla_decode backend={backend!r} does not read seq_lens: "
             "SparseMLASm120Wrapper takes per-token active lengths as "
             "backend_args['topk_length'] (and "
             "backend_args['extra_topk_length'] for the second indexed pool)"
         )
     if workspace_buffer is not None:
         raise ValueError(
-            "sparse_mla_decode backend='sm120' does not take a "
+            f"sparse_mla_decode backend={backend!r} does not take a "
             "workspace_buffer: the wrapper manages split-K scratch "
             "internally (or via backend_args['mid_out']/'mid_lse')"
         )
     if sm_scale is None:
-        raise ValueError("sparse_mla_decode backend='sm120' requires sm_scale")
+        raise ValueError(f"sparse_mla_decode backend={backend!r} requires sm_scale")
     ctor = {k: backend_args[k] for k in _SM120_CTOR_KEYS if k in backend_args}
+    # The front's backend name pins the wrapper's implementation: "cuda" is
+    # the wrapper's hand-written SM120 kernels (its "sparse" route), "cake"
+    # its Cake kernels. An explicitly selected backend is never swapped.
+    ctor["backend"] = "sparse" if backend == "cuda" else "cake"
     run = {k: backend_args[k] for k in _SM120_RUN_KEYS if k in backend_args}
     device = query.device
     if device.index is None:
@@ -308,11 +324,15 @@ def sparse_mla_decode(
     - ``backend="specialized"`` calls
       :func:`sparse_mla_decode_sm90` (SM90 fused kernel, with that entry's
       own composable-reference fallback and kill switch).
-    - ``backend="sm120"`` runs a front-cached
-      :class:`SparseMLASm120Wrapper` (SM120/SM121) as a single call.
+    - ``backend="cuda"`` runs a front-cached
+      :class:`SparseMLASm120Wrapper` (SM120/SM121) pinned to its
+      hand-written CUDA kernels, as a single call; ``backend="cake"`` the
+      same wrapper pinned to its Cake kernels. Backend names reflect the
+      implementation's nature, never the architecture.
     - ``backend="auto"`` routes by the query device's compute capability:
       SM90 to ``"specialized"`` (that entry's own allowlist then decides
-      fused vs composable) and SM120/SM121 to ``"sm120"``. Other devices
+      fused vs composable) and SM120/SM121 to ``"cuda"`` (the wrapper's own
+      default implementation; auto is purely a router). Other devices
       raise — in particular SM100/SM103/SM107, whose in-tree sparse-MLA
       decode entry (:func:`trtllm_batch_decode_sparse_mla_dsv4`) implements
       the DeepSeek-V4 op, not this one (see Notes). An explicitly selected
@@ -323,8 +343,8 @@ def sparse_mla_decode(
     ``kv_cache`` / ``indices`` follow the selected backend's documented
     formats (``specialized``: bf16 ``[B, q_len, 8, 576]`` over a uint8
     ``fp8_ds_mla`` Page64 ``[num_pages, 64, 656]`` cache with flattened
-    storage-slot indices; ``sm120``: packed uint8 FP8/NVFP4 records with
-    per-token ``topk_length`` metadata). Everything beyond the shared
+    storage-slot indices; ``cuda``/``cake``: packed uint8 FP8/NVFP4 records
+    with per-token ``topk_length`` metadata). Everything beyond the shared
     routing core travels in ``backend_args`` under the underlying entry's
     OWN parameter names and is forwarded verbatim; unknown keys raise.
 
@@ -333,45 +353,48 @@ def sparse_mla_decode(
     query : torch.Tensor
         Query tensor in the selected backend's documented format.
     kv_cache : torch.Tensor
-        Main KV pool. For ``sm120`` a second indexed pool may go in
+        Main KV pool. For ``cuda``/``cake`` a second indexed pool may go in
         ``backend_args['extra_kv_cache']`` (more rows in the same softmax).
     indices : torch.Tensor
         Top-k index table in the backend's documented convention. Index
         ENCODING differs by backend (``-1``-padded fixed-width rows for
-        ``specialized`` vs per-token active lengths for ``sm120``) and is
+        ``specialized`` vs per-token active lengths for the wrapper
+        backends) and is
         not translated here; the semantics — attend exactly the named rows —
         are the op.
     seq_lens : torch.Tensor, optional
         Per-request original KV lengths, int32 ``[B]``. Required by
         ``specialized`` (scheduling metadata only; it does not mask).
-        REFUSED by ``sm120`` (that wrapper takes per-token
+        REFUSED by ``cuda``/``cake`` (that wrapper takes per-token
         ``backend_args['topk_length']`` instead — a documented contract
         difference, not a silent remap).
     workspace_buffer : torch.Tensor, optional
         Byte workspace. Required by ``specialized`` (size with
         :func:`get_sparse_mla_sm90_workspace_size_bytes`). REFUSED by
-        ``sm120`` (the wrapper manages its own scratch).
+        ``cuda``/``cake`` (the wrapper manages its own scratch).
     sm_scale : float, optional
-        Softmax scale. Required by both backends.
+        Softmax scale. Required by every backend.
     out : torch.Tensor, optional
-        Preallocated output in the backend's documented format. For
-        ``sm120`` the front allocates a bf16 latent-space output when
-        omitted.
+        Preallocated output in the backend's documented format. For the
+        wrapper backends the front allocates a bf16 latent-space output
+        when omitted.
     backend : str
         One of ``SPARSE_MLA_DECODE_BACKENDS = ("auto", "specialized",
-        "sm120")``. Unknown names raise.
+        "cuda", "cake")``. Unknown names raise.
     backend_args : dict, optional
         Backend-specific keyword arguments under the underlying entry's own
-        names (for ``sm120``: constructor knobs such as ``kv_cache_format``
-        / ``kv_scale_format`` and run keywords such as ``topk_length`` /
-        ``attn_sink`` / ``return_lse``). Keys the selected backend does not
-        accept raise ``ValueError``.
+        names (for ``cuda``/``cake``: constructor knobs such as
+        ``kv_cache_format`` / ``kv_scale_format`` and run keywords such as
+        ``topk_length`` / ``attn_sink`` / ``return_lse``; the wrapper's own
+        ``backend`` ctor knob is owned by the front's backend name and is
+        refused). Keys the selected backend does not accept raise
+        ``ValueError``.
 
     Returns
     -------
     torch.Tensor or tuple
         The selected backend's documented return value (``(out, lse)`` for
-        ``sm120`` with ``backend_args['return_lse']=True``).
+        the wrapper backends with ``backend_args['return_lse']=True``).
 
     Notes
     -----
@@ -403,6 +426,14 @@ def sparse_mla_decode(
             backend,
             args,
         )
-    return _run_sm120(
-        query, kv_cache, indices, seq_lens, workspace_buffer, sm_scale, out, args
+    return _run_sm120_wrapper(
+        resolved,
+        query,
+        kv_cache,
+        indices,
+        seq_lens,
+        workspace_buffer,
+        sm_scale,
+        out,
+        args,
     )

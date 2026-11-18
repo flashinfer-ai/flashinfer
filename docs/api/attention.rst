@@ -245,8 +245,11 @@ Sparse MLA decode (generalized front)
 
 One routing surface over the same-op (selection-only) per-arch sparse-MLA
 decode entries: ``backend="specialized"`` (:func:`sparse_mla_decode_sm90`,
-SM90), ``backend="sm120"`` (:class:`SparseMLASm120Wrapper` as a single
-call, SM120/SM121), and ``backend="auto"`` routing by compute capability.
+SM90), ``backend="cuda"`` / ``backend="cake"`` (:class:`SparseMLASm120Wrapper`
+as a single call, SM120/SM121, pinned to its hand-written CUDA kernels or
+its Cake kernels respectively — backend names reflect the implementation's
+nature, never the architecture), and ``backend="auto"`` routing by compute
+capability.
 The backends keep their own tensor formats and contracts; backend-specific
 arguments pass through ``backend_args`` under the underlying entry's own
 names. :func:`trtllm_batch_decode_sparse_mla_dsv4` is intentionally not a

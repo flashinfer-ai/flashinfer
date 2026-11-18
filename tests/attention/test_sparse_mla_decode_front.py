@@ -51,8 +51,11 @@ def test_backends_tuple_is_plain_strings():
     assert SPARSE_MLA_DECODE_BACKENDS == (
         "auto",
         "specialized",
-        "sm120",
+        "cuda",
+        "cake",
     )
+    # Nature-named backends only: no arch-named labels.
+    assert not any(b.startswith("sm") for b in SPARSE_MLA_DECODE_BACKENDS)
     assert all(isinstance(b, str) for b in SPARSE_MLA_DECODE_BACKENDS)
 
 
@@ -101,8 +104,8 @@ def test_auto_on_cpu_tensor_raises():
     "cc,expected",
     [
         ((9, 0), "specialized"),
-        ((12, 0), "sm120"),
-        ((12, 1), "sm120"),
+        ((12, 0), "cuda"),
+        ((12, 1), "cuda"),
     ],
 )
 def test_auto_routes_by_capability(monkeypatch, cc, expected):
@@ -126,7 +129,7 @@ def test_explicit_backend_skips_capability_probe(monkeypatch):
         raise AssertionError("capability probed for an explicit backend")
 
     monkeypatch.setattr(front, "_capability", _boom)
-    for name in ("specialized", "sm120"):
+    for name in ("specialized", "cuda", "cake"):
         assert front._resolve_backend(name, torch.device("cpu")) == name
 
 
@@ -141,15 +144,17 @@ def test_dispatch_reaches_selected_adapter_only(monkeypatch):
     monkeypatch.setattr(
         front, "_run_specialized", lambda *a, **k: calls.append("specialized")
     )
-    monkeypatch.setattr(front, "_run_sm120", lambda *a, **k: calls.append("sm120"))
+    monkeypatch.setattr(front, "_run_sm120_wrapper", lambda b, *a, **k: calls.append(b))
     sparse_mla_decode(q, kv, idx, backend="specialized")
-    sparse_mla_decode(q, kv, idx, backend="sm120")
-    assert calls == ["specialized", "sm120"]
+    sparse_mla_decode(q, kv, idx, backend="cuda")
+    sparse_mla_decode(q, kv, idx, backend="cake")
+    assert calls == ["specialized", "cuda", "cake"]
     stats = front._sparse_mla_decode_stats()
-    assert stats["calls"] == 2
+    assert stats["calls"] == 3
     assert stats["backend_dispatches"] == {
         "specialized": 1,
-        "sm120": 1,
+        "cuda": 1,
+        "cake": 1,
     }
 
 
@@ -199,30 +204,39 @@ def test_specialized_rejects_backend_args():
         )
 
 
-def test_sm120_refuses_seq_lens_workspace_and_requires_sm_scale():
+@pytest.mark.parametrize("name", ["cuda", "cake"])
+def test_wrapper_backends_refuse_seq_lens_workspace_and_require_sm_scale(name):
     q, kv, idx = _cpu_call_args()
     with pytest.raises(ValueError, match="topk_length"):
-        sparse_mla_decode(
-            q, kv, idx, torch.zeros(2, dtype=torch.int32), backend="sm120"
-        )
+        sparse_mla_decode(q, kv, idx, torch.zeros(2, dtype=torch.int32), backend=name)
     with pytest.raises(ValueError, match="does not take a\\s+workspace_buffer"):
         sparse_mla_decode(
             q,
             kv,
             idx,
             workspace_buffer=torch.zeros(8, dtype=torch.uint8),
-            backend="sm120",
+            backend=name,
         )
     with pytest.raises(ValueError, match="requires sm_scale"):
-        sparse_mla_decode(q, kv, idx, backend="sm120")
+        sparse_mla_decode(q, kv, idx, backend=name)
     with pytest.raises(ValueError, match="does not accept"):
         sparse_mla_decode(
             q,
             kv,
             idx,
             sm_scale=1.0,
-            backend="sm120",
+            backend=name,
             backend_args={"sparse_topk_lens": torch.zeros(2)},
+        )
+    with pytest.raises(ValueError, match="does not accept"):
+        # The wrapper's own ctor 'backend' knob is owned by the front name.
+        sparse_mla_decode(
+            q,
+            kv,
+            idx,
+            sm_scale=1.0,
+            backend=name,
+            backend_args={"backend": "sparse"},
         )
 
 
@@ -231,7 +245,7 @@ def test_sm120_refuses_seq_lens_workspace_and_requires_sm_scale():
 # --------------------------------------------------------------------------
 
 
-def test_sm120_passthrough_caches_runner_and_allocates_out(monkeypatch):
+def test_wrapper_passthrough_caches_runner_and_allocates_out(monkeypatch):
     q = torch.zeros(3, 8, 576, dtype=torch.bfloat16)
     kv = torch.zeros(4, 584, dtype=torch.uint8)
     idx = torch.full((3, 2048), -1, dtype=torch.int32)
@@ -257,7 +271,7 @@ def test_sm120_passthrough_caches_runner_and_allocates_out(monkeypatch):
         kv,
         idx,
         sm_scale=0.0625,
-        backend="sm120",
+        backend="cuda",
         backend_args={"topk_length": topk, "kv_cache_format": "fp8"},
     )
     out2 = sparse_mla_decode(
@@ -265,12 +279,14 @@ def test_sm120_passthrough_caches_runner_and_allocates_out(monkeypatch):
         kv,
         idx,
         sm_scale=0.0625,
-        backend="sm120",
+        backend="cuda",
         backend_args={"topk_length": topk, "kv_cache_format": "fp8"},
     )
     # One construction, two runs: the front caches per (device, ctor knobs).
     assert len(made) == 1
     assert made[0]["kv_cache_format"] == "fp8"
+    # The front's backend name pins the wrapper implementation.
+    assert made[0]["backend"] == "sparse"
     runner = next(iter(front._sm120_runners.values()))
     assert len(runner.runs) == 2
     assert runner.runs[0][5]["topk_length"] is topk
