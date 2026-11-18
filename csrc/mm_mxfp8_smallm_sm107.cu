@@ -245,6 +245,11 @@ void Run(TensorView aq, TensorView bq, TensorView a_sf, TensorView b_sf, TensorV
   A.M = M;
   A.K = K;
   A.N = N;
+  // get_stream only retrieves the per-device FFI stream; it does not make
+  // that device current. Establish the operands' device for the launches
+  // (and restore the caller's current device on scope exit), so a call with
+  // all tensors on a non-current GPU is not issued on the wrong device.
+  ffi::CUDADeviceGuard device_guard(aq.device().device_id);
   cudaStream_t st = get_stream(aq.device());
   A.aq = (const uint8_t*)aq.data_ptr();
   A.bq = (const uint8_t*)bq.data_ptr();

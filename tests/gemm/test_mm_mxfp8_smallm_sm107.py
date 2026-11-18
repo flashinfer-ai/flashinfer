@@ -403,6 +403,101 @@ def test_specialized_small_scale_precise_path(monkeypatch):
         )
 
 
+def _const_operand(rows, k, value, scale_byte, device="cuda"):
+    """E4M3 operand filled with ``value`` plus a valid padded/swizzled scale
+    buffer filled with the UE8M0 byte ``scale_byte``."""
+    q = torch.full((rows, k), float(value), dtype=torch.bfloat16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    sf = torch.full(
+        (specialized._swizzled_sf_numel(rows, k),),
+        scale_byte,
+        dtype=torch.uint8,
+        device=device,
+    )
+    return q, sf
+
+
+@requires_sm107
+@pytest.mark.parametrize("m,n,k", [(4, 6144, 384), (4, 5120, 576), (8, 1152, 5120)])
+def test_extreme_scale_exponents_match_exact_value(m, n, k, monkeypatch):
+    """Reviewer-reported extreme MXFP8 exponent range: UE8M0 scale byte 254 on
+    an operand of 4 dequantizes to 2^129 — past BF16 (and FP32) range — while
+    every product term is an exact finite 4 (the B blocks carry scale byte 0).
+    The kernel must return the exact K*4, matching the tensor-core reference,
+    not inf: such k groups take the rebalanced precise path, which applies the
+    combined block-scale exponent after the raw-value product."""
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    a_q, a_sf = _const_operand(m, k, 4.0, 254)
+    b_q, b_sf = _const_operand(n, k, 1.0, 0)
+    calls = _count_kernel_launches(monkeypatch)
+    res = mm_mxfp8(
+        a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
+    )
+    assert len(calls) == 1
+    expected = torch.full((m, n), float(4 * k), dtype=torch.bfloat16, device="cuda")
+    assert torch.equal(res, expected), (
+        f"extreme-exponent result != exact {4 * k} "
+        f"(max={res.float().max().item()}, min={res.float().min().item()})"
+    )
+
+
+@requires_sm107
+def test_bf16_max_operand_times_zero_is_zero(monkeypatch):
+    """Finite BF16-max A straight out of mxfp8_quantize (E4M3 code 256 with
+    scale byte 247 — the scaled up-conversion alone would overflow to inf)
+    paired with an all-zero quantized B must give exactly zero, matching the
+    tensor-core reference, not NaN."""
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    m, n, k = (4, 6144, 384)
+    a_bf16 = torch.full(
+        (m, k), torch.finfo(torch.bfloat16).max, dtype=torch.bfloat16, device="cuda"
+    )
+    b_bf16 = torch.zeros((n, k), dtype=torch.bfloat16, device="cuda")
+    a_q, a_sf = mxfp8_quantize(a_bf16, sf_swizzle_layout=SfLayout.layout_128x4)
+    b_q, b_sf = mxfp8_quantize(b_bf16, sf_swizzle_layout=SfLayout.layout_128x4)
+    # The scenario must actually exercise the overflow-range class.
+    a_lin = specialized._unswizzle_sf(a_sf, m, k)
+    assert (a_lin >= 240).any(), "test setup must produce UE8M0 scales >= 240"
+    calls = _count_kernel_launches(monkeypatch)
+    res = mm_mxfp8(
+        a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
+    )
+    assert len(calls) == 1
+    assert torch.equal(res, torch.zeros_like(res)), (
+        "BF16-max x zero must be exactly zero, not NaN/inf"
+    )
+
+
+@requires_sm107
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason="requires two GPUs",
+)
+def test_operands_on_non_current_device(monkeypatch):
+    """A valid call with every operand on GPU 1 while GPU 0 is current must
+    run on GPU 1's stream/device (the FFI binding establishes the operand
+    device; the capture check is scoped to a.device) and must restore the
+    caller's current device."""
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    m, n, k = (4, 6144, 384)
+    dev1 = torch.device("cuda:1")
+    if get_compute_capability(dev1) != (10, 7):
+        pytest.skip("second GPU is not SM107")
+    a_q, a_sf = _const_operand(m, k, 1.0, 127, device=dev1)
+    b_q, b_sf = _const_operand(n, k, 1.0, 127, device=dev1)
+    torch.cuda.set_device(0)
+    calls = _count_kernel_launches(monkeypatch)
+    res = mm_mxfp8(
+        a_q, b_q.T, a_sf, b_sf, out_dtype=torch.bfloat16, backend="specialized"
+    )
+    assert len(calls) == 1
+    assert torch.cuda.current_device() == 0, "caller's current device not restored"
+    assert res.device == a_q.device
+    expected = torch.full((m, n), float(k), dtype=torch.bfloat16, device=dev1)
+    assert torch.equal(res, expected)
+
+
 @requires_sm107
 def test_explicit_specialized_off_list_raises(monkeypatch):
     """Explicit "specialized" off the allowlist raises NotImplementedError

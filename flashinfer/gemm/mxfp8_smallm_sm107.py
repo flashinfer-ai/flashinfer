@@ -252,10 +252,12 @@ def _device_supported(a: torch.Tensor) -> Optional[str]:
     allowlist = _load_allowlist()
     if allowlist is None or get_compute_capability(a.device) != allowlist["cc"]:
         return "compute_capability"
-    if (
-        torch.cuda.is_current_stream_capturing()
-        and "specialized" not in _backend_modules
-    ):
+    # The capture state that matters is the one of the stream the kernel will
+    # launch on — the current stream OF a.device (the FFI binding launches on
+    # that device's stream under a device guard) — not the ambient device's.
+    with torch.cuda.device(a.device):
+        capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and "specialized" not in _backend_modules:
         # Never compile/load inside a capture; the stock path is capture-safe.
         return "capturing_before_jit"
     return None

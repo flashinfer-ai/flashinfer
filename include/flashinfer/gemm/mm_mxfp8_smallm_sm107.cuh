@@ -316,6 +316,35 @@ DEVI float fma_f32(float a, float b, float c) {
   asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(r) : "f"(a), "f"(b), "f"(c));
   return r;
 }
+DEVI float add_f32(float a, float b) {
+  float r;
+  asm("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+  return r;
+}
+
+// UE8M0 bytes at the top of the range can expand a scaled E4M3 operand past
+// BF16's (and even FP32's) finite range although the dot product itself is
+// finite: 448 * 2^(247-127) already exceeds BF16-max, and byte 254 with
+// value 4 is 2^129, outside FP32 too.  Any byte >= 240 (a cheap conservative
+// word test: bits 7..4 all set) routes the k group to the rebalanced precise
+// path below, which never materializes a scaled operand.
+DEVI bool huge_scale_word(unsigned w) {
+  return ((w & (w << 1) & (w << 2) & (w << 3)) & 0x80808080u) != 0;
+}
+// One rebalanced product term: raw E4M3 magnitudes (exact in FP32), with the
+// combined block-scale exponent applied AFTER the product via scalbnf.  An
+// operand whose own dequant overflows (scale 254, value 4) still contributes
+// its exact finite product, and a zero partner gives 0, not NaN; the result
+// is inf only when the true term exceeds FP32 range, which the FP32
+// tensor-core accumulate could not represent either.  UE8M0 byte 255 is NaN.
+DEVI float term_rebalanced(unsigned vb, unsigned va, unsigned sb, unsigned sa) {
+  if (sb == 255u || sa == 255u) return __uint_as_float(0x7fc00000u);
+  float bv = dequant_f32(vb, 127u);
+  float av = dequant_f32(va, 127u);
+  float p;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(p) : "f"(bv), "f"(av));
+  return scalbnf(p, int(sb) + int(sa) - 254);
+}
 // Rare lossy conversion: each helper computes one output dot product from
 // the same register fragments.  Keeping one accumulator live reduces the
 // helper's register requirement on the usual, tensor-core-only path.
@@ -350,6 +379,44 @@ DEVI float4 precise_chunk(uint4 b0, uint4 b1, uint4 a, unsigned sb0, unsigned sb
   acc.y = precise_dot<BYTES>(b0, a, sb0, sa, acc.y, 1);
   acc.z = precise_dot<BYTES>(b1, a, sb1, sa, acc.z, 0);
   acc.w = precise_dot<BYTES>(b1, a, sb1, sa, acc.w, 1);
+  return acc;
+}
+
+// Rebalanced copy of precise_dot for k groups holding a huge (>= 240) scale
+// byte: same fragments, same shuffles, same accumulation order, but every
+// term goes through term_rebalanced so no scaled operand is ever formed.
+// The small-scale precise_dot above is kept unchanged: it bitwise-matches
+// the FP32-dequant reference (subnormal operand rounding included), which
+// the rebalanced form intentionally does not reproduce.
+template <int BYTES>
+__device__ __noinline__ float precise_dot_rb(uint4 b, uint4 a, unsigned sb, unsigned sa, float acc,
+                                             int acol) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2, q = lane & 3;
+#pragma unroll 1
+  for (int kp = 0; kp < 4; ++kp) {
+    const int bl = g * 4 + kp, al = (2 * q + acol) * 4 + kp;
+    unsigned bs = __shfl_sync(0xffffffffu, sb, bl);
+    unsigned as = __shfl_sync(0xffffffffu, sa, al);
+#pragma unroll 1
+    for (int w = 0; w < BYTES / 4; ++w) {
+      unsigned bw = __shfl_sync(0xffffffffu, pick(b, w), bl);
+      unsigned aw = __shfl_sync(0xffffffffu, pick(a, w), al);
+#pragma unroll 1
+      for (int c = 0; c < 4; ++c) {
+        acc = add_f32(acc, term_rebalanced((bw >> (8 * c)) & 255u, (aw >> (8 * c)) & 255u, bs, as));
+      }
+    }
+  }
+  return acc;
+}
+template <int BYTES>
+DEVI float4 precise_chunk_rb(uint4 b0, uint4 b1, uint4 a, unsigned sb0, unsigned sb1, unsigned sa,
+                             float4 acc) {
+  acc.x = precise_dot_rb<BYTES>(b0, a, sb0, sa, acc.x, 0);
+  acc.y = precise_dot_rb<BYTES>(b0, a, sb0, sa, acc.y, 1);
+  acc.z = precise_dot_rb<BYTES>(b1, a, sb1, sa, acc.z, 0);
+  acc.w = precise_dot_rb<BYTES>(b1, a, sb1, sa, acc.w, 1);
   return acc;
 }
 
@@ -651,12 +718,16 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
 
 #define MATHG(WB, WA, BV, AV, AC)                                                                \
   {                                                                                              \
-    bool tiny_ = false;                                                                          \
+    bool tiny_ = false, huge_ = false;                                                           \
     _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                          \
-        _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) tiny_ |=                                \
-        Q32 ? WB[s_][i_] < 3u : small_scale_word(WB[s_][i_]);                                    \
-    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) tiny_ |=                                 \
-        Q32 ? WA[j_] < 3u : small_scale_word(WA[j_]);                                            \
+        _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) {                                       \
+      tiny_ |= Q32 ? WB[s_][i_] < 3u : small_scale_word(WB[s_][i_]);                             \
+      huge_ |= Q32 ? WB[s_][i_] >= 240u : huge_scale_word(WB[s_][i_]);                           \
+    }                                                                                            \
+    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) {                                        \
+      tiny_ |= Q32 ? WA[j_] < 3u : small_scale_word(WA[j_]);                                     \
+      huge_ |= Q32 ? WA[j_] >= 240u : huge_scale_word(WA[j_]);                                   \
+    }                                                                                            \
     bool loss_ = false;                                                                          \
     if (__any_sync(0xffffffffu, tiny_)) {                                                        \
       _Pragma("unroll") for (int h_ = 0; h_ < 2; ++h_) {                                         \
@@ -674,7 +745,26 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
             loses_chunk<16>(AV[j_][h_], as_[j_]);                                                \
       }                                                                                          \
     }                                                                                            \
-    if (__any_sync(0xffffffffu, loss_)) {                                                        \
+    if (__any_sync(0xffffffffu, huge_)) {                                                        \
+      _Pragma("unroll") for (int h_ = 0; h_ < 2; ++h_) {                                         \
+        unsigned bs_[NSUB][2], as_[MSUB];                                                        \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                      \
+            _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) bs_[s_][i_] =                       \
+                Q32 ? WB[s_][i_] : (sfsel(WB[s_][i_], h_ ? sel1 : sel0) & 255u);                 \
+        _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) as_[j_] =                            \
+            Q32 ? WA[j_] : (sfsel(WA[j_], h_ ? sel1 : sel0) & 255u);                             \
+        _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                      \
+            _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) {                                \
+          float4 tmp_ = make_float4(AC[s_][j_][0], AC[s_][j_][1], AC[s_][j_][2], AC[s_][j_][3]); \
+          tmp_ = precise_chunk_rb<16>(BV[s_][0][h_], BV[s_][1][h_], AV[j_][h_], bs_[s_][0],      \
+                                      bs_[s_][1], as_[j_], tmp_);                                \
+          AC[s_][j_][0] = tmp_.x;                                                                \
+          AC[s_][j_][1] = tmp_.y;                                                                \
+          AC[s_][j_][2] = tmp_.z;                                                                \
+          AC[s_][j_][3] = tmp_.w;                                                                \
+        }                                                                                        \
+      }                                                                                          \
+    } else if (__any_sync(0xffffffffu, loss_)) {                                                 \
       _Pragma("unroll") for (int h_ = 0; h_ < 2; ++h_) {                                         \
         unsigned bs_[NSUB][2], as_[MSUB];                                                        \
         _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                      \
@@ -761,12 +851,18 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
 
 #define HMATH(U, WB, WA, BV, AV)                                                                  \
   {                                                                                               \
-    bool tiny_ = false;                                                                           \
+    bool tiny_ = false, huge_ = false;                                                            \
     _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                           \
-        _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) tiny_ |=                                 \
-        (sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u) < 3u;                                 \
-    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) tiny_ |=                                  \
-        (sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u) < 3u;                                     \
+        _Pragma("unroll") for (int i_ = 0; i_ < 2; ++i_) {                                        \
+      const unsigned sb__ = sfsel(WB[s_][i_], ((U) & 1) ? sel1 : sel0) & 255u;                    \
+      tiny_ |= sb__ < 3u;                                                                         \
+      huge_ |= sb__ >= 240u;                                                                      \
+    }                                                                                             \
+    _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) {                                         \
+      const unsigned sa__ = sfsel(WA[j_], ((U) & 1) ? sel1 : sel0) & 255u;                        \
+      tiny_ |= sa__ < 3u;                                                                         \
+      huge_ |= sa__ >= 240u;                                                                      \
+    }                                                                                             \
     bool loss_ = false;                                                                           \
     if (__any_sync(0xffffffffu, tiny_)) {                                                         \
       _Pragma("unroll") for (int h_ = 0; h_ < 1; ++h_) {                                          \
@@ -784,7 +880,8 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
             loses_chunk<16>(AV[j_], as_[j_]);                                                     \
       }                                                                                           \
     }                                                                                             \
-    if (__any_sync(0xffffffffu, loss_)) {                                                         \
+    if (__any_sync(0xffffffffu, huge_ | loss_)) {                                                 \
+      const bool rb_ = __any_sync(0xffffffffu, huge_);                                            \
       _Pragma("unroll") for (int h_ = 0; h_ < 1; ++h_) {                                          \
         unsigned bs_[NSUB][2], as_[MSUB];                                                         \
         _Pragma("unroll") for (int s_ = 0; s_ < NSUB; ++s_)                                       \
@@ -796,8 +893,10 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
             _Pragma("unroll") for (int j_ = 0; j_ < MSUB; ++j_) {                                 \
           float4 tmp_ =                                                                           \
               make_float4(acc[s_][j_][0], acc[s_][j_][1], acc[s_][j_][2], acc[s_][j_][3]);        \
-          tmp_ = precise_chunk<16>(BV[s_][0], BV[s_][1], AV[j_], bs_[s_][0], bs_[s_][1], as_[j_], \
-                                   tmp_);                                                         \
+          tmp_ = rb_ ? precise_chunk_rb<16>(BV[s_][0], BV[s_][1], AV[j_], bs_[s_][0], bs_[s_][1], \
+                                            as_[j_], tmp_)                                        \
+                     : precise_chunk<16>(BV[s_][0], BV[s_][1], AV[j_], bs_[s_][0], bs_[s_][1],    \
+                                         as_[j_], tmp_);                                          \
           acc[s_][j_][0] = tmp_.x;                                                                \
           acc[s_][j_][1] = tmp_.y;                                                                \
           acc[s_][j_][2] = tmp_.z;                                                                \
@@ -935,7 +1034,7 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
       for (int c = 0; c < rem; ++c) {
         const Index kbase = ((gfull << 2) + c) * 32 - Index(q) * (Q32 ? 24 : 8);
         uint2 Bv[NSUB][2], Av[MSUB];
-        bool loss = false;
+        bool loss = false, huge = false;
 #pragma unroll
         for (int s = 0; s < NSUB; ++s)
 #pragma unroll
@@ -943,23 +1042,29 @@ __global__ void __launch_bounds__(32 * WN * WK, BPS) __cluster_dims__(1, (CLSC >
             Bv[s][i] = ldg64(bq + boff[s][i] + kbase);
             loss |= loses_chunk<8>(make_uint4(Bv[s][i].x, Bv[s][i].y, 0, 0),
                                    (wb[s][i] >> (8 * c)) & 255u);
+            huge |= ((wb[s][i] >> (8 * c)) & 255u) >= 240u;
           }
 #pragma unroll
         for (int j = 0; j < MSUB; ++j) {
           Av[j] = ldg64(aq + aoff[j] + kbase);
           loss |= loses_chunk<8>(make_uint4(Av[j].x, Av[j].y, 0, 0), (wa[j] >> (8 * c)) & 255u);
+          huge |= ((wa[j] >> (8 * c)) & 255u) >= 240u;
         }
-        if (__any_sync(0xffffffffu, loss)) {
+        if (__any_sync(0xffffffffu, loss | huge)) {
+          const bool rb = __any_sync(0xffffffffu, huge);
 #pragma unroll
           for (int s = 0; s < NSUB; ++s)
 #pragma unroll
             for (int j = 0; j < MSUB; ++j) {
               float4 tmp = make_float4(acc[s][j][0], acc[s][j][1], acc[s][j][2], acc[s][j][3]);
-              tmp =
-                  precise_chunk<8>(make_uint4(Bv[s][0].x, Bv[s][0].y, 0, 0),
-                                   make_uint4(Bv[s][1].x, Bv[s][1].y, 0, 0),
-                                   make_uint4(Av[j].x, Av[j].y, 0, 0), (wb[s][0] >> (8 * c)) & 255u,
-                                   (wb[s][1] >> (8 * c)) & 255u, (wa[j] >> (8 * c)) & 255u, tmp);
+              const uint4 b0 = make_uint4(Bv[s][0].x, Bv[s][0].y, 0, 0);
+              const uint4 b1 = make_uint4(Bv[s][1].x, Bv[s][1].y, 0, 0);
+              const uint4 a0 = make_uint4(Av[j].x, Av[j].y, 0, 0);
+              const unsigned sb0 = (wb[s][0] >> (8 * c)) & 255u;
+              const unsigned sb1 = (wb[s][1] >> (8 * c)) & 255u;
+              const unsigned sa0 = (wa[j] >> (8 * c)) & 255u;
+              tmp = rb ? precise_chunk_rb<8>(b0, b1, a0, sb0, sb1, sa0, tmp)
+                       : precise_chunk<8>(b0, b1, a0, sb0, sb1, sa0, tmp);
               acc[s][j][0] = tmp.x;
               acc[s][j][1] = tmp.y;
               acc[s][j][2] = tmp.z;
