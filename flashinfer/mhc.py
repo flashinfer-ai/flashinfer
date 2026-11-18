@@ -166,7 +166,26 @@ def _check_mhc_pre_common_inputs(
     hidden_size = residual.shape[-1]
     if hc != _MHC_HC:
         raise ValueError(f"residual.shape[-2] / HC must be 4, got {hc}")
+    # The big-fuse kernels read the residual through 8-element (16-byte)
+    # bf16 vectors; reject unsupported hidden sizes here, before any
+    # projection GEMM or layout copy runs.
+    if hidden_size <= 0 or hidden_size % 8 != 0:
+        raise ValueError(
+            f"residual.shape[-1] / H must be positive and divisible by 8, "
+            f"got {hidden_size}"
+        )
     return total_tokens, hidden_size, outer_shape
+
+
+def _aligned_contiguous_residual(residual_flat: torch.Tensor) -> torch.Tensor:
+    """The big-fuse kernels use 16-byte vector loads on the residual;
+    contiguity alone does not establish base alignment (e.g. a
+    ``backing[1:].view(...)`` is contiguous with a misaligned base). Copy
+    only when the contiguous tensor's address is still misaligned."""
+    residual_flat = residual_flat.contiguous()
+    if residual_flat.data_ptr() % 16:
+        residual_flat = residual_flat.clone(memory_format=torch.contiguous_format)
+    return residual_flat
 
 
 def _check_positive_eps(name: str, value: float) -> None:
@@ -214,6 +233,8 @@ def mhc_pre_big_fuse(
         the split axis internally). dtype is implementation-defined.
     residual : torch.Tensor
         Multi-head residual tensor, shape ``[..., HC=4, H]`` (bfloat16).
+        ``H`` must be positive and divisible by 8 (the kernels read the
+        residual through 16-byte bf16 vectors).
         Same layout as :func:`mhc_post`'s ``residual``.
     mhc_scale : torch.Tensor
         mHC scaling tensor consumed by the Sinkhorn / mix step. Shape and
@@ -293,7 +314,9 @@ def mhc_pre_big_fuse(
         dot_mix_flat = dot_mix.reshape(num_splits, total_tokens, _MHC_MIX).contiguous()
         sqrsum_flat = sqrsum.reshape(num_splits, total_tokens).contiguous()
 
-    residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size).contiguous()
+    residual_flat = _aligned_contiguous_residual(
+        residual.reshape(total_tokens, _MHC_HC, hidden_size)
+    )
     mhc_scale = mhc_scale.contiguous()
     mhc_base = mhc_base.contiguous()
     post_mix = torch.empty(
@@ -367,6 +390,8 @@ def mhc_pre(
     ----------
     residual : torch.Tensor
         Multi-head residual tensor, shape ``[..., HC=4, H]`` (bfloat16).
+        ``H`` must be positive and divisible by 8 (the kernels read the
+        residual through 16-byte bf16 vectors).
     fn : torch.Tensor
         Projection matrix, shape ``[24, HC*H]`` (float32). The 24 rows are
         laid out as ``[pre(4), post(4), comb(16)]``.
@@ -437,19 +462,41 @@ def mhc_pre(
         # Layout normalization for a non-contiguous residual happens inside
         # the dispatcher, after its cheap eligibility checks: an ineligible
         # call must reach the big-fuse fallback without paying for the copy.
-        residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size)
-        served = mhc_pre_glm_cuda.maybe_dispatch_specialized(
-            backend,
-            residual_flat,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            mhc_pre_eps,
-            mhc_sinkhorn_eps,
-            mhc_post_mult_value,
-            sinkhorn_repeat,
+        # The flatten itself already copies when the leading axes are
+        # non-contiguous and ndim != 3, so gate that case on the same
+        # layout-independent checks first.
+        served = None
+        skip_dispatch = (
+            backend == "auto"
+            and residual.dim() != 3
+            and not residual.is_contiguous()
+            and mhc_pre_glm_cuda.rejects_before_flatten(
+                total_tokens,
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                mhc_pre_eps,
+                mhc_sinkhorn_eps,
+                mhc_post_mult_value,
+                sinkhorn_repeat,
+            )
         )
+        if not skip_dispatch:
+            residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size)
+            served = mhc_pre_glm_cuda.maybe_dispatch_specialized(
+                backend,
+                residual_flat,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                mhc_pre_eps,
+                mhc_sinkhorn_eps,
+                mhc_post_mult_value,
+                sinkhorn_repeat,
+            )
         if served is not None:
             post_mix, comb_mix, layer_input = served
             return (
@@ -507,6 +554,8 @@ def mhc_pre_big_fuse_with_prenorm(
         derivation.
     residual : torch.Tensor
         Multi-head residual tensor, shape ``[..., HC=4, H]`` (bfloat16).
+        ``H`` must be positive and divisible by 8 (the kernels read the
+        residual through 16-byte bf16 vectors).
         ``sqrsum`` is computed from this tensor inside the kernel; same
         layout as :func:`mhc_post`'s ``residual``.
     mhc_scale : torch.Tensor
@@ -561,7 +610,9 @@ def mhc_pre_big_fuse_with_prenorm(
             f"got {dot_mix_shape}"
         )
 
-    residual_flat = residual.reshape(total_tokens, _MHC_HC, hidden_size).contiguous()
+    residual_flat = _aligned_contiguous_residual(
+        residual.reshape(total_tokens, _MHC_HC, hidden_size)
+    )
     mhc_scale = mhc_scale.contiguous()
     mhc_base = mhc_base.contiguous()
     post_mix = torch.empty(

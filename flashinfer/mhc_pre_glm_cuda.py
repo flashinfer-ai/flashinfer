@@ -45,11 +45,19 @@ LAST_FALLBACK_REASONS: list = []
 
 _BUILT = {"ready": False}
 
+# A failed module load is remembered so "auto" does not re-run the build
+# (ninja compile/link, or the immediate raise when JIT is disabled) on every
+# later eligible call. An explicit backend="specialized" call always retries,
+# so callers can recover after the toolchain or artifact is fixed; a retry
+# that succeeds clears the marker for "auto" too.
+_LOAD_FAILED = {"type": None}
+
 
 @functools.cache
 def get_mhc_pre_glm_module():
     mod = gen_mhc_pre_glm_module().build_and_load()
     _BUILT["ready"] = True
+    _LOAD_FAILED["type"] = None
     return mod
 
 
@@ -153,6 +161,50 @@ def supported_with_reasons(
     return []
 
 
+def rejects_before_flatten(
+    total_tokens,
+    residual,
+    fn,
+    hc_scale,
+    hc_base,
+    rms_eps,
+    mhc_pre_eps,
+    mhc_sinkhorn_eps,
+    mhc_post_mult_value,
+    sinkhorn_repeat,
+):
+    """Layout-independent eligibility pre-screen for an "auto" call whose
+    residual flatten would materialize a copy (ndim != 3 and non-contiguous).
+    Runs the dispatcher's layout-ignoring checks against a zero-storage
+    stand-in with the flattened shape, so an ineligible call (wrong scalar
+    pins, geometry, dtype, device, ...) reaches the big-fuse fallback without
+    paying for a flatten copy the fallback does not need. Returns True (and
+    records the fallback) when the call is rejected regardless of layout."""
+    probe = torch.empty_strided(
+        (total_tokens,) + tuple(residual.shape[-2:]),
+        (0, 0, 0),
+        dtype=residual.dtype,
+        device=residual.device,
+    )
+    reasons = supported_with_reasons(
+        probe,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        mhc_pre_eps,
+        mhc_sinkhorn_eps,
+        mhc_post_mult_value,
+        sinkhorn_repeat,
+        _ignore_residual_layout=True,
+    )
+    if reasons:
+        LAST_FALLBACK_REASONS[:] = reasons
+        DISPATCH_STATS["fallback"] += 1
+        return True
+    return False
+
+
 def maybe_dispatch_specialized(
     backend,
     residual,
@@ -210,11 +262,20 @@ def maybe_dispatch_specialized(
     )
     LAST_FALLBACK_REASONS[:] = reasons
     if not reasons:
+        if backend != "specialized" and _LOAD_FAILED["type"] is not None:
+            # The load already failed once; do not re-run the build on every
+            # eligible "auto" call. backend="specialized" retries below.
+            LAST_FALLBACK_REASONS[:] = [
+                "specialized_module_unavailable:" + _LOAD_FAILED["type"]
+            ]
+            DISPATCH_STATS["fallback"] += 1
+            return None
         try:
             get_mhc_pre_glm_module()
         except Exception as e:  # pragma: no cover - environment-dependent
             # A missing prebuilt JIT artifact (or a build failure) must not
             # take down "auto": record the reason and keep the big-fuse path.
+            _LOAD_FAILED["type"] = type(e).__name__
             if backend == "specialized":
                 raise
             LAST_FALLBACK_REASONS[:] = [
