@@ -116,10 +116,14 @@ be merged and exercised directly.
 **The handler uses the first unfenced command line.** Quoted replies, code fences,
 inline code and mentions embedded in prose do not issue commands. This also keeps
 the inline example command in an AI recommendation from starting another run.
-The job guard excludes comments by `flashinfer-bot`, the account used by
-`FLASHINFER_BOT_TOKEN`, before checkout and permission checks. Keep that guard in
-sync if the posting account changes. Generated replies retain copyable commands;
-model explanations and validation errors remove bot mentions without regard to case.
+Commands posted by `flashinfer-bot`, the account used by `FLASHINFER_BOT_TOKEN`,
+are authorized by that token and always run, so automation holding it can start
+CI. The notes this handler posts as that account end with the hidden marker
+`<!-- flashinfer-bot:ci-bot-commands-note -->`, and the job guard skips bot comments carrying it
+before checkout and permission checks, so a generated reply is never read back as
+a command. Keep the guard, the marker and the account name in sync. Generated
+replies retain copyable commands; model explanations and validation errors remove
+bot mentions without regard to case.
 
 **A narrowed run is not a full run.** The GPU lanes change name and the summary states the
 scope, but the required check reports success either way. Green on a narrowed run means
