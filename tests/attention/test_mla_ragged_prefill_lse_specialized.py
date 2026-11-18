@@ -28,7 +28,10 @@ import pytest
 import torch
 
 import flashinfer.mla_ragged_prefill_dsr1_cuda as spec_mod
-from flashinfer.prefill import trtllm_ragged_attention_deepseek
+from flashinfer.prefill import (
+    ragged_attention_deepseek,
+    trtllm_ragged_attention_deepseek,
+)
 
 requires_sm103 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
@@ -127,7 +130,9 @@ def _ws():
 
 
 def _api(inp, backend="auto", return_lse=True, out=None):
-    return trtllm_ragged_attention_deepseek(
+    # the generic front is the ONLY surface exposing the specialized
+    # backend (the vendor-named entry stays stock)
+    return ragged_attention_deepseek(
         query=inp["q"],
         key=inp["k"],
         value=inp["v"],
@@ -313,12 +318,12 @@ def test_generalized_entry_parity_and_dispatch():
     # the direct specialized name produces the same bits
     spec_o, spec_l = ragged_attention_deepseek(**{**kwargs, "backend": "specialized"})
     assert torch.equal(spec_o, gen_o) and torch.equal(spec_l, gen_l)
-    # parity with the entry-level specialized route
-    direct_o, direct_l = _api(inp, backend="specialized")
-    assert torch.equal(gen_o, direct_o) and torch.equal(gen_l, direct_l)
+    # the vendor-named entry stays STOCK: it has no specialized backend
+    with pytest.raises(ValueError, match="trtllm-gen"):
+        trtllm_ragged_attention_deepseek(**{**kwargs, "backend": "specialized"})
     # the named "trtllm" backend equals the entry's trtllm-gen path
     stock_o, stock_l = ragged_attention_deepseek(**{**kwargs, "backend": "trtllm"})
-    ds_o, ds_l = _api(inp, backend="trtllm-gen")
+    ds_o, ds_l = _api(inp, backend="trtllm")
     assert torch.equal(stock_o, ds_o) and torch.equal(stock_l, ds_l)
     # return_lse=False leaves the specialized allowlist: "auto" must select
     # "trtllm" (no behavior of its own) and match the entry at the SAME args
