@@ -1767,6 +1767,20 @@ DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
 # "em8-15" or "em16+".  Every other call runs the whole program.
 DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
     212: {
+        ("even", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
+        ("uneven", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
+        ("even", "em2-7"): (
+            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
+            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
+        ),
+        ("uneven", "em2-7"): (
+            "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
+            "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
+            "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
+        ),
         ("even", "em8-15"): (
             "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8",
             "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8",
@@ -1779,8 +1793,6 @@ DOMAIN_SERVING_CELLS: dict[int, dict[tuple[str, str], tuple[str, ...]]] = {
             "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8",
             "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8",
         ),
-        ("even", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
-        ("uneven", "em<=1"): ("sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2",),
     },
 }
 
