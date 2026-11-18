@@ -86,6 +86,9 @@ def test_window_reuse_capture_geometry_and_cleanup(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     second = handle.dispatch(DispatchInputParams(x=[x]))
     assert first.expert_tensors.data_ptr() == second.expert_tensors.data_ptr()
+    calls = [call for call in handle._handle.calls if call[0] == "dispatch"]
+    assert len(calls) == 2
+    assert all(call[2].tokens is fleet._dispatch_windows["tokens"][3] for call in calls)
     assert len(windows) == 1
     with pytest.raises(ValueError, match="geometry"):
         fleet._dispatch_window("tokens", (4, 4, 4096), x.dtype, x.device)

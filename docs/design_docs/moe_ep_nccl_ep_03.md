@@ -16,9 +16,10 @@ Pass `FleetAlgoKnobNcclEpConfig` in the Fleet's `algo_knobs` to set a group-wide
 `require_fused`, or `force_scan`. Unsupported fields fail early on older
 providers. A positive group top-k bounds every handle created by that Fleet.
 
-HT uses Flat layout, which supports both flows. The default leaves flow
-selection to the provider. A handle-time received-token counter requires
-metadata before dispatch and is incompatible with `require_fused`; under
+HT uses Flat layout. Explicit `pull_push` requires all ranks to belong to one
+NCCL LSA team; `require_fused` has the same topology restriction. The default
+leaves flow selection to the provider. A handle-time received-token counter
+requires metadata before dispatch and is incompatible with `require_fused`; under
 `auto` the provider can select its unfused fallback.
 
 Set `eager_recv=True` on EP0.3 to size receive payload and routing arrays from
@@ -27,7 +28,11 @@ allocates compact arrays for expert compute. An empty receiver uses one inactive
 row with masked routing. Handle creation, updates and dispatch reject CUDA graph
 capture in this mode. The default fixed-capacity mode supports capture and
 avoids the host count read. Eager sizing is HT-only and cannot use
-`require_fused`. It does not reduce the provider's internal staging reservation.
+`require_fused`. It changes the provider's receive bound to AUTO, which can
+increase internal staging even though FI's receive arrays become smaller.
+For example, four ranks with capacity 128 and top-k 2 use an AUTO bound of
+1024 rows instead of the fixed mode's 512. Account for this reservation when
+enabling eager sizing; group creation can run out of memory sooner.
 
 Set `dispatch_zero_copy=True` to register a persistent receive window for LL
 Rank-Major dispatch on EP0.3. Warm up outside CUDA graph capture; registration
@@ -50,8 +55,12 @@ scale rows separately using NCCL's FWD recipe. Through `MoEEpSplitLayer`, this
 requires MXFP8 activation dispatch and `FusedMoeKernelConfig.mxfp8_dispatch=False`;
 FI quantizes before dispatch and supplies the received scales to expert compute.
 The low-level handle takes `DispatchInputParams(x=[values, scales])`, with
-contiguous, matching row counts and 16-byte-aligned rows. LL Expert-Major,
-LL Rank-Major and HT Flat support forwarding; existing HT eager sizing also
+contiguous, matching row counts and 16-byte-aligned rows. Split-layer MXFP8
+forwarding therefore requires hidden size divisible by 512. In fixed-capacity
+mode, receive payload and scale geometry, dtype and device stay fixed for the
+Fleet, including without receive windows. A changed geometry requires a new Fleet; dispatch
+rejects it before releasing buffers that captured graphs may still reference.
+LL Expert-Major, LL Rank-Major and HT Flat support forwarding; HT eager sizing also
 applies. Window-backed forwarding retains the LL Rank-Major restriction above.
 Fused provider DeepSeek FP8 dispatch quantization remains unwrapped.
 
@@ -71,9 +80,17 @@ overflow policy still applies. CUDA 12, other LL JIT sizes, and opt-in CFT/NUCS
 remain outside qualification. These limits concern the split NCCL backend;
 native MegaMoE uses its own communication path.
 
+Eager forwards using a Fleet graph state must run on the stream that created
+the state. A different eager caller stream is rejected before input preparation
+or transport. Capture may use another stream because the transport follows
+the active capture stream.
+
 Fault-tolerance query/update use the C ABI because their Python counterparts
 take an EP Tensor and a host NumPy array rather than pointers. Mask updates keep
 their pinned host input unchanged until its asynchronous copy finishes; reuse,
 topology replacement and destruction wait for that copy when needed.
+`update_topology()` preserves the Fleet's fault-tolerance settings; create a
+new Fleet to change them. A native replacement failure leaves no live group.
+Handle creation and group access then fail until a successful topology retry.
 Normal LL group destruction still barriers across the original communicator
 and can block after a peer exits.

@@ -224,17 +224,18 @@ def test_split_layer_payload_and_scale_context(forward):
 
 
 @pytest.mark.parametrize("option", ["dispatch_quantization", "combine_quantization"])
-def test_layer_rejects_quantization_on_other_transport(option):
+@pytest.mark.parametrize("backend", ["nixl_ep", "nvlink_two_sided"])
+def test_layer_rejects_quantization_on_other_transport(option, backend):
     from flashinfer.moe_ep import FleetAlgoKnobNcclEpConfig
     from flashinfer.moe_ep.modes.split_layer import MoEEpSplitLayer
 
     value = "forward" if option == "dispatch_quantization" else "nvfp4"
-    layer = SimpleNamespace(
-        _comm_backend_name=lambda: "nixl_ep",
-        _fleet_knobs=[FleetAlgoKnobNcclEpConfig(**{option: value})],
-    )
+    layer = MoEEpSplitLayer.__new__(MoEEpSplitLayer)
+    torch.nn.Module.__init__(layer)
+    layer._comm_backend = backend
+    layer._fleet_knobs = [FleetAlgoKnobNcclEpConfig(**{option: value})]
     with pytest.raises(ValueError, match="requires nccl_ep"):
-        MoEEpSplitLayer._validate_fleet_config(layer)
+        layer._validate_at_init()
 
 
 @pytest.mark.parametrize("invalid", ["dtype", "dimensions", "stride"])

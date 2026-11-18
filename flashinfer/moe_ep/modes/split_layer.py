@@ -113,6 +113,7 @@ class MoEEpSplitGraphState:
     __slots__ = (
         "_layer_ref",
         "_handle",
+        "_operation_stream",
         "_hidden_states",
         "_topk_ids",
         "_topk_weights",
@@ -128,6 +129,8 @@ class MoEEpSplitGraphState:
         handle: "Handle | None",
         t: "MoEEpTensors",
         out: torch.Tensor,
+        *,
+        operation_stream: int | None = None,
     ) -> None:
         """Bind one layer, its persistent handle (if any) and one static buffer set.
 
@@ -140,6 +143,7 @@ class MoEEpSplitGraphState:
         # so a strong back-reference would make the pair uncollectable.
         self._layer_ref = weakref.ref(layer)
         self._handle = handle
+        self._operation_stream = operation_stream
         self._hidden_states = t.hidden_states
         self._topk_ids = t.topk_ids
         self._topk_weights = t.topk_weights
@@ -171,6 +175,16 @@ class MoEEpSplitGraphState:
         occupies its layer's one graph-state slot.
         """
         return self._destroyed
+
+    def _check_operation_stream(self):
+        if (
+            self._operation_stream is not None
+            and not _is_capturing()
+            and torch.cuda.current_stream().cuda_stream != self._operation_stream
+        ):
+            raise MoEEpConfigError(
+                "eager use of a Fleet graph state requires its creating stream"
+            )
 
     def _check(self, layer: "MoEEpSplitLayer", t: "MoEEpTensors") -> None:
         """Gate one ``forward``: right layer, live state, unchanged buffers.
@@ -487,6 +501,7 @@ class MoEEpSplitLayer(nn.Module):
         return on_communication
 
     def _validate_at_init(self, *, validate_weights=True) -> None:
+        self._validate_nccl_config()
         validate_bootstrap_world_size(self._bootstrap)
         if validate_weights:
             validate_fleet_weights(
@@ -686,6 +701,7 @@ class MoEEpSplitLayer(nn.Module):
                 t, output, compute=compute
             )
         else:
+            state._check_operation_stream()
             # Fleet handles bind weights at creation; refresh their contents
             # when eager callers provide a different routing buffer.
             if t.topk_weights.data_ptr() != state._topk_weights.data_ptr():
@@ -770,15 +786,9 @@ class MoEEpSplitLayer(nn.Module):
 
     # ------------------------------------------------- Fleet/Handle path
 
-    def _validate_fleet_config(self) -> None:
+    def _validate_nccl_config(self) -> None:
         backend_name = self._comm_backend_name()
-        # nixl_ep rendezvous-store validation is deferred to fleet creation
-        # (first forward): layers are routinely constructed before
-        # torch.distributed is initialized, and NixlEpFleet._resolve_store
-        # raises the same actionable error when neither tcp_store nor an
-        # initialized default group is available.
-        fleet_knobs = _index_knobs(self._fleet_knobs)
-        nccl_options = fleet_knobs.get(FleetAlgoKnobNcclEpConfig)
+        nccl_options = _index_knobs(self._fleet_knobs).get(FleetAlgoKnobNcclEpConfig)
         if (
             isinstance(nccl_options, FleetAlgoKnobNcclEpConfig)
             and (
@@ -788,9 +798,6 @@ class MoEEpSplitLayer(nn.Module):
             and backend_name != "nccl_ep"
         ):
             raise MoEEpConfigError("native communication quantization requires nccl_ep")
-        if backend_name not in ("nccl_ep", "nixl_ep"):
-            return
-        validate_arch_for_backend(backend_name)
         if self._forward_scales:
             from ...fused_moe.api import QuantFormat
 
@@ -798,6 +805,23 @@ class MoEEpSplitLayer(nn.Module):
                 raise MoEEpConfigError(
                     "native scale forwarding currently requires an MXFP8 dispatch format"
                 )
+            if self._fleet_params.token_hidden_size % 512:
+                raise MoEEpConfigError(
+                    "native MXFP8 forwarding requires hidden size divisible by 512 "
+                    "for 16-byte-aligned scale rows"
+                )
+
+    def _validate_fleet_config(self) -> None:
+        backend_name = self._comm_backend_name()
+        # nixl_ep rendezvous-store validation is deferred to fleet creation
+        # (first forward): layers are routinely constructed before
+        # torch.distributed is initialized, and NixlEpFleet._resolve_store
+        # raises the same actionable error when neither tcp_store nor an
+        # initialized default group is available.
+        fleet_knobs = _index_knobs(self._fleet_knobs)
+        if backend_name not in ("nccl_ep", "nixl_ep"):
+            return
+        validate_arch_for_backend(backend_name)
         cap_knob = fleet_knobs.get(FleetAlgoKnobTopologyCapacity)
         topology_capacity = (
             int(cap_knob.n) if cap_knob is not None else None  # type: ignore[attr-defined]
@@ -825,15 +849,14 @@ class MoEEpSplitLayer(nn.Module):
         self, t: "MoEEpTensors", out: torch.Tensor
     ) -> MoEEpSplitGraphState:
         fleet = self._ensure_fleet()
+        operation_stream = torch.cuda.current_stream().cuda_stream
         handle = fleet.create_handle(
             HandleParams(topk_ids=t.topk_ids),
             algo_knobs=[
                 # Bound once, to the stream creation runs on. Under capture the
                 # handle issues transport work on the capture stream instead --
                 # see NcclEpHandle._op_stream.
-                HandleAlgoKnobUserStream(
-                    stream=torch.cuda.current_stream().cuda_stream
-                ),
+                HandleAlgoKnobUserStream(stream=operation_stream),
                 # Bound to the STATIC weights buffer: combine reads it from
                 # this address on every replay.
                 HandleAlgoKnobTopKWeights(weights=t.topk_weights),
@@ -856,12 +879,15 @@ class MoEEpSplitLayer(nn.Module):
         except Exception:
             handle.destroy()
             raise
-        return MoEEpSplitGraphState(self, handle, t, out)
+        return MoEEpSplitGraphState(
+            self, handle, t, out, operation_stream=operation_stream
+        )
 
     def _fleet_forward(
         self, t: "MoEEpTensors", graph_state: Optional[MoEEpSplitGraphState]
     ) -> torch.Tensor:
         if graph_state is not None:
+            graph_state._check_operation_stream()
             handle = graph_state._handle
             # The per-step half: recompute routing from the (rewritten) ids
             # into the handle's existing buffers. Recorded inside the capture.

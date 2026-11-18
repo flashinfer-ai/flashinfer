@@ -92,7 +92,12 @@ def test_invalid_replacement_preserves_live_group(
 
     monkeypatch.setattr(fake_nccl_ep, "GroupConfig", checked_config)
     invalid = FleetAlgoKnobNcclEpConfig(num_topk=9 if failure == "options" else 3)
-    with pytest.raises(ValueError):
+    reason = (
+        "num_topk"
+        if failure == "options"
+        else "provider rejected candidate configuration"
+    )
+    with pytest.raises(ValueError, match=reason):
         fleet.update_topology(
             BootstrapConfig(rank=0, world_size=2), [allocator, invalid]
         )

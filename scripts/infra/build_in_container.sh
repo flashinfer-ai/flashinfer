@@ -141,7 +141,12 @@ uv pip install --python "${VENV}/bin/python" \
     "${CUDA_EXTRA_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.32.0" \
     "cuda-tile>=1.4.0" "cuda-python>=13.0" \
     "nccl-extensions>=0.2.0" "nccl4py>=0.4.1" \
-    "nvidia-nccl-cu13>=2.30.7"   # Load the selected NCCL EP runtime first on LD_LIBRARY_PATH
+    "nvidia-nccl-cu13>=2.30.7"
+
+# Prefer the selected wheel before any system NCCL, including later sessions.
+NCCL_WHEEL_LIB="$("${VENV}/bin/python" -c \
+    'import nvidia.nccl, os; print(os.path.join(list(nvidia.nccl.__path__)[0], "lib"))')"
+export LD_LIBRARY_PATH="${NCCL_WHEEL_LIB}:${LD_LIBRARY_PATH:-}"
 
 # ---- 6. FlashInfer + both EP backends -------------------------------------
 # Wipe any half-populated meson subproject extracts from prior aborted runs.
@@ -181,7 +186,7 @@ BUILD_NIXL_EP=1 \
 # ---- 7. persist env for subsequent srun on the same container --------------
 cat > /etc/profile.d/flashinfer.sh <<EOF
 export PATH=${VENV}/bin:${UCX_PREFIX}/bin:/root/.local/bin:\${PATH}
-export LD_LIBRARY_PATH=${UCX_PREFIX}/lib:/opt/mellanox/doca/lib/${MULTIARCH}:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=${NCCL_WHEEL_LIB}:${UCX_PREFIX}/lib:/opt/mellanox/doca/lib/${MULTIARCH}:/usr/local/cuda/lib64:\${LD_LIBRARY_PATH:-}
 export PKG_CONFIG_PATH=${UCX_PREFIX}/lib/pkgconfig:/opt/mellanox/doca/lib/${MULTIARCH}/pkgconfig:\${PKG_CONFIG_PATH:-}
 export CPATH=/opt/mellanox/doca/include:\${CPATH:-}
 export VIRTUAL_ENV=${VENV}

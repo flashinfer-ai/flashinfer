@@ -20,6 +20,7 @@ from flashinfer.moe_ep import (
 from tests.moe_ep.test_nccl_ep_release_multirank import (
     _assert_collective,
     _assert_collective_close,
+    _assert_receive_ownership,
     released_runtime as released_runtime,
 )
 
@@ -77,7 +78,10 @@ def test_dispatch_window_graph_and_empty_receivers(
         ],
     )
 
+    received = None
+
     def step():
+        nonlocal received
         handle.update(HandleParams(ids))
         received = handle.dispatch(DispatchInputParams(x=[values]))
         local = received.expert_tensors.float()
@@ -117,6 +121,9 @@ def test_dispatch_window_graph_and_empty_receivers(
                 torch.bfloat16
             )
             _assert_collective_close(result, expected)
+            _assert_receive_ownership(
+                received, rank, world, tokens, concentrated=phase == 1
+            )
         _assert_collective(
             len(fleet._dispatch_windows) == (1 if windows else 0),
             "unexpected dispatch-window count",

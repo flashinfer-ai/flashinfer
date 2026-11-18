@@ -98,6 +98,7 @@ def test_eager_ht_capture_fails_before_provider_calls(
     handle = _make_handle(fleet)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     params = HandleParams(topk_ids=torch.zeros(16, 2, dtype=torch.int64))
+    native_handles = list(fake_nccl_ep._log["handles"])
     for operation in (
         lambda: fleet.create_handle(params),
         lambda: handle.update(params),
@@ -106,6 +107,7 @@ def test_eager_ht_capture_fails_before_provider_calls(
         with pytest.raises(ValueError, match="capture"):
             operation()
     assert handle._handle.calls == []
+    assert fake_nccl_ep._log["handles"] == native_handles
 
 
 @pytest.mark.parametrize("forward", [False, True])
@@ -147,8 +149,15 @@ def test_empty_ht_rows_use_the_operation_stream(
         if forward
         else [values]
     )
-    streams = []
+    streams, allocations = [], []
+    original_empty = torch.empty
     original_zero, original_fill = torch.Tensor.zero_, torch.Tensor.fill_
+
+    def empty(*args, **kwargs):
+        tensor = original_empty(*args, **kwargs)
+        if tensor.is_cuda:
+            allocations.append(torch.cuda.current_stream().cuda_stream)
+        return tensor
 
     def zero(tensor, *args, **kwargs):
         if tensor.is_cuda:
@@ -162,12 +171,14 @@ def test_empty_ht_rows_use_the_operation_stream(
 
     monkeypatch.setattr(torch.Tensor, "zero_", zero)
     monkeypatch.setattr(torch.Tensor, "fill_", fill)
+    monkeypatch.setattr(torch, "empty", empty)
     try:
         with torch.cuda.stream(caller):
             handle.dispatch(DispatchInputParams(x=payload))
             assert torch.cuda.current_stream() == caller
         torch.cuda.synchronize()
         assert streams == [operation.cuda_stream] * (4 if forward else 3)
+        assert allocations == [operation.cuda_stream] * (4 if forward else 3)
         assert handle._dispatch_output_t.eq(0).all()
         assert handle._dispatch_out_w.eq(0).all()
         assert handle._dispatch_out_idx.eq(-1).all()

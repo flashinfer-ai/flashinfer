@@ -20,6 +20,9 @@ from flashinfer.moe_ep import (
 from tests.moe_ep.test_nccl_ep_release_multirank import (
     _assert_collective,
     _assert_collective_close,
+    _assert_receive_ownership,
+    _require_single_lsa_team,
+    nccl_lsa_teams as nccl_lsa_teams,
     released_runtime as released_runtime,
 )
 
@@ -45,8 +48,11 @@ def test_forwarded_scales_graph_and_empty_receivers(
     flow,
     windows,
     eager,
+    nccl_lsa_teams,  # noqa: F811 - shared pytest fixture
 ):
     rank, world = released_runtime
+    if flow == "pull_push":
+        _require_single_lsa_team(nccl_lsa_teams)
     tokens, hidden, capacity = 4, 2048, 8
     fleet = create_fleet(
         BootstrapConfig(
@@ -78,8 +84,10 @@ def test_forwarded_scales_graph_and_empty_receivers(
     values = torch.full(
         (tokens, hidden), float(rank + 1), device="cuda", dtype=torch.bfloat16
     ).to(torch.float8_e4m3fn)
-    scales = torch.full(
-        (tokens, 16), float(rank + 1), device="cuda", dtype=torch.float32
+    scales = (
+        ((torch.arange(16, device="cuda", dtype=torch.float32) + 1) * (rank + 1))
+        .expand(tokens, -1)
+        .contiguous()
     )
     out = torch.empty(tokens, hidden, device="cuda", dtype=torch.bfloat16)
     handle = fleet.create_handle(
@@ -90,10 +98,18 @@ def test_forwarded_scales_graph_and_empty_receivers(
         ],
     )
 
+    received = None
+
     def step():
+        nonlocal received
         handle.update(HandleParams(ids))
         received = handle.dispatch(DispatchInputParams(x=[values, scales]))
-        local = received.expert_tensors.float() * received.expert_scales[..., :1]
+        local = (
+            received.expert_tensors.float()
+            * received.expert_scales.repeat_interleave(
+                hidden // scales.shape[1], dim=-1
+            )
+        )
         if received.recv_topk_idx is not None:
             is_local = (received.recv_topk_idx >= 0) & (received.recv_topk_idx < 2)
             gain = received.recv_topk_weights.masked_fill(~is_local, 0).sum(-1)
@@ -114,6 +130,8 @@ def test_forwarded_scales_graph_and_empty_receivers(
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
                 result = step()
+            with pytest.raises(ValueError, match="geometry changed"):
+                handle.dispatch(DispatchInputParams(x=[values, scales.repeat(1, 2)]))
         for phase in range(3):
             if phase == 1:
                 # Only rank zero owns these experts; every other receiver empties.
@@ -130,8 +148,25 @@ def test_forwarded_scales_graph_and_empty_receivers(
             else:
                 graph.replay()
             torch.cuda.synchronize()
-            expected = (values.float() * scales[:, :1]).to(torch.bfloat16)
+            expected = (
+                values.float()
+                * scales.repeat_interleave(hidden // scales.shape[1], dim=-1)
+            ).to(torch.bfloat16)
             _assert_collective_close(result, expected)
+            _assert_receive_ownership(
+                received,
+                rank,
+                world,
+                tokens,
+                concentrated=phase == 1,
+                expert_major=algorithm is EpAlgorithm.LOW_LATENCY
+                and layout is EpLayout.EXPERT_MAJOR,
+            )
+            if eager and phase == 1:
+                _assert_collective(
+                    rank == 0 or received.expert_tensors.numel() == hidden,
+                    "empty eager receiver needs one inactive row",
+                )
         _assert_collective(
             len(fleet._dispatch_windows) == (2 if windows else 0),
             "unexpected forwarded dispatch-window count",
@@ -211,7 +246,9 @@ def _nvfp4_reference(handle, rank):
     ).reshape(world, capacity, hidden)
     original = handle._dispatch_inputs.tokens._buffer.view(torch.uint8)
     sent = [torch.empty_like(original) for _ in range(world)]
+    sent_ids = [torch.empty_like(handle._topk_idx) for _ in range(world)]
     dist.all_gather(sent, original)
+    dist.all_gather(sent_ids, handle._topk_idx)
     received = handle._dispatch_output_t.view(torch.uint8)
     ordered = torch.empty_like(decoded)
     # This controlled input has unique rows. Validate the full row after matching
@@ -229,6 +266,17 @@ def _nvfp4_reference(handle, rank):
         _assert_collective(
             torch.equal(received[source], rows[mapping]), "received token bytes differ"
         )
+        expected_ids = sent_ids[source][mapping]
+        expected_ids = torch.where(
+            expected_ids // handle._num_local_experts == rank,
+            expected_ids % handle._num_local_experts,
+            -1,
+        )
+        actual_ids = handle._dispatch_out_idx.reshape(world, capacity, -1)[source]
+        _assert_collective(
+            torch.equal(actual_ids, expected_ids),
+            "received expert IDs do not match current routes",
+        )
         ordered[source].index_copy_(0, mapping, decoded[source])
     dist.all_reduce(ordered)
     return ordered[rank].to(torch.bfloat16)
@@ -244,6 +292,12 @@ def test_nvfp4_combine_graph(
     windows,
 ):
     rank, world = released_runtime
+    supported = torch.tensor(
+        int(torch.cuda.get_device_capability()[0] >= 10), device="cuda"
+    )
+    dist.all_reduce(supported, op=dist.ReduceOp.MIN)
+    if not supported.item():
+        pytest.skip("NVFP4 reference quantizer requires SM100+ on every rank")
     tokens = 8
     fleet = create_fleet(
         BootstrapConfig(

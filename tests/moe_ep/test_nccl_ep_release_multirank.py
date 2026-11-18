@@ -40,6 +40,45 @@ def _assert_collective_close(actual, expected):
     _assert_collective(failure is None, failure or "reference failed on another rank")
 
 
+def _assert_receive_ownership(
+    received, rank, world, tokens, *, concentrated, expert_major=False
+):
+    if received.expert_counts is not None:
+        actual = int(received.expert_counts.sum().item())
+    elif received.recv_total_counter is not None:
+        actual = int(received.recv_total_counter.item())
+    else:
+        ids = received.recv_topk_idx
+        actual = int(((ids >= 0) & (ids < 2)).any(-1).sum().item())
+    expected = (
+        tokens * world
+        if concentrated and rank == 0
+        else (0 if concentrated else 2 * tokens)
+    )
+    if concentrated and expert_major:
+        expected *= 2
+    _assert_collective(actual == expected, f"receive ownership: {actual} != {expected}")
+
+
+@pytest.fixture(scope="module")
+def nccl_lsa_teams(released_runtime):
+    from nccl.ep.interop.torch import get_nccl_comm_from_group
+
+    comm = get_nccl_comm_from_group()
+    try:
+        count = int(getattr(comm, "n_lsa_teams", 0))
+        counts = [None] * dist.get_world_size()
+        dist.all_gather_object(counts, count)
+        return 1 if all(value == 1 for value in counts) else 0
+    finally:
+        comm.destroy()
+
+
+def _require_single_lsa_team(teams):
+    if teams != 1:
+        pytest.skip("requires one verified NCCL LSA team on every rank")
+
+
 def _identity_expected(inputs, *, weighted_combine):
     active = inputs.topk_ids >= 0
     if weighted_combine:
@@ -130,8 +169,10 @@ def _layer_and_inputs(
 
 
 @pytest.mark.parametrize("flow", ["push_pull", "pull_push"])
-def test_release_ht_eager_receive_arrays(released_runtime, flow):
+def test_release_ht_eager_receive_arrays(released_runtime, nccl_lsa_teams, flow):
     rank, world = released_runtime
+    if flow == "pull_push":
+        _require_single_lsa_team(nccl_lsa_teams)
     layer, inputs = _layer_and_inputs(
         rank,
         world,
@@ -211,8 +252,12 @@ def test_release_ht_eager_receive_arrays(released_runtime, flow):
         for flow in (None, "push_pull", "pull_push")
     ],
 )
-def test_release_forward_graph(released_runtime, hidden, policy, tokens, flow):
+def test_release_forward_graph(
+    released_runtime, nccl_lsa_teams, hidden, policy, tokens, flow
+):
     rank, world = released_runtime
+    if flow == "pull_push" or policy == "require_fused":
+        _require_single_lsa_team(nccl_lsa_teams)
     algorithm = (
         EpAlgorithm.LOW_LATENCY if policy is None else EpAlgorithm.HIGH_THROUGHPUT
     )
@@ -256,21 +301,18 @@ def test_release_mask_api_and_readmission(released_runtime):
     try:
         layer.forward(inputs)
         fleet = layer._ensure_fleet()
-        mixed = [1] * world
-        mixed[(rank + 1) % world] = 0
+        # Quiescent, disjoint cohorts keep each mask-clean barrier consistent.
+        mixed = [int(peer % 2 == rank % 2) for peer in range(world)]
         fleet.set_active_mask(mixed)
         observed_mask = fleet.query_active_mask().cpu().tolist()
-        # Restore before collective work: each rank used a different local mask.
-        fleet.set_active_mask([1] * world)
-        fleet.set_active_mask([1] * world)
         _assert_collective(observed_mask == mixed, "mask query did not match update")
-        _assert_collective(
-            fleet.query_active_mask().cpu().tolist() == [1] * world,
-            "mask restoration failed",
-        )
         _assert_collective(not fleet.query_fault(), "unexpected fault flag")
         dist.barrier()
         fleet.clear_faults(readmit=True)
+        _assert_collective(
+            fleet.query_active_mask().cpu().tolist() == [1] * world,
+            "readmission did not restore the active mask",
+        )
         output = layer.forward(inputs)
         torch.cuda.synchronize()
         _assert_collective_close(

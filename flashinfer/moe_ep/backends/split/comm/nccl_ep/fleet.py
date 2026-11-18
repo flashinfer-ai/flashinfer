@@ -34,6 +34,7 @@ from .....algo_knobs import (
     FleetAlgoKnobQuantization,
     FleetAlgoKnobRdmaBufferSize,
     HandleAlgoKnobNumReceivedTokens,
+    HandleAlgoKnobUserStream,
     _index_knobs,
 )
 from .....config import EpAlgorithm, EpLayout, FleetParams
@@ -46,6 +47,7 @@ from .....core.comm.fault_tolerance import (
     reject_graph_capture as _reject_graph_capture_impl,
 )
 from ._mask_ffi import mask_ffi
+from ._runtime import ep_version, stream_context, stream_is_capturing, torch_stream
 
 if TYPE_CHECKING:
     from .....config import BootstrapConfig
@@ -164,10 +166,7 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         validate_arch_for_backend("nccl_ep")
         validate_bootstrap_world_size(bootstrap)
         self._nccl_ep = _import_nccl_ep()
-        get_version = getattr(self._nccl_ep, "get_lib_version", None)
-        self._ep_version = (
-            Version(str(get_version())) if get_version is not None else None
-        )
+        self._ep_version = ep_version(self._nccl_ep)
         validate_ll_hidden_size(params, "nccl_ep", nccl_ep_version=self._ep_version)
 
         # HT: clamp the per-rank dispatch budget to the library's build-time cap so
@@ -453,11 +452,16 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     ) -> "Handle":
         from .handle import NcclEpHandle
 
+        self._require_live_group()
         options = self._nccl_options()
         if options.eager_recv:
-            import torch
-
-            if torch.cuda.is_current_stream_capturing():
+            stream_knob = _index_knobs(algo_knobs).get(HandleAlgoKnobUserStream)
+            stream = (
+                stream_knob.stream
+                if isinstance(stream_knob, HandleAlgoKnobUserStream)
+                else self.stream
+            )
+            if stream_is_capturing(stream):
                 raise MoEEpConfigError("eager_recv does not support CUDA graph capture")
         if options.num_topk and params.topk_ids.shape[1] > options.num_topk:
             raise MoEEpConfigError(
@@ -500,13 +504,18 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
             )
 
     def _require_ft(self, op: str):
+        self._require_live_group()
         if self._ft is None:
             self._no_fault_tolerance(op)
         return self._ft
 
-    @staticmethod
-    def _reject_graph_capture(op: str) -> None:
+    def _reject_graph_capture(self, op: str) -> None:
         _reject_graph_capture_impl(op)
+        import torch
+
+        if torch.cuda.is_available():
+            with stream_context(self._current_stream()):
+                _reject_graph_capture_impl(op)
 
     def _current_stream(self) -> int:
         if self._stream:
@@ -608,7 +617,7 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         if event is None:
             event = torch.cuda.Event()
             self._hot_cache["ft_update_done"] = event
-        event.record(torch.cuda.ExternalStream(stream))
+        event.record(torch_stream(stream))
         self._ft_epoch += 1
 
     def _wait_mask_update(self) -> None:
@@ -658,11 +667,19 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     ) -> None:
         """Re-create the EP group over a fresh communicator (grow/shrink)."""
         knobs = _index_knobs(algo_knobs) if algo_knobs else self._fleet_knobs
+        ft = knobs.get(FleetAlgoKnobFaultTolerance)
+        ft = ft if isinstance(ft, FleetAlgoKnobFaultTolerance) and ft.enabled else None
+        if ft != self._ft:
+            raise MoEEpConfigError(
+                "fault-tolerance settings cannot change during update_topology; "
+                "create a new Fleet"
+            )
         validate_bootstrap_world_size(bootstrap)
         config = self._build_group_config(bootstrap=bootstrap, fleet_knobs=knobs)
         self._wait_mask_update()
         if not self._destroyed:
             self._group.destroy()
+        self._group = None
         self._release_dispatch_windows()
         self._destroy_owned_comm()
         self._destroyed = True
@@ -681,6 +698,7 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
             return
         self._wait_mask_update()
         self._group.destroy()
+        self._group = None
         self._release_dispatch_windows()
         self._destroy_owned_comm()
         self._destroyed = True
@@ -692,7 +710,15 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
     @property
     def group(self):
         """The live :class:`nccl.ep.Group`."""
+        self._require_live_group()
         return self._group
+
+    def _require_live_group(self):
+        if self._destroyed or self._group is None:
+            raise MoEEpConfigError(
+                "NCCL EP Fleet has no live group; create a new Fleet or retry "
+                "update_topology with a valid configuration"
+            )
 
     @property
     def nccl_ep(self):

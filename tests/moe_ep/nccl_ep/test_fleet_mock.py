@@ -261,7 +261,10 @@ def test_mask_update_keeps_host_input_unchanged_until_copy_finishes(
             trace.append("wait")
 
     monkeypatch.setattr(torch.cuda, "Event", PendingCopy)
-    monkeypatch.setattr(torch.cuda, "ExternalStream", lambda stream: stream)
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet.torch_stream",
+        lambda stream: stream,
+    )
     fleet.set_active_mask([1, 0, 1, 1])
     fleet.set_active_mask([1, 1, 0, 1])
     assert trace == ["copy", "wait", "copy"]

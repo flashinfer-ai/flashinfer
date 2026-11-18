@@ -24,6 +24,7 @@ from .....config import (
 )
 from .....core.comm.handle import Handle
 from .....core.validation.common import MoEEpConfigError
+from ._runtime import stream_context, stream_is_capturing
 
 _HP = _os.environ.get("EP_PROFILE_HOST") == "1"
 _HP_SKIP = int(_os.environ.get("EP_PROFILE_SKIP", "15"))
@@ -149,13 +150,14 @@ class NcclEpHandle(Handle):
         # exposes it only when requested; eager sizing also needs it internally.
         # LL rejects handle-time layout_info.
         self._recv_total_target = None
+        self._recv_total_output = None
         create_layout_info = None
         num_recv_knob = self._handle_knobs.get(HandleAlgoKnobNumReceivedTokens)
         if self._is_ht and (num_recv_knob is not None or self._eager_recv):
             tgt = (
                 num_recv_knob.target  # type: ignore[attr-defined]
                 if num_recv_knob is not None
-                else torch.empty(1, dtype=torch.int32, device=topk_idx.device)
+                else self._allocate_receive((1,), torch.int32, topk_idx.device)
             )
             if tgt.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
@@ -167,6 +169,11 @@ class NcclEpHandle(Handle):
                     "HandleAlgoKnobNumReceivedTokens.target must have >= 1 element, "
                     f"got shape {tuple(tgt.shape)}"
                 )
+            if self._eager_recv and num_recv_knob is not None:
+                # A caller may share its output counter with another handle.
+                # Sizing must use metadata owned by this handle alone.
+                self._recv_total_output = tgt
+                tgt = self._allocate_receive((1,), torch.int32, topk_idx.device)
             self._recv_total_target = tgt
             create_layout_info = self._ep.LayoutInfo(
                 recv_total_counter=self._ep.Tensor(tgt)
@@ -182,6 +189,7 @@ class NcclEpHandle(Handle):
             # capture (nccl_ep.h:422), so it stays on the handle's own stream.
             stream=self._stream,
         )
+        self._publish_recv_count(self._stream)
         _t = _hp("hinit.create_handle_c", _t)
 
         # InitHandle ran on self._stream. Every later op issued on that same
@@ -194,6 +202,17 @@ class NcclEpHandle(Handle):
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
         return int(k.stream) if k is not None else self._fleet.stream  # type: ignore[attr-defined]
+
+    def _publish_recv_count(self, stream):
+        if self._recv_total_output is not None:
+            with stream_context(
+                stream,
+                device=self._recv_total_target.device,
+                enabled=self._recv_total_target.is_cuda,
+            ):
+                self._recv_total_output.as_strided((1,), (1,)).copy_(
+                    self._recv_total_target
+                )
 
     def _op_stream(self) -> int:
         """Stream to issue transport work on.
@@ -291,7 +310,7 @@ class NcclEpHandle(Handle):
         """
         import torch
 
-        if self._eager_recv and torch.cuda.is_current_stream_capturing():
+        if self._eager_recv and stream_is_capturing(self._stream):
             raise MoEEpConfigError("eager_recv does not support CUDA graph capture")
         topk_idx = params.topk_ids
         if topk_idx.dtype != torch.int64:
@@ -361,6 +380,7 @@ class NcclEpHandle(Handle):
             layout_info=self._create_layout_info,
             stream=op_stream,
         )
+        self._publish_recv_count(op_stream)
 
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         expected = 2 if self._native_options.dispatch_quantization == "forward" else 1
@@ -386,21 +406,36 @@ class NcclEpHandle(Handle):
         return self._dispatch_ll(x)
 
     def _native_receive(self, name, shape, dtype, device, *, window=False):
-        import torch
-
         if window:
             return self._fleet._dispatch_window(name, shape, dtype, device)
+        if self._eager_recv:
+            tensor = self._allocate_receive(shape, dtype, device)
+            return tensor, self._ep.Tensor(tensor)
         key = ("native_receive", name)
         tensor = self._hot.get(key)
-        if (
-            tensor is None
-            or tuple(tensor.shape) != tuple(shape)
+        if tensor is not None and (
+            tuple(tensor.shape) != tuple(shape)
             or tensor.dtype != dtype
             or tensor.device != device
         ):
-            tensor = torch.empty(shape, dtype=dtype, device=device)
+            raise MoEEpConfigError(
+                "forwarded receive geometry changed; create a new Fleet to "
+                "preserve buffers referenced by captured graphs"
+            )
+        if tensor is None:
+            tensor = self._allocate_receive(shape, dtype, device)
             self._hot[key] = tensor
         return tensor, self._ep.Tensor(tensor)
+
+    def _allocate_receive(self, shape, dtype, device):
+        import torch
+
+        with stream_context(
+            self._op_stream(),
+            device=device,
+            enabled=torch.device(device).type == "cuda",
+        ):
+            return torch.empty(shape, dtype=dtype, device=device)
 
     def _dispatch_forwarded(self, x, scales):
         """Forward quantized value/scale rows to the selected NCCL layout."""
@@ -411,7 +446,7 @@ class NcclEpHandle(Handle):
             raise MoEEpConfigError("native dispatch requires contiguous 2D tokens")
         if x.shape[0] > p.max_tokens_per_rank:
             raise MoEEpConfigError("native dispatch exceeds max_tokens_per_rank")
-        if self._eager_recv and torch.cuda.is_current_stream_capturing():
+        if self._eager_recv and stream_is_capturing(self._stream):
             raise MoEEpConfigError(
                 "eager_recv does not support CUDA graph dispatch capture"
             )
@@ -450,12 +485,8 @@ class NcclEpHandle(Handle):
         world, cap = self._world_size, p.max_tokens_per_rank
         num_recv = world * cap
         if self._eager_recv:
-            context = (
-                torch.cuda.stream(
-                    torch.cuda.ExternalStream(self._op_stream(), device=x.device)
-                )
-                if x.is_cuda
-                else contextlib.nullcontext()
+            context = stream_context(
+                self._op_stream(), device=x.device, enabled=x.is_cuda
             )
             with context:
                 num_recv = int(self._recv_total_target.reshape(-1)[0].item())
@@ -509,12 +540,8 @@ class NcclEpHandle(Handle):
             field = "src_rank_counters" if self._is_rank_major else "expert_counters"
             layout = self._ep.LayoutInfo(**{field: self._ep.Tensor(self._recv_count_t)})
         if self._eager_recv and num_recv == 0:
-            context = (
-                torch.cuda.stream(
-                    torch.cuda.ExternalStream(self._op_stream(), device=x.device)
-                )
-                if x.is_cuda
-                else contextlib.nullcontext()
+            context = stream_context(
+                self._op_stream(), device=x.device, enabled=x.is_cuda
             )
             with context:
                 out_t.zero_()
@@ -570,13 +597,7 @@ class NcclEpHandle(Handle):
             raise MoEEpConfigError(
                 "NVFP4 combine requires contiguous 3D BF16 expert outputs"
             )
-        context = (
-            torch.cuda.stream(
-                torch.cuda.ExternalStream(self._op_stream(), device=x.device)
-            )
-            if x.is_cuda
-            else contextlib.nullcontext()
-        )
+        context = stream_context(self._op_stream(), device=x.device, enabled=x.is_cuda)
         with context:
             amax = x.abs().amax(dim=-1, keepdim=True).float()
             scales = torch.where(amax > 0, 2688.0 / amax, 0.0)
@@ -768,7 +789,7 @@ class NcclEpHandle(Handle):
     def _dispatch_ht(self, x) -> DispatchOutput:
         import torch
 
-        if self._eager_recv and torch.cuda.is_current_stream_capturing():
+        if self._eager_recv and stream_is_capturing(self._stream):
             raise MoEEpConfigError(
                 "eager_recv does not support CUDA graph dispatch capture"
             )
@@ -780,8 +801,7 @@ class NcclEpHandle(Handle):
         if self._eager_recv:
             target = self._recv_total_target
             if target.is_cuda:
-                stream = torch.cuda.ExternalStream(self._op_stream(), device=x.device)
-                with torch.cuda.stream(stream):
+                with stream_context(self._op_stream(), device=x.device):
                     num_recv = int(target.reshape(-1)[0].item())
             else:
                 num_recv = int(target.reshape(-1)[0].item())
@@ -824,23 +844,19 @@ class NcclEpHandle(Handle):
             or cached[0].dtype != x.dtype
             or cached[0].device != x.device
         ):
-            out_t = torch.empty(capacity, hidden, dtype=x.dtype, device=x.device)
-            out_w = torch.empty(
-                capacity, self._top_k, dtype=torch.float32, device=x.device
+            out_t = self._allocate_receive((capacity, hidden), x.dtype, x.device)
+            out_w = self._allocate_receive(
+                (capacity, self._top_k), torch.float32, x.device
             )
-            out_idx = torch.empty(
-                capacity, self._top_k, dtype=torch.int64, device=x.device
+            out_idx = self._allocate_receive(
+                (capacity, self._top_k), torch.int64, x.device
             )
             self._hot["ht_recv_bufs"] = (out_t, out_w, out_idx)
         else:
             out_t, out_w, out_idx = cached
         if self._eager_recv and num_recv == 0:
-            context = (
-                torch.cuda.stream(
-                    torch.cuda.ExternalStream(self._op_stream(), device=x.device)
-                )
-                if x.is_cuda
-                else contextlib.nullcontext()
+            context = stream_context(
+                self._op_stream(), device=x.device, enabled=x.is_cuda
             )
             with context:
                 out_t.zero_()
