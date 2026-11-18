@@ -8,8 +8,7 @@ instruction is PTX:
     mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X
       .m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0
 
-The instruction issue path uses the low-level
-``cute_nvgpu.arch.mma.SM120.block_scaled`` operation.
+The scalar-scale path issues the instruction through a CuTe MMA atom.
 """
 
 from __future__ import annotations
@@ -22,9 +21,7 @@ import cutlass.cute.nvgpu.warp.mma as warp_mma
 import cutlass.utils.blackwell_helpers as sm120_utils
 from cutlass import Float32, Uint32
 from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir, llvm
-from cutlass.cute.nvgpu.warp.mma import _pack_shape
+from cutlass._mlir.dialects import llvm
 
 
 MMA_M = 16
@@ -52,6 +49,17 @@ MXFP4_MXFP8_MMA_PTX_E2M1_E4M3 = (
 
 
 
+def _make_sm120_mma_op(
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    acc_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+) -> warp_mma.MmaMXF8Op | warp_mma.MmaMXF8F6F4Op:
+    if a_dtype == b_dtype:
+        return warp_mma.MmaMXF8Op(a_dtype, acc_dtype, sf_dtype)
+    return warp_mma.MmaMXF8F6F4Op(a_dtype, b_dtype, acc_dtype, sf_dtype)
+
+
 def make_swapab_m64n8k128_tiled_mma(
     *,
     a_dtype: Type[cutlass.Numeric],
@@ -64,16 +72,10 @@ def make_swapab_m64n8k128_tiled_mma(
     Four compute warps cover the four M16 atoms in one ``M64 x N8`` MMA
     slice.
 
-    The CuTe MMA op is used here only to construct tiling/fragment layouts;
-    the actual MMA issue is emitted by ``_arch_mma_m16n8k32_mxfp8`` below.
+    The tiler uses the same CuTe MMA op as the scalar issue path.
     """
 
-    if a_dtype == b_dtype:
-        op = warp_mma.MmaMXF8Op(a_dtype, acc_dtype, sf_dtype)
-    else:
-        op = warp_mma.MmaMXF8F6F4Op(
-            a_dtype, b_dtype, acc_dtype, sf_dtype
-        )
+    op = _make_sm120_mma_op(a_dtype, b_dtype, acc_dtype, sf_dtype)
     permutation_mnk = sm120_utils.get_permutation_mnk(
         (64, 64, 128),
         MXFP8_BLOCK,
@@ -140,59 +142,23 @@ def _arch_mma_m16n8k32_mxfp8(
     b_dtype: Type[cutlass.Numeric],
     acc_dtype: Type[cutlass.Numeric],
     sf_dtype: Type[cutlass.Numeric],
-    thread_id_a: int = 0,
-    thread_id_b: int = 0,
     loc=None,
     ip=None,
 ) -> None:
-    """Issue one QMMA ``m16n8k32`` MXFP8 block-scaled instruction.
-
-    Per lane:
-      A = 4 x b32, B = 2 x b32, C/D = 4 x f32.
-    """
-
-    a_i32 = a_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
-    b_i32 = b_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
-    sfa_i8 = sfa_scalar.bitcast(cutlass.Int8, loc=loc, ip=ip)
-    sfb_i8 = sfb_scalar.bitcast(cutlass.Int8, loc=loc, ip=ip)
-
-    # Byte selectors are for packed 32-bit scale words, not these scalar bytes.
-    shape_attr = _pack_shape((MMA_M, MMA_N, MMA_K), loc=loc, ip=ip).type.attribute
-    res = _cute_nvgpu_ir.arch_mma_SM120_block_scaled(
-        [acc_dtype.mlir_type] * 4,
-        shape_attr,
-        MXFP8_BLOCK,
-        ir.TypeAttr.get(a_dtype.mlir_type),
-        ir.TypeAttr.get(b_dtype.mlir_type),
-        ir.TypeAttr.get(sf_dtype.mlir_type),
-        [
-            a_i32[0].ir_value(loc=loc, ip=ip),
-            a_i32[1].ir_value(loc=loc, ip=ip),
-            a_i32[2].ir_value(loc=loc, ip=ip),
-            a_i32[3].ir_value(loc=loc, ip=ip),
-        ],
-        [
-            b_i32[0].ir_value(loc=loc, ip=ip),
-            b_i32[1].ir_value(loc=loc, ip=ip),
-        ],
-        [
-            acc[0].ir_value(loc=loc, ip=ip),
-            acc[1].ir_value(loc=loc, ip=ip),
-            acc[2].ir_value(loc=loc, ip=ip),
-            acc[3].ir_value(loc=loc, ip=ip),
-        ],
-        sfa_i8.ir_value(loc=loc, ip=ip),
-        sfb_i8.ir_value(loc=loc, ip=ip),
-        thread_id_a=thread_id_a,
-        thread_id_b=thread_id_b,
+    """Issue one ``m16n8k32`` MMA with scalar E8M0 scales."""
+    atom = cute.make_mma_atom(
+        _make_sm120_mma_op(a_dtype, b_dtype, acc_dtype, sf_dtype),
         loc=loc,
         ip=ip,
     )
+    sfa = cute.make_rmem_tensor(((1, 1),), sf_dtype, loc=loc, ip=ip)
+    sfb = cute.make_rmem_tensor(((1, 1),), sf_dtype, loc=loc, ip=ip)
+    sfa[0] = sfa_scalar
+    sfb[0] = sfb_scalar
 
-    acc[0] = acc_dtype(res[0])
-    acc[1] = acc_dtype(res[1])
-    acc[2] = acc_dtype(res[2])
-    acc[3] = acc_dtype(res[3])
+    # Match the rank-one A/B views by slicing the singleton tile modes of C.
+    acc_vec = acc[(None,) + (0,) * (cute.rank(acc) - 1)]
+    cute.gemm(atom, acc_vec, (a_reg, sfa), (b_reg, sfb), acc_vec, loc=loc, ip=ip)
 
 
 @dsl_user_op
