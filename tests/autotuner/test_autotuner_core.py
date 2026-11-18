@@ -2677,6 +2677,9 @@ def test_group_rejection_retires_runner_hash_aliases(monkeypatch):
     tuner._winner_cache()[key_512_old] = (0, None)
     tuner._winner_cache()[key_128_old] = (0, None)
     tuner._ranked_cache()[key_512_old] = (tuner._profiling_policy(config), (0,))
+    for bucket in (128, 512):
+        key = AutoTuner._get_cache_key("alias_op", r_new, ((bucket, 16),), config, ())
+        tuner._winner_cache()[key] = (0, None)
 
     other_policy = MeasurementPolicy(execution_mode="cuda_graph")
     with autotune_v2(
@@ -2698,7 +2701,9 @@ def test_group_rejection_retires_runner_hash_aliases(monkeypatch):
     monkeypatch.setattr(
         autotuner_module,
         "_all_ranks_hit_cache",
-        lambda local_hit, selection=None, *, phase="cache": phase == "cache",
+        lambda local_hit, selection=None, *, phase="cache": (
+            local_hit and phase == "cache"
+        ),
     )
     with autotune(True):
         assert tuner.choose_one(
@@ -2774,9 +2779,8 @@ def test_managed_publish_keeps_legacy_exclusion(tmp_path, monkeypatch):
     )
 
 
-def test_distributed_multibucket_retune_clears_rejected_profile(monkeypatch):
-    """Re-profiling a previously rejected bucket while final_selection checks a
-    different bucket must clear the rejection when the group agrees."""
+def test_group_agreement_does_not_clear_other_bucket_rejection(monkeypatch):
+    """Agreement for the requested bucket cannot un-reject a losing runner in another bucket."""
 
     class OtherRunner(DummyRunner):
         pass
@@ -2818,7 +2822,9 @@ def test_distributed_multibucket_retune_clears_rejected_profile(monkeypatch):
     monkeypatch.setattr(
         autotuner_module,
         "_all_ranks_hit_cache",
-        lambda local_hit, selection=None, *, phase="cache": phase == "cache",
+        lambda local_hit, selection=None, *, phase="cache": (
+            local_hit and phase == "cache"
+        ),
     )
     with autotune(True):
         assert tuner.choose_one(
@@ -2849,8 +2855,11 @@ def test_distributed_multibucket_retune_clears_rejected_profile(monkeypatch):
 
     monkeypatch.setattr(autotuner_module, "_tune_process_group", None)
     assert tuner.choose_one(
+        "mb_retune", [runner_a, runner_b], config, [torch.empty((512, 16))]
+    ) == (runner_a, 0)
+    assert tuner.choose_one(
         "mb_retune", [runner_b, runner_c], config, [torch.empty((512, 16))]
-    ) == (runner_b, 1)
+    ) == (runner_b, -1)
 
 
 # ---------------------------------------------------------------------------

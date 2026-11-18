@@ -2614,11 +2614,13 @@ class AutoTuner:
             managed_store = self._active_managed_store
             if managed_store is not None:
                 store_id = (str(managed_store.root), managed_store.env_hash)
+                rejected_file_keys = self._rejected_file_keys.get(winner_identity)
                 for r_id, cache_key in runner_keys:
+                    if rejected_file_keys and cache_key.file_key in rejected_file_keys:
+                        continue
                     # Warm path: memoise on the cheap hashable key_fields
                     # tuple, not the str() file_key, so steady-state serving
-                    # rebuilds no string.  file_key is materialised only on a
-                    # cold miss, to address the on-disk entry.
+                    # needs no file_key without rejections or memo misses.
                     memo_key = (*store_id, cache_key.key_fields)
                     hit = self._managed_decoded.get(memo_key)
                     if hit is None:
@@ -3274,7 +3276,6 @@ class AutoTuner:
             race_default = self._in_v2_context
 
             incomplete_winner: tuple[int, Any] | None = None
-            published_profiles: list[tuple[tuple[int, ...], ...]] = []
             pbar = None
             for _step, p in enumerate(profiles):
                 tensors = None
@@ -3638,8 +3639,6 @@ class AutoTuner:
                                     tuning_config,
                                     inputs,
                                 )
-                            else:
-                                published_profiles.append(p.get_opt_shapes())
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -3700,10 +3699,9 @@ class AutoTuner:
                         record_group_rejection=True,
                     )
                     return runners[0], -1
-                for shape in dict.fromkeys((input_shapes, *published_profiles)):
-                    self._clear_rejected_profile(
-                        custom_op, runners, shape, tuning_config, inputs
-                    )
+                self._clear_rejected_profile(
+                    custom_op, runners, input_shapes, tuning_config, inputs
+                )
             return runners[runner_id], tactic
 
     def _clear_rejected_profile(

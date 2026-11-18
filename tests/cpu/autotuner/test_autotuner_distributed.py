@@ -750,8 +750,9 @@ case = os.environ["CACHE_CASE"]
 single_runner = case.startswith("final_single_runner_")
 different_valid_tactics = case == "final_single_runner_different_valid_tactics"
 retire_and_retune = case == "final_rejected_no_borrow_and_retune"
+failed_unlink = case == "final_cached_disagreement_managed_failed_unlink"
 cached_disagreement = case.startswith("final_cached_disagreement")
-managed = case == "final_cached_disagreement_managed" or retire_and_retune
+managed = case.startswith("final_cached_disagreement_managed") or retire_and_retune
 complete = single_runner or cached_disagreement or retire_and_retune
 agreed = case in ("final_incomplete_agreement", "final_single_runner_agreement")
 allow_rejected_bucket = False
@@ -829,7 +830,17 @@ try:
     def context():
         return autotune_v2(cache_root=root / "cache") if managed else autotune(True)
     with context():
-        for repeat in (False, True):
+        if failed_unlink:
+            key = tuner._get_cache_key("test::final_selection", winner, ((8, 8),), config)
+            stale_entry = tuner._active_managed_store._entry_path(key.file_key)
+            unlink = Path.unlink
+            def fail_for_stale_entry(path, *args, **kwargs):
+                if path == stale_entry:
+                    raise PermissionError("injected cache unlink failure")
+                return unlink(path, *args, **kwargs)
+            Path.unlink = fail_for_stale_entry
+        repeats = (False,) if failed_unlink else (False, True)
+        for repeat in repeats:
             profiled.clear()
             selections.append(tuner.choose_one("test::final_selection", runners, config, inputs))
             if retire_and_retune:
@@ -838,13 +849,16 @@ try:
             else:
                 expected_calls = [] if repeat and complete and agreed else expected_profiled
             assert profiled == expected_calls
-    assert selections == [expected, expected], (
+    assert selections == [expected] * len(repeats), (
         rank, case, [(type(runner).__name__, tactic) for runner, tactic in selections]
     )
     if complete:
         set_autotune_process_group(None)
         if managed:
             dist.barrier()
+            if failed_unlink:
+                assert stale_entry.is_file()
+                assert tuner.choose_one("test::final_selection", runners, config, inputs) == expected
             autotune_v2_reload()
         serving = tuner.choose_one("test::final_selection", runners, config, inputs)
         assert serving == expected, (rank, case, type(serving[0]).__name__, serving[1])
@@ -894,6 +908,7 @@ finally:
         "final_incomplete_agreement",
         "final_cached_disagreement",
         "final_cached_disagreement_managed",
+        "final_cached_disagreement_managed_failed_unlink",
         "final_rejected_no_borrow_and_retune",
         "final_single_runner_disagreement",
         "final_single_runner_agreement",
