@@ -65,7 +65,11 @@ FAKE_WORKER = textwrap.dedent(
             plans = plans[1:]
         if mode == "badindex":
             plans = [(99, mine[0], b"x")]
+        rid = req.get("request_id")
+        if mode == "wrongid" and rid is not None:
+            rid += 1
         b.write_frame(sys.stdout.buffer, {{
+            "request_id": rid,
             "device_index": req["device_index"],
             "candidates": mine,
             "plans": plans,
@@ -230,5 +234,37 @@ def test_worker_count_is_capped_at_cpu_count(monkeypatch, caplog):
     try:
         assert pool.num_workers == 6
         assert "FLASHINFER_CUDNN_PLAN_BUILD_WORKERS" in caplog.text
+    finally:
+        pool.shutdown()
+
+
+@pytest.mark.parametrize("where", ["write_frame", "_read_frame"])
+def test_interrupt_kills_pool_and_propagates(fake_cmd, monkeypatch, where):
+    # An interrupt between sending requests and reading every reply would
+    # leave replies queued for the next build (stale plans for a new shape).
+    pool = _pool(fake_cmd, "ok")
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+        procs = pool._all_processes()
+
+        def interrupt(*args, **kwargs):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(pool_mod, where, interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            pool.build(SPEC, device_index=0, heur_modes=[0])
+        assert pool.broken
+        assert all(p.poll() is not None for p in procs)
+        monkeypatch.undo()
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is None
+    finally:
+        pool.shutdown()
+
+
+def test_reply_for_another_request_falls_back(fake_cmd):
+    pool = _pool(fake_cmd, "wrongid")
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is None
+        assert pool.broken
     finally:
         pool.shutdown()

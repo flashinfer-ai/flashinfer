@@ -209,6 +209,7 @@ def _worker_main() -> None:
         if request is None:
             return
         response = {
+            "request_id": request.get("request_id"),
             "device_index": request["device_index"],
             "candidates": [],
             "plans": [],

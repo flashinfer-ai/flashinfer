@@ -120,6 +120,9 @@ class CudnnPlanBuildPool:
         self.idle_s = idle_s
         self._idle_timer: threading.Timer | None = None
         self._last_use = 0.0
+        # Echoed by workers; a reply for another request means the pipes are
+        # out of step, so its plans must not be used.
+        self._next_request_id = 0
 
     @property
     def broken(self) -> bool:
@@ -154,8 +157,13 @@ class CudnnPlanBuildPool:
                 return None
             try:
                 result = self._build(spec, device_index, list(heur_modes))
-            except Exception as exc:  # noqa: BLE001 - never fail a tuning run
+            except BaseException as exc:  # noqa: BLE001 - never fail a tuning run
+                # An interrupt between sending requests and reading every reply
+                # leaves replies queued for the next build, so the workers go
+                # too; only real errors are swallowed.
                 self._fail(exc)
+                if not isinstance(exc, Exception):
+                    raise
                 return None
             self._last_use = time.monotonic()
             self._schedule_idle_stop()
@@ -186,10 +194,13 @@ class CudnnPlanBuildPool:
         if procs is None:
             procs = self._workers[device_index] = self._spawn(device_index)
         wire = spec_to_wire(spec)
+        self._next_request_id += 1
+        request_id = self._next_request_id
         for shard_index, proc in enumerate(procs):
             write_frame(
                 proc.stdin,
                 {
+                    "request_id": request_id,
                     "device_index": device_index,
                     "spec": wire,
                     "heur_modes": heur_modes,
@@ -199,6 +210,8 @@ class CudnnPlanBuildPool:
         deadline = time.monotonic() + self.timeout_s
         responses = [_read_frame(proc, deadline) for proc in procs]
         self.last_responses = responses
+        if any(r.get("request_id") != request_id for r in responses):
+            raise _WorkerFailure("reply for another request")
 
         candidates = responses[0]["candidates"]
         by_index = {}
