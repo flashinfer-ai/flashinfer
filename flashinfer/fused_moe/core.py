@@ -5442,8 +5442,8 @@ def trtllm_bf16_moe(
         With ``ClampedRelu2``, required: contiguous CUDA float32 positive finite
         scales ``s``, one per local expert. FC1 applies
         ``(s * tanh(relu(x) / s)) ** 2`` before conversion to BF16.
-        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. Requires a matching
-        kernel artifact. Scale values are a caller contract; no host readback.
+        ``gemm1_alpha`` and ``gemm1_beta`` must be absent.
+        Scale values are a caller contract; no host readback.
         A trainer-side SwiGLU given as a clamp value ``v`` (linear half
         clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
         ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
@@ -5691,8 +5691,8 @@ def trtllm_bf16_routed_moe(
         With ``ClampedRelu2``, required: contiguous CUDA float32 positive finite
         scales ``s``, one per local expert. FC1 applies
         ``(s * tanh(relu(x) / s)) ** 2`` before conversion to BF16.
-        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. Requires a matching
-        kernel artifact. Scale values are a caller contract; no host readback.
+        ``gemm1_alpha`` and ``gemm1_beta`` must be absent.
+        Scale values are a caller contract; no host readback.
         A trainer-side SwiGLU given as a clamp value ``v`` (linear half
         clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
         ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
@@ -6540,7 +6540,7 @@ def trtllm_fp8_block_scale_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` SwigluStep (MxFp8 only); ``9`` Identity; ``12`` ClampedRelu2
-        (MXFP8 only; requires ``gemm1_clamp_limit`` and a matching kernel artifact).
+        (MXFP8 only; requires ``gemm1_clamp_limit``).
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -6573,10 +6573,8 @@ def trtllm_fp8_block_scale_moe(
         a contiguous CUDA float32 tensor containing a positive finite scale
         ``s`` for each local expert (including fused shared experts, if any).
         FC1 applies ``(s * tanh(relu(x) / s)) ** 2`` before MXFP8 quantization.
-        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. This requires a
-        kernel artifact containing the ClampedRelu2 kernels; older
-        artifacts reject this activation. Scale values are a caller contract
-        and are not read back to the host during CUDA graph capture.
+        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. Scale values are a
+        caller contract and are not read back during CUDA graph capture.
 
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
         With ``Swiglu``, supported for MxFp8 and DeepSeekFp8 and clamps
@@ -6873,7 +6871,7 @@ def trtllm_fp8_block_scale_routed_moe(
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
         ``6`` Relu2; ``7`` SwigluStep; ``9`` Identity; ``12`` ClampedRelu2
-        (MXFP8 only; requires ``gemm1_clamp_limit`` and a matching kernel artifact).
+        (MXFP8 only; requires ``gemm1_clamp_limit``).
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
         parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
@@ -6895,10 +6893,8 @@ def trtllm_fp8_block_scale_routed_moe(
         a contiguous CUDA float32 tensor containing a positive finite scale
         ``s`` for each local expert (including fused shared experts, if any).
         FC1 applies ``(s * tanh(relu(x) / s)) ** 2`` before MXFP8 quantization.
-        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. This requires a
-        kernel artifact containing the ClampedRelu2 kernels; older
-        artifacts reject this activation. Scale values are a caller contract
-        and are not read back to the host during CUDA graph capture.
+        ``gemm1_alpha`` and ``gemm1_beta`` must be absent. Scale values are a
+        caller contract and are not read back during CUDA graph capture.
 
         Optional ``[local_num_experts]`` float32 per-expert clamp limit.
         With ``ActivationType.Swiglu``, supported for MxFp8 and
