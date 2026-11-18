@@ -531,6 +531,21 @@ def _scale_value(scale: Any, name: str) -> Tuple[Optional[float], Optional[str]]
     if isinstance(scale, (int, float)) and not isinstance(scale, bool):
         return float(scale), None
     if isinstance(scale, torch.Tensor) and scale.numel() == 1:
+        # Reading a CUDA tensor's value is a device-to-host sync; under
+        # CUDA-graph capture that read is forbidden and would otherwise
+        # poison the capture with an opaque runtime error (and the dequant
+        # fallback needs the same host value, so it cannot serve the call
+        # either). Reject it with a documented error instead.
+        if (
+            scale.is_cuda
+            and hasattr(torch.cuda, "is_current_stream_capturing")
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            return None, (
+                f"{name} is a CUDA tensor, whose value cannot be read "
+                "during CUDA-graph capture; pass a Python float (or a CPU "
+                "scalar tensor) when capturing"
+            )
         return float(scale.reshape(-1)[0].item()), None
     return None, f"{name} must be a scalar, got {type(scale).__name__}"
 
@@ -552,9 +567,11 @@ def _mla_dec_fp8q_sm90_dispatch(
     """Run-time half. Returns (output, query): output not-None means the
     specialized kernel served the call; otherwise output is None and `query`
     is the exact bf16-dequantised query for the stock plan (which was made
-    for bf16 q). Capture-safe: no sync except reading scalar scale tensors,
-    no compilation; the only allocation is the output tensor when the caller
-    did not pass one."""
+    for bf16 q). Capture-safe: no sync except reading scalar scale tensors
+    eagerly — under CUDA-graph capture a CUDA-tensor scale cannot be read
+    and is rejected with a clear ValueError (pass float scales, or CPU
+    scalar tensors, when capturing) — no compilation; the only allocation
+    is the output tensor when the caller did not pass one."""
     global _announced
     state = getattr(wrapper, "_mla_dec_fp8q_sm90_state", None)
     counters = _counters
