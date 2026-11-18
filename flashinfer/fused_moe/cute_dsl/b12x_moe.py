@@ -45,16 +45,6 @@ from ...api_logging import flashinfer_api
 from ...trace.templates.moe import b12x_fused_moe_trace, b12x_moe_wrapper_run_trace
 from ...utils import supported_compute_capability
 
-# Selectable backends of :func:`b12x_fused_moe` and ``B12xMoEWrapper``.
-# "b12x" is the stock micro/static/dynamic dispatch; "specialized" is the
-# agent-generated shape-specialized SM120 W4A16 backend; "auto" picks
-# "specialized" only on its allowlisted shapes/contract and the stock path
-# everywhere else. An explicitly selected backend is never silently
-# swapped. The canonical tuple (and the shared dispatch gate both entry
-# points call) lives with the specialized backend so the guard semantics
-# cannot drift between the two call sites.
-from ..specialized_moe_nvfp4_w4a16_sm120 import BACKENDS
-
 
 def _is_cuda_graph_capturing() -> bool:
     try:
@@ -148,7 +138,6 @@ def b12x_fused_moe(
     activation_precision: str = "fp4",
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
-    backend: str = "auto",
 ) -> torch.Tensor:
     r"""Run fused MoE on SM120/SM121 using b12x CuTe-DSL kernels.
 
@@ -227,14 +216,6 @@ def b12x_fused_moe(
     activation_precision : str
         Backward-compatible alias for ``quant_mode``.  ``"fp4"`` selects
         ``quant_mode="nvfp4"``; ``"bf16"`` selects ``quant_mode="w4a16"``.
-    backend : str
-        ``"auto"`` (default) routes to the ``"specialized"`` agent-generated
-        SM120 W4A16 backend only on its allowlisted shapes/contract and the
-        stock ``"b12x"`` dispatch everywhere else. ``"b12x"`` forces the
-        stock path. ``"specialized"`` raises when the call cannot be served
-        (an explicitly selected backend is never silently swapped).
-        ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the
-        specialized backend entirely.
     quant_mode : Optional[str]
         Quantization mode, ``"nvfp4"`` / ``"w4a4"``, ``"mxfp4"``, or
         ``"w4a16"``. When set, selects the backend and internal workspace
@@ -318,31 +299,6 @@ def b12x_fused_moe(
             device=x.device,
         )
 
-    from .blackwell_sm12x.moe_dispatch import _normalize_quant_mode
-    from .. import specialized_moe_nvfp4_w4a16_sm120 as _spec
-
-    served = _spec.maybe_run_specialized(
-        backend,
-        x,
-        w1_weight,
-        w1_weight_sf,
-        w2_weight,
-        w2_weight_sf,
-        token_selected_experts,
-        token_final_scales,
-        num_experts,
-        top_k,
-        w1_alpha=w1_alpha,
-        w2_alpha=w2_alpha,
-        output=output,
-        activation=activation,
-        quant_mode=_normalize_quant_mode(quant_mode, activation_precision),
-        source_format=source_format,
-        expert_parallel=num_local_experts != num_experts or expert_map is not None,
-    )
-    if served is not None:
-        return served
-
     from .blackwell_sm12x.moe_dispatch import launch_sm120_moe
 
     return launch_sm120_moe(
@@ -402,11 +358,6 @@ class B12xMoEWrapper:
             When set, this selects the backend and internal workspace family.
         source_format: Source weight format for quant_mode="w4a16".
             Supports "modelopt" and "compressed_tensors". Default: "modelopt".
-        backend: "auto" (default) routes each run() call to the
-            "specialized" agent-generated SM120 W4A16 backend on its
-            allowlisted shapes/contract only; "b12x" forces the stock path;
-            "specialized" raises when a call cannot be served. Same contract
-            as b12x_fused_moe's backend kwarg.
         shared_static_workspace, shared_dynamic_workspace, shared_output:
             Optional externally-allocated buffers reused instead of fresh
             allocations. Callers running many identically-shaped wrappers
@@ -450,7 +401,6 @@ class B12xMoEWrapper:
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
-        backend: str = "auto",
         shared_static_workspace: Optional[object] = None,
         shared_dynamic_workspace: Optional[object] = None,
         shared_output: Optional[torch.Tensor] = None,
@@ -507,18 +457,6 @@ class B12xMoEWrapper:
         source_format : str
             Source weight format for ``quant_mode="w4a16"`` —
             ``"modelopt"`` (default) or ``"compressed_tensors"``.
-        backend : str
-            Same contract as the ``backend`` kwarg of
-            :func:`b12x_fused_moe` (this wrapper is also what the unified
-            ``MoELayer`` b12x runners drive, so ``MoELayer`` reaches the
-            same dispatch). ``"auto"`` (default) routes each ``run()`` call
-            to the ``"specialized"`` agent-generated SM120 W4A16 backend
-            only on its allowlisted shapes/contract and the stock
-            ``"b12x"`` dispatch everywhere else. ``"b12x"`` forces the
-            stock path. ``"specialized"`` raises when a call cannot be
-            served (an explicitly selected backend is never silently
-            swapped). ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables
-            the specialized backend entirely.
         shared_static_workspace, shared_dynamic_workspace : Optional[object]
             Externally allocated workspaces reused instead of fresh
             allocations.  Callers running many identically-shaped wrappers
@@ -571,9 +509,6 @@ class B12xMoEWrapper:
             self.quant_mode
         )
         self.source_format = source_format
-        if backend not in BACKENDS:
-            raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
-        self.backend = backend
         _validate_w4a4_dimensions(hidden_size, intermediate_size, self.quant_mode)
         self._dispatch_kwargs: dict[str, Any] = dict(
             activation_precision=self.activation_precision,
@@ -857,37 +792,6 @@ class B12xMoEWrapper:
                 dtype=self.output_dtype,
                 device=x.device,
             )
-
-        # The same specialized-backend gate as :func:`b12x_fused_moe`, so the
-        # unified MoELayer path (B12xW4A16Runner drives this wrapper, not the
-        # flat entry) reaches the agent-generated SM120 W4A16 kernels under
-        # the same allowlist/kill-switch/never-swap semantics.
-        from .. import specialized_moe_nvfp4_w4a16_sm120 as _spec
-
-        served = _spec.maybe_run_specialized(
-            self.backend,
-            x,
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            token_selected_experts,
-            token_final_scales,
-            self.num_experts,
-            self.top_k,
-            w1_alpha=w1_alpha,
-            w2_alpha=w2_alpha,
-            output=moe_output,
-            activation=self.activation,
-            quant_mode=self.quant_mode,
-            source_format=self.source_format,
-            expert_parallel=(
-                self.num_local_experts != self.num_experts
-                or self.expert_map is not None
-            ),
-        )
-        if served is not None:
-            return served
 
         from .blackwell_sm12x.moe_dispatch import (
             launch_sm120_moe,

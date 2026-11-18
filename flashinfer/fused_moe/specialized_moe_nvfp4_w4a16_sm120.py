@@ -12,33 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The "specialized" backend of ``b12x_fused_moe``: agent-generated,
-shape-specialized NVFP4 W4A16 (bf16-activation) routed-MoE kernels for
-SM120 at the contract E=128, top_k=6, hidden=2688, intermediate=1856,
-non-gated ReLU^2 (the Nemotron-3.5-Lightning serving geometry).
+"""Specialized agent-generated, shape-specialized NVFP4 W4A16
+(bf16-activation) routed-MoE kernels for SM120 at the contract E=128,
+top_k=6, hidden=2688, intermediate=1856, non-gated ReLU^2 (the
+Nemotron-3.5-Lightning serving geometry).
 
-Dispatch model (the ``backend`` kwarg of :func:`b12x_fused_moe` and of
-``B12xMoEWrapper`` — the wrapper is what the unified ``MoELayer`` path's
-``B12xW4A16Runner`` drives, so both the flat entry and ``MoELayer`` reach
-the same :func:`maybe_run_specialized` gate):
-  * ``backend="auto"`` routes to "specialized" only on the allowlisted
-    shapes/contract (``specialized_moe_nvfp4_w4a16_sm120_allowlist.json``);
-    everything else keeps the stock path. An explicitly selected backend is
-    never silently swapped.
-  * ``backend="specialized"`` raises with the recorded refusal reasons when
-    the call cannot be served (this module has no composable fallback of
-    its own; nothing is silently swapped to another fused backend).
-  * ``backend="b12x"`` forces the stock path; the specialized kernels are
-    never consulted.
-  * ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` disables the backend
-    entirely (``auto`` behaves as stock; explicit "specialized" raises;
-    :func:`warmup` refuses without loading or launching the module).
+This module is the kernels' OWN dispatch surface, and its sole public home
+is the unified MoE API: ``SpecializedW4A16Config`` (``api.py``, a default
+backend candidate on SM120) and ``SpecializedW4A16Runner`` (``runners.py``)
+call :func:`specialized_support_reasons` / :func:`run_specialized_moe_nvfp4_w4a16`
+directly. The kernels are not b12x kernels and are not reachable through
+``b12x_fused_moe`` or ``B12xMoEWrapper``: ``MoELayer``'s ``backend=auto``
+cross-backend shootout times them as their own named candidate
+(``"specialized_w4a16"``) next to the stock ``"b12x_w4a16"`` backend and
+routes to them where they win. An explicitly selected other backend is
+never served by them, and the runner never serves a call with a different
+kernel. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects the backend at
+layer construction and makes the runner decline every call
+(:func:`warmup` refuses without loading or launching the module).
 
 Guard order: GPU-free checks (kill switch, geometry, dtypes, allowlist)
 -> layout checks (shapes, contiguity, alignment) -> device checks
-(compute capability, graph-capture / autotune state). Refusals are
-recorded in :data:`fallback_reasons` and per-backend dispatch counts in
-:data:`dispatch_stats`.
+(compute capability, graph-capture state). Refusals are recorded in
+:data:`fallback_reasons` and dispatch counts in :data:`dispatch_stats`.
 
 Weight layout, consumed in place (no repack): ``w1 uint8 [E, I, H/2]``
 (two E2M1 codes per byte, low nibble = element 2i), ``w1_scale
@@ -82,14 +78,6 @@ _T_MIN_LARGE = int(_ALLOWLIST["token_counts_min_large"])
 
 ENV_DISABLE = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 
-# Selectable backends of the b12x W4A16 entry points (the canonical tuple;
-# ``flashinfer.fused_moe.cute_dsl.b12x_moe`` re-exports it). "b12x" is the
-# stock micro/static/dynamic dispatch; "specialized" is this agent-generated
-# shape-specialized SM120 W4A16 backend; "auto" picks "specialized" only on
-# its allowlisted shapes/contract and the stock path everywhere else. An
-# explicitly selected backend is never silently swapped.
-BACKENDS = ("auto", "specialized", "b12x")
-
 # Observability: per-backend dispatch counts and recent refusal reasons.
 dispatch_stats: collections.Counter = collections.Counter()
 fallback_reasons: collections.deque = collections.deque(maxlen=64)
@@ -120,15 +108,6 @@ def _is_capturing() -> bool:
         return False
 
 
-def _autotune_active() -> bool:
-    try:
-        from ..autotuner import AutoTuner
-
-        return AutoTuner.get().is_tuning_mode
-    except Exception:  # noqa: BLE001
-        return False
-
-
 @functools.cache
 def _module():
     from ..jit.specialized_moe_nvfp4_w4a16_sm120 import (
@@ -155,16 +134,13 @@ def specialized_support_reasons(
     activation: str = "relu2",
     quant_mode: Optional[str] = "w4a16",
     source_format: str = "modelopt",
-    allow_autotune: bool = False,
 ) -> Tuple[bool, List[str]]:
     """Guard, in the required order. Returns (supported, refusal_reasons).
 
-    ``allow_autotune=True`` skips the autotune-mode bail: the unified
-    ``SpecializedW4A16Runner`` is a first-class autotune candidate, so when
-    IT is the thing being timed the specialized kernel must be what runs.
-    The default (``False``) keeps the bail for the auto-gate inside the
-    b12x entry points, where autotuning must time the stock path it would
-    otherwise capture."""
+    Runs under autotune tuning mode by design: the unified
+    ``SpecializedW4A16Runner`` is a first-class cross-backend autotune
+    candidate, so when it is the thing being timed the specialized kernel
+    is what runs."""
     reasons: List[str] = []
     E = _C["num_experts"]
     TOPK = _C["top_k"]
@@ -280,8 +256,6 @@ def specialized_support_reasons(
             reasons.append(f"cuda_version:{_v.major}.{_v.minor}")
     except Exception:  # noqa: BLE001
         reasons.append("cuda_version:unknown")
-    if not allow_autotune and _autotune_active():
-        reasons.append("autotune_capture")
     if _is_capturing():
         if not _warmed["done"]:
             reasons.append("graph_capture_before_warmup")
@@ -309,88 +283,6 @@ def specialized_support_reasons(
     return not reasons, reasons
 
 
-def maybe_run_specialized(
-    backend: str,
-    x: torch.Tensor,
-    w1_weight: torch.Tensor,
-    w1_weight_sf: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_sf: torch.Tensor,
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    *,
-    w1_alpha: Optional[torch.Tensor],
-    w2_alpha: Optional[torch.Tensor],
-    output: torch.Tensor,
-    activation: str,
-    quant_mode: Optional[str],
-    source_format: str,
-    expert_parallel: bool = False,
-) -> Optional[torch.Tensor]:
-    """The single dispatch gate of the "specialized" backend, shared by both
-    call sites (:func:`b12x_fused_moe` and ``B12xMoEWrapper.run`` — the
-    latter is what the unified ``MoELayer`` path traverses) so the guard
-    semantics cannot drift between them.
-
-    Returns ``output`` (written in place) when the specialized backend
-    served the call; ``None`` when the call keeps the stock path
-    (``backend="b12x"``, or ``backend="auto"`` with the refusal recorded in
-    :data:`fallback_reasons`). ``backend="specialized"`` raises with the
-    refusal reasons instead of falling back — an explicitly selected backend
-    is never silently swapped, and this module has no composable fallback of
-    its own. ``quant_mode`` must already be normalized (e.g. ``"w4a16"``).
-    """
-    if backend not in BACKENDS:
-        raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
-    if backend == "b12x":
-        return None
-    if expert_parallel:
-        ok, reasons = False, ["expert_parallelism"]
-    else:
-        ok, reasons = specialized_support_reasons(
-            x,
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            token_selected_experts,
-            token_final_scales,
-            num_experts,
-            top_k,
-            w1_alpha=w1_alpha,
-            w2_alpha=w2_alpha,
-            output=output,
-            activation=activation,
-            quant_mode=quant_mode,
-            source_format=source_format,
-        )
-    if ok:
-        dispatch_stats["specialized"] += 1
-        return run_specialized_moe_nvfp4_w4a16(
-            x,
-            w1_weight,
-            w1_weight_sf,
-            w1_alpha,
-            w2_weight,
-            w2_weight_sf,
-            w2_alpha,
-            token_selected_experts,
-            token_final_scales,
-            output,
-        )
-    fallback_reasons.append(tuple(reasons))
-    if backend == "specialized":
-        # never silently swapped to another fused backend; this module has
-        # no composable fallback of its own
-        raise ValueError(
-            "backend='specialized' cannot serve this call: " + ", ".join(reasons)
-        )
-    dispatch_stats["b12x"] += 1
-    return None
-
-
 def run_specialized_moe_nvfp4_w4a16(
     x: torch.Tensor,
     w1_weight: torch.Tensor,
@@ -404,7 +296,8 @@ def run_specialized_moe_nvfp4_w4a16(
     output: torch.Tensor,
 ) -> torch.Tensor:
     """Run the specialized kernels (DPS: writes ``output`` [T, H] bf16 in
-    place). Callers go through :func:`specialized_support_reasons` first."""
+    place). The unified ``SpecializedW4A16Runner`` goes through
+    :func:`specialized_support_reasons` first."""
     tw = token_final_scales
     if tw.dtype != torch.float32:
         tw = tw.float()

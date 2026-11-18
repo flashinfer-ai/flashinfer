@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Dispatch-logic tests for the "specialized" SM120 NVFP4-W4A16 MoE backend.
+"""Dispatch-logic tests for the specialized SM120 NVFP4-W4A16 MoE backend.
 
-These tests exercise the routing decisions only — which backend a call
-reaches under ``auto``, the kill switch, the allowlist, and the
-never-swap-explicit rule — through BOTH reachability paths:
-
-  * the flat entry (``b12x_fused_moe``) / ``B12xMoEWrapper`` directly, and
-  * the unified ``MoELayer`` path (``BackendOptions((B12xW4A16Config(),))``
-    -> ``B12xW4A16Runner`` -> ``B12xMoEWrapper.run``).
+The kernels' sole public home is the unified MoE API: these tests exercise
+the guard (:func:`specialized_support_reasons`), the unified
+``SpecializedW4A16Runner`` (direct module dispatch, allowlist eligibility,
+kill switch, capture guard, no-fallback honesty), default-list visibility,
+and the NEGATIVE CONTROLS for the removed facade hook (``b12x_fused_moe`` /
+``B12xMoEWrapper`` carry no ``backend`` kwarg and never reach the
+specialized kernels).
 
 The kernel launches and the stock SM12x machinery are monkeypatched, and the
 SM120 device/toolkit probes are mocked, so everything here runs CPU-side on
@@ -149,12 +149,12 @@ def _activations(t):
 
 
 # ---------------------------------------------------------------------------
-# The shared dispatch gate (maybe_run_specialized)
+# The guard (specialized_support_reasons)
 # ---------------------------------------------------------------------------
 
 
-class TestSharedDispatchGate:
-    def _gate(self, backend, t, weights, **overrides):
+class TestGuard:
+    def _reasons(self, t, weights, **overrides):
         x, ids, tw = _activations(t)
         kwargs = dict(
             w1_alpha=weights["w1_alpha"],
@@ -165,8 +165,7 @@ class TestSharedDispatchGate:
             source_format="modelopt",
         )
         kwargs.update(overrides)
-        return spec.maybe_run_specialized(
-            backend,
+        return spec.specialized_support_reasons(
             x,
             weights["w1_weight"],
             weights["w1_weight_sf"],
@@ -179,62 +178,37 @@ class TestSharedDispatchGate:
             **kwargs,
         )
 
-    def test_canonical_backends_reexported(self):
-        from flashinfer.fused_moe.cute_dsl.b12x_moe import BACKENDS
+    def test_on_allowlist_supported(self, sm120_env, weights):
+        ok, reasons = self._reasons(16, weights)
+        assert ok and not reasons
 
-        assert BACKENDS is spec.BACKENDS
-        assert BACKENDS == ("auto", "specialized", "b12x")
-
-    def test_bogus_backend_raises(self, sm120_env, weights):
-        with pytest.raises(ValueError, match="backend must be one of"):
-            self._gate("fa2", 16, weights)
-
-    def test_auto_on_allowlist_serves_specialized(self, sm120_env, weights):
-        out = self._gate("auto", 16, weights)
-        assert out is not None and bool((out == 7.0).all())
-        assert sm120_env["spec_calls"] == 1
-
-    def test_auto_off_allowlist_declines_with_reason(self, sm120_env, weights):
-        before_b12x = spec.dispatch_stats.get("b12x", 0)
-        assert self._gate("auto", 8, weights) is None
-        assert sm120_env["spec_calls"] == 0
-        assert spec.dispatch_stats.get("b12x", 0) == before_b12x + 1
-        assert any(
-            any(r.startswith("token_count") for r in reasons)
-            for reasons in spec.fallback_reasons
-        )
-
-    def test_explicit_stock_backend_skips_the_guard_entirely(self, sm120_env, weights):
-        n_reasons = len(spec.fallback_reasons)
-        assert self._gate("b12x", 16, weights) is None
-        assert sm120_env["spec_calls"] == 0
-        assert len(spec.fallback_reasons) == n_reasons
-
-    def test_explicit_specialized_raises_instead_of_swapping(self, sm120_env, weights):
-        with pytest.raises(ValueError, match="token_count"):
-            self._gate("specialized", 8, weights)
-        assert sm120_env["spec_calls"] == 0
+    def test_off_allowlist_token_count(self, sm120_env, weights):
+        ok, reasons = self._reasons(8, weights)
+        assert not ok
+        assert any(r.startswith("token_count") for r in reasons)
 
     def test_kill_switch(self, sm120_env, weights, monkeypatch):
         monkeypatch.setenv(spec.ENV_DISABLE, "1")
-        assert self._gate("auto", 16, weights) is None
-        with pytest.raises(ValueError, match="kill_switch"):
-            self._gate("specialized", 16, weights)
-        assert sm120_env["spec_calls"] == 0
+        ok, reasons = self._reasons(16, weights)
+        assert not ok and "kill_switch" in reasons
 
-    def test_expert_parallel_declines(self, sm120_env, weights):
-        assert self._gate("auto", 16, weights, expert_parallel=True) is None
-        assert sm120_env["spec_calls"] == 0
-        assert ("expert_parallelism",) in spec.fallback_reasons
+    def test_missing_alpha(self, sm120_env, weights):
+        ok, reasons = self._reasons(16, weights, w1_alpha=None)
+        assert not ok and "w1_alpha_missing" in reasons
 
-    def test_missing_alpha_declines(self, sm120_env, weights):
-        assert self._gate("auto", 16, weights, w1_alpha=None) is None
-        assert sm120_env["spec_calls"] == 0
-        assert any("w1_alpha_missing" in reasons for reasons in spec.fallback_reasons)
+    def test_runs_under_autotune_tuning_mode(self, sm120_env, weights, monkeypatch):
+        """The guard has no autotune bail: the unified runner is a
+        first-class autotune candidate, so the specialized kernels are what
+        the shootout times."""
+        from flashinfer.autotuner import AutoTuner
+
+        monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+        ok, reasons = self._reasons(16, weights)
+        assert ok and not reasons
 
 
 # ---------------------------------------------------------------------------
-# B12xMoEWrapper reachability (the hook the unified runner traverses)
+# Facade negative controls: the kernels are NOT a b12x backend
 # ---------------------------------------------------------------------------
 
 
@@ -269,58 +243,33 @@ def _run_wrapper(wrapper, weights, t):
     )
 
 
-class TestWrapperReachability:
-    def test_wrapper_rejects_bogus_backend(self, sm120_env):
-        with pytest.raises(ValueError, match="backend must be one of"):
-            _make_wrapper(backend="fa2")
+class TestFacadeNegativeControls:
+    def test_no_backend_kwarg_on_the_b12x_entry_points(self):
+        """The specialized kernels are not b12x kernels, so the vendor entry
+        points carry no backend kwarg and no re-exported BACKENDS tuple."""
+        import inspect
 
-    def test_wrapper_auto_reaches_specialized_on_allowlisted_shape(
-        self, sm120_env, weights
-    ):
-        before = spec.dispatch_stats.get("specialized", 0)
-        out = _run_wrapper(_make_wrapper(), weights, 16)
-        assert sm120_env["spec_calls"] == 1
-        assert sm120_env["stock_calls"] == 0
-        assert spec.dispatch_stats.get("specialized", 0) == before + 1
-        assert bool((out == 7.0).all())
+        from flashinfer.fused_moe.cute_dsl import b12x_moe
 
-    def test_wrapper_auto_off_allowlist_keeps_stock(self, sm120_env, weights):
-        _run_wrapper(_make_wrapper(), weights, 8)
-        assert sm120_env["spec_calls"] == 0
-        assert sm120_env["stock_calls"] == 1
+        assert "backend" not in inspect.signature(b12x_moe.b12x_fused_moe).parameters
+        assert (
+            "backend"
+            not in inspect.signature(b12x_moe.B12xMoEWrapper.__init__).parameters
+        )
+        assert not hasattr(b12x_moe, "BACKENDS")
+        assert not hasattr(spec, "BACKENDS")
+        assert not hasattr(spec, "maybe_run_specialized")
 
-    def test_wrapper_explicit_stock_never_receives_specialized(
-        self, sm120_env, weights
-    ):
-        _run_wrapper(_make_wrapper(backend="b12x"), weights, 16)
-        assert sm120_env["spec_calls"] == 0
-        assert sm120_env["stock_calls"] == 1
-
-    def test_wrapper_kill_switch_keeps_stock(self, sm120_env, weights, monkeypatch):
-        monkeypatch.setenv(spec.ENV_DISABLE, "1")
+    def test_wrapper_never_reaches_the_specialized_kernels(self, sm120_env, weights):
+        """Even on an allowlisted shape, the b12x wrapper is the stock
+        path, period."""
         _run_wrapper(_make_wrapper(), weights, 16)
         assert sm120_env["spec_calls"] == 0
         assert sm120_env["stock_calls"] == 1
 
-    def test_wrapper_explicit_specialized_off_allowlist_raises(
-        self, sm120_env, weights
-    ):
-        with pytest.raises(ValueError, match="token_count"):
-            _run_wrapper(_make_wrapper(backend="specialized"), weights, 8)
-        assert sm120_env["stock_calls"] == 0
-
-    def test_wrapper_expert_parallel_keeps_stock(self, sm120_env, weights):
-        expert_map = torch.full((E,), -1, dtype=torch.int32)
-        expert_map[: E // 2] = torch.arange(E // 2, dtype=torch.int32)
-        wrapper = _make_wrapper(num_local_experts=E // 2, expert_map=expert_map)
-        _run_wrapper(wrapper, weights, 16)
-        assert sm120_env["spec_calls"] == 0
-        assert sm120_env["stock_calls"] == 1
-        assert ("expert_parallelism",) in spec.fallback_reasons
-
 
 # ---------------------------------------------------------------------------
-# MoELayer reachability (BackendOptions((B12xW4A16Config(),)) on sm120)
+# Unified MoELayer surface: the kernels' public home
 # ---------------------------------------------------------------------------
 
 
@@ -349,7 +298,7 @@ def _moe_config(t, backends=None, top_k=TOPK):
     )
 
 
-def _make_layer_and_packs(weights, t, backends=None):
+def _make_layer_and_packs(weights, t, backends=None, winner_key=None):
     from flashinfer.fused_moe import (
         MoEActivationPack,
         MoELayer,
@@ -357,7 +306,11 @@ def _make_layer_and_packs(weights, t, backends=None):
     )
 
     layer = MoELayer(_moe_config(t, backends), device=torch.device("cpu"))
-    layer._select_winner = lambda *_: (layer.runners[0], -1)
+    if winner_key is None:
+        layer._select_winner = lambda *_, **__: (layer.runners[0], -1)
+    else:
+        winner = next(r for r in layer.runners if r.backend_key == winner_key)
+        layer._select_winner = lambda *_, **__: (winner, -1)
 
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for("b12x_w4a16", weights)
@@ -371,50 +324,28 @@ def _make_layer_and_packs(weights, t, backends=None):
     return layer, act_pack, weight_pack
 
 
-class TestMoELayerReachability:
-    def test_moe_layer_auto_reaches_specialized_on_allowlisted_shape(
-        self, sm120_env, weights
-    ):
-        layer, act_pack, weight_pack = _make_layer_and_packs(weights, 16)
-        before = spec.dispatch_stats.get("specialized", 0)
-        out = layer(act_pack, weight_pack)
-        assert sm120_env["spec_calls"] == 1
-        assert sm120_env["stock_calls"] == 0
-        assert spec.dispatch_stats.get("specialized", 0) == before + 1
-        assert bool((out == 7.0).all())
-        assert layer.winner_backend == "b12x_w4a16"
-
-    def test_moe_layer_off_allowlist_keeps_stock(self, sm120_env, weights):
-        layer, act_pack, weight_pack = _make_layer_and_packs(weights, 8)
-        layer(act_pack, weight_pack)
-        assert sm120_env["spec_calls"] == 0
-        assert sm120_env["stock_calls"] == 1
-        assert any(
-            any(r.startswith("token_count") for r in reasons)
-            for reasons in spec.fallback_reasons
-        )
-
-    def test_moe_layer_kill_switch_keeps_stock(self, sm120_env, weights, monkeypatch):
-        monkeypatch.setenv(spec.ENV_DISABLE, "1")
-        layer, act_pack, weight_pack = _make_layer_and_packs(weights, 16)
-        layer(act_pack, weight_pack)
-        assert sm120_env["spec_calls"] == 0
-        assert sm120_env["stock_calls"] == 1
-        assert any("kill_switch" in reasons for reasons in spec.fallback_reasons)
-
-
-# ---------------------------------------------------------------------------
-# First-class autotune candidacy (SpecializedW4A16Config / -Runner)
-# ---------------------------------------------------------------------------
-
-
 def _specialized_configs():
     from flashinfer.fused_moe import B12xW4A16Config, SpecializedW4A16Config
 
     return B12xW4A16Config, SpecializedW4A16Config
 
 
-class TestFirstClassAutotuneCandidate:
+class TestUnifiedSurface:
+    def test_default_visible(self):
+        from flashinfer.fused_moe.api import _DEFAULT_BACKEND
+
+        _, SpecializedW4A16Config = _specialized_configs()
+        assert any(isinstance(c, SpecializedW4A16Config) for c in _DEFAULT_BACKEND)
+        assert any(
+            isinstance(c, SpecializedW4A16Config)
+            for c in _DEFAULT_BACKEND.valid_for(120)
+        )
+        for arch in (90, 100, 103, 121):
+            assert not any(
+                isinstance(c, SpecializedW4A16Config)
+                for c in _DEFAULT_BACKEND.valid_for(arch)
+            )
+
     def test_both_candidates_constructed(self, sm120_env, weights):
         B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
         layer, _, _ = _make_layer_and_packs(
@@ -425,93 +356,84 @@ class TestFirstClassAutotuneCandidate:
             "specialized_w4a16",
         ]
 
-    def test_specialized_runner_serves_specialized_under_autotune(
-        self, sm120_env, weights, monkeypatch
-    ):
-        """When the specialized candidate is the thing being timed, the
-        specialized kernel is what runs (no autotune-mode bail), and the
+    def test_specialized_runner_dispatches_its_own_module(self, sm120_env, weights):
+        """The runner calls the kernels' own module directly; the
         layout-identical b12x_w4a16 weight view serves it as an alias."""
+        B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights,
+            16,
+            backends=(B12xW4A16Config(), SpecializedW4A16Config()),
+            winner_key="specialized_w4a16",
+        )
+        before = spec.dispatch_stats.get("specialized", 0)
+        out = layer(act_pack, weight_pack)
+        assert sm120_env["spec_calls"] == 1
+        assert sm120_env["stock_calls"] == 0
+        assert spec.dispatch_stats.get("specialized", 0) == before + 1
+        assert bool((out == 7.0).all())
+        assert layer.winner_backend == "specialized_w4a16"
+
+    def test_runs_under_autotune_tuning_mode(self, sm120_env, weights, monkeypatch):
+        """First-class candidacy: the specialized kernel is what runs while
+        the autotuner times this runner (no bail, no tuner-state games)."""
+        from flashinfer.autotuner import AutoTuner
+
         _, SpecializedW4A16Config = _specialized_configs()
-        monkeypatch.setattr(spec, "_autotune_active", lambda: True)
+        monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
         layer, act_pack, weight_pack = _make_layer_and_packs(
             weights, 16, backends=(SpecializedW4A16Config(),)
         )
         runner = layer.runners[0]
-        assert runner.backend_key == "specialized_w4a16"
         out = runner.forward(runner.pack_inputs(act_pack, weight_pack))
         assert sm120_env["spec_calls"] == 1
-        assert sm120_env["stock_calls"] == 0
         assert bool((out == 7.0).all())
 
-    def test_b12x_auto_gate_still_bails_under_autotune(
-        self, sm120_env, weights, monkeypatch
-    ):
-        """Negative control: the shipped gate inside the b12x path keeps its
-        autotune-mode bail, so timing the b12x candidate times stock."""
-        monkeypatch.setattr(spec, "_autotune_active", lambda: True)
-        layer, act_pack, weight_pack = _make_layer_and_packs(weights, 16)
+    def test_off_allowlist_declined_and_stock_serves(self, sm120_env, weights):
+        """Out-of-allowlist token counts are declined at eligibility time:
+        auto routes them to the stock b12x backend (negative control for
+        the removed in-runner torch fallback — nothing serves through the
+        specialized runner)."""
+        B12xW4A16Config, SpecializedW4A16Config = _specialized_configs()
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 8, backends=(B12xW4A16Config(), SpecializedW4A16Config())
+        )
+        eligible = layer._eligible_runners(act_pack, weight_pack)
+        assert [layer.runners[i].backend_key for i in eligible] == ["b12x_w4a16"]
         layer(act_pack, weight_pack)
         assert sm120_env["spec_calls"] == 0
         assert sm120_env["stock_calls"] == 1
-        assert any("autotune_capture" in reasons for reasons in spec.fallback_reasons)
 
-    def test_specialized_runner_off_allowlist_falls_back_to_torch(
-        self, sm120_env, weights
-    ):
-        """Off-allowlist calls take the composable pure-torch path — never
-        the specialized kernel, never another fused backend."""
+    def test_off_allowlist_specialized_only_layer_refuses(self, sm120_env, weights):
+        """A specialized-only layer refuses an out-of-allowlist call rather
+        than serving it with a different kernel."""
         _, SpecializedW4A16Config = _specialized_configs()
         layer, act_pack, weight_pack = _make_layer_and_packs(
             weights, 8, backends=(SpecializedW4A16Config(),)
         )
-        runner = layer.runners[0]
-        out = runner.forward(runner.pack_inputs(act_pack, weight_pack))
+        with pytest.raises(NotImplementedError, match="routing_input_mode"):
+            layer(act_pack, weight_pack)
         assert sm120_env["spec_calls"] == 0
-        assert sm120_env["stock_calls"] == 0
-        assert out.shape == (8, H) and out.dtype == torch.bfloat16
-        assert any(
-            any(r.startswith("token_count") for r in reasons)
-            for reasons in spec.fallback_reasons
-        )
 
-    def test_torch_fallback_matches_reference_math(self, sm120_env):
-        """The fallback's dequant+ReLU^2 math on a crafted exact case: one
-        expert, unit scales, constant codes, so the result is closed-form."""
-        from flashinfer.fused_moe import MoEActivationPack, MoELayer, MoEWeightPack
-
+    def test_declined_accepted_call_raises_instead_of_fallback(
+        self, sm120_env, weights, monkeypatch
+    ):
+        """A call-time guard refusal after acceptance raises: the runner
+        never serves a call with another kernel (no torch fallback)."""
         _, SpecializedW4A16Config = _specialized_configs()
-        v = {
-            # Code 0x22 = E2M1 (1.0, 1.0) in every packed byte.
-            "w1_weight": torch.full((E, I, H // 2), 0x22, dtype=torch.uint8),
-            "w1_weight_sf": torch.ones(E, I, H // 16).to(torch.float8_e4m3fn),
-            "w1_alpha": torch.full((E,), 0.5, dtype=torch.float32),
-            "w2_weight": torch.full((E, H, I // 2), 0x22, dtype=torch.uint8),
-            "w2_weight_sf": torch.ones(E, H, I // 16).to(torch.float8_e4m3fn),
-            "w2_alpha": torch.full((E,), 0.5, dtype=torch.float32),
-        }
-        layer = MoELayer(
-            _moe_config(8, (SpecializedW4A16Config(),)), device=torch.device("cpu")
+        layer, act_pack, weight_pack = _make_layer_and_packs(
+            weights, 16, backends=(SpecializedW4A16Config(),)
         )
         runner = layer.runners[0]
-        weight_pack = MoEWeightPack()
-        weight_pack.prepare_for("specialized_w4a16", v)
-        t = 8  # off-allowlist -> torch fallback
-        x = torch.full((t, H), 2.0**-11, dtype=torch.bfloat16)
-        ids = torch.zeros(t, TOPK, dtype=torch.int32)
-        tw = torch.full((t, TOPK), 1.0 / TOPK, dtype=torch.float32)
-        act_pack = MoEActivationPack(
-            hidden_states_q=x, hidden_states_scale=None, topk_ids=ids, topk_weights=tw
+        packed = runner.pack_inputs(act_pack, weight_pack)
+        monkeypatch.setattr(
+            spec,
+            "specialized_support_reasons",
+            lambda *a, **k: (False, ["token_count:16"]),
         )
-        out = runner.forward(runner.pack_inputs(act_pack, weight_pack))
-        # Every weight element dequants to 1.0 (code) * 1.0 (scale) * 0.5
-        # (alpha) = 0.5: fc1 row = relu(H * x * 0.5)^2; fc2 row multiplies
-        # by 0.5 and sums over I; all top-k slots hit expert 0 with routing
-        # weights summing to 1.
-        expected = (H * 2.0**-11 * 0.5) ** 2 * I * 0.5
-        assert sm120_env["spec_calls"] == 0 and sm120_env["stock_calls"] == 0
-        assert torch.allclose(out.float(), torch.full((t, H), expected), rtol=2e-2), (
-            f"fallback mean {out.float().mean().item()} vs expected {expected}"
-        )
+        with pytest.raises(RuntimeError, match="declined an accepted call"):
+            runner.forward(packed)
+        assert sm120_env["spec_calls"] == 0
 
     def test_capture_guard_raises_instead_of_capturing_fallback(
         self, sm120_env, weights, monkeypatch
@@ -547,9 +469,3 @@ class TestFirstClassAutotuneCandidate:
                 _moe_config(16, (SpecializedW4A16Config(),), top_k=4),
                 device=torch.device("cpu"),
             )
-
-    def test_not_in_default_backend(self):
-        from flashinfer.fused_moe.api import _DEFAULT_BACKEND
-
-        _, SpecializedW4A16Config = _specialized_configs()
-        assert not any(isinstance(c, SpecializedW4A16Config) for c in _DEFAULT_BACKEND)

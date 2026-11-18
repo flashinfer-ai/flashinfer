@@ -2904,18 +2904,26 @@ class B12xW4A16Config:
 
 @dataclass(frozen=True)
 class SpecializedW4A16Config:
-    """SM120 agent-generated shape-specialized W4A16 MoE backend.
+    """SM120 agent-generated shape-specialized W4A16 MoE backend (its own
+    module, :mod:`flashinfer.fused_moe.specialized_moe_nvfp4_w4a16_sm120`
+    — not a b12x kernel, and not reachable through ``b12x_fused_moe`` or
+    ``B12xMoEWrapper``).
 
-    An opt-in autotune candidate over the same checkpoint weight view as
-    :class:`B12xW4A16Config` (its runner also accepts the ``"b12x_w4a16"``
-    view as an alias, so one prepared pack serves both candidates). Unlike
-    the auto-gate inside the b12x entry points — which bails during
-    autotuning so the stock path is what gets timed — this candidate runs
-    the specialized kernels deterministically on their allowlisted
-    shapes/contract when it is the one being timed or dispatched, and falls
-    back to a composable pure-torch path (never another fused backend)
-    off-allowlist. ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects the
-    candidate at support-check time.
+    Uses the same checkpoint weight view as :class:`B12xW4A16Config` (its
+    runner also accepts the ``"b12x_w4a16"`` view as an alias, so one
+    prepared pack serves both candidates with no second weight copy).
+
+    A DEFAULT backend candidate: ``supported()`` gates the arch (SM120) and
+    the runner gates the kernels' fixed contract (E=128, top_k=6,
+    hidden=2688, intermediate=1856, ReLU^2, CUDA >= 13.1 toolkit) and
+    per-call token-count allowlist, so under ``backend=auto`` the
+    ``MoELayer`` per-token-bucket shootout times the specialized kernels
+    directly on matching layers — including under autotune tuning mode —
+    and routes to them where they win. The runner serves ONLY the kernels'
+    own domain: out-of-allowlist calls are declined at eligibility time and
+    served by whichever other configured backend wins them.
+    ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` rejects the candidate at
+    support-check time and makes the runner decline every call.
     """
 
     @classmethod
@@ -3610,6 +3618,11 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
+        # Specialized agent-generated kernels: first-class auto/autotune
+        # candidates on the layers they were optimized for (supported() and
+        # the runner gate arch + contract; out-of-domain calls are declined
+        # and served by the other candidates).
+        SpecializedW4A16Config(),
         CuteDslConfig(),
         CuTileMxfp4Bf16Config(),
         CuTileFp8PerTensorBf16Config(),
