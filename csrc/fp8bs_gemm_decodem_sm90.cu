@@ -1859,9 +1859,10 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
         early_ws[u] = wsp[ExactRound ? kc + u : (kc + u < Sk ? kc + u : Sk - 1)];
     }
 
-    constexpr bool EarlyActFence =
-        CompactM2 || (DenseOut && MT == 24) || (MT == 16 && SPLIT == 8 && ExactRound && AsyncPush);
-    if constexpr (EarlyActFence) asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    // Order matters: the proxy fence publishes only writes that are complete
+    // when it executes, so drain the cp.async stage(s) the next WGMMA
+    // consumes first, then fence (covering both those weight copies and the
+    // generic-proxy activation stores), then join at the CTA barrier.
     if constexpr (PairPipe) {
       asm volatile("cp.async.wait_group 1;" ::: "memory");
     } else if constexpr (PipeWeights && KU == 2) {
@@ -1871,13 +1872,8 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
     } else {
       asm volatile("cp.async.wait_group 0;" ::: "memory");
     }
-    if constexpr (EarlyActFence) {
-      // The local activation-publication fence was issued above the weight
-      // drain; the following CTA barrier joins both paths.
-    } else {
-      asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::
-                       : "memory");
-    }
+    asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::
+                     : "memory");
     __syncthreads();
 
     if constexpr (MmaPipe) {
@@ -1912,6 +1908,9 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
         issue_ku_wgmma_group<MT>(pg[0], da[0], db[0]);
         if constexpr (PipeWeights) {
           asm volatile("cp.async.wait_group 0;" ::: "memory");
+          // Publish the just-drained weight stage to the async proxy before
+          // the barrier hands it to the next WGMMA group.
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
           __syncthreads();
         }
         issue_ku_wgmma_group<MT>(pg[1], da[1], db[1]);
@@ -1919,6 +1918,7 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
         issue_ku_wgmma_group<MT>(pg[0], da[0], db[0]);
         issue_ku_wgmma_group<MT>(pg[1], da[1], db[1]);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
         issue_ku_wgmma_group<MT>(pg[2], da[2], db[2]);
         issue_ku_wgmma_group<MT>(pg[3], da[3], db[3]);
@@ -1990,11 +1990,15 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
               else
                 asm volatile("cp.async.wait_group 0;" ::: "memory");
             }
+            // Publish the just-drained weight stage to the async proxy
+            // before the barrier hands it to WGMMA.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
           }
         } else if constexpr (PairPipe) {
           if (u == 2) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncthreads();
           }
         }
@@ -2492,8 +2496,6 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
             raw[a], bq, activation_scale, eps, row0 + 8 * a, subgroup_lane);
       }
     }
-    asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::
-                     : "memory");
     if (kb + 1 < kb_end) {
       ISSUE_WTILE(kb + 1, buf ^ 1);
       cp_async_commit();
@@ -2501,6 +2503,12 @@ __global__ __launch_bounds__(128, 2) void __cluster_dims__(SPLIT, 1, 1)
     } else {
       cp_async_wait<0>();
     }
+    // Publish the just-drained weight buffer and the generic-proxy
+    // activation stores to the async proxy only after the copy wait; the
+    // next buffer may stay in flight.  A fence issued before the wait would
+    // leave a copy that completes after it unpublished.
+    asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::
+                     : "memory");
     __syncthreads();
 
     float partial[NACC];

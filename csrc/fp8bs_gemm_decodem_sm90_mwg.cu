@@ -470,26 +470,18 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* 
       }
     }
 
+    // Order matters: the proxy fence publishes only writes that are complete
+    // when it executes.  Drain the cp.async group(s) consumed by the next
+    // WGMMA first, then fence (covering both the drained weight copies and
+    // the generic-proxy activation stores), then join at the warpgroup
+    // barrier.  A fence issued before the wait would leave any copy that
+    // completes after it unpublished to the async proxy.
     if constexpr (WeightPipeW1) {
-      asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;" ::
-                       : "memory");
       asm volatile("cp.async.wait_group 1;" ::: "memory");
-    } else if constexpr (MT == 16 && NWG == 8 && KU == 2 && ExactOneRound) {
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      asm volatile("cp.async.wait_group 0;" ::: "memory");
-    } else if constexpr (MT == 8 && NWG == 6 && KU == 2 && ExactOneRound && PipelineMMA) {
-      // Activation stores are independent of the cp.async weight stream.
-      // Start their proxy-ordering fence while those copies are still
-      // draining, then join both paths at the named warpgroup barrier below.
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      asm volatile("cp.async.wait_group 0;" ::: "memory");
-    } else if constexpr (SparseM1) {
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-      asm volatile("cp.async.wait_group 0;" ::: "memory");
     } else {
       asm volatile("cp.async.wait_group 0;" ::: "memory");
-      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
 
     if constexpr (PipelineMMA) {
@@ -532,6 +524,9 @@ __global__ __launch_bounds__(128 * NWG, 1) void mwg_kernel(const __nv_bfloat16* 
         if constexpr (WeightPipeW1) {
           if (u > 0) {
             asm volatile("cp.async.wait_group 0;" ::: "memory");
+            // Publish the just-drained second weight stage to the async
+            // proxy before the barrier hands it to WGMMA.
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             asm volatile("bar.sync %0, 128;" ::"r"(bar) : "memory");
           }
         }
