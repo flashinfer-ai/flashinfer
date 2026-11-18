@@ -684,17 +684,25 @@ __global__ __launch_bounds__(NWARP * 32, MINB) void moe_gemv_group16(
 // is monotone, so the retained total stays bounded (< 2x the final capacity).
 static void* g_ws = nullptr;
 static size_t g_ws_bytes = 0;
+static int g_ws_device = -1;
 static std::vector<void*> g_retired_ws;
 static void* ws_get(size_t bytes) {
-  if (bytes > g_ws_bytes) {
+  // The allocation is only valid on the device it was made on: an unchanged
+  // byte requirement must not reuse another device's workspace (peer access
+  // is not guaranteed), so the current device keys the cache alongside size.
+  int device = -1;
+  cudaGetDevice(&device);
+  if (bytes > g_ws_bytes || device != g_ws_device) {
     if (g_ws) g_retired_ws.push_back(g_ws);
     g_ws = nullptr;
     g_ws_bytes = 0;
+    g_ws_device = -1;
     cudaError_t err = cudaMalloc(&g_ws, bytes);
     TVM_FFI_ICHECK(err == cudaSuccess && g_ws != nullptr)
         << "specialized MoE workspace cudaMalloc(" << bytes
         << ") failed: " << cudaGetErrorString(err);
     g_ws_bytes = bytes;
+    g_ws_device = device;
   }
   return g_ws;
 }

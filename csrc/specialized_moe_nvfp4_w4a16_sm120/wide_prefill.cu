@@ -54,7 +54,11 @@ Workspace g_workspace;
 
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
-bool g_ws_fresh = false;
+// Persistent-grid sizes depend on the launch device's SM count and occupancy;
+// cache them per device so a value computed on one GPU is never reused on a
+// smaller one (where it could exceed the resident-block capacity and leave
+// blocks waiting at the grid barrier).
+constexpr int kMaxCachedDevices = 64;
 
 // Buffers retired by workspace growth or a device change stay alive for the
 // process lifetime: a CUDA graph captured earlier may still replay kernels
@@ -68,9 +72,7 @@ void* ensure_workspace(size_t bytes, int device) {
     g_workspace.ptr = nullptr;
     g_workspace.bytes = 0;
   }
-  g_ws_fresh = false;
   if (g_workspace.ptr == nullptr) {
-    g_ws_fresh = true;
     cudaSetDevice(device);
     cudaError_t err = cudaMalloc(&g_workspace.ptr, bytes);
     TVM_FFI_ICHECK(err == cudaSuccess && g_workspace.ptr != nullptr)
@@ -1772,8 +1774,11 @@ __device__ __forceinline__ void dec_tile_direct(const __nv_bfloat16* __restrict_
   }
 }
 
-// Device-wide barrier over a persistent grid; the counter is monotonic so it
-// needs no reset between launches as long as the grid size is fixed.
+// Device-wide barrier over a persistent grid. The host zeroes the selected
+// counter immediately before each ordered launch (stream-ordered, so it is
+// also captured into CUDA graphs), which keeps every launch's epoch valid
+// regardless of workspace reuse across shapes and prevents the unsigned
+// counter from ever wrapping within a launch.
 __device__ __forceinline__ void dec_grid_barrier(unsigned int* bar, unsigned int gsz) {
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -2382,7 +2387,10 @@ void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ff
   const size_t inter_off = bytes;
   bytes += align_up(size_t(routes) * I * sizeof(__nv_bfloat16));
   const size_t output_scratch_off = bytes;
-  bytes += align_up(size_t(routes) * H * sizeof(__nv_bfloat16));
+  // route_out / output_acc are consumed only by the T < 2048 combine paths;
+  // the T >= 2048 branches write the FC2 output directly to y, so skipping
+  // the slice there saves routes * H * 2 bytes of workspace.
+  if (T < 2048) bytes += align_up(size_t(routes) * H * sizeof(__nv_bfloat16));
   const size_t routes_off = bytes;
   const size_t route_capacity = T >= 2048 ? size_t(E) * routes : size_t(routes);
   bytes += align_up(route_capacity * sizeof(int32_t));
@@ -2403,8 +2411,10 @@ void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ff
   const size_t desc2_off = bytes;
   bytes += align_up(desc_mtiles * ((H + 127) / 128) * sizeof(uint32_t));
   const size_t bar_off = bytes;
-  // Persistent decode grids differ for T=1..4.  Keep one monotonic barrier
-  // epoch per shape so alternating calls cannot observe another grid's epoch.
+  // Persistent decode grids differ for T=1..4, so each shape owns a slot.
+  // bar_off is shape-dependent (the workspace is reused across shapes), so
+  // the selected slot is zeroed before every ordered launch below; a slot is
+  // never trusted to hold a prior epoch.
   bytes += align_up(5 * sizeof(unsigned int));
 
   char* workspace = static_cast<char*>(ensure_workspace(bytes, device));
@@ -2420,7 +2430,6 @@ void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ff
   auto* desc1 = reinterpret_cast<uint32_t*>(workspace + desc1_off);
   auto* desc2 = reinterpret_cast<uint32_t*>(workspace + desc2_off);
   auto* bars = reinterpret_cast<unsigned int*>(workspace + bar_off);
-  if (g_ws_fresh) cudaMemsetAsync(bars, 0, 5 * sizeof(unsigned int), stream);
 
   const auto* x = static_cast<const __nv_bfloat16*>(hidden_states.data_ptr());
   const auto* p1 = static_cast<const uint8_t*>(w1_packed.data_ptr());
@@ -2476,7 +2485,9 @@ void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ff
   }
     if (T <= 4) {
       constexpr int FRPW = 4;
-      static int fused_grid = 0;
+      static int fused_grid_by_device[kMaxCachedDevices] = {};
+      int fused_grid =
+          (device >= 0 && device < kMaxCachedDevices) ? fused_grid_by_device[device] : 0;
       if (fused_grid == 0) {
         int nb = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -2485,21 +2496,26 @@ void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ff
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
         fused_grid = nb * sms;
         if (fused_grid < 1) fused_grid = 1;
+        if (device >= 0 && device < kMaxCachedDevices) fused_grid_by_device[device] = fused_grid;
       }
       unsigned int* bar = bars + (T - 1);
+      cudaMemsetAsync(bar, 0, sizeof(unsigned int), stream);
       int grid = fused_grid;
       const int maxitems = routes * (H / (DEC_WARPS * FRPW));
       if (grid > maxitems) grid = maxitems;
       dec_fused_direct_kernel<FRPW, 3><<<grid, DEC_THREADS, 0, stream>>>(
           x, p1, s1, a1, p2, s2, a2, ids, tw, routes, inter, y, out_pairs, bar);
     } else {
-      // All grouped fallback shapes use the same occupancy-capped grid, but
-      // must not share epochs with any of the four direct-decode grids.
+      // All grouped fallback shapes use the same occupancy-capped grid, and
+      // the slot is zeroed before each launch, so no epoch is shared with
+      // any of the four direct-decode grids.
       unsigned int* bar = bars + 4;
+      cudaMemsetAsync(bar, 0, sizeof(unsigned int), stream);
 #define FUSED_GRP(MTV)                                                                           \
   {                                                                                              \
     constexpr int MT_ = MTV;                                                                     \
-    static int fg = 0;                                                                           \
+    static int fg_by_device[kMaxCachedDevices] = {};                                             \
+    int fg = (device >= 0 && device < kMaxCachedDevices) ? fg_by_device[device] : 0;             \
     if (fg == 0) {                                                                               \
       int nb = 0;                                                                                \
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(                                             \
@@ -2508,6 +2524,7 @@ void RunWidePrefill(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ff
       cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);                      \
       fg = nb * sms;                                                                             \
       if (fg < 1) fg = 1;                                                                        \
+      if (device >= 0 && device < kMaxCachedDevices) fg_by_device[device] = fg;                  \
     }                                                                                            \
     dec_route_kernel<MT_>                                                                        \
         <<<1, 256, 0, stream>>>(ids, routes, tiles1, counts, offsets, route_list);               \

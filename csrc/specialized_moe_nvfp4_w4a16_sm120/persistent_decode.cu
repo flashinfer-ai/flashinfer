@@ -52,7 +52,11 @@ Workspace g_workspace;
 
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
-bool g_ws_fresh = false;
+// Persistent-grid sizes depend on the launch device's SM count and occupancy;
+// cache them per device so a value computed on one GPU is never reused on a
+// smaller one (where it could exceed the resident-block capacity and leave
+// blocks waiting at the grid barrier).
+constexpr int kMaxCachedDevices = 64;
 
 // Buffers retired by workspace growth or a device change stay alive for the
 // process lifetime: a CUDA graph captured earlier may still replay kernels
@@ -66,15 +70,16 @@ void* ensure_workspace(size_t bytes, int device) {
     g_workspace.ptr = nullptr;
     g_workspace.bytes = 0;
   }
-  g_ws_fresh = false;
   if (g_workspace.ptr == nullptr) {
-    g_ws_fresh = true;
     cudaSetDevice(device);
     cudaError_t err = cudaMalloc(&g_workspace.ptr, bytes);
     TVM_FFI_ICHECK(err == cudaSuccess && g_workspace.ptr != nullptr)
         << "specialized MoE workspace cudaMalloc(" << bytes
         << ") failed: " << cudaGetErrorString(err);
-    cudaMemset(g_workspace.ptr, 0, bytes);
+    cudaError_t zerr = cudaMemset(g_workspace.ptr, 0, bytes);
+    TVM_FFI_ICHECK(zerr == cudaSuccess)
+        << "specialized MoE workspace cudaMemset(" << bytes
+        << ") failed: " << cudaGetErrorString(zerr);
     g_workspace.bytes = bytes;
     g_workspace.device = device;
   }
@@ -1474,8 +1479,11 @@ __device__ __forceinline__ void dec_tile_direct_bf16(const __nv_bfloat16* __rest
   }
 }
 
-// Device-wide barrier over a persistent grid; the counter is monotonic so it
-// needs no reset between launches as long as the grid size is fixed.
+// Device-wide barrier over a persistent grid. The host zeroes the selected
+// counter immediately before each ordered launch (stream-ordered, so it is
+// also captured into CUDA graphs), which keeps every launch's epoch valid
+// regardless of workspace reuse across shapes and prevents the unsigned
+// counter from ever wrapping within a launch.
 __device__ __forceinline__ unsigned int dec_atomic_add_release(unsigned int* bar,
                                                                unsigned int value) {
   unsigned int old;
@@ -2238,9 +2246,10 @@ void RunPersistentDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packe
   }
     if (T <= 4) {
       constexpr int FRPW = 4;
-      if (g_ws_fresh) cudaMemsetAsync(bar, 0, sizeof(unsigned int), stream);
+      cudaMemsetAsync(bar, 0, sizeof(unsigned int), stream);
       if (T == 1) {
-        static int grid_t1 = 0;
+        static int grid_t1_by_device[kMaxCachedDevices] = {};
+        int grid_t1 = (device >= 0 && device < kMaxCachedDevices) ? grid_t1_by_device[device] : 0;
         if (grid_t1 == 0) {
           int nb = 0;
           int sms = 1;
@@ -2253,18 +2262,23 @@ void RunPersistentDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packe
           grid_t1 = nb * sms;
           if (grid_t1 < 1) grid_t1 = 1;
           if (grid_t1 > 376) grid_t1 = 376;
+          if (device >= 0 && device < kMaxCachedDevices) grid_t1_by_device[device] = grid_t1;
         }
         int routes_arg = routes;
         int out_pairs_arg = out_pairs;
         void* args[] = {
             &x,  &p1, &s1, &a1, &p2, &s2, &a2, &ids, &tw, &routes_arg, &inter, &y, &out_pairs_arg,
             &bar};
-        cudaLaunchCooperativeKernel(
+        cudaError_t lerr = cudaLaunchCooperativeKernel(
             (const void*)
                 dec_fused_direct_kernel<FRPW, 3, true, false, true, true, true, false, true>,
             dim3(grid_t1), dim3(DEC_THREADS), args, 0, stream);
+        TVM_FFI_ICHECK(lerr == cudaSuccess) << "specialized MoE T=1 cooperative launch (grid "
+                                            << grid_t1 << ") failed: " << cudaGetErrorString(lerr);
       } else {
-        static int occupancy_t4 = 0;
+        static int occupancy_t4_by_device[kMaxCachedDevices] = {};
+        int occupancy_t4 =
+            (device >= 0 && device < kMaxCachedDevices) ? occupancy_t4_by_device[device] : 0;
         if (occupancy_t4 == 0) {
           int nb = 0;
           int sms = 1;
@@ -2275,6 +2289,8 @@ void RunPersistentDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packe
           cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
           occupancy_t4 = nb * sms;
           if (occupancy_t4 < 1) occupancy_t4 = 1;
+          if (device >= 0 && device < kMaxCachedDevices)
+            occupancy_t4_by_device[device] = occupancy_t4;
         }
         int grid_t4 = occupancy_t4;
         const int maxitems = routes * (H / (DEC_WARPS * FRPW));
@@ -2284,15 +2300,18 @@ void RunPersistentDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packe
         void* args[] = {
             &x,  &p1, &s1, &a1, &p2, &s2, &a2, &ids, &tw, &routes_arg, &inter, &y, &out_pairs_arg,
             &bar};
-        cudaLaunchCooperativeKernel(
+        cudaError_t lerr = cudaLaunchCooperativeKernel(
             (const void*)dec_fused_direct_kernel<FRPW, 3, true, true, false, true, true, true>,
             dim3(grid_t4), dim3(DEC_THREADS), args, 0, stream);
+        TVM_FFI_ICHECK(lerr == cudaSuccess) << "specialized MoE T=4 cooperative launch (grid "
+                                            << grid_t4 << ") failed: " << cudaGetErrorString(lerr);
       }
     } else {
 #define FUSED_GRP(MTV)                                                                           \
   {                                                                                              \
     constexpr int MT_ = MTV;                                                                     \
-    static int fg = 0;                                                                           \
+    static int fg_by_device[kMaxCachedDevices] = {};                                             \
+    int fg = (device >= 0 && device < kMaxCachedDevices) ? fg_by_device[device] : 0;             \
     if (fg == 0) {                                                                               \
       int nb = 0;                                                                                \
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(                                             \
@@ -2301,8 +2320,9 @@ void RunPersistentDirect(ffi::TensorView hidden_states, ffi::TensorView w1_packe
       cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);                      \
       fg = nb * sms;                                                                             \
       if (fg < 1) fg = 1;                                                                        \
+      if (device >= 0 && device < kMaxCachedDevices) fg_by_device[device] = fg;                  \
     }                                                                                            \
-    if (g_ws_fresh) cudaMemsetAsync(bar, 0, sizeof(unsigned int), stream);                       \
+    cudaMemsetAsync(bar, 0, sizeof(unsigned int), stream);                                       \
     dec_route_kernel<MT_>                                                                        \
         <<<1, 256, 0, stream>>>(ids, routes, tiles1, counts, offsets, route_list);               \
     dec_fused_grp_kernel<MT_, 4, 3>                                                              \

@@ -9602,9 +9602,17 @@ class B12xW4A16Runner(_B12xRunner):
     Supports expert parallelism over a contiguous expert shard
     (``ExpertConfig.local_expert_offset`` / ``local_num_experts``): each rank
     computes a zero-filled partial that the caller sums across the EP group.
+
+    Accepts the layout-identical ``specialized_w4a16`` weight view as an
+    alias (the reciprocal of :class:`SpecializedW4A16Runner` accepting
+    ``b12x_w4a16``), so a pack prepared under either key serves both
+    candidates — in particular token counts the specialized runner declines
+    still have this stock runner eligible. The native ``b12x_w4a16`` view
+    keeps precedence when both are registered.
     """
 
     backend_key = "b12x_w4a16"
+    weight_view_aliases = ("specialized_w4a16",)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.BF16),)
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
