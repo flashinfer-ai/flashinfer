@@ -594,6 +594,8 @@ def test_ssd_combined_fi_trace_state_slot_pools(
     assert ("initial_state_flags" in inputs) == initial_pool
     if initial_pool:
         assert inputs["initial_state_flags"]["shape"] == ["num_sequences"]
+        # The caller's bool flags are traced as their uint8 view.
+        assert inputs["initial_state_flags"]["dtype"] == "uint8"
         assert inputs["initial_state_flags"]["optional"] is True
     assert inputs["null_slot_id"]["dtype"] == "int32"
     assert inputs["null_slot_id"]["optional"] is True

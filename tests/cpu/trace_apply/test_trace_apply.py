@@ -655,6 +655,107 @@ def test_ssd_combined_apply_rejects_mixed_slot_state_dtypes(monkeypatch, name, d
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("slots_name", "pool_name"),
+    (
+        ("initial_state_slots", "initial_states"),
+        ("final_state_slots", "final_states"),
+    ),
+)
+def test_ssd_combined_apply_rejects_slot_vector_without_pool(
+    monkeypatch, slots_name, pool_name
+):
+    """A slot call without the pool of one of its slot vectors reaches the
+    original API (which raises before any write), never the solution of the
+    definition the complete call names, though its other pool still gives
+    the same state dtype."""
+    import functools
+
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
+
+    complete = _ssd_combined_state_kwargs(slots=True, dtype=torch.float16)
+    f16_name = "ssd_combined_varlen_slots_f16_sidx_i64_d_none_final_h2_d64_g2_s128"
+    assert _ssd_combined_definition_name(complete) == f16_name
+    missing = dict(complete)
+    del missing[pool_name]
+    with pytest.raises(ValueError, match=f"{slots_name} requires {pool_name}"):
+        ssd_combined_trace_dispatch(**missing)
+
+    calls = []
+
+    @functools.wraps(module.ssd_combined_fwd)
+    def cpu_original(*args, **kwargs):
+        calls.append("original")
+        raise ValueError("slot vector without its state pool")
+
+    monkeypatch.setattr(module, "ssd_combined_fwd", cpu_original)
+    assert ta.enable_apply({f16_name: _ssd_combined_tag_solution(calls, "f16")})
+    with pytest.raises(ValueError, match="without its state pool"):
+        module.ssd_combined_fwd(**missing)
+    assert calls == ["original"]
+    assert ta.stats().get(SSD_FI_API, {}).get("hit", 0) == 0
+    module.ssd_combined_fwd(**complete)
+    assert calls == ["original", "f16"]
+
+
+@pytest.mark.cpu_only
+def test_ssd_combined_bool_and_uint8_flags_share_one_slot_contract(
+    monkeypatch, tmp_path
+):
+    """The API reads bool and uint8 ``initial_state_flags`` as the same bytes.
+    Both trace to one slot definition that records uint8 flags, and Apply
+    hands its solution uint8 flags: a view of the caller's bool flags, or the
+    caller's uint8 flags unchanged. The original API keeps the caller's
+    tensor."""
+    import functools
+
+    module = importlib.import_module("flashinfer.mamba.ssd_combined")
+    f32_name = "ssd_combined_varlen_slots_f32_sidx_i64_d_none_final_h2_d64_g2_s128"
+    f16_name = "ssd_combined_varlen_slots_f16_sidx_i64_d_none_final_h2_d64_g2_s128"
+    bool_flags = torch.tensor([True, False])
+    uint8_flags = torch.tensor([1, 0], dtype=torch.uint8)
+    bool_kwargs = _ssd_combined_state_kwargs(slots=True, dtype=torch.float32)
+    bool_kwargs["initial_state_flags"] = bool_flags
+    uint8_kwargs = dict(bool_kwargs, initial_state_flags=uint8_flags)
+    for kwargs in (bool_kwargs, uint8_kwargs):
+        assert _ssd_combined_definition_name(kwargs) == f32_name
+        definition = module.ssd_combined_fwd.fi_trace(save_dir=tmp_path, **kwargs)
+        assert definition["name"] == f32_name
+        assert definition["inputs"]["initial_state_flags"]["dtype"] == "uint8"
+    assert [path.name for path in tmp_path.iterdir()] == [f"{f32_name}.json"]
+    assert bool_kwargs["initial_state_flags"] is bool_flags
+
+    seen = []
+
+    def solution(**inputs):
+        seen.append(inputs["initial_state_flags"])
+        return inputs["x"], inputs["final_states"]
+
+    @functools.wraps(module.ssd_combined_fwd)
+    def cpu_original(*args, **kwargs):
+        seen.append(kwargs["initial_state_flags"])
+        return kwargs["x"], kwargs["final_states"]
+
+    monkeypatch.setattr(module, "ssd_combined_fwd", cpu_original)
+    assert ta.enable_apply({f32_name: solution})
+    module.ssd_combined_fwd(**bool_kwargs)
+    module.ssd_combined_fwd(**uint8_kwargs)
+    assert ta.stats().get(SSD_FI_API, {}).get("hit", 0) == 2
+    bool_seen, uint8_seen = seen
+    assert bool_seen.dtype == torch.uint8
+    assert bool_seen.data_ptr() == bool_flags.data_ptr()
+    assert bool_seen.tolist() == [1, 0]
+    assert uint8_seen is uint8_flags
+
+    # No solution for this name: the original API gets the caller's bool flags.
+    seen.clear()
+    ta.enable_apply({f16_name: solution})
+    module.ssd_combined_fwd(**bool_kwargs)
+    assert len(seen) == 1 and seen[0] is bool_flags
+
+
+@pytest.mark.cpu_only
 def test_ssd_combined_templates_keep_main_output_order():
     """The positional destination order of every SSDCombined schema is the
     dense order of the base revision: out, checkpoint_states, seq_chunk_cumsum

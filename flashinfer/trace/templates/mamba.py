@@ -170,6 +170,19 @@ selective_state_update_trace = TraceTemplate(
 )
 
 
+def _ssd_canonical_flags(kwargs):
+    """``kwargs`` with bool ``initial_state_flags`` replaced by their uint8
+    view (zero-copy, the bytes the kernels read), so bool and uint8 flags
+    trace to one definition and reach its solution in one dtype. Any other
+    value is left for the API to check."""
+
+    flags = kwargs.get("initial_state_flags")
+    if isinstance(flags, torch.Tensor) and flags.dtype == torch.bool:
+        kwargs = dict(kwargs)
+        kwargs["initial_state_flags"] = flags.view(torch.uint8)
+    return kwargs
+
+
 class _SSDCombinedTraceTemplate(TraceTemplate):
     """SSDCombined schema with the public state-dtype precedence rule."""
 
@@ -178,11 +191,15 @@ class _SSDCombinedTraceTemplate(TraceTemplate):
     # positional destination order of ``outputs``.
     return_outputs = ("out", "final_states")
 
+    def canonical_inputs(self, namespace):
+        """The Apply namespace in the form the traced definition records."""
+        return _ssd_canonical_flags(namespace)
+
     def build_fi_trace_fn(self, fi_api: str):
         build_definition = super().build_fi_trace_fn(fi_api)
 
         def fi_trace(save_dir=None, name=None, **kwargs):
-            kwargs = dict(kwargs)
+            kwargs = dict(_ssd_canonical_flags(kwargs))
             state_dtype_source = kwargs.get("initial_states")
             if state_dtype_source is None:
                 state_dtype_source = kwargs.get("final_states")
@@ -352,10 +369,12 @@ def _make_ssd_combined_trace(
                     ),
                     "initial_state_flags": Tensor(
                         ["num_sequences"],
+                        dtype="uint8",
                         optional=True,
                         description=(
-                            "Per-sequence bool / uint8 flags: 0 starts the "
-                            "sequence from zero state."
+                            "uint8 view of the caller's bool / uint8 "
+                            "per-sequence flags: 0 starts the sequence from "
+                            "zero state."
                         ),
                     ),
                 }
@@ -570,6 +589,14 @@ def ssd_combined_trace_dispatch(**kwargs):
     initial_slots = kwargs.get("initial_state_slots") is not None
     final_slots = kwargs.get("final_state_slots") is not None
     slots = initial_slots or final_slots
+    # The API rejects a slot vector without its pool before any write, so
+    # such a call must reach it rather than match a slot definition.
+    for slots_name, pool_name in (
+        ("initial_state_slots", "initial_states"),
+        ("final_state_slots", "final_states"),
+    ):
+        if kwargs.get(slots_name) is not None and kwargs.get(pool_name) is None:
+            raise ValueError(f"SSDCombined trace: {slots_name} requires {pool_name}")
     mode = "varlen" if slots or kwargs.get("seq_idx") is not None else "batched"
     D = kwargs.get("D")
     if D is None:
