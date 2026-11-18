@@ -141,6 +141,9 @@ class CudnnPlanBuildPool:
         # Echoed by workers; a reply for another request means the pipes are
         # out of step, so its plans must not be used.
         self._next_request_id = 0
+        # A forked child inherits this object (possibly with the lock held by
+        # another thread of the parent); only the creating process uses it.
+        self._owner_pid = os.getpid()
 
     @property
     def broken(self) -> bool:
@@ -157,22 +160,27 @@ class CudnnPlanBuildPool:
             env["LD_LIBRARY_PATH"] = os.pathsep.join(
                 lib_dirs + [p for p in [env.get("LD_LIBRARY_PATH")] if p]
             )
-        procs = []
-        for _ in range(self.num_workers):
-            log = tempfile.TemporaryFile()  # noqa: SIM115 - closed with its worker in _stop
-            try:
-                proc = subprocess.Popen(
-                    self._worker_cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=log,
-                    env=env,
-                )
-            except BaseException:
-                log.close()
-                raise
-            self._stderr_logs[proc.pid] = log
-            procs.append(proc)
+        procs: list = []
+        try:
+            for _ in range(self.num_workers):
+                log = tempfile.TemporaryFile()  # noqa: SIM115 - closed with its worker in _stop
+                try:
+                    proc = subprocess.Popen(
+                        self._worker_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=log,
+                        env=env,
+                    )
+                except BaseException:
+                    log.close()
+                    raise
+                self._stderr_logs[proc.pid] = log
+                procs.append(proc)
+        except BaseException:
+            # Not yet in self._workers, so _fail could not stop these.
+            self._stop(kill=True, procs=procs)
+            raise
         return procs
 
     def _read_reply(self, proc, deadline: float):
@@ -191,6 +199,8 @@ class CudnnPlanBuildPool:
         ``candidates`` is every tactic in plan-index order; the plans follow
         that order and omit candidates that could not be built.
         """
+        if os.getpid() != self._owner_pid:
+            return None
         with self._lock:
             if self._broken:
                 return None
@@ -282,8 +292,9 @@ class CudnnPlanBuildPool:
         )
         self._stop(kill=True)
 
-    def _stop(self, kill: bool) -> None:
-        for proc in self._all_processes():
+    def _stop(self, kill: bool, procs=None) -> None:
+        procs = self._all_processes() if procs is None else procs
+        for proc in procs:
             try:
                 if kill:
                     proc.kill()
@@ -291,9 +302,11 @@ class CudnnPlanBuildPool:
                     proc.stdin.close()
             except OSError:
                 pass
-        for proc in self._all_processes():
+        # One deadline for all workers, not one per worker.
+        deadline = time.monotonic() + 5
+        for proc in procs:
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
@@ -307,6 +320,8 @@ class CudnnPlanBuildPool:
                         stream.close()
 
     def shutdown(self) -> None:
+        if os.getpid() != self._owner_pid:
+            return
         with self._lock:
             if self._idle_timer is not None:
                 self._idle_timer.cancel()
@@ -318,16 +333,44 @@ _pool = None
 _pool_resolved = False
 
 
+def _release_inherited_pipes(pool) -> None:
+    # The child's copies of the workers' stdin pipes would keep them from
+    # seeing EOF when the parent stops them. Point the descriptors at
+    # /dev/null instead of closing them: the inherited file objects close
+    # them again later, which must not hit a reused descriptor number.
+    devnull = os.open(os.devnull, os.O_RDWR)
+    try:
+        for proc in pool._all_processes():
+            for stream in (proc.stdin, proc.stdout):
+                with contextlib.suppress(OSError, ValueError, AttributeError):
+                    os.dup2(devnull, stream.fileno())
+    finally:
+        os.close(devnull)
+
+
 def _reset_after_fork() -> None:
     # The workers and pipes belong to the parent; a forked child starts over
     # (and re-reads the environment variable) on its first tuning call.
     global _pool, _pool_resolved
+    if _pool is not None:
+        with contextlib.suppress(OSError):
+            _release_inherited_pipes(_pool)
     _pool = None
     _pool_resolved = False
 
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_after_fork)
+
+
+def _shutdown_pool() -> None:
+    # Looks the pool up at exit, so a forked child (whose pool is reset) does
+    # not touch the parent's.
+    if _pool is not None:
+        _pool.shutdown()
+
+
+atexit.register(_shutdown_pool)
 
 
 def get_cudnn_plan_build_pool():
@@ -355,5 +398,4 @@ def get_cudnn_plan_build_pool():
         logger.warning("Capping %s=%d at %d (CPU count)", ENV_VAR, workers, cpus)
         workers = cpus
     _pool = CudnnPlanBuildPool(workers)
-    atexit.register(_pool.shutdown)
     return _pool

@@ -333,3 +333,83 @@ def test_forked_child_gets_a_fresh_pool_and_leaves_parent_workers(
         assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
     finally:
         pool.shutdown()
+
+
+def _wait_child(pid, timeout_s):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return os.waitstatus_to_exitcode(status)
+        time.sleep(0.05)
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)
+    return None
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_child_forked_during_a_build_exits_without_hanging(fake_cmd, monkeypatch):
+    # Forked while another thread holds the pool lock: the child's copy of the
+    # lock stays held, so the inherited exit hook must not wait for it.
+    pool = pool_mod.CudnnPlanBuildPool(
+        2, timeout_s=10.0, worker_cmd=fake_cmd("ok"), idle_s=600
+    )
+    monkeypatch.setattr(pool_mod, "_pool", pool)
+    monkeypatch.setattr(pool_mod, "_pool_resolved", True)
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+        with pool._lock:
+            pid = os.fork()
+            if pid == 0:
+                pool.shutdown()
+                pool_mod._shutdown_pool()
+                os._exit(0)
+        assert _wait_child(pid, 5) == 0
+    finally:
+        pool.shutdown()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_live_forked_child_does_not_stall_shutdown(fake_cmd, monkeypatch):
+    # The child inherits the workers' stdin pipes; unless it drops them the
+    # workers never see EOF and each graceful stop waits out its timeout.
+    pool = pool_mod.CudnnPlanBuildPool(
+        3, timeout_s=10.0, worker_cmd=fake_cmd("ok"), idle_s=600
+    )
+    monkeypatch.setattr(pool_mod, "_pool", pool)
+    monkeypatch.setattr(pool_mod, "_pool_resolved", True)
+    pid = None
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is not None
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(4)
+            os._exit(0)
+        start = time.monotonic()
+        pool.shutdown()
+        assert time.monotonic() - start < 2
+    finally:
+        pool.shutdown()
+        if pid:
+            _wait_child(pid, 10)
+
+
+def test_failed_spawn_stops_the_workers_already_started(fake_cmd, monkeypatch):
+    started = []
+    real_popen = pool_mod.subprocess.Popen
+
+    def popen(*args, **kwargs):
+        if started:
+            raise OSError("cannot start worker")
+        proc = real_popen(*args, **kwargs)
+        started.append(proc)
+        return proc
+
+    monkeypatch.setattr(pool_mod.subprocess, "Popen", popen)
+    pool = _pool(fake_cmd, "ok")
+    try:
+        assert pool.build(SPEC, device_index=0, heur_modes=[0]) is None
+        assert started and all(p.poll() is not None for p in started)
+        assert not pool._stderr_logs
+    finally:
+        pool.shutdown()
