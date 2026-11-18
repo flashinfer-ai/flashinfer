@@ -84,6 +84,16 @@ void invokeNvfp4QuantAndPerTokenScale(uint32_t m, uint32_t n, T const* input, fl
                                       QuantizationSFLayout sfLayout, NVFP4RecipeSpec const& recipe,
                                       cudaStream_t stream = 0, bool enable_pdl = false);
 
+// Copy the permuted rows written by invokeNvfp4QuantAndPerTokenScale back to expanded
+// (token * topK + slot) order with linear block scales. Expanded rows that map to no
+// permuted row (expanded_idx_to_permuted_idx < 0, e.g. a non-local expert) are zeroed.
+void invokeNvfp4PermutedRowsToExpanded(uint32_t m, uint32_t n,
+                                       int32_t const* expanded_idx_to_permuted_idx,
+                                       uint8_t const* weight, uint8_t const* scale,
+                                       float const* perTokenScale, QuantizationSFLayout sfLayout,
+                                       uint8_t* weightOut, uint8_t* scaleOut,
+                                       float* perTokenScaleOut, cudaStream_t stream = 0);
+
 template <typename T>
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, T const* SFIn,
                                 T* SFOutput, int multiProcessorCount, cudaStream_t stream = 0);

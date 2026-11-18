@@ -1767,7 +1767,7 @@ def _encode_tiled(drv, spec: TensorMapSpec) -> bytes:
 
 
 def activation_spec(t: torch.Tensor, total_tokens: int, heads: int) -> TensorMapSpec:
-    """Key-major ``(128, T_total, H)`` view of contiguous ``[1, T, H, 128]``.
+    """Key-major ``(128, T_total, H)`` view of token-strided ``[1, T, H, 128]``.
 
     A 128-byte S128 segment is 64 BF16 or 32 FP32, so the box's inner extent
     follows the dtype: Q/K/V/out and BF16 ``G`` take two boxes per tile, FP32
@@ -1779,7 +1779,7 @@ def activation_spec(t: torch.Tensor, total_tokens: int, heads: int) -> TensorMap
         dtype=t.dtype,
         base=t.data_ptr(),
         global_dims=(DK, total_tokens, heads),
-        global_stride_bytes=(heads * DK * esz, DK * esz),
+        global_stride_bytes=(t.stride(1) * esz, t.stride(2) * esz),
         box_dims=(segment, BT, 1),
     )
 

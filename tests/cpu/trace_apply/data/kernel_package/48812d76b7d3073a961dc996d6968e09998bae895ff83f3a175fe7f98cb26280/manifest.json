@@ -1,0 +1,13 @@
+{
+  "bundle_sha256": "72f4003f1e5c84e68b00e9836d512b7fcf634eebc852cbaf9ff90098efac7cd3",
+  "files": {
+    "definition.json": "9408fba4cfc0744df4ab64d7db8a846a9748baa05e0c10a5f9c1a5c39539b465",
+    "kernel.py": "622c25599727f3439b35b95263576fc32265a496e97ac53b4f470a7d1dc220ed",
+    "prepare.py": "559d77bc0caa10e3a887df4209b48dd1e91d2528ac243850edf2bab2bcd0b5f7",
+    "solution.json": "ed9cc76c4c363d4d5c7f419ec7a9d9835e091d1638e8b315df3cfbd638b24b30"
+  },
+  "schema_version": 1,
+  "sealed_files": {
+    "qualification.json": "7ebeb591e9e4d42d5205ab6f2c2fca0405bb76d5e4388a3b5c62343e5b13d472"
+  }
+}

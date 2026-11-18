@@ -72,7 +72,7 @@ kernel_cake_msa_icp_indexer_eb804215a3d74733ee47(int* __restrict__ qo_lens, int*
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* item_sums = reinterpret_cast<int*>(smem_raw + 0);
     const int item_sums_addr = smem + 0;
     int* col_sums = reinterpret_cast<int*>(smem_raw + 128);

@@ -134,15 +134,16 @@ kernel_cake_kda_prefill_cecd42adc9f960dab210(float* __restrict__ split_state, __
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_m = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_m_addr = smem + 1024;
     float* smem_carry = reinterpret_cast<float*>(smem_raw + 1024);
     const int smem_carry_addr = smem + 1024;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.wait;" ::: "memory");
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 2 barriers)
-    // Mbarriers at smem_raw[0..16)
+    // Mbarrier init (2 barriers at smem_raw[0..16))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -222,7 +223,7 @@ kernel_cake_kda_prefill_cecd42adc9f960dab210(float* __restrict__ split_state, __
             if (warp == 0) {
                 if (elect_sync()) {
                     mbarrier_arrive_expect_tx(map_full_addr + (map_slot) * 8, 32768);
-                    cp_async_bulk_gmem2smem(smem_m_addr + map_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part_begin * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (map_slot) * 8);
+                    cp_async_bulk_gmem2smem(smem_m_addr + map_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + (unsigned long long)((part_begin * num_heads + task) * 16384) * (unsigned long long)2), 32768, map_full_addr + (map_slot) * 8);
                 }
             }
         }
@@ -312,7 +313,7 @@ kernel_cake_kda_prefill_cecd42adc9f960dab210(float* __restrict__ split_state, __
                 if (warp == 0) {
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8, 32768);
-                        cp_async_bulk_gmem2smem(smem_m_addr + ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0) * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8);
+                        cp_async_bulk_gmem2smem(smem_m_addr + ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0) * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + (unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2), 32768, map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8);
                     }
                 }
             }

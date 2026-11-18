@@ -226,6 +226,16 @@ def nvfp4_row_bytes(rope_dim: int) -> int:
     return NVFP4_DATA_BYTES + rope_dim + NVFP4_SCALE_BYTES
 
 
+def is_sm107_target() -> bool:
+    """Whether the CuTe DSL compile target is SM107 itself (``sm_107``
+    through ``sm_107f``), so SM107-only resources such as its 327 KiB of SMEM
+    per CTA (SM100: 227 KiB) can be assumed. The ``sm_100f`` family target
+    is excluded: it also builds for SM100/SM103.
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+
+
 def use_sm107_nvfp4_converter() -> bool:
     """Whether the compile target is SM107, which uses the f16x2 converter.
 
@@ -235,9 +245,7 @@ def use_sm107_nvfp4_converter() -> bool:
     converter.
     """
     arch = BaseDSL._get_dsl().get_arch_enum()
-    if arch == Arch.sm_100f:
-        return True
-    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+    return arch == Arch.sm_100f or is_sm107_target()
 
 
 @cute.jit
@@ -694,26 +702,13 @@ def issue_whole_record(
 
 
 @cute.jit
-def convert_nvfp4_record(
-    dst,
-    thread_idx,
-    *,
-    stage_bytes: cutlass.Constexpr[int],
-    rope_dim: cutlass.Constexpr[int],
-    raw=None,
-    raw_empty=None,
-):
-    """Snapshot two 16-value rows per lane, then write conflict-free panels.
+def snapshot_nvfp4_record(raw, thread_idx, packed, scales, rope, *, rope_dim):
+    """Load two 16-value rows per lane and their scales/RoPE from a raw record tile.
 
     The E4M3 RoPE tail needs no conversion. On SM107 it moves as 8-byte pieces
     with rope_dim // 8 lanes per row, so one warp access covers several rows
     instead of two bytes per lane per row."""
     row_bytes = nvfp4_row_bytes(rope_dim)
-    if cutlass.const_expr(raw is None):
-        raw = dst
-    packed = cutlass.Array(Int32, 32, space=cutlass.AddressSpace.rmem)
-    scales = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
-    rope = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
     lane = thread_idx & Int32(31)
     first_row = thread_idx >> Int32(5)
     column = lane * Int32(16)
@@ -771,17 +766,41 @@ def convert_nvfp4_record(
                 dtype=Int32,
             ).load(count=2, alignment=8)
             rope[group * 2], rope[group * 2 + 1] = words[0], words[1]
-    if cutlass.const_expr(raw_empty is not None):
-        # Raw storage is disjoint from every expanded destination. Each
-        # warp snapshots all of its bytes before its release-arrival. The
-        # raw-empty barrier has eight arrivals; the metadata TMA producer
-        # acquires it and proxy-fences before any overwrite.
-        cute.arch.sync_warp()
-        if prims.elect_sync():
-            prims.mbarrier_arrive(raw_empty, scope=prims.MemScope.CTA)
-    else:
-        # In-place expansion must join all readers before any output store.
-        prims.barrier_cta_sync(barrier_id=12, thread_count=256)
+
+
+@cute.jit
+def release_raw_record(raw_empty):
+    """Arrive once per warp on a raw-empty barrier after the warp's snapshot."""
+    # Raw storage is disjoint from every expanded destination. Each warp
+    # snapshots all of its bytes before its release-arrival. The raw-empty
+    # barrier has eight arrivals; the metadata TMA producer acquires it and
+    # proxy-fences before any overwrite.
+    cute.arch.sync_warp()
+    if prims.elect_sync():
+        prims.mbarrier_arrive(raw_empty, scope=prims.MemScope.CTA)
+
+
+@cute.jit
+def store_nvfp4_record(
+    dst,
+    thread_idx,
+    packed,
+    scales,
+    rope,
+    *,
+    stage_bytes: cutlass.Constexpr[int],
+    rope_dim: cutlass.Constexpr[int],
+):
+    """Convert a register snapshot and write conflict-free panels."""
+    lane = thread_idx & Int32(31)
+    first_row = thread_idx >> Int32(5)
+    # Same RoPE lane/row assignment as snapshot_nvfp4_record.
+    row_vector_rope = rope_dim and use_sm107_nvfp4_converter()
+    if cutlass.const_expr(row_vector_rope):
+        rope_lanes = max(rope_dim // 8, 1)
+        rope_rows = 32 // rope_lanes
+        rope_row = first_row + (lane // Int32(rope_lanes)) * Int32(8)
+        rope_column = (lane % Int32(rope_lanes)) * Int32(8)
     panel = lane >> Int32(3)
     local_column = (lane & Int32(7)) * Int32(16)
     for chunk in cutlass.range_constexpr(8):
@@ -817,6 +836,39 @@ def convert_nvfp4_record(
                 rope[group * 2],
                 rope[group * 2 + 1],
             )
+
+
+@cute.jit
+def convert_nvfp4_record(
+    dst,
+    thread_idx,
+    *,
+    stage_bytes: cutlass.Constexpr[int],
+    rope_dim: cutlass.Constexpr[int],
+    raw=None,
+    raw_empty=None,
+):
+    """Snapshot two16-value rows per lane, then write conflict-free panels."""
+    if cutlass.const_expr(raw is None):
+        raw = dst
+    packed = cutlass.Array(Int32, 32, space=cutlass.AddressSpace.rmem)
+    scales = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
+    rope = cutlass.Array(Int32, 8, space=cutlass.AddressSpace.rmem)
+    snapshot_nvfp4_record(raw, thread_idx, packed, scales, rope, rope_dim=rope_dim)
+    if cutlass.const_expr(raw_empty is not None):
+        release_raw_record(raw_empty)
+    else:
+        # In-place expansion must join all readers before any output store.
+        prims.barrier_cta_sync(barrier_id=12, thread_count=256)
+    store_nvfp4_record(
+        dst,
+        thread_idx,
+        packed,
+        scales,
+        rope,
+        stage_bytes=stage_bytes,
+        rope_dim=rope_dim,
+    )
 
 
 @cute.jit

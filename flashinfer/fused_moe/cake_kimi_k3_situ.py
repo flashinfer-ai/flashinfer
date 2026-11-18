@@ -45,10 +45,15 @@ _LARGE_C7_TOKENS = (8192, 16384)
 # "m1_s2a_m1ef" selector) -- sm_100a today; sm_103a keeps "n8_feature" / "n8_w2a_m16" /
 # "m1_s2a".  Same stage lists and launch arguments as the routes they supersede.
 _SMALL_L2POLICY_ARCHES = ("sm_100a",)
-# Architectures whose 4096-token route runs the same 8-bit per-tile partial FC2
-# and finalize behind the work5fd FC1 (eight kernels); the 2048-token route
-# keeps the BF16 expert output everywhere.
-_MID_Q8I_ARCHES = ("sm_103a",)
+# Architectures whose 2048- and 4096-token routes fuse the quantization with the
+# routing-table reset and run the routing histogram and scatter kernels that
+# privatize the expert histogram in per-CTA shared memory and reserve a block of
+# rows per CTA, 256 routed pairs per CTA (seven launches; the
+# "mid_work5fd_p256fh2qr" / "mid_q8i_p256fh2qr" selectors) -- sm_103a today.  Its
+# 4096-token route also runs the 8-bit per-tile partial FC2 and finalize behind
+# the work5fd FC1; the 2048-token route keeps the BF16 expert output.  Every other
+# architecture keeps the eight-launch "mid_work5fd" route on both rows.
+_MID_P256FH2QR_ARCHES = ("sm_103a",)
 _MID_Q8I_TOKENS = (4096,)
 # Architectures and token counts whose large route runs the routing histogram
 # and scatter kernels that privatize the expert histogram in per-CTA shared
@@ -79,7 +84,7 @@ _ROUTE_MC_CLUSTER = 8
 # Routed (token, expert-slot) pairs one CTA of the routing histogram and
 # scatter kernels handles: 256 for the production kernels, 1024 for the
 # per-CTA privatized kernels of the "large_q8i_p1024" selector, 512 for those of
-# the "large_q8i_p512fh2qr" selector.
+# the "large_q8i_p512fh2qr" selector (the "mid_*_p256fh2qr" kernels keep 256).
 _ROUTE_PAIRS_PER_CTA = {"large_q8i_p1024": 1024, "large_q8i_p512fh2qr": 512}
 # FC2 device-workfeed pools. The 16-token route runs an FC2 program built for
 # two resident CTAs per SM (__launch_bounds__(512, 2)), so its pool holds
@@ -113,9 +118,9 @@ _GENERIC = (
 _FUSED = ("quant", "fused_router", "fc1", "fc2", "finalize")
 _QUANT_ROUTE = ("quant_route", "fc1", "fc2", "finalize")
 _M1_FUSED = ("fc1", "fc2", "finalize")
-# The seven-stage large route whose quantization and routing-table reset run in
-# one launch (blocks below num_tokens quantize, the trailing blocks reset; the
-# "large_q8i_p512fh2qr" selector).
+# The seven-stage route whose quantization and routing-table reset run in one
+# launch (blocks below num_tokens quantize, the trailing blocks reset; the
+# "large_q8i_p512fh2qr" and "mid_*_p256fh2qr" selectors).
 _QR_GENERIC = ("quant_reset",) + _GENERIC[2:]
 
 
@@ -222,13 +227,33 @@ _SELECTORS = {
         _N32_CLAIM8_FC2_GRID_N,
     ),
     "mid_work5fd": (_GENERIC, _generic(128, fc1="fc1:n128_work5fd"), None),
-    "mid_q8i": (
-        _GENERIC,
+    "mid_work5fd_p256fh2qr": (
+        _QR_GENERIC,
+        _generic(
+            128,
+            fc1="fc1:n128_work5fd",
+            extra={
+                "quant_reset": "quant_reset:n128_p256fh2qr",
+                "route_histogram": "route_histogram:n128_p256f",
+                "route_scatter": "route_scatter:n128_p256fh2",
+            },
+            stages=_QR_GENERIC,
+        ),
+        None,
+    ),
+    "mid_q8i_p256fh2qr": (
+        _QR_GENERIC,
         _generic(
             128,
             fc1="fc1:n128_work5fd",
             fc2="fc2:n128_q8i",
             finalize="finalize:n128_q8i",
+            extra={
+                "quant_reset": "quant_reset:n128_p256fh2qr",
+                "route_histogram": "route_histogram:n128_p256f",
+                "route_scatter": "route_scatter:n128_p256fh2",
+            },
+            stages=_QR_GENERIC,
         ),
         None,
     ),
@@ -301,8 +326,10 @@ def _selector(arch, num_tokens):
     if num_tokens in _N32_CLAIM8_TOKENS:
         return "n32_claim8"
     if num_tokens in _MID_WORK5FD_TOKENS:
-        if arch in _MID_Q8I_ARCHES and num_tokens in _MID_Q8I_TOKENS:
-            return "mid_q8i"
+        if arch in _MID_P256FH2QR_ARCHES:
+            if num_tokens in _MID_Q8I_TOKENS:
+                return "mid_q8i_p256fh2qr"
+            return "mid_work5fd_p256fh2qr"
         return "mid_work5fd"
     if num_tokens in _LARGE_C7_TOKENS:
         if arch in _LARGE_P512FH2QR_ARCHES and num_tokens in _LARGE_P512FH2QR_TOKENS:

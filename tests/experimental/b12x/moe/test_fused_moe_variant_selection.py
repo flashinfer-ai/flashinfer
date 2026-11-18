@@ -172,6 +172,104 @@ def test_nonverifier_tuning_routes_retain_cyclic_coverage(tokens):
     )
 
 
+@pytest.mark.parametrize("deterministic_output", [True, False])
+def test_tuning_space_offers_direct_route_only_to_nondeterministic_queries(
+    deterministic_output,
+):
+    from b12x.preparation import DeviceIdentity, FrozenMapping
+    from b12x.moe.fused_moe._tuning import TUNING, MoeDecodeQuery
+
+    query = MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        quant_modes=("w4a8_mx",),
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        io_dtype="bfloat16",
+        num_experts=384,
+        hidden_size=2048,
+        intermediate_size=2304,
+        top_k=8,
+        num_tokens=1,
+        routed_rows=8,
+        route_num_experts=384,
+        route_logits_dtype="float32",
+        apply_router_weight_on_input=False,
+        collect_activation_amax=False,
+        deterministic_output=deterministic_output,
+        swiglu_limit=None,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        w13_layout="fused",
+        weight_layouts=("fused",),
+        w4a16_weight_layout=None,
+        w4a16_scale_format=None,
+        w4a16_block_size_m=None,
+        fast_math=True,
+        numerical_recipe=None,
+        controls=FrozenMapping(),
+    )
+    device = DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=(12, 0),
+        sm_count=170,
+        product_name="NVIDIA GeForce RTX 5090",
+    )
+    route_modes = {
+        config.dynamic_route_mode
+        for _, config in TUNING.choices(query, device)
+        if config.backend == "dynamic"
+    }
+    assert "grouped" in route_modes
+    assert ("direct" in route_modes) == (not deterministic_output)
+
+
+@pytest.mark.parametrize("deterministic_output", [True, False])
+def test_tuning_space_offers_micro_only_to_nondeterministic_queries(
+    deterministic_output,
+):
+    from b12x.preparation import DeviceIdentity, FrozenMapping
+    from b12x.moe.fused_moe._tuning import TUNING, MoeDecodeQuery
+
+    query = MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        quant_modes=("w4a8_mx",),
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        io_dtype="bfloat16",
+        num_experts=384,
+        hidden_size=5120,
+        intermediate_size=2304,
+        top_k=6,
+        num_tokens=1,
+        routed_rows=6,
+        route_num_experts=384,
+        route_logits_dtype="float32",
+        apply_router_weight_on_input=False,
+        collect_activation_amax=False,
+        deterministic_output=deterministic_output,
+        swiglu_limit=10.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        w13_layout="w31",
+        weight_layouts=("w31",),
+        w4a16_weight_layout=None,
+        w4a16_scale_format=None,
+        w4a16_block_size_m=None,
+        fast_math=True,
+        numerical_recipe=None,
+        controls=FrozenMapping(),
+    )
+    device = DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=(12, 0),
+        sm_count=170,
+        product_name="NVIDIA GeForce RTX 5090",
+    )
+    backends = {config.backend for _, config in TUNING.choices(query, device)}
+    assert "dynamic" in backends
+    assert ("micro" in backends) == (not deterministic_output)
+
+
 def test_variant_for_preserves_exact_counts_and_reuses_prefill_capacity():
     variants = {count: _Variant(count) for count in (1, 2, 4, 8, 125, 128)}
     assert variant_for(variants, 4) is variants[4]
@@ -436,3 +534,130 @@ def test_native_launch_metadata_tracks_capacity_when_packed_program_is_cached(
         )
         assert program_keys(launch) == expected_programs
     assert len(compiled) == 2
+
+
+@pytest.mark.parametrize("deterministic_output", [True, False])
+def test_heuristic_dynamic_route_mode_respects_deterministic_output(
+    deterministic_output,
+):
+    from b12x.preparation import FrozenMapping, DeviceIdentity
+    from b12x.moe.fused_moe._tuning import MoeDecodeQuery
+    from flashinfer.experimental.b12x.moe.fused_moe._impl import (
+        _heuristic_dynamic_route_mode,
+        _dynamic_direct_routing_selected,
+        _dynamic_kernel_intermediate_size,
+    )
+
+    query = MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        quant_modes=("w4a8_mx",),
+        source_format="mxfp8",
+        activation="silu",
+        io_dtype="bfloat16",
+        num_experts=384,
+        hidden_size=2048,
+        intermediate_size=2304,
+        top_k=8,
+        num_tokens=1,
+        routed_rows=8,
+        route_num_experts=384,
+        route_logits_dtype="float32",
+        apply_router_weight_on_input=False,
+        collect_activation_amax=False,
+        deterministic_output=deterministic_output,
+        swiglu_limit=None,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        w13_layout="fused",
+        weight_layouts=("fused",),
+        w4a16_weight_layout=None,
+        w4a16_scale_format=None,
+        w4a16_block_size_m=None,
+        fast_math=True,
+        numerical_recipe=None,
+        controls=FrozenMapping(),
+    )
+    device = DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=(8, 0),
+        sm_count=108,
+        product_name="NVIDIA A100-PCIE-40GB",
+    )
+    planned_tile_m = 16
+    route_mode = _heuristic_dynamic_route_mode(
+        query,
+        device,
+        planned_tile_m=planned_tile_m,
+    )
+    if deterministic_output:
+        assert route_mode == "grouped"
+    else:
+        assert route_mode == "direct"
+
+    dynamic_n = _dynamic_kernel_intermediate_size(
+        query.intermediate_size, query.quant_mode
+    )
+    is_direct = _dynamic_direct_routing_selected(
+        route_mode=route_mode,
+        quant_mode=query.quant_mode,
+        activation=query.activation,
+        routed_rows=query.routed_rows,
+        num_experts=query.num_experts,
+        n=dynamic_n,
+        deterministic_output=bool(query.deterministic_output),
+        planned_tile_m=planned_tile_m,
+    )
+    assert is_direct == (not deterministic_output)
+
+
+@pytest.mark.parametrize("deterministic_output", [True, False])
+def test_heuristic_decode_config_keeps_deterministic_queries_off_micro(
+    deterministic_output,
+):
+    from b12x.preparation import FrozenMapping, DeviceIdentity
+    from b12x.moe.fused_moe._tuning import MoeDecodeQuery
+    from flashinfer.experimental.b12x.moe.fused_moe._impl import (
+        _heuristic_moe_decode_config,
+    )
+
+    query = MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        quant_modes=("w4a8_mx",),
+        source_format="fp4_e8m0_k32",
+        activation="silu",
+        io_dtype="bfloat16",
+        num_experts=384,
+        hidden_size=5120,
+        intermediate_size=2304,
+        top_k=6,
+        num_tokens=1,
+        routed_rows=6,
+        route_num_experts=384,
+        route_logits_dtype="float32",
+        apply_router_weight_on_input=False,
+        collect_activation_amax=False,
+        deterministic_output=deterministic_output,
+        swiglu_limit=10.0,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        w13_layout="w31",
+        weight_layouts=("w31",),
+        w4a16_weight_layout=None,
+        w4a16_scale_format=None,
+        w4a16_block_size_m=None,
+        fast_math=True,
+        numerical_recipe=None,
+        controls=FrozenMapping(),
+    )
+    device = DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=(12, 0),
+        sm_count=170,
+        product_name="NVIDIA GeForce RTX 5090",
+    )
+    config = _heuristic_moe_decode_config(query, device)
+    if deterministic_output:
+        assert config.backend == "dynamic"
+        assert config.dynamic_route_mode == "grouped"
+    else:
+        assert config.backend == "micro"

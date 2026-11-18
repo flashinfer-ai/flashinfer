@@ -16,11 +16,14 @@ limitations under the License.
 
 import pytest
 import torch
-from tests.test_helpers.jit_utils import (
+from tests.jit.test_helpers.jit_utils import (
     gen_decode_attention_modules,
     gen_prefill_attention_modules,
 )
-from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.infra.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 
 import flashinfer
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache

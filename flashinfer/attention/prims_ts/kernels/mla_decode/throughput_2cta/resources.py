@@ -61,6 +61,7 @@ from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
 from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
+from ..helpers.kv_bounds import query_kv_bound
 from ..helpers.gather import (
     gather4_cached,
     load_sparse_rows,
@@ -73,7 +74,7 @@ from ..helpers.gather import (
 
 from .nvfp4_kv_load import load_nvfp4_kv_stage, publish_nvfp4_v
 from ..helpers.sparse_indices import cache_sparse_source_lengths
-from ..helpers.nvfp4_kv import prefetch_nvfp4_kv_row
+from ..helpers.nvfp4_kv import prefetch_nvfp4_kv_row, store_shared_u32x4
 from .config import (
     OUTPUT_TMA_STAGE_BYTES,
     V_SMEM_K_BLOCK_TOKENS,
@@ -108,6 +109,7 @@ from ..helpers.math import (
     fma_packed_f32x2,
     mul_packed_f32x2,
     output_dtype,
+    pack_float2_to_bf16,
     p_desc_layout,
     p_desc_leading_byte_offset,
     p_desc_stride_byte_offset,
@@ -530,7 +532,9 @@ class MlaWorkQueue(WorkQueue):
             self.cu_seqlens_q,
             safe_b_idx,
         )
-        if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value):
+        if cutlass.const_expr(
+            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
+        ):
             # Split partitioning owns the mask-visible CTA domain. The final
             # physical row resolves to the tile's latest valid Q
             # token. Row-causal softmax narrows earlier rows without changing
@@ -2433,6 +2437,7 @@ class TmemSResource(HighThroughputMlaResource):
     scale_softmax_log2: Any = None  # softmax_scale * log2(e)
     page_offsets: Any = None
     cache_seqs: Any = None  # per-batch valid K length
+    kv_bounds: Any = None  # per-logical-query prefix length
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
     logical_num_heads_q: cutlass.Constexpr[int] = 128
@@ -2826,9 +2831,25 @@ class TmemSResource(HighThroughputMlaResource):
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
         tile_offset_k = k_index * Int32(cfg.mma_qk_tiler[1])
         needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
+            not cfg.use_kv_bounds and cfg.mask_type == MaskType.CAUSAL.value
         )
-        if cutlass.const_expr(needs_row_causal_mask):
+        row_kv_bound = Int32(0)
+        if cutlass.const_expr(cfg.use_kv_bounds):
+            row_in_tile = self.cta_rank * Int32(
+                cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
+            ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
+            flat_query_row = (
+                Int32(work_tile.tile_idx[1]) * Int32(cfg.mma_qk_tiler[0]) + row_in_tile
+            )
+            row_kv_bound = query_kv_bound(
+                self.kv_bounds,
+                self.cu_seqlens_q,
+                Int32(work_tile.tile_idx[2]),
+                flat_query_row // Int32(self.logical_num_heads_q),
+                self.logical_seq_len_q,
+            )
+            group_needs_mask = True
+        elif cutlass.const_expr(needs_row_causal_mask):
             batch_idx = Int32(work_tile.tile_idx[2])
             _, logical_seq_len_q = query_batch_bounds(
                 self.cu_seqlens_q,
@@ -2957,7 +2978,9 @@ class TmemSResource(HighThroughputMlaResource):
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(cfg.use_kv_bounds):
+                    token_is_visible = token_idx < row_kv_bound
+                elif cutlass.const_expr(needs_row_causal_mask):
                     mask_flat_row = Int32(self.logical_num_heads_q) * (
                         token_idx - K + logical_seq_len_q
                     )
@@ -4127,6 +4150,49 @@ class GmemOResource(HighThroughputMlaResource):
         )
 
     @cute.jit
+    def _store_staged_bf16_slice(self, values, flat_row, column, valid, local_tidx):
+        """TMA-store one warp's normalized 32-row x 128-column BF16 slice.
+
+        Each correction warp owns two 4 KiB boxes (32 rows x 64 BF16, 128-byte
+        swizzle) that it reuses across slices and work tiles. Its elected lane
+        issues and retires the bulk groups; a box is rewritten only after the
+        group that last read it has finished reading SMEM.
+        """
+        lane = local_tidx & Int32(31)
+        warp = local_tidx >> Int32(5)
+        # Consecutive lanes own consecutive flattened rows.
+        first_row = Int32(flat_row) - lane
+        for box in cutlass.range_constexpr(2):
+            slot = (warp * Int32(2) + Int32(box)) * Int32(4096)
+            if prims.elect_sync():
+                prims.cp_async_bulk_wait_group(1, read=True)
+            cute.arch.sync_warp()
+            for chunk in cutlass.range_constexpr(8):
+                base = box * 64 + chunk * 8
+                words = [
+                    pack_float2_to_bf16(values[base + 2 * w], values[base + 2 * w + 1])
+                    for w in range(4)
+                ]
+                offset = (
+                    slot
+                    + lane * Int32(128)
+                    + ((Int32(chunk) ^ (lane & Int32(7))) * Int32(16))
+                )
+                store_shared_u32x4(
+                    self.smem_o, offset, words[0], words[1], words[2], words[3]
+                )
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            if valid:
+                if prims.elect_sync():
+                    prims.cp_async_bulk_tensor_global_shared_cta(
+                        self.tma_o_desc,
+                        self.smem_o.subview(slot),
+                        (column + box * 64, first_row),
+                    )
+                    prims.cp_async_bulk_commit_group()
+
+    @cute.jit
     def _store_quantized_slice(
         self,
         values,
@@ -4640,7 +4706,24 @@ class GmemOResource(HighThroughputMlaResource):
                 qk_acc_regs[i] = scaled[0]
                 qk_acc_regs[i + 1] = scaled[1]
 
-        if row_in_tile < physical_tile_rows and query_is_valid:
+        if cutlass.const_expr(cfg.stage_bf16_output):
+            if cutlass.const_expr(self.cu_seqlens_q is not None):
+                staged_row = storage_flat_query_row
+            else:
+                staged_row = (
+                    logical_head_idx
+                    + logical_q_idx * logical_num_heads_q
+                    + batch_idx * logical_num_heads_q * Int32(self.output.shape[2])
+                )
+            self._store_staged_bf16_slice(
+                qk_acc_regs,
+                staged_row,
+                iter_n * tile_d + g_j,
+                row_in_tile < physical_tile_rows and query_is_valid,
+                local_tidx,
+            )
+        direct_store = Int32(0 if cfg.stage_bf16_output else 1)
+        if row_in_tile < physical_tile_rows and query_is_valid and direct_store != 0:
             if cutlass.const_expr(self.partial_output is not None):
                 S_q = (
                     cutlass.Int32(self.partial_output.shape[3])

@@ -227,7 +227,7 @@ __device__ __forceinline__ void tma_store_4d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -281,7 +281,7 @@ kernel_cake_kda_prefill_7138a130b696b71c9455(__nv_bfloat16* __restrict__ q, cons
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_qd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_qd_addr = smem + 1024;
     __nv_bfloat16* smem_g_raw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -343,8 +343,7 @@ kernel_cake_kda_prefill_7138a130b696b71c9455(__nv_bfloat16* __restrict__ q, cons
     float* smem_gate_all = reinterpret_cast<float*>(smem_raw + 25600);
     const int smem_gate_all_addr = smem + 25600;
 
-    // Mbarrier init (20 pipeline groups, 0 ordered-sequence groups, 84 barriers)
-    // Mbarriers at smem_raw[0..672)
+    // Mbarrier init (84 barriers at smem_raw[0..672))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -474,16 +473,16 @@ kernel_cake_kda_prefill_7138a130b696b71c9455(__nv_bfloat16* __restrict__ q, cons
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_state = taddr + 64;
+    const unsigned int tmem_tmem_state_inp = taddr;
+    const unsigned int tmem_tmem_u_acc = taddr + 224;
+    const unsigned int tmem_tmem_u2_inp = taddr + 224;
+    const unsigned int tmem_tmem_u2_acc = taddr + 256;
+    const unsigned int tmem_tmem_out = taddr + 192;
+    const unsigned int tmem_tmem_state_out = taddr + 64;
 
     // Kernel post-init ops
-    const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_u_acc = taddr + 224;
-    const int tmem_tmem_u2_inp = taddr + 224;
-    const int tmem_tmem_u2_acc = taddr + 256;
-    const int tmem_tmem_out = taddr + 192;
-    const int tmem_tmem_state_out = taddr + 64;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
     }
@@ -1145,7 +1144,7 @@ kernel_cake_kda_prefill_7138a130b696b71c9455(__nv_bfloat16* __restrict__ q, cons
                 mbarrier_wait(state_diag_ready_addr + (mma_stage) * 8, _phase_qk_full_1);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_2_0 = make_warp_uniform(((((smem_state_diag0_addr) >> 4) & 0x3FFF) | 0x200000) + (0) * 32);
-                mma_ts_step(tmem_tmem_state, tmem_tmem_state_inp, _mma_b_lo_2_0, 0xC0004010, 67437712, 1);
+                mma_ts_step(tmem_tmem_state, tmem_tmem_state_inp + 0, _mma_b_lo_2_0, 0xC0004010, 67437712, 1);
                 int _mma_b_lo_2_1 = make_warp_uniform(((((smem_state_diag1_addr) >> 4) & 0x3FFF) | 0x200000) + (0) * 32);
                 mma_ts_step((tmem_tmem_state + (16)), tmem_tmem_state_inp + 8, _mma_b_lo_2_1, 0xC0004010, 67437712, 1);
                 int _mma_b_lo_2_2 = make_warp_uniform(((((smem_state_diag2_addr) >> 4) & 0x3FFF) | 0x200000) + (0) * 32);

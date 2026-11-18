@@ -49,7 +49,6 @@ _EXPERT_ROW_SEGMENTS = (32, 16, 16)
 _EXPERT_ROWS = sum(_EXPERT_ROW_SEGMENTS)
 _SUPPORTED_TOKENS = (16, 32, _MAX_TOKENS_PER_RANK)
 _CUTE_DSL_PEER_CAPACITY = 32
-_CUTE_DSL_FLAG_WORDS = 2 + 2 * 2 * _WORLD_SIZE
 
 
 def _require_tensor(
@@ -328,9 +327,13 @@ class _Workspace:
         backend: str = "cuda",
     ) -> None:
         _validate_backend(backend)
+        # The CuTe-DSL programs read their peer tables by value on the host;
+        # both backends share every other part of the layout below.
         host_peer_table = backend == "cute_dsl"
+        # One sense-reversing word per cross-rank barrier: word 0 publishes the
+        # mailboxes, word 1 completes the return of the route terms.
         self.flags = _allocate_symmetric(
-            (_CUTE_DSL_FLAG_WORDS if host_peer_table else 2,),
+            (2,),
             torch.uint32,
             device=device,
             group_name=group_name,
@@ -338,11 +341,11 @@ class _Workspace:
             host_peer_table=host_peer_table,
         )
         self.flags.tensor.zero_()
-        # CUDA backend: row and route mailboxes with one slot per source rank. Every
-        # rank stores its routes into its slot on every rank and each BF16 row into
-        # its slot on the ranks that own the row's experts, so dispatch reads both
-        # from local memory.
-        route_slots = () if host_peer_table else (_WORLD_SIZE,)
+        # Row and route mailboxes with one slot per source rank. Every rank stores
+        # its routes into its slot on every rank and each BF16 row into its slot
+        # on the ranks that own the row's experts, so dispatch reads both from
+        # local memory.
+        route_slots = (_WORLD_SIZE,)
         self.published_hidden = _allocate_symmetric(
             (*route_slots, tokens, _HIDDEN),
             torch.bfloat16,

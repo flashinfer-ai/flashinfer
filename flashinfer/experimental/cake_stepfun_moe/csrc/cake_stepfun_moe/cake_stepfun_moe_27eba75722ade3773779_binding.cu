@@ -103,8 +103,10 @@ void Run(TensorView a_topk_ids, TensorView a_topk_weights, TensorView a_topk_pac
   check_same_device(a_cta_idx_xy_to_mn_limit, a_topk_ids, "cta_idx_xy_to_mn_limit", "topk_ids");
   check_contiguous(a_num_non_exiting_ctas, "num_non_exiting_ctas");
   check_same_device(a_num_non_exiting_ctas, a_topk_ids, "num_non_exiting_ctas", "topk_ids");
-  TVM_FFI_CHECK((a_num_tokens == 10), ValueError)
+  TVM_FFI_CHECK((a_num_tokens == 10LL), ValueError)
       << KERNEL_NAME << ": requires (num_tokens == 10)";
+  TVM_FFI_CHECK((a_num_experts <= 128LL), ValueError)
+      << KERNEL_NAME << ": requires (num_experts <= 128)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

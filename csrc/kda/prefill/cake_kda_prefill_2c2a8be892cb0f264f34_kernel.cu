@@ -297,7 +297,7 @@ __device__ __forceinline__ void tmem_st_x8_u32(int addr, const uint32_t* src) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -369,7 +369,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_qd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_qd_addr = smem + 1024;
     __nv_bfloat16* smem_g_raw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -467,8 +467,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
     unsigned int* smem_work_item_resolved = reinterpret_cast<unsigned int*>(smem_raw + 227348);
     const int smem_work_item_resolved_addr = smem + 227348;
 
-    // Mbarrier init (26 pipeline groups, 0 ordered-sequence groups, 82 barriers)
-    // Mbarriers at smem_raw[0..656)
+    // Mbarrier init (82 barriers at smem_raw[0..656))
 
     if (warp == 10) {
         // --- pipeline 'chunk_pipe' ---
@@ -544,33 +543,33 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_state = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_0 = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_1 = taddr + 80;
+    const unsigned int tmem_tmem_state_decay_2 = taddr + 96;
+    const unsigned int tmem_tmem_state_decay_3 = taddr + 112;
+    const unsigned int tmem_tmem_state_decay_4 = taddr + 128;
+    const unsigned int tmem_tmem_state_decay_5 = taddr + 144;
+    const unsigned int tmem_tmem_state_decay_6 = taddr + 160;
+    const unsigned int tmem_tmem_state_decay_7 = taddr + 176;
+    const unsigned int tmem_tmem_state_inp = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_0 = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_1 = taddr + 8;
+    const unsigned int tmem_tmem_state_inp_decay_2 = taddr + 16;
+    const unsigned int tmem_tmem_state_inp_decay_3 = taddr + 24;
+    const unsigned int tmem_tmem_state_inp_decay_4 = taddr + 32;
+    const unsigned int tmem_tmem_state_inp_decay_5 = taddr + 40;
+    const unsigned int tmem_tmem_state_inp_decay_6 = taddr + 48;
+    const unsigned int tmem_tmem_state_inp_decay_7 = taddr + 56;
+    const unsigned int tmem_tmem_u_acc = taddr + 224;
+    const unsigned int tmem_tmem_u2_inp = taddr + 224;
+    const unsigned int tmem_tmem_u2_acc = taddr;
+    const unsigned int tmem_tmem_out = taddr + 192;
+    const unsigned int tmem_tmem_state_out = taddr + 64;
+    const unsigned int tmem_tmem_turn_set1 = taddr + 256;
 
     // Kernel post-init ops
-    const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_decay_0 = taddr + 64;
-    const int tmem_tmem_state_decay_1 = taddr + 80;
-    const int tmem_tmem_state_decay_2 = taddr + 96;
-    const int tmem_tmem_state_decay_3 = taddr + 112;
-    const int tmem_tmem_state_decay_4 = taddr + 128;
-    const int tmem_tmem_state_decay_5 = taddr + 144;
-    const int tmem_tmem_state_decay_6 = taddr + 160;
-    const int tmem_tmem_state_decay_7 = taddr + 176;
-    const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_state_inp_decay_0 = taddr;
-    const int tmem_tmem_state_inp_decay_1 = taddr + 8;
-    const int tmem_tmem_state_inp_decay_2 = taddr + 16;
-    const int tmem_tmem_state_inp_decay_3 = taddr + 24;
-    const int tmem_tmem_state_inp_decay_4 = taddr + 32;
-    const int tmem_tmem_state_inp_decay_5 = taddr + 40;
-    const int tmem_tmem_state_inp_decay_6 = taddr + 48;
-    const int tmem_tmem_state_inp_decay_7 = taddr + 56;
-    const int tmem_tmem_u_acc = taddr + 224;
-    const int tmem_tmem_u2_inp = taddr + 224;
-    const int tmem_tmem_u2_acc = taddr;
-    const int tmem_tmem_out = taddr + 192;
-    const int tmem_tmem_state_out = taddr + 64;
-    const int tmem_tmem_turn_set1 = taddr + 256;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
     }
@@ -1606,14 +1605,14 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
             {
                 uint32_t _scalar_bits_0;
                 asm volatile("ld.global.nc.b32 %0, [%1];"
-                    : "=r"(_scalar_bits_0) : "l"((const void*)(seq_order + bin_mix_plan + (4 * bin_mix_grid) + (0))));
+                    : "=r"(_scalar_bits_0) : "l"((const void*)(seq_order + bin_mix_plan + 4 * bin_mix_grid + (0))));
                 word[0] = (int32_t)_scalar_bits_0;
             }
             int word_0[1];
             {
                 uint32_t _scalar_bits_1;
                 asm volatile("ld.global.nc.b32 %0, [%1];"
-                    : "=r"(_scalar_bits_1) : "l"((const void*)(seq_order + bin_mix_plan + (4 * bid) + (0))));
+                    : "=r"(_scalar_bits_1) : "l"((const void*)(seq_order + bin_mix_plan + 4 * bid + (0))));
                 word_0[0] = (int32_t)_scalar_bits_1;
             }
             if (word[0] == 1479619105 && word_0[0] < 0) {
@@ -1621,14 +1620,14 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                 {
                     uint32_t _scalar_bits_2;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_2) : "l"((const void*)(seq_order + bin_mix_plan + (4 * bid) + 1 + (0))));
+                        : "=r"(_scalar_bits_2) : "l"((const void*)(seq_order + bin_mix_plan + 4 * bid + 1 + (0))));
                     word_1[0] = (int32_t)_scalar_bits_2;
                 }
                 int word_2[1];
                 {
                     uint32_t _scalar_bits_3;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_3) : "l"((const void*)(seq_order + bin_mix_plan + (4 * bid) + 3 + (0))));
+                        : "=r"(_scalar_bits_3) : "l"((const void*)(seq_order + bin_mix_plan + 4 * bid + 3 + (0))));
                     word_2[0] = (int32_t)_scalar_bits_3;
                 }
                 int bin_mix_base = 0;
@@ -1646,14 +1645,14 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                 {
                     uint32_t _scalar_bits_4;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_4) : "l"((const void*)(seq_order + bin_mix_plan + (4 * bid) + 1 + (0))));
+                        : "=r"(_scalar_bits_4) : "l"((const void*)(seq_order + bin_mix_plan + 4 * bid + 1 + (0))));
                     word_3[0] = (int32_t)_scalar_bits_4;
                 }
                 int word_4[1];
                 {
                     uint32_t _scalar_bits_5;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_5) : "l"((const void*)(seq_order + bin_mix_plan + (4 * bid) + 3 + (0))));
+                        : "=r"(_scalar_bits_5) : "l"((const void*)(seq_order + bin_mix_plan + 4 * bid + 3 + (0))));
                     word_4[0] = (int32_t)_scalar_bits_5;
                 }
                 int bin_mix_pbase = 0;
@@ -1720,21 +1719,21 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                     {
                         uint32_t _scalar_bits_10;
                         asm volatile("ld.global.nc.b32 %0, [%1];"
-                            : "=r"(_scalar_bits_10) : "l"((const void*)(seq_order + bin_mix_vplan + (4 * bid) + 1 + (0))));
+                            : "=r"(_scalar_bits_10) : "l"((const void*)(seq_order + bin_mix_vplan + 4 * bid + 1 + (0))));
                         word_9[0] = (int32_t)_scalar_bits_10;
                     }
                     int word_10[1];
                     {
                         uint32_t _scalar_bits_11;
                         asm volatile("ld.global.nc.b32 %0, [%1];"
-                            : "=r"(_scalar_bits_11) : "l"((const void*)(seq_order + bin_mix_vplan + (4 * bid) + 3 + (0))));
+                            : "=r"(_scalar_bits_11) : "l"((const void*)(seq_order + bin_mix_vplan + 4 * bid + 3 + (0))));
                         word_10[0] = (int32_t)_scalar_bits_11;
                     }
                     int word_11[1];
                     {
                         uint32_t _scalar_bits_12;
                         asm volatile("ld.global.nc.b32 %0, [%1];"
-                            : "=r"(_scalar_bits_12) : "l"((const void*)(seq_order + bin_mix_vplan + (4 * bid) + (0))));
+                            : "=r"(_scalar_bits_12) : "l"((const void*)(seq_order + bin_mix_vplan + 4 * bid + (0))));
                         word_11[0] = (int32_t)_scalar_bits_12;
                     }
                     int bin_mix_vend = word_10[0] - word_11[0];
@@ -1766,7 +1765,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                     {
                         uint32_t _scalar_bits_14;
                         asm volatile("ld.global.nc.b32 %0, [%1];"
-                            : "=r"(_scalar_bits_14) : "l"((const void*)(seq_order + bin_mix_vplan + (4 * bin_mix_vgrid) + (0))));
+                            : "=r"(_scalar_bits_14) : "l"((const void*)(seq_order + bin_mix_vplan + 4 * bin_mix_vgrid + (0))));
                         word_13[0] = (int32_t)_scalar_bits_14;
                     }
                     if (bin_mix_vfound == 0 && word_13[0] == 1479619107) {
@@ -1829,21 +1828,21 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                 {
                     uint32_t _scalar_bits_18;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_18) : "l"((const void*)(seq_order + bin_mix_plan_0 + (4 * bin_mix_grid_0) + (0))));
+                        : "=r"(_scalar_bits_18) : "l"((const void*)(seq_order + bin_mix_plan_0 + 4 * bin_mix_grid_0 + (0))));
                     word_17[0] = (int32_t)_scalar_bits_18;
                 }
                 int word_18[1];
                 {
                     uint32_t _scalar_bits_19;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_19) : "l"((const void*)(seq_order + bin_mix_plan_0 + (4 * bid) + (0))));
+                        : "=r"(_scalar_bits_19) : "l"((const void*)(seq_order + bin_mix_plan_0 + 4 * bid + (0))));
                     word_18[0] = (int32_t)_scalar_bits_19;
                 }
                 int word_19[1];
                 {
                     uint32_t _scalar_bits_20;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_20) : "l"((const void*)(seq_order + bin_mix_plan_0 + (4 * bid) + 1 + (0))));
+                        : "=r"(_scalar_bits_20) : "l"((const void*)(seq_order + bin_mix_plan_0 + 4 * bid + 1 + (0))));
                     word_19[0] = (int32_t)_scalar_bits_20;
                 }
                 if (word_17[0] == 1479619105 && word_18[0] > 0) {
@@ -1921,7 +1920,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                             float unbounded_direct_log2;
                             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2) : "f"(1.0f + unbounded_exponential));
                             float unbounded_softplus_log2 = ((unbounded_biased <= 20.0f) ? ((unbounded_biased < -4.0f) ? unbounded_series_log2 : unbounded_direct_log2) : unbounded_biased * 1.442695f);
-                            early_gate0 = (-early_gate_rate) * unbounded_softplus_log2;
+                            early_gate0 = -early_gate_rate * unbounded_softplus_log2;
                         }
                     }
                     int _stage_smem_free = (int)((unsigned int)prep_ordinal % 4);
@@ -1994,7 +1993,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                             float unbounded_direct_log2_1;
                             asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2_1) : "f"(1.0f + unbounded_exponential_1));
                             float unbounded_softplus_log2_1 = ((unbounded_biased_1 <= 20.0f) ? ((unbounded_biased_1 < -4.0f) ? unbounded_series_log2_1 : unbounded_direct_log2_1) : unbounded_biased_1 * 1.442695f);
-                            float first_gate_value = (-gate_rate) * unbounded_softplus_log2_1;
+                            float first_gate_value = -gate_rate * unbounded_softplus_log2_1;
                             first_gate_log2 = ((first_gate_token < eos_3) ? first_gate_value : 0.0f);
                         }
                         unbounded_total_log2 = unbounded_total_log2 + first_gate_log2;
@@ -2047,7 +2046,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                         float unbounded_direct_log2_2;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(unbounded_direct_log2_2) : "f"(1.0f + unbounded_exponential_2));
                         float unbounded_softplus_log2_2 = ((unbounded_biased_2 <= 20.0f) ? ((unbounded_biased_2 < -4.0f) ? unbounded_series_log2_2 : unbounded_direct_log2_2) : unbounded_biased_2 * 1.442695f);
-                        float last_gate_value = (-gate_rate) * unbounded_softplus_log2_2;
+                        float last_gate_value = -gate_rate * unbounded_softplus_log2_2;
                         float last_gate_log2 = ((last_gate_token < eos_3) ? last_gate_value : 0.0f);
                         unbounded_total_log2 = unbounded_total_log2 + last_gate_log2;
                         prefix_log2 += max_noftz(last_gate_log2, -15.0f);
@@ -3860,14 +3859,14 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                                 {
                                     uint32_t _scalar_bits_60;
                                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                                        : "=r"(_scalar_bits_60) : "l"((const void*)(seq_order + bin_mix_tail_plan + (4 * bid) + 1 + (0))));
+                                        : "=r"(_scalar_bits_60) : "l"((const void*)(seq_order + bin_mix_tail_plan + 4 * bid + 1 + (0))));
                                     word_27[0] = (int32_t)_scalar_bits_60;
                                 }
                                 int word_28[1];
                                 {
                                     uint32_t _scalar_bits_61;
                                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                                        : "=r"(_scalar_bits_61) : "l"((const void*)(seq_order + bin_mix_tail_plan + (4 * bid) + 2 + (0))));
+                                        : "=r"(_scalar_bits_61) : "l"((const void*)(seq_order + bin_mix_tail_plan + 4 * bid + 2 + (0))));
                                     word_28[0] = (int32_t)_scalar_bits_61;
                                 }
                                 int bin_mix_slot = word_27[0] * 8 + (prep_ordinal - word_28[0]);
@@ -3875,7 +3874,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                                 {
                                     uint32_t _scalar_bits_62;
                                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                                        : "=r"(_scalar_bits_62) : "l"((const void*)(seq_order + bin_mix_tail_plan + (4 * bin_mix_tail_grid) + (0))));
+                                        : "=r"(_scalar_bits_62) : "l"((const void*)(seq_order + bin_mix_tail_plan + 4 * bin_mix_tail_grid + (0))));
                                     word_29[0] = (int32_t)_scalar_bits_62;
                                 }
                                 if (word_29[0] == 1479619107) {
@@ -3906,14 +3905,14 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                                     }
                                 }
                                 {
-                                    void* _cpbulk_dst_66 = reinterpret_cast<void*>(chunk_state + ((long long)bin_mix_slot * 16384));
+                                    void* _cpbulk_dst_66 = reinterpret_cast<void*>(chunk_state + (long long)bin_mix_slot * 16384);
                                     asm volatile(
                                         "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                         :: "l"(_cpbulk_dst_66), "r"(smem_qd_addr + (unsigned int)prep_ordinal % 4 * 41984), "r"((uint32_t)(31232))
                                         : "memory");
                                 }
                                 {
-                                    void* _cpbulk_dst_67 = reinterpret_cast<void*>(chunk_state + ((long long)bin_mix_slot * 16384) + 15616);
+                                    void* _cpbulk_dst_67 = reinterpret_cast<void*>(chunk_state + (long long)bin_mix_slot * 16384 + 15616);
                                     asm volatile(
                                         "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
                                         :: "l"(_cpbulk_dst_67), "r"(smem_qd_addr + 41472 + (unsigned int)prep_ordinal % 4 * 41984), "r"((uint32_t)(144))
@@ -3973,7 +3972,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
             {
                 uint32_t _scalar_bits_68;
                 asm volatile("ld.global.nc.b32 %0, [%1];"
-                    : "=r"(_scalar_bits_68) : "l"((const void*)(seq_order + bin_mix_take_plan + (4 * bin_mix_take_grid) + (0))));
+                    : "=r"(_scalar_bits_68) : "l"((const void*)(seq_order + bin_mix_take_plan + 4 * bin_mix_take_grid + (0))));
                 word_33[0] = (int32_t)_scalar_bits_68;
             }
             int bin_mix_take_g = 0;
@@ -3982,7 +3981,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                 {
                     uint32_t _scalar_bits_69;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_69) : "l"((const void*)(seq_order + bin_mix_take_plan + (4 * bid) + (0))));
+                        : "=r"(_scalar_bits_69) : "l"((const void*)(seq_order + bin_mix_take_plan + 4 * bid + (0))));
                     word_34[0] = (int32_t)_scalar_bits_69;
                 }
                 bin_mix_take_g = word_34[0];
@@ -3992,7 +3991,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                 {
                     uint32_t _scalar_bits_70;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_70) : "l"((const void*)(seq_order + bin_mix_take_plan + (4 * bid) + (0))));
+                        : "=r"(_scalar_bits_70) : "l"((const void*)(seq_order + bin_mix_take_plan + 4 * bid + (0))));
                     word_35[0] = (int32_t)_scalar_bits_70;
                 }
                 bin_mix_take_g = word_35[0];
@@ -4002,7 +4001,7 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                 {
                     uint32_t _scalar_bits_71;
                     asm volatile("ld.global.nc.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_71) : "l"((const void*)(seq_order + bin_mix_take_plan + (4 * bid) + 1 + (0))));
+                        : "=r"(_scalar_bits_71) : "l"((const void*)(seq_order + bin_mix_take_plan + 4 * bid + 1 + (0))));
                     word_36[0] = (int32_t)_scalar_bits_71;
                 }
                 int bin_mix_total = bin_chunk_base_3;
@@ -4081,8 +4080,8 @@ kernel_cake_kda_prefill_2c2a8be892cb0f264f34(__nv_bfloat16* __restrict__ q, cons
                             asm volatile("st.relaxed.gpu.global.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(zero_workspace) + (take_slot))), "r"(static_cast<unsigned int>(0)) : "memory");
                             asm volatile("fence.proxy.async.global;" ::: "memory");
                             mbarrier_expect_tx(qk_full_addr + ((int)((unsigned int)take_ordinal % 4)) * 8, 31376);
-                            cp_async_bulk_gmem2smem(smem_qd_addr + (unsigned int)take_ordinal % 4 * 41984, chunk_state + ((long long)take_slot * 16384), 31232, qk_full_addr + ((int)((unsigned int)take_ordinal % 4)) * 8);
-                            cp_async_bulk_gmem2smem(smem_qd_addr + 41472 + (unsigned int)take_ordinal % 4 * 41984, chunk_state + ((long long)take_slot * 16384) + 15616, 144, qk_full_addr + ((int)((unsigned int)take_ordinal % 4)) * 8);
+                            cp_async_bulk_gmem2smem(smem_qd_addr + (unsigned int)take_ordinal % 4 * 41984, chunk_state + (long long)take_slot * 16384, 31232, qk_full_addr + ((int)((unsigned int)take_ordinal % 4)) * 8);
+                            cp_async_bulk_gmem2smem(smem_qd_addr + 41472 + (unsigned int)take_ordinal % 4 * 41984, chunk_state + (long long)take_slot * 16384 + 15616, 144, qk_full_addr + ((int)((unsigned int)take_ordinal % 4)) * 8);
                         }
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");

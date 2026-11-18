@@ -31,7 +31,7 @@ jobs:
 
       - name: Run XFails tracker
         run: |
-          python scripts/xfails_tracker.py > reports/xfails_report.txt 2>&1 || {
+          python scripts/infra/xfails_tracker.py > reports/xfails_report.txt 2>&1 || {
             echo "Error: XFails tracker script failed"
             cat reports/xfails_report.txt
             exit 1
