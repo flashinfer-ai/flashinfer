@@ -215,7 +215,8 @@ jobs:
           # so a note that quotes a command can never start another run.
           NOTE_MARKER='<!-- flashinfer-bot:ci-bot-commands-note -->'
           post_note() {
-            printf '\n%s\n' "$NOTE_MARKER" >> "$SCOPE_NOTE"
+            # Fail closed: never post a note without its marker.
+            printf '\n%s\n' "$NOTE_MARKER" >> "$SCOPE_NOTE" || return 1
             bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE"
           }
           reject() {
