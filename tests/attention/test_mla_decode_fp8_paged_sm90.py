@@ -327,9 +327,9 @@ def test_fp8q_backend_stock_never_prepares():
     device = torch.device("cuda:0")
     batch = _make_batch([2983], device)
     _reset_mla_dec_fp8q_sm90_stats()
-    w = _plan_wrapper(batch, device, fp8q_backend="stock")
+    w = _plan_wrapper(batch, device, fp8q_backend="dequant")
     stats = _mla_dec_fp8q_sm90_stats()
-    assert stats["plans_selector_stock"] == 1, stats
+    assert stats["plans_selector_dequant"] == 1, stats
     assert stats["plans_prepared"] == 0, stats
     out = _run(w, batch)  # served by dequant + stock
     stats = _mla_dec_fp8q_sm90_stats()

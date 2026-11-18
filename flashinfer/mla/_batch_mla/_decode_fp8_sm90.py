@@ -75,7 +75,7 @@ _DISABLE_ENV = "FLASHINFER_DISABLE_MLA_DECODE_FP8_PAGED_SM90"
 # shared specialized-kernel kill switch (#5667 convention), honored as an
 # alias of the route-scoped switch above; the census records which fired
 _DISABLE_ENV_SHARED = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
-_FP8Q_BACKENDS = ("auto", "specialized", "stock")
+_FP8Q_BACKENDS = ("auto", "specialized", "dequant")
 _NUM_HEADS = 8
 _HEAD_DIM_CKV = 512
 _HEAD_DIM_KPE = 64
@@ -87,7 +87,7 @@ _MAX_KV_LEN = 262144
 _COMPUTE_CAPABILITY = (9, 0)
 
 _counters: Dict[str, int] = {
-    "plans_selector_stock": 0,
+    "plans_selector_dequant": 0,
     "specialized_raises": 0,
     "plans_seen": 0,
     "plans_disabled": 0,
@@ -188,10 +188,10 @@ def _mla_dec_fp8q_sm90_prepare(
     wrapper._mla_dec_fp8q_sm90_state = None
     counters["plans_seen"] += 1
     selector = _fp8q_selector(wrapper)
-    if selector == "stock":
-        counters["plans_selector_stock"] += 1
+    if selector == "dequant":
+        counters["plans_selector_dequant"] += 1
         logger.info_once(
-            "mla_decode_fp8_paged_sm90: fp8q_backend='stock'; the fast "
+            "mla_decode_fp8_paged_sm90: fp8q_backend='dequant'; the fast "
             "path is never prepared, fp8-Q calls are served by exact "
             "dequantisation into the stock MLA path"
         )

@@ -306,15 +306,15 @@ class BatchMLAPagedAttentionWrapper:
             Existing non-FA graph plans allow one plan per wrapper. Use a new
             wrapper when preparing a different backend for a new capture.
         """
-        if fp8q_backend not in ("auto", "specialized", "stock"):
+        if fp8q_backend not in ("auto", "specialized", "dequant"):
             raise ValueError(
                 "fp8q_backend must be one of ('auto', 'specialized', "
-                "'stock'), got %r" % (fp8q_backend,)
+                "'dequant'), got %r" % (fp8q_backend,)
             )
         # SM90 fp8-query fast-path selector (orthogonal to `backend`, which
         # names the PLANNER backend): 'auto' = guarded dispatch with
         # fail-closed dequant fallback; 'specialized' = explicit selection,
-        # never silently swapped (ineligible plans/calls raise); 'stock' =
+        # never silently swapped (ineligible plans/calls raise); 'dequant' =
         # never prepare the fast path.
         self._fp8q_backend = fp8q_backend
         self._float_workspace_buffer = float_workspace_buffer
