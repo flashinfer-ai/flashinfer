@@ -253,3 +253,33 @@ def test_cuda_graph_replay_matches_eager():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, eager)
+
+
+@requires_sm103
+def test_invalid_table_entries_never_reach_a_gather():
+    """Inactive tail columns (beyond sparse_topk_lens) carry no
+    offset-validity contract, and -1 holes may point anywhere: neither may
+    produce a global read. Tail columns hold out-of-range garbage
+    (INT_MAX-class), pool row 0 holds NaN, and the output must still match
+    the fp32 reference exactly as the length/hole mask defines it."""
+    inp = _make_inputs(2, 6, 32768, seed=43)
+    # poison pool row 0 (both pools): a hole clamped-and-gathered would
+    # propagate NaN through the PV MMA even at zero probability
+    inp["swa_kv_cache"].reshape(-1, D)[0] = float("nan")
+    inp["compressed_kv_cache"].reshape(-1, D)[0] = float("nan")
+    # punch -1 holes into the active region of a few rows
+    inp["sparse_indices"][3, 5] = -1
+    inp["sparse_indices"][7, 60] = -1
+    # garbage in the inactive tail: shorten some rows' lens and poison tails
+    lens = inp["sparse_topk_lens"]
+    lens[1] = 40
+    lens[9] = 100
+    tbl = inp["sparse_indices"]
+    tbl[1, 40:] = 2**31 - 1024  # far out of range
+    tbl[9, 100:] = -(2**30)
+    gold = _reference(inp).float()
+    assert torch.isfinite(gold).all()
+    out = _api(inp, backend="specialized")
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all()
+    _assert_close(out, gold)

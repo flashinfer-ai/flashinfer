@@ -403,12 +403,12 @@ __global__ __launch_bounds__(256, 2) void mla_ws_c4(
 #pragma unroll
       for (int r = 0; r < 16; ++r) {
         const int row = ldrow + r * 2;
-        int off = Idx[tl * 32 + row];
-        if (off < 0) off = 0;
-        const uint8_t* src = pool + (size_t)off * 1024 + ldch * 16;
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(
+        const int off = Idx[tl * 32 + row];
+        const int cpsz = off >= 0 ? 16 : 0;  // zero-fill invalid rows
+        const uint8_t* src = pool + (size_t)(off >= 0 ? off : 0) * 1024 + ldch * 16;
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(
                          sa(kvb + row * 1024 + swz(row, ldch) * 16)),
-                     "l"(src));
+                     "l"(src), "r"(cpsz));
       }
       asm volatile(
           "cp.async.commit_group;\n"
@@ -727,15 +727,19 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
 #pragma unroll
       for (int r = 0; r < ROWS_PER_WARP; ++r) {
         const int row = warp + r * NWARP;
-        int off = iv[r];
-        if (off < 0) off = 0;
-        const uint8_t* row_src = pool + (size_t)off * 1024;
+        const int off = iv[r];
+        // Invalid rows (negative index, or tail columns masked at staging)
+        // are ZERO-FILLED via the cp.async src-size operand: no global read
+        // at all, so garbage/NaN pool contents can never enter the PV MMA.
+        const int cpsz = off >= 0 ? 16 : 0;
+        const uint8_t* row_src = pool + (size_t)(off >= 0 ? off : 0) * 1024;
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
           const int ch = lane + half * 32;
           const uint8_t* s = row_src + ch * 16;
           uint32_t d = sa(dst + row * 1024 + swz(row, ch) * 16);
-          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(s));
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(s),
+                       "r"(cpsz));
         }
       }
     } else {
@@ -747,11 +751,11 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
 #pragma unroll
       for (int r = 0; r < 8; ++r) {
         const int row = ldrow + r * (NTHREAD / 64);
-        int off = iv[r];
-        if (off < 0) off = 0;
-        const uint8_t* s = pool + (size_t)off * 1024 + ldch * 16;
+        const int off = iv[r];
+        const int cpsz = off >= 0 ? 16 : 0;  // zero-fill invalid rows
+        const uint8_t* s = pool + (size_t)(off >= 0 ? off : 0) * 1024 + ldch * 16;
         uint32_t d = sa(dst + row * 1024 + swz(row, ldch) * 16);
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(s));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(s), "r"(cpsz));
       }
     }
   };
@@ -785,8 +789,10 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
     constexpr int FIRST_STAGED_COL = kC4DirectTile0 ? TILE : 0;
     for (int i = FIRST_STAGED_COL + tid; i < ncols; i += NTHREAD) {
       const int gcol = tile0 * TILE + i;
-      const int v = myidx[gcol];
-      // Keep the reference gather index; apply the length mask in softmax.
+      // Mask tail columns past the per-token length to -1 BEFORE staging:
+      // inactive entries carry no offset-validity contract, so they must
+      // never reach a gather (the softmax length mask still applies).
+      const int v = (gcol < len) ? myidx[gcol] : -1;
       Idx[i] = v;
     }
   }
@@ -804,23 +810,26 @@ __global__ __launch_bounds__((TILE == 32 ? 256 : 128), (TILE == 32 ? 2 : 3)) voi
       const int gcol = base + row;
       int valid_v = -1;
       if (lane == 0) {
-        const int v = myidx[gcol];
+        // length-masked at staging (see the staged-Idx comment above)
+        const int v = (gcol < len) ? myidx[gcol] : -1;
         valid_v = v;
         Idx[row] = valid_v;
       }
       valid_v = __shfl_sync(0xffffffff, valid_v, 0);
-      iv[r] = valid_v >= 0 ? valid_v : 0;
+      iv[r] = valid_v;  // raw: negative means zero-fill at the gather
     }
 #pragma unroll
     for (int r = 0; r < ROWS_PER_WARP; ++r) {
       const int row = warp + r * NWARP;
-      const uint8_t* row_src = pool + (size_t)iv[r] * 1024;
+      const int off = iv[r];
+      const int cpsz = off >= 0 ? 16 : 0;  // zero-fill invalid rows
+      const uint8_t* row_src = pool + (size_t)(off >= 0 ? off : 0) * 1024;
 #pragma unroll
       for (int half = 0; half < 2; ++half) {
         const int ch = lane + half * 32;
         const uint8_t* s = row_src + ch * 16;
         const uint32_t d = sa(KVs + row * 1024 + swz(row, ch) * 16);
-        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(s));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(d), "l"(s), "r"(cpsz));
       }
     }
   } else {
@@ -1777,8 +1786,10 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
   }
   if (tid < 64) {
     const int gcol = gcol0 + tid;
+    // inactive tail columns carry no offset-validity contract: mask BEFORE
+    // staging so they never reach a gather (softmax length mask unchanged)
     const int v = myidx[gcol];
-    Idx[tid] = v;
+    Idx[tid] = (gcol < len && v >= 0) ? v : -1;
   }
   __syncthreads();
 
@@ -1794,14 +1805,14 @@ __global__ __launch_bounds__(256, 2) void mla_fused2_c10(
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
       const int row = STAGE_WAIT ? ((warp >> 2) * 16 + (warp & 3) + r * 4) : (warp + r * 8);
-      int off = iv[r];
-      if (off < 0) off = 0;
-      const uint8_t* src = pool + (size_t)off * 1024 + lane * 16;
+      const int off = iv[r];
+      const int cpsz = off >= 0 ? 16 : 0;  // zero-fill invalid rows
+      const uint8_t* src = pool + (size_t)(off >= 0 ? off : 0) * 1024 + lane * 16;
       const uint32_t d = sa(dst + row * 1024 + swz(row, lane) * 16);
       asm volatile(
-          "cp.async.cg.shared.global [%0], [%1], 16;\n\t"
-          "cp.async.cg.shared.global [%0+512], [%1+512], 16;\n" ::"r"(d),
-          "l"(src));
+          "cp.async.cg.shared.global [%0], [%1], 16, %2;\n\t"
+          "cp.async.cg.shared.global [%0+512], [%1+512], 16, %2;\n" ::"r"(d),
+          "l"(src), "r"(cpsz));
     }
     asm volatile("cp.async.commit_group;\n");
   };
@@ -2171,8 +2182,10 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
   }
   if (tid < 64) {
     const int gcol = gcol0 + tid;
+    // inactive tail columns carry no offset-validity contract: mask BEFORE
+    // staging so they never reach a gather (softmax length mask unchanged)
     const int v = myidx[gcol];
-    Idx[tid] = v;
+    Idx[tid] = (gcol < len && v >= 0) ? v : -1;
   }
   __syncthreads();
 
@@ -2188,15 +2201,15 @@ __global__ __launch_bounds__(256, 1) void mla_fused2_h8_c10(
 #pragma unroll
     for (int r = 0; r < 4; ++r) {
       const int row = STAGE_WAIT ? ((warp >> 2) * 16 + (warp & 3) + r * 4) : (warp + r * 8);
-      int off = iv[r];
-      if (off < 0) off = 0;
-      const uint8_t* src = pool + (size_t)off * 1024 + lane * 16;
+      const int off = iv[r];
+      const int cpsz = off >= 0 ? 16 : 0;  // zero-fill invalid rows
+      const uint8_t* src = pool + (size_t)(off >= 0 ? off : 0) * 1024 + lane * 16;
       const uint32_t d = sa(dst + row * 1024 + swz(row, lane) * 16);
       asm volatile(
-          "cp.async.cg.shared.global [%0], [%1], 16;\n\t"
-          "cp.async.cg.shared.global [%0+512], [%1+512], 16;\n"
+          "cp.async.cg.shared.global [%0], [%1], 16, %2;\n\t"
+          "cp.async.cg.shared.global [%0+512], [%1+512], 16, %2;\n"
           :
-          : "r"(d), "l"(src));
+          : "r"(d), "l"(src), "r"(cpsz));
     }
     asm volatile("cp.async.commit_group;\n");
   };
@@ -2535,11 +2548,12 @@ __global__ __launch_bounds__(256, 2) void mla_tcgen_c10(
       const int rr = r + pass * 8;
       const int grow = (tid >> 6) + rr * 4;
       const int ch = tid & 63;
-      int off = Idx[grow];
-      if (off < 0) off = 0;
-      const uint8_t* src = pool + (size_t)off * 1024 + ch * 16;
+      const int off = Idx[grow];
+      const int cpsz = off >= 0 ? 16 : 0;  // zero-fill invalid rows
+      const uint8_t* src = pool + (size_t)(off >= 0 ? off : 0) * 1024 + ch * 16;
       char* dst = KVs + (ch >> 3) * (64 * 128) + grow * 128 + (((ch & 7) ^ (grow & 7)) * 16);
-      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa(dst)), "l"(src));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(sa(dst)), "l"(src),
+                   "r"(cpsz));
     }
     asm volatile("cp.async.commit_group;\n");
   }
@@ -2886,13 +2900,14 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
       const int row = warp + r * NWARP;
-      const int off = iv[r] < 0 ? 0 : iv[r];
-      const uint8_t* src = pool + (size_t)off * 1024 + lane * 16;
+      const int off = iv[r];
+      const int cpsz = off >= 0 ? 16 : 0;  // zero-fill invalid rows
+      const uint8_t* src = pool + (size_t)(off >= 0 ? off : 0) * 1024 + lane * 16;
       const uint32_t d = sa(dst + row * 1024 + swz(row, lane) * 16);
       asm volatile(
-          "cp.async.cg.shared.global [%0], [%1], 16;\n\t"
-          "cp.async.cg.shared.global [%0+512], [%1+512], 16;\n" ::"r"(d),
-          "l"(src));
+          "cp.async.cg.shared.global [%0], [%1], 16, %2;\n\t"
+          "cp.async.cg.shared.global [%0+512], [%1+512], 16, %2;\n" ::"r"(d),
+          "l"(src), "r"(cpsz));
     }
   };
 
@@ -2913,8 +2928,10 @@ __global__ __launch_bounds__(128, 3) void mla_b13(
     const int ncols = ntile * TILE;
     for (int i = tid; i < ncols; i += NTHREAD) {
       const int gcol = tile0 * TILE + i;
+      // mask inactive tail columns and holes before staging (see sibling
+      // kernels): they carry no offset-validity contract
       const int v = myidx[gcol];
-      Idx[i] = v;
+      Idx[i] = (gcol < len && v >= 0) ? v : -1;
     }
   }
   __syncthreads();
