@@ -218,11 +218,18 @@ def test_backend_names_reflect_implementations():
 
 
 @requires_sm103
-def test_empty_selection_rows_produce_zero_output():
+@pytest.mark.parametrize(
+    "B,SEQ",
+    [
+        (4, 300),  # direct-K short route, partial final page
+        (304, 512),  # 4-page F16 general route, splits=1 single-cluster epilogue
+    ],
+)
+def test_empty_selection_rows_produce_zero_output(B, SEQ):
     """A query row whose q2k_indices are all -1 selects nothing; the
     specialized route must return ZERO for that row (the packed backend's
     empty-effective-KV convention), never 0/0 = NaN."""
-    inp = _make_inputs(4, 300, seed=47)
+    inp = _make_inputs(B, SEQ, seed=47)
     inp["topk"][0, 2, :] = -1
     gold = _reference(inp)
     out = _api(inp, backend="specialized")
