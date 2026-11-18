@@ -36,7 +36,9 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import tcgen05
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ....batch_invariant import canon
 from ....batch_invariant.fp_interface.cute import CuteF32, fmax3
@@ -46,6 +48,32 @@ from .. import spec
 from .operands import ACC_DTYPE, BAR_SOFTMAX_ALL, BAR_XCHG, IN_DTYPE, Q_ROWS
 
 _NEG_INF = float("-inf")
+
+
+@dsl_user_op
+def masked_score(
+    s: Float32, lim_lo: Int32, lim_hi: Int32, col: int, *, loc=None, ip=None
+) -> Float32:
+    """The spec's mask of one score: ``-inf`` when its key -- static column ``col`` of the tile -- lies outside the row's visible range
+    ``[lim_lo, lim_hi)`` (tile-relative bounds), else ``s`` unchanged. A select, not an arithmetic op: two compares of the bounds against
+    the immediate column and one ``selp`` per key, with no dependence between keys (the general per-key ``if`` lowered to a predicate
+    chain over uniform-register key sums, several times the instructions)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(s).ir_value(loc=loc, ip=ip),
+                Int32(lim_lo).ir_value(loc=loc, ip=ip),
+                Int32(lim_hi).ir_value(loc=loc, ip=ip),
+            ],
+            "{ .reg .pred p; setp.gt.s32 p, $2, %d; setp.le.or.s32 p, $3, %d, p; selp.f32 $0, 0fFF800000, $1, p; }"
+            % (col, col),
+            "=f,f,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
 class _RegLoader:
@@ -334,16 +362,18 @@ def unit_loop(
             ((k0 < lo_row) | (k0 + T > L_row)) & (row < rows_valid)
         )
         if need_mask:
+            # the row's visible range in tile-relative columns: key k0 + col is masked iff col < lim_lo or col >= lim_hi (the slice's
+            # columns offset by col_base)
+            lim_lo = lo_row - k0
+            lim_hi = L_row - k0
             if cutlass.const_expr(not exchange):
                 for i in cutlass.range_constexpr(T):
-                    key = k0 + cols_f[i]
-                    if (key < lo_row) | (key >= L_row):
-                        rF[i] = neg_inf
+                    rF[i] = masked_score(rF[i], lim_lo, lim_hi, int(cols_f[i]))
             if cutlass.const_expr(not one_slice):
+                lim_lo_s = lim_lo - col_base
+                lim_hi_s = lim_hi - col_base
                 for i in cutlass.range_constexpr(kpt):
-                    key = k0 + col_base + cols_s[i]
-                    if (key < lo_row) | (key >= L_row):
-                        rS[i] = neg_inf
+                    rS[i] = masked_score(rS[i], lim_lo_s, lim_hi_s, int(cols_s[i]))
         if cutlass.const_expr(exchange):
             sp = []
             for i in cutlass.range_constexpr(kpt):
