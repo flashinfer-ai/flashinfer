@@ -77,7 +77,7 @@ def _load_allowlist() -> Optional[dict]:
             ),
         }
     except (
-        FileNotFoundError,
+        OSError,
         ModuleNotFoundError,
         json.JSONDecodeError,
         KeyError,
@@ -371,6 +371,21 @@ class SpecializedMxfp8SmallMRunner(TunableRunner):
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         a, b, a_descale, b_descale, _, out, _ = inputs
+        # The autotuner's v2 default-racing prepends tactic -1 for runners[0]
+        # even when get_valid_tactics returned [], and bucketed profiles can
+        # synthesize shapes off the allowlist. The kernel must never run
+        # outside its measured contract, so forward re-checks eligibility and
+        # refuses: the profiling loop records a refused tactic as failed
+        # (time inf) and moves on, and the ranking path's direct
+        # forward(tactic=-1, do_preparation=True) call cannot reach this
+        # runner because precompile_tactics handles preparation.
+        reason = _specialized_supported(
+            a, b, a_descale, b_descale, out, out.dtype, self._use_8x4_sf_layout
+        )
+        if reason is not None:
+            raise NotImplementedError(
+                f"mm_mxfp8 specialized SM107 kernel cannot serve this profile ({reason})"
+            )
         if not _launch_specialized(a, b, a_descale, b_descale, out):
             raise RuntimeError(
                 "mm_mxfp8 specialized SM107 kernel: JIT module unavailable "

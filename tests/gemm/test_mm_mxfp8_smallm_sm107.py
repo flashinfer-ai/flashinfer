@@ -451,6 +451,13 @@ def test_runner_declines_ineligible_inputs_cpu():
     assert runner.get_valid_tactics(inputs, None) == []
     assert runner.supports_inputs(inputs) is False
     assert runner.is_tactic_compatible(inputs, -1) is False
+    # The v2 autotuner default-races (runners[0], tactic=-1) even when
+    # get_valid_tactics returned [], with bucket-synthesized shapes that can
+    # be off the allowlist: forward itself must refuse rather than launch the
+    # kernel outside its contract (the profiler records the refusal as a
+    # failed tactic).
+    with pytest.raises(NotImplementedError, match="cannot serve this profile"):
+        runner.forward(inputs, tactic=-1)
 
 
 def test_eligibility_probe_tolerates_out_none():
