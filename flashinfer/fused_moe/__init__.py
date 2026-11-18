@@ -156,9 +156,24 @@ _PRIMS_TS_LAZY_EXPORTS = {
     "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
 }
 
+# Specialized flat ops are likewise imported on first use. Their modules run
+# the api-logging decorator and load a trace template at import time, so a
+# plain ``import flashinfer`` must not execute them: the MoELayer backend
+# registration (W4A16MxFp4LatentConfig in api.py, its runner mapping in
+# layer.py) stays eager because it is pure Python with no kernel-side
+# imports, while the flat entry point resolves lazily through
+# ``__getattr__`` below.
+_SPECIALIZED_FLAT_OP_LAZY_EXPORTS = {
+    "w4a16_mxfp4_latent_routed_moe": ".w4a16_mxfp4_moe",
+}
+
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS.keys())
+    return sorted(
+        set(globals())
+        | _PRIMS_TS_LAZY_EXPORTS.keys()
+        | _SPECIALIZED_FLAT_OP_LAZY_EXPORTS.keys()
+    )
 
 
 # Other legacy flat-argument APIs (unchanged, not deprecated)
@@ -236,10 +251,6 @@ from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
 )
 
-from .w4a16_mxfp4_moe import (  # noqa: F401
-    w4a16_mxfp4_latent_routed_moe as w4a16_mxfp4_latent_routed_moe,
-)
-
 from .trtllm_gen_routing import (  # noqa: F401
     TrtllmGenRoutingResult as TrtllmGenRoutingResult,
     trtllm_gen_routing as trtllm_gen_routing,
@@ -315,7 +326,9 @@ except ImportError:
 
 
 def __getattr__(name: str):
-    module_name = _PRIMS_TS_LAZY_EXPORTS.get(name)
+    module_name = _PRIMS_TS_LAZY_EXPORTS.get(
+        name
+    ) or _SPECIALIZED_FLAT_OP_LAZY_EXPORTS.get(name)
     if module_name is not None:
         value = getattr(importlib.import_module(module_name, __name__), name)
         globals()[name] = value
