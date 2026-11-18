@@ -142,7 +142,10 @@ def arch_smem_cap(device=None) -> int:
 
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
-    return _arch_smem_cap(torch.device(device))
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _arch_smem_cap(device)
 
 
 @functools.cache

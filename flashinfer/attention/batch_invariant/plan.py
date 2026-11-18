@@ -18,7 +18,7 @@ Positions are bottom-right causal: token ``i`` of request ``b`` (``0 <= i < q_le
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from .spec import TILE_KEYS, chunk_len
 
@@ -173,6 +173,95 @@ def kv_lengths(
     return out
 
 
+def chunk_tile_counts(
+    tile_lo: int, tile_hi: int, chunk_lo: int, chunk_hi: int, tpc: int
+) -> tuple:
+    """A unit's chunks as ``(n_chunks, first_tiles, last_tiles)``: every chunk but the first and the last holds ``tpc`` tiles, the
+    first ``min(tile_hi, (chunk_lo + 1) tpc) - tile_lo`` and the last ``tile_hi - max(tile_lo, (chunk_hi - 1) tpc)`` (one chunk:
+    its own tiles). The planner prices the split kind from these three numbers instead of listing every chunk."""
+    n = chunk_hi - chunk_lo
+    if n <= 1:
+        return n, tile_hi - tile_lo, tile_hi - tile_lo
+    return (
+        n,
+        min(tile_hi, (chunk_lo + 1) * tpc) - tile_lo,
+        tile_hi - max(tile_lo, (chunk_hi - 1) * tpc),
+    )
+
+
+def _swaps_lengths(
+    units: Sequence[tuple], split: Sequence[bool], inkernel_max_chunks: int, tpc: int
+) -> tuple:
+    """The multiset of walk-unit lengths (tiles) of a Swaps-body batch as ``{length: count}``, with the fixup rows and the in-kernel
+    fold groups the split units add: ``units[i] = (tiles, (n_chunks, first_tiles, last_tiles), rows)``, split into one unit per
+    chunk when ``split[i]``."""
+    counts: Dict[int, int] = {}
+    fixup_rows = 0
+    inkernel_groups = 0
+    for (tiles, (n_chunks, first, last), rows), s in zip(units, split, strict=True):
+        if s and n_chunks > 1:
+            counts[first] = counts.get(first, 0) + 1
+            counts[last] = counts.get(last, 0) + 1
+            if n_chunks > 2:
+                counts[tpc] = counts.get(tpc, 0) + n_chunks - 2
+            if n_chunks > inkernel_max_chunks:
+                fixup_rows += rows
+            else:
+                inkernel_groups += 1
+        else:
+            counts[tiles] = counts.get(tiles, 0) + 1
+    return counts, fixup_rows, inkernel_groups
+
+
+def _swaps_walk_cost(
+    counts: Dict[int, int],
+    fixup_rows: int,
+    inkernel_groups: int,
+    grid: int,
+    sm_count: int,
+    D: int,
+    relax_last_wave: bool,
+) -> float:
+    """``swaps_kind_cost`` over a length multiset: the walk takes the units longest first in waves of ``grid``; a wave costs its longest
+    unit's tiles at the rate of its active CTAs (the HBM rate from ``STREAM_SAT_FRACTION`` of the SMs up; below it the per-CTA rate
+    plus the unit boundary's bubble), the first wave adds its opening burst's contention, the split groups add the fixup kernel's cost
+    or the in-kernel fold's per wave of folding units. The waves are walked over the runs of equal lengths, so the cost of a batch
+    is linear in its distinct lengths and its waves, never in its chunks."""
+    total = sum(counts.values())
+    if total == 0:
+        return 0.0
+    scale = D / 128
+    grid = max(1, min(grid, total))
+    sat = STREAM_SAT_FRACTION[D] * sm_count
+    runs = sorted(counts.items(), reverse=True)  # (length, count), longest first
+    n_waves = -(-total // grid)
+    cost = 0.0
+    r = 0
+    left = runs[0][1]  # units left in the current run
+    for i in range(n_waves):
+        width = min(grid, total - i * grid)
+        top = runs[r][0]
+        streamed = top * scale * width / sm_count
+        if relax_last_wave and n_waves > 1 and i == n_waves - 1:
+            cost += streamed
+        else:
+            cost += max(top * scale * sat / sm_count + UNIT_BUBBLE[D], streamed)
+        take = width
+        while take > 0:
+            c = min(take, left)
+            take -= c
+            left -= c
+            if left == 0 and r + 1 < len(runs):
+                r += 1
+                left = runs[r][1]
+    cost += FIRST_WAVE_RAMP * scale * grid / sm_count
+    if fixup_rows:
+        cost += FIXUP_BASE_COST + FIXUP_ROW_COST * fixup_rows
+    if inkernel_groups:
+        cost += INKERNEL_FOLD_COST * -(-inkernel_groups // grid)
+    return cost
+
+
 def swaps_kind_cost(
     units: Sequence[tuple],
     split: Sequence[bool],
@@ -182,46 +271,17 @@ def swaps_kind_cost(
     inkernel_max_chunks: int,
     relax_last_wave: bool = False,
 ) -> float:
-    """The predicted makespan of a Swaps-body batch whose unit ``i`` -- ``units[i] = (tiles, chunk_tiles, rows)`` with ``chunk_tiles``
-    the tiles of each of its chunks -- is split into one unit per chunk when ``split[i]``, walked by ``grid`` persistent CTAs. The
-    walk takes the units longest first in waves of ``grid``; a wave costs its longest unit's tiles at the rate of its active CTAs (the
-    HBM rate from ``STREAM_SAT_FRACTION`` of the SMs up; below it the per-CTA rate plus the unit boundary's bubble), the first wave
-    adds its opening burst's contention, the split groups add the fixup kernel's cost or the in-kernel fold's per wave of folding
-    units. ``relax_last_wave``: a multi-wave walk's last wave is charged at the HBM rate whatever its width -- the form used off the
-    parts the per-CTA rate was fitted on, so that a part-filled last wave alone never turns a fused batch into a split one."""
-    scale = D / 128
-    lengths: List[int] = []
-    fixup_rows = 0
-    inkernel_groups = 0
-    for (tiles, chunk_tiles, rows), s in zip(units, split, strict=True):
-        if s and len(chunk_tiles) > 1:
-            lengths.extend(chunk_tiles)
-            if len(chunk_tiles) > inkernel_max_chunks:
-                fixup_rows += rows
-            else:
-                inkernel_groups += 1
-        else:
-            lengths.append(tiles)
-    if not lengths:
-        return 0.0
-    lengths.sort(reverse=True)
-    grid = max(1, min(grid, len(lengths)))
-    sat = STREAM_SAT_FRACTION[D] * sm_count
-    cost = 0.0
-    n_waves = -(-len(lengths) // grid)
-    for i, w in enumerate(range(0, len(lengths), grid)):
-        wave = lengths[w : w + grid]
-        streamed = wave[0] * scale * len(wave) / sm_count
-        if relax_last_wave and n_waves > 1 and i == n_waves - 1:
-            cost += streamed
-        else:
-            cost += max(wave[0] * scale * sat / sm_count + UNIT_BUBBLE[D], streamed)
-    cost += FIRST_WAVE_RAMP * scale * grid / sm_count
-    if fixup_rows:
-        cost += FIXUP_BASE_COST + FIXUP_ROW_COST * fixup_rows
-    if inkernel_groups:
-        cost += INKERNEL_FOLD_COST * -(-inkernel_groups // grid)
-    return cost
+    """The predicted makespan of a Swaps-body batch whose unit ``i`` -- ``units[i] = (tiles, (n_chunks, first_tiles, last_tiles),
+    rows)``, the chunks as ``chunk_tile_counts`` gives them -- is split into one unit per chunk when ``split[i]``, walked by ``grid``
+    persistent CTAs (``_swaps_walk_cost``). ``relax_last_wave``: a multi-wave walk's last wave is charged at the HBM rate whatever its
+    width -- the form used off the parts the per-CTA rate was fitted on, so that a part-filled last wave alone never turns a fused
+    batch into a split one."""
+    counts, fixup_rows, inkernel_groups = _swaps_lengths(
+        units, split, inkernel_max_chunks, chunk_len(D) // TILE_KEYS
+    )
+    return _swaps_walk_cost(
+        counts, fixup_rows, inkernel_groups, grid, sm_count, D, relax_last_wave
+    )
 
 
 def swaps_fused_grids(
@@ -264,6 +324,10 @@ def swaps_unit_kinds(
     if n == 0:
         return [], 0
     fused = [False] * n
+    tpc = chunk_len(D) // TILE_KEYS
+    f_counts, f_fixup_rows, f_inkernel = _swaps_lengths(
+        units, fused, inkernel_max_chunks, tpc
+    )
     best_grid, best_cost = 0, float("inf")
     if grid_search:
         grids = swaps_fused_grids(n, sm_count, D, max(u[0] for u in units))
@@ -279,17 +343,22 @@ def swaps_unit_kinds(
         ):
             grids.append(even)
     for g in grids:
-        c = swaps_kind_cost(units, fused, g, sm_count, D, inkernel_max_chunks)
+        c = _swaps_walk_cost(f_counts, f_fixup_rows, f_inkernel, g, sm_count, D, False)
         if c <= best_cost:
             best_grid, best_cost = g, c
-    split = [len(u[1]) > 1 for u in units]
+    split = [u[1][0] > 1 for u in units]
     if any(split):
-        c = swaps_kind_cost(units, split, sm_count, sm_count, D, inkernel_max_chunks)
+        s_counts, s_fixup_rows, s_inkernel = _swaps_lengths(
+            units, split, inkernel_max_chunks, tpc
+        )
+        c = _swaps_walk_cost(
+            s_counts, s_fixup_rows, s_inkernel, sm_count, sm_count, D, False
+        )
         fused_cmp = (
             best_cost
             if grid_search
-            else swaps_kind_cost(
-                units, fused, best_grid, sm_count, D, inkernel_max_chunks, True
+            else _swaps_walk_cost(
+                f_counts, f_fixup_rows, f_inkernel, best_grid, sm_count, D, True
             )
         )
         if c < fused_cmp:
@@ -402,14 +471,7 @@ def build_plan(
     if split_policy == "auto" and swap_batch:
         swaps_kinds, plan.grid = swaps_unit_kinds(
             [
-                (
-                    thi - tlo,
-                    [
-                        min(thi, (j + 1) * tpc) - max(tlo, j * tpc)
-                        for j in range(clo, chi)
-                    ],
-                    ntok * g,
-                )
+                (thi - tlo, chunk_tile_counts(tlo, thi, clo, chi, tpc), ntok * g)
                 for _, _, _, ntok, clo, chi, tlo, thi, _, _ in tiles
             ],
             sm_count,
