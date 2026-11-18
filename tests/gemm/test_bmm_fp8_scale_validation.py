@@ -71,13 +71,16 @@ def test_bmm_fp8_wrong_device_rejected():
 
     b, m, k, n = 2, 4, 8, 16
 
-    A = torch.randn(b, m, k, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    B = torch.randn(b, k, n, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-    A_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
-    B_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+    A = torch.randn(b, m, k, device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    B = torch.randn(b, k, n, device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
 
     # Test with scale on CPU while operands are on CUDA
     A_scale_cpu = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+    B_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
     with pytest.raises(ValueError, match="A_scale must be on the same CUDA device"):
         bmm_fp8(A, B, A_scale_cpu, B_scale, torch.bfloat16, backend="cublas")
