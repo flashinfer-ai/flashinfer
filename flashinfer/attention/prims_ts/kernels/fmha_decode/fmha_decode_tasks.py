@@ -3650,7 +3650,20 @@ def _softmax_schedule_body(
         and not use_sage
         and memberships_in_gmem
     )
-    if cutlass.const_expr(preloads_memberships):
+    # Q128 Keeps lanes own whole 128-token rows: eight words per tile.
+    memberships8 = preloads_memberships and cfg.tile_size_q == 128
+    if cutlass.const_expr(memberships8):
+        (
+            page_membership0,
+            page_membership1,
+            page_membership2,
+            page_membership3,
+            page_membership4,
+            page_membership5,
+            page_membership6,
+            page_membership7,
+        ) = tmem_s.load_first_page_memberships8()
+    elif cutlass.const_expr(preloads_memberships):
         (
             page_membership0,
             page_membership1,
@@ -3687,7 +3700,19 @@ def _softmax_schedule_body(
             new_max_arr=new_max_arr,
             s_arr=s_arr,
         )
-        if cutlass.const_expr(preloads_memberships):
+        if cutlass.const_expr(memberships8):
+            compute_softmax_loop = tmem_s.compute_softmax_loop_with_memberships8
+            softmax_loop_kwargs.update(
+                page_membership0=page_membership0,
+                page_membership1=page_membership1,
+                page_membership2=page_membership2,
+                page_membership3=page_membership3,
+                page_membership4=page_membership4,
+                page_membership5=page_membership5,
+                page_membership6=page_membership6,
+                page_membership7=page_membership7,
+            )
+        elif cutlass.const_expr(preloads_memberships):
             compute_softmax_loop = tmem_s.compute_softmax_loop_with_memberships
             softmax_loop_kwargs.update(
                 page_membership0=page_membership0,
@@ -3711,7 +3736,18 @@ def _softmax_schedule_body(
         old_max_arr, sum_arr, new_max_arr, s_arr = compute_softmax_loop(
             **softmax_loop_kwargs
         )
-        if cutlass.const_expr(preloads_memberships):
+        if cutlass.const_expr(memberships8):
+            (
+                page_membership0,
+                page_membership1,
+                page_membership2,
+                page_membership3,
+                page_membership4,
+                page_membership5,
+                page_membership6,
+                page_membership7,
+            ) = tmem_s.load_next_page_memberships8()
+        elif cutlass.const_expr(preloads_memberships):
             (
                 page_membership0,
                 page_membership1,

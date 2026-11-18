@@ -45,6 +45,7 @@ from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
 from ._block_sparse.common import _num_sparse_pattern_heads
+from ._q_token_kv_block_sparse_policy import membership_planes
 from ._scales import GlobalScale, normalize_scale, resolve_scale, scale_types
 
 if TYPE_CHECKING:
@@ -716,6 +717,32 @@ class QTokenKvBlockSparsePagedTSWrapper:
         products are exact in BF16), FP8 Q runs FP8 MMA on K/V rounded to E4M3.
         The output is BF16 either way.
 
+        NVFP4 K/V is transformed to BF16 inside the kernel, once per KV tile of
+        every route that loads it. Grouped routes overlap, so long packed query
+        batches transform each selected token many times (about 90 times at
+        4K queries over a 64K context). A framework can instead convert each
+        request's visible NVFP4 pages to a BF16 paged cache once per call and
+        run this wrapper with BF16 K/V (``kv_dtype=torch.bfloat16`` and that
+        cache's block table). Results are unchanged, since E2M1 x E4M3 products
+        are exact in BF16. This needs no Prims-TS support; the trade-off is:
+
+        - It pays only with TileQ128 groups (``group_size * Hq / Hkv > 64``,
+          e.g. G32 for 4 Q heads per KV head, G16 for 8), whose transform is
+          on the critical path, and with many queries. On GB300 (D256, top-k
+          512 blocks of 4 tokens, 0-64K prefixes) it measured 1.02-1.37x faster
+          than the best NVFP4 launch for 1K-4K packed queries (more with more
+          queries and longer prefixes), 0.84-1.11x at 512, and 0.63-1.0x
+          (never faster) at 128-256.
+        - Its cost grows with visible tokens x KV heads, not with the queries
+          (about 26 us for 64K tokens x 2 KV heads, near HBM bandwidth), and
+          the BF16 copy takes about 3.6x the NVFP4 cache's memory. Overlap it
+          with independent work (e.g. the indexer's top-k) and skip it for long
+          contexts, where it can cost more than it saves (not measured past
+          64K).
+        - Converting only the blocks the indexer selected did not pay: marking
+          them costs more than it saves, and long query batches select half or
+          more of the visible blocks anyway.
+
         Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``. Fixed Q is
         ``[B, Nq, G, Hq, D]`` without ``qo_indptr``. ``indexer_block_ids`` is
         Int32 ``[total_q, block_topk]`` for shared patterns or
@@ -1095,8 +1122,12 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     return (groups, page_capacity), (groups, membership_words), (groups,)
 
@@ -1236,8 +1267,12 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
-        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        # G9-G32: ceil(G / 8) byte planes per route row (queries 8p..8p+7 in plane p).
+        else membership_planes(group_size)
+        * (
+            (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+            // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
+        )
     )
     q_token_kv_block_sparse_page_indices_shape = (metadata_rows, page_capacity)
     q_token_kv_block_sparse_page_indices_bytes = metadata_rows * page_capacity * 4

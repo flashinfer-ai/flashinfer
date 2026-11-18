@@ -283,7 +283,7 @@ class TmemSResource(DecodeGenResourceBase):
             Uint32(0),
             f"Grouped-Q page-membership byte of the lane's token group {i}.",
         )
-        for i in range(4)
+        for i in range(8)
     )
     inst_id: Constexpr[int] = 0
     cfg: Constexpr[FmhaDecodeConfig] = None
@@ -319,6 +319,11 @@ class TmemSResource(DecodeGenResourceBase):
     page_membership1: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     page_membership2: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     page_membership3: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    # Words 4-7: a Q128 Keeps lane owns a whole 128-token row (32 pages).
+    page_membership4: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    page_membership5: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    page_membership6: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    page_membership7: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def _init_placeholder_state(self) -> None:
         """Create placeholder register and scratch state for softmax."""
@@ -1177,16 +1182,18 @@ class TmemSResource(DecodeGenResourceBase):
         pages_per_lane = cfg.num_s_regs_per_thread // page_span
         if cutlass.const_expr(page_memberships is not None):
             # Raw GMEM words were loaded one tile ahead by the schedule.
-            assert pages_per_lane == 16
-            return (
-                self.page_offsets_ref.q_token_kv_block_sparse_page_keep_word16_from_raw(
+            assert pages_per_lane in (16, 32)
+            assert len(page_memberships) == pages_per_lane // 4
+            for vector_idx in cutlass.range_constexpr(pages_per_lane // 16):
+                bits = self.page_offsets_ref.q_token_kv_block_sparse_page_keep_word16_from_raw(
                     stage_info,
                     local_tile_idx,
-                    col_base // Int32(cfg.num_tokens_per_page),
+                    col_base // Int32(cfg.num_tokens_per_page) + Int32(vector_idx * 16),
                     q_token_idx,
-                    page_memberships,
+                    page_memberships[4 * vector_idx : 4 * vector_idx + 4],
                 )
-            )
+                keep_word |= bits << Uint32(vector_idx * 16)
+            return keep_word
         if cutlass.const_expr(pages_per_lane >= 16):
             for vector_idx in cutlass.range_constexpr(pages_per_lane // 16):
                 bits = self.page_offsets_ref.q_token_kv_block_sparse_page_keep_word16(
@@ -1204,6 +1211,7 @@ class TmemSResource(DecodeGenResourceBase):
                     local_tile_idx,
                     col_base // Int32(cfg.num_tokens_per_page)
                     + Int32(page_vector_idx * 4),
+                    q_token_idx,
                 )
             )
             # Select query q's bit from each byte (positions 0/8/16/24), then
@@ -1213,7 +1221,9 @@ class TmemSResource(DecodeGenResourceBase):
             byte_bits = (memberships >> (q_token_idx & Int32(7))) & Uint32(0x01010101)
             packed_bits = (byte_bits * Uint32(0x01020408)) >> Uint32(24)
             packed_bits = cutlass.select_(
-                Uint32(q_token_idx) < Uint32(8), packed_bits, Uint32(0)
+                Uint32(q_token_idx) < Uint32(8 * cfg.page_membership_planes),
+                packed_bits,
+                Uint32(0),
             )
             keep_word = keep_word | (packed_bits << Uint32(page_vector_idx * 4))
         if cutlass.const_expr(pages_per_lane < 4):
@@ -2479,17 +2489,32 @@ class TmemSResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.use_keeps_mma_ab):
             # A Keeps lane owns a contiguous 64-token column half of its row:
             # sixteen pages in four aligned words.
-            lane_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX] & Int32(31)
+            warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+            lane_idx = warp_grp_thread_idx & Int32(31)
             first_page = _keeps_col_base(
                 cfg, lane_idx, cfg.softmax_score_fragment_regs
             ) // Int32(cfg.num_tokens_per_page)
-            for word_idx in cutlass.range_constexpr(4):
+            query_idx = None
+            if cutlass.const_expr(cfg.page_membership_planes > 1):
+                # G9-G32: the query of this row selects its membership byte plane.
+                query_idx, _ = _q_row_token_and_local_head(
+                    cfg,
+                    self.h_r,
+                    _logical_q_group_idx(cfg, stage_info, self.q_group_idx),
+                    _keeps_row_idx(cfg, warp_grp_thread_idx),
+                )
+            page_span = min(cfg.num_tokens_per_page, cfg.num_s_regs_per_thread)
+            num_words = cfg.num_s_regs_per_thread // page_span // 4
+            for word_idx in cutlass.range_constexpr(num_words):
                 words.append(
                     self.page_offsets_ref.load_q_token_kv_block_sparse_page_membership_raw(
-                        stage_info, local_tile_idx, first_page + Int32(word_idx * 4)
+                        stage_info,
+                        local_tile_idx,
+                        first_page + Int32(word_idx * 4),
+                        query_idx,
                     )
                 )
-            return words[0], words[1], words[2], words[3]
+            return tuple(words)
         local_idx_k0 = task_cache[_TASK_CACHE_WARP_IDX] * Int32(32) + (
             task_cache[_TASK_CACHE_LANE_IDX] >> Int32(2)
         )
@@ -2543,6 +2568,84 @@ class TmemSResource(DecodeGenResourceBase):
         local_tile_idx = _softmax_tile_idx(self.cfg, stage_info, self.inst_id)
         return self.load_raw_page_membership_words(
             stage_info, local_tile_idx + Int32(self.cfg.num_insts_kv)
+        )
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(
+            page_membership0,
+            page_membership1,
+            page_membership2,
+            page_membership3,
+            page_membership4,
+            page_membership5,
+            page_membership6,
+            page_membership7,
+        ),
+    )
+    @cute.jit
+    def load_first_page_memberships8(self, stage_info: StageInfo) -> tuple:
+        """``load_first_page_memberships`` for 32-page (Q128 Keeps) lanes."""
+        return self.load_raw_page_membership_words(stage_info, Int32(self.inst_id))
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(
+            page_membership0,
+            page_membership1,
+            page_membership2,
+            page_membership3,
+            page_membership4,
+            page_membership5,
+            page_membership6,
+            page_membership7,
+        ),
+    )
+    @cute.jit
+    def load_next_page_memberships8(self, stage_info: StageInfo) -> tuple:
+        """``load_next_page_memberships`` for 32-page (Q128 Keeps) lanes."""
+        local_tile_idx = _softmax_tile_idx(self.cfg, stage_info, self.inst_id)
+        return self.load_raw_page_membership_words(
+            stage_info, local_tile_idx + Int32(self.cfg.num_insts_kv)
+        )
+
+    @consumer_work(returns=(old_max_arr, sum_arr, new_max_arr, s_arr))
+    @cute.jit
+    def compute_softmax_loop_with_memberships8(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        page_membership0: Uint32,
+        page_membership1: Uint32,
+        page_membership2: Uint32,
+        page_membership3: Uint32,
+        page_membership4: Uint32,
+        page_membership5: Uint32,
+        page_membership6: Uint32,
+        page_membership7: Uint32,
+    ) -> tuple[object, object, object, object]:
+        """``compute_softmax_loop_with_memberships`` for 32-page Keeps lanes."""
+        assert self.cfg.use_keeps_mma_ab and not self.cfg.streams_tmem_p_fragments
+        return self._compute_softmax_loop_keeps(
+            stage_info,
+            old_max_arr=old_max_arr,
+            sum_arr=sum_arr,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            page_memberships=(
+                page_membership0,
+                page_membership1,
+                page_membership2,
+                page_membership3,
+                page_membership4,
+                page_membership5,
+                page_membership6,
+                page_membership7,
+            ),
         )
 
     @consumer_work(returns=(old_max_arr, sum_arr, new_max_arr, s_arr))

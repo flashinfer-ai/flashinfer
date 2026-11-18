@@ -802,6 +802,9 @@ class FmhaDecodeConfig:
     # Private prepared-plan layout: eight query words per 32 page-4 IDs.
     # Legacy public membership tensors keep the default page-byte encoding.
     query_major_memberships: bool = False
+    # Page-major membership byte planes per route row: ceil(G / 8) for G9-G32
+    # routes; set by the QToken resolver from the planned G.
+    q_token_membership_planes: int = 1
     # None preserves each sparse family's default in raw/static configs too.
     share_pattern_across_kv_heads: bool | None = None
     # Allow the attention grid to acquire a programmatic launch dependency.
@@ -1042,6 +1045,19 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def page_membership_planes(self) -> int:
+        """Byte planes in a page-major membership row.
+
+        Groups of up to eight queries keep one membership byte per fragment.
+        Larger groups (G16, G32) use ceil(G / 8) byte planes, plane p holding
+        queries 8p..8p+7 at p / planes of the row, so every reader keeps its
+        byte extraction and only offsets the row.
+        """
+        if self.uses_q_token_kv_block_sparse_page_membership:
+            return self.q_token_membership_planes
+        return 1
+
+    @property
     def is_multi_token_q(self) -> bool:
         """Runtime Q domains retain general token indexing and masking."""
         return not self.fixed_seqlen or self.max_seq_len_q > 1
@@ -1076,7 +1092,8 @@ class FmhaDecodeConfig:
                 not self.fixed_seqlen
                 or 0
                 < self.max_seq_len_q
-                <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+                # Up to four byte planes hold G9-G32 (see page_membership_planes).
+                <= 4 * Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
             )
             and self.grouped_q_fits_tile
         )
@@ -1122,7 +1139,7 @@ class FmhaDecodeConfig:
             return False
         if self.use_keeps_mma_ab:
             return (
-                self.tile_size_q == 64
+                self.tile_size_q in (64, 128)
                 and self.tile_size_kv == 128
                 and self.num_tokens_per_page == 4
                 and not self.streams_tmem_p_fragments
@@ -1563,10 +1580,15 @@ class FmhaDecodeConfig:
         tile into registers and releases the stage before waiting for its BF16
         destination, so loading the next tile overlaps the conversion.
         """
+        # Separate-scale (SW128 payload) rings also capture with several raw
+        # stages: holding a raw stage until the BF16 destination frees (after
+        # the previous QK/PV) starved the loader; releasing it right after the
+        # LDS lets the ring run a full tile further ahead. Interleaved rows
+        # measured slower with capture.
         return (
             self.uses_keeps_transformed_kv
             and self.q_dtype_bytes == 2
-            and self.kv_stages == 1
+            and (self.kv_stages == 1 or self.uses_sw128_nvfp4_raw_payload)
         )
 
     @property

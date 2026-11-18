@@ -1328,6 +1328,104 @@ def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("group_size", "packed", "max_seq_len_kv"),
+    (
+        (16, False, 128 * 1024),
+        (32, True, 256 * 1024),
+        # The O(1) word-rank array would lower occupancy (G16) or not fit
+        # (G16 at 4M, G32 at 2M): the kernel walks the word summaries instead.
+        (16, False, 1024 * 1024 + 1),
+        (16, True, 4 * 1024 * 1024),
+        (32, False, 2 * 1024 * 1024),
+    ),
+)
+def test_wide_group_sort_union_long_context_matches_reference(
+    group_size: int,
+    packed: bool,
+    max_seq_len_kv: int,
+) -> None:
+    """G16/G32 bit-map unions over long prefixes match a host reference, plane by plane."""
+
+    (
+        blocks,
+        table,
+        requests,
+        positions,
+        storage_page_size,
+        qo_indptr,
+    ) = _make_wide_sort_union_case(group_size, packed, max_seq_len_kv)
+    outputs = tuple(
+        torch.full(shape, -7, dtype=torch.int32, device="cuda")
+        for shape in get_prims_ts_q_token_kv_block_sparse_metadata_output_shapes(
+            blocks.shape[0],
+            blocks.shape[1],
+            group_size,
+            num_query_groups=2,
+        )
+    )
+    indices, memberships, seq_lens = build_prims_ts_q_token_kv_block_sparse_metadata(
+        blocks,
+        table,
+        requests,
+        positions,
+        group_size=group_size,
+        storage_page_size=storage_page_size,
+        max_seq_len_kv=max_seq_len_kv,
+        qo_indptr=qo_indptr,
+        out=outputs,
+    )
+    blocks_host = blocks.cpu()
+    table_host = table.cpu()
+    positions_host = positions.cpu()
+    requests_host = requests.cpu()
+    rows, block_topk = blocks_host.shape
+    route_offsets = (
+        [0, group_size, rows] if qo_indptr is None else qo_indptr.cpu().tolist()
+    )
+    planes = (group_size + 7) // 8
+    plane_bytes = memberships.shape[1] // planes * 4
+    membership_bytes = memberships.cpu().contiguous().view(torch.uint8)
+    indices_host = indices.cpu()
+    seq_lens_host = seq_lens.cpu()
+    subpages_per_storage_page = storage_page_size // 4
+    for group in range(2):
+        first_row, group_end = route_offsets[group], route_offsets[group + 1]
+        membership_by_block: dict[int, int] = {}
+        for q_index in range(group_end - first_row):
+            row = first_row + q_index
+            visible_tokens = int(positions_host[row]) + 1
+            complete_pages = min(visible_tokens // 4, block_topk)
+            for logical_block in blocks_host[row, :complete_pages].tolist():
+                if 0 <= logical_block < visible_tokens // 4:
+                    membership_by_block[logical_block] = membership_by_block.get(
+                        logical_block, 0
+                    ) | (1 << q_index)
+            if visible_tokens % 4:
+                tail_block = visible_tokens // 4
+                membership_by_block[tail_block] = membership_by_block.get(
+                    tail_block, 0
+                ) | (1 << q_index)
+        union = sorted(membership_by_block.items())
+        last_tail = (int(positions_host[group_end - 1]) + 1) % 4
+        tail_padding = 0 if last_tail == 0 else 4 - last_tail
+        assert int(seq_lens_host[group]) == max(len(union) * 4 - tail_padding, 1)
+        for rank, (logical_block, membership) in enumerate(union):
+            storage_page, token_offset = divmod(logical_block * 4, storage_page_size)
+            request = int(requests_host[first_row])
+            locator = (
+                int(table_host[request, storage_page]) * subpages_per_storage_page
+                + token_offset // 4
+            )
+            assert int(indices_host[group, rank]) == locator, (group, rank)
+            for plane in range(planes):
+                assert (
+                    int(membership_bytes[group, plane * plane_bytes + rank])
+                    == (membership >> (8 * plane)) & 0xFF
+                ), (group, rank, plane)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("group_size", range(2, 9))
 @pytest.mark.parametrize("packed", (False, True))
 def test_query_major_memberships_graph(group_size: int, packed: bool) -> None:
@@ -2013,14 +2111,16 @@ def _run_private_q_token_kv_block_sparse_decode(
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
-    ("group_size", "segment_memberships", "expected_keeps"),
+    ("group_size", "num_qo_heads", "segment_memberships", "expected_keeps"),
     (
-        (2, (0b01, 0b10, 0b11, 0b01, 0b10), False),
-        (4, (0b0001, 0b0010, 0b0100, 0b1111, 0b1000), True),
+        (2, 8, (0b01, 0b10, 0b11, 0b01, 0b10), False),
+        (2, 12, (0b01, 0b10, 0b11, 0b01, 0b10), True),
+        (4, 12, (0b0001, 0b0010, 0b0100, 0b1111, 0b1000), True),
     ),
 )
 def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundaries(
     group_size: int,
+    num_qo_heads: int,
     segment_memberships: tuple[int, ...],
     expected_keeps: bool,
 ) -> None:
@@ -2029,14 +2129,15 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
     Every 32 page-four locators form one KV128 tile.  Using a different
     membership mask in each tile makes a split that restarts the membership
     pointer, or applies the locator stride to membership words, visibly route
-    pages to the wrong query.  Q2 covers the production SwapsMmaAb path and Q4
-    covers KeepsMmaAb; both resolve to a separate-reduction split-KV launch.
+    pages to the wrong query.  Eight-head Q2 (16 rows) covers the production
+    SwapsMmaAb path; twelve-head Q2 and Q4 (24 and 48 rows) cover KeepsMmaAb,
+    which D256 BF16 takes beyond 16 rows. All resolve to a separate-reduction
+    split-KV launch.
     """
 
     from flashinfer.attention.prims_ts import decode as decode_module
 
     batch_size = 1
-    num_qo_heads = 12
     num_kv_heads = 1
     head_dim = 256
     sparse_page_size = 4
@@ -2068,7 +2169,7 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
         False,
     )
     assert spec.config.use_keeps_mma_ab is expected_keeps
-    assert spec.config.tile_size_q == (64 if expected_keeps else 32)
+    assert spec.config.tile_size_q == (64 if expected_keeps else 16)
     # The exact first-wave fanout is device-capacity dependent; this test only
     # requires a real multi-split launch to exercise split-local addressing.
     assert spec.config.splits_kv == spec.config.max_splits_kv
