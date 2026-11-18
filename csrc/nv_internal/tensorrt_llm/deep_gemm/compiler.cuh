@@ -52,6 +52,21 @@ namespace deep_gemm::jit {
 // their first load and are launched with PDL).
 static constexpr char const* kKernelCacheVersion = "v1";
 
+// Name of a kernel's entry in the cache. Compiler::build writes entries under this name, and code
+// that only asks whether an entry exists has to build the same name, so both call this.
+// Simplified signature, no MD5 calculation; kKernelCacheVersion stands in for the source hash.
+inline std::string kernel_cache_name(uint32_t shape_n, uint32_t shape_k, uint32_t block_m,
+                                     uint32_t block_n, uint32_t block_k, uint32_t num_groups,
+                                     uint32_t num_stages, uint32_t num_tma_multicast,
+                                     deep_gemm::GemmType gemm_type, bool swapAB) {
+  return std::string(swapAB ? "gemm_swapAB_" : "gemm_") + kKernelCacheVersion + "_" +
+         std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_" + std::to_string(block_m) +
+         "_" + std::to_string(block_n) + "_" + std::to_string(block_k) + "_" +
+         std::to_string(num_groups) + "_" + std::to_string(num_stages) +
+         std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" +
+         std::to_string(num_tma_multicast) + "_" + gemm_type_to_string(gemm_type);
+}
+
 // Generate a unique ID for temporary directories to avoid collisions
 inline std::string generateUniqueId() {
   // Use current time and random number to generate a unique ID
@@ -264,15 +279,8 @@ class Compiler {
           sm_version);
     }
 
-    // Build signature - simplified, no MD5 calculation; kKernelCacheVersion stands in for the
-    // source hash
-    std::string name = std::string(swapAB ? "gemm_swapAB_" : "gemm_") + kKernelCacheVersion + "_" +
-                       std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_" +
-                       std::to_string(block_m) + "_" + std::to_string(block_n) + "_" +
-                       std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" +
-                       std::to_string(num_stages) + std::to_string(num_groups) + "_" +
-                       std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast) + "_" +
-                       gemm_type_to_string(gemm_type);
+    std::string name = kernel_cache_name(shape_n, shape_k, block_m, block_n, block_k, num_groups,
+                                         num_stages, num_tma_multicast, gemm_type, swapAB);
     std::filesystem::path path = getCacheDir() / name;
 
     // Check runtime cache or file system hit
