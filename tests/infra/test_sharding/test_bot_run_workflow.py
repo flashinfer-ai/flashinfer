@@ -362,6 +362,37 @@ class BotWorkflowTests(unittest.TestCase):
                     self.assertEqual(0, result.returncode, result.stderr)
                     self.assertEqual("authorized=true\n", output.read_text())
 
+    def test_generated_notes_never_contain_a_live_command(self):
+        # Model text reaches the note's reason line. Repeated "@"s must not
+        # survive mention stripping as a fresh command at the start of a line.
+        for reason in (
+            "@@flashinfer-bot run all",
+            "@@@FlashInfer-Bot rerun",
+            "@flashinfer-bot stop",
+            "prefix @@flashinfer-bot run tests/moe",
+        ):
+            with self.subTest(reason=reason):
+                prose = scope._public_prose(reason)
+                self.assertNotRegex(prose, r"(?i)@flashinfer-bot")
+                note = scope.TargetSelection(
+                    [], outcome="needs_maintainer", reason=prose
+                ).note("a" * 40)
+                with tempfile.TemporaryDirectory() as directory:
+                    output = Path(directory) / "output"
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", step("Parse command")],
+                        env=dict(
+                            os.environ,
+                            COMMENT_BODY=note,
+                            RUNNER_TEMP=directory,
+                            GITHUB_OUTPUT=str(output),
+                        ),
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(0, result.returncode, result.stderr)
+                    self.assertEqual("command=unknown\n", output.read_text())
+
     def test_parser_ignores_quoted_inline_fenced_and_prose_mentions(self):
         for body in (
             "> @flashinfer-bot run",
