@@ -8474,7 +8474,19 @@ def mm_mxfp8(
     if hasattr(runner, "is_tactic_compatible") and not (
         runner.supports_inputs(inputs) and runner.is_tactic_compatible(inputs, tactic)
     ):
-        runner, tactic = runners[0], -1
+        # Fall back to the first runner that accepts these inputs rather than
+        # runners[0] unconditionally: the specialized default refuses
+        # off-profile inputs in forward, so skipping it here keeps the
+        # fallback able to serve the call.
+        runner = next(
+            (
+                r
+                for r in runners
+                if not hasattr(r, "supports_inputs") or r.supports_inputs(inputs)
+            ),
+            runners[0],
+        )
+        tactic = -1
 
     runner(inputs=inputs, tactic=tactic)
     return out

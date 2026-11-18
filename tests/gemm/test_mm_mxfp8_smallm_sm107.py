@@ -72,6 +72,8 @@ def test_allowlist_is_well_formed():
     for m, n, k in shapes:
         assert 1 <= m <= 32, (m, n, k)
         assert k % 32 == 0, (m, n, k)
+        # the kernel's vector stores rely on 8-byte-aligned bf16 output rows
+        assert n % 4 == 0, (m, n, k)
     assert len(shapes) == 34
     for shape in _ON_LIST_SHAPES:
         assert shape in shapes, shape
@@ -91,6 +93,49 @@ def test_allowlist_is_well_formed():
         assert excluded not in shapes, excluded
 
 
+def _fp8_cpu_view(shape, offset):
+    """A contiguous fp8 CPU tensor whose data pointer sits `offset` bytes
+    into its storage (fresh allocations are 256-byte aligned, so `offset`
+    controls the pointer's alignment class)."""
+    n = shape[0] * shape[1]
+    base = torch.zeros(n + 256, dtype=torch.uint8)
+    return base[offset : offset + n].view(torch.float8_e4m3fn).view(shape)
+
+
+def test_offset_operand_view_declines_with_pointer_alignment(monkeypatch):
+    """The kernel's 32-byte ldg256 operand loads require aligned pointers;
+    a contiguous view into offset storage must be declined CPU-side."""
+    monkeypatch.delenv(_DISABLE_ENV, raising=False)
+    m, n, k = 4, 6144, 384
+    a = _fp8_cpu_view((m, k), 16)
+    b = _fp8_cpu_view((n, k), 0).t()
+    out = torch.empty(m, n, dtype=torch.bfloat16)
+    sf = torch.zeros(_swizzled_sf_numel(max(m, n), k), dtype=torch.uint8)
+    assert (
+        specialized._common_supported(a, b, sf, sf, out, torch.bfloat16, False)
+        == "pointer_alignment"
+    )
+    # aligned control: the same metadata with offset 0 passes this guard
+    a0 = _fp8_cpu_view((m, k), 0)
+    assert (
+        specialized._common_supported(a0, b, sf, sf, out, torch.bfloat16, False)
+        != "pointer_alignment"
+    )
+
+
+def test_strided_scale_declines_with_scale_layout():
+    """A strided 1D scale view passes the ndim/dtype checks but interleaves
+    foreign bytes; the layout guard must decline it CPU-side."""
+    m, n, k = 4, 6144, 384
+    a = _fp8_cpu_view((m, k), 0)
+    b = _fp8_cpu_view((n, k), 0).t()
+    sf = torch.zeros(2 * _swizzled_sf_numel(n, k), dtype=torch.uint8)
+    strided = sf[::2]
+    assert (
+        specialized._layout_supported(a, b, strided, strided, False) == "scale_layout"
+    )
+
+
 def test_backends_declaration():
     assert MM_MXFP8_BACKENDS[0] == "auto"
     assert "specialized" in MM_MXFP8_BACKENDS
@@ -105,9 +150,27 @@ def test_backends_declaration():
 
 
 def test_swizzled_sf_numel_matches_quantizer_padding():
-    for rows, k in [(1, 384), (24, 6144), (32, 1024), (6144, 384), (768, 6144)]:
+    for rows, k in [
+        (1, 384),
+        (24, 6144),
+        (32, 1024),
+        (6144, 384),
+        (768, 6144),
+        (4, 576),  # 18 scale columns pad to 20
+    ]:
         expected = ((rows + 127) // 128 * 128) * ((k // 32 + 3) // 4 * 4)
         assert _swizzled_sf_numel(rows, k) == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_swizzled_sf_numel_matches_quantizer_buffer():
+    """The helper must agree with the scale buffer mxfp8_quantize actually
+    returns: a padded class (K=576, 18 scale columns pad to 20) and an
+    unpadded control (K=384)."""
+    for rows, k in [(4, 576), (4, 384)]:
+        x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16)
+        _, sf = mxfp8_quantize(x, sf_swizzle_layout=SfLayout.layout_128x4)
+        assert sf.numel() == _swizzled_sf_numel(rows, k), (rows, k, sf.numel())
 
 
 def _reference_swizzle(lin, rows, k):
