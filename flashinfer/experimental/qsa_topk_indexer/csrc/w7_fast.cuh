@@ -19,6 +19,13 @@
 
 namespace w7n {
 
+// Surface a rejected launch through TVM FFI instead of returning normally
+// with the output partially written. Never synchronizes successful launches.
+static inline void w7_check_launch(cudaError_t st, const char* what) {
+  TVM_FFI_ICHECK(st == cudaSuccess)
+      << "qsa_topk_indexer: " << what << " launch failed: " << cudaGetErrorString(st);
+}
+
 #define W7_QROW 36    // padded query rows stay conflict free
 #define W7_KROW 32    // compact key rows use an XOR chunk swizzle
 #define W7_GM 8       // tokens owned by one CTA
@@ -293,8 +300,12 @@ __device__ __forceinline__ void w7_fill_prefix_body(const int* __restrict__ cu, 
   if (tid >= pair_threads) return;
 
   const int n = min(W7_FKTHR * PT, items - g0);
-  const int lead = begin & 1;  // rows are 16 B mod 32 B aligned
   int4* const dst = out4 + (size_t)begin * W7_RW;
+  // Peel until the paired v8.b32 stores are 32 B aligned, derived from the
+  // ACTUAL first destination address: rows are 16 B mod 32 B (odd int4
+  // count), and a contiguous output view whose base is 16 mod 32 passes the
+  // Python checks, so `begin & 1` alone is not a valid alignment proxy.
+  const int lead = (int)((reinterpret_cast<uintptr_t>(dst + g0) >> 4) & 1);
   if (tid == 0 && lead) w7st(dst + g0, w7rowval(g0 % W7_RW, g0 / W7_RW + 1));
 
   const int npair = (n - lead) >> 1;
@@ -1101,10 +1112,17 @@ static inline void Run(const uint8_t* qi, const uint8_t* ck, const int* cu, cons
     w7_score<false><<<grid, W7_NTHR, smem, stream>>>(qi, ck, cu, B, T, cpb, out, ntile, fused_gx);
   }
 #else
+  // A rejected scored launch must surface as an error: an already-pending
+  // identity fill would otherwise let Python return a partially written
+  // buffer as a successful dispatch.
   if (B == 2)
-    cudaLaunchKernelEx(&config, w7_score<true>, qi, ck, cu, B, T, cpb, out, ntile, fused_gx);
+    w7_check_launch(
+        cudaLaunchKernelEx(&config, w7_score<true>, qi, ck, cu, B, T, cpb, out, ntile, fused_gx),
+        "w7_score<true>");
   else
-    cudaLaunchKernelEx(&config, w7_score<false>, qi, ck, cu, B, T, cpb, out, ntile, fused_gx);
+    w7_check_launch(
+        cudaLaunchKernelEx(&config, w7_score<false>, qi, ck, cu, B, T, cpb, out, ntile, fused_gx),
+        "w7_score<false>");
 #endif
 }
 

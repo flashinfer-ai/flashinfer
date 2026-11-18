@@ -19,6 +19,13 @@
 
 namespace ffi = tvm::ffi;
 
+// Surface a rejected launch through TVM FFI instead of returning normally
+// with the output partially written. Never synchronizes successful launches.
+static inline void qsa_check_launch(cudaError_t st, const char* what) {
+  TVM_FFI_ICHECK(st == cudaSuccess)
+      << "qsa_topk_indexer: " << what << " launch failed: " << cudaGetErrorString(st);
+}
+
 #define CR 4
 #define BLOCK_TOPK 512
 #define PWIDTH 2052
@@ -328,6 +335,10 @@ __global__ __launch_bounds__(NTHR, 1) void qsa_slow(const uint8_t* __restrict__ 
           uint32_t prefix = 0u, pmask = 0u;
           int k = BLOCK_TOPK;
           for (int shift = 24; shift >= 0; shift -= 8) {
+            // Order the previous digit's h[] resolution reads (lane L) before
+            // any lane clears the bins: the shuffles between them do not
+            // order shared-memory accesses.
+            __syncwarp();
             for (int i = lane; i < 256; i += 32) h[i] = 0;
             __syncwarp();
             for (int v = lane; v < vis; v += 32) {
@@ -471,9 +482,13 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlen
     config.stream = stream;
     config.attrs = &attr;
     config.numAttrs = 1;
-    cudaLaunchKernelEx(&config, qsa_slow<3>, (const uint8_t*)qi.data_ptr(),
-                       (const uint8_t*)ck_cache.data_ptr(), cu, B, T,
-                       (const int*)cpage_base.data_ptr(), scap, out);
+    // A rejected scored launch must not return as a successful dispatch:
+    // rows past the identity writer's range would stay unwritten while the
+    // Python wrapper counts the call served.
+    const cudaError_t st = cudaLaunchKernelEx(&config, qsa_slow<3>, (const uint8_t*)qi.data_ptr(),
+                                              (const uint8_t*)ck_cache.data_ptr(), cu, B, T,
+                                              (const int*)cpage_base.data_ptr(), scap, out);
+    qsa_check_launch(st, "qsa_slow");
   }
 }
 

@@ -246,6 +246,10 @@ void Run(ffi::TensorView qi, ffi::TensorView ck_cache, ffi::TensorView cu_seqlen
   if (total_tokens <= 0) return;
   const int batch = static_cast<int>(cpage_base.shape()[0]);
 
+  // Every launch below targets the stream of packed's device: make that
+  // device current for the whole dispatch (the calling thread may have a
+  // different GPU current, and the Python entry point sets no device).
+  ffi::CUDADeviceGuard device_guard(packed.device().device_id);
   cudaStream_t stream =
       static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, packed.device().device_id));
   const int* cu = static_cast<const int*>(cu_seqlens.data_ptr());

@@ -103,8 +103,13 @@ __global__ __launch_bounds__(NT) void qf_req(const int* __restrict__ cu, int* __
   const int r = blockIdx.x;
   const int beg = cu[r], end = cu[r + 1];
   // A v8.b32 store requires 32-byte alignment.  Each row is 8208 bytes, so
-  // the paired-row path is aligned exactly when the first token is even.
-  if (end == beg + 2 && (beg & 1) == 0) {
+  // with a 32 B-aligned output base the paired-row path is aligned exactly
+  // when the first token is even. The Python API accepts contiguous views
+  // whose base is 16 mod 32, so check the ACTUAL destination address and
+  // take the generic int4 path below when it is not 32 B aligned.
+  const bool pair_aligned =
+      ((reinterpret_cast<uintptr_t>(out) + (size_t)beg * (size_t)(QF_RW * 16)) & 31) == 0;
+  if (end == beg + 2 && (beg & 1) == 0 && pair_aligned) {
     int4* o0 = (int4*)(out + (size_t)beg * (QF_RW * 4));
     int4* o1 = o0 + QF_RW;
     if constexpr (NT == 128) {
