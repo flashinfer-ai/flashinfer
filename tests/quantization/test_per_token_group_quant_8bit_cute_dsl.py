@@ -88,6 +88,9 @@ def _eligible(x, group_size=128, dst_dtype=torch.float8_e4m3fn, cms=False):
 def test_specialized_matches_reference(shape, backend):
     torch.manual_seed(42)
     x = torch.empty(shape, device="cuda", dtype=torch.bfloat16).uniform_(-2.0, 2.0)
+    # bf16-exact absmax where the reciprocal-multiply scale differs from the
+    # IEEE quotient by one fp32 ulp (fl32(255 * fl32(1/448)) != fl32(255/448)).
+    x.view(-1)[0] = 255.0
     assert _eligible(x)
 
     _reset_per_token_group_quant_stats()
@@ -142,6 +145,10 @@ def test_kill_switches_match_stock(monkeypatch, env):
     _skip_unless_stock_cutile_usable()
     torch.manual_seed(7)
     x = torch.empty((64, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-3, 3)
+    # One group with bf16-exact absmax 255: its specialized scale
+    # (reciprocal multiply) differs from the stock IEEE quotient by one ulp,
+    # which the tolerance below covers.
+    x.view(-1)[0] = 255.0
 
     fast_q, fast_s = per_token_group_quant_8bit(x, 128, backend="specialized")
 
@@ -280,3 +287,46 @@ def test_specialized_cuda_graph_matches_eager():
     torch.testing.assert_close(
         graph_q.view(torch.uint8), eager_q.view(torch.uint8), rtol=0, atol=0
     )
+
+
+@requires_fast_path
+def test_cold_graph_capture_auto_falls_back_with_dedicated_reason(monkeypatch):
+    """A not-yet-compiled specialized variant cannot JIT under CUDA graph
+    capture; backend='auto' records the stock cutile kernel into the graph
+    under the dedicated reason 'capturing_before_jit' (not a generic
+    jit_or_launch_failure), and the failure memo is not set, so later eager
+    calls still take the specialized path."""
+    _skip_unless_stock_cutile_usable()
+    from flashinfer.quantization.kernels.cute_dsl import (
+        per_token_group_quant_8bit_cute_dsl as _mod,
+    )
+
+    torch.manual_seed(9)
+    x = torch.empty((8, 2560), device="cuda", dtype=torch.bfloat16).uniform_(-2, 2)
+    # Warm the stock path so the capture below replays a compiled kernel.
+    per_token_group_quant_8bit(x, 128, backend="cutile")
+    torch.cuda.synchronize()
+
+    # Force a cold specialized variant for this capture.
+    monkeypatch.setattr(_mod, "_CACHE", {})
+    _reset_per_token_group_quant_stats()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        graph_q, graph_s = per_token_group_quant_8bit(x, 128, backend="auto")
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 0, "stock": 1}
+    assert _ptgq_stats["fallback_reasons"] == {"capturing_before_jit": 1}
+
+    x.uniform_(-3, 3)
+    g.replay()
+    torch.cuda.synchronize()
+    eager_q, eager_s = per_token_group_quant_8bit(x, 128, backend="cutile")
+    torch.testing.assert_close(graph_s, eager_s, rtol=0, atol=0)
+    torch.testing.assert_close(
+        graph_q.view(torch.uint8), eager_q.view(torch.uint8), rtol=0, atol=0
+    )
+
+    # The capture-time refusal must not trip the process-level failure memo:
+    # an eager auto call afterwards runs the specialized kernel again.
+    _reset_per_token_group_quant_stats()
+    per_token_group_quant_8bit(x, 128, backend="auto")
+    assert _ptgq_stats["backend_dispatches"] == {"specialized": 1, "stock": 0}
