@@ -960,6 +960,12 @@ __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
   FLIST_DECL;
   int f_own = 0;
   int phA = 0, phAb = 0, phM0 = 0, phM1 = 0, phMw = 0, phAx = 0, phBx = 0;
+  // Non-fused B-stage phases, carried across persistent segments as two
+  // scalars (barriers are initialized exactly once per kernel: PTX makes
+  // mbarrier.init on a still-valid barrier undefined behavior, so segments
+  // must carry phases rather than re-initialize, and two scalars keep the
+  // dynamically indexed phase array out of the critical scorer).
+  int phB0 = 0, phB1 = 0;
   int phB[STAGES];
   if constexpr (FUSED) {
 #pragma unroll
@@ -967,17 +973,6 @@ __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
   }
 
   while (FUSED ? (pos < hi) : (hot_pos < hot_hi)) {
-    // Non-fused paths retire every B-stage transfer before the segment
-    // rendezvous, so restart the two barriers and derive parity from the
-    // segment-local iteration.  This removes the dynamically indexed
-    // phase array from the critical scorer without changing fused W6.
-    if constexpr (!FUSED) {
-      if (warp == 0 && elect_one()) {
-        mbar_init(barB, 1);
-        mbar_init(barB + 8, 1);
-        asm volatile("fence.mbarrier_init.release.cluster;");
-      }
-    }
     int nb, tile_units, qbase, nqt, krow0;
     if constexpr (USE_W1_BOUNDARIES) {
       // All W1 scored tiles are full 256-query tiles.  Tile t sees
@@ -1152,7 +1147,12 @@ __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
           mbar_wait(barB + buf * 8, phB[buf]);
           phB[buf] ^= 1;
         } else {
-          mbar_wait(barB + buf * 8, (i / STAGES) & 1);
+          mbar_wait(barB + buf * 8, buf ? phB1 : phB0);
+          if (buf) {
+            phB1 ^= 1;
+          } else {
+            phB0 ^= 1;
+          }
         }
         // Accumulator 0 is free again once its previous epilogue
         // retired.  The issuer and the drain warps reach this barrier
