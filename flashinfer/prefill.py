@@ -9807,6 +9807,32 @@ def trtllm_batch_context_with_kv_cache(
 # its own.
 BATCH_CONTEXT_BACKENDS = ("auto", "specialized", "trtllm", "cake")
 
+# Defaults of trtllm_batch_context_with_kv_cache's optional parameters, for
+# the front's keyword fast path (kept in sync with the entry's signature;
+# the positional slow path binds the real signature).
+_BATCH_CONTEXT_DEFAULTS = dict(
+    window_left=-1,
+    out=None,
+    out_dtype=None,
+    o_sf_scale=None,
+    o_sf_vec_size=None,
+    kv_layout="HND",
+    enable_pdl=None,
+    sinks=None,
+    kv_cache_sf=None,
+    skip_softmax_threshold_scale_factor=None,
+    uses_shared_paged_kv_idx=True,
+    causal=True,
+    lse=None,
+    return_lse=False,
+    multi_ctas_kv_counter_buffer=None,
+    use_fp16_softmax=None,
+    uses_spcompress=None,
+    window_right=-1,
+    variable_window_token_starts=None,
+    variable_window_token_ends=None,
+)
+
 
 def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
     """Generalized batch-context (chunked-prefill) attention over paged KV.
@@ -9832,15 +9858,22 @@ def batch_context_with_kv_cache(*args, backend: str = "auto", **kwargs):
             f"backend must be one of {BATCH_CONTEXT_BACKENDS}, got {backend!r}"
         )
     if backend in ("auto", "specialized"):
-        import inspect as _inspect
-
         from .gqa_ctx_fp8_ikv_cuda import maybe_dispatch_specialized as _mds
 
-        bound = _inspect.signature(trtllm_batch_context_with_kv_cache).bind(
-            *args, **kwargs
-        )
-        bound.apply_defaults()
-        a = bound.arguments
+        if args:
+            # positional usage: full signature bind (slow path)
+            import inspect as _inspect
+
+            bound = _inspect.signature(trtllm_batch_context_with_kv_cache).bind(
+                *args, **kwargs
+            )
+            bound.apply_defaults()
+            a = dict(bound.arguments)
+        else:
+            # keyword usage (the serving call form): defaults + kwargs,
+            # no inspect machinery on the hot path
+            a = dict(_BATCH_CONTEXT_DEFAULTS)
+            a.update(kwargs)
         served = _mds(
             backend=backend,
             query=a["query"],
