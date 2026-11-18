@@ -318,9 +318,12 @@ def test_generalized_entry_parity_and_dispatch():
     stock_o, stock_l = ragged_attention_deepseek(**{**kwargs, "backend": "trtllm-gen"})
     ds_o, ds_l = _api(inp, backend="trtllm-gen")
     assert torch.equal(stock_o, ds_o) and torch.equal(stock_l, ds_l)
-    # return_lse=False parity through the front
+    # return_lse=False parity through the front: this call form leaves the
+    # specialized allowlist (it keeps the stock path), so compare the front
+    # against the direct entry at the SAME arguments, not against gen_o
     gen_only = ragged_attention_deepseek(**{**kwargs, "return_lse": False})
-    assert torch.equal(gen_only, gen_o)
+    direct_only = _api(inp, return_lse=False)
+    assert torch.equal(gen_only, direct_only)
     # invalid backend raises through the front too
     with pytest.raises(ValueError, match="backend must be one of"):
         ragged_attention_deepseek(**{**kwargs, "backend": "bogus"})
