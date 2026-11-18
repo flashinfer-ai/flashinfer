@@ -8706,10 +8706,6 @@ def trtllm_ragged_attention_deepseek(
     check_trtllm_gen_sm107_only_feature(
         uses_spcompress, "uses_spcompress", query.device
     )
-    if backend not in ("trtllm-gen", "cute-dsl"):
-        raise ValueError(
-            f"backend must be one of ('trtllm-gen', 'cute-dsl'), got {backend!r}"
-        )
     if backend != "cute-dsl" and not is_causal and window_left >= 0:
         raise NotImplementedError(
             "trtllm-gen ragged attention requires a right-window bound for non-causal "
