@@ -10,7 +10,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
-# These cases source the Linux CI helpers in scripts/jit_cache_build_common.sh,
+# These cases source the Linux CI helpers in scripts/infra/jit_cache_build_common.sh,
 # which rely on POSIX tools that the bash shipped on native Windows lacks.
 requires_posix_bash = pytest.mark.skipif(
     sys.platform == "win32", reason="sources Linux CI bash scripts"
@@ -43,7 +43,7 @@ def cuda_config_module():
 @pytest.fixture
 def wheel_index_module():
     name = "_test_update_whl_index"
-    module = _load_module(name, REPO_ROOT / "scripts" / "update_whl_index.py")
+    module = _load_module(name, REPO_ROOT / "scripts" / "infra" / "update_whl_index.py")
     try:
         yield module
     finally:
@@ -52,7 +52,7 @@ def wheel_index_module():
 
 @pytest.fixture
 def release_verifier_module():
-    scripts_dir = REPO_ROOT / "scripts"
+    scripts_dir = REPO_ROOT / "scripts" / "infra"
     name = "_test_verify_jit_cache_provider_release"
     sys.path.insert(0, str(scripts_dir))
     module = _load_module(name, scripts_dir / "verify_jit_cache_provider_release.py")
@@ -105,7 +105,7 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
 @pytest.mark.cpu_only
 @requires_posix_bash
 def test_jit_cache_python_setup_hardens_incomplete_downloads(tmp_path):
-    common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
+    common_script = REPO_ROOT / "scripts" / "infra" / "jit_cache_build_common.sh"
     fake_python = tmp_path / "python"
     invocation_log = tmp_path / "python-invocations"
     fake_python.write_text(
@@ -143,7 +143,7 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
 @requires_posix_bash
 @pytest.mark.parametrize("cuda_version", ["13.0", "130", "13.4", "134", "14.0"])
 def test_sccache_uses_release_for_all_cuda_versions(cuda_version):
-    common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
+    common_script = REPO_ROOT / "scripts" / "infra" / "jit_cache_build_common.sh"
     script = f"""
 set -euo pipefail
 source "{common_script}"
@@ -307,7 +307,7 @@ def test_shim_builds_on_runner_without_builder_image():
     assert any(
         str(step.get("uses", "")).startswith("actions/setup-python@") for step in steps
     )
-    assert build["run"] == "bash scripts/build_jit_cache_shim_wheel.sh"
+    assert 'bash "${INFRA_DIR}/build_jit_cache_shim_wheel.sh"' in build["run"]
     assert "DOCKER_IMAGE" not in build["env"]
     assert "PYTORCH_INDEX" not in build["env"]
 

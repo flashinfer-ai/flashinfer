@@ -67,6 +67,7 @@ systems with 36 NVLink ports per GPU, before launching MegaMoE.
 | `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper` | `backend="auto", batch_invariant=True` (constructor) | `attention.bf16` per head dim: 128-key tiles and 512-key chunks on the absolute KV axis, the online softmax step and the chunk merge of `attention/batch_invariant/spec.py`; `fingerprint(<wrapper name>, head_dim=...)`. The three wrappers (prefill and decode, paged and ragged KV) compute one class: a token's bits depend on its KV position, head and window alone | bf16 q / K / V / out; head dim 64 / 128 / 256; GQA (`num_qo_heads` a multiple of `num_kv_heads`, up to 128 per group); causal (bottom-right aligned) with an optional `window_left`; page sizes 1..128 (powers of two); NHD / HND. CUDA graphs: capture `run()` after `plan()`; a replay reproduces the planned batch and a new `plan()` needs a new capture (`use_cuda_graph=True` raises). `plan()` runs a host-side planner (of the order of 10 us per request). Not: soft cap, custom masks, fused RoPE, non-causal prefill, fp8 / fp4 KV, q / k / v scales, LSE output, sinks |
 | `MoELayer` with `BatchInvariantBf16Config` (`flashinfer.fused_moe`) | `MoEConfig(..., backend=BackendOptions((BatchInvariantBf16Config(),)))`: named explicitly, never a default candidate (alone in the candidates the layer skips its shootout) | one class per typed activation of the layer (gated, on the (gate, up) pair: `SwiGLU` with any `alpha` / `beta` / `limit`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `SiTU`, `PowLU`; ungated, on one accumulator: `ReLU2`, `Identity`, `GELU`, `ReLU`, `SiLU`; the activation's scalars are binary32 constants of the chain, so a parameter set is a class): the class's own routing (the declared `exp`, the strict selection order `(score desc, index asc)` on exact binary32 scores, the method's weight formula; a NaN logit is skipped by the row maximum, contributes `+0` to the softmax sum and is never selected), the deterministic permutation of the expanded rows (expert order, then token-slot order), the two grouped GEMMs as placements of the unsplit member of the dense class, `gemm.bf16.kfold` at `K=H` / `K=I` (per expert one fp32 fold over all of K whatever the weight shape: the dense operator's chunk rule, which runs `gemm.bf16.kchunk[C]` for a narrow weight, does not apply, so `mm_bf16(batch_invariant=True)` on one expert's weight reproduces these bits only where that rule leaves K unsplit; the gate / up pair of a SwiGLU term in one thread's fragment; the chain's declared arithmetic on the fp32 accumulators: `cvt_bf16(mul(silu(g), u))` for the default `SwiGLU`, every sigmoid / tanh through the declared `exp`, GELU / GeGLU through a declared `erf`, PowLU through a declared `log` and the correctly rounded `sqrt`, the clamps as `fmin` / `fmax`), and the slot-order fp32 combine `cvt_bf16(fold_r add(acc, mul(y_r, w_r)))`; `fingerprint("fused_moe", H=, I=, top_k=, num_experts=, method=, act=, n_group=, topk_group=)` (`method` a `RoutingMethodType` the class implements, the groups for `DeepSeekV3`'s group-limited selection, `act` an `ActivationConfig` of the layer or `"swiglu"` / `"relu2"`) | bf16 `hidden_states (T, H)`, `H` and `I` multiples of 8, `1 <= top_k <= min(E, 16)`, `E <= 1024`; routing from logits (`RoutingInputMode.FromLogits`: fp32 or bf16 `(T, E)` logits, methods `Default`, `Renormalize`, `RenormalizeNaive`, `Sigmoid`, `SigmoidRenorm`, `TopK` (the logits as weights), `Llama4` (`top_k = 1`) and `TopKSigmoid` (the sigmoid of the chosen logits as weights), `DeepSeekV3` with or without expert groups (`n_group` dividing `E` into groups of at least two experts, `1 <= topk_group <= n_group <= 16`, `top_k <= topk_group * E / n_group`: the group score is the sum of a group's two largest biased scores), a bias exactly for the methods that select on `sigmoid(l) + bias`) or pre-routed ids and weights (`PackedPrecomputed` / `UnpackedPrecomputed`, bf16 or fp32 weights; any `RoutingConfig`, since the selection is the caller's: a routing term the from-logits mode has no class for is refused at a from-logits call, not at construction); weights from `BatchInvariantBf16Config.prepare_weights(w1 [E, 2I, H] (rows up, gate) or [E, I, H] for the ungated activations, w2 [E, H, I], activation=...)` with `E` the local experts of a shard; bf16 output, or with `do_finalize=False` the layer's triple `[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]` (the rows in the class's permutation, the weights as the combine folds them -- fp32 from logits, where the other backends return bf16: the fold widens a bf16 weight exactly, so a receiver that needs bf16 rounds them itself -- and the flat map with `-1` at a dropped slot: the class's slot-order fold over it is the finalized output bit for bit, as the public op `fused_moe.batch_invariant.api.combine_unfinalized(*triple)` computes it; `use_fused_finalize` is ignored); expert-parallel shards (`ExpertConfig.local_expert_offset` / `local_num_experts`: the rank's output is the dense fold restricted to its experts, the other slots dropped; the receiver's slot-order fold over the ranks' unfinalized rows is the dense output, the fixed-order sum of finalized partials the split path's within-placement form); no fused shared experts. SM100 / SM103 / SM107 |
 | `MoELayer` with `BatchInvariantFp8PerTensorConfig` under `QuantConfig(FP8PerTensor, FP8PerTensor)` (`flashinfer.fused_moe`) | `MoEConfig(..., quant=QuantConfig(weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor), backend=BackendOptions((BatchInvariantFp8PerTensorConfig(),)))`: named explicitly, never a default candidate | the fp8 per-tensor (W8A8) classes `moe.e4m3.<act>`, one per typed activation and parameter set as the bf16 backend: the bf16 classes' routing (every method and group form of the bf16 row), permutation and slot-order combine; the two grouped GEMMs as placements of the dense fp8 class `gemm.e4m3.kfold[K=H]` / `[K=I]` (the 32-wide fp8 step); the static per-tensor scales in FlashInfer's multiplier convention (`q = x * s`), the class's dequantization scales their correctly rounded reciprocals formed once at preparation, the per-tile alpha `mul(s_a, s_w[e])` formed on the device; GEMM1's fused quantization `cvt.rn.satfinite.e4m3(mul(act(alpha-scaled accumulators), intermediate_scale_global))` (the activation chain of the bf16 class on the dequantized fp32 accumulators, no bf16 rounding, the activation's scalars in dequantized units) and GEMM2's `cvt_bf16(mul(acc, mul(s_inter, s_w2[e])))`; `fingerprint("fused_moe_fp8", H=, I=, top_k=, num_experts=, method=, act=, n_group=, topk_group=)` (the dimensions of `fused_moe`; the scales' values are inputs, not dimensions) | e4m3 `hidden_states (T, H)` from `BatchInvariantFp8PerTensorConfig.prepare_activations(x_bf16, hidden_states_scale_global=)` (no activation scale tensor), `H` and `I` multiples of 16, `1 <= top_k <= min(E, 16)`, `E <= 1024`; the routing modes, methods and groups of the bf16 backend through the same route kernels (its NaN-logit rule included; a term outside the from-logits classes is refused at the from-logits call, so a pre-routed layer builds under any `RoutingConfig`); weights from `BatchInvariantFp8PerTensorConfig.prepare_weights(w1 [E, 2I, H] (rows up, gate) or [E, I, H], w2 [E, H, I], hidden_states_scale_global=, intermediate_scale_global=, activation=...)` (the experts quantized here with one `448 / amax` multiplier per expert and GEMM); bf16 output; `do_finalize=True` only (the unfinalized triple is refused) and dense expert placement only (`local_expert_offset` / `local_num_experts` shards are refused: the class's EP form is not part of this backend); no fused shared experts. SM100 / SM103 / SM107 |
+| `chunk_gated_delta_rule` | `backend="auto", batch_invariant=True` | `gdn.bf16.c64`: the native SM100 / SM103 / SM107 chunked GDN prefill kernel without context parallelism (64-token chunks, fp32 state, log-domain gates, the Q / K l2-norm); decode computes row `p` of that kernel from rows cached since the last chunk boundary (a step kernel that issues the same tensor-core folds as `mma.sync`), so decode row `p` is prefill row `p` and prefill, chunked prefill, decode and multi-token steps are one class; `fingerprint("chunk_gated_delta_rule")` (no dimension) | bf16 packed q / k `[T, HQ, 128]` and v `[T, HV, 128]` with `HV` a multiple of `HQ`, fp32 log gates `g` and fp32 `beta` `[T, HV]` (`gate_domain="log"`), `use_qk_l2norm_in_kernel=True`; the state an fp32 pool `[slots, HV, 128, 128]` addressed by int32 `state_indices` and updated in place (a slot holds the state at the last 64-token boundary; the rows since it live next to the pool); a call with one token per sequence is a decode step, a call with more tokens is a prefill from the slot's state as a chunk boundary, and `prefix_lens` continues an open chunk (multi-token steps, pieces cut anywhere); `cu_seqlens` / `cu_seqlens_cpu`, `output`, `output_final_state` (the pool). CUDA graphs: a decode step over fixed buffers is capturable once no slot of the pool is waiting for its rebuild, i.e. after one eager decode step (or call of fewer than 64 tokens per sequence) on every slot prefilled since (while a slot the pool addresses waits, capturing a step raises). Not: `use_cp`, checkpoints, `output_state_indices`, the fused gate (`A_log` / `dt_bias` / `beta_is_logit`), linear-domain gates, a bf16 or fp16 state, fp16 activations, other head sizes. SM100 / SM103 / SM107 |
 
 ## The dispatcher and the launch grid
 
@@ -356,3 +357,97 @@ threshold) and the kept mass tree's placement invariance (`mass_invariance`); th
 procedures on concrete pattern lists against the Python reference and the conformance executable prints the mass and
 renormalisation terms. Exact CPU model: `sampling/support_reference.py`. Tests: the model's properties, the dispatcher's
 membership and the placement pins in `tests/utils/test_batch_invariant_sampling_draw_support.py`.
+
+## Linear attention (GDN)
+
+`flashinfer.chunk_gated_delta_rule(q, k, v, g, beta, initial_state=<fp32 pool>, state_indices=, cu_seqlens=,
+use_qk_l2norm_in_kernel=True, gate_domain="log", batch_invariant=True)` runs one class, `gdn.bf16.c64`, for every
+phase. The term is a kernel FlashInfer already ships: the chunked GDN prefill of
+`gdn_kernels/blackwell/gated_delta_net_chunked.py` without context parallelism, which is deterministic, batch-invariant
+and prefix-stable, and whose fp32 state at a multiple of 64 tokens is an exact resume point. The operator's other
+routes (the context-parallel programs `auto` picks at low parallelism, cuDNN, Cake) compute different bits; the class
+never takes them. Today's GDN decode kernels run a per-token recurrence whose bits differ from the prefill's, so a
+token's decode output and its prefill output disagree; the class is what the mode promises instead.
+
+A decode step does not update the state token by token. The pool slot holds the state at the sequence's last chunk
+boundary; the class keeps, next to the pool and keyed by the pool's storage, the rows of the open chunk's solve that
+row `p` depends on (the normalized keys, the log2 gates and betas, the M and X rows of the blocked inverse, the VKS
+and NV rows), a bf16 copy of the boundary state and the open-row count. The step kernel
+(`include/flashinfer/gdn/batch_invariant_decode.cuh`, one CTA per (request, v-head), one launch per step) computes row
+`p` of the prefill from them: every tensor-core product of the prefill is a tcgen05 `kind::f16` fold, and the bf16
+`mma.sync.aligned.m16n8k16` fold with the same operands, k-order and starting accumulator gives the same fp32 bits at
+every stage shape, so the step issues them as `mma.sync` from registers and repeats the prefill's scalar epilogues
+operation for operation (the file is built without fast math and with `-fmad=false`; the one fused multiply-add is the
+prefill's own, in the 8 x 8 Gauss-Jordan). The 64th row of a chunk folds the next boundary state and writes it to the
+pool. The step reads its count on the device and nothing on the host.
+
+Calls with several tokens per sequence take placements of the same term, chosen by the call's shape alone
+(`spec.STEP_MAX_TOKENS`). A call whose sequences bring fewer than 64 tokens is one launch of the step kernel's span
+form: it appends each sequence's run of rows to its slot in a loop, with the open chunk's tiles resident in shared
+memory, commits a chunk inside the loop when a run crosses a boundary, and checks `prefix_lens` against the slot's
+count on the device, so it reads nothing on the host and can be captured in a CUDA graph (with 64 or more tokens in
+the call, pass `cu_seqlens_cpu`: without it the offsets are read from the device). A sequence whose
+`prefix_lens` is not where its slot's open chunk ends gets NaN rows and its slot is left as it was, as for a slot index
+outside the pool: never another sequence's bits. A call that brings whole chunks runs them through the prefill kernel:
+from chunk boundaries it is one prefill call in place over the caller's tensors, which also returns the rows of the
+open tails and stores each sequence's last boundary state as a checkpoint in its pool slot. Such a call reads its slot
+indices on the host and refuses a repeated or out-of-range slot before anything is written (inside a CUDA graph
+capture a whole-chunk prefill does not read them and trusts the caller). One more launch keeps the
+tails' raw rows next to the pool; their cached rows are built by one span launch before the slot's next step. Until
+then the slot's count cell is negative and a step launched without that rebuild (a captured graph) returns NaN rows
+for the slot. While any slot of the pool waits for its rebuild, the pool's next step or span call starts with that
+rebuild; a slot restarted since is skipped on the device, and nothing is read on the host. Such a call cannot be captured
+in a CUDA graph and raises, whichever slots it touches: a tail waiting in one slot blocks the capture of a step on
+another, so run one eager call on the pool between a ragged prefill and a capture. The first call on a pool allocates
+the state next to it and cannot be captured either (it raises). A sequence that continues an open chunk and brings whole
+chunks first completes its chunk in a span launch. Per slot the class holds
+`HV * (32 KB + 48.5 KB + 16 KB)` bytes next to the pool (4.6 MB at 16 / 48 heads), and
+`64 * (HQ * 256 + HV * 264)` more (1.1 MB) once a prefill has left an open tail in the pool. It is allocated at the
+pool's first call for every slot the pool's storage holds from the pool's offset, not for the slots of the view that
+was passed (which is what lets views of one buffer share it): a pool carved from the start of a larger buffer pays for
+the whole remainder, so give the pool a storage of its own.
+
+What the caller owes the class:
+
+* A new sequence loaded into a slot starts with a prefill call (more tokens than sequences) or carries `prefix_lens`.
+  A one-token call without `prefix_lens` continues what the slot holds: on a reused slot it continues the previous
+  sequence, with finite rows that are not the new sequence's (nothing detects a slot whose state the caller replaced).
+* A sequence moves to another slot, or is saved for reuse (a prefix cache), only at a multiple of 64 tokens, where the
+  slot's fp32 state is the sequence's state. Inside a chunk the open rows live next to the pool and are not exported,
+  so a copy of the fp32 state does not continue the sequence.
+* Every call on a pool passes a view that starts at the pool's first slot (a view that starts at another slot is
+  another pool, with its own open rows).
+* Slot indices are unique and inside the pool. The calls that bring whole chunks check them on the host (except a
+  whole-chunk prefill inside a CUDA graph capture); a call of fewer than 64 tokens per sequence checks the range on
+  the device (NaN rows) and does not detect a repeated slot.
+* `cu_seqlens_cpu` agrees with `cu_seqlens` and spares a call of 64 tokens or more the read of `cu_seqlens`; a decode
+  call's `cu_seqlens` are `arange(N + 1)`. A call of fewer than 64 tokens without `cu_seqlens_cpu` does not check a
+  device `cu_seqlens`: it stays inside its buffers, and rows that no sequence covers are left unwritten.
+* The inputs, `output` and the pool are 16-byte aligned (a typed error otherwise), and `output` does not partly
+  overlap an input (not checked, as for the operator without the flag).
+* The inputs are finite. A NaN or inf in `k`, `v`, `g` or `beta` reaches every row of its 64-token chunk in a
+  prefill and only the rows from its own on in decode, so the two differ on the rows before it; another sequence's
+  rows are never affected.
+
+`output_final_state` returns the pool. The decode entries (`gated_delta_rule_decode_pretranspose`,
+`gated_delta_rule_mtp`) do not take the flag: they compute the gates from the raw parameters and keep another state
+layout; a decode step of the class is a one-token call of `chunk_gated_delta_rule`.
+
+`lean/BIKernels/Gdn.lean` models the two kernels as an opaque chunk step and an opaque row step and defines the
+prefill as the fold of the chunk step over 64-row chunks. Four device facts carry the model, all checked bit for bit
+on the device, for finite inputs, together with determinism and independence of the batch. Two are hypotheses of the
+theorems: the chunk step is causal (the outputs of a chunk prefix are the prefix of the chunk's outputs) and the row
+step returns the chunk step's last output on the same rows. Two are built into the definitions: a long prefill is the
+fold of the chunk step (`stateAfter`, `prefillRow`), and the commit on a chunk's 64th row stores the chunk step's
+state (`poolState`).
+Proved from them: the decode row equals the prefill row at every position (`decode_eq_prefill`), the prefill kernel
+run over whole chunks and an open tail returns the prefill's rows (`replay_eq_prefill`), the commit rule (the boundary state advances
+on a chunk's 64th row) carries the prefill's boundary states (`pool_eq_stateAfter`), and a call's whole chunks and
+tail are the position arithmetic (`extend_boundary`). The packed call is modelled as the per-sequence terms by
+definition (`batch_term` only unfolds it); the pool's bookkeeping in `pool.py` (pending rebuilds, count cells) is
+not modelled and is covered by the device tests. R3 is not claimed as a configuration-space statement: the kernels are hand-written and expose no configuration space; the fingerprint digests their sources.
+`lake exe gdnconformance` prints the arithmetic for the generated cases (`lean/BIKernels/GdnCases.lean`, rendered by
+`gdn/lean_cases.py`; kernel `decide` only), which the device-free test `tests/batch_invariant/test_gdn_lean.py`
+compares with the Python specification. Tests: `tests/gdn/test_batch_invariant_gdn.py` (every comparison
+`torch.equal`; one test runs a set of cases in two fresh processes and asserts that the second returns the hashes and
+the case set of the first, and `FLASHINFER_GDN_BI_HASH_DIR` does the same for the whole file across two runs).
