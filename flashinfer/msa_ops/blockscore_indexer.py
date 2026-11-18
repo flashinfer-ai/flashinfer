@@ -298,7 +298,12 @@ def msa_blockscore_topk_indexer(
         )
         raise
 
-    module.run(qi, ki, cu_seqlens, kv_base, seq_lens, prefix_lens, output)
+    # The launchers take their stream from qi's device, but kernel launches
+    # and one-time function-attribute setup act on the *current* device:
+    # enter qi's device so a caller holding another current device cannot
+    # launch across devices.
+    with torch.cuda.device(qi.device):
+        module.run(qi, ki, cu_seqlens, kv_base, seq_lens, prefix_lens, output)
     _stats["dispatches"] += 1
     _stats["backend_dispatches"]["specialized"] += 1
     return output

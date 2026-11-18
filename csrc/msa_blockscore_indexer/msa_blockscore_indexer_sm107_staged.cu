@@ -658,7 +658,6 @@ __device__ __forceinline__ uint64_t pack_key(float v, int j) {
 // and never writes a score plane.  Query tiles split across several CTAs
 // publish per-segment lists; the tile's last CTA merges them and emits sel,
 // so one kernel covers scoring and selection.
-#define MAXSLOT 16
 #define PARTW (15u * (unsigned)BM)
 #define MAXTILES_F 1024
 
@@ -1267,8 +1266,14 @@ __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
           store_sel16(selp + (size_t)fq * TOPK, I);
         }
       } else {
-        uint64_t* const pw = part_workspace<GUARDED>() +
-                             ((size_t)tg * MAXSLOT + (size_t)(blockIdx.x - clo)) * PARTW + qloc;
+        // Slot tg + blockIdx.x (base tg + clo, local index blockIdx.x - clo).
+        // Tiles are visited in global unit order, so the base advances by at
+        // least the previous tile's span and no two (tile, CTA) partial lists
+        // collide, whatever per-tile CTA span the device-side metadata
+        // produces.  A fixed per-tile slot count would overflow into the next
+        // tile's slots whenever one tile spans more CTAs than the cap.
+        uint64_t* const pw =
+            part_workspace<GUARDED>() + (size_t)(tg + (int)blockIdx.x) * PARTW + qloc;
         if (tid >= 32) {
           pw[0 * BM] = L0;
           pw[1 * BM] = L1;
@@ -1315,7 +1320,7 @@ __global__ __launch_bounds__(NTHR_P, 1) void persistent_score_kernel(
 #pragma unroll 1
               for (int sl = 0; sl < nsl; ++sl) {
                 const uint64_t* const sp =
-                    part_workspace<GUARDED>() + ((size_t)tg * MAXSLOT + (size_t)sl) * PARTW + tid;
+                    part_workspace<GUARDED>() + (size_t)(tg + clo + sl) * PARTW + tid;
 #pragma unroll
                 for (int i = 1; i < 16; ++i) {
                   const uint64_t nv = sp[(15 - i) * BM];
@@ -2043,14 +2048,15 @@ __global__ __launch_bounds__(256, 2) void direct_fallback_kernel(
 }
 
 // ---------------- host side ----------------
-static void make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t box_rows) {
+static CUresult make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t box_rows) {
   uint64_t gdim[2] = {(uint64_t)DHEAD, rows};
   uint64_t gstr[1] = {(uint64_t)DHEAD * 2ull};
   uint32_t bdim[2] = {64u, box_rows};
   uint32_t bstr[2] = {1u, 1u};
-  cuTensorMapEncodeTiled(tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ptr, gdim, gstr, bdim,
-                         bstr, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return cuTensorMapEncodeTiled(tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ptr, gdim, gstr,
+                                bdim, bstr, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
 // cudaFuncSetAttribute is per device: key the one-time setup by device id.
@@ -2148,8 +2154,11 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
   }
 
   CUtensorMap qmap, kmap;
-  make_map(&qmap, qi.data_ptr(), (uint64_t)TQ, BMT);
-  make_map(&kmap, ki.data_ptr(), (uint64_t)TKPAD, BN);
+  const CUresult qres = make_map(&qmap, qi.data_ptr(), (uint64_t)TQ, BMT);
+  const CUresult kres = make_map(&kmap, ki.data_ptr(), (uint64_t)TKPAD, BN);
+  TVM_FFI_ICHECK(qres == CUDA_SUCCESS && kres == CUDA_SUCCESS)
+      << "cuTensorMapEncodeTiled failed (qi: " << (int)qres << ", ki: " << (int)kres
+      << "); qi/ki must be 16-byte-aligned contiguous BF16";
 
   const int ntiles = (TQ + BM - 1) / BM + B - 1;
   if (ntiles > 65535) {
@@ -2185,12 +2194,13 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
   // matches the 32 B sector better than the 32 B eight-score burst once a
   // score row is only 32-64 floats wide.
   const bool use_epi4 = epilogue4_w5 || (pgtot <= 128);
-  // One kernel covers scoring and selection when the query tile's top-15
-  // lists can be merged in place: single request, at most MAXSLOT CTAs per
-  // tile, and a partial-list workspace inside the fixed scratch buffer.
+  // One kernel covers scoring and selection when each query tile's top-15
+  // partial lists can be merged in place.  Slot tg + blockIdx.x is collision
+  // free for any metadata-dependent tile span, and its largest index is
+  // bounded by the tile count plus the 212-CTA persistent grid.
   const int ntiles_f = (TQ + BM - 1) / BM + B - 1;
   const bool fuse_sel = !guarded && exact_w6 && ntiles_f + B <= MAXTILES_F &&
-                        (size_t)(ntiles_f + B) * MAXSLOT * PARTW <= (size_t)(SCORE_FLOATS / 2);
+                        (size_t)(ntiles_f + 212) * PARTW <= (size_t)(SCORE_FLOATS / 2);
   const int fixed_chunk = fixed22_w1 ? 22 : ((B == 1 && pgtot <= 128) ? 24 : 0);
 
   const int smem = NAT * ASZ + STAGES * BSZ;

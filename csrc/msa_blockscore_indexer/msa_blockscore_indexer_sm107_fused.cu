@@ -809,14 +809,15 @@ __global__ __launch_bounds__(256, 2) void direct_fallback_kernel(
 }
 
 // ---------------- host side ----------------
-static void make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t box_rows) {
+static CUresult make_map(CUtensorMap* tm, const void* ptr, uint64_t rows, uint32_t box_rows) {
   uint64_t gdim[2] = {(uint64_t)DHEAD, rows};
   uint64_t gstr[1] = {(uint64_t)DHEAD * 2ull};
   uint32_t bdim[2] = {64u, box_rows};
   uint32_t bstr[2] = {1u, 1u};
-  cuTensorMapEncodeTiled(tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ptr, gdim, gstr, bdim,
-                         bstr, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                         CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return cuTensorMapEncodeTiled(tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, (void*)ptr, gdim, gstr,
+                                bdim, bstr, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
 // cudaFuncSetAttribute is per device: key the one-time setup by device id.
@@ -863,8 +864,11 @@ void Run(ffi::TensorView qi, ffi::TensorView ki, ffi::TensorView cu_seqlens,
   }
   {
     CUtensorMap qmap, kmap;
-    make_map(&qmap, qi.data_ptr(), (uint64_t)TQ, BMT);
-    make_map(&kmap, ki.data_ptr(), (uint64_t)TKPAD, BN);
+    const CUresult qres = make_map(&qmap, qi.data_ptr(), (uint64_t)TQ, BMT);
+    const CUresult kres = make_map(&kmap, ki.data_ptr(), (uint64_t)TKPAD, BN);
+    TVM_FFI_ICHECK(qres == CUDA_SUCCESS && kres == CUDA_SUCCESS)
+        << "cuTensorMapEncodeTiled failed (qi: " << (int)qres << ", ki: " << (int)kres
+        << "); qi/ki must be 16-byte-aligned contiguous BF16";
     const int smem = NAT * ASZ + STAGES * BSZ;
     const int attr_dev = qi.device().device_id;
     if (attr_dev >= 0 && attr_dev < 64 && !g_attr_set[attr_dev]) {
