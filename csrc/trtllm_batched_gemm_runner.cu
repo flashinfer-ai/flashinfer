@@ -492,6 +492,10 @@ void TrtllmGenBatchedGemmRunner::run(
     FLASHINFER_CHECK(numTokens > 0, "Batched GEMM with routeAct requires numTokens > 0");
   }
 
+  if (mOptions.eltwiseActType == EltwiseActType::ClampedRelu2) {
+    FLASHINFER_CHECK(ptrClampLimit, "ClampedRelu2 requires a device clamp-limit buffer");
+  }
+
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
@@ -654,6 +658,13 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
   int32_t multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
   BatchedGemmData gemmData{};
+  // The pinned TRTLLM-Gen validator checks pointer presence even for shape-only queries.
+  // This host placeholder is never dereferenced or passed to a kernel; run() checks the
+  // real clamp pointer. Remove when upstream supports shape-only ClampedRelu2 validation.
+  float const clampLimitPlaceholder = 1.0f;
+  if (mOptions.eltwiseActType == EltwiseActType::ClampedRelu2) {
+    gemmData.mInputBuffers.mPtrClampLimit = &clampLimitPlaceholder;
+  }
   // Dims
   gemmData.mProblemDimensions.mNumBatches = numBatches;
   gemmData.mProblemDimensions.mNumTokens = numTokens;
