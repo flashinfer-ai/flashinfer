@@ -62,11 +62,15 @@ std::string CuError(CUresult result) {
   return os.str();
 }
 
-// Makes `device` current (and its primary context exist) for the scope.
+// Makes `device` current (and its primary context exist) for the scope. On exit
+// the caller's context is current again, also when it is not a primary context.
 class DeviceScope {
  public:
   explicit DeviceScope(int device) {
     ok_ = cudaGetDevice(&previous_) == cudaSuccess;
+    if (cuCtxGetCurrent(&previous_context_) != CUDA_SUCCESS) {
+      previous_context_ = nullptr;
+    }
     if (ok_ && previous_ != device) {
       ok_ = cudaSetDevice(device) == cudaSuccess;
       restore_ = ok_;
@@ -77,13 +81,19 @@ class DeviceScope {
   DeviceScope& operator=(DeviceScope const&) = delete;
   ~DeviceScope() {
     if (restore_) {
-      static_cast<void>(cudaSetDevice(previous_));
+      // cudaSetDevice would make the previous device's primary context current.
+      if (previous_context_ != nullptr) {
+        static_cast<void>(cuCtxSetCurrent(previous_context_));
+      } else {
+        static_cast<void>(cudaSetDevice(previous_));
+      }
     }
   }
   bool ok() const { return ok_; }
 
  private:
   int previous_{};
+  CUcontext previous_context_{};
   bool ok_{};
   bool restore_{};
 };
@@ -190,7 +200,7 @@ struct Split {
   size_t cut{};       // bytes [0, cut) from the base are on domain 0
   size_t boundary{};  // physical boundary: cut, or size when cut == nbytes
   CUcontext context{};
-  unsigned long long context_id{};  // cuCtxGetId of `context`: a reused handle differs
+  unsigned long long context_id{};  // cuCtxGetId of `context`: unique, unlike a handle
 };
 
 std::map<CUdeviceptr, Split>& Splits() {
@@ -320,10 +330,14 @@ class ContextScope {
 };
 
 // Frees a split allocation; called by the tensor deleter, so it never throws.
-// It runs in the context that made the allocation: when another context is
-// current, that context is current again afterwards. The registry lock is not
-// held while the context synchronizes. A CUDA graph that still reads the
-// allocation faults on its next replay, as the range is unmapped.
+// It runs in the context that made the allocation when that context still exists
+// (when another context is current, that context is current again afterwards).
+// When it was destroyed, the range is unmapped and released in the device's
+// current context: VMM memory belongs to the process, not to a context, and the
+// stale context handle (which may name another context now) is never made
+// current. The registry lock is not held while the context synchronizes. A CUDA
+// graph that still reads the allocation faults on its next replay, as the range
+// is unmapped.
 void SplitFree(CUdeviceptr address) noexcept {
   try {
     Split split{};
@@ -343,22 +357,22 @@ void SplitFree(CUdeviceptr address) noexcept {
       Splits().erase(address);
       return;
     }
-    if (result != CUDA_SUCCESS) {
+    unsigned long long current_id = 0;
+    if (result == CUDA_SUCCESS && current != nullptr) {
+      result = cuCtxGetId(current, &current_id);
+    }
+    if (result != CUDA_SUCCESS || current == nullptr) {
       return;  // no current context to read: leave it mapped rather than corrupt it
     }
     ContextScope context_scope;  // declared after `scope`: restored before the device
-    if (current != split.context) {
+    // Ids, not handles, are compared: a destroyed context's handle can name a new one.
+    if (current_id != split.context_id) {
       unsigned long long id = 0;
-      if (cuCtxGetId(split.context, &id) != CUDA_SUCCESS || id != split.context_id) {
-        // The allocation's context was destroyed, and its handle may name a new
-        // context now: never make it current. Only the registry entry remains.
-        std::lock_guard<std::mutex> lock(SplitsMutex());
-        Splits().erase(address);
-        return;
-      }
-      if (!context_scope.Push(split.context)) {
+      bool const alive = cuCtxGetId(split.context, &id) == CUDA_SUCCESS && id == split.context_id;
+      if (alive && !context_scope.Push(split.context)) {
         return;  // cannot enter the allocation's context: leave it mapped
       }
+      // Not alive: the allocation's context was destroyed; free in the current one.
     }
     {
       // The range leaves the registry before it is unmapped: no lookup finds it.

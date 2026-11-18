@@ -239,13 +239,20 @@ def test_sm_table_on_the_cpu_under_a_cuda_default_device():
 
 def test_generated_source_is_published_whole(tmp_path):
     """Generated sources are written to a temporary file and moved into place; an
-    unchanged source is not rewritten (its timestamp stays)."""
+    unchanged source is not rewritten (its timestamp stays). The file gets the
+    mode a plain open() would: 0o666 less the umask."""
     import os
+    import stat
 
     from flashinfer.jit.cake_locality import _publish_if_different
 
     path = tmp_path / "gen" / "cake_locality_probe.cu"
-    _publish_if_different(path, "first")
+    previous = os.umask(0o027)
+    try:
+        _publish_if_different(path, "first")
+    finally:
+        os.umask(previous)
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
     assert path.read_text() == "first"
     stamp = os.stat(path).st_mtime_ns
     inode = os.stat(path).st_ino
@@ -476,37 +483,68 @@ def _current_context(driver) -> int:
     return int(_ok(driver.cuCtxGetCurrent()))
 
 
+def _create_context(driver, device: int):
+    """A new (non-primary) context of ``device``, made current."""
+    cu_device = _ok(driver.cuDeviceGet(device))
+    try:
+        return _ok(driver.cuCtxCreate(None, 0, cu_device))
+    except TypeError:  # cuda-python 12: cuCtxCreate(flags, dev)
+        return _ok(driver.cuCtxCreate(0, cu_device))
+
+
+def _free_bytes(driver) -> int:
+    """Free device memory of the current context's device, from the driver."""
+    return int(_ok(driver.cuMemGetInfo()))
+
+
+# Large enough that a leak is far outside the noise of context creation.
+_LEAK_PROBE_BYTES = 512 * 1024**2
+_FREE_SLACK = 64 * 1024**2
+
+
 @pytest.mark.parametrize(
-    "case", ["freed_under_another", "made_under_another", "context_destroyed"]
+    "case",
+    [
+        "freed_under_another",
+        "made_under_another",
+        "context_destroyed",
+        "context_destroyed_new_current",
+    ],
 )
 def test_split_empty_freed_in_its_own_context(case):
     """A split allocation is unmapped and leaves the registry when its last tensor
     is freed while another context of the device is current, in the context that
-    made it (the caller's context is current again afterwards); when that
-    context was destroyed, its registry entry is dropped."""
+    made it (the caller's context is current again afterwards). When that
+    context was destroyed, its memory is still mapped (VMM memory outlives the
+    context), and the free unmaps and releases it in the current context, also
+    when that is a context made after the destroy, which may reuse the destroyed
+    one's handle. The device's free memory returns in every case."""
     device = _require_locality()
     driver = _driver()
     unit = cl.granularity(device)
+    nbytes = -(-_LEAK_PROBE_BYTES // unit) * unit
+    cut = nbytes // 2 // unit * unit
+    gc.collect()
     torch.cuda.synchronize(device)
     primary = _current_context(driver)
+    free_before = _free_bytes(driver)
     tensor = None
     if case == "freed_under_another":
-        tensor = cl.split_empty((2 * unit,), torch.uint8, unit, device)
-    cu_device = _ok(driver.cuDeviceGet(device))
-    try:
-        other = _ok(driver.cuCtxCreate(None, 0, cu_device))
-    except TypeError:  # cuda-python 12: cuCtxCreate(flags, dev)
-        other = _ok(driver.cuCtxCreate(0, cu_device))
-    destroyed = False
+        tensor = cl.split_empty((nbytes,), torch.uint8, cut, device)
+    other = _create_context(driver, device)
+    contexts = [other]  # the live contexts this test made, innermost last
     try:
         assert _current_context(driver) == int(other) != primary
         if tensor is None:
-            tensor = cl.split_empty((2 * unit,), torch.uint8, unit, device)
+            tensor = cl.split_empty((nbytes,), torch.uint8, cut, device)
             _ok(driver.cuCtxPopCurrent())
             assert _current_context(driver) == primary
-            if case == "context_destroyed":
-                _ok(driver.cuCtxDestroy(other))
-                destroyed = True
+            if case.startswith("context_destroyed"):
+                _ok(driver.cuCtxDestroy(contexts.pop()))
+                # The range outlived its context: its memory is still in use.
+                assert _free_bytes(driver) <= free_before - nbytes + _FREE_SLACK
+                if case == "context_destroyed_new_current":
+                    contexts.append(_create_context(driver, device))
         base = tensor.data_ptr()
         assert cl.homing(base) is not None
         caller = _current_context(driver)
@@ -515,12 +553,54 @@ def test_split_empty_freed_in_its_own_context(case):
         assert cl.homing(base) is None
         assert _current_context(driver) == caller
     finally:
-        if not destroyed:
-            if _current_context(driver) == int(other):
+        for context in reversed(contexts):
+            if _current_context(driver) == int(context):
                 _ok(driver.cuCtxPopCurrent())
-            _ok(driver.cuCtxDestroy(other))
+            _ok(driver.cuCtxDestroy(context))
     assert _current_context(driver) == primary
     torch.cuda.synchronize(device)
+    assert _free_bytes(driver) >= free_before - _FREE_SLACK
+
+
+def test_split_calls_on_another_device_keep_the_callers_context():
+    """Allocating, querying and freeing split memory of another device leaves the
+    caller's context current, also when it is not a primary context."""
+    device = _require_locality()
+    peer = next(
+        (
+            index
+            for index in range(torch.cuda.device_count())
+            if index != device and torch.cuda.get_device_capability(index) == (10, 7)
+        ),
+        None,
+    )
+    if peer is None:
+        pytest.skip("needs a second sm_107a device")
+    driver = _driver()
+    unit = cl.granularity(peer)
+    warm = cl.split_empty((2 * unit,), torch.uint8, unit, peer)  # streams, module
+    del warm
+    gc.collect()
+    primary = _current_context(driver)
+    other = _create_context(driver, device)
+    try:
+        assert _current_context(driver) == int(other) != primary
+        assert cl.granularity(peer) == unit
+        assert _current_context(driver) == int(other)
+        tensor = cl.split_empty((2 * unit,), torch.uint8, unit, peer)
+        assert _current_context(driver) == int(other)
+        base = tensor.data_ptr()
+        assert cl.pointer_domain(base + unit, peer) == 1
+        assert _current_context(driver) == int(other)
+        del tensor
+        gc.collect()
+        assert cl.homing(base) is None
+        assert _current_context(driver) == int(other)
+    finally:
+        if _current_context(driver) == int(other):
+            _ok(driver.cuCtxPopCurrent())
+        _ok(driver.cuCtxDestroy(other))
+    assert _current_context(driver) == primary
 
 
 def test_split_empty_cuda_graph_replay():
@@ -671,33 +751,54 @@ def test_launch_counters_default_stream_pairs_are_per_thread(
     assert {0, 1, 2} == cl._THREAD_KEYED_HANDLES
 
 
-@pytest.mark.parametrize("wrapped", [False, True], ids=["direct", "wrapped"])
+# The message ``_domain_pools`` raises when the pools' first allocation fails: the
+# allocator's error follows the colon, and the cause is a torch.OutOfMemoryError
+# whatever the driver error was.
+_SMOKE_FAILURE = (
+    "locality-domain 0 allocation smoke test failed: localized VMM allocation in "
+    "domain 0 failed: {}"
+)
+
+
+@pytest.mark.parametrize("case", ["direct", "wrapped", "wrapped_refusal"])
 def test_launch_counters_out_of_memory_pair_not_cached(
-    fresh_counters, monkeypatch, wrapped
+    fresh_counters, monkeypatch, case
 ):
     """A pair made unhomed because a locality-domain pool was out of memory serves
     its call and is not cached; the next call tries the pools again. The same
-    holds when the pools' first allocation wraps the exhaustion in a
-    LocalityDomainError (as ``_domain_pools`` does); any other refusal is
-    remembered."""
+    holds when the pools' first allocation wraps a CUDA out-of-memory error in a
+    LocalityDomainError (as ``_domain_pools`` does). A wrapped driver refusal
+    (CUDA_ERROR_NOT_SUPPORTED), like any other refusal, is remembered."""
     from flashinfer import locality_domain
 
     device = _require_cuda()
     calls = []
+    error = {
+        "wrapped": "CUDA_ERROR_OUT_OF_MEMORY (2): out of memory",
+        "wrapped_refusal": "CUDA_ERROR_NOT_SUPPORTED (801): operation not supported",
+    }.get(case)
 
     def exhausted(_index):
         calls.append(_index)
-        if not wrapped:
+        if error is None:
             raise torch.OutOfMemoryError("pool exhausted")
         try:
             raise torch.OutOfMemoryError("pool exhausted")
         except torch.OutOfMemoryError as exc:
             raise locality_domain.LocalityDomainError(
-                "locality-domain pool smoke allocation failed"
+                _SMOKE_FAILURE.format(error)
             ) from exc
 
     monkeypatch.setattr(locality_domain, "_domain_pools", exhausted)
     stream = torch.cuda.Stream(device=device)
+    if case == "wrapped_refusal":
+        with torch.cuda.stream(stream):
+            first = cl.launch_counters(2, device)
+            assert cl.launch_counters(2, device)[0] is first[0]
+        torch.cuda.synchronize(device)
+        assert all(int(t.abs().sum()) == 0 for t in first)
+        assert calls == [device] and device in cl._POOLS_UNAVAILABLE
+        return
     with torch.cuda.stream(stream):
         first = cl.launch_counters(2, device)
         second = cl.launch_counters(2, device)

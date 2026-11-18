@@ -596,10 +596,25 @@ def pointer_domain(ptr: int, device: Any = None) -> int:
 
 # Devices whose locality-domain pools refused (a LocalityDomainError, which a
 # later call would repeat): their counters are ordinary tensors from then on. A
-# pool that ran out of memory (torch.OutOfMemoryError, raised directly or as the
-# cause of a LocalityDomainError from the pools' first allocation) is not a
-# refusal: a later call tries the pools again.
+# pool that ran out of memory (see _pool_out_of_memory) is not a refusal: a later
+# call tries the pools again.
 _POOLS_UNAVAILABLE: set[int] = set()
+
+
+def _pool_out_of_memory(exc: BaseException) -> bool:
+    """Whether a locality-domain pool error is exhaustion, which a later call may
+    not meet: a ``torch.OutOfMemoryError``, or a ``LocalityDomainError`` from the
+    pools' first allocation whose allocator error is ``CUDA_ERROR_OUT_OF_MEMORY``.
+    That first allocation reports every allocator failure as an out-of-memory
+    cause, so its other driver errors (``CUDA_ERROR_NOT_SUPPORTED``,
+    ``CUDA_ERROR_INVALID_VALUE``, ...) are refusals."""
+    import torch
+
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return isinstance(
+        exc.__cause__, torch.OutOfMemoryError
+    ) and "CUDA_ERROR_OUT_OF_MEMORY" in str(exc)
 
 
 def _allocate_pair(words: int, device_index: int) -> tuple[tuple[Any, Any], bool]:
@@ -623,9 +638,7 @@ def _allocate_pair(words: int, device_index: int) -> tuple[tuple[Any, Any], bool
                     pair.append(torch.empty(shape, dtype=torch.int32, device=target))
             return (pair[0], pair[1]), True
         except (locality_domain.LocalityDomainError, torch.OutOfMemoryError) as exc:
-            if isinstance(exc, torch.OutOfMemoryError) or isinstance(
-                exc.__cause__, torch.OutOfMemoryError
-            ):
+            if _pool_out_of_memory(exc):
                 # Exhaustion, also when the pools' first allocation wrapped it in
                 # a LocalityDomainError: not remembered, a later call retries.
                 unhomed = tuple(

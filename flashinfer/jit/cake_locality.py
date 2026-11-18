@@ -18,7 +18,7 @@ import contextlib
 import functools
 import os
 import pathlib
-import tempfile
+import secrets
 
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec, sm107a_nvcc_flags
@@ -38,13 +38,12 @@ def _publish_if_different(path: pathlib.Path, content: str) -> None:
             return
     except FileNotFoundError:
         path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(
-        dir=path.parent, prefix=path.name + ".", suffix=".tmp"
-    )
+    temporary = path.parent / f"{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    # Mode 0o666 less the umask, as a plain open() creates it.
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
     try:
         with os.fdopen(fd, "w") as f:
             f.write(content)
-        os.chmod(temporary, 0o644)  # mkstemp creates 0600; match a plain open()
         os.replace(temporary, path)
     except BaseException:
         with contextlib.suppress(FileNotFoundError):
