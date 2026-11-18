@@ -2617,6 +2617,9 @@ def _tinygemm_bf16_gemm_runner():
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, _ = inputs
+            # Same as TGVRunner.forward(): this must hold even if the
+            # requirement checks and get_valid_tactics() were bypassed.
+            _require_tma_bf16_k_alignment("TinyGEMM", a.shape[-1])
             weight = b.transpose(-2, -1)
             if bias is None:
                 module.tinygemm2_nobias_op(a, weight, out, bool(pdl))
@@ -2686,6 +2689,9 @@ def _tgv_gemm_runner(dtype: torch.dtype, use_sm_100f: bool):
             **kwargs,
         ) -> torch.Tensor:
             a, b, bias, pdl, out, *_ = inputs
+            # skip_check=True and the default tactic -1 reach forward() without
+            # going through the requirement checks or get_valid_tactics().
+            _require_tma_bf16_k_alignment("TGV", a.shape[-1])
             # The C++ TGV kernel is 2D-only — always fall back to cute_ext
             # for batched inputs regardless of the toggle.
             if _TGV_DEBUG_USE_CPP and a.dim() == 2:
