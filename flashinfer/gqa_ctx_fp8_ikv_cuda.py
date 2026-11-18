@@ -146,6 +146,11 @@ def supported_with_reasons(
             or _t.device != query.device
         ):
             r.append(_name + "_not_int32_cuda_contiguous")
+    # the kernel's cp.async / vectorized paths need 16-byte-aligned bases;
+    # contiguity alone does not establish that (e.g. backing[1:].view(...))
+    for _name, _t in (("query", query), ("kv", k), ("out", out)):
+        if _t.data_ptr() % 16:
+            r.append(_name + "_not_16B_aligned")
     if r:
         return r
     if (

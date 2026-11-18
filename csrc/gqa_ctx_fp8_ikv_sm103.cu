@@ -13,6 +13,7 @@
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
+#include <cstring>
 
 #ifndef Q2_CAUSAL_PRUNE
 #define Q2_CAUSAL_PRUNE 0
@@ -88,11 +89,15 @@ struct alignas(8) F32x2 {
   float x, y;
 };
 __device__ __forceinline__ F32x2 fma_f32x2(F32x2 a, F32x2 b, F32x2 c) {
+  // memcpy, not reinterpret_cast references: defined object access (the
+  // copies compile away; the asm sees the same 64-bit registers).
+  uint64_t ua, ub, uc, ud;
+  std::memcpy(&ua, &a, sizeof(ua));
+  std::memcpy(&ub, &b, sizeof(ub));
+  std::memcpy(&uc, &c, sizeof(uc));
+  asm("fma.rn.f32x2 %0,%1,%2,%3;\n" : "=l"(ud) : "l"(ua), "l"(ub), "l"(uc));
   F32x2 d;
-  asm("fma.rn.f32x2 %0,%1,%2,%3;\n"
-      : "=l"(reinterpret_cast<uint64_t&>(d))
-      : "l"(reinterpret_cast<const uint64_t&>(a)), "l"(reinterpret_cast<const uint64_t&>(b)),
-        "l"(reinterpret_cast<const uint64_t&>(c)));
+  std::memcpy(&d, &ud, sizeof(d));
   return d;
 }
 
@@ -215,7 +220,8 @@ __device__ __forceinline__ void widen_q_smem(uint32_t ah[8][4], const uint8_t* q
 
 // 16 fp8 -> 16 half, written to Vh row l at column c
 __device__ __forceinline__ void cvt_store_v(__half* vh, int l, int c, uint4 raw) {
-  const unsigned short* bs = reinterpret_cast<const unsigned short*>(&raw);
+  unsigned short bs[8];  // defined access into the raw payload
+  std::memcpy(bs, &raw, sizeof(bs));
   uint4 h0, h1;
   h0.x = fp8x2_to_h2(bs[0]);
   h0.y = fp8x2_to_h2(bs[1]);
@@ -425,14 +431,21 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny(const uint8_t* __restric
   const int r = blockIdx.y;
   // one dependent round trip for all per-request metadata: issued together,
   // before any branch, so q and kv are only two round trips from kernel start.
-  const int q0 = U2 ? r * 2 : __ldg(cu_q + r);
-  const int kvlen = U2 ? 2 : __ldg(seq_lens + r);
+  // U2 speculates uniform packing (q0 = 2r, qlen = kvlen = 2) and VERIFIES
+  // it against cu_q/seq_lens (the loads issue together, one round trip);
+  // on mismatch the loaded metadata drives the same masked body, so the
+  // route stays exact for callers whose packing differs (e.g. extra
+  // storage rows past cu_q[-1], or short requests under max_q_len).
+  const int q0r = __ldg(cu_q + r);
+  const int q1r = __ldg(cu_q + r + 1);
+  const int kvr = __ldg(seq_lens + r);
+  const bool uni = !U2 || (q0r == r * 2 && q1r == r * 2 + 2 && kvr == 2);
+  const int q0 = (U2 && uni) ? r * 2 : q0r;
+  const int kvlen = (U2 && uni) ? 2 : kvr;
   const int pg = __ldg(block_table + r * btw);
-  const int qlen = U2 ? 2 : (__ldg(cu_q + r + 1) - q0);
+  const int qlen = (U2 && uni) ? 2 : (q1r - q0r);
   const int pbase = U2 ? 0 : blockIdx.x * WARPS;
-  if constexpr (!U2) {
-    if (pbase >= qlen) return;
-  }
+  if (pbase >= qlen) return;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -448,8 +461,8 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny(const uint8_t* __restric
 
   const int gid = lane >> 2, tig = lane & 3;
   const int p = U2 ? warp : (pbase + warp);
-  const bool active = U2 ? true : (p < qlen);
-  const int tok = q0 + (U2 ? p : (active ? p : 0));
+  const bool active = p < qlen;
+  const int tok = q0 + (active ? p : 0);
   const int vis = kvlen - qlen + p + 1;
 
   const uint8_t* qa0 = q + (size_t)tok * HQD + gid * DH + tig * 4;
@@ -582,25 +595,29 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny_async(
   const int r = RFAST ? (int)blockIdx.x : (int)blockIdx.y;
   // one dependent round trip for all per-request metadata: issued together,
   // before any branch, so q and kv are only two round trips from kernel start.
-  const int q0 = U2 ? r * 2 : __ldg(cu_q + r);
-  const int kvlen = U2 ? 2 : ldv32(seq_lens + r);
+  // U2 speculation verified against cu_q/seq_lens (loads issue together);
+  // on mismatch the loaded metadata drives the same masked body.
+  const int q0r = __ldg(cu_q + r);
+  const int q1r = __ldg(cu_q + r + 1);
+  const int kvr = ldv32(seq_lens + r);
+  const bool uni = !U2 || (q0r == r * 2 && q1r == r * 2 + 2 && kvr == 2);
+  const int q0 = (U2 && uni) ? r * 2 : q0r;
+  const int kvlen = (U2 && uni) ? 2 : kvr;
   const int pg = (U2 && BTW1) ? __ldg(block_table + r) : ldv32(block_table + r * btw);
-  const int qlen = U2 ? 2 : (__ldg(cu_q + r + 1) - q0);
+  const int qlen = (U2 && uni) ? 2 : (q1r - q0r);
   const int pbase = (U2 || PB0) ? 0
                                 : (RFAST ? (DS == 2 ? ((int)gridDim.y - 1 - (int)blockIdx.y) * WARPS
                                                     : (int)blockIdx.y * WARPS)
                                          : (int)blockIdx.x * WARPS);
-  if constexpr (!U2) {
-    if (pbase >= qlen) return;
-  }
+  if (pbase >= qlen) return;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const int dpart = DS == 1 ? 0 : (int)blockIdx.z;
   const int gid = lane >> 2, tig = lane & 3;
   const int p = U2 ? warp : (pbase + warp);
-  const bool active = U2 ? true : (p < qlen);
-  const int tok = U2 ? (q0 + p) : (q0 + (active ? p : 0));
+  const bool active = p < qlen;
+  const int tok = q0 + (active ? p : 0);
   const uint8_t* vbase = kvb + (size_t)pg * (PAGE * KVTOK) + DH;
 
   if constexpr (ASYNC_QK) {
@@ -741,7 +758,7 @@ __global__ __launch_bounds__(32 * WARPS) void attn_tiny_async(
     for (int kk = 0; kk < 4; ++kk) mma_f8(c0, c1, c2, c3, a[kk], bq[kk]);
   }
 
-  const int vis = U2 ? (p + 1) : (kvlen - qlen + p + 1);
+  const int vis = kvlen - qlen + p + 1;  // == p + 1 on the verified-uniform U2 path
   const int l0 = tig * 2;
   float s0 = (l0 < vis) ? c0 * SCALE_LOG2E : -INFINITY;
   float s1 = (l0 + 1 < vis) ? c1 * SCALE_LOG2E : -INFINITY;
@@ -937,12 +954,18 @@ __global__ __launch_bounds__(32 * WARPS, WARPS == 4 ? 3 : 1) void attn_gen(
   const int pblock = FUSETAIL ? (int)gridDim.y + 1 - (int)blockIdx.y
                      : LPT    ? (int)gridDim.y - 1 - (int)blockIdx.y
                               : (int)blockIdx.x;
-  const int q0 = U128 ? r * 128 : __ldg(cu_q + r);
-  const int qlen = U128 ? 128 : (__ldg(cu_q + r + 1) - q0);
-  const int kvlen = U128 ? 128 : __ldg(seq_lens + r);
+  // U128 speculation verified against cu_q/seq_lens (loads issue together);
+  // on mismatch the loaded metadata drives the same masked body.
+  const int q0r = __ldg(cu_q + r);
+  const int q1r = __ldg(cu_q + r + 1);
+  const int kvr = __ldg(seq_lens + r);
+  const bool uni = !U128 || (q0r == r * 128 && q1r == r * 128 + 128 && kvr == 128);
+  const int q0 = (U128 && uni) ? r * 128 : q0r;
+  const int qlen = (U128 && uni) ? 128 : (q1r - q0r);
+  const int kvlen = (U128 && uni) ? 128 : kvr;
   const int pg0 = U128 ? ldu32(block_table + r * btw) : __ldg(block_table + r * btw);
   const int pbase = pblock * WARPS;
-  if (!U128 && pbase >= qlen) return;
+  if (pbase >= qlen) return;
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -952,7 +975,7 @@ __global__ __launch_bounds__(32 * WARPS, WARPS == 4 ? 3 : 1) void attn_gen(
   const int tok = q0 + (active ? p : 0);
   const int vis = kvlen - qlen + p + 1;
 
-  const int pmax = U128 ? (pbase + WARPS - 1) : min(pbase + WARPS - 1, qlen - 1);
+  const int pmax = (U128 && uni) ? (pbase + WARPS - 1) : min(pbase + WARPS - 1, qlen - 1);
   const int vmax = kvlen - qlen + pmax + 1;
   const int ntiles = (vmax + 31) >> 5;
 
@@ -1381,13 +1404,18 @@ __global__ __launch_bounds__(128, 1) void attn_split(const uint8_t* __restrict__
 #define SVBUF(b) (smem + 4 * (32 * KSTR) + (b) * (32 * DH))
 
   const int r = U128 ? 0 : (int)blockIdx.y;
+  // U128 speculation verified against cu_q/seq_lens; on mismatch the loaded
+  // metadata drives the same masked body (q0 == cu_q[0] == 0 by contract).
+  const int q1r = __ldg(cu_q + r + 1);
+  const int kvr = __ldg(seq_lens + r);
+  const bool uni = !U128 || (q1r == 128 && kvr == 128);
   const int q0 = U128 ? 0 : cu_q[r];
-  const int qlen = U128 ? 128 : (cu_q[r + 1] - q0);
-  const int kvlen = U128 ? 128 : seq_lens[r];
+  const int qlen = (U128 && uni) ? 128 : (q1r - q0);
+  const int kvlen = (U128 && uni) ? 128 : kvr;
   // The grid is one CTA per query token and never exceeds the SM count, so the
   // kernel ends with token 127's CTA; launch it first instead of last.
   const int p = U128 ? (127 - (int)blockIdx.x) : (int)blockIdx.x;
-  if (!U128 && p >= qlen) return;
+  if (p >= qlen) return;
 
   const int tok = q0 + p;
   const int vis = kvlen - qlen + p + 1;
@@ -1751,13 +1779,17 @@ __global__ __launch_bounds__(128, 6) void attn_coop_b7(
   const int r = U128 ? (int)blockIdx.x : (int)blockIdx.y;
   const int t0 = U128 ? (127 - (int)blockIdx.y) : ((int)gridDim.x - 1 - (int)blockIdx.x);
 
-  const int q0 = U128 ? r * 128 : __ldg(cuq + r);
-  const int kvlen = U128 ? 128 : __ldg(sl + r);
+  // U128 speculation verified against cuq/sl (loads issue together); on
+  // mismatch the loaded metadata drives the same masked body.
+  const int q0r = __ldg(cuq + r);
+  const int q1r = __ldg(cuq + r + 1);
+  const int kvr = __ldg(sl + r);
+  const bool uni = !U128 || (q0r == r * 128 && q1r == r * 128 + 128 && kvr == 128);
+  const int q0 = (U128 && uni) ? r * 128 : q0r;
+  const int kvlen = (U128 && uni) ? 128 : kvr;
   const int page0 = U128 ? ldu32(bt + r) : __ldg(bt + r * btw);
-  const int qlen = U128 ? 128 : (__ldg(cuq + r + 1) - q0);
-  if constexpr (!U128) {
-    if (t0 >= qlen) return;
-  }
+  const int qlen = (U128 && uni) ? 128 : (q1r - q0r);
+  if (t0 >= qlen) return;
   const int vis = kvlen - qlen + t0 + 1;
   const int spad = (vis + 31) & ~31;
   const int nchunks = spad >> 5;
@@ -1999,9 +2031,15 @@ __global__ void __launch_bounds__((128 * NTOK), (NTOK == 4 ? 2 : (NTOK == 2 ? 4 
   const int r = LPT ? (int)blockIdx.x : (int)blockIdx.y;
   const int tile = LPT ? (int)gridDim.y - 1 - (int)blockIdx.y : (int)blockIdx.x;
 
-  const int q0 = U128 ? r * 128 : __ldg(cuq + r);
-  const int qlen = U128 ? 128 : (__ldg(cuq + r + 1) - q0);
-  const int kvlen = U128 ? 128 : __ldg(sl + r);
+  // U128 speculation verified against cuq/sl (loads issue together); on
+  // mismatch the loaded metadata drives the same masked body.
+  const int q0r = __ldg(cuq + r);
+  const int q1r = __ldg(cuq + r + 1);
+  const int kvr = __ldg(sl + r);
+  const bool uni = !U128 || (q0r == r * 128 && q1r == r * 128 + 128 && kvr == 128);
+  const int q0 = (U128 && uni) ? r * 128 : q0r;
+  const int qlen = (U128 && uni) ? 128 : (q1r - q0r);
+  const int kvlen = (U128 && uni) ? 128 : kvr;
   const int page0 = __ldg(bt + r * btw);
   const int t0 = tile * NTOK;
   if (t0 >= qlen) return;
