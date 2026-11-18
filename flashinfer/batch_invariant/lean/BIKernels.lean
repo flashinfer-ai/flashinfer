@@ -36,3 +36,5 @@ import BIKernels.CombineWireCases
 import BIKernels.QuantizedStagePartition
 import BIKernels.Gdn
 import BIKernels.GdnCases
+import BIKernels.SparseMLA
+import BIKernels.SparseMLACases

@@ -46,3 +46,6 @@ lean_exe numericalmegamoeconformance where
 
 lean_exe a16megamoeconformance where
   root := `A16MegaMoEMain
+
+lean_exe sparsemlaconformance where
+  root := `SparseMLAMain
