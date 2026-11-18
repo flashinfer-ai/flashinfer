@@ -40,18 +40,9 @@ from .test_kda_ucache_flush import _load_flush, _make_case
 
 # Base tests the UMMA backend cannot run yet at the current stage. MUST be
 # empty once the kernel covers T in {4, 8} x w_ring in {16, 32} (stage S3).
-# S2: verify rows at T=4 / w_ring=16 only. Rows with hist_len >= flush_min run
-# (outputs and ring appends are exact) but do not fold their ring into the
-# pool yet, so every test that checks a folded pool row is pending, and so is
-# every w_ring=32 test. Base tests that run flush rows but never read the
-# pool back (ring appends, live-window protection, graph-vs-eager bitwise,
-# lower_bound outputs) run.
+# S3a: verify and flush rows at T=4 / w_ring=16; every w_ring=32 test and every
+# T=8 case is pending.
 _PENDING_NAMES: set = {
-    "test_folded_state_matches_fp32_reference",
-    "test_strong_decay_matches_fp32_reference",
-    "test_padded_rows_and_permuted_pool",
-    "test_large_batch_randomized_oracle_and_determinism",
-    "test_restart_hist_on_flush_across_steps",
     "test_w32_output_and_fold_match_fp32_reference",
     "test_w32_tma_late_forced",
     "test_w32_strong_decay_deep_window",
@@ -61,12 +52,8 @@ _PENDING_NAMES: set = {
 
 
 def _PENDING_PARAMS(params: dict) -> bool:
-    """Per-parameter pending filter: T=8, w_ring=32 and fold cases (S2)."""
-    return (
-        params.get("t") == 8
-        or params.get("w_ring") == 32
-        or params.get("history") in ("fold_mixed", "fold")
-    )
+    """Per-parameter pending filter: T=8 and w_ring=32 cases (S3a)."""
+    return params.get("t") == 8 or params.get("w_ring") == 32
 
 
 @pytest.fixture(autouse=True)

@@ -44,12 +44,16 @@ CTA = (head, request), grid (H, B), 192 threads, 4 CTAs / SM:
 UMMAs (kind::f16 with BF16 A / B, fp32 accumulate in TMEM):
   readout  H  = S0 . X_r^T   M128 N16 K128   A: state (SMEM)  B: X_r (K-major SW128)
   history  H += D . C^T      M128 N16 K16    A: D (TMEM)      B: C (SW32)
+  fold     F  = D . K~       M128 N64 K16    A: D (TMEM)      B: K~ half (MN-major SW128)
 X_r = [khat; qhat] (.) bdec rows 0..2T-1 (zero rows after), so H holds S_h khat_t in
 column t and S_h qhat_t in column T + t.
 
-Status (stage S2): verify rows at T = 4, w_ring = 16, one head per CTA. Rows with
-hist_len >= flush_min run as verify rows (outputs and ring appends correct, the g
-append restarts at 0) but do NOT fold their ring into the state pool yet.
+Flush rows (hist_len >= flush_min) also fold the window into the state, one K half at
+a time: S_half <- bf16(bdec . S0_half + F) in place in SMEM (per-channel bdec), then a
+TMA store of the half back to the pool slot. Consumer order on flush rows: RMW of half
+0 -> epilogue -> RMW of half 1 (the fold UMMA of half 1 hides behind the epilogue).
+
+Status (stage S3a): T = 4, w_ring = 16, one head per CTA.
 """
 
 from __future__ import annotations
@@ -84,6 +88,7 @@ _MIN_BLOCKS_PER_SM = 4  # 128 of the 512 TMEM columns, ~54 KB SMEM, 80 registers
 # 32..39 for window slots j 0..15.
 _COL_H = 0
 _COL_D = 32
+_COL_F = 64  # fold F = D . K~ for the current state K half (64 columns)
 # s_coef fp32 words: A[t][s] at 0, Bq[t][s] at 64, beta[t] at 128
 _CO_A, _CO_BQ, _CO_BETA = 0, 64, 128
 
@@ -192,6 +197,46 @@ def _rsqrt_approx(x: Float32, *, loc=None, ip=None) -> Float32:
         ip=ip,
     )
     return Float32(r)
+
+
+@dsl_user_op
+def _fold_fma2_bf16x2(
+    w: Uint32,
+    bd_lo: Float32,
+    bd_hi: Float32,
+    f0: Float32,
+    f1: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Fold of one packed bf16 state pair with PER-CHANNEL bdec: (lo * bd_lo + f0,
+    hi * bd_hi + f1) as fp32, one fma.rn each (the HMMA kernel's _fold_fma2_bf16x2)."""
+    r = llvm.inline_asm(
+        llvm.StructType.get_literal([_T.f32(), _T.f32()]),
+        [
+            Uint32(w).ir_value(loc=loc, ip=ip),
+            Float32(bd_lo).ir_value(loc=loc, ip=ip),
+            Float32(bd_hi).ir_value(loc=loc, ip=ip),
+            Float32(f0).ir_value(loc=loc, ip=ip),
+            Float32(f1).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 _wl, _wh; .reg .f32 _fl, _fh;"
+        " shl.b32 _wl, $2, 16;"
+        " and.b32 _wh, $2, 0xFFFF0000;"
+        " mov.b32 _fl, _wl;"
+        " mov.b32 _fh, _wh;"
+        " fma.rn.f32 $0, _fl, $3, $5; fma.rn.f32 $1, _fh, $4, $6; }",
+        "=f,=f,r,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(_T.f32(), r, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(_T.f32(), r, [1], loc=loc, ip=ip)),
+    )
 
 
 @dsl_user_op
@@ -343,6 +388,42 @@ def _bulk_g2s_if(
     )
 
 
+def _rmw(g, ct, row, tbase, st_addr, bdec_addr, f_epi_a, f_gdone):
+    """Flush rows: S_half <- bf16(bdec . S0_half + F) in place on state K half g (TMEM
+    F at cols 64..127, this thread's V row = TMEM lane), then publish the half to warp
+    0's TMA store (f_gdone). bdec is per channel (s_bdec, a warp-uniform broadcast
+    read). Half 0 releases the F columns (f_epi_a) after its last TMEM load so the fold
+    UMMA of half 1 can overwrite them."""
+    ldn = 32  # TMEM columns per load
+    nch = ldn // 8  # 16-B (8-channel) chunks per load
+    srow = st_addr + g * 16384 + row * 128
+    for grp in range(64 // ldn):
+        fv = U.tmem_ld(ct, tbase + _COL_F + grp * ldn, ldn)
+        U.tmem_wait_ld()
+        if g == 0 and grp == 64 // ldn - 1:
+            U.fence_before_sync()
+            cute.arch.mbarrier_arrive(f_epi_a)
+        for cc in range(nch):
+            chunk = grp * nch + cc  # logical 8-channel chunk of this half
+            ba = bdec_addr + (g * 64 + chunk * 8) * 4
+            bd = _lds_f32x4(ba) + _lds_f32x4(ba + 16)
+            sa = srow + ((chunk ^ (row % 8)) * 16)
+            ow = U.lds_v4(sa)
+            nw = []
+            for i in range(4):
+                lo, hi = _fold_fma2_bf16x2(
+                    ow[i],
+                    bd[2 * i],
+                    bd[2 * i + 1],
+                    fv[cc * 8 + 2 * i],
+                    fv[cc * 8 + 2 * i + 1],
+                )
+                nw.append(U.pack_bf16x2(lo, hi))
+            U.sts_v4(sa, nw[0], nw[1], nw[2], nw[3])
+    cute.arch.fence_view_async_shared()  # the TMA store reads the half (async proxy)
+    cute.arch.mbarrier_arrive(f_gdone)
+
+
 # ----------------------------------------------------------------------------- kernel
 class KdaReplayMtpUmma:
     def __init__(self, T: int, h: int, w_ring: int = 16, u_src: str = "smem"):
@@ -397,6 +478,7 @@ class KdaReplayMtpUmma:
         stream,
     ):
         tma_ld = self._make_state_tma(state, cpasync.CopyBulkTensorTileG2SOp())
+        tma_st = self._make_state_tma(state, cpasync.CopyBulkTensorTileS2GOp())
         self.kernel(
             q,
             k,
@@ -416,6 +498,7 @@ class KdaReplayMtpUmma:
             lower_bound,
             flush_min,
             tma_ld,
+            tma_st,
         ).launch(
             grid=(self.h, q.shape[0], 1),
             block=(self.num_threads, 1, 1),
@@ -444,6 +527,7 @@ class KdaReplayMtpUmma:
         lower_bound: Float32,
         flush_min: Int32,
         tma_ld: cpasync.TmaInfo,
+        tma_st: cpasync.TmaInfo,
     ):
         T = self.T
         T2 = 2 * T
@@ -495,12 +579,20 @@ class KdaReplayMtpUmma:
         )
         s_coef = smem.allocate_tensor(Float32, cute.make_layout(136), byte_alignment=16)
         s_gp = smem.allocate_tensor(Float32, cute.make_layout(K_DIM), byte_alignment=16)
+        # bdec = e^{G_P} per channel (flush RMW)
+        s_bdec = smem.allocate_tensor(
+            Float32, cute.make_layout(K_DIM), byte_alignment=16
+        )
         st_full = [smem.allocate_array(cutlass.Int64, 1) for _ in range(2)]
         u_full = smem.allocate_array(cutlass.Int64, 1)
         x_ready = smem.allocate_array(cutlass.Int64, 1)
         d_ready = smem.allocate_array(cutlass.Int64, 1)
         mma_done = smem.allocate_array(cutlass.Int64, 1)
         tmem_done = smem.allocate_array(cutlass.Int64, 1)
+        f_mma_a = smem.allocate_array(cutlass.Int64, 1)
+        f_mma_b = smem.allocate_array(cutlass.Int64, 1)
+        f_epi_a = smem.allocate_array(cutlass.Int64, 1)
+        f_gdone = [smem.allocate_array(cutlass.Int64, 1) for _ in range(2)]
         tmem_addr = smem.allocate(Int32, 4)
 
         # TMEM first: the next CTA on this SM is not launched before this one relinquishes
@@ -525,6 +617,11 @@ class KdaReplayMtpUmma:
                 cute.arch.mbarrier_init(d_ready, 128)
                 cute.arch.mbarrier_init(mma_done, 1)
                 cute.arch.mbarrier_init(tmem_done, 128)
+                cute.arch.mbarrier_init(f_mma_a, 1)
+                cute.arch.mbarrier_init(f_mma_b, 1)
+                cute.arch.mbarrier_init(f_epi_a, 128)
+                cute.arch.mbarrier_init(f_gdone[0], 128)
+                cute.arch.mbarrier_init(f_gdone[1], 128)
                 cute.arch.mbarrier_init_fence()
             cute.arch.fence_acq_rel_cta()
             cute.arch.barrier_arrive(barrier_id=3, number_of_threads=64)
@@ -598,6 +695,18 @@ class KdaReplayMtpUmma:
                     s_state[None, (None, gk)],
                     st_full[gk],
                 )
+            if is_flush:
+                # store each folded K half back to the pool slot once its RMW is done
+                cpasync.prefetch_descriptor(tma_st.atom)
+                for gk in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_wait(f_gdone[gk], 0)
+                    U.simple_tma_copy(
+                        tma_st.atom,
+                        s_state[None, (None, gk)],
+                        tma_st.tma_tensor[sidx, h, None, (None, gk)],
+                    )
+                    cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
         elif warp == 1:
             # ============================================================ UMMA issuer
             tbase = tmem_addr[0]
@@ -610,7 +719,10 @@ class KdaReplayMtpUmma:
                 sd + Uint64((st_addr + 16384) >> 4),
             ]
             c_desc = U.sdesc_sw32(Uint64(c_addr >> 4))
+            # MN-major SW128 K~: SBO = 1024 B between 8-slot K atoms, N halves 2048 B apart
+            kt_desc = U.sdesc_mn_sw128(2048, 1024) + Uint64(kt_addr >> 4)
             id_r = _bf16_idesc(128, 16)
+            id_f = _bf16_idesc(128, 64, b_mn_major=True)
             cute.arch.barrier(barrier_id=3, number_of_threads=64)  # warp 0's inits
             cute.arch.mbarrier_wait(x_ready, 0)
             U.fence_after_sync()
@@ -632,6 +744,23 @@ class KdaReplayMtpUmma:
             if P > 0:
                 U.umma_ts(tbase + _COL_H, tbase + _COL_D, c_desc, id_r, True)
             U.umma_commit(mma_done)
+            if is_flush:
+                # fold F = D . K~ per state K half into cols 64..127. The commit of half
+                # 0 also covers the readout, so the consumers' RMW may overwrite s_state
+                # once f_mma_a completes. Half 1 reuses the F columns after the RMW of
+                # half 0 has read them (f_epi_a).
+                U.umma_ts(tbase + _COL_F, tbase + _COL_D, kt_desc, id_f, False)
+                U.umma_commit(f_mma_a)
+                cute.arch.mbarrier_wait(f_epi_a, 0)
+                U.fence_after_sync()
+                U.umma_ts(
+                    tbase + _COL_F,
+                    tbase + _COL_D,
+                    kt_desc + Uint64(2048 >> 4),
+                    id_f,
+                    False,
+                )
+                U.umma_commit(f_mma_b)
             cute.arch.mbarrier_wait(tmem_done, 0)
             U.fence_after_sync()
             U.tmem_dealloc(tbase, _TMEM_COLS)
@@ -715,6 +844,7 @@ class KdaReplayMtpUmma:
             c = ct
             s_gp[c] = gp
             bdec = _sel(P > 0, _exp(gp), 1.0, Float32)
+            s_bdec[c] = bdec
             gbase = _sel(is_flush, 0.0, gp, Float32)
             eA = _exp(alog)
             cum = Float32(0.0)
@@ -859,6 +989,14 @@ class KdaReplayMtpUmma:
             cute.arch.mbarrier_arrive(d_ready)
             _bar_sync_ua(1, 128)  # coefficient tables
 
+            st_addr_c = s_state.iterator.toint()
+            bdec_addr = s_bdec.iterator.toint()
+            if is_flush:
+                # fold RMW of K half 0 first: its UMMA was issued right after the history
+                cute.arch.mbarrier_wait(f_mma_a, 0)
+                U.fence_after_sync()
+                _rmw(0, ct, row, tbase, st_addr_c, bdec_addr, f_epi_a, f_gdone[0])
+
             # -------- epilogue: per V row forward substitution
             cute.arch.mbarrier_wait(mma_done, 0)
             U.fence_after_sync()
@@ -866,7 +1004,9 @@ class KdaReplayMtpUmma:
             hq = U.tmem_ld(ct, tbase + _COL_H + T, T)
             U.tmem_wait_ld()
             U.fence_before_sync()
-            cute.arch.mbarrier_arrive(tmem_done)
+            if not is_flush:
+                # verify rows: release TMEM before the solve (warp 1 deallocates early)
+                cute.arch.mbarrier_arrive(tmem_done)
             uu: list = []
             for t in cutlass.range_constexpr(T):
                 bt = s_coef[_CO_BETA + t]
@@ -880,6 +1020,13 @@ class KdaReplayMtpUmma:
                     y = y + s_coef[_CO_BQ + t * 8 + s_] * uu[s_]
                 out[brow, t, h, row] = BFloat16(y)
                 u_cache[sidx, h, (base + P + t) & RING_MASK, row] = BFloat16(uu[t])
+            if is_flush:
+                # fold RMW of K half 1 (its UMMA ran behind the epilogue), then TMEM is free
+                cute.arch.mbarrier_wait(f_mma_b, 0)
+                U.fence_after_sync()
+                _rmw(1, ct, row, tbase, st_addr_c, bdec_addr, f_epi_a, f_gdone[1])
+                U.fence_before_sync()
+                cute.arch.mbarrier_arrive(tmem_done)
 
     # ------------------------------------------------------------------ compile
     @staticmethod
