@@ -14,6 +14,7 @@
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -2508,7 +2509,8 @@ def test_nvcc_identity_captures_resolved_path_and_exact_version_output(
     tmp_path, monkeypatch
 ) -> None:
     cuda_root = tmp_path / "cuda"
-    nvcc = cuda_root / "bin" / "nvcc"
+    nvcc_name = "nvcc.exe" if os.name == "nt" else "nvcc"
+    nvcc = cuda_root / "bin" / nvcc_name
     nvcc.parent.mkdir(parents=True)
     nvcc.write_text("compiler", encoding="utf-8")
     version_output = "nvcc: NVIDIA (R) Cuda compiler driver\nBuild exact-output\n"

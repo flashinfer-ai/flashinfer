@@ -20,7 +20,7 @@ the "unquantized" path downstream. Backends discriminate with
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Union
 
 import torch
@@ -45,6 +45,10 @@ class MoEWeightPack:
       with packed E2M1 weights. These are canonical, unswizzled scale planes;
       backend preprocessing handles the physical layout.
 
+    ``shared_expert`` optionally carries one replicated FFN as another pack
+    with a leading expert dimension of one. SM107 shared fusion prepares this
+    pack separately; backends without shared fusion reject it.
+
     Supplying exactly one scale raises: that state used to silently select
     the re-quantize-from-bf16 path in every backend, ignoring the provided
     scale.
@@ -60,6 +64,7 @@ class MoEWeightPack:
     w2: torch.Tensor
     w13_scale: Optional[torch.Tensor]
     w2_scale: Optional[torch.Tensor]
+    shared_expert: Optional["MoEWeightPack"]
 
     def __new__(
         cls,
@@ -67,6 +72,8 @@ class MoEWeightPack:
         w2: torch.Tensor = None,  # type: ignore[assignment]
         w13_scale: Optional[torch.Tensor] = None,
         w2_scale: Optional[torch.Tensor] = None,
+        *,
+        shared_expert: Optional["MoEWeightPack"] = None,
     ):
         if cls is not MoEWeightPack:
             # Variant subclasses construct normally (their dataclass __init__
@@ -82,9 +89,13 @@ class MoEWeightPack:
                 "bf16). Pass both scales, or neither."
             )
         if w13_scale is None:
-            return UnquantizedMoEWeights(w13=w13, w2=w2)
+            return UnquantizedMoEWeights(w13=w13, w2=w2, shared_expert=shared_expert)
         return PrequantizedMoEWeights(
-            w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale
+            w13=w13,
+            w2=w2,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            shared_expert=shared_expert,
         )
 
     # No __init__ here: after __new__ returns a variant, CPython re-runs the
@@ -101,6 +112,7 @@ class UnquantizedMoEWeights(MoEWeightPack):
 
     w13: torch.Tensor
     w2: torch.Tensor
+    shared_expert: Optional[MoEWeightPack] = field(default=None, kw_only=True)
     # ClassVar: readable as ``pack.w13_scale is None`` but NOT a dataclass
     # field, and invisible to the Prequantized variant's field defaults.
     # mypy flags instance->class overrides; the shadowing is the point here.
@@ -113,6 +125,8 @@ class UnquantizedMoEWeights(MoEWeightPack):
         w2: torch.Tensor,
         w13_scale: None = None,
         w2_scale: None = None,
+        *,
+        shared_expert: Optional[MoEWeightPack] = None,
     ) -> None:
         # Hand-written (dataclass skips codegen when __init__ exists): the
         # factory's re-init passes the caller's ORIGINAL arguments, so
@@ -125,6 +139,7 @@ class UnquantizedMoEWeights(MoEWeightPack):
             )
         object.__setattr__(self, "w13", w13)
         object.__setattr__(self, "w2", w2)
+        object.__setattr__(self, "shared_expert", shared_expert)
 
 
 @dataclass(frozen=True)
@@ -136,6 +151,7 @@ class PrequantizedMoEWeights(MoEWeightPack):
     w2: torch.Tensor
     w13_scale: torch.Tensor
     w2_scale: torch.Tensor
+    shared_expert: Optional[MoEWeightPack] = field(default=None, kw_only=True)
 
 
 def dummy_moe_weights(

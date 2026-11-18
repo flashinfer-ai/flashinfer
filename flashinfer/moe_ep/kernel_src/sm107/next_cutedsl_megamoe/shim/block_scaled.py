@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional, Protocol, Tuple
 
 import torch
 
@@ -36,6 +36,7 @@ from flashinfer.moe_ep._compat import deprecated_aliases
 from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
+from .shared_expert import Sm107SharedExpertConfig, validate_feature_config
 from .tuning_state import AutoTuningState
 
 if TYPE_CHECKING:
@@ -171,7 +172,35 @@ class Sm107BlockScaledMoeConfig:
     has_fc2_alpha: bool = dataclasses.field(default=True, kw_only=True)
     has_fc1_norm_const: bool = dataclasses.field(default=True, kw_only=True)
 
+    use_tanh_sigmoid: bool = False
+    epilogue_warpgroups: int = 1
+    shared_expert: Sm107SharedExpertConfig | None = None
+    combine_dedup: bool = False
+
     def __post_init__(self) -> None:
+        validate_feature_config(self)
+        if self.shared_expert is not None:
+            if self.hidden % 128:
+                raise ValueError("shared fusion requires hidden size divisible by 128")
+            if self.reduce_topk_in_kernel:
+                raise ValueError(
+                    "shared fusion adds its output through separate reduction"
+                )
+        if self.combine_dedup and (
+            self.kernel_variant != "inference"
+            or self.combine_dtype != "bf16"
+            or not self.apply_routing_weights_before_fc2
+            or not self.fc2_use_bulk
+            or self.token_back_mode not in ("reuse_dispatch_warps", "standalone_warps")
+            or self.epilogue_warpgroups != 1
+            or self.reduce_topk_in_kernel
+            or self.world_size > 32
+        ):
+            raise ValueError(
+                "combine_dedup requires standard inference, early weights, BF16 bulk "
+                "combine, separate reduction, one epilogue warpgroup, at most 32 ranks, "
+                "and reuse_dispatch_warps or standalone_warps"
+            )
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
         if self.kernel_variant not in ("inference", "genphase"):
@@ -196,6 +225,21 @@ class Sm107BlockScaledMoeConfig:
             and (self.swiglu_alpha is not None or self.swiglu_beta is not None)
         ):
             raise ValueError("custom activation constants require batch_invariant=True")
+        if type(self.use_tanh_sigmoid) is not bool:
+            raise ValueError("use_tanh_sigmoid must be a bool.")
+        if type(
+            self.epilogue_warpgroups
+        ) is not int or self.epilogue_warpgroups not in (1, 2):
+            raise ValueError("epilogue_warpgroups must be 1 or 2.")
+        if self.epilogue_warpgroups == 2 and (
+            self.kernel_variant != "inference"
+            or self.combine_dtype != "bf16"
+            or not self.fc2_use_bulk
+            or self.token_back_mode != "epi_warps"
+        ):
+            raise ValueError(
+                "Two epilogue warpgroups require standard inference with BF16 bulk combine and epi_warps."
+            )
         if self.activation not in ("swiglu", "situ"):
             raise ValueError("activation must be 'swiglu' or 'situ'.")
         if self.activation == "situ" and not self.batch_invariant:
@@ -400,11 +444,11 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError("GenPhase supports at most 1024 tokens per rank.")
             n64_decode = (
                 self.cluster_shape_mn in ((2, 1), (4, 1))
-                and tiler == (256, 64, 128)
+                and tiler == (256, 64, 2 * instruction_k)
                 and (
                     self.quant_kind == "mxfp8_e4m3"
                     or (
-                        self.quant_kind == "mxfp4_mxfp8"
+                        self.quant_kind in ("mxfp4_mxfp8", "nvfp4")
                         and self.cluster_shape_mn == (4, 1)
                     )
                 )
@@ -508,6 +552,10 @@ class Sm107BlockScaledSymmBuffer:
     Create via :func:`get_symm_buffer_for_sm107_block_scaled_mega_moe`.
     """
 
+    shared_x: torch.Tensor
+    shared_x_sf: torch.Tensor
+    shared_x_sf_linear: torch.Tensor
+
     def __init__(
         self, config: Sm107BlockScaledMoeConfig, *, process_group=None
     ) -> None:
@@ -547,6 +595,9 @@ class Sm107BlockScaledSymmBuffer:
         self._routing_checks: dict[tuple, Any] = {}
         # Missing scalar bindings use the workspace's own tensors.
         self._bound_scalars: dict = {}
+        self._shared_weights: (
+            tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights] | None
+        ) = None
 
         self._validate_batch_invariant_scalars()
 
@@ -574,6 +625,23 @@ class Sm107BlockScaledSymmBuffer:
             ),
             execution=self._prepare_execution_local(cfg, kernel),
         )
+        if cfg.shared_expert is not None:
+            kind = cfg.shared_expert.kind
+            dtype = torch.float8_e4m3fn if kind == "mxfp8_e4m3" else torch.float8_e5m2
+            tokens = cfg.padded_tokens_per_rank
+            prepared.update(
+                shared_x=torch.empty((tokens, cfg.hidden), dtype=dtype, device=device),
+                shared_x_sf_linear=torch.empty(
+                    (tokens, cfg.hidden // 32),
+                    dtype=torch.float8_e8m0fnu,
+                    device=device,
+                ),
+                shared_x_sf=torch.empty(
+                    (swizzled_flat_sf_size(tokens, cfg.hidden // 32),),
+                    dtype=torch.float8_e8m0fnu,
+                    device=device,
+                ),
+            )
         for name in (*_SCALAR_NAMES, "_default_scalar"):
             prepared[name] = (
                 torch.ones(cfg.experts_per_rank, dtype=torch.float32, device=device)
@@ -622,6 +690,24 @@ class Sm107BlockScaledSymmBuffer:
             raise RuntimeError("SM107 mega workspaces must be 128-byte aligned.")
         return dict(
             local_workspace=local,
+            shared_output=(
+                torch.empty(
+                    (cfg.padded_tokens_per_rank, cfg.hidden),
+                    dtype=torch.bfloat16,
+                    device=local.device,
+                )
+                if cfg.shared_expert is not None
+                else None
+            ),
+            tmp_workspace=(
+                torch.empty(
+                    (max(int(kernel.get_tmp_buffer_bytes()), 1),),
+                    dtype=torch.uint8,
+                    device=local.device,
+                )
+                if cfg.kernel_variant == "inference"
+                else None
+            ),
             output_activation=(
                 None
                 if cfg.reduce_topk_in_kernel
@@ -662,6 +748,8 @@ class Sm107BlockScaledSymmBuffer:
         shared_bytes = int(workspace.total_bytes("shared"))
         # Allocated fully zeroed, which covers require_zero_workspace_leading_bytes.
         self.local_workspace = prepared["local_workspace"]
+        self.tmp_workspace = prepared["tmp_workspace"]
+        self.shared_output = prepared["shared_output"]
         self.shared_workspace = comm.sym_zeros((max(shared_bytes, 1),), torch.uint8)
         comm.prepare_local(
             self._bind_execution_state,
@@ -676,7 +764,7 @@ class Sm107BlockScaledSymmBuffer:
         workspace = kernel._device_workspace
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
-        if not cfg.reduce_topk_in_kernel:
+        if not cfg.reduce_topk_in_kernel and not cfg.combine_dedup:
             region = (
                 kernel.pre_reduced_activation_region
                 if cfg.kernel_variant == "genphase"
@@ -699,6 +787,10 @@ class Sm107BlockScaledSymmBuffer:
         if (
             self.local_workspace.data_ptr() % 128 != 0
             or self.shared_workspace.data_ptr() % 128 != 0
+            or (
+                self.tmp_workspace is not None
+                and self.tmp_workspace.data_ptr() % 128 != 0
+            )
         ):
             raise RuntimeError("SM107 mega workspaces must be 128-byte aligned.")
 
@@ -720,9 +812,12 @@ class Sm107BlockScaledSymmBuffer:
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
-        from sources import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
-        from sources.api import ImplDesc, ProblemDesc
-        from sources.quant_def import CombineFormat
+        from ..src import (
+            RubinInferenceGenphaseMegaMoE,
+            RubinInferenceMegaMoE,
+        )
+        from ..src.sources.api import ImplDesc, ProblemDesc
+        from ..src.sources.quant_def import CombineFormat
 
         from flashinfer.moe_ep.backends.mega.kernel.sm100.common.block_scaled_batch_invariant import (
             validate_block_scaled_batch_invariant,
@@ -806,11 +901,25 @@ class Sm107BlockScaledSymmBuffer:
                 "situ_linear_beta": None
                 if activation_variant is not None
                 else cfg.situ_linear_beta,
+                "use_tanh_sigmoid": cfg.use_tanh_sigmoid,
                 "world_size": cfg.world_size,
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
                 "max_tokens_per_rank": cfg.padded_tokens_per_rank,
                 "apply_topk_at_fc1": cfg.apply_routing_weights_before_fc2,
+                **(
+                    dict(
+                        shared_expert=True,
+                        shared_quant_kind=cfg.shared_expert.kind,
+                        shared_hidden_size=cfg.hidden,
+                        shared_intermediate_gateup_size=2
+                        * cfg.shared_expert.intermediate_size,
+                        shared_output_size=cfg.hidden,
+                        reduce_shared_output=True,
+                    )
+                    if cfg.shared_expert is not None
+                    else {}
+                ),
             }
         )
         impl_fields = {
@@ -830,6 +939,17 @@ class Sm107BlockScaledSymmBuffer:
             "token_back_mode": cfg.token_back_mode,
             "reduce_topk_in_kernel": cfg.reduce_topk_in_kernel,
         }
+        if cfg.kernel_variant == "inference":
+            impl_fields["epilogue_warpgroups"] = cfg.epilogue_warpgroups
+            impl_fields["combine_dedup"] = cfg.combine_dedup
+        if cfg.shared_expert is not None:
+            for name, value in (
+                ("shared_l2_position", cfg.shared_expert.l2_position),
+                ("shared_work_id_mode", cfg.shared_expert.work_id_mode),
+                ("shared_fc1_swizzle", cfg.shared_expert.fc1_swizzle),
+            ):
+                if value is not None:
+                    impl_fields[name] = value
         if cfg.fc2_tma_stages is not None:
             impl_fields["fc2_tma_stages"] = cfg.fc2_tma_stages
         if cfg.fallback_cluster_shape_mn is not None:
@@ -870,7 +990,7 @@ class Sm107BlockScaledSymmBuffer:
         return value if value is not None else getattr(self, name)
 
     def _peer_mapper(self):
-        from sources.communication.nvlink_domain.symmetric_buffer import (
+        from ..src.sources.communication.nvlink_domain.symmetric_buffer import (
             SymmetricBufferHost,
         )
 
@@ -879,6 +999,61 @@ class Sm107BlockScaledSymmBuffer:
             offsets=tuple(self._peer_offsets),
             rank=self.config.rank,
             max_ranks=self.config.world_size,
+        )
+
+    def bind_shared_weights(self, weights) -> None:
+        """Retain prepared shared weights and rebind pointers when they change."""
+        shared = self.config.shared_expert
+        if shared is None:
+            if weights is not None:
+                raise ValueError("shared weights require shared_expert configuration")
+            return
+        if not isinstance(weights, tuple) or len(weights) != 2:
+            raise ValueError(
+                "shared fusion requires prepared shared FC1 and FC2 weights"
+            )
+        from types import SimpleNamespace
+
+        fmt = SimpleNamespace(
+            torch_weight_data_dtype=(
+                torch.float8_e4m3fn
+                if shared.kind == "mxfp8_e4m3"
+                else torch.float8_e5m2
+            ),
+            torch_act_sf_dtype=torch.float8_e8m0fnu,
+        )
+        hidden, intermediate = self.config.hidden, shared.intermediate_size
+        for name, leg, shape, scale_size in (
+            (
+                "shared_fc1",
+                weights[0],
+                (1, hidden, 2 * intermediate),
+                swizzled_flat_sf_size(2 * intermediate, hidden // 32),
+            ),
+            (
+                "shared_fc2",
+                weights[1],
+                (1, intermediate, hidden),
+                swizzled_flat_sf_size(hidden, intermediate // 32),
+            ),
+        ):
+            _validate_weight_leg(name, leg, shape, scale_size, fmt, self.device)
+        self._shared_weights = weights
+
+    def _shared_runtime_kwargs(self) -> dict:
+        if self.config.shared_expert is None:
+            return {}
+        if self._shared_weights is None:
+            raise ValueError("bind shared weights before preparing shared fusion")
+        fc1, fc2 = self._shared_weights
+        return dict(
+            shared_activation=_to_cute(self.shared_x),
+            shared_activation_sf=_to_cute(self.shared_x_sf),
+            shared_fc1_weight=_to_cute(fc1[0]),
+            shared_fc1_weight_sf=_to_cute(fc1[1]),
+            shared_fc2_weight=_to_cute(fc2[0]),
+            shared_fc2_weight_sf=_to_cute(fc2[1]),
+            shared_output=_to_cute(self.shared_output, assumed_align=32),
         )
 
     def _runtime_kwargs(
@@ -901,6 +1076,7 @@ class Sm107BlockScaledSymmBuffer:
         output_cute = _to_cute(output, dynamic_leading=False)
         output_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
         return {
+            **self._shared_runtime_kwargs(),
             "activation": _to_cute(self.x),
             "activation_sf": _to_cute(self.x_sf),
             "topk_indices": _to_cute(self.topk_idx),
@@ -912,6 +1088,11 @@ class Sm107BlockScaledSymmBuffer:
             "output_activation": output_cute,
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
+            **(
+                {"tmp_buffer": _to_cute_ptr(self.tmp_workspace)}
+                if self.config.kernel_variant == "inference"
+                else {}
+            ),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
             **{
@@ -957,6 +1138,10 @@ class Sm107BlockScaledSymmBuffer:
         self._validate_batch_invariant_scalars()
         key = (
             self.batch_invariant_fingerprint,
+            tuple(t.data_ptr() for leg in self._shared_weights for t in leg)
+            if self.config.shared_expert is not None
+            and self._shared_weights is not None
+            else None,
             transformed_l1[0].data_ptr(),
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),
@@ -1005,7 +1190,9 @@ class Sm107BlockScaledSymmBuffer:
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
-        elif not getattr(self.kernel, "masks_invalid_combine_slots", False):
+        elif not self.config.combine_dedup and not getattr(
+            self.kernel, "masks_invalid_combine_slots", False
+        ):
             # Invalid routes do not write a combine slot. Clear those slots on
             # every launch so a masked route cannot reuse an earlier result.
             invalid = (self.topk_idx < 0) | (
@@ -1035,6 +1222,8 @@ class Sm107BlockScaledSymmBuffer:
         self.output_activation = None
         self.shared_workspace = None
         self.local_workspace = None
+        self.tmp_workspace = None
+        self.shared_output = None
 
     def install_tuned_knobs(
         self,
@@ -1095,6 +1284,9 @@ class Sm107BlockScaledSymmBuffer:
         self._routing_checks.clear()
         self._tuning_inputs = None
         self._bound_scalars = {}
+        self._shared_weights = None
+        for name in ("shared_x", "shared_x_sf", "shared_x_sf_linear"):
+            setattr(self, name, None)
         for name in ("x", "x_sf", "topk_weights"):
             comm.free_sym_tensor(getattr(self, name, None))
             setattr(self, name, None)
@@ -1148,6 +1340,10 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     has_fc2_alpha: bool = True,
     has_fc1_norm_const: bool = True,
     process_group=None,
+    use_tanh_sigmoid: bool = False,
+    epilogue_warpgroups: int = 1,
+    shared_expert: Sm107SharedExpertConfig | None = None,
+    combine_dedup: bool = False,
 ) -> Sm107BlockScaledSymmBuffer:
     """Allocate the SM107 block-scaled mega session workspace.
 
@@ -1192,6 +1388,10 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         situ_linear_beta=situ_linear_beta,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
+        use_tanh_sigmoid=use_tanh_sigmoid,
+        epilogue_warpgroups=epilogue_warpgroups,
+        shared_expert=shared_expert,
+        combine_dedup=combine_dedup,
     )
     return Sm107BlockScaledSymmBuffer(config, process_group=process_group)
 
@@ -1214,12 +1414,20 @@ def _expected_weight_shapes(
     return fc1_shape, fc2_shape, fc1_sf, fc2_sf
 
 
+class _WeightFormat(Protocol):
+    @property
+    def torch_weight_data_dtype(self) -> torch.dtype: ...
+
+    @property
+    def torch_act_sf_dtype(self) -> torch.dtype: ...
+
+
 def _validate_weight_leg(
     name: str,
     leg: TransformedBlockScaledWeights,
     expected_weight_shape: Tuple[int, ...],
     expected_sf_numel: int,
-    cfg: Sm107BlockScaledMoeConfig,
+    cfg: _WeightFormat,
     device: torch.device,
 ) -> None:
     if (
