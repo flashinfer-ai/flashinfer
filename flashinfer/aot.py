@@ -1073,8 +1073,12 @@ def gen_all_modules(
             # SM120 only: the specialized fp8 blockwise-scale decode GEMMs
             # (gemm_fp8_nt_groupwise backend "specialized") are pinned to the
             # exact sm_120a target (64 KB dynamic-smem opt-in, measured
-            # allowlist); SM121 resolves to the stock backends.
-            jit_specs.append(gen_specialized_gemm_fp8_blockwise_sm120_module())
+            # allowlist); SM121 resolves to the stock backends. The kernels
+            # use 256-bit ld.global.nc v8.b32 loads (PTX ISA 8.8), first
+            # shipped with CUDA 12.9: older toolkits cannot compile the
+            # module, matching the runtime dispatch guard.
+            if get_cuda_version() >= Version("12.9"):
+                jit_specs.append(gen_specialized_gemm_fp8_blockwise_sm120_module())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:

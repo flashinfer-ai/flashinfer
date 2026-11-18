@@ -252,6 +252,16 @@ constexpr int red_smem_bytes() {
   return (NW_K > 1) ? NW_N * NW_K * NACC * 32 * static_cast<int>(sizeof(float)) : 0;
 }
 
+// Surface a rejected launch to the FFI caller instead of returning normally
+// with Y unwritten: the Python wrapper would otherwise count the dispatch as
+// successful and mark the shape warmed for capture. Successful launches are
+// never synchronized; for <<<...>>> launches the immediate error is only
+// observable through cudaGetLastError().
+static inline void check_launch(cudaError_t status) {
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "specialized sm120 fp8 gemm launch failed: " << cudaGetErrorString(status);
+}
+
 template <int NW_N, int NW_K, int NT, int MR, int KU, int ITERS, int MINB>
 static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As, const float* Bs,
                              __nv_bfloat16* Y, int M, int N, int K, int KB, const dim3& grid,
@@ -263,6 +273,7 @@ static inline void launch_bw(const uint8_t* A, const uint8_t* B, const float* As
                          cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
   }
   gemm_bw<NW_N, NW_K, NT, MR, KU, ITERS, MINB><<<grid, TH, SMEM, s>>>(A, B, As, Bs, Y, M, N, K, KB);
+  check_launch(cudaGetLastError());
 }
 
 template <int NW_N, int NW_K, int NT, int KU, int ITERS, int MINB>
@@ -322,7 +333,8 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, gemm_bw<4, 4, 1, 8, 1, 1, 1>, Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);
+    check_launch(cudaLaunchKernelEx(&config, gemm_bw<4, 4, 1, 8, 1, 1, 1>, Ap, Bp, Asp, Bsp, Yp, M,
+                                    N, K, KB));
     return;
   }
 
@@ -349,7 +361,8 @@ void Run(ffi::TensorView A, ffi::TensorView B, ffi::TensorView As, ffi::TensorVi
     attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicyLoadBalancing;
     config.attrs = attrs;
     config.numAttrs = 2;
-    cudaLaunchKernelEx(&config, gemm_bw<4, 4, 1, 16, 1, 1, 1>, Ap, Bp, Asp, Bsp, Yp, M, N, K, KB);
+    check_launch(cudaLaunchKernelEx(&config, gemm_bw<4, 4, 1, 16, 1, 1, 1>, Ap, Bp, Asp, Bsp, Yp, M,
+                                    N, K, KB));
     return;
   }
 

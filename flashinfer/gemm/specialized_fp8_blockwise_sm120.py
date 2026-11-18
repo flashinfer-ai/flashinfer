@@ -110,6 +110,14 @@ def is_specialized_supported(
         return _no("kill_switch")
     if a.dim() != 2 or b.dim() != 2:
         return _no("geometry:not_2d")
+    # The kernel launches on A's device (combo_entry makes it current) and
+    # reads every operand through raw pointers: an operand on another device
+    # would be an illegal cross-device access, not a torch error.
+    devices = {a.device, b.device, a_scale.device, b_scale.device}
+    if out is not None:
+        devices.add(out.device)
+    if len(devices) != 1:
+        return _no("device:operand_mismatch")
     M, K = a.shape
     N = b.shape[0]
     m_max = _allowlist().get((N, K))

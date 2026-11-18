@@ -225,11 +225,18 @@ def test_kill_switch_disables_backend(stock_sentinel, monkeypatch):
     from flashinfer.gemm import specialized_fp8_blockwise_sm120 as specmod
 
     monkeypatch.setenv("FLASHINFER_SPECIALIZED_KERNEL_DISABLE", "1")
-    a, b, a_scale, b_scale = _gen_inputs(4, 64, 2048, seed=47)
+    # Stock-routing assertion on an aligned-N class: the stock cutlass
+    # groupwise checker rejects 128-unaligned N on SM120 (#9555), so an N=64
+    # auto call with the kill switch set raises BackendSupportedError before
+    # it could reach the sentinel.
+    a, b, a_scale, b_scale = _gen_inputs(4, 1024, 2048, seed=47)
     with pytest.raises(stock_sentinel):
         _call(a, b, a_scale, b_scale, backend="auto")
     reasons = {reason for _, reason in specmod.fallback_reasons}
     assert "kill_switch" in reasons
+    # Explicit ``specialized`` under the kill switch serves through the
+    # composable path, including the 128-unaligned N=64 class.
+    a, b, a_scale, b_scale = _gen_inputs(4, 64, 2048, seed=48)
     ref = _reference(a, b, a_scale, b_scale)
     out = _call(a, b, a_scale, b_scale, backend="specialized", out=_nan_out(4, 64))
     torch.cuda.synchronize()
