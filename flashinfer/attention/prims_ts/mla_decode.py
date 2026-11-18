@@ -1884,7 +1884,8 @@ class BatchMLADecodePagedTSWrapper:
             Launch every kernel of the plan with programmatic dependent launch
             (PDL); each kernel waits in-kernel for the preceding grid before it
             reads its inputs. ``None`` (default) enables it on devices that
-            support PDL.
+            support PDL. The neutral-row kernel that ``use_kv_bounds`` runs
+            before attention keeps a plain launch; stream order covers it.
         """
 
         lse_mode = validate_lse_mode(lse_mode)

@@ -239,7 +239,10 @@ in `plan()`; it changes neither kernel selection nor workspace sizes. Split FMHA
 decode launches (`BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`,
 `prepare_prims_ts_batch_decode_with_kv_cache`) whose reduction is fused into
 attention or runs across a cluster keep plain stream ordering, and the
-synchronous inspection of the block-sparse one-shot APIs is a plain launch.
+synchronous inspection of the block-sparse one-shot APIs is a plain launch. So
+is the MLA neutral-row kernel that `use_kv_bounds` runs before attention:
+stream order covers its reads, and the attention grid's entry wait covers its
+stores; launched with PDL and a wait, it cost 0.2 to 0.7 us per call on B200.
 
 ## QToken-KvBlock-Sparse-Attention interface
 

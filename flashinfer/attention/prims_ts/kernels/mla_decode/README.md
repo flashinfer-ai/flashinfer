@@ -139,6 +139,8 @@ checks structure and values outside capture; trusted runs perform no host
 readback. Retain the vector and mutate its contents between completed launches
 or graph replays. A zero prefix writes zero O and optional LSE `-inf`. A bounds-only neutral initialization launch also
 covers requests with zero local KV when the ordinary task schedule skips them.
+It is a plain launch even under `enable_pdl`: stream order covers its reads, and
+the attention grid's entry wait covers its stores.
 `plan(zero_empty_rows=False)` omits this initialization launch while retaining
 per-query prefix masking. In that mode empty-row results are unspecified, not
 guaranteed preserved; initialize them or exclude them from merging. The default
