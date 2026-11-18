@@ -561,7 +561,8 @@ portfolio fails closed outside these contracts:
   ``(SwiGLU(), 4096, 256, 512, 10)``, ``(SwiGLU(), 3072, 768, 256, 8)``,
   and ``(SwiGLU(), 3072, 384, 256, 8)``;
 * the token count is 1--32, routing is ``UnpackedPrecomputed`` with contiguous
-  int32 expert IDs and BF16 routing weights;
+  int32 expert IDs and BF16 routing weights; an ID outside
+  ``[0, num_experts)`` drops its routing slot (see below);
 * quantization is NVFP4, finalization and PDL are enabled, and expert
   parallelism, fused shared experts, bias, and LoRA are disabled.
 
@@ -637,17 +638,18 @@ its dictionary directly::
     )
     output = MoELayer(config)(activations, weights)
 
+The kernels drop every routing slot whose expert ID lies outside
+``[0, num_experts)``, for example a ``-1`` padding slot. A dropped slot adds
+nothing to the output, and its routing weight is ignored even when it is NaN or
+Inf. Any number of a token's slots may be dropped, and a token without a valid
+slot outputs zeros. The check runs on the device in every launch and CUDA Graph replay; no
+host code reads ``topk_ids``, so the routing tensor may change between calls
+and replays without any revalidation.
+
 The runner prepares its route-map workspace before a timed launch or CUDA
 Graph capture and reuses it for the same token count and geometry. Warm up each
-shape and routing tensor before capturing it; an unseen workspace shape or an
-unvalidated routing-tensor generation during capture is rejected instead of
-initializing implicitly. Repeated calls reuse the routing validation receipt
-until a normal tensor is modified in place. Inference tensors lack a version
-counter, so their receipt is identity/storage based. Every later inference-mode
-mutation and graph replay must keep expert IDs in the configured range because
-neither path can be revalidated automatically. At most 64 live routing tensors
-are retained; validating another distinct tensor fails explicitly, so construct
-a new runner for another bounded lifetime.
+shape before capturing it; an unseen workspace shape during capture is
+rejected instead of initializing implicitly.
 
 The runner retains a bounded prepared-workspace cache keyed by execution stream
 and geometry. Preparation issues a generation receipt, and the binding records

@@ -292,7 +292,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_4e1f92bce3484b974240(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_tiles, int* __restrict__ work_counter, int grid_m, int max_tiles, int K_tiles)
+kernel_cake_warp_decode_4e1f92bce3484b974240(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_tiles, int* __restrict__ work_counter, int grid_m, int max_tiles, int K_tiles, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -392,8 +392,9 @@ kernel_cake_warp_decode_4e1f92bce3484b974240(const __grid_constant__ CUtensorMap
             vec_load_0[0] = (int32_t)_scalar_bits_1;
         }
         route_expert = vec_load_0[0];
-        if (route_expert < 0 || route_expert >= 512) {
-            asm volatile("trap;" ::: "memory");
+        if ((unsigned int)route_expert >= (unsigned int)num_experts) {
+            route_valid = false;
+            route_expert = 0;
         }
     }
     int expert_slot = route_expert & 511;

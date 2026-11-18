@@ -974,7 +974,6 @@ class CakeWarpDecodeRunner(MoERunner):
         SiTU(gate_scale=4.0, linear_scale=25.0): ("gemm1_alpha", "gemm1_beta"),
     }
     _MAX_STREAM_WORKSPACES: ClassVar[int] = 64
-    _MAX_TOPK_VALIDATION_RECEIPTS: ClassVar[int] = 64
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -1004,9 +1003,6 @@ class CakeWarpDecodeRunner(MoERunner):
             tuple[int, int, tuple[int, int, int, int, int]],
             tuple[torch.Tensor, int],
         ] = {}
-        self._topk_validation_receipts: OrderedDict[
-            int, tuple[torch.Tensor, int, int | None, int]
-        ] = OrderedDict()
         # There is exactly one adaptive schedule. Exact runtime shapes are
         # profiled as-is, so the autotuner never synthesizes invalid expert ids.
         self.tuning_config = TuningConfig(use_cuda_graph=True)
@@ -1166,67 +1162,6 @@ class CakeWarpDecodeRunner(MoERunner):
     @staticmethod
     def _stream_token(stream: Any) -> int:
         return 0 if stream is None else int(stream.cuda_stream)
-
-    @staticmethod
-    def _topk_version(topk_ids: torch.Tensor) -> int | None:
-        try:
-            return int(topk_ids._version)
-        except RuntimeError:
-            # Inference tensors do not expose a version counter. Their receipt
-            # is therefore identity-only; callers retain the same obligation
-            # to keep graph-time mutations in range as on graph replay.
-            return None
-
-    def _validate_expert_id_range(
-        self, topk_ids: torch.Tensor, num_experts: int
-    ) -> None:
-        # The adaptive direct schedules use each ID as an expert-array/TMA
-        # coordinate. Validate while inputs are packed, never in the timed or
-        # captured launch path. CUDA Graph callers must keep later mutations in
-        # the same documented range.
-        if not torch.is_tensor(topk_ids):
-            return
-        cache_key = id(topk_ids)
-        data_ptr = topk_ids.data_ptr()
-        version = self._topk_version(topk_ids)
-        receipt = self._topk_validation_receipts.get(cache_key)
-        if (
-            receipt is not None
-            and receipt[0] is topk_ids
-            and receipt[1] == data_ptr
-            and receipt[2] == version
-            and receipt[3] == num_experts
-        ):
-            self._topk_validation_receipts.move_to_end(cache_key)
-            return
-        if self._is_current_stream_capturing():
-            raise RuntimeError(
-                "Cake warp decode topk_ids must be range-validated before CUDA "
-                "Graph capture; warm up this exact tensor version first."
-            )
-        in_range = torch.logical_and(topk_ids >= 0, topk_ids < num_experts).all()
-        if not bool(in_range.item()):
-            raise ValueError(
-                "CakeWarpDecodeRunner requires every topk_ids value to satisfy "
-                f"0 <= id < {num_experts}."
-            )
-        if (
-            cache_key not in self._topk_validation_receipts
-            and len(self._topk_validation_receipts)
-            >= self._MAX_TOPK_VALIDATION_RECEIPTS
-        ):
-            raise RuntimeError(
-                "Cake warp decode supports at most 64 live routing-validation "
-                "receipts; construct a new runner before validating another "
-                "topk_ids tensor."
-            )
-        self._topk_validation_receipts[cache_key] = (
-            topk_ids,
-            data_ptr,
-            version,
-            num_experts,
-        )
-        self._topk_validation_receipts.move_to_end(cache_key)
 
     def _cache_workspace_for_stream(
         self,
@@ -1462,7 +1397,8 @@ class CakeWarpDecodeRunner(MoERunner):
             allowed_weights_dtypes=(torch.bfloat16,),
             require_contiguous=True,
         )
-        self._validate_expert_id_range(act.topk_ids, routing.num_experts)
+        # Expert ids outside [0, num_experts) are dropped inside the kernels;
+        # the host never reads topk_ids, so capture and replay need no receipt.
         device = act.hidden_states_q.device
         if device != self.device:
             raise ValueError(

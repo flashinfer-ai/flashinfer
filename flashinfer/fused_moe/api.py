@@ -696,6 +696,13 @@ class CakeWarpDecodeConfig:
     :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
     representation usable by both runners.
 
+    A routing slot whose ``topk_ids`` value lies outside ``[0, num_experts)``,
+    such as a ``-1`` padding slot, is dropped inside the kernels: it adds
+    nothing to the output and its weight is ignored, even if NaN or Inf. A
+    token may have several dropped slots, and a token without a valid slot
+    outputs zeros. No host check reads ``topk_ids``, so CUDA Graph replays may
+    change the ids freely.
+
     CUDA Graph capture requires a warmed workspace. Graph replays and eager
     calls that share a workspace must be ordered by the caller; captured calls
     do not insert a wait for another graph using that workspace. Use separate

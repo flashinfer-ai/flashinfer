@@ -267,7 +267,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_c2a25e69aaf3a844baef(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_tiles, int* __restrict__ work_counter, int grid_m, int max_tiles, int K_tiles)
+kernel_cake_warp_decode_c2a25e69aaf3a844baef(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_tiles, int* __restrict__ work_counter, int grid_m, int max_tiles, int K_tiles, int num_experts)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -348,6 +348,7 @@ kernel_cake_warp_decode_c2a25e69aaf3a844baef(const __grid_constant__ CUtensorMap
         vec_load_0[0] = (int32_t)_scalar_bits_1;
     }
     int first_expert = vec_load_0[0];
+    first_expert = (((unsigned int)first_expert < (unsigned int)num_experts) ? first_expert : 0);
 
     // Mbarrier init (18 pipeline groups, 0 ordered-sequence groups, 88 barriers)
     // Mbarriers at smem_raw[0..704)
@@ -453,6 +454,7 @@ kernel_cake_warp_decode_c2a25e69aaf3a844baef(const __grid_constant__ CUtensorMap
                     vec_load_1[0] = (int32_t)_scalar_bits_0;
                 }
                 int expert = vec_load_1[0];
+                expert = (((unsigned int)expert < (unsigned int)num_experts) ? expert : 0);
                 mbarrier_wait_hint(throttle_empty_addr + (throttle_stage) * 8, _phase_throttle_empty, 10000000);
                 mbarrier_arrive(throttle_full_addr + (throttle_stage) * 8);
                 throttle_stage += 1;
@@ -562,7 +564,7 @@ kernel_cake_warp_decode_c2a25e69aaf3a844baef(const __grid_constant__ CUtensorMap
                         : "=r"(_scalar_bits_0) : "l"((const void*)(tile_expert + (n_tile_2))) : "memory");
                     vec_load_2[0] = (int32_t)_scalar_bits_0;
                 }
-                unsigned int sf_tile = (unsigned int)vec_load_2[0] * (unsigned int)grid_m + m_tile_2;
+                unsigned int sf_tile = (unsigned int)((((unsigned int)vec_load_2[0] < (unsigned int)num_experts) ? vec_load_2[0] : 0)) * (unsigned int)grid_m + m_tile_2;
                 #pragma unroll 1
                 for (int k_3 = 0; k_3 < K_tiles; k_3++) {
                     mbarrier_wait_hint(sfa_empty_addr + (stage_2) * 8, _phase_sfa_empty, 10000000);
@@ -967,6 +969,7 @@ kernel_cake_warp_decode_c2a25e69aaf3a844baef(const __grid_constant__ CUtensorMap
                     vec_load_3[0] = (int32_t)_scalar_bits_0;
                 }
                 int expert_1 = vec_load_3[0];
+                expert_1 = (((unsigned int)expert_1 < (unsigned int)num_experts) ? expert_1 : 0);
                 int vec_load_4[1];
                 {
                     uint32_t _scalar_bits_1;
