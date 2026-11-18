@@ -96,6 +96,24 @@ def _attention_fingerprint(head_dim: int) -> str:
     return spec_fingerprint(head_dim)
 
 
+def _sparse_mla_fingerprint(
+    qk_rope_head_dim: int, dtype: Union[torch.dtype, str]
+) -> str:
+    """The sparse MLA class of a layout (``qk_rope_head_dim`` 64 or 0) and an operand dtype (bf16, or e4m3 as
+    ``torch.float8_e4m3fn`` / ``torch.uint8`` / ``"e4m3"``)."""
+    from ..mla.batch_invariant.spec import ROPE_DIMS, spec_fingerprint
+
+    if int(qk_rope_head_dim) not in ROPE_DIMS:
+        raise ValueError(f"qk_rope_head_dim {qk_rope_head_dim}: one of {ROPE_DIMS}")
+    if dtype in (torch.bfloat16, "bf16"):
+        fmt = "bf16"
+    elif dtype in (getattr(torch, "float8_e4m3fn", None), torch.uint8, "e4m3"):
+        fmt = "e4m3"
+    else:
+        raise ValueError(f"dtype {dtype!r}: bf16 or e4m3")
+    return spec_fingerprint(int(qk_rope_head_dim), fmt)
+
+
 def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device.
@@ -620,6 +638,10 @@ CLASSES: Dict[str, ClassInfo] = {
     "BatchPrefillWithRaggedKVCacheWrapper": ClassInfo(
         "attention.bf16", ("head_dim",), _attention_fingerprint
     ),
+    # sparse MLA (`sparse_mla_top_k > 0`): one class per layout and operand format, for decode and prefill alike
+    "trtllm_batch_decode_with_kv_cache_mla": ClassInfo(
+        "mla.sparse", ("qk_rope_head_dim", "dtype"), _sparse_mla_fingerprint
+    ),
     # the unified MoE layer with `BatchInvariantFp8PerTensorConfig`: the same dimensions as `fused_moe`; the static per-tensor
     # scales are inputs of the class (their values never enter the identifier)
     "fused_moe_fp8": ClassInfo(
@@ -737,6 +759,11 @@ def fingerprint(op: str, **dims) -> str:
     ``BatchInvariantFp8PerTensorConfig``: the fp8 GEMM folds at ``K = H`` and ``K = I``, the fused e4m3 quantization of the
     activation on the alpha-scaled accumulators and GEMM2's scaled chain are the specification; the static per-tensor
     scales, like the operands, are inputs.
+
+    ``trtllm_batch_decode_with_kv_cache_mla`` (``sparse_mla_top_k > 0``) takes ``qk_rope_head_dim`` (64 or 0) and
+    ``dtype`` (bf16 or e4m3): the 128-position tiles of the index list, the two tile reductions, the tile merge and the
+    epilogue are the specification; the head count, the batch, the list width and the live counts are inputs.
+
     >>> fingerprint("chunk_gated_delta_rule")  # doctest: +SKIP
     'gdn-bf16-c64-...'
     """
