@@ -64,11 +64,11 @@ def test_bmm_fp8_wrong_device_rejected():
     A_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     B_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
-    # Move A to CPU to simulate mismatch
-    A_cpu = A.cpu()
+    # Test with scale on CPU while operands are on CUDA
+    A_scale_cpu = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
     with pytest.raises(ValueError, match="A_scale must be on the same CUDA device"):
-        bmm_fp8(A_cpu.cuda(), A, A_scale, B_scale, torch.bfloat16, backend="cublas")
+        bmm_fp8(A, B, A_scale_cpu, B_scale, torch.bfloat16, backend="cublas")
 
 
 def test_bmm_fp8_zero_dim_scalar_rejected():
