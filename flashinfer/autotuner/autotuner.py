@@ -3274,6 +3274,7 @@ class AutoTuner:
             race_default = self._in_v2_context
 
             incomplete_winner: tuple[int, Any] | None = None
+            published_profiles: list[tuple[tuple[int, ...], ...]] = []
             pbar = None
             for _step, p in enumerate(profiles):
                 tensors = None
@@ -3637,6 +3638,8 @@ class AutoTuner:
                                     tuning_config,
                                     inputs,
                                 )
+                            else:
+                                published_profiles.append(p.get_opt_shapes())
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)
                                 + 1
@@ -3697,9 +3700,10 @@ class AutoTuner:
                         record_group_rejection=True,
                     )
                     return runners[0], -1
-                self._clear_rejected_profile(
-                    custom_op, runners, input_shapes, tuning_config, inputs
-                )
+                for shape in dict.fromkeys((input_shapes, *published_profiles)):
+                    self._clear_rejected_profile(
+                        custom_op, runners, shape, tuning_config, inputs
+                    )
             return runners[runner_id], tactic
 
     def _clear_rejected_profile(
@@ -3745,6 +3749,7 @@ class AutoTuner:
         ranked = self._ranked_cache()
         identity = self._winner_cache_identity()
         store = self._active_managed_store
+        rejected_file_keys: set[str] = set()
         for runner in runners:
             # Older runners may include exact dimensions in their extras.
             # Retire both the lookup key and the synthesized bucket's key.
@@ -3778,6 +3783,7 @@ class AutoTuner:
                     self._rejected_file_keys.setdefault(identity, set()).add(
                         key.file_key
                     )
+                    rejected_file_keys.add(key.file_key)
                 if store is not None:
                     self._managed_decoded.pop(
                         (str(store.root), store.env_hash, key.key_fields), None
@@ -3786,6 +3792,14 @@ class AutoTuner:
                     # readers until publish atomically overwrites the file.
                     if key.file_key != republish_key:
                         store.discard(key.file_key)
+        if rejected_file_keys:
+            # Retire other runner_hash instances of the same file_key in this identity.
+            for table in (winners, ranked):
+                for alias_key in [k for k in table if k.file_key in rejected_file_keys]:
+                    table.pop(alias_key, None)
+                    self._profiling_cache_policies.pop((identity, alias_key), None)
+                    self._profiling_cache_selections.pop((identity, alias_key), None)
+                    self._profiling_cache_candidates.pop((identity, alias_key), None)
         if identity is None:
             self._dirty = True
             self._dirty_seq += 1
@@ -3897,12 +3911,6 @@ class AutoTuner:
         identity = self._winner_cache_identity()
         self._winner_cache()[key] = (tactic, profile)
         self._profiling_cache_policies[(identity, key)] = policy
-        if identity is None:
-            self._invalidated_file_keys.discard(key.file_key)
-        else:
-            excluded = self._excluded_file_keys.get(identity)
-            if excluded is not None:
-                excluded.discard(key.file_key)
         rejected = self._rejected_file_keys.get(identity)
         if rejected is not None:
             rejected.discard(key.file_key)

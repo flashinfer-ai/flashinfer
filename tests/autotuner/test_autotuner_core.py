@@ -2657,6 +2657,202 @@ def test_single_process_tuning_does_not_block_top_bucket_fallback(monkeypatch):
     ) == (runner_a, 0)
 
 
+def test_group_rejection_retires_runner_hash_aliases(monkeypatch):
+    """Group rejection retires every runner_hash alias of the rejected file_key
+    in the active identity without touching other buckets or identities."""
+    from flashinfer.autotune_cache import MeasurementPolicy, autotune_v2
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._collect_metadata",
+        lambda: {"test": "alias"},
+    )
+
+    r_old, r_new = DummyRunner([0]), DummyRunner([0])
+    config = _pow2_bucket_config()
+    key_512_old = AutoTuner._get_cache_key("alias_op", r_old, ((512, 16),), config, ())
+    key_128_old = AutoTuner._get_cache_key("alias_op", r_old, ((128, 16),), config, ())
+    tuner._winner_cache()[key_512_old] = (0, None)
+    tuner._winner_cache()[key_128_old] = (0, None)
+    tuner._ranked_cache()[key_512_old] = (tuner._profiling_policy(config), (0,))
+
+    other_policy = MeasurementPolicy(execution_mode="cuda_graph")
+    with autotune_v2(
+        mode="replay", persistent_cache=False, measurement_policy=other_policy
+    ):
+        tuner._winner_cache()[key_512_old] = (0, None)
+
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", object())
+    monkeypatch.setattr(
+        autotuner_module,
+        "_check_tuning_group_phase",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        autotuner_module,
+        "_sync_oom_across_tune_group",
+        lambda *a, **k: False,
+    )
+    monkeypatch.setattr(
+        autotuner_module,
+        "_all_ranks_hit_cache",
+        lambda local_hit, selection=None, *, phase="cache": phase == "cache",
+    )
+    with autotune(True):
+        assert tuner.choose_one(
+            "alias_op", [r_new], config, [torch.empty((512, 16))]
+        ) == (r_new, -1)
+
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", None)
+    assert key_512_old not in tuner._winner_cache()
+    assert key_512_old not in tuner._ranked_cache()
+    assert key_128_old in tuner._winner_cache()
+    assert tuner.search_cache(
+        "alias_op", [r_old], ((512, 16),), config, inputs=[torch.empty((512, 16))]
+    ) == (False, 0, -1, None)
+    with autotune_v2(
+        mode="replay", persistent_cache=False, measurement_policy=other_policy
+    ):
+        assert key_512_old in tuner._winner_cache()
+
+
+def test_managed_publish_keeps_legacy_exclusion(tmp_path, monkeypatch):
+    """Publishing to a managed store must keep loaded legacy entries excluded
+    for other runner instances during bare process-scope serving."""
+    from flashinfer.autotune_cache import autotune_v2
+
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", "0")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._collect_metadata",
+        lambda: {"test": "legacy_excl"},
+    )
+
+    legacy_path = tmp_path / "legacy.json"
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    config = TuningConfig()
+    inputs = [torch.empty((8, 16))]
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner, inp, tac, cfg, **kw: 1.0 if tac == 0 else 5.0,
+    )
+    with autotune(True):
+        assert (
+            tuner.choose_one("legacy_excl_op", [DummyRunner([0, 1])], config, inputs)[1]
+            == 0
+        )
+    tuner.save_configs(str(legacy_path))
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    tuner.load_configs(str(legacy_path))
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner, inp, tac, cfg, **kw: 1.0 if tac == 1 else 5.0,
+    )
+    old_runner = DummyRunner([0, 1])
+    managed_config = TuningConfig(use_cold_l2_cache=True)
+    with autotune_v2(cache_root=tmp_path):
+        assert (
+            tuner.choose_one("legacy_excl_op", [old_runner], managed_config, inputs)[1]
+            == 1
+        )
+
+    fresh_runner = DummyRunner([0, 1])
+    assert hash(fresh_runner) != hash(old_runner)
+    assert tuner.choose_one(
+        "legacy_excl_op", [fresh_runner], managed_config, inputs
+    ) == (
+        fresh_runner,
+        1,
+    )
+
+
+def test_distributed_multibucket_retune_clears_rejected_profile(monkeypatch):
+    """Re-profiling a previously rejected bucket while final_selection checks a
+    different bucket must clear the rejection when the group agrees."""
+
+    class OtherRunner(DummyRunner):
+        pass
+
+    class UnseenRunner(DummyRunner):
+        pass
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._collect_metadata",
+        lambda: {"test": "multibucket"},
+    )
+    runner_a, runner_b, runner_c = (
+        DummyRunner([0]),
+        OtherRunner([1]),
+        UnseenRunner([2]),
+    )
+    config = _pow2_bucket_config()
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner, inp, tac, cfg, **kw: (
+            1.0 if isinstance(runner, OtherRunner) else 2.0
+        ),
+    )
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", object())
+    monkeypatch.setattr(
+        autotuner_module,
+        "_check_tuning_group_phase",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        autotuner_module,
+        "_sync_oom_across_tune_group",
+        lambda *a, **k: False,
+    )
+    monkeypatch.setattr(
+        autotuner_module,
+        "_all_ranks_hit_cache",
+        lambda local_hit, selection=None, *, phase="cache": phase == "cache",
+    )
+    with autotune(True):
+        assert tuner.choose_one(
+            "mb_retune", [runner_a, runner_b], config, [torch.empty((512, 16))]
+        ) == (runner_a, -1)
+
+    # Re-tune with inputs in bucket 128 while profiles cover both 128 and 512,
+    # and the group agrees at final_selection. runner_a wins 512 this time.
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner, inp, tac, cfg, **kw: (
+            1.0
+            if (isinstance(runner, OtherRunner) and inp[0].shape[0] <= 128)
+            or (type(runner) is DummyRunner and inp[0].shape[0] > 128)
+            else 2.0
+        ),
+    )
+    monkeypatch.setattr(
+        autotuner_module,
+        "_all_ranks_hit_cache",
+        lambda local_hit, selection=None, *, phase="cache": local_hit,
+    )
+    with autotune(True):
+        assert tuner.choose_one(
+            "mb_retune", [runner_a, runner_b], config, [torch.empty((128, 16))]
+        ) == (runner_b, 1)
+
+    monkeypatch.setattr(autotuner_module, "_tune_process_group", None)
+    assert tuner.choose_one(
+        "mb_retune", [runner_b, runner_c], config, [torch.empty((512, 16))]
+    ) == (runner_b, 1)
+
+
 # ---------------------------------------------------------------------------
 # Tests for value-aware profiling usage
 # ---------------------------------------------------------------------------
