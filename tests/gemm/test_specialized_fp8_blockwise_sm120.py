@@ -139,19 +139,22 @@ def _call(a, b, a_scale, b_scale, backend, out=None):
 # of combo_entry.cu (each class picks a different kernel per M range, and some
 # routes have exact-M forms, e.g. the N=64 cluster launches at M=1/16/32 and
 # the N=1024 switch at M<=2), with M capped at the class's admitted max.
-ALLOWLIST_NK_MMAX = {
-    (64, 2048): 32,
-    (1024, 2048): 32,
-    (2048, 512): 32,
-    (2048, 4096): 32,
-    (9216, 2048): 16,
-    (12288, 2048): 16,
-}
+# Loaded from the SHIPPED allowlist (the same file the dispatcher reads), so
+# the parametrization cannot drift from what auto-routing actually admits.
+def _shipped_allowlist():
+    from flashinfer.gemm.specialized_fp8_blockwise_sm120 import _allowlist
+
+    return _allowlist()
+
+
+ALLOWLIST_NK_MMAX = _shipped_allowlist()
 ROUTE_BOUNDARY_MS = (1, 2, 3, 4, 5, 8, 9, 15, 16, 17, 32)
 ROUTE_CASES = [
     (m, n, k)
     for (n, k), m_max in sorted(ALLOWLIST_NK_MMAX.items())
-    for m in ROUTE_BOUNDARY_MS
+    # always include the class's own admitted max, so a widened allowlist
+    # entry is exercised at its new boundary even before this tuple is told
+    for m in sorted(set(ROUTE_BOUNDARY_MS) | {m_max})
     if m <= m_max
 ]
 
