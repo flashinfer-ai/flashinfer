@@ -147,7 +147,8 @@ def _empty_out(batch_size: int, num_v_heads: int = _HV) -> torch.Tensor:
     )
 
 
-def _whole_name(batch_size: int, scale: float) -> str:
+def _whole_name(batch_size: int, scale: float, heads=(_H, _HV)) -> str:
+    num_q_heads, num_v_heads = heads
     route = cake_gdn.select_cake_gdn_decode_variant(
         arch="sm_107a",
         batch_size=batch_size,
@@ -155,9 +156,9 @@ def _whole_name(batch_size: int, scale: float) -> str:
         state_dtype="float32",
         head_size=_HEAD,
         layout="nontranspose",
-        num_k_heads=_H,
-        num_q_heads=_H,
-        num_v_heads=_HV,
+        num_k_heads=num_q_heads,
+        num_q_heads=num_q_heads,
+        num_v_heads=num_v_heads,
         scale=scale,
         seq_len=1,
         use_qk_l2norm=True,
@@ -168,14 +169,16 @@ def _whole_name(batch_size: int, scale: float) -> str:
 def _whole(tensors, state, scale):
     """The whole-GPU body's ``(out, state)`` of one call on a fresh ordinary copy of
     ``state`` (a direct launch of the routed record)."""
-    batch_size = state.shape[0]
-    name = _whole_name(batch_size, scale)
+    batch_size, num_v_heads = int(state.shape[0]), int(state.shape[1])
+    name = _whole_name(batch_size, scale, (int(tensors["q"].shape[2]), num_v_heads))
     entry = cake_gdn.load_cake_gdn_kernel(name, "sm_107a")
     grid_x = (
-        batch_size * _HV * cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(name)
+        batch_size
+        * num_v_heads
+        * cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(name)
     )
     ordinary = state.clone()
-    out = _empty_out(batch_size)
+    out = _empty_out(batch_size, num_v_heads)
     entry(*_call_args(tensors, ordinary, out), grid_x, 1, 1)
     torch.cuda.synchronize()
     return out, ordinary
@@ -258,10 +261,13 @@ _TWIN_BATCHES = [32, 33, 36, 37, 48, 63, 64, 127, 128, 255, 256, 512, 1024]
 
 @pytest.mark.parametrize("scale", [_SCALE, 1.0])
 @pytest.mark.parametrize("batch_size", _TWIN_BATCHES)
-def test_twin_matches_the_whole_body_bitwise(batch_size: int, scale: float) -> None:
+def test_twin_matches_the_whole_body_bitwise(
+    monkeypatch, batch_size: int, scale: float
+) -> None:
     # localize_gdn_decode_state homes the state at the byte cut; the public call on it
     # runs the twin (its launch is resolved, not "no twin") and gives the whole body's
-    # output and state bit for bit, within tolerance of the reference.
+    # output and state bit for bit, within tolerance of the reference; with
+    # backend="auto" too.
     device, table = _require_domain()
     tensors, initial = _inputs(batch_size)
     whole_out, whole_state = _whole(tensors, initial, scale)
@@ -281,15 +287,24 @@ def test_twin_matches_the_whole_body_bitwise(batch_size: int, scale: float) -> N
             out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
         )
         torch.testing.assert_close(homed, expected_state, atol=1e-3, rtol=1e-3)
+    homed.copy_(initial)
+    monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
+    out = _public(tensors, homed, scale, backend="auto")
+    torch.cuda.synchronize()
+    launch = _domain_launch(device, batch_size, scale, table, homed)
+    assert launch is not None and launch[0] is not None
+    assert _same_bits(out, whole_out)
+    assert _same_bits(homed, whole_state)
 
 
-@pytest.mark.parametrize("batch_size", [37, 64, 128])
-def test_twin_bits_do_not_depend_on_the_cut(batch_size: int) -> None:
+@pytest.mark.parametrize("scale", [_SCALE, 1.0])
+@pytest.mark.parametrize("batch_size", [37, 64, 128, 256, 512])
+def test_twin_bits_do_not_depend_on_the_cut(batch_size: int, scale: float) -> None:
     # Every row on die 0, every row on die 1, the byte cut, the SM-count cut and two
     # uneven cuts: the same bits as the whole body.
     device, table = _require_domain()
     tensors, initial = _inputs(batch_size)
-    whole_out, whole_state = _whole(tensors, initial, _SCALE)
+    whole_out, whole_state = _whole(tensors, initial, scale)
     cuts = {
         0,
         batch_size,
@@ -300,16 +315,16 @@ def test_twin_bits_do_not_depend_on_the_cut(batch_size: int) -> None:
     }
     for rows0 in sorted(cuts):
         homed = _home(initial, rows0)
-        out = _public(tensors, homed, _SCALE)
+        out = _public(tensors, homed, scale)
         torch.cuda.synchronize()
-        launch = _domain_launch(device, batch_size, _SCALE, table, homed)
+        launch = _domain_launch(device, batch_size, scale, table, homed)
         assert launch is not None and launch[0] is not None and launch[2] == rows0
         assert _same_bits(out, whole_out), rows0
         assert _same_bits(homed, whole_state), rows0
         del homed
-    homed = localize_gdn_decode_state(initial, _H, rows0=13)
+    homed = localize_gdn_decode_state(initial, _H, scale, rows0=13)
     assert cake_locality.tensor_homing(homed).cut == 13 * _ROW_BYTES
-    out = _public(tensors, homed, _SCALE)
+    out = _public(tensors, homed, scale)
     torch.cuda.synchronize()
     assert _same_bits(out, whole_out) and _same_bits(homed, whole_state)
 
@@ -382,6 +397,8 @@ def test_twin_counters_left_zero_and_reused() -> None:
     homed = localize_gdn_decode_state(initial, _H)
     out = _empty_out(batch_size)
     stream = torch.cuda.Stream()
+    # The homing copy and the output fill ran on the current stream.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         _public(tensors, homed, _SCALE, out=out)
         pair = cake_locality.launch_counters(locality.DOMAIN_COUNTER_WORDS, device)
@@ -433,22 +450,27 @@ def test_homed_state_rows_live_on_their_dies() -> None:
 
 def test_states_the_twin_does_not_serve_run_the_whole_body(monkeypatch) -> None:
     # An ordinary state, a copy of a homed state, a prefix view of a homed allocation,
-    # a homed state below 32 rows, a homed state without an SM table and a homed state
-    # of a row without a Cake route each run what an ordinary state runs, bit for bit.
+    # a homed state below 32 rows (B 9 / 10 too, where the whole route changes body;
+    # both scales), a homed state without an SM table, a homed state of the H4 / HV8
+    # rows and a homed state of a row without a Cake route each run what an ordinary
+    # state runs, bit for bit.
     device, table = _require_domain()
     batch_size = 64
     tensors, initial = _inputs(batch_size)
     whole_out, whole_state = _whole(tensors, initial, _SCALE)
     monkeypatch.setattr(gdn_decode, "_CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES", {})
 
-    def check_whole(state, out_ref, state_ref, scale=_SCALE, backend="cake_gdn"):
-        out = _public(tensors, state, scale, backend=backend)
-        torch.cuda.synchronize()
-        assert _same_bits(out, out_ref) and _same_bits(state, state_ref)
+    def no_twin():
         assert not any(
             launch[0] is not None
             for launch in gdn_decode._CAKE_GDN_NONTRANSPOSE_DOMAIN_LAUNCHES.values()
         )
+
+    def check_whole(state, out_ref, state_ref, scale=_SCALE, backend="cake_gdn"):
+        out = _public(tensors, state, scale, backend=backend)
+        torch.cuda.synchronize()
+        assert _same_bits(out, out_ref) and _same_bits(state, state_ref)
+        no_twin()
 
     check_whole(initial.clone(), whole_out, whole_state)
     homed = localize_gdn_decode_state(initial, _H)
@@ -461,14 +483,35 @@ def test_states_the_twin_does_not_serve_run_the_whole_body(monkeypatch) -> None:
     with monkeypatch.context() as patch:
         patch.setattr(cake_locality, "sm_table", lambda device=None: None)
         check_whole(homed, whole_out, whole_state)
-    for small in (16, 31):
-        small_tensors, small_initial = _inputs(small)
+    for small in (9, 10, 16, 31):
+        for scale in (_SCALE, 1.0):
+            small_tensors, small_initial = _inputs(small)
+            small_out, small_state = _whole(small_tensors, small_initial, scale)
+            homed_small = localize_gdn_decode_state(small_initial, _H, scale)
+            assert homed_small is small_initial
+            ordinary = small_initial.clone()
+            small_homed = _home(small_initial, (small + 1) // 2)
+            for state in (ordinary, small_homed):
+                out = _public(small_tensors, state, scale)
+                torch.cuda.synchronize()
+                assert _same_bits(out, small_out), (small, scale)
+                assert _same_bits(state, small_state), (small, scale)
+            no_twin()
+    # The H4 / HV8 rows (K^-0.5; their whole route below 32 rows), homed by hand on
+    # die 1 only, on die 0 only and at half the rows.
+    for small, rows0 in ((4, 0), (4, 4), (16, 8)):
+        small_tensors, small_initial = _inputs(small, heads=(4, 8))
         small_out, small_state = _whole(small_tensors, small_initial, _SCALE)
-        assert localize_gdn_decode_state(small_initial, _H) is small_initial
-        small_homed = _home(small_initial, (small + 1) // 2)
-        out = _public(small_tensors, small_homed, _SCALE)
-        torch.cuda.synchronize()
-        assert _same_bits(out, small_out) and _same_bits(small_homed, small_state)
+        assert localize_gdn_decode_state(small_initial, 4) is small_initial
+        ordinary = small_initial.clone()
+        small_homed = _home(small_initial, rows0)
+        assert cake_locality.tensor_homing(small_homed) is not None
+        for state in (ordinary, small_homed):
+            out = _public(small_tensors, state, _SCALE)
+            torch.cuda.synchronize()
+            assert _same_bits(out, small_out), (small, rows0)
+            assert _same_bits(state, small_state), (small, rows0)
+        no_twin()
     # No Cake route at H8 / HV16: the homed state is refused as the ordinary one is,
     # before launch, both left untouched.
     other_tensors, other_initial = _inputs(batch_size, heads=(8, 16))
@@ -512,6 +555,8 @@ def test_twin_cuda_graph_capture_and_replay() -> None:
     homed = localize_gdn_decode_state(initial, _H)
     out = _empty_out(batch_size)
     stream = torch.cuda.Stream()
+    # The homing copy and the output fill ran on the current stream.
+    stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         _public(tensors, homed, _SCALE, out=out)
     stream.synchronize()
