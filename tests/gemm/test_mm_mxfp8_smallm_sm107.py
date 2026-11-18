@@ -31,8 +31,6 @@ _MIN_COS_SIM = 0.98
 # Every allowlisted shape: each has its own compile-time route, so each must
 # run numerically. Derived from the shipped dispatch surface so the test can
 # never drift from the allowlist.
-from flashinfer.gemm.mxfp8_smallm_sm107 import _load_allowlist
-
 _ALLOWLIST = _load_allowlist()
 assert _ALLOWLIST is not None, "specialized allowlist must ship with the package"
 _ON_LIST_SHAPES = sorted(_ALLOWLIST["shapes"])
