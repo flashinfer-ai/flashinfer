@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace ffi = tvm::ffi;
 namespace wmma = nvcuda::wmma;
@@ -53,9 +54,15 @@ inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1)
 
 bool g_ws_fresh = false;
 
+// Buffers retired by workspace growth or a device change stay alive for the
+// process lifetime: a CUDA graph captured earlier may still replay kernels
+// holding the old address. Growth is monotone along the warmup ladder, so
+// the retained total stays bounded (under 2x the final capacity per device).
+std::vector<void*> g_retired_workspaces;
+
 void* ensure_workspace(size_t bytes, int device) {
   if (g_workspace.ptr != nullptr && (g_workspace.bytes < bytes || g_workspace.device != device)) {
-    cudaFree(g_workspace.ptr);
+    g_retired_workspaces.push_back(g_workspace.ptr);
     g_workspace.ptr = nullptr;
     g_workspace.bytes = 0;
   }
@@ -63,7 +70,10 @@ void* ensure_workspace(size_t bytes, int device) {
   if (g_workspace.ptr == nullptr) {
     g_ws_fresh = true;
     cudaSetDevice(device);
-    cudaMalloc(&g_workspace.ptr, bytes);
+    cudaError_t err = cudaMalloc(&g_workspace.ptr, bytes);
+    TVM_FFI_ICHECK(err == cudaSuccess && g_workspace.ptr != nullptr)
+        << "specialized MoE workspace cudaMalloc(" << bytes
+        << ") failed: " << cudaGetErrorString(err);
     cudaMemset(g_workspace.ptr, 0, bytes);
     g_workspace.bytes = bytes;
     g_workspace.device = device;

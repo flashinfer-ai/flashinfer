@@ -42,12 +42,14 @@ float8_e4m3fn [E, I, H/16]`` row-major group-16 (UNswizzled), ``w1_alpha
 float32 [E]``; same pattern for ``w2``.
 
 CUDA-graph contract: call :func:`warmup` (largest T first) on the capture
-stream before capturing — the module keeps a process-global workspace
-(cudaMalloc growth) and synchronizes on stream transitions, both illegal
-inside capture; the guard refuses capture until warmup has run, when the
-captured token count exceeds the largest token count already run on the
-device (``graph_capture_token_count_exceeds_warmed``), and when the
-capture stream or device differs from the one the backend last ran on
+stream before capturing — each kernel family keeps its own process-global
+workspace (cudaMalloc growth) and the module synchronizes on stream
+transitions, both illegal inside capture; the guard refuses capture until
+warmup has run, when the captured token count's kernel family has never
+run on the device (``graph_capture_family_not_warmed``), when it exceeds
+the largest token count that family has already run
+(``graph_capture_token_count_exceeds_warmed``), and when the capture
+stream or device differs from the one the backend last ran on
 (``graph_capture_stream_mismatch`` — re-run :func:`warmup` on the capture
 stream). Replay is single-flight: captured graphs bake the shared
 process-global workspace addresses in, so two captured graphs must not
@@ -63,7 +65,8 @@ import functools
 import json
 import os
 import pathlib
-from typing import List, Optional, Tuple
+import threading
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -83,18 +86,45 @@ dispatch_stats: collections.Counter = collections.Counter()
 fallback_reasons: collections.deque = collections.deque(maxlen=64)
 
 # Warmup / last-run state for the CUDA-graph capture guard: the largest
-# token count run per current device (the process-global workspace grows
-# monotonically with it) and the stream/device of the last backend run.
-_warmed = {"done": False, "max_t": 0, "device": None, "stream": None}
+# token count run per kernel family on the current device (each family owns
+# its own process-global native workspace, grown monotonically with T) and
+# the stream/device of the last backend run. One host-side lock serializes
+# capture admission, native execution and the state update (the native
+# mutex does not protect this Python state).
+_state_lock = threading.Lock()
+_warmed: Dict[str, Any] = {
+    "done": False,
+    "family_max_t": {},
+    "device": None,
+    "stream": None,
+}
+
+
+def _family(t: int) -> str:
+    """Kernel family of a token count, mirroring the native ``Run()``
+    dispatch. Each family is its own translation unit with its own
+    process-global workspace, so warming one family says nothing about
+    another's capture readiness."""
+    if t == 1:
+        return "t1"
+    if t == 64:
+        return "fast64"
+    if t == 1024:
+        return "fixed1024"
+    if t > 64:
+        return "wide"
+    return "decode"
 
 
 def _note_run(device: torch.device, t: int) -> None:
+    """Record a successful backend run. Callers hold ``_state_lock``."""
     if _warmed["device"] != device:
-        # The native workspace is freed and re-created on a device change.
-        _warmed["max_t"] = 0
+        # The native workspaces are retired and re-created on a device change.
+        _warmed["family_max_t"] = {}
     _warmed["device"] = device
     _warmed["stream"] = torch.cuda.current_stream(device).cuda_stream
-    _warmed["max_t"] = max(_warmed["max_t"], t)
+    fam = _family(t)
+    _warmed["family_max_t"][fam] = max(_warmed["family_max_t"].get(fam, 0), t)
 
 
 def _disabled() -> bool:
@@ -257,21 +287,29 @@ def specialized_support_reasons(
     except Exception:  # noqa: BLE001
         reasons.append("cuda_version:unknown")
     if _is_capturing():
-        if not _warmed["done"]:
-            reasons.append("graph_capture_before_warmup")
-        else:
-            if _warmed["max_t"] < T:
-                # Larger T grows the process-global workspace (cudaMalloc),
-                # which is illegal inside capture.
-                reasons.append("graph_capture_token_count_exceeds_warmed")
-            if (
-                _warmed["device"] != x.device
-                or _warmed["stream"] != torch.cuda.current_stream(x.device).cuda_stream
-            ):
-                # The native runner synchronizes the previous stream on a
-                # stream/device transition, which is illegal inside capture.
-                # Re-run warmup on the capture stream.
-                reasons.append("graph_capture_stream_mismatch")
+        with _state_lock:
+            if not _warmed["done"]:
+                reasons.append("graph_capture_before_warmup")
+            else:
+                fam_max = _warmed["family_max_t"].get(_family(T), 0)
+                if fam_max == 0:
+                    # This T's kernel family has never run: its own native
+                    # workspace is cold and would cudaMalloc inside capture.
+                    # Re-run warmup with this token count included.
+                    reasons.append("graph_capture_family_not_warmed")
+                elif fam_max < T:
+                    # Larger T grows the family's process-global workspace
+                    # (cudaMalloc), which is illegal inside capture.
+                    reasons.append("graph_capture_token_count_exceeds_warmed")
+                if (
+                    _warmed["device"] != x.device
+                    or _warmed["stream"]
+                    != torch.cuda.current_stream(x.device).cuda_stream
+                ):
+                    # The native runner synchronizes the previous stream on a
+                    # stream/device transition, which is illegal inside
+                    # capture. Re-run warmup on the capture stream.
+                    reasons.append("graph_capture_stream_mismatch")
     if not reasons:
         # The module must be buildable/loadable (e.g. FLASHINFER_DISABLE_JIT
         # with a cold JIT cache raises); record a refusal so ``auto`` falls
@@ -301,20 +339,25 @@ def run_specialized_moe_nvfp4_w4a16(
     tw = token_final_scales
     if tw.dtype != torch.float32:
         tw = tw.float()
-    _note_run(x.device, int(x.shape[0]))
-    output.zero_()
-    _module().run(
-        x,
-        w1_weight,
-        w1_weight_sf,
-        w1_alpha,
-        w2_weight,
-        w2_weight_sf,
-        w2_alpha,
-        token_selected_experts,
-        tw,
-        output,
-    )
+    # One critical section covers the native launch and the successful
+    # state update, so a concurrent capture-admission check never reads a
+    # stream/family state that another thread's in-flight run is about to
+    # invalidate (the native mutex only serializes the launches).
+    with _state_lock:
+        output.zero_()
+        _module().run(
+            x,
+            w1_weight,
+            w1_weight_sf,
+            w1_alpha,
+            w2_weight,
+            w2_weight_sf,
+            w2_alpha,
+            token_selected_experts,
+            tw,
+            output,
+        )
+        _note_run(x.device, int(x.shape[0]))
     return output
 
 
@@ -358,4 +401,5 @@ def warmup(
             out,
         )
     torch.cuda.synchronize()
-    _warmed["done"] = True
+    with _state_lock:
+        _warmed["done"] = True

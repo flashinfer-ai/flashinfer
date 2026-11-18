@@ -9736,8 +9736,29 @@ class SpecializedW4A16Runner(B12xW4A16Runner):
 
         if _spec._disabled():
             return False
+        # Decline any pack the call-time guard would refuse, so it is
+        # excluded before profiling and winner selection instead of raising
+        # in forward (NVFP4xBF16 packs carry raw bf16 [T, H] activations).
+        x = act.hidden_states_q
+        if (
+            x.dim() != 2
+            or x.shape[1] != _spec._C["hidden_size"]
+            or x.dtype != torch.bfloat16
+            or not x.is_contiguous()
+        ):
+            return False
         t = act.num_tokens
         return t in _spec._T_EXACT or t >= _spec._T_MIN_LARGE
+
+    def supports_graph_capture_timing(self) -> bool:
+        """Cross-backend graph timing (``bench_gpu_time(use_cuda_graph=True)``)
+        captures on a fresh internal stream, which can never satisfy the
+        specialized module's contract that :func:`warmup` runs on the capture
+        stream itself — the capture guard would refuse and ``forward`` would
+        raise inside the profiling capture. ``MoELayer._select_winner`` times
+        a shootout containing this runner eagerly instead (every candidate in
+        the same mode, so the comparison stays fair)."""
+        return False
 
     def _ensure_inner(self, hidden_size: int, num_tokens: int) -> None:
         """Size the output buffer; there is no inner wrapper to build."""

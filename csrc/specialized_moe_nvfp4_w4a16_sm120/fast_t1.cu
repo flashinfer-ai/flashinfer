@@ -20,6 +20,7 @@
 #include <tvm/ffi/tvm_ffi.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace ffi = tvm::ffi;
 
@@ -678,12 +679,21 @@ __global__ __launch_bounds__(NWARP * 32, MINB) void moe_gemv_group16(
 // ---------------------------------------------------------------- host
 
 // Device scratch arena (workspace only - never holds results between calls).
+// Buffers retired by growth stay alive for the process lifetime: a CUDA graph
+// captured earlier may still replay kernels holding the old address. Growth
+// is monotone, so the retained total stays bounded (< 2x the final capacity).
 static void* g_ws = nullptr;
 static size_t g_ws_bytes = 0;
+static std::vector<void*> g_retired_ws;
 static void* ws_get(size_t bytes) {
   if (bytes > g_ws_bytes) {
-    if (g_ws) cudaFree(g_ws);
-    cudaMalloc(&g_ws, bytes);
+    if (g_ws) g_retired_ws.push_back(g_ws);
+    g_ws = nullptr;
+    g_ws_bytes = 0;
+    cudaError_t err = cudaMalloc(&g_ws, bytes);
+    TVM_FFI_ICHECK(err == cudaSuccess && g_ws != nullptr)
+        << "specialized MoE workspace cudaMalloc(" << bytes
+        << ") failed: " << cudaGetErrorString(err);
     g_ws_bytes = bytes;
   }
   return g_ws;

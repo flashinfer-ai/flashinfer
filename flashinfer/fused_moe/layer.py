@@ -305,10 +305,14 @@ class MoELayer:
                 )
                 runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
+                # The build is inside the guard too: a failed JIT build
+                # rejects this candidate with its reason and lets selection
+                # continue over the remaining backends, instead of aborting
+                # layer construction.
+                runner.build()
             except (NotImplementedError, ValueError, RuntimeError) as exc:
                 rejected.append(f"{runner_cls.__name__}: {exc}")
                 continue
-            runner.build()
             self.runners.append(runner)
             self._tuning_runner_ids.append(backend_index)
 
@@ -576,6 +580,15 @@ class MoELayer:
         best_tactic: Any = -1
         best_inputs: Optional[List[torch.Tensor]] = None
 
+        # bench_gpu_time's graph timing captures each candidate on a fresh
+        # internal stream. A runner whose capture contract that bench cannot
+        # satisfy (e.g. warmup required on the capture stream itself) opts
+        # out via supports_graph_capture_timing(); the whole shootout then
+        # times eagerly so every candidate is measured the same way.
+        time_with_graph = all(
+            getattr(r, "supports_graph_capture_timing", lambda: True)() for r in runners
+        )
+
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
             launch_kwargs = runner.launch_kwargs_for(inputs)
@@ -608,7 +621,7 @@ class MoELayer:
                 run_candidate,
                 dry_run_iters=5,
                 repeat_iters=30,
-                use_cuda_graph=True,
+                use_cuda_graph=time_with_graph,
             )
             t_ms = median(times)
             if t_ms < best_time_ms:

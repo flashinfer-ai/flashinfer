@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <vector>
 
 namespace ffi = tvm::ffi;
 namespace wmma = nvcuda::wmma;
@@ -70,18 +71,30 @@ Workspace g_workspace;
 std::mutex g_run_mutex;
 cudaStream_t g_last_stream = nullptr;
 int g_last_stream_device = -1;
+// The default stream is a valid previous stream, so track "have we run"
+// separately instead of using nullptr as the sentinel.
+bool g_have_last_stream = false;
+// Buffers retired by workspace growth or a device change. A CUDA graph
+// captured earlier may still replay kernels holding the old address, so
+// retired buffers are kept alive for the process lifetime. Growth is
+// monotone along the warmup ladder, so the retained total stays bounded
+// (under 2x the final capacity per device).
+std::vector<void*> g_retired_workspaces;
 
 inline size_t align_up(size_t x, size_t a = 256) { return (x + a - 1) & ~(a - 1); }
 
 void* ensure_workspace(size_t bytes, int device) {
   if (g_workspace.ptr != nullptr && (g_workspace.bytes < bytes || g_workspace.device != device)) {
-    cudaFree(g_workspace.ptr);
+    g_retired_workspaces.push_back(g_workspace.ptr);
     g_workspace.ptr = nullptr;
     g_workspace.bytes = 0;
   }
   if (g_workspace.ptr == nullptr) {
     cudaSetDevice(device);
-    cudaMalloc(&g_workspace.ptr, bytes);
+    cudaError_t err = cudaMalloc(&g_workspace.ptr, bytes);
+    TVM_FFI_ICHECK(err == cudaSuccess && g_workspace.ptr != nullptr)
+        << "specialized MoE workspace cudaMalloc(" << bytes
+        << ") failed: " << cudaGetErrorString(err);
     g_workspace.bytes = bytes;
     g_workspace.device = device;
   }
@@ -1576,13 +1589,14 @@ void Run(ffi::TensorView hidden_states, ffi::TensorView w1_packed, ffi::TensorVi
   // All specialized paths reuse process-global scratch. Serialize their host
   // launch sequences and order transitions between current CUDA streams.
   std::lock_guard<std::mutex> run_lock(g_run_mutex);
-  if (g_last_stream != nullptr && (g_last_stream != stream || g_last_stream_device != device)) {
+  if (g_have_last_stream && (g_last_stream != stream || g_last_stream_device != device)) {
     cudaSetDevice(g_last_stream_device);
     cudaStreamSynchronize(g_last_stream);
     cudaSetDevice(device);
   }
   g_last_stream = stream;
   g_last_stream_device = device;
+  g_have_last_stream = true;
 
   const int T = int(hidden_states.size(0));
   if (T == 1) {
