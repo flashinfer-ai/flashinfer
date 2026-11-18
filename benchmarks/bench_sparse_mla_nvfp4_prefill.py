@@ -124,10 +124,15 @@ def main() -> None:
                 prefill_cp_size=4,
                 keep_decoded=False,
             )
-            fn = native_prefill_calls(f)[0] if args.mega else f["baseline"]
+            fn = native_prefill_calls(f)[0 if args.mega else 1]
             us = _median_us(fn, args.warmup_ms, args.measure_ms, args.cuda_graph)
             print(f"{qlen},{4 * qlen},64,{us:.4f}")
         return
+
+    if args.num_tokens <= 64:
+        raise SystemExit(
+            "Paired attention benchmarks require Q > 64; use --customer-q for forced prefill"
+        )
 
     torch.manual_seed(args.seed)
     kv_bf16 = (
@@ -371,7 +376,7 @@ def main() -> None:
         run_fp8()
         run_nv()
         torch.cuda.synchronize()
-        if args.mega:
+        if args.mega or args.full_pipeline:
             fp8_out = (
                 fp8_quant.float().reshape(*q.shape[:2], 16, 32)
                 * torch.exp2(fp8_sf.float() - 127)[..., None]
