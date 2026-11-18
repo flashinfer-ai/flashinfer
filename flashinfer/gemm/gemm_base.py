@@ -13049,7 +13049,7 @@ def fp8_blockscale_gemm_sm90(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     *,
-    backend: Literal["auto", "specialized", "stock"] = "auto",
+    backend: Literal["auto", "specialized", "deepgemm"] = "auto",
 ) -> torch.Tensor:
     """
     Perform FP8 block-scaled GEMM with automatic swapAB optimization.
@@ -13125,7 +13125,7 @@ def fp8_blockscale_gemm_sm90(
     - Input scales only support per-token format: (M, K//128)
     - The function uses DeepGEMM backend with JIT compilation
     backend : str
-        One of ``("auto", "specialized", "stock")``, keyword-only.
+        One of ``("auto", "specialized", "deepgemm")``, keyword-only.
         ``"auto"`` (the default) is the stock route, except that it routes
         to ``"specialized"`` — an SM90 decode-M kernel for the
         BF16-activation / FP8-weight / 128x128-block-scale form with the
@@ -13136,7 +13136,7 @@ def fp8_blockscale_gemm_sm90(
         a call it cannot serve falls back to the stock route (this op's
         composable path) with the reason recorded in
         ``flashinfer.gemm.fp8bs_decodem_sm90._fp8bs_decodem_stats()``.
-        ``"stock"`` pins the stock route: an explicitly selected backend is
+        ``"deepgemm"`` pins the stock DeepGEMM-backed route: an explicitly selected backend is
         never silently swapped. Unknown names raise ``ValueError``.
         ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call) keeps
         every call on the stock route.
@@ -13276,7 +13276,7 @@ def fp8_blockscale_gemm_sm90(
 
     # Specialized SM90 decode-M backend (fp8bs_gemm_decodem_sm90): serves
     # the BF16-activation / FP8-weight / per-block-scale form at M <= 24 on
-    # its packaged allowlist; explicit "stock" never reaches it, and a
+    # its packaged allowlist; explicit "deepgemm" never reaches it, and a
     # "specialized"/"auto" call it cannot serve continues on the stock
     # route below with the reason recorded.
     if backend in ("auto", "specialized"):
@@ -13285,7 +13285,7 @@ def fp8_blockscale_gemm_sm90(
         )
         if res is not None:
             return res
-    _fp8bs_stats["backend_dispatches"]["stock"] += 1
+    _fp8bs_stats["backend_dispatches"]["deepgemm"] += 1
 
     # Get the runner
     runner = get_fp8_blockscale_gemm_runner_sm90()

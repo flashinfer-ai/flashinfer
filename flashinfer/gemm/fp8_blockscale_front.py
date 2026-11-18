@@ -20,10 +20,10 @@ plain strings without another arch-suffixed public entry.
 
 Backends
 --------
-``"sm90"``
+``"deepgemm"``
     The stock SM90 route of ``fp8_blockscale_gemm_sm90`` (its original
     DeepGEMM-based kernels), i.e. the underlying entry with
-    ``backend="stock"``.
+    ``backend="deepgemm"``.
 ``"specialized"``
     The agent-generated SM90 decode-M kernel, i.e. the underlying entry
     with ``backend="specialized"`` (that entry's own composable fallback
@@ -43,10 +43,10 @@ import torch
 from ..api_logging import flashinfer_api
 
 # Backends behind the generalized front (plain strings, #5667 pattern).
-FP8_BLOCKSCALE_GEMM_BACKENDS = ("auto", "sm90", "specialized")
+FP8_BLOCKSCALE_GEMM_BACKENDS = ("auto", "deepgemm", "specialized")
 
 # front backend -> fp8_blockscale_gemm_sm90 backend
-_INNER_BACKEND = {"auto": "auto", "sm90": "stock", "specialized": "specialized"}
+_INNER_BACKEND = {"auto": "auto", "deepgemm": "deepgemm", "specialized": "specialized"}
 
 
 @flashinfer_api
@@ -83,8 +83,8 @@ def fp8_blockscale_gemm(
     out, out_dtype
         As in :func:`fp8_blockscale_gemm_sm90`.
     backend : str
-        One of ``FP8_BLOCKSCALE_GEMM_BACKENDS = ("auto", "sm90",
-        "specialized")``. ``"sm90"`` pins the stock SM90 route,
+        One of ``FP8_BLOCKSCALE_GEMM_BACKENDS = ("auto", "deepgemm",
+        "specialized")``. ``"deepgemm"`` pins the stock SM90 route,
         ``"specialized"`` the agent-generated SM90 decode-M kernel (with
         that backend's own composable fallback), and ``"auto"`` the
         underlying entry's own auto routing. Unknown names raise; an

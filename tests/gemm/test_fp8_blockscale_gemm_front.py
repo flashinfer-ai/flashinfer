@@ -22,7 +22,7 @@ def _cpu_args():
 
 
 def test_backends_tuple_is_plain_strings():
-    assert FP8_BLOCKSCALE_GEMM_BACKENDS == ("auto", "sm90", "specialized")
+    assert FP8_BLOCKSCALE_GEMM_BACKENDS == ("auto", "deepgemm", "specialized")
     assert all(isinstance(b, str) for b in FP8_BLOCKSCALE_GEMM_BACKENDS)
 
 
@@ -49,7 +49,7 @@ def test_non_sm90_device_refused_with_contract_pointer(monkeypatch):
 
 @pytest.mark.parametrize(
     "front_backend,inner_backend",
-    [("auto", "auto"), ("sm90", "stock"), ("specialized", "specialized")],
+    [("auto", "auto"), ("deepgemm", "deepgemm"), ("specialized", "specialized")],
 )
 def test_backend_mapping_to_arch_entry(monkeypatch, front_backend, inner_backend):
     import flashinfer.gemm.gemm_base as gemm_base

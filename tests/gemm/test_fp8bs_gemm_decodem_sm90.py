@@ -101,7 +101,7 @@ def test_specialized_matches_reference(backend, shape):
     _reset_fp8bs_decodem_stats()
     out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
     st = _fp8bs_decodem_stats()
-    assert st["backend_dispatches"] == {"specialized": 1, "stock": 0}, st
+    assert st["backend_dispatches"] == {"specialized": 1, "deepgemm": 0}, st
     assert out.shape == (M, N) and out.dtype == torch.bfloat16
     rel = _rel_fro(out, ref)
     assert rel <= 0.03, rel
@@ -116,9 +116,9 @@ def test_explicit_stock_never_swapped_and_matches():
     x, wq, ws = _make(8, 8192, 1536, seed=7)
     ref = _reference(x, wq, ws)
     _reset_fp8bs_decodem_stats()
-    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="stock")
+    out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="deepgemm")
     st = _fp8bs_decodem_stats()
-    assert st["backend_dispatches"] == {"specialized": 0, "stock": 1}, st
+    assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
     assert st["fallback_reasons"] == {}, st
     assert _rel_fro(out, ref) <= 0.03
 
@@ -133,7 +133,7 @@ def test_kill_switch_forces_stock(monkeypatch):
     _reset_fp8bs_decodem_stats()
     out = fp8_blockscale_gemm_sm90(x, wq, None, ws)  # auto
     st = _fp8bs_decodem_stats()
-    assert st["backend_dispatches"] == {"specialized": 0, "stock": 1}, st
+    assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
     assert st["fallback_reasons"] == {"auto: kill_switch": 1}, st
     monkeypatch.delenv(SPECIALIZED_KERNEL_DISABLE_ENV)
     # both backends agree against the fp32 reference
@@ -148,7 +148,7 @@ def test_off_coverage_specialized_falls_back_recorded():
     _reset_fp8bs_decodem_stats()
     out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
     st = _fp8bs_decodem_stats()
-    assert st["backend_dispatches"] == {"specialized": 0, "stock": 1}, st
+    assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
     assert st["fallback_reasons"] == {"specialized: m_band": 1}, st
     assert _rel_fro(out, _reference(x, wq, ws)) <= 0.03
 
@@ -214,7 +214,7 @@ def test_k_zero_stays_on_stock_contract():
     out = torch.empty((M, N), device="cuda", dtype=torch.bfloat16)
     ok, reason = _eligibility(x, wq, None, ws, out)
     assert not ok and reason == "k_zero"
-    for backend in ("auto", "specialized", "stock"):
+    for backend in ("auto", "specialized", "deepgemm"):
         with pytest.raises(RuntimeError, match="input is null"):
             fp8_blockscale_gemm_sm90(x, wq, None, ws, backend=backend)
 
@@ -234,7 +234,7 @@ def test_jit_build_failure_falls_back_to_stock(monkeypatch):
     _reset_fp8bs_decodem_stats()
     out = fp8_blockscale_gemm_sm90(x, wq, None, ws, backend="specialized")
     st = _fp8bs_decodem_stats()
-    assert st["backend_dispatches"] == {"specialized": 0, "stock": 1}, st
+    assert st["backend_dispatches"] == {"specialized": 0, "deepgemm": 1}, st
     assert st["fallback_reasons"] == {"specialized: jit_build_failure": 1}, st
     assert _rel_fro(out, ref) <= 0.03
 

@@ -18,7 +18,7 @@ Backend surface (#5667 semantics), driven from
 - ``"specialized"`` selects this kernel explicitly; a call it cannot serve
   falls back to the stock route (this op's composable path) with the
   reason recorded — never to another fused backend.
-- ``"stock"`` pins the stock route; an explicitly selected backend is
+- ``"deepgemm"`` pins the stock route; an explicitly selected backend is
   never silently swapped.
 - ``FLASHINFER_SPECIALIZED_KERNEL_DISABLE=1`` (read per call; shared by
   FlashInfer's specialized kernels) keeps every call on the stock route.
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 SPECIALIZED_KERNEL_DISABLE_ENV = "FLASHINFER_SPECIALIZED_KERNEL_DISABLE"
 
-FP8BS_GEMM_BACKENDS = ("auto", "specialized", "stock")
+FP8BS_GEMM_BACKENDS = ("auto", "specialized", "deepgemm")
 
 _DISPATCH_FILE = "fp8bs_gemm_decodem_sm90_dispatch.json"
 
@@ -60,7 +60,7 @@ class GraphCaptureJitError(RuntimeError):
 
 
 _stats: Dict[str, Any] = {
-    "backend_dispatches": {"specialized": 0, "stock": 0},
+    "backend_dispatches": {"specialized": 0, "deepgemm": 0},
     "fallback_reasons": {},
     "jit_build": "not attempted",
 }
@@ -75,7 +75,7 @@ def _fp8bs_decodem_stats() -> Dict[str, Any]:
 
 
 def _reset_fp8bs_decodem_stats() -> None:
-    _stats["backend_dispatches"] = {"specialized": 0, "stock": 0}
+    _stats["backend_dispatches"] = {"specialized": 0, "deepgemm": 0}
     _stats["fallback_reasons"] = {}
 
 
