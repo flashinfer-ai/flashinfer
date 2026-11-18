@@ -58,6 +58,9 @@ def test_split_units_rejects(units, counts):
 def test_die_class():
     assert cl.die_class((106, 106)) == "even"
     assert cl.die_class((104, 108)) == "even"
+    assert cl.die_class((108, 104)) == "even"
+    assert cl.die_class((105, 109)) == "even"  # a gap of 4 SMs is even
+    assert cl.die_class((104, 109)) == "uneven"
     assert cl.die_class((102, 110)) == "uneven"
     assert cl.die_class((112, 100)) == "uneven"
 
@@ -97,6 +100,94 @@ def test_pack_rows():
     assert cl.pack_rows([(sm, 0, 0, 4) for sm in range(4)]) is None  # one die
     assert cl.pack_rows([(256, 0, 0, 4), (1, 1, 0, 4)]) is None  # SM id too large
     assert cl.pack_rows([(0, 0, 0, 257), (1, 1, 0, 257)]) is None  # nsmid too large
+
+
+class _Probes:
+    """A stand-in probe returning the given ``(table, cacheable)`` outcomes."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def __call__(self, device_index):
+        self.calls += 1
+        return self.outcomes.pop(0)
+
+
+def _fake_device(monkeypatch, probe):
+    monkeypatch.setattr(cl, "_is_locality_arch", lambda index: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(cl, "_probe", lambda device_index: probe(device_index))
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_sm_table_caches_only_repeatable_outcomes(monkeypatch, cached):
+    """A probe miss or a probe that raised is tried again by the next call; a
+    table, or an outcome a later probe would repeat (an old driver, invalid rows),
+    is kept."""
+    table = cl.SmTable(device_index=5, counts=(106, 106), entries=None)
+    probe = _Probes((None, cached), (table, True))
+    _fake_device(monkeypatch, probe)
+    try:
+        assert cl.sm_table(5) is None
+        assert (5 in cl._TABLES) == cached
+        second = cl.sm_table(5)
+        assert second is (None if cached else table)
+        assert probe.calls == (1 if cached else 2)
+        assert cl.sm_table(5) is second
+        assert probe.calls == (1 if cached else 2)
+    finally:
+        cl._forget()
+
+
+def test_sm_table_one_probe_per_device(monkeypatch):
+    """Concurrent first calls on one device run one probe."""
+    import threading
+    import time
+
+    table = cl.SmTable(device_index=6, counts=(106, 106), entries=None)
+    entered = []
+
+    def slow_probe(device_index):
+        entered.append(device_index)
+        time.sleep(0.2)
+        return table, True
+
+    _fake_device(monkeypatch, slow_probe)
+    results = []
+    try:
+        threads = [
+            threading.Thread(target=lambda: results.append(cl.sm_table(6)))
+            for _ in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert entered == [6]
+        assert results == [table] * 4
+    finally:
+        cl._forget()
+
+
+def test_probe_module_failure_is_not_cached(monkeypatch):
+    """A probe library that fails to build or load is tried again; a toolkit
+    older than LOCALITY_CUDA is remembered."""
+
+    def broken():
+        raise RuntimeError("build failed")
+
+    try:
+        cl._forget()
+        monkeypatch.setattr(cl, "_toolkit_supported", lambda: True)
+        monkeypatch.setattr(cl, "_module", broken)
+        assert cl._probe_module() == (None, False)
+        assert not cl._PROBE_MODULE
+        monkeypatch.setattr(cl, "_toolkit_supported", lambda: False)
+        assert cl._probe_module() == (None, True)
+        assert cl._PROBE_MODULE == [None]
+    finally:
+        cl._forget()
 
 
 def test_force_table():

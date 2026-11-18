@@ -1751,8 +1751,9 @@ SERVING_PROGRAMS: dict[str, str] = {
 }
 
 # The locality-domain twins of sm_107a serving programs: one launch over both dies
-# of a dual-die GPU with B homed by groups (the result does not depend on where B
-# is homed).
+# of a dual-die GPU with B homed by groups.  A twin is bitwise equal to the
+# whole-GPU build of the same source for any cut, and equal within the family's
+# tolerance to the whole-GPU program of SERVING_PROGRAMS (an older build).
 DOMAIN_SERVING_PROGRAMS: dict[str, str] = {
     "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ab6c89e07571f01aee29",
     "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1da4ddd8c761e3fef61d",

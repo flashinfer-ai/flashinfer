@@ -12852,7 +12852,8 @@ def _check_batch_deepgemm_fp8_nt_groupwise_cake(
 ) -> bool:
     """Admission of the generated Cake programs: exactly the band the Cake dispatcher owns.
 
-    SM100a / SM103a / SM107a devices with an exported SM count, the ``(N, K)``
+    SM100a / SM103a / SM107a devices with an exported SM count (packed-scale
+    serving problems: any SM count of SM107a), the ``(N, K)``
     geometries the architecture's route chain owns, 128-aligned ``M`` / ``N`` / ``K``, contiguous FP8
     operands with float32 ``(1, 128, 128)`` scales (or the native MN-major packed
     UE8M0 int32 scales of the serving routes), int32 ``masked_m`` and a bfloat16
@@ -13004,10 +13005,11 @@ def batch_deepgemm_fp8_nt_groupwise(
         SM100a, SM103a and SM107a, consumed without conversion.
         On a dual-die SM107a GPU, packed-scale problems whose ``b`` was homed per
         die by
-        :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.localize_weights` run, in
-        the listed cells, a locality-domain form of the serving program: one
-        launch over both dies, each die reading first the expert weights homed
-        in its own memory.
+        :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.localize_weights` run a
+        locality-domain form of the serving program: one launch over both dies,
+        each die reading first the expert weights homed in its own memory.  Its
+        result is equal within tolerance to the whole-GPU program's, not
+        bitwise.
         Every launch of the Cake backend, including the first, may be captured
         into a CUDA graph; see
         :func:`flashinfer.gemm.cake_batch_deepgemm_fp8.prepare_batch_deepgemm_fp8_nt_groupwise`

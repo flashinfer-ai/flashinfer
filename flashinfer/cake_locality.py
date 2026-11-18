@@ -19,18 +19,24 @@ A Cake locality-domain kernel is one launch over both dies of the GPU. It reads
 the die of its SM from the SM table (:func:`sm_table`), takes the operands that
 each die reads most from memory homed on that die (:func:`split_empty`), and
 claims its work through one small counter workspace per die (:func:`counters`).
-Every such kernel returns the same bits for any SM table and any homing: they
-only order the claims, so a missing table or an unhomed operand costs speed and
-never changes results.
+The SM table and the homing only order the claims: such a kernel is bitwise
+equal to the whole-GPU build of the same source for any cut and any SM table.
+It is equal within the family's tolerance to the whole-GPU programs FlashInfer
+ships for the same problem, which are an older build, so a call that falls back
+to the whole-GPU route (no SM table, an unhomed operand, an unlisted cell) may
+change the low bits of the result.
 
-:func:`sm_table` probes the SMs of a device once per process, outside CUDA graph
-capture, through a FlashInfer JIT build of :data:`PROBE_SOURCE`. Every condition
-it cannot meet gives ``None``, and a caller then takes its whole-GPU route.
+:func:`sm_table` probes the SMs of a device outside CUDA graph capture through a
+FlashInfer JIT build of :data:`PROBE_SOURCE`, and caches only the outcomes that a
+later probe would repeat. Every condition it cannot meet gives ``None``, and a
+caller then takes its whole-GPU route.
 
 :func:`split_empty` reserves one virtual address range and backs ``[0, cut)``
 with memory of die 0 and ``[cut, size)`` with memory of die 1. The allocation is
 in a registry keyed by its base pointer from allocation until its last tensor is
-freed; :func:`homing` reads it.
+freed; :func:`homing` reads it. Freeing it unmaps the memory, so a CUDA graph
+that still reads a freed allocation faults on its next replay: keep the tensor
+alive as long as any graph that reads it.
 
 Imports: the standard library at module level; ``torch`` and the JIT module
 inside the functions that need them.
@@ -228,7 +234,8 @@ class Homing:
 
 _LOCK = threading.Lock()
 _TABLES: dict[int, SmTable | None] = {}
-_PROBE_MODULE: list[Any] = []  # the loaded module, or None, once tried
+_PROBE_MODULE: list[Any] = []  # the loaded module, or None for an old toolkit
+_PROBE_LOCKS: dict[int, threading.Lock] = {}  # one per device: one probe at a time
 
 
 def _device_index(device: Any) -> int:
@@ -276,19 +283,29 @@ def _module() -> Any:
         ) from exc
 
 
-def _probe_module() -> Any:
-    """The loaded locality module, or ``None`` (once tried) when it cannot load."""
+def _toolkit_supported() -> bool:
+    from .jit.cpp_ext import get_cuda_version
+
+    version = get_cuda_version()
+    return (int(version.major), int(version.minor)) >= LOCALITY_CUDA
+
+
+def _probe_module() -> tuple[Any, bool]:
+    """``(module, cacheable)``: the loaded locality module, or ``None`` when it
+    cannot load; a toolkit older than :data:`LOCALITY_CUDA` is remembered, a build
+    or load failure is not (the next call tries again)."""
     with _LOCK:
         if _PROBE_MODULE:
-            return _PROBE_MODULE[0]
+            return _PROBE_MODULE[0], True
     try:
-        module = _module()
-    except Exception:  # noqa: BLE001 - no probe library: every call stays whole
-        module = None
-    with _LOCK:
-        if not _PROBE_MODULE:
-            _PROBE_MODULE.append(module)
-        return _PROBE_MODULE[0]
+        if not _toolkit_supported():
+            with _LOCK:
+                if not _PROBE_MODULE:
+                    _PROBE_MODULE.append(None)
+                return _PROBE_MODULE[0], True
+        return _module(), True
+    except Exception:  # noqa: BLE001 - no probe library: this call stays whole
+        return None, False
 
 
 # --------------------------------------------------------------------------- probe
@@ -302,18 +319,20 @@ def sm_table(device: Any = None) -> SmTable | None:
     condition                                               result (cached)
     ======================================================  =================
     the device is not :data:`LOCALITY_ARCH`                 None (yes)
-    toolkit before :data:`LOCALITY_CUDA`, or the probe
-    library does not build or load                          None (yes)
+    toolkit before :data:`LOCALITY_CUDA`                    None (yes)
     driver before :data:`LOCALITY_CUDA`                     None (yes)
-    the first call is under CUDA graph capture, or torch
-    cannot tell whether it is                               None (no)
-    the probe misses an SM :data:`PROBE_ATTEMPTS` times,
     the dies are not exactly 0 and 1, or a row is invalid  None (yes)
+    the call is under CUDA graph capture, or torch cannot
+    tell whether it is                                      None (no)
+    the probe library does not build or load, the probe
+    raises, or it misses an SM :data:`PROBE_ATTEMPTS`
+    times (another context held it)                         None (no)
     ======================================================  =================
 
-    The probe synchronizes the device once and runs on a private stream; call this
-    eagerly before a graph capture, so a captured call and an eager call see the
-    same table."""
+    An outcome that is not cached is probed again by the next call. One probe of a
+    device runs at a time. The probe synchronizes the device and runs on a private
+    stream; call this eagerly before a graph capture, so a captured call and an
+    eager call see the same table."""
     import torch
 
     try:
@@ -323,36 +342,45 @@ def sm_table(device: Any = None) -> SmTable | None:
     with _LOCK:
         if index in _TABLES:
             return _TABLES[index]
+        lock = _PROBE_LOCKS.setdefault(index, threading.Lock())
     try:
         capturing = torch.cuda.is_current_stream_capturing()
     except Exception:  # noqa: BLE001 - no CUDA runtime to ask: nothing to probe yet
         return None
     if capturing:
         return None
-    if not _is_locality_arch(index):
-        return _remember(index, None)
-    compiler = getattr(torch, "compiler", None)
-    disable = getattr(compiler, "disable", None)
-    probe = disable(_probe) if disable is not None else _probe
-    return _remember(index, probe(index))
+    with lock:
+        with _LOCK:
+            if index in _TABLES:
+                return _TABLES[index]
+        if not _is_locality_arch(index):
+            return _remember(index, None, True)
+        compiler = getattr(torch, "compiler", None)
+        disable = getattr(compiler, "disable", None)
+        probe = disable(_probe) if disable is not None else _probe
+        table, cacheable = probe(index)
+        return _remember(index, table, cacheable)
 
 
-def _remember(index: int, table: SmTable | None) -> SmTable | None:
+def _remember(index: int, table: SmTable | None, cacheable: bool) -> SmTable | None:
+    if not cacheable:
+        return table
     with _LOCK:
         return _TABLES.setdefault(index, table)
 
 
-def _probe(device_index: int) -> SmTable | None:
-    """Run the probe on device ``device_index`` (see :func:`sm_table`)."""
+def _probe(device_index: int) -> tuple[SmTable | None, bool]:
+    """Run the probe on device ``device_index``: ``(table, cacheable)`` (see
+    :func:`sm_table`)."""
     import torch
 
-    module = _probe_module()
+    module, cacheable = _probe_module()
     if module is None:
-        return None
+        return None, cacheable
     try:
         driver = int(module.driver_version())
         if (driver // 1000, driver % 1000 // 10) < LOCALITY_CUDA:
-            return None
+            return None, True
         import tvm_ffi
 
         properties = torch.cuda.get_device_properties(device_index)
@@ -370,15 +398,15 @@ def _probe(device_index: int) -> SmTable | None:
             if len({row[0] for row in rows}) == ctas:
                 break
         else:
-            return None
-    except Exception:  # noqa: BLE001 - a probe that cannot run routes nothing
-        return None
+            return None, False
+    except Exception:  # noqa: BLE001 - a probe that cannot run routes nothing now
+        return None, False
     packed = pack_rows(rows)
     if packed is None:
-        return None
+        return None, True
     counts, words = packed
     entries = torch.tensor(words, dtype=torch.int32)
-    return SmTable(device_index=device_index, counts=counts, entries=entries)
+    return SmTable(device_index=device_index, counts=counts, entries=entries), True
 
 
 def _force_table(counts: Sequence[int], device_index: int = 0) -> SmTable:
@@ -440,7 +468,8 @@ def split_empty(
     a multiple of :func:`granularity` between them. The memory is freed when the
     tensor and all its views are freed: the device is synchronized, both parts are
     unmapped and released, and the allocation leaves the :func:`homing` registry.
-    Allocate and free outside CUDA graph capture."""
+    Allocate and free outside CUDA graph capture; a graph that still reads the
+    tensor after it is freed faults on replay."""
     import math
 
     import torch
@@ -498,15 +527,28 @@ def pointer_domain(ptr: int, device: Any = None) -> int:
 
 def counters(words: int, device: Any = None) -> tuple[Any, Any]:
     """Each die's claim counters of one launch: two zeroed int32 tensors of ``words``
-    words, homed on die 0 and die 1. A kernel leaves them zero after every launch;
-    two launches in flight never share one pair. Call outside CUDA graph capture."""
+    words, homed on die 0 and die 1 through FlashInfer's locality-domain memory
+    pools. When those pools are unavailable (another PyTorch allocator backend, no
+    ``MemPool`` support, or no locality domains), the pair is two ordinary zeroed
+    tensors: the claims are not homed, and the results are the same bits. A kernel
+    leaves them zero after every launch; two launches in flight never share one
+    pair. Call outside CUDA graph capture."""
     import torch
 
-    from .locality_domain import get_localized_domains
+    from . import locality_domain
 
     index = _device_index(device)
-    domains = get_localized_domains(index)
-    pair = tuple(domains.empty(die, (int(words),), torch.int32) for die in range(2))
+    target = torch.device("cuda", index)
+    shape = (int(words),)
+    try:
+        pools = locality_domain._domain_pools(index).pools
+        use_mem_pool = locality_domain._use_mem_pool()
+        pair = []
+        for die in range(2):
+            with use_mem_pool(pools[die], device=target):
+                pair.append(torch.empty(shape, dtype=torch.int32, device=target))
+    except (locality_domain.LocalityDomainError, torch.OutOfMemoryError):
+        pair = [torch.empty(shape, dtype=torch.int32, device=target) for _ in range(2)]
     for tensor in pair:
         tensor.zero_()
     return pair[0], pair[1]

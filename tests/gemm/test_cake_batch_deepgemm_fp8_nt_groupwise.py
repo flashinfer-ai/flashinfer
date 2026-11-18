@@ -20,6 +20,8 @@ from flashinfer.gemm.cake_batch_deepgemm_fp8 import (
     PACKED_NK,
     PAIR_COUNTER_WORDS,
     SUPPORTED_NK,
+    domain_serving_program,
+    domain_serving_routed,
     expected_m_class,
     is_batch_deepgemm_fp8_nt_groupwise_cake_available,
     localize_weights,
@@ -66,14 +68,24 @@ def _require_packed():
 
 
 def _packed_serving(test):
-    """A test of the packed-scale serving routes alone: they take their grid from
-    the SM count, so they run on every SM count of a packed-scale architecture."""
+    """A test of the packed-scale serving routes alone: on SM107a they take their
+    grid from the SM count, so they run on every SM count of that architecture;
+    elsewhere they need the device's exported route chain as before."""
     test.packed_serving = True
+    return test
+
+
+def _host_only(test):
+    """A test of host-side selection rules: it launches no kernel and runs on any
+    device (the CUDA tensors it builds only carry metadata)."""
+    test.host_only = True
     return test
 
 
 @pytest.fixture(autouse=True)
 def _require_generated_program(request):
+    if getattr(request.function, "host_only", False):
+        return
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
@@ -81,7 +93,7 @@ def _require_generated_program(request):
         pytest.skip(
             "generated Cake batch DeepGEMM FP8 programs target SM100a, SM103a and SM107a"
         )
-    if getattr(request.function, "packed_serving", False):
+    if getattr(request.function, "packed_serving", False) and _arch() == "sm_107a":
         _require_packed()
     elif not is_batch_deepgemm_fp8_nt_groupwise_cake_available(device):
         pytest.skip(
@@ -924,25 +936,66 @@ def test_sm100a_sm103a_masked_m_once_bn32_matches_reference(groups, m, expected_
 
 _SERVING_ROUTE = "seed_serving_m32_packed"
 _SERVING_M = 256
-# ((N, K), groups, expected_m) of every cell routed to a twin, and of boundary
-# rows that stay on the whole program.
-_DOMAIN_CELLS = [
-    ((4096, 7168), 32, 8),
-    ((4096, 7168), 64, 8),
-    ((7168, 2048), 32, 8),
-    ((7168, 2048), 64, 8),
-    ((4096, 7168), 64, 1),
-]
-_WHOLE_CELLS = [
-    ((4096, 7168), 32, 1),
-    ((4096, 7168), 64, 4),
-    ((4096, 7168), 64, 16),
-    ((7168, 2048), 32, 1),
-    ((7168, 2048), 64, 2),
-    ((7168, 2048), 64, 16),
-]
+# One expected_m per expected_m class.
+_CLASS_EXPECTED_M = (1, 4, 8, 16)
 _RACE_ENV = "FLASHINFER_CAKE_DOMAIN_RACE_LAUNCHES"
 _RACE_PLACEMENTS = ("stream", "occupier-die0", "occupier-die1", "one-die0", "one-die1")
+
+# The cells of the twins' source rule, keyed by serving key: a (die class,
+# expected_m class) cell is listed where the twin ran below 0.98 x the fastest
+# whole-GPU build of the same N, K and groups on every timed 212-SM GPU of that
+# die class.  DOMAIN_SERVING_CELLS must route exactly these.
+_SOURCE_ROUTES = {
+    "sm_107a:n4096_k7168_g32_s5e2_evict_normal_l8": {
+        ("even", "em8-15"),
+        ("uneven", "em8-15"),
+    },
+    "sm_107a:n4096_k7168_g64_s5e2_evict_normal_l8": {
+        ("even", "em8-15"),
+        ("uneven", "em8-15"),
+    },
+    "sm_107a:n7168_k2048_g32_s5e2_evict_normal_l8": {
+        ("even", "em8-15"),
+        ("uneven", "em8-15"),
+    },
+    "sm_107a:n7168_k2048_g64_s5e2_evict_normal_l8": {
+        ("even", "em8-15"),
+        ("uneven", "em8-15"),
+    },
+    "sm_107a:n4096_k7168_g64_s6e1_evict_normal_l2": {
+        ("even", "em<=1"),
+        ("uneven", "em<=1"),
+    },
+}
+_SOURCE_SM_COUNT = 212
+# Probe vectors of the source rule: die splits at both sides of the even bound
+# (a gap of 4 SMs is even), and expected_m at both sides of every class bound.
+_PROBE_DIES = (
+    (106, 106),
+    (108, 104),
+    (104, 108),
+    (105, 109),
+    (104, 109),
+    (102, 110),
+    (112, 100),
+)
+_PROBE_EXPECTED_M = (0, 1, 2, 7, 8, 15, 16, 64)
+
+
+def _source_twin(key, dies, expected_m):
+    """The twin the source rule launches for serving key ``key`` (qualified)."""
+    if expected_m <= 1:
+        em = "em<=1"
+    elif expected_m < 8:
+        em = "em2-7"
+    elif expected_m < 16:
+        em = "em8-15"
+    else:
+        em = "em16+"
+    die = "even" if abs(dies[0] - dies[1]) <= 4 else "uneven"
+    if (die, em) in _SOURCE_ROUTES.get(key, ()):
+        return DOMAIN_SERVING_PROGRAMS[key]
+    return None
 
 
 def _cell_id(cell):
@@ -954,6 +1007,28 @@ def _serving_key(arch, sm_count, nk, groups, expected_m):
     n, k = nk
     stages, epi, hint, _, l2 = serving_config(_SERVING_M, k, expected_m, sm_count, arch)
     return f"{arch}:{serving_program_key(n, k, groups, stages, epi, hint, l2)}"
+
+
+def _listed(cell):
+    """True when some SM count and die class route ``cell`` to a twin."""
+    nk, groups, expected_m = cell
+    for sm_count, cells in DOMAIN_SERVING_CELLS.items():
+        key = _serving_key("sm_107a", sm_count, nk, groups, expected_m)
+        for (_, em_class), keys in cells.items():
+            if em_class == expected_m_class(expected_m) and key in keys:
+                return True
+    return False
+
+
+# ((N, K), groups, expected_m) of every serving shape, one expected_m per class;
+# the twin tests take the cells some die class routes to a twin.
+_SHAPE_CELLS = [
+    (nk, groups, expected_m)
+    for nk in sorted(PACKED_NK)
+    for groups in sorted(PACKED_GROUPS)
+    for expected_m in _CLASS_EXPECTED_M
+]
+_DOMAIN_CELLS = [cell for cell in _SHAPE_CELLS if _listed(cell)]
 
 
 def _whole_program(key):
@@ -990,6 +1065,35 @@ def _require_domain():
     return device, table
 
 
+def _require_routed(cell, device, table):
+    """The twin program of ``cell`` on this device; skips a cell its die class
+    does not route."""
+    nk, groups, expected_m = cell
+    sm_count = device_sm_count(device)
+    key = _serving_key("sm_107a", sm_count, nk, groups, expected_m)
+    twin = domain_serving_program(
+        "sm_107a", sm_count, key.split(":", 1)[1], expected_m, table.counts
+    )
+    if twin is None:
+        pytest.skip(
+            f"{_cell_id(cell)} is not routed to a twin for the dies {table.counts}"
+        )
+    return twin
+
+
+def _home(b, table, g_cut=None):
+    """``b`` copied into a split allocation cut after group ``g_cut`` (default:
+    the dies' SM-proportional share), whatever :func:`localize_weights` decides."""
+    groups = int(b.shape[0])
+    if g_cut is None:
+        g_cut = cake_locality.split_units(groups, table.counts)[0]
+    homed = cake_locality.split_empty(
+        tuple(b.shape), b.dtype, g_cut * b[0].numel() * b.element_size(), b.device
+    )
+    homed.copy_(b)
+    return homed
+
+
 @functools.lru_cache(maxsize=1)
 def _serving_problem(nk, groups, expected_m):
     """Packed-scale serving inputs of one cell (masks around ``expected_m``, an
@@ -1015,61 +1119,240 @@ def _valid_bits(out, valid):
     return out.view(torch.int16)[valid].clone()
 
 
-@_packed_serving
-def test_domain_serving_cells_rule():
-    """The twin cells: listed SM counts, both die classes, the expected_m classes."""
-    assert expected_m_class(0) == expected_m_class(1) == "em<=1"
-    assert expected_m_class(2) == expected_m_class(7) == "em2-7"
-    assert expected_m_class(8) == expected_m_class(15) == "em8-15"
-    assert expected_m_class(16) == "em16+"
+@_host_only
+def test_domain_serving_cells_follow_the_source_rule():
+    """DOMAIN_SERVING_CELLS route exactly the source rule's cells over its probe
+    vectors, for every sm_107a serving key of the packed-scale shapes."""
+    assert set(DOMAIN_SERVING_CELLS) == {_SOURCE_SM_COUNT}
+    assert set(_SOURCE_ROUTES) <= set(DOMAIN_SERVING_PROGRAMS)
     assert all(_whole_program(key) for key in DOMAIN_SERVING_PROGRAMS)
+    for dies, die in (((105, 109), "even"), ((104, 109), "uneven")):
+        assert cake_locality.die_class(dies) == die
+    for expected_m, em in ((0, "em<=1"), (1, "em<=1"), (2, "em2-7"), (7, "em2-7")):
+        assert expected_m_class(expected_m) == em
+    for expected_m, em in ((8, "em8-15"), (15, "em8-15"), (16, "em16+"), (64, "em16+")):
+        assert expected_m_class(expected_m) == em
+    keys = set(DOMAIN_SERVING_PROGRAMS) | {
+        _serving_key("sm_107a", _SOURCE_SM_COUNT, nk, groups, expected_m)
+        for nk in PACKED_NK
+        for groups in PACKED_GROUPS
+        for expected_m in range(0, 70)
+    }
+    reached = set()
+    for dies in _PROBE_DIES:
+        for expected_m in _PROBE_EXPECTED_M:
+            for key in sorted(keys):
+                got = domain_serving_program(
+                    "sm_107a", _SOURCE_SM_COUNT, key.split(":", 1)[1], expected_m, dies
+                )
+                assert got == _source_twin(key, dies, expected_m), (
+                    key,
+                    dies,
+                    expected_m,
+                )
+                if got is not None:
+                    cell = (cake_locality.die_class(dies), expected_m_class(expected_m))
+                    reached.add((key, *cell))
+    listed = {
+        (key, *cell)
+        for cell, cell_keys in DOMAIN_SERVING_CELLS[_SOURCE_SM_COUNT].items()
+        for key in cell_keys
+    }
+    assert listed == reached
+
+
+@_host_only
+def test_every_sm107a_serving_key_has_a_twin():
+    """Every serving program an SM107a packed-scale problem selects, at any
+    expected_m, has a locality-domain twin of the same key."""
+    keys = {
+        _serving_key("sm_107a", _SOURCE_SM_COUNT, nk, groups, expected_m)
+        for nk in PACKED_NK
+        for groups in PACKED_GROUPS
+        for expected_m in range(0, 70)
+    }
+    assert sorted(keys - set(DOMAIN_SERVING_PROGRAMS)) == []
+    assert sorted(set(DOMAIN_SERVING_PROGRAMS) - keys) == []
+    for key, twin in DOMAIN_SERVING_PROGRAMS.items():
+        assert PROGRAMS[twin]["arches"] == ["sm_107a"], key
+        assert PROGRAMS[twin]["arg_plan"] == "plan8", key
+
+
+@_host_only
+def test_domain_serving_plan_of_listed_cells():
+    """A listed cell plans its twin (one CTA per SM, a counter pair); the same
+    problem without an SM split, at an unmeasured SM count or off SM107a plans
+    the whole program."""
     for counts in ((104, 108), (108, 104), (102, 110), (112, 100)):
         sm_count = sum(counts)
-        for cell in _DOMAIN_CELLS:
+        for cell in _SHAPE_CELLS:
             nk, groups, expected_m = cell
+            key = _serving_key("sm_107a", sm_count, nk, groups, expected_m)
             plan = serving_plan(
                 "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
             )
-            key = _serving_key("sm_107a", sm_count, nk, groups, expected_m)
-            assert plan.route == DOMAIN_SERVING_ROUTE
-            assert plan.parent == _SERVING_ROUTE
-            assert [stage.program for stage in plan.stages] == [
-                DOMAIN_SERVING_PROGRAMS[key]
-            ]
-            assert plan.stages[0].grid == (sm_count, 1, 1)
-            assert plan.workspaces == {
-                "counters0": (PAIR_COUNTER_WORDS,),
-                "counters1": (PAIR_COUNTER_WORDS,),
-            }
+            twin = _source_twin(key, counts, expected_m)
             whole = serving_plan(
                 "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m
             )
             assert whole.route == _SERVING_ROUTE and whole.workspaces == {}
             assert whole.stages[0].program == _whole_program(key)
-        for cell in _WHOLE_CELLS:
-            nk, groups, expected_m = cell
-            plan = serving_plan(
-                "sm_107a", sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
-            )
-            assert plan.route == _SERVING_ROUTE, cell
-    # No cell is listed for an unmeasured SM count, nor off SM107a.
+            if twin is None:
+                assert plan.route == _SERVING_ROUTE, cell
+                continue
+            assert plan.route == DOMAIN_SERVING_ROUTE
+            assert plan.parent == _SERVING_ROUTE
+            assert [stage.program for stage in plan.stages] == [twin]
+            assert plan.stages[0].grid == (sm_count, 1, 1)
+            assert plan.workspaces == {
+                "counters0": (PAIR_COUNTER_WORDS,),
+                "counters1": (PAIR_COUNTER_WORDS,),
+            }
     for arch, sm_count, counts in (
         ("sm_107a", 216, (108, 108)),
         ("sm_100a", 148, (74, 74)),
     ):
-        nk, groups, expected_m = _DOMAIN_CELLS[0]
-        plan = serving_plan(
-            arch, sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
+        for cell in _DOMAIN_CELLS:
+            nk, groups, expected_m = cell
+            plan = serving_plan(
+                arch, sm_count, groups, _SERVING_M, *nk, expected_m, counts=counts
+            )
+            assert plan.route == _SERVING_ROUTE
+
+
+@_host_only
+def test_domain_serving_routed_needs_every_expected_m_routed(monkeypatch):
+    """Weights are localizable only where every expected_m runs a twin."""
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    for dies in _PROBE_DIES:
+        for nk in sorted(PACKED_NK):
+            for groups in sorted(PACKED_GROUPS):
+                want = all(
+                    _source_twin(
+                        _serving_key("sm_107a", _SOURCE_SM_COUNT, nk, groups, em),
+                        dies,
+                        em,
+                    )
+                    for em in range(0, 70)
+                )
+                got = domain_serving_routed(
+                    "sm_107a", _SOURCE_SM_COUNT, dies, *nk, groups
+                )
+                assert got == want, (dies, nk, groups)
+    for arch, sm_count, n, k, groups in (
+        ("sm_107a", _SOURCE_SM_COUNT, 512, 128, 64),
+        ("sm_107a", _SOURCE_SM_COUNT, 4096, 7168, 16),
+        ("sm_107a", 216, 4096, 7168, 64),
+        ("sm_103a", _SOURCE_SM_COUNT, 4096, 7168, 64),
+    ):
+        assert not domain_serving_routed(arch, sm_count, (106, 106), n, k, groups)
+    # Every cell keeps its shape localizable only while it is listed.
+    for (die, em_class), keys in DOMAIN_SERVING_CELLS[_SOURCE_SM_COUNT].items():
+        dies = (106, 106) if die == "even" else (102, 110)
+        for key in keys:
+            n, k, groups = (
+                int(part[1:]) for part in key.split(":", 1)[1].split("_")[:3]
+            )
+            cells = {
+                count: {
+                    cell: tuple(
+                        other
+                        for other in cell_keys
+                        if (cell, other) != ((die, em_class), key)
+                    )
+                    for cell, cell_keys in table.items()
+                }
+                for count, table in DOMAIN_SERVING_CELLS.items()
+            }
+            with monkeypatch.context() as patch:
+                patch.setattr(module, "DOMAIN_SERVING_CELLS", cells)
+                assert not domain_serving_routed(
+                    "sm_107a", _SOURCE_SM_COUNT, dies, n, k, groups
+                ), (key, die, em_class)
+
+
+@_host_only
+def test_unlisted_sm_counts_of_sm100a_sm103a_still_raise(monkeypatch):
+    """The packed-scale serving route runs on every SM count of SM107a only:
+    SM100a and SM103a keep refusing an SM count without a route chain."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    device = torch.device("cuda")
+    a = torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn, device=device)
+    scale = torch.empty((1, 1, 1), dtype=torch.int32, device=device)
+    masked_m = torch.zeros((1,), dtype=torch.int32, device=device)
+    for arch, sm_count in (("sm_103a", 148), ("sm_103a", 160), ("sm_100a", 132)):
+        patch_arch = functools.partial(lambda _index, value: value, value=arch)
+        patch_sms = functools.partial(lambda _index, value: value, value=sm_count)
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "device_arch", patch_arch)
+            patch.setattr(module, "device_sm_count", patch_sms)
+            with pytest.raises(ValueError, match=f"this device has {sm_count}$"):
+                prepare_batch_deepgemm_fp8_nt_groupwise(a, a, scale, scale, masked_m, 0)
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "device_arch", lambda _index: "sm_107a")
+        patch.setattr(module, "device_sm_count", lambda _index: 212)
+        with pytest.raises(ValueError, match="aligned M, N and K"):
+            prepare_batch_deepgemm_fp8_nt_groupwise(a, a, scale, scale, masked_m, 0)
+
+
+@_host_only
+def test_domain_counters_must_not_overlap():
+    """Caller-owned counters of the two dies must not share a byte."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from flashinfer.gemm.cake_batch_deepgemm_fp8 import _check_workspace
+
+    (nk, groups, expected_m) = _DOMAIN_CELLS[0]
+    counts = (106, 106)
+    plan = serving_plan(
+        "sm_107a", sum(counts), groups, _SERVING_M, *nk, expected_m, counts=counts
+    )
+    assert plan.route == DOMAIN_SERVING_ROUTE
+    device = torch.device("cuda", torch.cuda.current_device())
+    words = torch.zeros(4, dtype=torch.int32, device=device)
+    for first, second in ((words[0:2], words[0:2]), (words[0:2], words[1:3])):
+        with pytest.raises(ValueError, match="overlap"):
+            _check_workspace(plan, {"counters0": first, "counters1": second}, device)
+        with pytest.raises(ValueError, match="overlap"):
+            _check_workspace(plan, {"counters0": second, "counters1": first}, device)
+    _check_workspace(plan, {"counters0": words[2:4], "counters1": words[0:2]}, device)
+
+
+@_host_only
+def test_counters_fall_back_to_unhomed_zeros(monkeypatch):
+    """Without FlashInfer's locality-domain pools (another allocator backend, no
+    MemPool, no locality domains) the counters are ordinary zeroed tensors."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from flashinfer import locality_domain
+
+    def refuse(_index):
+        raise locality_domain.LocalityDomainError("backend:cudaMallocAsync")
+
+    monkeypatch.setattr(locality_domain, "_domain_pools", refuse)
+    first, second = cake_locality.counters(PAIR_COUNTER_WORDS)
+    for tensor in (first, second):
+        assert tensor.dtype == torch.int32 and tuple(tensor.shape) == (
+            PAIR_COUNTER_WORDS,
         )
-        assert plan.route == _SERVING_ROUTE
+        assert tensor.device.type == "cuda"
+        assert int(tensor.abs().sum()) == 0
+    assert first.data_ptr() != second.data_ptr()
 
 
 @_packed_serving
 @pytest.mark.parametrize("cell", _DOMAIN_CELLS, ids=_cell_id)
 def test_domain_twin_matches_reference(cell):
     """(a) The twin over the shape list: the reference within the family tolerance,
-    the public API the same bits; the whole program is checked the same way."""
+    the public API the same bits; the whole program is checked the same way.
+    ``localize_weights`` homes the weights exactly when every expected_m of
+    their shape is routed to a twin."""
     device, table = _require_domain()
+    twin_program = _require_routed(cell, device, table)
     nk, groups, expected_m = cell
     a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
     sm_count = device_sm_count(device)
@@ -1080,15 +1363,23 @@ def test_domain_twin_matches_reference(cell):
     assert whole.route == _SERVING_ROUTE
     assert whole.programs == (_whole_program(key),)
     whole_out = whole.launch()
-    homed = localize_weights(b)
-    assert homed is not b and torch.equal(homed.view(torch.uint8), b.view(torch.uint8))
+    localized = localize_weights(b)
+    if domain_serving_routed("sm_107a", sm_count, table.counts, *nk, groups):
+        assert localized is not b
+        assert cake_locality.homing(localized) is not None
+        homed = localized
+    else:
+        assert localized is b
+        homed = _home(b, table)
+    assert torch.equal(homed.view(torch.uint8), b.view(torch.uint8))
     twin = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, homed, a_packed, b_packed, masked_m, expected_m
     )
     assert twin.route == DOMAIN_SERVING_ROUTE
-    assert twin.programs == (DOMAIN_SERVING_PROGRAMS[key],)
+    assert twin.programs == (twin_program,) == (DOMAIN_SERVING_PROGRAMS[key],)
     assert twin.grids == ((sm_count // 2 * 2, 1, 1),)
     assert twin.g_cut == cake_locality.split_units(groups, table.counts)[0]
+    assert not twin.capture_only
     twin_out = twin.launch()
     torch.cuda.synchronize()
     _assert_valid_rows_close(twin_out, reference, masked_m)
@@ -1101,8 +1392,61 @@ def test_domain_twin_matches_reference(cell):
     same = torch.equal(_valid_bits(whole_out, valid), _valid_bits(twin_out, valid))
     print(
         f"TWIN {_cell_id(cell)} counts={table.counts} g_cut={twin.g_cut} "
-        f"bitwise_equal_to_whole_program={same}"
+        f"bitwise_equal_to_shipped_whole_program={same}"
     )
+
+
+@_packed_serving
+def test_localize_weights_refuses_what_could_run_slower(monkeypatch):
+    """``localize_weights`` returns ``b`` itself for weights of a non-serving
+    shape or dtype, for a shape with an expected_m whose cell is not listed, and
+    for a cut off the allocation granularity; it raises for a ``g_cut`` outside
+    ``[0, B]``."""
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    device, table = _require_domain()
+    sm_count = device_sm_count(device)
+    for shape, dtype in (
+        ((64, 512, 128), torch.float8_e4m3fn),
+        ((16, 7168, 2048), torch.float8_e4m3fn),
+        ((32, 7168, 2048), torch.uint8),
+    ):
+        weights = torch.zeros(shape, dtype=dtype, device=f"cuda:{device}")
+        assert localize_weights(weights) is weights
+        del weights
+    routed = [
+        (nk, groups)
+        for nk in sorted(PACKED_NK)
+        for groups in sorted(PACKED_GROUPS)
+        if domain_serving_routed("sm_107a", sm_count, table.counts, *nk, groups)
+    ]
+    shapes = {(nk, groups) for nk in PACKED_NK for groups in PACKED_GROUPS}
+    for nk, groups in sorted(shapes - set(routed)):
+        weights = torch.zeros(
+            (groups, *nk), dtype=torch.float8_e4m3fn, device=f"cuda:{device}"
+        )
+        assert localize_weights(weights) is weights
+        del weights
+    if not routed:
+        pytest.skip(f"no serving shape is localizable on the dies {table.counts}")
+    nk, groups = min(routed, key=lambda item: item[0][0] * item[0][1] * item[1])
+    weights = torch.zeros(
+        (groups, *nk), dtype=torch.float8_e4m3fn, device=f"cuda:{device}"
+    )
+    homed = localize_weights(weights)
+    assert homed is not weights and cake_locality.homing(homed) is not None
+    del homed
+    with pytest.raises(ValueError, match="g_cut"):
+        localize_weights(weights, groups + 1)
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "DOMAIN_SERVING_CELLS", {})
+        assert localize_weights(weights) is weights
+    with monkeypatch.context() as patch:
+        # A granularity of 3 MiB: a cut of an odd number of 14 or 28 MiB groups
+        # is off it.
+        patch.setattr(cake_locality, "granularity", lambda device=None: 3 << 20)
+        assert localize_weights(weights, 1) is weights
+        assert localize_weights(weights, 0) is not weights
 
 
 @_packed_serving
@@ -1111,6 +1455,7 @@ def test_domain_twin_bits_do_not_depend_on_the_cut(cell):
     """(b) Empty-die cuts both ways, an uneven cut and the SM-proportional cuts of
     both die orders give the same bits."""
     device, table = _require_domain()
+    _require_routed(cell, device, table)
     _, groups, expected_m = cell
     a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
     cuts = sorted(
@@ -1124,7 +1469,7 @@ def test_domain_twin_bits_do_not_depend_on_the_cut(cell):
     )
     first = None
     for g_cut in cuts:
-        homed = localize_weights(b, g_cut)
+        homed = _home(b, table, g_cut)
         prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
             a, homed, a_packed, b_packed, masked_m, expected_m
         )
@@ -1142,14 +1487,17 @@ def test_domain_twin_bits_do_not_depend_on_the_cut(cell):
 
 
 @_packed_serving
-@pytest.mark.parametrize("cell", [_DOMAIN_CELLS[1], _DOMAIN_CELLS[4]], ids=_cell_id)
-def test_domain_twin_counters_zero_and_reused(cell):
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS[:2], ids=_cell_id)
+def test_domain_twin_counters_zero_and_reused(cell, monkeypatch):
     """(c) The claim counters are zero after every launch and reused by the next;
-    a launch allocates nothing; a caller-owned counter pair is bound as given."""
-    _require_domain()
+    a launch allocates nothing; a caller-owned counter pair is bound as given;
+    without the locality-domain pools the counters are unhomed and the result
+    is the same bits."""
+    device, table = _require_domain()
+    _require_routed(cell, device, table)
     _, _, expected_m = cell
     a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
-    homed = localize_weights(b)
+    homed = _home(b, table)
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, homed, a_packed, b_packed, masked_m, expected_m
     )
@@ -1190,21 +1538,41 @@ def test_domain_twin_counters_zero_and_reused(cell):
     torch.cuda.synchronize()
     assert torch.equal(_valid_bits(given.out, valid), first)
     assert all(int(t.abs().sum()) == 0 for t in owned.values())
+    from flashinfer import locality_domain
+
+    def refuse(_index):
+        raise locality_domain.LocalityDomainError("backend:cudaMallocAsync")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(locality_domain, "_domain_pools", refuse)
+        unhomed = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a, homed, a_packed, b_packed, masked_m, expected_m
+        )
+        assert unhomed.route == DOMAIN_SERVING_ROUTE
+        unhomed.launch()
+        public = batch_deepgemm_fp8_nt_groupwise(
+            a, homed, a_packed, b_packed, masked_m, expected_m, backend="cake"
+        )
+        torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(unhomed.out, valid), first)
+    assert torch.equal(_valid_bits(public, valid), first)
+    assert all(int(t.abs().sum()) == 0 for t in unhomed.workspace.values())
 
 
 @_packed_serving
-@pytest.mark.parametrize("cell", [_DOMAIN_CELLS[0], _DOMAIN_CELLS[3]], ids=_cell_id)
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS[:2], ids=_cell_id)
 def test_domain_weights_and_counters_homed_per_die(cell):
     """(d) ``pointer_domain`` of the first and last bytes of each die's groups of
     ``b``, and of each die's counters."""
     device, table = _require_domain()
+    _require_routed(cell, device, table)
     nk, groups, expected_m = cell
     a, b, _, _, a_packed, b_packed, masked_m, _, _ = _serving_problem(*cell)
     group_bytes = nk[0] * nk[1]
     for g_cut in sorted(
         {cake_locality.split_units(groups, table.counts)[0], 0, groups, groups // 4}
     ):
-        homed = localize_weights(b, g_cut)
+        homed = _home(b, table, g_cut)
         record = cake_locality.homing(homed)
         assert record is not None and record.cut == g_cut * group_bytes
         base = homed.data_ptr()
@@ -1217,7 +1585,7 @@ def test_domain_weights_and_counters_homed_per_die(cell):
         assert torch.equal(homed.view(torch.uint8), b.view(torch.uint8))
         del homed
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
-        a, localize_weights(b), a_packed, b_packed, masked_m, expected_m
+        a, _home(b, table), a_packed, b_packed, masked_m, expected_m
     )
     assert prepared.route == DOMAIN_SERVING_ROUTE
     for die in range(2):
@@ -1227,14 +1595,32 @@ def test_domain_weights_and_counters_homed_per_die(cell):
 
 @_packed_serving
 def test_domain_fallbacks_take_the_whole_route(monkeypatch):
-    """(e) An unhomed ``b``, no SM table and an unlisted cell take the whole program."""
-    _require_domain()
-    cell = _DOMAIN_CELLS[2]
+    """(e) An unhomed ``b``, a copy of homed weights, no listed cell and no SM
+    table take the whole program; ``localize_weights`` then returns ``b``."""
+    import flashinfer.gemm.cake_batch_deepgemm_fp8 as module
+
+    device, table = _require_domain()
+    cell = next(
+        (
+            cell
+            for cell in _DOMAIN_CELLS
+            if domain_serving_program(
+                "sm_107a",
+                device_sm_count(device),
+                _serving_key("sm_107a", device_sm_count(device), *cell).split(":")[1],
+                cell[2],
+                table.counts,
+            )
+        ),
+        None,
+    )
+    if cell is None:
+        pytest.skip(f"no cell is routed to a twin for the dies {table.counts}")
     nk, groups, expected_m = cell
     a, b, a_scale, b_scale, a_packed, b_packed, masked_m, reference, _ = (
         _serving_problem(*cell)
     )
-    homed = localize_weights(b)
+    homed = _home(b, table)
     unhomed = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, b, a_packed, b_packed, masked_m, expected_m
     )
@@ -1244,16 +1630,17 @@ def test_domain_fallbacks_take_the_whole_route(monkeypatch):
         a, homed.clone(), a_packed, b_packed, masked_m, expected_m
     )
     assert copied.route == _SERVING_ROUTE
-    # No unlisted cell on the homed weights: expected_m classes em<=1 (no twin of
-    # the K=2048 key), em2-7 and em16+.
-    for hint in (1, 4, 16):
-        prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
-            a, homed, a_packed, b_packed, masked_m, hint
-        )
-        assert prepared.route == _SERVING_ROUTE, hint
-        out = prepared.launch()
-        torch.cuda.synchronize()
-        _assert_valid_rows_close(out, reference, masked_m)
+    for cells in ({}, {device_sm_count(device): {}}):
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "DOMAIN_SERVING_CELLS", cells)
+            assert localize_weights(b) is b
+            prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
+                a, homed, a_packed, b_packed, masked_m, expected_m
+            )
+            assert prepared.route == _SERVING_ROUTE
+            out = prepared.launch()
+            torch.cuda.synchronize()
+            _assert_valid_rows_close(out, reference, masked_m)
     with monkeypatch.context() as patch:
         patch.setattr(cake_locality, "sm_table", lambda device=None: None)
         assert localize_weights(b) is b
@@ -1273,19 +1660,20 @@ def test_domain_fallbacks_take_the_whole_route(monkeypatch):
 
 
 @_packed_serving
-@pytest.mark.parametrize("cell", [_DOMAIN_CELLS[0], _DOMAIN_CELLS[4]], ids=_cell_id)
+@pytest.mark.parametrize("cell", _DOMAIN_CELLS[:2], ids=_cell_id)
 def test_domain_twin_cuda_graph_capture_and_replay(cell):
     """(f) The first launch of a prepared twin is captured and replayed; replays
     follow new activations and leave the counters zero; the public API's call is
-    capturable too."""
-    _require_domain()
+    capturable too; a twin prepared under capture launches only under capture."""
+    device_index, table = _require_domain()
+    _require_routed(cell, device_index, table)
     _, _, expected_m = cell
     a0, b, a_scale, b_scale, a_packed, b_packed, masked_m, reference, valid = (
         _serving_problem(*cell)
     )
     device = a0.device
     a = a0.clone()
-    homed = localize_weights(b)
+    homed = _home(b, table)
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, homed, a_packed, b_packed, masked_m, expected_m
     )
@@ -1323,6 +1711,20 @@ def test_domain_twin_cuda_graph_capture_and_replay(cell):
     public_graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(_valid_bits(out, valid), first)
+    captured_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(captured_graph, stream=stream):
+        captured = prepare_batch_deepgemm_fp8_nt_groupwise(
+            a0, homed, a_packed, b_packed, masked_m, expected_m
+        )
+        captured.launch()
+    assert captured.route == DOMAIN_SERVING_ROUTE and captured.capture_only
+    with pytest.raises(RuntimeError, match="capture"):
+        captured.launch()
+    captured.out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    captured_graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_valid_bits(captured.out, valid), first)
 
 
 # The race's occupier: one 1024-thread block per SM (its whole opt-in shared
@@ -1494,11 +1896,12 @@ def test_domain_twin_race(cell, placement):
     if not launches:
         pytest.skip(f"a stress gate: set {_RACE_ENV} to the launches per placement")
     device, table = _require_domain()
+    _require_routed(cell, device, table)
     from flashinfer.locality_domain import get_localized_domains
 
     _, _, expected_m = cell
     a, b, _, _, a_packed, b_packed, masked_m, reference, valid = _serving_problem(*cell)
-    homed = localize_weights(b)
+    homed = _home(b, table)
     prepared = prepare_batch_deepgemm_fp8_nt_groupwise(
         a, homed, a_packed, b_packed, masked_m, expected_m
     )

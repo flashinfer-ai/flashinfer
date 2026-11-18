@@ -286,24 +286,34 @@ CUdeviceptr SplitAlloc(int device, size_t nbytes, size_t cut) {
 }
 
 // Frees a split allocation; called by the tensor deleter, so it never throws.
+// The registry lock is not held while the context synchronizes. A CUDA graph that
+// still reads the allocation faults on its next replay, as the range is unmapped.
 void SplitFree(CUdeviceptr address) noexcept {
   try {
-    std::lock_guard<std::mutex> lock(SplitsMutex());
-    auto& splits = Splits();
-    auto it = splits.find(address);
-    if (it == splits.end()) {
-      return;
+    Split split{};
+    {
+      std::lock_guard<std::mutex> lock(SplitsMutex());
+      auto it = Splits().find(address);
+      if (it == Splits().end()) {
+        return;
+      }
+      split = it->second;
     }
-    Split const split = it->second;
     DeviceScope scope(split.device);
     CUcontext current{};
     CUresult result = cuCtxGetCurrent(&current);
     if (result == CUDA_ERROR_DEINITIALIZED || !scope.ok()) {
-      splits.erase(it);
+      std::lock_guard<std::mutex> lock(SplitsMutex());
+      Splits().erase(address);
       return;
     }
     if (result != CUDA_SUCCESS || current != split.context) {
       return;  // not this allocation's context: leave it mapped rather than corrupt it
+    }
+    {
+      // The range leaves the registry before it is unmapped: no lookup finds it.
+      std::lock_guard<std::mutex> lock(SplitsMutex());
+      Splits().erase(address);
     }
     // As cudaFree does: no kernel still in flight may read the memory being unmapped.
     static_cast<void>(cuCtxSynchronize());
@@ -314,7 +324,6 @@ void SplitFree(CUdeviceptr address) noexcept {
       }
     }
     static_cast<void>(api.address_free(address, split.size));
-    splits.erase(it);
   } catch (...) {
   }
 }

@@ -27,9 +27,12 @@ On a dual-die SM107a device (two locality domains) whose weights ``b`` were
 allocated by :func:`localize_weights`, a packed-scale serving problem in a
 listed cell runs the serving program's locality-domain twin: one launch over
 both dies, each die claiming first the groups of ``b`` homed in its memory,
-through a pair of per-die claim counters owned by the prepared launch.  The
-twin's result does not depend on where ``b`` is homed; every other call runs the
-whole-GPU program.
+through a pair of per-die claim counters owned by the prepared launch.  A twin
+is bitwise equal to the whole-GPU build of the same source for any cut; it is
+equal within the family's tolerance to the whole-GPU serving program shipped
+here, which is an older build, so falling back to the whole-GPU program may
+change the low bits of the result.  Every other call runs the whole-GPU
+program.
 """
 
 from __future__ import annotations
@@ -90,6 +93,9 @@ DOMAIN_SERVING_ROUTE = "seed_serving_m32_packed_domain"
 PAIR_COUNTER_WORDS = 2
 DOMAIN_ARCH = "sm_107a"
 DOMAIN_COUNTERS = ("counters0", "counters1")
+# Values of expected_m at both sides of every bound of serving_config and of
+# expected_m_class: every serving key a weight shape reaches is reached by one.
+DOMAIN_EXPECTED_M_PROBES = (0, 1, 2, 3, 4, 7, 8, 15, 16, 17)
 WORKSPACE_DTYPES = {
     "sfa_packed": torch.int32,
     "sfb_packed": torch.int32,
@@ -177,6 +183,36 @@ def domain_serving_program(
     if qualified not in DOMAIN_SERVING_CELLS.get(sm_count, {}).get(cell, ()):
         return None
     return DOMAIN_SERVING_PROGRAMS[qualified]
+
+
+def domain_serving_routed(
+    arch: str,
+    sm_count: int,
+    counts: tuple[int, int],
+    n: int,
+    k: int,
+    groups: int,
+) -> bool:
+    """True when every packed-scale serving problem on weights of ``groups`` x
+    ``(n, k)`` runs a locality-domain twin on a device of ``sm_count`` SMs split
+    ``counts`` over its dies: whatever its ``expected_m``, the serving key it
+    selects has a twin listed in the cell of that ``expected_m``.  Homed weights
+    of any other shape could run a whole-GPU program, which is slower on homed
+    weights than on ordinary ones, so :func:`localize_weights` refuses them."""
+    if (
+        arch != DOMAIN_ARCH
+        or (n, k) not in PACKED_NK
+        or groups not in PACKED_GROUPS
+        or sm_count not in DOMAIN_SERVING_CELLS
+    ):
+        return False
+    for expected_m in DOMAIN_EXPECTED_M_PROBES:
+        # The serving rule reads K, expected_m and the device, not M.
+        stages, epi, hint, _, l2 = serving_config(0, k, expected_m, sm_count, arch)
+        key = serving_program_key(n, k, groups, stages, epi, hint, l2)
+        if domain_serving_program(arch, sm_count, key, expected_m, counts) is None:
+            return False
+    return True
 
 
 def serving_plan(
@@ -337,6 +373,13 @@ def _resolve(
             f"got {torch.cuda.get_device_capability(index)}"
         )
     sm_count = device_sm_count(index)
+    # SM107a runs its packed-scale serving programs on every SM count (their grid
+    # comes from the SM count); its float32-scale route chain is checked below.
+    if arch != DOMAIN_ARCH and route_chain(arch, sm_count) is None:
+        raise ValueError(
+            f"the Cake batch DeepGEMM FP8 backend is exported for {arch} devices with "
+            f"{sorted(_exported_sm_counts(arch))} SMs; this device has {sm_count}"
+        )
     if tuple(int(v) for v in scale_granularity_mnk) != (1, BLOCK, BLOCK):
         raise ValueError(
             f"the Cake batch DeepGEMM FP8 backend requires scale_granularity_mnk=(1, {BLOCK}, {BLOCK})"
@@ -408,8 +451,6 @@ def _resolve(
             device=device,
             strides=(N * cols, 1, N),
         )
-        # The serving programs take their grid from the SM count: they run on
-        # every SM count of a packed-scale architecture.
         domain = _domain_homing(b, index, B) if arch == DOMAIN_ARCH else None
         plan = serving_plan(
             arch,
@@ -429,7 +470,7 @@ def _resolve(
             raise ValueError(
                 f"the Cake batch DeepGEMM FP8 backend is exported for {arch} devices with "
                 f"{sorted(_exported_sm_counts(arch))} SMs (packed UE8M0 scales: any SM "
-                f"count); this device has {sm_count}"
+                f"count of {DOMAIN_ARCH}); this device has {sm_count}"
             )
         _require_tensor(
             a_scale,
@@ -503,7 +544,9 @@ def check_batch_deepgemm_fp8_nt_groupwise_cake(
 
 
 def is_batch_deepgemm_fp8_nt_groupwise_cake_available(device: torch.device) -> bool:
-    """True when generated programs and a route chain are registered for ``device``."""
+    """True when generated programs and a float32-scale route chain are registered
+    for ``device``.  The packed-scale serving programs also run on SM107a devices
+    without a route chain (any SM count)."""
     return device.type == "cuda" and generated_program_available(device)
 
 
@@ -577,7 +620,10 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     and ``workspace["counters1"]``: zero before the first launch, left zero by
     every launch.  Launches of one prepared launch must therefore not overlap
     (successive launches on one stream, or graph replays on one stream, never
-    do); prepare one launch per concurrent stream.
+    do); prepare one launch per concurrent stream.  A twin launch prepared under
+    CUDA graph capture without caller-owned counters zeroes its counters inside
+    that capture, so it belongs to that capture: ``launch()`` raises outside
+    capture, and it must be launched in the capture it was prepared in.
     """
 
     route: str
@@ -592,9 +638,17 @@ class PreparedBatchDeepGemmFp8NtGroupwise:
     # The locality-domain twin's first group of ``b`` homed on die 1 (``None`` on
     # every other route).
     g_cut: Optional[int] = None
+    # True when the launch's counters were zeroed inside a graph capture.
+    capture_only: bool = False
 
     def launch(self) -> torch.Tensor:
         with torch.cuda.device(self.out.device), tvm_ffi.use_torch_stream():
+            if self.capture_only and not torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "this locality-domain launch was prepared under CUDA graph "
+                    "capture, which zeroes its claim counters: launch it only in "
+                    "that capture, or prepare it outside capture"
+                )
             for entry, arguments in self._launches:
                 entry(*arguments)
         return self.out
@@ -645,6 +699,21 @@ def _check_workspace(
             dtype=WORKSPACE_DTYPES[key],
             device=device,
         )
+    if DOMAIN_COUNTERS[0] in plan.workspaces:
+        # Each die claims through its own counters: the two must not share a byte.
+        spans = sorted(
+            (
+                int(workspace[name].data_ptr()),
+                int(workspace[name].data_ptr())
+                + workspace[name].numel() * workspace[name].element_size(),
+            )
+            for name in DOMAIN_COUNTERS
+        )
+        if spans[0][1] > spans[1][0]:
+            raise ValueError(
+                f"workspaces {DOMAIN_COUNTERS[0]} and {DOMAIN_COUNTERS[1]} overlap; "
+                "each die needs its own zeroed counters"
+            )
 
 
 def _family_bindings(
@@ -786,8 +855,13 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
             (problem.B, problem.M, problem.N), dtype=torch.bfloat16, device=device
         )
     plan = problem.plan
+    capture_only = False
     if workspace is None:
         workspace = _allocate_workspace(plan, device)
+        capture_only = (
+            DOMAIN_COUNTERS[0] in plan.workspaces
+            and torch.cuda.is_current_stream_capturing()
+        )
     else:
         _check_workspace(plan, workspace, device)
     launches = []
@@ -852,6 +926,7 @@ def prepare_batch_deepgemm_fp8_nt_groupwise(
         workspace=workspace,
         _launches=tuple(launches),
         g_cut=problem.g_cut,
+        capture_only=capture_only,
     )
 
 
@@ -862,29 +937,50 @@ def localize_weights(b: torch.Tensor, g_cut: Optional[int] = None) -> torch.Tens
 
     ``g_cut`` defaults to the SM-proportional share of die 0,
     ``split_units(B, counts)[0]`` over the device's probed SM table.  Passing the
-    copy as ``b`` lets the packed-scale serving problems of the listed cells run
-    the locality-domain twin route; the result does not depend on ``g_cut``.
-    Returns ``b`` itself when the device has no SM table
-    (:func:`flashinfer.cake_locality.sm_table` is ``None``).  Call it outside CUDA
-    graph capture; the memory is freed with the returned tensor.
+    copy as ``b`` makes every packed-scale serving problem on it run the
+    locality-domain twin of its serving program; the twin's result is the same
+    bits for any ``g_cut``.
+
+    Returns ``b`` itself, unhomed, when homing could make a call slower: the
+    device has no SM table (:func:`flashinfer.cake_locality.sm_table` is
+    ``None``), ``b`` is not float8_e4m3fn weights of a packed-scale serving shape
+    (``(N, K)`` in ``PACKED_NK``, ``B`` in ``PACKED_GROUPS``), some ``expected_m``
+    of that shape selects a serving program without a twin listed in its cell
+    (:func:`domain_serving_routed`), or the cut is not a multiple of the
+    allocation granularity of locality-domain memory.  Raises ``ValueError`` for
+    a ``g_cut`` outside ``[0, B]``.
+
+    Call it outside CUDA graph capture.  The memory is freed with the returned
+    tensor; a CUDA graph that reads the tensor after it is freed faults on
+    replay, so keep it alive as long as such a graph.
     """
     if not isinstance(b, torch.Tensor) or b.device.type != "cuda" or b.ndim != 3:
         raise ValueError("b must be a CUDA torch.Tensor of shape (B, N, K)")
     if not b.is_contiguous():
         raise ValueError("b must be contiguous")
+    groups, n, k = (int(extent) for extent in b.shape)
+    if g_cut is not None and not 0 <= int(g_cut) <= groups:
+        raise ValueError(f"g_cut must be in [0, {groups}], got {g_cut}")
+    if b.dtype != torch.float8_e4m3fn:
+        return b
     index = _device_index(b.device)
+    arch = device_arch(index)
+    if arch != DOMAIN_ARCH:
+        return b
     table = cake_locality.sm_table(index)
     if table is None:
         return b
-    groups = int(b.shape[0])
+    if not domain_serving_routed(
+        arch, device_sm_count(index), table.counts, n, k, groups
+    ):
+        return b
     if g_cut is None:
         g_cut = cake_locality.split_units(groups, table.counts)[0]
-    if not 0 <= int(g_cut) <= groups:
-        raise ValueError(f"g_cut must be in [0, {groups}], got {g_cut}")
-    group_bytes = b[0].numel() * b.element_size()
-    homed = cake_locality.split_empty(
-        tuple(b.shape), b.dtype, int(g_cut) * group_bytes, index
-    )
+    group_bytes = n * k * b.element_size()
+    cut = int(g_cut) * group_bytes
+    if 0 < cut < groups * group_bytes and cut % cake_locality.granularity(index):
+        return b
+    homed = cake_locality.split_empty(tuple(b.shape), b.dtype, cut, index)
     homed.copy_(b)
     return homed
 
@@ -926,6 +1022,7 @@ __all__ = [
     "bind_named_arguments",
     "check_batch_deepgemm_fp8_nt_groupwise_cake",
     "domain_serving_program",
+    "domain_serving_routed",
     "expected_m_class",
     "is_batch_deepgemm_fp8_nt_groupwise_cake_available",
     "localize_weights",
