@@ -574,9 +574,8 @@ def test_routed_attention_builds_write_the_default_bits(sel, wide, monkeypatch):
             device,
         )
         assert 2 * sms <= tiles and 2 * tiles < 5 * sms if wide else 2 * tiles < sms
-        # On SM103 a tail split (from 24 blocks a row) takes the p3 one once the grid
-        # holds a tile per SM, else splits without p3 from 32 blocks a row; SM100
-        # splits without p3 from 24 blocks a row.
+        # A tail split (from 24 blocks a row) takes the p3 one once the grid holds a
+        # tile per SM; SM103 splits without p3 from 32 blocks a row only.
         split = next(
             (
                 name
@@ -679,6 +678,76 @@ def test_tail_split_rows_are_deterministic_and_close_to_the_default_build(
     finite = torch.isfinite(default_lse)
     assert torch.equal(torch.isinf(lse), ~finite)
     torch.testing.assert_close(lse[finite], default_lse[finite], atol=1e-2, rtol=0)
+
+
+@requires_sm100
+@pytest.mark.parametrize("heads", [3, 5, 7, 8])
+def test_combined_call_launches_the_p3_tail_split_by_the_serial_rule(heads):
+    """A combined call whose quantizer is the one-launch program and whose attention
+    routes to ``attention_sd_tsplit_p3`` follows ``_TAIL_SPLIT_P3_SERIAL``: the build
+    without programmatic dependent launch (its PDL flag is 0) where the rule holds,
+    ``attention_sd_tsplit`` with PDL where it does not, the build with PDL on the other
+    architectures and outside a combined call; the bits are those of the attention call
+    on the quantizer's outputs."""
+    device = torch.device("cuda")
+    index = torch.cuda.current_device()
+    arch = loader.device_arch(index)
+    sms = loader.sm_count(index)
+    sel, seqlen = 40, 4096
+    tiles = heads * _ceil_div(seqlen, _BLOCK)
+    plan = pkg._tail_split(arch, tiles, sel, index, True)
+    if 8 * heads > sms or plan is None:
+        pytest.skip(f"{sms} SMs leave {heads} heads no one-launch p3 tail split")
+    g = torch.Generator(device=device).manual_seed(5)
+    q, k, v = (
+        torch.randn(
+            (1, seqlen, heads, _HEAD_DIM), device=device, generator=g
+        ).bfloat16()
+        for _ in range(3)
+    )
+    nb = seqlen // _BLOCK
+    scores = torch.rand((1, heads, nb, nb), device=device, generator=g)
+    idx = (
+        scores.argsort(dim=-1, descending=True)[..., :sel].to(torch.int32).contiguous()
+    )
+    _, (q8, k8, v8, qs, ks, vs), impl = pkg._quantize_program(q, k, v, "auto", None)
+    assert impl == "one_launch", impl
+    rule = pkg._p3_serial(arch, plan)
+    for after in (False, True):
+        record, _, args, _, _ = pkg._attention_operands(
+            q8,
+            k8,
+            v8,
+            idx,
+            sel,
+            qs,
+            ks,
+            vs,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            operands_checked=True,
+            after_one_launch=after,
+        )
+        expect = "attention_sd_tsplit_p3_pdl", 1
+        if after and rule is not None:
+            expect = (
+                ("attention_sd_tsplit_p3_pdl", 0)
+                if rule
+                else ("attention_sd_tsplit_pdl", 1)
+            )
+        assert (record, args[-4]) == expect, (record, args[-4:])
+    out, _ = pkg.bsa_attn_sm100_sage_quantize_fwd_cake(q, k, v, idx, sel)
+    q8, k8, v8, qs, ks, vs = sage_fp8_quantize_sm100(q, k, v)
+    ref, _ = bsa_attn_sm100_sage_fwd_cake(
+        q8, k8, v8, idx, sel, q_scale=qs, k_scale=ks, v_scale=vs
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
 
 
 @requires_sm100

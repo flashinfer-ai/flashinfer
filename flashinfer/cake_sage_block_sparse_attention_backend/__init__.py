@@ -251,9 +251,10 @@ _ATTENTION_ROUTES = {
     "sm_103a": (("attention_sd", 23),),
 }
 #: The tail-split build of ``attention_sd`` and, per architecture, the selected blocks a
-#: row from which it runs (it pays off from about 24 on SM100 and 30 on SM103; on SM103
-#: ``attention_sd_tsplit_p3`` below takes the split rows from 24 to 64 blocks a row once
-#: the grid holds a tile per SM): clusters of two CTAs, where the tiles of the last,
+#: row from which it runs (it pays off from about 24 on SM100 and 30 on SM103;
+#: ``attention_sd_tsplit_p3`` below takes the split rows from 24 blocks a row, up to 64
+#: on SM103, once the grid holds a tile per SM): clusters of two CTAs, where the tiles
+#: of the last,
 #: partial wave of the persistent grid run as two halves of their KV blocks, one per
 #: CTA of a cluster, and the first half folds the second half's output and softmax
 #: statistics into its own.
@@ -264,10 +265,20 @@ _TAIL_SPLIT = {"sm_100a": 24, "sm_103a": 32}
 #: The tail split of ``attention_sdp3`` (below) and, per architecture, the band of
 #: selected blocks a row ``(lo, hi)`` (``hi`` ``None``: no bound) in which it replaces
 #: ``attention_sd_tsplit`` once the grid holds a tile per SM (``total_tiles >= SMs``).
-#: It splits the same tiles, with the occupancy of its own record.  SM100 split rows
-#: keep ``attention_sd_tsplit``.
+#: It splits the same tiles, with the occupancy of its own record.
 _TAIL_SPLIT_P3_ROLE = "attention_sd_tsplit_p3"
-_TAIL_SPLIT_P3 = {"sm_103a": (24, 64)}
+_TAIL_SPLIT_P3 = {"sm_100a": (24, None), "sm_103a": (24, 64)}
+#: Per architecture, how a combined call launches a split row of
+#: ``attention_sd_tsplit_p3`` with programmatic dependent launch after the one-launch
+#: quantizer.  On SM100 an eager PDL launch behind that quantizer runs this build's
+#: tiles about a fifth slower (most on the CTAs that hold a split tile), which costs
+#: more than the overlap saves; launched after the quantizer ends, or in a CUDA graph,
+#: it runs at full speed.  ``(waves, parts)``: when the persistent grid runs at least
+#: ``waves`` waves and the split tiles fill at most ``1/parts`` of its slots, the call
+#: launches the build without PDL; otherwise it launches ``attention_sd_tsplit`` with
+#: PDL, which is then as fast or faster.  The other builds, and every build after the
+#: other quantizers, keep PDL.
+_TAIL_SPLIT_P3_SERIAL = {"sm_100a": (4, 3)}
 #: The ``p3`` build (a fifth warpgroup merges, scales and stores each tile while the
 #: next tile runs) and, per architecture, the band of selected blocks a row
 #: ``(lo, hi, waves)`` in which it replaces the default or ``attention_qs`` build when
@@ -376,19 +387,37 @@ def _tail_split(
     return min(full + 2 * tail, slots), full, full + 2 * tail
 
 
+def _p3_serial(arch: str, plan: Tuple[int, int, int]) -> Optional[bool]:
+    """After the one-launch quantizer, does the ``attention_sd_tsplit_p3`` plan
+    ``(grid, split_from, items)`` launch without PDL (``True``) or give way to
+    ``attention_sd_tsplit`` (``False``)?  ``None``: the architecture keeps PDL."""
+    rule = _TAIL_SPLIT_P3_SERIAL.get(arch)
+    if rule is None:
+        return None
+    waves, parts = rule
+    grid, split_from, items = plan
+    tail = (items - split_from) // 2
+    return split_from >= (waves - 1) * grid and parts * tail <= grid
+
+
 #: The launch route of each call key ``(arch, block_sparse_num, total_tiles, device,
-#: pdl)``: ``(record, items, split, tail)``, where ``items`` is the ``total_tiles``
-#: argument, ``split`` the tail-split parameters and ``tail`` the PDL flag and the
-#: grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
+#: pdl, after_one_launch)``: ``(record, items, split, tail)``, where ``items`` is the
+#: ``total_tiles`` argument, ``split`` the tail-split parameters and ``tail`` the PDL
+#: flag and the grid.  Filled outside CUDA-graph capture (a capture may not know the occupancy yet),
 #: so a repeated call pays one dict lookup.  Code that changes ``_ATTENTION_ROUTES``,
 #: ``_TAIL_SPLIT``, ``_TAIL_SPLIT_P3``, ``_P3_BANDS`` or ``_SDP3_BANDS`` clears it.
 _ROUTES: dict = {}
 
 
 def _route(
-    arch: str, block_sparse_num: int, total_tiles: int, device_index: int, pdl: bool
+    arch: str,
+    block_sparse_num: int,
+    total_tiles: int,
+    device_index: int,
+    pdl: bool,
+    after_one_launch: bool = False,
 ) -> Tuple[str, int, Tuple[int, ...], Tuple[int, ...]]:
-    key = (arch, block_sparse_num, total_tiles, device_index, pdl)
+    key = (arch, block_sparse_num, total_tiles, device_index, pdl, after_one_launch)
     hit = _ROUTES.get(key)
     if hit is not None:
         return hit
@@ -397,20 +426,29 @@ def _route(
     grid = max(1, min(total_tiles, sms))
     items = total_tiles
     split: Tuple[int, ...] = ()
+    serial = False
     if role == "attention_sd":
         for p3, name in ((True, _TAIL_SPLIT_P3_ROLE), (False, _TAIL_SPLIT_ROLE)):
             plan = _tail_split(arch, total_tiles, block_sparse_num, device_index, p3)
-            if plan is not None:
-                role = name
-                grid, split_from, items = plan
-                split = (split_from,)
-                break
+            if plan is None:
+                continue
+            if p3 and pdl and after_one_launch:
+                launch = _p3_serial(arch, plan)
+                if launch is False:
+                    continue
+                serial = launch is True
+            role = name
+            grid, split_from, items = plan
+            split = (split_from,)
+            break
     if not split:
         if _sdp3(arch, block_sparse_num, total_tiles, sms):
             role = _SDP3_ROLE
         elif _p3(arch, block_sparse_num, total_tiles, sms):
             role = _P3_ROLE
     record, flag = _record(role, pdl)
+    if serial and flag:
+        flag = (0,)
     hit = (record, items, split, flag + (grid, 1, 1))
     if not torch.cuda.is_current_stream_capturing():
         _ROUTES[key] = hit
@@ -435,6 +473,7 @@ def _attention_operands(
     enable_pdl: Optional[bool],
     operands_checked: bool = False,
     check_addresses: bool = True,
+    after_one_launch: bool = False,
 ):
     """Validate one attention call and return ``(record, arch, args, out, lse)``.
 
@@ -442,7 +481,8 @@ def _attention_operands(
     nothing is launched or loaded.  ``operands_checked`` skips the checks of Q/K/V and
     their scales, which the quantizer of :func:`bsa_attn_sm100_sage_quantize_fwd_cake`
     has just allocated in this layout.  ``check_addresses=False`` skips the alignment
-    checks (fake tensors have no data).
+    checks (fake tensors have no data).  ``after_one_launch``: the call follows the
+    one-launch quantizer in the same launch sequence (``_TAIL_SPLIT_P3_SERIAL``).
     """
     if not operands_checked:
         for name, t in (("q", q), ("k", k), ("v", v)):
@@ -571,7 +611,7 @@ def _attention_operands(
     total_tiles = batch * heads * q_blocks
     pdl = _pdl_supported(device_index) if enable_pdl is None else bool(enable_pdl)
     record, items, split, tail = _route(
-        arch, int(block_sparse_num), total_tiles, device_index, pdl
+        arch, int(block_sparse_num), total_tiles, device_index, pdl, after_one_launch
     )
     # Positional binding in the record's ``arg_plan`` order (buffers, parameters,
     # the PDL launch flag, grid).
@@ -812,6 +852,19 @@ def _quantize_calls(
     enable_pdl: Optional[bool],
 ):
     """Validate one quantizer call and return ``(calls, outputs)``; launches nothing."""
+    calls, outputs, _ = _quantize_program(q, k, v, impl, enable_pdl)
+    return calls, outputs
+
+
+def _quantize_program(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    impl: str,
+    enable_pdl: Optional[bool],
+):
+    """``(calls, outputs, impl)`` of one quantizer call, ``impl`` the program it runs
+    (``"one_launch"``, ``"tma"`` or ``"two_launch"``); launches nothing."""
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor) or t.ndim != 4:
             raise ValueError(f"{name} must be a rank-4 BSHD tensor")
@@ -934,7 +987,7 @@ def _quantize_calls(
                     ),
                 ),
             )
-            return calls_tma, (q8, k8, v8, q_scale, k_scale, v_scale)
+            return calls_tma, (q8, k8, v8, q_scale, k_scale, v_scale), "tma"
         passes = _ceil_div(max(seqlen_q, seqlen_k), 16 * _CLUSTER_WARPS * _CLUSTER_CTAS)
         calls: Tuple[Tuple[Any, Tuple[Any, ...]], ...] = (
             (
@@ -963,7 +1016,7 @@ def _quantize_calls(
                 ),
             ),
         )
-        return calls, (q8, k8, v8, q_scale, k_scale, v_scale)
+        return calls, (q8, k8, v8, q_scale, k_scale, v_scale), "one_launch"
     q_scale = torch.empty((batch, heads, seqlen_q), dtype=torch.float32, device=device)
     k_scale = torch.empty((batch, kv_heads, groups), dtype=torch.float32, device=device)
     v_scale = torch.empty((batch, kv_heads, dim), dtype=torch.float32, device=device)
@@ -1020,7 +1073,7 @@ def _quantize_calls(
             ),
         ),
     )
-    return calls, (q8, k8, v8, q_scale, k_scale, v_scale)
+    return calls, (q8, k8, v8, q_scale, k_scale, v_scale), "two_launch"
 
 
 def sage_fp8_quantize_sm100(
@@ -1089,7 +1142,7 @@ def bsa_attn_sm100_sage_quantize_fwd_cake(
     host time of the attention call does not separate the quantizer from the attention
     kernel on the device.
     """
-    calls, (q8, k8, v8, q_scale, k_scale, v_scale) = _quantize_calls(
+    calls, (q8, k8, v8, q_scale, k_scale, v_scale), impl = _quantize_program(
         q, k, v, "auto", enable_pdl
     )
     attention, out, lse = _attention_call(
@@ -1109,6 +1162,7 @@ def bsa_attn_sm100_sage_quantize_fwd_cake(
         lse,
         enable_pdl,
         operands_checked=True,
+        after_one_launch=impl == "one_launch",
     )
     _launch(*calls, attention)
     return out, lse
